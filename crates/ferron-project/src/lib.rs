@@ -41,12 +41,51 @@ struct SceneSection  {
     start: Option<PathBuf>
 }
 
+#[derive(Debug)]
 pub enum ProjectError {
     Io { path: PathBuf, source: std::io::Error },
     Parse { path: PathBuf, message: String },
     AbsolutePath { field: &'static str, value: PathBuf },
     ParentDirInPath { field: &'static str, value: PathBuf },
     UnsupportedVersion { found: u32 },
+}
+
+impl std::fmt::Display for ProjectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { path, source } => {
+                write!(f, "could not read {}: {source}", path.display())
+            }
+            Self::Parse { path, message } => {
+                write!(f, "could not parse {}: {message}", path.display())
+            }
+            Self::AbsolutePath { field, value } => write!(
+                f,
+                "`{field}` must be relative to the project, got `{}`; \
+                 absolute paths are machine-local and must not be committed",
+                value.display()
+            ),
+            Self::ParentDirInPath { field, value } => write!(
+                f,
+                "`{field}` must stay inside the project, got `{}`; \
+                 remove the `..` components",
+                value.display()
+            ),
+            Self::UnsupportedVersion { found } => write!(
+                f,
+                "unsupported `format_version` {found}; this engine supports {SUPPORTED_FORMAT_VERSION}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProjectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
 }
 
 pub struct Project {
