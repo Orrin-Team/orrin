@@ -529,16 +529,15 @@ pub struct Scripting {
 }
 
 impl Scripting {
-    /// Locate the built `Ferron` managed assembly: `FERRON_SCRIPT_DIR` wins if
-    /// set; otherwise probe `scripting/Ferron/bin/{Debug,Release}/net*`
-    /// (relative to the working directory) and pick the most recently built.
-    pub fn find_assembly_dir() -> Option<PathBuf> {
-        if let Ok(dir) = std::env::var("FERRON_SCRIPT_DIR") {
-            return Some(PathBuf::from(dir));
-        }
+    /// Locate the built managed assembly under `scripts_dir` by probing
+    /// `bin/{Debug,Release}/net*` and picking the most recently built.
+    ///
+    /// The caller decides where `scripts_dir` comes from (project manifest or
+    /// the built-in default) and handles the `FERRON_SCRIPT_DIR` override.
+    pub fn find_assembly_dir(scripts_dir: &Path) -> Option<PathBuf> {
         let mut best: Option<(SystemTime, PathBuf)> = None;
         for config in ["Debug", "Release"] {
-            let bin = Path::new("scripting/Ferron/bin").join(config);
+            let bin = scripts_dir.join("bin").join(config);
             let Ok(entries) = std::fs::read_dir(&bin) else {
                 continue;
             };
