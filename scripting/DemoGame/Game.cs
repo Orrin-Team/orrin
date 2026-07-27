@@ -1,6 +1,7 @@
+using Ferron;
 using Ferron.Math;
 
-namespace Ferron.Demo;
+namespace DemoGame;
 
 // Demo entry behaviour (attached by the engine at startup; see FERRON_ENTRY):
 // spawns a player cube, moves it with the arrow keys, and drops a cube with a

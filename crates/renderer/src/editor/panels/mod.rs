@@ -3,6 +3,8 @@ mod environment;
 mod hierarchy;
 mod inspector;
 mod performance;
+#[cfg(feature = "scripting")]
+mod scripts;
 
 use glam::Vec3;
 
@@ -17,6 +19,8 @@ pub fn draw(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
     inspector::show(ctx, world, state);
     environment::show(ctx, world);
     performance::show(ctx, world);
+    #[cfg(feature = "scripting")]
+    scripts::show(ctx, world, state);
     console::show(ctx, world);
 }
 

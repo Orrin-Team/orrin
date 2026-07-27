@@ -6,7 +6,7 @@ version = "0.1.0"
 
 [scripts]
 dir = "scripts"
-entry = "Ferron.Demo.Game, Ferron"
+entry = "HelloFerron.Main, HelloFerron"
 
 [assets]
 dir = "assets"

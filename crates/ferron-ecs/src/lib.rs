@@ -19,9 +19,15 @@ use std::marker::PhantomData;
 /// An entity is identified by a slot `index` plus a `generation`. When a slot
 /// is reused by a later entity the generation changes, so a stale handle to a
 /// despawned entity can be detected instead of silently aliasing the new one.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+///
+/// Slot 0 is reserved and never allocated, so `Entity::default()` — index 0,
+/// generation 0 — names no live entity and never will. That makes the
+/// all-zeroes handle usable as a null sentinel across the FFI boundary, where a
+/// C# `Entity` field left uninitialized is exactly those bytes.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
 pub struct Entity {
-    /// Index of the storage slot this entity occupies.
+    /// Index of the storage slot this entity occupies. Never 0 for a live
+    /// entity; see the type-level docs.
     pub index: u32,
     /// How many times this slot has been reused; bumped on every despawn.
     pub generation: u32,
@@ -42,11 +48,31 @@ impl Entity {
 }
 
 // Hands out entity ids and recycles the indices
-#[derive(Default)]
 struct EntityAllocator {
     generations: Vec<u32>,
     alive: Vec<bool>,
     free: Vec<u32>,
+}
+
+/// Seeds slot 0 as permanently dead, which is why this is hand-written —
+/// **do not collapse it back into `#[derive(Default)]`**.
+///
+/// `allocate` takes the next fresh index from `generations.len()`, so starting
+/// at length 1 never hands out `{0, 0}`; `deallocate` refuses a slot that isn't
+/// alive, so 0 never reaches the free list either.
+///
+/// The payoff is across the FFI boundary: C# cannot customize a struct's
+/// `default`, so an unassigned `Ferron.Entity` field is always all-zeroes.
+/// Without this it aliases the first entity ever spawned and silently mutates
+/// it; with it, `is_alive` is false and every lookup misses.
+impl Default for EntityAllocator {
+    fn default() -> Self {
+        EntityAllocator {
+            generations: vec![0],
+            alive: vec![false],
+            free: Vec::new(),
+        }
+    }
 }
 
 impl EntityAllocator {
@@ -884,6 +910,42 @@ mod tests {
             .for_each(|e, health| seen.push((e, health.map(|h| h.0))));
         seen.sort_by_key(|(e, _)| e.index());
         assert_eq!(seen, vec![(a, Some(3)), (empty, None)]);
+    }
+
+    /// Slot 0 is reserved, so the all-zeroes handle is inert forever. This is
+    /// what lets `Entity::default()` double as the FFI null sentinel: C# cannot
+    /// override a struct's default, so an unassigned `Entity` field over there
+    /// is these exact bytes, and it must not name anything.
+    ///
+    /// Pinned as its own test because the property is invisible at the call
+    /// site — a refactor of `allocate` that reverted to handing out index 0
+    /// would break the C# boundary while every other ECS test still passed.
+    #[test]
+    fn entity_slot_zero_is_never_allocated() {
+        let mut world = World::new();
+
+        let null = Entity::default();
+        assert!(!world.is_alive(null));
+
+        // Includes the recycle path: despawning must not put slot 0 in play.
+        let mut spawned = Vec::new();
+        for _ in 0..8 {
+            spawned.push(world.spawn());
+        }
+        for entity in spawned.drain(..).take(4) {
+            assert!(world.despawn(entity));
+        }
+        for _ in 0..8 {
+            spawned.push(world.spawn());
+        }
+        assert!(spawned.iter().all(|e| e.index() != 0), "slot 0 was handed out: {spawned:?}");
+
+        // Inert against component storage too, not just the allocator.
+        world.insert(null, Health(1));
+        assert!(world.get::<Health>(null).is_none());
+        let mut visited = 0;
+        world.query::<&Health>().for_each(|_, _| visited += 1);
+        assert_eq!(visited, 0);
     }
 
     #[test]

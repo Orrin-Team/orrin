@@ -67,6 +67,14 @@ impl Editor {
         state.apply(world);
     }
 
+    /// Whether the user asked for a script reload since the last call. Drained
+    /// by the app at the start of the script phase — see
+    /// `EditorState::script_reload_request`.
+    #[cfg(feature = "scripting")]
+    pub fn take_script_reload_request(&mut self) -> bool {
+        self.state.take_script_reload_request()
+    }
+
     pub fn draw(
         &mut self,
         before: Box<dyn GpuFuture>,

@@ -117,6 +117,93 @@ impl App {
 
         event_loop.run_app(&mut app).unwrap();
     }
+
+    /// Boot the script host and attach the project's entry Behaviour.
+    ///
+    /// Two assemblies, resolved separately because they have different owners:
+    /// the *bindings* (`Ferron.dll`) belong to the engine and stay in the
+    /// default load context forever, while the *game* assembly belongs to the
+    /// project and is what a hot reload swaps. Each follows env > manifest >
+    /// built-in default, with its own env override.
+    #[cfg(feature = "scripting")]
+    fn boot_scripting(&mut self) -> Option<crate::scripting::Scripting> {
+        use crate::scripting::Scripting;
+        use std::path::{Path, PathBuf};
+
+        const BINDINGS: &str = "scripting/Ferron";
+        const DEMO_SCRIPTS: &str = "scripting/DemoGame";
+        const DEMO_ENTRY: &str = "DemoGame.Game, DemoGame";
+
+        let bindings_dir = match std::env::var("FERRON_SCRIPT_DIR") {
+            Ok(dir) => Some(PathBuf::from(dir)),
+            // Next to the executable is the shipped layout, and it is the only
+            // one that works from inside a project directory. The cwd-relative
+            // probe is the repo checkout, where the bindings are still an
+            // unbuilt source tree.
+            Err(_) => Scripting::bindings_beside_executable()
+                .or_else(|| Scripting::find_bindings_dir(Path::new(BINDINGS))),
+        };
+        let Some(bindings_dir) = bindings_dir else {
+            eprintln!(
+                "scripting disabled: no Ferron bindings next to the engine, and none \
+                 under {BINDINGS} (run `dotnet build {BINDINGS}`, or set FERRON_SCRIPT_DIR)"
+            );
+            return None;
+        };
+
+        let entry = std::env::var("FERRON_ENTRY")
+            .ok()
+            .or_else(|| {
+                self.project
+                    .as_ref()
+                    .map(|project| project.entry_type().to_string())
+            })
+            .unwrap_or_else(|| DEMO_ENTRY.to_string());
+
+        // Without a project this is the engine's own demo game, which is a
+        // normal game assembly like any other — one loading path, so the demo
+        // exercises hot reload exactly as a user's project does.
+        let scripts_dir = self
+            .project
+            .as_ref()
+            .map(|project| project.scripts_dir())
+            .unwrap_or_else(|| PathBuf::from(DEMO_SCRIPTS));
+
+        let game_dll = match std::env::var("FERRON_GAME_DLL") {
+            Ok(path) => Some(PathBuf::from(path)),
+            Err(_) => match Scripting::assembly_of(&entry) {
+                Some(assembly) => Scripting::find_game_assembly(&scripts_dir, assembly),
+                None => {
+                    eprintln!(
+                        "scripting disabled: entry `{entry}` names no assembly — it must be \
+                         assembly-qualified (`MyGame.Main, MyGame`) so the engine knows which \
+                         DLL to load"
+                    );
+                    return None;
+                }
+            },
+        };
+        let Some(game_dll) = game_dll else {
+            eprintln!(
+                "scripting disabled: no built game assembly for `{entry}` under {} \
+                 (run `dotnet build` there, or set FERRON_GAME_DLL)",
+                scripts_dir.display()
+            );
+            return None;
+        };
+
+        let scripting = Scripting::boot(&bindings_dir, &game_dll)?;
+
+        // One entry Behaviour; it finds or spawns everything else itself
+        // through the script API.
+        let entity = self
+            .world
+            .spawn_entity()
+            .with(crate::scene::Name::new("Script Entry"))
+            .id();
+        scripting.attach(&mut self.world, entity, &entry);
+        Some(scripting)
+    }
 }
 
 impl ApplicationHandler for App {
@@ -146,45 +233,7 @@ impl ApplicationHandler for App {
         // the manifest.
         #[cfg(feature = "scripting")]
         {
-            let scripts_dir = self
-                .project
-                .as_ref()
-                .map(|project| project.scripts_dir())
-                .unwrap_or_else(|| std::path::PathBuf::from("scripting/Ferron"));
-
-            let assembly_dir = match std::env::var("FERRON_SCRIPT_DIR") {
-                Ok(dir) => Some(std::path::PathBuf::from(dir)),
-                Err(_) => crate::scripting::Scripting::find_assembly_dir(&scripts_dir),
-            };
-
-            let scripting = match assembly_dir {
-                Some(dir) => crate::scripting::Scripting::boot(&dir),
-                None => {
-                    eprintln!(
-                        "scripting disabled: no built managed assembly under {} \
-                         (run `dotnet build` there, or set FERRON_SCRIPT_DIR)",
-                        scripts_dir.display()
-                    );
-                    None
-                }
-            };
-            if let Some(scripting) = &scripting {
-                let entry = std::env::var("FERRON_ENTRY")
-                    .ok()
-                    .or_else(|| {
-                        self.project
-                            .as_ref()
-                            .map(|project| project.entry_type().to_string())
-                    })
-                    .unwrap_or_else(|| "Ferron.Demo.Game, Ferron".to_string());
-                let entity = self
-                    .world
-                    .spawn_entity()
-                    .with(crate::scene::Name::new("Script Entry"))
-                    .id();
-                scripting.attach(&mut self.world, entity, &entry);
-            }
-            self.scripting = scripting;
+            self.scripting = self.boot_scripting();
         }
 
         let editor = Editor::new(event_loop, surface, renderer.queue(), renderer.color_format());
@@ -260,9 +309,25 @@ impl ApplicationHandler for App {
                 // they'll read this frame.
                 crate::collision::run(&mut self.world);
 
+                // A reload requested from the editor last frame lands here:
+                // before the tick, after collision, with no dispatch window
+                // open and no world borrow held — the only point in the frame
+                // where managed objects may be destroyed and re-created.
                 #[cfg(feature = "scripting")]
-                if let Some(scripting) = &self.scripting {
-                    scripting.tick(&mut self.world, delta);
+                {
+                    let reload_requested = active.editor.take_script_reload_request();
+                    if let Some(scripting) = &self.scripting {
+                        if reload_requested {
+                            let outcome = scripting.reload(&mut self.world);
+                            let frame = self.world.resource::<Time>().frame_count();
+                            self.world.resource_mut::<LogBuffer>().push(
+                                outcome.level(),
+                                outcome.to_string(),
+                                frame,
+                            );
+                        }
+                        scripting.tick(&mut self.world, delta);
+                    }
                 }
 
                 // Before extraction: the UI may spawn/despawn/edit entities.

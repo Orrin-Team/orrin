@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- The directory is `scripts`, which would otherwise name the assembly.
+         This has to agree with the assembly half of `scripts.entry` in
+         ferron.toml — that is where the engine reads the game DLL's name. -->
+    <AssemblyName>HelloFerron</AssemblyName>
+    <RootNamespace>HelloFerron</RootNamespace>
+    <!-- The engine's host is already running the runtime; a game assembly is
+         loaded into a collectible context and never boots its own. -->
+    <GenerateRuntimeConfigurationFiles>false</GenerateRuntimeConfigurationFiles>
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <DefineConstants>$(DefineConstants);FERRON_DEBUG</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- `Private=false` keeps Ferron.dll out of this project's output, so the
+         load context resolves it to the single copy the engine already holds
+         function pointers into. Never remove it: a second copy means a second
+         set of types, and every Behaviour cast across the boundary fails.
+
+         A project outside this repository references the Ferron.dll shipped
+         with the engine instead; the ProjectReference here is only because the
+         example lives in the engine's own tree. -->
+    <ProjectReference Include="../../../scripting/Ferron/Ferron.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

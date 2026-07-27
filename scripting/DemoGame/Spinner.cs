@@ -2,7 +2,7 @@ using Ferron;
 using Ferron.Math;
 using Quaternion = Ferron.Math.Quaternion;
 
-namespace SampleGame;
+namespace DemoGame;
 
 public class Spinner : Behaviour
 {

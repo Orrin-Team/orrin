@@ -1,6 +1,7 @@
+using Ferron;
 using Ferron.Math;
 
-namespace Ferron.Demo;
+namespace DemoGame;
 
 // Transform-only "alive" animation: the cube drifts in a gentle figure-8, bobs,
 // breathes (squash & stretch synced to the bob), and tumbles on a tilted axis.

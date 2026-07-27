@@ -15,17 +15,22 @@ public readonly struct Entity : IEquatable<Entity>
         Generation = generation;
     }
 
-    /// The null handle: what a failed SpawnRenderable or lookup returns. Must
-    /// match Rust CEntity::NULL ({uint.MaxValue, uint.MaxValue}); the engine
-    /// never allocates this index, so it can't name a live entity.
-    public static Entity Null => new(uint.MaxValue, uint.MaxValue);
+    /// The null handle: what a failed SpawnRenderable or lookup returns, and
+    /// what `default(Entity)` is. Must match Rust CEntity::NULL ({0, 0}).
+    ///
+    /// All-zeroes deliberately. C# gives every struct an all-zeroes `default`
+    /// that types cannot override, so an `Entity` field you never assigned —
+    /// most often one a hot reload could not restore — reads as this value. The
+    /// engine reserves entity slot 0 and never allocates it, so the handle
+    /// names nothing and `IsValid` catches the uninitialized case for free.
+    public static Entity Null => new(0, 0);
 
     /// False for the null handle (e.g. a SpawnRenderable given an unknown asset,
-    /// or an ABI call made outside the script dispatch window). This only rules
-    /// out the null sentinel — it does NOT detect a stale handle to an entity
-    /// that has since been despawned; use HasComponent or a World lookup for
-    /// that.
-    public bool IsValid => Index != uint.MaxValue || Generation != uint.MaxValue;
+    /// an ABI call made outside the script dispatch window, or a field that was
+    /// never assigned). This only rules out the null sentinel — it does NOT
+    /// detect a stale handle to an entity that has since been despawned; use
+    /// HasComponent or a World lookup for that.
+    public bool IsValid => Index != 0;
 
     /// True while this handle is live and the entity has a T component.
     public bool HasComponent<T>() where T : struct =>

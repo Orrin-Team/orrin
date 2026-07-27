@@ -32,7 +32,7 @@ public static unsafe class Behaviours
     // silently disagree with Rust by 4 bytes on any 32-bit target; ulong is the
     // same 8 bytes on every platform. It's converted back to `nint` only at the
     // GCHandle calls, which take a pointer-sized value.
-    static Behaviour? Resolve(ulong handle) =>
+    internal static Behaviour? Resolve(ulong handle) =>
         handle != 0 && GCHandle.FromIntPtr((nint)handle).Target is Behaviour behaviour ? behaviour : null;
 
     /// Log a contained script exception with the script's type, the hook that
@@ -202,17 +202,38 @@ public static unsafe class Behaviours
         }
     }
 
+    /// Resolve an assembly-qualified Behaviour name (`MyGame.Player, MyGame`).
+    ///
+    /// The game assembly is searched first and by hand, because `Type.GetType`
+    /// resolves through the *default* ALC: handed `MyGame.Player, MyGame` it
+    /// would load a second copy of the game assembly into the uncollectible
+    /// context, which pins those types for the life of the process and quietly
+    /// defeats hot reload. Only the fallback, for engine-owned types such as
+    /// the lifecycle probes, may go through the default ALC.
     static Type? ResolveType(string name)
     {
-        var type = Type.GetType(name);
-        if (type is not null)
-            return type;
+        // Behaviours are instantiated with a parameterless constructor, so they
+        // are never generic and the first comma always separates the type from
+        // its assembly.
+        var comma = name.IndexOf(',');
+        var typeName = (comma < 0 ? name : name[..comma]).Trim();
+        var assemblyName = comma < 0 ? null : name[(comma + 1)..].Trim();
+
+        foreach (var assembly in GameAssembly.CurrentAssemblies)
+        {
+            if (assemblyName is { Length: > 0 } && assembly.GetName().Name != assemblyName)
+                continue;
+            if (assembly.GetType(typeName) is { } fromGame)
+                return fromGame;
+        }
+
+        if (Type.GetType(name) is { } qualified)
+            return qualified;
 
         foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
         {
-            type = assembly.GetType(name);
-            if (type is not null)
-                return type;
+            if (assembly.GetType(typeName) is { } loaded)
+                return loaded;
         }
         return null;
     }

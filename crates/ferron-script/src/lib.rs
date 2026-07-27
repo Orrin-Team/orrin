@@ -326,16 +326,27 @@ pub struct CEntity {
 }
 
 impl CEntity {
-    /// Returned when an ABI call can't produce a real entity. `u32::MAX` is
-    /// never handed out by the ECS allocator (it would require that many live
-    /// slots), so this can't collide with a real handle the way `{0, 0}` did —
-    /// `{0, 0}` is the first entity ever spawned. The `SparseSet` already treats
-    /// a `u32::MAX` index as its empty `SENTINEL`, so every lookup rejects this
-    /// handle as "not found" rather than aliasing a live entity. C# mirrors it
-    /// as `Ferron.Entity.Null`; keep the two in sync.
+    /// Returned when an ABI call can't produce a real entity.
+    ///
+    /// All-zeroes, because that is what C# produces for an `Entity` field left
+    /// uninitialized — a struct's `default` cannot be customized there, and the
+    /// commonest source of one is a Behaviour field a hot reload could not
+    /// restore. Making the sentinel coincide with it means those two cases are
+    /// the same value instead of two different "not an entity" handles, only
+    /// one of which `IsValid` knew about.
+    ///
+    /// This is safe only because `ferron_ecs` reserves slot 0 and never
+    /// allocates it (see `EntityAllocator::default`): `is_alive` is false for
+    /// `{0, 0}` and every `SparseSet` lookup misses, so it cannot alias a live
+    /// entity. Do not restore that reservation's removal without moving this
+    /// sentinel back.
+    ///
+    /// C# mirrors it as `Ferron.Entity.Null`; keep the two in sync, and note
+    /// the `sizeof` handshake in `Bootstrap.Init` cannot catch a mismatch here
+    /// — the layout is unchanged, only the value.
     pub const NULL: Self = Self {
-        index: u32::MAX,
-        generation: u32::MAX,
+        index: 0,
+        generation: 0,
     };
 }
 
@@ -360,6 +371,65 @@ pub struct CCollision {
     pub normal: [f32; 3],
 }
 
+/// Outcome of a game-assembly operation. The discriminants are lock-step with
+/// the constants in C# `Ferron.GameAssembly`; append, never renumber — same
+/// rule as the ABI table and the key codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameAssemblyStatus {
+    Ok,
+    /// The path was null or not valid UTF-8.
+    BadArgument,
+    /// No file at that path — usually a build that hasn't run yet.
+    NotFound,
+    /// The image was rejected: a corrupt or half-written DLL, a missing
+    /// dependency, the wrong target framework. Managed side logged the detail.
+    LoadFailed,
+    /// `Commit`/`Rollback`/`Unload` with nothing to act on.
+    NothingStaged,
+    /// The swap succeeded, but the retired context outlived its unload: some
+    /// reference into the old assembly is still reachable. The new code is live
+    /// regardless — this is a diagnostic, not a failure.
+    Leaked,
+    Unknown(i32),
+}
+
+impl GameAssemblyStatus {
+    fn from_raw(code: i32) -> Self {
+        match code {
+            0 => Self::Ok,
+            1 => Self::BadArgument,
+            2 => Self::NotFound,
+            3 => Self::LoadFailed,
+            4 => Self::NothingStaged,
+            5 => Self::Leaked,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Whether the operation did what was asked. `Leaked` counts: the swap
+    /// happened, and refusing to proceed over a leaked context would strand the
+    /// session on stale code for a condition it cannot fix.
+    pub fn succeeded(self) -> bool {
+        matches!(self, Self::Ok | Self::Leaked)
+    }
+}
+
+impl std::fmt::Display for GameAssemblyStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok => f.write_str("ok"),
+            Self::BadArgument => f.write_str("invalid assembly path"),
+            Self::NotFound => f.write_str("assembly not found"),
+            Self::LoadFailed => f.write_str("assembly could not be loaded"),
+            Self::NothingStaged => f.write_str("no assembly staged"),
+            Self::Leaked => {
+                f.write_str("the previous assembly did not unload (something still references it)")
+            }
+            Self::Unknown(code) => write!(f, "unknown status {code}"),
+        }
+    }
+}
+
 /// The booted .NET runtime plus the managed lifecycle entry points. Holding the
 /// `HostfxrContext` keeps the runtime resident for the host's lifetime.
 pub struct ScriptHost {
@@ -376,6 +446,17 @@ pub struct ScriptHost {
     disable_fn: extern "system" fn(u64) -> u8,
     collision_enter_fn: extern "system" fn(u64, *const CCollision) -> u8,
     collision_exit_fn: extern "system" fn(u64, *const CCollision) -> u8,
+    // Game-assembly swap. These live in `Ferron.dll`, which is in the default
+    // (uncollectible) load context, so the pointers stay valid across every
+    // reload of the game assembly — the whole reason the bindings and the game
+    // are separate assemblies.
+    game_load_fn: extern "system" fn(*const c_char) -> i32,
+    game_commit_fn: extern "system" fn() -> i32,
+    game_rollback_fn: extern "system" fn() -> i32,
+    game_unload_fn: extern "system" fn() -> i32,
+    state_capture_fn: extern "system" fn(u64) -> u64,
+    state_apply_fn: extern "system" fn(u64, u64) -> u8,
+    state_discard_fn: extern "system" fn(),
 }
 
 impl ScriptHost {
@@ -403,6 +484,8 @@ impl ScriptHost {
         let (
             init, create_fn, start_fn, update_fn, enable_fn, disable_fn,
             collision_enter_fn, collision_exit_fn, destroy,
+            game_load_fn, game_commit_fn, game_rollback_fn, game_unload_fn,
+            state_capture_fn, state_apply_fn, state_discard_fn,
         ) = {
             let loader = context.get_delegate_loader_for_assembly(pdcstr!("Ferron.dll"))?;
             (
@@ -445,6 +528,34 @@ impl ScriptHost {
                     pdcstr!("Ferron.Behaviours, Ferron"),
                     pdcstr!("Destroy"),
                 )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const c_char) -> i32>(
+                    pdcstr!("Ferron.GameAssembly, Ferron"),
+                    pdcstr!("Load"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn() -> i32>(
+                    pdcstr!("Ferron.GameAssembly, Ferron"),
+                    pdcstr!("Commit"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn() -> i32>(
+                    pdcstr!("Ferron.GameAssembly, Ferron"),
+                    pdcstr!("Rollback"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn() -> i32>(
+                    pdcstr!("Ferron.GameAssembly, Ferron"),
+                    pdcstr!("Unload"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64) -> u64>(
+                    pdcstr!("Ferron.BehaviourState, Ferron"),
+                    pdcstr!("Capture"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, u64) -> u8>(
+                    pdcstr!("Ferron.BehaviourState, Ferron"),
+                    pdcstr!("Apply"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn()>(
+                    pdcstr!("Ferron.BehaviourState, Ferron"),
+                    pdcstr!("Discard"),
+                )?,
             )
         };
 
@@ -471,7 +582,62 @@ impl ScriptHost {
             disable_fn,
             collision_enter_fn,
             collision_exit_fn,
+            game_load_fn,
+            game_commit_fn,
+            game_rollback_fn,
+            game_unload_fn,
+            state_capture_fn,
+            state_apply_fn,
+            state_discard_fn,
         })
+    }
+
+    // Game-assembly swap. Loading is *staged*: `stage_game` builds a new
+    // collectible load context without disturbing the running one, so a bad
+    // build can be rejected by `rollback_game` while every live behaviour is
+    // still intact. Only `commit_game` retires the old context, and it must not
+    // be called until every `GCHandle` into the old assembly has been freed —
+    // a surviving handle pins its type and the context never unloads.
+
+    /// Stage the game assembly at `dll_path`. Follow with `commit_game` (after
+    /// tearing down the old behaviours) or `rollback_game`.
+    pub fn stage_game(&self, dll_path: &CStr) -> GameAssemblyStatus {
+        GameAssemblyStatus::from_raw((self.game_load_fn)(dll_path.as_ptr()))
+    }
+
+    /// Retire the live load context and promote the staged one.
+    pub fn commit_game(&self) -> GameAssemblyStatus {
+        GameAssemblyStatus::from_raw((self.game_commit_fn)())
+    }
+
+    /// Drop a staged assembly, leaving the running one untouched.
+    pub fn rollback_game(&self) -> GameAssemblyStatus {
+        GameAssemblyStatus::from_raw((self.game_rollback_fn)())
+    }
+
+    /// Unload the live game assembly without replacing it.
+    pub fn unload_game(&self) -> GameAssemblyStatus {
+        GameAssemblyStatus::from_raw((self.game_unload_fn)())
+    }
+
+    /// Snapshot a behaviour's reloadable fields before its handle is freed.
+    /// Returns a snapshot id, or `0` when there was nothing to keep — pass a
+    /// nonzero id to `apply_state` once the behaviour has been re-created.
+    pub fn capture_state(&self, handle: u64) -> u64 {
+        (self.state_capture_fn)(handle)
+    }
+
+    /// Restore a snapshot onto a freshly created behaviour. The snapshot is
+    /// consumed either way; `false` means nothing was restored (the type was
+    /// renamed, or every field changed shape).
+    pub fn apply_state(&self, handle: u64, snapshot: u64) -> bool {
+        (self.state_apply_fn)(handle, snapshot) != 0
+    }
+
+    /// Drop snapshots no `apply_state` claimed — behaviours whose type
+    /// disappeared in the edit that triggered the reload.
+    pub fn discard_states(&self) {
+        (self.state_discard_fn)()
     }
 
     /// Instantiate a `Behaviour` by assembly-qualified type name, attached to
