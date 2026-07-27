@@ -1,6 +1,5 @@
 /target
 /.idea
 /.claude
-*.ferron
-*.lock
 bin
+.ferron/

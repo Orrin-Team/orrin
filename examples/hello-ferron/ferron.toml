@@ -1,0 +1,16 @@
+format_version = 1
+
+[project]
+name = "hello-ferron"
+version = "0.1.0"
+
+[scripts]
+dir = "scripts"
+entry = "Ferron.Demo.Game, Ferron"
+
+[assets]
+dir = "assets"
+
+# Uncomment once the scene format lands (issue #6 / scene format):
+# [scenes]
+# start = "scenes/main.fscene"
