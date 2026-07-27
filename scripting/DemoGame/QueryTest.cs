@@ -1,9 +1,10 @@
+using Ferron;
 using Ferron.Math;
 
-namespace Ferron.Demo;
+namespace DemoGame;
 
 // Self-checking exercise of the entity-querying ABI (issue #12). Run with
-//   FERRON_ENTRY="Ferron.Demo.QueryTest, Ferron"
+//   FERRON_ENTRY="DemoGame.QueryTest, DemoGame"
 // and read the [PASS]/[FAIL] lines; the summary prints once phase 2 finishes.
 //
 // Phases are separated by update ticks because structural changes (SetTag,

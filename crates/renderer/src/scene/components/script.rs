@@ -18,12 +18,19 @@
 /// contains and logs the exception, then reports it back through the lifecycle
 /// ABI). A faulted script is skipped by every future tick — no dispatch, no
 /// per-frame log spam — so one bad script can't take the engine down. It stays
-/// set until something clears it (the inspector's "Clear fault" button today; a
-/// hot-reload path when one lands), which re-arms the script from wherever its
-/// lifecycle left off.
+/// set until something clears it (the inspector's "Clear fault" button, or a
+/// hot reload, which re-creates the behaviour from the new code), which re-arms
+/// the script from wherever its lifecycle left off.
+///
+/// `type_name` is the assembly-qualified name the behaviour was created from.
+/// It is kept on the Rust side because a hot reload has to re-instantiate the
+/// script *after* the managed object is gone: by the time the new assembly is
+/// live, the only surviving record of what used to be attached here is this
+/// string.
 #[derive(Debug)]
 pub struct ScriptComponent {
     pub handle: u64,
+    pub type_name: String,
     pub started: bool,
     pub enabled: bool,
     pub active: bool,

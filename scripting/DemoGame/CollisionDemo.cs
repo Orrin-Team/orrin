@@ -1,9 +1,10 @@
+using Ferron;
 using Ferron.Math;
 
-namespace Ferron.Demo;
+namespace DemoGame;
 
 // Collision demo entry — run with:
-//   FERRON_ENTRY="Ferron.Demo.CollisionDemo, Ferron" \
+//   FERRON_ENTRY="DemoGame.CollisionDemo, DemoGame" \
 //     cargo run -p renderer-prototype --features scripting
 //
 // Spawns a cube and a sphere gliding toward each other; each carries a Bumper

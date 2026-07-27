@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Must match the framework the engine's host boots; see Ferron.csproj. -->
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- A game assembly is loaded into a collectible AssemblyLoadContext, from a
+         byte copy, so it never needs its own runtimeconfig.json: the runtime is
+         already up. -->
+    <GenerateRuntimeConfigurationFiles>false</GenerateRuntimeConfigurationFiles>
+    <!-- Debug symbols travel with the DLL as a portable .pdb; the load context
+         reads it alongside the image so contained script exceptions keep their
+         file and line numbers. -->
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+
+  <!-- Debug.DrawLine/DrawRay are [Conditional("FERRON_DEBUG")], and the
+       attribute is evaluated at the *call site* — so every game project that
+       wants debug drawing has to define the symbol itself, not just Ferron. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <DefineConstants>$(DefineConstants);FERRON_DEBUG</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- `Private=false` keeps Ferron.dll out of this project's output. A second
+         copy would be a second set of types and every cast across the boundary
+         would fail; see GameLoadContext.Load. -->
+    <ProjectReference Include="../Ferron/Ferron.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

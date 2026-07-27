@@ -39,3 +39,35 @@ class ThrowingUpdate : Behaviour
     public override void OnUpdate(float deltaTime) =>
         throw new InvalidOperationException("update boom");
 }
+
+/// Exercises `BehaviourState` capture/apply across a reload: one field of each
+/// shape the closed type set is meant to cover, plus a `[Transient]` one that
+/// must *not* survive and a readonly one that cannot be written back. The test
+/// creates it, mutates it by ticking, captures, destroys, re-creates, applies,
+/// and asserts the logged line.
+///
+/// It lives in the bindings assembly like the other probes — the field walk
+/// stops at `Behaviour`, not at an assembly boundary, so engine-owned lifecycle
+/// state is excluded without making in-assembly types untestable.
+class StatefulProbe : Behaviour
+{
+    public int Counter;
+    public string Label = "fresh";
+    public Math.Vector3 Offset;
+
+    [Transient]
+    public int Scratch;
+
+    public readonly int Fixed = 7;
+
+    public override void OnUpdate(float deltaTime)
+    {
+        Counter++;
+        Scratch++;
+        Label = $"tick{Counter}";
+        Offset = new Math.Vector3(Counter, 0f, 0f);
+        Native.Log(
+            $"probe:state counter={Counter} label={Label} offset={Offset.x} "
+            + $"scratch={Scratch} fixed={Fixed}");
+    }
+}

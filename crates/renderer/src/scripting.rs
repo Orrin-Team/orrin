@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use glam::{Quat, Vec3};
 
 use ferron_ecs::{Entity, World};
-use ferron_script::{CCollision, CEntity, CTransform, FerronApi, ScriptHost};
+use ferron_script::{CCollision, CEntity, CTransform, FerronApi, GameAssemblyStatus, ScriptHost};
 
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::{
@@ -440,20 +440,36 @@ extern "C" fn despawn(entity: CEntity) -> bool {
 // Debug logging routes into the engine's `LogBuffer` resource (surfaced by the
 // editor console), stamped with the current frame. Like input/time, the sink is
 // an engine-side resource, so the real impls live here and reach it through the
-// active-world seam. Outside a dispatch window (no active world) the message is
-// dropped — a script can only log while it is ticking.
+// active-world seam.
+//
+// Outside a dispatch window there is no world to reach, and the cases that hit
+// that path — OnDestroy during a despawn, and everything C# reports during a
+// hot reload — are exactly the ones worth hearing about, so the message falls
+// back to stderr instead of being dropped. It just doesn't reach the console
+// panel.
 fn log_at(level: LogLevel, message: *const c_char) {
     if message.is_null() {
         return;
     }
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
     let text = unsafe { CStr::from_ptr(message) }.to_string_lossy().into_owned();
-    ferron_script::with_world((), |world| {
+    let buffered = ferron_script::with_world(false, |world| {
         let frame = world.get_resource::<Time>().map_or(0, |time| time.frame_count());
-        if let Some(mut log) = world.get_resource_mut::<LogBuffer>() {
-            log.push(level, text, frame);
+        match world.get_resource_mut::<LogBuffer>() {
+            Some(mut log) => {
+                log.push(level, text.clone(), frame);
+                true
+            }
+            None => false,
         }
     });
+    if !buffered {
+        match level {
+            LogLevel::Info => println!("[c#] {text}"),
+            LogLevel::Warning => eprintln!("[c# WARN] {text}"),
+            LogLevel::Error => eprintln!("[c# ERROR] {text}"),
+        }
+    }
 }
 
 extern "C" fn log_info(message: *const c_char) {
@@ -524,57 +540,307 @@ fn build_api() -> FerronApi {
     }
 }
 
+/// What a reload did, for the editor console.
+///
+/// Failures are deliberately non-fatal and non-destructive: a reload that can't
+/// find or load the new assembly leaves the session running exactly the code it
+/// already had, because the swap is staged and nothing is torn down until the
+/// new image has been accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadOutcome {
+    /// The swap happened. `restored` counts behaviours re-created from the new
+    /// assembly, `lost` those whose type no longer exists in it (renamed or
+    /// deleted — the entity keeps its other components, just not the script).
+    Swapped {
+        restored: usize,
+        lost: usize,
+        /// The retired assembly outlived its unload. The new code is live; the
+        /// old one just never unmapped.
+        leaked: bool,
+    },
+    /// The new assembly was rejected; the previous one is still running.
+    Rejected(GameAssemblyStatus),
+}
+
+impl std::fmt::Display for ReloadOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Swapped { restored, lost, leaked } => {
+                write!(f, "scripts reloaded: {restored} restored")?;
+                if *lost > 0 {
+                    write!(f, ", {lost} dropped (type no longer in the assembly)")?;
+                }
+                if *leaked {
+                    write!(f, "; the previous assembly did not unload")?;
+                }
+                Ok(())
+            }
+            Self::Rejected(status) => {
+                write!(f, "reload rejected ({status}); still running the previous build")
+            }
+        }
+    }
+}
+
+impl ReloadOutcome {
+    /// Console severity: anything that didn't swap is a warning, since the
+    /// developer asked for new code and is still looking at the old.
+    pub fn level(&self) -> LogLevel {
+        match self {
+            Self::Swapped { lost: 0, leaked: false, .. } => LogLevel::Info,
+            Self::Swapped { .. } => LogLevel::Warning,
+            Self::Rejected(_) => LogLevel::Warning,
+        }
+    }
+}
+
 pub struct Scripting {
     host: ScriptHost,
+    /// The game DLL this session loaded, kept so a reload can re-read the same
+    /// path after the build tool has overwritten it.
+    game_dll: PathBuf,
 }
 
 impl Scripting {
-    /// Locate the built managed assembly under `scripts_dir` by probing
-    /// `bin/{Debug,Release}/net*` and picking the most recently built.
+    /// Locate the engine's own bindings assembly (`Ferron.dll` plus its
+    /// runtimeconfig) by probing `bin/{Debug,Release}/net*` under `bindings_dir`
+    /// and picking the most recently built.
     ///
-    /// The caller decides where `scripts_dir` comes from (project manifest or
-    /// the built-in default) and handles the `FERRON_SCRIPT_DIR` override.
-    pub fn find_assembly_dir(scripts_dir: &Path) -> Option<PathBuf> {
-        let mut best: Option<(SystemTime, PathBuf)> = None;
+    /// This is engine-owned and never comes from a project: `Ferron.dll` boots
+    /// CoreCLR and holds every ABI entry point, so it lives in the default load
+    /// context for the life of the process. A project supplies only its *game*
+    /// assembly — see [`find_game_assembly`](Self::find_game_assembly).
+    pub fn find_bindings_dir(bindings_dir: &Path) -> Option<PathBuf> {
+        Self::newest_under(bindings_dir, |dir| {
+            let dll = dir.join("Ferron.dll");
+            (dir.join("Ferron.runtimeconfig.json").is_file() && dll.is_file()).then_some(dll)
+        })
+        .map(|(dir, _)| dir)
+    }
+
+    /// The bindings sitting directly beside the engine executable — the layout
+    /// an exported build ships, and the only one that resolves when the engine
+    /// is launched from inside a project directory rather than the repo root.
+    pub fn bindings_beside_executable() -> Option<PathBuf> {
+        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        (dir.join("Ferron.dll").is_file() && dir.join("Ferron.runtimeconfig.json").is_file())
+            .then_some(dir)
+    }
+
+    /// Locate a project's built game assembly: `<scripts_dir>/bin/{Debug,
+    /// Release}/net*/<assembly_name>.dll`, most recently built wins.
+    ///
+    /// `assembly_name` comes from the assembly half of the manifest's
+    /// `scripts.entry` (`"HelloFerron.Main, HelloFerron"` → `HelloFerron`), so
+    /// the manifest needs no separate field for it and the two can't drift.
+    pub fn find_game_assembly(scripts_dir: &Path, assembly_name: &str) -> Option<PathBuf> {
+        let file = format!("{assembly_name}.dll");
+        Self::newest_under(scripts_dir, |dir| {
+            let dll = dir.join(&file);
+            dll.is_file().then_some(dll)
+        })
+        .map(|(_, dll)| dll)
+    }
+
+    /// Probe `root/bin/{Debug,Release}/*` for directories `accept` recognizes,
+    /// returning the one whose named file is newest.
+    fn newest_under(
+        root: &Path,
+        accept: impl Fn(&Path) -> Option<PathBuf>,
+    ) -> Option<(PathBuf, PathBuf)> {
+        let mut best: Option<(SystemTime, PathBuf, PathBuf)> = None;
         for config in ["Debug", "Release"] {
-            let bin = scripts_dir.join("bin").join(config);
-            let Ok(entries) = std::fs::read_dir(&bin) else {
+            let Ok(entries) = std::fs::read_dir(root.join("bin").join(config)) else {
                 continue;
             };
             for entry in entries.flatten() {
                 let dir = entry.path();
-                let dll = dir.join("Ferron.dll");
-                if !dir.join("Ferron.runtimeconfig.json").is_file() || !dll.is_file() {
+                let Some(file) = accept(&dir) else {
                     continue;
-                }
-                let modified = dll
+                };
+                let modified = file
                     .metadata()
                     .and_then(|meta| meta.modified())
                     .unwrap_or(SystemTime::UNIX_EPOCH);
-                if best.as_ref().map_or(true, |(t, _)| modified > *t) {
-                    best = Some((modified, dir));
+                if best.as_ref().is_none_or(|(t, _, _)| modified > *t) {
+                    best = Some((modified, dir, file));
                 }
             }
         }
-        best.map(|(_, dir)| dir)
+        best.map(|(_, dir, file)| (dir, file))
     }
 
-    /// Boot the runtime, loading the managed assembly from `assembly_dir`.
-    /// Returns `None` (with a logged reason) if the runtime can't start.
-    pub fn boot(assembly_dir: &Path) -> Option<Self> {
-        match ScriptHost::boot(&build_api(), assembly_dir) {
-            Ok(host) => Some(Self { host }),
+    /// The assembly half of an assembly-qualified type name
+    /// (`"HelloFerron.Main, HelloFerron"` → `"HelloFerron"`), or `None` for a
+    /// bare type name.
+    pub fn assembly_of(entry_type: &str) -> Option<&str> {
+        entry_type
+            .split_once(',')
+            .map(|(_, assembly)| assembly.trim())
+            .filter(|assembly| !assembly.is_empty())
+    }
+
+    /// Boot the runtime from the bindings in `bindings_dir`, then load the
+    /// project's game assembly from `game_dll`. Returns `None` (with a logged
+    /// reason) if either step fails — the engine then runs without scripting
+    /// rather than half-initialized.
+    pub fn boot(bindings_dir: &Path, game_dll: &Path) -> Option<Self> {
+        let host = match ScriptHost::boot(&build_api(), bindings_dir) {
+            Ok(host) => host,
             Err(err) => {
                 eprintln!("scripting disabled: {err}");
-                None
+                return None;
             }
+        };
+
+        // The initial load is the same staged swap a reload performs, with
+        // nothing live to retire: stage, then commit.
+        let scripting = Self {
+            host,
+            game_dll: game_dll.to_path_buf(),
+        };
+        match scripting.stage() {
+            Ok(()) => {}
+            Err(status) => {
+                eprintln!(
+                    "scripting disabled: could not load {} ({status})",
+                    game_dll.display()
+                );
+                return None;
+            }
+        }
+        let status = scripting.host.commit_game();
+        if !status.succeeded() {
+            eprintln!("scripting disabled: {status}");
+            return None;
+        }
+        Some(scripting)
+    }
+
+    /// Stage `self.game_dll` in a fresh load context without retiring the live
+    /// one. On `Err` nothing has changed and no rollback is owed — the managed
+    /// side only records a pending context on success.
+    fn stage(&self) -> Result<(), GameAssemblyStatus> {
+        let Some(path) = self.game_dll.to_str().and_then(|p| CString::new(p).ok()) else {
+            return Err(GameAssemblyStatus::BadArgument);
+        };
+        let status = self.host.stage_game(&path);
+        if status.succeeded() {
+            Ok(())
+        } else {
+            Err(status)
         }
     }
 
+    /// Swap in a freshly built game assembly without restarting the engine.
+    ///
+    /// None of the four phases commute:
+    ///
+    /// - **Staging is first** because it is the only step that can abort for
+    ///   free, while every live behaviour is still intact. Past it there is no
+    ///   way back, so an early return added below would owe a `rollback_game()`.
+    /// - **Collection is separate from teardown** because `query` holds a
+    ///   `RefCell` borrow of the storage the teardown loop needs mutably — a
+    ///   runtime panic, not a compile error.
+    /// - **Capture precedes destroy, and commit follows both.** Dropping the
+    ///   component frees its `GCHandle`, leaving nothing to snapshot; and
+    ///   `commit_game` retires the old load context only once *every* handle
+    ///   into it is gone. Faulted scripts are included for that second reason:
+    ///   skipping them strands a handle and leaks a context per reload after.
+    /// - **Re-creation follows commit**, since `Behaviours.ResolveType` searches
+    ///   the live context — attach earlier and every behaviour is faithfully
+    ///   rebuilt from the *old* code.
+    pub fn reload(&self, world: &mut World) -> ReloadOutcome {
+        if let Err(status) = self.stage() {
+            return ReloadOutcome::Rejected(status);
+        }
+
+        struct Reloading {
+            entity: Entity,
+            handle: u64,
+            type_name: String,
+            enabled: bool,
+            started: bool,
+            snapshot: u64,
+        }
+
+        let mut pending: Vec<Reloading> = Vec::new();
+        world.query::<&ScriptComponent>().for_each(|entity, script| {
+            pending.push(Reloading {
+                entity,
+                handle: script.handle,
+                type_name: script.type_name.clone(),
+                enabled: script.enabled,
+                started: script.started,
+                snapshot: 0,
+            })
+        });
+
+        for script in pending.iter_mut() {
+            script.snapshot = self.host.capture_state(script.handle);
+            // Dropped here and not bound to anything: the `Drop` impl is what
+            // fires OnDisable/OnDestroy (against the old code, correctly) and
+            // frees the handle. A binding that outlived the commit below would
+            // pin the retired assembly.
+            let _ = world.remove::<ScriptComponent>(script.entity);
+        }
+
+        let status = self.host.commit_game();
+        if !status.succeeded() {
+            return ReloadOutcome::Rejected(status);
+        }
+        // Not a failure: the new code is live regardless, and a leak is not
+        // something the engine can act on from here — only report.
+        let leaked = status == GameAssemblyStatus::Leaked;
+
+        let mut restored = 0usize;
+        let mut lost = 0usize;
+
+        for script in &pending {
+            let handle = self.attach_with(
+                world,
+                script.entity,
+                &script.type_name,
+                script.started,
+                script.enabled,
+            );
+            // The type is no longer in the assembly — renamed or deleted, an
+            // ordinary thing to do between builds. The entity keeps every other
+            // component; `attach_with` has already named the missing type.
+            if handle == 0 {
+                lost += 1;
+                continue;
+            }
+            if script.snapshot != 0 {
+                self.host.apply_state(handle, script.snapshot);
+            }
+            restored += 1;
+        }
+
+        // Last, so it only drops the snapshots belonging to the `lost` scripts.
+        self.host.discard_states();
+
+        ReloadOutcome::Swapped { restored, lost, leaked }
+    }
+
     /// Attach a C# `Behaviour` (by assembly-qualified type name) to `entity`.
+    /// A no-op when the type isn't in the loaded game assembly.
     pub fn attach(&self, world: &mut World, entity: Entity, type_name: &str) {
+        self.attach_with(world, entity, type_name, false, true);
+    }
+
+    /// `attach`, with the lifecycle position a hot reload has to carry over.
+    /// Returns the new managed handle, or `0` if the type could not be created.
+    pub fn attach_with(
+        &self,
+        world: &mut World,
+        entity: Entity,
+        type_name: &str,
+        started: bool,
+        enabled: bool,
+    ) -> u64 {
         let Ok(name) = CString::new(type_name) else {
-            return;
+            return 0;
         };
         let handle = self.host.create(
             CEntity {
@@ -583,20 +849,37 @@ impl Scripting {
             },
             &name,
         );
+        if handle == 0 {
+            // Silence here used to mean "the scene came up with no scripts and
+            // nothing said why" — the commonest cause is a typo'd or renamed
+            // entry type, which is invisible otherwise.
+            eprintln!(
+                "[script] no Behaviour `{type_name}` in the loaded game assembly \
+                 (check the type name and that the project has been rebuilt)"
+            );
+        }
         if handle != 0 {
             world.insert(
                 entity,
                 ScriptComponent {
                     handle,
-                    started: false,
+                    type_name: type_name.to_owned(),
+                    started,
                     // Desired-on from birth; `active` stays false until the
                     // first tick actually dispatches OnEnable.
-                    enabled: true,
+                    enabled,
                     active: false,
                     faulted: false,
                 },
             );
         }
+        handle
+    }
+
+    /// The managed host, for the steps of a reload that talk to C# directly
+    /// (state capture, the context commit).
+    pub fn host(&self) -> &ScriptHost {
+        &self.host
     }
 
     /// Request an activation change; the transition (OnEnable/OnDisable) is

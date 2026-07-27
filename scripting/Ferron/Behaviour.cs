@@ -1,5 +1,10 @@
 namespace Ferron;
 
+/// Keep constructors pure — no logging, no registration, no engine calls. The
+/// engine builds a throwaway instance of each Behaviour type during a hot
+/// reload to read its field defaults, so a constructor with side effects fires
+/// more often than the lifecycle below suggests. `Entity` is not assigned yet
+/// at construction either; do setup in OnStart.
 public abstract class Behaviour
 {
     public Entity Entity { get; internal set; }

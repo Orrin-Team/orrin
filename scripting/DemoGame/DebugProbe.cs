@@ -1,7 +1,7 @@
 using Ferron;
 using Ferron.Math;
 
-namespace Ferron.Demo;
+namespace DemoGame;
 
 public class DebugProbe : Behaviour
 {

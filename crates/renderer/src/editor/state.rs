@@ -21,6 +21,12 @@ pub struct EditorState {
     pub selected: Option<Entity>,
     spawn_request: Option<SpawnKind>,
     despawn_request: Option<Entity>,
+    /// Unlike the two above, this one is *not* serviced by `apply`: a script
+    /// reload destroys and re-creates managed objects, which may only happen at
+    /// the start of the frame's script phase, outside any dispatch window. The
+    /// app drains it there.
+    #[cfg(feature = "scripting")]
+    script_reload_request: bool,
 }
 
 impl EditorState {
@@ -30,6 +36,16 @@ impl EditorState {
 
     pub fn request_despawn(&mut self, entity: Entity) {
         self.despawn_request = Some(entity);
+    }
+
+    #[cfg(feature = "scripting")]
+    pub fn request_script_reload(&mut self) {
+        self.script_reload_request = true;
+    }
+
+    #[cfg(feature = "scripting")]
+    pub fn take_script_reload_request(&mut self) -> bool {
+        std::mem::take(&mut self.script_reload_request)
     }
 
     pub fn apply(&mut self, world: &mut World) {

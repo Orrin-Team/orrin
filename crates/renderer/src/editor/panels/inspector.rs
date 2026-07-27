@@ -167,6 +167,7 @@ fn script_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
     egui::CollapsingHeader::new("Script")
         .default_open(true)
         .show(ui, |ui| {
+            ui.weak(script.type_name.clone());
             // Only the desired state is written here; the script tick sees the
             // change next frame and dispatches OnEnable/OnDisable itself.
             ui.checkbox(&mut script.enabled, "Enabled");
