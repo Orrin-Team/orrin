@@ -44,6 +44,10 @@ pub struct App {
     debug_lines: Vec<DebugLine>,
     #[cfg(feature = "scripting")]
     scripting: Option<crate::scripting::Scripting>,
+    /// The Ferron project this run was launched inside, if any. `None` means
+    /// the engine is running standalone on its built-in demo scene.
+    #[cfg(feature = "scripting")]
+    project: Option<ferron_project::Project>,
 }
 
 impl App {
@@ -63,6 +67,28 @@ impl App {
         )
         .expect("failed to create instance");
 
+        let cwd = std::env::current_dir().unwrap_or_else(|err| {
+            eprintln!("ferron: cannot read the current directory: {err}");
+            std::process::exit(1);
+        });
+
+        // A manifest that exists but doesn't load is fatal: silently falling
+        // back to the demo scene would hide the user's real project.
+        let project = match ferron_project::Project::locate(&cwd) {
+            Ok(project) => project,
+            Err(err) => {
+                eprintln!("ferron: {err}");
+                std::process::exit(1);
+            }
+        };
+        if let Some(project) = &project {
+            println!(
+                "ferron: project `{}` at {}",
+                project.name(),
+                project.root().display()
+            );
+        }
+
         let mut app = App {
             instance,
             active: None,
@@ -74,6 +100,8 @@ impl App {
             debug_lines: Vec::new(),
             #[cfg(feature = "scripting")]
             scripting: None,
+            #[cfg(feature = "scripting")]
+            project,
         };
 
         app.world.insert_resource(Camera::default());
@@ -112,23 +140,43 @@ impl ApplicationHandler for App {
             .sync_from(&self.world.resource::<Camera>());
 
         // Attach one entry Behaviour; it finds or spawns everything else itself
-        // through the script API. Assembly and entry type are overridable
-        // (FERRON_SCRIPT_DIR / FERRON_ENTRY).
+        // through the script API. Both the scripts directory and the entry type
+        // resolve as env override > project manifest > built-in default, so a
+        // developer can always point a run at something else without editing
+        // the manifest.
         #[cfg(feature = "scripting")]
         {
-            let scripting = match crate::scripting::Scripting::find_assembly_dir() {
+            let scripts_dir = self
+                .project
+                .as_ref()
+                .map(|project| project.scripts_dir())
+                .unwrap_or_else(|| std::path::PathBuf::from("scripting/Ferron"));
+
+            let assembly_dir = match std::env::var("FERRON_SCRIPT_DIR") {
+                Ok(dir) => Some(std::path::PathBuf::from(dir)),
+                Err(_) => crate::scripting::Scripting::find_assembly_dir(&scripts_dir),
+            };
+
+            let scripting = match assembly_dir {
                 Some(dir) => crate::scripting::Scripting::boot(&dir),
                 None => {
                     eprintln!(
-                        "scripting disabled: no built Ferron assembly found \
-                         (run `dotnet build scripting/Ferron` or set FERRON_SCRIPT_DIR)"
+                        "scripting disabled: no built managed assembly under {} \
+                         (run `dotnet build` there, or set FERRON_SCRIPT_DIR)",
+                        scripts_dir.display()
                     );
                     None
                 }
             };
             if let Some(scripting) = &scripting {
                 let entry = std::env::var("FERRON_ENTRY")
-                    .unwrap_or_else(|_| "Ferron.Demo.Game, Ferron".to_string());
+                    .ok()
+                    .or_else(|| {
+                        self.project
+                            .as_ref()
+                            .map(|project| project.entry_type().to_string())
+                    })
+                    .unwrap_or_else(|| "Ferron.Demo.Game, Ferron".to_string());
                 let entity = self
                     .world
                     .spawn_entity()
