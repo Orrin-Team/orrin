@@ -101,8 +101,19 @@ pub fn find(start: &Path) -> Result<Engine, String> {
     ))
 }
 
-fn beside_executable() -> Option<PathBuf> {
+/// The CLI's own location, with symlinks resolved.
+///
+/// Putting a dev build on `$PATH` means symlinking it, and `current_exe`
+/// reports the *link* on macOS while `/proc/self/exe` resolves it on Linux.
+/// Left alone, that difference decides whether the checkout probe below finds
+/// anything, so the same symlink would work on one platform and not the other.
+fn current_exe() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
+    Some(exe.canonicalize().unwrap_or(exe))
+}
+
+fn beside_executable() -> Option<PathBuf> {
+    let exe = current_exe()?;
     let candidate = exe.with_file_name(format!("{ENGINE_EXE}{}", std::env::consts::EXE_SUFFIX));
     candidate.is_file().then_some(candidate)
 }
@@ -111,8 +122,7 @@ fn beside_executable() -> Option<PathBuf> {
 /// source tree. Checking both means `orrin run` works on a project stored
 /// outside the checkout as long as the CLI itself was built inside one.
 pub fn find_checkout(start: &Path) -> Option<PathBuf> {
-    let from_exe = std::env::current_exe().ok();
-    let starts = [Some(start.to_path_buf()), from_exe];
+    let starts = [Some(start.to_path_buf()), current_exe()];
 
     starts
         .into_iter()
@@ -146,7 +156,7 @@ pub fn find_bindings(start: &Path) -> Option<PathBuf> {
         return Some(PathBuf::from(dir));
     }
 
-    if let Ok(exe) = std::env::current_exe()
+    if let Some(exe) = current_exe()
         && let Some(dir) = exe.parent()
         && dir.join("Orrin.dll").is_file()
     {

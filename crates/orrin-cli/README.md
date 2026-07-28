@@ -7,6 +7,26 @@ The crate is `orrin-cli`; the binary it installs is **`orrin`**.
 cargo build -p orrin-cli
 ```
 
+## Putting `orrin` on `$PATH`
+
+**While developing the engine**, symlink the dev build — the link keeps pointing
+at whatever `cargo build -p orrin-cli` last produced, so there is no reinstall
+step:
+
+```bash
+ln -sf "$PWD/target/debug/orrin" ~/.local/bin/orrin
+```
+
+Symlinks are resolved before the checkout is probed, so this behaves the same
+on macOS and Linux even though `current_exe` reports the link on one and the
+target on the other.
+
+**`cargo install --path crates/orrin-cli`** also works, but it *copies* the
+binary to `~/.cargo/bin`, severing it from the checkout. Projects inside the
+checkout still work (the project's own location finds it), but a project
+anywhere else has no engine to run and needs `$ORRIN_ENGINE` set. That is the
+right trade only once there are real engine releases to install against.
+
 ## Commands
 
 ### `orrin new <name> [--path DIR]`
@@ -77,8 +97,9 @@ In order, because a wrong guess here is near-invisible:
    error, never a silent fallback.
 2. **A shipped install** — `orrin-core` and `Orrin.dll` sitting *together*
    beside the CLI. That pairing is what an exported build lays down.
-3. **An engine checkout** above the project or above the CLI itself →
-   `cargo run -p orrin-core --features scripting`.
+3. **An engine checkout** above the project or above the CLI itself (with the
+   CLI's path canonicalized first, so a symlink on `$PATH` still points into
+   the checkout) → `cargo run -p orrin-core --features scripting`.
 4. **`orrin-core` alone** beside the CLI.
 
 Step 2 requires the bindings specifically so that a cargo `target/` directory —
