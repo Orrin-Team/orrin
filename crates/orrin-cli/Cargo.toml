@@ -1,0 +1,20 @@
+[package]
+name = "orrin-cli"
+version.workspace = true
+edition.workspace = true
+description = "Create, build, and run Orrin projects"
+
+# The crate is `orrin-cli` so it doesn't collide with the engine binary
+# `orrin-core`, but the command contributors type is `orrin`.
+[[bin]]
+name = "orrin"
+path = "src/main.rs"
+
+[dependencies]
+orrin-project.workspace = true
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[dev-dependencies]
+tempfile = "3"
