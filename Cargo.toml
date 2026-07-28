@@ -1,19 +1,19 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-# ferron-script hosts CoreCLR (downloads nethost at build time, targets .NET 10),
+# orrin-script hosts CoreCLR (downloads nethost at build time, targets .NET 10),
 # so it's kept out of the default workspace build/CI. Build it explicitly:
-#   cargo build --manifest-path crates/ferron-script/Cargo.toml
-exclude = ["crates/ferron-script"]
+#   cargo build --manifest-path crates/orrin-script/Cargo.toml
+exclude = ["crates/orrin-script"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-ferron-script = { path = "crates/ferron-script" }
-ferron-project = { path = "crates/ferron-project" }
-ferron-ecs = { path = "crates/ferron-ecs" }
+orrin-script = { path = "crates/orrin-script" }
+orrin-project = { path = "crates/orrin-project" }
+orrin-ecs = { path = "crates/orrin-ecs" }
 vulkano = "0.35"
 vulkano-shaders = "0.35"
 winit = "0.30"

@@ -1,11 +1,11 @@
-using Ferron;
-using Ferron.Math;
+using Orrin;
+using Orrin.Math;
 
 namespace DemoGame;
 
 // Collision demo entry — run with:
-//   FERRON_ENTRY="DemoGame.CollisionDemo, DemoGame" \
-//     cargo run -p renderer-prototype --features scripting
+//   ORRIN_ENTRY="DemoGame.CollisionDemo, DemoGame" \
+//     cargo run -p orrin-core --features scripting
 //
 // Spawns a cube and a sphere gliding toward each other; each carries a Bumper
 // that logs the collision, stops, and swaps to the neon material on contact.

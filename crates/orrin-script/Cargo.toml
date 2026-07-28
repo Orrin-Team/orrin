@@ -1,0 +1,18 @@
+[package]
+name = "orrin-script"
+version = "0.1.0"
+edition = "2024"
+description = "C# scripting host for the Orrin engine: boots CoreCLR via netcorehost and exposes a C ABI over the engine."
+publish = false
+
+[dependencies]
+# Hosts the .NET runtime in-process. Default features include `nethost-download`
+# (fetches the nethost binary from NuGet at build time, so no local .NET SDK is
+# needed to *compile* this crate) and `net10_0` (the target runtime).
+#
+# If you have a different runtime installed, switch the framework feature, e.g.:
+#   netcorehost = { version = "0.20", default-features = false, \
+#                   features = ["nethost-download", "utils", "net8_0"] }
+# and set the matching TargetFramework in scripting/Orrin/Orrin.csproj.
+netcorehost = "0.20"
+orrin-ecs = { path = "../orrin-ecs" }

@@ -1,8 +1,8 @@
-# Ferron
+# Orrin
 
 **A game engine you actually own, built in Rust, scripted in C#, designed around everything other engines neglect.**
 
-Ferron is an early-stage, open game engine for 3D games of every style, from low-poly to (eventually) path-traced realism. The whole stack core, renderer, and editor is yours to read, change, and ship. No black boxes, no royalties, no licensing traps, and no cloud service you can't run yourself.
+Orrin is an early-stage, open game engine for 3D games of every style, from low-poly to (eventually) path-traced realism. The whole stack core, renderer, and editor is yours to read, change, and ship. No black boxes, no royalties, no licensing traps, and no cloud service you can't run yourself.
 
 > **Status:** early and moving fast. APIs will change. The honest version of every claim below is tagged: things that work **today**, things the current milestones deliver **this year**, and things the architecture is being laid for **on the roadmap**. An engine that tells you what's aspirational is an engine you can trust about what isn't.
 
@@ -12,7 +12,7 @@ Ferron is an early-stage, open game engine for 3D games of every style, from low
 
 The mainstream engines are enormously capable and they all neglect the same things: the daily loop of *iterating, collaborating, and owning your work*. Scenes that can't merge. References that break when files move. Renderers you can't see inside. Script changes that cost a restart. Package managers that don't resolve anything. Terms that change under you.
 
-Ferron is architected around six commitments instead:
+Orrin is architected around six commitments instead:
 
 **Iteration is sacred.** Change code, see the result, engine still running. Your game is an external C# assembly that hot-reloads on save script state survives because state lives in components, by construction. Shaders and assets reload the same way. Editor startup and reload latency are guarded by CI benchmarks, because speed decays one dependency at a time. *(Hot reload: this year Phase 2.)*
 
@@ -37,13 +37,13 @@ Ferron is architected around six commitments instead:
 
 ## The road to a shippable engine (2026)
 
-Five public milestones take Ferron from tech demo to "a newcomer ships a small game with only the public C# API":
+Five public milestones take Orrin from tech demo to "a newcomer ships a small game with only the public C# API":
 
 1. **Scripting Foundation** — the permanent C# API surface: collision, entity querying, error isolation, core math. *(~75% complete)*
-2. **External Projects & Hot Reload** — your game as an external `game.dll`, hot reload, `ferron` CLI, project structure, prefabs, input mapping.
+2. **External Projects & Hot Reload** — your game as an external `game.dll`, hot reload, `orrin` CLI, project structure, prefabs, input mapping.
 3. **Editor Usability & Asset Pipeline** — the editor becomes the authoring tool: undo/redo, play/stop, deterministic scene persistence, UUID + content-addressed asset pipeline.
 4. **Visual & Gameplay Foundations** — render graph, shadow mapping, transform hierarchy, many-light forward+, in-game UI, audio.
-5. **Shippability** — PBR material system (bindless, path-tracing-ready), scene management, `ferron build --export`, a complete demo game, and docs.
+5. **Shippability** — PBR material system (bindless, path-tracing-ready), scene management, `orrin build --export`, a complete demo game, and docs.
 
 Beyond the showcase: skeletal animation, physics (Rapier), the render-graph inspector and reference path tracer, the package ecosystem, live collaboration, and as the long-term north star real-time path tracing. Architecture decisions for all of these are recorded as ADRs in `docs/adr/` as they're made, so contributors can see not just what was decided but why.
 
@@ -51,11 +51,11 @@ Beyond the showcase: skeletal animation, physics (Rapier), the render-graph insp
 
 ```bash
 # Run the engine
-cargo run -p renderer-prototype
+cargo run -p orrin-core
 
 # With C# scripting (requires the .NET SDK)
-dotnet build scripting/Ferron -c Debug
-cargo run -p renderer-prototype --features scripting
+dotnet build scripting/Orrin -c Debug
+cargo run -p orrin-core --features scripting
 ```
 
 ## Tech
