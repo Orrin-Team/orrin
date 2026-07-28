@@ -1,4 +1,6 @@
 pub mod app;
+#[cfg(feature = "scripting")]
+pub mod build_watcher;
 pub mod camera_controller;
 pub mod collision;
 pub mod editor;

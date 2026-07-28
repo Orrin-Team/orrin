@@ -13,6 +13,7 @@ edition = "2024"
 [workspace.dependencies]
 orrin-script = { path = "crates/orrin-script" }
 orrin-project = { path = "crates/orrin-project" }
+orrin-build = { path = "crates/orrin-build" }
 orrin-ecs = { path = "crates/orrin-ecs" }
 vulkano = "0.35"
 vulkano-shaders = "0.35"

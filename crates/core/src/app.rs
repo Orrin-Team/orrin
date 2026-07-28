@@ -44,10 +44,23 @@ pub struct App {
     debug_lines: Vec<DebugLine>,
     #[cfg(feature = "scripting")]
     scripting: Option<crate::scripting::Scripting>,
+    /// Rebuild-on-save. `None` when the project's layout gave nothing to watch
+    /// — see `BuildWatcher::for_game_assembly`.
+    #[cfg(feature = "scripting")]
+    build_watcher: Option<crate::build_watcher::BuildWatcher>,
     /// The Orrin project this run was launched inside, if any. `None` means
     /// the engine is running standalone on its built-in demo scene.
     #[cfg(feature = "scripting")]
     project: Option<orrin_project::Project>,
+}
+
+/// What `boot_scripting` produced: the live host, and the watcher that keeps it
+/// fed. The watcher is optional and independent — failing to start one leaves
+/// scripting perfectly usable, just without rebuild-on-save.
+#[cfg(feature = "scripting")]
+struct Scripts {
+    scripting: crate::scripting::Scripting,
+    watcher: Option<crate::build_watcher::BuildWatcher>,
 }
 
 impl App {
@@ -101,6 +114,8 @@ impl App {
             #[cfg(feature = "scripting")]
             scripting: None,
             #[cfg(feature = "scripting")]
+            build_watcher: None,
+            #[cfg(feature = "scripting")]
             project,
         };
 
@@ -114,6 +129,10 @@ impl App {
         app.world.insert_resource(crate::collision::CollisionState::default());
         app.world.insert_resource(LogBuffer::default());
         app.world.insert_resource(DebugLines::default());
+        // Inserted whether or not a watcher ever starts: the Scripts panel reads
+        // it either way, and `Off` is how it explains itself.
+        #[cfg(feature = "scripting")]
+        app.world.insert_resource(crate::build_watcher::BuildStatus::default());
 
         event_loop.run_app(&mut app).unwrap();
     }
@@ -126,7 +145,8 @@ impl App {
     /// project and is what a hot reload swaps. Each follows env > manifest >
     /// built-in default, with its own env override.
     #[cfg(feature = "scripting")]
-    fn boot_scripting(&mut self) -> Option<crate::scripting::Scripting> {
+    fn boot_scripting(&mut self) -> Option<Scripts> {
+        use crate::build_watcher::{BuildStatus, BuildWatcher};
         use crate::scripting::Scripting;
         use std::path::{Path, PathBuf};
 
@@ -202,7 +222,17 @@ impl App {
             .with(crate::scene::Name::new("Script Entry"))
             .id();
         scripting.attach(&mut self.world, entity, &entry);
-        Some(scripting)
+
+        let watcher = match BuildWatcher::for_game_assembly(&game_dll, Some(&bindings_dir)) {
+            Ok(watcher) => Some(watcher),
+            Err(reason) => {
+                eprintln!("rebuild-on-save is off: {reason}");
+                self.world.resource_mut::<BuildStatus>().disable(reason);
+                None
+            }
+        };
+
+        Some(Scripts { scripting, watcher })
     }
 }
 
@@ -232,8 +262,9 @@ impl ApplicationHandler for App {
         // developer can always point a run at something else without editing
         // the manifest.
         #[cfg(feature = "scripting")]
-        {
-            self.scripting = self.boot_scripting();
+        if let Some(scripts) = self.boot_scripting() {
+            self.scripting = Some(scripts.scripting);
+            self.build_watcher = scripts.watcher;
         }
 
         let editor = Editor::new(event_loop, surface, renderer.queue(), renderer.color_format());
@@ -315,7 +346,13 @@ impl ApplicationHandler for App {
                 // where managed objects may be destroyed and re-created.
                 #[cfg(feature = "scripting")]
                 {
-                    let reload_requested = active.editor.take_script_reload_request();
+                    let mut reload_requested = active.editor.take_script_reload_request();
+                    // A green rebuild raises the button's own request rather
+                    // than reloading itself, so both routes converge on the one
+                    // safe point below and a failed build never reaches it.
+                    if let Some(watcher) = &mut self.build_watcher {
+                        reload_requested |= watcher.service(&self.world);
+                    }
                     if let Some(scripting) = &self.scripting {
                         if reload_requested {
                             let outcome = scripting.reload(&mut self.world);
@@ -325,6 +362,14 @@ impl ApplicationHandler for App {
                                 outcome.to_string(),
                                 frame,
                             );
+                            // Only a swap that happened means the session is
+                            // running what was built; a rejected one leaves the
+                            // compiled code still ahead of the live code.
+                            if matches!(outcome, crate::scripting::ReloadOutcome::Swapped { .. }) {
+                                self.world
+                                    .resource_mut::<crate::build_watcher::BuildStatus>()
+                                    .reloaded();
+                            }
                         }
                         scripting.tick(&mut self.world, delta);
                     }

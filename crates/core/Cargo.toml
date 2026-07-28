@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 orrin-project.workspace =  true
 orrin-script = { workspace = true, optional = true }
+orrin-build = { workspace = true, optional = true }
 orrin-ecs.workspace = true
 vulkano.workspace = true
 vulkano-shaders.workspace = true
@@ -15,10 +16,13 @@ image.workspace = true
 egui.workspace = true
 egui_winit_vulkano.workspace = true
 sysinfo = "0.33"
+# Filesystem watching for rebuild-on-save; only pulled in with `scripting`.
+notify = { version = "8", optional = true }
 # Raw VK_EXT_memory_budget query for VRAM usage; pinned to vulkano 0.35's ash.
 ash = "0.38"
 
 [features]
 # Opt-in C# scripting. Off by default so the standard workspace build and CI
-# don't pull in orrin-script (netcorehost + the nethost download).
-scripting = ["dep:orrin-script"]
+# don't pull in orrin-script (netcorehost + the nethost download). The build
+# watcher rides along: rebuild-on-save has nothing to reload without scripting.
+scripting = ["dep:orrin-script", "dep:orrin-build", "dep:notify"]

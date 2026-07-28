@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::SystemTime;
 
 use orrin_project::Project;
@@ -70,28 +69,18 @@ fn build_scripts(
 }
 
 fn dotnet_build(dir: &Path, configuration: &str, bindings: Option<&Path>) -> Fallible {
-    let mut cmd = Command::new("dotnet");
-    cmd.arg("build")
-        .arg(dir)
-        .args(["-c", configuration])
-        .arg("--nologo");
-
-    // A game csproj generated outside the engine tree resolves `Orrin.dll`
-    // through this property; inside the tree it is a ProjectReference and the
-    // property is simply unused.
-    if let Some(bindings) = bindings {
-        cmd.arg(format!("-p:OrrinBindings={}", bindings.display()));
+    // Inherited, not captured: a terminal build should stream the compiler's
+    // output as it happens. The engine's watcher captures the same invocation
+    // instead, because its output goes to the editor console.
+    let report = orrin_build::Build {
+        project_dir: dir,
+        configuration,
+        bindings,
     }
+    .run(orrin_build::Output::Inherit)
+    .map_err(|err| err.to_string())?;
 
-    let status = cmd.status().map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            "`dotnet` is not installed or not on PATH; install the .NET 10 SDK".to_string()
-        } else {
-            format!("could not run `dotnet build`: {err}")
-        }
-    })?;
-
-    if !status.success() {
+    if !report.success {
         return Err(format!("`dotnet build {}` failed", display_path(dir)));
     }
 

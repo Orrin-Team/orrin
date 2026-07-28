@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 orrin-project.workspace = true
+orrin-build.workspace = true
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
