@@ -1,8 +1,8 @@
 # hello-orrin
 
-A hand-written Orrin project showing the canonical on-disk layout. There is no
-`orrin new` yet (issue #17), so this directory doubles as the reference for
-what that command will eventually generate.
+A hand-written Orrin project showing the canonical on-disk layout. This is the
+reference `orrin new` generates from; if the two drift, this directory is the
+one that is right.
 
 ```
 hello-orrin/
@@ -20,6 +20,15 @@ collectible load context, separate from the engine's `Orrin.dll` bindings, so
 it can be swapped while the engine runs.
 
 ## Running it
+
+Through the CLI, which does all of the below and needs no environment setup:
+
+```bash
+cargo build -p orrin-cli
+cd examples/hello-orrin && ../../target/debug/orrin run
+```
+
+By hand:
 
 ```bash
 cargo build -p orrin-core --features scripting
@@ -63,7 +72,8 @@ already had and says so in the console.
 
 ## Why `ORRIN_SCRIPT_DIR` is still needed
 
-Only for the *engine's* bindings, not for the game. The engine looks for
+Only when launching the engine by hand — `orrin run` resolves the bindings and
+passes them itself. Only for the *engine's* bindings, not for the game. The engine looks for
 `Orrin.dll` beside its own executable — the layout an exported build ships —
 and otherwise probes `scripting/Orrin/bin/` relative to the working directory,
 which doesn't resolve from inside a project. The override goes away with export

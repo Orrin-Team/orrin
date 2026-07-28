@@ -50,13 +50,30 @@ Beyond the showcase: skeletal animation, physics (Rapier), the render-graph insp
 ## Quick start
 
 ```bash
-# Run the engine
+# Run the engine on its built-in demo
 cargo run -p orrin-core
 
 # With C# scripting (requires the .NET SDK)
 dotnet build scripting/Orrin -c Debug
 cargo run -p orrin-core --features scripting
 ```
+
+### Starting a game
+
+The `orrin` CLI creates and runs projects, so you don't need to know any of the
+above:
+
+```bash
+cargo build -p orrin-cli
+
+./target/debug/orrin new my-game
+cd my-game
+../target/debug/orrin run
+```
+
+`orrin new` scaffolds the manifest, a `.csproj`, and an entry `Behaviour`;
+`orrin run` builds the scripts, indexes the assets, and launches the engine on
+the project. See [`crates/orrin-cli/README.md`](crates/orrin-cli/README.md).
 
 ## Tech
 
