@@ -91,6 +91,11 @@ pub struct BuildStatus {
     pub diagnostics: Vec<String>,
     /// How long the last successful build took.
     pub last_duration: Option<Duration>,
+    /// A build has succeeded that the session is not running yet. Set by every
+    /// green build and cleared by the reload that consumes it, so with
+    /// auto-reload off the panel can say the compiled code is newer than the
+    /// live code instead of reporting a flat success.
+    pub pending_reload: bool,
 }
 
 impl Default for BuildStatus {
@@ -100,6 +105,7 @@ impl Default for BuildStatus {
             state: BuildState::Idle,
             diagnostics: Vec::new(),
             last_duration: None,
+            pending_reload: false,
         }
     }
 }
@@ -110,7 +116,10 @@ pub enum BuildState {
     Building,
     Succeeded,
     Failed,
-    /// No watcher is running. The string says why.
+    /// The compiler could not be run. Distinct from `Off`: the watcher is still
+    /// watching and will try again on the next save.
+    Unavailable(String),
+    /// No watcher is running at all. The string says why.
     Off(String),
 }
 
@@ -119,19 +128,28 @@ impl BuildStatus {
         self.state = BuildState::Off(reason.into());
     }
 
+    /// Record that the live session is now running the latest build.
+    pub fn reloaded(&mut self) {
+        self.pending_reload = false;
+    }
+
     fn observe(&mut self, event: BuildEvent) {
         self.state = match event {
             BuildEvent::Started => BuildState::Building,
             BuildEvent::Succeeded { duration } => {
                 self.last_duration = Some(duration);
                 self.diagnostics.clear();
+                self.pending_reload = true;
                 BuildState::Succeeded
             }
             BuildEvent::Failed { diagnostics } => {
                 self.diagnostics = diagnostics;
                 BuildState::Failed
             }
-            BuildEvent::Unavailable { reason } => BuildState::Off(reason),
+            BuildEvent::Unavailable { reason } => {
+                self.diagnostics.clear();
+                BuildState::Unavailable(reason)
+            }
         };
     }
 }
@@ -272,10 +290,7 @@ impl BuildWatcher {
         // compiler was running start the next build the moment this one lands —
         // including in this same call, since the branch above just cleared
         // `building_since`.
-        if self.building_since.is_none()
-            && let Some(since) = self.pending_since
-            && since.elapsed() >= DEBOUNCE
-        {
+        if should_build(self.pending_since, self.building_since.is_some(), Instant::now()) {
             self.pending_since = None;
             self.spawn_build();
             events.push(BuildEvent::Started);
@@ -303,6 +318,18 @@ impl BuildWatcher {
             let _ = finished.send(result);
         });
     }
+}
+
+/// Whether a rebuild should start now: something changed, it has been quiet for
+/// `DEBOUNCE` since the last of it, and no build is already running.
+///
+/// Only ever one build at a time. Overlapping them would race two compilers on
+/// one output directory, and the later one's result could land first and reload
+/// the session onto the earlier build's code.
+fn should_build(pending_since: Option<Instant>, building: bool, now: Instant) -> bool {
+    !building
+        && pending_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= DEBOUNCE)
 }
 
 fn failure_lines(report: &orrin_build::Report) -> Vec<String> {
@@ -352,6 +379,30 @@ fn is_script_source(root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nothing_is_built_until_the_directory_goes_quiet() {
+        let now = Instant::now();
+        let quiet = now - DEBOUNCE;
+        let just_now = now - DEBOUNCE / 2;
+
+        assert!(!should_build(None, false, now), "no change, no build");
+        assert!(!should_build(Some(just_now), false, now), "still inside the debounce");
+        assert!(should_build(Some(quiet), false, now), "quiet for long enough");
+    }
+
+    #[test]
+    fn a_change_during_a_build_waits_for_it_rather_than_racing_it() {
+        let now = Instant::now();
+        let quiet = now - DEBOUNCE;
+
+        // Two compilers on one output directory would race, and the later one's
+        // result could land first and reload the session onto older code.
+        assert!(!should_build(Some(quiet), true, now));
+        // `pending_since` is not cleared while waiting, so the moment the build
+        // in flight lands the next one starts.
+        assert!(should_build(Some(quiet), false, now));
+    }
 
     #[test]
     fn the_build_location_comes_from_the_assembly_path() {

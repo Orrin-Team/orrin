@@ -362,6 +362,14 @@ impl ApplicationHandler for App {
                                 outcome.to_string(),
                                 frame,
                             );
+                            // Only a swap that happened means the session is
+                            // running what was built; a rejected one leaves the
+                            // compiled code still ahead of the live code.
+                            if matches!(outcome, crate::scripting::ReloadOutcome::Swapped { .. }) {
+                                self.world
+                                    .resource_mut::<crate::build_watcher::BuildStatus>()
+                                    .reloaded();
+                            }
                         }
                         scripting.tick(&mut self.world, delta);
                     }

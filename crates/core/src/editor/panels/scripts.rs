@@ -15,6 +15,7 @@ use crate::scene::ScriptComponent;
 
 const ERROR: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x5A, 0x4A);
 const OK: egui::Color32 = egui::Color32::from_rgb(0x7A, 0xC0, 0x8A);
+const PENDING: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xB3, 0x4A);
 
 pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
     let mut live = 0usize;
@@ -61,7 +62,15 @@ fn show_build_state(ui: &mut egui::Ui, status: &BuildStatus) {
             let took = status
                 .last_duration
                 .map_or_else(String::new, |d| format!(" ({:.1}s)", d.as_secs_f32()));
-            ui.colored_label(OK, format!("Build up to date{took}"));
+            // A green build is not the same as a live session running it: with
+            // auto-reload off the compiled code is ahead of the loaded code
+            // until someone presses the button.
+            if status.pending_reload {
+                ui.colored_label(PENDING, format!("New build ready{took}"));
+                ui.weak("Click Reload scripts to run it.");
+            } else {
+                ui.colored_label(OK, format!("Build up to date{took}"));
+            }
         }
         BuildState::Failed => {
             ui.colored_label(
@@ -81,6 +90,11 @@ fn show_build_state(ui: &mut egui::Ui, status: &BuildStatus) {
                             }
                         });
                 });
+        }
+        BuildState::Unavailable(reason) => {
+            ui.colored_label(ERROR, "Could not run the compiler.");
+            ui.weak(reason);
+            ui.weak("Still watching; the next save tries again.");
         }
         BuildState::Off(reason) => {
             ui.weak("Rebuild-on-save is off.");
