@@ -1,9 +1,9 @@
-using Ferron;
-using Ferron.Math;
+using Orrin;
+using Orrin.Math;
 
 namespace DemoGame;
 
-// Demo entry behaviour (attached by the engine at startup; see FERRON_ENTRY):
+// Demo entry behaviour (attached by the engine at startup; see ORRIN_ENTRY):
 // spawns a player cube, moves it with the arrow keys, and drops a cube with a
 // cycling material each time Space is pressed.
 public class Game : Behaviour

@@ -1,0 +1,6 @@
+# Engine-generated: compiled assets and the rebuildable asset index.
+.orrin/
+
+# C# build output for the project's game assembly.
+scripts/bin/
+scripts/obj/

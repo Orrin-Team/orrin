@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <!-- Must match the framework the engine's host boots; see Ferron.csproj. -->
+    <!-- Must match the framework the engine's host boots; see Orrin.csproj. -->
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -15,18 +15,18 @@
     <DebugType>portable</DebugType>
   </PropertyGroup>
 
-  <!-- Debug.DrawLine/DrawRay are [Conditional("FERRON_DEBUG")], and the
+  <!-- Debug.DrawLine/DrawRay are [Conditional("ORRIN_DEBUG")], and the
        attribute is evaluated at the *call site* — so every game project that
-       wants debug drawing has to define the symbol itself, not just Ferron. -->
+       wants debug drawing has to define the symbol itself, not just Orrin. -->
   <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
-    <DefineConstants>$(DefineConstants);FERRON_DEBUG</DefineConstants>
+    <DefineConstants>$(DefineConstants);ORRIN_DEBUG</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- `Private=false` keeps Ferron.dll out of this project's output. A second
+    <!-- `Private=false` keeps Orrin.dll out of this project's output. A second
          copy would be a second set of types and every cast across the boundary
          would fail; see GameLoadContext.Load. -->
-    <ProjectReference Include="../Ferron/Ferron.csproj" Private="false" />
+    <ProjectReference Include="../Orrin/Orrin.csproj" Private="false" />
   </ItemGroup>
 
 </Project>

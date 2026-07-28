@@ -1,28 +1,28 @@
-# Ferron Architecture Plan
+# Orrin Architecture Plan
 
-This document describes the long-term architecture for Ferron. It assumes the current state of the codebase (Rust core with a lightweight ECS, Vulkan renderer via vulkano, egui editor, C# scripting hosted in-process through CoreCLR) and the Phase 1 to 5 showcase roadmap. The point of writing it down now is to make sure the big features planned for later, meaning real-time collaboration, the asset and package ecosystem, and path tracing, can be built on top of what exists without a rewrite. The project is planned on a horizon of roughly a decade, so decisions here favour designs that stay correct over designs that ship fastest.
+This document describes the long-term architecture for Orrin. It assumes the current state of the codebase (Rust core with a lightweight ECS, Vulkan renderer via vulkano, egui editor, C# scripting hosted in-process through CoreCLR) and the Phase 1 to 5 showcase roadmap. The point of writing it down now is to make sure the big features planned for later, meaning real-time collaboration, the asset and package ecosystem, and path tracing, can be built on top of what exists without a rewrite. The project is planned on a horizon of roughly a decade, so decisions here favour designs that stay correct over designs that ship fastest.
 
 ## 1. What mainstream engines get wrong
 
-Unity and Unreal are very capable, and this plan doesn't pretend otherwise. But they share a consistent blind spot: they optimise the moment of creation and neglect the daily grind of iterating, collaborating, and owning your work. Ferron targets six specific failures.
+Unity and Unreal are very capable, and this plan doesn't pretend otherwise. But they share a consistent blind spot: they optimise the moment of creation and neglect the daily grind of iterating, collaborating, and owning your work. Orrin targets six specific failures.
 
-Iteration speed. Unreal's compile-and-restart loop and Unity's domain reload stalls are the most complained-about aspects of both engines. Ferron treats "change code, see the result in under two seconds" as a hard constraint that every subsystem has to respect, covering game code, shaders, and assets.
+Iteration speed. Unreal's compile-and-restart loop and Unity's domain reload stalls are the most complained-about aspects of both engines. Orrin treats "change code, see the result in under two seconds" as a hard constraint that every subsystem has to respect, covering game code, shaders, and assets.
 
-Version control and collaboration. Unity scenes produce constant merge conflicts. Unreal's answer is binary files plus Perforce plus exclusive locking. Neither engine can put two people in the same scene at the same time. Ferron treats the scene as a mergeable, diffable, concurrently editable document from the start (section 4).
+Version control and collaboration. Unity scenes produce constant merge conflicts. Unreal's answer is binary files plus Perforce plus exclusive locking. Neither engine can put two people in the same scene at the same time. Orrin treats the scene as a mergeable, diffable, concurrently editable document from the start (section 4).
 
-Renderer opacity. Unity's SRP is hard to see into and Unreal's renderer is a monolith in practice. Debugging a slow or wrong frame means external tools and guesswork. Ferron's render graph is data: inspectable in the editor, profiled per pass, and extensible by registering nodes instead of forking the engine (section 3).
+Renderer opacity. Unity's SRP is hard to see into and Unreal's renderer is a monolith in practice. Debugging a slow or wrong frame means external tools and guesswork. Orrin's render graph is data: inspectable in the editor, profiled per pass, and extensible by registering nodes instead of forking the engine (section 3).
 
-Dependency management. Unity's package manager is shallow and its asset store has no dependency resolution. Unreal's plugin ecosystem has none either. There is currently no good answer to "I want to share a gameplay system, with its assets, versioned and self-hostable." Ferron ships a real package manager over content-addressed assets (section 5). The short description is Cargo, for game content.
+Dependency management. Unity's package manager is shallow and its asset store has no dependency resolution. Unreal's plugin ecosystem has none either. There is currently no good answer to "I want to share a gameplay system, with its assets, versioned and self-hostable." Orrin ships a real package manager over content-addressed assets (section 5). The short description is Cargo, for game content.
 
-Ownership. Licensing changes, runtime fees, closed editors. Ferron's position is full source including the editor, and no subsystem may ever depend on a service that only Ferron-the-organisation can run. Anything networked (collaboration server, registry, build cache) must be self-hostable, with paid hosting as a convenience on top.
+Ownership. Licensing changes, runtime fees, closed editors. Orrin's position is full source including the editor, and no subsystem may ever depend on a service that only Orrin-the-organisation can run. Anything networked (collaboration server, registry, build cache) must be self-hostable, with paid hosting as a convenience on top.
 
-Diagnostics. GPU device losses with no explanation, shaders that silently render black, assets that fail to import without saying why. Ferron borrows the Rust compiler's attitude: a failure names the entity, asset, or pass involved and suggests a likely fix. Cheap to build early, nearly impossible to retrofit.
+Diagnostics. GPU device losses with no explanation, shaders that silently render black, assets that fail to import without saying why. Orrin borrows the Rust compiler's attitude: a failure names the entity, asset, or pass involved and suggests a likely fix. Cheap to build early, nearly impossible to retrofit.
 
 Everything below is justified against these six commitments.
 
 ## 2. Core data architecture
 
-Whether collaboration, the asset ecosystem, and path tracing turn out to be feasible depends heavily on one early decision: is the engine's state plain data addressed by stable IDs, or objects connected by pointers? Ferron commits to plain data.
+Whether collaboration, the asset ecosystem, and path tracing turn out to be feasible depends heavily on one early decision: is the engine's state plain data addressed by stable IDs, or objects connected by pointers? Orrin commits to plain data.
 
 ### 2.1 The ECS is the source of truth
 
@@ -74,7 +74,7 @@ The payoff is that content made during the showcase years never gets re-authored
 
 ### 3.4 A reference path tracer, early and slow
 
-Well before real-time ray tracing is attempted, Ferron should ship an offline reference path tracer as an editor mode: brute force, unbiased, seconds per frame, running as a compute shader against the same bindless scene. Press a key, see ground truth.
+Well before real-time ray tracing is attempted, Orrin should ship an offline reference path tracer as an editor mode: brute force, unbiased, seconds per frame, running as a compute shader against the same bindless scene. Press a key, see ground truth.
 
 It earns its keep three ways. It's a correctness oracle for every raster feature (SSAO, shadows, tonemapping all get validated against an unbiased render). It builds the actual infrastructure that real-time path tracing needs later: acceleration structures, ray payloads, BSDF sampling. And it's a showcase feature in its own right, since neither Unity nor Unreal offers a one-keystroke in-editor ground-truth comparison. Real-time path tracing then becomes an optimisation programme over proven pieces (hardware RT, ReSTIR-family sampling, denoising) that can be scheduled over years instead of being a research project.
 
@@ -84,13 +84,13 @@ Validation layers on in every dev build. Device loss dumps the render graph stat
 
 ## 4. Real-time collaboration
 
-Collaboration is Ferron's most defensible differentiator, and it's also the feature that depends most on the groundwork in section 2. If components are ID-addressed plain data with registry-derived diffs, collaboration is an engineering project. If they aren't, it's impossible, which is roughly where Unity and Unreal find themselves.
+Collaboration is Orrin's most defensible differentiator, and it's also the feature that depends most on the groundwork in section 2. If components are ID-addressed plain data with registry-derived diffs, collaboration is an engineering project. If they aren't, it's impossible, which is roughly where Unity and Unreal find themselves.
 
 ### 4.1 CRDT scenes, locked binaries
 
 Two different problems hide inside the word collaboration and they need different mechanisms.
 
-Structured scene data (entities, components, hierarchy) becomes a CRDT document. Each editing session is a replica. The operations are the same property diffs the registry already produces, plus create, delete, and reparent. CRDTs merge automatically and deterministically: two people move different objects and both edits land; two people move the same object and the last write wins per field. Rust has mature CRDT libraries (Automerge, Loro, yrs), and Ferron should adopt one behind an engine-owned SceneDocument API rather than building this from scratch.
+Structured scene data (entities, components, hierarchy) becomes a CRDT document. Each editing session is a replica. The operations are the same property diffs the registry already produces, plus create, delete, and reparent. CRDTs merge automatically and deterministically: two people move different objects and both edits land; two people move the same object and the last write wins per field. Rust has mature CRDT libraries (Automerge, Loro, yrs), and Orrin should adopt one behind an engine-owned SceneDocument API rather than building this from scratch.
 
 Binary assets don't merge, and pretending they might is a research trap. For textures, meshes, and audio the server provides checkout locks: open a texture for editing and others see who holds it. This is the one place the Perforce model is actually right.
 
@@ -112,7 +112,7 @@ Nothing in Phases 1 to 5 implements any of this. The only requirement is that Ph
 
 ## 5. Assets and packages
 
-Mainstream engines treat "assets in my project" and "packages from elsewhere" as unrelated systems. Ferron unifies them. A package is a versioned, signed collection of assets plus optional C# code, and the local asset database is the union of the project's own assets and its resolved dependencies.
+Mainstream engines treat "assets in my project" and "packages from elsewhere" as unrelated systems. Orrin unifies them. A package is a versioned, signed collection of assets plus optional C# code, and the local asset database is the union of the project's own assets and its resolved dependencies.
 
 ### 5.1 The asset database
 
@@ -124,7 +124,7 @@ The cache being content-addressed quietly powers a lot downstream: deduplication
 
 ### 5.2 The package manager
 
-Cargo's model applied to game content. A ferron.toml manifest with name, semver version, dependency ranges, and declared contents; a lockfile committed to the project; a resolver for transitive dependencies. Registries are deliberately boring, self-hostable static services (an index plus content-addressed blobs), and a project can pin several, including a private one on a team's own server. A public community registry hosted by Ferron is the ecosystem play, but as with collaboration, hosting is convenience rather than privilege.
+Cargo's model applied to game content. An orrin.toml manifest with name, semver version, dependency ranges, and declared contents; a lockfile committed to the project; a resolver for transitive dependencies. Registries are deliberately boring, self-hostable static services (an index plus content-addressed blobs), and a project can pin several, including a private one on a team's own server. A public community registry hosted by Orrin is the ecosystem play, but as with collaboration, hosting is convenience rather than privilege.
 
 Because assets carry UUIDs and content hashes, a package's assets drop into a project with no path conflicts, and two packages sharing a texture store it once. Package code loads through CoreCLR the same way project code does, and runs under the same error isolation being built in Phase 1: a misbehaving package logs and disables itself instead of taking down the editor.
 

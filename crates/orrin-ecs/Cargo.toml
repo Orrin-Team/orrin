@@ -1,0 +1,28 @@
+[package]
+name = "orrin-ecs"
+version.workspace = true
+edition.workspace = true
+description = "A minimal, engine-agnostic ECS core (entities, component storage, queries) for the Orrin renderer."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AlternativeLua/orrin"
+keywords = ["ecs", "gamedev", "game-engine"]
+categories = ["game-development", "data-structures"]
+
+# Intentionally empty: the ECS is the *mechanism* only. It must not depend on
+# the renderer, math, or windowing crates. Components live in the engine.
+[dependencies]
+
+[dev-dependencies]
+# Property tests for sparse-set / generational-handle invariants (test-only,
+# so it doesn't affect the crate's runtime dependency graph).
+proptest = "1"
+
+# This crate is the safe "mechanism" tier (generational handles + sparse-set
+# storage), so unsafe is forbidden. Relax to `deny`/`allow` here if you later
+# add an archetype backend that needs manual memory management.
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"

@@ -1,6 +1,6 @@
-using Ferron;
-using Ferron.Math;
-using Quaternion = Ferron.Math.Quaternion;
+using Orrin;
+using Orrin.Math;
+using Quaternion = Orrin.Math.Quaternion;
 
 namespace DemoGame;
 

@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Must match the netcorehost framework feature in crates/orrin-script. -->
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Needed for `unsafe`, function pointers, and [UnmanagedCallersOnly]. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Emit Orrin.runtimeconfig.json next to the DLL so the Rust host can load
+         it via hostfxr's initialize_for_runtime_config. -->
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+  </PropertyGroup>
+
+  <!-- Debug.DrawLine/DrawRay are [Conditional("ORRIN_DEBUG")]. Define the symbol
+       in Debug builds so the calls compile in; leave it undefined in Release
+       (export) builds so the compiler strips the call sites. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <DefineConstants>$(DefineConstants);ORRIN_DEBUG</DefineConstants>
+  </PropertyGroup>
+
+</Project>
