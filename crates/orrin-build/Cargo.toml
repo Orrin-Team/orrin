@@ -1,0 +1,5 @@
+[package]
+name = "orrin-build"
+version.workspace = true
+edition.workspace = true
+description = "Compiling an Orrin project's C# with `dotnet build`"
