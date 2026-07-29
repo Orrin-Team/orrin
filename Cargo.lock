@@ -2517,6 +2517,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrin-registry"
+version = "0.1.0"
+
+[[package]]
 name = "orrin-script"
 version = "0.1.0"
 dependencies = [
