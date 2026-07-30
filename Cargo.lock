@@ -2493,6 +2493,7 @@ dependencies = [
  "orrin-build",
  "orrin-ecs",
  "orrin-project",
+ "orrin-registry",
  "orrin-script",
  "sysinfo",
  "vulkano",
@@ -2519,6 +2520,10 @@ dependencies = [
 [[package]]
 name = "orrin-registry"
 version = "0.1.0"
+dependencies = [
+ "glam",
+ "orrin-ecs",
+]
 
 [[package]]
 name = "orrin-script"

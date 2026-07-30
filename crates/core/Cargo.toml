@@ -8,6 +8,7 @@ orrin-project.workspace =  true
 orrin-script = { workspace = true, optional = true }
 orrin-build = { workspace = true, optional = true }
 orrin-ecs.workspace = true
+orrin-registry.workspace = true
 vulkano.workspace = true
 vulkano-shaders.workspace = true
 winit.workspace = true
