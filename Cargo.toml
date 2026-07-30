@@ -26,6 +26,7 @@ egui = "0.31"
 egui_winit_vulkano = "0.28"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.dev]
 opt-level = 1

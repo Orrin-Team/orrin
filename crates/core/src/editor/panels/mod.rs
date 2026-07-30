@@ -3,6 +3,7 @@ mod environment;
 mod hierarchy;
 mod inspector;
 mod performance;
+mod scene;
 #[cfg(feature = "scripting")]
 mod scripts;
 
@@ -27,6 +28,7 @@ pub fn draw(
     performance::show(ctx, world);
     #[cfg(feature = "scripting")]
     scripts::show(ctx, world, state);
+    scene::show(ctx, world, state);
     console::show(ctx, world);
 }
 

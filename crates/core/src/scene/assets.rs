@@ -29,6 +29,16 @@ impl Assets {
         self.meshes.iter().map(|(n, &h)| (n.as_str(), h))
     }
 
+    /// The name a handle was registered under — what a scene file stores, since
+    /// the handle itself is an upload index with no meaning across sessions.
+    /// Linear, over a map with a handful of entries, on the save path only.
+    pub fn mesh_name(&self, handle: MeshHandle) -> Option<&str> {
+        self.meshes
+            .iter()
+            .find(|&(_, h)| *h == handle)
+            .map(|(n, _)| n.as_str())
+    }
+
     pub fn insert_material(&mut self, name: impl Into<String>, handle: MaterialHandle) {
         self.materials.insert(name.into(), handle);
     }
@@ -39,6 +49,14 @@ impl Assets {
 
     pub fn materials(&self) -> impl Iterator<Item = (&str, MaterialHandle)> {
         self.materials.iter().map(|(n, &h)| (n.as_str(), h))
+    }
+
+    /// See [`mesh_name`](Self::mesh_name).
+    pub fn material_name(&self, handle: MaterialHandle) -> Option<&str> {
+        self.materials
+            .iter()
+            .find(|&(_, h)| *h == handle)
+            .map(|(n, _)| n.as_str())
     }
 
     pub fn insert_texture(&mut self, name: impl Into<String>, handle: TextureHandle) {

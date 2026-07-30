@@ -7,3 +7,4 @@ edition.workspace = true
 orrin-ecs.workspace=true
 orrin-macros.workspace = true
 glam.workspace = true
+uuid.workspace = true

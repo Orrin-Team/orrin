@@ -9,6 +9,17 @@ pub const LIGHT: ComponentId = ComponentId::new("orrin.light");
 pub const COLLIDER: ComponentId = ComponentId::new("orrin.collider");
 pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
 
+/// Reserved, not registered. `MeshHandle` and `MaterialHandle` are upload
+/// indices, so a scene stores the asset's *name* instead — a translation that
+/// needs the `Assets` resource, which `Reflect::to_value` deliberately cannot
+/// reach. `scene::persist` does it one level up, where the world is in scope.
+///
+/// The ids live here anyway so the namespace stays auditable in one place, and
+/// so that when assets gain stable ids these two can register properly and take
+/// the same ids — scenes written today keep parsing.
+pub const MESH: ComponentId = ComponentId::new("orrin.mesh");
+pub const MATERIAL: ComponentId = ComponentId::new("orrin.material");
+
 /// Describe every component the engine itself owns to `registry`.
 ///
 /// The counterpart a game assembly exports under the same name, called again
@@ -81,7 +92,7 @@ mod tests {
         assert_eq!(
             out,
             "\
-entity 1
+entity #1
   orrin.collider
     is_trigger = false
     shape = Box
@@ -113,7 +124,7 @@ entity 1
         assert_eq!(
             out,
             "\
-entity 1
+entity #1
   orrin.light = Point
     color = (1.0, 1.0, 1.0)
     intensity = 8.0

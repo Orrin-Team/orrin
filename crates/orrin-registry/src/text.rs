@@ -1,19 +1,43 @@
-//! Deterministic text dump of a world's registered components.
+//! Writing the scene format, and the debug dump that shares its grammar.
 //!
-//! Not the committed scene format — that arrives with save/load — but every
-//! rule here is one the scene format inherits, so they are worth fixing now
-//! while nothing depends on them: components sorted by id, fields sorted by
-//! name, floats printed canonically. Identical worlds must produce identical
-//! bytes, or a git diff of a scene is noise and a content hash is unstable.
+//! Every rule here exists for determinism: entities sorted by id, components
+//! sorted by id, fields sorted by name, floats printed canonically. Identical
+//! scenes must produce identical bytes, or a git diff is noise and a content
+//! hash is unstable. [`crate::parse`] is the inverse.
 
 use std::fmt::Write;
 
 use orrin_ecs::{Entity, World};
 
+use crate::EntityId;
 use crate::registry::Registry;
+use crate::scene::{FORMAT_VERSION, SceneDocument};
 use crate::value::Value;
 
 const INDENT: &str = "  ";
+
+/// Write a scene file: a version header, then every entity sorted by id.
+///
+/// Sorted by [`EntityId`], not by slot: a slot index depends on this session's
+/// spawn and despawn history, so two worlds holding the same scene could write
+/// their entities in different orders. Identity is the only stable sort key,
+/// and without one "identical scenes produce identical files" is false.
+pub fn write_document(out: &mut String, document: &SceneDocument) {
+    let _ = writeln!(out, "orrin-scene {FORMAT_VERSION}");
+
+    let mut entities: Vec<_> = document.entities.iter().collect();
+    entities.sort_by_key(|entity| entity.id);
+
+    for entity in entities {
+        let _ = writeln!(out, "\nentity {}", entity.id);
+
+        let mut components: Vec<_> = entity.components.iter().collect();
+        components.sort_by(|a, b| a.0.cmp(&b.0));
+        for (id, value) in components {
+            write_named(out, id.as_str(), value, 1);
+        }
+    }
+}
 
 /// Dump every live entity, in ascending slot order.
 pub fn write_world(out: &mut String, registry: &Registry, world: &World) {
@@ -24,14 +48,23 @@ pub fn write_world(out: &mut String, registry: &Registry, world: &World) {
 
 /// Dump one entity and all of its registered components.
 ///
+/// A view of live state, not a scene: an entity that has no [`EntityId`] yet is
+/// headed by its slot index behind a `#`, which the parser refuses. Re-reading
+/// a dump would invent identities that collide with the next session's.
+///
 /// Components are found by asking every registered type whether it is present,
 /// rather than by enumerating the world's storages — which keeps the ECS free
 /// of any type-erased iteration API. It costs one `has` call per registered
 /// type per entity, which is nothing at the scale this runs.
 pub fn write_entity(out: &mut String, registry: &Registry, world: &World, entity: Entity) {
-    // Only the slot index: the generation is session-local bookkeeping, and
-    // cross-session identity waits for a stable `EntityId`.
-    let _ = writeln!(out, "entity {}", entity.index());
+    match world.get::<EntityId>(entity) {
+        Some(id) => {
+            let _ = writeln!(out, "entity {}", *id);
+        }
+        None => {
+            let _ = writeln!(out, "entity #{}", entity.index());
+        }
+    }
 
     let mut components: Vec<(&str, Value)> = registry
         .components()
@@ -116,8 +149,8 @@ fn write_scalar(out: &mut String, value: &Value) {
             }
             out.push(')');
         }
-        Value::Entity(e) => {
-            let _ = write!(out, "entity({}:{})", e.index(), e.generation());
+        Value::Entity(id) => {
+            let _ = write!(out, "entity({id})");
         }
         Value::List(_) => out.push_str("[]"),
         // Routed to `write_fields` by `write_named` and never reached here.
@@ -244,7 +277,7 @@ mod tests {
         assert_eq!(
             out,
             "\
-entity 1
+entity #1
   test.placement
     rotation = (0.0, 0.0, 0.0, 1.0)
     scale = (1.0, 1.0, 1.0)
@@ -260,7 +293,7 @@ entity 1
         let empty = world.spawn();
         let mut out = String::new();
         write_entity(&mut out, &registry, &world, empty);
-        assert_eq!(out, "entity 2\n");
+        assert_eq!(out, "entity #2\n");
     }
 
     #[test]

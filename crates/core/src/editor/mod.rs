@@ -65,7 +65,7 @@ impl Editor {
             let ctx = gui.context();
             panels::draw(&ctx, world, state, registry);
         });
-        state.apply(world);
+        state.apply(world, registry);
     }
 
     /// Whether the user asked for a script reload since the last call. Drained

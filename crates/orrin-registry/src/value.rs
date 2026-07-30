@@ -28,7 +28,10 @@ pub enum Value {
     String(String),
     Vec3(glam::Vec3),
     Quat(glam::Quat),
-    Entity(orrin_ecs::Entity),
+    /// A reference to another entity, by its persistent identity. There is
+    /// deliberately no variant for a raw `orrin_ecs::Entity` — see
+    /// [`EntityId`](crate::EntityId).
+    Entity(crate::EntityId),
     /// Fields in declaration order — the order an inspector should draw them.
     /// Canonical (sorted) ordering is the text writer's job, not the data's.
     Struct(Vec<(String, Value)>),

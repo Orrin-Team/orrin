@@ -38,13 +38,65 @@ macro_rules! impl_leaf {
 }
 
 impl_leaf!(bool, Bool, "bool");
-impl_leaf!(i32, I32, "i32");
-impl_leaf!(u32, U32, "u32");
-impl_leaf!(f32, F32, "f32");
 impl_leaf!(String, String, "string");
 impl_leaf!(glam::Vec3, Vec3, "vec3");
 impl_leaf!(glam::Quat, Quat, "quat");
-impl_leaf!(orrin_ecs::Entity, Entity, "entity");
+impl_leaf!(crate::EntityId, Entity, "entity");
+
+/// The numeric leaves read leniently across the integer/float boundary.
+///
+/// The text format writes `3` for both an `i32` and a `u32` — width isn't in
+/// the syntax — so the parser cannot know which variant a number was, and a
+/// strict reader would reject half of all integer fields. Hand-edited files get
+/// the same benefit: writing `speed = 3` for an `f32` works.
+///
+/// The leniency is on *read* only. `to_value` always produces the field's
+/// declared variant, so re-saving canonicalizes the file, and `Value` equality
+/// stays exact — `Value::I32(3)` is still not `Value::U32(3)`.
+impl Reflect for f32 {
+    fn to_value(&self) -> Value {
+        Value::F32(*self)
+    }
+
+    fn from_value(value: &Value) -> Result<Self, ValueError> {
+        match value {
+            Value::F32(v) => Ok(*v),
+            Value::I32(v) => Ok(*v as f32),
+            Value::U32(v) => Ok(*v as f32),
+            other => Err(ValueError::mismatch("f32", other)),
+        }
+    }
+}
+
+impl Reflect for i32 {
+    fn to_value(&self) -> Value {
+        Value::I32(*self)
+    }
+
+    fn from_value(value: &Value) -> Result<Self, ValueError> {
+        match value {
+            Value::I32(v) => Ok(*v),
+            Value::U32(v) => i32::try_from(*v)
+                .map_err(|_| ValueError::invalid("an i32", format!("{v}"))),
+            other => Err(ValueError::mismatch("i32", other)),
+        }
+    }
+}
+
+impl Reflect for u32 {
+    fn to_value(&self) -> Value {
+        Value::U32(*self)
+    }
+
+    fn from_value(value: &Value) -> Result<Self, ValueError> {
+        match value {
+            Value::U32(v) => Ok(*v),
+            Value::I32(v) => u32::try_from(*v)
+                .map_err(|_| ValueError::invalid("a u32", format!("{v}"))),
+            other => Err(ValueError::mismatch("u32", other)),
+        }
+    }
+}
 
 impl<T: Reflect> Reflect for Vec<T> {
     fn to_value(&self) -> Value {

@@ -6,6 +6,7 @@ mod mesh_handle;
 mod name;
 mod spin;
 mod tag;
+mod unknown;
 #[cfg(feature = "scripting")]
 mod script;
 
@@ -17,5 +18,6 @@ pub use mesh_handle::MeshHandle;
 pub use name::Name;
 pub use spin::Spin;
 pub use tag::Tag;
+pub use unknown::UnknownComponents;
 #[cfg(feature = "scripting")]
 pub use script::ScriptComponent;

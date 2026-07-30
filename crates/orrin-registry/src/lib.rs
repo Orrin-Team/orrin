@@ -13,10 +13,15 @@
 //! (`inventory`, `ctor`) does not survive a dynamic library boundary, which is
 //! exactly the configuration hot reload creates.
 
+mod entity_id;
 mod reflect;
 mod registry;
+mod scene;
 mod text;
 mod value;
+
+pub use entity_id::EntityId;
+pub use scene::{FORMAT_VERSION, ParseError, SceneDocument, SceneEntity, parse};
 
 /// Shares its name with the [`Reflect`](trait@Reflect) trait, the way
 /// `serde::Serialize` does — the derive lives in the macro namespace and the
@@ -24,5 +29,5 @@ mod value;
 pub use orrin_macros::Reflect;
 pub use reflect::{Reflect, take};
 pub use registry::{ComponentId, ComponentVtable, Registry};
-pub use text::{write_entity, write_world};
+pub use text::{write_document, write_entity, write_world};
 pub use value::{FieldPath, PathSegment, Value, ValueError};
