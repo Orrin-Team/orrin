@@ -16,6 +16,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 
 use orrin_ecs::World;
+use orrin_registry::Registry;
 
 use self::state::EditorState;
 
@@ -56,13 +57,13 @@ impl Editor {
         self.gui.update(event)
     }
 
-    pub fn run(&mut self, world: &mut World) {
+    pub fn run(&mut self, world: &mut World, registry: &Registry) {
         // Destructure for disjoint borrows: `gui` drives egui while the closure
         // edits `state`/`world`.
         let Editor { gui, state } = self;
         gui.immediate_ui(|gui| {
             let ctx = gui.context();
-            panels::draw(&ctx, world, state);
+            panels::draw(&ctx, world, state, registry);
         });
         state.apply(world);
     }
