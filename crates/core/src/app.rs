@@ -13,6 +13,8 @@ use crate::camera_controller::CameraController;
 use crate::editor::Editor;
 use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::{RenderBackend, RenderItem, SceneLighting};
+use crate::profile::Profiler;
+use crate::profile_scope;
 use crate::scene::entities::build_default_scene;
 use crate::scene::{
     AmbientLight, Camera, DebugLine, DebugLines, HdrSettings, InputState, LogBuffer, SsaoSettings,
@@ -132,6 +134,7 @@ impl App {
         app.world.insert_resource(SsaoSettings::default());
         app.world.insert_resource(HdrSettings::default());
         app.world.insert_resource(FrameStats::new());
+        app.world.insert_resource(Profiler::default());
         app.world.insert_resource(InputState::new());
         app.world.insert_resource(crate::collision::CollisionState::default());
         app.world.insert_resource(LogBuffer::default());
@@ -340,12 +343,18 @@ impl ApplicationHandler for App {
                 self.world.resource_mut::<Time>().update(delta);
                 self.world.resource_mut::<FrameStats>().record(delta);
 
-                systems::spin(&self.world, delta);
+                {
+                    profile_scope!("spin");
+                    systems::spin(&self.world, delta);
+                }
 
                 // After the transform-mutating systems and before the script
                 // tick, so the events scripts receive match the positions
                 // they'll read this frame.
-                crate::collision::run(&mut self.world);
+                {
+                    profile_scope!("collision");
+                    crate::collision::run(&mut self.world);
+                }
 
                 // A reload requested from the editor last frame lands here:
                 // before the tick, after collision, with no dispatch window
@@ -358,10 +367,12 @@ impl ApplicationHandler for App {
                     // than reloading itself, so both routes converge on the one
                     // safe point below and a failed build never reaches it.
                     if let Some(watcher) = &mut self.build_watcher {
+                        profile_scope!("build watcher");
                         reload_requested |= watcher.service(&self.world);
                     }
                     if let Some(scripting) = &self.scripting {
                         if reload_requested {
+                            profile_scope!("script reload");
                             let outcome = scripting.reload(&mut self.world);
                             let frame = self.world.resource::<Time>().frame_count();
                             self.world.resource_mut::<LogBuffer>().push(
@@ -378,25 +389,34 @@ impl ApplicationHandler for App {
                                     .reloaded();
                             }
                         }
-                        scripting.tick(&mut self.world, delta);
+                        {
+                            profile_scope!("script tick");
+                            scripting.tick(&mut self.world, delta);
+                        }
                     }
                 }
 
                 // Before extraction: the UI may spawn/despawn/edit entities.
-                active.editor.run(&mut self.world, &self.registry);
+                {
+                    profile_scope!("editor");
+                    active.editor.run(&mut self.world, &self.registry);
+                }
 
                 // After the UI, so the editor's own camera edits are the
                 // baseline the controller builds on.
                 self.camera_controller
                     .update(&mut self.world.resource_mut::<Camera>(), delta);
 
-                systems::extract_renderables(&self.world, &mut self.render_items);
-                systems::extract_lighting(&self.world, &mut self.lighting);
-                // Copy this frame's debug lines out (they're Copy) so the render
-                // borrow below doesn't overlap the world borrow.
-                self.debug_lines.clear();
-                self.debug_lines
-                    .extend_from_slice(self.world.resource::<DebugLines>().lines());
+                {
+                    profile_scope!("extract");
+                    systems::extract_renderables(&self.world, &mut self.render_items);
+                    systems::extract_lighting(&self.world, &mut self.lighting);
+                    // Copy this frame's debug lines out (they're Copy) so the render
+                    // borrow below doesn't overlap the world borrow.
+                    self.debug_lines.clear();
+                    self.debug_lines
+                        .extend_from_slice(self.world.resource::<DebugLines>().lines());
+                }
                 let camera = *self.world.resource::<Camera>();
                 let ssao = *self.world.resource::<SsaoSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
@@ -405,15 +425,18 @@ impl ApplicationHandler for App {
                     renderer, editor, ..
                 } = active;
                 let mut overlay = |before, image| editor.draw(before, image);
-                renderer.render_with_overlay(
-                    &self.render_items,
-                    &self.lighting,
-                    &camera,
-                    &ssao,
-                    &hdr,
-                    &self.debug_lines,
-                    &mut overlay,
-                );
+                {
+                    profile_scope!("render submit");
+                    renderer.render_with_overlay(
+                        &self.render_items,
+                        &self.lighting,
+                        &camera,
+                        &ssao,
+                        &hdr,
+                        &self.debug_lines,
+                        &mut overlay,
+                    );
+                }
 
                 let gpu_ms = renderer.gpu_frame_ms();
                 let (vram_used, vram_total) = renderer.gpu_memory();
@@ -430,6 +453,11 @@ impl ApplicationHandler for App {
                 // Clear the one-frame pressed/released edges now that scripts
                 // have observed them during the tick above.
                 self.world.resource_mut::<InputState>().end_frame();
+
+                // Last, so every scope guard above has dropped and this frame's
+                // CPU spans are complete. Its GPU spans arrive later and are
+                // filed against this frame by index.
+                self.world.resource_mut::<Profiler>().end_frame();
             }
             _ => {}
         }
