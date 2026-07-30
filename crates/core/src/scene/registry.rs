@@ -128,7 +128,7 @@ entity 1
         let err = Light::from_value(&stale).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "expected Directional or Point, found `Spot`"
+            "expected one of: Directional, Point, found `Spot`"
         );
     }
 

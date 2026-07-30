@@ -16,6 +16,7 @@ orrin-project = { path = "crates/orrin-project" }
 orrin-build = { path = "crates/orrin-build" }
 orrin-ecs = { path = "crates/orrin-ecs" }
 orrin-registry = { path = "crates/orrin-registry" }
+orrin-macros = { path = "crates/orrin-macros" }
 vulkano = "0.35"
 vulkano-shaders = "0.35"
 winit = "0.30"

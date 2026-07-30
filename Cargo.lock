@@ -2509,6 +2509,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrin-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "orrin-project"
 version = "0.1.0"
 dependencies = [
@@ -2523,6 +2532,7 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "orrin-ecs",
+ "orrin-macros",
 ]
 
 [[package]]

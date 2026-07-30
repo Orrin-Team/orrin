@@ -1,18 +1,8 @@
-use orrin_registry::{Reflect, Value, ValueError};
+use orrin_registry::Reflect;
 
 /// A display name for tooling; doesn't affect simulation or rendering.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Reflect)]
 pub struct Name(pub String);
-
-impl Reflect for Name {
-    fn to_value(&self) -> Value {
-        self.0.to_value()
-    }
-
-    fn from_value(value: &Value) -> Result<Self, ValueError> {
-        String::from_value(value).map(Self)
-    }
-}
 
 impl Name {
     #[inline]

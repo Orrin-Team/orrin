@@ -18,6 +18,10 @@ mod registry;
 mod text;
 mod value;
 
+/// Shares its name with the [`Reflect`](trait@Reflect) trait, the way
+/// `serde::Serialize` does — the derive lives in the macro namespace and the
+/// trait in the type namespace, so one import brings both.
+pub use orrin_macros::Reflect;
 pub use reflect::{Reflect, take};
 pub use registry::{ComponentId, ComponentVtable, Registry};
 pub use text::{write_entity, write_world};
