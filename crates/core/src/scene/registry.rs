@@ -1,10 +1,13 @@
 use orrin_registry::{ComponentId, Registry};
 
-use super::{LocalTransform, Name, Tag};
+use super::{Collider, Light, LocalTransform, Name, Spin, Tag};
 
 pub const TRANSFORM: ComponentId = ComponentId::new("orrin.transform");
 pub const NAME: ComponentId = ComponentId::new("orrin.name");
 pub const TAG: ComponentId = ComponentId::new("orrin.tag");
+pub const LIGHT: ComponentId = ComponentId::new("orrin.light");
+pub const COLLIDER: ComponentId = ComponentId::new("orrin.collider");
+pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
 
 /// Describe every component the engine itself owns to `registry`.
 ///
@@ -25,6 +28,9 @@ pub fn register_components(registry: &mut Registry) {
     registry.register::<LocalTransform>(TRANSFORM, "Transform");
     registry.register::<Name>(NAME, "Name");
     registry.register::<Tag>(TAG, "Tag");
+    registry.register::<Light>(LIGHT, "Light");
+    registry.register::<Collider>(COLLIDER, "Collider");
+    registry.register::<Spin>(SPIN, "Spin");
     registry.end_engine_registration();
 }
 
@@ -35,7 +41,7 @@ mod tests {
     use orrin_registry::{Reflect, Value};
 
     use super::*;
-    use crate::scene::Transform;
+    use crate::scene::{ColliderShape, Transform};
 
     fn world() -> (World, orrin_ecs::Entity) {
         let mut world = World::new();
@@ -57,7 +63,17 @@ mod tests {
     fn engine_components_dump_deterministically() {
         let mut registry = Registry::new();
         register_components(&mut registry);
-        let (world, entity) = world();
+        let (mut world, entity) = world();
+        world.insert(
+            entity,
+            Collider {
+                shape: ColliderShape::Box {
+                    half_extents: Vec3::splat(0.5),
+                },
+                is_trigger: false,
+            },
+        );
+        world.insert(entity, Spin::new(Vec3::Y, 1.5));
 
         let mut out = String::new();
         orrin_registry::write_entity(&mut out, &registry, &world, entity);
@@ -66,7 +82,14 @@ mod tests {
             out,
             "\
 entity 1
+  orrin.collider
+    is_trigger = false
+    shape = Box
+      half_extents = (0.5, 0.5, 0.5)
   orrin.name = \"Cube\"
+  orrin.spin
+    axis = (0.0, 1.0, 0.0)
+    speed = 1.5
   orrin.tag = \"player\"
   orrin.transform
     rotation = (0.0, 0.0, 0.0, 1.0)
@@ -74,6 +97,56 @@ entity 1
     translation = (0.0, 1.5, 0.0)
 "
         );
+    }
+
+    #[test]
+    fn a_light_dumps_as_its_variant() {
+        let mut registry = Registry::new();
+        register_components(&mut registry);
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(entity, Light::point(Vec3::ONE, 8.0, 10.0));
+
+        let mut out = String::new();
+        orrin_registry::write_entity(&mut out, &registry, &world, entity);
+
+        assert_eq!(
+            out,
+            "\
+entity 1
+  orrin.light = Point
+    color = (1.0, 1.0, 1.0)
+    intensity = 8.0
+    range = 10.0
+"
+        );
+    }
+
+    #[test]
+    fn an_unknown_variant_names_itself() {
+        let stale = Value::enumeration("Spot", [("angle", Value::F32(30.0))]);
+        let err = Light::from_value(&stale).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "expected Directional or Point, found `Spot`"
+        );
+    }
+
+    /// The reason `Spin` cannot be derived: `apply` feeds `axis` to
+    /// `Quat::from_axis_angle`, so a zero axis would produce NaN rotations that
+    /// spread through the hierarchy. A field-assigning `from_value` would let a
+    /// hand-edited scene do exactly that.
+    #[test]
+    fn spin_refuses_an_axis_it_cannot_normalize() {
+        let broken = Value::strukt([("axis", Vec3::ZERO.to_value()), ("speed", Value::F32(1.0))]);
+        let err = Spin::from_value(&broken).unwrap_err();
+        assert_eq!(err.path.to_string(), "axis");
+        assert_eq!(err.expected, "a non-zero axis");
+
+        let unnormalized =
+            Value::strukt([("axis", Vec3::new(0.0, 4.0, 0.0).to_value()), ("speed", Value::F32(1.0))]);
+        let spin = Spin::from_value(&unnormalized).unwrap();
+        assert_eq!(spin.to_value().field("axis"), Some(&Vec3::Y.to_value()));
     }
 
     /// Catches the classic asymmetry: a field renamed in `to_value` but not in
@@ -97,6 +170,13 @@ entity 1
         }));
         round_trips(&Name::new("Cube"));
         round_trips(&Tag::new("player"));
+        round_trips(&Light::directional(Vec3::ONE, 2.0));
+        round_trips(&Light::point(Vec3::new(1.0, 0.5, 0.2), 8.0, 10.0));
+        round_trips(&Collider {
+            shape: ColliderShape::Sphere { radius: 1.5 },
+            is_trigger: true,
+        });
+        round_trips(&Spin::new(Vec3::new(0.0, 1.0, 1.0), 2.0));
     }
 
     #[test]

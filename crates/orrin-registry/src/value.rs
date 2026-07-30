@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 
 /// A component's data in a form nothing needs the concrete type to work with.
@@ -54,11 +55,16 @@ pub enum PathSegment {
 pub struct FieldPath(Vec<PathSegment>);
 
 /// A [`Value`] that did not match the type being read out of it.
+///
+/// `found` is a `Cow` because most failures report a type name known at compile
+/// time, but an unrecognized enum variant has to name the variant it actually
+/// read — and a diagnostic that says "unknown variant" without saying which one
+/// is not worth printing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValueError {
     pub path: FieldPath,
     pub expected: &'static str,
-    pub found: &'static str,
+    pub found: Cow<'static, str>,
 }
 
 impl Value {
@@ -82,6 +88,22 @@ impl Value {
     /// Build a [`Value::Struct`] from a fixed set of named fields.
     pub fn strukt<const N: usize>(fields: [(&str, Value); N]) -> Value {
         Value::Struct(fields.map(|(name, value)| (name.to_owned(), value)).into())
+    }
+
+    /// Build a [`Value::Enum`] from a variant name and its payload.
+    pub fn enumeration<const N: usize>(variant: &str, fields: [(&str, Value); N]) -> Value {
+        Value::Enum {
+            variant: variant.to_owned(),
+            fields: fields.map(|(name, value)| (name.to_owned(), value)).into(),
+        }
+    }
+
+    /// The variant name, for enum values only.
+    pub fn variant(&self) -> Option<&str> {
+        match self {
+            Value::Enum { variant, .. } => Some(variant),
+            _ => None,
+        }
     }
 
     /// Look up a named field of a struct *or* of an enum variant, so a variant's
@@ -145,8 +167,27 @@ impl ValueError {
         Self {
             path: FieldPath::empty(),
             expected,
-            found: found.type_name(),
+            found: Cow::Borrowed(found.type_name()),
         }
+    }
+
+    /// A value of the right *shape* that the type still refuses — a broken
+    /// invariant rather than a type error. A scene file is untrusted input, so
+    /// a type whose constructor establishes something its fields don't has to
+    /// be able to say no.
+    pub fn invalid(expected: &'static str, found: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            path: FieldPath::empty(),
+            expected,
+            found: found.into(),
+        }
+    }
+
+    /// An enum value naming a variant the type no longer has. `expected` should
+    /// list the variants that exist, since the usual cause is a variant renamed
+    /// out from under a saved scene.
+    pub fn unknown_variant(expected: &'static str, found: &str) -> Self {
+        Self::invalid(expected, format!("`{found}`"))
     }
 
     /// A field that isn't there at all. Note this *already* names the field, so
@@ -156,7 +197,7 @@ impl ValueError {
         Self {
             path: FieldPath::field(field),
             expected: "a value",
-            found: "nothing",
+            found: Cow::Borrowed("nothing"),
         }
     }
 
