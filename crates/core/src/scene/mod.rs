@@ -5,6 +5,8 @@ mod debug;
 pub mod entities;
 mod hdr;
 mod mesh;
+mod persist;
+pub mod registry;
 mod ssao;
 mod time;
 mod transform;
@@ -15,13 +17,15 @@ pub use camera::Camera;
 pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};
 pub use components::{
     AmbientLight, Collider, ColliderShape, Light, LocalTransform, MaterialHandle, MeshHandle,
-    Name, Spin, Tag,
+    Name, Spin, Tag, UnknownComponents,
 };
 #[cfg(feature = "scripting")]
 pub use components::ScriptComponent;
 pub use hdr::HdrSettings;
 pub use input::InputState;
 pub use mesh::CpuMesh;
+pub use persist::{LoadIssue, instantiate, load, save, to_document};
+pub use registry::register_components;
 pub use ssao::SsaoSettings;
 pub use time::Time;
 pub use transform::Transform;

@@ -1,5 +1,7 @@
+use orrin_registry::Reflect;
+
 /// A display name for tooling; doesn't affect simulation or rendering.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Reflect)]
 pub struct Name(pub String);
 
 impl Name {

@@ -1,6 +1,10 @@
 use glam::Vec3;
+use orrin_registry::Reflect;
 
-#[derive(Clone, Copy, Debug)]
+/// Variant names are part of the on-disk format, exactly like a component's id:
+/// renaming `Directional` orphans every saved light that used it, and nothing
+/// catches that at compile time. Add variants freely; rename them never.
+#[derive(Clone, Copy, Debug, Reflect)]
 pub enum Light {
     Directional {
         color: Vec3,
@@ -26,6 +30,12 @@ impl Light {
             intensity,
             range,
         }
+    }
+}
+
+impl Default for Light {
+    fn default() -> Self {
+        Self::directional(Vec3::ONE, 1.0)
     }
 }
 

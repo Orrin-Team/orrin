@@ -1,0 +1,10 @@
+[package]
+name = "orrin-registry"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+orrin-ecs.workspace=true
+orrin-macros.workspace = true
+glam.workspace = true
+uuid.workspace = true

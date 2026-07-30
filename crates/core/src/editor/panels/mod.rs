@@ -3,24 +3,32 @@ mod environment;
 mod hierarchy;
 mod inspector;
 mod performance;
+mod scene;
 #[cfg(feature = "scripting")]
 mod scripts;
 
 use glam::Vec3;
 
 use orrin_ecs::World;
+use orrin_registry::Registry;
 
 use super::state::EditorState;
 
 // Side/bottom panels only — no `CentralPanel`, so the center stays transparent
 // and the 3D scene shows through behind the editor.
-pub fn draw(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
+pub fn draw(
+    ctx: &egui::Context,
+    world: &mut World,
+    state: &mut EditorState,
+    registry: &Registry,
+) {
     hierarchy::show(ctx, world, state);
-    inspector::show(ctx, world, state);
+    inspector::show(ctx, world, state, registry);
     environment::show(ctx, world);
     performance::show(ctx, world);
     #[cfg(feature = "scripting")]
     scripts::show(ctx, world, state);
+    scene::show(ctx, world, state);
     console::show(ctx, world);
 }
 

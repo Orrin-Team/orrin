@@ -5,14 +5,22 @@
 use glam::{EulerRot, Quat};
 
 use orrin_ecs::{Entity, World};
+use orrin_registry::Registry;
 
 use super::{color_row, vec3_row};
 use crate::editor::state::EditorState;
 #[cfg(feature = "scripting")]
 use crate::scene::ScriptComponent;
-use crate::scene::{Assets, Light, LocalTransform, MaterialHandle, MeshHandle, Name};
+use crate::scene::{
+    Assets, Light, LocalTransform, LogBuffer, LogLevel, MaterialHandle, MeshHandle, Name, Time,
+};
 
-pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
+pub fn show(
+    ctx: &egui::Context,
+    world: &mut World,
+    state: &mut EditorState,
+    registry: &Registry,
+) {
     egui::SidePanel::right("inspector")
         .resizable(true)
         .default_width(280.0)
@@ -36,7 +44,34 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
             light_section(ui, world, entity);
             #[cfg(feature = "scripting")]
             script_section(ui, world, entity);
+            dump_section(ui, world, registry, entity);
         });
+}
+
+/// Print the entity exactly as the registry sees it.
+///
+/// Every section above names a concrete component type; this one names none —
+/// it asks each registered type whether it's present and prints whatever comes
+/// back. That difference is the point of the registry, and until the inspector
+/// itself is registry-driven this button is how a component's registration gets
+/// eyeballed.
+fn dump_section(ui: &mut egui::Ui, world: &mut World, registry: &Registry, entity: Entity) {
+    ui.separator();
+    if !ui.button("Dump to console").clicked() {
+        return;
+    }
+
+    let mut text = String::new();
+    orrin_registry::write_entity(&mut text, registry, world, entity);
+
+    // Both resource borrows are taken after the dump is built, so no component
+    // borrow is still open when the log is written.
+    let frame = world
+        .get_resource::<Time>()
+        .map_or(0, |time| time.frame_count());
+    if let Some(mut log) = world.get_resource_mut::<LogBuffer>() {
+        log.push(LogLevel::Info, text, frame);
+    }
 }
 
 fn name_section(ui: &mut egui::Ui, world: &World, entity: Entity) {

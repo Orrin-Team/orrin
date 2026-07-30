@@ -1,6 +1,7 @@
 use glam::{Mat4, Quat, Vec3};
+use orrin_registry::Reflect;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Reflect)]
 pub struct Transform {
     pub translation: Vec3,
     pub rotation: Quat,

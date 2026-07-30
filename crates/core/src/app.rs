@@ -21,6 +21,7 @@ use crate::scene::{
 use crate::stats::FrameStats;
 use crate::systems;
 use orrin_ecs::World;
+use orrin_registry::Registry;
 
 struct Active {
     window: Arc<Window>,
@@ -32,6 +33,9 @@ pub struct App {
     instance: Arc<Instance>,
     active: Option<Active>,
     world: World,
+    /// Not a world resource: it has to survive the world being cleared, and a
+    /// scene load needs it before there is a world to read it out of.
+    registry: Registry,
     camera_controller: CameraController,
     /// Timestamp of the previous rendered frame; `None` until the first frame
     /// establishes a baseline. Delta is `now - last_instant`, never a
@@ -106,6 +110,7 @@ impl App {
             instance,
             active: None,
             world: World::default(),
+            registry: Registry::new(),
             camera_controller: CameraController::new(),
             last_instant: None,
             render_items: Vec::new(),
@@ -118,6 +123,8 @@ impl App {
             #[cfg(feature = "scripting")]
             project,
         };
+
+        crate::scene::register_components(&mut app.registry);
 
         app.world.insert_resource(Camera::default());
         app.world.insert_resource(Time::new());
@@ -376,7 +383,7 @@ impl ApplicationHandler for App {
                 }
 
                 // Before extraction: the UI may spawn/despawn/edit entities.
-                active.editor.run(&mut self.world);
+                active.editor.run(&mut self.world, &self.registry);
 
                 // After the UI, so the editor's own camera edits are the
                 // baseline the controller builds on.

@@ -1,10 +1,15 @@
 use std::ops::{Deref, DerefMut};
 
+use orrin_registry::Reflect;
+
 use crate::scene::Transform;
 
 /// The ECS component form of [`Transform`]; derefs to it, so all its helpers
 /// are available directly on a `LocalTransform`.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// The derive flattens a newtype, so this reads and writes exactly as a
+/// [`Transform`] does — no `.0` level in the scene file or in field paths.
+#[derive(Clone, Copy, Debug, Default, Reflect)]
 pub struct LocalTransform(pub Transform);
 
 impl LocalTransform {
