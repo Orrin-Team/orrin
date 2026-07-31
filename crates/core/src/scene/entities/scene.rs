@@ -5,13 +5,13 @@ use orrin_ecs::World;
 use super::textures::{bump_normals, checkerboard, load_rgba, metallic_roughness};
 use super::{spawn_directional_light, spawn_mesh, spawn_point_light};
 use crate::gfx::{Material, RenderBackend};
-use crate::scene::{Assets, Camera, CpuMesh, Spin, Transform};
+use crate::scene::{Assets, Camera, CpuMesh, MeshBounds, Spin, Transform};
 
 const GRID: i32 = 10;
 const SPACING: f32 = 2.0;
 
 pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) {
-    let assets = load_assets(backend);
+    let (assets, mesh_bounds) = load_assets(backend);
 
     let cube = assets.mesh("cube").unwrap();
     let plane = assets.mesh("plane").unwrap();
@@ -24,6 +24,7 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
         .collect();
 
     world.insert_resource(assets);
+    world.insert_resource(mesh_bounds);
 
     let half = (GRID - 1) as f32 * SPACING * 0.5;
     let mut index = 0;
@@ -88,12 +89,19 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
     });
 }
 
-fn load_assets(backend: &mut impl RenderBackend) -> Assets {
+fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds) {
     let mut assets = Assets::new();
+    let mut bounds = MeshBounds::default();
 
-    assets.insert_mesh("cube", backend.load_mesh(&CpuMesh::cube()));
-    assets.insert_mesh("plane", backend.load_mesh(&CpuMesh::plane()));
-    assets.insert_mesh("sphere", backend.load_mesh(&CpuMesh::sphere(32, 16)));
+    load_mesh(backend, &mut assets, &mut bounds, "cube", &CpuMesh::cube());
+    load_mesh(backend, &mut assets, &mut bounds, "plane", &CpuMesh::plane());
+    load_mesh(
+        backend,
+        &mut assets,
+        &mut bounds,
+        "sphere",
+        &CpuMesh::sphere(32, 16),
+    );
 
     // A spread across the metallic-roughness range so the PBR BRDF is visible.
     let palette = [
@@ -192,5 +200,23 @@ fn load_assets(backend: &mut impl RenderBackend) -> Assets {
         }),
     );
 
-    assets
+    (assets, bounds)
+}
+
+/// Upload a mesh and register it in both world-side tables at once, so a mesh
+/// can never reach a draw list without the bounds the culler needs.
+fn load_mesh(
+    backend: &mut impl RenderBackend,
+    assets: &mut Assets,
+    bounds: &mut MeshBounds,
+    name: &str,
+    mesh: &CpuMesh,
+) {
+    let handle = backend.load_mesh(mesh);
+    assets.insert_mesh(name, handle);
+    // Read back from the backend's own upload, so the box culling tests is the
+    // box the drawn geometry occupies.
+    if let Some(aabb) = backend.mesh_bounds(handle) {
+        bounds.insert(handle, aabb);
+    }
 }

@@ -1,4 +1,8 @@
+use glam::Vec3;
+
+use crate::geom::Aabb;
 use crate::gfx::Vertex;
+use crate::scene::MeshHandle;
 
 #[derive(Clone, Default)]
 pub struct CpuMesh {
@@ -6,9 +10,44 @@ pub struct CpuMesh {
     pub indices: Vec<u32>,
 }
 
+/// Object-space bounds of every uploaded mesh, indexed by [`MeshHandle`].
+///
+/// The world-side mirror of what the backend derived at upload: culling runs in
+/// extraction, which has a `World` and no renderer. Uploads only ever append, so
+/// a handle's slot never changes meaning — a scene load resolves names against
+/// the meshes already uploaded rather than re-uploading them.
+#[derive(Default)]
+pub struct MeshBounds {
+    bounds: Vec<Aabb>,
+}
+
+impl MeshBounds {
+    pub fn insert(&mut self, handle: MeshHandle, bounds: Aabb) {
+        let index = handle.0 as usize;
+        if self.bounds.len() <= index {
+            // A gap means a mesh was uploaded without registering here; EMPTY is
+            // invalid, and an invalid box is never culled.
+            self.bounds.resize(index + 1, Aabb::EMPTY);
+        }
+        self.bounds[index] = bounds;
+    }
+
+    /// `None` for a handle that was never registered — the caller must draw it
+    /// rather than cull what it cannot measure.
+    pub fn get(&self, handle: MeshHandle) -> Option<Aabb> {
+        self.bounds.get(handle.0 as usize).copied()
+    }
+}
+
 impl CpuMesh {
     pub fn new(vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
         Self { vertices, indices }
+    }
+
+    /// Object-space bounds over every vertex, whether or not an index references
+    /// it. [`Aabb::EMPTY`] for a mesh with no vertices.
+    pub fn bounds(&self) -> Aabb {
+        Aabb::from_points(self.vertices.iter().map(|v| Vec3::from(v.position)))
     }
 
     pub fn cube() -> Self {

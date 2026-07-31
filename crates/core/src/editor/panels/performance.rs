@@ -1,6 +1,7 @@
 use orrin_ecs::World;
 
 use crate::profile::{self, Lane, Profiler, Row};
+use crate::scene::Culling;
 use crate::stats::FrameStats;
 
 pub fn show(ctx: &egui::Context, world: &World) {
@@ -42,6 +43,17 @@ pub fn show(ctx: &egui::Context, world: &World) {
                 None => {
                     ui.label(format!("VRAM: {total_gb:.1} GB (usage n/a)"));
                 }
+            }
+
+            if let Some(mut culling) = world.get_resource_mut::<Culling>() {
+                ui.label(format!(
+                    "Draws: {} / {} ({} culled)",
+                    culling.visible(),
+                    culling.total(),
+                    culling.culled(),
+                ));
+                ui.checkbox(&mut culling.enabled, "Frustum culling")
+                    .on_hover_text("Off draws everything — the A/B for a suspected culling bug.");
             }
 
             ui.add_space(4.0);

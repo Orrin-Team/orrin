@@ -1,5 +1,7 @@
 use glam::{Mat4, Vec3};
 
+use crate::geom::Frustum;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
     pub position: Vec3,
@@ -43,5 +45,13 @@ impl Camera {
     #[inline]
     pub fn view_projection(&self, aspect: f32) -> Mat4 {
         self.projection(aspect) * self.view()
+    }
+
+    /// The six clip planes of this camera's volume, for culling. `aspect` must
+    /// be the one the frame is drawn with, or the side planes will not match
+    /// what ends up on screen.
+    #[inline]
+    pub fn frustum(&self, aspect: f32) -> Frustum {
+        Frustum::from_view_projection(self.view_projection(aspect))
     }
 }
