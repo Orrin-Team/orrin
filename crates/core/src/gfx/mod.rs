@@ -1,4 +1,7 @@
+pub mod headless;
 pub mod vulkan;
+
+pub use headless::HeadlessBackend;
 
 use crate::geom::Aabb;
 use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings};

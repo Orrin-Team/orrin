@@ -37,3 +37,17 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --verbose
+
+      # Architecture §6: "editor cold start stays under a few seconds, guarded
+      # by a CI benchmark, because startup time decays one dependency at a
+      # time." The gate itself already ran above as part of the workspace tests
+      # — this repeats it only to put the measured number in the log, so the
+      # trend is visible per commit instead of only when the cap is finally
+      # breached. It reuses the test artifacts just built, so it costs seconds.
+      #
+      # It measures the CPU half of startup (registration, resources, meshes,
+      # textures, scene graph) through a headless backend. Device creation is
+      # absent because the runner has no GPU; see crates/core/tests/cold_start.rs
+      # for why that is the right line to draw.
+      - name: Cold start benchmark
+        run: cargo test -p orrin-core --test cold_start -- --nocapture

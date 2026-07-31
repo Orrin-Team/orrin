@@ -119,11 +119,34 @@ fn build_and_query(c: &mut Criterion) {
     group.finish();
 }
 
+/// The same per-frame work as `build_and_query`, but against one tree that is
+/// rebuilt in place. The gap between the two groups is what `collision::run`
+/// stopped paying the allocator every frame.
+fn rebuild_and_query(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bvh_rebuild_and_query");
+    for count in COUNTS {
+        let boxes = bounds(count, dense_spread(count));
+        let mut bvh = Bvh::default();
+        let mut pairs = Vec::new();
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_function(format!("{count}"), |b| {
+            b.iter(|| {
+                pairs.clear();
+                bvh.rebuild(black_box(&boxes));
+                bvh.query_pairs(&mut pairs);
+                black_box(pairs.len())
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     build,
     query_pairs_sparse,
     query_pairs_dense,
-    build_and_query
+    build_and_query,
+    rebuild_and_query
 );
 criterion_main!(benches);

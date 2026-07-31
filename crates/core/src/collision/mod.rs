@@ -9,11 +9,9 @@
 mod bvh;
 mod narrowphase;
 
-use std::collections::HashMap;
-
 use glam::{Mat3, Vec3};
 
-use orrin_ecs::{Entity, World};
+use orrin_ecs::{Entity, FxHashMap, World};
 
 use crate::scene::{Collider, ColliderShape, LocalTransform};
 
@@ -46,8 +44,14 @@ pub struct CollisionEvent {
 
 #[derive(Default)]
 pub struct CollisionState {
-    touching: HashMap<(Entity, Entity), Contact>,
+    /// Hashed with [`FxHasher`](orrin_ecs::FxHasher) rather than SipHash: the
+    /// key is a pair of engine-generated handles, and every overlapping pair
+    /// hashes it at least twice a frame (insert, then the diff's lookup).
+    touching: FxHashMap<(Entity, Entity), Contact>,
     pub events: Vec<CollisionEvent>,
+    /// Lives across frames only to keep its buffers; the tree in it is rebuilt
+    /// from scratch every frame and never read from one frame to the next.
+    broadphase: Bvh,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,8 +111,8 @@ fn pair_key(a: Entity, b: Entity) -> (Entity, Entity) {
 }
 
 fn diff_pairs(
-    previous: &HashMap<(Entity, Entity), Contact>,
-    current: &HashMap<(Entity, Entity), Contact>,
+    previous: &FxHashMap<(Entity, Entity), Contact>,
+    current: &FxHashMap<(Entity, Entity), Contact>,
     events: &mut Vec<CollisionEvent>,
 ) {
     for (key, contact) in current {
@@ -143,7 +147,13 @@ fn diff_pairs(
 /// as touching this frame, so a clean separation surfaces as an Exit event next
 /// frame — matching how impulse engines report it.
 pub fn run(world: &mut World) {
-    world.resource_mut::<CollisionState>().events.clear();
+    // Taken out rather than borrowed for the whole function: everything below
+    // reaches back into the world, and the tree is put back at the end.
+    let mut broadphase = {
+        let mut state = world.resource_mut::<CollisionState>();
+        state.events.clear();
+        std::mem::take(&mut state.broadphase)
+    };
 
     struct Body {
         entity: Entity,
@@ -162,15 +172,14 @@ pub fn run(world: &mut World) {
             });
         });
 
+    let bounds: Vec<Aabb> = bodies.iter().map(|body| body.shape.bounds()).collect();
     let mut candidates: Vec<(u32, u32)> = Vec::new();
-    if bodies.len() >= 2 {
-        let bounds: Vec<Aabb> = bodies.iter().map(|body| body.shape.bounds()).collect();
-        Bvh::build(&bounds).query_pairs(&mut candidates);
-    }
+    broadphase.rebuild(&bounds);
+    broadphase.query_pairs(&mut candidates);
 
     // Contacts are stored re-oriented to the canonical pair order, so the diff
     // and the resolver never have to guess which way the normal points.
-    let mut current: HashMap<(Entity, Entity), Contact> = HashMap::new();
+    let mut current: FxHashMap<(Entity, Entity), Contact> = FxHashMap::default();
     let mut corrections: Vec<(Entity, Vec3)> = Vec::new();
     for &(i, j) in &candidates {
         let (a, b) = (&bodies[i as usize], &bodies[j as usize]);
@@ -202,9 +211,10 @@ pub fn run(world: &mut World) {
     }
 
     let mut state = world.resource_mut::<CollisionState>();
-    let CollisionState { touching, events } = &mut *state;
+    let CollisionState { touching, events, broadphase: stored } = &mut *state;
     if !(touching.is_empty() && current.is_empty()) {
         diff_pairs(touching, &current, events);
     }
     *touching = current;
+    *stored = broadphase;
 }

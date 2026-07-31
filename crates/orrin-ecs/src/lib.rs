@@ -7,8 +7,11 @@
 
 use std::any::{Any, TypeId};
 use std::cell::{Ref, RefCell, RefMut};
-use std::collections::HashMap;
 use std::marker::PhantomData;
+
+mod hash;
+
+pub use hash::{FxBuildHasher, FxHashMap, FxHasher};
 
 //
 // Entities
@@ -234,8 +237,11 @@ impl<T: 'static> AnyStorage for SparseSet<T> {
 #[derive(Default)]
 pub struct World {
     entities: EntityAllocator,
-    storages: HashMap<TypeId, RefCell<Box<dyn AnyStorage>>>,
-    resources: HashMap<TypeId, RefCell<Box<dyn Any>>>,
+    // Keyed by `TypeId` and hashed with [`FxHasher`] rather than SipHash: every
+    // `get`/`get_mut`/`has` pays this hash, and the scripting FFI runs them per
+    // component per entity per frame.
+    storages: FxHashMap<TypeId, RefCell<Box<dyn AnyStorage>>>,
+    resources: FxHashMap<TypeId, RefCell<Box<dyn Any>>>,
 }
 
 impl World {
@@ -466,6 +472,15 @@ pub trait QueryParam {
     /// What a single matched entity yields, e.g. `&T` or `(&mut A, &B)`.
     type Item<'a>;
 
+    /// Whether this parameter is able to drive iteration — true for a required
+    /// component, false for an optional one, which matches every entity and so
+    /// has no candidate list of its own.
+    ///
+    /// A constant rather than a runtime check so a tuple can work out *which*
+    /// of its parameters drove at compile time, and the dense-index dispatch in
+    /// [`get_at`](QueryParam::get_at) folds away entirely.
+    const CAN_DRIVE: bool;
+
     /// Borrow the storage this query needs, or `None` if the query can never
     /// match (a required component whose storage doesn't exist). Optional
     /// parameters always succeed and carry an absent storage as `None` inside
@@ -485,11 +500,29 @@ pub trait QueryParam {
     /// Fetch the item for `entity`, or `None` if it lacks one of the required
     /// components.
     fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>>;
+
+    /// Fetch the item at candidate position `i`, where `entity` is what
+    /// [`driver_entity_at`](QueryParam::driver_entity_at) answered for that
+    /// same `i`.
+    ///
+    /// The parameter that drove already knows where its value lives — `i` *is*
+    /// its dense index — so it reads straight out of the packed array and skips
+    /// the sparse indirection and generation check that [`get`](QueryParam::get)
+    /// would redo. Parameters that did not drive have only the handle to go on
+    /// and fall back to `get`.
+    fn get_at<'a>(
+        fetch: &'a mut Self::Fetch<'_>,
+        i: usize,
+        entity: Entity,
+    ) -> Option<Self::Item<'a>>;
 }
+
 
 impl<T: 'static> QueryParam for &T {
     type Fetch<'w> = Ref<'w, SparseSet<T>>;
     type Item<'a> = &'a T;
+
+    const CAN_DRIVE: bool = true;
 
     fn init(world: &World) -> Option<Self::Fetch<'_>> {
         let cell = world.storages.get(&TypeId::of::<T>())?;
@@ -511,11 +544,21 @@ impl<T: 'static> QueryParam for &T {
     fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>> {
         fetch.get(entity)
     }
+
+    fn get_at<'a>(
+        fetch: &'a mut Self::Fetch<'_>,
+        i: usize,
+        _entity: Entity,
+    ) -> Option<Self::Item<'a>> {
+        fetch.dense_values.get(i)
+    }
 }
 
 impl<T: 'static> QueryParam for Option<&T> {
     type Fetch<'w> = Option<Ref<'w, SparseSet<T>>>;
     type Item<'a> = Option<&'a T>;
+
+    const CAN_DRIVE: bool = false;
 
     fn init(world: &World) -> Option<Self::Fetch<'_>> {
         Some(<&T as QueryParam>::init(world))
@@ -532,11 +575,23 @@ impl<T: 'static> QueryParam for Option<&T> {
     fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>> {
         Some(fetch.as_ref().and_then(|set| set.get(entity)))
     }
+
+    // An optional parameter never drives, so `i` names a position in some other
+    // parameter's dense array and is meaningless here.
+    fn get_at<'a>(
+        fetch: &'a mut Self::Fetch<'_>,
+        _i: usize,
+        entity: Entity,
+    ) -> Option<Self::Item<'a>> {
+        Self::get(fetch, entity)
+    }
 }
 
 impl<T: 'static> QueryParam for Option<&mut T> {
     type Fetch<'w> = Option<RefMut<'w, SparseSet<T>>>;
     type Item<'a> = Option<&'a mut T>;
+
+    const CAN_DRIVE: bool = false;
 
     fn init(world: &World) -> Option<Self::Fetch<'_>> {
         Some(<&mut T as QueryParam>::init(world))
@@ -553,11 +608,22 @@ impl<T: 'static> QueryParam for Option<&mut T> {
     fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>> {
         Some(fetch.as_mut().and_then(|set| set.get_mut(entity)))
     }
+
+    // As above: never the driver, so the dense index belongs to someone else.
+    fn get_at<'a>(
+        fetch: &'a mut Self::Fetch<'_>,
+        _i: usize,
+        entity: Entity,
+    ) -> Option<Self::Item<'a>> {
+        Self::get(fetch, entity)
+    }
 }
 
 impl<T: 'static> QueryParam for &mut T {
     type Fetch<'w> = RefMut<'w, SparseSet<T>>;
     type Item<'a> = &'a mut T;
+
+    const CAN_DRIVE: bool = true;
 
     fn init(world: &World) -> Option<Self::Fetch<'_>> {
         let cell = world.storages.get(&TypeId::of::<T>())?;
@@ -579,46 +645,73 @@ impl<T: 'static> QueryParam for &mut T {
     fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>> {
         fetch.get_mut(entity)
     }
+
+    fn get_at<'a>(
+        fetch: &'a mut Self::Fetch<'_>,
+        i: usize,
+        _entity: Entity,
+    ) -> Option<Self::Item<'a>> {
+        fetch.dense_values.get_mut(i)
+    }
 }
 
 macro_rules! impl_query_for_tuple {
-    ($first:ident => $first_idx:tt $(, $name:ident => $idx:tt)*) => {
-        impl<$first: QueryParam $(, $name: QueryParam)*> QueryParam for ($first, $($name,)*) {
-            type Fetch<'w> = ($first::Fetch<'w>, $($name::Fetch<'w>,)*);
-            type Item<'a> = ($first::Item<'a>, $($name::Item<'a>,)*);
+    ($($name:ident => $idx:tt [$($earlier:ident)*]),+) => {
+        impl<$($name: QueryParam),+> QueryParam for ($($name,)+) {
+            type Fetch<'w> = ($($name::Fetch<'w>,)+);
+            type Item<'a> = ($($name::Item<'a>,)+);
+
+            const CAN_DRIVE: bool = false $(|| $name::CAN_DRIVE)+;
 
             fn init(world: &World) -> Option<Self::Fetch<'_>> {
-                Some(($first::init(world)?, $($name::init(world)?,)*))
+                Some(($($name::init(world)?,)+))
             }
 
             // The first parameter able to drive wins. Both chains must probe
             // in the same order so `driver_entity_at` answers from the same
             // parameter as `driver_len`.
             fn driver_len(fetch: &Self::Fetch<'_>) -> Option<usize> {
-                $first::driver_len(&fetch.$first_idx)
-                    $(.or_else(|| $name::driver_len(&fetch.$idx)))*
+                Option::<usize>::None
+                    $(.or_else(|| $name::driver_len(&fetch.$idx)))+
             }
 
             fn driver_entity_at(fetch: &Self::Fetch<'_>, i: usize) -> Option<Entity> {
-                $first::driver_entity_at(&fetch.$first_idx, i)
-                    $(.or_else(|| $name::driver_entity_at(&fetch.$idx, i)))*
+                Option::<Entity>::None
+                    $(.or_else(|| $name::driver_entity_at(&fetch.$idx, i)))+
             }
 
             fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>> {
                 // Disjoint mutable borrows of distinct tuple fields are fine.
-                Some((
-                    $first::get(&mut fetch.$first_idx, entity)?,
-                    $($name::get(&mut fetch.$idx, entity)?,)*
-                ))
+                Some(($($name::get(&mut fetch.$idx, entity)?,)+))
+            }
+
+            // Exactly one position drove — the first that could — and only it
+            // may read `i` as its own dense index. `[$($earlier)*]` is that
+            // position's predecessors, spelled out at the invocation because a
+            // macro cannot fold over a prefix of its own repetition. The test
+            // is a `const` block, so each arm is a branch already taken at
+            // compile time.
+            fn get_at<'a>(
+                fetch: &'a mut Self::Fetch<'_>,
+                i: usize,
+                entity: Entity,
+            ) -> Option<Self::Item<'a>> {
+                Some(($(
+                    if const { $name::CAN_DRIVE $(&& !$earlier::CAN_DRIVE)* } {
+                        $name::get_at(&mut fetch.$idx, i, entity)?
+                    } else {
+                        $name::get(&mut fetch.$idx, entity)?
+                    },
+                )+))
             }
         }
     };
 }
 
-impl_query_for_tuple!(A => 0, B => 1);
-impl_query_for_tuple!(A => 0, B => 1, C => 2);
-impl_query_for_tuple!(A => 0, B => 1, C => 2, D => 3);
-impl_query_for_tuple!(A => 0, B => 1, C => 2, D => 3, E => 4);
+impl_query_for_tuple!(A => 0 [], B => 1 [A]);
+impl_query_for_tuple!(A => 0 [], B => 1 [A], C => 2 [A B]);
+impl_query_for_tuple!(A => 0 [], B => 1 [A], C => 2 [A B], D => 3 [A B C]);
+impl_query_for_tuple!(A => 0 [], B => 1 [A], C => 2 [A B], D => 3 [A B C], E => 4 [A B C D]);
 
 /// Runs a prepared query. Created by [`World::query`].
 pub struct QueryRunner<'w, Q> {
@@ -643,7 +736,7 @@ impl<'w, Q: QueryParam> QueryRunner<'w, Q> {
                 for i in 0..count {
                     let entity = Q::driver_entity_at(&fetch, i)
                         .expect("query driver lost between driver_len and driver_entity_at");
-                    if let Some(item) = Q::get(&mut fetch, entity) {
+                    if let Some(item) = Q::get_at(&mut fetch, i, entity) {
                         if visit(entity, item) {
                             return Some(entity);
                         }
@@ -946,6 +1039,60 @@ mod tests {
         let mut visited = 0;
         world.query::<&Health>().for_each(|_, _| visited += 1);
         assert_eq!(visited, 0);
+    }
+
+    /// The driving parameter now reads its value straight out of the dense
+    /// array at the candidate index instead of resolving the entity through
+    /// `sparse`. That is only correct while `dense_entities[i]` and
+    /// `dense_values[i]` describe the same entity — which `remove`'s
+    /// swap-with-last is exactly the thing that could break.
+    ///
+    /// Every other query test builds its storage in one pass and never removes,
+    /// so the dense order matches insertion order and a `get_at` that quietly
+    /// returned the wrong slot would still pass all of them.
+    #[test]
+    fn driver_reads_the_right_value_after_dense_reordering() {
+        let mut world = World::new();
+        let entities: Vec<Entity> = (0..16)
+            .map(|i| {
+                let e = world.spawn();
+                world.insert(e, Health(i));
+                world.insert(e, Position { x: i as f32, y: 0.0 });
+                e
+            })
+            .collect();
+
+        // Swap-remove from the middle and the ends, so the dense array ends up
+        // in an order unrelated to the entity indices.
+        for e in [entities[3], entities[0], entities[9], entities[15]] {
+            assert!(world.despawn(e));
+        }
+
+        let mut seen = Vec::new();
+        world.query::<&Health>().for_each(|entity, health| seen.push((entity, health.0)));
+        for (entity, hp) in &seen {
+            // The value the query handed out must be the one this entity owns.
+            assert_eq!(world.get::<Health>(*entity).unwrap().0, *hp);
+        }
+        assert_eq!(seen.len(), 12);
+
+        // Same again through a tuple, where the driver takes the fast path and
+        // the second parameter still goes through `sparse`.
+        let mut pairs = Vec::new();
+        world
+            .query::<(&Health, &Position)>()
+            .for_each(|entity, (health, position)| pairs.push((entity, health.0, position.x)));
+        assert_eq!(pairs.len(), 12);
+        for (_, hp, x) in &pairs {
+            assert_eq!(*hp as f32, *x, "driver and non-driver disagree about the entity");
+        }
+
+        // And with the driver written through: a stale dense index would move
+        // the wrong entity's value.
+        world.query::<&mut Health>().for_each(|_, health| health.0 += 100);
+        for (entity, hp) in seen {
+            assert_eq!(world.get::<Health>(entity).unwrap().0, hp + 100);
+        }
     }
 
     #[test]

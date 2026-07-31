@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
+use super::context::VkContext;
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageUsage};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass};
 use vulkano::swapchain::{PresentMode, Surface, Swapchain, SwapchainCreateInfo};
-use super::context::VkContext;
 
 pub const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
 
@@ -15,7 +15,7 @@ pub const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
 /// - `Immediate`: uncapped, may tear (not always supported).
 ///
 /// Falls back to `Fifo` automatically if the surface doesn't support the choice.
-pub const PRESENT_MODE: PresentMode = PresentMode::Fifo;
+pub const PRESENT_MODE: PresentMode = PresentMode::Immediate;
 
 pub struct SwapchainState {
     pub swapchain: Arc<Swapchain>,
@@ -91,11 +91,7 @@ impl SwapchainState {
     }
 
     // Returns false if the surface has zero area (minimized) and recreation is skipped.
-    pub fn recreate(
-        &mut self,
-        render_pass: &Arc<RenderPass>,
-        extent: [u32; 2],
-    ) -> bool {
+    pub fn recreate(&mut self, render_pass: &Arc<RenderPass>, extent: [u32; 2]) -> bool {
         if extent[0] == 0 || extent[1] == 0 {
             return false;
         }

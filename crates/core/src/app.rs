@@ -163,25 +163,36 @@ impl App {
         };
 
         crate::scene::register_components(&mut app.registry);
+        Self::install_default_resources(&mut app.world);
 
-        app.world.insert_resource(Camera::default());
-        app.world.insert_resource(Time::new());
-        app.world.insert_resource(AmbientLight::default());
-        app.world.insert_resource(SsaoSettings::default());
-        app.world.insert_resource(HdrSettings::default());
-        app.world.insert_resource(FrameStats::new());
-        app.world.insert_resource(Profiler::default());
-        app.world.insert_resource(InputState::new());
-        app.world.insert_resource(crate::collision::CollisionState::default());
-        app.world.insert_resource(LogBuffer::default());
-        app.world.insert_resource(DebugLines::default());
-        app.world.insert_resource(Culling::default());
+        event_loop.run_app(&mut app).unwrap();
+    }
+
+    /// Every world resource the engine starts with, before any window or device
+    /// exists.
+    ///
+    /// Split out of [`run`](App::run) so the cold-start guard
+    /// (`tests/cold_start.rs`) measures the list the engine actually installs
+    /// rather than a copy of it — a resource added here and not there would
+    /// otherwise be invisible to the very benchmark meant to catch startup
+    /// creep.
+    pub fn install_default_resources(world: &mut World) {
+        world.insert_resource(Camera::default());
+        world.insert_resource(Time::new());
+        world.insert_resource(AmbientLight::default());
+        world.insert_resource(SsaoSettings::default());
+        world.insert_resource(HdrSettings::default());
+        world.insert_resource(FrameStats::new());
+        world.insert_resource(Profiler::default());
+        world.insert_resource(InputState::new());
+        world.insert_resource(crate::collision::CollisionState::default());
+        world.insert_resource(LogBuffer::default());
+        world.insert_resource(DebugLines::default());
+        world.insert_resource(Culling::default());
         // Inserted whether or not a watcher ever starts: the Scripts panel reads
         // it either way, and `Off` is how it explains itself.
         #[cfg(feature = "scripting")]
-        app.world.insert_resource(crate::build_watcher::BuildStatus::default());
-
-        event_loop.run_app(&mut app).unwrap();
+        world.insert_resource(crate::build_watcher::BuildStatus::default());
     }
 
     /// Boot the script host and attach the project's entry Behaviour.

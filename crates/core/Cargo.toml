@@ -34,3 +34,11 @@ scripting = ["dep:orrin-script", "dep:orrin-build", "dep:notify"]
 [[bench]]
 name = "bvh"
 harness = false
+
+[[bench]]
+name = "startup"
+harness = false
+
+[[bench]]
+name = "collision"
+harness = false
