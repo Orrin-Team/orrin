@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use glam::{Mat3, Mat4, Vec3};
+use glam::{Mat4, Vec3};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::AutoCommandBufferBuilder;
@@ -25,6 +25,7 @@ use vulkano::pipeline::{
 };
 use vulkano::render_pass::{RenderPass, Subpass};
 
+use crate::geom::Aabb;
 use crate::gfx::{Material, RenderItem, SceneLighting, Vertex, MAX_POINT_LIGHTS, MAX_TEXTURES};
 use crate::scene::Camera;
 
@@ -36,6 +37,10 @@ pub struct GpuMesh {
     pub vertex_buffer: Subbuffer<[Vertex]>,
     pub index_buffer: Subbuffer<[u32]>,
     pub index_count: u32,
+    /// Object-space bounds, derived here because upload is the last place the
+    /// vertex data exists on the CPU. Culling reads them through
+    /// [`RenderBackend::mesh_bounds`](crate::gfx::RenderBackend::mesh_bounds).
+    pub bounds: Aabb,
 }
 
 /// Per-run push constants. Only the small, per-run-varying values live here; the
@@ -312,9 +317,9 @@ impl ForwardPass {
         .unwrap()
     }
 
-    /// Build this frame's per-object rows. Shared by the SSAO prepass and the
-    /// forward pass: both need the same model and normal matrices, and the
-    /// inverse-transpose is expensive enough to be worth computing once.
+    /// Build this frame's per-object rows, written straight into the mapped
+    /// subbuffer. Shared by the SSAO prepass and the forward pass: both need the
+    /// same rows, and the allocator recycles the storage frame to frame.
     ///
     /// One row per item, including items whose mesh is missing, so a run's
     /// object rows stay contiguous and `object_base` is just the run's start.
@@ -328,12 +333,9 @@ impl ForwardPass {
         {
             let mut rows = buffer.write().unwrap();
             for (row, item) in rows.iter_mut().zip(items) {
-                let model = item.model;
-                // Inverse-transpose so normals stay perpendicular under non-uniform scale.
-                let normal_matrix = Mat4::from_mat3(Mat3::from_mat4(model).inverse().transpose());
                 *row = GpuObject {
-                    model: model.to_cols_array_2d(),
-                    normal_matrix: normal_matrix.to_cols_array_2d(),
+                    model: item.model.to_cols_array_2d(),
+                    normal_matrix: Mat4::from_mat3(item.normal_matrix).to_cols_array_2d(),
                 };
             }
         }
@@ -500,6 +502,7 @@ pub fn upload_mesh(
         vertex_buffer,
         index_buffer,
         index_count: indices.len() as u32,
+        bounds: Aabb::from_points(vertices.iter().map(|v| Vec3::from(v.position))),
     }
 }
 
@@ -581,12 +584,18 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
 #[cfg(test)]
 mod tests {
     use super::runs;
+    use crate::geom::Aabb;
     use crate::gfx::{MaterialHandle, MeshHandle, RenderItem};
-    use glam::Mat4;
+    use glam::{Mat3, Mat4, Vec3};
 
     fn item(mesh: u32, material: u32) -> RenderItem {
         RenderItem {
             model: Mat4::IDENTITY,
+            normal_matrix: Mat3::IDENTITY,
+            bounds: Aabb {
+                min: Vec3::splat(-0.5),
+                max: Vec3::splat(0.5),
+            },
             mesh: MeshHandle(mesh),
             material: MaterialHandle(material),
         }

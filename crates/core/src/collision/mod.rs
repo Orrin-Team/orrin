@@ -18,6 +18,9 @@ use orrin_ecs::{Entity, World};
 use crate::scene::{Collider, ColliderShape, LocalTransform};
 
 pub use bvh::Bvh;
+/// Broadphase bounds and mesh bounds are the same box; it lives in
+/// [`crate::geom`] so extraction can cull without depending on collision.
+pub use crate::geom::Aabb;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Contact {
@@ -45,29 +48,6 @@ pub struct CollisionEvent {
 pub struct CollisionState {
     touching: HashMap<(Entity, Entity), Contact>,
     pub events: Vec<CollisionEvent>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Aabb {
-    pub min: Vec3,
-    pub max: Vec3,
-}
-
-impl Aabb {
-    pub fn overlaps(&self, other: &Aabb) -> bool {
-        (self.min.cmple(other.max) & other.min.cmple(self.max)).all()
-    }
-
-    pub fn union(&self, other: &Aabb) -> Aabb {
-        Aabb {
-            min: self.min.min(other.min),
-            max: self.max.max(other.max),
-        }
-    }
-
-    pub fn center(&self) -> Vec3 {
-        (self.min + self.max) * 0.5
-    }
 }
 
 #[derive(Clone, Copy, Debug)]

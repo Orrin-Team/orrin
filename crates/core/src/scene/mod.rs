@@ -1,6 +1,7 @@
 mod assets;
 mod camera;
 mod components;
+mod culling;
 mod debug;
 pub mod entities;
 mod hdr;
@@ -14,6 +15,7 @@ mod input;
 
 pub use assets::Assets;
 pub use camera::Camera;
+pub use culling::Culling;
 pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};
 pub use components::{
     AmbientLight, Collider, ColliderShape, Light, LocalTransform, MaterialHandle, MeshHandle,
@@ -23,7 +25,7 @@ pub use components::{
 pub use components::ScriptComponent;
 pub use hdr::HdrSettings;
 pub use input::InputState;
-pub use mesh::CpuMesh;
+pub use mesh::{CpuMesh, MeshBounds};
 pub use persist::{LoadIssue, instantiate, load, save, to_document};
 pub use registry::register_components;
 pub use ssao::SsaoSettings;

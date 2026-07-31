@@ -25,6 +25,7 @@ use vulkano::sync::GpuFuture;
 use vulkano::sync::{self, future::FenceSignalFuture};
 use vulkano::{Validated, VulkanError};
 
+use crate::geom::Aabb;
 use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings};
 
 use self::context::VkContext;
@@ -120,6 +121,10 @@ impl RenderBackend for VulkanRenderer {
         handle
     }
 
+    fn mesh_bounds(&self, mesh: MeshHandle) -> Option<Aabb> {
+        self.meshes.get(mesh.0 as usize).map(|gpu| gpu.bounds)
+    }
+
     fn load_material(&mut self, material: &Material) -> MaterialHandle {
         let handle = MaterialHandle(self.materials.len() as u32);
         self.materials.push(forward::to_gpu_material(material));
@@ -185,6 +190,13 @@ impl VulkanRenderer {
 
     pub fn color_format(&self) -> Format {
         self.swapchain.swapchain.image_format()
+    }
+
+    /// The extent the next frame will be drawn at — the swapchain's, not the
+    /// window's, which can already be a resize ahead of it. Culling has to use
+    /// this one or its side planes won't be the ones on screen.
+    pub fn extent(&self) -> [u32; 2] {
+        self.swapchain.extent
     }
 
     /// Whole-frame GPU time in milliseconds, or `None` if the device doesn't

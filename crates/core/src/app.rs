@@ -21,8 +21,8 @@ use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::entities::{build_default_scene, spawn_stress_scene, StressSpec};
 use crate::scene::{
-    AmbientLight, Camera, DebugLine, DebugLines, HdrSettings, InputState, LogBuffer, SsaoSettings,
-    Time,
+    AmbientLight, Camera, Culling, DebugLine, DebugLines, HdrSettings, InputState, LogBuffer,
+    SsaoSettings, Time,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -175,6 +175,7 @@ impl App {
         app.world.insert_resource(crate::collision::CollisionState::default());
         app.world.insert_resource(LogBuffer::default());
         app.world.insert_resource(DebugLines::default());
+        app.world.insert_resource(Culling::default());
         // Inserted whether or not a watcher ever starts: the Scripts panel reads
         // it either way, and `Off` is how it explains itself.
         #[cfg(feature = "scripting")]
@@ -464,7 +465,11 @@ impl ApplicationHandler for App {
 
                 {
                     profile_scope!("extract");
-                    systems::extract_renderables(&self.world, &mut self.render_items);
+                    // The frustum has to be the one this frame draws with, so
+                    // the aspect comes from the swapchain the pass will use.
+                    let extent = active.renderer.extent();
+                    let aspect = extent[0] as f32 / extent[1].max(1) as f32;
+                    systems::extract_renderables(&self.world, aspect, &mut self.render_items);
                     systems::extract_lighting(&self.world, &mut self.lighting);
                     // Copy this frame's debug lines out (they're Copy) so the render
                     // borrow below doesn't overlap the world borrow.

@@ -1,7 +1,8 @@
 pub mod vulkan;
 
+use crate::geom::Aabb;
 use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings};
-use glam::{Mat4, Vec3};
+use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::BufferContents;
 use vulkano::pipeline::graphics::vertex_input::Vertex as VertexTrait;
 
@@ -22,9 +23,19 @@ pub struct Vertex {
     pub tangent: [f32; 4],
 }
 
+/// One visible instance, as extraction hands it to the passes. Everything a
+/// pass needs is here: no pass reaches back into the world, and none recomputes
+/// what extraction already knew.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderItem {
     pub model: Mat4,
+    /// Inverse-transpose of `model`'s upper 3x3, so normals stay perpendicular
+    /// under non-uniform scale. Derived from the transform's rotation and scale
+    /// at extraction rather than inverted out of `model` per pass per frame.
+    pub normal_matrix: Mat3,
+    /// World-space bounds: what the camera frustum tested, and what a shadow
+    /// cascade tests against its own frustum without re-deriving anything.
+    pub bounds: Aabb,
     pub mesh: MeshHandle,
     pub material: MaterialHandle,
 }
@@ -118,6 +129,10 @@ impl Default for SceneLighting {
 // backends (wgpu, D3D12) without touching scene/app code.
 pub trait RenderBackend {
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle;
+    /// Object-space bounds derived at upload; `None` for a handle this backend
+    /// never issued. Mirrored into [`MeshBounds`](crate::scene::MeshBounds) at
+    /// load, since culling runs before any backend type is in reach.
+    fn mesh_bounds(&self, mesh: MeshHandle) -> Option<Aabb>;
     fn load_material(&mut self, material: &Material) -> MaterialHandle;
     fn load_texture(
         &mut self,
