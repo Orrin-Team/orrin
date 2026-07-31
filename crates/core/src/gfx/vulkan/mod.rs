@@ -5,6 +5,7 @@ mod line;
 mod swapchain;
 mod texture;
 mod ssao;
+mod timestamps;
 
 use std::sync::Arc;
 
@@ -17,12 +18,11 @@ use vulkano::device::Queue;
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
 use vulkano::instance::Instance;
-use vulkano::query::{QueryPool, QueryPoolCreateInfo, QueryResultFlags, QueryType};
 use vulkano::swapchain::{
     acquire_next_image, Surface, SwapchainPresentInfo,
 };
 use vulkano::sync::GpuFuture;
-use vulkano::sync::{self, future::FenceSignalFuture, PipelineStage};
+use vulkano::sync::{self, future::FenceSignalFuture};
 use vulkano::{Validated, VulkanError};
 
 use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings};
@@ -33,104 +33,13 @@ use self::line::LinePass;
 use self::swapchain::SwapchainState;
 use self::ssao::SsaoPass;
 use self::hdr::{HdrPass, HDR_FORMAT};
+use self::timestamps::GpuTimestamps;
 
+use crate::profile::Profiler;
 use crate::scene::DebugLine;
 use super::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle, MAX_TEXTURES};
 
 type FrameFuture = FenceSignalFuture<Box<dyn GpuFuture>>;
-
-/// Measures whole-frame GPU time with timestamp queries.
-///
-/// Two query pools ping-pong: each frame writes one and reads back the *other*
-/// (last frame's) non-blocking, so a pool is never read while it's being reset
-/// and the CPU never stalls on the GPU. The pair is validated before use, so a
-/// driver that reports a reset-but-unwritten query (read back as 0 on some
-/// MoltenVK configs) can't produce a bogus multi-second spike.
-struct GpuTimer {
-    pools: [Arc<QueryPool>; 2],
-    /// Nanoseconds per timestamp tick (`VkPhysicalDeviceLimits::timestampPeriod`).
-    period_ns: f32,
-    /// Mask for the valid low bits of a timestamp, per the queue family.
-    valid_mask: u64,
-    last_ms: f32,
-    /// Pool to write this frame; the other holds last frame's pair.
-    write_index: usize,
-    /// Whether each pool currently holds a written, readable pair.
-    written: [bool; 2],
-}
-
-impl GpuTimer {
-    /// `None` if the device/queue doesn't support timestamps (e.g. some MoltenVK
-    /// configs), in which case the overlay simply shows no GPU time.
-    fn new(ctx: &VkContext) -> Option<Self> {
-        let phys = ctx.device.physical_device();
-        let qfi = ctx.queue.queue_family_index() as usize;
-        let valid_bits = phys.queue_family_properties()[qfi].timestamp_valid_bits?;
-        let period_ns = phys.properties().timestamp_period;
-        if period_ns == 0.0 {
-            return None;
-        }
-        let make = || {
-            QueryPool::new(
-                ctx.device.clone(),
-                QueryPoolCreateInfo {
-                    query_count: 2,
-                    ..QueryPoolCreateInfo::query_type(QueryType::Timestamp)
-                },
-            )
-        };
-        let pools = [make().ok()?, make().ok()?];
-        let valid_mask = if valid_bits >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << valid_bits) - 1
-        };
-        Some(Self {
-            pools,
-            period_ns,
-            valid_mask,
-            last_ms: 0.0,
-            write_index: 0,
-            written: [false, false],
-        })
-    }
-
-    fn pool(&self) -> Arc<QueryPool> {
-        self.pools[self.write_index].clone()
-    }
-
-    /// Non-blocking read of last frame's pool. Keeps the previous value if the
-    /// results aren't ready, or if the pair is invalid (out of order / zero).
-    fn read(&mut self) {
-        let read_index = self.write_index ^ 1;
-        if !self.written[read_index] {
-            return;
-        }
-        let mut results = [0u64; 2];
-        let available = self.pools[read_index]
-            .get_results(0..2, &mut results, QueryResultFlags::empty())
-            .unwrap_or(false);
-        if !available {
-            return;
-        }
-        let start = results[0] & self.valid_mask;
-        let end = results[1] & self.valid_mask;
-        if start == 0 || end <= start {
-            return;
-        }
-        let ms = ((end - start) as f64 * self.period_ns as f64 / 1_000_000.0) as f32;
-        // A real frame is never seconds long here; anything past 1 s is a driver
-        // quirk, not a measurement, so drop it.
-        if ms.is_finite() && (0.0..1000.0).contains(&ms) {
-            self.last_ms = ms;
-        }
-    }
-
-    fn advance(&mut self) {
-        self.written[self.write_index] = true;
-        self.write_index ^= 1;
-    }
-}
 
 /// A hook that draws over the final swapchain image between the tonemap pass and
 /// present (the editor UI). Given the future to wait on and that image's view, it
@@ -160,8 +69,8 @@ pub struct VulkanRenderer {
     previous_frame_end: Option<FrameFuture>,
     recreate_swapchain: bool,
     pending_extent: [u32; 2],
-    /// Whole-frame GPU timing; `None` if the device lacks timestamp support.
-    timer: Option<GpuTimer>,
+    /// Per-pass GPU timing; `None` if the device lacks timestamp support.
+    timestamps: Option<GpuTimestamps>,
 }
 
 impl VulkanRenderer {
@@ -173,7 +82,7 @@ impl VulkanRenderer {
         let ssao = SsaoPass::new(&ctx, extent);
         let line = LinePass::new(&ctx.device, &ctx.memory_allocator, &forward.render_pass);
         let swapchain = SwapchainState::new(&ctx, &surface, &hdr.tonemap_rp, format, extent);
-        let timer = GpuTimer::new(&ctx);
+        let timestamps = GpuTimestamps::new(&ctx);
 
         // Default textures so every material slot resolves to a valid view:
         // index 0 = white (a no-op multiply), index 1 = flat normal (0,0,1).
@@ -197,7 +106,7 @@ impl VulkanRenderer {
             previous_frame_end: None,
             recreate_swapchain: false,
             pending_extent: extent,
-            timer,
+            timestamps,
         }
     }
 }
@@ -264,7 +173,7 @@ impl RenderBackend for VulkanRenderer {
         hdr: &HdrSettings,
     ) {
         // No overlay path (e.g. export/headless) draws no debug lines.
-        self.render_frame(items, lighting, camera, ssao, hdr, &[], None);
+        self.render_frame(items, lighting, camera, ssao, hdr, &[], None, None);
     }
 }
 
@@ -280,7 +189,16 @@ impl VulkanRenderer {
     /// Whole-frame GPU time in milliseconds, or `None` if the device doesn't
     /// support timestamp queries. Trails the displayed frame by one.
     pub fn gpu_frame_ms(&self) -> Option<f32> {
-        self.timer.as_ref().map(|t| t.last_ms)
+        self.timestamps.as_ref().map(GpuTimestamps::last_frame_ms)
+    }
+
+    /// File the GPU spans of frames that have completed since the last call.
+    /// Separate from rendering because the profiler lives in the world, which
+    /// the renderer deliberately can't reach.
+    pub fn drain_gpu_spans(&mut self, profiler: &mut Profiler) {
+        if let Some(timestamps) = self.timestamps.as_mut() {
+            timestamps.drain_completed(profiler);
+        }
     }
 
     /// Live device-local VRAM as `(used, total)` bytes; `used` is `None` when the
@@ -299,9 +217,19 @@ impl VulkanRenderer {
         ssao: &SsaoSettings,
         hdr: &HdrSettings,
         debug_lines: &[DebugLine],
+        profiler_frame: u64,
         overlay: Overlay<'_>,
     ) {
-        self.render_frame(items, lighting, camera, ssao, hdr, debug_lines, Some(overlay));
+        self.render_frame(
+            items,
+            lighting,
+            camera,
+            ssao,
+            hdr,
+            debug_lines,
+            Some(profiler_frame),
+            Some(overlay),
+        );
     }
 
     fn render_frame(
@@ -312,6 +240,7 @@ impl VulkanRenderer {
         ssao: &SsaoSettings,
         hdr: &HdrSettings,
         debug_lines: &[DebugLine],
+        profiler_frame: Option<u64>,
         overlay: Option<Overlay<'_>>,
     ) {
         if self.pending_extent[0] == 0 || self.pending_extent[1] == 0 {
@@ -335,12 +264,6 @@ impl VulkanRenderer {
             }
         }
 
-        // Read back the previous frame's GPU timestamps (non-blocking) before this
-        // frame overwrites the query pool.
-        if let Some(timer) = self.timer.as_mut() {
-            timer.read();
-        }
-
         let (image_index, suboptimal, acquire_future) =
             match acquire_next_image(self.swapchain.swapchain.clone(), None)
                 .map_err(Validated::unwrap)
@@ -356,6 +279,21 @@ impl VulkanRenderer {
             self.recreate_swapchain = true;
         }
 
+        // Taken out of `self` for the duration of recording: the pass brackets
+        // below interleave with calls that borrow `self` immutably, and a field
+        // borrow held across them wouldn't compile. Restored before returning,
+        // and only if it was taken — every early return above happens first.
+        let mut timestamps = match profiler_frame {
+            Some(frame) => {
+                let mut taken = self.timestamps.take();
+                if let Some(timestamps) = taken.as_mut() {
+                    timestamps.begin_frame(frame);
+                }
+                taken
+            }
+            None => None,
+        };
+
         let mut builder = AutoCommandBufferBuilder::primary(
             self.ctx.command_buffer_allocator.clone(),
             self.ctx.queue.queue_family_index(),
@@ -363,16 +301,10 @@ impl VulkanRenderer {
         )
         .unwrap();
 
-        // Stamp the start of GPU work. Reset must be outside any render pass, so
-        // it's recorded here before the SSAO/forward/tonemap passes begin.
-        if let Some(timer) = &self.timer {
-            let pool = timer.pool();
-            unsafe {
-                builder.reset_query_pool(pool.clone(), 0..2).unwrap();
-                builder
-                    .write_timestamp(pool, 0, PipelineStage::TopOfPipe)
-                    .unwrap();
-            }
+        // Resets are illegal inside a render pass, so they and the reserved
+        // whole-frame pair go here, ahead of every pass below.
+        if let Some(timestamps) = timestamps.as_mut() {
+            timestamps.record_resets(&mut builder);
         }
 
         // Drive the SSAO tunables from the world resource each frame. When SSAO
@@ -395,12 +327,21 @@ impl VulkanRenderer {
         let texture_set = self.texture_set.clone().unwrap();
 
         let ao_view = if ssao.enabled {
+            let pass = timestamps
+                .as_mut()
+                .and_then(|timestamps| timestamps.begin_pass(&mut builder, "ssao"));
             self.ssao.record(&mut builder, self, items, camera, self.swapchain.extent);
+            if let Some(timestamps) = timestamps.as_mut() {
+                timestamps.end_pass(&mut builder, pass);
+            }
             self.ssao.ao_view()
         } else {
             self.ssao.white_view()
         };
 
+        let forward_pass = timestamps
+            .as_mut()
+            .and_then(|timestamps| timestamps.begin_pass(&mut builder, "forward"));
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -436,7 +377,13 @@ impl VulkanRenderer {
             .record(&mut builder, debug_lines, camera, self.swapchain.extent);
 
         builder.end_render_pass(Default::default()).unwrap();
+        if let Some(timestamps) = timestamps.as_mut() {
+            timestamps.end_pass(&mut builder, forward_pass);
+        }
 
+        let tonemap_pass = timestamps
+            .as_mut()
+            .and_then(|timestamps| timestamps.begin_pass(&mut builder, "tonemap"));
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -455,16 +402,12 @@ impl VulkanRenderer {
             .record_tonemap(&mut builder, &self.ctx, self.swapchain.extent);
         builder.end_render_pass(Default::default()).unwrap();
 
-        // Stamp the end of GPU work, then flip pools so this pair is read next frame.
-        if let Some(timer) = &self.timer {
-            unsafe {
-                builder
-                    .write_timestamp(timer.pool(), 1, PipelineStage::BottomOfPipe)
-                    .unwrap();
-            }
+        if let Some(timestamps) = timestamps.as_mut() {
+            timestamps.end_pass(&mut builder, tonemap_pass);
+            timestamps.end_frame(&mut builder);
         }
-        if let Some(timer) = self.timer.as_mut() {
-            timer.advance();
+        if timestamps.is_some() {
+            self.timestamps = timestamps;
         }
 
         let command_buffer = builder.build().unwrap();

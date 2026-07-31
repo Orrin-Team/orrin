@@ -420,6 +420,9 @@ impl ApplicationHandler for App {
                 let camera = *self.world.resource::<Camera>();
                 let ssao = *self.world.resource::<SsaoSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
+                // Stamped into this frame's GPU queries so the readback, some
+                // frames later, can file its spans against the right frame.
+                let profiler_frame = self.world.resource::<Profiler>().frame_index();
 
                 let Active {
                     renderer, editor, ..
@@ -434,9 +437,14 @@ impl ApplicationHandler for App {
                         &ssao,
                         &hdr,
                         &self.debug_lines,
+                        profiler_frame,
                         &mut overlay,
                     );
                 }
+
+                // Before `gpu_frame_ms`, which reads the whole-frame pair this
+                // drain refreshes.
+                renderer.drain_gpu_spans(&mut self.world.resource_mut::<Profiler>());
 
                 let gpu_ms = renderer.gpu_frame_ms();
                 let (vram_used, vram_total) = renderer.gpu_memory();

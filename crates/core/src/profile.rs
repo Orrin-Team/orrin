@@ -258,13 +258,28 @@ impl Profiler {
     /// A name appearing several times in one frame is summed within that frame,
     /// so `avg_ms` reads as "cost per frame" rather than "cost per call" — the
     /// question being asked of a phase table.
+    ///
+    /// "Latest" and the average's denominator both mean *frames that carry spans
+    /// in this lane*, not all retained frames. GPU spans arrive a frame or more
+    /// late, so the newest frames never have any: counting them would peg the
+    /// GPU lane's `last_ms` at zero and drag every average down.
     pub fn aggregate(&self, lane: Lane) -> Vec<Row> {
         let mut rows: Vec<Row> = Vec::new();
         let mut index_of: std::collections::HashMap<&'static str, usize> =
             std::collections::HashMap::new();
-        let latest = self.latest().map(|frame| frame.index);
+        let latest = self
+            .ring
+            .iter()
+            .rev()
+            .find(|frame| !frame.lane(lane).is_empty())
+            .map(|frame| frame.index);
+        let mut populated = 0usize;
 
         for frame in &self.ring {
+            if frame.lane(lane).is_empty() {
+                continue;
+            }
+            populated += 1;
             let mut frame_totals: Vec<(usize, f32, u32)> = Vec::new();
             for span in frame.lane(lane) {
                 let row_index = *index_of.entry(span.name).or_insert_with(|| {
@@ -300,7 +315,7 @@ impl Profiler {
             }
         }
 
-        let frames = self.ring.len().max(1) as f32;
+        let frames = populated.max(1) as f32;
         for row in &mut rows {
             row.avg_ms /= frames;
         }
@@ -316,7 +331,8 @@ pub struct Row {
     pub depth: u16,
     /// Cost in the most recent frame.
     pub last_ms: f32,
-    /// Mean cost per retained frame, including frames the name never appeared in.
+    /// Mean cost per frame that carried spans in this lane, including frames the
+    /// name itself never appeared in.
     pub avg_ms: f32,
     pub max_ms: f32,
     /// Times the name was entered in the most recent frame.
@@ -403,6 +419,24 @@ mod tests {
         }
         assert!(!profiler.push_gpu_span(0, span("forward", 0, 0, 1)));
         assert!(profiler.push_gpu_span(3, span("forward", 0, 0, 1)));
+    }
+
+    /// The newest frames never carry GPU spans yet, so a lane's "latest" has to
+    /// mean its newest *populated* frame or the column reads zero forever.
+    #[test]
+    fn gpu_lane_reports_the_newest_frame_that_has_spans() {
+        let mut profiler = Profiler::new(8);
+        for _ in 0..4 {
+            profiler.end_frame();
+        }
+        profiler.push_gpu_span(1, span("forward", 0, 0, 3_000_000));
+        // Frames 2 and 3 exist but their readback hasn't arrived.
+
+        let rows = profiler.aggregate(Lane::Gpu);
+        assert_eq!(rows[0].name, "forward");
+        assert_eq!(rows[0].last_ms, 3.0);
+        // Averaged over the one frame with GPU data, not all four retained.
+        assert_eq!(rows[0].avg_ms, 3.0);
     }
 
     #[test]
