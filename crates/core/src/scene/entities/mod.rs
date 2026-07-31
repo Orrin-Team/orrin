@@ -1,7 +1,9 @@
 mod scene;
+mod stress;
 mod textures;
 
 pub use scene::build_default_scene;
+pub use stress::{spawn_stress_scene, StressSpec};
 
 use glam::{Quat, Vec3};
 

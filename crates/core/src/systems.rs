@@ -22,6 +22,12 @@ pub fn extract_renderables(world: &World, out: &mut Vec<RenderItem>) {
                 material: material.copied().unwrap_or(MaterialHandle(0)),
             });
         });
+
+    // Grouping by mesh lets the passes bind vertex/index buffers once per run
+    // instead of once per draw, which dominates recording cost in scenes that
+    // reuse a handful of meshes. Opaque geometry is depth-tested, so draw order
+    // carries no visual meaning to preserve.
+    out.sort_unstable_by_key(|item| (item.mesh.0, item.material.0));
 }
 
 pub fn extract_lighting(world: &World, out: &mut SceneLighting) {

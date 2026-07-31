@@ -1,6 +1,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use vulkano::instance::debug::{
+    DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger,
+    DebugUtilsMessengerCallback, DebugUtilsMessengerCreateInfo,
+};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::swapchain::Surface;
 use vulkano::VulkanLibrary;
@@ -13,7 +17,9 @@ use crate::camera_controller::CameraController;
 use crate::editor::Editor;
 use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::{RenderBackend, RenderItem, SceneLighting};
-use crate::scene::entities::build_default_scene;
+use crate::profile::Profiler;
+use crate::profile_scope;
+use crate::scene::entities::{build_default_scene, spawn_stress_scene, StressSpec};
 use crate::scene::{
     AmbientLight, Camera, DebugLine, DebugLines, HdrSettings, InputState, LogBuffer, SsaoSettings,
     Time,
@@ -56,6 +62,11 @@ pub struct App {
     /// the engine is running standalone on its built-in demo scene.
     #[cfg(feature = "scripting")]
     project: Option<orrin_project::Project>,
+    /// Extra profiling load from `ORRIN_STRESS`; `None` for a normal run.
+    stress: Option<StressSpec>,
+    /// Kept alive for the process: dropping the messenger stops validation
+    /// output, which is exactly when you need it most.
+    _debug_messenger: Option<DebugUtilsMessenger>,
 }
 
 /// What `boot_scripting` produced: the live host, and the watcher that keeps it
@@ -73,16 +84,41 @@ impl App {
         event_loop.set_control_flow(ControlFlow::Poll);
 
         let library = VulkanLibrary::new().expect("failed to load vulkan library");
-        let required_extensions = Surface::required_extensions(&event_loop).unwrap();
+        let mut enabled_extensions = Surface::required_extensions(&event_loop).unwrap();
+
+        // Architecture §3.5: validation on in every dev build. Silently skipped
+        // when the layer isn't installed, so a machine without the Vulkan SDK
+        // (and CI) still runs — a GPU crash with no named cause is the thing
+        // this exists to prevent.
+        let validation = should_validate() && has_validation_layer(&library);
+        if validation {
+            enabled_extensions.ext_debug_utils = true;
+        }
+
         let instance = Instance::new(
             library,
             InstanceCreateInfo {
                 flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
-                enabled_extensions: required_extensions,
+                enabled_extensions,
+                enabled_layers: if validation {
+                    vec![VALIDATION_LAYER.to_owned()]
+                } else {
+                    Vec::new()
+                },
                 ..Default::default()
             },
         )
         .expect("failed to create instance");
+
+        let debug_messenger = validation.then(|| attach_debug_messenger(&instance));
+        if validation {
+            println!("orrin: Vulkan validation layer enabled");
+        } else if should_validate() {
+            eprintln!(
+                "orrin: validation requested but `{VALIDATION_LAYER}` isn't installed; \
+                 GPU errors will not be named (install the Vulkan SDK)"
+            );
+        }
 
         let cwd = std::env::current_dir().unwrap_or_else(|err| {
             eprintln!("orrin: cannot read the current directory: {err}");
@@ -122,6 +158,8 @@ impl App {
             build_watcher: None,
             #[cfg(feature = "scripting")]
             project,
+            stress: StressSpec::from_env().filter(|spec| !spec.is_empty()),
+            _debug_messenger: debug_messenger,
         };
 
         crate::scene::register_components(&mut app.registry);
@@ -132,6 +170,7 @@ impl App {
         app.world.insert_resource(SsaoSettings::default());
         app.world.insert_resource(HdrSettings::default());
         app.world.insert_resource(FrameStats::new());
+        app.world.insert_resource(Profiler::default());
         app.world.insert_resource(InputState::new());
         app.world.insert_resource(crate::collision::CollisionState::default());
         app.world.insert_resource(LogBuffer::default());
@@ -230,6 +269,22 @@ impl App {
             .id();
         scripting.attach(&mut self.world, entity, &entry);
 
+        // Stress scripts are just the entry Behaviour again: one more dispatch
+        // target each tick, through the identical attach path, so the load is
+        // representative rather than a special case.
+        let stress_scripts = self.stress.map_or(0, |spec| spec.scripts);
+        for index in 0..stress_scripts {
+            let entity = self
+                .world
+                .spawn_entity()
+                .with(crate::scene::Name::new(format!("Stress Script {index}")))
+                .id();
+            scripting.attach(&mut self.world, entity, &entry);
+        }
+        if stress_scripts > 0 {
+            println!("orrin: stress load added — {stress_scripts} scripted entities");
+        }
+
         let watcher = match BuildWatcher::for_game_assembly(&game_dll, Some(&bindings_dir)) {
             Ok(watcher) => Some(watcher),
             Err(reason) => {
@@ -260,6 +315,9 @@ impl ApplicationHandler for App {
             VulkanRenderer::new(&self.instance, surface.clone(), [size.width, size.height]);
 
         build_default_scene(&mut self.world, &mut renderer);
+        if let Some(spec) = self.stress {
+            spawn_stress_scene(&mut self.world, &spec);
+        }
         self.camera_controller
             .sync_from(&self.world.resource::<Camera>());
 
@@ -340,12 +398,18 @@ impl ApplicationHandler for App {
                 self.world.resource_mut::<Time>().update(delta);
                 self.world.resource_mut::<FrameStats>().record(delta);
 
-                systems::spin(&self.world, delta);
+                {
+                    profile_scope!("spin");
+                    systems::spin(&self.world, delta);
+                }
 
                 // After the transform-mutating systems and before the script
                 // tick, so the events scripts receive match the positions
                 // they'll read this frame.
-                crate::collision::run(&mut self.world);
+                {
+                    profile_scope!("collision");
+                    crate::collision::run(&mut self.world);
+                }
 
                 // A reload requested from the editor last frame lands here:
                 // before the tick, after collision, with no dispatch window
@@ -358,10 +422,12 @@ impl ApplicationHandler for App {
                     // than reloading itself, so both routes converge on the one
                     // safe point below and a failed build never reaches it.
                     if let Some(watcher) = &mut self.build_watcher {
+                        profile_scope!("build watcher");
                         reload_requested |= watcher.service(&self.world);
                     }
                     if let Some(scripting) = &self.scripting {
                         if reload_requested {
+                            profile_scope!("script reload");
                             let outcome = scripting.reload(&mut self.world);
                             let frame = self.world.resource::<Time>().frame_count();
                             self.world.resource_mut::<LogBuffer>().push(
@@ -378,42 +444,62 @@ impl ApplicationHandler for App {
                                     .reloaded();
                             }
                         }
-                        scripting.tick(&mut self.world, delta);
+                        {
+                            profile_scope!("script tick");
+                            scripting.tick(&mut self.world, delta);
+                        }
                     }
                 }
 
                 // Before extraction: the UI may spawn/despawn/edit entities.
-                active.editor.run(&mut self.world, &self.registry);
+                {
+                    profile_scope!("editor");
+                    active.editor.run(&mut self.world, &self.registry);
+                }
 
                 // After the UI, so the editor's own camera edits are the
                 // baseline the controller builds on.
                 self.camera_controller
                     .update(&mut self.world.resource_mut::<Camera>(), delta);
 
-                systems::extract_renderables(&self.world, &mut self.render_items);
-                systems::extract_lighting(&self.world, &mut self.lighting);
-                // Copy this frame's debug lines out (they're Copy) so the render
-                // borrow below doesn't overlap the world borrow.
-                self.debug_lines.clear();
-                self.debug_lines
-                    .extend_from_slice(self.world.resource::<DebugLines>().lines());
+                {
+                    profile_scope!("extract");
+                    systems::extract_renderables(&self.world, &mut self.render_items);
+                    systems::extract_lighting(&self.world, &mut self.lighting);
+                    // Copy this frame's debug lines out (they're Copy) so the render
+                    // borrow below doesn't overlap the world borrow.
+                    self.debug_lines.clear();
+                    self.debug_lines
+                        .extend_from_slice(self.world.resource::<DebugLines>().lines());
+                }
                 let camera = *self.world.resource::<Camera>();
                 let ssao = *self.world.resource::<SsaoSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
+                // Stamped into this frame's GPU queries so the readback, some
+                // frames later, can file its spans against the right frame.
+                let profiler_frame = self.world.resource::<Profiler>().frame_index();
 
                 let Active {
                     renderer, editor, ..
                 } = active;
                 let mut overlay = |before, image| editor.draw(before, image);
-                renderer.render_with_overlay(
-                    &self.render_items,
-                    &self.lighting,
-                    &camera,
-                    &ssao,
-                    &hdr,
-                    &self.debug_lines,
-                    &mut overlay,
-                );
+                {
+                    profile_scope!("render submit");
+                    renderer.render_with_overlay(
+                        &self.render_items,
+                        &self.lighting,
+                        &camera,
+                        &ssao,
+                        &hdr,
+                        &self.debug_lines,
+                        profiler_frame,
+                        &mut overlay,
+                    );
+                }
+
+                // Before `gpu_frame_ms`, which reads the whole-frame pair this
+                // drain refreshes.
+                renderer.drain_gpu_spans(&mut self.world.resource_mut::<Profiler>());
 
                 let gpu_ms = renderer.gpu_frame_ms();
                 let (vram_used, vram_total) = renderer.gpu_memory();
@@ -430,6 +516,11 @@ impl ApplicationHandler for App {
                 // Clear the one-frame pressed/released edges now that scripts
                 // have observed them during the tick above.
                 self.world.resource_mut::<InputState>().end_frame();
+
+                // Last, so every scope guard above has dropped and this frame's
+                // CPU spans are complete. Its GPU spans arrive later and are
+                // filed against this frame by index.
+                self.world.resource_mut::<Profiler>().end_frame();
             }
             _ => {}
         }
@@ -450,4 +541,63 @@ impl ApplicationHandler for App {
             active.window.request_redraw();
         }
     }
+}
+
+const VALIDATION_LAYER: &str = "VK_LAYER_KHRONOS_validation";
+
+/// On by default in dev builds; `ORRIN_VALIDATION=0`/`1` overrides either way,
+/// so a release build can be checked without rebuilding it as debug.
+fn should_validate() -> bool {
+    match std::env::var("ORRIN_VALIDATION").ok().as_deref() {
+        Some("0") | Some("false") => false,
+        Some(_) => true,
+        None => cfg!(debug_assertions),
+    }
+}
+
+fn has_validation_layer(library: &Arc<VulkanLibrary>) -> bool {
+    library
+        .layer_properties()
+        .map(|mut layers| layers.any(|layer| layer.name() == VALIDATION_LAYER))
+        .unwrap_or(false)
+}
+
+/// Print validation messages with the offending object named, per architecture
+/// §3.5. Errors go to stderr so a crash log carries them.
+fn attach_debug_messenger(instance: &Arc<Instance>) -> DebugUtilsMessenger {
+    // SAFETY: the callback only formats and prints; it makes no Vulkan calls.
+    let callback = unsafe {
+        DebugUtilsMessengerCallback::new(|severity, message_type, data| {
+            let label = if severity.intersects(DebugUtilsMessageSeverity::ERROR) {
+                "error"
+            } else if severity.intersects(DebugUtilsMessageSeverity::WARNING) {
+                "warning"
+            } else {
+                "info"
+            };
+            eprintln!(
+                "[vulkan {label}] {}{}",
+                data.message_id_name.map(|name| format!("{name}: ")).unwrap_or_default(),
+                data.message
+            );
+            let _ = message_type;
+        })
+    };
+
+    // SAFETY: `ext_debug_utils` was enabled on the instance above, which is the
+    // only precondition beyond the callback's.
+    unsafe {
+        DebugUtilsMessenger::new(
+            instance.clone(),
+            DebugUtilsMessengerCreateInfo {
+                message_severity: DebugUtilsMessageSeverity::ERROR
+                    | DebugUtilsMessageSeverity::WARNING,
+                message_type: DebugUtilsMessageType::GENERAL
+                    | DebugUtilsMessageType::VALIDATION
+                    | DebugUtilsMessageType::PERFORMANCE,
+                ..DebugUtilsMessengerCreateInfo::user_callback(callback)
+            },
+        )
+    }
+    .expect("failed to create the validation messenger")
 }

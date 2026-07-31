@@ -1,5 +1,6 @@
 use orrin_ecs::World;
 
+use crate::profile::{self, Lane, Profiler, Row};
 use crate::stats::FrameStats;
 
 pub fn show(ctx: &egui::Context, world: &World) {
@@ -45,7 +46,74 @@ pub fn show(ctx: &egui::Context, world: &World) {
 
             ui.add_space(4.0);
             graph(ui, &stats, CPU_COLOR, GPU_COLOR);
+
+            if let Some(profiler) = world.get_resource::<Profiler>() {
+                ui.add_space(6.0);
+                ui.separator();
+
+                let mut enabled = profile::is_enabled();
+                if ui.checkbox(&mut enabled, "Collect phase timings").changed() {
+                    profile::set_enabled(enabled);
+                }
+                if enabled {
+                    phases(ui, &profiler, Lane::Cpu, "CPU phases", CPU_COLOR);
+                    phases(ui, &profiler, Lane::Gpu, "GPU passes", GPU_COLOR);
+                }
+            }
         });
+}
+
+/// One lane's phase table, slowest first.
+fn phases(ui: &mut egui::Ui, profiler: &Profiler, lane: Lane, title: &str, color: egui::Color32) {
+    let rows = profiler.aggregate(lane);
+    egui::CollapsingHeader::new(egui::RichText::new(title).color(color))
+        .default_open(true)
+        .show(ui, |ui| {
+            if rows.is_empty() {
+                // The GPU lane is empty for the first frames of a run: readback
+                // trails, so there is nothing to show rather than nothing to time.
+                ui.weak("no spans yet");
+                return;
+            }
+
+            let total = lane_total(&rows);
+            egui::Grid::new(title)
+                .num_columns(5)
+                .striped(true)
+                .spacing([10.0, 2.0])
+                .show(ui, |ui| {
+                    for heading in ["", "last", "avg", "max", "share"] {
+                        ui.label(egui::RichText::new(heading).weak().small());
+                    }
+                    ui.end_row();
+
+                    for row in &rows {
+                        let indent = "  ".repeat(row.depth as usize);
+                        ui.label(format!("{indent}{}", row.name));
+                        ui.monospace(format!("{:.2}", row.last_ms));
+                        ui.monospace(format!("{:.2}", row.avg_ms));
+                        ui.monospace(format!("{:.2}", row.max_ms));
+                        if total > 0.0 && row.depth == 0 {
+                            ui.monospace(format!("{:.0}%", 100.0 * row.last_ms / total));
+                        } else {
+                            ui.label("");
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+/// What a share is a share *of*.
+///
+/// The GPU lane reserves a `frame` row spanning everything, so summing top-level
+/// rows there would double-count it. Where no such row exists (the CPU lane), the
+/// top-level rows are the total.
+fn lane_total(rows: &[Row]) -> f32 {
+    if let Some(frame) = rows.iter().find(|row| row.name == "frame") {
+        return frame.last_ms;
+    }
+    rows.iter().filter(|row| row.depth == 0).map(|row| row.last_ms).sum()
 }
 
 // Reference lines mark 60 fps (16.7 ms) and 30 fps (33.3 ms).

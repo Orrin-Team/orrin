@@ -38,16 +38,19 @@ pub struct GpuMesh {
     pub index_count: u32,
 }
 
-/// Per-draw push constants. Only the small, per-draw-varying values live here;
-/// the fat per-object matrices moved to the set-4 storage buffer so this range
-/// stays under the 128-byte guaranteed `maxPushConstantsSize` (it was 196).
+/// Per-run push constants. Only the small, per-run-varying values live here; the
+/// fat per-object matrices are in the set-4 storage buffer so this range stays
+/// under the 128-byte guaranteed `maxPushConstantsSize` (it was 196).
+///
+/// `view_proj` replaced a pre-multiplied `mvp` when draws became instanced: a
+/// run covers many models, so the model half has to be applied in the shader.
 #[derive(vulkano::buffer::BufferContents, Clone, Copy)]
 #[repr(C)]
 struct PushConstants {
-    mvp: [[f32; 4]; 4],
+    view_proj: [[f32; 4]; 4],
     material_index: u32,
-    /// Row into the set-4 object buffer holding this draw's model/normal matrix.
-    object_index: u32,
+    /// First set-4 object row of this run; the shader adds `gl_InstanceIndex`.
+    object_base: u32,
 }
 
 /// Per-object transforms, indexed by [`PushConstants::object_index`] from a
@@ -55,7 +58,7 @@ struct PushConstants {
 /// because every field is a 64-byte `mat4` (a multiple of 16).
 #[derive(vulkano::buffer::BufferContents, Clone, Copy)]
 #[repr(C)]
-struct GpuObject {
+pub(super) struct GpuObject {
     model: [[f32; 4]; 4],
     /// Inverse-transpose of `model`'s rotation/scale, for transforming normals
     /// correctly under non-uniform scaling. Stored as a mat4; only the upper-left
@@ -309,6 +312,34 @@ impl ForwardPass {
         .unwrap()
     }
 
+    /// Build this frame's per-object rows. Shared by the SSAO prepass and the
+    /// forward pass: both need the same model and normal matrices, and the
+    /// inverse-transpose is expensive enough to be worth computing once.
+    ///
+    /// One row per item, including items whose mesh is missing, so a run's
+    /// object rows stay contiguous and `object_base` is just the run's start.
+    pub(super) fn upload_objects(&self, items: &[RenderItem]) -> Subbuffer<[GpuObject]> {
+        // allocate_slice rejects length 0; an empty scene still needs a bindable
+        // buffer, so round up to one (unwritten, unread) slot.
+        let buffer = self
+            .object_buffer_allocator
+            .allocate_slice::<GpuObject>(items.len().max(1) as u64)
+            .unwrap();
+        {
+            let mut rows = buffer.write().unwrap();
+            for (row, item) in rows.iter_mut().zip(items) {
+                let model = item.model;
+                // Inverse-transpose so normals stay perpendicular under non-uniform scale.
+                let normal_matrix = Mat4::from_mat3(Mat3::from_mat4(model).inverse().transpose());
+                *row = GpuObject {
+                    model: model.to_cols_array_2d(),
+                    normal_matrix: normal_matrix.to_cols_array_2d(),
+                };
+            }
+        }
+        buffer
+    }
+
     pub fn draw(
         &self,
         builder: &mut AutoCommandBufferBuilder<
@@ -322,6 +353,7 @@ impl ForwardPass {
         ao_view: Arc<ImageView>,
         material_set: Arc<DescriptorSet>,
         texture_set: Arc<DescriptorSet>,
+        object_buffer: Subbuffer<[GpuObject]>,
     ) {
         let aspect = extent[0] as f32 / extent[1] as f32;
         let view_proj = camera.view_projection(aspect);
@@ -346,31 +378,6 @@ impl ForwardPass {
             [WriteDescriptorSet::image_view_sampler(0, ao_view, self.ao_sampler.clone())],
             [],
         ).unwrap();
-
-        // Per-object transforms for this frame, one entry per item so the loop's
-        // `object_index` is just the `items` index. Built for every item, even
-        // ones whose mesh is missing and get skipped below, to keep that mapping
-        // trivial.
-        let objects: Vec<GpuObject> = items
-            .iter()
-            .map(|item| {
-                let model = item.model;
-                // Inverse-transpose so normals stay perpendicular under non-uniform scale.
-                let normal_matrix =
-                    Mat4::from_mat3(Mat3::from_mat4(model).inverse().transpose());
-                GpuObject {
-                    model: model.to_cols_array_2d(),
-                    normal_matrix: normal_matrix.to_cols_array_2d(),
-                }
-            })
-            .collect();
-        // allocate_slice rejects length 0; an empty scene still needs a bindable
-        // buffer, so round up to one (unwritten, unread) slot.
-        let object_buffer = self
-            .object_buffer_allocator
-            .allocate_slice::<GpuObject>(objects.len().max(1) as u64)
-            .unwrap();
-        object_buffer.write().unwrap()[..objects.len()].copy_from_slice(&objects);
 
         let object_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
@@ -402,14 +409,18 @@ impl ForwardPass {
             )
             .unwrap();
 
-        for (object_index, item) in items.iter().enumerate() {
+        // `extract_renderables` groups items by (mesh, material), so each run is
+        // one instanced draw: the recording cost stops scaling with entity count
+        // and starts scaling with distinct mesh/material pairs.
+        for run in runs(items) {
+            let item = &items[run.start];
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
             let push = PushConstants {
-                mvp: (view_proj * item.model).to_cols_array_2d(),
+                view_proj: view_proj.to_cols_array_2d(),
                 material_index: item.material.0,
-                object_index: object_index as u32,
+                object_base: run.start as u32,
             };
 
             builder
@@ -420,10 +431,34 @@ impl ForwardPass {
                 .bind_index_buffer(mesh.index_buffer.clone())
                 .unwrap();
             unsafe {
-                builder.draw_indexed(mesh.index_count, 1, 0, 0, 0).unwrap();
+                builder
+                    .draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0)
+                    .unwrap();
             }
         }
     }
+}
+
+/// Split `items` into maximal runs sharing a mesh and material.
+///
+/// Correct only because `extract_renderables` sorts on the same key: an unsorted
+/// list still yields valid runs, just short ones, so a missed sort costs
+/// performance rather than producing wrong pixels.
+pub(super) fn runs(items: &[RenderItem]) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+    let mut start = 0usize;
+    std::iter::from_fn(move || {
+        if start >= items.len() {
+            return None;
+        }
+        let key = (items[start].mesh.0, items[start].material.0);
+        let mut end = start + 1;
+        while end < items.len() && (items[end].mesh.0, items[end].material.0) == key {
+            end += 1;
+        }
+        let run = start..end;
+        start = end;
+        Some(run)
+    })
 }
 
 pub fn upload_mesh(
@@ -541,6 +576,75 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
         },
     )
     .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runs;
+    use crate::gfx::{MaterialHandle, MeshHandle, RenderItem};
+    use glam::Mat4;
+
+    fn item(mesh: u32, material: u32) -> RenderItem {
+        RenderItem {
+            model: Mat4::IDENTITY,
+            mesh: MeshHandle(mesh),
+            material: MaterialHandle(material),
+        }
+    }
+
+    fn ranges(items: &[RenderItem]) -> Vec<(usize, usize)> {
+        runs(items).map(|run| (run.start, run.end)).collect()
+    }
+
+    #[test]
+    fn a_sorted_list_collapses_into_one_run_per_mesh_material_pair() {
+        let items = [
+            item(0, 0),
+            item(0, 0),
+            item(0, 1),
+            item(3, 1),
+            item(3, 1),
+            item(3, 1),
+        ];
+        assert_eq!(ranges(&items), vec![(0, 2), (2, 3), (3, 6)]);
+    }
+
+    /// Every run must be non-empty, contiguous, and cover the list exactly —
+    /// `object_base` is the run's start, so a gap or overlap would draw an
+    /// instance against another object's transform.
+    #[test]
+    fn runs_partition_the_list_without_gaps_or_overlaps() {
+        let items = [item(1, 0), item(1, 0), item(2, 7), item(2, 7), item(9, 9)];
+        let ranges = ranges(&items);
+        assert_eq!(ranges.first().unwrap().0, 0);
+        assert_eq!(ranges.last().unwrap().1, items.len());
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "runs must be contiguous: {ranges:?}");
+        }
+        assert!(ranges.iter().all(|(start, end)| end > start));
+        assert_eq!(ranges.iter().map(|(s, e)| e - s).sum::<usize>(), items.len());
+    }
+
+    /// Same mesh but a different material can't share an instanced draw: the
+    /// material index is a per-run push constant.
+    #[test]
+    fn a_material_change_breaks_a_run() {
+        let items = [item(4, 0), item(4, 1)];
+        assert_eq!(ranges(&items), vec![(0, 1), (1, 2)]);
+    }
+
+    /// An unsorted list still has to partition correctly — it just yields more,
+    /// shorter runs. Wrong pixels are not an acceptable cost of a missed sort.
+    #[test]
+    fn an_unsorted_list_still_partitions_correctly() {
+        let items = [item(0, 0), item(5, 0), item(0, 0)];
+        assert_eq!(ranges(&items), vec![(0, 1), (1, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn an_empty_list_has_no_runs() {
+        assert!(ranges(&[]).is_empty());
+    }
 }
 
 mod vs {

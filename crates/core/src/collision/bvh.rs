@@ -87,10 +87,15 @@ impl Bvh {
 
     /// Append every overlapping body pair `(i, j)` with `i < j` to `out`.
     pub fn query_pairs(&self, out: &mut Vec<(u32, u32)>) {
+        // Hoisted out of the leaf loop: a stack per leaf is one allocation per
+        // body, and reusing it keeps the capacity reached by the deepest
+        // traversal for every leaf after the first.
+        let mut stack: Vec<NodeIndex> = Vec::new();
+
         for node in &self.nodes {
             let NodeKind::Leaf { body } = node.kind else { continue };
 
-            let mut stack: Vec<NodeIndex> = Vec::new();
+            stack.clear();
             if let Some(root) = self.root {
                 stack.push(root);
             }

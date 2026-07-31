@@ -5,6 +5,7 @@ pub mod camera_controller;
 pub mod collision;
 pub mod editor;
 pub mod gfx;
+pub mod profile;
 pub mod scene;
 #[cfg(feature = "scripting")]
 pub mod scripting;
