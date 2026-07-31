@@ -402,6 +402,10 @@ impl ForwardPass {
             )
             .unwrap();
 
+        // `extract_renderables` groups items by mesh, so a repeated handle means
+        // the bound buffers are already the right ones. Rebinding per draw is
+        // what makes recording, not the GPU, the limit in mesh-reusing scenes.
+        let mut bound_mesh: Option<u32> = None;
         for (object_index, item) in items.iter().enumerate() {
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
@@ -414,11 +418,15 @@ impl ForwardPass {
 
             builder
                 .push_constants(self.pipeline.layout().clone(), 0, push)
-                .unwrap()
-                .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
-                .unwrap()
-                .bind_index_buffer(mesh.index_buffer.clone())
                 .unwrap();
+            if bound_mesh != Some(item.mesh.0) {
+                builder
+                    .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
+                    .unwrap()
+                    .bind_index_buffer(mesh.index_buffer.clone())
+                    .unwrap();
+                bound_mesh = Some(item.mesh.0);
+            }
             unsafe {
                 builder.draw_indexed(mesh.index_count, 1, 0, 0, 0).unwrap();
             }

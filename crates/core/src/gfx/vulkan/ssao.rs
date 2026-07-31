@@ -451,6 +451,8 @@ impl SsaoPass {
             )
             .unwrap();
 
+        // Same grouping as the forward pass; see the note there.
+        let mut bound_mesh: Option<u32> = None;
         for item in items {
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else { continue };
             let model = item.model;
@@ -462,11 +464,15 @@ impl SsaoPass {
             };
             builder
                 .push_constants(self.prepass_pipeline.layout().clone(), 0, push)
-                .unwrap()
-                .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
-                .unwrap()
-                .bind_index_buffer(mesh.index_buffer.clone())
                 .unwrap();
+            if bound_mesh != Some(item.mesh.0) {
+                builder
+                    .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
+                    .unwrap()
+                    .bind_index_buffer(mesh.index_buffer.clone())
+                    .unwrap();
+                bound_mesh = Some(item.mesh.0);
+            }
             unsafe { builder.draw_indexed(mesh.index_count, 1, 0, 0, 0).unwrap() };
         }
         builder.end_render_pass(Default::default()).unwrap();

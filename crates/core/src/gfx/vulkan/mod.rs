@@ -36,6 +36,7 @@ use self::hdr::{HdrPass, HDR_FORMAT};
 use self::timestamps::GpuTimestamps;
 
 use crate::profile::Profiler;
+use crate::profile_scope;
 use crate::scene::DebugLine;
 use super::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle, MAX_TEXTURES};
 
@@ -264,7 +265,11 @@ impl VulkanRenderer {
             }
         }
 
-        let (image_index, suboptimal, acquire_future) =
+        // Split out because under Fifo this blocks until the presentation engine
+        // hands back an image — a vsync wait, not work. Folded into a single
+        // "render" scope it swamps the numbers and hides real regressions.
+        let (image_index, suboptimal, acquire_future) = {
+            profile_scope!("acquire");
             match acquire_next_image(self.swapchain.swapchain.clone(), None)
                 .map_err(Validated::unwrap)
             {
@@ -274,7 +279,8 @@ impl VulkanRenderer {
                     return;
                 }
                 Err(e) => panic!("failed to acquire next image: {e}"),
-            };
+            }
+        };
         if suboptimal {
             self.recreate_swapchain = true;
         }
@@ -294,6 +300,7 @@ impl VulkanRenderer {
             None => None,
         };
 
+        let recording = crate::profile::scope("record");
         let mut builder = AutoCommandBufferBuilder::primary(
             self.ctx.command_buffer_allocator.clone(),
             self.ctx.queue.queue_family_index(),
@@ -411,6 +418,7 @@ impl VulkanRenderer {
         }
 
         let command_buffer = builder.build().unwrap();
+        drop(recording);
 
         if let Some(prev) = self.previous_frame_end.as_mut() {
             prev.cleanup_finished();
@@ -429,13 +437,17 @@ impl VulkanRenderer {
         // Let the overlay (editor UI) draw onto the same swapchain image before
         // present. Without one, present the tonemapped scene directly.
         let before_present = match overlay {
-            Some(draw) => draw(
-                after_scene,
-                self.swapchain.image_views[image_index as usize].clone(),
-            ),
+            Some(draw) => {
+                profile_scope!("overlay");
+                draw(
+                    after_scene,
+                    self.swapchain.image_views[image_index as usize].clone(),
+                )
+            }
             None => after_scene,
         };
 
+        let submitting = crate::profile::scope("submit");
         let future = before_present
             .then_swapchain_present(
                 self.ctx.queue.clone(),
@@ -454,6 +466,7 @@ impl VulkanRenderer {
                 eprintln!("failed to flush future: {e}");
             }
         }
+        drop(submitting);
     }
 }
 
