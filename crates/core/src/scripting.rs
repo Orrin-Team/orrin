@@ -11,7 +11,7 @@ use std::time::SystemTime;
 
 use glam::{Quat, Vec3};
 
-use orrin_ecs::{Entity, World};
+use orrin_ecs::{Entity, FxHashMap, World};
 use orrin_script::{CCollision, CEntity, CTransform, OrrinApi, GameAssemblyStatus, ScriptHost};
 
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
@@ -594,11 +594,37 @@ impl ReloadOutcome {
     }
 }
 
+/// One script's lifecycle state for the duration of a tick, lifted out of the
+/// world so no storage borrow is held while C# runs. Written back at the end of
+/// the tick.
+struct Pending {
+    entity: Entity,
+    handle: u64,
+    started: bool,
+    enabled: bool,
+    active: bool,
+    /// Set the moment a hook throws this tick, so the later phases (collision,
+    /// update) skip a script that faulted during activation.
+    faulted: bool,
+}
+
 pub struct Scripting {
     host: ScriptHost,
     /// The game DLL this session loaded, kept so a reload can re-read the same
     /// path after the build tool has overwritten it.
     game_dll: PathBuf,
+    /// `tick`'s scratch, kept between frames for the allocation and nothing
+    /// else — every tick clears it before use and it is never read in between.
+    ///
+    /// `tick` *takes* these rather than holding a `RefMut`, because the buffers
+    /// are live across the dispatch window: a borrow held there would turn any
+    /// future re-entry into a `RefCell` panic instead of a compile error, and
+    /// the whole point of the window is that C# may call back in.
+    pending: RefCell<Vec<Pending>>,
+    /// `entity -> index into pending`, so routing a collision event costs a
+    /// hash lookup instead of a scan over every scripted entity. Built only on
+    /// ticks that actually have events.
+    routing: RefCell<FxHashMap<Entity, usize>>,
 }
 
 impl Scripting {
@@ -698,6 +724,8 @@ impl Scripting {
         let scripting = Self {
             host,
             game_dll: game_dll.to_path_buf(),
+            pending: RefCell::new(Vec::new()),
+            routing: RefCell::new(FxHashMap::default()),
         };
         match scripting.stage() {
             Ok(()) => {}
@@ -897,18 +925,8 @@ impl Scripting {
     /// (OnEnable/OnStart/OnDisable), then this frame's collision callbacks,
     /// then OnUpdate.
     pub fn tick(&self, world: &mut World, delta_time: f32) {
-        struct Pending {
-            entity: Entity,
-            handle: u64,
-            started: bool,
-            enabled: bool,
-            active: bool,
-            // Set the moment a hook throws this tick, so the later phases
-            // (collision, update) skip a script that faulted during activation.
-            faulted: bool,
-        }
-
-        let mut pending: Vec<Pending> = Vec::new();
+        let mut pending = self.pending.take();
+        pending.clear();
         world.query::<&ScriptComponent>().for_each(|entity, script| {
             // Already-faulted scripts are inert: never collected, never
             // dispatched to, until something clears the flag.
@@ -925,6 +943,7 @@ impl Scripting {
             })
         });
         if pending.is_empty() {
+            self.pending.replace(pending);
             return;
         }
 
@@ -935,6 +954,15 @@ impl Scripting {
         let events: Vec<CollisionEvent> = world
             .get_resource_mut::<CollisionState>()
             .map_or_else(Vec::new, |mut state| std::mem::take(&mut state.events));
+
+        // Built here and not inside the window, and only when there is
+        // something to route: a tick with no collisions should not pay for an
+        // index nothing reads.
+        let mut routing = self.routing.take();
+        routing.clear();
+        if !events.is_empty() {
+            routing.extend(pending.iter().enumerate().map(|(i, script)| (script.entity, i)));
+        }
 
         orrin_script::with_active_world(world, || {
             for script in &mut pending {
@@ -966,12 +994,17 @@ impl Scripting {
             // "from me toward the other", both sides.
             for event in &events {
                 for (target, other, flip) in [(event.a, event.b, false), (event.b, event.a, true)] {
-                    let Some(script) = pending
-                        .iter_mut()
-                        .find(|script| script.entity == target && script.active && !script.faulted)
-                    else {
+                    // An entity holds at most one `ScriptComponent`, so the
+                    // index names the same entry the linear scan used to find.
+                    // The activation flags are still re-read per event, since a
+                    // fault raised by an earlier one must stop delivery here.
+                    let Some(&index) = routing.get(&target) else {
                         continue;
                     };
+                    let script = &mut pending[index];
+                    if !script.active || script.faulted {
+                        continue;
+                    }
                     let normal = if flip { -event.normal } else { event.normal };
                     let collision = CCollision {
                         other: CEntity { index: other.index, generation: other.generation },
@@ -1012,6 +1045,9 @@ impl Scripting {
                 component.faulted = script.faulted;
             }
         }
+
+        self.pending.replace(pending);
+        self.routing.replace(routing);
     }
 
     /// Apply the structural changes scripts queued during a dispatch. Runs

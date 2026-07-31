@@ -25,24 +25,47 @@ struct Node {
     kind: NodeKind,
 }
 
+#[derive(Default)]
 pub struct Bvh {
     nodes: Vec<Node>,
     root: Option<NodeIndex>,
+    /// Scratch for the partition in `build_ranges`, held here rather than
+    /// created per build for the same reason as `nodes` — see
+    /// [`rebuild`](Bvh::rebuild). Never read outside a build.
+    indices: Vec<usize>,
 }
 
 impl Bvh {
     /// Build a tree over `bounds`; leaf `body` values are indices into it.
+    ///
+    /// Allocates. A caller that rebuilds every frame should keep one `Bvh` and
+    /// call [`rebuild`](Bvh::rebuild) instead.
     pub fn build(bounds: &[Aabb]) -> Self {
-        let mut indices: Vec<usize> = (0..bounds.len()).collect();
-        let mut nodes = Vec::new();
+        let mut bvh = Bvh::default();
+        bvh.rebuild(bounds);
+        bvh
+    }
 
-        let root = if indices.is_empty() {
+    /// Rebuild over `bounds` in place, keeping the buffers the last build grew.
+    ///
+    /// Rebuilding from scratch every frame is the design (see the module docs)
+    /// and stays; the two `Vec`s it filled were the incidental part. Clearing
+    /// instead of dropping keeps the capacity the previous frame reached, so a
+    /// scene whose body count is stable stops calling the allocator after the
+    /// first frame — which is most scenes, most frames.
+    pub fn rebuild(&mut self, bounds: &[Aabb]) {
+        self.nodes.clear();
+        self.indices.clear();
+        self.indices.extend(0..bounds.len());
+
+        // Disjoint fields, so the partition scratch and the node arena can be
+        // borrowed at once.
+        let Bvh { nodes, indices, root } = self;
+        *root = if indices.is_empty() {
             None
         } else {
-            Some(Self::build_ranges(&mut nodes, bounds, &mut indices))
+            Some(Self::build_ranges(nodes, bounds, indices))
         };
-
-        Bvh { nodes, root }
     }
 
     fn build_ranges(nodes: &mut Vec<Node>, bounds: &[Aabb], indices: &mut [usize]) -> NodeIndex {
@@ -137,6 +160,33 @@ mod tests {
         Bvh::build(bounds).query_pairs(&mut pairs);
         pairs.sort_unstable();
         pairs
+    }
+
+    /// A reused tree has to answer exactly what a fresh one does, including
+    /// after a rebuild over *fewer* bodies — where stale nodes left in the
+    /// arena, or stale indices in the partition scratch, would show up as
+    /// phantom pairs.
+    #[test]
+    fn rebuild_matches_a_fresh_build() {
+        let crowded: Vec<Aabb> = (0..12)
+            .map(|i| {
+                let min = Vec3::new(i as f32 * 0.5, 0.0, 0.0);
+                Aabb { min, max: min + Vec3::ONE }
+            })
+            .collect();
+        let sparse = vec![
+            aabb([0.0; 3], [1.0; 3]),
+            aabb([0.5, 0.5, 0.5], [1.5, 1.5, 1.5]),
+        ];
+
+        let mut reused = Bvh::default();
+        for bounds in [&crowded, &sparse, &crowded, &Vec::new(), &sparse] {
+            let mut from_reused = Vec::new();
+            reused.rebuild(bounds);
+            reused.query_pairs(&mut from_reused);
+            from_reused.sort_unstable();
+            assert_eq!(from_reused, pairs_of(bounds));
+        }
     }
 
     #[test]
