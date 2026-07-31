@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-use glam::{Mat3, Mat4};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
-use vulkano::buffer::{BufferContents, BufferUsage};
+use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo,
     SubpassContents,
@@ -33,6 +32,7 @@ use crate::gfx::{RenderItem, Vertex};
 use crate::scene::Camera;
 use super::context::VkContext;
 use super::swapchain::DEPTH_FORMAT;
+use super::forward::GpuObject;
 use super::VulkanRenderer;
 
 const NORMAL_FORMAT: Format = Format::R8G8B8A8_UNORM;
@@ -64,8 +64,8 @@ struct SsaoParamsUbo {
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 struct PrepassPush {
-    mvp: [[f32; 4]; 4],
-    normal_matrix: [[f32; 4]; 4],
+    /// First object row of this instanced run; the shader adds `gl_InstanceIndex`.
+    object_base: u32,
 }
 
 fn build_kernel() -> [[f32; 4]; KERNEL_MAX] {
@@ -386,11 +386,11 @@ impl SsaoPass {
         items: &[RenderItem],
         camera: &Camera,
         extent: [u32; 2],
+        object_buffer: Subbuffer<[GpuObject]>,
     ) {
         let aspect = extent[0] as f32 / extent[1] as f32;
         let view = camera.view();
         let proj = camera.projection(aspect);
-        let view_proj = proj * view;
 
         let frame_buf = self.uniform_allocator.allocate_sized::<FrameUbo>().unwrap();
         *frame_buf.write().unwrap() = FrameUbo {
@@ -430,6 +430,14 @@ impl SsaoPass {
         )
             .unwrap();
 
+        let object_set_prepass = DescriptorSet::new(
+            renderer.ctx.descriptor_set_allocator.clone(),
+            self.prepass_pipeline.layout().set_layouts()[1].clone(),
+            [WriteDescriptorSet::buffer(0, object_buffer)],
+            [],
+        )
+            .unwrap();
+
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -447,33 +455,29 @@ impl SsaoPass {
                 PipelineBindPoint::Graphics,
                 self.prepass_pipeline.layout().clone(),
                 0,
-                vec![frame_set_prepass],
+                vec![frame_set_prepass, object_set_prepass],
             )
             .unwrap();
 
-        // Same grouping as the forward pass; see the note there.
-        let mut bound_mesh: Option<u32> = None;
-        for item in items {
+        // One instanced draw per (mesh, material) run, matching the forward pass.
+        // The model and normal matrices come from the shared object buffer, so
+        // this pass no longer recomputes an inverse-transpose per item.
+        for run in super::forward::runs(items) {
+            let item = &items[run.start];
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else { continue };
-            let model = item.model;
-            let normal_matrix =
-                Mat4::from_mat3(Mat3::from_mat4(model).inverse().transpose());
-            let push = PrepassPush {
-                mvp: (view_proj * model).to_cols_array_2d(),
-                normal_matrix: normal_matrix.to_cols_array_2d(),
-            };
+            let push = PrepassPush { object_base: run.start as u32 };
             builder
                 .push_constants(self.prepass_pipeline.layout().clone(), 0, push)
+                .unwrap()
+                .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
+                .unwrap()
+                .bind_index_buffer(mesh.index_buffer.clone())
                 .unwrap();
-            if bound_mesh != Some(item.mesh.0) {
+            unsafe {
                 builder
-                    .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
+                    .draw_indexed(mesh.index_count, run.len() as u32, 0, 0, 0)
                     .unwrap()
-                    .bind_index_buffer(mesh.index_buffer.clone())
-                    .unwrap();
-                bound_mesh = Some(item.mesh.0);
-            }
-            unsafe { builder.draw_indexed(mesh.index_count, 1, 0, 0, 0).unwrap() };
+            };
         }
         builder.end_render_pass(Default::default()).unwrap();
 

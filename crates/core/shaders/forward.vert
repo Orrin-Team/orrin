@@ -16,12 +16,13 @@ layout(location = 5) out vec3 v_color;
 // Declared identically to the fragment shader so the two stages
 // share one push-constant range. `material_index` is unused here.
 layout(push_constant) uniform Push {
-    mat4 mvp;
+    mat4 view_proj;
     uint material_index;
-    uint object_index;
+    // First object row of this instanced run; gl_InstanceIndex counts from it.
+    uint object_base;
 } push;
 
-// Per-object transforms, indexed by push.object_index. Mirrors GpuObject in
+// Per-object transforms, indexed per instance. Mirrors GpuObject in
 // forward.rs; std430 packs it exactly like the Rust struct (all mat4 fields).
 struct Object {
     mat4 model;
@@ -32,8 +33,9 @@ layout(set = 4, binding = 0, std430) readonly buffer Objects {
 };
 
 void main() {
-    mat4 model = objects[push.object_index].model;
-    mat4 normal_matrix = objects[push.object_index].normal_matrix;
+    uint object = push.object_base + uint(gl_InstanceIndex);
+    mat4 model = objects[object].model;
+    mat4 normal_matrix = objects[object].normal_matrix;
 
     vec4 world = model * vec4(position, 1.0);
     v_world_pos = world.xyz;
@@ -49,5 +51,5 @@ void main() {
     v_bitangent = B;
     v_uv = uv;
     v_color = color;
-    gl_Position = push.mvp * vec4(position, 1.0);
+    gl_Position = push.view_proj * world;
 }

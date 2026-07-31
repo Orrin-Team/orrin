@@ -1,6 +1,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use vulkano::instance::debug::{
+    DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger,
+    DebugUtilsMessengerCallback, DebugUtilsMessengerCreateInfo,
+};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::swapchain::Surface;
 use vulkano::VulkanLibrary;
@@ -60,6 +64,9 @@ pub struct App {
     project: Option<orrin_project::Project>,
     /// Extra profiling load from `ORRIN_STRESS`; `None` for a normal run.
     stress: Option<StressSpec>,
+    /// Kept alive for the process: dropping the messenger stops validation
+    /// output, which is exactly when you need it most.
+    _debug_messenger: Option<DebugUtilsMessenger>,
 }
 
 /// What `boot_scripting` produced: the live host, and the watcher that keeps it
@@ -77,16 +84,41 @@ impl App {
         event_loop.set_control_flow(ControlFlow::Poll);
 
         let library = VulkanLibrary::new().expect("failed to load vulkan library");
-        let required_extensions = Surface::required_extensions(&event_loop).unwrap();
+        let mut enabled_extensions = Surface::required_extensions(&event_loop).unwrap();
+
+        // Architecture §3.5: validation on in every dev build. Silently skipped
+        // when the layer isn't installed, so a machine without the Vulkan SDK
+        // (and CI) still runs — a GPU crash with no named cause is the thing
+        // this exists to prevent.
+        let validation = should_validate() && has_validation_layer(&library);
+        if validation {
+            enabled_extensions.ext_debug_utils = true;
+        }
+
         let instance = Instance::new(
             library,
             InstanceCreateInfo {
                 flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
-                enabled_extensions: required_extensions,
+                enabled_extensions,
+                enabled_layers: if validation {
+                    vec![VALIDATION_LAYER.to_owned()]
+                } else {
+                    Vec::new()
+                },
                 ..Default::default()
             },
         )
         .expect("failed to create instance");
+
+        let debug_messenger = validation.then(|| attach_debug_messenger(&instance));
+        if validation {
+            println!("orrin: Vulkan validation layer enabled");
+        } else if should_validate() {
+            eprintln!(
+                "orrin: validation requested but `{VALIDATION_LAYER}` isn't installed; \
+                 GPU errors will not be named (install the Vulkan SDK)"
+            );
+        }
 
         let cwd = std::env::current_dir().unwrap_or_else(|err| {
             eprintln!("orrin: cannot read the current directory: {err}");
@@ -127,6 +159,7 @@ impl App {
             #[cfg(feature = "scripting")]
             project,
             stress: StressSpec::from_env().filter(|spec| !spec.is_empty()),
+            _debug_messenger: debug_messenger,
         };
 
         crate::scene::register_components(&mut app.registry);
@@ -508,4 +541,63 @@ impl ApplicationHandler for App {
             active.window.request_redraw();
         }
     }
+}
+
+const VALIDATION_LAYER: &str = "VK_LAYER_KHRONOS_validation";
+
+/// On by default in dev builds; `ORRIN_VALIDATION=0`/`1` overrides either way,
+/// so a release build can be checked without rebuilding it as debug.
+fn should_validate() -> bool {
+    match std::env::var("ORRIN_VALIDATION").ok().as_deref() {
+        Some("0") | Some("false") => false,
+        Some(_) => true,
+        None => cfg!(debug_assertions),
+    }
+}
+
+fn has_validation_layer(library: &Arc<VulkanLibrary>) -> bool {
+    library
+        .layer_properties()
+        .map(|mut layers| layers.any(|layer| layer.name() == VALIDATION_LAYER))
+        .unwrap_or(false)
+}
+
+/// Print validation messages with the offending object named, per architecture
+/// §3.5. Errors go to stderr so a crash log carries them.
+fn attach_debug_messenger(instance: &Arc<Instance>) -> DebugUtilsMessenger {
+    // SAFETY: the callback only formats and prints; it makes no Vulkan calls.
+    let callback = unsafe {
+        DebugUtilsMessengerCallback::new(|severity, message_type, data| {
+            let label = if severity.intersects(DebugUtilsMessageSeverity::ERROR) {
+                "error"
+            } else if severity.intersects(DebugUtilsMessageSeverity::WARNING) {
+                "warning"
+            } else {
+                "info"
+            };
+            eprintln!(
+                "[vulkan {label}] {}{}",
+                data.message_id_name.map(|name| format!("{name}: ")).unwrap_or_default(),
+                data.message
+            );
+            let _ = message_type;
+        })
+    };
+
+    // SAFETY: `ext_debug_utils` was enabled on the instance above, which is the
+    // only precondition beyond the callback's.
+    unsafe {
+        DebugUtilsMessenger::new(
+            instance.clone(),
+            DebugUtilsMessengerCreateInfo {
+                message_severity: DebugUtilsMessageSeverity::ERROR
+                    | DebugUtilsMessageSeverity::WARNING,
+                message_type: DebugUtilsMessageType::GENERAL
+                    | DebugUtilsMessageType::VALIDATION
+                    | DebugUtilsMessageType::PERFORMANCE,
+                ..DebugUtilsMessengerCreateInfo::user_callback(callback)
+            },
+        )
+    }
+    .expect("failed to create the validation messenger")
 }

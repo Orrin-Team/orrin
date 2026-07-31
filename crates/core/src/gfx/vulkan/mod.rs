@@ -333,11 +333,22 @@ impl VulkanRenderer {
         let material_set = self.material_set.clone().unwrap();
         let texture_set = self.texture_set.clone().unwrap();
 
+        // One upload feeding both the SSAO prepass and the forward pass; the
+        // per-object inverse-transpose is too expensive to compute twice.
+        let object_buffer = self.forward.upload_objects(items);
+
         let ao_view = if ssao.enabled {
             let pass = timestamps
                 .as_mut()
                 .and_then(|timestamps| timestamps.begin_pass(&mut builder, "ssao"));
-            self.ssao.record(&mut builder, self, items, camera, self.swapchain.extent);
+            self.ssao.record(
+                &mut builder,
+                self,
+                items,
+                camera,
+                self.swapchain.extent,
+                object_buffer.clone(),
+            );
             if let Some(timestamps) = timestamps.as_mut() {
                 timestamps.end_pass(&mut builder, pass);
             }
@@ -376,6 +387,7 @@ impl VulkanRenderer {
             ao_view,
             material_set,
             texture_set,
+            object_buffer,
         );
 
         // Debug lines share the forward subpass: depth-tested against the scene,

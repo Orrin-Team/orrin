@@ -63,9 +63,9 @@ vec4 sample_tex(uint index, vec2 uv) {
 // Declared identically to the vertex shader so the stages share one
 // push-constant range; only material_index is read here.
 layout(push_constant) uniform Push {
-    mat4 mvp;
+    mat4 view_proj;
     uint material_index;
-    uint object_index;
+    uint object_base;
 } push;
 
 // --- Cook-Torrance terms (metallic-roughness workflow) ---
