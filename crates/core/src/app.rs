@@ -15,7 +15,7 @@ use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::{RenderBackend, RenderItem, SceneLighting};
 use crate::profile::Profiler;
 use crate::profile_scope;
-use crate::scene::entities::build_default_scene;
+use crate::scene::entities::{build_default_scene, spawn_stress_scene, StressSpec};
 use crate::scene::{
     AmbientLight, Camera, DebugLine, DebugLines, HdrSettings, InputState, LogBuffer, SsaoSettings,
     Time,
@@ -58,6 +58,8 @@ pub struct App {
     /// the engine is running standalone on its built-in demo scene.
     #[cfg(feature = "scripting")]
     project: Option<orrin_project::Project>,
+    /// Extra profiling load from `ORRIN_STRESS`; `None` for a normal run.
+    stress: Option<StressSpec>,
 }
 
 /// What `boot_scripting` produced: the live host, and the watcher that keeps it
@@ -124,6 +126,7 @@ impl App {
             build_watcher: None,
             #[cfg(feature = "scripting")]
             project,
+            stress: StressSpec::from_env().filter(|spec| !spec.is_empty()),
         };
 
         crate::scene::register_components(&mut app.registry);
@@ -233,6 +236,22 @@ impl App {
             .id();
         scripting.attach(&mut self.world, entity, &entry);
 
+        // Stress scripts are just the entry Behaviour again: one more dispatch
+        // target each tick, through the identical attach path, so the load is
+        // representative rather than a special case.
+        let stress_scripts = self.stress.map_or(0, |spec| spec.scripts);
+        for index in 0..stress_scripts {
+            let entity = self
+                .world
+                .spawn_entity()
+                .with(crate::scene::Name::new(format!("Stress Script {index}")))
+                .id();
+            scripting.attach(&mut self.world, entity, &entry);
+        }
+        if stress_scripts > 0 {
+            println!("orrin: stress load added — {stress_scripts} scripted entities");
+        }
+
         let watcher = match BuildWatcher::for_game_assembly(&game_dll, Some(&bindings_dir)) {
             Ok(watcher) => Some(watcher),
             Err(reason) => {
@@ -263,6 +282,9 @@ impl ApplicationHandler for App {
             VulkanRenderer::new(&self.instance, surface.clone(), [size.width, size.height]);
 
         build_default_scene(&mut self.world, &mut renderer);
+        if let Some(spec) = self.stress {
+            spawn_stress_scene(&mut self.world, &spec);
+        }
         self.camera_controller
             .sync_from(&self.world.resource::<Camera>());
 

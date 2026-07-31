@@ -22,8 +22,15 @@ notify = { version = "8", optional = true }
 # Raw VK_EXT_memory_budget query for VRAM usage; pinned to vulkano 0.35's ash.
 ash = "0.38"
 
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
 [features]
 # Opt-in C# scripting. Off by default so the standard workspace build and CI
 # don't pull in orrin-script (netcorehost + the nethost download). The build
 # watcher rides along: rebuild-on-save has nothing to reload without scripting.
 scripting = ["dep:orrin-script", "dep:orrin-build", "dep:notify"]
+
+[[bench]]
+name = "bvh"
+harness = false
