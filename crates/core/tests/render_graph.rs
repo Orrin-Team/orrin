@@ -1,0 +1,154 @@
+//! The synchronisation tripwire the render graph exists to make possible (#7).
+//!
+//! A wrong barrier is the worst bug the renderer can have: it produces correct
+//! pixels on the machine that wrote it and a race on someone else's scheduler,
+//! and it survives review because nobody reads a barrier and sees it is one flag
+//! too loose. The graph derives them instead, which means the derivation itself
+//! can be pinned — this file renders the reference frame's plan to text and
+//! compares it against a checked-in baseline.
+//!
+//! **What a failure means.** The plan changed. That is legitimate whenever the
+//! frame's structure changed on purpose, and a regression whenever it didn't:
+//! a barrier that quietly loosens, a transition that disappears, a pass that
+//! moves. Read the diff before regenerating — the baseline is the review, so
+//! updating it without reading it spends the whole mechanism.
+//!
+//! Regenerate with `ORRIN_UPDATE_GOLDEN=1 cargo test -p orrin-core --test
+//! render_graph`, and put the diff in the commit.
+//!
+//! It runs on a GPU-less CI runner because compiling a graph takes no `Device`,
+//! which is the property that made the derivation worth doing this way.
+
+use std::fs;
+use std::path::PathBuf;
+
+use orrin_core::gfx::vulkan::frame::{declare, FrameConfig};
+use vulkano::format::Format;
+
+/// The swapchain format the baseline is written against. Real ones vary by
+/// surface; the plan does not depend on it, and pinning it keeps the file from
+/// depending on whoever regenerated it.
+const COLOR_FORMAT: Format = Format::B8G8R8A8_SRGB;
+
+fn configs() -> Vec<(&'static str, FrameConfig)> {
+    vec![
+        (
+            "editor frame, SSAO on",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                overlay: true,
+            },
+        ),
+        // SSAO off is a different graph, not a flag read at record time: the
+        // three passes are never registered and the forward pass never declares
+        // the read. Both shapes are baselined because both ship.
+        (
+            "editor frame, SSAO off",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: false,
+                overlay: true,
+            },
+        ),
+        (
+            "headless frame, no overlay",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                overlay: false,
+            },
+        ),
+    ]
+}
+
+fn golden_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/frame_graph.txt")
+}
+
+fn render() -> String {
+    let mut out = String::new();
+    for (label, config) in configs() {
+        let frame = declare(config).expect("the reference frame must compile");
+        out.push_str(&format!("=== {label} ===\n{}\n", frame.graph));
+    }
+    out
+}
+
+#[test]
+fn the_derived_barrier_sequence_matches_the_baseline() {
+    let actual = render();
+    let path = golden_path();
+
+    if std::env::var_os("ORRIN_UPDATE_GOLDEN").is_some() {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &actual).unwrap();
+        return;
+    }
+
+    let expected = fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        actual,
+        expected,
+        "the frame's derived barrier plan no longer matches {}.\n\
+         If the frame's structure changed on purpose, regenerate with \
+         ORRIN_UPDATE_GOLDEN=1 and commit the diff. If it did not, this is a \
+         synchronisation regression: a barrier has loosened or a transition has \
+         gone missing.",
+        path.display(),
+    );
+}
+
+/// A pass's declarations and the engine code that runs it are looked up by the
+/// same index, so a registration that forgets its body would silently run the
+/// wrong pass.
+#[test]
+fn every_declared_pass_has_a_body() {
+    for (label, config) in configs() {
+        let frame = declare(config).unwrap();
+        assert_eq!(
+            frame.bodies.len(),
+            frame.graph.pass_count(),
+            "{label}: {} passes declared but {} bodies registered",
+            frame.graph.pass_count(),
+            frame.bodies.len(),
+        );
+    }
+}
+
+/// Nothing in the shipped frame is dead. A culled pass is a pass that recorded
+/// work no one reads, which is worth noticing the moment it appears rather than
+/// when someone profiles it.
+#[test]
+fn the_reference_frame_culls_nothing() {
+    for (label, config) in configs() {
+        let frame = declare(config).unwrap();
+        let culled: Vec<&str> = frame
+            .graph
+            .culled()
+            .iter()
+            .map(|&id| frame.graph.pass_name(id))
+            .collect();
+        assert!(culled.is_empty(), "{label}: culled {culled:?}");
+    }
+}
+
+/// The swapchain image is acquired undefined and handed back to the presentation
+/// engine, so the frame owes a closing transition to `PresentSrc` whatever else
+/// it does.
+#[test]
+fn every_configuration_leaves_the_swapchain_presentable() {
+    for (label, config) in configs() {
+        let frame = declare(config).unwrap();
+        let closing: Vec<_> = frame
+            .graph
+            .final_barriers()
+            .iter()
+            .filter(|barrier| {
+                frame.graph.resource_name(barrier.resource) == "swapchain_color"
+                    && barrier.new_layout == vulkano::image::ImageLayout::PresentSrc
+            })
+            .collect();
+        assert_eq!(closing.len(), 1, "{label}: {:?}", frame.graph.final_barriers());
+    }
+}

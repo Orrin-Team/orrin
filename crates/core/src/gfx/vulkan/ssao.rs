@@ -2,17 +2,13 @@ use std::sync::Arc;
 
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo,
-    SubpassContents,
-};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::memory::allocator::MemoryTypeFilter;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
@@ -26,7 +22,7 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
+use vulkano::render_pass::{RenderPass, Subpass};
 use vulkano::shader::EntryPoint;
 use crate::gfx::{RenderItem, Vertex};
 use crate::scene::Camera;
@@ -35,8 +31,8 @@ use super::swapchain::DEPTH_FORMAT;
 use super::forward::GpuObject;
 use super::VulkanRenderer;
 
-const NORMAL_FORMAT: Format = Format::R8G8B8A8_UNORM;
-const AO_FORMAT: Format = Format::R8_UNORM;
+pub(super) const NORMAL_FORMAT: Format = Format::R8G8B8A8_UNORM;
+pub(super) const AO_FORMAT: Format = Format::R8_UNORM;
 const NOISE_SIZE: u32 = 4;
 const KERNEL_SIZE: usize = 32;
 const KERNEL_MAX: usize = 64;
@@ -213,72 +209,18 @@ fn build_fullscreen_pipeline(
     ).unwrap()
 }
 
-struct SsaoTargets {
-    _extent: [u32; 2],
-    depth_view: Arc<ImageView>,
-    normal_view: Arc<ImageView>,
-    raw_ao_view: Arc<ImageView>,
-    pub blur_ao_view: Arc<ImageView>,
-    prepass_fb: Arc<Framebuffer>,
-    ssao_fb: Arc<Framebuffer>,
-    blur_fb: Arc<Framebuffer>,
-}
-
-impl SsaoTargets {
-    fn new(
-        mem: &Arc<StandardMemoryAllocator>,
-        prepass_rp: &Arc<RenderPass>,
-        ssao_rp: &Arc<RenderPass>,
-        blur_rp: &Arc<RenderPass>,
-        extent: [u32; 2],
-    ) -> Self {
-        let make = |format: Format, usage: ImageUsage| {
-            ImageView::new_default(
-                Image::new(
-                    mem.clone(),
-                    ImageCreateInfo {
-                        image_type: ImageType::Dim2d,
-                        format,
-                        extent: [extent[0], extent[1], 1],
-                        usage,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo::default(),
-                ).unwrap()
-            ).unwrap()
-        };
-
-        let color = ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED;
-        let normal_view = make(NORMAL_FORMAT, color);
-        let depth_view = make(DEPTH_FORMAT, ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::SAMPLED);
-        let raw_ao_view = make(AO_FORMAT, color);
-        let blur_ao_view = make(AO_FORMAT, color);
-
-        let prepass_fb = Framebuffer::new(
-            prepass_rp.clone(),
-            FramebufferCreateInfo {
-                attachments: vec![normal_view.clone(), depth_view.clone()],
-                ..Default::default()
-            }
-        ).unwrap();
-
-        let ssao_fb = Framebuffer::new(
-            ssao_rp.clone(),
-            FramebufferCreateInfo { attachments: vec!{raw_ao_view.clone()}, ..Default::default() }
-        ).unwrap();
-        let blur_fb = Framebuffer::new(
-            blur_rp.clone(),
-            FramebufferCreateInfo {attachments: vec!{blur_ao_view.clone()}, ..Default::default() }
-        ).unwrap();
-
-        Self { _extent: extent, depth_view, normal_view, raw_ao_view, blur_ao_view, prepass_fb, ssao_fb, blur_fb }
-    }
+/// The per-frame uniforms both SSAO passes read. Allocated once and handed to
+/// each: the graph splits what used to be one `record` into three nodes, and the
+/// camera matrices should not be uploaded three times because of that.
+pub(super) struct SsaoUniforms {
+    frame: Subbuffer<FrameUbo>,
+    params: Subbuffer<SsaoParamsUbo>,
 }
 
 pub struct SsaoPass {
-    prepass_rp: Arc<RenderPass>,
-    ssao_rp: Arc<RenderPass>,
-    blur_rp: Arc<RenderPass>,
+    pub(super) prepass_rp: Arc<RenderPass>,
+    pub(super) ssao_rp: Arc<RenderPass>,
+    pub(super) blur_rp: Arc<RenderPass>,
     prepass_pipeline: Arc<GraphicsPipeline>,
     ssao_pipeline: Arc<GraphicsPipeline>,
     blur_pipeline: Arc<GraphicsPipeline>,
@@ -287,17 +229,18 @@ pub struct SsaoPass {
     nearest_repeat: Arc<Sampler>,
     noise_view: Arc<ImageView>,
     /// 1x1 white (=1.0) AO view bound when SSAO is disabled, so the forward
-    /// shader samples "no occlusion" without a separate code path.
+    /// shader samples "no occlusion" without a separate code path. Not a graph
+    /// resource: with SSAO off the graph has no AO node at all, so there is
+    /// nothing for the forward pass to declare a read of.
     white_view: Arc<ImageView>,
     kernel: [[f32; 4]; KERNEL_MAX],
-    targets: SsaoTargets,
     pub radius: f32,
     pub bias: f32,
     pub power: f32,
 }
 
 impl SsaoPass {
-    pub fn new(ctx: &VkContext, extent: [u32; 2]) -> Self {
+    pub fn new(ctx: &VkContext) -> Self {
         let device = &ctx.device;
         let prepass_rp = prepass_render_pass(device);
         let ssao_rp = ao_render_pass(device);
@@ -340,10 +283,6 @@ impl SsaoPass {
             }
         ).unwrap();
 
-        let targets = SsaoTargets::new(
-            &ctx.memory_allocator, &prepass_rp, &ssao_rp, &blur_rp, extent,
-        );
-
         Self {
             prepass_rp,
             ssao_rp,
@@ -357,21 +296,10 @@ impl SsaoPass {
             noise_view: build_noise(ctx),
             white_view: super::texture::upload_texture(ctx, &[255u8], [1, 1], AO_FORMAT),
             kernel: build_kernel(),
-            targets,
             radius: 1.0,
             bias: 0.025,
             power: 1.0,
         }
-    }
-
-    pub fn resize(&mut self, mem: &Arc<StandardMemoryAllocator>, extent: [u32; 2]) {
-        self.targets =
-            SsaoTargets::new(mem, &self.prepass_rp, &self.ssao_rp, &self.blur_rp, extent);
-    }
-
-    /// The blurred-AO view to bind into the forward pass this frame.
-    pub fn ao_view(&self) -> Arc<ImageView> {
-        self.targets.blur_ao_view.clone()
     }
 
     /// A 1x1 white (=1.0) view, bound when SSAO is disabled.
@@ -379,28 +307,19 @@ impl SsaoPass {
         self.white_view.clone()
     }
 
-    pub fn record(
-        &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        renderer: &VulkanRenderer,
-        items: &[RenderItem],
-        camera: &Camera,
-        extent: [u32; 2],
-        object_buffer: Subbuffer<[GpuObject]>,
-    ) {
+    pub(super) fn begin_frame(&self, camera: &Camera, extent: [u32; 2]) -> SsaoUniforms {
         let aspect = extent[0] as f32 / extent[1] as f32;
-        let view = camera.view();
         let proj = camera.projection(aspect);
 
-        let frame_buf = self.uniform_allocator.allocate_sized::<FrameUbo>().unwrap();
-        *frame_buf.write().unwrap() = FrameUbo {
-            view: view.to_cols_array_2d(),
+        let frame = self.uniform_allocator.allocate_sized::<FrameUbo>().unwrap();
+        *frame.write().unwrap() = FrameUbo {
+            view: camera.view().to_cols_array_2d(),
             proj: proj.to_cols_array_2d(),
             inv_proj: proj.inverse().to_cols_array_2d(),
         };
 
-        let params_buf = self.uniform_allocator.allocate_sized::<SsaoParamsUbo>().unwrap();
-        *params_buf.write().unwrap() = SsaoParamsUbo {
+        let params = self.uniform_allocator.allocate_sized::<SsaoParamsUbo>().unwrap();
+        *params.write().unwrap() = SsaoParamsUbo {
             kernel: self.kernel,
             noise_scale: [
                 extent[0] as f32 / NOISE_SIZE as f32,
@@ -413,24 +332,27 @@ impl SsaoPass {
             _pad: [0.0; 2],
         };
 
-        let viewport = Viewport {
-            offset: [0.0, 0.0],
-            extent: [extent[0] as f32, extent[1] as f32],
-            depth_range: 0.0..=1.0,
-        };
-        let set_vp = |b: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>| {
-            b.set_viewport(0, [viewport.clone()].into_iter().collect()).unwrap();
-        };
+        SsaoUniforms { frame, params }
+    }
 
-        let frame_set_prepass = DescriptorSet::new(
+    pub(super) fn record_prepass(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        renderer: &VulkanRenderer,
+        items: &[RenderItem],
+        extent: [u32; 2],
+        uniforms: &SsaoUniforms,
+        object_buffer: Subbuffer<[GpuObject]>,
+    ) {
+        let frame_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.prepass_pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::buffer(0, frame_buf.clone())],
+            [WriteDescriptorSet::buffer(0, uniforms.frame.clone())],
             [],
         )
             .unwrap();
 
-        let object_set_prepass = DescriptorSet::new(
+        let object_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.prepass_pipeline.layout().set_layouts()[1].clone(),
             [WriteDescriptorSet::buffer(0, object_buffer)],
@@ -438,16 +360,7 @@ impl SsaoPass {
         )
             .unwrap();
 
-        builder
-            .begin_render_pass(
-                RenderPassBeginInfo {
-                    clear_values: vec![Some([0.5, 0.5, 1.0, 0.0].into()), Some(1.0.into())],
-                    ..RenderPassBeginInfo::framebuffer(self.targets.prepass_fb.clone())
-                },
-                SubpassBeginInfo { contents: SubpassContents::Inline, ..Default::default() },
-            )
-            .unwrap();
-        set_vp(builder);
+        set_viewport(builder, extent);
         builder
             .bind_pipeline_graphics(self.prepass_pipeline.clone())
             .unwrap()
@@ -455,7 +368,7 @@ impl SsaoPass {
                 PipelineBindPoint::Graphics,
                 self.prepass_pipeline.layout().clone(),
                 0,
-                vec![frame_set_prepass, object_set_prepass],
+                vec![frame_set, object_set],
             )
             .unwrap();
 
@@ -479,40 +392,42 @@ impl SsaoPass {
                     .unwrap()
             };
         }
-        builder.end_render_pass(Default::default()).unwrap();
+    }
 
-        let ssao_uniforms = DescriptorSet::new(
+    /// `depth_view` and `normal_view` are the prepass's graph outputs, declared
+    /// as this pass's `Sampled` inputs.
+    pub(super) fn record_ao(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        renderer: &VulkanRenderer,
+        extent: [u32; 2],
+        uniforms: &SsaoUniforms,
+        depth_view: Arc<ImageView>,
+        normal_view: Arc<ImageView>,
+    ) {
+        let uniform_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.ssao_pipeline.layout().set_layouts()[0].clone(),
             [
-                WriteDescriptorSet::buffer(0, frame_buf),
-                WriteDescriptorSet::buffer(1, params_buf),
+                WriteDescriptorSet::buffer(0, uniforms.frame.clone()),
+                WriteDescriptorSet::buffer(1, uniforms.params.clone()),
             ],
             [],
         )
             .unwrap();
-        let ssao_textures = DescriptorSet::new(
+        let texture_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.ssao_pipeline.layout().set_layouts()[1].clone(),
             [
-                WriteDescriptorSet::image_view_sampler(0, self.targets.depth_view.clone(), self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, self.targets.normal_view.clone(), self.nearest_clamp.clone()),
+                WriteDescriptorSet::image_view_sampler(0, depth_view, self.nearest_clamp.clone()),
+                WriteDescriptorSet::image_view_sampler(1, normal_view, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view_sampler(2, self.noise_view.clone(), self.nearest_repeat.clone()),
             ],
             [],
         )
             .unwrap();
 
-        builder
-            .begin_render_pass(
-                RenderPassBeginInfo {
-                    clear_values: vec![Some([1.0, 0.0, 0.0, 0.0].into())],
-                    ..RenderPassBeginInfo::framebuffer(self.targets.ssao_fb.clone())
-                },
-                SubpassBeginInfo { contents: SubpassContents::Inline, ..Default::default() },
-            )
-            .unwrap();
-        set_vp(builder);
+        set_viewport(builder, extent);
         builder
             .bind_pipeline_graphics(self.ssao_pipeline.clone())
             .unwrap()
@@ -520,30 +435,28 @@ impl SsaoPass {
                 PipelineBindPoint::Graphics,
                 self.ssao_pipeline.layout().clone(),
                 0,
-                vec![ssao_uniforms, ssao_textures],
+                vec![uniform_set, texture_set],
             )
             .unwrap();
         unsafe { builder.draw(3, 1, 0, 0).unwrap() };
-        builder.end_render_pass(Default::default()).unwrap();
+    }
 
-        let blur_input = DescriptorSet::new(
+    pub(super) fn record_blur(
+        &self,
+        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        renderer: &VulkanRenderer,
+        extent: [u32; 2],
+        raw_ao_view: Arc<ImageView>,
+    ) {
+        let input = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.blur_pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::image_view_sampler(0, self.targets.raw_ao_view.clone(), self.nearest_clamp.clone())],
+            [WriteDescriptorSet::image_view_sampler(0, raw_ao_view, self.nearest_clamp.clone())],
             [],
         )
             .unwrap();
 
-        builder
-            .begin_render_pass(
-                RenderPassBeginInfo {
-                    clear_values: vec![Some([1.0, 0.0, 0.0, 0.0].into())],
-                    ..RenderPassBeginInfo::framebuffer(self.targets.blur_fb.clone())
-                },
-                SubpassBeginInfo { contents: SubpassContents::Inline, ..Default::default() },
-            )
-            .unwrap();
-        set_vp(builder);
+        set_viewport(builder, extent);
         builder
             .bind_pipeline_graphics(self.blur_pipeline.clone())
             .unwrap()
@@ -551,12 +464,25 @@ impl SsaoPass {
                 PipelineBindPoint::Graphics,
                 self.blur_pipeline.layout().clone(),
                 0,
-                vec![blur_input],
+                vec![input],
             )
             .unwrap();
         unsafe { builder.draw(3, 1, 0, 0).unwrap() };
-        builder.end_render_pass(Default::default()).unwrap();
     }
+}
+
+fn set_viewport(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    extent: [u32; 2],
+) {
+    let viewport = Viewport {
+        offset: [0.0, 0.0],
+        extent: [extent[0] as f32, extent[1] as f32],
+        depth_range: 0.0..=1.0,
+    };
+    builder
+        .set_viewport(0, [viewport].into_iter().collect())
+        .unwrap();
 }
 
 mod fullscreen_vs {

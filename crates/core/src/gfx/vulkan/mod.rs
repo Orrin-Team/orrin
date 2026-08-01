@@ -1,7 +1,9 @@
 mod context;
 mod forward;
+pub mod frame;
 mod hdr;
 mod line;
+mod resources;
 mod swapchain;
 mod texture;
 mod ssao;
@@ -10,7 +12,7 @@ mod timestamps;
 use std::sync::Arc;
 
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, RenderPassBeginInfo, SubpassBeginInfo,
+    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer, SubpassBeginInfo,
     SubpassContents,
 };
 use vulkano::descriptor_set::DescriptorSet;
@@ -30,10 +32,14 @@ use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, Ssa
 
 use self::context::VkContext;
 use self::forward::{ForwardPass, GpuMesh, GpuMaterial};
+use crate::gfx::graph::PassKind;
+
+use self::frame::{Frame, FrameConfig, PassBody};
 use self::line::LinePass;
+use self::resources::{begin_info, GraphImages, PassFramebuffers};
 use self::swapchain::SwapchainState;
 use self::ssao::SsaoPass;
-use self::hdr::{HdrPass, HDR_FORMAT};
+use self::hdr::HdrPass;
 use self::timestamps::GpuTimestamps;
 
 use crate::profile::Profiler;
@@ -42,6 +48,11 @@ use crate::scene::DebugLine;
 use super::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle, MAX_TEXTURES};
 
 type FrameFuture = FenceSignalFuture<Box<dyn GpuFuture>>;
+
+/// MSAA sample count for the forward pass. One definition, because the forward
+/// pipeline, its render pass attachments, and the graph's declaration of the
+/// MSAA targets all have to agree or framebuffer creation fails at startup.
+pub(crate) const MSAA_SAMPLES: vulkano::image::SampleCount = vulkano::image::SampleCount::Sample4;
 
 /// A hook that draws over the final swapchain image between the tonemap pass and
 /// present (the editor UI). Given the future to wait on and that image's view, it
@@ -73,15 +84,22 @@ pub struct VulkanRenderer {
     pending_extent: [u32; 2],
     /// Per-pass GPU timing; `None` if the device lacks timestamp support.
     timestamps: Option<GpuTimestamps>,
+    /// The structure this frame's graph was compiled for. A frame whose config
+    /// still matches reuses the compiled graph — recompiling is for a change of
+    /// *shape* (SSAO on or off, overlay or not), never for a change of contents.
+    config: FrameConfig,
+    frame: Frame,
+    images: GraphImages,
+    framebuffers: PassFramebuffers,
 }
 
 impl VulkanRenderer {
     pub fn new(instance: &Arc<Instance>, surface: Arc<Surface>, extent: [u32; 2]) -> Self {
         let ctx = VkContext::new(instance, &surface);
         let format = swapchain_color_format(&ctx, &surface);
-        let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, HDR_FORMAT);
-        let hdr = HdrPass::new(&ctx, &forward.render_pass, format, extent);
-        let ssao = SsaoPass::new(&ctx, extent);
+        let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, hdr::HDR_FORMAT);
+        let hdr = HdrPass::new(&ctx, format);
+        let ssao = SsaoPass::new(&ctx);
         let line = LinePass::new(&ctx.device, &ctx.memory_allocator, &forward.render_pass);
         let swapchain = SwapchainState::new(&ctx, &surface, &hdr.tonemap_rp, format, extent);
         let timestamps = GpuTimestamps::new(&ctx);
@@ -92,6 +110,17 @@ impl VulkanRenderer {
             texture::upload_texture(&ctx, &[255, 255, 255, 255], [1, 1], Format::R8G8B8A8_UNORM),
             texture::upload_texture(&ctx, &[128, 128, 255, 255], [1, 1], Format::R8G8B8A8_UNORM),
         ];
+
+        // Compiled for the editor's frame, which is what all but the headless
+        // path uses; anything else recompiles on its first render.
+        let config = FrameConfig {
+            color_format: format,
+            ssao: true,
+            overlay: true,
+        };
+        let frame = frame::declare(config).expect("the engine's frame must compile");
+        let images = GraphImages::allocate(&ctx.memory_allocator, &frame.graph, extent);
+        let framebuffers = PassFramebuffers::build(&frame, &images, &forward, &ssao);
 
         Self {
             ctx,
@@ -109,7 +138,43 @@ impl VulkanRenderer {
             recreate_swapchain: false,
             pending_extent: extent,
             timestamps,
+            config,
+            frame,
+            images,
+            framebuffers,
         }
+    }
+
+    /// Recompile the graph if the frame's structure changed, then (re)allocate
+    /// what it owns. Also the resize path: a new extent keeps the graph and
+    /// replaces only the images it sized against the old one.
+    fn ensure_graph(&mut self, config: FrameConfig) {
+        if self.config != config {
+            self.frame = frame::declare(config).expect("the engine's frame must compile");
+            self.config = config;
+        } else if !self.images.is_stale(self.swapchain.extent) {
+            return;
+        }
+        self.reallocate();
+    }
+
+    fn new_command_buffer(&self) -> AutoCommandBufferBuilder<PrimaryAutoCommandBuffer> {
+        AutoCommandBufferBuilder::primary(
+            self.ctx.command_buffer_allocator.clone(),
+            self.ctx.queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap()
+    }
+
+    fn reallocate(&mut self) {
+        self.images = GraphImages::allocate(
+            &self.ctx.memory_allocator,
+            &self.frame.graph,
+            self.swapchain.extent,
+        );
+        self.framebuffers =
+            PassFramebuffers::build(&self.frame, &self.images, &self.forward, &self.ssao);
     }
 }
 
@@ -261,21 +326,21 @@ impl VulkanRenderer {
         }
 
         if self.recreate_swapchain {
-            if self.swapchain.recreate(
-                &self.hdr.tonemap_rp,
-                self.pending_extent,
-            ) {
-                self.hdr.resize(
-                    &self.ctx.memory_allocator,
-                    &self.forward.render_pass,
-                    self.pending_extent,
-                );
-                self.ssao.resize(&self.ctx.memory_allocator, self.pending_extent);
+            if self.swapchain.recreate(&self.hdr.tonemap_rp, self.pending_extent) {
                 self.recreate_swapchain = false;
             } else {
                 return;
             }
         }
+
+        // The frame's structure, and the only thing that recompiles the graph.
+        // Everything else about this call — how many objects, which camera, what
+        // exposure — flows through the same compiled schedule.
+        self.ensure_graph(FrameConfig {
+            color_format: self.swapchain.swapchain.image_format(),
+            ssao: ssao.enabled,
+            overlay: overlay.is_some(),
+        });
 
         // Split out because under Fifo this blocks until the presentation engine
         // hands back an image — a vsync wait, not work. Folded into a single
@@ -313,12 +378,7 @@ impl VulkanRenderer {
         };
 
         let recording = crate::profile::scope("record");
-        let mut builder = AutoCommandBufferBuilder::primary(
-            self.ctx.command_buffer_allocator.clone(),
-            self.ctx.queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
+        let mut builder = self.new_command_buffer();
 
         // Resets are illegal inside a render pass, so they and the reserved
         // whole-frame pair go here, ahead of every pass below.
@@ -349,92 +409,115 @@ impl VulkanRenderer {
         // per-object inverse-transpose is too expensive to compute twice.
         let object_buffer = self.forward.upload_objects(items);
 
-        let ao_view = if ssao.enabled {
-            let pass = timestamps
-                .as_mut()
-                .and_then(|timestamps| timestamps.begin_pass(&mut builder, "ssao"));
-            self.ssao.record(
-                &mut builder,
-                self,
-                items,
-                camera,
-                self.swapchain.extent,
-                object_buffer.clone(),
-            );
-            if let Some(timestamps) = timestamps.as_mut() {
-                timestamps.end_pass(&mut builder, pass);
-            }
-            self.ssao.ao_view()
-        } else {
-            self.ssao.white_view()
+        // Uploaded once even though two graph nodes read it — which is what the
+        // shared `object_transforms` declaration in `frame::declare` records.
+        let ssao_uniforms = self
+            .frame
+            .ids
+            .ssao
+            .map(|_| self.ssao.begin_frame(camera, self.swapchain.extent));
+
+        // With SSAO off the graph has no AO node, so the forward pass samples a
+        // 1x1 white view instead: "no occlusion" with no second shader path.
+        let ao_view = match self.frame.ids.ssao {
+            Some(ids) => self.images.view(ids.ao),
+            None => self.ssao.white_view(),
         };
 
-        let forward_pass = timestamps
-            .as_mut()
-            .and_then(|timestamps| timestamps.begin_pass(&mut builder, "forward"));
-        builder
-            .begin_render_pass(
-                RenderPassBeginInfo {
-                    clear_values: vec![
-                        Some([0.02, 0.02, 0.03, 1.0].into()),
-                        Some(1.0.into()),
-                        None,
-                    ],
-                    ..RenderPassBeginInfo::framebuffer(self.hdr.forward_framebuffer())
-                },
-                SubpassBeginInfo {
-                    contents: SubpassContents::Inline,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        // The whole frame, in the order the compiler derived. Nothing below
+        // decides what runs next, what an image's layout is, or what has to
+        // finish before what — a pass that needs a different place in the frame
+        // gets there by changing its declarations, not by being moved here.
+        let extent = self.swapchain.extent;
+        let mut raw_passes = Vec::new();
+        for pass_id in self.frame.graph.order().to_vec() {
+            let body = self.frame.bodies[pass_id.index()];
 
-        self.forward.draw(
-            &mut builder,
-            self,
-            items,
-            lighting,
-            camera,
-            self.swapchain.extent,
-            ao_view,
-            material_set,
-            texture_set,
-            object_buffer,
-        );
+            if self.frame.graph.pass_kind(pass_id) == PassKind::Raw {
+                // Escape-hatch passes own their submission, so they run on the
+                // future after this command buffer rather than inside it.
+                // `compile` has already established that none of them precedes
+                // an inline pass.
+                raw_passes.push(body);
+                continue;
+            }
 
-        // Debug lines share the forward subpass: depth-tested against the scene,
-        // drawn on top of it, before the pass ends.
-        self.line
-            .record(&mut builder, debug_lines, camera, self.swapchain.extent);
+            let timed = timestamps.as_mut().and_then(|timestamps| {
+                timestamps.begin_pass(&mut builder, self.frame.graph.pass_name(pass_id))
+            });
 
-        builder.end_render_pass(Default::default()).unwrap();
-        if let Some(timestamps) = timestamps.as_mut() {
-            timestamps.end_pass(&mut builder, forward_pass);
+            let framebuffer = self
+                .framebuffers
+                .get(pass_id.index())
+                .unwrap_or_else(|| self.swapchain.framebuffers[image_index as usize].clone());
+            builder
+                .begin_render_pass(
+                    begin_info(framebuffer, body),
+                    SubpassBeginInfo {
+                        contents: SubpassContents::Inline,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            match body {
+                PassBody::SsaoPrepass => self.ssao.record_prepass(
+                    &mut builder,
+                    self,
+                    items,
+                    extent,
+                    ssao_uniforms.as_ref().unwrap(),
+                    object_buffer.clone(),
+                ),
+                PassBody::SsaoResolve => {
+                    let ids = self.frame.ids.ssao.unwrap();
+                    self.ssao.record_ao(
+                        &mut builder,
+                        self,
+                        extent,
+                        ssao_uniforms.as_ref().unwrap(),
+                        self.images.view(ids.depth),
+                        self.images.view(ids.normal),
+                    );
+                }
+                PassBody::SsaoBlur => {
+                    let ids = self.frame.ids.ssao.unwrap();
+                    self.ssao
+                        .record_blur(&mut builder, self, extent, self.images.view(ids.raw_ao));
+                }
+                PassBody::Forward => {
+                    self.forward.draw(
+                        &mut builder,
+                        self,
+                        items,
+                        lighting,
+                        camera,
+                        extent,
+                        ao_view.clone(),
+                        material_set.clone(),
+                        texture_set.clone(),
+                        object_buffer.clone(),
+                    );
+                    // Debug lines share the forward subpass: depth-tested against
+                    // the scene, drawn on top of it, before the pass ends.
+                    self.line.record(&mut builder, debug_lines, camera, extent);
+                }
+                PassBody::Tonemap => self.hdr.record_tonemap(
+                    &mut builder,
+                    &self.ctx,
+                    extent,
+                    self.images.view(self.frame.ids.hdr_color),
+                ),
+                PassBody::Overlay => unreachable!("handled above"),
+            }
+
+            builder.end_render_pass(Default::default()).unwrap();
+            if let Some(timestamps) = timestamps.as_mut() {
+                timestamps.end_pass(&mut builder, timed);
+            }
         }
 
-        let tonemap_pass = timestamps
-            .as_mut()
-            .and_then(|timestamps| timestamps.begin_pass(&mut builder, "tonemap"));
-        builder
-            .begin_render_pass(
-                RenderPassBeginInfo {
-                    clear_values: vec![None],
-                    ..RenderPassBeginInfo::framebuffer(
-                        self.swapchain.framebuffers[image_index as usize].clone(),
-                    )
-                },
-                SubpassBeginInfo {
-                    contents: SubpassContents::Inline,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        self.hdr
-            .record_tonemap(&mut builder, &self.ctx, self.swapchain.extent);
-        builder.end_render_pass(Default::default()).unwrap();
-
         if let Some(timestamps) = timestamps.as_mut() {
-            timestamps.end_pass(&mut builder, tonemap_pass);
             timestamps.end_frame(&mut builder);
         }
         if timestamps.is_some() {
@@ -448,7 +531,7 @@ impl VulkanRenderer {
             prev.cleanup_finished();
         }
 
-        let after_scene = self
+        let mut future = self
             .previous_frame_end
             .take()
             .map(|f| f.boxed())
@@ -458,18 +541,23 @@ impl VulkanRenderer {
             .unwrap()
             .boxed();
 
-        // Let the overlay (editor UI) draw onto the same swapchain image before
-        // present. Without one, present the tonemapped scene directly.
-        let before_present = match overlay {
-            Some(draw) => {
-                profile_scope!("overlay");
-                draw(
-                    after_scene,
-                    self.swapchain.image_views[image_index as usize].clone(),
-                )
+        let mut overlay = overlay;
+        for body in raw_passes {
+            match body {
+                PassBody::Overlay => {
+                    profile_scope!("overlay");
+                    let draw = overlay
+                        .take()
+                        .expect("the graph scheduled an overlay pass but none was supplied");
+                    future = draw(
+                        future,
+                        self.swapchain.image_views[image_index as usize].clone(),
+                    );
+                }
+                other => unreachable!("{other:?} is not a raw pass"),
             }
-            None => after_scene,
-        };
+        }
+        let before_present = future;
 
         let submitting = crate::profile::scope("submit");
         let future = before_present
