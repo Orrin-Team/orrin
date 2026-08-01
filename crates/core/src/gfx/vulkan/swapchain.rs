@@ -15,7 +15,7 @@ pub const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
 /// - `Immediate`: uncapped, may tear (not always supported).
 ///
 /// Falls back to `Fifo` automatically if the surface doesn't support the choice.
-pub const PRESENT_MODE: PresentMode = PresentMode::Immediate;
+pub const PRESENT_MODE: PresentMode = PresentMode::Fifo;
 
 pub struct SwapchainState {
     pub swapchain: Arc<Swapchain>,

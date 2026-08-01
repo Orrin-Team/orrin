@@ -66,6 +66,7 @@ impl VkContext {
                 enabled_extensions: device_extensions,
                 enabled_features: DeviceFeatures {
                     image_view_format_swizzle: swizzle,
+                    sampler_anisotropy: true,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()
