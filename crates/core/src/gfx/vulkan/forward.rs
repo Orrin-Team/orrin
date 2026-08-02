@@ -10,6 +10,7 @@ use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
@@ -17,7 +18,6 @@ use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
 use vulkano::pipeline::graphics::vertex_input::{Vertex as _, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
@@ -26,12 +26,12 @@ use vulkano::pipeline::{
 use vulkano::render_pass::{RenderPass, Subpass};
 
 use crate::geom::Aabb;
-use crate::gfx::{Material, RenderItem, SceneLighting, Vertex, MAX_POINT_LIGHTS, MAX_TEXTURES};
+use crate::gfx::{MAX_POINT_LIGHTS, MAX_TEXTURES, Material, RenderItem, SceneLighting, Vertex};
 use crate::scene::Camera;
 
+use super::VulkanRenderer;
 use super::context::VkContext;
 use super::swapchain::DEPTH_FORMAT;
-use super::VulkanRenderer;
 
 pub struct GpuMesh {
     pub vertex_buffer: Subbuffer<[Vertex]>,
@@ -240,9 +240,22 @@ impl ForwardPass {
             },
         );
 
+        // Material textures are the only ones with a mip chain to sample; the
+        // AO and tonemap inputs are screen-space targets read at 1:1.
+        let anisotropy = device.enabled_features().sampler_anisotropy.then(|| {
+            device
+                .physical_device()
+                .properties()
+                .max_sampler_anisotropy
+                .min(16.0)
+        });
+
         let sampler = Sampler::new(
             device.clone(),
-            SamplerCreateInfo::simple_repeat_linear_no_mipmap(),
+            SamplerCreateInfo {
+                anisotropy,
+                ..SamplerCreateInfo::simple_repeat_linear()
+            },
         )
         .unwrap();
 
@@ -252,7 +265,8 @@ impl ForwardPass {
                 address_mode: [SamplerAddressMode::ClampToEdge; 3],
                 ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         Self {
             render_pass,
@@ -260,7 +274,7 @@ impl ForwardPass {
             uniform_buffer_allocator,
             object_buffer_allocator,
             sampler,
-            ao_sampler
+            ao_sampler,
         }
     }
 
@@ -303,8 +317,12 @@ impl ForwardPass {
         textures: &[Arc<ImageView>],
     ) -> Arc<DescriptorSet> {
         let default_view = textures[0].clone();
-        let texture_array =
-            (0..MAX_TEXTURES).map(|i| textures.get(i).cloned().unwrap_or_else(|| default_view.clone()));
+        let texture_array = (0..MAX_TEXTURES).map(|i| {
+            textures
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| default_view.clone())
+        });
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
             self.pipeline.layout().set_layouts()[2].clone(),
@@ -344,9 +362,7 @@ impl ForwardPass {
 
     pub fn draw(
         &self,
-        builder: &mut AutoCommandBufferBuilder<
-            vulkano::command_buffer::PrimaryAutoCommandBuffer,
-        >,
+        builder: &mut AutoCommandBufferBuilder<vulkano::command_buffer::PrimaryAutoCommandBuffer>,
         renderer: &VulkanRenderer,
         items: &[RenderItem],
         lighting: &SceneLighting,
@@ -377,9 +393,14 @@ impl ForwardPass {
         let ao_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.pipeline.layout().set_layouts()[3].clone(),
-            [WriteDescriptorSet::image_view_sampler(0, ao_view, self.ao_sampler.clone())],
+            [WriteDescriptorSet::image_view_sampler(
+                0,
+                ao_view,
+                self.ao_sampler.clone(),
+            )],
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         let object_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
@@ -631,7 +652,10 @@ mod tests {
             assert_eq!(pair[0].1, pair[1].0, "runs must be contiguous: {ranges:?}");
         }
         assert!(ranges.iter().all(|(start, end)| end > start));
-        assert_eq!(ranges.iter().map(|(s, e)| e - s).sum::<usize>(), items.len());
+        assert_eq!(
+            ranges.iter().map(|(s, e)| e - s).sum::<usize>(),
+            items.len()
+        );
     }
 
     /// Same mesh but a different material can't share an instanced draw: the

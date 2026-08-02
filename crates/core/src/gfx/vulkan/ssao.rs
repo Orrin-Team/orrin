@@ -27,6 +27,7 @@ use vulkano::shader::EntryPoint;
 use crate::gfx::{RenderItem, Vertex};
 use crate::scene::Camera;
 use super::context::VkContext;
+use super::texture::MipPolicy;
 use super::swapchain::DEPTH_FORMAT;
 use super::forward::GpuObject;
 use super::VulkanRenderer;
@@ -101,7 +102,13 @@ fn build_noise(ctx: &VkContext) -> Arc<ImageView> {
             255,
         ]);
     }
-    super::texture::upload_texture(ctx, &pixels, [NOISE_SIZE, NOISE_SIZE], NORMAL_FORMAT)
+    super::texture::upload_texture(
+        ctx,
+        &pixels,
+        [NOISE_SIZE, NOISE_SIZE],
+        NORMAL_FORMAT,
+        MipPolicy::None,
+    )
 }
 
 fn prepass_render_pass(device: &Arc<Device>) -> Arc<RenderPass> {
@@ -294,7 +301,13 @@ impl SsaoPass {
             nearest_clamp,
             nearest_repeat,
             noise_view: build_noise(ctx),
-            white_view: super::texture::upload_texture(ctx, &[255u8], [1, 1], AO_FORMAT),
+            white_view: super::texture::upload_texture(
+                ctx,
+                &[255u8],
+                [1, 1],
+                AO_FORMAT,
+                MipPolicy::None,
+            ),
             kernel: build_kernel(),
             radius: 1.0,
             bias: 0.025,

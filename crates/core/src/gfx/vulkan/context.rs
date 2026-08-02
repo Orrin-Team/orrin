@@ -45,6 +45,9 @@ impl VkContext {
         let swizzle = physical_device
             .supported_features()
             .image_view_format_swizzle;
+
+        let anisotropy = physical_device.supported_features().sampler_anisotropy;
+
         if physical_device.supported_extensions().khr_portability_subset {
             device_extensions.khr_portability_subset = true;
         }
@@ -66,7 +69,7 @@ impl VkContext {
                 enabled_extensions: device_extensions,
                 enabled_features: DeviceFeatures {
                     image_view_format_swizzle: swizzle,
-                    sampler_anisotropy: true,
+                    sampler_anisotropy: anisotropy,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()

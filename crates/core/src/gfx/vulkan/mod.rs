@@ -107,8 +107,20 @@ impl VulkanRenderer {
         // Default textures so every material slot resolves to a valid view:
         // index 0 = white (a no-op multiply), index 1 = flat normal (0,0,1).
         let textures = vec![
-            texture::upload_texture(&ctx, &[255, 255, 255, 255], [1, 1], Format::R8G8B8A8_UNORM),
-            texture::upload_texture(&ctx, &[128, 128, 255, 255], [1, 1], Format::R8G8B8A8_UNORM),
+            texture::upload_texture(
+                &ctx,
+                &[255, 255, 255, 255],
+                [1, 1],
+                Format::R8G8B8A8_UNORM,
+                texture::MipPolicy::None,
+            ),
+            texture::upload_texture(
+                &ctx,
+                &[128, 128, 255, 255],
+                [1, 1],
+                Format::R8G8B8A8_UNORM,
+                texture::MipPolicy::None,
+            ),
         ];
 
         // Compiled for the editor's frame, which is what all but the headless
@@ -223,7 +235,13 @@ impl RenderBackend for VulkanRenderer {
         } else {
             Format::R8G8B8A8_UNORM
         };
-        let view = texture::upload_texture(&self.ctx, pixels, [width, height], format);
+        let view = texture::upload_texture(
+            &self.ctx,
+            pixels,
+            [width, height],
+            format,
+            texture::MipPolicy::Generate,
+        );
         let handle = TextureHandle(self.textures.len() as u32);
         self.textures.push(view);
         self.texture_set = None;
