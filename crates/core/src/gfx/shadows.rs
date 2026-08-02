@@ -8,34 +8,36 @@ pub const OVERLAP: f32 = 0.005;
 /// Vulkan NDC: x,y in [-1,1], z in [0,1]. First four are the near plane.
 const NDC_CORNERS: [Vec3; 8] = [
     Vec3::new(-1.0, -1.0, 0.0),
-    Vec3::new( 1.0, -1.0, 0.0),
-    Vec3::new(-1.0,  1.0, 0.0),
-    Vec3::new( 1.0,  1.0, 0.0),
+    Vec3::new(1.0, -1.0, 0.0),
+    Vec3::new(-1.0, 1.0, 0.0),
+    Vec3::new(1.0, 1.0, 0.0),
     Vec3::new(-1.0, -1.0, 1.0),
-    Vec3::new( 1.0, -1.0, 1.0),
-    Vec3::new(-1.0,  1.0, 1.0),
-    Vec3::new( 1.0,  1.0, 1.0),
+    Vec3::new(1.0, -1.0, 1.0),
+    Vec3::new(-1.0, 1.0, 1.0),
+    Vec3::new(1.0, 1.0, 1.0),
 ];
 
-pub struct CascadeConfig { 
-    pub count: usize, 
-    pub max_distance: f32, 
-    pub lambda: f32, 
+pub struct CascadeConfig {
+    pub count: usize,
+    pub max_distance: f32,
+    pub lambda: f32,
     pub resolution: u32,
     pub pullback: f32,
 }
 
 #[derive(Clone, Copy, Default)]
 pub struct Cascade {
-    pub view_proj: Mat4,      // render + sample
-    pub light_view: Mat4,     // cull: world -> light space
-    pub half_extent: f32,     // the snapped sphere radius, r
-    pub depth_range: f32,     // 0 .. 2r + pullback
+    pub view_proj: Mat4,  // render + sample
+    pub light_view: Mat4, // cull: world -> light space
+    pub half_extent: f32, // the snapped sphere radius, r
+    pub depth_range: f32, // 0 .. 2r + pullback
     pub split_distance: f32,
     pub texel_world_size: f32,
 }
 
-#[derive(Clone, Copy)]
+/// A `count` of zero means shadows are off — every other field is then inert,
+/// which is what `Default` produces.
+#[derive(Clone, Copy, Default)]
 pub struct CascadeSet {
     pub cascades: [Cascade; MAX_CASCADES],
     pub splits: [f32; MAX_CASCADES],
@@ -84,7 +86,10 @@ pub fn fit_cascade(
     config: &CascadeConfig,
 ) -> Cascade {
     let center = corners.iter().sum::<Vec3>() / 8.0;
-    let mut radius = corners.iter().map(|c| (*c - center).length()).fold(0.0f32, f32::max);
+    let mut radius = corners
+        .iter()
+        .map(|c| (*c - center).length())
+        .fold(0.0f32, f32::max);
     radius = (radius * 16.0).ceil() / 16.0; // Quantising the radius because of float noise
 
     // Unit length is load-bearing, not cosmetic: `eye` below is placed by
@@ -92,7 +97,11 @@ pub fn fit_cascade(
     // clips the far corners out of the map with no error anywhere.
     let light_dir = light_dir.normalize();
 
-    let up = if light_dir.dot(Vec3::Y).abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let up = if light_dir.dot(Vec3::Y).abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
     let rot = Mat4::look_at_rh(Vec3::ZERO, light_dir, up); // Rotation only, eye at origin
 
     let texel = 2.0 * radius / config.resolution as f32;
@@ -104,24 +113,36 @@ pub fn fit_cascade(
     let eye = snapped_center - light_dir * (radius + config.pullback);
     let light_view = Mat4::look_at_rh(eye, snapped_center, up);
 
-    let mut ortho = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.0, 2.0*radius + config.pullback);
+    let mut ortho = Mat4::orthographic_rh(
+        -radius,
+        radius,
+        -radius,
+        radius,
+        0.0,
+        2.0 * radius + config.pullback,
+    );
     ortho.y_axis.y *= -1.0;
 
     let view_proj = ortho * light_view;
     let half_extent = radius;
-    let depth_range = 2.0*radius + config.pullback;
-    
-    Cascade { 
-        view_proj, 
-        light_view, 
+    let depth_range = 2.0 * radius + config.pullback;
+
+    Cascade {
+        view_proj,
+        light_view,
         half_extent,
         depth_range,
         split_distance,
-        texel_world_size: texel 
+        texel_world_size: texel,
     }
 }
 
-pub fn cascades(camera: &Camera, aspect: f32, light_dir: Vec3, config: &CascadeConfig) -> CascadeSet {
+pub fn cascades(
+    camera: &Camera,
+    aspect: f32,
+    light_dir: Vec3,
+    config: &CascadeConfig,
+) -> CascadeSet {
     let count = config.count.clamp(1, MAX_CASCADES);
     // Unit length is not cosmetic here: `fit_cascade` scales the near-plane
     // pullback by this vector, so an inspector sun of (0,-2,0) would silently
@@ -132,12 +153,20 @@ pub fn cascades(camera: &Camera, aspect: f32, light_dir: Vec3, config: &CascadeC
 
     let mut cascades = [Cascade::default(); MAX_CASCADES];
     for i in 0..count {
-        let near = if i == 0 { camera.near } else { splits[i - 1] * (1.0 - OVERLAP) };
+        let near = if i == 0 {
+            camera.near
+        } else {
+            splits[i - 1] * (1.0 - OVERLAP)
+        };
         let corners = sub_frustum_corners(camera, aspect, near, splits[i]);
         cascades[i] = fit_cascade(&corners, light_dir, splits[i], config);
     }
 
-    CascadeSet { cascades, splits, count }
+    CascadeSet {
+        cascades,
+        splits,
+        count,
+    }
 }
 
 #[cfg(test)]
@@ -264,7 +293,10 @@ mod tests {
     /// comparison and index a cascade with no matrix behind it.
     #[test]
     fn unused_slots_hold_the_far_distance() {
-        let config = CascadeConfig { count: 2, ..config() };
+        let config = CascadeConfig {
+            count: 2,
+            ..config()
+        };
         let splits = split_distances(0.1, &config);
         for &split in &splits[config.count..] {
             assert_eq!(split, config.max_distance);
@@ -276,11 +308,41 @@ mod tests {
     #[test]
     fn degenerate_configs_stay_finite() {
         let cases = [
-            ("zero cascades", CascadeConfig { count: 0, ..config() }),
-            ("too many cascades", CascadeConfig { count: 99, ..config() }),
-            ("negative lambda", CascadeConfig { lambda: -5.0, ..config() }),
-            ("lambda past one", CascadeConfig { lambda: 7.0, ..config() }),
-            ("max distance below near", CascadeConfig { max_distance: 0.05, ..config() }),
+            (
+                "zero cascades",
+                CascadeConfig {
+                    count: 0,
+                    ..config()
+                },
+            ),
+            (
+                "too many cascades",
+                CascadeConfig {
+                    count: 99,
+                    ..config()
+                },
+            ),
+            (
+                "negative lambda",
+                CascadeConfig {
+                    lambda: -5.0,
+                    ..config()
+                },
+            ),
+            (
+                "lambda past one",
+                CascadeConfig {
+                    lambda: 7.0,
+                    ..config()
+                },
+            ),
+            (
+                "max distance below near",
+                CascadeConfig {
+                    max_distance: 0.05,
+                    ..config()
+                },
+            ),
         ];
         for (label, config) in cases {
             for (i, split) in split_distances(0.1, &config).iter().enumerate() {
@@ -334,10 +396,7 @@ mod tests {
             let corners = sub_frustum_corners(&camera, aspect, 5.0, 25.0);
             // Measure in view space, where x is horizontal by construction.
             let view = camera.view();
-            let local: Vec<Vec3> = corners
-                .iter()
-                .map(|c| view.transform_point3(*c))
-                .collect();
+            let local: Vec<Vec3> = corners.iter().map(|c| view.transform_point3(*c)).collect();
             let x = local.iter().map(|p| p.x.abs()).fold(0.0f32, f32::max);
             let y = local.iter().map(|p| p.y.abs()).fold(0.0f32, f32::max);
             (x, y)
@@ -535,7 +594,11 @@ mod tests {
         let set = cascades(&camera, ASPECT, sun(), &config);
         let slack = 2.0 / config.resolution as f32;
         for i in 0..set.count {
-            let near = if i == 0 { camera.near } else { set.splits[i - 1] };
+            let near = if i == 0 {
+                camera.near
+            } else {
+                set.splits[i - 1]
+            };
             for corner in sub_frustum_corners(&camera, ASPECT, near, set.splits[i]) {
                 let ndc = set.cascades[i].view_proj.project_point3(corner);
                 assert!(inside_ndc(ndc, slack), "cascade {i}: {corner} -> {ndc}");

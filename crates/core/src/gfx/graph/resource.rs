@@ -38,6 +38,18 @@ pub struct ImageDesc {
     pub format: Format,
     pub extent: Extent,
     pub samples: SampleCount,
+    /// `Some(n)` makes this a 2D *array* image of `n` layers — how a set of
+    /// same-sized targets, the shadow cascades, becomes one resource and
+    /// therefore one descriptor binding. The graph tracks state per resource,
+    /// not per layer, so passes writing different layers are still ordered
+    /// against each other.
+    ///
+    /// An `Option` rather than a count defaulting to 1 because "array of one"
+    /// and "not an array" are different images to a shader: the sampler type is
+    /// baked into the pipeline, so a one-cascade frame still has to present a
+    /// `texture2DArray`. Deriving the view type from the layer count instead
+    /// silently produces a plain 2D view whenever the count happens to be one.
+    pub array_layers: Option<u32>,
 }
 
 impl ImageDesc {
@@ -46,11 +58,25 @@ impl ImageDesc {
             format,
             extent: Extent::Frame,
             samples: SampleCount::Sample1,
+            array_layers: None,
         }
     }
 
     pub fn samples(mut self, samples: SampleCount) -> Self {
         self.samples = samples;
+        self
+    }
+
+    /// Size this image independently of the frame's extent, so a swapchain
+    /// resize leaves it alone.
+    pub fn extent(mut self, extent: Extent) -> Self {
+        self.extent = extent;
+        self
+    }
+
+    /// Make this a 2D array image of `layers` layers, even when `layers` is 1.
+    pub fn array_layers(mut self, layers: u32) -> Self {
+        self.array_layers = Some(layers);
         self
     }
 }

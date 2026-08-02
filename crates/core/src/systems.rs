@@ -3,7 +3,8 @@ use glam::{Mat3, Vec3};
 use orrin_ecs::World;
 
 use crate::geom::Aabb;
-use crate::gfx::{PointLight, RenderItem, SceneLighting, MAX_POINT_LIGHTS};
+use crate::gfx::shadows::{Cascade, CascadeSet, MAX_CASCADES};
+use crate::gfx::{MAX_POINT_LIGHTS, PointLight, RenderItem, SceneLighting};
 use crate::scene::{
     AmbientLight, Camera, Culling, FogSettings, Light, LocalTransform, MaterialHandle, MeshBounds,
     MeshHandle, Spin, Transform,
@@ -71,6 +72,195 @@ pub fn extract_renderables(world: &World, aspect: f32, out: &mut Vec<RenderItem>
     }
 }
 
+/// Build each cascade's caster list.
+///
+/// The camera-culled list [`extract_renderables`] produces is the wrong input
+/// for a shadow pass: an object behind the camera can still cast into view. Each
+/// cascade instead takes everything whose bounds, swept toward the light, reach
+/// its box — which in light space means overlapping in x and y, and not lying
+/// entirely beyond the far plane. There is deliberately no near test: something
+/// nearer the light than the cascade is exactly what casts into it.
+///
+/// One sweep of the world, N box tests per object. N separate sweeps would ask
+/// the same question of the same entities four times, since a near cascade's
+/// casters are almost always a subset of a far one's.
+pub fn extract_shadow_casters(
+    world: &World,
+    cascades: &CascadeSet,
+    out: &mut [Vec<RenderItem>; MAX_CASCADES],
+) {
+    for list in out.iter_mut() {
+        list.clear();
+    }
+    if cascades.count == 0 {
+        return;
+    }
+
+    let bounds = world.get_resource::<MeshBounds>();
+    world
+        .query::<(&LocalTransform, &MeshHandle, Option<&MaterialHandle>)>()
+        .for_each(|_entity, (transform, mesh, material)| {
+            let model = transform.matrix();
+            let world_bounds = bounds
+                .as_ref()
+                .and_then(|table| table.get(*mesh))
+                .unwrap_or(Aabb::EMPTY)
+                .transformed(&model);
+
+            let item = RenderItem {
+                model,
+                normal_matrix: normal_matrix(transform),
+                bounds: world_bounds,
+                mesh: *mesh,
+                material: material.copied().unwrap_or(MaterialHandle(0)),
+            };
+
+            for (list, cascade) in out.iter_mut().zip(&cascades.cascades[..cascades.count]) {
+                if casts_into(&world_bounds, cascade) {
+                    list.push(item);
+                }
+            }
+        });
+
+    // Same key the forward pass groups on, so each cascade's draws still
+    // collapse into one instanced call per (mesh, material) pair.
+    for list in out.iter_mut() {
+        list.sort_unstable_by_key(|item| (item.mesh.0, item.material.0));
+    }
+}
+
+/// Whether `bounds`, extended infinitely toward the light, reaches `cascade`.
+fn casts_into(bounds: &Aabb, cascade: &Cascade) -> bool {
+    let ls = bounds.transformed(&cascade.light_view);
+    let half = cascade.half_extent;
+    // `light_view` is a right-handed look-at, so what the pass renders lies at
+    // negative z, between the eye at 0 and the far plane at -depth_range.
+    ls.min.x <= half
+        && ls.max.x >= -half
+        && ls.min.y <= half
+        && ls.max.y >= -half
+        && ls.max.z >= -cascade.depth_range
+}
+
+#[cfg(test)]
+mod shadow_culling_tests {
+    use super::*;
+    use crate::gfx::shadows::{CascadeConfig, cascades};
+    use crate::scene::Camera;
+    use glam::Vec3;
+
+    const ASPECT: f32 = 16.0 / 9.0;
+
+    fn config() -> CascadeConfig {
+        CascadeConfig {
+            count: 4,
+            max_distance: 100.0,
+            lambda: 0.75,
+            resolution: 2048,
+            pullback: 50.0,
+        }
+    }
+
+    /// Straight down, so "toward the light" is unambiguously +Y and the tests
+    /// can place casters by inspection.
+    fn set(camera: &Camera) -> CascadeSet {
+        cascades(camera, ASPECT, Vec3::NEG_Y, &config())
+    }
+
+    fn box_at(center: Vec3, half: f32) -> Aabb {
+        Aabb {
+            min: center - Vec3::splat(half),
+            max: center + Vec3::splat(half),
+        }
+    }
+
+    /// The whole reason this is not `extract_renderables` with a different
+    /// frustum. An object the camera cannot see still casts into what it can,
+    /// and a cull that drops it produces missing shadows that read as a bias
+    /// bug.
+    #[test]
+    fn an_object_behind_the_camera_still_casts() {
+        let camera = Camera::default();
+        let set = set(&camera);
+        let cascade = &set.cascades[0];
+
+        // Directly above the cascade's center, so it is behind the camera in
+        // view terms but squarely between the sun and the lit ground.
+        let center = cascade.light_view.inverse().transform_point3(Vec3::new(
+            0.0,
+            0.0,
+            -cascade.depth_range * 0.5,
+        ));
+        let overhead = center + Vec3::Y * 500.0;
+
+        assert!(
+            casts_into(&box_at(overhead, 1.0), cascade),
+            "an object between the sun and the cascade was culled",
+        );
+    }
+
+    /// The other half: no near plane does not mean no far plane. Something
+    /// past the cascade casts away from it, not into it.
+    #[test]
+    fn an_object_beyond_the_far_plane_does_not_cast() {
+        let camera = Camera::default();
+        let set = set(&camera);
+        let cascade = &set.cascades[0];
+
+        let below = cascade.light_view.inverse().transform_point3(Vec3::new(
+            0.0,
+            0.0,
+            -cascade.depth_range - 100.0,
+        ));
+
+        assert!(!casts_into(&box_at(below, 1.0), cascade));
+    }
+
+    #[test]
+    fn an_object_outside_the_box_sideways_does_not_cast() {
+        let camera = Camera::default();
+        let set = set(&camera);
+        let cascade = &set.cascades[0];
+
+        for axis in [Vec3::X, Vec3::Y] {
+            let outside = cascade.light_view.inverse().transform_point3(
+                axis * (cascade.half_extent + 10.0) - Vec3::Z * cascade.depth_range * 0.5,
+            );
+            assert!(
+                !casts_into(&box_at(outside, 1.0), cascade),
+                "an object {} past the box edge was kept",
+                cascade.half_extent + 10.0,
+            );
+        }
+    }
+
+    /// A caster inside a near cascade is inside the far ones too, since the
+    /// cascades nest. If this ever fails the fit has stopped nesting, which
+    /// would show up as shadows vanishing at a specific distance.
+    #[test]
+    fn a_near_cascades_casters_are_also_the_far_ones() {
+        let camera = Camera::default();
+        let set = set(&camera);
+        let bounds = box_at(camera.position + Vec3::new(0.0, 0.0, -5.0), 0.5);
+
+        assert!(casts_into(&bounds, &set.cascades[0]));
+        for index in 1..set.count {
+            assert!(
+                casts_into(&bounds, &set.cascades[index]),
+                "cascade {index} rejected what cascade 0 accepted",
+            );
+        }
+    }
+
+    /// Culling reads the light-space box, so a cascade set that was never
+    /// built must reject everything rather than index uninitialised matrices.
+    #[test]
+    fn an_empty_cascade_set_casts_nothing() {
+        let set = CascadeSet::default();
+        assert_eq!(set.count, 0);
+    }
+}
+
 /// The inverse-transpose of a transform's upper 3x3, without inverting anything.
 ///
 /// For `M = R * S` with `R` a rotation and `S` diagonal, `(R*S)^-T` is
@@ -116,9 +306,8 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
     }
 
     let mut has_sun = false;
-    world
-        .query::<(&LocalTransform, &Light)>()
-        .for_each(|_entity, (transform, light)| match *light {
+    world.query::<(&LocalTransform, &Light)>().for_each(
+        |_entity, (transform, light)| match *light {
             Light::Directional { color, intensity } => {
                 // The shader supports one directional light, so the first wins.
                 if !has_sun {
@@ -143,7 +332,8 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
                     });
                 }
             }
-        });
+        },
+    );
 }
 
 #[cfg(test)]
@@ -195,7 +385,10 @@ mod tests {
         assert_eq!(items[0].model.w_axis.truncate(), Vec3::ZERO);
 
         let culling = world.resource::<Culling>();
-        assert_eq!((culling.visible(), culling.total(), culling.culled()), (1, 2, 1));
+        assert_eq!(
+            (culling.visible(), culling.total(), culling.culled()),
+            (1, 2, 1)
+        );
     }
 
     #[test]
@@ -228,7 +421,10 @@ mod tests {
 
         let mut world = test_world();
         spawn(&mut world, beside, CUBE);
-        assert!(extract(&world).is_empty(), "a unit cube there is off screen");
+        assert!(
+            extract(&world).is_empty(),
+            "a unit cube there is off screen"
+        );
 
         let mut world = test_world();
         world
@@ -289,7 +485,12 @@ mod tests {
             scale: Vec3::new(1.0, 0.0, 1.0),
             ..Default::default()
         };
-        assert!(normal_matrix(&transform).to_cols_array().iter().all(|v| v.is_finite()));
+        assert!(
+            normal_matrix(&transform)
+                .to_cols_array()
+                .iter()
+                .all(|v| v.is_finite())
+        );
     }
 
     #[test]

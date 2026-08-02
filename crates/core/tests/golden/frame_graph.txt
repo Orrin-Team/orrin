@@ -38,6 +38,64 @@
 -- end of frame
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
 
+=== editor frame, four cascades ===
+00 pass shadow_cascade_0 [Inline]
+  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+     object_transforms StorageRead
+     shadow_cascades DepthAttachment
+01 pass shadow_cascade_1 [Inline]
+  ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+     object_transforms StorageRead
+     shadow_cascades DepthAttachment
+02 pass shadow_cascade_2 [Inline]
+  ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+     object_transforms StorageRead
+     shadow_cascades DepthAttachment
+03 pass shadow_cascade_3 [Inline]
+  ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+     object_transforms StorageRead
+     shadow_cascades DepthAttachment
+04 pass ssao_prepass [Inline]
+  ! ssao_normal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+  ! ssao_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+     object_transforms StorageRead
+     ssao_normal ColorAttachment
+     ssao_depth DepthAttachment
+05 pass ssao_resolve [Inline]
+  ! ssao_depth DepthStencilAttachmentOptimal->ShaderReadOnlyOptimal src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
+  ! ssao_normal ColorAttachmentOptimal->ShaderReadOnlyOptimal src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
+  ! ssao_raw_ao Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+     ssao_depth Sampled
+     ssao_normal Sampled
+     ssao_raw_ao ColorAttachment
+06 pass ssao_blur [Inline]
+  ! ssao_raw_ao ColorAttachmentOptimal->ShaderReadOnlyOptimal src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
+  ! ssao_ao Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+     ssao_raw_ao Sampled
+     ssao_ao ColorAttachment
+07 pass forward [Inline]
+  ! ssao_ao ColorAttachmentOptimal->ShaderReadOnlyOptimal src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
+  ! shadow_cascades DepthStencilAttachmentOptimal->ShaderReadOnlyOptimal src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
+  ! msaa_hdr Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+  ! msaa_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! hdr_color Undefined->TransferDstOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentWrite
+     object_transforms StorageRead
+     ssao_ao Sampled
+     shadow_cascades Sampled
+     msaa_hdr ColorAttachment
+     msaa_depth DepthAttachment
+     hdr_color ResolveAttachment
+08 pass tonemap [Inline]
+  ! hdr_color TransferDstOptimal->ShaderReadOnlyOptimal src ColorAttachmentOutput/ColorAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
+  ! swapchain_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+     hdr_color Sampled
+     swapchain_color ColorAttachment
+09 pass overlay [Raw]
+  ! swapchain_color src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
+     swapchain_color ColorAttachment
+-- end of frame
+  ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
+
 === editor frame, SSAO off ===
 00 pass forward [Inline]
   ! msaa_hdr Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -59,35 +117,45 @@
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
 
 === headless frame, no overlay ===
-00 pass ssao_prepass [Inline]
+00 pass shadow_cascade_0 [Inline]
+  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+     object_transforms StorageRead
+     shadow_cascades DepthAttachment
+01 pass shadow_cascade_1 [Inline]
+  ! shadow_cascades src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+     object_transforms StorageRead
+     shadow_cascades DepthAttachment
+02 pass ssao_prepass [Inline]
   ! ssao_normal Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! ssao_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      ssao_normal ColorAttachment
      ssao_depth DepthAttachment
-01 pass ssao_resolve [Inline]
+03 pass ssao_resolve [Inline]
   ! ssao_depth DepthStencilAttachmentOptimal->ShaderReadOnlyOptimal src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! ssao_normal ColorAttachmentOptimal->ShaderReadOnlyOptimal src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! ssao_raw_ao Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      ssao_depth Sampled
      ssao_normal Sampled
      ssao_raw_ao ColorAttachment
-02 pass ssao_blur [Inline]
+04 pass ssao_blur [Inline]
   ! ssao_raw_ao ColorAttachmentOptimal->ShaderReadOnlyOptimal src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! ssao_ao Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      ssao_raw_ao Sampled
      ssao_ao ColorAttachment
-03 pass forward [Inline]
+05 pass forward [Inline]
   ! ssao_ao ColorAttachmentOptimal->ShaderReadOnlyOptimal src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
+  ! shadow_cascades DepthStencilAttachmentOptimal->ShaderReadOnlyOptimal src EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! msaa_hdr Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
   ! msaa_depth Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
   ! hdr_color Undefined->TransferDstOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentWrite
      object_transforms StorageRead
      ssao_ao Sampled
+     shadow_cascades Sampled
      msaa_hdr ColorAttachment
      msaa_depth DepthAttachment
      hdr_color ResolveAttachment
-04 pass tonemap [Inline]
+06 pass tonemap [Inline]
   ! hdr_color TransferDstOptimal->ShaderReadOnlyOptimal src ColorAttachmentOutput/ColorAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! swapchain_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      hdr_color Sampled

@@ -14,13 +14,15 @@ use vulkano::format::Format;
 use vulkano::image::ImageLayout;
 
 use crate::gfx::graph::{
-    compile, Access, FrameGraph, GraphBuilder, GraphError, ImageDesc, PassId, PassKind, ResourceId,
+    Access, Extent, FrameGraph, GraphBuilder, GraphError, ImageDesc, PassId, PassKind, ResourceId,
+    compile,
 };
+use crate::gfx::shadows::MAX_CASCADES;
 
+use super::MSAA_SAMPLES;
 use super::hdr::HDR_FORMAT;
 use super::ssao::{AO_FORMAT, NORMAL_FORMAT};
 use super::swapchain::DEPTH_FORMAT;
-use super::MSAA_SAMPLES;
 
 /// What a frame's structure depends on. A change to any of these recompiles the
 /// graph; nothing else does, which is the "recompiled on structure change, not
@@ -32,6 +34,8 @@ pub struct FrameConfig {
     /// Whether the editor's egui overlay draws over the frame. Off for headless
     /// and export renders.
     pub overlay: bool,
+    pub shadow_cascades: u8,
+    pub shadow_resolution: u32,
 }
 
 /// Which piece of engine code a graph node runs.
@@ -47,6 +51,7 @@ pub enum PassBody {
     Forward,
     Tonemap,
     Overlay,
+    ShadowCascade(u32),
 }
 
 /// Handles the executor needs to bind per-frame resources and to find the
@@ -59,6 +64,7 @@ pub struct FrameIds {
     pub msaa_hdr: ResourceId,
     pub msaa_depth: ResourceId,
     pub ssao: Option<SsaoIds>,
+    pub shadows: Option<ResourceId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -98,6 +104,33 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         ImageLayout::PresentSrc,
     );
 
+    let shadows = (config.shadow_cascades > 0).then(|| {
+        builder.create_image(
+            "shadow_cascades",
+            ImageDesc::new(DEPTH_FORMAT)
+                .extent(Extent::Fixed([config.shadow_resolution; 2]))
+                .array_layers(config.shadow_cascades as u32),
+        )
+    });
+
+    const CASCADE_PASS_NAMES: [&str; MAX_CASCADES] = [
+        "shadow_cascade_0",
+        "shadow_cascade_1",
+        "shadow_cascade_2",
+        "shadow_cascade_3",
+    ];
+
+    if let Some(shadows) = shadows {
+        for cascade in 0..config.shadow_cascades as u32 {
+            let id = builder
+                .pass(CASCADE_PASS_NAMES[cascade as usize], PassKind::Inline)
+                .access(object_transforms, Access::StorageRead)
+                .access(shadows, Access::DepthAttachment)
+                .build();
+            record(id, PassBody::ShadowCascade(cascade), &mut bodies);
+        }
+    }
+
     let ssao = config.ssao.then(|| SsaoIds {
         normal: builder.create_image("ssao_normal", ImageDesc::new(NORMAL_FORMAT)),
         depth: builder.create_image("ssao_depth", ImageDesc::new(DEPTH_FORMAT)),
@@ -105,10 +138,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         ao: builder.create_image("ssao_ao", ImageDesc::new(AO_FORMAT)),
     });
 
-    let msaa_hdr = builder.create_image(
-        "msaa_hdr",
-        ImageDesc::new(HDR_FORMAT).samples(MSAA_SAMPLES),
-    );
+    let msaa_hdr =
+        builder.create_image("msaa_hdr", ImageDesc::new(HDR_FORMAT).samples(MSAA_SAMPLES));
     let msaa_depth = builder.create_image(
         "msaa_depth",
         ImageDesc::new(DEPTH_FORMAT).samples(MSAA_SAMPLES),
@@ -146,6 +177,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     if let Some(ssao) = ssao {
         forward = forward.access(ssao.ao, Access::Sampled);
     }
+    if let Some(shadows) = shadows {
+        forward = forward.access(shadows, Access::Sampled);
+    }
     let id = forward
         .access(msaa_hdr, Access::ColorAttachment)
         .access(msaa_depth, Access::DepthAttachment)
@@ -177,6 +211,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             msaa_hdr,
             msaa_depth,
             ssao,
+            shadows,
         },
         bodies,
     })

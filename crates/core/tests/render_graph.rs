@@ -22,13 +22,18 @@
 use std::fs;
 use std::path::PathBuf;
 
-use orrin_core::gfx::vulkan::frame::{declare, FrameConfig};
+use orrin_core::gfx::vulkan::frame::{FrameConfig, declare};
 use vulkano::format::Format;
 
 /// The swapchain format the baseline is written against. Real ones vary by
 /// surface; the plan does not depend on it, and pinning it keeps the file from
 /// depending on whoever regenerated it.
 const COLOR_FORMAT: Format = Format::B8G8R8A8_SRGB;
+
+/// The cascade resolution the baseline is written against. It changes what the
+/// images are sized to, not what the plan says, so pinning it keeps the file
+/// from depending on whoever regenerated it.
+const SHADOW_RESOLUTION: u32 = 2048;
 
 fn configs() -> Vec<(&'static str, FrameConfig)> {
     vec![
@@ -38,6 +43,24 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 color_format: COLOR_FORMAT,
                 ssao: true,
                 overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+            },
+        ),
+        // Four cascades write four layers of one image, which the graph tracks
+        // as one resource — so consecutive cascades are separated by a
+        // write-after-write barrier with no layout transition. That
+        // serialisation is the cost of not tracking subresources in v1, and it
+        // is in the baseline so that removing it later is a visible diff rather
+        // than a silent one.
+        (
+            "editor frame, four cascades",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                overlay: true,
+                shadow_cascades: 4,
+                shadow_resolution: SHADOW_RESOLUTION,
             },
         ),
         // SSAO off is a different graph, not a flag read at record time: the
@@ -49,6 +72,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 color_format: COLOR_FORMAT,
                 ssao: false,
                 overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
             },
         ),
         (
@@ -57,6 +82,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 color_format: COLOR_FORMAT,
                 ssao: true,
                 overlay: false,
+                shadow_cascades: 2,
+                shadow_resolution: SHADOW_RESOLUTION,
             },
         ),
     ]
@@ -133,6 +160,38 @@ fn the_reference_frame_culls_nothing() {
     }
 }
 
+/// A one-cascade frame is the case that catches a view type derived from the
+/// layer count rather than from the declaration: an image of exactly one array
+/// layer looks like a plain 2D image to that heuristic, while the forward
+/// pipeline's sampler is compiled as a `texture2DArray` regardless. It renders
+/// on four cascades and fails on one, so the setting that provokes it is the
+/// one nobody drags to on purpose.
+#[test]
+fn a_single_cascade_map_is_still_declared_as_an_array() {
+    for count in 1..=4u8 {
+        let frame = declare(FrameConfig {
+            color_format: COLOR_FORMAT,
+            ssao: true,
+            overlay: true,
+            shadow_cascades: count,
+            shadow_resolution: SHADOW_RESOLUTION,
+        })
+        .unwrap();
+
+        let (_, image) = frame
+            .graph
+            .transient_images()
+            .find(|(id, _)| frame.graph.resource_name(*id) == "shadow_cascades")
+            .unwrap_or_else(|| panic!("{count} cascades declared no shadow map"));
+
+        assert_eq!(
+            image.desc.array_layers,
+            Some(u32::from(count)),
+            "{count} cascades must declare a {count}-layer array, not a plain image",
+        );
+    }
+}
+
 /// The swapchain image is acquired undefined and handed back to the presentation
 /// engine, so the frame owes a closing transition to `PresentSrc` whatever else
 /// it does.
@@ -149,6 +208,11 @@ fn every_configuration_leaves_the_swapchain_presentable() {
                     && barrier.new_layout == vulkano::image::ImageLayout::PresentSrc
             })
             .collect();
-        assert_eq!(closing.len(), 1, "{label}: {:?}", frame.graph.final_barriers());
+        assert_eq!(
+            closing.len(),
+            1,
+            "{label}: {:?}",
+            frame.graph.final_barriers()
+        );
     }
 }

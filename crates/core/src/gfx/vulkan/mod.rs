@@ -4,9 +4,10 @@ pub mod frame;
 mod hdr;
 mod line;
 mod resources;
+mod shadow;
+mod ssao;
 mod swapchain;
 mod texture;
-mod ssao;
 mod timestamps;
 
 use std::sync::Arc;
@@ -20,32 +21,34 @@ use vulkano::device::Queue;
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
 use vulkano::instance::Instance;
-use vulkano::swapchain::{
-    acquire_next_image, Surface, SwapchainPresentInfo,
-};
+use vulkano::swapchain::{Surface, SwapchainPresentInfo, acquire_next_image};
 use vulkano::sync::GpuFuture;
 use vulkano::sync::{self, future::FenceSignalFuture};
 use vulkano::{Validated, VulkanError};
 
 use crate::geom::Aabb;
-use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings};
+use crate::gfx::shadows::CascadeSet;
+use crate::scene::{
+    Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, ShadowSettings, SsaoSettings,
+};
 
 use self::context::VkContext;
-use self::forward::{ForwardPass, GpuMesh, GpuMaterial};
+use self::forward::{ForwardPass, GpuMaterial, GpuMesh};
 use crate::gfx::graph::PassKind;
 
 use self::frame::{Frame, FrameConfig, PassBody};
-use self::line::LinePass;
-use self::resources::{begin_info, GraphImages, PassFramebuffers};
-use self::swapchain::SwapchainState;
-use self::ssao::SsaoPass;
 use self::hdr::HdrPass;
+use self::line::LinePass;
+use self::resources::{GraphImages, PassFramebuffers, begin_info};
+use self::shadow::ShadowPass;
+use self::ssao::SsaoPass;
+use self::swapchain::SwapchainState;
 use self::timestamps::GpuTimestamps;
 
+use super::{MAX_TEXTURES, Material, RenderBackend, RenderItem, SceneLighting, TextureHandle};
 use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::DebugLine;
-use super::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle, MAX_TEXTURES};
 
 type FrameFuture = FenceSignalFuture<Box<dyn GpuFuture>>;
 
@@ -58,8 +61,22 @@ pub(crate) const MSAA_SAMPLES: vulkano::image::SampleCount = vulkano::image::Sam
 /// present (the editor UI). Given the future to wait on and that image's view, it
 /// returns the future to present. A plain closure, so this module stays free of
 /// any UI/egui types.
-pub type Overlay<'a> =
-    &'a mut dyn FnMut(Box<dyn GpuFuture>, Arc<ImageView>) -> Box<dyn GpuFuture>;
+pub type Overlay<'a> = &'a mut dyn FnMut(Box<dyn GpuFuture>, Arc<ImageView>) -> Box<dyn GpuFuture>;
+
+/// Everything the cascade passes need for one frame.
+///
+/// Bundled because the three travel together and are meaningless apart: the
+/// matrices decide what each pass draws with, the caster lists were culled
+/// against those same matrices, and the settings supply the bias the maps are
+/// rendered with. `None` means shadows are off, which is what makes the graph
+/// drop the passes entirely rather than run them over an empty list.
+#[derive(Clone, Copy)]
+pub struct ShadowFrame<'a> {
+    pub cascades: &'a CascadeSet,
+    /// Indexed like `cascades.cascades`.
+    pub casters: &'a [Vec<RenderItem>],
+    pub settings: &'a ShadowSettings,
+}
 
 pub struct VulkanRenderer {
     pub(crate) ctx: VkContext,
@@ -67,6 +84,7 @@ pub struct VulkanRenderer {
     forward: ForwardPass,
     hdr: HdrPass,
     ssao: SsaoPass,
+    shadow: ShadowPass,
     /// Debug-line overlay, recorded into the forward pass. Editor-only in
     /// practice: fed lines only through `render_with_overlay`.
     line: LinePass,
@@ -100,6 +118,7 @@ impl VulkanRenderer {
         let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, hdr::HDR_FORMAT);
         let hdr = HdrPass::new(&ctx, format);
         let ssao = SsaoPass::new(&ctx);
+        let shadow = ShadowPass::new(&ctx);
         let line = LinePass::new(&ctx.device, &ctx.memory_allocator, &forward.render_pass);
         let swapchain = SwapchainState::new(&ctx, &surface, &hdr.tonemap_rp, format, extent);
         let timestamps = GpuTimestamps::new(&ctx);
@@ -129,10 +148,12 @@ impl VulkanRenderer {
             color_format: format,
             ssao: true,
             overlay: true,
+            shadow_cascades: 0,
+            shadow_resolution: 1,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let images = GraphImages::allocate(&ctx.memory_allocator, &frame.graph, extent);
-        let framebuffers = PassFramebuffers::build(&frame, &images, &forward, &ssao);
+        let framebuffers = PassFramebuffers::build(&frame, &images, &forward, &ssao, &shadow);
 
         Self {
             ctx,
@@ -140,6 +161,7 @@ impl VulkanRenderer {
             forward,
             hdr,
             ssao,
+            shadow,
             line,
             meshes: Vec::new(),
             materials: vec![forward::to_gpu_material(&Material::default())],
@@ -185,8 +207,13 @@ impl VulkanRenderer {
             &self.frame.graph,
             self.swapchain.extent,
         );
-        self.framebuffers =
-            PassFramebuffers::build(&self.frame, &self.images, &self.forward, &self.ssao);
+        self.framebuffers = PassFramebuffers::build(
+            &self.frame,
+            &self.images,
+            &self.forward,
+            &self.ssao,
+            &self.shadow,
+        );
     }
 }
 
@@ -261,8 +288,9 @@ impl RenderBackend for VulkanRenderer {
         ssao: &SsaoSettings,
         hdr: &HdrSettings,
     ) {
-        // No overlay path (e.g. export/headless) draws no debug lines.
-        self.render_frame(items, lighting, camera, ssao, hdr, &[], None, None);
+        // No overlay path (e.g. export/headless) draws no debug lines and no
+        // shadows.
+        self.render_frame(items, lighting, camera, ssao, hdr, &[], None, None, None);
     }
 }
 
@@ -314,6 +342,7 @@ impl VulkanRenderer {
         hdr: &HdrSettings,
         debug_lines: &[DebugLine],
         profiler_frame: u64,
+        shadows: Option<ShadowFrame<'_>>,
         overlay: Overlay<'_>,
     ) {
         self.render_frame(
@@ -324,6 +353,7 @@ impl VulkanRenderer {
             hdr,
             debug_lines,
             Some(profiler_frame),
+            shadows,
             Some(overlay),
         );
     }
@@ -337,6 +367,7 @@ impl VulkanRenderer {
         hdr: &HdrSettings,
         debug_lines: &[DebugLine],
         profiler_frame: Option<u64>,
+        shadows: Option<ShadowFrame<'_>>,
         overlay: Option<Overlay<'_>>,
     ) {
         if self.pending_extent[0] == 0 || self.pending_extent[1] == 0 {
@@ -344,7 +375,10 @@ impl VulkanRenderer {
         }
 
         if self.recreate_swapchain {
-            if self.swapchain.recreate(&self.hdr.tonemap_rp, self.pending_extent) {
+            if self
+                .swapchain
+                .recreate(&self.hdr.tonemap_rp, self.pending_extent)
+            {
                 self.recreate_swapchain = false;
             } else {
                 return;
@@ -358,6 +392,11 @@ impl VulkanRenderer {
             color_format: self.swapchain.swapchain.image_format(),
             ssao: ssao.enabled,
             overlay: overlay.is_some(),
+            // Sourced from the cascade set rather than the setting, so the
+            // number of passes the graph declares cannot disagree with the
+            // number of matrices there are to draw them with.
+            shadow_cascades: shadows.map_or(0, |s| s.cascades.count as u8),
+            shadow_resolution: shadows.map_or(1, |s| s.settings.resolution),
         });
 
         // Split out because under Fifo this blocks until the presentation engine
@@ -411,6 +450,10 @@ impl VulkanRenderer {
         self.ssao.bias = ssao.bias;
         self.ssao.power = ssao.power;
         self.hdr.exposure = hdr.exposure;
+        if let Some(shadows) = shadows {
+            self.shadow.constant_bias = shadows.settings.constant_bias;
+            self.shadow.slope_bias = shadows.settings.slope_bias;
+        }
 
         // Material table and texture array are static after asset load, so cache
         // their descriptor sets and rebuild only when invalidated (set to None).
@@ -423,9 +466,15 @@ impl VulkanRenderer {
         let material_set = self.material_set.clone().unwrap();
         let texture_set = self.texture_set.clone().unwrap();
 
-        // One upload feeding both the SSAO prepass and the forward pass; the
-        // per-object inverse-transpose is too expensive to compute twice.
-        let object_buffer = self.forward.upload_objects(items);
+        // One upload feeding every geometry pass in the frame — the SSAO
+        // prepass, the forward pass, and each cascade — because the per-object
+        // inverse-transpose is too expensive to compute more than once. The
+        // camera-visible items come first, so the two screen-space passes still
+        // index from zero and the cascades index from `caster_bases`.
+        let no_casters: [Vec<RenderItem>; 0] = [];
+        let (object_buffer, caster_bases) = self
+            .forward
+            .upload_objects(items, shadows.map_or(&no_casters, |s| s.casters));
 
         // Uploaded once even though two graph nodes read it — which is what the
         // shared `object_transforms` declaration in `frame::declare` records.
@@ -441,6 +490,19 @@ impl VulkanRenderer {
             Some(ids) => self.images.view(ids.ao),
             None => self.ssao.white_view(),
         };
+
+        // Same trick for shadows: with them off there is no cascade image to
+        // read, so the forward pass samples a 1x1 depth texture of 1.0 and every
+        // comparison reports "lit".
+        let shadow_view = match self.frame.ids.shadows {
+            Some(id) => self.images.view(id),
+            None => self.shadow.lit_view(),
+        };
+        debug_assert_eq!(
+            shadow_view.view_type(),
+            vulkano::image::view::ImageViewType::Dim2dArray,
+            "the forward pipeline binds the cascades as texture2DArray",
+        );
 
         // The whole frame, in the order the compiler derived. Nothing below
         // decides what runs next, what an image's layout is, or what has to
@@ -479,6 +541,19 @@ impl VulkanRenderer {
                 .unwrap();
 
             match body {
+                PassBody::ShadowCascade(cascade) => {
+                    let shadows = shadows.expect("the graph scheduled a cascade with no shadows");
+                    let index = cascade as usize;
+                    self.shadow.record(
+                        &mut builder,
+                        self,
+                        &shadows.casters[index],
+                        shadows.cascades.cascades[index].view_proj,
+                        caster_bases[index],
+                        self.config.shadow_resolution,
+                        object_buffer.clone(),
+                    );
+                }
                 PassBody::SsaoPrepass => self.ssao.record_prepass(
                     &mut builder,
                     self,
@@ -512,6 +587,8 @@ impl VulkanRenderer {
                         camera,
                         extent,
                         ao_view.clone(),
+                        shadow_view.clone(),
+                        shadows,
                         material_set.clone(),
                         texture_set.clone(),
                         object_buffer.clone(),

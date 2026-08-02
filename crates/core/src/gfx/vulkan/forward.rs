@@ -26,12 +26,13 @@ use vulkano::pipeline::{
 use vulkano::render_pass::{RenderPass, Subpass};
 
 use crate::geom::Aabb;
+use crate::gfx::shadows::MAX_CASCADES;
 use crate::gfx::{MAX_POINT_LIGHTS, MAX_TEXTURES, Material, RenderItem, SceneLighting, Vertex};
 use crate::scene::Camera;
 
-use super::VulkanRenderer;
 use super::context::VkContext;
 use super::swapchain::DEPTH_FORMAT;
+use super::{ShadowFrame, VulkanRenderer};
 
 pub struct GpuMesh {
     pub vertex_buffer: Subbuffer<[Vertex]>,
@@ -71,6 +72,12 @@ pub(super) struct GpuObject {
     normal_matrix: [[f32; 4]; 4],
 }
 
+/// Where `forward.frag` declares the cascade comparison sampler. It is bound
+/// immutably at pipeline-layout construction, so these have to match the shader
+/// by hand rather than being derived from it.
+const SHADOW_SET: usize = 3;
+const SHADOW_SAMPLER_BINDING: u32 = 2;
+
 /// Default texture indices, matching the order `VulkanRenderer::new` seeds them.
 const WHITE_TEXTURE: u32 = 0;
 const FLAT_NORMAL_TEXTURE: u32 = 1;
@@ -86,7 +93,12 @@ pub(crate) struct GpuMaterial {
 }
 
 /// Pack the engine's [`SceneLighting`] into the std140 layout the shader expects.
-fn to_gpu_lighting(lighting: &SceneLighting, camera_pos: Vec3, extent: [u32; 2]) -> GpuLighting {
+fn to_gpu_lighting(
+    lighting: &SceneLighting,
+    camera_pos: Vec3,
+    extent: [u32; 2],
+    shadows: Option<ShadowFrame<'_>>,
+) -> GpuLighting {
     let (w, h) = (extent[0] as f32, extent[1] as f32);
     let count = lighting.point_lights.len().min(MAX_POINT_LIGHTS);
     let mut point_lights = [GpuPointLight::ZERO; MAX_POINT_LIGHTS];
@@ -105,6 +117,40 @@ fn to_gpu_lighting(lighting: &SceneLighting, camera_pos: Vec3, extent: [u32; 2])
 
     // The shader wants the direction *toward* the light, so negate.
     let to_sun = (-lighting.sun.direction).normalize_or_zero();
+
+    let mut cascade_view_proj = [[[0.0f32; 4]; 4]; MAX_CASCADES];
+    let mut cascade_splits = [0.0f32; MAX_CASCADES];
+    let mut cascade_texel_sizes = [0.0f32; MAX_CASCADES];
+    // A zero count is what makes every shadow lookup return "lit"; the arrays
+    // above are then never indexed.
+    let shadow_params = match shadows {
+        Some(shadows) => {
+            for (slot, cascade) in cascade_view_proj
+                .iter_mut()
+                .zip(&shadows.cascades.cascades[..shadows.cascades.count])
+            {
+                *slot = cascade.view_proj.to_cols_array_2d();
+            }
+            for (index, cascade) in shadows.cascades.cascades[..shadows.cascades.count]
+                .iter()
+                .enumerate()
+            {
+                cascade_splits[index] = cascade.split_distance;
+                cascade_texel_sizes[index] = cascade.texel_world_size;
+            }
+            [
+                shadows.cascades.count as f32,
+                crate::gfx::shadows::OVERLAP,
+                shadows.settings.strength,
+                if shadows.settings.debug_cascades {
+                    1.0
+                } else {
+                    0.0
+                },
+            ]
+        }
+        None => [0.0; 4],
+    };
 
     GpuLighting {
         camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 0.0],
@@ -135,6 +181,10 @@ fn to_gpu_lighting(lighting: &SceneLighting, camera_pos: Vec3, extent: [u32; 2])
             lighting.fog_density.max(0.0),
         ],
         fog_params: [lighting.fog_height_falloff, lighting.fog_height, 0.0, 0.0],
+        cascade_view_proj,
+        cascade_splits,
+        cascade_texel_sizes,
+        shadow_params,
         point_lights,
     }
 }
@@ -179,6 +229,18 @@ struct GpuLighting {
     fog_color: [f32; 4],
     /// x = height falloff, y = reference height.
     fog_params: [f32; 4],
+    /// Per-cascade light view-projection. std140 lays a `mat4` out as four
+    /// `vec4`s with no padding between them, which is exactly what this is.
+    cascade_view_proj: [[[f32; 4]; 4]; MAX_CASCADES],
+    /// Split distances, as radial distance from the camera.
+    cascade_splits: [f32; MAX_CASCADES],
+    /// World size of one shadow texel in each cascade, for the normal-offset
+    /// bias. It differs per cascade because each fits a different-sized box to
+    /// the same number of texels.
+    cascade_texel_sizes: [f32; MAX_CASCADES],
+    /// x = cascade count, y = blend overlap fraction, z = strength,
+    /// w = 1.0 to tint by cascade index.
+    shadow_params: [f32; 4],
     point_lights: [GpuPointLight; MAX_POINT_LIGHTS],
 }
 
@@ -347,28 +409,49 @@ impl ForwardPass {
     }
 
     /// Build this frame's per-object rows, written straight into the mapped
-    /// subbuffer. Shared by the SSAO prepass and the forward pass: both need the
-    /// same rows, and the allocator recycles the storage frame to frame.
+    /// subbuffer. Shared by every geometry pass in the frame: they need the same
+    /// rows, and the allocator recycles the storage frame to frame.
     ///
     /// One row per item, including items whose mesh is missing, so a run's
-    /// object rows stay contiguous and `object_base` is just the run's start.
-    pub(super) fn upload_objects(&self, items: &[RenderItem]) -> Subbuffer<[GpuObject]> {
+    /// object rows stay contiguous and a run's base is just its start.
+    ///
+    /// `items` goes first so the forward and SSAO passes keep indexing from
+    /// zero; each cascade's casters follow, and the returned bases say where.
+    /// One buffer rather than one per list is what keeps `object_transforms` a
+    /// single resource in the graph rather than a convenient fiction.
+    pub(super) fn upload_objects(
+        &self,
+        items: &[RenderItem],
+        casters: &[Vec<RenderItem>],
+    ) -> (Subbuffer<[GpuObject]>, [u32; MAX_CASCADES]) {
+        let total: usize = items.len() + casters.iter().map(Vec::len).sum::<usize>();
         // allocate_slice rejects length 0; an empty scene still needs a bindable
         // buffer, so round up to one (unwritten, unread) slot.
         let buffer = self
             .object_buffer_allocator
-            .allocate_slice::<GpuObject>(items.len().max(1) as u64)
+            .allocate_slice::<GpuObject>(total.max(1) as u64)
             .unwrap();
+
+        let mut bases = [0u32; MAX_CASCADES];
         {
             let mut rows = buffer.write().unwrap();
-            for (row, item) in rows.iter_mut().zip(items) {
-                *row = GpuObject {
-                    model: item.model.to_cols_array_2d(),
-                    normal_matrix: Mat4::from_mat3(item.normal_matrix).to_cols_array_2d(),
-                };
+            let mut next = 0usize;
+            let mut write = |list: &[RenderItem], next: &mut usize| {
+                for item in list {
+                    rows[*next] = GpuObject {
+                        model: item.model.to_cols_array_2d(),
+                        normal_matrix: Mat4::from_mat3(item.normal_matrix).to_cols_array_2d(),
+                    };
+                    *next += 1;
+                }
+            };
+            write(items, &mut next);
+            for (base, list) in bases.iter_mut().zip(casters) {
+                *base = next as u32;
+                write(list, &mut next);
             }
         }
-        buffer
+        (buffer, bases)
     }
 
     pub fn draw(
@@ -380,6 +463,8 @@ impl ForwardPass {
         camera: &Camera,
         extent: [u32; 2],
         ao_view: Arc<ImageView>,
+        shadow_view: Arc<ImageView>,
+        shadows: Option<ShadowFrame<'_>>,
         material_set: Arc<DescriptorSet>,
         texture_set: Arc<DescriptorSet>,
         object_buffer: Subbuffer<[GpuObject]>,
@@ -391,7 +476,8 @@ impl ForwardPass {
             .uniform_buffer_allocator
             .allocate_sized::<GpuLighting>()
             .unwrap();
-        *lighting_buffer.write().unwrap() = to_gpu_lighting(lighting, camera.position, extent);
+        *lighting_buffer.write().unwrap() =
+            to_gpu_lighting(lighting, camera.position, extent, shadows);
 
         let lighting_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
@@ -401,14 +487,17 @@ impl ForwardPass {
         )
         .unwrap();
 
+        // Set 3 is the screen-space and shadow inputs. The cascades are kept as
+        // a separate image and comparison sampler rather than a combined one,
+        // for the same reason the texture array is: Metal caps samplers per
+        // stage far lower than sampled images.
         let ao_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.pipeline.layout().set_layouts()[3].clone(),
-            [WriteDescriptorSet::image_view_sampler(
-                0,
-                ao_view,
-                self.ao_sampler.clone(),
-            )],
+            [
+                WriteDescriptorSet::image_view_sampler(0, ao_view, self.ao_sampler.clone()),
+                WriteDescriptorSet::image_view(1, shadow_view),
+            ],
             [],
         )
         .unwrap();
@@ -571,9 +660,20 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
         PipelineShaderStageCreateInfo::new(fs),
     ];
 
+    // The shadow comparison sampler has to be immutable — part of the layout
+    // rather than something written into a descriptor set — because MoltenVK
+    // cannot accept a written one. Everything else in the layout is still
+    // derived from the shaders' own interface.
+    let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
+    layout_info.set_layouts[SHADOW_SET]
+        .bindings
+        .get_mut(&SHADOW_SAMPLER_BINDING)
+        .expect("forward.frag must declare the shadow comparison sampler")
+        .immutable_samplers = vec![super::shadow::comparison_sampler(device)];
+
     let layout = PipelineLayout::new(
         device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+        layout_info
             .into_pipeline_layout_create_info(device.clone())
             .unwrap(),
     )

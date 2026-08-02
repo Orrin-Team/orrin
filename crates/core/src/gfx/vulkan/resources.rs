@@ -11,16 +11,17 @@ use std::sync::Arc;
 
 use vulkano::command_buffer::RenderPassBeginInfo;
 use vulkano::format::ClearValue;
-use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageCreateInfo, ImageType};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
+use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
+use vulkano::image::{Image, ImageCreateInfo, ImageSubresourceRange, ImageType};
 use vulkano::memory::MemoryPropertyFlags;
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo};
 
 use crate::gfx::graph::{FrameGraph, ResourceId};
 
 use super::forward::ForwardPass;
 use super::frame::{Frame, PassBody};
+use super::shadow::ShadowPass;
 use super::ssao::SsaoPass;
 
 /// Graph-owned images, indexed by [`ResourceId`].
@@ -54,31 +55,46 @@ impl GraphImages {
         let mut views = vec![None; graph.resource_count()];
         for (id, image) in graph.transient_images() {
             let extent = image.desc.extent.resolve(extent);
-            let view = ImageView::new_default(
-                Image::new(
-                    memory.clone(),
-                    ImageCreateInfo {
-                        image_type: ImageType::Dim2d,
-                        format: image.desc.format,
-                        extent: [extent[0], extent[1], 1],
-                        usage: image.usage,
-                        samples: image.desc.samples,
-                        ..Default::default()
-                    },
-                    if image.memoryless {
-                        lazy.clone()
-                    } else {
-                        AllocationCreateInfo::default()
-                    },
+            let allocated = Image::new(
+                memory.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: image.desc.format,
+                    extent: [extent[0], extent[1], 1],
+                    usage: image.usage,
+                    samples: image.desc.samples,
+                    array_layers: image.desc.array_layers.unwrap_or(1),
+                    ..Default::default()
+                },
+                if image.memoryless {
+                    lazy.clone()
+                } else {
+                    AllocationCreateInfo::default()
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "render graph: could not allocate `{}` ({:?}, {:?}): {error}",
+                    graph.resource_name(id),
+                    image.desc.format,
+                    image.usage,
                 )
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "render graph: could not allocate `{}` ({:?}, {:?}): {error}",
-                        graph.resource_name(id),
-                        image.desc.format,
-                        image.usage,
-                    )
-                }),
+            });
+
+            // The view type comes from the declaration, not from the layer
+            // count: an array image of one layer must still be viewed as an
+            // array, because the sampler type is compiled into the pipeline and
+            // cannot depend on how many cascades the settings happen to ask for.
+            let view = ImageView::new(
+                allocated.clone(),
+                ImageViewCreateInfo {
+                    view_type: if image.desc.array_layers.is_some() {
+                        ImageViewType::Dim2dArray
+                    } else {
+                        ImageViewType::Dim2d
+                    },
+                    ..ImageViewCreateInfo::from_image(&allocated)
+                },
             )
             .unwrap();
             views[id.index()] = Some(view);
@@ -99,6 +115,26 @@ impl GraphImages {
             .clone()
             .expect("render graph resource is not a graph-owned image")
     }
+
+    /// A single-layer 2D view of one layer of an array image.
+    ///
+    /// A framebuffer attachment has to be one layer, while the same image is
+    /// sampled as a whole array — so the cascades need both kinds of view over
+    /// the same allocation.
+    pub fn layer_view(&self, id: ResourceId, layer: u32) -> Arc<ImageView> {
+        let image = self.view(id).image().clone();
+
+        let info = ImageViewCreateInfo {
+            view_type: ImageViewType::Dim2d,
+            subresource_range: ImageSubresourceRange {
+                array_layers: layer..layer + 1,
+                ..image.subresource_range()
+            },
+            ..ImageViewCreateInfo::from_image(&image)
+        };
+
+        ImageView::new(image, info).unwrap()
+    }
 }
 
 /// One framebuffer per pass that draws into graph-owned images, indexed by
@@ -117,6 +153,7 @@ impl PassFramebuffers {
         images: &GraphImages,
         forward: &ForwardPass,
         ssao: &SsaoPass,
+        shadow: &ShadowPass,
     ) -> Self {
         let ids = frame.ids;
         // Only scheduled passes get one. A culled pass's images are never
@@ -149,6 +186,17 @@ impl PassFramebuffers {
                             images.view(ids.msaa_depth),
                             images.view(ids.hdr_color),
                         ],
+                    ),
+                    // One layer of the cascade array, not the array view: a
+                    // framebuffer attachment is a single layer, and handing it
+                    // the whole array would make every cascade clear and
+                    // overwrite the same pixels without erroring.
+                    PassBody::ShadowCascade(cascade) => (
+                        shadow.render_pass.clone(),
+                        vec![images.layer_view(
+                            ids.shadows.expect("shadow pass without a shadow image"),
+                            cascade,
+                        )],
                     ),
                     PassBody::Tonemap | PassBody::Overlay => return None,
                 };
@@ -184,6 +232,7 @@ pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
         PassBody::Forward => vec![Some([0.02, 0.02, 0.03, 1.0].into()), Some(1.0.into()), None],
         PassBody::Tonemap => vec![None],
         PassBody::Overlay => Vec::new(),
+        PassBody::ShadowCascade(_) => vec![Some(1.0.into())],
     }
 }
 

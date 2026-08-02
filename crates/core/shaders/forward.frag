@@ -12,6 +12,8 @@ layout(location = 0) out vec4 f_color;
 // Keep in sync with MAX_POINT_LIGHTS / MAX_TEXTURES in forward.rs.
 const int MAX_POINT_LIGHTS = 16;
 const int MAX_TEXTURES = 64;
+// Keep in sync with MAX_CASCADES in gfx/shadows.rs.
+const int MAX_CASCADES = 4;
 const float PI = 3.14159265359;
 
 struct PointLight {
@@ -28,6 +30,10 @@ layout(set = 0, binding = 0) uniform Lighting {
     vec4 viewport;      // x=w, y=h, z=1/w, w=1/h
     vec4 fog_color;     // rgb = color, w = density at the reference height
     vec4 fog_params;    // x = height falloff, y = reference height
+    mat4 cascade_view_proj[MAX_CASCADES];
+    vec4 cascade_splits;      // per-cascade far distance, radial from the camera
+    vec4 cascade_texel_sizes; // world size of one shadow texel, per cascade
+    vec4 shadow_params;       // x = count, y = blend overlap, z = strength, w = debug
     PointLight point_lights[MAX_POINT_LIGHTS];
 } lighting;
 
@@ -55,6 +61,12 @@ layout(set = 2, binding = 1) uniform sampler tex_sampler;
 
 // Screen-space ambient occlusion (blurred), sampled by screen-space UV.
 layout(set = 3, binding = 0) uniform sampler2D u_ao;
+
+// The cascade depth maps, one array layer each, and the comparison sampler
+// they are read through. Separated for the same reason the texture array above
+// is: Metal allows far fewer samplers per stage than sampled images.
+layout(set = 3, binding = 1) uniform texture2DArray u_shadow_maps;
+layout(set = 3, binding = 2) uniform samplerShadow u_shadow_cmp;
 
 // Index is dynamically uniform (from the material), so plain indexing
 // is legal without the nonuniform qualifier.
@@ -194,6 +206,88 @@ vec3 apply_fog(vec3 color, vec3 world_pos, vec3 camera_pos) {
     return mix(color, lighting.fog_color.rgb, amount);
 }
 
+// --- Cascaded shadow maps ---
+
+// The cascade this fragment is routed to: the first whose far distance it is
+// nearer than. Distance is radial rather than view-space depth, which costs a
+// little over-coverage at the frustum corners and buys rotation invariance —
+// the same property the sphere fit on the CPU side is built around.
+int select_cascade(float view_dist) {
+    int count = int(lighting.shadow_params.x);
+    for (int i = 0; i < count; ++i) {
+        if (view_dist < lighting.cascade_splits[i]) {
+            return i;
+        }
+    }
+    return count - 1;
+}
+
+// Percentage-closer filtered visibility from one cascade. 1.0 is lit.
+float cascade_shadow(int cascade, vec3 world_pos, vec3 N, vec3 L) {
+    // Normal-offset bias: move the lookup along the surface normal by about a
+    // texel's worth of world space, more at grazing angles where a texel covers
+    // the most depth. Offsetting in texture space rather than in depth is what
+    // removes acne without the peter-panning a depth offset causes.
+    float texel = lighting.cascade_texel_sizes[cascade];
+    float slope = 1.0 - max(dot(N, L), 0.0);
+    vec3 p = world_pos + N * texel * 1.4142136 * (1.0 + slope);
+
+    vec4 clip = lighting.cascade_view_proj[cascade] * vec4(p, 1.0);
+    vec3 ndc = clip.xyz / clip.w;
+    // Past the cascade's far plane there is nothing to occlude against.
+    if (ndc.z > 1.0) {
+        return 1.0;
+    }
+
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    vec2 step = 1.0 / vec2(textureSize(sampler2DArrayShadow(u_shadow_maps, u_shadow_cmp), 0).xy);
+
+    // 3x3 taps. Each is itself a hardware 2x2 comparison — the compare happens
+    // before the bilinear filter — so this is effectively a 4x4 kernel.
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec2 offset = vec2(x, y) * step;
+            sum += texture(
+                sampler2DArrayShadow(u_shadow_maps, u_shadow_cmp),
+                vec4(uv + offset, float(cascade), ndc.z)
+            );
+        }
+    }
+    return sum / 9.0;
+}
+
+// Sun visibility, blended across the cascade seam.
+float sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist) {
+    int count = int(lighting.shadow_params.x);
+    if (count <= 0) {
+        return 1.0;
+    }
+
+    int cascade = select_cascade(view_dist);
+    float shadow = cascade_shadow(cascade, world_pos, N, L);
+
+    // The next cascade only has depth slightly before its own near plane, and
+    // that overlap is what `cascades()` widened each slice by — so the blend
+    // band has to be the same fraction or it fades into a region with no data.
+    float split = lighting.cascade_splits[cascade];
+    float band = split * lighting.shadow_params.y;
+    if (cascade + 1 < count && view_dist > split - band) {
+        float t = clamp((view_dist - (split - band)) / max(band, 1e-4), 0.0, 1.0);
+        shadow = mix(shadow, cascade_shadow(cascade + 1, world_pos, N, L), t);
+    }
+
+    return mix(1.0, shadow, lighting.shadow_params.z);
+}
+
+// Distinct tint per cascade, for checking that the splits land where intended.
+vec3 cascade_debug_tint(int cascade) {
+    if (cascade == 0) return vec3(1.0, 0.4, 0.4);
+    if (cascade == 1) return vec3(0.4, 1.0, 0.4);
+    if (cascade == 2) return vec3(0.4, 0.6, 1.0);
+    return vec3(1.0, 1.0, 0.4);
+}
+
 // Smooth, range-limited falloff (windowed inverse-square).
 float attenuate(float dist, float range) {
     float s = dist / max(range, 1e-4);
@@ -241,11 +335,14 @@ void main() {
     float ao = texture(u_ao, gl_FragCoord.xy * lighting.viewport.zw).r;
     vec3 color = lighting.ambient.rgb * lighting.ambient.w * albedo * ao;
 
-    // Directional sun.
+    // Directional sun. Only this term is shadowed: ambient is what `u_ao`
+    // attenuates, and point lights cast nothing yet.
+    float view_dist = length(v_world_pos - lighting.camera_pos.xyz);
     {
         vec3 L = normalize(lighting.sun_direction.xyz);
         vec3 radiance = lighting.sun_color.rgb * lighting.sun_color.w;
-        color += brdf(N, V, L, radiance, albedo, metallic, a, f0, energy);
+        float shadow = sun_shadow(v_world_pos, N, L, view_dist);
+        color += brdf(N, V, L, radiance, albedo, metallic, a, f0, energy) * shadow;
     }
 
     // Point lights.
@@ -265,6 +362,10 @@ void main() {
     color += m.emissive.rgb * emis_tex;
 
     color = apply_fog(color, v_world_pos, lighting.camera_pos.xyz);
+
+    if (lighting.shadow_params.w > 0.5) {
+        color *= cascade_debug_tint(select_cascade(view_dist));
+    }
 
     f_color = vec4(color, 1.0);
 }

@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use vulkano::VulkanLibrary;
 use vulkano::instance::debug::{
     DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger,
     DebugUtilsMessengerCallback, DebugUtilsMessengerCreateInfo,
 };
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::swapchain::Surface;
-use vulkano::VulkanLibrary;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -15,15 +15,16 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::camera_controller::CameraController;
 use crate::editor::Editor;
+use crate::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
+use crate::gfx::vulkan::ShadowFrame;
 use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::{RenderBackend, RenderItem, SceneLighting};
 use crate::profile::Profiler;
 use crate::profile_scope;
-use crate::scene::entities::{build_default_scene, spawn_stress_scene, StressSpec};
+use crate::scene::entities::{StressSpec, build_default_scene, spawn_stress_scene};
 use crate::scene::{
     AmbientLight, Camera, Culling, DebugLine, DebugLines, FogSettings, HdrSettings, InputState,
-    LogBuffer,
-    SsaoSettings, Time,
+    LogBuffer, ShadowSettings, SsaoSettings, Time,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -50,6 +51,11 @@ pub struct App {
     last_instant: Option<Instant>,
     render_items: Vec<RenderItem>,
     lighting: SceneLighting,
+    /// This frame's cascade matrices and the caster list each was culled
+    /// against. Kept on the app so the per-cascade `Vec`s keep their capacity
+    /// across frames instead of reallocating.
+    cascades: CascadeSet,
+    shadow_casters: [Vec<RenderItem>; MAX_CASCADES],
     /// This frame's debug lines, copied out of the `DebugLines` resource so the
     /// renderer borrow doesn't overlap the world borrow.
     debug_lines: Vec<DebugLine>,
@@ -152,6 +158,8 @@ impl App {
             last_instant: None,
             render_items: Vec::new(),
             lighting: SceneLighting::default(),
+            cascades: CascadeSet::default(),
+            shadow_casters: Default::default(),
             debug_lines: Vec::new(),
             #[cfg(feature = "scripting")]
             scripting: None,
@@ -182,6 +190,7 @@ impl App {
         world.insert_resource(Time::new());
         world.insert_resource(AmbientLight::default());
         world.insert_resource(SsaoSettings::default());
+        world.insert_resource(ShadowSettings::default());
         world.insert_resource(HdrSettings::default());
         world.insert_resource(FogSettings::default());
         world.insert_resource(FrameStats::new());
@@ -346,7 +355,12 @@ impl ApplicationHandler for App {
             self.build_watcher = scripts.watcher;
         }
 
-        let editor = Editor::new(event_loop, surface, renderer.queue(), renderer.color_format());
+        let editor = Editor::new(
+            event_loop,
+            surface,
+            renderer.queue(),
+            renderer.color_format(),
+        );
 
         self.active = Some(Active {
             window,
@@ -373,7 +387,8 @@ impl ApplicationHandler for App {
             .resource_mut::<InputState>()
             .on_window_event(&event, egui_wants);
         let was_looking = self.camera_controller.looking();
-        self.camera_controller.process_window_event(&event, egui_wants);
+        self.camera_controller
+            .process_window_event(&event, egui_wants);
         if self.camera_controller.looking() != was_looking {
             let looking = self.camera_controller.looking();
             active.window.set_cursor_visible(!looking);
@@ -484,6 +499,25 @@ impl ApplicationHandler for App {
                     let aspect = extent[0] as f32 / extent[1].max(1) as f32;
                     systems::extract_renderables(&self.world, aspect, &mut self.render_items);
                     systems::extract_lighting(&self.world, &mut self.lighting);
+                    // Cascades are fitted before extraction because the caster
+                    // lists are culled against them: a shadow pass needs what
+                    // reaches its box, which is not what the camera can see.
+                    let shadow_settings = *self.world.resource::<ShadowSettings>();
+                    self.cascades = if shadow_settings.enabled {
+                        cascades(
+                            &self.world.resource::<Camera>().clone(),
+                            aspect,
+                            self.lighting.sun.direction,
+                            &shadow_settings.cascade_config(),
+                        )
+                    } else {
+                        CascadeSet::default()
+                    };
+                    systems::extract_shadow_casters(
+                        &self.world,
+                        &self.cascades,
+                        &mut self.shadow_casters,
+                    );
                     // Copy this frame's debug lines out (they're Copy) so the render
                     // borrow below doesn't overlap the world borrow.
                     self.debug_lines.clear();
@@ -492,6 +526,7 @@ impl ApplicationHandler for App {
                 }
                 let camera = *self.world.resource::<Camera>();
                 let ssao = *self.world.resource::<SsaoSettings>();
+                let shadow_settings = *self.world.resource::<ShadowSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
                 // Stamped into this frame's GPU queries so the readback, some
                 // frames later, can file its spans against the right frame.
@@ -511,6 +546,11 @@ impl ApplicationHandler for App {
                         &hdr,
                         &self.debug_lines,
                         profiler_frame,
+                        (self.cascades.count > 0).then(|| ShadowFrame {
+                            cascades: &self.cascades,
+                            casters: &self.shadow_casters,
+                            settings: &shadow_settings,
+                        }),
                         &mut overlay,
                     );
                 }
@@ -551,7 +591,9 @@ impl ApplicationHandler for App {
         event: DeviceEvent,
     ) {
         self.camera_controller.process_device_event(&event);
-        self.world.resource_mut::<InputState>().on_device_event(&event);
+        self.world
+            .resource_mut::<InputState>()
+            .on_device_event(&event);
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
@@ -595,7 +637,9 @@ fn attach_debug_messenger(instance: &Arc<Instance>) -> DebugUtilsMessenger {
             };
             eprintln!(
                 "[vulkan {label}] {}{}",
-                data.message_id_name.map(|name| format!("{name}: ")).unwrap_or_default(),
+                data.message_id_name
+                    .map(|name| format!("{name}: "))
+                    .unwrap_or_default(),
                 data.message
             );
             let _ = message_type;
