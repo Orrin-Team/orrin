@@ -1,7 +1,7 @@
 pub mod graph;
 pub mod headless;
-pub mod vulkan;
 pub mod shadows;
+pub mod vulkan;
 
 pub use headless::HeadlessBackend;
 
@@ -148,13 +148,8 @@ pub trait RenderBackend {
     /// load, since culling runs before any backend type is in reach.
     fn mesh_bounds(&self, mesh: MeshHandle) -> Option<Aabb>;
     fn load_material(&mut self, material: &Material) -> MaterialHandle;
-    fn load_texture(
-        &mut self,
-        pixels: &[u8],
-        width: u32,
-        height: u32,
-        srgb: bool,
-    ) -> TextureHandle;
+    fn load_texture(&mut self, pixels: &[u8], width: u32, height: u32, srgb: bool)
+    -> TextureHandle;
     fn resize(&mut self, extent: [u32; 2]);
     fn render(
         &mut self,

@@ -7,8 +7,8 @@
 //! bodies exist. The seam is `build` + `query_pairs`; a persistent tree can
 //! replace the internals later without touching `collision::run`.
 
-use glam::Vec3;
 use super::Aabb;
+use glam::Vec3;
 
 type NodeIndex = u32;
 
@@ -60,7 +60,11 @@ impl Bvh {
 
         // Disjoint fields, so the partition scratch and the node arena can be
         // borrowed at once.
-        let Bvh { nodes, indices, root } = self;
+        let Bvh {
+            nodes,
+            indices,
+            root,
+        } = self;
         *root = if indices.is_empty() {
             None
         } else {
@@ -71,7 +75,12 @@ impl Bvh {
     fn build_ranges(nodes: &mut Vec<Node>, bounds: &[Aabb], indices: &mut [usize]) -> NodeIndex {
         if indices.len() == 1 {
             let index = nodes.len() as u32;
-            nodes.push(Node { aabb: bounds[indices[0]], kind: NodeKind::Leaf { body: indices[0] as u32 } });
+            nodes.push(Node {
+                aabb: bounds[indices[0]],
+                kind: NodeKind::Leaf {
+                    body: indices[0] as u32,
+                },
+            });
             return index;
         }
 
@@ -87,15 +96,20 @@ impl Bvh {
         }
 
         let span = max_c - min_c;
-        let axis: usize = if span.x >= span.y && span.x >= span.z { 0 }
-        else if span.y >= span.z { 1 }
-        else { 2 };
+        let axis: usize = if span.x >= span.y && span.x >= span.z {
+            0
+        } else if span.y >= span.z {
+            1
+        } else {
+            2
+        };
 
         // Median by count, not by value: both halves stay non-empty even when
         // every center coincides, so the recursion always terminates.
         let mid = indices.len() / 2;
-        indices.select_nth_unstable_by(mid, |&i, &j|
-            bounds[i].center()[axis].total_cmp(&bounds[j].center()[axis]));
+        indices.select_nth_unstable_by(mid, |&i, &j| {
+            bounds[i].center()[axis].total_cmp(&bounds[j].center()[axis])
+        });
 
         let (left_half, right_half) = indices.split_at_mut(mid);
         let left = Self::build_ranges(nodes, bounds, left_half);
@@ -104,7 +118,10 @@ impl Bvh {
         let aabb = nodes[left as usize].aabb.union(&nodes[right as usize].aabb);
 
         let index = nodes.len() as u32;
-        nodes.push(Node { aabb, kind: NodeKind::Internal { left, right } });
+        nodes.push(Node {
+            aabb,
+            kind: NodeKind::Internal { left, right },
+        });
         index
     }
 
@@ -116,7 +133,9 @@ impl Bvh {
         let mut stack: Vec<NodeIndex> = Vec::new();
 
         for node in &self.nodes {
-            let NodeKind::Leaf { body } = node.kind else { continue };
+            let NodeKind::Leaf { body } = node.kind else {
+                continue;
+            };
 
             stack.clear();
             if let Some(root) = self.root {
@@ -152,7 +171,10 @@ mod tests {
     use glam::Vec3;
 
     fn aabb(min: [f32; 3], max: [f32; 3]) -> Aabb {
-        Aabb { min: Vec3::from_array(min), max: Vec3::from_array(max) }
+        Aabb {
+            min: Vec3::from_array(min),
+            max: Vec3::from_array(max),
+        }
     }
 
     fn pairs_of(bounds: &[Aabb]) -> Vec<(u32, u32)> {
@@ -171,7 +193,10 @@ mod tests {
         let crowded: Vec<Aabb> = (0..12)
             .map(|i| {
                 let min = Vec3::new(i as f32 * 0.5, 0.0, 0.0);
-                Aabb { min, max: min + Vec3::ONE }
+                Aabb {
+                    min,
+                    max: min + Vec3::ONE,
+                }
             })
             .collect();
         let sparse = vec![
@@ -213,7 +238,10 @@ mod tests {
         for x in 0..4 {
             for z in 0..4 {
                 let min = Vec3::new(x as f32 * 0.75, 0.0, z as f32 * 0.75);
-                bounds.push(Aabb { min, max: min + Vec3::ONE });
+                bounds.push(Aabb {
+                    min,
+                    max: min + Vec3::ONE,
+                });
             }
         }
         let mut expected = Vec::new();

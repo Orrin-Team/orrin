@@ -3,9 +3,7 @@ use glam::Vec3;
 use orrin_ecs::{Entity, World};
 use orrin_registry::Registry;
 
-use crate::scene::{
-    self, entities, Assets, LogBuffer, LogLevel, MaterialHandle, Time, Transform,
-};
+use crate::scene::{self, Assets, LogBuffer, LogLevel, MaterialHandle, Time, Transform, entities};
 
 /// Where the editor's Save/Load buttons read and write. Relative to the
 /// process's working directory — a real file picker and a project-relative
@@ -145,7 +143,10 @@ fn load_scene(world: &mut World, registry: &Registry, path: &str) -> (LogLevel, 
         log(world, LogLevel::Warning, issue.to_string());
     }
     match issues.len() {
-        0 => (LogLevel::Info, format!("loaded {count} entities from {path}")),
+        0 => (
+            LogLevel::Info,
+            format!("loaded {count} entities from {path}"),
+        ),
         n => (
             LogLevel::Warning,
             format!("loaded {count} entities from {path}; {n} component(s) kept but not applied"),

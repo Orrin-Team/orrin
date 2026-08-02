@@ -154,8 +154,10 @@ entity #1
         assert_eq!(err.path.to_string(), "axis");
         assert_eq!(err.expected, "a non-zero axis");
 
-        let unnormalized =
-            Value::strukt([("axis", Vec3::new(0.0, 4.0, 0.0).to_value()), ("speed", Value::F32(1.0))]);
+        let unnormalized = Value::strukt([
+            ("axis", Vec3::new(0.0, 4.0, 0.0).to_value()),
+            ("speed", Value::F32(1.0)),
+        ]);
         let spin = Spin::from_value(&unnormalized).unwrap();
         assert_eq!(spin.to_value().field("axis"), Some(&Vec3::Y.to_value()));
     }
@@ -196,7 +198,10 @@ entity #1
         register_components(&mut registry);
 
         assert_eq!(Name::new("x").to_value(), Tag::new("x").to_value());
-        assert_ne!(registry.of::<Name>().unwrap().id, registry.of::<Tag>().unwrap().id);
+        assert_ne!(
+            registry.of::<Name>().unwrap().id,
+            registry.of::<Tag>().unwrap().id
+        );
     }
 
     #[test]
@@ -229,8 +234,8 @@ entity #1
             ("rotation", Quat::IDENTITY.to_value()),
             ("scale", Vec3::ONE.to_value()),
         ]);
-        let err = (registry.get(&TRANSFORM).unwrap().write)(&mut world, entity, &broken)
-            .unwrap_err();
+        let err =
+            (registry.get(&TRANSFORM).unwrap().write)(&mut world, entity, &broken).unwrap_err();
         assert_eq!(
             err.to_string(),
             "field `translation`: expected vec3, found bool"

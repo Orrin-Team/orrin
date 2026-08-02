@@ -125,11 +125,19 @@ fn lane_total(rows: &[Row]) -> f32 {
     if let Some(frame) = rows.iter().find(|row| row.name == "frame") {
         return frame.last_ms;
     }
-    rows.iter().filter(|row| row.depth == 0).map(|row| row.last_ms).sum()
+    rows.iter()
+        .filter(|row| row.depth == 0)
+        .map(|row| row.last_ms)
+        .sum()
 }
 
 // Reference lines mark 60 fps (16.7 ms) and 30 fps (33.3 ms).
-fn graph(ui: &mut egui::Ui, stats: &FrameStats, cpu_color: egui::Color32, gpu_color: egui::Color32) {
+fn graph(
+    ui: &mut egui::Ui,
+    stats: &FrameStats,
+    cpu_color: egui::Color32,
+    gpu_color: egui::Color32,
+) {
     let cpu = stats.history();
     let gpu = stats.gpu_history();
     let size = egui::vec2(ui.available_width().max(220.0), 64.0);

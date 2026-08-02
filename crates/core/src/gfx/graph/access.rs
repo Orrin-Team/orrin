@@ -63,7 +63,9 @@ impl Access {
             Access::TransferRead => ImageLayout::TransferSrcOptimal,
             Access::TransferWrite => ImageLayout::TransferDstOptimal,
             // Buffer-only accesses; never reached for an image.
-            Access::UniformRead | Access::VertexRead | Access::IndirectRead => ImageLayout::Undefined,
+            Access::UniformRead | Access::VertexRead | Access::IndirectRead => {
+                ImageLayout::Undefined
+            }
         }
     }
 
@@ -110,9 +112,7 @@ impl Access {
             Access::StorageWrite => {
                 AccessFlags::SHADER_STORAGE_READ | AccessFlags::SHADER_STORAGE_WRITE
             }
-            Access::VertexRead => {
-                AccessFlags::VERTEX_ATTRIBUTE_READ | AccessFlags::INDEX_READ
-            }
+            Access::VertexRead => AccessFlags::VERTEX_ATTRIBUTE_READ | AccessFlags::INDEX_READ,
             Access::IndirectRead => AccessFlags::INDIRECT_COMMAND_READ,
             Access::TransferRead => AccessFlags::TRANSFER_READ,
             Access::TransferWrite => AccessFlags::TRANSFER_WRITE,

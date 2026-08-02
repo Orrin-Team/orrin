@@ -60,7 +60,9 @@ impl InputState {
                 }
             }
             WindowEvent::MouseInput { button, state, .. } => {
-                let Some(bit) = mouse_bit(*button) else { return };
+                let Some(bit) = mouse_bit(*button) else {
+                    return;
+                };
                 if state.is_pressed() {
                     if !egui_wants {
                         self.mouse_pressed |= bit & !self.mouse_held;

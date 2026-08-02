@@ -134,11 +134,7 @@ impl Frustum {
 /// distance — which cascade selection will want.
 fn normalize_plane(plane: Vec4) -> Vec4 {
     let length = plane.truncate().length();
-    if length > 0.0 {
-        plane / length
-    } else {
-        plane
-    }
+    if length > 0.0 { plane / length } else { plane }
 }
 
 #[cfg(test)]
@@ -237,8 +233,14 @@ mod tests {
             min: Vec3::splat(-0.01),
             max: Vec3::splat(0.01),
         };
-        assert!(frustum.intersects(&tiny.transformed(&Mat4::from_translation(Vec3::new(0.0, 0.0, 4.0)))));
-        assert!(!frustum.intersects(&tiny.transformed(&Mat4::from_translation(Vec3::new(0.0, 0.0, 5.5)))));
+        assert!(
+            frustum
+                .intersects(&tiny.transformed(&Mat4::from_translation(Vec3::new(0.0, 0.0, 4.0))))
+        );
+        assert!(
+            !frustum
+                .intersects(&tiny.transformed(&Mat4::from_translation(Vec3::new(0.0, 0.0, 5.5))))
+        );
     }
 
     /// An object big enough to span the whole view is visible even though every

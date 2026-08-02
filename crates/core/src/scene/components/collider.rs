@@ -9,8 +9,12 @@ use orrin_registry::Reflect;
 pub enum ColliderShape {
     /// Narrowphase treats boxes as world-space AABBs, so a rotated entity gets a
     /// conservatively enlarged volume rather than a true OBB test.
-    Box { half_extents: Vec3 },
-    Sphere { radius: f32 },
+    Box {
+        half_extents: Vec3,
+    },
+    Sphere {
+        radius: f32,
+    },
 }
 
 /// `is_trigger` colliders fire the same enter/exit events as solid ones but are
@@ -32,4 +36,3 @@ impl Default for Collider {
         }
     }
 }
-

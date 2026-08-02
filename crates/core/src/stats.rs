@@ -77,12 +77,7 @@ impl FrameStats {
         }
     }
 
-    pub fn set_gpu_stats(
-        &mut self,
-        gpu_ms: Option<f32>,
-        vram_used: Option<u64>,
-        vram_total: u64,
-    ) {
+    pub fn set_gpu_stats(&mut self, gpu_ms: Option<f32>, vram_used: Option<u64>, vram_total: u64) {
         self.gpu_ms = gpu_ms;
         if let Some(ms) = gpu_ms {
             if self.gpu_ms_history.len() == HISTORY {

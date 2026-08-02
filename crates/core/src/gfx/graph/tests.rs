@@ -206,9 +206,11 @@ fn a_pass_whose_output_nothing_reads_is_culled() {
     assert_eq!(graph.culled().len(), 1);
     assert_eq!(graph.pass_name(graph.culled()[0]), "wasted");
     // Nothing runs that touches it, so nothing allocates it either.
-    assert!(graph
-        .transient_images()
-        .all(|(id, _)| graph.resource_name(id) != "orphan"));
+    assert!(
+        graph
+            .transient_images()
+            .all(|(id, _)| graph.resource_name(id) != "orphan")
+    );
 }
 
 /// The usage flags an image is created with come from what passes declared, so
@@ -265,9 +267,11 @@ fn an_attachment_only_image_is_marked_memoryless() {
     let graph = compile(builder).unwrap();
     let (_, created) = graph.transient_images().next().unwrap();
     assert!(created.memoryless);
-    assert!(created
-        .usage
-        .contains(vulkano::image::ImageUsage::TRANSIENT_ATTACHMENT));
+    assert!(
+        created
+            .usage
+            .contains(vulkano::image::ImageUsage::TRANSIENT_ATTACHMENT)
+    );
 }
 
 #[test]
@@ -349,10 +353,12 @@ fn a_second_reader_in_the_same_layout_needs_no_barrier() {
         .iter()
         .position(|&id| graph.pass_name(id) == "read_twice")
         .unwrap();
-    assert!(graph
-        .barriers_before(slot)
-        .iter()
-        .all(|barrier| graph.resource_name(barrier.resource) != "color"));
+    assert!(
+        graph
+            .barriers_before(slot)
+            .iter()
+            .all(|barrier| graph.resource_name(barrier.resource) != "color")
+    );
 }
 
 /// An acquired swapchain image arrives `Undefined` and must be handed back as
@@ -377,10 +383,7 @@ fn an_import_is_left_in_its_declared_exit_layout() {
     };
     assert_eq!(barrier.old_layout, ImageLayout::ColorAttachmentOptimal);
     assert_eq!(barrier.new_layout, ImageLayout::PresentSrc);
-    assert_eq!(
-        barrier.src_stages,
-        PipelineStages::COLOR_ATTACHMENT_OUTPUT
-    );
+    assert_eq!(barrier.src_stages, PipelineStages::COLOR_ATTACHMENT_OUTPUT);
 }
 
 /// v1 records the frame as one command buffer and runs raw passes on the future

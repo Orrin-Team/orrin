@@ -16,12 +16,7 @@ use super::state::EditorState;
 
 // Side/bottom panels only — no `CentralPanel`, so the center stays transparent
 // and the 3D scene shows through behind the editor.
-pub fn draw(
-    ctx: &egui::Context,
-    world: &mut World,
-    state: &mut EditorState,
-    registry: &Registry,
-) {
+pub fn draw(ctx: &egui::Context, world: &mut World, state: &mut EditorState, registry: &Registry) {
     hierarchy::show(ctx, world, state);
     inspector::show(ctx, world, state, registry);
     environment::show(ctx, world);

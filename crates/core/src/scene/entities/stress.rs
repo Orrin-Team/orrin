@@ -44,7 +44,10 @@ impl StressSpec {
         }
 
         if let Ok(meshes) = raw.parse::<usize>() {
-            return Some(Self { meshes, ..Default::default() });
+            return Some(Self {
+                meshes,
+                ..Default::default()
+            });
         }
 
         let mut spec = Self::default();
@@ -81,9 +84,10 @@ impl StressSpec {
 /// Spawn the mesh and collider load. Scripted entities are attached separately,
 /// since they need the script host that doesn't exist at scene-build time.
 pub fn spawn_stress_scene(world: &mut World, spec: &StressSpec) {
-    let Some((cube, material)) = world.get_resource::<Assets>().and_then(|assets| {
-        Some((assets.mesh("cube")?, assets.material("clay")?))
-    }) else {
+    let Some((cube, material)) = world
+        .get_resource::<Assets>()
+        .and_then(|assets| Some((assets.mesh("cube")?, assets.material("clay")?)))
+    else {
         eprintln!("ORRIN_STRESS: the default scene's cube/clay assets are missing; no load added");
         return;
     };
@@ -128,7 +132,9 @@ pub fn spawn_stress_scene(world: &mut World, spec: &StressSpec) {
             .with(LocalTransform::from(Transform::from_translation(position)))
             .with(Collider {
                 shape: if index % 2 == 0 {
-                    ColliderShape::Box { half_extents: Vec3::splat(0.5) }
+                    ColliderShape::Box {
+                        half_extents: Vec3::splat(0.5),
+                    }
                 } else {
                     ColliderShape::Sphere { radius: 0.5 }
                 },
@@ -180,7 +186,10 @@ mod tests {
     #[test]
     fn a_bare_count_means_meshes() {
         // Parsing is env-driven in practice, but the shape is what matters here.
-        let spec = StressSpec { meshes: 2000, ..Default::default() };
+        let spec = StressSpec {
+            meshes: 2000,
+            ..Default::default()
+        };
         assert_eq!(spec.meshes, 2000);
         assert!(!spec.is_empty());
         assert!(StressSpec::default().is_empty());
@@ -188,8 +197,12 @@ mod tests {
 
     #[test]
     fn the_generator_is_stable_across_runs() {
-        let first: Vec<u64> = (0..4).scan(Rng::new(SEED), |rng, _| Some(rng.next_u64())).collect();
-        let second: Vec<u64> = (0..4).scan(Rng::new(SEED), |rng, _| Some(rng.next_u64())).collect();
+        let first: Vec<u64> = (0..4)
+            .scan(Rng::new(SEED), |rng, _| Some(rng.next_u64()))
+            .collect();
+        let second: Vec<u64> = (0..4)
+            .scan(Rng::new(SEED), |rng, _| Some(rng.next_u64()))
+            .collect();
         assert_eq!(first, second);
         // And it actually varies, rather than repeating one value.
         assert!(first.windows(2).any(|w| w[0] != w[1]));

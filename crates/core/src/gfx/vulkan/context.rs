@@ -10,8 +10,8 @@ use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags,
 };
 use vulkano::instance::Instance;
-use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::memory::MemoryHeapFlags;
+use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::swapchain::Surface;
 use vulkano::{Version, VulkanObject};
 
@@ -48,7 +48,10 @@ impl VkContext {
 
         let anisotropy = physical_device.supported_features().sampler_anisotropy;
 
-        if physical_device.supported_extensions().khr_portability_subset {
+        if physical_device
+            .supported_extensions()
+            .khr_portability_subset
+        {
             device_extensions.khr_portability_subset = true;
         }
 
@@ -132,8 +135,7 @@ impl VkContext {
         // vulkano makes the same call internally.
         let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
         {
-            let mut props2 =
-                vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
             unsafe {
                 (instance.fns().v1_1.get_physical_device_memory_properties2)(
                     phys.handle(),

@@ -42,7 +42,11 @@ fn demo_world() -> World {
         .spawn_entity()
         .with(LocalTransform::from(Transform {
             translation: Vec3::new(0.0, -0.75, 0.0),
-            scale: Vec3::new(GRID as f32 * SPACING * 1.5, 0.5, GRID as f32 * SPACING * 1.5),
+            scale: Vec3::new(
+                GRID as f32 * SPACING * 1.5,
+                0.5,
+                GRID as f32 * SPACING * 1.5,
+            ),
             ..Default::default()
         }))
         .with(CUBE);

@@ -1,4 +1,5 @@
-   pub struct Time {
+
+pub struct Time {
     // Accumulated as f64: repeatedly adding small f32 deltas to an f32 total
     // loses resolution as the total grows (~2 ms granularity after a few hours),
     // eventually dropping short frames entirely. Exposed as f32 at the getter.

@@ -15,10 +15,10 @@ use orrin_ecs::{Entity, FxHashMap, World};
 
 use crate::scene::{Collider, ColliderShape, LocalTransform};
 
-pub use bvh::Bvh;
 /// Broadphase bounds and mesh bounds are the same box; it lives in
 /// [`crate::geom`] so extraction can cull without depending on collision.
 pub use crate::geom::Aabb;
+pub use bvh::Bvh;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Contact {
@@ -191,7 +191,10 @@ pub fn run(world: &mut World) {
         let contact = if key.0 == a.entity {
             contact
         } else {
-            Contact { normal: -contact.normal, ..contact }
+            Contact {
+                normal: -contact.normal,
+                ..contact
+            }
         };
         current.insert(key, contact);
 
@@ -211,7 +214,11 @@ pub fn run(world: &mut World) {
     }
 
     let mut state = world.resource_mut::<CollisionState>();
-    let CollisionState { touching, events, broadphase: stored } = &mut *state;
+    let CollisionState {
+        touching,
+        events,
+        broadphase: stored,
+    } = &mut *state;
     if !(touching.is_empty() && current.is_empty()) {
         diff_pairs(touching, &current, events);
     }

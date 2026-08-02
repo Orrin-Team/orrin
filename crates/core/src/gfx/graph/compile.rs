@@ -154,7 +154,7 @@ fn check_raw_passes_last(order: &[PassId], passes: &[PassDecl]) -> Result<(), Gr
                 return Err(GraphError::RawPassNotLast {
                     raw,
                     followed_by: pass.name,
-                })
+                });
             }
             (PassKind::Inline, None) => {}
         }
@@ -485,11 +485,9 @@ fn derive_images(
         }
 
         let memoryless = accesses.iter().all(|access| access.is_attachment());
-        let mut usage = accesses
-            .iter()
-            .fold(ImageUsage::empty(), |usage, access| {
-                usage | access.image_usage()
-            });
+        let mut usage = accesses.iter().fold(ImageUsage::empty(), |usage, access| {
+            usage | access.image_usage()
+        });
         if memoryless {
             usage |= ImageUsage::TRANSIENT_ATTACHMENT;
         }

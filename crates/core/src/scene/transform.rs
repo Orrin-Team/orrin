@@ -21,7 +21,10 @@ impl Default for Transform {
 impl Transform {
     #[inline]
     pub fn from_translation(translation: Vec3) -> Self {
-        Self { translation, ..Default::default() }
+        Self {
+            translation,
+            ..Default::default()
+        }
     }
 
     #[inline]

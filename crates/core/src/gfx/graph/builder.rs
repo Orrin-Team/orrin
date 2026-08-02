@@ -105,8 +105,13 @@ impl GraphBuilder {
 
     pub(super) fn validate_names(&self) -> Result<(), GraphError> {
         for (index, resource) in self.resources.iter().enumerate() {
-            if self.resources[..index].iter().any(|r| r.name == resource.name) {
-                return Err(GraphError::DuplicateResource { name: resource.name });
+            if self.resources[..index]
+                .iter()
+                .any(|r| r.name == resource.name)
+            {
+                return Err(GraphError::DuplicateResource {
+                    name: resource.name,
+                });
             }
         }
         for (index, pass) in self.passes.iter().enumerate() {

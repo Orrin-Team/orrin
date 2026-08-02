@@ -54,21 +54,18 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .show(ui, |ui| {
-                    ui.with_layout(
-                        egui::Layout::top_down_justified(egui::Align::LEFT),
-                        |ui| {
-                            for entity in entities {
-                                let label = world
-                                    .get::<Name>(entity)
-                                    .map(|n| n.0.clone())
-                                    .unwrap_or_else(|| format!("Entity {}", entity.index()));
-                                let selected = state.selected == Some(entity);
-                                if ui.selectable_label(selected, label).clicked() {
-                                    state.selected = Some(entity);
-                                }
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                        for entity in entities {
+                            let label = world
+                                .get::<Name>(entity)
+                                .map(|n| n.0.clone())
+                                .unwrap_or_else(|| format!("Entity {}", entity.index()));
+                            let selected = state.selected == Some(entity);
+                            if ui.selectable_label(selected, label).clicked() {
+                                state.selected = Some(entity);
                             }
-                        },
-                    );
+                        }
+                    });
                 });
         });
 }

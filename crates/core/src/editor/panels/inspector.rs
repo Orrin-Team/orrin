@@ -15,12 +15,7 @@ use crate::scene::{
     Assets, Light, LocalTransform, LogBuffer, LogLevel, MaterialHandle, MeshHandle, Name, Time,
 };
 
-pub fn show(
-    ctx: &egui::Context,
-    world: &mut World,
-    state: &mut EditorState,
-    registry: &Registry,
-) {
+pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState, registry: &Registry) {
     egui::SidePanel::right("inspector")
         .resizable(true)
         .default_width(280.0)

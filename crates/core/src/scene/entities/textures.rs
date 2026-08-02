@@ -13,7 +13,11 @@ pub fn checkerboard(size: u32, checks: u32, a: [u8; 3], b: [u8; 3]) -> Vec<u8> {
     let mut data = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
         for x in 0..size {
-            let c = if ((x / cell) + (y / cell)).is_multiple_of(2) { a } else { b };
+            let c = if ((x / cell) + (y / cell)).is_multiple_of(2) {
+                a
+            } else {
+                b
+            };
             data.extend_from_slice(&[c[0], c[1], c[2], 255]);
         }
     }

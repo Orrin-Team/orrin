@@ -193,7 +193,10 @@ fn apply_asset_ref(
     value: &Value,
 ) -> Result<(), String> {
     let Value::String(name) = value else {
-        return Err(format!("expected an asset name, found {}", value.type_name()));
+        return Err(format!(
+            "expected an asset name, found {}",
+            value.type_name()
+        ));
     };
 
     // Resolved before inserting: the lookup borrows the `Assets` resource and
@@ -407,7 +410,11 @@ mod tests {
         let mut world = World::new();
         let issues = load(&text, &mut world, &registry).unwrap();
         assert_eq!(issues.len(), 1);
-        assert!(issues[0].message.contains("expected string"), "{}", issues[0]);
+        assert!(
+            issues[0].message.contains("expected string"),
+            "{}",
+            issues[0]
+        );
 
         let entity = world.entities().next().unwrap();
         assert!(world.get::<Tag>(entity).is_none());
@@ -468,4 +475,3 @@ mod tests {
         assert_eq!(parsed.entities[0].components[0].1, value);
     }
 }
-

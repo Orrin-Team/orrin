@@ -15,15 +15,23 @@ pub fn test(a: &WorldShape, b: &WorldShape) -> Option<Contact> {
     match (a, b) {
         (WorldShape::Box(a), WorldShape::Box(b)) => aabb_aabb(a, b),
         (
-            WorldShape::Sphere { center: ca, radius: ra },
-            WorldShape::Sphere { center: cb, radius: rb },
+            WorldShape::Sphere {
+                center: ca,
+                radius: ra,
+            },
+            WorldShape::Sphere {
+                center: cb,
+                radius: rb,
+            },
         ) => sphere_sphere(*ca, *ra, *cb, *rb),
         (WorldShape::Box(a), WorldShape::Sphere { center, radius }) => {
             aabb_sphere(a, *center, *radius)
         }
         (WorldShape::Sphere { center, radius }, WorldShape::Box(b)) => {
-            aabb_sphere(b, *center, *radius)
-                .map(|contact| Contact { normal: -contact.normal, ..contact })
+            aabb_sphere(b, *center, *radius).map(|contact| Contact {
+                normal: -contact.normal,
+                ..contact
+            })
         }
     }
 }
@@ -32,27 +40,18 @@ fn aabb_aabb(a: &Aabb, b: &Aabb) -> Option<Contact> {
     let extent = a.max.min(b.max) - a.min.max(b.min);
     let delta = b.center() - a.center();
 
-    if extent.x <= 0.0 || extent.y <= 0.0 || extent.z <= 0.0 { return None }
+    if extent.x <= 0.0 || extent.y <= 0.0 || extent.z <= 0.0 {
+        return None;
+    }
 
     // The smallest-overlap axis is what makes the MTV minimum: pushing out
     // along any other axis moves further. `delta` only decides the sign.
     let (depth, normal) = if extent.x <= extent.y && extent.x <= extent.z {
-        (
-            extent.x,
-            if delta.x >= 0.0 { Vec3::X } else { Vec3::NEG_X }
-        )
-    }
-    else if extent.y <= extent.z {
-        (
-            extent.y,
-            if delta.y >= 0.0 { Vec3::Y } else { Vec3::NEG_Y }
-        )
-    }
-    else {
-        (
-            extent.z,
-            if delta.z >= 0.0 { Vec3::Z } else { Vec3::NEG_Z }
-        )
+        (extent.x, if delta.x >= 0.0 { Vec3::X } else { Vec3::NEG_X })
+    } else if extent.y <= extent.z {
+        (extent.y, if delta.y >= 0.0 { Vec3::Y } else { Vec3::NEG_Y })
+    } else {
+        (extent.z, if delta.z >= 0.0 { Vec3::Z } else { Vec3::NEG_Z })
     };
 
     let overlap_min = a.min.max(b.min);
@@ -63,7 +62,7 @@ fn aabb_aabb(a: &Aabb, b: &Aabb) -> Option<Contact> {
     Some(Contact {
         normal,
         point,
-        depth
+        depth,
     })
 }
 
@@ -79,7 +78,7 @@ fn sphere_sphere(ca: Vec3, ra: f32, cb: Vec3, rb: f32) -> Option<Contact> {
             normal,
             point: (ca + normal * ra),
             depth: (ra + rb) - dist,
-        })
+        });
     }
     None
 }
@@ -89,7 +88,9 @@ fn aabb_sphere(a: &Aabb, center: Vec3, radius: f32) -> Option<Contact> {
     let d = center - closest;
     let dist = d.length();
 
-    if dist >= radius { return None }
+    if dist >= radius {
+        return None;
+    }
 
     // Center inside the box: `d` is zero (exact — clamp returns the center
     // unchanged), so there's no direction to normalize. Push out through the
@@ -99,24 +100,30 @@ fn aabb_sphere(a: &Aabb, center: Vec3, radius: f32) -> Option<Contact> {
         let to_max = a.max - center;
 
         let candidates = [
-            (to_min.x, Vec3::NEG_X), (to_max.x, Vec3::X),
-            (to_min.y, Vec3::NEG_Y), (to_max.y, Vec3::Y),
-            (to_min.z, Vec3::NEG_Z), (to_max.z, Vec3::Z),
+            (to_min.x, Vec3::NEG_X),
+            (to_max.x, Vec3::X),
+            (to_min.y, Vec3::NEG_Y),
+            (to_max.y, Vec3::Y),
+            (to_min.z, Vec3::NEG_Z),
+            (to_max.z, Vec3::Z),
         ];
 
-        let (face_dist, normal) = candidates.iter().min_by(|x, y| x.0.total_cmp(&y.0)).unwrap();
+        let (face_dist, normal) = candidates
+            .iter()
+            .min_by(|x, y| x.0.total_cmp(&y.0))
+            .unwrap();
 
         return Some(Contact {
             normal: *normal,
             depth: face_dist + radius,
-            point: center
-        })
+            point: center,
+        });
     }
 
     Some(Contact {
         normal: d / dist,
         depth: radius - dist,
-        point: closest
+        point: closest,
     })
 }
 
@@ -132,12 +139,21 @@ mod tests {
     use super::*;
 
     fn unit_box_at(center: Vec3) -> Aabb {
-        Aabb { min: center - Vec3::splat(0.5), max: center + Vec3::splat(0.5) }
+        Aabb {
+            min: center - Vec3::splat(0.5),
+            max: center + Vec3::splat(0.5),
+        }
     }
 
     #[test]
     fn separated_shapes_do_not_collide() {
-        assert!(aabb_aabb(&unit_box_at(Vec3::ZERO), &unit_box_at(Vec3::new(3.0, 0.0, 0.0))).is_none());
+        assert!(
+            aabb_aabb(
+                &unit_box_at(Vec3::ZERO),
+                &unit_box_at(Vec3::new(3.0, 0.0, 0.0))
+            )
+            .is_none()
+        );
         assert!(sphere_sphere(Vec3::ZERO, 0.5, Vec3::new(3.0, 0.0, 0.0), 0.5).is_none());
         assert!(aabb_sphere(&unit_box_at(Vec3::ZERO), Vec3::new(3.0, 0.0, 0.0), 0.5).is_none());
     }
@@ -183,7 +199,11 @@ mod tests {
 
     #[test]
     fn resolve_offsets_split_the_mtv() {
-        let contact = Contact { point: Vec3::ZERO, normal: Vec3::X, depth: 0.2 };
+        let contact = Contact {
+            point: Vec3::ZERO,
+            normal: Vec3::X,
+            depth: 0.2,
+        };
         let (offset_a, offset_b) = resolve_offsets(&contact);
         assert!((offset_a - Vec3::new(-0.1, 0.0, 0.0)).length() < 1e-5);
         assert!((offset_b - Vec3::new(0.1, 0.0, 0.0)).length() < 1e-5);

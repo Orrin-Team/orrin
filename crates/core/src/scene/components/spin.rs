@@ -68,7 +68,9 @@ impl Reflect for Spin {
         // through the transform hierarchy and is unrecoverable by the time it's
         // visible. Rejected here, at the boundary where untrusted input enters.
         if axis.try_normalize().is_none() {
-            return Err(ValueError::invalid("a non-zero axis", format!("{axis:?}")).at_field("axis"));
+            return Err(
+                ValueError::invalid("a non-zero axis", format!("{axis:?}")).at_field("axis")
+            );
         }
         Ok(Self::new(axis, take(value, "speed")?))
     }

@@ -60,7 +60,11 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
         "Ground",
         Transform {
             translation: Vec3::new(0.0, -0.75, 0.0),
-            scale: Vec3::new(GRID as f32 * SPACING * 1.5, 0.5, GRID as f32 * SPACING * 1.5),
+            scale: Vec3::new(
+                GRID as f32 * SPACING * 1.5,
+                0.5,
+                GRID as f32 * SPACING * 1.5,
+            ),
             ..Default::default()
         },
         cube,
@@ -94,7 +98,13 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds) {
     let mut bounds = MeshBounds::default();
 
     load_mesh(backend, &mut assets, &mut bounds, "cube", &CpuMesh::cube());
-    load_mesh(backend, &mut assets, &mut bounds, "plane", &CpuMesh::plane());
+    load_mesh(
+        backend,
+        &mut assets,
+        &mut bounds,
+        "plane",
+        &CpuMesh::plane(),
+    );
     load_mesh(
         backend,
         &mut assets,
@@ -105,39 +115,54 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds) {
 
     // A spread across the metallic-roughness range so the PBR BRDF is visible.
     let palette = [
-        ("gold", Material {
-            base_color: Vec3::new(1.0, 0.84, 0.40),
-            metallic: 1.0,
-            roughness: 0.18,
-            ..Material::default()
-        }),
-        ("copper", Material {
-            base_color: Vec3::new(0.95, 0.64, 0.54),
-            metallic: 1.0,
-            roughness: 0.45,
-            ..Material::default()
-        }),
-        ("glossy", Material {
-            base_color: Vec3::new(0.9, 0.9, 0.95),
-            metallic: 0.0,
-            roughness: 0.12,
-            reflectance: 0.7,
-            ..Material::default()
-        }),
-        ("clay", Material {
-            base_color: Vec3::splat(0.8),
-            metallic: 0.0,
-            roughness: 0.85,
-            ..Material::default()
-        }),
-        ("neon", Material {
-            base_color: Vec3::splat(0.4),
-            metallic: 0.0,
-            roughness: 0.0,
-            reflectance: 0.0,
-            emissive: Vec3::new(8.0, 8.0, 8.0),
-            ..Material::default()
-        }),
+        (
+            "gold",
+            Material {
+                base_color: Vec3::new(1.0, 0.84, 0.40),
+                metallic: 1.0,
+                roughness: 0.18,
+                ..Material::default()
+            },
+        ),
+        (
+            "copper",
+            Material {
+                base_color: Vec3::new(0.95, 0.64, 0.54),
+                metallic: 1.0,
+                roughness: 0.45,
+                ..Material::default()
+            },
+        ),
+        (
+            "glossy",
+            Material {
+                base_color: Vec3::new(0.9, 0.9, 0.95),
+                metallic: 0.0,
+                roughness: 0.12,
+                reflectance: 0.7,
+                ..Material::default()
+            },
+        ),
+        (
+            "clay",
+            Material {
+                base_color: Vec3::splat(0.8),
+                metallic: 0.0,
+                roughness: 0.85,
+                ..Material::default()
+            },
+        ),
+        (
+            "neon",
+            Material {
+                base_color: Vec3::splat(0.4),
+                metallic: 0.0,
+                roughness: 0.0,
+                reflectance: 0.0,
+                emissive: Vec3::new(8.0, 8.0, 8.0),
+                ..Material::default()
+            },
+        ),
     ];
     for (name, material) in palette {
         assets.insert_material(name, backend.load_material(&material));

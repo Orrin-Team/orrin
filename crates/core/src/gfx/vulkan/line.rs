@@ -11,23 +11,25 @@
 
 use std::sync::Arc;
 
-use vulkano::buffer::{BufferContents, BufferUsage};
+use crate::scene::{Camera, DebugLine};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
+use vulkano::buffer::{BufferContents, BufferUsage};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::device::Device;
 use vulkano::memory::allocator::{MemoryTypeFilter, StandardMemoryAllocator};
-use vulkano::pipeline::graphics::vertex_input::{Vertex as VertexTrait, VertexDefinition};
-use vulkano::pipeline::{DynamicState, GraphicsPipeline, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo};
+use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
+use vulkano::pipeline::graphics::vertex_input::{Vertex as VertexTrait, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
+use vulkano::pipeline::{
+    DynamicState, GraphicsPipeline, Pipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+};
 use vulkano::render_pass::{RenderPass, Subpass};
-use crate::scene::{Camera, DebugLine};
 
 /// One endpoint of a debug line: world-space position + RGBA colour. Two of
 /// these make a segment, drawn with `PrimitiveTopology::LineList`.
@@ -74,7 +76,7 @@ impl LinePass {
                 .into_pipeline_layout_create_info(device.clone())
                 .unwrap(),
         )
-            .unwrap();
+        .unwrap();
 
         let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
 
@@ -94,7 +96,7 @@ impl LinePass {
             GraphicsPipelineCreateInfo {
                 stages: stages.into_iter().collect(),
                 vertex_input_state: Some(vertex_input_state),
-                input_assembly_state: Some(InputAssemblyState  {
+                input_assembly_state: Some(InputAssemblyState {
                     topology: PrimitiveTopology::LineList,
                     ..Default::default()
                 }),
@@ -121,7 +123,7 @@ impl LinePass {
                 ..GraphicsPipelineCreateInfo::layout(layout)
             },
         )
-            .unwrap();
+        .unwrap();
 
         Self {
             pipeline,
@@ -172,8 +174,8 @@ impl LinePass {
                     extent: [extent[0] as f32, extent[1] as f32],
                     depth_range: 0.0..=1.0,
                 }]
-                    .into_iter()
-                    .collect(),
+                .into_iter()
+                .collect(),
             )
             .unwrap()
             .bind_pipeline_graphics(self.pipeline.clone())

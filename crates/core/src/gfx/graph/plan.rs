@@ -45,12 +45,7 @@ impl fmt::Display for FrameGraph {
                 self.write_barrier(f, barrier)?;
             }
             for &(resource, access) in &pass.accesses {
-                writeln!(
-                    f,
-                    "     {} {:?}",
-                    self.resource_name(resource),
-                    access
-                )?;
+                writeln!(f, "     {} {:?}", self.resource_name(resource), access)?;
             }
         }
         if !self.final_barriers().is_empty() {

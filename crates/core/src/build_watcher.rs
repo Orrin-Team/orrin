@@ -38,20 +38,28 @@ const TAIL_LINES: usize = 5;
 pub enum BuildEvent {
     /// The debounce elapsed and a rebuild started.
     Started,
-    Succeeded { duration: Duration },
+    Succeeded {
+        duration: Duration,
+    },
     /// The compiler rejected the code. `diagnostics` are its error and warning
     /// lines, or the tail of the log when the build died before compiling.
-    Failed { diagnostics: Vec<String> },
+    Failed {
+        diagnostics: Vec<String>,
+    },
     /// `dotnet build` could not be run at all.
-    Unavailable { reason: String },
+    Unavailable {
+        reason: String,
+    },
 }
 
 impl BuildEvent {
     fn log_into(&self, log: &mut LogBuffer, frame: u64) {
         match self {
-            Self::Started => {
-                log.push(LogLevel::Info, "scripts changed; rebuilding".to_owned(), frame)
-            }
+            Self::Started => log.push(
+                LogLevel::Info,
+                "scripts changed; rebuilding".to_owned(),
+                frame,
+            ),
             Self::Succeeded { duration } => log.push(
                 LogLevel::Info,
                 format!("scripts rebuilt in {:.1}s", duration.as_secs_f32()),
@@ -71,9 +79,11 @@ impl BuildEvent {
                     log.push(LogLevel::Error, format!("... and {hidden} more"), frame);
                 }
             }
-            Self::Unavailable { reason } => {
-                log.push(LogLevel::Error, format!("script build could not run: {reason}"), frame)
-            }
+            Self::Unavailable { reason } => log.push(
+                LogLevel::Error,
+                format!("script build could not run: {reason}"),
+                frame,
+            ),
         }
     }
 }
@@ -209,15 +219,16 @@ impl BuildWatcher {
         // Filtering here rather than on the main thread keeps the channel down
         // to "something worth compiling changed" — a `dotnet build` writes
         // hundreds of files under `bin/` and `obj/` that must never reach it.
-        let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            let Ok(event) = event else { return };
-            if !(event.kind.is_create() || event.kind.is_modify() || event.kind.is_remove()) {
-                return;
-            }
-            if event.paths.iter().any(|path| is_script_source(&root, path)) {
-                let _ = changes_tx.send(());
-            }
-        })?;
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                let Ok(event) = event else { return };
+                if !(event.kind.is_create() || event.kind.is_modify() || event.kind.is_remove()) {
+                    return;
+                }
+                if event.paths.iter().any(|path| is_script_source(&root, path)) {
+                    let _ = changes_tx.send(());
+                }
+            })?;
         watcher.watch(scripts_dir, RecursiveMode::Recursive)?;
 
         let (finished, results) = mpsc::channel();
@@ -274,7 +285,10 @@ impl BuildWatcher {
         }
 
         if let Ok(result) = self.results.try_recv() {
-            let elapsed = self.building_since.take().map_or(Duration::ZERO, |t| t.elapsed());
+            let elapsed = self
+                .building_since
+                .take()
+                .map_or(Duration::ZERO, |t| t.elapsed());
             events.push(match result {
                 Ok(report) if report.success => BuildEvent::Succeeded { duration: elapsed },
                 Ok(report) => BuildEvent::Failed {
@@ -290,7 +304,11 @@ impl BuildWatcher {
         // compiler was running start the next build the moment this one lands —
         // including in this same call, since the branch above just cleared
         // `building_since`.
-        if should_build(self.pending_since, self.building_since.is_some(), Instant::now()) {
+        if should_build(
+            self.pending_since,
+            self.building_since.is_some(),
+            Instant::now(),
+        ) {
             self.pending_since = None;
             self.spawn_build();
             events.push(BuildEvent::Started);
@@ -327,9 +345,7 @@ impl BuildWatcher {
 /// one output directory, and the later one's result could land first and reload
 /// the session onto the earlier build's code.
 fn should_build(pending_since: Option<Instant>, building: bool, now: Instant) -> bool {
-    !building
-        && pending_since
-            .is_some_and(|since| now.saturating_duration_since(since) >= DEBOUNCE)
+    !building && pending_since.is_some_and(|since| now.saturating_duration_since(since) >= DEBOUNCE)
 }
 
 fn failure_lines(report: &orrin_build::Report) -> Vec<String> {
@@ -369,11 +385,18 @@ fn is_script_source(root: &Path, path: &Path) -> bool {
 
     // Editors save through hidden temp files (`.#Player.cs`, `.Player.cs.swp`).
     // The write that matters always lands on the real name afterwards.
-    if path.file_name().and_then(|name| name.to_str()).is_none_or(|name| name.starts_with('.')) {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_none_or(|name| name.starts_with('.'))
+    {
         return false;
     }
 
-    matches!(path.extension().and_then(|ext| ext.to_str()), Some("cs" | "csproj"))
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("cs" | "csproj")
+    )
 }
 
 #[cfg(test)]
@@ -387,8 +410,14 @@ mod tests {
         let just_now = now - DEBOUNCE / 2;
 
         assert!(!should_build(None, false, now), "no change, no build");
-        assert!(!should_build(Some(just_now), false, now), "still inside the debounce");
-        assert!(should_build(Some(quiet), false, now), "quiet for long enough");
+        assert!(
+            !should_build(Some(just_now), false, now),
+            "still inside the debounce"
+        );
+        assert!(
+            should_build(Some(quiet), false, now),
+            "quiet for long enough"
+        );
     }
 
     #[test]
@@ -419,7 +448,10 @@ mod tests {
         // What `$ORRIN_GAME_DLL` pointing at a hand-placed DLL looks like: there
         // is no project to rebuild, so no watcher may start.
         assert_eq!(build_location(Path::new("/tmp/MyGame.dll")), None);
-        assert_eq!(build_location(Path::new("/tmp/out/Debug/net10.0/MyGame.dll")), None);
+        assert_eq!(
+            build_location(Path::new("/tmp/out/Debug/net10.0/MyGame.dll")),
+            None
+        );
     }
 
     #[test]
@@ -431,8 +463,14 @@ mod tests {
         assert!(is_script_source(root, &root.join("MyGame.csproj")));
 
         // The infinite-rebuild loop this exists to prevent.
-        assert!(!is_script_source(root, &root.join("obj/Debug/net10.0/MyGame.AssemblyInfo.cs")));
-        assert!(!is_script_source(root, &root.join("bin/Debug/net10.0/MyGame.dll")));
+        assert!(!is_script_source(
+            root,
+            &root.join("obj/Debug/net10.0/MyGame.AssemblyInfo.cs")
+        ));
+        assert!(!is_script_source(
+            root,
+            &root.join("bin/Debug/net10.0/MyGame.dll")
+        ));
 
         assert!(!is_script_source(root, &root.join("readme.md")));
         assert!(!is_script_source(root, &root.join(".#Player.cs")));

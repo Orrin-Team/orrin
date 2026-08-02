@@ -7,13 +7,13 @@ use vulkano::device::Device;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
+use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
 use vulkano::pipeline::graphics::vertex_input::VertexInputState;
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
@@ -108,7 +108,9 @@ impl HdrPass {
             .push_constants(
                 self.tonemap_pipeline.layout().clone(),
                 0,
-                TonemapPush { exposure: self.exposure },
+                TonemapPush {
+                    exposure: self.exposure,
+                },
             )
             .unwrap();
         unsafe { builder.draw(3, 1, 0, 0).unwrap() };
@@ -130,8 +132,14 @@ fn build_tonemap_pipeline(
     device: &Arc<Device>,
     render_pass: &Arc<RenderPass>,
 ) -> Arc<GraphicsPipeline> {
-    let vs = fullscreen_vs::load(device.clone()).unwrap().entry_point("main").unwrap();
-    let fs = tonemap_fs::load(device.clone()).unwrap().entry_point("main").unwrap();
+    let vs = fullscreen_vs::load(device.clone())
+        .unwrap()
+        .entry_point("main")
+        .unwrap();
+    let fs = tonemap_fs::load(device.clone())
+        .unwrap()
+        .entry_point("main")
+        .unwrap();
     let stages = [
         PipelineShaderStageCreateInfo::new(vs),
         PipelineShaderStageCreateInfo::new(fs),

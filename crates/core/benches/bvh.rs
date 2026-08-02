@@ -5,7 +5,7 @@
 //! dense ones make `query_pairs` do real traversal work, which is the case that
 //! degrades first as scenes grow.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use glam::Vec3;
 use orrin_core::collision::{Aabb, Bvh};
@@ -38,7 +38,10 @@ fn bounds(count: usize, spread: f32) -> Vec<Aabb> {
                 (rng.unit() - 0.5) * spread,
             );
             let half = Vec3::splat(0.5);
-            Aabb { min: center - half, max: center + half }
+            Aabb {
+                min: center - half,
+                max: center + half,
+            }
         })
         .collect()
 }

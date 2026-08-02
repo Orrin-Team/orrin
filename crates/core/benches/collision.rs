@@ -14,7 +14,7 @@
 //! has a populated `touching` map. Benchmarking the first frame instead would
 //! measure only the Enter path and never the diff.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use glam::Vec3;
 
@@ -60,7 +60,9 @@ fn world_with_colliders(count: usize) -> World {
             .with(LocalTransform::from(Transform::from_translation(position)))
             .with(Collider {
                 shape: if index % 2 == 0 {
-                    ColliderShape::Box { half_extents: Vec3::splat(0.5) }
+                    ColliderShape::Box {
+                        half_extents: Vec3::splat(0.5),
+                    }
                 } else {
                     ColliderShape::Sphere { radius: 0.5 }
                 },

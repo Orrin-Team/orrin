@@ -18,8 +18,8 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Frames kept for aggregation; matches `FrameStats::HISTORY` so the table and
@@ -232,7 +232,11 @@ impl Profiler {
     /// `false` if that frame has already aged out of the ring, which is the
     /// normal outcome for a readback that stalled for hundreds of frames.
     pub fn push_gpu_span(&mut self, frame_index: u64, span: Span) -> bool {
-        match self.ring.iter_mut().find(|frame| frame.index == frame_index) {
+        match self
+            .ring
+            .iter_mut()
+            .find(|frame| frame.index == frame_index)
+        {
             Some(frame) => {
                 frame.gpu.push(span);
                 true
@@ -349,7 +353,12 @@ mod tests {
     static SERIAL: Mutex<()> = Mutex::new(());
 
     fn span(name: &'static str, depth: u16, start_ns: u64, end_ns: u64) -> Span {
-        Span { name, depth, start_ns, end_ns }
+        Span {
+            name,
+            depth,
+            start_ns,
+            end_ns,
+        }
     }
 
     #[test]
@@ -373,10 +382,7 @@ mod tests {
         let frame = profiler.latest().unwrap();
         let depths: Vec<_> = frame.cpu.iter().map(|s| (s.name, s.depth)).collect();
         // Inner scopes close first, so they land ahead of their parent.
-        assert_eq!(
-            depths,
-            vec![("inner", 1), ("sibling", 1), ("outer", 0)]
-        );
+        assert_eq!(depths, vec![("inner", 1), ("sibling", 1), ("outer", 0)]);
     }
 
     #[test]

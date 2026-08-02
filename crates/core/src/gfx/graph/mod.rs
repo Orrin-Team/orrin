@@ -59,7 +59,7 @@ mod resource;
 
 pub use access::Access;
 pub use builder::{GraphBuilder, PassBuilder, PassId, PassKind};
-pub use compile::{compile, FrameGraph, TransientImage};
+pub use compile::{FrameGraph, TransientImage, compile};
 pub use error::GraphError;
 pub use plan::Barrier;
 pub use resource::{Extent, ImageDesc, ImportedLayouts, ResourceId};

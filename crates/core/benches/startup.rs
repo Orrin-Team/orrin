@@ -17,7 +17,7 @@
 //! The number this prints is the baseline; `tests/cold_start.rs` is what
 //! actually fails a build.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use orrin_core::App;
 use orrin_core::gfx::HeadlessBackend;
@@ -43,7 +43,10 @@ fn cold_start(c: &mut Criterion) {
     // the one failure mode that would make every future number meaningless.
     let (world, backend) = boot();
     let (meshes, materials, textures) = backend.upload_counts();
-    assert!(meshes >= 3 && materials > 0 && textures > 0, "headless boot uploaded nothing");
+    assert!(
+        meshes >= 3 && materials > 0 && textures > 0,
+        "headless boot uploaded nothing"
+    );
     assert!(world.entities().count() > 1, "headless boot built no scene");
 
     c.bench_function("cold_start", |b| b.iter(|| black_box(boot())));

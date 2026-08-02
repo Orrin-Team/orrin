@@ -66,7 +66,10 @@ fn cold_start_stays_within_budget() {
         "the headless boot uploaded nothing ({meshes} meshes, {materials} materials, \
          {textures} textures) — this test would pass no matter how slow startup got"
     );
-    assert!(world.entities().count() > 1, "the headless boot built no scene");
+    assert!(
+        world.entities().count() > 1,
+        "the headless boot built no scene"
+    );
 
     let mut timings: Vec<Duration> = (0..SAMPLES)
         .map(|_| {
@@ -80,7 +83,10 @@ fn cold_start_stays_within_budget() {
     timings.sort_unstable();
     let median = timings[SAMPLES / 2];
 
-    println!("cold start (CPU half, headless): {:.1} ms", median.as_secs_f64() * 1e3);
+    println!(
+        "cold start (CPU half, headless): {:.1} ms",
+        median.as_secs_f64() * 1e3
+    );
 
     assert!(
         median <= budget,

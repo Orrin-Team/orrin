@@ -5,14 +5,14 @@
 //! table with `..orrin_script::default_api()`.
 
 use std::cell::RefCell;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use glam::{Quat, Vec3};
 
 use orrin_ecs::{Entity, FxHashMap, World};
-use orrin_script::{CCollision, CEntity, CTransform, OrrinApi, GameAssemblyStatus, ScriptHost};
+use orrin_script::{CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi, ScriptHost};
 
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::{
@@ -149,13 +149,20 @@ extern "C" fn find_by_tag(tag: *const c_char, out: *mut CEntity) -> bool {
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
     let tag = unsafe { CStr::from_ptr(tag) }.to_string_lossy();
     orrin_script::with_world(false, |world| {
-        let found = world.query::<&Tag>().find(|_, t| t.as_str() == tag.as_ref());
+        let found = world
+            .query::<&Tag>()
+            .find(|_, t| t.as_str() == tag.as_ref());
 
         match found {
             Some(e) => {
                 // SAFETY: `out` was null-checked above; C# passes a pointer to
                 // a single stack-allocated Entity slot (see Native.FindByTag).
-                unsafe { *out = CEntity { index: e.index, generation: e.generation } }
+                unsafe {
+                    *out = CEntity {
+                        index: e.index,
+                        generation: e.generation,
+                    }
+                }
                 true
             }
             None => false,
@@ -173,7 +180,10 @@ extern "C" fn find_all_by_tag(tag: *const c_char, out: *mut CEntity, capacity: i
         let mut matches: Vec<CEntity> = Vec::new();
         world.query::<&Tag>().for_each(|e, t| {
             if t.as_str() == tag.as_ref() {
-                matches.push(CEntity { index: e.index, generation: e.generation });
+                matches.push(CEntity {
+                    index: e.index,
+                    generation: e.generation,
+                });
             }
         });
 
@@ -240,7 +250,9 @@ extern "C" fn set_tag(entity: CEntity, tag: *const c_char) -> bool {
         return false;
     }
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
-    let tag = unsafe { CStr::from_ptr(tag) }.to_string_lossy().into_owned();
+    let tag = unsafe { CStr::from_ptr(tag) }
+        .to_string_lossy()
+        .into_owned();
     orrin_script::with_world(false, |world| {
         let entity = Entity {
             index: entity.index,
@@ -264,17 +276,27 @@ fn queue_add_collider(entity: CEntity, collider: Collider) -> bool {
             return false;
         }
         COMMANDS.with(|commands| {
-            commands.borrow_mut().push(Command::AddCollider { entity, collider })
+            commands
+                .borrow_mut()
+                .push(Command::AddCollider { entity, collider })
         });
         true
     })
 }
 
-extern "C" fn add_box_collider(entity: CEntity, hx: f32, hy: f32, hz: f32, is_trigger: bool) -> bool {
+extern "C" fn add_box_collider(
+    entity: CEntity,
+    hx: f32,
+    hy: f32,
+    hz: f32,
+    is_trigger: bool,
+) -> bool {
     queue_add_collider(
         entity,
         Collider {
-            shape: ColliderShape::Box { half_extents: Vec3::new(hx, hy, hz) },
+            shape: ColliderShape::Box {
+                half_extents: Vec3::new(hx, hy, hz),
+            },
             is_trigger,
         },
     )
@@ -314,7 +336,9 @@ extern "C" fn set_material(entity: CEntity, material: *const c_char) -> bool {
             return false;
         };
         COMMANDS.with(|commands| {
-            commands.borrow_mut().push(Command::SetMaterial { entity, material })
+            commands
+                .borrow_mut()
+                .push(Command::SetMaterial { entity, material })
         });
         true
     })
@@ -325,7 +349,9 @@ extern "C" fn add_script(entity: CEntity, type_name: *const c_char) -> bool {
         return false;
     }
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
-    let type_name = unsafe { CStr::from_ptr(type_name) }.to_string_lossy().into_owned();
+    let type_name = unsafe { CStr::from_ptr(type_name) }
+        .to_string_lossy()
+        .into_owned();
     orrin_script::with_world(false, |world| {
         let entity = Entity {
             index: entity.index,
@@ -335,7 +361,9 @@ extern "C" fn add_script(entity: CEntity, type_name: *const c_char) -> bool {
             return false;
         }
         COMMANDS.with(|commands| {
-            commands.borrow_mut().push(Command::AttachScript { entity, type_name })
+            commands
+                .borrow_mut()
+                .push(Command::AttachScript { entity, type_name })
         });
         true
     })
@@ -360,12 +388,24 @@ enum Command {
     Despawn(Entity),
     // Adding a component changes which entities queries match, so it defers
     // like the other structural edits; a same-tick FindByTag won't see it.
-    SetTag { entity: Entity, tag: String },
-    AddCollider { entity: Entity, collider: Collider },
-    SetMaterial { entity: Entity, material: MaterialHandle },
+    SetTag {
+        entity: Entity,
+        tag: String,
+    },
+    AddCollider {
+        entity: Entity,
+        collider: Collider,
+    },
+    SetMaterial {
+        entity: Entity,
+        material: MaterialHandle,
+    },
     // Applied by `Scripting::apply_commands` (needs the host to create the
     // managed instance); the new behaviour gets OnEnable/OnStart next tick.
-    AttachScript { entity: Entity, type_name: String },
+    AttachScript {
+        entity: Entity,
+        type_name: String,
+    },
 }
 
 thread_local! {
@@ -452,9 +492,13 @@ fn log_at(level: LogLevel, message: *const c_char) {
         return;
     }
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
-    let text = unsafe { CStr::from_ptr(message) }.to_string_lossy().into_owned();
+    let text = unsafe { CStr::from_ptr(message) }
+        .to_string_lossy()
+        .into_owned();
     let buffered = orrin_script::with_world(false, |world| {
-        let frame = world.get_resource::<Time>().map_or(0, |time| time.frame_count());
+        let frame = world
+            .get_resource::<Time>()
+            .map_or(0, |time| time.frame_count());
         match world.get_resource_mut::<LogBuffer>() {
             Some(mut log) => {
                 log.push(level, text.clone(), frame);
@@ -502,9 +546,17 @@ extern "C" fn debug_draw_line(
     duration: f32,
 ) {
     orrin_script::with_world((), |world| {
-        let now = world.get_resource::<Time>().map_or(0.0, |time| time.elapsed_time());
+        let now = world
+            .get_resource::<Time>()
+            .map_or(0.0, |time| time.elapsed_time());
         if let Some(mut lines) = world.get_resource_mut::<DebugLines>() {
-            lines.push(Vec3::new(fx, fy, fz), Vec3::new(tx, ty, tz), [r, g, b, a], now, duration);
+            lines.push(
+                Vec3::new(fx, fy, fz),
+                Vec3::new(tx, ty, tz),
+                [r, g, b, a],
+                now,
+                duration,
+            );
         }
     });
 }
@@ -565,7 +617,11 @@ pub enum ReloadOutcome {
 impl std::fmt::Display for ReloadOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Swapped { restored, lost, leaked } => {
+            Self::Swapped {
+                restored,
+                lost,
+                leaked,
+            } => {
                 write!(f, "scripts reloaded: {restored} restored")?;
                 if *lost > 0 {
                     write!(f, ", {lost} dropped (type no longer in the assembly)")?;
@@ -576,7 +632,10 @@ impl std::fmt::Display for ReloadOutcome {
                 Ok(())
             }
             Self::Rejected(status) => {
-                write!(f, "reload rejected ({status}); still running the previous build")
+                write!(
+                    f,
+                    "reload rejected ({status}); still running the previous build"
+                )
             }
         }
     }
@@ -587,7 +646,11 @@ impl ReloadOutcome {
     /// developer asked for new code and is still looking at the old.
     pub fn level(&self) -> LogLevel {
         match self {
-            Self::Swapped { lost: 0, leaked: false, .. } => LogLevel::Info,
+            Self::Swapped {
+                lost: 0,
+                leaked: false,
+                ..
+            } => LogLevel::Info,
             Self::Swapped { .. } => LogLevel::Warning,
             Self::Rejected(_) => LogLevel::Warning,
         }
@@ -793,16 +856,18 @@ impl Scripting {
         }
 
         let mut pending: Vec<Reloading> = Vec::new();
-        world.query::<&ScriptComponent>().for_each(|entity, script| {
-            pending.push(Reloading {
-                entity,
-                handle: script.handle,
-                type_name: script.type_name.clone(),
-                enabled: script.enabled,
-                started: script.started,
-                snapshot: 0,
-            })
-        });
+        world
+            .query::<&ScriptComponent>()
+            .for_each(|entity, script| {
+                pending.push(Reloading {
+                    entity,
+                    handle: script.handle,
+                    type_name: script.type_name.clone(),
+                    enabled: script.enabled,
+                    started: script.started,
+                    snapshot: 0,
+                })
+            });
 
         for script in pending.iter_mut() {
             script.snapshot = self.host.capture_state(script.handle);
@@ -848,7 +913,11 @@ impl Scripting {
         // Last, so it only drops the snapshots belonging to the `lost` scripts.
         self.host.discard_states();
 
-        ReloadOutcome::Swapped { restored, lost, leaked }
+        ReloadOutcome::Swapped {
+            restored,
+            lost,
+            leaked,
+        }
     }
 
     /// Attach a C# `Behaviour` (by assembly-qualified type name) to `entity`.
@@ -927,21 +996,23 @@ impl Scripting {
     pub fn tick(&self, world: &mut World, delta_time: f32) {
         let mut pending = self.pending.take();
         pending.clear();
-        world.query::<&ScriptComponent>().for_each(|entity, script| {
-            // Already-faulted scripts are inert: never collected, never
-            // dispatched to, until something clears the flag.
-            if script.faulted {
-                return;
-            }
-            pending.push(Pending {
-                entity,
-                handle: script.handle,
-                started: script.started,
-                enabled: script.enabled,
-                active: script.active,
-                faulted: false,
-            })
-        });
+        world
+            .query::<&ScriptComponent>()
+            .for_each(|entity, script| {
+                // Already-faulted scripts are inert: never collected, never
+                // dispatched to, until something clears the flag.
+                if script.faulted {
+                    return;
+                }
+                pending.push(Pending {
+                    entity,
+                    handle: script.handle,
+                    started: script.started,
+                    enabled: script.enabled,
+                    active: script.active,
+                    faulted: false,
+                })
+            });
         if pending.is_empty() {
             self.pending.replace(pending);
             return;
@@ -961,7 +1032,12 @@ impl Scripting {
         let mut routing = self.routing.take();
         routing.clear();
         if !events.is_empty() {
-            routing.extend(pending.iter().enumerate().map(|(i, script)| (script.entity, i)));
+            routing.extend(
+                pending
+                    .iter()
+                    .enumerate()
+                    .map(|(i, script)| (script.entity, i)),
+            );
         }
 
         orrin_script::with_active_world(world, || {
@@ -1007,7 +1083,10 @@ impl Scripting {
                     }
                     let normal = if flip { -event.normal } else { event.normal };
                     let collision = CCollision {
-                        other: CEntity { index: other.index, generation: other.generation },
+                        other: CEntity {
+                            index: other.index,
+                            generation: other.generation,
+                        },
                         point: event.point.to_array(),
                         normal: normal.to_array(),
                     };

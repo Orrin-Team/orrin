@@ -151,8 +151,8 @@ impl CameraController {
         self.sync_from(camera);
         if self.looking {
             self.yaw += self.look_delta.0 * self.sensitivity;
-            self.pitch =
-                (self.pitch - self.look_delta.1 * self.sensitivity).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+            self.pitch = (self.pitch - self.look_delta.1 * self.sensitivity)
+                .clamp(-PITCH_LIMIT, PITCH_LIMIT);
         }
 
         let forward = forward_dir(self.yaw, self.pitch);
