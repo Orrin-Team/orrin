@@ -90,9 +90,37 @@ vec3 fresnel_schlick(float v_dot_h, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - v_dot_h, 0.0, 1.0), 5.0);
 }
 
+// Specular antialiasing: widen linear roughness `a` to cover the normal
+// variance inside this pixel, which the single-sample BRDF below cannot see.
+// MSAA cannot do this — it supersamples coverage, not shader inputs.
+// sigma = 0.5 px, the standard deviation of the pixel filter kernel in image
+// space; the shader wants its square.
+const float SPEC_AA_SIGMA2 = 0.25;
+// Clamping threshold, from Kaplanyan et al. 2016.
+const float SPEC_AA_KAPPA = 0.18;
+
+// Specular antialiasing, Tokuyoshi & Kaplanyan 2019 listing 2: widen the linear
+// roughness to cover the normal variance inside this pixel, which the
+// single-sample BRDF below cannot see. MSAA does not help — it supersamples
+// coverage, not shader inputs. Filtering off the normal rather than the
+// halfvector costs the same regardless of light count and needs no tangent
+// frame, so it holds up on meshes with degenerate tangents.
+float filter_roughness(float a, vec3 N) {
+    vec3 dndu = dFdx(N);
+    vec3 dndv = dFdy(N);
+    float variance = SPEC_AA_SIGMA2 * (dot(dndu, dndu) + dot(dndv, dndv));
+    // Dropping the 2.0 gives the paper's less conservative variant: less
+    // overfiltering, at the risk of underfiltering.
+    float kernel_roughness2 = min(2.0 * variance, SPEC_AA_KAPPA);
+    // The paper works in squared roughness, so square, widen, and root back.
+    return sqrt(clamp(a * a + kernel_roughness2, 0.0, 1.0));
+}
+
 // Outgoing radiance toward the camera from one light direction L.
+// Takes linear roughness `a` rather than perceptual: the caller filters it once
+// for specular antialiasing, and this runs once per light.
 vec3 brdf(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 albedo,
-          float metallic, float roughness, vec3 f0) {
+          float metallic, float a, vec3 f0) {
     float n_dot_l = max(dot(N, L), 0.0);
     if (n_dot_l <= 0.0) {
         return vec3(0.0);
@@ -101,8 +129,6 @@ vec3 brdf(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 albedo,
     float n_dot_v = max(dot(N, V), 1e-4);
     float n_dot_h = max(dot(N, H), 0.0);
     float v_dot_h = max(dot(V, H), 0.0);
-
-    float a = roughness * roughness; // perceptual -> linear roughness
 
     float D = distribution_ggx(n_dot_h, a);
     float Vis = visibility_smith_ggx(n_dot_v, n_dot_l, a);
@@ -151,6 +177,8 @@ void main() {
     mat3 TBN = mat3(normalize(v_tangent), normalize(v_bitangent), normalize(v_normal));
     vec3 N = normalize(TBN * n_tangent);
 
+    float a = filter_roughness(roughness * roughness, N); // perceptual -> linear
+
     vec3 V = normalize(lighting.camera_pos.xyz - v_world_pos);
 
     // Crude diffuse ambient (stands in for image-based lighting),
@@ -162,7 +190,7 @@ void main() {
     {
         vec3 L = normalize(lighting.sun_direction.xyz);
         vec3 radiance = lighting.sun_color.rgb * lighting.sun_color.w;
-        color += brdf(N, V, L, radiance, albedo, metallic, roughness, f0);
+        color += brdf(N, V, L, radiance, albedo, metallic, a, f0);
     }
 
     // Point lights.
@@ -175,7 +203,7 @@ void main() {
         if (atten <= 0.0) continue;
         vec3 L = to_light / max(dist, 1e-4);
         vec3 radiance = light.color.rgb * light.color.w * atten;
-        color += brdf(N, V, L, radiance, albedo, metallic, roughness, f0);
+        color += brdf(N, V, L, radiance, albedo, metallic, a, f0);
     }
 
     // Emissive adds on top, unaffected by scene lighting.
