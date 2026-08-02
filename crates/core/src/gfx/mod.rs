@@ -1,6 +1,7 @@
 pub mod graph;
 pub mod headless;
 pub mod vulkan;
+pub mod shadows;
 
 pub use headless::HeadlessBackend;
 
