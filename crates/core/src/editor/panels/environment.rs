@@ -1,7 +1,7 @@
 use orrin_ecs::World;
 
 use super::{color_row, vec3_row};
-use crate::scene::{AmbientLight, Camera, HdrSettings, SsaoSettings};
+use crate::scene::{AmbientLight, Camera, FogSettings, HdrSettings, SsaoSettings};
 
 pub fn show(ctx: &egui::Context, world: &mut World) {
     egui::TopBottomPanel::bottom("environment")
@@ -37,9 +37,22 @@ fn lighting_column(ui: &mut egui::Ui, world: &World) {
     }
     ui.add_space(6.0);
     ui.strong("Ambient");
-    let mut ambient = world.resource_mut::<AmbientLight>();
-    color_row(ui, "Color", &mut ambient.color);
-    ui.add(egui::Slider::new(&mut ambient.intensity, 0.0..=2.0).text("Intensity"));
+    {
+        let mut ambient = world.resource_mut::<AmbientLight>();
+        color_row(ui, "Color", &mut ambient.color);
+        ui.add(egui::Slider::new(&mut ambient.intensity, 0.0..=2.0).text("Intensity"));
+    }
+    ui.add_space(6.0);
+    ui.strong("Fog");
+    let mut fog = world.resource_mut::<FogSettings>();
+    color_row(ui, "Color", &mut fog.color);
+    ui.add(
+        egui::Slider::new(&mut fog.density, 0.0..=0.1)
+            .logarithmic(true)
+            .text("Density"),
+    );
+    ui.add(egui::Slider::new(&mut fog.height_falloff, 0.0..=1.0).text("Falloff"));
+    ui.add(egui::Slider::new(&mut fog.height, -20.0..=20.0).text("Height"));
 }
 
 fn camera_column(ui: &mut egui::Ui, world: &World) {

@@ -4,6 +4,7 @@ mod components;
 mod culling;
 mod debug;
 pub mod entities;
+mod fog;
 mod hdr;
 mod mesh;
 mod persist;
@@ -23,6 +24,7 @@ pub use components::{
 };
 #[cfg(feature = "scripting")]
 pub use components::ScriptComponent;
+pub use fog::FogSettings;
 pub use hdr::HdrSettings;
 pub use input::InputState;
 pub use mesh::{CpuMesh, MeshBounds};

@@ -26,6 +26,8 @@ layout(set = 0, binding = 0) uniform Lighting {
     vec4 sun_color;     // rgb = color, w = intensity
     vec4 params;        // x = point light count (y,z legacy, unused by PBR)
     vec4 viewport;      // x=w, y=h, z=1/w, w=1/h
+    vec4 fog_color;     // rgb = color, w = density at the reference height
+    vec4 fog_params;    // x = height falloff, y = reference height
     PointLight point_lights[MAX_POINT_LIGHTS];
 } lighting;
 
@@ -90,6 +92,29 @@ vec3 fresnel_schlick(float v_dot_h, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - v_dot_h, 0.0, 1.0), 5.0);
 }
 
+// Split-sum environment BRDF (scale, bias), Karis' analytic fit from the 2014
+// mobile PBR notes. A stand-in for the DFG lookup table image-based lighting
+// will bring; swap both callers to the table when it exists.
+vec2 env_brdf_approx(float perceptual_roughness, float n_dot_v) {
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    vec4 r = perceptual_roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * n_dot_v)) * r.x + r.y;
+    return vec2(-1.04, 1.04) * a004 + r.zw;
+}
+
+// Multiple-scattering compensation (Kulla & Conty). Single-scatter GGX drops
+// the energy that would have bounced between microfacets, so rough metals go
+// dark and desaturated; scaling the specular lobe by 1 + f0*(1/Ess - 1) puts it
+// back, where Ess is the single-scatter directional albedo.
+vec3 energy_compensation(vec3 f0, float perceptual_roughness, float n_dot_v) {
+    vec2 dfg = env_brdf_approx(perceptual_roughness, n_dot_v);
+    // Ess is the split-sum result for a fully reflective surface (f0 = 1). It
+    // tends to 1 as roughness falls, so this stays near 1 for smooth materials.
+    float ess = max(dfg.x + dfg.y, 1e-3);
+    return 1.0 + f0 * (1.0 / ess - 1.0);
+}
+
 // Specular antialiasing: widen linear roughness `a` to cover the normal
 // variance inside this pixel, which the single-sample BRDF below cannot see.
 // MSAA cannot do this — it supersamples coverage, not shader inputs.
@@ -120,7 +145,7 @@ float filter_roughness(float a, vec3 N) {
 // Takes linear roughness `a` rather than perceptual: the caller filters it once
 // for specular antialiasing, and this runs once per light.
 vec3 brdf(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 albedo,
-          float metallic, float a, vec3 f0) {
+          float metallic, float a, vec3 f0, vec3 energy) {
     float n_dot_l = max(dot(N, L), 0.0);
     if (n_dot_l <= 0.0) {
         return vec3(0.0);
@@ -134,13 +159,39 @@ vec3 brdf(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 albedo,
     float Vis = visibility_smith_ggx(n_dot_v, n_dot_l, a);
     vec3 F = fresnel_schlick(v_dot_h, f0);
 
-    vec3 specular = D * Vis * F;
+    vec3 specular = D * Vis * F * energy;
 
     // Diffuse keeps the energy not reflected (1 - F) and not metallic.
     vec3 kd = (vec3(1.0) - F) * (1.0 - metallic);
     vec3 diffuse = kd * albedo / PI;
 
     return (diffuse + specular) * radiance * n_dot_l;
+}
+
+// Exponential height fog. Density decays with altitude, so the amount along a
+// view ray is the integral of that decay rather than a function of distance
+// alone — which is what keeps a ray climbing out of the layer from fogging as
+// heavily as one running through it.
+vec3 apply_fog(vec3 color, vec3 world_pos, vec3 camera_pos) {
+    float density = lighting.fog_color.w;
+    if (density <= 0.0) {
+        return color;
+    }
+
+    float falloff = lighting.fog_params.x;
+    vec3 ray = world_pos - camera_pos;
+    float dist = length(ray);
+    float dir_y = ray.y / max(dist, 1e-4);
+
+    float at_camera = exp(-falloff * (camera_pos.y - lighting.fog_params.y));
+
+    // The quotient has a removable singularity for rays with no vertical
+    // component, where the integral is just the ray length.
+    float t = falloff * dir_y * dist;
+    float integral = abs(t) > 1e-4 ? (1.0 - exp(-t)) / (falloff * dir_y) : dist;
+
+    float amount = clamp(1.0 - exp(-density * at_camera * integral), 0.0, 1.0);
+    return mix(color, lighting.fog_color.rgb, amount);
 }
 
 // Smooth, range-limited falloff (windowed inverse-square).
@@ -181,6 +232,10 @@ void main() {
 
     vec3 V = normalize(lighting.camera_pos.xyz - v_world_pos);
 
+    // Both are constant across lights, so they are computed once here rather
+    // than once per light inside brdf().
+    vec3 energy = energy_compensation(f0, roughness, max(dot(N, V), 1e-4));
+
     // Crude diffuse ambient (stands in for image-based lighting),
     // attenuated by screen-space ambient occlusion.
     float ao = texture(u_ao, gl_FragCoord.xy * lighting.viewport.zw).r;
@@ -190,7 +245,7 @@ void main() {
     {
         vec3 L = normalize(lighting.sun_direction.xyz);
         vec3 radiance = lighting.sun_color.rgb * lighting.sun_color.w;
-        color += brdf(N, V, L, radiance, albedo, metallic, a, f0);
+        color += brdf(N, V, L, radiance, albedo, metallic, a, f0, energy);
     }
 
     // Point lights.
@@ -203,11 +258,13 @@ void main() {
         if (atten <= 0.0) continue;
         vec3 L = to_light / max(dist, 1e-4);
         vec3 radiance = light.color.rgb * light.color.w * atten;
-        color += brdf(N, V, L, radiance, albedo, metallic, a, f0);
+        color += brdf(N, V, L, radiance, albedo, metallic, a, f0, energy);
     }
 
     // Emissive adds on top, unaffected by scene lighting.
     color += m.emissive.rgb * emis_tex;
+
+    color = apply_fog(color, v_world_pos, lighting.camera_pos.xyz);
 
     f_color = vec4(color, 1.0);
 }

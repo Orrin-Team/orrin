@@ -21,7 +21,8 @@ use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::entities::{build_default_scene, spawn_stress_scene, StressSpec};
 use crate::scene::{
-    AmbientLight, Camera, Culling, DebugLine, DebugLines, HdrSettings, InputState, LogBuffer,
+    AmbientLight, Camera, Culling, DebugLine, DebugLines, FogSettings, HdrSettings, InputState,
+    LogBuffer,
     SsaoSettings, Time,
 };
 use crate::stats::FrameStats;
@@ -182,6 +183,7 @@ impl App {
         world.insert_resource(AmbientLight::default());
         world.insert_resource(SsaoSettings::default());
         world.insert_resource(HdrSettings::default());
+        world.insert_resource(FogSettings::default());
         world.insert_resource(FrameStats::new());
         world.insert_resource(Profiler::default());
         world.insert_resource(InputState::new());

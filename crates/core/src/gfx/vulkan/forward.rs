@@ -128,6 +128,13 @@ fn to_gpu_lighting(lighting: &SceneLighting, camera_pos: Vec3, extent: [u32; 2])
             0.0,
         ],
         viewport: [w, h, 1.0 / w, 1.0 / h],
+        fog_color: [
+            lighting.fog_color.x,
+            lighting.fog_color.y,
+            lighting.fog_color.z,
+            lighting.fog_density.max(0.0),
+        ],
+        fog_params: [lighting.fog_height_falloff, lighting.fog_height, 0.0, 0.0],
         point_lights,
     }
 }
@@ -168,6 +175,10 @@ struct GpuLighting {
     params: [f32; 4],
     /// x=w, y=h, z=1/w, w=1/h
     viewport: [f32; 4],
+    /// rgb = fog color, w = density at the reference height.
+    fog_color: [f32; 4],
+    /// x = height falloff, y = reference height.
+    fog_params: [f32; 4],
     point_lights: [GpuPointLight; MAX_POINT_LIGHTS],
 }
 
