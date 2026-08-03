@@ -34,6 +34,11 @@ pub struct EditorState {
     pub scene_path: String,
     spawn_request: Option<SpawnKind>,
     despawn_request: Option<Entity>,
+    /// `(child, new parent)`, with `None` meaning "detach to a root". Requested
+    /// rather than applied inline for the same reason as the two above: the
+    /// hierarchy panel is iterating a snapshot of the tree while it builds, and
+    /// a reparent reshapes exactly that.
+    reparent_request: Option<(Entity, Option<Entity>)>,
     /// Serviced by `apply` for the same reason spawn/despawn are: loading
     /// despawns every entity, and a `ScriptComponent`'s `Drop` tears down a
     /// managed object, which may only happen outside a dispatch window.
@@ -53,6 +58,7 @@ impl Default for EditorState {
             scene_path: DEFAULT_SCENE_PATH.to_owned(),
             spawn_request: None,
             despawn_request: None,
+            reparent_request: None,
             scene_request: None,
             #[cfg(feature = "scripting")]
             script_reload_request: false,
@@ -71,6 +77,10 @@ impl EditorState {
 
     pub fn request_despawn(&mut self, entity: Entity) {
         self.despawn_request = Some(entity);
+    }
+
+    pub fn request_reparent(&mut self, child: Entity, parent: Option<Entity>) {
+        self.reparent_request = Some((child, parent));
     }
 
     #[cfg(feature = "scripting")]
@@ -93,6 +103,14 @@ impl EditorState {
             crate::scene::despawn_recursive(world, entity);
             if self.selected == Some(entity) {
                 self.selected = None;
+            }
+        }
+        if let Some((child, parent)) = self.reparent_request.take() {
+            // `keep_world`: a drag in the tree changes who owns an object, not
+            // where it is. Without it, dropping something onto a distant parent
+            // would fling it across the scene.
+            if let Err(error) = crate::scene::reparent(world, child, parent, true) {
+                log(world, LogLevel::Warning, error.to_string());
             }
         }
         if let Some(request) = self.scene_request.take() {

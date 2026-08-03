@@ -13,6 +13,7 @@ use crate::editor::state::EditorState;
 use crate::scene::ScriptComponent;
 use crate::scene::{
     Assets, Light, LocalTransform, LogBuffer, LogLevel, MaterialHandle, MeshHandle, Name, Time,
+    WorldTransform,
 };
 
 pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState, registry: &Registry) {
@@ -115,6 +116,23 @@ fn transform_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
             }
 
             vec3_row(ui, "Scale", &mut t.scale, 0.05);
+
+            // The fields above are parent-relative. For anything with a parent
+            // that makes them baffling on their own — a cube sitting visibly at
+            // x=12 reads "Position 0". The world position is the reconciling
+            // number, and it is read-only because it is derived.
+            if !crate::scene::is_transform_root(world, entity)
+                && let Some(world_transform) = world.get::<WorldTransform>(entity)
+            {
+                let position = world_transform.translation();
+                ui.horizontal(|ui| {
+                    ui.weak("World");
+                    ui.weak(format!(
+                        "{:.2}, {:.2}, {:.2}",
+                        position.x, position.y, position.z
+                    ));
+                });
+            }
         });
 }
 

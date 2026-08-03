@@ -29,7 +29,8 @@ pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};
 pub use fog::FogSettings;
 pub use hdr::HdrSettings;
 pub use hierarchy::{
-    Hierarchy, HierarchyError, despawn_recursive, is_transform_root, propagate_transforms, reparent,
+    Hierarchy, HierarchyError, despawn_recursive, ensure_current, is_transform_root,
+    propagate_transforms, reparent,
 };
 pub use input::InputState;
 pub use mesh::{CpuMesh, MeshBounds};
