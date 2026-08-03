@@ -404,6 +404,54 @@ pub fn propagate_transforms(world: &mut World) {
     hierarchy.propagate(world);
 }
 
+/// Whether `entity`'s local transform is already its world transform.
+///
+/// True for an entity with no parent, one whose parent has been despawned, and
+/// one whose parent is an organizational node with no transform of its own —
+/// the three cases propagation treats alike. Anything else holds a
+/// parent-relative local transform, so a world-space quantity cannot be written
+/// into it without first being converted.
+pub fn is_transform_root(world: &World, entity: Entity) -> bool {
+    match live_parent(world, entity) {
+        Some(parent) => !world.has::<WorldTransform>(parent),
+        None => true,
+    }
+}
+
+/// Despawn `entity` together with everything beneath it, and report how many
+/// entities went.
+///
+/// Deleting a parent deletes its subtree, as it does in Unity and Godot. The
+/// alternative — orphaning the children to roots — leaves objects floating at
+/// their last offset relative to something that no longer exists, which is
+/// never what anyone means by deleting the parent.
+///
+/// The subtree is collected in full before anything is despawned. Traversing
+/// links while dropping the components that hold them would be reading a graph
+/// as it is dismantled.
+pub fn despawn_recursive(world: &mut World, entity: Entity) -> usize {
+    if !world.is_alive(entity) {
+        return 0;
+    }
+    ensure_current(world);
+
+    let doomed = {
+        let hierarchy = world.resource::<Hierarchy>();
+        let mut doomed = vec![entity];
+        let mut i = 0;
+        while i < doomed.len() {
+            doomed.extend_from_slice(hierarchy.children_of(doomed[i]));
+            i += 1;
+        }
+        doomed
+    };
+
+    doomed
+        .iter()
+        .filter(|&&entity| world.despawn(entity))
+        .count()
+}
+
 /// Attach `child` to `parent`, or detach it when `parent` is `None`.
 ///
 /// With `keep_world`, the child's local transform is rewritten so that its world
@@ -882,5 +930,84 @@ mod tests {
 
         let hierarchy = world.resource::<Hierarchy>();
         assert_eq!(hierarchy.order().len(), entities.len());
+    }
+
+    /// Deleting a parent deletes its subtree, as it does in Unity and Godot.
+    /// Orphaning the children instead would leave them floating at their last
+    /// offset relative to something that no longer exists.
+    #[test]
+    fn despawning_a_parent_takes_its_whole_subtree() {
+        let mut world = World::new();
+        let root = spawn_at(&mut world, Transform::default());
+        let child = spawn_at(&mut world, Transform::default());
+        let grandchild = spawn_at(&mut world, Transform::default());
+        let sibling = spawn_at(&mut world, Transform::default());
+        reparent(&mut world, child, Some(root), false).unwrap();
+        reparent(&mut world, grandchild, Some(child), false).unwrap();
+
+        assert_eq!(despawn_recursive(&mut world, root), 3);
+
+        assert!(!world.is_alive(root));
+        assert!(!world.is_alive(child));
+        assert!(!world.is_alive(grandchild));
+        assert!(world.is_alive(sibling), "an unrelated entity was taken too");
+    }
+
+    /// A folder node has no transform, but it is still a parent — deleting it
+    /// has to take its contents, or the organizational graph and the delete
+    /// would disagree.
+    #[test]
+    fn despawning_a_transformless_parent_still_takes_its_children() {
+        let mut world = World::new();
+        let folder = spawn_bare(&mut world);
+        let child = spawn_at(&mut world, Transform::default());
+        reparent(&mut world, child, Some(folder), false).unwrap();
+
+        assert_eq!(despawn_recursive(&mut world, folder), 2);
+        assert!(!world.is_alive(child));
+    }
+
+    #[test]
+    fn despawning_a_leaf_takes_only_itself() {
+        let mut world = World::new();
+        let root = spawn_at(&mut world, Transform::default());
+        let child = spawn_at(&mut world, Transform::default());
+        reparent(&mut world, child, Some(root), false).unwrap();
+
+        assert_eq!(despawn_recursive(&mut world, child), 1);
+        assert!(world.is_alive(root));
+    }
+
+    #[test]
+    fn despawning_a_stale_handle_does_nothing() {
+        let mut world = World::new();
+        let ghost = spawn_at(&mut world, Transform::default());
+        world.despawn(ghost);
+
+        assert_eq!(despawn_recursive(&mut world, ghost), 0);
+    }
+
+    /// The three cases propagation treats alike, which is what makes this the
+    /// right test for "is this entity's local transform already its world one".
+    #[test]
+    fn transform_roots_are_the_unparented_the_orphaned_and_the_foldered() {
+        let mut world = World::new();
+        let parent = spawn_at(&mut world, Transform::default());
+        let folder = spawn_bare(&mut world);
+        let unparented = spawn_at(&mut world, Transform::default());
+        let orphan = spawn_at(&mut world, Transform::default());
+        let in_folder = spawn_at(&mut world, Transform::default());
+        let real_child = spawn_at(&mut world, Transform::default());
+        let doomed = spawn_at(&mut world, Transform::default());
+        reparent(&mut world, orphan, Some(doomed), false).unwrap();
+        reparent(&mut world, in_folder, Some(folder), false).unwrap();
+        reparent(&mut world, real_child, Some(parent), false).unwrap();
+        propagate_transforms(&mut world);
+        world.despawn(doomed);
+
+        assert!(is_transform_root(&world, unparented));
+        assert!(is_transform_root(&world, orphan), "orphaned by a despawn");
+        assert!(is_transform_root(&world, in_folder), "under a folder node");
+        assert!(!is_transform_root(&world, real_child));
     }
 }

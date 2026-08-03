@@ -1155,7 +1155,9 @@ impl Scripting {
                     world.insert(entity, material);
                 }
                 Command::Despawn(entity) => {
-                    world.despawn(entity);
+                    // Takes the subtree with it, so a script that despawns a
+                    // parent does not leave its children behind.
+                    crate::scene::despawn_recursive(world, entity);
                 }
                 Command::SetTag { entity, tag } => {
                     // `insert` is a stale-handle no-op, so a despawn queued earlier

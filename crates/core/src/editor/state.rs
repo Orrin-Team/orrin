@@ -90,7 +90,7 @@ impl EditorState {
             }
         }
         if let Some(entity) = self.despawn_request.take() {
-            world.despawn(entity);
+            crate::scene::despawn_recursive(world, entity);
             if self.selected == Some(entity) {
                 self.selected = None;
             }

@@ -13,7 +13,9 @@ use glam::{Mat3, Vec3};
 
 use orrin_ecs::{Entity, FxHashMap, World};
 
-use crate::scene::{Collider, ColliderShape, LocalTransform, WorldTransform};
+use crate::scene::{
+    Collider, ColliderShape, LocalTransform, LogBuffer, LogLevel, Time, WorldTransform,
+};
 
 /// Broadphase bounds and mesh bounds are the same box; it lives in
 /// [`crate::geom`] so extraction can cull without depending on collision.
@@ -52,6 +54,10 @@ pub struct CollisionState {
     /// Lives across frames only to keep its buffers; the tree in it is rebuilt
     /// from scratch every frame and never read from one frame to the next.
     broadphase: Bvh,
+    /// Whether the "a child collider was not resolved" notice has been logged.
+    /// Once per session, not once per frame — the condition is persistent, so
+    /// reporting it every frame would bury the console.
+    warned_about_parented_collider: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +118,36 @@ fn world_shape(transform: &WorldTransform, collider: &Collider) -> WorldShape {
             })
         }
     }
+}
+
+/// Say once that a parented collider went unresolved.
+///
+/// Before the hierarchy existed every entity was a root, so resolution applied
+/// to everything. Something that becomes a child now stops being pushed, and
+/// silence would make that read as a physics bug rather than a rule.
+fn warn_once_about_parented_colliders(world: &World) {
+    let mut state = world.resource_mut::<CollisionState>();
+    if state.warned_about_parented_collider {
+        return;
+    }
+    state.warned_about_parented_collider = true;
+    drop(state);
+
+    let Some(mut log) = world.get_resource_mut::<LogBuffer>() else {
+        return;
+    };
+    let frame = world
+        .get_resource::<Time>()
+        .map(|time| time.frame_count())
+        .unwrap_or(0);
+    log.push(
+        LogLevel::Warning,
+        "a collider on a parented entity overlapped something and was not pushed \
+         apart: a parent/child link is a rigid attachment, so only entities \
+         without a transformed parent are resolved"
+            .to_owned(),
+        frame,
+    );
 }
 
 /// Canonical ordering for an unordered entity pair, so `(a, b)` and `(b, a)`
@@ -221,10 +257,28 @@ pub fn run(world: &mut World) {
 
     // One entity at a time: `get_mut` borrows the whole LocalTransform storage,
     // so holding two at once would panic the RefCell.
+    let mut skipped_a_child = false;
     for (entity, offset) in corrections {
+        // `offset` is a world-space displacement, and the write below lands in a
+        // *local* transform. Those are the same thing only for a transform root.
+        //
+        // Rather than convert, a parented collider is left unresolved: a
+        // parent/child link here means rigid attachment, so a door handle
+        // parented to a door should not squirt out of the door when something
+        // bumps it. Unity draws the same line, resolving rigidbodies rather than
+        // transforms. The conversion belongs with a rigidbody component that can
+        // say which entities are meant to be pushed.
+        if !crate::scene::is_transform_root(world, entity) {
+            skipped_a_child = true;
+            continue;
+        }
         if let Some(mut transform) = world.get_mut::<LocalTransform>(entity) {
             transform.translation += offset;
         }
+    }
+
+    if skipped_a_child {
+        warn_once_about_parented_colliders(world);
     }
 
     let mut state = world.resource_mut::<CollisionState>();
@@ -232,10 +286,117 @@ pub fn run(world: &mut World) {
         touching,
         events,
         broadphase: stored,
+        ..
     } = &mut *state;
     if !(touching.is_empty() && current.is_empty()) {
         diff_pairs(touching, &current, events);
     }
     *touching = current;
     *stored = broadphase;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::{LogBuffer, Transform, propagate_transforms, reparent};
+
+    fn sphere_at(world: &mut World, position: Vec3) -> Entity {
+        world
+            .spawn_entity()
+            .with(LocalTransform::from(Transform::from_translation(position)))
+            .with(Collider {
+                shape: ColliderShape::Sphere { radius: 1.0 },
+                is_trigger: false,
+            })
+            .id()
+    }
+
+    fn test_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(CollisionState::default());
+        world.insert_resource(LogBuffer::default());
+        world
+    }
+
+    fn local_position(world: &World, entity: Entity) -> Vec3 {
+        world.get::<LocalTransform>(entity).unwrap().translation
+    }
+
+    /// The baseline the rule below is a departure from: two overlapping roots
+    /// are still pushed apart.
+    #[test]
+    fn two_overlapping_roots_are_pushed_apart() {
+        let mut world = test_world();
+        let a = sphere_at(&mut world, Vec3::ZERO);
+        let b = sphere_at(&mut world, Vec3::new(0.5, 0.0, 0.0));
+        propagate_transforms(&mut world);
+
+        run(&mut world);
+
+        assert_ne!(local_position(&world, a), Vec3::ZERO);
+        assert_ne!(local_position(&world, b), Vec3::new(0.5, 0.0, 0.0));
+    }
+
+    /// A parent/child link is a rigid attachment, so a parented collider is not
+    /// pushed out of penetration — the correction is a world-space vector and
+    /// the write would land in a parent-relative transform.
+    #[test]
+    fn a_parented_collider_is_not_resolved() {
+        let mut world = test_world();
+        let anchor = sphere_at(&mut world, Vec3::new(0.0, 5.0, 0.0));
+        let child = sphere_at(&mut world, Vec3::ZERO);
+        reparent(&mut world, child, Some(anchor), false).unwrap();
+        // Overlaps the child at its world position, which the anchor puts at +5Y.
+        let intruder = sphere_at(&mut world, Vec3::new(0.5, 5.0, 0.0));
+        propagate_transforms(&mut world);
+
+        run(&mut world);
+
+        assert_eq!(
+            local_position(&world, child),
+            Vec3::ZERO,
+            "a parented collider was pushed out of its parent's frame"
+        );
+        assert_ne!(
+            local_position(&world, intruder),
+            Vec3::new(0.5, 5.0, 0.0),
+            "the unparented half of the pair should still resolve"
+        );
+    }
+
+    /// Silence would make the rule above read as a physics bug. Once per
+    /// session, not once per frame — the condition persists.
+    #[test]
+    fn skipping_a_parented_collider_is_reported_exactly_once() {
+        let mut world = test_world();
+        let anchor = sphere_at(&mut world, Vec3::new(0.0, 5.0, 0.0));
+        let child = sphere_at(&mut world, Vec3::ZERO);
+        reparent(&mut world, child, Some(anchor), false).unwrap();
+        sphere_at(&mut world, Vec3::new(0.5, 5.0, 0.0));
+
+        for _ in 0..5 {
+            propagate_transforms(&mut world);
+            run(&mut world);
+        }
+
+        assert_eq!(world.resource::<LogBuffer>().len(), 1);
+    }
+
+    /// A child of a *transformless* parent is a transform root: its local
+    /// transform is already its world one, so there is nothing to convert and
+    /// the correction applies as normal.
+    #[test]
+    fn a_child_of_a_folder_node_is_still_resolved() {
+        let mut world = test_world();
+        let folder = world.spawn();
+        let child = sphere_at(&mut world, Vec3::ZERO);
+        reparent(&mut world, child, Some(folder), false).unwrap();
+        sphere_at(&mut world, Vec3::new(0.5, 0.0, 0.0));
+        propagate_transforms(&mut world);
+
+        run(&mut world);
+
+        assert_ne!(local_position(&world, child), Vec3::ZERO);
+        assert_eq!(world.resource::<LogBuffer>().len(), 0);
+    }
 }
