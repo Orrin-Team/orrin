@@ -46,17 +46,16 @@ fn ensure_bindings(start: &Path, configuration: &str) -> Result<Option<PathBuf>,
     };
 
     let bindings_project = checkout.join("scripting/Orrin");
-    println!("orrin: building engine bindings ({})", display_path(&bindings_project));
+    println!(
+        "orrin: building engine bindings ({})",
+        display_path(&bindings_project)
+    );
     dotnet_build(&bindings_project, configuration, None)?;
 
     Ok(engine::built_bindings(&checkout))
 }
 
-fn build_scripts(
-    project: &Project,
-    configuration: &str,
-    bindings: Option<&Path>,
-) -> Fallible {
+fn build_scripts(project: &Project, configuration: &str, bindings: Option<&Path>) -> Fallible {
     let scripts = project.scripts_dir();
     if !scripts.is_dir() {
         return Err(format!(
@@ -121,7 +120,10 @@ fn index_assets(project: &Project) -> Fallible {
         collect(&assets_dir, &assets_dir, &mut assets)?;
         assets.sort_by(|a, b| a.path.cmp(&b.path));
     } else {
-        println!("orrin: no assets directory at {}", display_path(&assets_dir));
+        println!(
+            "orrin: no assets directory at {}",
+            display_path(&assets_dir)
+        );
     }
 
     let relative_root = assets_dir
@@ -156,8 +158,8 @@ fn index_assets(project: &Project) -> Fallible {
 }
 
 fn collect(dir: &Path, base: &Path, out: &mut Vec<Asset>) -> Fallible {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|err| format!("could not read {}: {err}", dir.display()))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|err| format!("could not read {}: {err}", dir.display()))?;
 
     for entry in entries {
         let entry = entry.map_err(|err| format!("could not read {}: {err}", dir.display()))?;

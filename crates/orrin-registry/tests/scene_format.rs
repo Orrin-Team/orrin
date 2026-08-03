@@ -108,8 +108,14 @@ fn entities_are_written_in_id_order_whatever_order_they_arrived_in() {
         &mut forwards,
         &SceneDocument {
             entities: vec![
-                SceneEntity { id: low, components: Vec::new() },
-                SceneEntity { id: high, components: Vec::new() },
+                SceneEntity {
+                    id: low,
+                    components: Vec::new(),
+                },
+                SceneEntity {
+                    id: high,
+                    components: Vec::new(),
+                },
             ],
         },
     );
@@ -119,8 +125,14 @@ fn entities_are_written_in_id_order_whatever_order_they_arrived_in() {
         &mut backwards,
         &SceneDocument {
             entities: vec![
-                SceneEntity { id: high, components: Vec::new() },
-                SceneEntity { id: low, components: Vec::new() },
+                SceneEntity {
+                    id: high,
+                    components: Vec::new(),
+                },
+                SceneEntity {
+                    id: low,
+                    components: Vec::new(),
+                },
             ],
         },
     );
@@ -146,7 +158,10 @@ fn a_missing_header_is_reported_on_line_one() {
 #[test]
 fn an_unsupported_version_names_itself() {
     let err = parse("orrin-scene 99\n").unwrap_err();
-    assert_eq!(err.to_string(), "line 1: scene format version 99 is not supported (this build reads 1)");
+    assert_eq!(
+        err.to_string(),
+        "line 1: scene format version 99 is not supported (this build reads 1)"
+    );
 }
 
 #[test]

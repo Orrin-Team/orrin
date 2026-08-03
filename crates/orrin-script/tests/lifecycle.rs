@@ -9,7 +9,7 @@
 //! Requires `dotnet build scripting/Orrin` first. Skips with a note when the
 //! assembly is missing — this crate is workspace-excluded, so CI never runs it.
 
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -44,8 +44,7 @@ fn assembly_dir() -> Option<PathBuf> {
         };
         for entry in entries.flatten() {
             let dir = entry.path();
-            if dir.join("Orrin.dll").is_file() && dir.join("Orrin.runtimeconfig.json").is_file()
-            {
+            if dir.join("Orrin.dll").is_file() && dir.join("Orrin.runtimeconfig.json").is_file() {
                 return Some(dir);
             }
         }
@@ -130,7 +129,12 @@ fn behaviour_lifecycle() {
     orrin_script::destroy_handle(handle);
     assert_eq!(
         take_logs(),
-        ["probe:ctor", "probe:OnEnable", "probe:OnDisable", "probe:OnDestroy"],
+        [
+            "probe:ctor",
+            "probe:OnEnable",
+            "probe:OnDisable",
+            "probe:OnDestroy"
+        ],
     );
 
     // A throwing user constructor is contained: 0 handle, logged, no abort.
@@ -158,16 +162,23 @@ fn behaviour_lifecycle() {
     // and logs naming the offending type and hook.
     let handle = create(&host, probe);
     host.enable(handle);
-    assert!(!host.update(handle, 0.016), "a clean OnUpdate must not report a fault");
+    assert!(
+        !host.update(handle, 0.016),
+        "a clean OnUpdate must not report a fault"
+    );
     orrin_script::destroy_handle(handle);
     take_logs(); // discard the probe's own hook chatter
 
     let handle = create(&host, "Orrin.Tests.ThrowingUpdate, Orrin");
     assert_ne!(handle, 0);
-    assert!(host.update(handle, 0.016), "a throwing OnUpdate must report a fault");
+    assert!(
+        host.update(handle, 0.016),
+        "a throwing OnUpdate must report a fault"
+    );
     let logs = take_logs();
     assert!(
-        logs.iter().any(|l| l.contains("ThrowingUpdate") && l.contains("OnUpdate")),
+        logs.iter()
+            .any(|l| l.contains("ThrowingUpdate") && l.contains("OnUpdate")),
         "expected a fault log naming the script type and hook, got {logs:?}"
     );
     orrin_script::destroy_handle(handle);
@@ -206,7 +217,8 @@ fn state_preservation(host: &ScriptHost) {
     host.update(handle, 0.016);
     let logs = take_logs();
     assert!(
-        logs.iter().any(|l| l.contains("counter=2") && l.contains("scratch=2")),
+        logs.iter()
+            .any(|l| l.contains("counter=2") && l.contains("scratch=2")),
         "probe should have ticked twice before capture, got {logs:?}"
     );
 
@@ -219,9 +231,15 @@ fn state_preservation(host: &ScriptHost) {
         return;
     }
 
-    assert_ne!(snapshot, 0, "a probe with capturable fields must yield a snapshot");
+    assert_ne!(
+        snapshot, 0,
+        "a probe with capturable fields must yield a snapshot"
+    );
     let handle = create(host, probe);
-    assert!(host.apply_state(handle, snapshot), "snapshot should restore onto a fresh instance");
+    assert!(
+        host.apply_state(handle, snapshot),
+        "snapshot should restore onto a fresh instance"
+    );
     host.enable(handle);
     host.update(handle, 0.016);
 
@@ -234,11 +252,26 @@ fn state_preservation(host: &ScriptHost) {
     // Counter, Label and Offset carry over, so the third tick continues from
     // two rather than restarting. Scratch is `[Transient]` and Fixed is
     // readonly: both come back at their constructor values.
-    assert!(state.contains("counter=3"), "Counter must survive the swap: {state}");
-    assert!(state.contains("label=tick3"), "Label must survive the swap: {state}");
-    assert!(state.contains("offset=3"), "Offset (an Orrin value type) must survive: {state}");
-    assert!(state.contains("scratch=1"), "[Transient] fields must reset: {state}");
-    assert!(state.contains("fixed=7"), "readonly fields are never written back: {state}");
+    assert!(
+        state.contains("counter=3"),
+        "Counter must survive the swap: {state}"
+    );
+    assert!(
+        state.contains("label=tick3"),
+        "Label must survive the swap: {state}"
+    );
+    assert!(
+        state.contains("offset=3"),
+        "Offset (an Orrin value type) must survive: {state}"
+    );
+    assert!(
+        state.contains("scratch=1"),
+        "[Transient] fields must reset: {state}"
+    );
+    assert!(
+        state.contains("fixed=7"),
+        "readonly fields are never written back: {state}"
+    );
 
     orrin_script::destroy_handle(handle);
     take_logs();
@@ -250,7 +283,9 @@ fn state_preservation(host: &ScriptHost) {
 /// repeatable instead of leaking an assembly per reload.
 fn game_assembly_swap(host: &ScriptHost) {
     let Some(dll) = game_assembly() else {
-        eprintln!("skipping game assembly swap: no built DemoGame (run `dotnet build scripting/DemoGame`)");
+        eprintln!(
+            "skipping game assembly swap: no built DemoGame (run `dotnet build scripting/DemoGame`)"
+        );
         return;
     };
     let path = CString::new(dll.to_str().expect("utf-8 path")).unwrap();
@@ -273,7 +308,10 @@ fn game_assembly_swap(host: &ScriptHost) {
     let first = create(host, hover);
     assert_ne!(first, 0, "{hover} should resolve from the game assembly");
     host.enable(first);
-    assert!(!host.update(first, 0.016), "a game behaviour should tick without faulting");
+    assert!(
+        !host.update(first, 0.016),
+        "a game behaviour should tick without faulting"
+    );
     take_logs();
 
     // Snapshot before teardown, exactly as a reload does, and deliberately keep
@@ -284,7 +322,10 @@ fn game_assembly_swap(host: &ScriptHost) {
     // Capturing from a *real* game assembly is the only way to catch that; the
     // in-bindings probe cannot, since its types are never collectible.
     let snapshot = host.capture_state(first);
-    assert_ne!(snapshot, 0, "{hover} should have a field that deviates after one tick");
+    assert_ne!(
+        snapshot, 0,
+        "{hover} should have a field that deviates after one tick"
+    );
 
     // The handle is the last reference into the old context; free it and the
     // next commit must retire that context cleanly. A `Leaked` here means
@@ -300,7 +341,10 @@ fn game_assembly_swap(host: &ScriptHost) {
     );
 
     let second = create(host, hover);
-    assert_ne!(second, 0, "{hover} should resolve from the swapped-in assembly");
+    assert_ne!(
+        second, 0,
+        "{hover} should resolve from the swapped-in assembly"
+    );
     assert!(
         host.apply_state(second, snapshot),
         "a snapshot taken from the previous assembly must restore onto the new one"

@@ -13,7 +13,10 @@ pub fn scaffold(name: &str, parent: &Path) -> Fallible {
     if root.exists() {
         let empty = std::fs::read_dir(&root).is_ok_and(|mut dir| dir.next().is_none());
         if !empty {
-            return Err(format!("{} already exists and is not empty", root.display()));
+            return Err(format!(
+                "{} already exists and is not empty",
+                root.display()
+            ));
         }
     }
 
@@ -55,7 +58,8 @@ fn write(path: &Path, contents: &str) -> Fallible {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
     }
-    std::fs::write(path, contents).map_err(|err| format!("could not write {}: {err}", path.display()))
+    std::fs::write(path, contents)
+        .map_err(|err| format!("could not write {}: {err}", path.display()))
 }
 
 /// A project name doubles as a directory name and as the source of the game
@@ -135,14 +139,20 @@ obj/
 fn readme(name: &str, assembly: &str) -> String {
     let csproj = format!("{assembly}.csproj");
     let tree = [
-        ("  orrin.toml", "project manifest — the engine reads this from cwd (or any parent)"),
+        (
+            "  orrin.toml",
+            "project manifest — the engine reads this from cwd (or any parent)",
+        ),
         ("  assets/", "source assets + .meta sidecars"),
         ("  scripts/", "C# game code"),
         (
             &format!("    {csproj}"),
             &format!("builds {assembly}.dll, this project's game assembly"),
         ),
-        ("    Main.cs", "the entry Behaviour named by `scripts.entry`"),
+        (
+            "    Main.cs",
+            "the entry Behaviour named by `scripts.entry`",
+        ),
         ("  scenes/", "scene files"),
         ("  .orrin/", "generated, gitignored: cache + asset index"),
     ];
@@ -199,7 +209,9 @@ build that fails leaves the running session untouched.
 fn csproj(assembly: &str, checkout: Option<&Path>, root: &Path) -> String {
     let scripts_dir = root.join("scripts");
     let reference = checkout
-        .and_then(|checkout| relative_path(&scripts_dir, &checkout.join("scripting/Orrin/Orrin.csproj")))
+        .and_then(|checkout| {
+            relative_path(&scripts_dir, &checkout.join("scripting/Orrin/Orrin.csproj"))
+        })
         .map(|path| {
             format!(
                 r#"    <ProjectReference Include="{}" Private="false" />"#,
@@ -313,7 +325,10 @@ fn relative_path(from_dir: &Path, to: &Path) -> Option<PathBuf> {
     }
 
     let mut path = PathBuf::new();
-    path.extend(std::iter::repeat_n(Component::ParentDir, from.len() - shared));
+    path.extend(std::iter::repeat_n(
+        Component::ParentDir,
+        from.len() - shared,
+    ));
     path.extend(&to[shared..]);
     Some(path)
 }

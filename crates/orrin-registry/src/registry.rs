@@ -260,10 +260,7 @@ mod tests {
         let bad = Value::strukt([("text", Value::F32(1.0))]);
         let err = (label.write)(&mut world, entity, &bad).unwrap_err();
         assert_eq!(err.to_string(), "field `text`: expected string, found f32");
-        assert_eq!(
-            *world.get::<Label>(entity).unwrap(),
-            Label("ok".to_owned())
-        );
+        assert_eq!(*world.get::<Label>(entity).unwrap(), Label("ok".to_owned()));
     }
 
     #[test]

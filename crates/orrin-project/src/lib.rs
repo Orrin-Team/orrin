@@ -1,7 +1,7 @@
-use std::path::{Component, Path, PathBuf};
-use serde;
-use serde::{Deserialize};
 use crate::ProjectError::ParentDirInPath;
+use serde;
+use serde::Deserialize;
+use std::path::{Component, Path, PathBuf};
 
 const SUPPORTED_FORMAT_VERSION: u32 = 1;
 
@@ -24,30 +24,44 @@ struct ProjectSection {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ScriptsSection  {
+struct ScriptsSection {
     dir: PathBuf,
     entry: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AssetsSection  {
+struct AssetsSection {
     dir: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SceneSection  {
-    start: Option<PathBuf>
+struct SceneSection {
+    start: Option<PathBuf>,
 }
 
 #[derive(Debug)]
 pub enum ProjectError {
-    Io { path: PathBuf, source: std::io::Error },
-    Parse { path: PathBuf, message: String },
-    AbsolutePath { field: &'static str, value: PathBuf },
-    ParentDirInPath { field: &'static str, value: PathBuf },
-    UnsupportedVersion { found: u32 },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Parse {
+        path: PathBuf,
+        message: String,
+    },
+    AbsolutePath {
+        field: &'static str,
+        value: PathBuf,
+    },
+    ParentDirInPath {
+        field: &'static str,
+        value: PathBuf,
+    },
+    UnsupportedVersion {
+        found: u32,
+    },
 }
 
 impl std::fmt::Display for ProjectError {
@@ -129,11 +143,21 @@ impl Project {
         Ok(Project { root, manifest })
     }
 
-    pub fn name(&self) -> &str { &self.manifest.project.name }
-    pub fn version(&self) -> &str { &self.manifest.project.version }
-    pub fn root(&self) -> &Path { &self.root }
-    pub fn scripts_dir(&self) -> PathBuf { self.root.join(&self.manifest.scripts.dir) }
-    pub fn entry_type(&self) -> &str { &self.manifest.scripts.entry }
+    pub fn name(&self) -> &str {
+        &self.manifest.project.name
+    }
+    pub fn version(&self) -> &str {
+        &self.manifest.project.version
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn scripts_dir(&self) -> PathBuf {
+        self.root.join(&self.manifest.scripts.dir)
+    }
+    pub fn entry_type(&self) -> &str {
+        &self.manifest.scripts.entry
+    }
     pub fn assets_dir(&self) -> PathBuf {
         let dir = self
             .manifest
@@ -153,13 +177,21 @@ impl Project {
 
 fn validate(manifest: &Manifest) -> Result<(), ProjectError> {
     if manifest.format_version != SUPPORTED_FORMAT_VERSION {
-        return Err(ProjectError::UnsupportedVersion { found: manifest.format_version })
+        return Err(ProjectError::UnsupportedVersion {
+            found: manifest.format_version,
+        });
     }
 
     let paths = [
-        ("scripts.dir",  Some(manifest.scripts.dir.as_path())),
-        ("assets.dir",   manifest.assets.as_ref().map(|a| a.dir.as_path())),
-        ("scenes.start", manifest.scenes.as_ref().and_then(|s| s.start.as_deref())),
+        ("scripts.dir", Some(manifest.scripts.dir.as_path())),
+        (
+            "assets.dir",
+            manifest.assets.as_ref().map(|a| a.dir.as_path()),
+        ),
+        (
+            "scenes.start",
+            manifest.scenes.as_ref().and_then(|s| s.start.as_deref()),
+        ),
     ];
 
     for (field, path) in paths {
@@ -173,19 +205,27 @@ fn validate(manifest: &Manifest) -> Result<(), ProjectError> {
 
 fn check_path(field: &'static str, path: &Path) -> Result<(), ProjectError> {
     if path.is_absolute() {
-        return Err(ProjectError::AbsolutePath { field, value: path.to_path_buf() })
+        return Err(ProjectError::AbsolutePath {
+            field,
+            value: path.to_path_buf(),
+        });
     }
 
-    let has_parent_dir = path.components().any(|c|  c == Component::ParentDir);
-    if has_parent_dir { return Err(ParentDirInPath { field, value: path.to_path_buf() }) }
+    let has_parent_dir = path.components().any(|c| c == Component::ParentDir);
+    if has_parent_dir {
+        return Err(ParentDirInPath {
+            field,
+            value: path.to_path_buf(),
+        });
+    }
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs::create_dir_all;
     use super::*;
+    use std::fs::create_dir_all;
     use tempfile::TempDir;
 
     const VALID: &str = r#"
@@ -236,7 +276,13 @@ entry = "MyGame.Main, MyGame"
 
         let err = Project::locate(&root).expect_err("absolute scripts.dir");
         assert!(
-            matches!(err, ProjectError::AbsolutePath { field: "scripts.dir", .. }),
+            matches!(
+                err,
+                ProjectError::AbsolutePath {
+                    field: "scripts.dir",
+                    ..
+                }
+            ),
             "unexpected error: {err}"
         );
     }
@@ -275,7 +321,13 @@ entry = "MyGame.Main, MyGame"
 
         let err = Project::locate(&root).expect_err("scripts.dir escapes the project");
         assert!(
-            matches!(err, ProjectError::ParentDirInPath { field: "scripts.dir", .. }),
+            matches!(
+                err,
+                ProjectError::ParentDirInPath {
+                    field: "scripts.dir",
+                    ..
+                }
+            ),
             "unexpected error: {err}"
         );
     }
@@ -301,7 +353,10 @@ entry = "MyGame.Main, MyGame"
         let (_dir, root) = project_dir(&body);
 
         let err = Project::locate(&root).expect_err("unknown key in [scripts]");
-        assert!(matches!(err, ProjectError::Parse { .. }), "unexpected error: {err}");
+        assert!(
+            matches!(err, ProjectError::Parse { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -310,7 +365,10 @@ entry = "MyGame.Main, MyGame"
         let (_dir, root) = project_dir(&body);
 
         let err = Project::locate(&root).expect_err("unknown table");
-        assert!(matches!(err, ProjectError::Parse { .. }), "unexpected error: {err}");
+        assert!(
+            matches!(err, ProjectError::Parse { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -319,13 +377,17 @@ entry = "MyGame.Main, MyGame"
         let (_dir, root) = project_dir(&body);
 
         let err = Project::locate(&root).expect_err("scripts.entry is required");
-        assert!(matches!(err, ProjectError::Parse { .. }), "unexpected error: {err}");
+        assert!(
+            matches!(err, ProjectError::Parse { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn optional_sections_are_resolved_against_the_root() {
-        let body =
-            format!("{VALID}\n[assets]\ndir = \"art\"\n\n[scenes]\nstart = \"scenes/main.fscene\"\n");
+        let body = format!(
+            "{VALID}\n[assets]\ndir = \"art\"\n\n[scenes]\nstart = \"scenes/main.fscene\"\n"
+        );
         let (_dir, root) = project_dir(&body);
 
         let project = Project::locate(&root)
@@ -343,7 +405,13 @@ entry = "MyGame.Main, MyGame"
 
         let err = Project::locate(&root).expect_err("absolute assets.dir");
         assert!(
-            matches!(err, ProjectError::AbsolutePath { field: "assets.dir", .. }),
+            matches!(
+                err,
+                ProjectError::AbsolutePath {
+                    field: "assets.dir",
+                    ..
+                }
+            ),
             "unexpected error: {err}"
         );
     }
@@ -354,6 +422,9 @@ entry = "MyGame.Main, MyGame"
         let missing = dir.path().join("orrin.toml");
 
         let err = Project::load(&missing).expect_err("no such file");
-        assert!(matches!(err, ProjectError::Io { .. }), "unexpected error: {err}");
+        assert!(
+            matches!(err, ProjectError::Io { .. }),
+            "unexpected error: {err}"
+        );
     }
 }

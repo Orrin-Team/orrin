@@ -14,7 +14,7 @@
 use std::ffi::CString;
 use std::path::Path;
 
-use orrin_script::{default_api, CEntity, ScriptHost};
+use orrin_script::{CEntity, ScriptHost, default_api};
 
 fn main() {
     let host = match ScriptHost::boot(&default_api(), Path::new(".")) {

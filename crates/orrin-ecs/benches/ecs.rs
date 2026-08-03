@@ -5,7 +5,7 @@
 //! runs, and it currently re-resolves the driving parameter's entity through the
 //! sparse array even though iteration already knows its dense index.
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 
 use orrin_ecs::{Entity, World};
 
@@ -34,8 +34,22 @@ fn populated(count: usize) -> (World, Vec<Entity>) {
     let mut entities = Vec::with_capacity(count);
     for i in 0..count {
         let entity = world.spawn();
-        world.insert(entity, Position { x: i as f32, y: 0.0, z: 0.0 });
-        world.insert(entity, Velocity { x: 1.0, y: 0.5, z: 0.0 });
+        world.insert(
+            entity,
+            Position {
+                x: i as f32,
+                y: 0.0,
+                z: 0.0,
+            },
+        );
+        world.insert(
+            entity,
+            Velocity {
+                x: 1.0,
+                y: 0.5,
+                z: 0.0,
+            },
+        );
         if i % 4 == 0 {
             world.insert(entity, Tag);
         }
@@ -66,7 +80,9 @@ fn query_one_component(c: &mut Criterion) {
         group.bench_function(format!("{count}"), |b| {
             b.iter(|| {
                 let mut sum = 0.0f32;
-                world.query::<&Position>().for_each(|_, position| sum += position.x);
+                world
+                    .query::<&Position>()
+                    .for_each(|_, position| sum += position.x);
                 black_box(sum)
             })
         });
@@ -103,7 +119,9 @@ fn query_sparse_match(c: &mut Criterion) {
         group.bench_function(format!("{count}"), |b| {
             b.iter(|| {
                 let mut matched = 0usize;
-                world.query::<(&Position, &Tag)>().for_each(|_, _| matched += 1);
+                world
+                    .query::<(&Position, &Tag)>()
+                    .for_each(|_, _| matched += 1);
                 black_box(matched)
             })
         });

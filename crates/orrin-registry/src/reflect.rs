@@ -76,8 +76,9 @@ impl Reflect for i32 {
     fn from_value(value: &Value) -> Result<Self, ValueError> {
         match value {
             Value::I32(v) => Ok(*v),
-            Value::U32(v) => i32::try_from(*v)
-                .map_err(|_| ValueError::invalid("an i32", format!("{v}"))),
+            Value::U32(v) => {
+                i32::try_from(*v).map_err(|_| ValueError::invalid("an i32", format!("{v}")))
+            }
             other => Err(ValueError::mismatch("i32", other)),
         }
     }
@@ -91,8 +92,9 @@ impl Reflect for u32 {
     fn from_value(value: &Value) -> Result<Self, ValueError> {
         match value {
             Value::U32(v) => Ok(*v),
-            Value::I32(v) => u32::try_from(*v)
-                .map_err(|_| ValueError::invalid("a u32", format!("{v}"))),
+            Value::I32(v) => {
+                u32::try_from(*v).map_err(|_| ValueError::invalid("a u32", format!("{v}")))
+            }
             other => Err(ValueError::mismatch("u32", other)),
         }
     }

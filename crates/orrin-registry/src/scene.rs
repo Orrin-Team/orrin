@@ -7,9 +7,9 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::EntityId;
 use crate::registry::ComponentId;
 use crate::value::Value;
-use crate::EntityId;
 
 /// Bumped whenever the grammar changes in a way older files don't satisfy.
 /// Migrations are explicit functions kept in the repo; a file whose version
@@ -99,7 +99,9 @@ fn parse_header(line: &Line) -> Result<(), ParseError> {
     if version != FORMAT_VERSION {
         return Err(ParseError::new(
             line.number,
-            format!("scene format version {version} is not supported (this build reads {FORMAT_VERSION})"),
+            format!(
+                "scene format version {version} is not supported (this build reads {FORMAT_VERSION})"
+            ),
         ));
     }
     Ok(())
@@ -200,7 +202,11 @@ fn group(children: Vec<(String, Value)>, line: usize) -> Result<Value, ParseErro
 
     match indices {
         Some(indices) if !children.is_empty() => {
-            if indices.iter().enumerate().any(|(expected, &got)| expected != got) {
+            if indices
+                .iter()
+                .enumerate()
+                .any(|(expected, &got)| expected != got)
+            {
                 return Err(ParseError::new(line, "list indices must count up from [0]"));
             }
             Ok(Value::List(children.into_iter().map(|(_, v)| v).collect()))
@@ -318,10 +324,7 @@ fn parse_string(body: &str, line: usize) -> Result<String, ParseError> {
             Some('r') => out.push('\r'),
             Some('t') => out.push('\t'),
             Some(other) => {
-                return Err(ParseError::new(
-                    line,
-                    format!("unknown escape `\\{other}`"),
-                ));
+                return Err(ParseError::new(line, format!("unknown escape `\\{other}`")));
             }
             None => return Err(ParseError::new(line, "string ends with a dangling `\\`")),
         }

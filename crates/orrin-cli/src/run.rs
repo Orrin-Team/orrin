@@ -35,11 +35,7 @@ pub fn run(args: &ProjectArgs, no_build: bool, engine_args: &[String]) -> Fallib
         command.args(engine_args);
     }
 
-    println!(
-        "orrin: running `{}` with {}",
-        project.name(),
-        engine.origin
-    );
+    println!("orrin: running `{}` with {}", project.name(), engine.origin);
 
     let status = command.status().map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {

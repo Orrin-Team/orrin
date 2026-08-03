@@ -63,7 +63,10 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotInstalled => {
-                write!(f, "`dotnet` is not installed or not on PATH; install the .NET 10 SDK")
+                write!(
+                    f,
+                    "`dotnet` is not installed or not on PATH; install the .NET 10 SDK"
+                )
             }
             Self::Spawn(err) => write!(f, "could not run `dotnet build`: {err}"),
         }
@@ -190,7 +193,9 @@ mod tests {
         // MSBuild emits each diagnostic inline and again under `Build FAILED.`;
         // the console should show it once.
         let line = "/p/Player.cs(12,9): error CS0103: nope [/p/MyGame.csproj]";
-        let report = report(&format!("{line}\n\nBuild FAILED.\n\n{line}\n    1 Error(s)\n"));
+        let report = report(&format!(
+            "{line}\n\nBuild FAILED.\n\n{line}\n    1 Error(s)\n"
+        ));
 
         assert_eq!(report.diagnostics().len(), 1);
     }

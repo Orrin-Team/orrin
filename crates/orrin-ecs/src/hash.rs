@@ -175,7 +175,11 @@ mod tests {
         seen.sort_unstable();
         let before = seen.len();
         seen.dedup();
-        assert_eq!(seen.len(), before, "different lengths hashed to the same value");
+        assert_eq!(
+            seen.len(),
+            before,
+            "different lengths hashed to the same value"
+        );
     }
 
     #[test]

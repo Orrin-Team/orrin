@@ -89,10 +89,7 @@ fn nesting_composes() {
         label: Label("x".to_owned()),
         waypoints: vec![Vec3::ZERO, Vec3::ONE],
     });
-    assert_eq!(
-        encoded.field("label"),
-        Some(&Value::String("x".to_owned()))
-    );
+    assert_eq!(encoded.field("label"), Some(&Value::String("x".to_owned())));
     assert_eq!(
         encoded.field("health").and_then(|h| h.field("max")),
         Some(&Value::F32(2.0))
@@ -164,13 +161,19 @@ fn skipped_variant_fields_behave_the_same() {
 #[test]
 fn a_missing_field_names_itself() {
     let err = Health::from_value(&Value::strukt([("current", Value::F32(1.0))])).unwrap_err();
-    assert_eq!(err.to_string(), "field `max`: expected a value, found nothing");
+    assert_eq!(
+        err.to_string(),
+        "field `max`: expected a value, found nothing"
+    );
 }
 
 #[test]
 fn a_nested_failure_reports_the_full_path() {
     let broken = Value::strukt([
-        ("health", Value::strukt([("current", Value::F32(1.0)), ("max", Value::Bool(true))])),
+        (
+            "health",
+            Value::strukt([("current", Value::F32(1.0)), ("max", Value::Bool(true))]),
+        ),
         ("label", Value::String("x".to_owned())),
         ("waypoints", Value::List(Vec::new())),
     ]);

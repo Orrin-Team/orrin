@@ -136,11 +136,14 @@ pub fn find_checkout(start: &Path) -> Option<PathBuf> {
 /// would be committing a machine-local path, which the manifest rules forbid
 /// and which would break for everyone else on the project.
 pub fn checkout_containing(dir: &Path) -> Option<PathBuf> {
-    dir.ancestors().find(|dir| is_checkout(dir)).map(Path::to_path_buf)
+    dir.ancestors()
+        .find(|dir| is_checkout(dir))
+        .map(Path::to_path_buf)
 }
 
 fn is_checkout(dir: &Path) -> bool {
-    dir.join("crates/core/Cargo.toml").is_file() && dir.join("scripting/Orrin/Orrin.csproj").is_file()
+    dir.join("crates/core/Cargo.toml").is_file()
+        && dir.join("scripting/Orrin/Orrin.csproj").is_file()
 }
 
 /// The directory holding the engine's built `Orrin.dll` bindings.
