@@ -39,6 +39,9 @@ pub struct EditorState {
     /// What the top bar calls this session. Not the window title and not a
     /// path — just the name, so a run says which project it is inside.
     pub project_name: String,
+    /// The hierarchy's search box. Lives here rather than in the panel so it
+    /// survives the frame, and so a filtered tree stays filtered.
+    pub hierarchy_query: String,
     spawn_request: Option<SpawnKind>,
     despawn_request: Option<Entity>,
     /// `(child, new parent)`, with `None` meaning "detach to a root". Requested
@@ -67,6 +70,7 @@ impl Default for EditorState {
             selected: None,
             scene_path: DEFAULT_SCENE_PATH.to_owned(),
             project_name: NO_PROJECT.to_owned(),
+            hierarchy_query: String::new(),
             spawn_request: None,
             despawn_request: None,
             reparent_request: None,
