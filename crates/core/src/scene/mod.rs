@@ -21,7 +21,7 @@ pub use camera::Camera;
 pub use components::ScriptComponent;
 pub use components::{
     AmbientLight, Collider, ColliderShape, Light, LocalTransform, MaterialHandle, MeshHandle, Name,
-    Spin, Tag, UnknownComponents,
+    Spin, Tag, UnknownComponents, WorldTransform,
 };
 pub use culling::Culling;
 pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};

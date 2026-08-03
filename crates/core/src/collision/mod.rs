@@ -13,7 +13,7 @@ use glam::{Mat3, Vec3};
 
 use orrin_ecs::{Entity, FxHashMap, World};
 
-use crate::scene::{Collider, ColliderShape, LocalTransform};
+use crate::scene::{Collider, ColliderShape, LocalTransform, WorldTransform};
 
 /// Broadphase bounds and mesh bounds are the same box; it lives in
 /// [`crate::geom`] so extraction can cull without depending on collision.
@@ -72,29 +72,43 @@ impl WorldShape {
     }
 }
 
-fn world_shape(transform: &LocalTransform, collider: &Collider) -> WorldShape {
+fn world_shape(transform: &WorldTransform, collider: &Collider) -> WorldShape {
+    // The linear part carries rotation and scale together, and under a hierarchy
+    // it can also carry shear — so both arms read it directly rather than
+    // decomposing back into a rotation and a scale, which shear does not survive.
+    let linear = Mat3::from_mat4(transform.0);
+    let center = transform.translation();
+
     match collider.shape {
         ColliderShape::Sphere { radius } => {
-            // Non-uniform scale would make this an ellipsoid; the largest scale
-            // component keeps a true sphere that still contains it, so contacts
-            // can fire early but never go missing.
+            // Non-uniform scale would make this an ellipsoid; the longest column
+            // is the largest distance a unit vector can be stretched to, so this
+            // is a true sphere that still contains it. Contacts can fire early,
+            // never go missing.
+            let stretch = linear
+                .x_axis
+                .length()
+                .max(linear.y_axis.length())
+                .max(linear.z_axis.length());
             WorldShape::Sphere {
-                center: transform.translation,
-                radius: radius * transform.scale.max_element().abs(),
+                center,
+                radius: radius * stretch,
             }
         }
         ColliderShape::Box { half_extents } => {
-            // World AABB of the rotated box is abs(R) * half: per world axis the
-            // farthest corner picks the sign of every term, which is the
+            // World AABB of the transformed box is abs(linear) * half: per world
+            // axis the farthest corner picks the sign of every term, which is the
             // element-wise abs.
-            let half = half_extents * transform.scale;
-            let r = Mat3::from_quat(transform.rotation);
-            let abs_r = Mat3::from_cols(r.x_axis.abs(), r.y_axis.abs(), r.z_axis.abs());
-            let world_half = abs_r * half;
+            let abs = Mat3::from_cols(
+                linear.x_axis.abs(),
+                linear.y_axis.abs(),
+                linear.z_axis.abs(),
+            );
+            let world_half = abs * half_extents;
 
             WorldShape::Box(Aabb {
-                min: transform.translation - world_half,
-                max: transform.translation + world_half,
+                min: center - world_half,
+                max: center + world_half,
             })
         }
     }
@@ -163,7 +177,7 @@ pub fn run(world: &mut World) {
 
     let mut bodies: Vec<Body> = Vec::new();
     world
-        .query::<(&LocalTransform, &Collider)>()
+        .query::<(&WorldTransform, &Collider)>()
         .for_each(|entity, (transform, collider)| {
             bodies.push(Body {
                 entity,

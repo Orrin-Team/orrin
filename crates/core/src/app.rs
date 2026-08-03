@@ -432,6 +432,13 @@ impl ApplicationHandler for App {
                     systems::spin(&self.world, delta);
                 }
 
+                // Collision reads world transforms, so they have to be current
+                // as of the last thing that wrote a local one — `spin`.
+                {
+                    profile_scope!("propagate");
+                    systems::propagate_transforms(&mut self.world);
+                }
+
                 // After the transform-mutating systems and before the script
                 // tick, so the events scripts receive match the positions
                 // they'll read this frame.
@@ -490,6 +497,15 @@ impl ApplicationHandler for App {
                 // baseline the controller builds on.
                 self.camera_controller
                     .update(&mut self.world.resource_mut::<Camera>(), delta);
+
+                // A second pass, because collision resolution, the script tick,
+                // and the editor have all written local transforms since the
+                // first one. Extraction reads world transforms, so without this
+                // the frame would draw everything one frame behind.
+                {
+                    profile_scope!("propagate");
+                    systems::propagate_transforms(&mut self.world);
+                }
 
                 {
                     profile_scope!("extract");

@@ -9,6 +9,7 @@ mod script;
 mod spin;
 mod tag;
 mod unknown;
+mod world_transform;
 
 pub use collider::{Collider, ColliderShape};
 pub use light::{AmbientLight, Light};
@@ -21,3 +22,4 @@ pub use script::ScriptComponent;
 pub use spin::Spin;
 pub use tag::Tag;
 pub use unknown::UnknownComponents;
+pub use world_transform::WorldTransform;

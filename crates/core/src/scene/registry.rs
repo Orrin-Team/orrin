@@ -35,6 +35,10 @@ pub const MATERIAL: ComponentId = ComponentId::new("orrin.material");
 ///   teardown path. It joins as a *bridge* to the C# property bag, never as an
 ///   ordinary component — a registry `write` replaces the component wholesale,
 ///   which here would free a live handle.
+/// - `WorldTransform` is derived from `LocalTransform` every frame, so a saved
+///   value would be overwritten before anything could read it. Writing one to a
+///   scene would also record a *result* beside the inputs that produce it, which
+///   is the kind of redundancy a file format cannot keep consistent.
 pub fn register_components(registry: &mut Registry) {
     registry.register::<LocalTransform>(TRANSFORM, "Transform");
     registry.register::<Name>(NAME, "Name");
