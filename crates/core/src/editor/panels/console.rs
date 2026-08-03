@@ -1,5 +1,6 @@
 use orrin_ecs::World;
 
+use crate::editor::theme;
 use crate::scene::{LogBuffer, LogLevel};
 
 pub fn show(ctx: &egui::Context, world: &mut World) {
@@ -28,9 +29,9 @@ pub fn show(ctx: &egui::Context, world: &mut World) {
                 .show(ui, |ui| {
                     for entry in log.iter() {
                         let (color, tag) = match entry.level {
-                            LogLevel::Info => (egui::Color32::LIGHT_GRAY, "INFO"),
-                            LogLevel::Warning => (egui::Color32::from_rgb(255, 200, 80), "WARN"),
-                            LogLevel::Error => (egui::Color32::from_rgb(255, 110, 110), "ERROR"),
+                            LogLevel::Info => (theme::LOG_INFO, "INFO"),
+                            LogLevel::Warning => (theme::LOG_WARN, "WARN"),
+                            LogLevel::Error => (theme::LOG_ERROR, "ERROR"),
                         };
                         ui.colored_label(color, format!("[{}] {}", tag, entry.message));
                     }

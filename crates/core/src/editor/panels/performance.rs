@@ -1,5 +1,6 @@
 use orrin_ecs::World;
 
+use crate::editor::theme;
 use crate::profile::{self, Lane, Profiler, Row};
 use crate::scene::Culling;
 use crate::stats::FrameStats;
@@ -8,9 +9,6 @@ pub fn show(ctx: &egui::Context, world: &World) {
     let Some(stats) = world.get_resource::<FrameStats>() else {
         return;
     };
-
-    const CPU_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 200, 255);
-    const GPU_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 170, 80);
 
     egui::Window::new("Performance")
         .default_pos(egui::pos2(12.0, 12.0))
@@ -21,10 +19,10 @@ pub fn show(ctx: &egui::Context, world: &World) {
                     .size(24.0)
                     .strong(),
             );
-            ui.colored_label(CPU_COLOR, format!("CPU: {:.2} ms (avg)", stats.frame_ms()));
+            ui.colored_label(theme::CPU, format!("CPU: {:.2} ms (avg)", stats.frame_ms()));
             match stats.gpu_ms() {
-                Some(ms) => ui.colored_label(GPU_COLOR, format!("GPU: {ms:.2} ms")),
-                None => ui.colored_label(GPU_COLOR, "GPU: n/a"),
+                Some(ms) => ui.colored_label(theme::GPU, format!("GPU: {ms:.2} ms")),
+                None => ui.colored_label(theme::GPU, "GPU: n/a"),
             };
 
             if !stats.history().is_empty() {
@@ -57,7 +55,7 @@ pub fn show(ctx: &egui::Context, world: &World) {
             }
 
             ui.add_space(4.0);
-            graph(ui, &stats, CPU_COLOR, GPU_COLOR);
+            graph(ui, &stats, theme::CPU, theme::GPU);
 
             if let Some(profiler) = world.get_resource::<Profiler>() {
                 ui.add_space(6.0);
@@ -68,8 +66,8 @@ pub fn show(ctx: &egui::Context, world: &World) {
                     profile::set_enabled(enabled);
                 }
                 if enabled {
-                    phases(ui, &profiler, Lane::Cpu, "CPU phases", CPU_COLOR);
-                    phases(ui, &profiler, Lane::Gpu, "GPU passes", GPU_COLOR);
+                    phases(ui, &profiler, Lane::Cpu, "CPU phases", theme::CPU);
+                    phases(ui, &profiler, Lane::Gpu, "GPU passes", theme::GPU);
                 }
             }
         });
@@ -156,10 +154,7 @@ fn graph(
     let scale_ms = peak.max(33.3);
     let y_for = |ms: f32| rect.bottom() - rect.height() * (ms / scale_ms).clamp(0.0, 1.0);
 
-    for (ms, color) in [
-        (16.67, egui::Color32::from_rgb(60, 120, 60)),
-        (33.33, egui::Color32::from_rgb(130, 95, 40)),
-    ] {
+    for (ms, color) in [(16.67, theme::GUIDE_60), (33.33, theme::GUIDE_30)] {
         if ms <= scale_ms {
             painter.hline(rect.x_range(), y_for(ms), egui::Stroke::new(1.0, color));
         }

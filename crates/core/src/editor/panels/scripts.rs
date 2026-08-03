@@ -11,11 +11,8 @@ use orrin_ecs::World;
 
 use crate::build_watcher::{BuildState, BuildStatus};
 use crate::editor::state::EditorState;
+use crate::editor::theme::{ERROR, OK, PENDING};
 use crate::scene::ScriptComponent;
-
-const ERROR: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x5A, 0x4A);
-const OK: egui::Color32 = egui::Color32::from_rgb(0x7A, 0xC0, 0x8A);
-const PENDING: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xB3, 0x4A);
 
 pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
     let mut live = 0usize;

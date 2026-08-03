@@ -223,7 +223,7 @@ fn script_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
                 // A hook threw and the engine disabled the script (see the log
                 // for the exception). Clearing re-arms it from next tick — the
                 // manual counterpart to "re-enable on hot reload".
-                ui.colored_label(egui::Color32::from_rgb(0xE0, 0x5A, 0x4A), "⚠ faulted");
+                ui.colored_label(crate::editor::theme::ERROR, "⚠ faulted");
                 if ui.button("Clear fault").clicked() {
                     script.faulted = false;
                 }

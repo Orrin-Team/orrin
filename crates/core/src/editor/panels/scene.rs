@@ -1,6 +1,7 @@
 use orrin_ecs::World;
 
 use crate::editor::state::{EditorState, SceneRequest};
+use crate::editor::theme;
 use crate::scene::UnknownComponents;
 
 pub fn show(ctx: &egui::Context, world: &World, state: &mut EditorState) {
@@ -33,7 +34,7 @@ pub fn show(ctx: &egui::Context, world: &World, state: &mut EditorState) {
             if carried > 0 {
                 ui.separator();
                 ui.colored_label(
-                    egui::Color32::from_rgb(255, 200, 80),
+                    theme::LOG_WARN,
                     format!("⚠ carrying {carried} unapplied component(s)"),
                 );
                 ui.weak("Preserved on save. See the console for which.");
