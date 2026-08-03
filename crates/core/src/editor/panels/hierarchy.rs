@@ -129,28 +129,26 @@ fn snapshot(world: &mut World) -> Vec<Node> {
 fn draw(ui: &mut egui::Ui, nodes: &[Node], index: usize, state: &mut EditorState) {
     let node = &nodes[index];
     let selected = state.selected == Some(node.entity);
-    let id = egui::Id::new((
-        "hierarchy_row",
-        node.entity.index(),
-        node.entity.generation(),
-    ));
 
     if node.children.is_empty() {
-        let response = row(ui, id, node, selected, state);
+        let response = row(ui, node, selected, state);
         accept_drop(&response, node.entity, state);
         return;
     }
 
     // Default-open: a scene that opens fully collapsed hides everything the
-    // panel exists to show.
-    let collapsing = egui::collapsing_header::CollapsingState::load_with_default_open(
-        ui.ctx(),
-        id.with("collapse"),
-        true,
-    );
+    // panel exists to show. Keyed on the entity so the open/closed state follows
+    // a row rather than its position in the list.
+    let id = egui::Id::new((
+        "hierarchy_collapse",
+        node.entity.index(),
+        node.entity.generation(),
+    ));
+    let collapsing =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
     collapsing
         .show_header(ui, |ui| {
-            let response = row(ui, id, node, selected, state);
+            let response = row(ui, node, selected, state);
             accept_drop(&response, node.entity, state);
         })
         .body(|ui| {
@@ -160,19 +158,39 @@ fn draw(ui: &mut egui::Ui, nodes: &[Node], index: usize, state: &mut EditorState
         });
 }
 
-fn row(
-    ui: &mut egui::Ui,
-    id: egui::Id,
-    node: &Node,
-    selected: bool,
-    state: &mut EditorState,
-) -> egui::Response {
-    ui.dnd_drag_source(id, node.entity, |ui| {
-        if ui.selectable_label(selected, &node.label).clicked() {
-            state.selected = Some(node.entity);
-        }
-    })
-    .response
+/// A row is both clickable and draggable, which rules out `Ui::dnd_drag_source`:
+/// that lays a second `Sense::drag()` interaction over the same rect, and it
+/// claims the press before the label beneath can read it as a click. Selecting
+/// an entity would then be impossible — every press would begin a drag.
+///
+/// `Response::dnd_set_drag_payload` is the API for this case; it stores the
+/// payload only once a drag has actually started, so a press that never moves
+/// stays a click.
+fn row(ui: &mut egui::Ui, node: &Node, selected: bool, state: &mut EditorState) -> egui::Response {
+    let response = ui
+        .selectable_label(selected, &node.label)
+        .interact(egui::Sense::click_and_drag());
+
+    if response.clicked() {
+        state.selected = Some(node.entity);
+    }
+    response.dnd_set_drag_payload(node.entity);
+
+    // Without the floating preview `dnd_drag_source` would have painted, the
+    // drop target is the only feedback about where the row will land.
+    if response
+        .dnd_hover_payload::<Entity>()
+        .is_some_and(|d| *d != node.entity)
+    {
+        ui.painter().rect_stroke(
+            response.rect,
+            2.0,
+            ui.visuals().selection.stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    response
 }
 
 /// Reparent the dragged entity onto `target`, if one was released here.
