@@ -39,6 +39,12 @@ public unsafe struct OrrinApi
     public delegate* unmanaged<
         float, float, float, float, float, float, float, float, float, float, float, void>
         DebugDrawLine;
+    // Hierarchy. Appended after DebugDrawLine, matching the Rust struct; never
+    // reordered above it.
+    public delegate* unmanaged<Entity, Transform*, byte> GetWorldTransform;
+    public delegate* unmanaged<Entity, Transform*, byte> SetWorldTransform;
+    public delegate* unmanaged<Entity, Entity> GetParent;
+    public delegate* unmanaged<Entity, Entity, byte, byte> SetParent;
 }
 
 public static unsafe class Native
@@ -80,6 +86,43 @@ public static unsafe class Native
 
     public static void SetTransform(Entity entity, Transform value) =>
         _api.SetTransform(entity, &value);
+
+    /// The entity's transform in world space.
+    ///
+    /// The engine holds this as a matrix, so what comes back is the closest
+    /// position/rotation/scale fit to it. That is exact for any chain of
+    /// rotations and uniform scales, and approximate once a non-uniformly
+    /// scaled ancestor introduces shear — the scale is the lossy part, the
+    /// position never is.
+    public static Transform GetWorldTransform(Entity entity)
+    {
+        Transform transform = default;
+        _api.GetWorldTransform(entity, &transform);
+        return transform;
+    }
+
+    /// Place the entity in world space, whatever it is parented to. The engine
+    /// composes with the inverse of the parent's transform, so a script never
+    /// has to know it has a parent.
+    public static void SetWorldTransform(Entity entity, Transform value) =>
+        _api.SetWorldTransform(entity, &value);
+
+    /// The entity's parent, or `Entity.Null` if it is a root.
+    public static Entity GetParent(Entity entity) => _api.GetParent(entity);
+
+    /// Attach `entity` to `parent`, or pass `Entity.Null` to detach it.
+    ///
+    /// With `keepWorld` the entity stays where it is and only its local
+    /// transform is rewritten; without it, the local transform is kept and the
+    /// entity moves into its new parent's frame — which is what attaching a
+    /// pickup to a hand wants.
+    ///
+    /// Returns false, and changes nothing, if the move would create a cycle,
+    /// parent an entity to itself, or name a despawned entity. The reparent
+    /// itself is structural, so it applies after the current tick's dispatch —
+    /// `GetParent` will not reflect it until the next frame.
+    public static bool SetParent(Entity entity, Entity parent, bool keepWorld = true) =>
+        _api.SetParent(entity, parent, keepWorld ? (byte)1 : (byte)0) != 0;
 
     public static bool KeyDown(uint code) => _api.KeyDown(code) != 0;
 

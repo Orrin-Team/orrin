@@ -12,10 +12,10 @@ public class Spinner : Behaviour
 
     public override void OnUpdate(float deltaTime)
     {
-        var t = Transform;
+        var t = LocalTransform;
         var radians = MathF.PI / 180f * DegreesPerSecond * deltaTime;
         t.Rotation =
             Quaternion.Normalize(Quaternion.Euler(0, radians,0));
-        Transform = t;
+        LocalTransform = t;
     }
 }

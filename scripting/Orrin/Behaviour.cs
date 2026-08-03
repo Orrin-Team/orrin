@@ -33,9 +33,37 @@ public abstract class Behaviour
     /// frame by definition.
     public virtual void OnCollisionExit(Collision other) { }
 
-    protected Transform Transform
+    /// This entity's transform relative to its parent. For an entity with no
+    /// parent it is also its world transform.
+    ///
+    /// Named for the space it is in, because once an entity can have a parent
+    /// "the transform" is ambiguous and the two disagree silently.
+    protected Transform LocalTransform
     {
         get => Native.GetTransform(Entity);
         set => Native.SetTransform(Entity, value);
     }
+
+    /// This entity's transform in world space, whatever it is parented to.
+    ///
+    /// Setting it composes with the inverse of the parent's transform, so an
+    /// object can be placed in the world without a script knowing whether it
+    /// has a parent. The scale that comes back is a best fit — see
+    /// [Native.GetWorldTransform].
+    protected Transform WorldTransform
+    {
+        get => Native.GetWorldTransform(Entity);
+        set => Native.SetWorldTransform(Entity, value);
+    }
+
+    /// This entity's parent, or `Entity.Null` if it is a root.
+    protected Entity Parent => Native.GetParent(Entity);
+
+    /// Attach this entity to `parent`, or pass `Entity.Null` to detach it.
+    ///
+    /// Returns false and changes nothing if the move would create a cycle. The
+    /// change is structural, so it lands after this tick's dispatch — `Parent`
+    /// still reads the old value until the next frame.
+    protected bool SetParent(Entity parent, bool keepWorld = true) =>
+        Native.SetParent(Entity, parent, keepWorld);
 }

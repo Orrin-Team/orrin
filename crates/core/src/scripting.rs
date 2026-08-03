@@ -9,7 +9,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use glam::{Quat, Vec3};
+use glam::{Mat4, Quat, Vec3};
 
 use orrin_ecs::{Entity, FxHashMap, World};
 use orrin_script::{CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi, ScriptHost};
@@ -17,7 +17,8 @@ use orrin_script::{CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::{
     Assets, Collider, ColliderShape, DebugLines, InputState, LocalTransform, LogBuffer, LogLevel,
-    MaterialHandle, MeshHandle, Name, ScriptComponent, Tag, Time, Transform,
+    MaterialHandle, MeshHandle, Name, Parent, ScriptComponent, Tag, Time, Transform,
+    WorldTransform,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -61,6 +62,121 @@ extern "C" fn set_transform(entity: CEntity, value: *const CTransform) -> bool {
         transform.translation = Vec3::from_array(value.position);
         transform.rotation = Quat::from_array(value.rotation);
         transform.scale = Vec3::from_array(value.scale);
+        true
+    })
+}
+
+// The world transform is a `Mat4` engine-side and a `CTransform` across the
+// ABI, so this hands back the closest translation/rotation/scale fit to it.
+// Exact for any chain of rotations and uniform scales; lossy once a
+// non-uniformly scaled ancestor has introduced shear, which no TRS triple can
+// spell. Scripts that need an exact world quantity should read the position,
+// which is always the matrix's translation column.
+extern "C" fn get_world_transform(entity: CEntity, out: *mut CTransform) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    orrin_script::with_world(false, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        let Some(world_transform) = world.get::<WorldTransform>(entity) else {
+            return false;
+        };
+        let (scale, rotation, translation) = world_transform.0.to_scale_rotation_translation();
+        // SAFETY: `out` is a valid, writable `CTransform` supplied by C#.
+        unsafe {
+            *out = CTransform {
+                position: translation.to_array(),
+                rotation: rotation.to_array(),
+                scale: scale.to_array(),
+            };
+        }
+        true
+    })
+}
+
+/// Write a world-space transform by composing it with the inverse of the
+/// parent's, so a script never has to know it has a parent at all.
+///
+/// Reads a `WorldTransform` produced by the last propagation, which for a script
+/// is the one after `spin`. A script that moves a parent and then world-places
+/// its child in the same tick composes against the parent's previous position.
+extern "C" fn set_world_transform(entity: CEntity, value: *const CTransform) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: `value` is a valid `CTransform` supplied by C#.
+    let value = unsafe { *value };
+    orrin_script::with_world(false, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        let target = Mat4::from_scale_rotation_translation(
+            Vec3::from_array(value.scale),
+            Quat::from_array(value.rotation),
+            Vec3::from_array(value.position),
+        );
+        let parent_world = crate::scene::parent_world_matrix(world, entity);
+        let local = parent_world.inverse() * target;
+
+        let Some(mut transform) = world.get_mut::<LocalTransform>(entity) else {
+            return false;
+        };
+        let (scale, rotation, translation) = local.to_scale_rotation_translation();
+        transform.translation = translation;
+        transform.rotation = rotation;
+        transform.scale = scale;
+        true
+    })
+}
+
+extern "C" fn get_parent(entity: CEntity) -> CEntity {
+    orrin_script::with_world(CEntity::NULL, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        match world.get::<Parent>(entity).map(|p| p.get()) {
+            Some(parent) if world.is_alive(parent) => CEntity {
+                index: parent.index,
+                generation: parent.generation,
+            },
+            _ => CEntity::NULL,
+        }
+    })
+}
+
+/// Validate now, apply after the dispatch window.
+///
+/// Reparenting attaches or detaches a component, so it is a structural change
+/// and cannot run mid-dispatch. Validating eagerly is what keeps the return
+/// value meaningful: a script learns immediately that it asked for a cycle,
+/// rather than finding out by the move silently not happening.
+extern "C" fn set_parent(child: CEntity, parent: CEntity, keep_world: bool) -> bool {
+    orrin_script::with_world(false, |world| {
+        let child = Entity {
+            index: child.index,
+            generation: child.generation,
+        };
+        // `CEntity::NULL` is all-zeroes and slot 0 is reserved, so a zero index
+        // is the null sentinel — the same test as C# `Entity.IsValid`.
+        let parent = (parent.index != 0).then_some(Entity {
+            index: parent.index,
+            generation: parent.generation,
+        });
+        if crate::scene::can_reparent(world, child, parent).is_err() {
+            return false;
+        }
+        COMMANDS.with(|commands| {
+            commands.borrow_mut().push(Command::Reparent {
+                child,
+                parent,
+                keep_world,
+            })
+        });
         true
     })
 }
@@ -406,6 +522,12 @@ enum Command {
         entity: Entity,
         type_name: String,
     },
+    // `None` detaches. Validated at the call, applied here — see `set_parent`.
+    Reparent {
+        child: Entity,
+        parent: Option<Entity>,
+        keep_world: bool,
+    },
 }
 
 thread_local! {
@@ -588,6 +710,10 @@ fn build_api() -> OrrinApi {
         log_warn,
         log_error,
         debug_draw_line,
+        get_world_transform,
+        set_world_transform,
+        get_parent,
+        set_parent,
         ..orrin_script::default_api()
     }
 }
@@ -1169,6 +1295,16 @@ impl Scripting {
                 }
                 Command::SetMaterial { entity, material } => {
                     world.insert(entity, material);
+                }
+                Command::Reparent {
+                    child,
+                    parent,
+                    keep_world,
+                } => {
+                    // Re-validated by `reparent` itself: the world has moved on
+                    // since the call, and the parent may have been despawned by
+                    // an earlier command in this same drain.
+                    let _ = crate::scene::reparent(world, child, parent, keep_world);
                 }
                 Command::AttachScript { entity, type_name } => {
                     // Creates the managed instance now; the enable/start pair

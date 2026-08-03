@@ -474,20 +474,7 @@ pub fn reparent(
     parent: Option<Entity>,
     keep_world: bool,
 ) -> Result<(), HierarchyError> {
-    if !world.is_alive(child) {
-        return Err(HierarchyError::StaleHandle { entity: child });
-    }
-    if let Some(parent) = parent {
-        if !world.is_alive(parent) {
-            return Err(HierarchyError::StaleHandle { entity: parent });
-        }
-        if parent == child {
-            return Err(HierarchyError::SelfParent { child });
-        }
-        if is_descendant_of(world, parent, child) {
-            return Err(HierarchyError::Cycle { child, parent });
-        }
-    }
+    can_reparent(world, child, parent)?;
 
     let old_world = keep_world
         .then(|| world.get::<WorldTransform>(child).map(|w| w.0))
@@ -499,10 +486,7 @@ pub fn reparent(
     };
 
     if let Some(old_world) = old_world {
-        let parent_world = parent
-            .and_then(|parent| world.get::<WorldTransform>(parent).map(|w| w.0))
-            .unwrap_or(Mat4::IDENTITY);
-        let new_local = parent_world.inverse() * old_world;
+        let new_local = parent_world_matrix(world, child).inverse() * old_world;
         if let Some(mut local) = world.get_mut::<LocalTransform>(child) {
             let (scale, rotation, translation) = new_local.to_scale_rotation_translation();
             local.translation = translation;
@@ -512,6 +496,46 @@ pub fn reparent(
     }
 
     Ok(())
+}
+
+/// Whether [`reparent`] would accept this move, without performing it.
+///
+/// Split out for the scripting ABI, where a reparent is a structural change and
+/// so has to be queued until the dispatch window closes. Checking here keeps the
+/// call's return value meaningful — a script learns immediately that it asked
+/// for a cycle, instead of finding out by the move silently not happening.
+pub fn can_reparent(
+    world: &World,
+    child: Entity,
+    parent: Option<Entity>,
+) -> Result<(), HierarchyError> {
+    if !world.is_alive(child) {
+        return Err(HierarchyError::StaleHandle { entity: child });
+    }
+    let Some(parent) = parent else {
+        return Ok(());
+    };
+    if !world.is_alive(parent) {
+        return Err(HierarchyError::StaleHandle { entity: parent });
+    }
+    if parent == child {
+        return Err(HierarchyError::SelfParent { child });
+    }
+    if is_descendant_of(world, parent, child) {
+        return Err(HierarchyError::Cycle { child, parent });
+    }
+    Ok(())
+}
+
+/// The matrix `entity`'s local transform is interpreted relative to — identity
+/// for a transform root.
+///
+/// This is the conversion between the two spaces, so anything holding a
+/// world-space quantity that has to land in a `LocalTransform` goes through it.
+pub fn parent_world_matrix(world: &World, entity: Entity) -> Mat4 {
+    live_parent(world, entity)
+        .and_then(|parent| world.get::<WorldTransform>(parent).map(|w| w.0))
+        .unwrap_or(Mat4::IDENTITY)
 }
 
 /// Whether `entity` is `ancestor` or sits anywhere beneath it.
@@ -1009,5 +1033,83 @@ mod tests {
         assert!(is_transform_root(&world, orphan), "orphaned by a despawn");
         assert!(is_transform_root(&world, in_folder), "under a folder node");
         assert!(!is_transform_root(&world, real_child));
+    }
+
+    /// The scripting ABI validates with `can_reparent` and applies with
+    /// `reparent` a tick later. If the two ever disagree, a script gets told
+    /// "yes" and then silently nothing happens.
+    #[test]
+    fn can_reparent_agrees_with_reparent() {
+        let mut world = World::new();
+        let root = spawn_at(&mut world, Transform::default());
+        let child = spawn_at(&mut world, Transform::default());
+        reparent(&mut world, child, Some(root), false).unwrap();
+        let ghost = spawn_at(&mut world, Transform::default());
+        world.despawn(ghost);
+
+        let cases = [
+            (root, Some(child)), // cycle
+            (root, Some(root)),  // self
+            (ghost, None),       // stale child
+            (root, Some(ghost)), // stale parent
+            (child, None),       // legal
+            (root, Some(child)), // cycle again, after the legal one
+        ];
+        for (child_arg, parent_arg) in cases {
+            let predicted = can_reparent(&world, child_arg, parent_arg);
+            let actual = reparent(&mut world, child_arg, parent_arg, false);
+            assert_eq!(predicted, actual, "for {child_arg:?} -> {parent_arg:?}");
+        }
+    }
+
+    /// `set_world_transform` divides out this matrix to get a local transform.
+    /// The round trip is the property it needs: place an object in world space,
+    /// propagate, and find it exactly where it was asked to be.
+    #[test]
+    fn dividing_out_the_parent_matrix_round_trips() {
+        let mut world = World::new();
+        let parent = spawn_at(
+            &mut world,
+            Transform {
+                translation: Vec3::new(-3.0, 4.0, 1.0),
+                rotation: Quat::from_rotation_y(1.1),
+                scale: Vec3::splat(2.0),
+            },
+        );
+        let child = spawn_at(&mut world, Transform::default());
+        reparent(&mut world, child, Some(parent), false).unwrap();
+        propagate_transforms(&mut world);
+
+        let desired = Mat4::from_scale_rotation_translation(
+            Vec3::ONE,
+            Quat::from_rotation_x(0.4),
+            Vec3::new(7.0, -2.0, 5.0),
+        );
+        let local = parent_world_matrix(&world, child).inverse() * desired;
+        {
+            let (scale, rotation, translation) = local.to_scale_rotation_translation();
+            let mut t = world.get_mut::<LocalTransform>(child).unwrap();
+            t.translation = translation;
+            t.rotation = rotation;
+            t.scale = scale;
+        }
+        propagate_transforms(&mut world);
+
+        assert!(close(world_of(&world, child), desired));
+    }
+
+    /// A transform root divides by identity, so the same code path places an
+    /// unparented entity without a special case.
+    #[test]
+    fn a_transform_root_has_an_identity_parent_matrix() {
+        let mut world = World::new();
+        let loose = spawn_at(&mut world, Transform::default());
+        let folder = spawn_bare(&mut world);
+        let in_folder = spawn_at(&mut world, Transform::default());
+        reparent(&mut world, in_folder, Some(folder), false).unwrap();
+        propagate_transforms(&mut world);
+
+        assert_eq!(parent_world_matrix(&world, loose), Mat4::IDENTITY);
+        assert_eq!(parent_world_matrix(&world, in_folder), Mat4::IDENTITY);
     }
 }

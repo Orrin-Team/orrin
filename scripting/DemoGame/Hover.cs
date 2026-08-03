@@ -19,7 +19,7 @@ public class Hover : Behaviour
 
     public override void OnStart()
     {
-        var t = Transform;
+        var t = LocalTransform;
         _basePosition = t.Position;
         _baseScale = t.Scale;
         Native.Log($"Hover attached to {Entity}");
@@ -43,10 +43,10 @@ public class Hover : Behaviour
 
         var axis = new Vector3(0.3f, 1f, 0.25f).normalized;
 
-        var t = Transform;
+        var t = LocalTransform;
         t.Position = _basePosition + drift;
         t.Rotation = Quaternion.AngleAxis(_time * TumbleSpeed * Mathf.Rad2Deg, axis);
         t.Scale = new Vector3(_baseScale.x * squash, _baseScale.y * stretch, _baseScale.z * squash);
-        Transform = t;
+        LocalTransform = t;
     }
 }

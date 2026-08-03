@@ -41,13 +41,13 @@ public class Bumper : Behaviour
         if (_stopped)
             return;
 
-        var transform = Transform;
+        var transform = LocalTransform;
         var toOrigin = -transform.Position;
         if (toOrigin.magnitude < 0.05f)
             return;
 
         transform.Position += toOrigin.normalized * (Speed * deltaTime);
-        Transform = transform;
+        LocalTransform = transform;
     }
 
     public override void OnCollisionEnter(Collision collision)

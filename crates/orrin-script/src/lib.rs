@@ -8,13 +8,13 @@
 //! `OrrinApi { get_transform, set_transform, ..default_api() }`.
 
 use std::cell::Cell;
-use std::ffi::{c_char, CStr};
+use std::ffi::{CStr, c_char};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use orrin_ecs::World;
 use netcorehost::hostfxr::{HostfxrContext, InitializedForRuntimeConfig};
 use netcorehost::{nethost, pdcstr};
+use orrin_ecs::World;
 
 /// Engine function table handed to managed code at startup. Field order and
 /// signatures must stay in lock-step with the C# `Orrin.OrrinApi` struct.
@@ -34,8 +34,7 @@ pub struct OrrinApi {
     // Structural ops. The engine queues these and applies them after the
     // dispatch window closes, but `spawn_renderable` reserves and returns a
     // real entity id immediately.
-    pub spawn_renderable:
-        extern "C" fn(*const c_char, *const c_char, *const CTransform) -> CEntity,
+    pub spawn_renderable: extern "C" fn(*const c_char, *const c_char, *const CTransform) -> CEntity,
     pub despawn: extern "C" fn(CEntity) -> bool,
     // Frame timing, read from the engine's `Time` resource. Engine-side (like
     // input), so the renderer supplies the real implementations.
@@ -71,8 +70,26 @@ pub struct OrrinApi {
     // choice as the collider extents.
     pub log_warn: extern "C" fn(*const c_char),
     pub log_error: extern "C" fn(*const c_char),
-    pub debug_draw_line:
-        extern "C" fn(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32),
+    pub debug_draw_line: extern "C" fn(f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32),
+    // Hierarchy. Appended after `debug_draw_line`; never reordered above it.
+    //
+    // The world transform is a matrix engine-side, so `get_world_transform`
+    // hands back the closest translation/rotation/scale fit to it. That is
+    // exact for any chain of rotations and uniform scales, and lossy once a
+    // non-uniformly scaled ancestor introduces shear — the same admission
+    // Unity's `lossyScale` makes. `set_world_transform` composes with the
+    // inverse of the parent's world transform engine-side, so a script never
+    // handles a matrix.
+    //
+    // `get_parent` returns `CEntity::NULL` for a root. `set_parent` is a
+    // *structural* change and so is deferred like `set_tag`: it validates
+    // eagerly (rejecting a self-parent, a cycle, or a stale handle) and applies
+    // after the dispatch window. Passing `CEntity::NULL` as the parent detaches.
+    // `keep_world` preserves the child's world transform across the move.
+    pub get_world_transform: extern "C" fn(CEntity, *mut CTransform) -> bool,
+    pub set_world_transform: extern "C" fn(CEntity, *const CTransform) -> bool,
+    pub get_parent: extern "C" fn(CEntity) -> CEntity,
+    pub set_parent: extern "C" fn(CEntity, CEntity, bool) -> bool,
 }
 
 /// A table with the generic functions wired and the rest stubbed; the engine
@@ -106,6 +123,10 @@ pub fn default_api() -> OrrinApi {
         log_warn: orrin_log_warn,
         log_error: orrin_log_error,
         debug_draw_line: stub_debug_draw_line,
+        get_world_transform: stub_get_transform,
+        set_world_transform: stub_set_transform,
+        get_parent: stub_get_parent,
+        set_parent: stub_set_parent,
     }
 }
 
@@ -139,6 +160,14 @@ extern "C" fn stub_add_sphere_collider(_entity: CEntity, _radius: f32, _is_trigg
 }
 
 extern "C" fn stub_set_material(_entity: CEntity, _material: *const c_char) -> bool {
+    false
+}
+
+extern "C" fn stub_get_parent(_entity: CEntity) -> CEntity {
+    CEntity::NULL
+}
+
+extern "C" fn stub_set_parent(_child: CEntity, _parent: CEntity, _keep_world: bool) -> bool {
     false
 }
 
