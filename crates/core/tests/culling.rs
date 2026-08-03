@@ -8,10 +8,11 @@
 
 use glam::Vec3;
 use orrin_core::gfx::RenderItem;
+use orrin_core::scene::propagate_transforms;
 use orrin_core::scene::{
     Camera, CpuMesh, Culling, LocalTransform, MeshBounds, MeshHandle, Transform,
 };
-use orrin_core::systems::{extract_renderables, propagate_transforms};
+use orrin_core::systems::extract_renderables;
 use orrin_ecs::World;
 
 const GRID: i32 = 10;

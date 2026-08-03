@@ -436,7 +436,7 @@ impl ApplicationHandler for App {
                 // as of the last thing that wrote a local one — `spin`.
                 {
                     profile_scope!("propagate");
-                    systems::propagate_transforms(&mut self.world);
+                    crate::scene::propagate_transforms(&mut self.world);
                 }
 
                 // After the transform-mutating systems and before the script
@@ -504,7 +504,7 @@ impl ApplicationHandler for App {
                 // the frame would draw everything one frame behind.
                 {
                     profile_scope!("propagate");
-                    systems::propagate_transforms(&mut self.world);
+                    crate::scene::propagate_transforms(&mut self.world);
                 }
 
                 {

@@ -16,37 +16,6 @@ pub fn spin(world: &World, dt: f32) {
         .for_each(|_entity, (transform, spin)| spin.apply(transform, dt));
 }
 
-/// Derive every entity's [`WorldTransform`] from its [`LocalTransform`].
-///
-/// Flat while the engine has no `Parent` component: an entity's world transform
-/// *is* its local one. When the hierarchy lands, only this function's body
-/// changes — its callers and its position in the frame are already where the
-/// hierarchy needs them, which is the point of introducing it separately.
-///
-/// Takes `&mut World` because it owns the insertion: an entity that has a
-/// `LocalTransform` and lacks a `WorldTransform` gets one here, so no spawn path
-/// has to remember to add both. Once the hierarchy exists this moves into the
-/// rebuild, which runs only on structural change.
-pub fn propagate_transforms(world: &mut World) {
-    let mut missing = Vec::new();
-    world
-        .query::<(&LocalTransform, Option<&WorldTransform>)>()
-        .for_each(|entity, (_, existing)| {
-            if existing.is_none() {
-                missing.push(entity);
-            }
-        });
-    for entity in missing {
-        world.insert(entity, WorldTransform::default());
-    }
-
-    world
-        .query::<(&LocalTransform, &mut WorldTransform)>()
-        .for_each(|_entity, (local, world_transform)| {
-            world_transform.0 = local.matrix();
-        });
-}
-
 /// Build this frame's draw list: every renderable the camera can see, with
 /// everything the passes need already derived.
 ///
@@ -380,8 +349,9 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_renderables, normal_matrix, propagate_transforms};
+    use super::{extract_renderables, normal_matrix};
     use crate::gfx::RenderItem;
+    use crate::scene::propagate_transforms;
     use crate::scene::{
         Camera, CpuMesh, Culling, LocalTransform, MeshBounds, MeshHandle, Transform, WorldTransform,
     };

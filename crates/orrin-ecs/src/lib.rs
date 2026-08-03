@@ -92,7 +92,7 @@ impl EntityAllocator {
             self.alive.push(true);
             Entity {
                 index,
-                generation: 0
+                generation: 0,
             }
         }
     }
@@ -242,6 +242,7 @@ pub struct World {
     // component per entity per frame.
     storages: FxHashMap<TypeId, RefCell<Box<dyn AnyStorage>>>,
     resources: FxHashMap<TypeId, RefCell<Box<dyn Any>>>,
+    structural_version: u64,
 }
 
 impl World {
@@ -250,8 +251,30 @@ impl World {
         Self::default()
     }
 
+    /// A counter bumped by every change to the world's *shape*: an entity
+    /// spawned or despawned, a component attached or detached.
+    ///
+    /// Mutating a component through [`get_mut`](World::get_mut) or a `&mut`
+    /// query deliberately does **not** bump it — that changes a value, not the
+    /// shape, and counting it would defeat the purpose.
+    ///
+    /// This exists so a cache derived from the world's structure can tell in
+    /// O(1) whether it is still valid. The alternative — a dirty flag that every
+    /// mutation site must remember to set — is only as good as the discipline of
+    /// the next call site added, and a missed one is a stale cache with no
+    /// symptom until something reads it. Here the ECS maintains it, so the bug
+    /// cannot be written.
+    ///
+    /// It is deliberately coarse: attaching *any* component bumps it, not just
+    /// the ones a given cache cares about. That errs toward rebuilding when
+    /// nothing relevant changed, never toward missing a rebuild that was needed.
+    pub fn structural_version(&self) -> u64 {
+        self.structural_version
+    }
+
     /// Create a new entity with no components and return its handle.
     pub fn spawn(&mut self) -> Entity {
+        self.structural_version += 1;
         self.entities.allocate()
     }
 
@@ -271,7 +294,10 @@ impl World {
     /// ```
     pub fn spawn_entity(&mut self) -> EntityBuilder<'_> {
         let entity = self.spawn();
-        EntityBuilder { world: self, entity }
+        EntityBuilder {
+            world: self,
+            entity,
+        }
     }
 
     /// Returns `true` while `entity` refers to a live (not yet despawned) entity.
@@ -298,6 +324,7 @@ impl World {
         for storage in self.storages.values() {
             storage.borrow_mut().remove_entity(entity);
         }
+        self.structural_version += 1;
         self.entities.deallocate(entity)
     }
 
@@ -320,6 +347,10 @@ impl World {
             .as_any_mut()
             .downcast_mut::<SparseSet<T>>()
             .expect("storage type mismatch");
+        // Bumped for a replacement as well as a first attachment: swapping one
+        // value of a relationship component for another reshapes the world just
+        // as much as attaching it did.
+        self.structural_version += 1;
         set.insert(entity, component)
     }
 
@@ -331,7 +362,14 @@ impl World {
             .as_any_mut()
             .downcast_mut::<SparseSet<T>>()
             .expect("storage type mismatch");
-        set.remove(entity)
+        let removed = set.remove(entity);
+        // Only a removal that removed something is a change. Bumping on a miss
+        // would let a loop that speculatively removes an absent component
+        // invalidate every structural cache, every frame.
+        if removed.is_some() {
+            self.structural_version += 1;
+        }
+        removed
     }
 
     /// Returns `true` if `entity` currently has a component of type `T`.
@@ -348,7 +386,7 @@ impl World {
                 .expect("storage type mismatch")
                 .get(entity)
         })
-            .ok()
+        .ok()
     }
 
     /// Mutably borrow `entity`'s component of type `T`, if present.
@@ -360,7 +398,7 @@ impl World {
                 .expect("storage type mismatch")
                 .get_mut(entity)
         })
-            .ok()
+        .ok()
     }
 
     /// Iterate over every entity that has all the required components in `Q`.
@@ -516,7 +554,6 @@ pub trait QueryParam {
         entity: Entity,
     ) -> Option<Self::Item<'a>>;
 }
-
 
 impl<T: 'static> QueryParam for &T {
     type Fetch<'w> = Ref<'w, SparseSet<T>>;
@@ -835,7 +872,13 @@ mod tests {
         for i in 0..4 {
             let e = world.spawn();
             world.insert(e, Position { x: 0.0, y: 0.0 });
-            world.insert(e, Velocity { x: i as f32, y: 1.0 });
+            world.insert(
+                e,
+                Velocity {
+                    x: i as f32,
+                    y: 1.0,
+                },
+            );
         }
         // One entity with no Velocity should be skipped by the query.
         let stationary = world.spawn();
@@ -1031,7 +1074,10 @@ mod tests {
         for _ in 0..8 {
             spawned.push(world.spawn());
         }
-        assert!(spawned.iter().all(|e| e.index() != 0), "slot 0 was handed out: {spawned:?}");
+        assert!(
+            spawned.iter().all(|e| e.index() != 0),
+            "slot 0 was handed out: {spawned:?}"
+        );
 
         // Inert against component storage too, not just the allocator.
         world.insert(null, Health(1));
@@ -1057,7 +1103,13 @@ mod tests {
             .map(|i| {
                 let e = world.spawn();
                 world.insert(e, Health(i));
-                world.insert(e, Position { x: i as f32, y: 0.0 });
+                world.insert(
+                    e,
+                    Position {
+                        x: i as f32,
+                        y: 0.0,
+                    },
+                );
                 e
             })
             .collect();
@@ -1069,7 +1121,9 @@ mod tests {
         }
 
         let mut seen = Vec::new();
-        world.query::<&Health>().for_each(|entity, health| seen.push((entity, health.0)));
+        world
+            .query::<&Health>()
+            .for_each(|entity, health| seen.push((entity, health.0)));
         for (entity, hp) in &seen {
             // The value the query handed out must be the one this entity owns.
             assert_eq!(world.get::<Health>(*entity).unwrap().0, *hp);
@@ -1084,12 +1138,17 @@ mod tests {
             .for_each(|entity, (health, position)| pairs.push((entity, health.0, position.x)));
         assert_eq!(pairs.len(), 12);
         for (_, hp, x) in &pairs {
-            assert_eq!(*hp as f32, *x, "driver and non-driver disagree about the entity");
+            assert_eq!(
+                *hp as f32, *x,
+                "driver and non-driver disagree about the entity"
+            );
         }
 
         // And with the driver written through: a stale dense index would move
         // the wrong entity's value.
-        world.query::<&mut Health>().for_each(|_, health| health.0 += 100);
+        world
+            .query::<&mut Health>()
+            .for_each(|_, health| health.0 += 100);
         for (entity, hp) in seen {
             assert_eq!(world.get::<Health>(entity).unwrap().0, hp + 100);
         }
@@ -1193,5 +1252,87 @@ mod tests {
         assert!(world.entities().any(|e| e == d));
         assert!(!world.entities().any(|e| e == b));
         assert_eq!(world.entities().count(), 3);
+    }
+
+    /// The counter exists so a structural cache can skip a rebuild. That only
+    /// works if every reshaping operation moves it.
+    #[test]
+    fn every_structural_change_bumps_the_version() {
+        let mut world = World::new();
+        let start = world.structural_version();
+
+        let entity = world.spawn();
+        let after_spawn = world.structural_version();
+        assert!(after_spawn > start, "spawn");
+
+        world.insert(entity, Position { x: 1.0, y: 0.0 });
+        let after_insert = world.structural_version();
+        assert!(after_insert > after_spawn, "insert");
+
+        world.remove::<Position>(entity);
+        let after_remove = world.structural_version();
+        assert!(after_remove > after_insert, "remove");
+
+        world.despawn(entity);
+        assert!(world.structural_version() > after_remove, "despawn");
+    }
+
+    /// Replacing a component's value reshapes the world for anything that
+    /// derives structure *from* that value — a parent link being the case this
+    /// was built for.
+    #[test]
+    fn replacing_a_component_bumps_the_version() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(entity, Position { x: 1.0, y: 0.0 });
+
+        let before = world.structural_version();
+        world.insert(entity, Position { x: 2.0, y: 0.0 });
+
+        assert!(world.structural_version() > before);
+    }
+
+    /// Mutating through a handle changes a value, not the shape. Counting it
+    /// would invalidate every structural cache on every frame that moved
+    /// anything, which is the whole cost the counter exists to avoid.
+    #[test]
+    fn mutating_a_component_does_not_bump_the_version() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(entity, Position { x: 1.0, y: 0.0 });
+
+        let before = world.structural_version();
+        world.get_mut::<Position>(entity).unwrap().x = 9.0;
+        world
+            .query::<&mut Position>()
+            .for_each(|_, position| position.x = 10.0);
+
+        assert_eq!(world.structural_version(), before);
+    }
+
+    /// A speculative remove of an absent component is a no-op, and a no-op that
+    /// bumped the version would make a caller that polls it rebuild forever.
+    #[test]
+    fn a_removal_that_removes_nothing_does_not_bump_the_version() {
+        let mut world = World::new();
+        let entity = world.spawn();
+
+        let before = world.structural_version();
+        assert!(world.remove::<Position>(entity).is_none());
+
+        assert_eq!(world.structural_version(), before);
+    }
+
+    /// Insert refuses a stale handle, and a refusal is not a change.
+    #[test]
+    fn inserting_through_a_stale_handle_does_not_bump_the_version() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.despawn(entity);
+
+        let before = world.structural_version();
+        assert!(world.insert(entity, Position { x: 1.0, y: 0.0 }).is_none());
+
+        assert_eq!(world.structural_version(), before);
     }
 }

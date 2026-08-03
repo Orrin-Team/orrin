@@ -6,6 +6,7 @@ mod debug;
 pub mod entities;
 mod fog;
 mod hdr;
+mod hierarchy;
 mod input;
 mod mesh;
 mod persist;
@@ -21,12 +22,13 @@ pub use camera::Camera;
 pub use components::ScriptComponent;
 pub use components::{
     AmbientLight, Collider, ColliderShape, Light, LocalTransform, MaterialHandle, MeshHandle, Name,
-    Spin, Tag, UnknownComponents, WorldTransform,
+    Parent, Spin, Tag, UnknownComponents, WorldTransform,
 };
 pub use culling::Culling;
 pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};
 pub use fog::FogSettings;
 pub use hdr::HdrSettings;
+pub use hierarchy::{Hierarchy, HierarchyError, propagate_transforms, reparent};
 pub use input::InputState;
 pub use mesh::{CpuMesh, MeshBounds};
 pub use persist::{LoadIssue, instantiate, load, save, to_document};
