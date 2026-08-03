@@ -20,6 +20,15 @@ pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
 pub const MESH: ComponentId = ComponentId::new("orrin.mesh");
 pub const MATERIAL: ComponentId = ComponentId::new("orrin.material");
 
+/// Reserved for the same reason, and resolved the same way one level up.
+///
+/// `Parent` holds an `orrin_ecs::Entity` — a slot handle whose meaning is this
+/// session's spawn history — so writing one to disk would name a different
+/// entity, or none, the next time the scene is opened. The file stores the
+/// parent's [`EntityId`](orrin_registry::EntityId) instead, which needs the
+/// world to translate in both directions and so cannot live in a `Reflect` impl.
+pub const PARENT: ComponentId = ComponentId::new("orrin.parent");
+
 /// Describe every component the engine itself owns to `registry`.
 ///
 /// The counterpart a game assembly exports under the same name, called again
@@ -39,6 +48,10 @@ pub const MATERIAL: ComponentId = ComponentId::new("orrin.material");
 ///   value would be overwritten before anything could read it. Writing one to a
 ///   scene would also record a *result* beside the inputs that produce it, which
 ///   is the kind of redundancy a file format cannot keep consistent.
+/// - `Parent` holds a session-local entity handle. It *is* persisted, under the
+///   reserved [`PARENT`] id, but as the parent's `EntityId` — a translation that
+///   needs the world in both directions, so it happens in `scene::persist`
+///   alongside the asset references, for exactly the same reason.
 pub fn register_components(registry: &mut Registry) {
     registry.register::<LocalTransform>(TRANSFORM, "Transform");
     registry.register::<Name>(NAME, "Name");
