@@ -166,6 +166,16 @@ impl Project {
             .map_or(Path::new("assets"), |a| a.dir.as_path());
         self.root.join(dir)
     }
+    /// Where the editor keeps per-project state that is *not* part of the
+    /// project: the chosen theme, the dock layout, user themes. Named by the
+    /// engine rather than by the manifest, so it never varies between projects
+    /// and `orrin.toml` gains no field for it.
+    pub fn editor_dir(&self) -> PathBuf {
+        self.root.join(".orrin")
+    }
+    pub fn themes_dir(&self) -> PathBuf {
+        self.editor_dir().join("themes")
+    }
     pub fn start_scene(&self) -> Option<PathBuf> {
         self.manifest
             .scenes

@@ -3,6 +3,7 @@ mod environment;
 mod hierarchy;
 mod inspector;
 mod performance;
+mod ribbon;
 mod scene;
 #[cfg(feature = "scripting")]
 mod scripts;
@@ -13,10 +14,20 @@ use orrin_ecs::World;
 use orrin_registry::Registry;
 
 use super::state::EditorState;
+use super::theme::ThemeSet;
 
 // Side/bottom panels only — no `CentralPanel`, so the center stays transparent
-// and the 3D scene shows through behind the editor.
-pub fn draw(ctx: &egui::Context, world: &mut World, state: &mut EditorState, registry: &Registry) {
+// and the 3D scene shows through behind the editor. The top bar is mounted
+// first so it spans the full window width rather than sitting between the side
+// panels.
+pub fn draw(
+    ctx: &egui::Context,
+    world: &mut World,
+    state: &mut EditorState,
+    registry: &Registry,
+    themes: &ThemeSet,
+) {
+    ribbon::show(ctx, state, themes);
     hierarchy::show(ctx, world, state);
     inspector::show(ctx, world, state, registry);
     environment::show(ctx, world);

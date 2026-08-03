@@ -16,6 +16,11 @@ glam.workspace = true
 image.workspace = true
 egui.workspace = true
 egui_winit_vulkano.workspace = true
+serde.workspace = true
+# User themes are hand-authored TOML; editor preferences are machine-written RON
+# (a dock layout is a tree of enums, which TOML cannot express).
+toml.workspace = true
+ron = "0.10"
 sysinfo = "0.33"
 # Filesystem watching for rebuild-on-save; only pulled in with `scripting`.
 notify = { version = "8", optional = true }

@@ -66,8 +66,8 @@ pub struct App {
     #[cfg(feature = "scripting")]
     build_watcher: Option<crate::build_watcher::BuildWatcher>,
     /// The Orrin project this run was launched inside, if any. `None` means
-    /// the engine is running standalone on its built-in demo scene.
-    #[cfg(feature = "scripting")]
+    /// the engine is running standalone on its built-in demo scene — and, for
+    /// the editor, that there is nowhere to keep themes or a layout.
     project: Option<orrin_project::Project>,
     /// Extra profiling load from `ORRIN_STRESS`; `None` for a normal run.
     stress: Option<StressSpec>,
@@ -165,7 +165,6 @@ impl App {
             scripting: None,
             #[cfg(feature = "scripting")]
             build_watcher: None,
-            #[cfg(feature = "scripting")]
             project,
             stress: StressSpec::from_env().filter(|spec| !spec.is_empty()),
             _debug_messenger: debug_messenger,
@@ -360,6 +359,7 @@ impl ApplicationHandler for App {
             surface,
             renderer.queue(),
             renderer.color_format(),
+            self.project.as_ref(),
         );
 
         self.active = Some(Active {

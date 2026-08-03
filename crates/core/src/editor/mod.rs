@@ -1,6 +1,7 @@
 //! In-window editor UI (egui overlay). New tools are added as `panels` modules.
 
 mod panels;
+mod prefs;
 mod state;
 mod theme;
 
@@ -18,11 +19,16 @@ use winit::event_loop::ActiveEventLoop;
 use orrin_ecs::World;
 use orrin_registry::Registry;
 
+use self::prefs::{Prefs, PrefsFile};
 use self::state::EditorState;
+use self::theme::ThemeSet;
 
 pub struct Editor {
     gui: Gui,
     state: EditorState,
+    themes: ThemeSet,
+    prefs: Prefs,
+    prefs_file: PrefsFile,
 }
 
 impl Editor {
@@ -31,6 +37,7 @@ impl Editor {
         surface: Arc<Surface>,
         queue: Arc<Queue>,
         format: Format,
+        project: Option<&orrin_project::Project>,
     ) -> Self {
         let gui = Gui::new(
             event_loop,
@@ -44,10 +51,23 @@ impl Editor {
                 ..Default::default()
             },
         );
-        theme::apply(&gui.context());
+
+        let mut themes = project.map_or_else(ThemeSet::default, |project| {
+            ThemeSet::load(&project.themes_dir())
+        });
+        let prefs_file = PrefsFile::new(project.map(|project| project.editor_dir()));
+        let prefs = prefs_file.load();
+        if let Some(name) = &prefs.theme {
+            themes.select(name);
+        }
+        theme::apply(&gui.context(), themes.active());
+
         Self {
             gui,
-            state: EditorState::default(),
+            state: EditorState::new(project),
+            themes,
+            prefs,
+            prefs_file,
         }
     }
 
@@ -60,12 +80,28 @@ impl Editor {
     pub fn run(&mut self, world: &mut World, registry: &Registry) {
         // Destructure for disjoint borrows: `gui` drives egui while the closure
         // edits `state`/`world`.
-        let Editor { gui, state } = self;
+        let Editor {
+            gui,
+            state,
+            themes,
+            prefs,
+            prefs_file,
+        } = self;
         gui.immediate_ui(|gui| {
             let ctx = gui.context();
-            panels::draw(&ctx, world, state, registry);
+            panels::draw(&ctx, world, state, registry, themes);
         });
         state.apply(world, registry);
+
+        // Restyling mid-frame would leave the panels already drawn on the old
+        // palette, so a pick takes effect on the next one.
+        if let Some(name) = state.take_theme_request()
+            && themes.select(&name)
+        {
+            theme::apply(&gui.context(), themes.active());
+            prefs.theme = Some(name);
+            prefs_file.save(prefs);
+        }
     }
 
     /// Whether the user asked for a script reload since the last call. Drained

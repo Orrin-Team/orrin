@@ -10,6 +10,10 @@ use crate::scene::{self, Assets, LogBuffer, LogLevel, MaterialHandle, Time, Tran
 /// `scenes/` directory belong with the asset database.
 pub const DEFAULT_SCENE_PATH: &str = "scene.orrin";
 
+/// Shown where a project name would go when the engine was launched outside
+/// one. Says what the session *is* rather than leaving the slot blank.
+const NO_PROJECT: &str = "built-in demo";
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SceneRequest {
     Save,
@@ -32,6 +36,9 @@ pub enum SpawnKind {
 pub struct EditorState {
     pub selected: Option<Entity>,
     pub scene_path: String,
+    /// What the top bar calls this session. Not the window title and not a
+    /// path — just the name, so a run says which project it is inside.
+    pub project_name: String,
     spawn_request: Option<SpawnKind>,
     despawn_request: Option<Entity>,
     /// `(child, new parent)`, with `None` meaning "detach to a root". Requested
@@ -39,6 +46,9 @@ pub struct EditorState {
     /// hierarchy panel is iterating a snapshot of the tree while it builds, and
     /// a reparent reshapes exactly that.
     reparent_request: Option<(Entity, Option<Entity>)>,
+    /// Not serviced by `apply` either: restyling has to happen between frames,
+    /// so the editor drains it after the UI pass rather than during it.
+    theme_request: Option<String>,
     /// Serviced by `apply` for the same reason spawn/despawn are: loading
     /// despawns every entity, and a `ScriptComponent`'s `Drop` tears down a
     /// managed object, which may only happen outside a dispatch window.
@@ -56,9 +66,11 @@ impl Default for EditorState {
         Self {
             selected: None,
             scene_path: DEFAULT_SCENE_PATH.to_owned(),
+            project_name: NO_PROJECT.to_owned(),
             spawn_request: None,
             despawn_request: None,
             reparent_request: None,
+            theme_request: None,
             scene_request: None,
             #[cfg(feature = "scripting")]
             script_reload_request: false,
@@ -67,6 +79,16 @@ impl Default for EditorState {
 }
 
 impl EditorState {
+    pub fn new(project: Option<&orrin_project::Project>) -> Self {
+        Self {
+            project_name: project.map_or_else(
+                || NO_PROJECT.to_owned(),
+                |project| project.name().to_owned(),
+            ),
+            ..Self::default()
+        }
+    }
+
     pub fn request_spawn(&mut self, kind: SpawnKind) {
         self.spawn_request = Some(kind);
     }
@@ -81,6 +103,14 @@ impl EditorState {
 
     pub fn request_reparent(&mut self, child: Entity, parent: Option<Entity>) {
         self.reparent_request = Some((child, parent));
+    }
+
+    pub fn request_theme(&mut self, name: impl Into<String>) {
+        self.theme_request = Some(name.into());
+    }
+
+    pub fn take_theme_request(&mut self) -> Option<String> {
+        self.theme_request.take()
     }
 
     #[cfg(feature = "scripting")]
