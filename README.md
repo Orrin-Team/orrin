@@ -2,7 +2,7 @@
 
 **A fast, fit to purpose game engine.**
 
-Orrin is a new, open source game engine for 3D games(2D planned for the future) for all kinds of fidelity. Orrin is built to allow you to purpose the game engine to your specific needs, be super fast when editing, coding or releasing.
+Orrin is a new, open source game engine for 3D games(2D planned for the future) for all kinds of fidelity. Orrin is built to allow you to purpose the game engine to your specific needs, be super fast when editing, coding or publishing.
 Join the [discord](https://discord.gg/sY8YBGFmRy) to discuss the development or see progress of the engine!
 
 ---
