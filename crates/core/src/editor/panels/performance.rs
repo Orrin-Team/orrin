@@ -5,13 +5,6 @@ use crate::profile::{self, Lane, Profiler, Row};
 use crate::scene::Culling;
 use crate::stats::FrameStats;
 
-pub fn show(ctx: &egui::Context, world: &World) {
-    egui::Window::new("Performance")
-        .default_pos(egui::pos2(12.0, 12.0))
-        .resizable(false)
-        .show(ctx, |ui| body(ui, world));
-}
-
 pub fn body(ui: &mut egui::Ui, world: &World) {
     let Some(stats) = world.get_resource::<FrameStats>() else {
         return;

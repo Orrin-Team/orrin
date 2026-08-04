@@ -12,6 +12,7 @@ use egui::ImageSource;
 use orrin_ecs::World;
 use orrin_registry::Registry;
 
+use crate::editor::dock::{Dock, Tab};
 use crate::editor::icons;
 use crate::editor::state::{
     EditorState, GizmoMode, GizmoSpace, RibbonTab, SNAP_STEP, SceneRequest, SpawnKind,
@@ -30,9 +31,10 @@ pub fn show(
     state: &mut EditorState,
     registry: &Registry,
     themes: &ThemeSet,
+    dock: &mut Dock,
 ) {
     quick_access(ctx, state, themes);
-    ribbon(ctx, world, state, registry);
+    ribbon(ctx, world, state, registry, dock);
     scene_tabs(ctx, state);
 }
 
@@ -88,28 +90,75 @@ fn theme_picker(ui: &mut egui::Ui, state: &mut EditorState, themes: &ThemeSet) {
         });
 }
 
-fn ribbon(ctx: &egui::Context, world: &mut World, state: &mut EditorState, registry: &Registry) {
+fn ribbon(
+    ctx: &egui::Context,
+    world: &mut World,
+    state: &mut EditorState,
+    registry: &Registry,
+    dock: &mut Dock,
+) {
     egui::TopBottomPanel::top("ribbon").show(ctx, |ui| {
-        ui.horizontal(|ui| match state.ribbon_tab {
-            RibbonTab::Home => {
-                gizmo_group(ui, state);
-                space_group(ui, state);
-                spawn_group(ui, state);
-                scene_group(ui, state);
+        ui.horizontal(|ui| {
+            match state.ribbon_tab {
+                RibbonTab::Home => {
+                    gizmo_group(ui, state);
+                    space_group(ui, state);
+                    spawn_group(ui, state);
+                    scene_group(ui, state);
+                }
+                RibbonTab::Scene => {
+                    spawn_group(ui, state);
+                    scene_group(ui, state);
+                    selection_group(ui, world, state, registry);
+                }
+                RibbonTab::Render => {
+                    passes_group(ui, world);
+                    frame_group(ui, world);
+                    unbuilt_group(ui);
+                }
+                RibbonTab::Scripts => scripts_groups(ui, world, state),
+                RibbonTab::Assets => assets_group(ui),
             }
-            RibbonTab::Scene => {
-                spawn_group(ui, state);
-                scene_group(ui, state);
-                selection_group(ui, world, state, registry);
-            }
-            RibbonTab::Render => {
-                passes_group(ui, world);
-                frame_group(ui, world);
-                unbuilt_group(ui);
-            }
-            RibbonTab::Scripts => scripts_groups(ui, world, state),
-            RibbonTab::Assets => assets_group(ui),
+            // On every tab: where the tools are is not a mode you switch into.
+            tools_group(ui, dock);
         });
+    });
+}
+
+fn tools_group(ui: &mut egui::Ui, dock: &mut Dock) {
+    group(ui, "Tools", |ui| {
+        menu_command(ui, Command::new(icons::panels(), "Window"), |ui| {
+            for tab in Tab::ALL {
+                let open = dock.is_open(tab);
+                if ui.selectable_label(open, tab.title()).clicked() {
+                    dock.toggle(tab);
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+            // Symmetric on purpose: a tool that can be floated and not docked
+            // again is a tool the user has lost.
+            ui.weak("Float");
+            let open: Vec<Tab> = Tab::ALL.into_iter().filter(|t| dock.is_open(*t)).collect();
+            for tab in open {
+                if ui
+                    .selectable_label(dock.is_floating(tab), tab.title())
+                    .clicked()
+                {
+                    dock.toggle_float(tab);
+                    ui.close_menu();
+                }
+            }
+        });
+        if command(
+            ui,
+            Command::new(icons::layout_dashboard(), "Reset layout")
+                .hint("Put every tool back where it started"),
+        )
+        .clicked()
+        {
+            dock.reset();
+        }
     });
 }
 

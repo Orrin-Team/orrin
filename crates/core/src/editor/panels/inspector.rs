@@ -7,7 +7,7 @@ use glam::{EulerRot, Quat};
 use orrin_ecs::{Entity, World};
 use orrin_registry::Registry;
 
-use super::{WIDTH_RANGE, color_row, vec3_row};
+use super::{color_row, vec3_row};
 use crate::editor::icons;
 use crate::editor::state::EditorState;
 #[cfg(feature = "scripting")]
@@ -16,19 +16,6 @@ use crate::scene::{
     Assets, Light, LocalTransform, LogBuffer, LogLevel, MaterialHandle, MeshHandle, Name, Time,
     WorldTransform,
 };
-
-pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState, registry: &Registry) {
-    egui::SidePanel::right("inspector")
-        .resizable(true)
-        .default_width(280.0)
-        .width_range(WIDTH_RANGE)
-        .show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.heading("Inspector");
-            ui.separator();
-            body(ui, world, state, registry);
-        });
-}
 
 pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState, registry: &Registry) {
     let Some(entity) = state.selected else {

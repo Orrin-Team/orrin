@@ -21,17 +21,6 @@ fn column_count(available: f32) -> usize {
     ((available / MIN_COLUMN_WIDTH) as usize).clamp(1, COLUMNS.len())
 }
 
-pub fn show(ctx: &egui::Context, world: &mut World) {
-    egui::TopBottomPanel::bottom("environment")
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.heading("Environment");
-            ui.separator();
-            body(ui, world);
-        });
-}
-
 pub fn body(ui: &mut egui::Ui, world: &mut World) {
     // This panel gets whatever the two side panels leave between them,
     // which on a narrow window is nothing at all. `Ui::columns` asserts

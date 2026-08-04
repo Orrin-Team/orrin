@@ -1,45 +1,38 @@
-mod console;
-mod environment;
-mod hierarchy;
-mod inspector;
-mod performance;
+// Visible to the dock, which mounts each tool's `body` into a tab.
+pub(super) mod console;
+pub(super) mod environment;
+pub(super) mod hierarchy;
+pub(super) mod inspector;
+pub(super) mod performance;
 mod ribbon;
-mod scene;
+pub(super) mod scene;
 #[cfg(feature = "scripting")]
-mod scripts;
+pub(super) mod scripts;
 
 use glam::Vec3;
 
 use orrin_ecs::World;
 use orrin_registry::Registry;
 
+use super::dock::Dock;
 use super::state::EditorState;
 use super::theme::ThemeSet;
 
-/// How far a side panel may be dragged. Bounds the drag only — a panel reports
-/// the width of its *content*, so keeping one narrow is the content's job.
-pub(super) const WIDTH_RANGE: std::ops::RangeInclusive<f32> = 160.0..=420.0;
-
-// Side/bottom panels only — no `CentralPanel`, so the center stays transparent
-// and the 3D scene shows through behind the editor. The top bar is mounted
-// first so it spans the full window width rather than sitting between the side
-// panels.
+// The top bar is mounted first so its three rows span the full window width.
+// Everything below it belongs to the dock, whose centre paints nothing — that
+// is what leaves the 3D scene visible behind the editor.
 pub fn draw(
     ctx: &egui::Context,
     world: &mut World,
     state: &mut EditorState,
     registry: &Registry,
     themes: &ThemeSet,
+    dock: &mut Dock,
 ) {
-    ribbon::show(ctx, world, state, registry, themes);
-    hierarchy::show(ctx, world, state);
-    inspector::show(ctx, world, state, registry);
-    environment::show(ctx, world);
-    performance::show(ctx, world);
-    #[cfg(feature = "scripting")]
-    scripts::show(ctx, world, state);
-    scene::show(ctx, world, state);
-    console::show(ctx, world);
+    // Before the dock, so a command that rearranges the layout is reflected in
+    // the same frame rather than the next one.
+    ribbon::show(ctx, world, state, registry, themes, dock);
+    dock.show(ctx, world, state, registry);
 }
 
 pub(super) fn vec3_row(ui: &mut egui::Ui, label: &str, v: &mut Vec3, speed: f32) {
@@ -64,6 +57,7 @@ pub(super) fn color_row(ui: &mut egui::Ui, label: &str, c: &mut Vec3) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::dock::{Dock, Tab};
     use crate::editor::state::RibbonTab;
     use crate::editor::theme;
     use crate::scene::{LocalTransform, Name};
@@ -79,6 +73,7 @@ mod tests {
         registry: Registry,
         state: EditorState,
         themes: ThemeSet,
+        dock: Dock,
         ctx: egui::Context,
         input: egui::RawInput,
         output: Option<egui::FullOutput>,
@@ -114,6 +109,7 @@ mod tests {
                 registry,
                 state: EditorState::default(),
                 themes,
+                dock: Dock::default(),
                 ctx,
                 input: egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
@@ -139,12 +135,13 @@ mod tests {
                     registry,
                     state,
                     themes,
+                    dock,
                     ctx,
                     input,
                     output,
                 } = self;
                 *output = Some(ctx.run(input.clone(), |ctx| {
-                    draw(ctx, world, state, registry, themes);
+                    draw(ctx, world, state, registry, themes, dock);
                 }));
             }
             self
@@ -197,6 +194,31 @@ mod tests {
 
         fn painted_contains(&self, needle: &str) -> bool {
             self.painted().iter().any(|text| text.contains(needle))
+        }
+
+        /// Where a docked tool's leaf ended up. Only meaningful after a frame:
+        /// egui_dock writes each node's rect while it draws.
+        fn tab(&self, tab: crate::editor::dock::Tab) -> egui::Rect {
+            let (surface, node, _) = self.dock.state().find_tab(&tab).expect("tab is open");
+            self.dock.state()[surface][node]
+                .rect()
+                .expect("node was drawn")
+        }
+
+        /// Every shape the last frame painted, as bounding rects.
+        fn painted_rects(&self) -> Vec<egui::Rect> {
+            fn collect(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+                match shape {
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                    egui::Shape::Noop => {}
+                    other => out.push(other.visual_bounding_rect()),
+                }
+            }
+            let mut out = Vec::new();
+            for clipped in &self.output.as_ref().expect("a frame has run").shapes {
+                collect(&clipped.shape, &mut out);
+            }
+            out
         }
 
         fn panel(&self, id: &str) -> egui::Rect {
@@ -377,10 +399,8 @@ mod tests {
         }
         editor.frames(2);
 
-        // Over a row, which is what makes its ✕ draw at all. Low in the panel,
-        // because the floating tool windows still open over the top of it and a
-        // covered row does not register a hover.
-        let tree = editor.panel("hierarchy");
+        // Over a row, which is what makes its ✕ draw at all.
+        let tree = editor.tab(Tab::Hierarchy);
         let row = egui::pos2(tree.center().x, tree.bottom() - 120.0);
         editor.hover(row).frames(2);
 
@@ -400,38 +420,139 @@ mod tests {
         );
     }
 
-    /// A panel that sizes its content from its own width grows by the overflow
-    /// every frame: the content's minimum width becomes the panel's new width,
-    /// which becomes a wider content minimum. Nothing shows on frame one.
+    /// A tool used to be a panel that took its width from its content, so
+    /// content could widen it — every frame, without settling. A docked leaf is
+    /// sized by its split instead, and this is what says so.
     #[test]
-    fn a_side_panel_does_not_widen_itself() {
-        let mut settled = Harness::new(egui::vec2(800.0, 600.0));
-        settled.frames(2);
-        let mut later = Harness::new(egui::vec2(800.0, 600.0));
-        later.frames(120);
-
+    fn a_docked_tool_does_not_widen_itself() {
         for build in [Harness::new, Harness::without_icons] {
             let mut settled = build(egui::vec2(800.0, 600.0));
             settled.frames(3);
             let mut later = build(egui::vec2(800.0, 600.0));
             later.frames(120);
 
-            for panel in ["hierarchy", "inspector"] {
-                assert_eq!(settled.panel(panel).width(), later.panel(panel).width());
+            for tab in [Tab::Hierarchy, Tab::Inspector] {
+                assert_eq!(settled.tab(tab).width(), later.tab(tab).width());
             }
         }
     }
 
-    /// The realistic route to a negative width: nobody resizes the window down
-    /// to 320px, but a scene does contain an entity with a long name, and a row
-    /// is as wide as the name in it.
+    /// The case that used to blow a side panel open across the viewport. A leaf
+    /// clips its content now, so the name has nowhere to push.
     #[test]
-    fn a_long_entity_name_cannot_push_a_side_panel_open() {
-        let mut editor = Harness::new(egui::vec2(800.0, 600.0));
-        editor.spawn(&"Spawn point ".repeat(40));
-        editor.frames(4);
+    fn a_long_entity_name_cannot_widen_its_tool() {
+        let mut plain = Harness::new(egui::vec2(1280.0, 800.0));
+        plain.frames(3);
+        let settled = plain.tab(Tab::Hierarchy).width();
 
-        assert!(editor.panel("hierarchy").width() <= *WIDTH_RANGE.end());
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn(&"Spawn point ".repeat(40));
+        editor.frames(3);
+
+        assert_eq!(editor.tab(Tab::Hierarchy).width(), settled);
+    }
+
+    /// The one that can silently break the editor's defining trait. The engine
+    /// draws no opaque surface over the middle of the window, so the Vulkan
+    /// render shows through behind the whole UI — and `egui_dock` paints a body
+    /// for every leaf, including a leaf holding no tabs. Nothing about a grey
+    /// rectangle in the middle looks like a bug in the layout code.
+    #[test]
+    fn nothing_is_painted_over_the_viewport() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Ground plane");
+        editor.frames(3);
+
+        // The gap between the tools, inset so a neighbour's own border or
+        // separator does not count as covering it.
+        let inset = 6.0;
+        let viewport = egui::Rect::from_min_max(
+            egui::pos2(
+                editor.tab(Tab::Hierarchy).right() + inset,
+                editor.panel("scene_tabs").bottom() + inset,
+            ),
+            egui::pos2(
+                editor.tab(Tab::Environment).left() - inset,
+                editor.tab(Tab::Console).top() - inset,
+            ),
+        );
+        assert!(
+            viewport.width() > 200.0 && viewport.height() > 200.0,
+            "the layout left no viewport to check: {viewport:?}"
+        );
+
+        let covering: Vec<_> = editor
+            .painted_rects()
+            .into_iter()
+            .filter(|rect| viewport.contains(rect.center()))
+            .collect();
+        assert!(
+            covering.is_empty(),
+            "{} shape(s) painted over the viewport, e.g. {:?}",
+            covering.len(),
+            covering.first()
+        );
+    }
+
+    /// The default layout is specified in pixels by the design system but built
+    /// from fractions, and a split's fraction describes the new node on two of
+    /// the four `split_*` calls and the old node on the other two. Getting that
+    /// backwards halves a column and looks plausible.
+    #[test]
+    fn the_default_layout_lands_on_the_specified_widths() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(3);
+
+        // Within a separator's width of the design system's numbers.
+        for (tab, target) in [
+            (Tab::Hierarchy, 220.0),
+            (Tab::Environment, 300.0),
+            (Tab::Inspector, 280.0),
+        ] {
+            let width = editor.tab(tab).width();
+            assert!(
+                (width - target).abs() <= 2.0,
+                "{} is {width}px wide, expected {target}",
+                tab.title()
+            );
+        }
+        let bottom = editor.tab(Tab::Console).height();
+        assert!(
+            (bottom - 200.0).abs() <= 2.0,
+            "bottom dock is {bottom}px tall"
+        );
+    }
+
+    /// Closing a tool and reopening it has to put it back somewhere findable.
+    #[test]
+    fn a_closed_tool_comes_back_where_it_belongs() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let home = editor.tab(Tab::Performance);
+
+        editor.dock.toggle(Tab::Performance);
+        assert!(!editor.dock.is_open(Tab::Performance));
+        editor.frames(2);
+
+        editor.dock.toggle(Tab::Performance);
+        editor.frames(2);
+        assert_eq!(editor.tab(Tab::Performance), home);
+    }
+
+    /// Reset undoes whatever the user did to the tree, including a float.
+    #[test]
+    fn reset_layout_restores_the_default_tree() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let home = editor.tab(Tab::Console);
+
+        editor.dock.toggle_float(Tab::Console);
+        assert!(editor.dock.is_floating(Tab::Console));
+
+        editor.dock.reset();
+        editor.frames(2);
+        assert!(!editor.dock.is_floating(Tab::Console));
+        assert_eq!(editor.tab(Tab::Console), home);
     }
 
     /// Not "the editor looks cramped": once the side panels are wider than the

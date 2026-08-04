@@ -15,13 +15,6 @@ use crate::editor::state::EditorState;
 use crate::editor::theme::{ERROR, OK, PENDING};
 use crate::scene::ScriptComponent;
 
-pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
-    egui::Window::new("Scripts")
-        .default_pos(egui::pos2(12.0, 232.0))
-        .default_size(egui::vec2(280.0, 120.0))
-        .show(ctx, |ui| body(ui, world, state));
-}
-
 pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
     let mut live = 0usize;
     let mut faulted = 0usize;

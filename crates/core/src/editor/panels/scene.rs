@@ -5,13 +5,6 @@ use crate::editor::state::{EditorState, SceneRequest};
 use crate::editor::theme;
 use crate::scene::UnknownComponents;
 
-pub fn show(ctx: &egui::Context, world: &World, state: &mut EditorState) {
-    egui::Window::new("Scene")
-        .default_pos(egui::pos2(12.0, 12.0))
-        .default_width(320.0)
-        .show(ctx, |ui| body(ui, world, state));
-}
-
 pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
     ui.horizontal(|ui| {
         ui.label("File");

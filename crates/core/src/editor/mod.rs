@@ -1,5 +1,6 @@
 //! In-window editor UI (egui overlay). New tools are added as `panels` modules.
 
+mod dock;
 mod icons;
 mod panels;
 mod prefs;
@@ -20,6 +21,7 @@ use winit::event_loop::ActiveEventLoop;
 use orrin_ecs::World;
 use orrin_registry::Registry;
 
+use self::dock::Dock;
 use self::prefs::{Prefs, PrefsFile};
 use self::state::EditorState;
 use self::theme::ThemeSet;
@@ -28,8 +30,18 @@ pub struct Editor {
     gui: Gui,
     state: EditorState,
     themes: ThemeSet,
+    dock: Dock,
     prefs: Prefs,
     prefs_file: PrefsFile,
+    last_layout_check: std::time::Instant,
+}
+
+/// The last chance to keep a layout: a drag in the final two seconds of a
+/// session would otherwise be thrown away on exit.
+impl Drop for Editor {
+    fn drop(&mut self) {
+        self.save_layout();
+    }
 }
 
 impl Editor {
@@ -57,7 +69,7 @@ impl Editor {
             ThemeSet::load(&project.themes_dir())
         });
         let prefs_file = PrefsFile::new(project.map(|project| project.editor_dir()));
-        let prefs = prefs_file.load();
+        let mut prefs = prefs_file.load();
         if let Some(name) = &prefs.theme {
             themes.select(name);
         }
@@ -68,8 +80,10 @@ impl Editor {
             gui,
             state: EditorState::new(project),
             themes,
+            dock: Dock::from_saved(prefs.layout.take()),
             prefs,
             prefs_file,
+            last_layout_check: std::time::Instant::now(),
         }
     }
 
@@ -86,12 +100,14 @@ impl Editor {
             gui,
             state,
             themes,
+            dock,
             prefs,
             prefs_file,
+            ..
         } = self;
         gui.immediate_ui(|gui| {
             let ctx = gui.context();
-            panels::draw(&ctx, world, state, registry, themes);
+            panels::draw(&ctx, world, state, registry, themes, dock);
         });
         state.apply(world, registry);
 
@@ -104,6 +120,39 @@ impl Editor {
             prefs.theme = Some(name);
             prefs_file.save(prefs);
         }
+
+        self.save_layout_if_settled();
+    }
+
+    /// Write the dock tree out when it has stopped moving.
+    ///
+    /// A layout changes by dragging, so there is no single moment to save at and
+    /// no cheap way to ask `DockState` whether it differs. Comparing the
+    /// serialised form catches every change including a drag, and throttling it
+    /// keeps that comparison off the frame budget — at this interval it is a few
+    /// microseconds a minute, and the most a crash can cost is the last drag.
+    fn save_layout_if_settled(&mut self) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+        if self.last_layout_check.elapsed() < INTERVAL {
+            return;
+        }
+        self.last_layout_check = std::time::Instant::now();
+        self.save_layout();
+    }
+
+    fn save_layout(&mut self) {
+        let current = self.dock.state();
+        if self
+            .prefs
+            .layout
+            .as_ref()
+            .is_some_and(|saved| ron::to_string(saved).ok() == ron::to_string(current).ok())
+        {
+            return;
+        }
+        self.prefs.layout = Some(current.clone());
+        self.prefs_file.save(&self.prefs);
     }
 
     /// Whether the user asked for a script reload since the last call. Drained

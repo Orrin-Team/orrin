@@ -16,6 +16,10 @@ const FILE: &str = "editor.ron";
 #[serde(default)]
 pub struct Prefs {
     pub theme: Option<String>,
+    /// The whole dock tree. `None` on a first run, and after a layout written
+    /// by a build whose tab set no longer parses — [`PrefsFile::load`] falls
+    /// back to defaults rather than refusing to open the editor.
+    pub layout: Option<egui_dock::DockState<super::dock::Tab>>,
 }
 
 /// Where preferences are read and written, or `None` when the session has no

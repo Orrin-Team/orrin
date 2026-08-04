@@ -28,6 +28,7 @@ sysinfo = "0.33"
 notify = { version = "8", optional = true }
 # Raw VK_EXT_memory_budget query for VRAM usage; pinned to vulkano 0.35's ash.
 ash = "0.38"
+egui_dock = { version = "0.16", features = ["serde"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

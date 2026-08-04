@@ -1,6 +1,5 @@
 use orrin_ecs::{Entity, World};
 
-use super::WIDTH_RANGE;
 use crate::editor::icons;
 use crate::editor::state::{EditorState, SpawnKind};
 use crate::editor::theme;
@@ -20,19 +19,6 @@ struct Node {
     /// than in `snapshot` because a node whose *child* matches has to stay
     /// visible — drop it and the tree collapses out from under the match.
     visible: bool,
-}
-
-pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
-    egui::SidePanel::left("hierarchy")
-        .resizable(true)
-        .default_width(220.0)
-        .width_range(WIDTH_RANGE)
-        .show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.heading("Hierarchy");
-            ui.separator();
-            body(ui, world, state);
-        });
 }
 
 pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
