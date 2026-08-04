@@ -15,6 +15,11 @@ use orrin_ecs::World;
 use orrin_registry::Registry;
 
 use super::dock::Dock;
+
+/// The height of a bar that names things: the quick-access row and a dock's tab
+/// strip. One number, because they sit in the same window and a 24px strip under
+/// a 30px row reads as a mistake.
+pub(super) const BAR_HEIGHT: f32 = 30.0;
 use super::state::EditorState;
 use super::theme::ThemeSet;
 

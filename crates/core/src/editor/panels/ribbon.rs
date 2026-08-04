@@ -20,7 +20,6 @@ use crate::editor::state::{
 use crate::editor::theme::ThemeSet;
 use crate::scene::{HdrSettings, ShadowSettings, SsaoSettings};
 
-const QUICK_ACCESS_HEIGHT: f32 = 30.0;
 const COMMAND_WIDTH: f32 = 76.0;
 const COMMAND_HEIGHT: f32 = 54.0;
 const CAPTION_SIZE: f32 = 9.0;
@@ -40,7 +39,7 @@ pub fn show(
 
 fn quick_access(ctx: &egui::Context, state: &mut EditorState, themes: &ThemeSet) {
     egui::TopBottomPanel::top("quick_access")
-        .exact_height(QUICK_ACCESS_HEIGHT)
+        .exact_height(super::BAR_HEIGHT)
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.label(egui::RichText::new(&state.project_name).weak().monospace());

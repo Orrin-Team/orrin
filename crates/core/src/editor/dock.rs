@@ -230,6 +230,9 @@ impl Dock {
                     .style(dock_style(ui.style()))
                     .show_close_buttons(true)
                     .show_add_buttons(false)
+                    // One stray click on the far-right ✕ would close every tool
+                    // in the region, and it is the same glyph as the per-tab one.
+                    .show_leaf_close_all_buttons(false)
                     .show_inside(ui, &mut viewer);
             });
     }
@@ -251,8 +254,9 @@ fn dock_style(style: &egui::Style) -> Style {
     dock.dock_area_padding = None;
     dock.main_surface_border_stroke = egui::Stroke::NONE;
 
-    // The same surface the top bar sits on, so the two read as one chrome.
+    // The same surface and height as the top bar, so the two read as one chrome.
     dock.tab_bar.bg_fill = visuals.panel_fill;
+    dock.tab_bar.height = super::panels::BAR_HEIGHT;
     dock.tab_bar.hline_color = outline;
     dock.tab_bar.corner_radius = egui::CornerRadius::ZERO;
 
@@ -268,9 +272,13 @@ fn dock_style(style: &egui::Style) -> Style {
     dock.tab.hovered.text_color = visuals.text_color();
     dock.tab.hovered.corner_radius = widget;
 
+    // An open tab is elevation, not selection: surfaces climb in value as they
+    // come forward, and the accent is kept for what the user has *picked*. A
+    // whole tab filled with accent also drowns out the one row in the hierarchy
+    // that is genuinely selected.
     for open in [&mut dock.tab.active, &mut dock.tab.focused] {
-        open.bg_fill = visuals.selection.bg_fill;
-        open.outline_color = visuals.selection.stroke.color;
+        open.bg_fill = visuals.widgets.inactive.bg_fill;
+        open.outline_color = outline;
         open.text_color = visuals.text_color();
         open.corner_radius = widget;
     }
@@ -377,10 +385,20 @@ mod tests {
         assert_eq!(dock.tab_bar.bg_fill, style.visuals.panel_fill);
         assert_eq!(dock.tab.tab_body.bg_fill, style.visuals.panel_fill);
 
-        // Open is a selection, not a lighter surface: accent at 0.45 with an
-        // accent stroke, the same as a selected row.
-        assert_eq!(dock.tab.active.bg_fill, style.visuals.selection.bg_fill);
-        assert_eq!(dock.tab.focused.bg_fill, style.visuals.selection.bg_fill);
+        // Open is elevation: a lighter surface with a hairline outline. The
+        // accent belongs to what the user picked, not to what is merely on top.
+        assert_eq!(
+            dock.tab.active.bg_fill,
+            style.visuals.widgets.inactive.bg_fill
+        );
+        assert_eq!(
+            dock.tab.focused.bg_fill,
+            style.visuals.widgets.inactive.bg_fill
+        );
+        assert_ne!(dock.tab.active.bg_fill, style.visuals.selection.bg_fill);
+
+        // A tab strip is a bar that names things, like the quick-access row.
+        assert_eq!(dock.tab_bar.height, crate::editor::panels::BAR_HEIGHT);
 
         // Idle has fill and no stroke; hover adds the accent one.
         assert_eq!(dock.tab.inactive.outline_color, egui::Color32::TRANSPARENT);
@@ -389,11 +407,18 @@ mod tests {
             style.visuals.widgets.hovered.bg_stroke.color
         );
 
-        // None of it may be hard-coded: a user theme has to carry through.
+        // None of it may be hard-coded: a user theme has to carry through. The
+        // accent reaches the dock through the hover stroke now that no fill
+        // uses it, and the surfaces move with the theme's greys.
         let mut ember = crate::editor::theme::Theme::default();
         ember.accent = [255, 120, 60];
+        ember.widget = [70, 60, 55];
         crate::editor::theme::apply(&ctx, &ember);
         let themed = dock_style(&ctx.style());
+        assert_ne!(
+            themed.tab.hovered.outline_color,
+            dock.tab.hovered.outline_color
+        );
         assert_ne!(themed.tab.active.bg_fill, dock.tab.active.bg_fill);
     }
 
