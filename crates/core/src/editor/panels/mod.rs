@@ -168,6 +168,33 @@ mod tests {
             out
         }
 
+        /// Park the pointer, so hover-only affordances draw.
+        fn hover(&mut self, at: egui::Pos2) -> &mut Self {
+            self.input.events.push(egui::Event::PointerMoved(at));
+            self.input.hovered_files.clear();
+            self
+        }
+
+        /// Every image the last frame painted, with the rect it landed in.
+        /// Icons are images, so this is how an icon's placement is asserted —
+        /// `painted` only ever sees text. An unrotated image is a `RectShape`
+        /// carrying a texture brush, which is what distinguishes one from the
+        /// plain fills the same variant is used for.
+        fn painted_images(&self) -> Vec<egui::Rect> {
+            fn collect(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+                match shape {
+                    egui::Shape::Rect(rect) if rect.brush.is_some() => out.push(rect.rect),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for clipped in &self.output.as_ref().expect("a frame has run").shapes {
+                collect(&clipped.shape, &mut out);
+            }
+            out
+        }
+
         fn painted_contains(&self, needle: &str) -> bool {
             self.painted().iter().any(|text| text.contains(needle))
         }
@@ -335,6 +362,42 @@ mod tests {
         ] {
             assert!(painted.contains(expected), "no body painted {expected:?}");
         }
+    }
+
+    /// egui's scroll bars float: they allocate nothing and expand over the
+    /// content when the pointer nears them — which is the same moment the row's
+    /// delete button appears. Without a reserved gutter the bar lands on top of
+    /// the button, and the only way to see that is to look at where things were
+    /// actually painted.
+    #[test]
+    fn the_row_delete_button_clears_the_scroll_bar() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        for n in 0..40 {
+            editor.spawn(&format!("Cube {n}"));
+        }
+        editor.frames(2);
+
+        // Over a row, which is what makes its ✕ draw at all. Low in the panel,
+        // because the floating tool windows still open over the top of it and a
+        // covered row does not register a hover.
+        let tree = editor.panel("hierarchy");
+        let row = egui::pos2(tree.center().x, tree.bottom() - 120.0);
+        editor.hover(row).frames(2);
+
+        let bar = egui::vec2(10.0, 0.0).x;
+        let cross = editor
+            .painted_images()
+            .into_iter()
+            .filter(|rect| tree.contains(rect.center()) && (rect.center().y - row.y).abs() < 12.0)
+            .max_by(|a, b| a.right().total_cmp(&b.right()))
+            .expect("the hovered row painted its delete icon");
+
+        assert!(
+            cross.right() <= tree.right() - bar,
+            "delete icon at {:?} runs under the scroll bar; tree ends at {}",
+            cross,
+            tree.right()
+        );
     }
 
     /// A panel that sizes its content from its own width grows by the overflow

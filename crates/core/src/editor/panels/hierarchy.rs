@@ -64,6 +64,14 @@ pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
+            // egui's scroll bars float: they allocate no width and expand over
+            // the content when the pointer nears them. A row that ran to the
+            // edge would put its delete button under the bar — and the bar
+            // appears exactly when the pointer is over the tree, which is
+            // exactly when that button is showing. Reserving the gutter costs a
+            // few pixels and keeps the button in one place.
+            ui.set_max_width((ui.available_width() - scroll_gutter(ui)).max(0.0));
+
             // Bands follow visible rows rather than depth, so a filtered
             // tree still stripes every other line.
             let mut row_index = 0usize;
@@ -89,6 +97,19 @@ pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
                 }
             }
         });
+}
+
+/// How much room a vertical scroll bar needs at its widest.
+///
+/// `ScrollStyle::allocated_width` reports zero for a floating bar, which is true
+/// of the space it *takes* and useless for the space it *covers*.
+fn scroll_gutter(ui: &egui::Ui) -> f32 {
+    let scroll = &ui.spacing().scroll;
+    if scroll.floating {
+        scroll.bar_width + scroll.bar_inner_margin
+    } else {
+        scroll.allocated_width()
+    }
 }
 
 fn add_menu(ui: &mut egui::Ui, state: &mut EditorState) {
