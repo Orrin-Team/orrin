@@ -5,6 +5,14 @@ use crate::gfx::shadows::MAX_CASCADES;
 use super::{color_row, vec3_row};
 use crate::scene::{AmbientLight, Camera, FogSettings, HdrSettings, ShadowSettings, SsaoSettings};
 
+type Column = fn(&mut egui::Ui, &World);
+
+const COLUMNS: [Column; 4] = [ssao_column, shadow_column, lighting_column, camera_column];
+
+/// Below this a column is narrower than the sliders in it, so the four fold
+/// into two and then one rather than shrinking past legibility.
+const MIN_COLUMN_WIDTH: f32 = 190.0;
+
 pub fn show(ctx: &egui::Context, world: &mut World) {
     egui::TopBottomPanel::bottom("environment")
         .resizable(false)
@@ -13,12 +21,25 @@ pub fn show(ctx: &egui::Context, world: &mut World) {
             ui.heading("Environment");
             ui.separator();
 
-            ui.columns(4, |cols| {
-                ssao_column(&mut cols[0], world);
-                shadow_column(&mut cols[1], world);
-                lighting_column(&mut cols[2], world);
-                camera_column(&mut cols[3], world);
-            });
+            // This panel gets whatever the two side panels leave between them,
+            // which on a narrow window is nothing at all. `Ui::columns` asserts
+            // on a negative column width instead of clamping, so the count has
+            // to come from the space that actually exists.
+            let available = ui.available_width();
+            if available > 0.0 {
+                let columns = ((available / MIN_COLUMN_WIDTH) as usize).clamp(1, COLUMNS.len());
+                ui.columns(columns, |cols| {
+                    let mut previous = usize::MAX;
+                    for (index, column) in COLUMNS.iter().enumerate() {
+                        let target = index * columns / COLUMNS.len();
+                        if target == previous {
+                            cols[target].add_space(6.0);
+                        }
+                        column(&mut cols[target], world);
+                        previous = target;
+                    }
+                });
+            }
             ui.add_space(4.0);
         });
 }

@@ -1,5 +1,6 @@
 use orrin_ecs::{Entity, World};
 
+use super::WIDTH_RANGE;
 use crate::editor::state::{EditorState, SpawnKind};
 use crate::editor::theme;
 use crate::scene::{Hierarchy, Name};
@@ -26,6 +27,7 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
     egui::SidePanel::left("hierarchy")
         .resizable(true)
         .default_width(220.0)
+        .width_range(WIDTH_RANGE)
         .show(ctx, |ui| {
             ui.add_space(4.0);
             ui.heading("Hierarchy");
@@ -223,14 +225,29 @@ fn row_ui(
     *row += 1;
 
     ui.horizontal(|ui| {
+        // A horizontal layout extends rather than wraps, and a `SidePanel`'s
+        // reported width is its content's, not the width it was asked for. One
+        // long entity name would therefore push the panel out over the viewport
+        // and squeeze whatever sits between the two side panels. Truncating is
+        // also what a tree row should do with a name too long to show.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+
         // The band has to land under the label, and the label's rect is only
         // known once it is laid out. Reserving the shape now and filling it in
         // afterwards is how egui paints behind something it has already drawn.
         let band = ui.painter().add(egui::Shape::Noop);
 
-        let response = ui
+        let room = ui.available_width();
+        let mut response = ui
             .selectable_label(selected, &node.label)
             .interact(egui::Sense::click_and_drag());
+
+        // A label that used everything it was offered is the one that got cut,
+        // and it is the only one worth a tooltip: repeating a name already fully
+        // on screen would pop a bubble over every row the pointer crosses.
+        if response.rect.width() >= room {
+            response = response.on_hover_text(&node.label);
+        }
 
         if response.clicked() {
             state.selected = Some(node.entity);

@@ -7,7 +7,7 @@ use glam::{EulerRot, Quat};
 use orrin_ecs::{Entity, World};
 use orrin_registry::Registry;
 
-use super::{color_row, vec3_row};
+use super::{WIDTH_RANGE, color_row, vec3_row};
 use crate::editor::state::EditorState;
 #[cfg(feature = "scripting")]
 use crate::scene::ScriptComponent;
@@ -20,6 +20,7 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState, reg
     egui::SidePanel::right("inspector")
         .resizable(true)
         .default_width(280.0)
+        .width_range(WIDTH_RANGE)
         .show(ctx, |ui| {
             ui.add_space(4.0);
             ui.heading("Inspector");
