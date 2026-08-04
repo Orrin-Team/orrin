@@ -205,6 +205,15 @@ mod tests {
                 .expect("node was drawn")
         }
 
+        /// A docked tool's *body*, without the tab strip above it.
+        fn tab_body(&self, tab: Tab) -> egui::Rect {
+            let (surface, node, _) = self.dock.state().find_tab(&tab).expect("tab is open");
+            match &self.dock.state()[surface][node] {
+                egui_dock::Node::Leaf { viewport, .. } => *viewport,
+                _ => panic!("tab is not in a leaf"),
+            }
+        }
+
         /// Every shape the last frame painted, as bounding rects.
         fn painted_rects(&self) -> Vec<egui::Rect> {
             fn collect(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
@@ -520,6 +529,32 @@ mod tests {
         assert!(
             (bottom - 200.0).abs() <= 2.0,
             "bottom dock is {bottom}px tall"
+        );
+    }
+
+    /// `Ui::columns` divides the width and does nothing to make the contents fit
+    /// it, so a column too narrow for a slider paints straight over its
+    /// neighbour. Docked at 300px this panel shipped four columns of overlapping
+    /// labels, and nothing about that is a panic or a missing shape — it is just
+    /// unreadable.
+    #[test]
+    fn the_environment_tool_fits_the_width_it_is_docked_at() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(3);
+
+        let tool = editor.tab_body(Tab::Environment);
+        let spilling: Vec<_> = editor
+            .painted_rects()
+            .into_iter()
+            .filter(|rect| tool.contains(rect.center()) && rect.right() > tool.right())
+            .collect();
+
+        assert!(
+            spilling.is_empty(),
+            "{} shape(s) run past the {}px tool, e.g. {:?}",
+            spilling.len(),
+            tool.width(),
+            spilling.first()
         );
     }
 

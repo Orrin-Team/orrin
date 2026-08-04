@@ -9,11 +9,15 @@ type Column = fn(&mut egui::Ui, &World);
 
 const COLUMNS: [Column; 4] = [ssao_column, shadow_column, lighting_column, camera_column];
 
-/// Deliberately tiny. Folding is a crash guard, not a responsive layout: four
-/// cramped columns are what this panel has always been, and stacking them makes
-/// it four times as tall, which on a short window costs far more than a
-/// squeezed slider does. Only a share too small to be a column at all folds.
-const MIN_COLUMN_WIDTH: f32 = 24.0;
+/// A slider plus the label that sits after it. Narrower than this and a column's
+/// contents run into its neighbour instead of wrapping — `Ui::columns` divides
+/// the width but does nothing to make the contents fit it.
+///
+/// This was once a full-window strip along the bottom, where four cramped
+/// columns were the intended look and folding was only a guard against a
+/// negative width. Docked, the same panel is a 300px tab, and four columns there
+/// is four overlapping ones. The number is now what it says it is.
+const MIN_COLUMN_WIDTH: f32 = 190.0;
 
 /// How many columns `available` can carry. Never zero: `Ui::columns` divides by
 /// the count, and it asserts on the negative width a shortfall would produce.
@@ -22,10 +26,7 @@ fn column_count(available: f32) -> usize {
 }
 
 pub fn body(ui: &mut egui::Ui, world: &mut World) {
-    // This panel gets whatever the two side panels leave between them,
-    // which on a narrow window is nothing at all. `Ui::columns` asserts
-    // on a negative column width instead of clamping, so the count has
-    // to come from the space that actually exists.
+    // A docked tab is as wide as its split, which can be nothing at all.
     let available = ui.available_width();
     if available > 0.0 {
         let columns = column_count(available);
@@ -34,7 +35,8 @@ pub fn body(ui: &mut egui::Ui, world: &mut World) {
             for (index, column) in COLUMNS.iter().enumerate() {
                 let target = index * columns / COLUMNS.len();
                 if target == previous {
-                    cols[target].add_space(6.0);
+                    cols[target].add_space(10.0);
+                    cols[target].separator();
                 }
                 column(&mut cols[target], world);
                 previous = target;
@@ -132,13 +134,21 @@ fn camera_column(ui: &mut egui::Ui, world: &World) {
 mod tests {
     use super::*;
 
-    /// The engine's default window leaves this panel a little under 300px
-    /// between the side panels. That has always drawn four columns, and a
-    /// reflow at the size the editor opens at is a regression, not a feature.
+    /// The width this panel is docked at. One column, because four at 75px each
+    /// overlap into an unreadable mess — which is exactly what shipped when this
+    /// threshold was still tuned for a full-window strip.
     #[test]
-    fn the_default_window_keeps_all_four_columns() {
-        assert_eq!(column_count(284.0), 4);
-        assert_eq!(column_count(1100.0), 4);
+    fn the_docked_width_folds_to_one_column() {
+        assert_eq!(column_count(300.0), 1);
+    }
+
+    /// Widen it — float it, or drag the split out — and the columns come back.
+    #[test]
+    fn a_wide_tool_spreads_back_out() {
+        assert_eq!(column_count(400.0), 2);
+        assert_eq!(column_count(600.0), 3);
+        assert_eq!(column_count(800.0), 4);
+        assert_eq!(column_count(2000.0), 4);
     }
 
     #[test]
