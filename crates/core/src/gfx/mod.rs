@@ -6,7 +6,9 @@ pub mod vulkan;
 pub use headless::HeadlessBackend;
 
 use crate::geom::Aabb;
-use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings};
+use crate::scene::{
+    Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings,
+};
 use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::BufferContents;
 use vulkano::pipeline::graphics::vertex_input::Vertex as VertexTrait;
@@ -150,6 +152,12 @@ pub trait RenderBackend {
     fn load_material(&mut self, material: &Material) -> MaterialHandle;
     fn load_texture(&mut self, pixels: &[u8], width: u32, height: u32, srgb: bool)
     -> TextureHandle;
+    /// Replace the environment with one baked from an equirectangular source:
+    /// tightly packed RGBA f32, row-major from the top-left.
+    ///
+    /// Baking is synchronous — it happens once, at load, and the alternative is
+    /// a half-written cubemap visible to the first frame.
+    fn load_environment(&mut self, pixels: &[f32], width: u32, height: u32);
     fn resize(&mut self, extent: [u32; 2]);
     fn render(
         &mut self,
@@ -158,5 +166,6 @@ pub trait RenderBackend {
         camera: &Camera,
         ssao: &SsaoSettings,
         hdr: &HdrSettings,
+        environment: &EnvironmentSettings,
     );
 }

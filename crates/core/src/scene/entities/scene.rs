@@ -2,7 +2,7 @@ use glam::Vec3;
 
 use orrin_ecs::World;
 
-use super::textures::{bump_normals, checkerboard, load_rgba, metallic_roughness};
+use super::textures::{bump_normals, checkerboard, load_rgba, metallic_roughness, sky_equirect};
 use super::{spawn_directional_light, spawn_mesh, spawn_point_light};
 use crate::gfx::{Material, RenderBackend};
 use crate::scene::{Assets, Camera, CpuMesh, MeshBounds, Spin, Transform};
@@ -73,6 +73,11 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
 
     let sun_dir = Vec3::new(-0.4, -1.0, -0.6).normalize();
     spawn_directional_light(world, "Sun", sun_dir, Vec3::new(1.0, 0.97, 0.92), 1.0);
+
+    // Fed the direction *toward* the sun, so the disc in the sky and the
+    // directional light that casts the shadows agree.
+    const SKY: [u32; 2] = [1024, 512];
+    backend.load_environment(&sky_equirect(SKY[0], SKY[1], -sun_dir), SKY[0], SKY[1]);
 
     for (i, (pos, color)) in [
         (Vec3::new(-4.0, 3.0, -4.0), Vec3::new(1.0, 0.35, 0.1)),

@@ -3,7 +3,10 @@ use orrin_ecs::World;
 use crate::gfx::shadows::MAX_CASCADES;
 
 use super::{color_row, vec3_row};
-use crate::scene::{AmbientLight, Camera, FogSettings, HdrSettings, ShadowSettings, SsaoSettings};
+use crate::scene::{
+    AmbientLight, Camera, EnvironmentSettings, FogSettings, HdrSettings, ShadowSettings,
+    SsaoSettings,
+};
 
 type Column = fn(&mut egui::Ui, &World);
 
@@ -101,6 +104,16 @@ fn lighting_column(ui: &mut egui::Ui, world: &World) {
         let mut ambient = world.resource_mut::<AmbientLight>();
         color_row(ui, "Color", &mut ambient.color);
         ui.add(egui::Slider::new(&mut ambient.intensity, 0.0..=2.0).text("Intensity"));
+    }
+    ui.add_space(6.0);
+    ui.strong("Sky");
+    {
+        let mut env = world.resource_mut::<EnvironmentSettings>();
+        ui.checkbox(&mut env.show_skybox, "Show skybox");
+        ui.add(egui::Slider::new(&mut env.intensity, 0.0..=4.0).text("Intensity"));
+        // Rotates the sampling direction, so it needs no rebake and can be
+        // dragged.
+        ui.add(egui::Slider::new(&mut env.yaw, -180.0..=180.0).text("Rotation"));
     }
     ui.add_space(6.0);
     ui.strong("Fog");

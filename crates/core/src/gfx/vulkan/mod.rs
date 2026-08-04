@@ -1,4 +1,5 @@
 mod context;
+mod environment;
 mod forward;
 pub mod frame;
 mod hdr;
@@ -29,10 +30,12 @@ use vulkano::{Validated, VulkanError};
 use crate::geom::Aabb;
 use crate::gfx::shadows::CascadeSet;
 use crate::scene::{
-    Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, ShadowSettings, SsaoSettings,
+    Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle, ShadowSettings,
+    SsaoSettings,
 };
 
 use self::context::VkContext;
+use self::environment::EnvironmentPass;
 use self::forward::{ForwardPass, GpuMaterial, GpuMesh};
 use crate::gfx::graph::PassKind;
 
@@ -88,6 +91,9 @@ pub struct VulkanRenderer {
     /// Debug-line overlay, recorded into the forward pass. Editor-only in
     /// practice: fed lines only through `render_with_overlay`.
     line: LinePass,
+    /// The environment cubemap and the skybox that draws it. Also recorded into
+    /// the forward pass, for the reason its module documents.
+    environment: EnvironmentPass,
     pub(crate) meshes: Vec<GpuMesh>,
     pub(crate) materials: Vec<GpuMaterial>,
     /// Texture views indexed by `TextureHandle`. Index 0 is a 1x1 white texture
@@ -120,6 +126,7 @@ impl VulkanRenderer {
         let ssao = SsaoPass::new(&ctx);
         let shadow = ShadowPass::new(&ctx);
         let line = LinePass::new(&ctx.device, &ctx.memory_allocator, &forward.render_pass);
+        let environment = EnvironmentPass::new(&ctx, &forward.render_pass);
         let swapchain = SwapchainState::new(&ctx, &surface, &hdr.tonemap_rp, format, extent);
         let timestamps = GpuTimestamps::new(&ctx);
 
@@ -163,6 +170,7 @@ impl VulkanRenderer {
             ssao,
             shadow,
             line,
+            environment,
             meshes: Vec::new(),
             materials: vec![forward::to_gpu_material(&Material::default())],
             textures,
@@ -275,6 +283,11 @@ impl RenderBackend for VulkanRenderer {
         handle
     }
 
+    fn load_environment(&mut self, pixels: &[f32], width: u32, height: u32) {
+        self.environment
+            .set_source(&self.ctx, pixels, [width, height]);
+    }
+
     fn resize(&mut self, extent: [u32; 2]) {
         self.pending_extent = extent;
         self.recreate_swapchain = true;
@@ -287,10 +300,22 @@ impl RenderBackend for VulkanRenderer {
         camera: &Camera,
         ssao: &SsaoSettings,
         hdr: &HdrSettings,
+        environment: &EnvironmentSettings,
     ) {
         // No overlay path (e.g. export/headless) draws no debug lines and no
         // shadows.
-        self.render_frame(items, lighting, camera, ssao, hdr, &[], None, None, None);
+        self.render_frame(
+            items,
+            lighting,
+            camera,
+            ssao,
+            hdr,
+            environment,
+            &[],
+            None,
+            None,
+            None,
+        );
     }
 }
 
@@ -340,6 +365,7 @@ impl VulkanRenderer {
         camera: &Camera,
         ssao: &SsaoSettings,
         hdr: &HdrSettings,
+        environment: &EnvironmentSettings,
         debug_lines: &[DebugLine],
         profiler_frame: u64,
         shadows: Option<ShadowFrame<'_>>,
@@ -351,6 +377,7 @@ impl VulkanRenderer {
             camera,
             ssao,
             hdr,
+            environment,
             debug_lines,
             Some(profiler_frame),
             shadows,
@@ -365,6 +392,7 @@ impl VulkanRenderer {
         camera: &Camera,
         ssao: &SsaoSettings,
         hdr: &HdrSettings,
+        environment: &EnvironmentSettings,
         debug_lines: &[DebugLine],
         profiler_frame: Option<u64>,
         shadows: Option<ShadowFrame<'_>>,
@@ -592,6 +620,18 @@ impl VulkanRenderer {
                         material_set.clone(),
                         texture_set.clone(),
                         object_buffer.clone(),
+                    );
+                    // Between the geometry and the lines, and it has to be:
+                    // after the geometry so the depth test rejects the sky
+                    // wherever something was drawn, and before the lines
+                    // because the sky passes its own test at the depth clear
+                    // and would otherwise paint over them.
+                    self.environment.record_skybox(
+                        &mut builder,
+                        &self.ctx,
+                        camera,
+                        extent,
+                        environment,
                     );
                     // Debug lines share the forward subpass: depth-tested against
                     // the scene, drawn on top of it, before the pass ends.

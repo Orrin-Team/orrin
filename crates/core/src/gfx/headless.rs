@@ -12,7 +12,9 @@
 
 use crate::geom::Aabb;
 use crate::gfx::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle};
-use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings};
+use crate::scene::{
+    Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings,
+};
 
 /// Counts uploads and derives mesh bounds; does no GPU work of any kind.
 #[derive(Default)]
@@ -65,6 +67,8 @@ impl RenderBackend for HeadlessBackend {
         handle
     }
 
+    fn load_environment(&mut self, _pixels: &[f32], _width: u32, _height: u32) {}
+
     fn resize(&mut self, _extent: [u32; 2]) {}
 
     fn render(
@@ -74,6 +78,7 @@ impl RenderBackend for HeadlessBackend {
         _camera: &Camera,
         _ssao: &SsaoSettings,
         _hdr: &HdrSettings,
+        _environment: &EnvironmentSettings,
     ) {
     }
 }

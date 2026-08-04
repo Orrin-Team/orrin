@@ -4,6 +4,7 @@ mod components;
 mod culling;
 mod debug;
 pub mod entities;
+mod environment;
 mod fog;
 mod hdr;
 mod hierarchy;
@@ -26,6 +27,7 @@ pub use components::{
 };
 pub use culling::Culling;
 pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};
+pub use environment::EnvironmentSettings;
 pub use fog::FogSettings;
 pub use hdr::HdrSettings;
 pub use hierarchy::{

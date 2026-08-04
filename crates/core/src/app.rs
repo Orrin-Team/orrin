@@ -23,8 +23,8 @@ use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::entities::{StressSpec, build_default_scene, spawn_stress_scene};
 use crate::scene::{
-    AmbientLight, Camera, Culling, DebugLine, DebugLines, FogSettings, HdrSettings, InputState,
-    LogBuffer, ShadowSettings, SsaoSettings, Time,
+    AmbientLight, Camera, Culling, DebugLine, DebugLines, EnvironmentSettings, FogSettings,
+    HdrSettings, InputState, LogBuffer, ShadowSettings, SsaoSettings, Time,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -192,6 +192,7 @@ impl App {
         world.insert_resource(ShadowSettings::default());
         world.insert_resource(HdrSettings::default());
         world.insert_resource(FogSettings::default());
+        world.insert_resource(EnvironmentSettings::default());
         world.insert_resource(FrameStats::new());
         world.insert_resource(Profiler::default());
         world.insert_resource(InputState::new());
@@ -544,6 +545,7 @@ impl ApplicationHandler for App {
                 let ssao = *self.world.resource::<SsaoSettings>();
                 let shadow_settings = *self.world.resource::<ShadowSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
+                let environment = *self.world.resource::<EnvironmentSettings>();
                 // Stamped into this frame's GPU queries so the readback, some
                 // frames later, can file its spans against the right frame.
                 let profiler_frame = self.world.resource::<Profiler>().frame_index();
@@ -560,6 +562,7 @@ impl ApplicationHandler for App {
                         &camera,
                         &ssao,
                         &hdr,
+                        &environment,
                         &self.debug_lines,
                         profiler_frame,
                         (self.cascades.count > 0).then(|| ShadowFrame {
