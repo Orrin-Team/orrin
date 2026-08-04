@@ -254,9 +254,9 @@ fn dock_style(style: &egui::Style) -> Style {
     dock.dock_area_padding = None;
     dock.main_surface_border_stroke = egui::Stroke::NONE;
 
-    // The same surface and height as the top bar, so the two read as one chrome.
+    // The same surface as the top bar, so the two read as one chrome.
     dock.tab_bar.bg_fill = visuals.panel_fill;
-    dock.tab_bar.height = super::panels::BAR_HEIGHT;
+    dock.tab_bar.height = super::panels::TAB_BAR_HEIGHT;
     dock.tab_bar.hline_color = outline;
     dock.tab_bar.corner_radius = egui::CornerRadius::ZERO;
 
@@ -397,8 +397,7 @@ mod tests {
         );
         assert_ne!(dock.tab.active.bg_fill, style.visuals.selection.bg_fill);
 
-        // A tab strip is a bar that names things, like the quick-access row.
-        assert_eq!(dock.tab_bar.height, crate::editor::panels::BAR_HEIGHT);
+        assert_eq!(dock.tab_bar.height, crate::editor::panels::TAB_BAR_HEIGHT);
 
         // Idle has fill and no stroke; hover adds the accent one.
         assert_eq!(dock.tab.inactive.outline_color, egui::Color32::TRANSPARENT);

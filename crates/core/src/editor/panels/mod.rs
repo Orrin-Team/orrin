@@ -16,10 +16,12 @@ use orrin_registry::Registry;
 
 use super::dock::Dock;
 
-/// The height of a bar that names things: the quick-access row and a dock's tab
-/// strip. One number, because they sit in the same window and a 24px strip under
-/// a 30px row reads as a mistake.
+/// The quick-access row across the top of the window.
 pub(super) const BAR_HEIGHT: f32 = 30.0;
+
+/// A dock's tab strip. Deliberately shorter than the bar above it: that one
+/// spans the window and names the session, this one repeats above every tool.
+pub(super) const TAB_BAR_HEIGHT: f32 = 24.0;
 use super::state::EditorState;
 use super::theme::ThemeSet;
 
