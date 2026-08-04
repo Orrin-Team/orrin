@@ -201,6 +201,20 @@ mod tests {
         assert!(editor.painted_contains("Rig"));
     }
 
+    /// Delete moved off the Hierarchy toolbar, so the Inspector is now the only
+    /// place that can despawn what you are looking at.
+    #[test]
+    fn the_inspector_offers_delete_for_the_selection() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let entity = editor.spawn("Ground plane");
+        editor.frames(1);
+        assert!(!editor.painted_contains("Delete"));
+
+        editor.state.selected = Some(entity);
+        editor.frames(1);
+        assert!(editor.painted_contains("Delete"));
+    }
+
     /// A panel that sizes its content from its own width grows by the overflow
     /// every frame: the content's minimum width becomes the panel's new width,
     /// which becomes a wider content minimum. Nothing shows on frame one.

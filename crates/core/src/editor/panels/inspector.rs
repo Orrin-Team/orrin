@@ -41,8 +41,39 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState, reg
             light_section(ui, world, entity);
             #[cfg(feature = "scripting")]
             script_section(ui, world, entity);
-            dump_section(ui, world, registry, entity);
+            actions_section(ui, world, registry, state, entity);
         });
+}
+
+/// What can be done to the selected entity as a whole, rather than to one of
+/// its components.
+fn actions_section(
+    ui: &mut egui::Ui,
+    world: &mut World,
+    registry: &Registry,
+    state: &mut EditorState,
+    entity: Entity,
+) {
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui.button("Dump to console").clicked() {
+            dump(world, registry, entity);
+        }
+        // The hierarchy deletes the row under the pointer; this deletes the
+        // thing being looked at. Both go through the same deferred request —
+        // despawning while a panel is iterating the tree is what that defers.
+        let name = world.get::<Name>(entity).map_or_else(
+            || format!("entity {}", entity.index()),
+            |name| name.0.clone(),
+        );
+        if ui
+            .button("🗑  Delete")
+            .on_hover_text(format!("Despawn {name}"))
+            .clicked()
+        {
+            state.request_despawn(entity);
+        }
+    });
 }
 
 /// Print the entity exactly as the registry sees it.
@@ -52,12 +83,7 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState, reg
 /// back. That difference is the point of the registry, and until the inspector
 /// itself is registry-driven this button is how a component's registration gets
 /// eyeballed.
-fn dump_section(ui: &mut egui::Ui, world: &mut World, registry: &Registry, entity: Entity) {
-    ui.separator();
-    if !ui.button("Dump to console").clicked() {
-        return;
-    }
-
+fn dump(world: &mut World, registry: &Registry, entity: Entity) {
     let mut text = String::new();
     orrin_registry::write_entity(&mut text, registry, world, entity);
 
