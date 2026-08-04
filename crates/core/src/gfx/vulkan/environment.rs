@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use glam::{Mat3, Mat4};
+use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, PrimaryAutoCommandBuffer,
@@ -46,6 +46,7 @@ use vulkano::pipeline::{
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
 use vulkano::sync::{self, GpuFuture};
 
+use crate::gfx::sh::{self, SH9};
 use crate::scene::{Camera, EnvironmentSettings};
 
 use super::MSAA_SAMPLES;
@@ -107,9 +108,13 @@ pub struct EnvironmentPass {
     cube_sampler: Arc<Sampler>,
     /// `None` until an environment is loaded. The skybox is simply not recorded
     /// in that case — there is no fallback cube, because nothing samples the
-    /// environment except the skybox until the irradiance and prefilter steps
-    /// land and give the forward shader a reason to.
+    /// environment except the skybox until the prefiltered specular chain lands
+    /// and gives the forward shader a reason to.
     cube: Option<Arc<ImageView>>,
+    /// Diffuse irradiance, projected from the equirect source on the CPU before
+    /// it was ever uploaded. Held beside the cube because the two are derived
+    /// from the same source and would be wrong to have disagree.
+    irradiance: Option<[Vec3; SH9]>,
 }
 
 impl EnvironmentPass {
@@ -154,6 +159,22 @@ impl EnvironmentPass {
             skybox_pipeline,
             cube_sampler,
             cube: None,
+            irradiance: None,
+        }
+    }
+
+    /// The nine coefficients the forward shader evaluates, scaled by the
+    /// environment's intensity.
+    ///
+    /// With no environment loaded this is `ambient` expressed as a band-0-only
+    /// series, which evaluates to exactly `ambient` for every normal. So the
+    /// flat ambient term is not a second path in the shader — it is the same
+    /// path with nothing above the constant, the way an SSAO-less frame samples
+    /// a 1x1 white image rather than branching.
+    pub fn irradiance(&self, ambient: Vec3, settings: &EnvironmentSettings) -> [Vec3; SH9] {
+        match self.irradiance {
+            Some(coefficients) => coefficients.map(|c| c * settings.intensity),
+            None => sh::from_constant(ambient),
         }
     }
 
@@ -173,6 +194,11 @@ impl EnvironmentPass {
             extent[0],
             extent[1],
         );
+
+        // Projected from the source rather than read back from the cube: the
+        // pixels are already here, and a readback would be the only GPU-to-CPU
+        // transfer anywhere in the engine.
+        self.irradiance = Some(sh::project_equirect(pixels, extent));
 
         let equirect = upload_equirect(ctx, pixels, extent);
         self.cube = Some(bake_cube(

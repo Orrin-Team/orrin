@@ -1,5 +1,6 @@
 pub mod graph;
 pub mod headless;
+pub mod sh;
 pub mod shadows;
 pub mod vulkan;
 

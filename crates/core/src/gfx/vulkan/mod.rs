@@ -620,6 +620,7 @@ impl VulkanRenderer {
                         material_set.clone(),
                         texture_set.clone(),
                         object_buffer.clone(),
+                        environment,
                     );
                     // Between the geometry and the lines, and it has to be:
                     // after the geometry so the depth test rejects the sky

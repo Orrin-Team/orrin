@@ -99,7 +99,9 @@ fn lighting_column(ui: &mut egui::Ui, world: &World) {
         ui.add(egui::Slider::new(&mut hdr.exposure, 0.1..=5.0).text("Exposure"));
     }
     ui.add_space(6.0);
-    ui.strong("Ambient");
+    ui.strong("Ambient").on_hover_text(
+        "Fallback only: an environment's irradiance replaces this when one is loaded",
+    );
     {
         let mut ambient = world.resource_mut::<AmbientLight>();
         color_row(ui, "Color", &mut ambient.color);

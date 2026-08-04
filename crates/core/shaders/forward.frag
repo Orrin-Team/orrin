@@ -35,6 +35,8 @@ layout(set = 0, binding = 0) uniform Lighting {
     vec4 cascade_texel_sizes; // world size of one shadow texel, per cascade
     vec4 shadow_params;       // x = count, y = blend overlap, z = strength, w = debug
     PointLight point_lights[MAX_POINT_LIGHTS];
+    vec4 environment;    // x = sin(env yaw), y = cos(env yaw)
+    vec4 irradiance[9];  // rgb = SH coefficient; see gfx/sh.rs
 } lighting;
 
 // Mirrors GpuMaterial in forward.rs. std430 packs this exactly like
@@ -133,6 +135,40 @@ vec3 energy_compensation(vec3 f0, float perceptual_roughness, float n_dot_v) {
 // sigma = 0.5 px, the standard deviation of the pixel filter kernel in image
 // space; the shader wants its square.
 const float SPEC_AA_SIGMA2 = 0.25;
+// Diffuse irradiance from the environment, divided by pi so the result is
+// already the diffuse response for unit albedo.
+//
+// The nine terms are the real spherical-harmonic basis for bands 0..=2, and
+// they must match `basis` in gfx/sh.rs term for term and component for
+// component — the coefficients were projected against that one. A mismatch is
+// not a compile error, it is lighting that is quietly rotated or mirrored.
+//
+// With no environment loaded these coefficients carry the scene's flat ambient
+// in band 0 alone, which evaluates to that ambient for every normal. So there
+// is one path here, not two.
+vec3 sh_irradiance(vec3 n) {
+    // The same yaw the skybox samples through, so what is drawn behind the
+    // scene and what lights it cannot disagree.
+    float s = lighting.environment.x;
+    float c = lighting.environment.y;
+    n = vec3(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+
+    vec3 e = lighting.irradiance[0].rgb * 0.282095
+           + lighting.irradiance[1].rgb * (0.488603 * n.y)
+           + lighting.irradiance[2].rgb * (0.488603 * n.z)
+           + lighting.irradiance[3].rgb * (0.488603 * n.x)
+           + lighting.irradiance[4].rgb * (1.092548 * n.x * n.y)
+           + lighting.irradiance[5].rgb * (1.092548 * n.y * n.z)
+           + lighting.irradiance[6].rgb * (0.315392 * (3.0 * n.z * n.z - 1.0))
+           + lighting.irradiance[7].rgb * (1.092548 * n.x * n.z)
+           + lighting.irradiance[8].rgb * (0.546274 * (n.x * n.x - n.y * n.y));
+
+    // Backstop for the ringing the band window in gfx/sh.rs is sized to
+    // contain: a truncated series overshoots at a sun disc and undershoots
+    // opposite it, and the undershoot can cross zero.
+    return max(e, vec3(0.0));
+}
+
 // Clamping threshold, from Kaplanyan et al. 2016.
 const float SPEC_AA_KAPPA = 0.18;
 
@@ -330,13 +366,15 @@ void main() {
     // than once per light inside brdf().
     vec3 energy = energy_compensation(f0, roughness, max(dot(N, V), 1e-4));
 
-    // Crude diffuse ambient (stands in for image-based lighting),
-    // attenuated by screen-space ambient occlusion.
+    // Diffuse image-based lighting, attenuated by screen-space ambient
+    // occlusion. The (1 - metallic) is the same factor `brdf` applies to its
+    // own diffuse lobe: a metal has no diffuse response, and until the
+    // prefiltered specular chain lands it has no environment response at all.
     float ao = texture(u_ao, gl_FragCoord.xy * lighting.viewport.zw).r;
-    vec3 color = lighting.ambient.rgb * lighting.ambient.w * albedo * ao;
+    vec3 color = sh_irradiance(N) * albedo * (1.0 - metallic) * ao;
 
-    // Directional sun. Only this term is shadowed: ambient is what `u_ao`
-    // attenuates, and point lights cast nothing yet.
+    // Directional sun. Only this term is shadowed: the environment is what
+    // `u_ao` attenuates, and point lights cast nothing yet.
     float view_dist = length(v_world_pos - lighting.camera_pos.xyz);
     {
         vec3 L = normalize(lighting.sun_direction.xyz);

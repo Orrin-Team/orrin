@@ -26,9 +26,10 @@ use vulkano::pipeline::{
 use vulkano::render_pass::{RenderPass, Subpass};
 
 use crate::geom::Aabb;
+use crate::gfx::sh::SH9;
 use crate::gfx::shadows::MAX_CASCADES;
 use crate::gfx::{MAX_POINT_LIGHTS, MAX_TEXTURES, Material, RenderItem, SceneLighting, Vertex};
-use crate::scene::Camera;
+use crate::scene::{Camera, EnvironmentSettings};
 
 use super::context::VkContext;
 use super::swapchain::DEPTH_FORMAT;
@@ -98,6 +99,8 @@ fn to_gpu_lighting(
     camera_pos: Vec3,
     extent: [u32; 2],
     shadows: Option<ShadowFrame<'_>>,
+    irradiance: [Vec3; SH9],
+    environment_yaw: f32,
 ) -> GpuLighting {
     let (w, h) = (extent[0] as f32, extent[1] as f32);
     let count = lighting.point_lights.len().min(MAX_POINT_LIGHTS);
@@ -186,6 +189,11 @@ fn to_gpu_lighting(
         cascade_texel_sizes,
         shadow_params,
         point_lights,
+        environment: {
+            let (sin, cos) = environment_yaw.to_radians().sin_cos();
+            [sin, cos, 0.0, 0.0]
+        },
+        irradiance: irradiance.map(|c| [c.x, c.y, c.z, 0.0]),
     }
 }
 
@@ -242,6 +250,14 @@ struct GpuLighting {
     /// w = 1.0 to tint by cascade index.
     shadow_params: [f32; 4],
     point_lights: [GpuPointLight; MAX_POINT_LIGHTS],
+    /// x = sin(environment yaw), y = cos(environment yaw). The same rotation
+    /// the skybox samples through, so the sky and what it lights agree.
+    environment: [f32; 4],
+    /// Diffuse irradiance as nine spherical-harmonic coefficients, already
+    /// convolved with the cosine lobe and divided by pi — see `gfx::sh`. `vec4`
+    /// rather than `vec3` because std140 pads an array element to 16 bytes
+    /// either way, so the padding may as well be visible on both sides.
+    irradiance: [[f32; 4]; SH9],
 }
 
 pub struct ForwardPass {
@@ -468,6 +484,7 @@ impl ForwardPass {
         material_set: Arc<DescriptorSet>,
         texture_set: Arc<DescriptorSet>,
         object_buffer: Subbuffer<[GpuObject]>,
+        environment: &EnvironmentSettings,
     ) {
         let aspect = extent[0] as f32 / extent[1] as f32;
         let view_proj = camera.view_projection(aspect);
@@ -476,8 +493,20 @@ impl ForwardPass {
             .uniform_buffer_allocator
             .allocate_sized::<GpuLighting>()
             .unwrap();
-        *lighting_buffer.write().unwrap() =
-            to_gpu_lighting(lighting, camera.position, extent, shadows);
+        // Falls back to the scene's flat ambient when nothing is loaded, which
+        // the coefficients express rather than the shader branching on.
+        let irradiance = renderer.environment.irradiance(
+            lighting.ambient_color * lighting.ambient_intensity,
+            environment,
+        );
+        *lighting_buffer.write().unwrap() = to_gpu_lighting(
+            lighting,
+            camera.position,
+            extent,
+            shadows,
+            irradiance,
+            environment.yaw,
+        );
 
         let lighting_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
