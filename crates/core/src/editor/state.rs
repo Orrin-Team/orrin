@@ -21,6 +21,59 @@ pub enum SceneRequest {
     Load,
 }
 
+/// Which set of ribbon groups is showing. Plain data with no references, like
+/// the rest of the editor's state — `docs/architecture.md` §2.1 wants this in
+/// the ECS eventually, and that rule is what keeps the move cheap.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RibbonTab {
+    Home,
+    Scene,
+    Render,
+    Scripts,
+    Assets,
+}
+
+impl RibbonTab {
+    pub const ALL: [Self; 5] = [
+        Self::Home,
+        Self::Scene,
+        Self::Render,
+        Self::Scripts,
+        Self::Assets,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Home => "Home",
+            Self::Scene => "Scene",
+            Self::Render => "Render",
+            Self::Scripts => "Scripts",
+            Self::Assets => "Assets",
+        }
+    }
+}
+
+/// What a transform gizmo would edit. The mode is real state and is remembered;
+/// the handles that would read it are Phase 3, so today it drives a readout and
+/// nothing else.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GizmoMode {
+    Select,
+    Move,
+    Rotate,
+    Scale,
+}
+
+/// Whether gizmo axes follow the entity or the scene.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GizmoSpace {
+    Local,
+    World,
+}
+
+/// What a gizmo drag would quantise to, when snapping is on.
+pub const SNAP_STEP: f32 = 0.25;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SpawnKind {
     Cube,
@@ -42,6 +95,10 @@ pub struct EditorState {
     /// The hierarchy's search box. Lives here rather than in the panel so it
     /// survives the frame, and so a filtered tree stays filtered.
     pub hierarchy_query: String,
+    pub ribbon_tab: RibbonTab,
+    pub gizmo_mode: GizmoMode,
+    pub gizmo_space: GizmoSpace,
+    pub snap: bool,
     spawn_request: Option<SpawnKind>,
     despawn_request: Option<Entity>,
     /// `(child, new parent)`, with `None` meaning "detach to a root". Requested
@@ -71,6 +128,10 @@ impl Default for EditorState {
             scene_path: DEFAULT_SCENE_PATH.to_owned(),
             project_name: NO_PROJECT.to_owned(),
             hierarchy_query: String::new(),
+            ribbon_tab: RibbonTab::Home,
+            gizmo_mode: GizmoMode::Select,
+            gizmo_space: GizmoSpace::World,
+            snap: false,
             spawn_request: None,
             despawn_request: None,
             reparent_request: None,

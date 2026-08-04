@@ -85,7 +85,7 @@ fn actions_section(
 /// back. That difference is the point of the registry, and until the inspector
 /// itself is registry-driven this button is how a component's registration gets
 /// eyeballed.
-fn dump(world: &mut World, registry: &Registry, entity: Entity) {
+pub(super) fn dump(world: &mut World, registry: &Registry, entity: Entity) {
     let mut text = String::new();
     orrin_registry::write_entity(&mut text, registry, world, entity);
 

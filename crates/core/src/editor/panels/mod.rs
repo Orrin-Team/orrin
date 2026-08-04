@@ -31,7 +31,7 @@ pub fn draw(
     registry: &Registry,
     themes: &ThemeSet,
 ) {
-    ribbon::show(ctx, state, themes);
+    ribbon::show(ctx, world, state, registry, themes);
     hierarchy::show(ctx, world, state);
     inspector::show(ctx, world, state, registry);
     environment::show(ctx, world);
@@ -64,6 +64,7 @@ pub(super) fn color_row(ui: &mut egui::Ui, label: &str, c: &mut Vec3) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::state::RibbonTab;
     use crate::editor::theme;
     use crate::scene::Name;
 
@@ -227,6 +228,44 @@ mod tests {
         editor.state.selected = Some(entity);
         editor.frames(1);
         assert!(editor.painted_contains("Delete"));
+    }
+
+    /// Every ribbon tab has to lay out: a group that borrows a resource the
+    /// other tabs do not touch will only fail on the tab that shows it.
+    #[test]
+    fn every_ribbon_tab_draws_its_groups() {
+        for (tab, caption) in [
+            (RibbonTab::Home, "Gizmo"),
+            (RibbonTab::Scene, "Selection"),
+            (RibbonTab::Render, "Passes"),
+            (RibbonTab::Scripts, "Assembly"),
+            (RibbonTab::Assets, "Asset pipeline"),
+        ] {
+            let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+            editor.state.ribbon_tab = tab;
+            editor.frames(2);
+            assert!(
+                editor.painted_contains(caption),
+                "{} tab did not draw {caption}",
+                tab.label()
+            );
+        }
+    }
+
+    /// The engine opens at 800x600 and the top bar is three stacked panels. If
+    /// they take the window, the tree and the viewport are gone and no test that
+    /// only checks for panics would notice.
+    #[test]
+    fn the_top_bar_leaves_the_rest_of_the_window_alone() {
+        let mut editor = Harness::new(egui::vec2(800.0, 600.0));
+        editor.spawn("Ground plane");
+        editor.frames(2);
+
+        let top = editor.panel("quick_access").height()
+            + editor.panel("ribbon").height()
+            + editor.panel("scene_tabs").height();
+        assert!(top < 200.0, "top bar took {top}px of 600");
+        assert!(editor.painted_contains("Ground plane"));
     }
 
     /// A panel that sizes its content from its own width grows by the overflow
