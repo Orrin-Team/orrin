@@ -111,6 +111,20 @@ fn lighting_column(ui: &mut egui::Ui, world: &World) {
     ui.strong("Sky");
     {
         let mut env = world.resource_mut::<EnvironmentSettings>();
+        ui.horizontal(|ui| {
+            ui.label("HDRI");
+            // A button rather than applying as you type: the bake blocks on the
+            // GPU for every keystroke otherwise, and every prefix of a filename
+            // is an error worth reporting exactly once.
+            if ui.button("Load").clicked() {
+                env.reload_requested = true;
+            }
+        });
+        ui.add(
+            egui::TextEdit::singleline(&mut env.hdri)
+                .hint_text("relative to assets/")
+                .desired_width(f32::INFINITY),
+        );
         ui.checkbox(&mut env.show_skybox, "Show skybox");
         ui.add(egui::Slider::new(&mut env.intensity, 0.0..=4.0).text("Intensity"));
         // Rotates the sampling direction, so it needs no rebake and can be

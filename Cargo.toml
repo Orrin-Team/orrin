@@ -21,7 +21,9 @@ vulkano = "0.35"
 vulkano-shaders = "0.35"
 winit = "0.30"
 glam = { version = "0.30", features = ["bytemuck"] }
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# `hdr` is the Radiance decoder the environment bake reads; it is what makes an
+# equirectangular HDRI loadable at all, since every LDR format clips the sun.
+image = { version = "0.25", default-features = false, features = ["jpeg", "hdr"] }
 egui = "0.31"
 egui_winit_vulkano = "0.28"
 serde = { version = "1", features = ["derive"] }

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,7 +25,7 @@ use crate::profile_scope;
 use crate::scene::entities::{StressSpec, build_default_scene, spawn_stress_scene};
 use crate::scene::{
     AmbientLight, Camera, Culling, DebugLine, DebugLines, EnvironmentSettings, FogSettings,
-    HdrSettings, InputState, LogBuffer, ShadowSettings, SsaoSettings, Time,
+    HdrSettings, InputState, LogBuffer, LogLevel, ShadowSettings, SsaoSettings, Time, load_hdri,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -192,7 +193,18 @@ impl App {
         world.insert_resource(ShadowSettings::default());
         world.insert_resource(HdrSettings::default());
         world.insert_resource(FogSettings::default());
-        world.insert_resource(EnvironmentSettings::default());
+        // `ORRIN_HDRI` names an environment relative to the assets directory,
+        // the same env-var-over-default shape the scripts directory and entry
+        // type resolve by. It exists because nothing persists the choice yet:
+        // a scene file cannot name an environment until resources are part of
+        // what a scene saves, and until then this is how a run gets one without
+        // a click.
+        let hdri = std::env::var("ORRIN_HDRI").unwrap_or_default();
+        world.insert_resource(EnvironmentSettings {
+            reload_requested: !hdri.trim().is_empty(),
+            hdri,
+            ..Default::default()
+        });
         world.insert_resource(FrameStats::new());
         world.insert_resource(Profiler::default());
         world.insert_resource(InputState::new());
@@ -545,7 +557,21 @@ impl ApplicationHandler for App {
                 let ssao = *self.world.resource::<SsaoSettings>();
                 let shadow_settings = *self.world.resource::<ShadowSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
-                let environment = *self.world.resource::<EnvironmentSettings>();
+                let environment = self.world.resource::<EnvironmentSettings>().clone();
+                if environment.reload_requested {
+                    self.world
+                        .resource_mut::<EnvironmentSettings>()
+                        .reload_requested = false;
+                    let message = load_environment(
+                        &mut active.renderer,
+                        self.project.as_ref(),
+                        &environment.hdri,
+                    );
+                    let frame = self.world.resource::<Time>().frame_count();
+                    self.world
+                        .resource_mut::<LogBuffer>()
+                        .push(message.0, message.1, frame);
+                }
                 // Stamped into this frame's GPU queries so the readback, some
                 // frames later, can file its spans against the right frame.
                 let profiler_frame = self.world.resource::<Profiler>().frame_index();
@@ -681,4 +707,51 @@ fn attach_debug_messenger(instance: &Arc<Instance>) -> DebugUtilsMessenger {
         )
     }
     .expect("failed to create the validation messenger")
+}
+
+/// Bake the environment from `hdri`, and report what happened in one line.
+///
+/// The path resolves against the project's assets directory, or `assets/`
+/// beside the working directory when there is no project — the same
+/// manifest-else-built-in-default shape the scripts directory resolves by.
+///
+/// A failure changes nothing: the session keeps the environment it already had,
+/// the way a rejected script build keeps the code it had. That matters more
+/// here than it looks, because the alternative to "keep the old sky" is "no sky
+/// and black metals" for a typo in a filename.
+fn load_environment(
+    renderer: &mut VulkanRenderer,
+    project: Option<&orrin_project::Project>,
+    hdri: &str,
+) -> (LogLevel, String) {
+    let hdri = hdri.trim();
+    if hdri.is_empty() {
+        return (
+            LogLevel::Warning,
+            "no environment file named; give a path relative to the assets directory".to_string(),
+        );
+    }
+
+    let assets_dir =
+        project.map_or_else(|| PathBuf::from("assets"), |project| project.assets_dir());
+
+    match load_hdri(&assets_dir, hdri) {
+        Ok(image) => {
+            renderer.load_environment(&image.pixels, image.width, image.height);
+            (
+                LogLevel::Info,
+                format!(
+                    "environment baked from `{hdri}` ({}x{})",
+                    image.width, image.height
+                ),
+            )
+        }
+        Err(error) => {
+            // Also to the terminal: a run without the editor open has no
+            // console panel to read, and a silently missing environment looks
+            // identical to one that loaded and happened to be dark.
+            eprintln!("orrin: {error}");
+            (LogLevel::Error, error.to_string())
+        }
+    }
 }

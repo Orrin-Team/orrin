@@ -39,6 +39,71 @@ const COSINE_LOBE: [f32; 3] = [1.0, 2.0 / 3.0, 0.25];
 /// is gentle enough to keep a sky reading as a sky.
 const WINDOW: [f32; 3] = [1.0, 0.900_316_3, 0.636_619_8];
 
+/// Radiance above this multiple of the environment's mean is left out of the
+/// *diffuse* projection.
+///
+/// An outdoor capture is mostly sun: measured on a 2K meadow HDRI, the sun disc
+/// is 0.02% of the pixels and 81% of the irradiance. A scene lit by that
+/// environment almost always also has a directional light standing in for the
+/// same sun — that is what casts the shadows, since an environment cannot — so
+/// leaving the disc in the diffuse series delivers the sun twice, and the
+/// second copy is *unshadowed*. It lights the insides of shadows the cascade
+/// maps correctly darkened, which does not read as "too bright" so much as
+/// "shadows do not work".
+///
+/// So the analytic light owns the sun's diffuse and the environment owns the
+/// sky's. The specular chain is deliberately not clamped: nothing else puts a
+/// sun in a metal's reflection.
+///
+/// The exact value barely matters, which is what makes it defensible rather
+/// than magic — the energy sits in the extreme tail, so on that same file any
+/// ceiling from 70x to 1400x the mean lands within 15% of the same answer.
+const SUN_CLAMP: f32 = 100.0;
+
+const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
+
+/// Solid-angle-weighted mean luminance, counting nothing above `ceiling`.
+fn mean_luminance(pixels: &[f32], extent: [u32; 2], ceiling: f32) -> f32 {
+    let (width, height) = (extent[0] as usize, extent[1] as usize);
+    let mut total = 0.0f64;
+    let mut measure = 0.0f64;
+
+    for y in 0..height {
+        let theta = (y as f32 + 0.5) / height as f32 * PI;
+        let weight = theta.sin() as f64;
+        for x in 0..width {
+            let texel = (y * width + x) * 4;
+            let luminance =
+                Vec3::new(pixels[texel], pixels[texel + 1], pixels[texel + 2]).dot(LUMA);
+            total += luminance.min(ceiling) as f64 * weight;
+        }
+        measure += weight * width as f64;
+    }
+
+    if measure > 0.0 {
+        (total / measure) as f32
+    } else {
+        0.0
+    }
+}
+
+/// The luminance the diffuse projection clips at: [`SUN_CLAMP`] times the mean,
+/// which is the scale the threshold is relative to so it means the same thing
+/// whatever units a capture was authored in.
+///
+/// Iterated twice because the first mean is itself sun-dominated — on an
+/// outdoor capture the disc supplies most of the average it is being compared
+/// against, which drags the threshold up toward the very value it exists to
+/// exclude. The second pass measures a mean the sun has already been taken out
+/// of. It converges immediately after that and a third pass moves nothing.
+fn diffuse_ceiling(pixels: &[f32], extent: [u32; 2]) -> f32 {
+    let mut ceiling = f32::INFINITY;
+    for _ in 0..2 {
+        ceiling = mean_luminance(pixels, extent, ceiling) * SUN_CLAMP;
+    }
+    ceiling
+}
+
 /// The real spherical-harmonic basis for bands 0..=2.
 ///
 /// Mirrored by `sh_irradiance` in `forward.frag`, which must evaluate these same
@@ -76,6 +141,7 @@ fn convolve(mut coefficients: [Vec3; SH9]) -> [Vec3; SH9] {
 pub fn project_equirect(pixels: &[f32], extent: [u32; 2]) -> [Vec3; SH9] {
     let (width, height) = (extent[0] as usize, extent[1] as usize);
     let mut coefficients = [Vec3::ZERO; SH9];
+    let ceiling = diffuse_ceiling(pixels, extent);
 
     // A texel's solid angle varies only with latitude: sin(theta) d(theta)
     // d(phi). Without it the poles — where texels are narrowest — would count
@@ -102,7 +168,15 @@ pub fn project_equirect(pixels: &[f32], extent: [u32; 2]) -> [Vec3; SH9] {
             let direction = Vec3::new(cos_phi * sin_theta, cos_theta, sin_phi * sin_theta);
 
             let texel = (y * width + x) * 4;
-            let radiance = Vec3::new(pixels[texel], pixels[texel + 1], pixels[texel + 2]);
+            let mut radiance = Vec3::new(pixels[texel], pixels[texel + 1], pixels[texel + 2]);
+
+            // Scaled rather than clamped per channel, so a clipped sun keeps
+            // its colour instead of drifting toward whichever channel was
+            // furthest over.
+            let luminance = radiance.dot(LUMA);
+            if ceiling > 0.0 && luminance > ceiling {
+                radiance *= ceiling / luminance;
+            }
 
             for (coefficient, harmonic) in coefficients.iter_mut().zip(basis(direction)) {
                 *coefficient += radiance * (harmonic * solid_angle);
@@ -231,6 +305,37 @@ mod tests {
         assert!(
             (horizon - 0.5).abs() < 0.1,
             "horizon lit to {horizon}, expected about half",
+        );
+    }
+
+    /// The sun clamp's whole job. An environment whose sun carries most of its
+    /// energy has to project to roughly what the *sky alone* would, because the
+    /// scene's directional light is about to deliver that sun again — and
+    /// unlike this series, that copy is shadowed.
+    ///
+    /// A large disc on purpose: a pinprick sun is clamped by any threshold at
+    /// all, while one big enough to dominate the mean is what defeats a
+    /// single-pass estimate of it.
+    #[test]
+    fn a_sun_does_not_dominate_the_diffuse_irradiance() {
+        let to_sun = Vec3::new(0.3, 1.0, 0.2).normalize();
+        let sky = 0.05;
+        let lit = equirect(256, 128, |d| {
+            if d.dot(to_sun) > 0.9995 {
+                Vec3::splat(50_000.0)
+            } else {
+                Vec3::splat(sky)
+            }
+        });
+        let sunless = equirect(256, 128, |_| Vec3::splat(sky));
+
+        let with_sun = evaluate(&project_equirect(&lit, [256, 128]), Vec3::Y).x;
+        let without = evaluate(&project_equirect(&sunless, [256, 128]), Vec3::Y).x;
+
+        assert!(
+            (with_sun - without).abs() < sky,
+            "a 50000:0.05 sun left {with_sun} against a sunless {without}; \
+             the disc is still dominating the irradiance",
         );
     }
 

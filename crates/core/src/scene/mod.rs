@@ -27,7 +27,7 @@ pub use components::{
 };
 pub use culling::Culling;
 pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};
-pub use environment::EnvironmentSettings;
+pub use environment::{EnvironmentSettings, Hdri, HdriError, load_hdri};
 pub use fog::FogSettings;
 pub use hdr::HdrSettings;
 pub use hierarchy::{

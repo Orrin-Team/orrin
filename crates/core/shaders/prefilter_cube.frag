@@ -21,7 +21,20 @@ layout(push_constant) uniform Push {
 } push;
 
 const float PI = 3.14159265359;
-const uint SAMPLE_COUNT = 128u;
+const uint SAMPLE_COUNT = 256u;
+
+// A per-texel rotation of the sample set about the normal.
+//
+// The Hammersley sequence is identical for every texel, and
+// `importance_sample_ggx` orients it in a frame built from the normal — so as
+// the normal sweeps across a face the samples rotate with it in lockstep, and
+// the estimator's error rotates coherently instead of varying. On a smooth
+// metal that reads as a pinwheel centred on the reflection, which the eye finds
+// far more objectionable than the noise it replaces. Interleaved gradient
+// noise, Jimenez 2014.
+float sample_rotation(vec2 fragment) {
+    return fract(52.9829189 * fract(dot(fragment, vec2(0.06711056, 0.00583715))));
+}
 
 // Van der Corput radical inverse in base 2, by bit reversal.
 float radical_inverse(uint bits) {
@@ -82,9 +95,16 @@ void main() {
 
     vec3 color = vec3(0.0);
     float weight = 0.0;
+    float rotation = sample_rotation(gl_FragCoord.xy);
 
     for (uint i = 0u; i < SAMPLE_COUNT; ++i) {
-        vec3 h = importance_sample_ggx(hammersley(i, SAMPLE_COUNT), n, a);
+        // Only the azimuth is offset. Perturbing the elevation as well would
+        // throw away the stratification that is the entire reason for using a
+        // low-discrepancy sequence rather than random numbers.
+        vec2 xi = hammersley(i, SAMPLE_COUNT);
+        xi.x = fract(xi.x + rotation);
+
+        vec3 h = importance_sample_ggx(xi, n, a);
         vec3 l = reflect(-v, h);
         float n_dot_l = dot(n, l);
         if (n_dot_l <= 0.0) {

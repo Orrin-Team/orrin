@@ -10,6 +10,11 @@ use crate::scene::{Assets, Camera, CpuMesh, MeshBounds, Spin, Transform};
 const GRID: i32 = 10;
 const SPACING: f32 = 2.0;
 
+/// Spheres per roughness row. Five puts a sample at 0, 0.25, 0.5, 0.75 and 1,
+/// which covers the prefiltered specular chain's six levels closely enough that
+/// a bad level shows up as one sphere that does not belong in the row.
+const SWEEP: usize = 5;
+
 pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) {
     let (assets, mesh_bounds) = load_assets(backend);
 
@@ -21,6 +26,18 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
     let palette: Vec<_> = ["gold", "copper", "glossy", "clay", "neon"]
         .into_iter()
         .map(|name| assets.material(name).unwrap())
+        .collect();
+    let sphere = assets.mesh("sphere").unwrap();
+    let sweep: Vec<_> = (0..SWEEP)
+        .map(|step| {
+            let percent = step * 100 / (SWEEP - 1);
+            (
+                assets.material(&format!("metal_{percent:03}")).unwrap(),
+                assets
+                    .material(&format!("dielectric_{percent:03}"))
+                    .unwrap(),
+            )
+        })
         .collect();
 
     world.insert_resource(assets);
@@ -71,6 +88,32 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
         ground_material,
     );
 
+    // In front of the grid and clear of the ground, so each sphere sees sky,
+    // ground and cubes at once — the three things a reflection has to get
+    // right, and the fastest way to spot one that does not.
+    let stride = 3.0;
+    let offset = (SWEEP - 1) as f32 * stride * 0.5;
+    for (step, (metal, dielectric)) in sweep.iter().enumerate() {
+        let x = step as f32 * stride - offset;
+        let percent = step * 100 / (SWEEP - 1);
+        for (name, material, z) in [
+            (format!("Metal {percent}%"), *metal, 11.0),
+            (format!("Dielectric {percent}%"), *dielectric, 14.0),
+        ] {
+            spawn_mesh(
+                world,
+                name,
+                Transform {
+                    translation: Vec3::new(x, 2.5, z),
+                    scale: Vec3::splat(2.0),
+                    ..Default::default()
+                },
+                sphere,
+                material,
+            );
+        }
+    }
+
     let sun_dir = Vec3::new(-0.4, -1.0, -0.6).normalize();
     spawn_directional_light(world, "Sun", sun_dir, Vec3::new(1.0, 0.97, 0.92), 1.0);
 
@@ -87,7 +130,11 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
     .into_iter()
     .enumerate()
     {
-        spawn_point_light(world, format!("Point Light {i}"), pos, color, 8.0, 10.0);
+        // Fill lights from when ambient was a flat 0.15 and everything not
+        // facing the sun was nearly black. With an environment supplying real
+        // irradiance they are decoration rather than fill, and at their old
+        // strength they washed the nearby cubes toward their own hues.
+        spawn_point_light(world, format!("Point Light {i}"), pos, color, 3.0, 10.0);
     }
 
     let span = GRID as f32 * SPACING;
@@ -171,6 +218,37 @@ fn load_assets(backend: &mut impl RenderBackend) -> (Assets, MeshBounds) {
     ];
     for (name, material) in palette {
         assets.insert_material(name, backend.load_material(&material));
+    }
+
+    // A roughness sweep at both ends of the metallic range: the readout for
+    // image-based lighting. A cube face samples essentially one direction and
+    // says almost nothing about a reflection; a sphere shows the whole
+    // environment at once, and a row of them shows every level of the
+    // prefiltered chain side by side. Neutral base colours on purpose — a
+    // tinted metal hides in its own colour what the environment is doing.
+    for step in 0..SWEEP {
+        let roughness = step as f32 / (SWEEP - 1) as f32;
+        let percent = step * 100 / (SWEEP - 1);
+
+        assets.insert_material(
+            format!("metal_{percent:03}"),
+            backend.load_material(&Material {
+                base_color: Vec3::new(0.95, 0.93, 0.88),
+                metallic: 1.0,
+                roughness,
+                ..Material::default()
+            }),
+        );
+        assets.insert_material(
+            format!("dielectric_{percent:03}"),
+            backend.load_material(&Material {
+                base_color: Vec3::splat(0.5),
+                metallic: 0.0,
+                roughness,
+                reflectance: 0.5,
+                ..Material::default()
+            }),
+        );
     }
 
     let tex = 256;
