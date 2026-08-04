@@ -36,6 +36,7 @@ layout(set = 0, binding = 0) uniform Lighting {
     vec4 shadow_params;       // x = count, y = blend overlap, z = strength, w = debug
     PointLight point_lights[MAX_POINT_LIGHTS];
     vec4 environment;    // x = sin(env yaw), y = cos(env yaw)
+    vec4 env_specular;   // rgb = multiplier on sampled environment radiance
     vec4 irradiance[9];  // rgb = SH coefficient; see gfx/sh.rs
 } lighting;
 
@@ -69,6 +70,14 @@ layout(set = 3, binding = 0) uniform sampler2D u_ao;
 // is: Metal allows far fewer samplers per stage than sampled images.
 layout(set = 3, binding = 1) uniform texture2DArray u_shadow_maps;
 layout(set = 3, binding = 2) uniform samplerShadow u_shadow_cmp;
+
+// Prefiltered specular environment: roughness increases with mip level. When no
+// environment is loaded this is a 1x1 white cube and `env_specular` carries the
+// scene's flat ambient, so there is one path here rather than two.
+// Keep in sync with SPECULAR_MIPS in gfx/vulkan/environment.rs.
+const float SPECULAR_MIPS = 6.0;
+layout(set = 3, binding = 3) uniform textureCube u_environment;
+layout(set = 3, binding = 4) uniform sampler u_environment_sampler;
 
 // Index is dynamically uniform (from the material), so plain indexing
 // is legal without the nonuniform qualifier.
@@ -146,12 +155,17 @@ const float SPEC_AA_SIGMA2 = 0.25;
 // With no environment loaded these coefficients carry the scene's flat ambient
 // in band 0 alone, which evaluates to that ambient for every normal. So there
 // is one path here, not two.
-vec3 sh_irradiance(vec3 n) {
-    // The same yaw the skybox samples through, so what is drawn behind the
-    // scene and what lights it cannot disagree.
+// World space into the environment's own frame. The same rotation the skybox
+// samples through, so what is drawn behind the scene and what lights it cannot
+// disagree.
+vec3 to_environment(vec3 v) {
     float s = lighting.environment.x;
     float c = lighting.environment.y;
-    n = vec3(c * n.x - s * n.z, n.y, s * n.x + c * n.z);
+    return vec3(c * v.x - s * v.z, v.y, s * v.x + c * v.z);
+}
+
+vec3 sh_irradiance(vec3 n) {
+    n = to_environment(n);
 
     vec3 e = lighting.irradiance[0].rgb * 0.282095
            + lighting.irradiance[1].rgb * (0.488603 * n.y)
@@ -167,6 +181,23 @@ vec3 sh_irradiance(vec3 n) {
     // contain: a truncated series overshoots at a sun disc and undershoots
     // opposite it, and the undershoot can cross zero.
     return max(e, vec3(0.0));
+}
+
+// Specular image-based lighting, Karis' split sum: the prefiltered chain is the
+// light integral, `env_brdf_approx` the BRDF integral. This is the term that
+// gives a metal anything to be — its diffuse response is zero by definition, so
+// without it a metal is lit only where it happens to mirror a light.
+//
+// `energy` is the same multi-scatter compensation the analytic lights get, and
+// it belongs here for the same reason: single-scatter GGX loses energy with
+// roughness whether the light is a sun or a sky.
+vec3 specular_ibl(vec3 N, vec3 V, vec3 f0, float perceptual_roughness, vec3 energy) {
+    vec3 R = to_environment(reflect(-V, N));
+    float lod = perceptual_roughness * (SPECULAR_MIPS - 1.0);
+    vec3 radiance = textureLod(samplerCube(u_environment, u_environment_sampler), R, lod).rgb;
+
+    vec2 dfg = env_brdf_approx(perceptual_roughness, max(dot(N, V), 1e-4));
+    return radiance * lighting.env_specular.rgb * (f0 * dfg.x + dfg.y) * energy;
 }
 
 // Clamping threshold, from Kaplanyan et al. 2016.
@@ -372,6 +403,7 @@ void main() {
     // prefiltered specular chain lands it has no environment response at all.
     float ao = texture(u_ao, gl_FragCoord.xy * lighting.viewport.zw).r;
     vec3 color = sh_irradiance(N) * albedo * (1.0 - metallic) * ao;
+    color += specular_ibl(N, V, f0, roughness, energy) * ao;
 
     // Directional sun. Only this term is shadowed: the environment is what
     // `u_ao` attenuates, and point lights cast nothing yet.

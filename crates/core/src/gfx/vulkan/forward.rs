@@ -101,6 +101,7 @@ fn to_gpu_lighting(
     shadows: Option<ShadowFrame<'_>>,
     irradiance: [Vec3; SH9],
     environment_yaw: f32,
+    env_specular: Vec3,
 ) -> GpuLighting {
     let (w, h) = (extent[0] as f32, extent[1] as f32);
     let count = lighting.point_lights.len().min(MAX_POINT_LIGHTS);
@@ -193,6 +194,7 @@ fn to_gpu_lighting(
             let (sin, cos) = environment_yaw.to_radians().sin_cos();
             [sin, cos, 0.0, 0.0]
         },
+        env_specular: [env_specular.x, env_specular.y, env_specular.z, 0.0],
         irradiance: irradiance.map(|c| [c.x, c.y, c.z, 0.0]),
     }
 }
@@ -253,6 +255,10 @@ struct GpuLighting {
     /// x = sin(environment yaw), y = cos(environment yaw). The same rotation
     /// the skybox samples through, so the sky and what it lights agree.
     environment: [f32; 4],
+    /// rgb = what sampled environment radiance is multiplied by. Carries the
+    /// scene's flat ambient when no environment is loaded, which is what makes
+    /// the 1x1 white fallback cube behave as a uniform environment.
+    env_specular: [f32; 4],
     /// Diffuse irradiance as nine spherical-harmonic coefficients, already
     /// convolved with the cosine lobe and divided by pi — see `gfx::sh`. `vec4`
     /// rather than `vec3` because std140 pads an array element to 16 bytes
@@ -493,12 +499,13 @@ impl ForwardPass {
             .uniform_buffer_allocator
             .allocate_sized::<GpuLighting>()
             .unwrap();
-        // Falls back to the scene's flat ambient when nothing is loaded, which
-        // the coefficients express rather than the shader branching on.
-        let irradiance = renderer.environment.irradiance(
-            lighting.ambient_color * lighting.ambient_intensity,
-            environment,
-        );
+        // Both halves fall back to the scene's flat ambient when nothing is
+        // loaded — the diffuse as a band-0-only series, the specular as a tint
+        // on a white cube. Two descriptions of the same uniform environment,
+        // which is what keeps them from disagreeing.
+        let ambient = lighting.ambient_color * lighting.ambient_intensity;
+        let irradiance = renderer.environment.irradiance(ambient, environment);
+        let env_specular = renderer.environment.specular_tint(ambient, environment);
         *lighting_buffer.write().unwrap() = to_gpu_lighting(
             lighting,
             camera.position,
@@ -506,6 +513,7 @@ impl ForwardPass {
             shadows,
             irradiance,
             environment.yaw,
+            env_specular,
         );
 
         let lighting_set = DescriptorSet::new(
@@ -526,6 +534,8 @@ impl ForwardPass {
             [
                 WriteDescriptorSet::image_view_sampler(0, ao_view, self.ao_sampler.clone()),
                 WriteDescriptorSet::image_view(1, shadow_view),
+                WriteDescriptorSet::image_view(3, renderer.environment.specular_view()),
+                WriteDescriptorSet::sampler(4, renderer.environment.sampler()),
             ],
             [],
         )
