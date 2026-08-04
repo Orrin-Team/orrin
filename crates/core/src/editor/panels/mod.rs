@@ -85,6 +85,17 @@ mod tests {
 
     impl Harness {
         fn new(size: egui::Vec2) -> Self {
+            Self::build(size, true)
+        }
+
+        /// Without the image loaders registered, so every icon fails to load.
+        /// egui gives an image-only button the whole available space when that
+        /// happens, which a content-sized panel turns into unbounded growth.
+        fn without_icons(size: egui::Vec2) -> Self {
+            Self::build(size, false)
+        }
+
+        fn build(size: egui::Vec2, icons: bool) -> Self {
             let mut world = World::default();
             crate::App::install_default_resources(&mut world);
             let mut registry = Registry::new();
@@ -92,6 +103,9 @@ mod tests {
 
             let themes = ThemeSet::default();
             let ctx = egui::Context::default();
+            if icons {
+                crate::editor::icons::install(&ctx);
+            }
             theme::apply(&ctx, themes.active());
 
             Self {
@@ -225,8 +239,15 @@ mod tests {
         let mut later = Harness::new(egui::vec2(800.0, 600.0));
         later.frames(120);
 
-        for panel in ["hierarchy", "inspector"] {
-            assert_eq!(settled.panel(panel).width(), later.panel(panel).width());
+        for build in [Harness::new, Harness::without_icons] {
+            let mut settled = build(egui::vec2(800.0, 600.0));
+            settled.frames(3);
+            let mut later = build(egui::vec2(800.0, 600.0));
+            later.frames(120);
+
+            for panel in ["hierarchy", "inspector"] {
+                assert_eq!(settled.panel(panel).width(), later.panel(panel).width());
+            }
         }
     }
 

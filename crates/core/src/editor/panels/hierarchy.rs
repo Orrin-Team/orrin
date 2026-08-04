@@ -1,6 +1,7 @@
 use orrin_ecs::{Entity, World};
 
 use super::WIDTH_RANGE;
+use crate::editor::icons;
 use crate::editor::state::{EditorState, SpawnKind};
 use crate::editor::theme;
 use crate::scene::{Hierarchy, Name};
@@ -88,7 +89,9 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
 }
 
 fn add_menu(ui: &mut egui::Ui, state: &mut EditorState) {
-    ui.menu_button("➕", |ui| {
+    // Icon-only, because it is a repeated row affordance and the tooltip
+    // carries the name — the rule that keeps icons out of the ribbon's labels.
+    icons::menu_button(ui, icons::plus(), icons::ROW, |ui| {
         for (label, kind) in [
             ("Cube", SpawnKind::Cube),
             ("Sphere", SpawnKind::Sphere),
@@ -110,7 +113,6 @@ fn add_menu(ui: &mut egui::Ui, state: &mut EditorState) {
             }
         }
     })
-    .response
     .on_hover_text("Add entity");
 }
 
@@ -279,9 +281,11 @@ fn row_ui(
         }
 
         if ui.rect_contains_pointer(strip) {
+            // Weak rather than full text colour: the affordance should be
+            // reachable without competing with the name it sits beside.
+            let weak = ui.visuals().weak_text_color();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("✕")
+                if icons::button(ui, icons::x(), 12.0, weak, false)
                     .on_hover_text(format!("Delete {}", node.label))
                     .clicked()
                 {

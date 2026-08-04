@@ -10,6 +10,7 @@
 use orrin_ecs::World;
 
 use crate::build_watcher::{BuildState, BuildStatus};
+use crate::editor::icons;
 use crate::editor::state::EditorState;
 use crate::editor::theme::{ERROR, OK, PENDING};
 use crate::scene::ScriptComponent;
@@ -39,7 +40,12 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
             ui.separator();
             ui.label(format!("{live} behaviour(s) attached"));
             if faulted > 0 {
-                ui.colored_label(ERROR, format!("{faulted} faulted — a reload clears them"));
+                icons::labelled(
+                    ui,
+                    icons::warning(),
+                    ERROR,
+                    &format!("{faulted} faulted — a reload clears them"),
+                );
             }
         });
 }
@@ -63,16 +69,23 @@ fn show_build_state(ui: &mut egui::Ui, status: &BuildStatus) {
             // auto-reload off the compiled code is ahead of the loaded code
             // until someone presses the button.
             if status.pending_reload {
-                ui.colored_label(PENDING, format!("New build ready{took}"));
+                icons::labelled(
+                    ui,
+                    icons::refresh(),
+                    PENDING,
+                    &format!("New build ready{took}"),
+                );
                 ui.weak("Click Reload scripts to run it.");
             } else {
-                ui.colored_label(OK, format!("Build up to date{took}"));
+                icons::labelled(ui, icons::check(), OK, &format!("Build up to date{took}"));
             }
         }
         BuildState::Failed => {
-            ui.colored_label(
+            icons::labelled(
+                ui,
+                icons::warning(),
                 ERROR,
-                format!("Build failed — {} diagnostic(s)", status.diagnostics.len()),
+                &format!("Build failed — {} diagnostic(s)", status.diagnostics.len()),
             );
             ui.weak("Still running the previous build.");
             egui::CollapsingHeader::new("Compiler output")
@@ -89,7 +102,7 @@ fn show_build_state(ui: &mut egui::Ui, status: &BuildStatus) {
                 });
         }
         BuildState::Unavailable(reason) => {
-            ui.colored_label(ERROR, "Could not run the compiler.");
+            icons::labelled(ui, icons::warning(), ERROR, "Could not run the compiler.");
             ui.weak(reason);
             ui.weak("Still watching; the next save tries again.");
         }

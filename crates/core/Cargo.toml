@@ -16,6 +16,8 @@ glam.workspace = true
 image.workspace = true
 egui.workspace = true
 egui_winit_vulkano.workspace = true
+# SVG image loader for the editor's Lucide icon set. egui renders no SVG itself.
+egui_extras = { version = "0.31", features = ["svg"] }
 serde.workspace = true
 # User themes are hand-authored TOML; editor preferences are machine-written RON
 # (a dock layout is a tree of enums, which TOML cannot express).

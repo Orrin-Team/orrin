@@ -8,6 +8,7 @@ use orrin_ecs::{Entity, World};
 use orrin_registry::Registry;
 
 use super::{WIDTH_RANGE, color_row, vec3_row};
+use crate::editor::icons;
 use crate::editor::state::EditorState;
 #[cfg(feature = "scripting")]
 use crate::scene::ScriptComponent;
@@ -66,8 +67,9 @@ fn actions_section(
             || format!("entity {}", entity.index()),
             |name| name.0.clone(),
         );
+        let trash = icons::inline(ui, icons::trash(), icons::ROW);
         if ui
-            .button("🗑  Delete")
+            .add(egui::Button::image_and_text(trash, "Delete"))
             .on_hover_text(format!("Despawn {name}"))
             .clicked()
         {
@@ -250,7 +252,7 @@ fn script_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
                 // A hook threw and the engine disabled the script (see the log
                 // for the exception). Clearing re-arms it from next tick — the
                 // manual counterpart to "re-enable on hot reload".
-                ui.colored_label(crate::editor::theme::ERROR, "⚠ faulted");
+                icons::labelled(ui, icons::warning(), crate::editor::theme::ERROR, "faulted");
                 if ui.button("Clear fault").clicked() {
                     script.faulted = false;
                 }

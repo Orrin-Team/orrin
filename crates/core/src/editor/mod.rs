@@ -1,5 +1,6 @@
 //! In-window editor UI (egui overlay). New tools are added as `panels` modules.
 
+mod icons;
 mod panels;
 mod prefs;
 mod state;
@@ -60,6 +61,7 @@ impl Editor {
         if let Some(name) = &prefs.theme {
             themes.select(name);
         }
+        icons::install(&gui.context());
         theme::apply(&gui.context(), themes.active());
 
         Self {
