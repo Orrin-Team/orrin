@@ -37,14 +37,22 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
             // fills whatever is left. Sizing the field from `available_width`
             // instead would feed the panel's own width back into its content's
             // minimum width, and a resizable panel then grows every frame.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                add_menu(ui, state);
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.hierarchy_query)
-                        .hint_text("Search entities")
-                        .desired_width(f32::INFINITY),
-                );
-            });
+            //
+            // The row has to be allocated at a bounded height: a `with_layout`
+            // here takes the panel's whole remaining rect, which leaves the tree
+            // below it nothing to draw into.
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    add_menu(ui, state);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.hierarchy_query)
+                            .hint_text("Search entities")
+                            .desired_width(f32::INFINITY),
+                    );
+                },
+            );
 
             ui.separator();
 

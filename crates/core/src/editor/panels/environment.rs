@@ -9,9 +9,17 @@ type Column = fn(&mut egui::Ui, &World);
 
 const COLUMNS: [Column; 4] = [ssao_column, shadow_column, lighting_column, camera_column];
 
-/// Below this a column is narrower than the sliders in it, so the four fold
-/// into two and then one rather than shrinking past legibility.
-const MIN_COLUMN_WIDTH: f32 = 190.0;
+/// Deliberately tiny. Folding is a crash guard, not a responsive layout: four
+/// cramped columns are what this panel has always been, and stacking them makes
+/// it four times as tall, which on a short window costs far more than a
+/// squeezed slider does. Only a share too small to be a column at all folds.
+const MIN_COLUMN_WIDTH: f32 = 24.0;
+
+/// How many columns `available` can carry. Never zero: `Ui::columns` divides by
+/// the count, and it asserts on the negative width a shortfall would produce.
+fn column_count(available: f32) -> usize {
+    ((available / MIN_COLUMN_WIDTH) as usize).clamp(1, COLUMNS.len())
+}
 
 pub fn show(ctx: &egui::Context, world: &mut World) {
     egui::TopBottomPanel::bottom("environment")
@@ -27,7 +35,7 @@ pub fn show(ctx: &egui::Context, world: &mut World) {
             // to come from the space that actually exists.
             let available = ui.available_width();
             if available > 0.0 {
-                let columns = ((available / MIN_COLUMN_WIDTH) as usize).clamp(1, COLUMNS.len());
+                let columns = column_count(available);
                 ui.columns(columns, |cols| {
                     let mut previous = usize::MAX;
                     for (index, column) in COLUMNS.iter().enumerate() {
@@ -125,5 +133,25 @@ fn camera_column(ui: &mut egui::Ui, world: &World) {
         .changed()
     {
         cam.fov_y = fov.to_radians();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The engine's default window leaves this panel a little under 300px
+    /// between the side panels. That has always drawn four columns, and a
+    /// reflow at the size the editor opens at is a regression, not a feature.
+    #[test]
+    fn the_default_window_keeps_all_four_columns() {
+        assert_eq!(column_count(284.0), 4);
+        assert_eq!(column_count(1100.0), 4);
+    }
+
+    #[test]
+    fn a_sliver_still_yields_a_usable_count() {
+        assert_eq!(column_count(20.0), 1);
+        assert_eq!(column_count(0.0), 1);
     }
 }

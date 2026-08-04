@@ -65,69 +65,167 @@ pub(super) fn color_row(ui: &mut egui::Ui, label: &str, c: &mut Vec3) {
 mod tests {
     use super::*;
     use crate::editor::theme;
+    use crate::scene::Name;
 
-    /// Lay the whole editor out at `size`, `frames` times over one context.
+    /// The whole editor, laid out headlessly at a chosen window size.
     ///
-    /// Headless: egui needs no GPU to place widgets, and placement is all that
-    /// is under test. Repeating on one context is the point — a panel whose
-    /// content width is derived from its own width does not misbehave on the
-    /// first frame, it creeps, and only a later frame can see that.
-    fn lay_out(size: egui::Vec2, frames: usize) -> egui::Context {
-        lay_out_scene(size, frames, |_| {})
+    /// egui needs no GPU to place widgets, and placement is what these tests are
+    /// about. Frames are explicit because a panel that sizes its content from
+    /// its own width does not misbehave on frame one — it creeps, and only a
+    /// later frame can see that.
+    struct Harness {
+        world: World,
+        registry: Registry,
+        state: EditorState,
+        themes: ThemeSet,
+        ctx: egui::Context,
+        input: egui::RawInput,
+        output: Option<egui::FullOutput>,
     }
 
-    fn lay_out_scene(
-        size: egui::Vec2,
-        frames: usize,
-        populate: impl FnOnce(&mut World),
-    ) -> egui::Context {
-        let mut world = World::default();
-        crate::App::install_default_resources(&mut world);
-        populate(&mut world);
-        let mut registry = Registry::new();
-        crate::scene::register_components(&mut registry);
+    impl Harness {
+        fn new(size: egui::Vec2) -> Self {
+            let mut world = World::default();
+            crate::App::install_default_resources(&mut world);
+            let mut registry = Registry::new();
+            crate::scene::register_components(&mut registry);
 
-        let mut state = EditorState::default();
-        let themes = ThemeSet::default();
-        let ctx = egui::Context::default();
-        theme::apply(&ctx, themes.active());
+            let themes = ThemeSet::default();
+            let ctx = egui::Context::default();
+            theme::apply(&ctx, themes.active());
 
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-            ..Default::default()
-        };
-        for _ in 0..frames {
-            let _ = ctx.run(input.clone(), |ctx| {
-                draw(ctx, &mut world, &mut state, &registry, &themes);
-            });
+            Self {
+                world,
+                registry,
+                state: EditorState::default(),
+                themes,
+                ctx,
+                input: egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                output: None,
+            }
         }
-        ctx
+
+        fn spawn(&mut self, name: &str) -> orrin_ecs::Entity {
+            let entity = self.world.spawn();
+            self.world.insert(entity, Name(name.to_owned()));
+            entity
+        }
+
+        fn frames(&mut self, count: usize) -> &mut Self {
+            for _ in 0..count {
+                let Self {
+                    world,
+                    registry,
+                    state,
+                    themes,
+                    ctx,
+                    input,
+                    output,
+                } = self;
+                *output = Some(ctx.run(input.clone(), |ctx| {
+                    draw(ctx, world, state, registry, themes);
+                }));
+            }
+            self
+        }
+
+        /// Every string the last frame actually painted. The editor is drawn,
+        /// not returned, so this is the only way to assert that a row reached
+        /// the screen rather than merely being iterated over.
+        fn painted(&self) -> Vec<String> {
+            fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect(shape, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for clipped in &self.output.as_ref().expect("a frame has run").shapes {
+                collect(&clipped.shape, &mut out);
+            }
+            out
+        }
+
+        fn painted_contains(&self, needle: &str) -> bool {
+            self.painted().iter().any(|text| text.contains(needle))
+        }
+
+        fn panel(&self, id: &str) -> egui::Rect {
+            egui::containers::panel::PanelState::load(&self.ctx, egui::Id::new(id))
+                .expect("panel was drawn")
+                .rect
+        }
     }
 
-    /// The width egui recorded for a panel on the last frame it drew.
-    fn panel_width(ctx: &egui::Context, id: &str) -> f32 {
-        egui::containers::panel::PanelState::load(ctx, egui::Id::new(id))
-            .expect("panel was drawn")
-            .rect
-            .width()
+    /// The tree is the panel. A toolbar row that takes the panel's whole rect
+    /// leaves it nothing to draw into, and nothing about that is a panic — the
+    /// editor just comes up empty.
+    #[test]
+    fn the_hierarchy_draws_its_rows() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Ground plane");
+        editor.spawn("Key light");
+        editor.frames(2);
+
+        assert!(editor.painted_contains("Ground plane"));
+        assert!(editor.painted_contains("Key light"));
+    }
+
+    #[test]
+    fn searching_hides_the_rows_that_do_not_match() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Ground plane");
+        editor.spawn("Key light");
+        editor.state.hierarchy_query = "key".to_owned();
+        editor.frames(2);
+
+        assert!(editor.painted_contains("Key light"));
+        assert!(!editor.painted_contains("Ground plane"));
+    }
+
+    /// The reason filtering happens in the draw walk and not in `snapshot`.
+    #[test]
+    fn a_parent_survives_a_search_its_child_matches() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let parent = editor.spawn("Rig");
+        let child = editor.spawn("Muzzle flash");
+        crate::scene::reparent(&mut editor.world, child, Some(parent), false).unwrap();
+        editor.state.hierarchy_query = "muzzle".to_owned();
+        editor.frames(2);
+
+        assert!(editor.painted_contains("Muzzle flash"));
+        assert!(editor.painted_contains("Rig"));
     }
 
     /// A panel that sizes its content from its own width grows by the overflow
     /// every frame: the content's minimum width becomes the panel's new width,
-    /// which becomes a wider content minimum. Nothing shows on frame one, so
-    /// the assertion has to compare a settled layout against a much later one.
+    /// which becomes a wider content minimum. Nothing shows on frame one.
     #[test]
     fn a_side_panel_does_not_widen_itself() {
-        let settled = lay_out(egui::vec2(800.0, 600.0), 2);
-        let later = lay_out(egui::vec2(800.0, 600.0), 120);
-        assert_eq!(
-            panel_width(&settled, "hierarchy"),
-            panel_width(&later, "hierarchy")
-        );
-        assert_eq!(
-            panel_width(&settled, "inspector"),
-            panel_width(&later, "inspector")
-        );
+        let mut settled = Harness::new(egui::vec2(800.0, 600.0));
+        settled.frames(2);
+        let mut later = Harness::new(egui::vec2(800.0, 600.0));
+        later.frames(120);
+
+        for panel in ["hierarchy", "inspector"] {
+            assert_eq!(settled.panel(panel).width(), later.panel(panel).width());
+        }
+    }
+
+    /// The realistic route to a negative width: nobody resizes the window down
+    /// to 320px, but a scene does contain an entity with a long name, and a row
+    /// is as wide as the name in it.
+    #[test]
+    fn a_long_entity_name_cannot_push_a_side_panel_open() {
+        let mut editor = Harness::new(egui::vec2(800.0, 600.0));
+        editor.spawn(&"Spawn point ".repeat(40));
+        editor.frames(4);
+
+        assert!(editor.panel("hierarchy").width() <= *WIDTH_RANGE.end());
     }
 
     /// Not "the editor looks cramped": once the side panels are wider than the
@@ -135,23 +233,11 @@ mod tests {
     /// and egui asserts inside `columns` rather than clamping.
     #[test]
     fn a_window_narrower_than_its_side_panels_still_lays_out() {
-        lay_out(egui::vec2(320.0, 600.0), 4);
+        Harness::new(egui::vec2(320.0, 600.0)).frames(4);
     }
 
     #[test]
     fn a_window_too_narrow_for_any_panel_still_lays_out() {
-        lay_out(egui::vec2(120.0, 400.0), 4);
-    }
-
-    /// The realistic route to the failure above: nobody resizes the window down
-    /// to 320px, but a scene does contain an entity with a long name, and a row
-    /// is as wide as the name in it.
-    #[test]
-    fn a_long_entity_name_cannot_push_a_side_panel_open() {
-        let ctx = lay_out_scene(egui::vec2(800.0, 600.0), 4, |world| {
-            let entity = world.spawn();
-            world.insert(entity, crate::scene::Name("Spawn point ".repeat(40)));
-        });
-        assert!(panel_width(&ctx, "hierarchy") <= *WIDTH_RANGE.end());
+        Harness::new(egui::vec2(120.0, 400.0)).frames(4);
     }
 }
