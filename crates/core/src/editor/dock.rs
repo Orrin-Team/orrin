@@ -226,17 +226,85 @@ impl Dock {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                let mut style = Style::from_egui(ui.style());
-                style.dock_area_padding = None;
-                style.main_surface_border_stroke = egui::Stroke::NONE;
-
                 DockArea::new(&mut self.state)
-                    .style(style)
+                    .style(dock_style(ui.style()))
                     .show_close_buttons(true)
                     .show_add_buttons(false)
                     .show_inside(ui, &mut viewer);
             });
     }
+}
+
+/// Dress the dock in the editor's own tokens.
+///
+/// `Style::from_egui` reads egui's surfaces, but it picks different ones than
+/// the top bar does — the tab strip becomes the sunken fill, and an active tab
+/// becomes the window fill rather than a selection. The result is a top bar and
+/// a dock that plainly do not belong to the same program. Everything here is
+/// derived from `Visuals`, so a user theme carries through unchanged.
+fn dock_style(style: &egui::Style) -> Style {
+    let visuals = &style.visuals;
+    let outline = visuals.widgets.noninteractive.bg_stroke.color;
+    let widget = visuals.widgets.inactive.corner_radius;
+
+    let mut dock = Style::from_egui(style);
+    dock.dock_area_padding = None;
+    dock.main_surface_border_stroke = egui::Stroke::NONE;
+
+    // The same surface the top bar sits on, so the two read as one chrome.
+    dock.tab_bar.bg_fill = visuals.panel_fill;
+    dock.tab_bar.hline_color = outline;
+    dock.tab_bar.corner_radius = egui::CornerRadius::ZERO;
+
+    // Idle has fill and no stroke; hover adds the accent stroke; the open tab is
+    // a selection. The same three states every other control in the editor uses.
+    dock.tab.inactive.bg_fill = visuals.panel_fill;
+    dock.tab.inactive.outline_color = egui::Color32::TRANSPARENT;
+    dock.tab.inactive.text_color = visuals.weak_text_color();
+    dock.tab.inactive.corner_radius = widget;
+
+    dock.tab.hovered.bg_fill = visuals.widgets.hovered.bg_fill;
+    dock.tab.hovered.outline_color = visuals.widgets.hovered.bg_stroke.color;
+    dock.tab.hovered.text_color = visuals.text_color();
+    dock.tab.hovered.corner_radius = widget;
+
+    for open in [&mut dock.tab.active, &mut dock.tab.focused] {
+        open.bg_fill = visuals.selection.bg_fill;
+        open.outline_color = visuals.selection.stroke.color;
+        open.text_color = visuals.text_color();
+        open.corner_radius = widget;
+    }
+    dock.tab.active_with_kb_focus = dock.tab.active.clone();
+    dock.tab.focused_with_kb_focus = dock.tab.focused.clone();
+    dock.tab.inactive_with_kb_focus = dock.tab.inactive.clone();
+
+    // A tool body is a panel: panel fill, one hairline outline, no fill change.
+    dock.tab.tab_body.bg_fill = visuals.panel_fill;
+    dock.tab.tab_body.stroke = egui::Stroke::new(1.0, outline);
+    dock.tab.tab_body.corner_radius = egui::CornerRadius::ZERO;
+    dock.tab.tab_body.inner_margin = egui::Margin::same(8);
+
+    dock.separator.color_idle = outline;
+    dock.separator.color_hovered = visuals.widgets.hovered.bg_stroke.color;
+    dock.separator.color_dragged = visuals.selection.stroke.color;
+
+    // Nothing decorative is ever coloured: the tab-strip buttons inherit the
+    // text colour and brighten on hover, like every other icon.
+    let weak = visuals.weak_text_color();
+    let text = visuals.text_color();
+    dock.buttons.close_tab_color = weak;
+    dock.buttons.close_tab_active_color = text;
+    dock.buttons.close_tab_bg_fill = visuals.widgets.hovered.bg_fill;
+    dock.buttons.close_all_tabs_color = weak;
+    dock.buttons.close_all_tabs_active_color = text;
+    dock.buttons.close_all_tabs_bg_fill = visuals.widgets.hovered.bg_fill;
+    dock.buttons.close_all_tabs_border_color = outline;
+    dock.buttons.collapse_tabs_color = weak;
+    dock.buttons.collapse_tabs_active_color = text;
+    dock.buttons.collapse_tabs_bg_fill = visuals.widgets.hovered.bg_fill;
+    dock.buttons.collapse_tabs_border_color = outline;
+
+    dock
 }
 
 struct Viewer<'a> {
@@ -292,6 +360,41 @@ mod tests {
             text,
             "the layout changed shape on the way back"
         );
+    }
+
+    /// The dock has to look like the rest of the editor. `Style::from_egui`
+    /// reads egui's surfaces but picks different ones than a panel does — the
+    /// tab strip lands on the sunken fill and an open tab on the window fill,
+    /// so the top bar and the dock read as two different programs.
+    #[test]
+    fn the_dock_wears_the_same_surfaces_as_a_panel() {
+        let ctx = egui::Context::default();
+        crate::editor::theme::apply(&ctx, &crate::editor::theme::Theme::default());
+        let style = ctx.style();
+        let dock = dock_style(&style);
+
+        // The strip a tab sits on is the surface the top bar sits on.
+        assert_eq!(dock.tab_bar.bg_fill, style.visuals.panel_fill);
+        assert_eq!(dock.tab.tab_body.bg_fill, style.visuals.panel_fill);
+
+        // Open is a selection, not a lighter surface: accent at 0.45 with an
+        // accent stroke, the same as a selected row.
+        assert_eq!(dock.tab.active.bg_fill, style.visuals.selection.bg_fill);
+        assert_eq!(dock.tab.focused.bg_fill, style.visuals.selection.bg_fill);
+
+        // Idle has fill and no stroke; hover adds the accent one.
+        assert_eq!(dock.tab.inactive.outline_color, egui::Color32::TRANSPARENT);
+        assert_eq!(
+            dock.tab.hovered.outline_color,
+            style.visuals.widgets.hovered.bg_stroke.color
+        );
+
+        // None of it may be hard-coded: a user theme has to carry through.
+        let mut ember = crate::editor::theme::Theme::default();
+        ember.accent = [255, 120, 60];
+        crate::editor::theme::apply(&ctx, &ember);
+        let themed = dock_style(&ctx.style());
+        assert_ne!(themed.tab.active.bg_fill, dock.tab.active.bg_fill);
     }
 
     #[test]
