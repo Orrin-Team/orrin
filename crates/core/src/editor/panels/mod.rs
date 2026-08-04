@@ -35,6 +35,12 @@ pub fn draw(
     dock.show(ctx, world, state, registry);
 }
 
+/// Every number, path, id and log line is monospace, so columns of figures
+/// align by eye rather than drifting with the width of each digit.
+pub(super) fn figures(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text).monospace()
+}
+
 pub(super) fn vec3_row(ui: &mut egui::Ui, label: &str, v: &mut Vec3, speed: f32) {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -188,6 +194,30 @@ mod tests {
             let mut out = Vec::new();
             for clipped in &self.output.as_ref().expect("a frame has run").shapes {
                 collect(&clipped.shape, &mut out);
+            }
+            out
+        }
+
+        /// The font family a painted string was laid out in. `None` when that
+        /// string never reached the screen.
+        fn family_of(&self, needle: &str) -> Option<egui::FontFamily> {
+            fn find(shape: &egui::Shape, needle: &str, out: &mut Option<egui::FontFamily>) {
+                match shape {
+                    egui::Shape::Text(text) if text.galley.text().contains(needle) => {
+                        *out = text
+                            .galley
+                            .job
+                            .sections
+                            .first()
+                            .map(|section| section.format.font_id.family.clone());
+                    }
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, needle, out)),
+                    _ => {}
+                }
+            }
+            let mut out = None;
+            for clipped in &self.output.as_ref().expect("a frame has run").shapes {
+                find(&clipped.shape, needle, &mut out);
             }
             out
         }
@@ -555,6 +585,38 @@ mod tests {
             spilling.len(),
             tool.width(),
             spilling.first()
+        );
+    }
+
+    /// "Every number, path, id and log line is monospace so columns align by
+    /// eye." A proportional face gives each digit a different width, so a column
+    /// of figures drifts — the rule is about alignment, not flavour.
+    #[test]
+    fn figures_are_monospace() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let entity = editor.spawn("Ground plane");
+        editor.state.selected = Some(entity);
+        editor.world.resource_mut::<crate::scene::LogBuffer>().push(
+            crate::scene::LogLevel::Info,
+            "saved 3 entities".to_owned(),
+            0,
+        );
+        editor.dock.activate(Tab::Performance);
+        editor.frames(3);
+
+        for figure in ["[INFO] saved 3 entities", "id 1", "CPU:", "Memory (RSS)"] {
+            assert_eq!(
+                editor.family_of(figure),
+                Some(egui::FontFamily::Monospace),
+                "{figure:?} is not monospace"
+            );
+        }
+
+        // Prose is not a column, and monospacing a sentence only makes it
+        // harder to read.
+        assert_eq!(
+            editor.family_of("Frustum culling"),
+            Some(egui::FontFamily::Proportional)
         );
     }
 

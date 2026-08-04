@@ -218,7 +218,34 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(8.0, 4.0);
         style.spacing.window_margin = egui::Margin::same(8);
+        style.spacing.indent = INDENT;
+        style.text_styles = text_styles();
+        style.animation_time = COLLAPSE_SECONDS;
     });
+}
+
+/// Disclosure triangles, and nothing else — hover, press and selection are
+/// instant fill swaps, because a frame-accurate instrument must not lag the
+/// pointer. egui's default is 83ms; the design system asks for 120.
+const COLLAPSE_SECONDS: f32 = 0.120;
+
+/// Disclosure bodies indent by this much.
+const INDENT: f32 = 18.0;
+
+/// Five sizes, no more: weight and colour do the emphasis work, size never
+/// does. These are egui's own defaults today, pinned here so the scale is a
+/// decision this editor made rather than one it inherits and could silently
+/// lose to a version bump.
+fn text_styles() -> std::collections::BTreeMap<egui::TextStyle, egui::FontId> {
+    use egui::{FontFamily::Monospace, FontFamily::Proportional, FontId, TextStyle};
+    [
+        (TextStyle::Small, FontId::new(9.0, Proportional)),
+        (TextStyle::Body, FontId::new(12.5, Proportional)),
+        (TextStyle::Button, FontId::new(12.5, Proportional)),
+        (TextStyle::Monospace, FontId::new(12.0, Monospace)),
+        (TextStyle::Heading, FontId::new(18.0, Proportional)),
+    ]
+    .into()
 }
 
 #[cfg(test)]
@@ -255,6 +282,38 @@ accent = [140, 120, 255]
         assert_eq!(visuals.widgets.active.bg_fill, theme.widget_active());
         assert_eq!(visuals.widgets.hovered.bg_stroke, theme.hover_stroke());
         assert_ne!(theme.select_fill(), Theme::default().select_fill());
+    }
+
+    /// "Five sizes, no more" — weight and colour do the emphasis work, size
+    /// never does. They match egui's defaults today; pinning them is what stops
+    /// a version bump from quietly editing the design.
+    #[test]
+    fn the_type_scale_is_five_sizes() {
+        let ctx = egui::Context::default();
+        apply(&ctx, &Theme::default());
+
+        let sizes: Vec<f32> = ctx.style().text_styles.values().map(|f| f.size).collect();
+        let mut unique: Vec<f32> = sizes.clone();
+        unique.dedup_by(|a, b| a == b);
+        unique.sort_by(f32::total_cmp);
+        unique.dedup_by(|a, b| a == b);
+
+        assert_eq!(unique, vec![9.0, 12.0, 12.5, 18.0]);
+        assert_eq!(
+            ctx.style().text_styles[&egui::TextStyle::Monospace].family,
+            egui::FontFamily::Monospace
+        );
+    }
+
+    /// Motion is effectively none, on purpose: a frame-accurate instrument must
+    /// not lag the pointer. The disclosure triangle is the one exception.
+    #[test]
+    fn only_the_disclosure_triangle_animates() {
+        let ctx = egui::Context::default();
+        apply(&ctx, &Theme::default());
+
+        assert_eq!(ctx.style().animation_time, 0.120);
+        assert_eq!(ctx.style().spacing.indent, 18.0);
     }
 
     #[test]

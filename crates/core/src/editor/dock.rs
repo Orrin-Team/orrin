@@ -132,6 +132,17 @@ impl Dock {
         self.state = default_layout();
     }
 
+    /// Bring a tool to the front of whatever leaf holds it. A tool sharing a
+    /// leaf with two others is only one tab wide on screen, so a command that
+    /// points at one has to be able to reveal it.
+    pub fn activate(&mut self, tab: Tab) {
+        if let Some(location) = self.state.find_tab(&tab) {
+            self.state.set_active_tab(location);
+            self.state
+                .set_focused_node_and_surface((location.0, location.1));
+        }
+    }
+
     pub fn is_open(&self, tab: Tab) -> bool {
         self.state.find_tab(&tab).is_some()
     }

@@ -7,7 +7,7 @@ use glam::{EulerRot, Quat};
 use orrin_ecs::{Entity, World};
 use orrin_registry::Registry;
 
-use super::{color_row, vec3_row};
+use super::{color_row, figures, vec3_row};
 use crate::editor::icons;
 use crate::editor::state::EditorState;
 #[cfg(feature = "scripting")]
@@ -96,7 +96,7 @@ fn name_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
             ui.text_edit_singleline(&mut name.0);
         });
     }
-    ui.weak(format!("id {}", entity.index()));
+    ui.label(figures(format!("id {}", entity.index())).weak());
 }
 
 fn transform_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
@@ -146,10 +146,13 @@ fn transform_section(ui: &mut egui::Ui, world: &World, entity: Entity) {
                 let position = world_transform.translation();
                 ui.horizontal(|ui| {
                     ui.weak("World");
-                    ui.weak(format!(
-                        "{:.2}, {:.2}, {:.2}",
-                        position.x, position.y, position.z
-                    ));
+                    ui.label(
+                        figures(format!(
+                            "{:.2}, {:.2}, {:.2}",
+                            position.x, position.y, position.z
+                        ))
+                        .weak(),
+                    );
                 });
             }
         });

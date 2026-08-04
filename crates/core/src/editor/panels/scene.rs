@@ -18,7 +18,7 @@ pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
         if ui.button("Load").clicked() {
             state.request_scene(SceneRequest::Load);
         }
-        ui.weak(format!("{} entities", world.entities().count()));
+        ui.label(super::figures(format!("{} entities", world.entities().count())).weak());
     });
 
     // Surfaced rather than hidden: these are components this build could

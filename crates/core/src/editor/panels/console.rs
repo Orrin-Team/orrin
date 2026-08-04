@@ -29,7 +29,7 @@ pub fn body(ui: &mut egui::Ui, world: &mut World) {
                         LogLevel::Warning => (theme::LOG_WARN, "WARN"),
                         LogLevel::Error => (theme::LOG_ERROR, "ERROR"),
                     };
-                    ui.colored_label(color, format!("[{}] {}", tag, entry.message));
+                    ui.label(super::figures(format!("[{tag}] {}", entry.message)).color(color));
                 }
             });
     }

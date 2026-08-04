@@ -1,5 +1,6 @@
 use orrin_ecs::World;
 
+use super::figures;
 use crate::editor::theme;
 use crate::profile::{self, Lane, Profiler, Row};
 use crate::scene::Culling;
@@ -14,37 +15,37 @@ pub fn body(ui: &mut egui::Ui, world: &World) {
             .size(24.0)
             .strong(),
     );
-    ui.colored_label(theme::CPU, format!("CPU: {:.2} ms (avg)", stats.frame_ms()));
-    match stats.gpu_ms() {
-        Some(ms) => ui.colored_label(theme::GPU, format!("GPU: {ms:.2} ms")),
-        None => ui.colored_label(theme::GPU, "GPU: n/a"),
-    };
+    ui.label(figures(format!("CPU: {:.2} ms (avg)", stats.frame_ms())).color(theme::CPU));
+    ui.label(match stats.gpu_ms() {
+        Some(ms) => figures(format!("GPU: {ms:.2} ms")).color(theme::GPU),
+        None => figures("GPU: n/a").color(theme::GPU),
+    });
 
     if !stats.history().is_empty() {
         let (min, max) = stats.min_max_ms();
-        ui.label(format!("CPU min {min:.2} · max {max:.2} ms"));
+        ui.label(figures(format!("CPU min {min:.2} · max {max:.2} ms")));
     }
 
     let rss_mb = stats.memory_bytes() as f64 / (1024.0 * 1024.0);
-    ui.label(format!("Memory (RSS): {rss_mb:.1} MB"));
+    ui.label(figures(format!("Memory (RSS): {rss_mb:.1} MB")));
     let total_gb = stats.vram_total() as f64 / (1024.0 * 1024.0 * 1024.0);
     match stats.vram_used() {
         Some(used) => {
             let used_mb = used as f64 / (1024.0 * 1024.0);
-            ui.label(format!("VRAM: {used_mb:.0} MB / {total_gb:.1} GB"));
+            ui.label(figures(format!("VRAM: {used_mb:.0} MB / {total_gb:.1} GB")));
         }
         None => {
-            ui.label(format!("VRAM: {total_gb:.1} GB (usage n/a)"));
+            ui.label(figures(format!("VRAM: {total_gb:.1} GB (usage n/a)")));
         }
     }
 
     if let Some(mut culling) = world.get_resource_mut::<Culling>() {
-        ui.label(format!(
+        ui.label(figures(format!(
             "Draws: {} / {} ({} culled)",
             culling.visible(),
             culling.total(),
             culling.culled(),
-        ));
+        )));
         ui.checkbox(&mut culling.enabled, "Frustum culling")
             .on_hover_text("Off draws everything — the A/B for a suspected culling bug.");
     }

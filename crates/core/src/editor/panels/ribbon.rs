@@ -113,7 +113,7 @@ fn ribbon(
                 }
                 RibbonTab::Render => {
                     passes_group(ui, world);
-                    frame_group(ui, world);
+                    frame_group(ui, world, dock);
                     unbuilt_group(ui);
                 }
                 RibbonTab::Scripts => scripts_groups(ui, world, state),
@@ -516,25 +516,30 @@ fn passes_group(ui: &mut egui::Ui, world: &World) {
     });
 }
 
-fn frame_group(ui: &mut egui::Ui, world: &World) {
+fn frame_group(ui: &mut egui::Ui, world: &World, dock: &mut Dock) {
     let (exposure, cascades) = {
         let hdr = world.resource::<HdrSettings>();
         let shadow = world.resource::<ShadowSettings>();
         (hdr.exposure, shadow.cascade_count)
     };
     group(ui, "Frame", |ui| {
-        command(
-            ui,
-            Command::new(icons::aperture(), "Exposure")
-                .sub(format!("{exposure:.2}"))
-                .hint("Edited in the Environment panel"),
-        );
-        command(
-            ui,
-            Command::new(icons::layers_2(), "Cascades")
-                .sub(cascades.to_string())
-                .hint("Edited in the Environment panel"),
-        );
+        let reveal = [
+            command(
+                ui,
+                Command::new(icons::aperture(), "Exposure")
+                    .sub(format!("{exposure:.2}"))
+                    .hint("Show the Environment tool, where this is edited"),
+            ),
+            command(
+                ui,
+                Command::new(icons::layers_2(), "Cascades")
+                    .sub(cascades.to_string())
+                    .hint("Show the Environment tool, where this is edited"),
+            ),
+        ];
+        if reveal.iter().any(|response| response.clicked()) {
+            dock.activate(Tab::Environment);
+        }
     });
 }
 
