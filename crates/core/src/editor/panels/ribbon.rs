@@ -118,7 +118,7 @@ fn ribbon(ctx: &egui::Context, world: &mut World, state: &mut EditorState, regis
 fn scene_tabs(ctx: &egui::Context, state: &mut EditorState) {
     egui::TopBottomPanel::top("scene_tabs").show(ctx, |ui| {
         ui.horizontal(|ui| {
-            ui.selectable_label(true, &state.scene_path);
+            let _ = ui.selectable_label(true, &state.scene_path);
             ui.separator();
             ui.weak("deterministic text format · git-diffable");
         });
@@ -529,30 +529,56 @@ fn scripts_groups(ui: &mut egui::Ui, _world: &mut World, _state: &mut EditorStat
     });
 }
 
+/// What the ribbon needs from the build watcher, read out in one borrow.
+///
+/// Summarised rather than cloned: `BuildState` carries a reason string and is
+/// deliberately not `Clone`, and the ribbon wants a colour and a word from it,
+/// not the state itself. Copying it out also closes the resource borrow before
+/// any command can ask to write one back.
+#[cfg(feature = "scripting")]
+struct Build {
+    color: egui::Color32,
+    word: &'static str,
+    building: bool,
+    auto_reload: bool,
+    took: Option<std::time::Duration>,
+}
+
 #[cfg(feature = "scripting")]
 fn scripts_groups(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
     use crate::build_watcher::{BuildState, BuildStatus};
     use crate::editor::theme;
 
-    let status = world.get_resource::<BuildStatus>().map(|status| {
-        (
-            status.state.clone(),
-            status.auto_reload,
-            status.last_duration,
-        )
+    let build = world.get_resource::<BuildStatus>().map(|status| {
+        let (color, word) = match &status.state {
+            BuildState::Succeeded => (theme::OK, "up to date"),
+            BuildState::Building => (theme::PENDING, "building"),
+            BuildState::Failed => (theme::ERROR, "failed"),
+            BuildState::Unavailable(_) => (theme::ERROR, "no compiler"),
+            BuildState::Idle | BuildState::Off(_) => (theme::LOG_INFO, "idle"),
+        };
+        Build {
+            color,
+            word,
+            building: matches!(status.state, BuildState::Building),
+            auto_reload: status.auto_reload,
+            took: status.last_duration,
+        }
     });
 
     group(ui, "Assembly", |ui| {
-        let sub = match &status {
-            Some((BuildState::Building, ..)) => "building…".to_owned(),
-            Some((_, _, Some(took))) => format!("{:.1}s", took.as_secs_f32()),
+        let sub = match &build {
+            Some(build) if build.building => "building…".to_owned(),
+            Some(Build {
+                took: Some(took), ..
+            }) => format!("{:.1}s", took.as_secs_f32()),
             _ => String::new(),
         };
         if command(ui, Command::new(icons::refresh(), "Reload").sub(sub)).clicked() {
             state.request_script_reload();
         }
 
-        let auto = status.as_ref().is_some_and(|(_, auto, _)| *auto);
+        let auto = build.as_ref().is_some_and(|build| build.auto_reload);
         if command(
             ui,
             Command::new(icons::repeat(), "Auto reload")
@@ -567,16 +593,9 @@ fn scripts_groups(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState)
     });
 
     // The build's own state, in the one place that is always on screen.
-    if let Some((state, ..)) = &status {
-        let (color, text) = match state {
-            BuildState::Succeeded => (theme::OK, "up to date"),
-            BuildState::Building => (theme::PENDING, "building"),
-            BuildState::Failed => (theme::ERROR, "failed"),
-            BuildState::Unavailable(_) => (theme::ERROR, "no compiler"),
-            BuildState::Idle | BuildState::Off(_) => (theme::LOG_INFO, "idle"),
-        };
+    if let Some(build) = &build {
         group(ui, "Build", |ui| {
-            ui.colored_label(color, text);
+            ui.colored_label(build.color, build.word);
         });
     }
 }

@@ -6,71 +6,72 @@ use crate::scene::Culling;
 use crate::stats::FrameStats;
 
 pub fn show(ctx: &egui::Context, world: &World) {
-    let Some(stats) = world.get_resource::<FrameStats>() else {
-        return;
-    };
-
     egui::Window::new("Performance")
         .default_pos(egui::pos2(12.0, 12.0))
         .resizable(false)
-        .show(ctx, |ui| {
-            ui.label(
-                egui::RichText::new(format!("{:.0} FPS", stats.fps()))
-                    .size(24.0)
-                    .strong(),
-            );
-            ui.colored_label(theme::CPU, format!("CPU: {:.2} ms (avg)", stats.frame_ms()));
-            match stats.gpu_ms() {
-                Some(ms) => ui.colored_label(theme::GPU, format!("GPU: {ms:.2} ms")),
-                None => ui.colored_label(theme::GPU, "GPU: n/a"),
-            };
+        .show(ctx, |ui| body(ui, world));
+}
 
-            if !stats.history().is_empty() {
-                let (min, max) = stats.min_max_ms();
-                ui.label(format!("CPU min {min:.2} · max {max:.2} ms"));
-            }
+pub fn body(ui: &mut egui::Ui, world: &World) {
+    let Some(stats) = world.get_resource::<FrameStats>() else {
+        return;
+    };
+    ui.label(
+        egui::RichText::new(format!("{:.0} FPS", stats.fps()))
+            .size(24.0)
+            .strong(),
+    );
+    ui.colored_label(theme::CPU, format!("CPU: {:.2} ms (avg)", stats.frame_ms()));
+    match stats.gpu_ms() {
+        Some(ms) => ui.colored_label(theme::GPU, format!("GPU: {ms:.2} ms")),
+        None => ui.colored_label(theme::GPU, "GPU: n/a"),
+    };
 
-            let rss_mb = stats.memory_bytes() as f64 / (1024.0 * 1024.0);
-            ui.label(format!("Memory (RSS): {rss_mb:.1} MB"));
-            let total_gb = stats.vram_total() as f64 / (1024.0 * 1024.0 * 1024.0);
-            match stats.vram_used() {
-                Some(used) => {
-                    let used_mb = used as f64 / (1024.0 * 1024.0);
-                    ui.label(format!("VRAM: {used_mb:.0} MB / {total_gb:.1} GB"));
-                }
-                None => {
-                    ui.label(format!("VRAM: {total_gb:.1} GB (usage n/a)"));
-                }
-            }
+    if !stats.history().is_empty() {
+        let (min, max) = stats.min_max_ms();
+        ui.label(format!("CPU min {min:.2} · max {max:.2} ms"));
+    }
 
-            if let Some(mut culling) = world.get_resource_mut::<Culling>() {
-                ui.label(format!(
-                    "Draws: {} / {} ({} culled)",
-                    culling.visible(),
-                    culling.total(),
-                    culling.culled(),
-                ));
-                ui.checkbox(&mut culling.enabled, "Frustum culling")
-                    .on_hover_text("Off draws everything — the A/B for a suspected culling bug.");
-            }
+    let rss_mb = stats.memory_bytes() as f64 / (1024.0 * 1024.0);
+    ui.label(format!("Memory (RSS): {rss_mb:.1} MB"));
+    let total_gb = stats.vram_total() as f64 / (1024.0 * 1024.0 * 1024.0);
+    match stats.vram_used() {
+        Some(used) => {
+            let used_mb = used as f64 / (1024.0 * 1024.0);
+            ui.label(format!("VRAM: {used_mb:.0} MB / {total_gb:.1} GB"));
+        }
+        None => {
+            ui.label(format!("VRAM: {total_gb:.1} GB (usage n/a)"));
+        }
+    }
 
-            ui.add_space(4.0);
-            graph(ui, &stats, theme::CPU, theme::GPU);
+    if let Some(mut culling) = world.get_resource_mut::<Culling>() {
+        ui.label(format!(
+            "Draws: {} / {} ({} culled)",
+            culling.visible(),
+            culling.total(),
+            culling.culled(),
+        ));
+        ui.checkbox(&mut culling.enabled, "Frustum culling")
+            .on_hover_text("Off draws everything — the A/B for a suspected culling bug.");
+    }
 
-            if let Some(profiler) = world.get_resource::<Profiler>() {
-                ui.add_space(6.0);
-                ui.separator();
+    ui.add_space(4.0);
+    graph(ui, &stats, theme::CPU, theme::GPU);
 
-                let mut enabled = profile::is_enabled();
-                if ui.checkbox(&mut enabled, "Collect phase timings").changed() {
-                    profile::set_enabled(enabled);
-                }
-                if enabled {
-                    phases(ui, &profiler, Lane::Cpu, "CPU phases", theme::CPU);
-                    phases(ui, &profiler, Lane::Gpu, "GPU passes", theme::GPU);
-                }
-            }
-        });
+    if let Some(profiler) = world.get_resource::<Profiler>() {
+        ui.add_space(6.0);
+        ui.separator();
+
+        let mut enabled = profile::is_enabled();
+        if ui.checkbox(&mut enabled, "Collect phase timings").changed() {
+            profile::set_enabled(enabled);
+        }
+        if enabled {
+            phases(ui, &profiler, Lane::Cpu, "CPU phases", theme::CPU);
+            phases(ui, &profiler, Lane::Gpu, "GPU passes", theme::GPU);
+        }
+    }
 }
 
 /// One lane's phase table, slowest first.

@@ -28,28 +28,31 @@ pub fn show(ctx: &egui::Context, world: &mut World) {
             ui.add_space(4.0);
             ui.heading("Environment");
             ui.separator();
-
-            // This panel gets whatever the two side panels leave between them,
-            // which on a narrow window is nothing at all. `Ui::columns` asserts
-            // on a negative column width instead of clamping, so the count has
-            // to come from the space that actually exists.
-            let available = ui.available_width();
-            if available > 0.0 {
-                let columns = column_count(available);
-                ui.columns(columns, |cols| {
-                    let mut previous = usize::MAX;
-                    for (index, column) in COLUMNS.iter().enumerate() {
-                        let target = index * columns / COLUMNS.len();
-                        if target == previous {
-                            cols[target].add_space(6.0);
-                        }
-                        column(&mut cols[target], world);
-                        previous = target;
-                    }
-                });
-            }
-            ui.add_space(4.0);
+            body(ui, world);
         });
+}
+
+pub fn body(ui: &mut egui::Ui, world: &mut World) {
+    // This panel gets whatever the two side panels leave between them,
+    // which on a narrow window is nothing at all. `Ui::columns` asserts
+    // on a negative column width instead of clamping, so the count has
+    // to come from the space that actually exists.
+    let available = ui.available_width();
+    if available > 0.0 {
+        let columns = column_count(available);
+        ui.columns(columns, |cols| {
+            let mut previous = usize::MAX;
+            for (index, column) in COLUMNS.iter().enumerate() {
+                let target = index * columns / COLUMNS.len();
+                if target == previous {
+                    cols[target].add_space(6.0);
+                }
+                column(&mut cols[target], world);
+                previous = target;
+            }
+        });
+    }
+    ui.add_space(4.0);
 }
 
 fn ssao_column(ui: &mut egui::Ui, world: &World) {

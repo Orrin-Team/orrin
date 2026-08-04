@@ -66,7 +66,7 @@ mod tests {
     use super::*;
     use crate::editor::state::RibbonTab;
     use crate::editor::theme;
-    use crate::scene::Name;
+    use crate::scene::{LocalTransform, Name};
 
     /// The whole editor, laid out headlessly at a chosen window size.
     ///
@@ -123,9 +123,12 @@ mod tests {
             }
         }
 
+        /// A scene entity as the editor expects one: named, and with the
+        /// transform every inspector section past the first reads.
         fn spawn(&mut self, name: &str) -> orrin_ecs::Entity {
             let entity = self.world.spawn();
             self.world.insert(entity, Name(name.to_owned()));
+            self.world.insert(entity, LocalTransform::default());
             entity
         }
 
@@ -266,6 +269,72 @@ mod tests {
             + editor.panel("scene_tabs").height();
         assert!(top < 200.0, "top bar took {top}px of 600");
         assert!(editor.painted_contains("Ground plane"));
+    }
+
+    /// The point of the show/body split: a tool's content draws into whatever
+    /// `Ui` it is handed, with no panel or window of its own. Docking hands it a
+    /// tab's `Ui`; this hands it a bare cell, which is the same contract.
+    #[test]
+    fn every_tool_body_draws_without_its_own_container() {
+        // Wide enough to lay every body out side by side and short enough that
+        // each fits: egui culls shapes outside the screen, so a column of tall
+        // cells would report half the tools as drawing nothing. Generous,
+        // because a body may overflow the cell it is given — the Environment
+        // one does — and that shifts everything after it.
+        let mut editor = Harness::new(egui::vec2(4200.0, 700.0));
+        let entity = editor.spawn("Ground plane");
+        editor.state.selected = Some(entity);
+
+        let Harness {
+            world,
+            registry,
+            state,
+            ctx,
+            input,
+            ..
+        } = &mut editor;
+
+        // A bounded rect, because a docked tab is bounded: the hierarchy's
+        // ScrollArea fills the height it is given, and given none it draws none.
+        let cell = egui::vec2(380.0, 640.0);
+        let mut run = || {
+            ctx.run(input.clone(), |ctx| {
+                egui::Area::new("bodies".into()).show(ctx, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui(cell, |ui| hierarchy::body(ui, world, state));
+                        ui.allocate_ui(cell, |ui| inspector::body(ui, world, state, registry));
+                        ui.allocate_ui(cell, |ui| environment::body(ui, world));
+                        ui.allocate_ui(cell, |ui| performance::body(ui, world));
+                        ui.allocate_ui(cell, |ui| scene::body(ui, world, state));
+                        ui.allocate_ui(cell, |ui| console::body(ui, world));
+                    });
+                });
+            })
+        };
+        // An Area settles on its second frame, like every other egui container.
+        run();
+        let output = run();
+
+        let mut painted = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::Shape::Text(text) = &clipped.shape {
+                painted.push(text.galley.text().to_owned());
+            }
+        }
+        let painted = painted.join("\u{1}");
+
+        // One string from each body, so a tool that silently drew nothing is not
+        // mistaken for one that drew.
+        for expected in [
+            "Ground plane", // hierarchy
+            "Transform",    // inspector
+            "SSAO",         // environment
+            "FPS",          // performance
+            "Save",         // scene
+            "messages",     // console
+        ] {
+            assert!(painted.contains(expected), "no body painted {expected:?}");
+        }
     }
 
     /// A panel that sizes its content from its own width grows by the overflow

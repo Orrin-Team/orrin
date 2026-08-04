@@ -26,24 +26,27 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState, reg
             ui.add_space(4.0);
             ui.heading("Inspector");
             ui.separator();
-
-            let Some(entity) = state.selected else {
-                ui.weak("Select an entity in the hierarchy.");
-                return;
-            };
-            if !world.is_alive(entity) {
-                state.selected = None;
-                return;
-            }
-
-            name_section(ui, world, entity);
-            transform_section(ui, world, entity);
-            mesh_material_section(ui, world, entity);
-            light_section(ui, world, entity);
-            #[cfg(feature = "scripting")]
-            script_section(ui, world, entity);
-            actions_section(ui, world, registry, state, entity);
+            body(ui, world, state, registry);
         });
+}
+
+pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState, registry: &Registry) {
+    let Some(entity) = state.selected else {
+        ui.weak("Select an entity in the hierarchy.");
+        return;
+    };
+    if !world.is_alive(entity) {
+        state.selected = None;
+        return;
+    }
+
+    name_section(ui, world, entity);
+    transform_section(ui, world, entity);
+    mesh_material_section(ui, world, entity);
+    light_section(ui, world, entity);
+    #[cfg(feature = "scripting")]
+    script_section(ui, world, entity);
+    actions_section(ui, world, registry, state, entity);
 }
 
 /// What can be done to the selected entity as a whole, rather than to one of

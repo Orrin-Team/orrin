@@ -23,8 +23,6 @@ struct Node {
 }
 
 pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
-    let nodes = snapshot(world, &state.hierarchy_query);
-
     egui::SidePanel::left("hierarchy")
         .resizable(true)
         .default_width(220.0)
@@ -33,58 +31,63 @@ pub fn show(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
             ui.add_space(4.0);
             ui.heading("Hierarchy");
             ui.separator();
+            body(ui, world, state);
+        });
+}
 
-            // Right-to-left so the Add button is placed first and the field
-            // fills whatever is left. Sizing the field from `available_width`
-            // instead would feed the panel's own width back into its content's
-            // minimum width, and a resizable panel then grows every frame.
-            //
-            // The row has to be allocated at a bounded height: a `with_layout`
-            // here takes the panel's whole remaining rect, which leaves the tree
-            // below it nothing to draw into.
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    add_menu(ui, state);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.hierarchy_query)
-                            .hint_text("Search entities")
-                            .desired_width(f32::INFINITY),
-                    );
-                },
+pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
+    let nodes = snapshot(world, &state.hierarchy_query);
+
+    // Right-to-left so the Add button is placed first and the field
+    // fills whatever is left. Sizing the field from `available_width`
+    // instead would feed the panel's own width back into its content's
+    // minimum width, and a resizable panel then grows every frame.
+    //
+    // The row has to be allocated at a bounded height: a `with_layout`
+    // here takes the panel's whole remaining rect, which leaves the tree
+    // below it nothing to draw into.
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            add_menu(ui, state);
+            ui.add(
+                egui::TextEdit::singleline(&mut state.hierarchy_query)
+                    .hint_text("Search entities")
+                    .desired_width(f32::INFINITY),
             );
+        },
+    );
 
-            ui.separator();
+    ui.separator();
 
-            egui::ScrollArea::vertical()
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    // Bands follow visible rows rather than depth, so a filtered
-                    // tree still stripes every other line.
-                    let mut row_index = 0usize;
-                    for index in 0..nodes.len() {
-                        if nodes[index].is_root && nodes[index].visible {
-                            draw(ui, &nodes, index, state, &mut row_index);
-                        }
-                    }
-                    if row_index == 0 {
-                        ui.weak(match state.hierarchy_query.trim() {
-                            "" => "Nothing in the scene.".to_owned(),
-                            query => format!("No entity matches “{query}”."),
-                        });
-                    }
-
-                    // Dropping below the tree detaches, which is the only way to
-                    // get something back to the top level once it has a parent.
-                    let empty = ui.available_size_before_wrap();
-                    if empty.y > 0.0 {
-                        let (_, response) = ui.allocate_exact_size(empty, egui::Sense::hover());
-                        if let Some(dragged) = response.dnd_release_payload::<Entity>() {
-                            state.request_reparent(*dragged, None);
-                        }
-                    }
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            // Bands follow visible rows rather than depth, so a filtered
+            // tree still stripes every other line.
+            let mut row_index = 0usize;
+            for index in 0..nodes.len() {
+                if nodes[index].is_root && nodes[index].visible {
+                    draw(ui, &nodes, index, state, &mut row_index);
+                }
+            }
+            if row_index == 0 {
+                ui.weak(match state.hierarchy_query.trim() {
+                    "" => "Nothing in the scene.".to_owned(),
+                    query => format!("No entity matches “{query}”."),
                 });
+            }
+
+            // Dropping below the tree detaches, which is the only way to
+            // get something back to the top level once it has a parent.
+            let empty = ui.available_size_before_wrap();
+            if empty.y > 0.0 {
+                let (_, response) = ui.allocate_exact_size(empty, egui::Sense::hover());
+                if let Some(dragged) = response.dnd_release_payload::<Entity>() {
+                    state.request_reparent(*dragged, None);
+                }
+            }
         });
 }
 
