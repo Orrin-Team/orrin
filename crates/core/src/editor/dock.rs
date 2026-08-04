@@ -17,6 +17,10 @@
 //!   paint nothing, so this is not what preserves the transparency — it is what
 //!   stops the centre being a drop target. The middle of the window is the
 //!   scene, not a slot a tool can be dragged into.
+//!
+//! The centre claims no *input* either, and that does not follow from painting
+//! nothing: egui hands the whole `CentralPanel` to the UI regardless. See
+//! [`Dock::wants_pointer`], which is what the editor asks in egui's place.
 
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
 use serde::{Deserialize, Serialize};
@@ -81,13 +85,16 @@ impl Tab {
 
 pub struct Dock {
     state: DockState<Tab>,
+    /// What the dock was handed this frame, and which parts of it the tools
+    /// actually occupy — see [`Dock::wants_pointer`]. `EVERYTHING` and no tools
+    /// until the first frame has drawn, so events before then reach the scene.
+    region: egui::Rect,
+    tools: Vec<egui::Rect>,
 }
 
 impl Default for Dock {
     fn default() -> Self {
-        Self {
-            state: default_layout(),
-        }
+        Self::with_layout(default_layout())
     }
 }
 
@@ -119,8 +126,14 @@ pub fn default_layout() -> DockState<Tab> {
 
 impl Dock {
     pub fn from_saved(saved: Option<DockState<Tab>>) -> Self {
+        Self::with_layout(saved.unwrap_or_else(default_layout))
+    }
+
+    fn with_layout(state: DockState<Tab>) -> Self {
         Self {
-            state: saved.unwrap_or_else(default_layout),
+            state,
+            region: egui::Rect::EVERYTHING,
+            tools: Vec::new(),
         }
     }
 
@@ -219,15 +232,21 @@ impl Dock {
             registry,
         };
 
+        let style = dock_style(&ctx.style());
+        // Leaves stop short of each other by a separator, which belongs to the
+        // dock rather than to the scene behind it.
+        let separator = style.separator.width;
+
         // The editor's defining trait: no fill in the centre, so the rendered
         // scene shows through behind everything. `DockArea::show` mounts its own
         // CentralPanel with the style's fill, which is why this one is mounted
         // here and the area drawn inside it.
+        self.region = ctx.available_rect();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
                 DockArea::new(&mut self.state)
-                    .style(dock_style(ui.style()))
+                    .style(style)
                     .show_close_buttons(true)
                     .show_add_buttons(false)
                     // One stray click on the far-right ✕ would close every tool
@@ -235,6 +254,45 @@ impl Dock {
                     .show_leaf_close_all_buttons(false)
                     .show_inside(ui, &mut viewer);
             });
+
+        let Self { state, tools, .. } = self;
+        tools.clear();
+        tools.extend(
+            state
+                .iter_all_nodes()
+                .filter(|(_, node)| node.is_leaf())
+                .filter_map(|(_, node)| node.rect())
+                .map(|rect| rect.expand(separator / 2.0)),
+        );
+    }
+
+    /// Whether a pointer event belongs to the editor rather than to the scene.
+    ///
+    /// egui cannot answer this for us. `Context::wants_pointer_input` is true
+    /// wherever the pointer is over an egui area, and a `CentralPanel` claims
+    /// every pixel it is given — so from the frame the dock was introduced, the
+    /// answer was "yes" across the whole window, transparent middle included,
+    /// and the right-click that starts the fly camera never got through. (Only
+    /// while a button was already down, which suppresses that check, did it.)
+    ///
+    /// So the dock answers instead, from what it drew: the pointer is over the
+    /// editor if it is outside the dock's own region — the top bar — or inside
+    /// one of the tools. Anything egui put in a layer of its own (a menu, a
+    /// floating tool window, a drag preview) is still egui's to claim.
+    pub fn wants_pointer(&self, ctx: &egui::Context) -> bool {
+        if ctx.is_using_pointer() {
+            return true;
+        }
+        let Some(pos) = ctx.pointer_interact_pos() else {
+            return false;
+        };
+        if ctx
+            .layer_id_at(pos)
+            .is_some_and(|layer| layer.order != egui::Order::Background)
+        {
+            return true;
+        }
+        !self.region.contains(pos) || self.tools.iter().any(|tool| tool.contains(pos))
     }
 }
 

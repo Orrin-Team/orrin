@@ -267,6 +267,28 @@ mod tests {
             out
         }
 
+        /// The gap the tools leave in the middle of the window — the scene.
+        /// Inset, so a neighbour's own border or separator does not count as
+        /// part of it. Only meaningful after a frame.
+        fn viewport(&self) -> egui::Rect {
+            let inset = 6.0;
+            let viewport = egui::Rect::from_min_max(
+                egui::pos2(
+                    self.tab(Tab::Hierarchy).right() + inset,
+                    self.panel("scene_tabs").bottom() + inset,
+                ),
+                egui::pos2(
+                    self.tab(Tab::Environment).left() - inset,
+                    self.tab(Tab::Console).top() - inset,
+                ),
+            );
+            assert!(
+                viewport.width() > 200.0 && viewport.height() > 200.0,
+                "the layout left no viewport to check: {viewport:?}"
+            );
+            viewport
+        }
+
         fn panel(&self, id: &str) -> egui::Rect {
             egui::containers::panel::PanelState::load(&self.ctx, egui::Id::new(id))
                 .expect("panel was drawn")
@@ -509,24 +531,7 @@ mod tests {
         editor.spawn("Ground plane");
         editor.frames(3);
 
-        // The gap between the tools, inset so a neighbour's own border or
-        // separator does not count as covering it.
-        let inset = 6.0;
-        let viewport = egui::Rect::from_min_max(
-            egui::pos2(
-                editor.tab(Tab::Hierarchy).right() + inset,
-                editor.panel("scene_tabs").bottom() + inset,
-            ),
-            egui::pos2(
-                editor.tab(Tab::Environment).left() - inset,
-                editor.tab(Tab::Console).top() - inset,
-            ),
-        );
-        assert!(
-            viewport.width() > 200.0 && viewport.height() > 200.0,
-            "the layout left no viewport to check: {viewport:?}"
-        );
-
+        let viewport = editor.viewport();
         let covering: Vec<_> = editor
             .painted_rects()
             .into_iter()
@@ -538,6 +543,41 @@ mod tests {
             covering.len(),
             covering.first()
         );
+    }
+
+    /// The input half of the same trait: the middle of the window paints
+    /// nothing *and* claims nothing. egui says otherwise — its
+    /// `wants_pointer_input` is true anywhere over the dock's `CentralPanel`,
+    /// which is the whole window — so the fly camera's right-click reached it
+    /// only while another button was held down. Asserted against egui's own
+    /// verdict, since the day that one starts telling the truth is the day the
+    /// dock can stop answering for it.
+    #[test]
+    fn the_viewport_does_not_claim_the_pointer() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(3);
+
+        let scene = editor.viewport().center();
+        editor.hover(scene).frames(2);
+        assert!(
+            editor.ctx.wants_pointer_input(),
+            "egui no longer claims the viewport; `Dock::wants_pointer` may be redundant"
+        );
+        assert!(
+            !editor.dock.wants_pointer(&editor.ctx),
+            "the scene's own pointer events are being withheld from it"
+        );
+
+        for (what, at) in [
+            ("a docked tool", editor.tab(Tab::Hierarchy).center()),
+            ("the top bar", editor.panel("scene_tabs").center()),
+        ] {
+            editor.hover(at).frames(2);
+            assert!(
+                editor.dock.wants_pointer(&editor.ctx),
+                "{what} let a pointer event through to the scene"
+            );
+        }
     }
 
     /// The default layout is specified in pixels by the design system but built

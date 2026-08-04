@@ -87,10 +87,20 @@ impl Editor {
         }
     }
 
-    /// Returns `true` if egui wants the event, so the caller can withhold it
-    /// from game/camera input.
+    /// Returns `true` if the editor wants the event, so the caller can withhold
+    /// it from game/camera input.
+    ///
+    /// egui's own verdict stands for everything but the pointer buttons and the
+    /// wheel; those it would claim across the whole window, for the reason
+    /// [`Dock::wants_pointer`] describes.
     pub fn on_window_event(&mut self, event: &WindowEvent) -> bool {
-        self.gui.update(event)
+        let consumed = self.gui.update(event);
+        match event {
+            WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => {
+                self.dock.wants_pointer(&self.gui.context())
+            }
+            _ => consumed,
+        }
     }
 
     pub fn run(&mut self, world: &mut World, registry: &Registry) {
