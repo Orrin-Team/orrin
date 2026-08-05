@@ -1,0 +1,58 @@
+#version 460
+
+// One step back up the bloom chain: a 3x3 tent filter over the coarser level,
+// added to the down-chain level of the same size.
+//
+// The sum lands in a *third* image rather than back into the down-chain level it
+// reads, and that is not a stylistic choice: a resource here is unversioned, so
+// accumulating in place makes the level both an input and an output of the same
+// chain and the graph rejects the result as a dependency cycle. See
+// `an_upsample_cannot_accumulate_into_the_level_it_read`.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The next level up the chain -- the coarser, more blurred one being spread.
+layout(set = 0, binding = 0) uniform sampler2D u_coarse;
+// This level's down-chain result, which the spread is added to.
+layout(set = 0, binding = 1) uniform sampler2D u_same_level;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D u_target;
+
+layout(push_constant) uniform Push {
+    float radius;
+    float scatter;
+} push;
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_target);
+    if (any(greaterThanEqual(texel, size))) {
+        return;
+    }
+
+    vec2 uv = (vec2(texel) + 0.5) / vec2(size);
+    vec2 ts = (1.0 / vec2(textureSize(u_coarse, 0))) * push.radius;
+
+    // 3x3 tent, weights 1-2-1 per axis over 16. Cheaper than a gaussian and,
+    // applied once per level on the way up, the accumulated result is smoother
+    // than any single-level blur of the same cost.
+    vec3 s = texture(u_coarse, uv + vec2(-1.0, -1.0) * ts).rgb * 1.0;
+    s     += texture(u_coarse, uv + vec2( 0.0, -1.0) * ts).rgb * 2.0;
+    s     += texture(u_coarse, uv + vec2( 1.0, -1.0) * ts).rgb * 1.0;
+    s     += texture(u_coarse, uv + vec2(-1.0,  0.0) * ts).rgb * 2.0;
+    s     += texture(u_coarse, uv                      ).rgb * 4.0;
+    s     += texture(u_coarse, uv + vec2( 1.0,  0.0) * ts).rgb * 2.0;
+    s     += texture(u_coarse, uv + vec2(-1.0,  1.0) * ts).rgb * 1.0;
+    s     += texture(u_coarse, uv + vec2( 0.0,  1.0) * ts).rgb * 2.0;
+    s     += texture(u_coarse, uv + vec2( 1.0,  1.0) * ts).rgb * 1.0;
+    s     *= 1.0 / 16.0;
+
+    // A blend, not a sum -- and the distinction is the whole reason this looks
+    // like bloom rather than like haze. Halving preserves average brightness, so
+    // every level carries roughly the frame's full energy; adding them makes the
+    // result as many times too bright as the chain is long, and since the chain
+    // length comes from the frame's extent, that would make the glow change when
+    // the window is resized. A convex combination at every step keeps the whole
+    // chain at the energy of one level however many there are.
+    vec3 result = mix(texture(u_same_level, uv).rgb, s, push.scatter);
+    imageStore(u_target, texel, vec4(result, 1.0));
+}

@@ -1,0 +1,56 @@
+#version 460
+
+// Bin the HDR target by log2 luminance. One invocation per pixel, one bin per
+// invocation in the workgroup -- which is why the workgroup is 16x16 = 256, the
+// bin count. Each workgroup accumulates privately in shared memory and then
+// contributes one atomic per bin to the global histogram, so global atomic
+// traffic is 256 per workgroup rather than one per pixel.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_hdr;
+layout(set = 0, binding = 1) buffer Histogram { uint bins[]; } histogram;
+
+layout(push_constant) uniform Push {
+    float min_log_luminance;
+    float inverse_log_luminance_range;
+    uvec2 extent;
+} push;
+
+shared uint local_bins[256];
+
+// Bin 0 is the black bucket. Pixels this dark carry no information about how the
+// scene should be exposed, and the averaging pass excludes them -- otherwise a
+// night sky, most of which is nearly zero, drags the metering down until the few
+// lit pixels blow out.
+const float BLACK_LUMINANCE = 0.005;
+
+uint bin_for(vec3 color) {
+    float luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    if (luminance < BLACK_LUMINANCE) {
+        return 0;
+    }
+    float normalized = clamp(
+        (log2(luminance) - push.min_log_luminance) * push.inverse_log_luminance_range,
+        0.0,
+        1.0);
+    // Bins 1..255: the +1 leaves bin 0 to the black bucket alone, and the
+    // averaging pass subtracts it back out.
+    return uint(normalized * 254.0 + 1.0);
+}
+
+void main() {
+    local_bins[gl_LocalInvocationIndex] = 0;
+    barrier();
+
+    uvec2 coord = gl_GlobalInvocationID.xy;
+    if (coord.x < push.extent.x && coord.y < push.extent.y) {
+        // texelFetch, not texture: metering wants the pixels that were rendered,
+        // and a filtered tap at a half-texel offset is a different set of them.
+        vec3 color = texelFetch(u_hdr, ivec2(coord), 0).rgb;
+        atomicAdd(local_bins[bin_for(color)], 1);
+    }
+    barrier();
+
+    atomicAdd(histogram.bins[gl_LocalInvocationIndex], local_bins[gl_LocalInvocationIndex]);
+}

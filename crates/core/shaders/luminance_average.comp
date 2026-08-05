@@ -1,0 +1,92 @@
+#version 460
+
+// Reduce the histogram to one adapted luminance, and from it the exposure the
+// tonemap pass applies. One workgroup of 256 invocations, one per bin.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Histogram { uint bins[]; } histogram;
+layout(set = 0, binding = 1) buffer Exposure {
+    float exposure;
+    float average_luminance;
+    float ev100;
+} target;
+
+layout(push_constant) uniform Push {
+    float min_log_luminance;
+    float log_luminance_range;
+    /// Fraction of the way to this frame's measurement to move, one for each
+    /// direction. Computed on the CPU from the frame's delta time, so the shader
+    /// needs no clock and the rate stays framerate-independent.
+    float brighten;
+    float darken;
+    float exposure_compensation;
+    uint pixel_count;
+} push;
+
+// Float, not uint, and that is not cosmetic: the reduction sums pixels * bin
+// index, which at 255 crosses a 32-bit unsigned at around 16.8 megapixels --
+// reachable on a 6K display, where it would wrap into a wildly wrong exposure
+// rather than fail. The bins themselves stay uint because they are accumulated
+// by atomics.
+shared float weighted[256];
+
+void main() {
+    uint index = gl_LocalInvocationIndex;
+    uint count = histogram.bins[index];
+
+    // Weighting a bin by its own index is what makes the sum an average in log
+    // space: the bins are evenly spaced in log2 luminance, so averaging indices
+    // and mapping back is the geometric mean of the luminances. An arithmetic
+    // mean of luminances would let one specular highlight outvote the frame.
+    weighted[index] = float(count) * float(index);
+
+    // Every bin belongs to exactly one invocation, so this frame's histogram can
+    // be reset here instead of by a separate clearing pass: the value is already
+    // read, and nothing else will touch it before the next frame accumulates.
+    histogram.bins[index] = 0;
+
+    // Only invocation 0's copy is the black bucket's, and only invocation 0 uses
+    // it -- but it has to be taken before the reduction overwrites the shared
+    // slot it came from.
+    uint black = count;
+
+    barrier();
+
+    // Tree reduction over the 256 shared slots. The branch is inside the loop
+    // and the barrier outside it, so every invocation reaches every barrier.
+    for (uint cutoff = 128; cutoff > 0; cutoff >>= 1) {
+        if (index < cutoff) {
+            weighted[index] += weighted[index + cutoff];
+        }
+        barrier();
+    }
+
+    if (index != 0) {
+        return;
+    }
+
+    // The black bucket is counted in pixel_count but contributes nothing to the
+    // weighted sum, so it has to leave the divisor too or a mostly-dark frame
+    // averages toward zero.
+    float lit = max(float(push.pixel_count) - float(black), 1.0);
+    float average_bin = (weighted[0] / lit) - 1.0;
+    float measured = exp2(
+        (average_bin / 254.0) * push.log_luminance_range + push.min_log_luminance);
+
+    float previous = target.average_luminance;
+    float adapted = previous
+        + (measured - previous) * (measured > previous ? push.brighten : push.darken);
+    // The exposure below takes log2 of this, so it may never reach zero however
+    // the arithmetic above lands.
+    adapted = max(adapted, 1e-5);
+
+    // Saturation-based speed exposure (Lagarde & de Rousiers): the EV100 a
+    // reflected-light meter calibrated at K=12.5 would read for this luminance,
+    // then the exposure mapping the resulting saturation point to 1.0.
+    float ev100 = log2(adapted * 100.0 / 12.5);
+
+    target.average_luminance = adapted;
+    target.ev100 = ev100;
+    target.exposure = 1.0 / (1.2 * exp2(ev100 - push.exposure_compensation));
+}

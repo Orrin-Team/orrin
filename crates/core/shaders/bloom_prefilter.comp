@@ -1,0 +1,83 @@
+#version 460
+
+// First level of the bloom chain: half the frame, exposure applied, and the one
+// place in the chain that guards against fireflies.
+//
+// Exposure is applied *here* rather than at composite time so the whole chain
+// works in the same units the tonemapper will. That is what makes `strength`
+// scene-invariant: metering has already normalised the input, so a fixed blend
+// looks the same in any lighting.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_source;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_target;
+layout(set = 0, binding = 2) readonly buffer Exposure {
+    float exposure;
+    float average_luminance;
+    float ev100;
+} auto_exposure;
+
+layout(push_constant) uniform Push {
+    float manual_exposure;
+    uint use_auto;
+} push;
+
+float luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// Karis average: weight each 2x2 group by 1/(1+luma) before combining, so a
+// single blown-out texel contributes in proportion to how *many* texels are
+// bright rather than to how bright it is. Without it one specular pixel becomes
+// a full-strength blob that flickers as the camera moves -- and it is only
+// needed here, because after this level the input is already an average.
+float karis_weight(vec3 c) {
+    return 1.0 / (1.0 + luma(c));
+}
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_target);
+    if (any(greaterThanEqual(texel, size))) {
+        return;
+    }
+
+    vec2 uv = (vec2(texel) + 0.5) / vec2(size);
+    vec2 ts = 1.0 / vec2(textureSize(u_source, 0));
+    float exposure = push.use_auto != 0 ? auto_exposure.exposure : push.manual_exposure;
+
+    // The 13-tap pattern from Jimenez's "Next Generation Post Processing"
+    // (SIGGRAPH 2014). A plain 4-tap box undersamples and makes the chain pulse
+    // as the camera moves; these overlapping groups do not.
+    vec3 a = texture(u_source, uv + vec2(-2.0, -2.0) * ts).rgb * exposure;
+    vec3 b = texture(u_source, uv + vec2( 0.0, -2.0) * ts).rgb * exposure;
+    vec3 c = texture(u_source, uv + vec2( 2.0, -2.0) * ts).rgb * exposure;
+    vec3 d = texture(u_source, uv + vec2(-1.0, -1.0) * ts).rgb * exposure;
+    vec3 e = texture(u_source, uv + vec2( 1.0, -1.0) * ts).rgb * exposure;
+    vec3 f = texture(u_source, uv + vec2(-2.0,  0.0) * ts).rgb * exposure;
+    vec3 g = texture(u_source, uv                      ).rgb * exposure;
+    vec3 h = texture(u_source, uv + vec2( 2.0,  0.0) * ts).rgb * exposure;
+    vec3 i = texture(u_source, uv + vec2(-1.0,  1.0) * ts).rgb * exposure;
+    vec3 j = texture(u_source, uv + vec2( 1.0,  1.0) * ts).rgb * exposure;
+    vec3 k = texture(u_source, uv + vec2(-2.0,  2.0) * ts).rgb * exposure;
+    vec3 l = texture(u_source, uv + vec2( 0.0,  2.0) * ts).rgb * exposure;
+    vec3 m = texture(u_source, uv + vec2( 2.0,  2.0) * ts).rgb * exposure;
+
+    vec3 g0 = (d + e + i + j) * 0.25;
+    vec3 g1 = (a + b + g + f) * 0.25;
+    vec3 g2 = (b + c + h + g) * 0.25;
+    vec3 g3 = (f + g + l + k) * 0.25;
+    vec3 g4 = (g + h + m + l) * 0.25;
+
+    float w0 = karis_weight(g0) * 0.5;
+    float w1 = karis_weight(g1) * 0.125;
+    float w2 = karis_weight(g2) * 0.125;
+    float w3 = karis_weight(g3) * 0.125;
+    float w4 = karis_weight(g4) * 0.125;
+
+    float total = w0 + w1 + w2 + w3 + w4;
+    vec3 result = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / max(total, 1e-5);
+
+    imageStore(u_target, texel, vec4(result, 1.0));
+}

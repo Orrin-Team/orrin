@@ -1,0 +1,47 @@
+#version 460
+
+// One step down the bloom chain: half the resolution of its source.
+//
+// The same 13-tap pattern as the prefilter, without the Karis weighting -- the
+// input here is already an average of averages, so there is no lone bright texel
+// left to overweight, and weighting again would only darken the result.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_source;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_target;
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_target);
+    if (any(greaterThanEqual(texel, size))) {
+        return;
+    }
+
+    vec2 uv = (vec2(texel) + 0.5) / vec2(size);
+    vec2 ts = 1.0 / vec2(textureSize(u_source, 0));
+
+    vec3 a = texture(u_source, uv + vec2(-2.0, -2.0) * ts).rgb;
+    vec3 b = texture(u_source, uv + vec2( 0.0, -2.0) * ts).rgb;
+    vec3 c = texture(u_source, uv + vec2( 2.0, -2.0) * ts).rgb;
+    vec3 d = texture(u_source, uv + vec2(-1.0, -1.0) * ts).rgb;
+    vec3 e = texture(u_source, uv + vec2( 1.0, -1.0) * ts).rgb;
+    vec3 f = texture(u_source, uv + vec2(-2.0,  0.0) * ts).rgb;
+    vec3 g = texture(u_source, uv                      ).rgb;
+    vec3 h = texture(u_source, uv + vec2( 2.0,  0.0) * ts).rgb;
+    vec3 i = texture(u_source, uv + vec2(-1.0,  1.0) * ts).rgb;
+    vec3 j = texture(u_source, uv + vec2( 1.0,  1.0) * ts).rgb;
+    vec3 k = texture(u_source, uv + vec2(-2.0,  2.0) * ts).rgb;
+    vec3 l = texture(u_source, uv + vec2( 0.0,  2.0) * ts).rgb;
+    vec3 m = texture(u_source, uv + vec2( 2.0,  2.0) * ts).rgb;
+
+    // Weights sum to one: the centre 2x2 carries half, the four overlapping
+    // corner groups an eighth each.
+    vec3 result = (d + e + i + j) * 0.125
+                + (a + b + g + f) * 0.03125
+                + (b + c + h + g) * 0.03125
+                + (f + g + l + k) * 0.03125
+                + (g + h + m + l) * 0.03125;
+
+    imageStore(u_target, texel, vec4(result, 1.0));
+}
