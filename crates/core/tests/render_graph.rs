@@ -35,6 +35,12 @@ const COLOR_FORMAT: Format = Format::B8G8R8A8_SRGB;
 /// from depending on whoever regenerated it.
 const SHADOW_RESOLUTION: u32 = 2048;
 
+/// The bloom chain length the baseline is written against — what
+/// `bloom::mip_count` yields for any frame from 1080p up. Pinned for the same
+/// reason as the cascade resolution: the plan should not depend on the window
+/// whoever regenerated it happened to have open.
+const BLOOM_MIPS: u8 = 6;
+
 fn configs() -> Vec<(&'static str, FrameConfig)> {
     vec![
         (
@@ -42,6 +48,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                auto_exposure: true,
+                bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -58,6 +66,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                auto_exposure: true,
+                bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -65,12 +75,49 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
         ),
         // SSAO off is a different graph, not a flag read at record time: the
         // three passes are never registered and the forward pass never declares
-        // the read. Both shapes are baselined because both ship.
+        // the read. Both shapes are baselined because both ship. Bloom is off
+        // here too, which is the shape where the tonemap pass declares no bloom
+        // input and samples a 1x1 black view instead.
         (
             "editor frame, SSAO off",
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: false,
+                auto_exposure: true,
+                bloom_mips: 0,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+            },
+        ),
+        // Metering off is the other shape that ships. Worth baselining for one
+        // thing in particular: the tonemap pass still declares its read of
+        // `exposure`, an import nothing writes in this configuration. That is
+        // legal where reading an unwritten *transient* is not, and it is what
+        // lets one tonemap pipeline serve both modes.
+        (
+            "editor frame, auto exposure off",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                auto_exposure: false,
+                bloom_mips: BLOOM_MIPS,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+            },
+        ),
+        // A window too small for a real chain still gets one level, and that
+        // shape has no upsample pass in it at all — so the tonemap pass
+        // composites the down chain directly. It is the case where `result()`
+        // takes its other branch, and nothing else in the suite reaches it.
+        (
+            "editor frame, one bloom level",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: true,
+                auto_exposure: true,
+                bloom_mips: 1,
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -81,6 +128,8 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                auto_exposure: true,
+                bloom_mips: BLOOM_MIPS,
                 overlay: false,
                 shadow_cascades: 2,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -172,6 +221,8 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
         let frame = declare(FrameConfig {
             color_format: COLOR_FORMAT,
             ssao: true,
+            auto_exposure: true,
+            bloom_mips: BLOOM_MIPS,
             overlay: true,
             shadow_cascades: count,
             shadow_resolution: SHADOW_RESOLUTION,

@@ -20,6 +20,7 @@ use crate::gfx::graph::{
 use crate::gfx::shadows::MAX_CASCADES;
 
 use super::MSAA_SAMPLES;
+use super::bloom::MAX_BLOOM_MIPS;
 use super::hdr::HDR_FORMAT;
 use super::ssao::{AO_FORMAT, NORMAL_FORMAT};
 use super::swapchain::DEPTH_FORMAT;
@@ -31,6 +32,15 @@ use super::swapchain::DEPTH_FORMAT;
 pub struct FrameConfig {
     pub color_format: Format,
     pub ssao: bool,
+    /// Whether the frame meters its own luminance. Off is a different graph, not
+    /// a flag read at record time: the two compute passes are never registered
+    /// and the tonemap pass falls back to the manual exposure it is pushed.
+    pub auto_exposure: bool,
+    /// Levels in the bloom chain, zero for none. Derived from the frame's extent
+    /// rather than set, so the number of passes registered cannot disagree with
+    /// the number of levels there is room for — the same reason
+    /// `shadow_cascades` is sourced from the cascade set.
+    pub bloom_mips: u8,
     /// Whether the editor's egui overlay draws over the frame. Off for headless
     /// and export renders.
     pub overlay: bool,
@@ -49,6 +59,14 @@ pub enum PassBody {
     SsaoResolve,
     SsaoBlur,
     Forward,
+    LuminanceHistogram,
+    LuminanceAverage,
+    /// Half the frame, exposed and firefly-weighted: the chain's first level.
+    BloomPrefilter,
+    /// Writes down-chain level `n`, reading level `n - 1`.
+    BloomDownsample(u32),
+    /// Writes up-chain level `n`, reading the coarser level and down-chain `n`.
+    BloomUpsample(u32),
     Tonemap,
     Overlay,
     ShadowCascade(u32),
@@ -63,8 +81,50 @@ pub struct FrameIds {
     pub hdr_color: ResourceId,
     pub msaa_hdr: ResourceId,
     pub msaa_depth: ResourceId,
+    /// Written by the metering passes and read by the tonemap pass. Always
+    /// declared, because the tonemap pass binds it whether or not anything wrote
+    /// it this frame — an import may be read without a writer, which is exactly
+    /// the case metering-off produces.
+    pub exposure: ResourceId,
+    /// `None` when metering is off, along with the two passes that touch it.
+    pub histogram: Option<ResourceId>,
+    pub bloom: Option<BloomIds>,
     pub ssao: Option<SsaoIds>,
     pub shadows: Option<ResourceId>,
+}
+
+/// The two chains bloom needs, each level a separate image.
+///
+/// Fixed-length arrays rather than `Vec` so `FrameIds` stays `Copy`; only the
+/// first `mips` entries of `down` and the first `mips - 1` of `up` are ever
+/// populated, and the rest stay `None` so a length mistake is a panic naming the
+/// level rather than a read of some other pass's image.
+#[derive(Clone, Copy, Debug)]
+pub struct BloomIds {
+    pub mips: u8,
+    pub down: [Option<ResourceId>; MAX_BLOOM_MIPS],
+    pub up: [Option<ResourceId>; MAX_BLOOM_MIPS],
+}
+
+impl BloomIds {
+    pub fn down(&self, level: usize) -> ResourceId {
+        self.down[level].expect("bloom down-chain level was never declared")
+    }
+
+    pub fn up(&self, level: usize) -> ResourceId {
+        self.up[level].expect("bloom up-chain level was never declared")
+    }
+
+    /// What the tonemap pass composites: the finest level of the up chain, or —
+    /// for a one-level chain, which has no upsample step — the down chain's only
+    /// level.
+    pub fn result(&self) -> ResourceId {
+        if self.mips >= 2 {
+            self.up(0)
+        } else {
+            self.down(0)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +172,30 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
                 .array_layers(config.shadow_cascades as u32),
         )
     });
+
+    // Resource and pass names live in separate namespaces, so a level's image
+    // and the pass that writes it can share a name — and it reads well in the
+    // plan, where `bloom_down_2` writes `bloom_down_2`.
+    const BLOOM_DOWN_NAMES: [&str; MAX_BLOOM_MIPS] = [
+        "bloom_down_0",
+        "bloom_down_1",
+        "bloom_down_2",
+        "bloom_down_3",
+        "bloom_down_4",
+        "bloom_down_5",
+    ];
+    const BLOOM_UP_NAMES: [&str; MAX_BLOOM_MIPS] = [
+        "bloom_up_0",
+        "bloom_up_1",
+        "bloom_up_2",
+        "bloom_up_3",
+        "bloom_up_4",
+        "bloom_up_5",
+    ];
+    // Level 0's downsample is the prefilter, which has its own name; the slot is
+    // present so the two tables index alike.
+    const BLOOM_DOWN_PASS_NAMES: [&str; MAX_BLOOM_MIPS] = BLOOM_DOWN_NAMES;
+    const BLOOM_UP_PASS_NAMES: [&str; MAX_BLOOM_MIPS] = BLOOM_UP_NAMES;
 
     const CASCADE_PASS_NAMES: [&str; MAX_CASCADES] = [
         "shadow_cascade_0",
@@ -187,9 +271,112 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .build();
     record(id, PassBody::Forward, &mut bodies);
 
-    let id = builder
+    // Imported, not created: temporal adaptation is a value that has to outlive
+    // the frame, and a transient is `Undefined` at every frame's start by
+    // contract. The exposure module owns the allocation; the graph only orders
+    // access to it.
+    let exposure = builder.import_buffer("exposure");
+
+    let histogram = config.auto_exposure.then(|| {
+        let histogram = builder.import_buffer("luminance_histogram");
+
+        let id = builder
+            .pass("luminance_histogram", PassKind::Compute)
+            .access(hdr_color, Access::Sampled)
+            .access(histogram, Access::StorageWrite)
+            .build();
+        record(id, PassBody::LuminanceHistogram, &mut bodies);
+
+        // One `StorageWrite` covers both halves of what this pass does to each
+        // buffer — it reads the bins and zeroes them, reads last frame's adapted
+        // luminance and replaces it. Declaring the read separately would be two
+        // accesses to one resource in one pass, which the compiler rejects
+        // because a pass is a single point in the schedule.
+        let id = builder
+            .pass("luminance_average", PassKind::Compute)
+            .access(histogram, Access::StorageWrite)
+            .access(exposure, Access::StorageWrite)
+            .build();
+        record(id, PassBody::LuminanceAverage, &mut bodies);
+
+        histogram
+    });
+
+    let bloom = (config.bloom_mips > 0).then(|| {
+        let mips = config.bloom_mips as usize;
+        let mut down = [None; MAX_BLOOM_MIPS];
+        let mut up = [None; MAX_BLOOM_MIPS];
+
+        // Level `n` is the frame halved `n + 1` times, so level 0 is half the
+        // frame. Sized off the frame rather than off the level above it, so a
+        // resize moves the whole chain together.
+        for level in 0..mips {
+            let shift = level as u32 + 1;
+            down[level] = Some(builder.create_image(
+                BLOOM_DOWN_NAMES[level],
+                ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(shift)),
+            ));
+            if level + 1 < mips {
+                up[level] = Some(builder.create_image(
+                    BLOOM_UP_NAMES[level],
+                    ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(shift)),
+                ));
+            }
+        }
+
+        let id = builder
+            .pass("bloom_prefilter", PassKind::Compute)
+            .access(hdr_color, Access::Sampled)
+            .access(exposure, Access::StorageRead)
+            .access(down[0].unwrap(), Access::StorageWrite)
+            .build();
+        record(id, PassBody::BloomPrefilter, &mut bodies);
+
+        for level in 1..mips {
+            let id = builder
+                .pass(BLOOM_DOWN_PASS_NAMES[level], PassKind::Compute)
+                .access(down[level - 1].unwrap(), Access::Sampled)
+                .access(down[level].unwrap(), Access::StorageWrite)
+                .build();
+            record(id, PassBody::BloomDownsample(level as u32), &mut bodies);
+        }
+
+        // Back down the chain, coarsest first. The coarsest step spreads the
+        // down chain's last level; every step after it spreads the up-chain
+        // level it just produced.
+        for level in (0..mips.saturating_sub(1)).rev() {
+            let coarse = if level + 2 < mips {
+                up[level + 1].unwrap()
+            } else {
+                down[level + 1].unwrap()
+            };
+            let id = builder
+                .pass(BLOOM_UP_PASS_NAMES[level], PassKind::Compute)
+                .access(coarse, Access::Sampled)
+                .access(down[level].unwrap(), Access::Sampled)
+                .access(up[level].unwrap(), Access::StorageWrite)
+                .build();
+            record(id, PassBody::BloomUpsample(level as u32), &mut bodies);
+        }
+
+        BloomIds {
+            mips: config.bloom_mips,
+            down,
+            up,
+        }
+    });
+
+    // Reading `exposure` is also what orders this behind the metering: nothing
+    // else connects the two, since tonemap and the histogram pass both only read
+    // `hdr_color`.
+    let mut tonemap = builder
         .pass("tonemap", PassKind::Inline)
         .access(hdr_color, Access::Sampled)
+        .access(exposure, Access::StorageRead);
+    if let Some(bloom) = bloom {
+        tonemap = tonemap.access(bloom.result(), Access::Sampled);
+    }
+    let id = tonemap
         .access(swapchain_color, Access::ColorAttachment)
         .build();
     record(id, PassBody::Tonemap, &mut bodies);
@@ -210,6 +397,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             hdr_color,
             msaa_hdr,
             msaa_depth,
+            exposure,
+            histogram,
+            bloom,
             ssao,
             shadows,
         },

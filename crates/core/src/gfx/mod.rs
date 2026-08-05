@@ -8,7 +8,8 @@ pub use headless::HeadlessBackend;
 
 use crate::geom::Aabb;
 use crate::scene::{
-    Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle, SsaoSettings,
+    BloomSettings, Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle,
+    SsaoSettings,
 };
 use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::BufferContents;
@@ -160,13 +161,18 @@ pub trait RenderBackend {
     /// a half-written cubemap visible to the first frame.
     fn load_environment(&mut self, pixels: &[f32], width: u32, height: u32);
     fn resize(&mut self, extent: [u32; 2]);
+    /// `dt` is the seconds elapsed since the last frame — what any temporal
+    /// effect a backend runs needs, exposure adaptation being the first of them.
+    /// Zero means "converge immediately", which is what a one-shot render wants.
     fn render(
         &mut self,
         items: &[RenderItem],
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
+        dt: f32,
     );
 }

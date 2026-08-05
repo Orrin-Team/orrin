@@ -23,6 +23,16 @@ pub enum PassKind {
     /// Records into the frame's primary command buffer. The executor puts the
     /// pass's barriers in front of it, so the graph's plan is what runs.
     Inline,
+    /// Records into the same command buffer as [`Inline`](PassKind::Inline), but
+    /// outside any render pass: a dispatch, not a draw.
+    ///
+    /// The distinction is the executor's, not the scheduler's — ordering,
+    /// barriers and usage flags are derived identically. It exists because a
+    /// dispatch is illegal inside a render pass, so the executor has to know
+    /// which passes to bracket with one, and because that makes "declared an
+    /// attachment from a compute pass" a compile error instead of a validation
+    /// message.
+    Compute,
     /// The escape hatch: a pass that builds and submits its own command buffer
     /// (egui, whose renderer owns its submission). The executor closes the
     /// command buffer recorded so far, submits it, hands the pass the resulting

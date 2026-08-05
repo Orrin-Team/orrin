@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use vulkano::buffer::BufferContents;
+use vulkano::buffer::{BufferContents, Subbuffer};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::Device;
@@ -22,6 +22,7 @@ use vulkano::pipeline::{
 use vulkano::render_pass::{RenderPass, Subpass};
 
 use super::context::VkContext;
+use super::exposure::GpuExposure;
 
 /// Offscreen color format the forward pass renders into. Float, so values can
 /// exceed 1.0 before tonemapping clamps them back to displayable range.
@@ -30,14 +31,23 @@ pub const HDR_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 struct TonemapPush {
-    exposure: f32,
+    manual_exposure: f32,
+    use_auto: u32,
+    bloom_strength: f32,
 }
 
 pub struct HdrPass {
     pub tonemap_rp: Arc<RenderPass>,
     tonemap_pipeline: Arc<GraphicsPipeline>,
     sampler: Arc<Sampler>,
-    pub exposure: f32,
+    /// The exposure applied when metering is off, already carrying the
+    /// compensation dial. With metering on the shader ignores it and reads the
+    /// value the averaging pass wrote instead.
+    pub manual_exposure: f32,
+    pub auto_exposure: bool,
+    /// Zero when bloom is off, which turns the shader's blend into a no-op
+    /// without a second pipeline or a branch that costs anything.
+    pub bloom_strength: f32,
 }
 
 impl HdrPass {
@@ -59,27 +69,32 @@ impl HdrPass {
             tonemap_rp,
             tonemap_pipeline,
             sampler,
-            exposure: 1.0,
+            manual_exposure: 1.0,
+            auto_exposure: true,
+            bloom_strength: 0.0,
         }
     }
 
     /// `hdr_view` is the graph's resolved HDR color target, declared as this
-    /// pass's `Sampled` input.
+    /// pass's `Sampled` input; `exposure` is the buffer the metering passes
+    /// wrote, declared as its `StorageRead`.
     pub fn record_tonemap(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         ctx: &VkContext,
         extent: [u32; 2],
         hdr_view: Arc<ImageView>,
+        exposure: Subbuffer<GpuExposure>,
+        bloom_view: Arc<ImageView>,
     ) {
         let set = DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
             self.tonemap_pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::image_view_sampler(
-                0,
-                hdr_view,
-                self.sampler.clone(),
-            )],
+            [
+                WriteDescriptorSet::image_view_sampler(0, hdr_view, self.sampler.clone()),
+                WriteDescriptorSet::buffer(1, exposure),
+                WriteDescriptorSet::image_view_sampler(2, bloom_view, self.sampler.clone()),
+            ],
             [],
         )
         .unwrap();
@@ -109,7 +124,9 @@ impl HdrPass {
                 self.tonemap_pipeline.layout().clone(),
                 0,
                 TonemapPush {
-                    exposure: self.exposure,
+                    manual_exposure: self.manual_exposure,
+                    use_auto: self.auto_exposure as u32,
+                    bloom_strength: self.bloom_strength,
                 },
             )
             .unwrap();

@@ -17,6 +17,14 @@ impl ResourceId {
 pub enum Extent {
     /// Tracks the frame's render extent, so a swapchain resize reallocates it.
     Frame,
+    /// The frame's extent halved `n` times — a level of a downsample chain, and
+    /// like [`Frame`](Extent::Frame) it follows a resize.
+    ///
+    /// A shift rather than a ratio because a bloom chain's levels must land on
+    /// exactly the sizes successive halvings produce: a level computed any other
+    /// way disagrees with the one the pass above it sampled from by a texel at
+    /// odd sizes, and the filter taps drift off centre.
+    FrameDiv(u32),
     Fixed([u32; 2]),
 }
 
@@ -24,6 +32,9 @@ impl Extent {
     pub fn resolve(self, frame: [u32; 2]) -> [u32; 2] {
         match self {
             Extent::Frame => frame,
+            // Floored at one: halving an odd extent far enough reaches zero, and
+            // a zero-extent image is not one Vulkan will create.
+            Extent::FrameDiv(shift) => [(frame[0] >> shift).max(1), (frame[1] >> shift).max(1)],
             Extent::Fixed(extent) => extent,
         }
     }

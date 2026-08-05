@@ -198,7 +198,16 @@ impl PassFramebuffers {
                             cascade,
                         )],
                     ),
-                    PassBody::Tonemap | PassBody::Overlay => return None,
+                    // The tonemap and overlay passes target the acquired
+                    // swapchain image; the metering passes are dispatches and
+                    // target no attachment at all.
+                    PassBody::Tonemap
+                    | PassBody::Overlay
+                    | PassBody::LuminanceHistogram
+                    | PassBody::LuminanceAverage
+                    | PassBody::BloomPrefilter
+                    | PassBody::BloomDownsample(_)
+                    | PassBody::BloomUpsample(_) => return None,
                 };
                 Some(
                     Framebuffer::new(
@@ -231,7 +240,13 @@ pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
         PassBody::SsaoResolve | PassBody::SsaoBlur => vec![Some([1.0, 0.0, 0.0, 0.0].into())],
         PassBody::Forward => vec![Some([0.02, 0.02, 0.03, 1.0].into()), Some(1.0.into()), None],
         PassBody::Tonemap => vec![None],
-        PassBody::Overlay => Vec::new(),
+        // No render pass, so nothing to clear.
+        PassBody::Overlay
+        | PassBody::LuminanceHistogram
+        | PassBody::LuminanceAverage
+        | PassBody::BloomPrefilter
+        | PassBody::BloomDownsample(_)
+        | PassBody::BloomUpsample(_) => Vec::new(),
         PassBody::ShadowCascade(_) => vec![Some(1.0.into())],
     }
 }

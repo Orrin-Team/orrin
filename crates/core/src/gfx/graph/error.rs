@@ -39,6 +39,13 @@ pub enum GraphError {
         raw: &'static str,
         followed_by: &'static str,
     },
+    /// A [`PassKind::Compute`](super::PassKind) pass declared an attachment.
+    /// Attachments only exist inside a render pass, and a dispatch cannot be.
+    AttachmentInComputePass {
+        pass: &'static str,
+        resource: &'static str,
+        access: Access,
+    },
 }
 
 impl fmt::Display for GraphError {
@@ -87,6 +94,17 @@ impl fmt::Display for GraphError {
                  passes on the future after it. Give `{followed_by}` a dependency \
                  that places it before `{raw}`, or fold its work into an inline \
                  pass."
+            ),
+            GraphError::AttachmentInComputePass {
+                pass,
+                resource,
+                access,
+            } => write!(
+                f,
+                "render graph: compute pass `{pass}` declares `{resource}` as \
+                 {access:?}, but a dispatch runs outside any render pass and an \
+                 attachment only exists inside one. Read it as Sampled or write \
+                 it as StorageWrite, or make `{pass}` an inline pass."
             ),
         }
     }

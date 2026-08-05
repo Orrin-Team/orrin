@@ -4,8 +4,8 @@ use crate::gfx::shadows::MAX_CASCADES;
 
 use super::{color_row, vec3_row};
 use crate::scene::{
-    AmbientLight, Camera, EnvironmentSettings, FogSettings, HdrSettings, ShadowSettings,
-    SsaoSettings,
+    AmbientLight, BloomSettings, Camera, EnvironmentSettings, FogSettings, HdrSettings,
+    ShadowSettings, SsaoSettings,
 };
 
 type Column = fn(&mut egui::Ui, &World);
@@ -96,7 +96,46 @@ fn lighting_column(ui: &mut egui::Ui, world: &World) {
     ui.strong("Tonemap");
     {
         let mut hdr = world.resource_mut::<HdrSettings>();
-        ui.add(egui::Slider::new(&mut hdr.exposure, 0.1..=5.0).text("Exposure"));
+        // Metering on or off is frame *structure*: it registers or drops the two
+        // compute passes, so it recompiles the graph. A checkbox, not something
+        // draggable.
+        ui.checkbox(&mut hdr.auto_exposure, "Auto exposure")
+            .on_hover_text("Meter the frame's luminance and adapt to it");
+        ui.add(
+            egui::Slider::new(&mut hdr.exposure_compensation, -4.0..=4.0)
+                .text("Compensation")
+                .suffix(" EV"),
+        );
+        if hdr.auto_exposure {
+            ui.add(
+                egui::Slider::new(&mut hdr.adaptation_brighten, 0.0..=4.0)
+                    .text("Brighten")
+                    .suffix(" s"),
+            );
+            ui.add(
+                egui::Slider::new(&mut hdr.adaptation_darken, 0.0..=4.0)
+                    .text("Darken")
+                    .suffix(" s"),
+            );
+            ui.add(egui::Slider::new(&mut hdr.min_log_luminance, -16.0..=0.0).text("Meter floor"));
+            ui.add(egui::Slider::new(&mut hdr.max_log_luminance, 0.0..=20.0).text("Meter ceiling"));
+        } else {
+            ui.add(egui::Slider::new(&mut hdr.manual_ev100, -6.0..=16.0).text("EV100"));
+        }
+    }
+    ui.add_space(6.0);
+    ui.strong("Bloom").on_hover_text(
+        "Filtered on the exposed image, so the strength holds across lighting changes",
+    );
+    {
+        let mut bloom = world.resource_mut::<BloomSettings>();
+        // Like metering, on/off is frame structure: it registers or drops the
+        // whole chain, so it recompiles the graph.
+        ui.checkbox(&mut bloom.enabled, "Enabled");
+        ui.add(egui::Slider::new(&mut bloom.strength, 0.0..=0.3).text("Strength"));
+        ui.add(egui::Slider::new(&mut bloom.radius, 0.5..=3.0).text("Radius"));
+        ui.add(egui::Slider::new(&mut bloom.scatter, 0.0..=0.95).text("Scatter"))
+            .on_hover_text("Weight toward the blurrier levels — how far the glow reaches");
     }
     ui.add_space(6.0);
     ui.strong("Ambient").on_hover_text(

@@ -421,6 +421,69 @@ fn an_inline_pass_after_a_raw_one_is_rejected_by_name() {
     );
 }
 
+/// A dispatch runs outside any render pass, so a compute pass has nothing to
+/// attach an attachment to. Left unchecked this compiles into a plan whose
+/// framebuffer the executor never builds, and surfaces as a validation message
+/// about a layout nothing reached.
+#[test]
+fn an_attachment_declared_by_a_compute_pass_is_rejected_by_name() {
+    let mut builder = GraphBuilder::new();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    builder
+        .pass("histogram", PassKind::Compute)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    assert_eq!(
+        compile(builder).unwrap_err(),
+        GraphError::AttachmentInComputePass {
+            pass: "histogram",
+            resource: "target",
+            access: Access::ColorAttachment,
+        }
+    );
+}
+
+/// A compute pass is scheduled and synchronised exactly like an inline one — the
+/// kind changes how the executor brackets it, not where it lands or what has to
+/// finish first. Worth pinning, because the alternative reading (compute is a
+/// separate queue, or floats to the front) is the one someone will assume.
+#[test]
+fn a_compute_pass_is_ordered_by_data_flow_like_any_other() {
+    let mut builder = GraphBuilder::new();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let measured = builder.import_buffer("measured");
+    let scene = builder.create_image("scene", image());
+
+    builder
+        .pass("present", PassKind::Inline)
+        .access(measured, Access::StorageRead)
+        .access(target, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("measure", PassKind::Compute)
+        .access(scene, Access::Sampled)
+        .access(measured, Access::StorageWrite)
+        .build();
+    builder
+        .pass("draw", PassKind::Inline)
+        .access(scene, Access::ColorAttachment)
+        .build();
+
+    let graph = compile(builder).unwrap();
+    assert_eq!(names(&graph), vec!["draw", "measure", "present"]);
+}
+
 #[test]
 fn duplicate_names_are_rejected() {
     let mut builder = GraphBuilder::new();
@@ -429,5 +492,63 @@ fn duplicate_names_are_rejected() {
     assert_eq!(
         compile(builder).unwrap_err(),
         GraphError::DuplicateResource { name: "color" }
+    );
+}
+
+/// A downsample chain cannot add its upsampled result back into the level it
+/// came from, and this is the test that says why.
+///
+/// `down1` reads `mip0` and `up0` writes it, so "readers after all writers"
+/// puts `down1` after `up0` — while `up0` reads `mip1`, which `down1` produces.
+/// That is a cycle, and it is a consequence of resources being unversioned:
+/// with a version per write the two would be different resources and the data
+/// dependency would order them. Until then a bloom chain needs a separate
+/// image to accumulate into, which is why `frame::declare` registers an up
+/// chain alongside the down chain rather than blending in place.
+#[test]
+fn an_upsample_cannot_accumulate_into_the_level_it_read() {
+    let mut builder = GraphBuilder::new();
+    let target = builder.import_image(
+        "target",
+        image(),
+        ImageLayout::Undefined,
+        ImageLayout::PresentSrc,
+    );
+    let scene = builder.create_image("scene", image());
+    let mip0 = builder.create_image("mip0", image());
+    let mip1 = builder.create_image("mip1", image());
+
+    builder
+        .pass("draw", PassKind::Inline)
+        .access(scene, Access::ColorAttachment)
+        .build();
+    builder
+        .pass("down0", PassKind::Compute)
+        .access(scene, Access::Sampled)
+        .access(mip0, Access::StorageWrite)
+        .build();
+    builder
+        .pass("down1", PassKind::Compute)
+        .access(mip0, Access::Sampled)
+        .access(mip1, Access::StorageWrite)
+        .build();
+    builder
+        .pass("up0", PassKind::Compute)
+        .access(mip1, Access::Sampled)
+        .access(mip0, Access::StorageWrite)
+        .build();
+    builder
+        .pass("composite", PassKind::Inline)
+        .access(mip0, Access::Sampled)
+        .access(target, Access::ColorAttachment)
+        .build();
+
+    let error = compile(builder).unwrap_err();
+    let GraphError::Cycle { passes } = error else {
+        panic!("expected a cycle, got {error}");
+    };
+    assert!(
+        passes.contains(&"down1") && passes.contains(&"up0"),
+        "{passes:?}"
     );
 }

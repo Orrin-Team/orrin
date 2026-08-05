@@ -1,4 +1,5 @@
 mod assets;
+mod bloom;
 mod camera;
 mod components;
 mod culling;
@@ -18,6 +19,7 @@ mod time;
 mod transform;
 
 pub use assets::Assets;
+pub use bloom::BloomSettings;
 pub use camera::Camera;
 #[cfg(feature = "scripting")]
 pub use components::ScriptComponent;

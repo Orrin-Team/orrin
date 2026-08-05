@@ -519,14 +519,22 @@ fn frame_group(ui: &mut egui::Ui, world: &World, dock: &mut Dock) {
     let (exposure, cascades) = {
         let hdr = world.resource::<HdrSettings>();
         let shadow = world.resource::<ShadowSettings>();
-        (hdr.exposure, shadow.cascade_count)
+        // The metered exposure never leaves the GPU, so what the ribbon can
+        // report is the mode and the compensation dial — the two things the user
+        // set — rather than the multiplier in force.
+        let exposure = if hdr.auto_exposure {
+            format!("Auto {:+.1} EV", hdr.exposure_compensation)
+        } else {
+            format!("EV100 {:.1}", hdr.manual_ev100 - hdr.exposure_compensation)
+        };
+        (exposure, shadow.cascade_count)
     };
     group(ui, "Frame", |ui| {
         let reveal = [
             command(
                 ui,
                 Command::new(icons::aperture(), "Exposure")
-                    .sub(format!("{exposure:.2}"))
+                    .sub(exposure)
                     .hint("Show the Environment tool, where this is edited"),
             ),
             command(

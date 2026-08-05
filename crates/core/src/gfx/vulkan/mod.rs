@@ -1,5 +1,7 @@
+mod bloom;
 mod context;
 mod environment;
+mod exposure;
 mod forward;
 pub mod frame;
 mod hdr;
@@ -30,8 +32,8 @@ use vulkano::{Validated, VulkanError};
 use crate::geom::Aabb;
 use crate::gfx::shadows::CascadeSet;
 use crate::scene::{
-    Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle, ShadowSettings,
-    SsaoSettings,
+    BloomSettings, Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle,
+    ShadowSettings, SsaoSettings,
 };
 
 use self::context::VkContext;
@@ -39,6 +41,8 @@ use self::environment::EnvironmentPass;
 use self::forward::{ForwardPass, GpuMaterial, GpuMesh};
 use crate::gfx::graph::PassKind;
 
+use self::bloom::BloomPass;
+use self::exposure::ExposurePass;
 use self::frame::{Frame, FrameConfig, PassBody};
 use self::hdr::HdrPass;
 use self::line::LinePass;
@@ -86,6 +90,12 @@ pub struct VulkanRenderer {
     swapchain: SwapchainState,
     forward: ForwardPass,
     hdr: HdrPass,
+    /// Owns the histogram and exposure buffers the graph imports, and records
+    /// the two dispatches that fill them.
+    exposure: ExposurePass,
+    /// Records the bloom chain's dispatches. The levels themselves are
+    /// graph-owned transients, so this holds only pipelines and settings.
+    bloom: BloomPass,
     ssao: SsaoPass,
     shadow: ShadowPass,
     /// Debug-line overlay, recorded into the forward pass. Editor-only in
@@ -123,6 +133,8 @@ impl VulkanRenderer {
         let format = swapchain_color_format(&ctx, &surface);
         let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, hdr::HDR_FORMAT);
         let hdr = HdrPass::new(&ctx, format);
+        let exposure = ExposurePass::new(&ctx);
+        let bloom = BloomPass::new(&ctx);
         let ssao = SsaoPass::new(&ctx);
         let shadow = ShadowPass::new(&ctx);
         let line = LinePass::new(&ctx.device, &ctx.memory_allocator, &forward.render_pass);
@@ -154,6 +166,8 @@ impl VulkanRenderer {
         let config = FrameConfig {
             color_format: format,
             ssao: true,
+            auto_exposure: true,
+            bloom_mips: bloom::mip_count(extent),
             overlay: true,
             shadow_cascades: 0,
             shadow_resolution: 1,
@@ -167,6 +181,8 @@ impl VulkanRenderer {
             swapchain,
             forward,
             hdr,
+            exposure,
+            bloom,
             ssao,
             shadow,
             line,
@@ -299,8 +315,10 @@ impl RenderBackend for VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
+        dt: f32,
     ) {
         // No overlay path (e.g. export/headless) draws no debug lines and no
         // shadows.
@@ -309,8 +327,10 @@ impl RenderBackend for VulkanRenderer {
             lighting,
             camera,
             ssao,
+            bloom,
             hdr,
             environment,
+            dt,
             &[],
             None,
             None,
@@ -364,8 +384,10 @@ impl VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
+        dt: f32,
         debug_lines: &[DebugLine],
         profiler_frame: u64,
         shadows: Option<ShadowFrame<'_>>,
@@ -376,8 +398,10 @@ impl VulkanRenderer {
             lighting,
             camera,
             ssao,
+            bloom,
             hdr,
             environment,
+            dt,
             debug_lines,
             Some(profiler_frame),
             shadows,
@@ -391,8 +415,12 @@ impl VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
+        // Seconds since the last frame, for exposure adaptation. Zero converges
+        // immediately, which is what a one-shot render wants.
+        dt: f32,
         debug_lines: &[DebugLine],
         profiler_frame: Option<u64>,
         shadows: Option<ShadowFrame<'_>>,
@@ -419,6 +447,15 @@ impl VulkanRenderer {
         self.ensure_graph(FrameConfig {
             color_format: self.swapchain.swapchain.image_format(),
             ssao: ssao.enabled,
+            auto_exposure: hdr.auto_exposure,
+            // Zero when bloom is off, and also when the window is too small for
+            // a chain — so a frame dragged to a sliver drops the passes rather
+            // than dispatching over one-texel levels.
+            bloom_mips: if bloom.enabled {
+                bloom::mip_count(self.swapchain.extent)
+            } else {
+                0
+            },
             overlay: overlay.is_some(),
             // Sourced from the cascade set rather than the setting, so the
             // number of passes the graph declares cannot disagree with the
@@ -477,7 +514,19 @@ impl VulkanRenderer {
         self.ssao.radius = ssao.radius;
         self.ssao.bias = ssao.bias;
         self.ssao.power = ssao.power;
-        self.hdr.exposure = hdr.exposure;
+        self.hdr.manual_exposure = hdr.manual_exposure();
+        self.hdr.auto_exposure = hdr.auto_exposure;
+        self.exposure.begin_frame(hdr, dt);
+        self.bloom.begin_frame(bloom, hdr);
+        // Sourced from the compiled frame, not from the setting: a window too
+        // small for a chain leaves bloom enabled but unbuilt, and a non-zero
+        // strength would then blend the 1x1 black stand-in into the image and
+        // darken it. The same reason the cascade count comes from the cascade
+        // set rather than from `ShadowSettings`.
+        self.hdr.bloom_strength = match self.frame.ids.bloom {
+            Some(_) => self.bloom.strength(),
+            None => 0.0,
+        };
         if let Some(shadows) = shadows {
             self.shadow.constant_bias = shadows.settings.constant_bias;
             self.shadow.slope_bias = shadows.settings.slope_bias;
@@ -541,7 +590,8 @@ impl VulkanRenderer {
         for pass_id in self.frame.graph.order().to_vec() {
             let body = self.frame.bodies[pass_id.index()];
 
-            if self.frame.graph.pass_kind(pass_id) == PassKind::Raw {
+            let kind = self.frame.graph.pass_kind(pass_id);
+            if kind == PassKind::Raw {
                 // Escape-hatch passes own their submission, so they run on the
                 // future after this command buffer rather than inside it.
                 // `compile` has already established that none of them precedes
@@ -553,6 +603,69 @@ impl VulkanRenderer {
             let timed = timestamps.as_mut().and_then(|timestamps| {
                 timestamps.begin_pass(&mut builder, self.frame.graph.pass_name(pass_id))
             });
+
+            // A dispatch is illegal inside a render pass, so a compute pass is
+            // recorded into the same command buffer with no bracket around it.
+            // That is the only thing the kind changes: ordering and barriers are
+            // derived for it exactly as for a draw.
+            if kind == PassKind::Compute {
+                match body {
+                    PassBody::LuminanceHistogram => self.exposure.record_histogram(
+                        &mut builder,
+                        &self.ctx,
+                        extent,
+                        self.images.view(self.frame.ids.hdr_color),
+                    ),
+                    PassBody::LuminanceAverage => {
+                        self.exposure
+                            .record_average(&mut builder, &self.ctx, extent)
+                    }
+                    PassBody::BloomPrefilter => {
+                        let ids = self.frame.ids.bloom.expect("bloom pass without levels");
+                        self.bloom.record_prefilter(
+                            &mut builder,
+                            &self.ctx,
+                            self.images.view(self.frame.ids.hdr_color),
+                            self.images.view(ids.down(0)),
+                            self.exposure.exposure_buffer(),
+                        );
+                    }
+                    PassBody::BloomDownsample(level) => {
+                        let ids = self.frame.ids.bloom.expect("bloom pass without levels");
+                        let level = level as usize;
+                        self.bloom.record_downsample(
+                            &mut builder,
+                            &self.ctx,
+                            self.images.view(ids.down(level - 1)),
+                            self.images.view(ids.down(level)),
+                        );
+                    }
+                    PassBody::BloomUpsample(level) => {
+                        let ids = self.frame.ids.bloom.expect("bloom pass without levels");
+                        let level = level as usize;
+                        // Mirrors what `declare` said this pass reads: an
+                        // up-chain level where there is one above, and the down
+                        // chain's last level at the top of the climb.
+                        let coarse = if level + 2 < ids.mips as usize {
+                            ids.up(level + 1)
+                        } else {
+                            ids.down(level + 1)
+                        };
+                        self.bloom.record_upsample(
+                            &mut builder,
+                            &self.ctx,
+                            self.images.view(coarse),
+                            self.images.view(ids.down(level)),
+                            self.images.view(ids.up(level)),
+                        );
+                    }
+                    other => unreachable!("{other:?} is not a compute pass"),
+                }
+                if let Some(timestamps) = timestamps.as_mut() {
+                    timestamps.end_pass(&mut builder, timed);
+                }
+                continue;
+            }
 
             let framebuffer = self
                 .framebuffers
@@ -643,8 +756,21 @@ impl VulkanRenderer {
                     &self.ctx,
                     extent,
                     self.images.view(self.frame.ids.hdr_color),
+                    self.exposure.exposure_buffer(),
+                    // With bloom off the graph has no chain, so the tonemap
+                    // pass samples a 1x1 black view at a zero strength: "no
+                    // bloom" with no second shader path.
+                    match self.frame.ids.bloom {
+                        Some(ids) => self.images.view(ids.result()),
+                        None => self.bloom.black_view(),
+                    },
                 ),
-                PassBody::Overlay => unreachable!("handled above"),
+                PassBody::Overlay
+                | PassBody::LuminanceHistogram
+                | PassBody::LuminanceAverage
+                | PassBody::BloomPrefilter
+                | PassBody::BloomDownsample(_)
+                | PassBody::BloomUpsample(_) => unreachable!("handled above"),
             }
 
             builder.end_render_pass(Default::default()).unwrap();

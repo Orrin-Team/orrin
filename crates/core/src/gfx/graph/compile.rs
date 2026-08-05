@@ -97,6 +97,7 @@ pub fn compile(builder: GraphBuilder) -> Result<FrameGraph, GraphError> {
 
     for pass in &passes {
         check_single_access_per_resource(pass, &resources)?;
+        check_compute_declares_no_attachment(pass, &resources)?;
     }
 
     let order = topological_order(&passes)?;
@@ -138,6 +139,29 @@ fn check_single_access_per_resource(
     Ok(())
 }
 
+/// A dispatch runs outside any render pass, so a compute pass has nothing to
+/// attach an attachment to. Caught here, where the message can say so, rather
+/// than as a framebuffer the executor never builds and a validation layer
+/// complaint about the layout it therefore never reached.
+fn check_compute_declares_no_attachment(
+    pass: &PassDecl,
+    resources: &[ResourceDecl],
+) -> Result<(), GraphError> {
+    if pass.kind != PassKind::Compute {
+        return Ok(());
+    }
+    for &(resource, access) in &pass.accesses {
+        if access.is_attachment() {
+            return Err(GraphError::AttachmentInComputePass {
+                pass: pass.name,
+                resource: resources[resource.index()].name,
+                access,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A raw pass owns its own submission, and v1 records the rest of the frame as a
 /// single command buffer submitted before any of them. Splitting that command
 /// buffer around a raw pass in the middle is possible, but it then hands the same
@@ -150,13 +174,13 @@ fn check_raw_passes_last(order: &[PassId], passes: &[PassDecl]) -> Result<(), Gr
         let pass = &passes[pass_id.index()];
         match (pass.kind, raw) {
             (PassKind::Raw, _) => raw = Some(pass.name),
-            (PassKind::Inline, Some(raw)) => {
+            (PassKind::Inline | PassKind::Compute, Some(raw)) => {
                 return Err(GraphError::RawPassNotLast {
                     raw,
                     followed_by: pass.name,
                 });
             }
-            (PassKind::Inline, None) => {}
+            (PassKind::Inline | PassKind::Compute, None) => {}
         }
     }
     Ok(())
