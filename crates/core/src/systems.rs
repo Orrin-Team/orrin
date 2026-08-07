@@ -4,7 +4,7 @@ use orrin_ecs::World;
 
 use crate::geom::Aabb;
 use crate::gfx::shadows::{Cascade, CascadeSet, MAX_CASCADES};
-use crate::gfx::{MAX_POINT_LIGHTS, PointLight, RenderItem, SceneLighting};
+use crate::gfx::{DrawList, MAX_POINT_LIGHTS, PointLight, RenderItem, SceneLighting};
 use crate::scene::{
     AmbientLight, Camera, Culling, FogSettings, Light, LocalTransform, MaterialHandle, MeshBounds,
     MeshHandle, Spin, WorldTransform,
@@ -16,19 +16,74 @@ pub fn spin(world: &World, dt: f32) {
         .for_each(|_entity, (transform, spin)| spin.apply(transform, dt));
 }
 
-/// Build this frame's draw list: every renderable the camera can see, with
-/// everything the passes need already derived.
+/// Everything a frame draws, derived in one sweep of the world.
+///
+/// The lists are orderings of indices into `items`, not copies of it: a
+/// `RenderItem` is 144 bytes and an object visible to the camera is usually also
+/// a caster in two or three cascades, so materialising each list separately
+/// would copy — and then sort — the same matrices five times over. Indices make
+/// widening a list a four-byte push and each sort a scan of `u32`s.
+#[derive(Default)]
+pub struct FrameGeometry {
+    /// Every renderable in the world, with its model, bounds and
+    /// inverse-transpose derived exactly once this frame.
+    items: Vec<RenderItem>,
+    /// What the camera frustum kept, in draw order.
+    visible: Vec<u32>,
+    /// What casts into each active cascade, in draw order.
+    cascades: [Vec<u32>; MAX_CASCADES],
+}
+
+impl FrameGeometry {
+    /// What the camera-facing passes draw: the forward pass and the SSAO
+    /// prepass, which share both the list and the object rows uploaded for it.
+    pub fn visible(&self) -> DrawList<'_> {
+        DrawList::new(&self.items, &self.visible)
+    }
+
+    /// What cascade `index` draws. Empty for a cascade the last extraction did
+    /// not fill, which is what shadows-off produces.
+    pub fn cascade(&self, index: usize) -> DrawList<'_> {
+        DrawList::new(&self.items, &self.cascades[index])
+    }
+}
+
+/// Build this frame's draw lists: what the camera can see, and what casts into
+/// each cascade, with everything the passes need already derived.
+///
+/// One sweep, because both questions are asked of the same entities and the
+/// expensive half of the answer — the world-space bounds and the
+/// inverse-transpose — does not depend on which question is being asked. Two
+/// sweeps recomputed a 3x3 inverse per object per frame for nothing.
+///
+/// The camera-culled list is the wrong input for a shadow pass: an object behind
+/// the camera can still cast into view. Each cascade instead takes everything
+/// whose bounds, swept toward the light, reach its box — overlapping in x and y
+/// in light space, and not lying entirely beyond the far plane. There is
+/// deliberately no near test: something nearer the light than the cascade is
+/// exactly what casts into it.
 ///
 /// `aspect` must be the one the frame is drawn with — the frustum's side planes
 /// are only the visible ones if it matches.
-pub fn extract_renderables(world: &World, aspect: f32, out: &mut Vec<RenderItem>) {
-    out.clear();
+pub fn extract_geometry(
+    world: &World,
+    aspect: f32,
+    cascades: &CascadeSet,
+    out: &mut FrameGeometry,
+) {
+    out.items.clear();
+    out.visible.clear();
+    for list in out.cascades.iter_mut() {
+        list.clear();
+    }
 
     let cull = world
         .get_resource::<Culling>()
         .is_none_or(|culling| culling.enabled);
-    let frustum = world.get_resource::<Camera>().map(|c| c.frustum(aspect));
+    let camera = world.get_resource::<Camera>();
+    let frustum = camera.as_ref().map(|c| c.frustum(aspect));
     let bounds = world.get_resource::<MeshBounds>();
+    let active = &cascades.cascades[..cascades.count];
     let mut total = 0usize;
 
     world
@@ -45,88 +100,97 @@ pub fn extract_renderables(world: &World, aspect: f32, out: &mut Vec<RenderItem>
                 .unwrap_or(Aabb::EMPTY)
                 .transformed(&model);
 
-            if cull
-                && let Some(frustum) = &frustum
-                && !frustum.intersects(&world_bounds)
-            {
+            let visible = !cull
+                || frustum
+                    .as_ref()
+                    .is_none_or(|frustum| frustum.intersects(&world_bounds));
+            let casts: [bool; MAX_CASCADES] = std::array::from_fn(|i| {
+                active
+                    .get(i)
+                    .is_some_and(|cascade| casts_into(&world_bounds, cascade))
+            });
+
+            // An object no list wants still costs the sweep, but it must not
+            // cost a row in `items` — the object buffer is uploaded from this
+            // array and a row nothing indexes is upload bandwidth for nothing.
+            if !visible && !casts.iter().any(|&c| c) {
                 return;
             }
 
-            out.push(RenderItem {
+            let index = out.items.len() as u32;
+            out.items.push(RenderItem {
                 model,
                 normal_matrix: normal_matrix(&model),
                 bounds: world_bounds,
                 mesh: *mesh,
                 material: material.copied().unwrap_or(MaterialHandle(0)),
             });
-        });
 
-    // Grouping by mesh lets the passes bind vertex/index buffers once per run
-    // instead of once per draw, and collapse each run into a single instanced
-    // draw. Opaque geometry is depth-tested, so draw order carries no visual
-    // meaning to preserve.
-    out.sort_unstable_by_key(|item| (item.mesh.0, item.material.0));
-
-    if let Some(mut culling) = world.get_resource_mut::<Culling>() {
-        culling.record(out.len(), total);
-    }
-}
-
-/// Build each cascade's caster list.
-///
-/// The camera-culled list [`extract_renderables`] produces is the wrong input
-/// for a shadow pass: an object behind the camera can still cast into view. Each
-/// cascade instead takes everything whose bounds, swept toward the light, reach
-/// its box — which in light space means overlapping in x and y, and not lying
-/// entirely beyond the far plane. There is deliberately no near test: something
-/// nearer the light than the cascade is exactly what casts into it.
-///
-/// One sweep of the world, N box tests per object. N separate sweeps would ask
-/// the same question of the same entities four times, since a near cascade's
-/// casters are almost always a subset of a far one's.
-pub fn extract_shadow_casters(
-    world: &World,
-    cascades: &CascadeSet,
-    out: &mut [Vec<RenderItem>; MAX_CASCADES],
-) {
-    for list in out.iter_mut() {
-        list.clear();
-    }
-    if cascades.count == 0 {
-        return;
-    }
-
-    let bounds = world.get_resource::<MeshBounds>();
-    world
-        .query::<(&WorldTransform, &MeshHandle, Option<&MaterialHandle>)>()
-        .for_each(|_entity, (transform, mesh, material)| {
-            let model = transform.0;
-            let world_bounds = bounds
-                .as_ref()
-                .and_then(|table| table.get(*mesh))
-                .unwrap_or(Aabb::EMPTY)
-                .transformed(&model);
-
-            let item = RenderItem {
-                model,
-                normal_matrix: normal_matrix(&model),
-                bounds: world_bounds,
-                mesh: *mesh,
-                material: material.copied().unwrap_or(MaterialHandle(0)),
-            };
-
-            for (list, cascade) in out.iter_mut().zip(&cascades.cascades[..cascades.count]) {
-                if casts_into(&world_bounds, cascade) {
-                    list.push(item);
+            if visible {
+                out.visible.push(index);
+            }
+            for (list, casts) in out.cascades.iter_mut().zip(casts) {
+                if casts {
+                    list.push(index);
                 }
             }
         });
 
-    // Same key the forward pass groups on, so each cascade's draws still
-    // collapse into one instanced call per (mesh, material) pair.
-    for list in out.iter_mut() {
-        list.sort_unstable_by_key(|item| (item.mesh.0, item.material.0));
+    // Grouping by mesh lets the passes bind vertex/index buffers once per run
+    // instead of once per draw, and collapse each run into a single instanced
+    // draw.
+    let key = |items: &[RenderItem], index: &u32| {
+        let item = &items[*index as usize];
+        (item.mesh.0, item.material.0)
+    };
+    out.visible.sort_unstable_by_key(|i| key(&out.items, i));
+    for list in out.cascades.iter_mut() {
+        list.sort_unstable_by_key(|i| key(&out.items, i));
     }
+
+    // Within the grouping, order the runs front to back. Opaque geometry is
+    // depth-tested, so this changes no pixel — it changes how many fragments
+    // reach the shader, since a nearer run already in the depth buffer rejects
+    // the ones behind it before they shade. Runs move whole, so every run is
+    // still one instanced draw.
+    if let Some(camera) = camera.as_ref() {
+        order_runs_front_to_back(&out.items, &mut out.visible, camera.position);
+    }
+
+    if let Some(mut culling) = world.get_resource_mut::<Culling>() {
+        culling.record(out.visible.len(), total);
+    }
+}
+
+/// Reorder `order`'s (mesh, material) runs by their nearest distance to `eye`,
+/// keeping each run contiguous.
+///
+/// Sorting individual items front to back would break every run into a draw of
+/// its own; the batching is worth more than the last few percent of rejection,
+/// so the run is the unit that moves.
+fn order_runs_front_to_back(items: &[RenderItem], order: &mut Vec<u32>, eye: Vec3) {
+    let runs: Vec<std::ops::Range<usize>> = DrawList::new(items, order).runs().collect();
+    if runs.len() < 2 {
+        return;
+    }
+
+    let mut keyed: Vec<(f32, std::ops::Range<usize>)> = runs
+        .into_iter()
+        .map(|run| {
+            let nearest = order[run.clone()]
+                .iter()
+                .map(|&i| items[i as usize].bounds.distance_squared_to(eye))
+                .fold(f32::INFINITY, f32::min);
+            (nearest, run)
+        })
+        .collect();
+    keyed.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mut sorted = Vec::with_capacity(order.len());
+    for (_, run) in &keyed {
+        sorted.extend_from_slice(&order[run.clone()]);
+    }
+    *order = sorted;
 }
 
 /// Whether `bounds`, extended infinitely toward the light, reaches `cascade`.
@@ -174,7 +238,7 @@ mod shadow_culling_tests {
         }
     }
 
-    /// The whole reason this is not `extract_renderables` with a different
+    /// The whole reason a cascade is not the camera's list with a different
     /// frustum. An object the camera cannot see still casts into what it can,
     /// and a cull that drops it produces missing shadows that read as a bias
     /// bug.
@@ -349,8 +413,9 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_renderables, normal_matrix};
+    use super::{FrameGeometry, extract_geometry, normal_matrix};
     use crate::gfx::RenderItem;
+    use crate::gfx::shadows::CascadeSet;
     use crate::scene::propagate_transforms;
     use crate::scene::{
         Camera, CpuMesh, Culling, LocalTransform, MeshBounds, MeshHandle, Transform, WorldTransform,
@@ -384,9 +449,12 @@ mod tests {
     /// transforms, and only propagation produces them.
     fn extract(world: &mut World) -> Vec<RenderItem> {
         propagate_transforms(world);
-        let mut items = Vec::new();
-        extract_renderables(world, ASPECT, &mut items);
-        items
+        let mut geometry = FrameGeometry::default();
+        // No cascades: these cover the camera list, and a cascade would only
+        // add items to `geometry.items` that the visible order does not name.
+        extract_geometry(world, ASPECT, &CascadeSet::default(), &mut geometry);
+        let visible = geometry.visible();
+        (0..visible.len()).map(|i| *visible.item(i)).collect()
     }
 
     #[test]
@@ -646,5 +714,171 @@ mod tests {
         spawn(&mut world, Vec3::new(0.0, 0.0, 400.0), CUBE);
 
         assert_eq!(extract(&mut world).len(), 1);
+    }
+}
+
+/// The half of extraction the camera-only tests above cannot reach: that one
+/// sweep still answers both questions, and that reordering never breaks a run.
+#[cfg(test)]
+mod geometry_tests {
+    use super::{FrameGeometry, extract_geometry};
+    use crate::gfx::shadows::{CascadeConfig, CascadeSet, cascades};
+    use crate::scene::{
+        Camera, CpuMesh, Culling, LocalTransform, MaterialHandle, MeshBounds, MeshHandle,
+        Transform, WorldTransform,
+    };
+    use glam::Vec3;
+    use orrin_ecs::World;
+
+    const ASPECT: f32 = 16.0 / 9.0;
+    const CUBE: MeshHandle = MeshHandle(0);
+
+    fn world_with(meshes: &[(Vec3, MeshHandle, u32)]) -> World {
+        let mut world = World::new();
+        let mut bounds = MeshBounds::default();
+        bounds.insert(CUBE, CpuMesh::cube().bounds());
+        bounds.insert(MeshHandle(1), CpuMesh::cube().bounds());
+        world.insert_resource(bounds);
+        world.insert_resource(Camera::default());
+        world.insert_resource(Culling::default());
+        for &(position, mesh, material) in meshes {
+            world
+                .spawn_entity()
+                .with(LocalTransform::from(Transform::from_translation(position)))
+                .with(WorldTransform(glam::Mat4::from_translation(position)))
+                .with(mesh)
+                .with(MaterialHandle(material));
+        }
+        world
+    }
+
+    fn sun_cascades(camera: &Camera) -> CascadeSet {
+        cascades(
+            camera,
+            ASPECT,
+            Vec3::NEG_Y,
+            &CascadeConfig {
+                count: 2,
+                max_distance: 100.0,
+                lambda: 0.75,
+                resolution: 1024,
+                pullback: 50.0,
+            },
+        )
+    }
+
+    /// The reason the two sweeps were merged rather than one dropped: an object
+    /// the camera culls can still be a caster, so it must survive into `items`
+    /// even though the visible order never names it.
+    #[test]
+    fn an_object_the_camera_culls_can_still_reach_a_cascade() {
+        let camera = Camera::default();
+        // Directly overhead of the origin: out of the camera's frustum, but
+        // between a straight-down sun and what the camera is looking at.
+        let world = world_with(&[(Vec3::new(0.0, 60.0, 0.0), CUBE, 0)]);
+        let set = sun_cascades(&camera);
+
+        let mut geometry = FrameGeometry::default();
+        extract_geometry(&world, ASPECT, &set, &mut geometry);
+
+        assert_eq!(geometry.visible().len(), 0, "it should not be visible");
+        assert!(
+            !geometry.cascade(0).is_empty(),
+            "an overhead caster was dropped from cascade 0",
+        );
+    }
+
+    /// An object no list wants must not reach `items` at all: the object buffer
+    /// is uploaded from that array, so a row nothing indexes is dead bandwidth.
+    #[test]
+    fn an_object_no_list_wants_costs_no_row() {
+        let camera = Camera::default();
+        // Far behind the camera and far outside every cascade box.
+        let world = world_with(&[(Vec3::new(0.0, 0.0, 5000.0), CUBE, 0)]);
+        let set = sun_cascades(&camera);
+
+        let mut geometry = FrameGeometry::default();
+        extract_geometry(&world, ASPECT, &set, &mut geometry);
+
+        assert_eq!(geometry.visible().len(), 0);
+        for i in 0..set.count {
+            assert_eq!(geometry.cascade(i).len(), 0, "cascade {i}");
+        }
+        assert_eq!(
+            geometry.items.len(),
+            0,
+            "an object nothing draws still took a row",
+        );
+    }
+
+    /// A caster shared with the camera is one `RenderItem`, indexed twice —
+    /// that sharing is the whole point of the index lists.
+    #[test]
+    fn a_visible_caster_is_stored_once_and_indexed_from_both() {
+        let camera = Camera::default();
+        let world = world_with(&[(Vec3::ZERO, CUBE, 0)]);
+        let set = sun_cascades(&camera);
+
+        let mut geometry = FrameGeometry::default();
+        extract_geometry(&world, ASPECT, &set, &mut geometry);
+
+        assert_eq!(geometry.items.len(), 1);
+        assert_eq!(geometry.visible.len(), 1);
+        assert_eq!(geometry.cascades[0].len(), 1);
+        assert_eq!(geometry.visible[0], geometry.cascades[0][0]);
+    }
+
+    /// Front-to-back ordering may reorder runs but must never split one: a run
+    /// is a single instanced draw whose base is its start, so a broken run
+    /// draws instances against the wrong transforms.
+    #[test]
+    fn front_to_back_ordering_keeps_every_run_whole() {
+        let camera = Camera::default();
+        // Two meshes interleaved in depth, so ordering has something to do and
+        // the grouping has something to hold together.
+        let world = world_with(&[
+            (Vec3::new(0.0, 0.0, -2.0), CUBE, 0),
+            (Vec3::new(0.0, 0.0, -8.0), MeshHandle(1), 0),
+            (Vec3::new(0.0, 0.0, -4.0), CUBE, 0),
+            (Vec3::new(0.0, 0.0, -6.0), MeshHandle(1), 0),
+        ]);
+
+        let mut geometry = FrameGeometry::default();
+        extract_geometry(&world, ASPECT, &CascadeSet::default(), &mut geometry);
+        let visible = geometry.visible();
+        assert_eq!(visible.len(), 4, "the camera should see all four");
+
+        // One run per mesh, still — reordering moved runs, it did not split them.
+        let runs: Vec<_> = visible.runs().collect();
+        assert_eq!(runs.len(), 2, "runs were split: {runs:?}");
+        for run in &runs {
+            let key = {
+                let item = visible.item(run.start);
+                (item.mesh.0, item.material.0)
+            };
+            for i in run.clone() {
+                let item = visible.item(i);
+                assert_eq!((item.mesh.0, item.material.0), key);
+            }
+        }
+    }
+
+    /// And that the reordering is actually front to back: the nearer run leads.
+    #[test]
+    fn the_nearer_run_is_drawn_first() {
+        let camera = Camera::default();
+        let world = world_with(&[
+            (Vec3::new(0.0, 0.0, -20.0), MeshHandle(1), 0),
+            (Vec3::new(0.0, 0.0, -2.0), CUBE, 0),
+        ]);
+
+        let mut geometry = FrameGeometry::default();
+        extract_geometry(&world, ASPECT, &CascadeSet::default(), &mut geometry);
+        let visible = geometry.visible();
+        assert_eq!(visible.len(), 2);
+
+        let near = visible.item(0).bounds.distance_squared_to(camera.position);
+        let far = visible.item(1).bounds.distance_squared_to(camera.position);
+        assert!(near <= far, "runs are back to front: {near} then {far}");
     }
 }

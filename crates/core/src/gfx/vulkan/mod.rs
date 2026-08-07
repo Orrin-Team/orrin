@@ -52,7 +52,7 @@ use self::ssao::SsaoPass;
 use self::swapchain::SwapchainState;
 use self::timestamps::GpuTimestamps;
 
-use super::{MAX_TEXTURES, Material, RenderBackend, RenderItem, SceneLighting, TextureHandle};
+use super::{DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TextureHandle};
 use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::DebugLine;
@@ -80,8 +80,10 @@ pub type Overlay<'a> = &'a mut dyn FnMut(Box<dyn GpuFuture>, Arc<ImageView>) -> 
 #[derive(Clone, Copy)]
 pub struct ShadowFrame<'a> {
     pub cascades: &'a CascadeSet,
-    /// Indexed like `cascades.cascades`.
-    pub casters: &'a [Vec<RenderItem>],
+    /// Indexed like `cascades.cascades`. Each is an ordering over the same item
+    /// array the camera's list indexes, so an object both visible and casting
+    /// exists once on the CPU however many cascades want it.
+    pub casters: &'a [DrawList<'a>],
     pub settings: &'a ShadowSettings,
 }
 
@@ -311,7 +313,7 @@ impl RenderBackend for VulkanRenderer {
 
     fn render(
         &mut self,
-        items: &[RenderItem],
+        draws: DrawList<'_>,
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
@@ -323,7 +325,7 @@ impl RenderBackend for VulkanRenderer {
         // No overlay path (e.g. export/headless) draws no debug lines and no
         // shadows.
         self.render_frame(
-            items,
+            draws,
             lighting,
             camera,
             ssao,
@@ -380,7 +382,7 @@ impl VulkanRenderer {
     /// editor UI) onto the final image before present.
     pub fn render_with_overlay(
         &mut self,
-        items: &[RenderItem],
+        draws: DrawList<'_>,
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
@@ -394,7 +396,7 @@ impl VulkanRenderer {
         overlay: Overlay<'_>,
     ) {
         self.render_frame(
-            items,
+            draws,
             lighting,
             camera,
             ssao,
@@ -411,7 +413,7 @@ impl VulkanRenderer {
 
     fn render_frame(
         &mut self,
-        items: &[RenderItem],
+        draws: DrawList<'_>,
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
@@ -548,10 +550,27 @@ impl VulkanRenderer {
         // inverse-transpose is too expensive to compute more than once. The
         // camera-visible items come first, so the two screen-space passes still
         // index from zero and the cascades index from `caster_bases`.
-        let no_casters: [Vec<RenderItem>; 0] = [];
+        let no_casters: [DrawList<'_>; 0] = [];
         let (object_buffer, caster_bases) = self
             .forward
-            .upload_objects(items, shadows.map_or(&no_casters, |s| s.casters));
+            .upload_objects(draws, shadows.map_or(&no_casters, |s| s.casters));
+
+        // One set per pipeline layout per frame, rather than one per pass. The
+        // buffer is a fresh subbuffer each frame so none of these can be cached
+        // across frames, but every cascade binds the same buffer through the
+        // same layout — so the shadow set is built once here instead of once per
+        // cascade, which is where the duplication actually was. They are kept
+        // separate rather than shared because set compatibility is a property of
+        // the layout each pipeline declares, not of the buffer written into it.
+        let forward_object_set = self.forward.build_object_set(&self.ctx, &object_buffer);
+        let shadow_object_set = shadows
+            .is_some()
+            .then(|| self.shadow.build_object_set(&self.ctx, &object_buffer));
+        let ssao_object_set = self
+            .frame
+            .ids
+            .ssao
+            .map(|_| self.ssao.build_object_set(&self.ctx, &object_buffer));
 
         // Uploaded once even though two graph nodes read it — which is what the
         // shared `object_transforms` declaration in `frame::declare` records.
@@ -587,7 +606,8 @@ impl VulkanRenderer {
         // gets there by changing its declarations, not by being moved here.
         let extent = self.swapchain.extent;
         let mut raw_passes = Vec::new();
-        for pass_id in self.frame.graph.order().to_vec() {
+        for index in 0..self.frame.graph.order().len() {
+            let pass_id = self.frame.graph.order()[index];
             let body = self.frame.bodies[pass_id.index()];
 
             let kind = self.frame.graph.pass_kind(pass_id);
@@ -684,24 +704,26 @@ impl VulkanRenderer {
             match body {
                 PassBody::ShadowCascade(cascade) => {
                     let shadows = shadows.expect("the graph scheduled a cascade with no shadows");
-                    let index = cascade as usize;
+                    let cascade_index = cascade as usize;
                     self.shadow.record(
                         &mut builder,
                         self,
-                        &shadows.casters[index],
-                        shadows.cascades.cascades[index].view_proj,
-                        caster_bases[index],
+                        shadows.casters[cascade_index],
+                        shadows.cascades.cascades[cascade_index].view_proj,
+                        caster_bases[cascade_index],
                         self.config.shadow_resolution,
-                        object_buffer.clone(),
+                        shadow_object_set
+                            .clone()
+                            .expect("the graph scheduled a cascade with no shadows"),
                     );
                 }
                 PassBody::SsaoPrepass => self.ssao.record_prepass(
                     &mut builder,
                     self,
-                    items,
+                    draws,
                     extent,
                     ssao_uniforms.as_ref().unwrap(),
-                    object_buffer.clone(),
+                    ssao_object_set.clone().unwrap(),
                 ),
                 PassBody::SsaoResolve => {
                     let ids = self.frame.ids.ssao.unwrap();
@@ -723,7 +745,7 @@ impl VulkanRenderer {
                     self.forward.draw(
                         &mut builder,
                         self,
-                        items,
+                        draws,
                         lighting,
                         camera,
                         extent,
@@ -732,7 +754,7 @@ impl VulkanRenderer {
                         shadows,
                         material_set.clone(),
                         texture_set.clone(),
-                        object_buffer.clone(),
+                        forward_object_set.clone(),
                         environment,
                     );
                     // Between the geometry and the lines, and it has to be:

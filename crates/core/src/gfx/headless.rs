@@ -11,7 +11,7 @@
 //! produces are indistinguishable from a live one's.
 
 use crate::geom::Aabb;
-use crate::gfx::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle};
+use crate::gfx::{DrawList, Material, RenderBackend, SceneLighting, TextureHandle};
 use crate::scene::{
     BloomSettings, Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle,
     SsaoSettings,
@@ -74,7 +74,7 @@ impl RenderBackend for HeadlessBackend {
 
     fn render(
         &mut self,
-        _items: &[RenderItem],
+        _draws: DrawList<'_>,
         _lighting: &SceneLighting,
         _camera: &Camera,
         _ssao: &SsaoSettings,

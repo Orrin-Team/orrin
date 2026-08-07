@@ -8,7 +8,7 @@ namespace DemoGame;
 // cycling material each time Space is pressed.
 public class Game : Behaviour
 {
-    public float MoveSpeed = 6f;
+    public float MoveSpeed = 32f;
 
     private static readonly string[] Palette = ["gold", "copper", "neon", "glossy"];
 

@@ -28,7 +28,7 @@ use vulkano::render_pass::{RenderPass, Subpass};
 use crate::geom::Aabb;
 use crate::gfx::sh::SH9;
 use crate::gfx::shadows::MAX_CASCADES;
-use crate::gfx::{MAX_POINT_LIGHTS, MAX_TEXTURES, Material, RenderItem, SceneLighting, Vertex};
+use crate::gfx::{DrawList, MAX_POINT_LIGHTS, MAX_TEXTURES, Material, SceneLighting, Vertex};
 use crate::scene::{Camera, EnvironmentSettings};
 
 use super::context::VkContext;
@@ -373,6 +373,25 @@ impl ForwardPass {
         }
     }
 
+    /// The set-4 per-object descriptor set for this frame's object buffer.
+    ///
+    /// Built once per frame by the executor rather than once per pass: the
+    /// buffer changes every frame, so nothing here can be cached across frames,
+    /// but nothing needs to be rebuilt within one either.
+    pub(super) fn build_object_set(
+        &self,
+        ctx: &VkContext,
+        objects: &Subbuffer<[GpuObject]>,
+    ) -> Arc<DescriptorSet> {
+        DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            self.pipeline.layout().set_layouts()[4].clone(),
+            [WriteDescriptorSet::buffer(0, objects.clone())],
+            [],
+        )
+        .unwrap()
+    }
+
     /// Build the set-1 material storage buffer + descriptor set. Cached by the
     /// renderer and only rebuilt when the material table changes.
     pub fn build_material_set(
@@ -443,10 +462,10 @@ impl ForwardPass {
     /// single resource in the graph rather than a convenient fiction.
     pub(super) fn upload_objects(
         &self,
-        items: &[RenderItem],
-        casters: &[Vec<RenderItem>],
+        visible: DrawList<'_>,
+        casters: &[DrawList<'_>],
     ) -> (Subbuffer<[GpuObject]>, [u32; MAX_CASCADES]) {
-        let total: usize = items.len() + casters.iter().map(Vec::len).sum::<usize>();
+        let total: usize = visible.len() + casters.iter().map(DrawList::len).sum::<usize>();
         // allocate_slice rejects length 0; an empty scene still needs a bindable
         // buffer, so round up to one (unwritten, unread) slot.
         let buffer = self
@@ -458,8 +477,9 @@ impl ForwardPass {
         {
             let mut rows = buffer.write().unwrap();
             let mut next = 0usize;
-            let mut write = |list: &[RenderItem], next: &mut usize| {
-                for item in list {
+            let mut write = |list: &DrawList<'_>, next: &mut usize| {
+                for i in 0..list.len() {
+                    let item = list.item(i);
                     rows[*next] = GpuObject {
                         model: item.model.to_cols_array_2d(),
                         normal_matrix: Mat4::from_mat3(item.normal_matrix).to_cols_array_2d(),
@@ -467,7 +487,7 @@ impl ForwardPass {
                     *next += 1;
                 }
             };
-            write(items, &mut next);
+            write(&visible, &mut next);
             for (base, list) in bases.iter_mut().zip(casters) {
                 *base = next as u32;
                 write(list, &mut next);
@@ -480,7 +500,7 @@ impl ForwardPass {
         &self,
         builder: &mut AutoCommandBufferBuilder<vulkano::command_buffer::PrimaryAutoCommandBuffer>,
         renderer: &VulkanRenderer,
-        items: &[RenderItem],
+        draws: DrawList<'_>,
         lighting: &SceneLighting,
         camera: &Camera,
         extent: [u32; 2],
@@ -489,7 +509,7 @@ impl ForwardPass {
         shadows: Option<ShadowFrame<'_>>,
         material_set: Arc<DescriptorSet>,
         texture_set: Arc<DescriptorSet>,
-        object_buffer: Subbuffer<[GpuObject]>,
+        object_set: Arc<DescriptorSet>,
         environment: &EnvironmentSettings,
     ) {
         let aspect = extent[0] as f32 / extent[1] as f32;
@@ -541,14 +561,6 @@ impl ForwardPass {
         )
         .unwrap();
 
-        let object_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[4].clone(),
-            [WriteDescriptorSet::buffer(0, object_buffer)],
-            [],
-        )
-        .unwrap();
-
         builder
             .set_viewport(
                 0,
@@ -571,11 +583,11 @@ impl ForwardPass {
             )
             .unwrap();
 
-        // `extract_renderables` groups items by (mesh, material), so each run is
-        // one instanced draw: the recording cost stops scaling with entity count
-        // and starts scaling with distinct mesh/material pairs.
-        for run in runs(items) {
-            let item = &items[run.start];
+        // `extract_geometry` groups the order by (mesh, material), so each run
+        // is one instanced draw: the recording cost stops scaling with entity
+        // count and starts scaling with distinct mesh/material pairs.
+        for run in draws.runs() {
+            let item = draws.item(run.start);
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
@@ -599,28 +611,6 @@ impl ForwardPass {
             }
         }
     }
-}
-
-/// Split `items` into maximal runs sharing a mesh and material.
-///
-/// Correct only because `extract_renderables` sorts on the same key: an unsorted
-/// list still yields valid runs, just short ones, so a missed sort costs
-/// performance rather than producing wrong pixels.
-pub(super) fn runs(items: &[RenderItem]) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
-    let mut start = 0usize;
-    std::iter::from_fn(move || {
-        if start >= items.len() {
-            return None;
-        }
-        let key = (items[start].mesh.0, items[start].material.0);
-        let mut end = start + 1;
-        while end < items.len() && (items[end].mesh.0, items[end].material.0) == key {
-            end += 1;
-        }
-        let run = start..end;
-        start = end;
-        Some(run)
-    })
 }
 
 pub fn upload_mesh(
@@ -750,84 +740,6 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
         },
     )
     .unwrap()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::runs;
-    use crate::geom::Aabb;
-    use crate::gfx::{MaterialHandle, MeshHandle, RenderItem};
-    use glam::{Mat3, Mat4, Vec3};
-
-    fn item(mesh: u32, material: u32) -> RenderItem {
-        RenderItem {
-            model: Mat4::IDENTITY,
-            normal_matrix: Mat3::IDENTITY,
-            bounds: Aabb {
-                min: Vec3::splat(-0.5),
-                max: Vec3::splat(0.5),
-            },
-            mesh: MeshHandle(mesh),
-            material: MaterialHandle(material),
-        }
-    }
-
-    fn ranges(items: &[RenderItem]) -> Vec<(usize, usize)> {
-        runs(items).map(|run| (run.start, run.end)).collect()
-    }
-
-    #[test]
-    fn a_sorted_list_collapses_into_one_run_per_mesh_material_pair() {
-        let items = [
-            item(0, 0),
-            item(0, 0),
-            item(0, 1),
-            item(3, 1),
-            item(3, 1),
-            item(3, 1),
-        ];
-        assert_eq!(ranges(&items), vec![(0, 2), (2, 3), (3, 6)]);
-    }
-
-    /// Every run must be non-empty, contiguous, and cover the list exactly —
-    /// `object_base` is the run's start, so a gap or overlap would draw an
-    /// instance against another object's transform.
-    #[test]
-    fn runs_partition_the_list_without_gaps_or_overlaps() {
-        let items = [item(1, 0), item(1, 0), item(2, 7), item(2, 7), item(9, 9)];
-        let ranges = ranges(&items);
-        assert_eq!(ranges.first().unwrap().0, 0);
-        assert_eq!(ranges.last().unwrap().1, items.len());
-        for pair in ranges.windows(2) {
-            assert_eq!(pair[0].1, pair[1].0, "runs must be contiguous: {ranges:?}");
-        }
-        assert!(ranges.iter().all(|(start, end)| end > start));
-        assert_eq!(
-            ranges.iter().map(|(s, e)| e - s).sum::<usize>(),
-            items.len()
-        );
-    }
-
-    /// Same mesh but a different material can't share an instanced draw: the
-    /// material index is a per-run push constant.
-    #[test]
-    fn a_material_change_breaks_a_run() {
-        let items = [item(4, 0), item(4, 1)];
-        assert_eq!(ranges(&items), vec![(0, 1), (1, 2)]);
-    }
-
-    /// An unsorted list still has to partition correctly — it just yields more,
-    /// shorter runs. Wrong pixels are not an acceptable cost of a missed sort.
-    #[test]
-    fn an_unsorted_list_still_partitions_correctly() {
-        let items = [item(0, 0), item(5, 0), item(0, 0)];
-        assert_eq!(ranges(&items), vec![(0, 1), (1, 2), (2, 3)]);
-    }
-
-    #[test]
-    fn an_empty_list_has_no_runs() {
-        assert!(ranges(&[]).is_empty());
-    }
 }
 
 mod vs {

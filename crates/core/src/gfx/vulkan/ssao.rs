@@ -2,10 +2,9 @@ use std::sync::Arc;
 
 use super::VulkanRenderer;
 use super::context::VkContext;
-use super::forward::GpuObject;
 use super::swapchain::DEPTH_FORMAT;
 use super::texture::MipPolicy;
-use crate::gfx::{RenderItem, Vertex};
+use crate::gfx::{DrawList, Vertex};
 use crate::scene::Camera;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
@@ -374,27 +373,34 @@ impl SsaoPass {
         SsaoUniforms { frame, params }
     }
 
+    /// The set-1 per-object descriptor set the prepass binds.
+    pub(super) fn build_object_set(
+        &self,
+        ctx: &VkContext,
+        objects: &Subbuffer<[super::forward::GpuObject]>,
+    ) -> Arc<DescriptorSet> {
+        DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            self.prepass_pipeline.layout().set_layouts()[1].clone(),
+            [WriteDescriptorSet::buffer(0, objects.clone())],
+            [],
+        )
+        .unwrap()
+    }
+
     pub(super) fn record_prepass(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         renderer: &VulkanRenderer,
-        items: &[RenderItem],
+        draws: DrawList<'_>,
         extent: [u32; 2],
         uniforms: &SsaoUniforms,
-        object_buffer: Subbuffer<[GpuObject]>,
+        object_set: Arc<DescriptorSet>,
     ) {
         let frame_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.prepass_pipeline.layout().set_layouts()[0].clone(),
             [WriteDescriptorSet::buffer(0, uniforms.frame.clone())],
-            [],
-        )
-        .unwrap();
-
-        let object_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.prepass_pipeline.layout().set_layouts()[1].clone(),
-            [WriteDescriptorSet::buffer(0, object_buffer)],
             [],
         )
         .unwrap();
@@ -414,8 +420,8 @@ impl SsaoPass {
         // One instanced draw per (mesh, material) run, matching the forward pass.
         // The model and normal matrices come from the shared object buffer, so
         // this pass no longer recomputes an inverse-transpose per item.
-        for run in super::forward::runs(items) {
-            let item = &items[run.start];
+        for run in draws.runs() {
+            let item = draws.item(run.start);
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };

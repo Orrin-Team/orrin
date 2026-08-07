@@ -331,6 +331,21 @@ float sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist) {
         return 1.0;
     }
 
+    // A surface facing away from the sun is already unlit by it — `brdf`
+    // returns zero for n_dot_l <= 0, so whatever the maps say gets multiplied
+    // into nothing. Leaving before the lookup saves the nine taps this cascade
+    // would cost, and the eighteen a fragment in the blend band would.
+    if (dot(N, L) <= 0.0) {
+        return 1.0;
+    }
+
+    // Strength zero is the "shadows off" slider, and the blend below collapses
+    // to a constant 1.0 at it. Same taps saved, for a setting rather than for
+    // the geometry.
+    if (lighting.shadow_params.z <= 0.0) {
+        return 1.0;
+    }
+
     int cascade = select_cascade(view_dist);
     float shadow = cascade_shadow(cascade, world_pos, N, L);
 

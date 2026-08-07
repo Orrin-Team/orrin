@@ -7,12 +7,12 @@
 //! isn't.
 
 use glam::Vec3;
-use orrin_core::gfx::RenderItem;
+use orrin_core::gfx::shadows::CascadeSet;
 use orrin_core::scene::propagate_transforms;
 use orrin_core::scene::{
     Camera, CpuMesh, Culling, LocalTransform, MeshBounds, MeshHandle, Transform,
 };
-use orrin_core::systems::extract_renderables;
+use orrin_core::systems::{FrameGeometry, extract_geometry};
 use orrin_ecs::World;
 
 const GRID: i32 = 10;
@@ -69,9 +69,9 @@ fn demo_camera() -> Camera {
 fn visible(world: &mut World, camera: Camera) -> usize {
     *world.resource_mut::<Camera>() = camera;
     propagate_transforms(world);
-    let mut items: Vec<RenderItem> = Vec::new();
-    extract_renderables(world, ASPECT, &mut items);
-    items.len()
+    let mut geometry = FrameGeometry::default();
+    extract_geometry(world, ASPECT, &CascadeSet::default(), &mut geometry);
+    geometry.visible().len()
 }
 
 #[test]

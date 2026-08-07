@@ -55,6 +55,21 @@ impl Aabb {
         (self.max - self.min) * 0.5
     }
 
+    /// Squared distance from `point` to the nearest point of this box, and zero
+    /// for a point inside it.
+    ///
+    /// Squared because every caller compares it against another of the same, and
+    /// front-to-back ordering only needs the comparison. An invalid box has no
+    /// nearest point, so it sorts to the back rather than producing a negative
+    /// clamp of `min - max`.
+    pub fn distance_squared_to(&self, point: Vec3) -> f32 {
+        if !self.is_valid() {
+            return f32::INFINITY;
+        }
+        let outside = (self.min - point).max(point - self.max).max(Vec3::ZERO);
+        outside.length_squared()
+    }
+
     /// The axis-aligned box enclosing this one after `model` — the same
     /// `abs(M) * half_extents` trick the collision side uses for a rotated box:
     /// along each world axis the farthest corner picks the sign of every term,

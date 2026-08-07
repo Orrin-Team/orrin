@@ -19,7 +19,7 @@ use crate::editor::Editor;
 use crate::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
 use crate::gfx::vulkan::ShadowFrame;
 use crate::gfx::vulkan::VulkanRenderer;
-use crate::gfx::{RenderBackend, RenderItem, SceneLighting};
+use crate::gfx::{DrawList, RenderBackend, SceneLighting};
 use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::entities::{StressSpec, build_default_scene, spawn_stress_scene};
@@ -30,6 +30,7 @@ use crate::scene::{
 };
 use crate::stats::FrameStats;
 use crate::systems;
+use crate::systems::FrameGeometry;
 use orrin_ecs::World;
 use orrin_registry::Registry;
 
@@ -51,13 +52,13 @@ pub struct App {
     /// establishes a baseline. Delta is `now - last_instant`, never a
     /// difference of two large "seconds since start" floats (which quantizes).
     last_instant: Option<Instant>,
-    render_items: Vec<RenderItem>,
+    /// This frame's renderables and the draw orders over them. Kept on the app
+    /// so its `Vec`s keep their capacity across frames instead of reallocating.
+    geometry: FrameGeometry,
     lighting: SceneLighting,
-    /// This frame's cascade matrices and the caster list each was culled
-    /// against. Kept on the app so the per-cascade `Vec`s keep their capacity
-    /// across frames instead of reallocating.
+    /// This frame's cascade matrices. The caster orders live in `geometry`,
+    /// which was culled against exactly these.
     cascades: CascadeSet,
-    shadow_casters: [Vec<RenderItem>; MAX_CASCADES],
     /// This frame's debug lines, copied out of the `DebugLines` resource so the
     /// renderer borrow doesn't overlap the world borrow.
     debug_lines: Vec<DebugLine>,
@@ -158,10 +159,9 @@ impl App {
             registry: Registry::new(),
             camera_controller: CameraController::new(),
             last_instant: None,
-            render_items: Vec::new(),
+            geometry: FrameGeometry::default(),
             lighting: SceneLighting::default(),
             cascades: CascadeSet::default(),
-            shadow_casters: Default::default(),
             debug_lines: Vec::new(),
             #[cfg(feature = "scripting")]
             scripting: None,
@@ -528,7 +528,6 @@ impl ApplicationHandler for App {
                     // the aspect comes from the swapchain the pass will use.
                     let extent = active.renderer.extent();
                     let aspect = extent[0] as f32 / extent[1].max(1) as f32;
-                    systems::extract_renderables(&self.world, aspect, &mut self.render_items);
                     systems::extract_lighting(&self.world, &mut self.lighting);
                     // Cascades are fitted before extraction because the caster
                     // lists are culled against them: a shadow pass needs what
@@ -544,10 +543,14 @@ impl ApplicationHandler for App {
                     } else {
                         CascadeSet::default()
                     };
-                    systems::extract_shadow_casters(
+                    // One sweep for both questions: the camera's list and every
+                    // cascade's are orderings over the same derived items, so the
+                    // cascades have to be fitted before it rather than after.
+                    systems::extract_geometry(
                         &self.world,
+                        aspect,
                         &self.cascades,
-                        &mut self.shadow_casters,
+                        &mut self.geometry,
                     );
                     // Copy this frame's debug lines out (they're Copy) so the render
                     // borrow below doesn't overlap the world borrow.
@@ -586,8 +589,12 @@ impl ApplicationHandler for App {
                 let mut overlay = |before, image| editor.draw(before, image);
                 {
                     profile_scope!("render submit");
+                    // Borrowed once here: `ShadowFrame` holds `DrawList`s into
+                    // `geometry`, so the array has to outlive the call.
+                    let caster_lists: [DrawList<'_>; MAX_CASCADES] =
+                        std::array::from_fn(|i| self.geometry.cascade(i));
                     renderer.render_with_overlay(
-                        &self.render_items,
+                        self.geometry.visible(),
                         &self.lighting,
                         &camera,
                         &ssao,
@@ -599,7 +606,7 @@ impl ApplicationHandler for App {
                         profiler_frame,
                         (self.cascades.count > 0).then(|| ShadowFrame {
                             cascades: &self.cascades,
-                            casters: &self.shadow_casters,
+                            casters: &caster_lists,
                             settings: &shadow_settings,
                         }),
                         &mut overlay,

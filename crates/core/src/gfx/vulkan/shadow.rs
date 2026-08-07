@@ -30,11 +30,10 @@ use vulkano::pipeline::{
 use vulkano::render_pass::{RenderPass, Subpass};
 use vulkano::sync::GpuFuture;
 
-use crate::gfx::{RenderItem, Vertex};
+use crate::gfx::{DrawList, Vertex};
 
 use super::VulkanRenderer;
 use super::context::VkContext;
-use super::forward::GpuObject;
 use super::swapchain::DEPTH_FORMAT;
 
 /// Per-run push constants: 68 bytes, comfortably inside the 128-byte guaranteed
@@ -80,6 +79,24 @@ impl ShadowPass {
         self.lit_view.clone()
     }
 
+    /// The per-object descriptor set every cascade binds.
+    ///
+    /// Built once per frame and handed to each cascade, rather than once per
+    /// cascade: all of them read the same buffer through the same layout.
+    pub(super) fn build_object_set(
+        &self,
+        ctx: &VkContext,
+        objects: &Subbuffer<[super::forward::GpuObject]>,
+    ) -> Arc<DescriptorSet> {
+        DescriptorSet::new(
+            ctx.descriptor_set_allocator.clone(),
+            self.pipeline.layout().set_layouts()[0].clone(),
+            [WriteDescriptorSet::buffer(0, objects.clone())],
+            [],
+        )
+        .unwrap()
+    }
+
     /// Record one cascade's depth pass.
     ///
     /// `resolution` is the shadow map's, not the frame's — every other pass in
@@ -90,20 +107,12 @@ impl ShadowPass {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         renderer: &VulkanRenderer,
-        casters: &[RenderItem],
+        casters: DrawList<'_>,
         view_proj: Mat4,
         object_base: u32,
         resolution: u32,
-        objects: Subbuffer<[GpuObject]>,
+        object_set: Arc<DescriptorSet>,
     ) {
-        let object_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[0].clone(),
-            [WriteDescriptorSet::buffer(0, objects)],
-            [],
-        )
-        .unwrap();
-
         builder
             .set_viewport(
                 0,
@@ -132,8 +141,8 @@ impl ShadowPass {
             )
             .unwrap();
 
-        for run in super::forward::runs(casters) {
-            let item = &casters[run.start];
+        for run in casters.runs() {
+            let item = casters.item(run.start);
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
