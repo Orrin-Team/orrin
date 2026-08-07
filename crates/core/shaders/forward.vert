@@ -27,6 +27,7 @@ layout(push_constant) uniform Push {
 struct Object {
     mat4 model;
     mat4 normal_matrix;
+    mat4 prev_model; // read only by the prepass; here to keep the stride in step
 };
 layout(set = 4, binding = 0, std430) readonly buffer Objects {
     Object objects[];

@@ -5,12 +5,17 @@ use crate::gfx::shadows::MAX_CASCADES;
 use super::{color_row, vec3_row};
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, EnvironmentSettings, FogSettings, HdrSettings,
-    ShadowSettings, SsaoSettings,
+    ShadowSettings, SsaoSettings, TaaSettings,
 };
 
 type Column = fn(&mut egui::Ui, &World);
 
-const COLUMNS: [Column; 4] = [ssao_column, shadow_column, lighting_column, camera_column];
+const COLUMNS: [Column; 4] = [
+    screen_space_column,
+    shadow_column,
+    lighting_column,
+    camera_column,
+];
 
 /// A slider plus the label that sits after it. Narrower than this and a column's
 /// contents run into its neighbour instead of wrapping — `Ui::columns` divides
@@ -49,13 +54,28 @@ pub fn body(ui: &mut egui::Ui, world: &mut World) {
     ui.add_space(4.0);
 }
 
-fn ssao_column(ui: &mut egui::Ui, world: &World) {
+fn screen_space_column(ui: &mut egui::Ui, world: &World) {
     ui.strong("SSAO");
-    let mut s = world.resource_mut::<SsaoSettings>();
-    ui.checkbox(&mut s.enabled, "Enabled");
-    ui.add(egui::Slider::new(&mut s.radius, 0.0..=4.0).text("Radius"));
-    ui.add(egui::Slider::new(&mut s.bias, 0.0..=0.1).text("Bias"));
-    ui.add(egui::Slider::new(&mut s.power, 0.1..=4.0).text("Power"));
+    {
+        let mut s = world.resource_mut::<SsaoSettings>();
+        ui.checkbox(&mut s.enabled, "Enabled");
+        ui.add(egui::Slider::new(&mut s.radius, 0.0..=4.0).text("Radius"));
+        ui.add(egui::Slider::new(&mut s.bias, 0.0..=0.1).text("Bias"));
+        ui.add(egui::Slider::new(&mut s.power, 0.1..=4.0).text("Power"));
+    }
+    ui.add_space(6.0);
+    ui.strong("Temporal AA")
+        .on_hover_text("Jitter the camera each frame and accumulate the results");
+    {
+        let mut taa = world.resource_mut::<TaaSettings>();
+        // Frame structure, like SSAO and bloom: it registers the resolve node
+        // and it is what keeps the geometry prepass in a frame with SSAO off.
+        ui.checkbox(&mut taa.enabled, "Enabled");
+        ui.add(egui::Slider::new(&mut taa.feedback, 0.5..=0.98).text("Feedback"))
+            .on_hover_text("How much of the reprojected history each frame keeps");
+        ui.add(egui::Slider::new(&mut taa.jitter_scale, 0.0..=1.5).text("Jitter"))
+            .on_hover_text("Fraction of a pixel the camera samples across");
+    }
 }
 
 fn shadow_column(ui: &mut egui::Ui, world: &World) {

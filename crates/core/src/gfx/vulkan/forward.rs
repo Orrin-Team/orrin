@@ -33,6 +33,7 @@ use crate::scene::{Camera, EnvironmentSettings};
 
 use super::context::VkContext;
 use super::swapchain::DEPTH_FORMAT;
+use super::taa::FrameView;
 use super::{ShadowFrame, VulkanRenderer};
 
 pub struct GpuMesh {
@@ -71,6 +72,12 @@ pub(super) struct GpuObject {
     /// correctly under non-uniform scaling. Stored as a mat4; only the upper-left
     /// 3x3 is used in the shader.
     normal_matrix: [[f32; 4]; 4],
+    /// Last frame's `model`, for the motion vector the prepass writes. Uploaded
+    /// for every pass rather than only the one that reads it: the buffer is
+    /// shared, so the row's stride is shared too, and a second layout for the
+    /// passes that ignore this field would be two ways for one object row to be
+    /// wrong.
+    prev_model: [[f32; 4]; 4],
 }
 
 /// Where `forward.frag` declares the cascade comparison sampler. It is bound
@@ -483,6 +490,7 @@ impl ForwardPass {
                     rows[*next] = GpuObject {
                         model: item.model.to_cols_array_2d(),
                         normal_matrix: Mat4::from_mat3(item.normal_matrix).to_cols_array_2d(),
+                        prev_model: item.prev_model.to_cols_array_2d(),
                     };
                     *next += 1;
                 }
@@ -503,6 +511,7 @@ impl ForwardPass {
         draws: DrawList<'_>,
         lighting: &SceneLighting,
         camera: &Camera,
+        view: &FrameView,
         extent: [u32; 2],
         ao_view: Arc<ImageView>,
         shadow_view: Arc<ImageView>,
@@ -512,8 +521,9 @@ impl ForwardPass {
         object_set: Arc<DescriptorSet>,
         environment: &EnvironmentSettings,
     ) {
-        let aspect = extent[0] as f32 / extent[1] as f32;
-        let view_proj = camera.view_projection(aspect);
+        // The jittered one, from the frame's shared view: every pass that
+        // rasterises geometry has to agree on it to a subpixel.
+        let view_proj = view.view_proj;
 
         let lighting_buffer = self
             .uniform_buffer_allocator

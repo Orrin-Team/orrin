@@ -335,6 +335,7 @@ mod tests {
         let config = FrameConfig {
             color_format: vulkano::format::Format::B8G8R8A8_SRGB,
             ssao: true,
+            taa: true,
             auto_exposure: true,
             bloom_mips: MAX_BLOOM_MIPS as u8,
             overlay: true,

@@ -22,7 +22,8 @@ use crate::gfx::shadows::MAX_CASCADES;
 use super::MSAA_SAMPLES;
 use super::bloom::MAX_BLOOM_MIPS;
 use super::hdr::HDR_FORMAT;
-use super::ssao::{AO_FORMAT, NORMAL_FORMAT};
+use super::prepass::{NORMAL_FORMAT, VELOCITY_FORMAT};
+use super::ssao::AO_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 
 /// What a frame's structure depends on. A change to any of these recompiles the
@@ -32,6 +33,11 @@ use super::swapchain::DEPTH_FORMAT;
 pub struct FrameConfig {
     pub color_format: Format,
     pub ssao: bool,
+    /// Whether the frame resolves against a reprojected history. Structural
+    /// twice over: it registers the resolve node, and it is what makes the
+    /// geometry prepass exist in a frame that has SSAO switched off — the
+    /// prepass is where the motion vectors come from.
+    pub taa: bool,
     /// Whether the frame meters its own luminance. Off is a different graph, not
     /// a flag read at record time: the two compute passes are never registered
     /// and the tonemap pass falls back to the manual exposure it is pushed.
@@ -55,10 +61,12 @@ pub struct FrameConfig {
 /// is exhaustive by the compiler's own reckoning rather than by convention.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PassBody {
-    SsaoPrepass,
+    GeometryPrepass,
     SsaoResolve,
     SsaoBlur,
     Forward,
+    /// Reprojects the history onto this frame and accumulates into it.
+    TaaResolve,
     LuminanceHistogram,
     LuminanceAverage,
     /// Half the frame, exposed and firefly-weighted: the chain's first level.
@@ -79,6 +87,10 @@ pub struct FrameIds {
     pub object_transforms: ResourceId,
     pub swapchain_color: ResourceId,
     pub hdr_color: ResourceId,
+    /// What the tonemap, metering and bloom passes read: the TAA output when the
+    /// frame has one, and `hdr_color` when it does not. Named once here so
+    /// nothing downstream has to ask which frame it is in.
+    pub scene_color: ResourceId,
     pub msaa_hdr: ResourceId,
     pub msaa_depth: ResourceId,
     /// Written by the metering passes and read by the tonemap pass. Always
@@ -89,7 +101,11 @@ pub struct FrameIds {
     /// `None` when metering is off, along with the two passes that touch it.
     pub histogram: Option<ResourceId>,
     pub bloom: Option<BloomIds>,
+    /// Present whenever anything downstream needs depth, normals or motion —
+    /// SSAO, TAA, or both.
+    pub prepass: Option<PrepassIds>,
     pub ssao: Option<SsaoIds>,
+    pub taa: Option<TaaIds>,
     pub shadows: Option<ResourceId>,
 }
 
@@ -127,12 +143,34 @@ impl BloomIds {
     }
 }
 
+/// What the one geometry pass in front of shading leaves behind. Written
+/// together because they come off the same rasterisation, and read apart: SSAO
+/// wants depth and normals, TAA wants depth and motion.
+#[derive(Clone, Copy, Debug)]
+pub struct PrepassIds {
+    pub normal: ResourceId,
+    pub velocity: ResourceId,
+    pub depth: ResourceId,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SsaoIds {
-    pub normal: ResourceId,
-    pub depth: ResourceId,
     pub raw_ao: ResourceId,
     pub ao: ResourceId,
+}
+
+/// The two images TAA carries across the frame boundary.
+///
+/// Both are **imported**, for the reason the exposure buffer is: a transient is
+/// `Undefined` at every frame's start by contract, and a history that survives
+/// one frame is precisely what this pass needs. The backing allocations are
+/// ping-ponged, so the image bound as `output` this frame is the one bound as
+/// `history` next — which is why `output` leaves the frame in the layout
+/// `history` declares it enters in.
+#[derive(Clone, Copy, Debug)]
+pub struct TaaIds {
+    pub history: ResourceId,
+    pub output: ResourceId,
 }
 
 pub struct Frame {
@@ -215,9 +253,19 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         }
     }
 
+    // One prepass serves both consumers rather than one each: they need the same
+    // rasterisation, and running it twice to hand each half of the result to a
+    // different reader is the cost the shared node exists to avoid. It writes
+    // all three targets whichever consumer asked for it — a second pipeline that
+    // dropped the normal attachment for a TAA-without-SSAO frame would buy a
+    // target's bandwidth at the price of a second render pass to keep in step.
+    let prepass = (config.ssao || config.taa).then(|| PrepassIds {
+        normal: builder.create_image("prepass_normal", ImageDesc::new(NORMAL_FORMAT)),
+        velocity: builder.create_image("prepass_velocity", ImageDesc::new(VELOCITY_FORMAT)),
+        depth: builder.create_image("prepass_depth", ImageDesc::new(DEPTH_FORMAT)),
+    });
+
     let ssao = config.ssao.then(|| SsaoIds {
-        normal: builder.create_image("ssao_normal", ImageDesc::new(NORMAL_FORMAT)),
-        depth: builder.create_image("ssao_depth", ImageDesc::new(DEPTH_FORMAT)),
         raw_ao: builder.create_image("ssao_raw_ao", ImageDesc::new(AO_FORMAT)),
         ao: builder.create_image("ssao_ao", ImageDesc::new(AO_FORMAT)),
     });
@@ -230,19 +278,23 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     );
     let hdr_color = builder.create_image("hdr_color", ImageDesc::new(HDR_FORMAT));
 
-    if let Some(ssao) = ssao {
+    if let Some(prepass) = prepass {
         let id = builder
-            .pass("ssao_prepass", PassKind::Inline)
+            .pass("geometry_prepass", PassKind::Inline)
             .access(object_transforms, Access::StorageRead)
-            .access(ssao.normal, Access::ColorAttachment)
-            .access(ssao.depth, Access::DepthAttachment)
+            .access(prepass.normal, Access::ColorAttachment)
+            .access(prepass.velocity, Access::ColorAttachment)
+            .access(prepass.depth, Access::DepthAttachment)
             .build();
-        record(id, PassBody::SsaoPrepass, &mut bodies);
+        record(id, PassBody::GeometryPrepass, &mut bodies);
+    }
 
+    if let Some(ssao) = ssao {
+        let prepass = prepass.expect("SSAO reads the geometry prepass");
         let id = builder
             .pass("ssao_resolve", PassKind::Inline)
-            .access(ssao.depth, Access::Sampled)
-            .access(ssao.normal, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
             .access(ssao.raw_ao, Access::ColorAttachment)
             .build();
         record(id, PassBody::SsaoResolve, &mut bodies);
@@ -271,6 +323,45 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .build();
     record(id, PassBody::Forward, &mut bodies);
 
+    let taa = config.taa.then(|| {
+        let prepass = prepass.expect("TAA reads the geometry prepass");
+        // Entry `ShaderReadOnlyOptimal` states the steady state, which the
+        // ping-pong guarantees: `output` below leaves every frame in exactly
+        // that layout, and it is the allocation `history` names next frame. The
+        // one frame where it is not true — the first after an allocation — is
+        // the frame the pass is told to ignore its history anyway.
+        let history = builder.import_image(
+            "taa_history",
+            ImageDesc::new(HDR_FORMAT),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        // Entered `Undefined` because every texel is written, and left where the
+        // next frame wants to find it.
+        let output = builder.import_image(
+            "taa_color",
+            ImageDesc::new(HDR_FORMAT),
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+
+        let id = builder
+            .pass("taa_resolve", PassKind::Compute)
+            .access(hdr_color, Access::Sampled)
+            .access(prepass.velocity, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(history, Access::Sampled)
+            .access(output, Access::StorageWrite)
+            .build();
+        record(id, PassBody::TaaResolve, &mut bodies);
+
+        TaaIds { history, output }
+    });
+
+    // Everything past shading reads this rather than `hdr_color`, so inserting
+    // the resolve is a change to one binding rather than to every consumer.
+    let scene_color = taa.map_or(hdr_color, |taa| taa.output);
+
     // Imported, not created: temporal adaptation is a value that has to outlive
     // the frame, and a transient is `Undefined` at every frame's start by
     // contract. The exposure module owns the allocation; the graph only orders
@@ -282,7 +373,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
         let id = builder
             .pass("luminance_histogram", PassKind::Compute)
-            .access(hdr_color, Access::Sampled)
+            .access(scene_color, Access::Sampled)
             .access(histogram, Access::StorageWrite)
             .build();
         record(id, PassBody::LuminanceHistogram, &mut bodies);
@@ -326,7 +417,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
         let id = builder
             .pass("bloom_prefilter", PassKind::Compute)
-            .access(hdr_color, Access::Sampled)
+            .access(scene_color, Access::Sampled)
             .access(exposure, Access::StorageRead)
             .access(down[0].unwrap(), Access::StorageWrite)
             .build();
@@ -371,7 +462,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // `hdr_color`.
     let mut tonemap = builder
         .pass("tonemap", PassKind::Inline)
-        .access(hdr_color, Access::Sampled)
+        .access(scene_color, Access::Sampled)
         .access(exposure, Access::StorageRead);
     if let Some(bloom) = bloom {
         tonemap = tonemap.access(bloom.result(), Access::Sampled);
@@ -395,12 +486,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             object_transforms,
             swapchain_color,
             hdr_color,
+            scene_color,
             msaa_hdr,
             msaa_depth,
             exposure,
             histogram,
             bloom,
+            prepass,
             ssao,
+            taa,
             shadows,
         },
         bodies,

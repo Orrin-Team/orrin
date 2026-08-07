@@ -6,10 +6,12 @@ mod forward;
 pub mod frame;
 mod hdr;
 mod line;
+mod prepass;
 mod resources;
 mod shadow;
 mod ssao;
 mod swapchain;
+mod taa;
 mod texture;
 mod timestamps;
 
@@ -33,7 +35,7 @@ use crate::geom::Aabb;
 use crate::gfx::shadows::CascadeSet;
 use crate::scene::{
     BloomSettings, Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle,
-    ShadowSettings, SsaoSettings,
+    ShadowSettings, SsaoSettings, TaaSettings,
 };
 
 use self::context::VkContext;
@@ -46,10 +48,12 @@ use self::exposure::ExposurePass;
 use self::frame::{Frame, FrameConfig, PassBody};
 use self::hdr::HdrPass;
 use self::line::LinePass;
+use self::prepass::GeometryPrepass;
 use self::resources::{GraphImages, PassFramebuffers, begin_info};
 use self::shadow::ShadowPass;
 use self::ssao::SsaoPass;
 use self::swapchain::SwapchainState;
+use self::taa::TaaPass;
 use self::timestamps::GpuTimestamps;
 
 use super::{DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TextureHandle};
@@ -98,7 +102,12 @@ pub struct VulkanRenderer {
     /// Records the bloom chain's dispatches. The levels themselves are
     /// graph-owned transients, so this holds only pipelines and settings.
     bloom: BloomPass,
+    /// The one geometry pass in front of shading, shared by SSAO and TAA.
+    prepass: GeometryPrepass,
     ssao: SsaoPass,
+    /// Owns the ping-ponged history the graph imports, and decides the frame's
+    /// subpixel jitter — which is why it is consulted before any pass records.
+    taa: TaaPass,
     shadow: ShadowPass,
     /// Debug-line overlay, recorded into the forward pass. Editor-only in
     /// practice: fed lines only through `render_with_overlay`.
@@ -137,7 +146,9 @@ impl VulkanRenderer {
         let hdr = HdrPass::new(&ctx, format);
         let exposure = ExposurePass::new(&ctx);
         let bloom = BloomPass::new(&ctx);
+        let prepass = GeometryPrepass::new(&ctx);
         let ssao = SsaoPass::new(&ctx);
+        let taa = TaaPass::new(&ctx);
         let shadow = ShadowPass::new(&ctx);
         let line = LinePass::new(&ctx.device, &ctx.memory_allocator, &forward.render_pass);
         let environment = EnvironmentPass::new(&ctx, &forward.render_pass);
@@ -168,6 +179,7 @@ impl VulkanRenderer {
         let config = FrameConfig {
             color_format: format,
             ssao: true,
+            taa: true,
             auto_exposure: true,
             bloom_mips: bloom::mip_count(extent),
             overlay: true,
@@ -176,7 +188,8 @@ impl VulkanRenderer {
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let images = GraphImages::allocate(&ctx.memory_allocator, &frame.graph, extent);
-        let framebuffers = PassFramebuffers::build(&frame, &images, &forward, &ssao, &shadow);
+        let framebuffers =
+            PassFramebuffers::build(&frame, &images, &forward, &prepass, &ssao, &shadow);
 
         Self {
             ctx,
@@ -185,7 +198,9 @@ impl VulkanRenderer {
             hdr,
             exposure,
             bloom,
+            prepass,
             ssao,
+            taa,
             shadow,
             line,
             environment,
@@ -237,6 +252,7 @@ impl VulkanRenderer {
             &self.frame,
             &self.images,
             &self.forward,
+            &self.prepass,
             &self.ssao,
             &self.shadow,
         );
@@ -317,6 +333,7 @@ impl RenderBackend for VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        taa: &TaaSettings,
         bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
@@ -329,6 +346,7 @@ impl RenderBackend for VulkanRenderer {
             lighting,
             camera,
             ssao,
+            taa,
             bloom,
             hdr,
             environment,
@@ -386,6 +404,7 @@ impl VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        taa: &TaaSettings,
         bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
@@ -400,6 +419,7 @@ impl VulkanRenderer {
             lighting,
             camera,
             ssao,
+            taa,
             bloom,
             hdr,
             environment,
@@ -417,6 +437,7 @@ impl VulkanRenderer {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        taa: &TaaSettings,
         bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
@@ -449,6 +470,7 @@ impl VulkanRenderer {
         self.ensure_graph(FrameConfig {
             color_format: self.swapchain.swapchain.image_format(),
             ssao: ssao.enabled,
+            taa: taa.enabled,
             auto_exposure: hdr.auto_exposure,
             // Zero when bloom is off, and also when the window is too small for
             // a chain — so a frame dragged to a sliver drops the passes rather
@@ -520,6 +542,12 @@ impl VulkanRenderer {
         self.hdr.auto_exposure = hdr.auto_exposure;
         self.exposure.begin_frame(hdr, dt);
         self.bloom.begin_frame(bloom, hdr);
+        // Before anything records: this is where the frame's subpixel jitter is
+        // chosen, and every pass that rasterises geometry has to be drawn with
+        // the matrices it returns rather than deriving its own from `camera`.
+        let view = self
+            .taa
+            .begin_frame(&self.ctx, taa, camera, self.swapchain.extent);
         // Sourced from the compiled frame, not from the setting: a window too
         // small for a chain leaves bloom enabled but unbuilt, and a non-zero
         // strength would then blend the 1x1 black stand-in into the image and
@@ -545,7 +573,7 @@ impl VulkanRenderer {
         let material_set = self.material_set.clone().unwrap();
         let texture_set = self.texture_set.clone().unwrap();
 
-        // One upload feeding every geometry pass in the frame — the SSAO
+        // One upload feeding every geometry pass in the frame — the geometry
         // prepass, the forward pass, and each cascade — because the per-object
         // inverse-transpose is too expensive to compute more than once. The
         // camera-visible items come first, so the two screen-space passes still
@@ -566,19 +594,28 @@ impl VulkanRenderer {
         let shadow_object_set = shadows
             .is_some()
             .then(|| self.shadow.build_object_set(&self.ctx, &object_buffer));
-        let ssao_object_set = self
+        let prepass_object_set = self
             .frame
             .ids
-            .ssao
-            .map(|_| self.ssao.build_object_set(&self.ctx, &object_buffer));
+            .prepass
+            .map(|_| self.prepass.build_object_set(&self.ctx, &object_buffer));
 
-        // Uploaded once even though two graph nodes read it — which is what the
-        // shared `object_transforms` declaration in `frame::declare` records.
-        let ssao_uniforms = self
+        // Uploaded once even though the prepass and the SSAO resolve both read
+        // it — which is what the shared `object_transforms` declaration in
+        // `frame::declare` records.
+        let frame_uniforms = self
             .frame
             .ids
-            .ssao
-            .map(|_| self.ssao.begin_frame(camera, self.swapchain.extent));
+            .prepass
+            .map(|_| self.prepass.begin_frame(&view));
+        let ssao_uniforms = self.frame.ids.ssao.map(|_| {
+            self.ssao.begin_frame(
+                self.swapchain.extent,
+                frame_uniforms
+                    .clone()
+                    .expect("SSAO reads the geometry prepass"),
+            )
+        });
 
         // With SSAO off the graph has no AO node, so the forward pass samples a
         // 1x1 white view instead: "no occlusion" with no second shader path.
@@ -599,6 +636,16 @@ impl VulkanRenderer {
             vulkano::image::view::ImageViewType::Dim2dArray,
             "the forward pipeline binds the cascades as texture2DArray",
         );
+
+        // What everything past shading composites. `scene_color` is the TAA
+        // output in a frame that has one and `hdr_color` in a frame that does
+        // not, and the graph already decided which — but the TAA images are
+        // imported, so their views come from the module that owns them rather
+        // than from the graph's allocations.
+        let scene_color = match self.frame.ids.taa {
+            Some(_) => self.taa.output_view(),
+            None => self.images.view(self.frame.ids.scene_color),
+        };
 
         // The whole frame, in the order the compiler derived. Nothing below
         // decides what runs next, what an image's layout is, or what has to
@@ -630,11 +677,26 @@ impl VulkanRenderer {
             // derived for it exactly as for a draw.
             if kind == PassKind::Compute {
                 match body {
+                    PassBody::TaaResolve => {
+                        let ids = self
+                            .frame
+                            .ids
+                            .prepass
+                            .expect("the graph scheduled TAA with no prepass");
+                        self.taa.record(
+                            &mut builder,
+                            &self.ctx,
+                            &view,
+                            self.images.view(self.frame.ids.hdr_color),
+                            self.images.view(ids.velocity),
+                            self.images.view(ids.depth),
+                        );
+                    }
                     PassBody::LuminanceHistogram => self.exposure.record_histogram(
                         &mut builder,
                         &self.ctx,
                         extent,
-                        self.images.view(self.frame.ids.hdr_color),
+                        scene_color.clone(),
                     ),
                     PassBody::LuminanceAverage => {
                         self.exposure
@@ -645,7 +707,7 @@ impl VulkanRenderer {
                         self.bloom.record_prefilter(
                             &mut builder,
                             &self.ctx,
-                            self.images.view(self.frame.ids.hdr_color),
+                            scene_color.clone(),
                             self.images.view(ids.down(0)),
                             self.exposure.exposure_buffer(),
                         );
@@ -717,16 +779,16 @@ impl VulkanRenderer {
                             .expect("the graph scheduled a cascade with no shadows"),
                     );
                 }
-                PassBody::SsaoPrepass => self.ssao.record_prepass(
+                PassBody::GeometryPrepass => self.prepass.record(
                     &mut builder,
                     self,
                     draws,
                     extent,
-                    ssao_uniforms.as_ref().unwrap(),
-                    ssao_object_set.clone().unwrap(),
+                    frame_uniforms.clone().unwrap(),
+                    prepass_object_set.clone().unwrap(),
                 ),
                 PassBody::SsaoResolve => {
-                    let ids = self.frame.ids.ssao.unwrap();
+                    let ids = self.frame.ids.prepass.unwrap();
                     self.ssao.record_ao(
                         &mut builder,
                         self,
@@ -748,6 +810,7 @@ impl VulkanRenderer {
                         draws,
                         lighting,
                         camera,
+                        &view,
                         extent,
                         ao_view.clone(),
                         shadow_view.clone(),
@@ -765,19 +828,19 @@ impl VulkanRenderer {
                     self.environment.record_skybox(
                         &mut builder,
                         &self.ctx,
-                        camera,
+                        &view,
                         extent,
                         environment,
                     );
                     // Debug lines share the forward subpass: depth-tested against
                     // the scene, drawn on top of it, before the pass ends.
-                    self.line.record(&mut builder, debug_lines, camera, extent);
+                    self.line.record(&mut builder, debug_lines, &view, extent);
                 }
                 PassBody::Tonemap => self.hdr.record_tonemap(
                     &mut builder,
                     &self.ctx,
                     extent,
-                    self.images.view(self.frame.ids.hdr_color),
+                    scene_color.clone(),
                     self.exposure.exposure_buffer(),
                     // With bloom off the graph has no chain, so the tonemap
                     // pass samples a 1x1 black view at a zero strength: "no
@@ -788,6 +851,7 @@ impl VulkanRenderer {
                     },
                 ),
                 PassBody::Overlay
+                | PassBody::TaaResolve
                 | PassBody::LuminanceHistogram
                 | PassBody::LuminanceAverage
                 | PassBody::BloomPrefilter

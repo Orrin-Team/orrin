@@ -11,7 +11,9 @@
 
 use std::sync::Arc;
 
-use crate::scene::{Camera, DebugLine};
+use crate::scene::DebugLine;
+
+use super::taa::FrameView;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, BufferUsage};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer};
@@ -137,7 +139,7 @@ impl LinePass {
         &mut self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         lines: &[DebugLine],
-        camera: &Camera,
+        view: &FrameView,
         extent: [u32; 2],
     ) {
         if lines.is_empty() {
@@ -163,8 +165,9 @@ impl LinePass {
             .unwrap();
         buffer.write().unwrap().copy_from_slice(&vertices);
 
-        let aspect = extent[0] as f32 / extent[1] as f32;
-        let view_proj = camera.view_projection(aspect).to_cols_array_2d();
+        // The frame's jittered view-projection, so a line lands on the same
+        // subpixel as the geometry it is drawn against.
+        let view_proj = view.view_proj.to_cols_array_2d();
 
         builder
             .set_viewport(

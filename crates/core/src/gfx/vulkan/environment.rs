@@ -47,11 +47,12 @@ use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpa
 use vulkano::sync::{self, GpuFuture};
 
 use crate::gfx::sh::{self, SH9};
-use crate::scene::{Camera, EnvironmentSettings};
+use crate::scene::EnvironmentSettings;
 
 use super::MSAA_SAMPLES;
 use super::context::VkContext;
 use super::hdr::HDR_FORMAT;
+use super::taa::FrameView;
 
 /// The environment carries the same radiance the scene does, so it uses the
 /// same format the forward target does.
@@ -266,7 +267,7 @@ impl EnvironmentPass {
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         ctx: &VkContext,
-        camera: &Camera,
+        view: &FrameView,
         extent: [u32; 2],
         settings: &EnvironmentSettings,
     ) {
@@ -288,12 +289,14 @@ impl EnvironmentPass {
         )
         .unwrap();
 
-        let aspect = extent[0] as f32 / extent[1] as f32;
         // Translation stripped: what the vertex shader unprojects is then a
         // direction, so the ray needs no camera-relative correction and holds
         // its precision arbitrarily far from the origin.
-        let view_rotation = Mat4::from_mat3(Mat3::from_mat4(camera.view()));
-        let inverse = (camera.projection(aspect) * view_rotation).inverse();
+        let view_rotation = Mat4::from_mat3(Mat3::from_mat4(view.view));
+        // The jittered projection, like every other pass in this render pass:
+        // a sky that ignored the jitter would sit still while the geometry
+        // shook against it, and TAA would resolve a seam along every silhouette.
+        let inverse = (view.proj * view_rotation).inverse();
         // Rotating the ray rotates the environment, so the yaw costs nothing in
         // the shader.
         let matrix = Mat4::from_rotation_y(settings.yaw.to_radians()) * inverse;

@@ -21,6 +21,7 @@ use crate::gfx::graph::{FrameGraph, ResourceId};
 
 use super::forward::ForwardPass;
 use super::frame::{Frame, PassBody};
+use super::prepass::GeometryPrepass;
 use super::shadow::ShadowPass;
 use super::ssao::SsaoPass;
 
@@ -152,6 +153,7 @@ impl PassFramebuffers {
         frame: &Frame,
         images: &GraphImages,
         forward: &ForwardPass,
+        prepass: &GeometryPrepass,
         ssao: &SsaoPass,
         shadow: &ShadowPass,
     ) -> Self {
@@ -164,11 +166,15 @@ impl PassFramebuffers {
             let body = frame.bodies[pass_id.index()];
             framebuffers[pass_id.index()] = (|| {
                 let (render_pass, attachments) = match body {
-                    PassBody::SsaoPrepass => {
-                        let ssao_ids = ids.ssao.expect("SSAO pass without SSAO resources");
+                    PassBody::GeometryPrepass => {
+                        let prepass_ids = ids.prepass.expect("prepass without its resources");
                         (
-                            ssao.prepass_rp.clone(),
-                            vec![images.view(ssao_ids.normal), images.view(ssao_ids.depth)],
+                            prepass.render_pass.clone(),
+                            vec![
+                                images.view(prepass_ids.normal),
+                                images.view(prepass_ids.velocity),
+                                images.view(prepass_ids.depth),
+                            ],
                         )
                     }
                     PassBody::SsaoResolve => {
@@ -203,6 +209,7 @@ impl PassFramebuffers {
                     // target no attachment at all.
                     PassBody::Tonemap
                     | PassBody::Overlay
+                    | PassBody::TaaResolve
                     | PassBody::LuminanceHistogram
                     | PassBody::LuminanceAverage
                     | PassBody::BloomPrefilter
@@ -234,14 +241,22 @@ impl PassFramebuffers {
 /// clearing first is bandwidth spent on values nothing reads.
 pub(super) fn clear_values(body: PassBody) -> Vec<Option<ClearValue>> {
     match body {
-        // Flat +Z in the normal buffer, far in depth.
-        PassBody::SsaoPrepass => vec![Some([0.5, 0.5, 1.0, 0.0].into()), Some(1.0.into())],
+        // Flat +Z in the normal buffer, no motion in the velocity buffer, far in
+        // depth. Zero velocity is what the sky and any unrasterised pixel are
+        // left with, and the resolve reads that as "reproject with the camera
+        // alone" rather than as a stationary surface.
+        PassBody::GeometryPrepass => vec![
+            Some([0.5, 0.5, 1.0, 0.0].into()),
+            Some([0.0, 0.0, 0.0, 0.0].into()),
+            Some(1.0.into()),
+        ],
         // 1.0 = fully unoccluded, so an untouched pixel darkens nothing.
         PassBody::SsaoResolve | PassBody::SsaoBlur => vec![Some([1.0, 0.0, 0.0, 0.0].into())],
         PassBody::Forward => vec![Some([0.02, 0.02, 0.03, 1.0].into()), Some(1.0.into()), None],
         PassBody::Tonemap => vec![None],
         // No render pass, so nothing to clear.
         PassBody::Overlay
+        | PassBody::TaaResolve
         | PassBody::LuminanceHistogram
         | PassBody::LuminanceAverage
         | PassBody::BloomPrefilter

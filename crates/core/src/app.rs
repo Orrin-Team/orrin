@@ -25,8 +25,8 @@ use crate::profile_scope;
 use crate::scene::entities::{StressSpec, build_default_scene, spawn_stress_scene};
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, Culling, DebugLine, DebugLines, EnvironmentSettings,
-    FogSettings, HdrSettings, InputState, LogBuffer, LogLevel, ShadowSettings, SsaoSettings, Time,
-    load_hdri,
+    FogSettings, HdrSettings, InputState, LogBuffer, LogLevel, ShadowSettings, SsaoSettings,
+    TaaSettings, Time, load_hdri,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -194,6 +194,7 @@ impl App {
         world.insert_resource(ShadowSettings::default());
         world.insert_resource(HdrSettings::default());
         world.insert_resource(BloomSettings::default());
+        world.insert_resource(TaaSettings::default());
         world.insert_resource(FogSettings::default());
         // `ORRIN_HDRI` names an environment relative to the assets directory,
         // the same env-var-over-default shape the scripts directory and entry
@@ -560,6 +561,7 @@ impl ApplicationHandler for App {
                 }
                 let camera = *self.world.resource::<Camera>();
                 let ssao = *self.world.resource::<SsaoSettings>();
+                let taa = *self.world.resource::<TaaSettings>();
                 let shadow_settings = *self.world.resource::<ShadowSettings>();
                 let bloom = *self.world.resource::<BloomSettings>();
                 let hdr = *self.world.resource::<HdrSettings>();
@@ -598,6 +600,7 @@ impl ApplicationHandler for App {
                         &self.lighting,
                         &camera,
                         &ssao,
+                        &taa,
                         &bloom,
                         &hdr,
                         &environment,

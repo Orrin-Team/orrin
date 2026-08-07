@@ -1,6 +1,6 @@
 use glam::{Mat3, Mat4, Vec3};
 
-use orrin_ecs::World;
+use orrin_ecs::{Entity, World};
 
 use crate::geom::Aabb;
 use crate::gfx::shadows::{Cascade, CascadeSet, MAX_CASCADES};
@@ -32,6 +32,49 @@ pub struct FrameGeometry {
     visible: Vec<u32>,
     /// What casts into each active cascade, in draw order.
     cascades: [Vec<u32>; MAX_CASCADES],
+    /// Where every extracted entity stood last frame, and where it stands now.
+    /// Swapped rather than updated in place at the end of each extraction, so an
+    /// entity nobody extracted last frame has no entry at all — which is what
+    /// makes `prev_model` fall back to `model` instead of to a matrix from
+    /// however many frames ago the object was last on screen.
+    motion: MotionHistory,
+}
+
+/// Last frame's world matrix per entity slot.
+///
+/// Indexed by slot rather than hashed because slots are dense and extraction
+/// already walks every renderable; the generation is stored alongside because a
+/// slot outlives the entity in it, and a reused slot must read as new rather
+/// than as the dead entity teleporting.
+#[derive(Default)]
+struct MotionHistory {
+    previous: Vec<Option<(u32, Mat4)>>,
+    current: Vec<Option<(u32, Mat4)>>,
+}
+
+impl MotionHistory {
+    fn begin(&mut self) {
+        self.current.clear();
+    }
+
+    /// Where `entity` stood last frame, defaulting to `model` for anything the
+    /// last extraction did not see.
+    fn record(&mut self, entity: Entity, model: Mat4) -> Mat4 {
+        let slot = entity.index() as usize;
+        if slot >= self.current.len() {
+            self.current.resize(slot + 1, None);
+        }
+        self.current[slot] = Some((entity.generation(), model));
+
+        match self.previous.get(slot).copied().flatten() {
+            Some((generation, previous)) if generation == entity.generation() => previous,
+            _ => model,
+        }
+    }
+
+    fn end(&mut self) {
+        std::mem::swap(&mut self.previous, &mut self.current);
+    }
 }
 
 impl FrameGeometry {
@@ -76,6 +119,7 @@ pub fn extract_geometry(
     for list in out.cascades.iter_mut() {
         list.clear();
     }
+    out.motion.begin();
 
     let cull = world
         .get_resource::<Culling>()
@@ -88,7 +132,7 @@ pub fn extract_geometry(
 
     world
         .query::<(&WorldTransform, &MeshHandle, Option<&MaterialHandle>)>()
-        .for_each(|_entity, (transform, mesh, material)| {
+        .for_each(|entity, (transform, mesh, material)| {
             total += 1;
             let model = transform.0;
             // A mesh with no registered bounds is unmeasurable, so it is drawn
@@ -120,6 +164,7 @@ pub fn extract_geometry(
             let index = out.items.len() as u32;
             out.items.push(RenderItem {
                 model,
+                prev_model: out.motion.record(entity, model),
                 normal_matrix: normal_matrix(&model),
                 bounds: world_bounds,
                 mesh: *mesh,
@@ -156,6 +201,8 @@ pub fn extract_geometry(
     if let Some(camera) = camera.as_ref() {
         order_runs_front_to_back(&out.items, &mut out.visible, camera.position);
     }
+
+    out.motion.end();
 
     if let Some(mut culling) = world.get_resource_mut::<Culling>() {
         culling.record(out.visible.len(), total);
@@ -455,6 +502,69 @@ mod tests {
         extract_geometry(world, ASPECT, &CascadeSet::default(), &mut geometry);
         let visible = geometry.visible();
         (0..visible.len()).map(|i| *visible.item(i)).collect()
+    }
+
+    /// The first extraction has nothing to compare against, so a brand-new
+    /// object must read as stationary. Anything else and every spawn flashes a
+    /// motion vector on the frame it appears, which TAA turns into a streak.
+    #[test]
+    fn an_object_seen_for_the_first_time_has_not_moved() {
+        let mut world = test_world();
+        spawn(&mut world, Vec3::ZERO, CUBE);
+
+        let items = extract(&mut world);
+        assert_eq!(items[0].prev_model, items[0].model);
+    }
+
+    /// Two extractions of the same geometry, with the object moved in between:
+    /// the second must report where the first found it.
+    #[test]
+    fn a_moved_object_reports_where_it_was() {
+        let mut world = test_world();
+        spawn(&mut world, Vec3::ZERO, CUBE);
+
+        let mut geometry = FrameGeometry::default();
+        propagate_transforms(&mut world);
+        extract_geometry(&world, ASPECT, &CascadeSet::default(), &mut geometry);
+        let before = *geometry.visible().item(0);
+
+        world
+            .query::<&mut LocalTransform>()
+            .for_each(|_entity, local| local.translation.x += 2.0);
+        propagate_transforms(&mut world);
+        extract_geometry(&world, ASPECT, &CascadeSet::default(), &mut geometry);
+        let after = *geometry.visible().item(0);
+
+        assert_ne!(after.model, before.model);
+        assert_eq!(after.prev_model, before.model);
+    }
+
+    /// A slot outlives the entity in it. Reading the dead occupant's matrix as
+    /// the new one's history would report a jump across the whole scene on the
+    /// frame a slot is recycled — which is exactly when a spawn is most likely
+    /// to be watched.
+    #[test]
+    fn a_recycled_entity_slot_starts_with_no_history() {
+        let mut world = test_world();
+        spawn(&mut world, Vec3::new(3.0, 0.0, 0.0), CUBE);
+
+        let mut geometry = FrameGeometry::default();
+        propagate_transforms(&mut world);
+        extract_geometry(&world, ASPECT, &CascadeSet::default(), &mut geometry);
+        let first = *geometry.visible().item(0);
+
+        let mut existing = Vec::new();
+        world
+            .query::<&LocalTransform>()
+            .for_each(|entity, _| existing.push(entity));
+        world.despawn(existing[0]);
+        spawn(&mut world, Vec3::ZERO, CUBE);
+        propagate_transforms(&mut world);
+        extract_geometry(&world, ASPECT, &CascadeSet::default(), &mut geometry);
+        let second = *geometry.visible().item(0);
+
+        assert_ne!(second.model, first.model);
+        assert_eq!(second.prev_model, second.model);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::editor::state::{
     EditorState, GizmoMode, GizmoSpace, RibbonTab, SNAP_STEP, SceneRequest, SpawnKind,
 };
 use crate::editor::theme::ThemeSet;
-use crate::scene::{HdrSettings, ShadowSettings, SsaoSettings};
+use crate::scene::{HdrSettings, ShadowSettings, SsaoSettings, TaaSettings};
 
 const COMMAND_WIDTH: f32 = 76.0;
 const COMMAND_HEIGHT: f32 = 54.0;
@@ -493,13 +493,22 @@ fn selection_group(
 
 fn passes_group(ui: &mut egui::Ui, world: &World) {
     group(ui, "Passes", |ui| {
-        let (ssao, shadows, tint) = {
+        let (ssao, taa, shadows, tint) = {
             let s = world.resource::<SsaoSettings>();
+            let taa = world.resource::<TaaSettings>();
             let shadow = world.resource::<ShadowSettings>();
-            (s.enabled, shadow.enabled, shadow.debug_cascades)
+            (
+                s.enabled,
+                taa.enabled,
+                shadow.enabled,
+                shadow.debug_cascades,
+            )
         };
         if command(ui, Command::new(icons::circle_dot(), "SSAO").active(ssao)).clicked() {
             world.resource_mut::<SsaoSettings>().enabled = !ssao;
+        }
+        if command(ui, Command::new(icons::grid(), "TAA").active(taa)).clicked() {
+            world.resource_mut::<TaaSettings>().enabled = !taa;
         }
         if command(ui, Command::new(icons::sun(), "Shadows").active(shadows)).clicked() {
             world.resource_mut::<ShadowSettings>().enabled = !shadows;

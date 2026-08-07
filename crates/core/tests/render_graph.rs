@@ -44,10 +44,11 @@ const BLOOM_MIPS: u8 = 6;
 fn configs() -> Vec<(&'static str, FrameConfig)> {
     vec![
         (
-            "editor frame, SSAO on",
+            "editor frame, TAA and SSAO on",
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                taa: true,
                 auto_exposure: true,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
@@ -66,6 +67,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                taa: false,
                 auto_exposure: true,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
@@ -83,8 +85,25 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: false,
+                taa: false,
                 auto_exposure: true,
                 bloom_mips: 0,
+                overlay: true,
+                shadow_cascades: 0,
+                shadow_resolution: SHADOW_RESOLUTION,
+            },
+        ),
+        // The shape that proves the prepass belongs to the frame rather than to
+        // SSAO: nothing reads its normal target here, and it still runs, because
+        // TAA needs the motion vectors that come off the same rasterisation.
+        (
+            "editor frame, TAA without SSAO",
+            FrameConfig {
+                color_format: COLOR_FORMAT,
+                ssao: false,
+                taa: true,
+                auto_exposure: true,
+                bloom_mips: BLOOM_MIPS,
                 overlay: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -100,6 +119,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                taa: false,
                 auto_exposure: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
@@ -116,6 +136,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                taa: false,
                 auto_exposure: true,
                 bloom_mips: 1,
                 overlay: true,
@@ -128,6 +149,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 color_format: COLOR_FORMAT,
                 ssao: true,
+                taa: false,
                 auto_exposure: true,
                 bloom_mips: BLOOM_MIPS,
                 overlay: false,
@@ -221,6 +243,7 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
         let frame = declare(FrameConfig {
             color_format: COLOR_FORMAT,
             ssao: true,
+            taa: false,
             auto_exposure: true,
             bloom_mips: BLOOM_MIPS,
             overlay: true,
@@ -241,6 +264,50 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
             "{count} cascades must declare a {count}-layer array, not a plain image",
         );
     }
+}
+
+/// TAA ping-pongs two allocations, so the image this frame writes as `taa_color`
+/// is the one next frame reads as `taa_history`. That only works if the frame
+/// leaves `taa_color` in exactly the layout `taa_history` is declared to enter
+/// in — otherwise every frame after the first samples an image the plan says is
+/// in some other layout, and the resulting read is undefined on hardware that
+/// takes the declaration seriously.
+///
+/// Nothing in the compiler enforces the pairing; it is a property of how the
+/// executor binds the two, so it is asserted here rather than derived.
+#[test]
+fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
+    let frame = declare(FrameConfig {
+        color_format: COLOR_FORMAT,
+        ssao: true,
+        taa: true,
+        auto_exposure: true,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        shadow_cascades: 0,
+        shadow_resolution: SHADOW_RESOLUTION,
+    })
+    .unwrap();
+
+    let plan = format!("{}", frame.graph);
+    assert!(
+        plan.contains("taa_color General->ShaderReadOnlyOptimal"),
+        "the resolve's output must end the frame sampled, not left in General:\n{plan}",
+    );
+    // An import already in its exit layout needs no closing transition, so the
+    // absence of one is the assertion: a `taa_color` line among the final
+    // barriers would mean the frame is handing the next one a layout it does not
+    // expect.
+    let closing: Vec<_> = frame
+        .graph
+        .final_barriers()
+        .iter()
+        .filter(|barrier| {
+            let name = frame.graph.resource_name(barrier.resource);
+            name == "taa_color" || name == "taa_history"
+        })
+        .collect();
+    assert!(closing.is_empty(), "{closing:?}");
 }
 
 /// The swapchain image is acquired undefined and handed back to the presentation

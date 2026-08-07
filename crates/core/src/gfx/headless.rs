@@ -14,7 +14,7 @@ use crate::geom::Aabb;
 use crate::gfx::{DrawList, Material, RenderBackend, SceneLighting, TextureHandle};
 use crate::scene::{
     BloomSettings, Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle,
-    SsaoSettings,
+    SsaoSettings, TaaSettings,
 };
 
 /// Counts uploads and derives mesh bounds; does no GPU work of any kind.
@@ -78,6 +78,7 @@ impl RenderBackend for HeadlessBackend {
         _lighting: &SceneLighting,
         _camera: &Camera,
         _ssao: &SsaoSettings,
+        _taa: &TaaSettings,
         _bloom: &BloomSettings,
         _hdr: &HdrSettings,
         _environment: &EnvironmentSettings,

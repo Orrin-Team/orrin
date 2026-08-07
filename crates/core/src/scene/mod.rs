@@ -15,6 +15,7 @@ mod persist;
 pub mod registry;
 mod shadow;
 mod ssao;
+mod taa;
 mod time;
 mod transform;
 
@@ -42,5 +43,6 @@ pub use persist::{LoadIssue, instantiate, load, save, to_document};
 pub use registry::register_components;
 pub use shadow::ShadowSettings;
 pub use ssao::SsaoSettings;
+pub use taa::TaaSettings;
 pub use time::Time;
 pub use transform::Transform;

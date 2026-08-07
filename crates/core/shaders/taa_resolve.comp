@@ -1,0 +1,209 @@
+#version 460
+
+// Temporal antialiasing: accumulate the jittered frame into a reprojected
+// history.
+//
+// The whole difficulty is that the history is *wrong* wherever the scene
+// changed — an object moved, a silhouette uncovered new background, a highlight
+// shifted — and reading it anyway is what makes bad TAA smear. Three mechanisms
+// answer that, and each covers a case the others cannot:
+//
+//  * Reprojection moves the sample to where this pixel's surface was, using the
+//    motion vector of the *nearest* fragment in the 3x3 (Karis' dilation). Take
+//    the centre pixel's instead and a silhouette drags the background's motion
+//    along its edge.
+//  * A neighbourhood clip rejects history that could not have come from this
+//    pixel's surroundings. Variance-based bounds (Salvi) rather than the plain
+//    min/max box, because one firefly in the 3x3 opens the box wide enough to
+//    admit anything.
+//  * Reversible tone weighting (Karis) does the blend in a compressed range, so
+//    a 40x-brighter sample cannot dominate an average of eight ordinary ones and
+//    flicker as it moves.
+//
+// It runs in HDR, before metering and bloom, so what those two see is already
+// resolved — a bloom chain fed the unresolved frame pulses at the jitter's
+// frequency.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_color;
+layout(set = 0, binding = 1) uniform sampler2D u_history;
+layout(set = 0, binding = 2) uniform sampler2D u_velocity;
+layout(set = 0, binding = 3) uniform sampler2D u_depth;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D u_target;
+layout(set = 0, binding = 5) uniform Params {
+    // Unjittered, so background reprojection agrees with the motion vectors the
+    // prepass wrote — those are unjittered too.
+    mat4 inv_view_proj;
+    mat4 prev_view_proj;
+    // xy = 1 / extent, z = history weight, w != 0 to ignore the history.
+    vec4 params;
+} taa;
+
+// How many standard deviations of the neighbourhood the history may sit outside
+// before it is pulled in. Around one is the usual compromise: lower clips real
+// motion blur off moving highlights, higher lets ghosts through.
+const float VARIANCE_GAMMA = 1.25;
+
+float luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// Reversible, unlike a real tonemap curve: the blend happens in here and
+// `expand` undoes it exactly, so no dynamic range is lost, only the weighting
+// distorted.
+vec3 compress(vec3 c) {
+    return c / (1.0 + luminance(c));
+}
+
+vec3 expand(vec3 c) {
+    return c / max(1.0 - luminance(c), 1e-4);
+}
+
+// YCoCg separates luma from chroma, and the clip below is far tighter in it
+// than in RGB: a bounding box in RGB around a set of samples that differ mostly
+// in brightness is a diagonal box with a great deal of empty corner.
+vec3 to_ycocg(vec3 c) {
+    return vec3(
+        0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
+        0.5 * c.r - 0.5 * c.b,
+        -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
+}
+
+vec3 from_ycocg(vec3 c) {
+    float t = c.x - c.z;
+    return vec3(t + c.y, c.x + c.z, t - c.y);
+}
+
+vec3 prepare(vec3 c) {
+    return to_ycocg(compress(c));
+}
+
+vec3 restore(vec3 c) {
+    return max(expand(from_ycocg(c)), vec3(0.0));
+}
+
+// Move `history` along the line to the box's centre until it is inside, rather
+// than clamping each axis independently. Clamping a chroma axis on its own
+// shifts the hue of what it rejects; this keeps the direction and shortens it.
+vec3 clip_to_box(vec3 lo, vec3 hi, vec3 history) {
+    vec3 centre = 0.5 * (hi + lo);
+    vec3 half_extent = 0.5 * (hi - lo) + 1e-5;
+    vec3 offset = history - centre;
+    vec3 units = abs(offset / half_extent);
+    float longest = max(units.x, max(units.y, units.z));
+    return longest > 1.0 ? centre + offset / longest : history;
+}
+
+// Bicubic (Catmull-Rom) history fetch, as five bilinear taps rather than
+// sixteen point ones. Bilinear would do, and is why so much TAA looks soft: the
+// history is resampled every single frame, so its filter's blur compounds
+// geometrically while this filter's slight sharpening does not.
+vec3 sample_history(vec2 uv, vec2 size) {
+    vec2 position = uv * size;
+    vec2 centre = floor(position - 0.5) + 0.5;
+    vec2 f = position - centre;
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+
+    vec2 w0 = f2 - 0.5 * (f3 + f);
+    vec2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+    vec2 w3 = 0.5 * (f3 - f2);
+    vec2 w2 = 1.0 - w0 - w1 - w3;
+
+    // The middle two taps of each axis are fetched as one bilinear sample
+    // placed between them, which is what collapses 4x4 to the cross below.
+    vec2 w12 = w1 + w2;
+    vec2 offset12 = w2 / max(w12, vec2(1e-5));
+
+    vec2 uv0 = (centre - 1.0) / size;
+    vec2 uv12 = (centre + offset12) / size;
+    vec2 uv3 = (centre + 2.0) / size;
+
+    float k0 = w0.x * w12.y;
+    float k1 = w12.x * w0.y;
+    float k2 = w12.x * w12.y;
+    float k3 = w3.x * w12.y;
+    float k4 = w12.x * w3.y;
+
+    vec3 sum = vec3(0.0);
+    sum += texture(u_history, vec2(uv0.x, uv12.y)).rgb * k0;
+    sum += texture(u_history, vec2(uv12.x, uv0.y)).rgb * k1;
+    sum += texture(u_history, vec2(uv12.x, uv12.y)).rgb * k2;
+    sum += texture(u_history, vec2(uv3.x, uv12.y)).rgb * k3;
+    sum += texture(u_history, vec2(uv12.x, uv3.y)).rgb * k4;
+
+    // Dropping the four corner taps loses a little weight; renormalising is
+    // what keeps the filter from darkening the history a fraction per frame,
+    // which over a still second is a visible fade.
+    return max(sum / (k0 + k1 + k2 + k3 + k4), vec3(0.0));
+}
+
+void main() {
+    ivec2 size = imageSize(u_target);
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(texel, size))) {
+        return;
+    }
+
+    vec3 current = texelFetch(u_color, texel, 0).rgb;
+    if (taa.params.w != 0.0) {
+        imageStore(u_target, texel, vec4(current, 1.0));
+        return;
+    }
+
+    vec3 sum = vec3(0.0);
+    vec3 sum_squared = vec3(0.0);
+    vec3 lowest = vec3(1e9);
+    vec3 highest = vec3(-1e9);
+    ivec2 nearest = texel;
+    float nearest_depth = 1.0; // forward-Z, so smaller is nearer
+
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 at = clamp(texel + ivec2(x, y), ivec2(0), size - 1);
+            vec3 c = prepare(texelFetch(u_color, at, 0).rgb);
+            sum += c;
+            sum_squared += c * c;
+            lowest = min(lowest, c);
+            highest = max(highest, c);
+
+            float depth = texelFetch(u_depth, at, 0).r;
+            if (depth < nearest_depth) {
+                nearest_depth = depth;
+                nearest = at;
+            }
+        }
+    }
+
+    vec2 uv = (vec2(texel) + 0.5) * taa.params.xy;
+    vec2 previous_uv;
+    if (nearest_depth >= 1.0) {
+        // Nothing was rasterised here, so the prepass wrote no motion — but the
+        // sky still moves when the camera does. Reproject the far-plane point
+        // through both view-projections to recover exactly that motion; skip
+        // this and the sky ghosts under any rotation.
+        vec4 world = taa.inv_view_proj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+        vec4 previous = taa.prev_view_proj * vec4(world.xyz / world.w, 1.0);
+        previous_uv = (previous.xy / previous.w) * 0.5 + 0.5;
+    } else {
+        previous_uv = uv - texelFetch(u_velocity, nearest, 0).rg;
+    }
+
+    // Off-screen history is not history at all; a clamped edge tap would smear
+    // the border inward every frame the camera pans.
+    if (any(lessThan(previous_uv, vec2(0.0))) || any(greaterThan(previous_uv, vec2(1.0)))) {
+        imageStore(u_target, texel, vec4(current, 1.0));
+        return;
+    }
+
+    vec3 mean = sum / 9.0;
+    vec3 deviation = sqrt(max(sum_squared / 9.0 - mean * mean, vec3(0.0)));
+    vec3 lo = max(mean - VARIANCE_GAMMA * deviation, lowest);
+    vec3 hi = min(mean + VARIANCE_GAMMA * deviation, highest);
+
+    vec3 history = clip_to_box(lo, hi, prepare(sample_history(previous_uv, vec2(size))));
+    vec3 resolved = mix(prepare(current), history, taa.params.z);
+
+    imageStore(u_target, texel, vec4(restore(resolved), 1.0));
+}

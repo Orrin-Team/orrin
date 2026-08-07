@@ -9,7 +9,7 @@ pub use headless::HeadlessBackend;
 use crate::geom::Aabb;
 use crate::scene::{
     BloomSettings, Camera, CpuMesh, EnvironmentSettings, HdrSettings, MaterialHandle, MeshHandle,
-    SsaoSettings,
+    SsaoSettings, TaaSettings,
 };
 use glam::{Mat3, Mat4, Vec3};
 use vulkano::buffer::BufferContents;
@@ -42,6 +42,12 @@ pub struct Vertex {
 #[derive(Clone, Copy, Debug)]
 pub struct RenderItem {
     pub model: Mat4,
+    /// What `model` was the last time this entity was extracted, and `model`
+    /// itself the first time it ever was. The prepass reprojects each vertex
+    /// through it to write a motion vector, so an object that appears this frame
+    /// reads as stationary rather than as having flown in from wherever the
+    /// slot's previous occupant stood.
+    pub prev_model: Mat4,
     /// Inverse-transpose of `model`'s upper 3x3, so normals stay perpendicular
     /// under non-uniform scale. Derived from the transform's rotation and scale
     /// at extraction rather than inverted out of `model` per pass per frame.
@@ -241,6 +247,7 @@ pub trait RenderBackend {
         lighting: &SceneLighting,
         camera: &Camera,
         ssao: &SsaoSettings,
+        taa: &TaaSettings,
         bloom: &BloomSettings,
         hdr: &HdrSettings,
         environment: &EnvironmentSettings,
@@ -257,6 +264,7 @@ mod draw_list_tests {
     fn item(mesh: u32, material: u32) -> RenderItem {
         RenderItem {
             model: Mat4::IDENTITY,
+            prev_model: Mat4::IDENTITY,
             normal_matrix: Mat3::IDENTITY,
             bounds: Aabb {
                 min: Vec3::splat(-0.5),
