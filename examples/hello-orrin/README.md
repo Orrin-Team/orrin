@@ -31,7 +31,7 @@ cd examples/hello-orrin && ../../target/debug/orrin run
 By hand:
 
 ```bash
-cargo build -p orrin-core --features scripting
+cargo build -p orrin-core
 dotnet build scripting/Orrin
 dotnet build examples/hello-orrin/scripts
 ```
@@ -50,8 +50,9 @@ Nothing points the engine at the game assembly: it derives the DLL's name from
 the assembly half of `scripts.entry` (`HelloOrrin.Main, HelloOrrin`) and finds
 it under `scripts/bin/`.
 
-Without `--features scripting` the manifest is still located and validated, so
-this is also the quickest way to check manifest errors.
+Built `--no-default-features` the manifest is still located and validated, so
+that is also the quickest way to check manifest errors on a machine with no
+.NET.
 
 ## Hot reload
 

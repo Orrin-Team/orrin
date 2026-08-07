@@ -34,9 +34,17 @@ egui_dock = { version = "0.16", features = ["serde"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [features]
-# Opt-in C# scripting. Off by default so the standard workspace build and CI
-# don't pull in orrin-script (netcorehost + the nethost download). The build
-# watcher rides along: rebuild-on-save has nothing to reload without scripting.
+default = ["scripting"]
+# C# scripting, on by default: it is what the engine *is*, and a second-class
+# build shape is one nobody compiles until it has already rotted.
+#
+# It is still a feature rather than a plain dependency, for one reason worth the
+# `#[cfg]`s: orrin-script pulls netcorehost, which downloads nethost from NuGet
+# at build time. `--no-default-features` is the build for a machine with no
+# network and no .NET, and CI compiles that shape too so it cannot rot either.
+#
+# The build watcher rides along: rebuild-on-save has nothing to reload without
+# scripting.
 scripting = ["dep:orrin-script", "dep:orrin-build", "dep:notify"]
 
 [[bench]]

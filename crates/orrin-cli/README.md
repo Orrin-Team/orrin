@@ -99,14 +99,14 @@ In order, because a wrong guess here is near-invisible:
    beside the CLI. That pairing is what an exported build lays down.
 3. **An engine checkout** above the project or above the CLI itself (with the
    CLI's path canonicalized first, so a symlink on `$PATH` still points into
-   the checkout) → `cargo run -p orrin-core --features scripting`.
+   the checkout) → `cargo run -p orrin-core`.
 4. **`orrin-core` alone** beside the CLI.
 
 Step 2 requires the bindings specifically so that a cargo `target/` directory —
 where the engine and CLI binaries are neighbours but no `Orrin.dll` is — falls
 through to step 3. Otherwise a contributor's `orrin run` would launch whatever
-stale `target/debug/orrin-core` existed, possibly one built without
-`--features scripting`, and scripts would simply never run with nothing said.
+stale `target/debug/orrin-core` existed rather than a rebuild of the sources
+they are editing.
 
 ## `$ORRIN_SCRIPT_DIR`
 

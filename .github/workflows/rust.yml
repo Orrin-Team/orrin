@@ -25,6 +25,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Scripting is a default feature, so the workspace build compiles
+      # orrin-script and hosts CoreCLR. The Rust half needs only the nethost
+      # binary, which netcorehost fetches from NuGet on its own — the SDK here
+      # is for the managed half: the bindings, the demo game, and the math
+      # tests below. Keep the version in step with the TargetFramework in
+      # scripting/Orrin/Orrin.csproj and the `net10_0` feature in
+      # crates/orrin-script/Cargo.toml; all three have to agree.
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
@@ -37,6 +49,32 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --verbose
+
+      # The other build shape. Scripting is on by default because a
+      # second-class build is one nobody compiles until it has already rotted —
+      # and the same is true in reverse, so the no-.NET build is compiled here
+      # rather than trusted. It is a `check` and not a `build` on purpose: what
+      # can break is the `#[cfg(feature = "scripting")]` seams, and those fail
+      # to typecheck long before anything reaches the linker.
+      - name: Check the build without scripting
+        run: cargo check -p orrin-core --no-default-features --all-targets --verbose
+
+      # The managed half, which no Rust target reaches. The bindings assembly
+      # is the engine's own and boots CoreCLR; DemoGame is a game assembly like
+      # any project's, and building it here is what keeps the one loading path
+      # honest.
+      - name: Build the C# assemblies
+        run: |
+          dotnet build scripting/Orrin
+          dotnet build scripting/DemoGame
+
+      # Math conventions are a public, breaking-to-change API (right-handed,
+      # -Z forward, degrees, YXZ euler, Hamilton products) and System.Numerics
+      # is the oracle they are checked against. It also asserts the layout of
+      # the blittable structs the ABI is frozen on — `sizeof(Transform) == 40` —
+      # which is the half of the Rust/C# lock-step that no Rust test can see.
+      - name: C# math and ABI layout tests
+        run: dotnet run --project scripting/Orrin.MathTests
 
       # Architecture §6: "editor cold start stays under a few seconds, guarded
       # by a CI benchmark, because startup time decays one dependency at a

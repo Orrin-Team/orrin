@@ -903,7 +903,17 @@ impl Scripting {
         let host = match ScriptHost::boot(&build_api(), bindings_dir) {
             Ok(host) => host,
             Err(err) => {
-                eprintln!("scripting disabled: {err}");
+                // Named, and with the fix attached, because scripting is a
+                // default feature: this is the first thing a machine with no
+                // .NET prints, and the bare hostfxr error underneath it is
+                // "No such file or directory (os error 2)".
+                eprintln!(
+                    "scripting disabled: could not host the .NET runtime from {} ({err})\n\
+                     \x20 the engine runs without it. Install the .NET SDK and \
+                     `dotnet build scripting/Orrin`, or build with \
+                     `--no-default-features` to leave scripting out entirely.",
+                    bindings_dir.display(),
+                );
                 return None;
             }
         };

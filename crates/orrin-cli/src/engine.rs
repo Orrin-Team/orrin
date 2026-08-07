@@ -13,7 +13,9 @@ pub enum Launcher {
     /// A built engine executable: a shipped install, or `$ORRIN_ENGINE`.
     Exe(PathBuf),
     /// The engine's own checkout — cargo rebuilds it, so a contributor's
-    /// `orrin run` always launches current sources with scripting compiled in.
+    /// `orrin run` always launches current sources. Scripting comes with the
+    /// default features, so there is no flag to pass and no way to get a
+    /// scriptless engine by forgetting one.
     Cargo { root: PathBuf },
 }
 
@@ -23,7 +25,7 @@ impl Engine {
             Launcher::Exe(exe) => Command::new(exe),
             Launcher::Cargo { root } => {
                 let mut cmd = Command::new("cargo");
-                cmd.args(["run", "-p", "orrin-core", "--features", "scripting"])
+                cmd.args(["run", "-p", "orrin-core"])
                     .arg("--manifest-path")
                     .arg(root.join("Cargo.toml"));
                 cmd
@@ -51,9 +53,9 @@ pub const BINDINGS_ENV: &str = "ORRIN_SCRIPT_DIR";
 /// what an exported build lays down, and it is also what distinguishes it from
 /// a cargo `target/` directory, where both engine and CLI binaries are
 /// neighbours but no bindings are. Without that distinction the checkout case
-/// below would be unreachable for contributors, who would silently get
-/// whatever stale `target/debug/orrin-core` happened to exist — possibly one
-/// built without `--features scripting`, so scripts would just never run.
+/// below would be unreachable for contributors, who would silently get whatever
+/// stale `target/debug/orrin-core` happened to exist rather than a rebuild of
+/// what they are editing.
 pub fn find(start: &Path) -> Result<Engine, String> {
     if let Some(value) = std::env::var_os(ENGINE_ENV) {
         let exe = PathBuf::from(value);
