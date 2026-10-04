@@ -7,6 +7,7 @@ pub mod collision;
 pub mod editor;
 pub mod geom;
 pub mod gfx;
+pub mod logging;
 pub mod profile;
 pub mod scene;
 #[cfg(feature = "scripting")]

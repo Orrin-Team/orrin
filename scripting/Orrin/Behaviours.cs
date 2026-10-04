@@ -38,11 +38,18 @@ public static unsafe class Behaviours
     /// Log a contained script exception with the script's type, the hook that
     /// threw, and the exception (type + message + stack trace), then report the
     /// fault so the caller stops dispatching to this behaviour.
+    ///
+    /// An error, attributed to the Behaviour rather than to this file: it is
+    /// the script's line in the console, and the one an export's log file is
+    /// there to keep.
     static byte Fault(Behaviour behaviour, string method, Exception e)
     {
-        Native.Log(
+        Native.LogEvent(
+            LogLevel.Error,
             $"[script] {behaviour.GetType().Name}.{method} threw {e.GetType().Name}: {e.Message} "
-            + $"— disabling this script until reload.\n{e.StackTrace}");
+            + $"— disabling this script until reload.\n{e.StackTrace}",
+            behaviour.GetType().Name,
+            0);
         return Faulted;
     }
 
@@ -66,7 +73,7 @@ public static unsafe class Behaviours
         {
             // A throwing user constructor must not escape to native code; 0 is
             // the existing "creation failed, don't attach" contract.
-            Native.Log($"[script] exception during create of {name}: {e}");
+            Native.LogError($"[script] exception during create of {name}: {e}");
             return 0;
         }
     }
@@ -193,7 +200,11 @@ public static unsafe class Behaviours
             }
             catch (Exception e)
             {
-                Native.Log($"[script] exception during destroy: {e}");
+                Native.LogEvent(
+                    LogLevel.Error,
+                    $"[script] exception during destroy: {e}",
+                    behaviour.GetType().Name,
+                    0);
             }
             finally
             {

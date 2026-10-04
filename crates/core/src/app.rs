@@ -74,6 +74,8 @@ pub struct App {
     /// This frame's debug lines, copied out of the `DebugLines` resource so the
     /// renderer borrow doesn't overlap the world borrow.
     debug_lines: Vec<DebugLine>,
+    /// The log stream's end for the console panel, drained once a frame.
+    console: crate::logging::ConsoleQueue,
     #[cfg(feature = "scripting")]
     scripting: Option<crate::scripting::Scripting>,
     /// Rebuild-on-save. `None` when the project's layout gave nothing to watch
@@ -111,6 +113,10 @@ struct Scripts {
 
 impl App {
     pub fn run() {
+        // First, so that everything below it — and every exit it takes — is
+        // heard.
+        let console = crate::logging::init(crate::logging::LogConfig::for_this_build());
+
         // Before anything that might dispatch into it — the scene build decodes
         // textures across it, and that happens on the first `resumed`.
         crate::threads::init();
@@ -147,16 +153,16 @@ impl App {
 
         let debug_messenger = validation.then(|| attach_debug_messenger(&instance));
         if validation {
-            println!("orrin: Vulkan validation layer enabled");
+            tracing::info!("Vulkan validation layer enabled");
         } else if should_validate() {
-            eprintln!(
-                "orrin: validation requested but `{VALIDATION_LAYER}` isn't installed; \
+            tracing::warn!(
+                "validation requested but `{VALIDATION_LAYER}` isn't installed; \
                  GPU errors will not be named (install the Vulkan SDK)"
             );
         }
 
         let cwd = std::env::current_dir().unwrap_or_else(|err| {
-            eprintln!("orrin: cannot read the current directory: {err}");
+            tracing::error!("cannot read the current directory: {err}");
             std::process::exit(1);
         });
 
@@ -165,13 +171,13 @@ impl App {
         let project = match orrin_project::Project::locate(&cwd) {
             Ok(project) => project,
             Err(err) => {
-                eprintln!("orrin: {err}");
+                tracing::error!("{err}");
                 std::process::exit(1);
             }
         };
         if let Some(project) = &project {
-            println!(
-                "orrin: project `{}` at {}",
+            tracing::info!(
+                "project `{}` at {}",
                 project.name(),
                 project.root().display()
             );
@@ -184,7 +190,7 @@ impl App {
         let gamepads = match crate::scene::input::Gamepads::new() {
             Ok(gamepads) => Some(gamepads),
             Err(error) => {
-                eprintln!("orrin: {error}");
+                tracing::warn!("{error}");
                 None
             }
         };
@@ -202,6 +208,7 @@ impl App {
             cascades: CascadeSet::default(),
             atlas: ShadowAtlas::default(),
             debug_lines: Vec::new(),
+            console,
             #[cfg(feature = "scripting")]
             scripting: None,
             #[cfg(feature = "scripting")]
@@ -294,7 +301,7 @@ impl App {
         }
         match crate::scene::input::config::load(&path) {
             Ok(specs) => self.world.resource_mut::<Actions>().apply(specs),
-            Err(error) => eprintln!("orrin: {error}"),
+            Err(error) => tracing::error!("{error}"),
         }
 
         // Watched even when the first read failed: the file is on disk, and
@@ -304,7 +311,7 @@ impl App {
             self.input_watcher = match crate::scene::input::ConfigWatcher::new(&path) {
                 Ok(watcher) => Some(watcher),
                 Err(error) => {
-                    eprintln!("orrin: {error}");
+                    tracing::warn!("{error}");
                     None
                 }
             };
@@ -338,7 +345,7 @@ impl App {
                 .or_else(|| Scripting::find_bindings_dir(Path::new(BINDINGS))),
         };
         let Some(bindings_dir) = bindings_dir else {
-            eprintln!(
+            tracing::warn!(
                 "scripting disabled: no Orrin bindings next to the engine, and none \
                  under {BINDINGS} (run `dotnet build {BINDINGS}`, or set ORRIN_SCRIPT_DIR)"
             );
@@ -368,7 +375,7 @@ impl App {
             Err(_) => match Scripting::assembly_of(&entry) {
                 Some(assembly) => Scripting::find_game_assembly(&scripts_dir, assembly),
                 None => {
-                    eprintln!(
+                    tracing::warn!(
                         "scripting disabled: entry `{entry}` names no assembly — it must be \
                          assembly-qualified (`MyGame.Main, MyGame`) so the engine knows which \
                          DLL to load"
@@ -378,7 +385,7 @@ impl App {
             },
         };
         let Some(game_dll) = game_dll else {
-            eprintln!(
+            tracing::warn!(
                 "scripting disabled: no built game assembly for `{entry}` under {} \
                  (run `dotnet build` there, or set ORRIN_GAME_DLL)",
                 scripts_dir.display()
@@ -415,13 +422,13 @@ impl App {
             scripting.attach(&mut self.world, entity, &entry);
         }
         if stress_scripts > 0 {
-            println!("orrin: stress load added — {stress_scripts} scripted entities");
+            tracing::info!("stress load added — {stress_scripts} scripted entities");
         }
 
         let watcher = match BuildWatcher::for_game_assembly(&game_dll, Some(&bindings_dir)) {
             Ok(watcher) => Some(watcher),
             Err(reason) => {
-                eprintln!("rebuild-on-save is off: {reason}");
+                tracing::warn!("rebuild-on-save is off: {reason}");
                 self.world.resource_mut::<BuildStatus>().disable(reason);
                 None
             }
@@ -671,6 +678,12 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Everything the stream has heard since the last frame, this
+                // frame's script tick included, into the buffer the console
+                // is about to draw.
+                self.console
+                    .drain_into(&mut self.world.resource_mut::<LogBuffer>(), frame);
+
                 // Before extraction: the UI may spawn/despawn/edit entities.
                 //
                 // Not run at all with the overlay off. That is deliberate and it
@@ -771,15 +784,11 @@ impl ApplicationHandler for App {
                     self.world
                         .resource_mut::<EnvironmentSettings>()
                         .reload_requested = false;
-                    let message = load_environment(
+                    load_environment(
                         &mut active.renderer,
                         self.project.as_ref(),
                         &environment.hdri,
                     );
-                    let frame = self.world.resource::<Time>().frame_count();
-                    self.world
-                        .resource_mut::<LogBuffer>()
-                        .push(message.0, message.1, frame);
                 }
                 // Stamped into this frame's GPU queries so the readback, some
                 // frames later, can file its spans against the right frame.
@@ -936,8 +945,8 @@ fn print_run_banner(world: &World, renderer: &VulkanRenderer, scene: SceneChoice
     };
     let extent = renderer.extent();
 
-    println!(
-        "Run config: {} build | debug assertions {} | validation {} | present {} | \
+    tracing::info!(
+        "run config: {} build | debug assertions {} | validation {} | present {} | \
          {}x{} | MSAA {} | overlay {} | GPU pass timings {} | scene {}",
         if cfg!(debug_assertions) {
             "unoptimised"
@@ -992,20 +1001,18 @@ fn attach_debug_messenger(instance: &Arc<Instance>) -> DebugUtilsMessenger {
     // SAFETY: the callback only formats and prints; it makes no Vulkan calls.
     let callback = unsafe {
         DebugUtilsMessengerCallback::new(|severity, message_type, data| {
-            let label = if severity.intersects(DebugUtilsMessageSeverity::ERROR) {
-                "error"
+            let id = data
+                .message_id_name
+                .map(|name| format!("{name}: "))
+                .unwrap_or_default();
+            let message = data.message;
+            if severity.intersects(DebugUtilsMessageSeverity::ERROR) {
+                tracing::error!("vulkan: {id}{message}");
             } else if severity.intersects(DebugUtilsMessageSeverity::WARNING) {
-                "warning"
+                tracing::warn!("vulkan: {id}{message}");
             } else {
-                "info"
-            };
-            eprintln!(
-                "[vulkan {label}] {}{}",
-                data.message_id_name
-                    .map(|name| format!("{name}: "))
-                    .unwrap_or_default(),
-                data.message
-            );
+                tracing::info!("vulkan: {id}{message}");
+            }
             let _ = message_type;
         })
     };
@@ -1039,13 +1046,11 @@ fn load_environment(
     renderer: &mut VulkanRenderer,
     project: Option<&orrin_project::Project>,
     hdri: &str,
-) -> (LogLevel, String) {
+) {
     let hdri = hdri.trim();
     if hdri.is_empty() {
-        return (
-            LogLevel::Warning,
-            "no environment file named; give a path relative to the assets directory".to_string(),
-        );
+        tracing::warn!("no environment file named; give a path relative to the assets directory");
+        return;
     }
 
     let assets_dir =
@@ -1054,20 +1059,12 @@ fn load_environment(
     match load_hdri(&assets_dir, hdri) {
         Ok(image) => {
             renderer.load_environment(&image.pixels, image.width, image.height);
-            (
-                LogLevel::Info,
-                format!(
-                    "environment baked from `{hdri}` ({}x{})",
-                    image.width, image.height
-                ),
-            )
+            tracing::info!(
+                "environment baked from `{hdri}` ({}x{})",
+                image.width,
+                image.height
+            );
         }
-        Err(error) => {
-            // Also to the terminal: a run without the editor open has no
-            // console panel to read, and a silently missing environment looks
-            // identical to one that loaded and happened to be dark.
-            eprintln!("orrin: {error}");
-            (LogLevel::Error, error.to_string())
-        }
+        Err(error) => tracing::error!("{error}"),
     }
 }

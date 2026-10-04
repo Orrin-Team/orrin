@@ -38,6 +38,10 @@ gltf = { version = "1", default-features = false, features = [
 # The engine's only source of parallelism. One pool, built once at startup by
 # `orrin_core::threads` — see that module for why it is not rayon's default.
 rayon = "1"
+# The front end of the engine's one log stream; `orrin_core::logging` is the
+# subscriber. Already in the tree through winit, so this adds no crate — and
+# without the default `attributes` feature it adds no proc macro either.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 egui = "0.31"
 egui_winit_vulkano = "0.28"
 serde = { version = "1", features = ["derive"] }

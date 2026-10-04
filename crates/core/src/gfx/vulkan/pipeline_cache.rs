@@ -80,7 +80,7 @@ impl ShaderCache {
         let cache = match cache {
             Ok(cache) => Some(cache),
             Err(e) => {
-                eprintln!("orrin: no pipeline cache ({e}); shaders compile from scratch each run");
+                tracing::warn!("no pipeline cache ({e}); shaders compile from scratch each run");
                 None
             }
         };
@@ -120,17 +120,17 @@ impl ShaderCache {
         if let Some(dir) = path.parent()
             && let Err(e) = std::fs::create_dir_all(dir)
         {
-            eprintln!("orrin: could not create {}: {e}", dir.display());
+            tracing::warn!("could not create {}: {e}", dir.display());
             return;
         }
 
         let temporary = path.with_extension("tmp");
         if let Err(e) = std::fs::write(&temporary, &data) {
-            eprintln!("orrin: could not write {}: {e}", temporary.display());
+            tracing::warn!("could not write {}: {e}", temporary.display());
             return;
         }
         if let Err(e) = std::fs::rename(&temporary, path) {
-            eprintln!("orrin: could not replace {}: {e}", path.display());
+            tracing::warn!("could not replace {}: {e}", path.display());
             let _ = std::fs::remove_file(&temporary);
         }
     }

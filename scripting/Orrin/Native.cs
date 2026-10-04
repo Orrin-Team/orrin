@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -57,6 +58,11 @@ public unsafe struct OrrinApi
     // struct; never reordered above it.
     public delegate* unmanaged<uint, byte> MouseButtonPressed;
     public delegate* unmanaged<uint, byte> MouseButtonReleased;
+    // Structured logging, appended after the mouse edges, matching the Rust
+    // struct: level, the script's name (or null), its line (or 0), the message.
+    // Every log goes through this one; Log/LogWarn/LogError above are what the
+    // table carried before it and are no longer called.
+    public delegate* unmanaged<uint, byte*, uint, byte*, void> LogEvent;
 }
 
 public static unsafe class Native
@@ -65,27 +71,48 @@ public static unsafe class Native
 
     internal static void Initialize(OrrinApi* api) => _api = *api;
 
-    public static void Log(string message) => Emit(_api.Log, message);
+    public static void Log(
+        string message,
+        [CallerFilePath] string file = "",
+        [CallerLineNumber] int line = 0) =>
+        LogEvent(LogLevel.Info, message, ScriptName(file), line);
 
-    public static void LogWarn(string message) => Emit(_api.LogWarn, message);
+    public static void LogWarn(
+        string message,
+        [CallerFilePath] string file = "",
+        [CallerLineNumber] int line = 0) =>
+        LogEvent(LogLevel.Warning, message, ScriptName(file), line);
 
-    public static void LogError(string message) => Emit(_api.LogError, message);
+    public static void LogError(
+        string message,
+        [CallerFilePath] string file = "",
+        [CallerLineNumber] int line = 0) =>
+        LogEvent(LogLevel.Error, message, ScriptName(file), line);
+
+    /// One line on the engine's log stream, attributed to `source` — a script's
+    /// name, or empty for none — at `line` in it (0 for unknown).
+    public static void LogEvent(LogLevel level, string message, string source, int line)
+    {
+        fixed (byte* sourceUtf8 = NulTerminated(source), messageUtf8 = NulTerminated(message))
+            _api.LogEvent((uint)level, sourceUtf8, (uint)line, messageUtf8);
+    }
+
+    /// What a `[CallerFilePath]` is called in a log line: the file's name with
+    /// no directory and no extension, which for a script is its Behaviour.
+    ///
+    /// Split by hand rather than with `Path`, which only knows the separator of
+    /// the machine it runs on — and the path is the one the *compiler* saw, so a
+    /// game built on Windows and run on Linux would keep its whole `C:\…` prefix.
+    internal static string ScriptName(string path)
+    {
+        var start = path.LastIndexOfAny(['/', '\\']) + 1;
+        var dot = path.LastIndexOf('.');
+        return dot > start ? path[start..dot] : path[start..];
+    }
 
     public static void DebugDrawLine(Vector3 from, Vector3 to, Color color, float duration) =>
         _api.DebugDrawLine(
             from.x, from.y, from.z, to.x, to.y, to.z, color.r, color.g, color.b, color.a, duration);
-
-    // Marshal `message` as a nul-terminated UTF-8 buffer and hand it to a native
-    // string sink (Log/LogWarn/LogError share this).
-    private static void Emit(delegate* unmanaged<byte*, void> sink, string message)
-    {
-        var bytes = Encoding.UTF8.GetBytes(message);
-        Span<byte> buffer = stackalloc byte[bytes.Length + 1];
-        bytes.CopyTo(buffer);
-        buffer[bytes.Length] = 0;
-        fixed (byte* p = buffer)
-            sink(p);
-    }
 
     public static Entity Spawn() => _api.Spawn();
 

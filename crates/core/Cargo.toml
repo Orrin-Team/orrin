@@ -33,6 +33,7 @@ notify = { version = "8", optional = true }
 ash = "0.38"
 egui_dock = { version = "0.16", features = ["serde"] }
 rayon = { workspace = true }
+tracing.workspace = true
 gilrs = "0.11.2"
 
 [dev-dependencies]
@@ -54,6 +55,10 @@ default = ["scripting"]
 # The build watcher rides along: rebuild-on-save has nothing to reload without
 # scripting.
 scripting = ["dep:orrin-script", "dep:orrin-build", "dep:notify"]
+# An exported game rather than the editor: trace and debug events are compiled
+# out, and warnings and errors are also written to a log file beside the
+# executable — see `logging::LogConfig::for_this_build`.
+export = ["tracing/max_level_info"]
 
 [[bench]]
 name = "bvh"

@@ -118,6 +118,9 @@ fn headless_instance() -> Arc<Instance> {
 #[test]
 #[ignore = "needs a GPU"]
 fn frame_cost() {
+    // The device and scene lines above the table are the engine's own, and
+    // they are only printed once something is listening for them.
+    orrin_core::logging::init(orrin_core::logging::LogConfig::for_this_build());
     // Before the scene is built: its texture decode is the first thing that
     // dispatches, and a pool built after that would not have been used for it.
     orrin_core::threads::init();
@@ -408,6 +411,7 @@ fn frame_cost() {
 #[test]
 #[ignore = "needs a model on disk"]
 fn model_load_cost() {
+    orrin_core::logging::init(orrin_core::logging::LogConfig::for_this_build());
     orrin_core::threads::init();
 
     let path = model_path();

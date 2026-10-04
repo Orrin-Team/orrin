@@ -21,9 +21,8 @@ namespace Orrin;
 /// replaces `TryCapture`/`TryApply` with vtables.
 ///
 /// No entry point may throw — a managed exception unwinding into native frames
-/// is undefined behaviour. Diagnostics go to `Console.Error`: with no active
-/// world the engine's log sink has nowhere to put them, and Rust logs the reload
-/// summary to the editor console itself.
+/// is undefined behaviour. Diagnostics go to `Console.Error`, and Rust logs the
+/// reload summary to the editor console itself.
 public static unsafe class BehaviourState
 {
     /// Snapshots by id. Lives in the default ALC, and by the rule above holds

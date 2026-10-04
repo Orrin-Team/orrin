@@ -74,6 +74,31 @@ pub enum GizmoSpace {
 /// What a gizmo drag would quantise to, when snapping is on.
 pub const SNAP_STEP: f32 = 0.25;
 
+/// Which log levels the console shows: one bit per [`LogLevel`], all set to
+/// begin with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LevelFilter(u8);
+
+impl Default for LevelFilter {
+    fn default() -> Self {
+        Self(u8::MAX)
+    }
+}
+
+impl LevelFilter {
+    pub fn shows(self, level: LogLevel) -> bool {
+        self.0 & (1 << level as u8) != 0
+    }
+
+    pub fn set(&mut self, level: LogLevel, shown: bool) {
+        if shown {
+            self.0 |= 1 << level as u8;
+        } else {
+            self.0 &= !(1 << level as u8);
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SpawnKind {
     Cube,
@@ -95,6 +120,8 @@ pub struct EditorState {
     /// The hierarchy's search box. Lives here rather than in the panel so it
     /// survives the frame, and so a filtered tree stays filtered.
     pub hierarchy_query: String,
+    /// The console's level toggles. Here for the reason the search box is.
+    pub console_levels: LevelFilter,
     pub ribbon_tab: RibbonTab,
     pub gizmo_mode: GizmoMode,
     pub gizmo_space: GizmoSpace,
@@ -128,6 +155,7 @@ impl Default for EditorState {
             scene_path: DEFAULT_SCENE_PATH.to_owned(),
             project_name: NO_PROJECT.to_owned(),
             hierarchy_query: String::new(),
+            console_levels: LevelFilter::default(),
             ribbon_tab: RibbonTab::Home,
             gizmo_mode: GizmoMode::Select,
             gizmo_space: GizmoSpace::World,

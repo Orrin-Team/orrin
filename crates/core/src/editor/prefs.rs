@@ -51,7 +51,7 @@ impl PrefsFile {
         match ron::from_str(&text) {
             Ok(prefs) => prefs,
             Err(e) => {
-                eprintln!("orrin: ignoring {} — {e}", path.display());
+                tracing::warn!("ignoring {} — {e}", path.display());
                 Prefs::default()
             }
         }
@@ -62,18 +62,18 @@ impl PrefsFile {
             return;
         };
         if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("orrin: cannot create {}: {e}", dir.display());
+            tracing::error!("cannot create {}: {e}", dir.display());
             return;
         }
         let text = match ron::ser::to_string_pretty(prefs, ron::ser::PrettyConfig::default()) {
             Ok(text) => text,
             Err(e) => {
-                eprintln!("orrin: cannot serialise editor preferences: {e}");
+                tracing::error!("cannot serialise editor preferences: {e}");
                 return;
             }
         };
         if let Err(e) = std::fs::write(&path, text) {
-            eprintln!("orrin: cannot write {}: {e}", path.display());
+            tracing::error!("cannot write {}: {e}", path.display());
         }
     }
 }
