@@ -621,7 +621,7 @@ impl VulkanRenderer {
             match presented.map_err(Validated::unwrap) {
                 Ok(future) => self.overlay_present.push(future),
                 Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
-                Err(e) => eprintln!("failed to flush the overlay: {e}"),
+                Err(e) => tracing::error!("failed to flush the overlay: {e}"),
             }
             return;
         }
@@ -659,12 +659,12 @@ impl VulkanRenderer {
                     match result {
                         Ok(suboptimal) => self.recreate_swapchain |= suboptimal,
                         Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
-                        Err(e) => eprintln!("failed to present: {e}"),
+                        Err(e) => tracing::error!("failed to present: {e}"),
                     }
                 }
             }
             Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
-            Err(e) => eprintln!("failed to present: {e}"),
+            Err(e) => tracing::error!("failed to present: {e}"),
         }
     }
 
@@ -870,7 +870,7 @@ impl RenderBackend for VulkanRenderer {
         // Clamp to the white default (handle 0) instead of handing back a slot
         // the GPU can't sample.
         if self.textures.len() >= MAX_TEXTURES {
-            eprintln!(
+            tracing::warn!(
                 "texture cap reached ({MAX_TEXTURES}); ignoring load and using the \
                  white default — material will render untextured"
             );
@@ -2132,8 +2132,8 @@ struct PendingTail {
 fn read_gpu_culling(ctx: &VkContext) -> bool {
     let asked = std::env::var("ORRIN_GPU_CULL").is_ok_and(|value| value.trim() == "1");
     if asked && !ctx.multi_draw {
-        println!(
-            "  GPU culling: unavailable — this device has no multi-draw indirect \
+        tracing::warn!(
+            "GPU culling: unavailable — this device has no multi-draw indirect \
              with a per-draw first instance; keeping the CPU sweep"
         );
     }

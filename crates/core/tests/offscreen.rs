@@ -55,6 +55,7 @@ fn output_dir() -> PathBuf {
 #[test]
 #[ignore = "needs a GPU"]
 fn captures_the_built_in_scenes() {
+    orrin_core::logging::init(orrin_core::logging::LogConfig::for_this_build());
     let dir = output_dir();
 
     for (name, settings) in [

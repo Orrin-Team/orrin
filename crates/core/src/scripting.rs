@@ -19,8 +19,8 @@ use orrin_script::{CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::{
     ActionId, Actions, Assets, Collider, ColliderShape, DebugLines, InputState, LocalTransform,
-    LogBuffer, LogLevel, MaterialHandle, MeshHandle, Name, Parent, ScriptComponent, Tag, Time,
-    Transform, WorldTransform,
+    LogLevel, MaterialHandle, MeshHandle, Name, Parent, ScriptComponent, Tag, Time, Transform,
+    WorldTransform,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -499,7 +499,7 @@ extern "C" fn set_material(entity: CEntity, material: *const c_char) -> bool {
             .get_resource::<Assets>()
             .and_then(|assets| assets.material(&name))
         else {
-            eprintln!("[script] set_material: unknown material {name:?}");
+            tracing::warn!("set_material: unknown material {name:?}");
             return false;
         };
         COMMANDS.with(|commands| {
@@ -603,17 +603,17 @@ extern "C" fn spawn_renderable(
         // site instead of silently when the queue drains.
         let (mesh, material) = {
             let Some(assets) = world.get_resource::<Assets>() else {
-                eprintln!("[script] spawn_renderable: no Assets resource");
+                tracing::warn!("spawn_renderable: no Assets resource");
                 return CEntity::NULL;
             };
             match (assets.mesh(&mesh_name), assets.material(&material_name)) {
                 (Some(mesh), Some(material)) => (mesh, material),
                 (mesh, material) => {
                     if mesh.is_none() {
-                        eprintln!("[script] spawn_renderable: unknown mesh {mesh_name:?}");
+                        tracing::warn!("spawn_renderable: unknown mesh {mesh_name:?}");
                     }
                     if material.is_none() {
-                        eprintln!("[script] spawn_renderable: unknown material {material_name:?}");
+                        tracing::warn!("spawn_renderable: unknown material {material_name:?}");
                     }
                     return CEntity::NULL;
                 }
@@ -650,55 +650,49 @@ extern "C" fn despawn(entity: CEntity) -> bool {
     })
 }
 
-// Debug logging routes into the engine's `LogBuffer` resource (surfaced by the
-// editor console), stamped with the current frame. Like input/time, the sink is
-// an engine-side resource, so the real impls live here and reach it through the
-// active-world seam.
+// A script's log line becomes an event on the engine's stream (`logging.rs`),
+// so it reaches stderr, the console and an export's log file like any other.
+// That needs no world, which is what lets the lines C# writes outside a
+// dispatch window — OnDestroy during a despawn, everything a hot reload
+// reports — reach the console too.
 //
-// Outside a dispatch window there is no world to reach, and the cases that hit
-// that path — OnDestroy during a despawn, and everything C# reports during a
-// hot reload — are exactly the ones worth hearing about, so the message falls
-// back to stderr instead of being dropped. It just doesn't reach the console
-// panel.
-fn log_at(level: LogLevel, message: *const c_char) {
+// `level` counts up from trace, matching `LogLevel` and C# `Orrin.LogLevel`.
+// One this build does not know is logged as an error rather than dropped: the
+// caller meant to be heard. `source` names the script and may be null.
+extern "C" fn log_event(level: u32, source: *const c_char, line: u32, message: *const c_char) {
     if message.is_null() {
         return;
     }
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
-    let text = unsafe { CStr::from_ptr(message) }
-        .to_string_lossy()
-        .into_owned();
-    let buffered = orrin_script::with_world(false, |world| {
-        let frame = world
-            .get_resource::<Time>()
-            .map_or(0, |time| time.frame_count());
-        match world.get_resource_mut::<LogBuffer>() {
-            Some(mut log) => {
-                log.push(level, text.clone(), frame);
-                true
-            }
-            None => false,
-        }
-    });
-    if !buffered {
-        match level {
-            LogLevel::Info => println!("[c#] {text}"),
-            LogLevel::Warning => eprintln!("[c# WARN] {text}"),
-            LogLevel::Error => eprintln!("[c# ERROR] {text}"),
-        }
+    let text = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+    let script = if source.is_null() {
+        std::borrow::Cow::Borrowed("")
+    } else {
+        // SAFETY: as above.
+        unsafe { CStr::from_ptr(source) }.to_string_lossy()
+    };
+    let script: &str = &script;
+    match level {
+        0 => tracing::trace!(script, line, "{text}"),
+        1 => tracing::debug!(script, line, "{text}"),
+        2 => tracing::info!(script, line, "{text}"),
+        3 => tracing::warn!(script, line, "{text}"),
+        _ => tracing::error!(script, line, "{text}"),
     }
 }
 
+// The unattributed sinks the table has carried since before `log_event`. The
+// bindings no longer call them; they stay because the table only grows.
 extern "C" fn log_info(message: *const c_char) {
-    log_at(LogLevel::Info, message);
+    log_event(LogLevel::Info as u32, std::ptr::null(), 0, message);
 }
 
 extern "C" fn log_warn(message: *const c_char) {
-    log_at(LogLevel::Warning, message);
+    log_event(LogLevel::Warning as u32, std::ptr::null(), 0, message);
 }
 
 extern "C" fn log_error(message: *const c_char) {
-    log_at(LogLevel::Error, message);
+    log_event(LogLevel::Error as u32, std::ptr::null(), 0, message);
 }
 
 // Debug lines are collected into the engine's per-frame `DebugLines` resource;
@@ -770,7 +764,7 @@ impl ScriptBridge for PropertyBags {
         match orrin_registry::wire::decode(&bytes) {
             Ok(value) => Some(value),
             Err(error) => {
-                eprintln!("[script] {type_name}'s property bag did not decode: {error}");
+                tracing::error!("{type_name}'s property bag did not decode: {error}");
                 None
             }
         }
@@ -826,7 +820,7 @@ impl ScriptBridge for PropertyBags {
         match orrin_registry::wire::decode(&bytes) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("[script] {type_name}'s defaults did not decode: {error}");
+                tracing::error!("{type_name}'s defaults did not decode: {error}");
                 empty
             }
         }
@@ -871,6 +865,7 @@ fn build_api() -> OrrinApi {
         axis_value,
         mouse_button_pressed,
         mouse_button_released,
+        log_event,
         ..orrin_script::default_api()
     }
 }
@@ -1064,7 +1059,7 @@ impl Scripting {
                 // default feature: this is the first thing a machine with no
                 // .NET prints, and the bare hostfxr error underneath it is
                 // "No such file or directory (os error 2)".
-                eprintln!(
+                tracing::warn!(
                     "scripting disabled: could not host the .NET runtime from {} ({err})\n\
                      \x20 the engine runs without it. Install the .NET SDK and \
                      `dotnet build scripting/Orrin`, or build with \
@@ -1086,7 +1081,7 @@ impl Scripting {
         match scripting.stage() {
             Ok(()) => {}
             Err(status) => {
-                eprintln!(
+                tracing::warn!(
                     "scripting disabled: could not load {} ({status})",
                     game_dll.display()
                 );
@@ -1095,7 +1090,7 @@ impl Scripting {
         }
         let status = scripting.host.commit_game();
         if !status.succeeded() {
-            eprintln!("scripting disabled: {status}");
+            tracing::warn!("scripting disabled: {status}");
             return None;
         }
         Some(scripting)
@@ -1243,8 +1238,8 @@ impl Scripting {
             // Silence here used to mean "the scene came up with no scripts and
             // nothing said why" — the commonest cause is a typo'd or renamed
             // entry type, which is invisible otherwise.
-            eprintln!(
-                "[script] no Behaviour `{type_name}` in the loaded game assembly \
+            tracing::error!(
+                "no Behaviour `{type_name}` in the loaded game assembly \
                  (check the type name and that the project has been rebuilt)"
             );
         }
@@ -1291,12 +1286,12 @@ impl Scripting {
         let listing = match orrin_registry::wire::decode(&bytes) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("[script] the component listing did not decode: {error}");
+                tracing::error!("the component listing did not decode: {error}");
                 return 0;
             }
         };
         let Value::List(entries) = listing else {
-            eprintln!("[script] the component listing was not a list");
+            tracing::error!("the component listing was not a list");
             return 0;
         };
 
@@ -1313,7 +1308,7 @@ impl Scripting {
                 entry.field("name").cloned(),
             )
             else {
-                eprintln!("[script] a component listing entry was missing id, type or name");
+                tracing::error!("a component listing entry was missing id, type or name");
                 continue;
             };
             // The `orrin.` namespace is the engine's, and a game claiming one of
@@ -1321,16 +1316,16 @@ impl Scripting {
             // by name rather than by the duplicate-id panic below, which would
             // take the editor down over a typo in someone's game code.
             if id.starts_with("orrin.") {
-                eprintln!(
-                    "[script] `{type_name}` claims the reserved id `{id}`; \
+                tracing::error!(
+                    "`{type_name}` claims the reserved id `{id}`; \
                      the `orrin.` prefix belongs to the engine's own components"
                 );
                 continue;
             }
             let component_id = ComponentId::owned(id);
             if registry.get(&component_id).is_some() {
-                eprintln!(
-                    "[script] `{type_name}` claims `{component_id}`, which is already registered"
+                tracing::error!(
+                    "`{type_name}` claims `{component_id}`, which is already registered"
                 );
                 continue;
             }
@@ -1548,5 +1543,75 @@ impl Scripting {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logging::{LogConfig, Stream};
+    use crate::scene::LogBuffer;
+
+    /// What `emit` put on the stream, as `(level, line)`.
+    fn logged(emit: impl FnOnce()) -> Vec<(LogLevel, String)> {
+        let (stream, console, _) = Stream::new(LogConfig {
+            stderr: false,
+            ..LogConfig::editor()
+        });
+        tracing::subscriber::with_default(stream, emit);
+        let mut log = LogBuffer::default();
+        console.drain_into(&mut log, 0);
+        log.iter()
+            .map(|entry| (entry.level, entry.text()))
+            .collect()
+    }
+
+    #[test]
+    fn a_script_log_keeps_its_level_and_names_its_script() {
+        let lines = logged(|| {
+            for (level, text) in [c"t", c"d", c"i", c"w", c"e"].into_iter().enumerate() {
+                log_event(level as u32, c"Spinner".as_ptr(), 14, text.as_ptr());
+            }
+        });
+        // An export build compiles the two quietest levels out at the call
+        // site, so there they never reach the stream to be filtered.
+        let floor = if cfg!(feature = "export") {
+            LogLevel::Info
+        } else {
+            LogLevel::Trace
+        };
+        assert_eq!(
+            lines,
+            LogLevel::ALL
+                .into_iter()
+                .zip(["t", "d", "i", "w", "e"])
+                .filter(|(level, _)| *level >= floor)
+                .map(|(level, text)| (level, format!("Spinner:14: {text}")))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The pre-`log_event` sinks pass no source, and a level from a newer
+    /// bindings assembly is one this build cannot name.
+    #[test]
+    fn an_unattributed_or_unknown_level_log_is_still_heard() {
+        let lines = logged(|| {
+            log_warn(c"legacy".as_ptr());
+            log_event(99, std::ptr::null(), 0, c"from the future".as_ptr());
+            log_event(2, std::ptr::null(), 0, std::ptr::null());
+        });
+        assert_eq!(
+            lines,
+            [
+                (
+                    LogLevel::Warning,
+                    "orrin_core::scripting: legacy".to_owned()
+                ),
+                (
+                    LogLevel::Error,
+                    "orrin_core::scripting: from the future".to_owned()
+                ),
+            ]
+        );
     }
 }

@@ -55,7 +55,7 @@ impl SceneChoice {
                 "showcase" | "courtyard" => Self::Showcase,
                 "sponza" | "crytek" => Self::Sponza,
                 other => {
-                    eprintln!(
+                    tracing::warn!(
                         "ORRIN_SCENE: unknown scene `{other}` (expected demo, showcase or \
                          sponza); opening the demo scene"
                     );

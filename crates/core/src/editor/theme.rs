@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 pub const OK: Color32 = Color32::from_rgb(0x7A, 0xC0, 0x8A);
 pub const PENDING: Color32 = Color32::from_rgb(0xE8, 0xB3, 0x4A);
 pub const ERROR: Color32 = Color32::from_rgb(0xE0, 0x5A, 0x4A);
+pub const LOG_TRACE: Color32 = Color32::from_gray(110);
+pub const LOG_DEBUG: Color32 = Color32::from_gray(150);
 pub const LOG_INFO: Color32 = Color32::LIGHT_GRAY;
 pub const LOG_WARN: Color32 = Color32::from_rgb(255, 200, 80);
 pub const LOG_ERROR: Color32 = Color32::from_rgb(255, 110, 110);
@@ -181,8 +183,8 @@ impl ThemeSet {
         for path in paths {
             match std::fs::read_to_string(&path).map(|text| toml::from_str::<Theme>(&text)) {
                 Ok(Ok(theme)) => set.themes.push(theme),
-                Ok(Err(e)) => eprintln!("orrin: {} is not a theme: {e}", path.display()),
-                Err(e) => eprintln!("orrin: cannot read {}: {e}", path.display()),
+                Ok(Err(e)) => tracing::warn!("{} is not a theme: {e}", path.display()),
+                Err(e) => tracing::warn!("cannot read {}: {e}", path.display()),
             }
         }
         set

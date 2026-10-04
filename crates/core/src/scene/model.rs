@@ -266,7 +266,7 @@ pub fn load(path: &Path, settings: &ImportSettings) -> Result<Model, ModelError>
         .flat_map(|m| m.pbr_metallic_roughness().base_color_texture())
         .any(|t| t.texture_transform().is_some())
     {
-        eprintln!(
+        tracing::warn!(
             "{}: uses KHR_texture_transform, which this renderer has no per-material UV \
              transform for; textures will sample untransformed",
             path.display()
@@ -286,7 +286,7 @@ pub fn load(path: &Path, settings: &ImportSettings) -> Result<Model, ModelError>
         let mut indices = Vec::new();
         for primitive in mesh.primitives() {
             if primitive.mode() != gltf::mesh::Mode::Triangles {
-                eprintln!(
+                tracing::warn!(
                     "{}: skipping a {:?} primitive of mesh `{}`; only triangle lists are drawn",
                     path.display(),
                     primitive.mode(),
@@ -855,10 +855,11 @@ fn spawn_node(
         return;
     };
     if depth > MAX_NODE_DEPTH {
-        eprintln!(
+        tracing::warn!(
             "{}: node tree is deeper than {MAX_NODE_DEPTH}; `{}` and anything under it is not \
              spawned — the file's hierarchy is not a tree",
-            model.name, node.name
+            model.name,
+            node.name
         );
         return;
     }

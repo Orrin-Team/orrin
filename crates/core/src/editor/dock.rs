@@ -397,7 +397,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
             Tab::Environment => panels::environment::body(ui, self.world),
             Tab::Performance => panels::performance::body(ui, self.world),
             Tab::Scene => panels::scene::body(ui, self.world, self.state),
-            Tab::Console => panels::console::body(ui, self.world),
+            Tab::Console => panels::console::body(ui, self.world, self.state),
             Tab::Scripts => {
                 #[cfg(feature = "scripting")]
                 panels::scripts::body(ui, self.world, self.state);

@@ -64,11 +64,13 @@ impl StressSpec {
         let mut spec = Self::default();
         for field in raw.split(',') {
             let Some((key, value)) = field.split_once('=') else {
-                eprintln!("ORRIN_STRESS: `{field}` is not `key=value`; ignoring the whole spec");
+                tracing::warn!(
+                    "ORRIN_STRESS: `{field}` is not `key=value`; ignoring the whole spec"
+                );
                 return None;
             };
             let Ok(count) = value.trim().parse::<usize>() else {
-                eprintln!("ORRIN_STRESS: `{value}` is not a count; ignoring the whole spec");
+                tracing::warn!("ORRIN_STRESS: `{value}` is not a count; ignoring the whole spec");
                 return None;
             };
             match key.trim() {
@@ -77,7 +79,7 @@ impl StressSpec {
                 "scripts" => spec.scripts = count,
                 "occluded" => spec.occluded = count,
                 other => {
-                    eprintln!(
+                    tracing::warn!(
                         "ORRIN_STRESS: unknown key `{other}` (expected meshes, colliders, \
                          scripts or occluded); ignoring the whole spec"
                     );
@@ -100,7 +102,9 @@ pub fn spawn_stress_scene(world: &mut World, spec: &StressSpec) {
         .get_resource::<Assets>()
         .and_then(|assets| Some((assets.mesh("cube")?, assets.material("clay")?)))
     else {
-        eprintln!("ORRIN_STRESS: the default scene's cube/clay assets are missing; no load added");
+        tracing::warn!(
+            "ORRIN_STRESS: the default scene's cube/clay assets are missing; no load added"
+        );
         return;
     };
 
@@ -179,9 +183,11 @@ pub fn spawn_stress_scene(world: &mut World, spec: &StressSpec) {
         );
     }
 
-    println!(
-        "orrin: stress load added — {} meshes, {} colliders, {} occluded props",
-        spec.meshes, spec.colliders, spec.occluded
+    tracing::info!(
+        "stress load added — {} meshes, {} colliders, {} occluded props",
+        spec.meshes,
+        spec.colliders,
+        spec.occluded
     );
 }
 

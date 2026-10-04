@@ -42,6 +42,9 @@ Inside `crates/core/src`:
 - `scene/` — components, resources, model import, persistence, entity builders
 - `editor/` — egui panels, dock, theme
 - `profile.rs` / `stats.rs` — frame profiler (CPU phases + GPU passes) and HUD
+- `logging.rs` — the one log stream: `tracing` events from the engine and
+  `Debug.Log*` from scripts, out to stderr, the editor console and an export's
+  log file. Log with `tracing::{info, warn, error}!`, never `println!`
 - `threads.rs` — the engine's *one* rayon pool. Read its module docs before
   parallelising anything
 
@@ -85,7 +88,7 @@ cargo test -p orrin-core --test cold_start -- --nocapture
 ```
 
 Useful environment variables (full list in each harness's module docs):
-`ORRIN_SCENE`, `ORRIN_STRESS`, `ORRIN_THREADS`, `ORRIN_VALIDATION`,
+`ORRIN_SCENE`, `ORRIN_STRESS`, `ORRIN_THREADS`, `ORRIN_VALIDATION`, `ORRIN_LOG`,
 `ORRIN_PERF_*`, `ORRIN_UPDATE_GOLDEN`, `ORRIN_COLD_START_BUDGET_MS`.
 
 CI (`.github/workflows/rust.yml`) runs: workspace build, workspace test, the

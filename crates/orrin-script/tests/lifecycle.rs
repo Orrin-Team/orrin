@@ -2,7 +2,7 @@
 //! `Orrin` assembly, drives the dispatch entry points the way the engine's
 //! script tick does, and asserts hook ordering through a captured log
 //! callback (scripts log via the `OrrinApi` table, so the test supplies its
-//! own `log` and reads the calls back).
+//! own `log_event` and reads the calls back).
 //!
 //! Everything lives in one `#[test]`: CoreCLR can only boot once per process.
 //!
@@ -17,18 +17,42 @@ use orrin_script::{CEntity, GameAssemblyStatus, ScriptHost};
 
 static LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-extern "C" fn capture_log(message: *const c_char) {
+/// Level, script and line of each entry in `LOGS`, index for index.
+static ORIGINS: Mutex<Vec<(u32, String, u32)>> = Mutex::new(Vec::new());
+
+extern "C" fn capture_log(level: u32, source: *const c_char, line: u32, message: *const c_char) {
     if message.is_null() {
         return;
     }
-    // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
+    // SAFETY: C# passes valid, null-terminated UTF-8 buffers.
     let text = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+    let source = if source.is_null() {
+        String::new()
+    } else {
+        // SAFETY: as above.
+        unsafe { CStr::from_ptr(source) }
+            .to_string_lossy()
+            .into_owned()
+    };
     LOGS.lock().unwrap().push(text.into_owned());
+    ORIGINS.lock().unwrap().push((level, source, line));
 }
 
 /// Drain and return everything logged since the last call.
 fn take_logs() -> Vec<String> {
+    ORIGINS.lock().unwrap().clear();
     std::mem::take(&mut *LOGS.lock().unwrap())
+}
+
+/// `take_logs`, with where each line came from.
+fn take_attributed_logs() -> Vec<(u32, String, u32, String)> {
+    let origins = std::mem::take(&mut *ORIGINS.lock().unwrap());
+    let logs = std::mem::take(&mut *LOGS.lock().unwrap());
+    origins
+        .into_iter()
+        .zip(logs)
+        .map(|((level, source, line), text)| (level, source, line, text))
+        .collect()
 }
 
 /// `ORRIN_SCRIPT_DIR` override, else probe the C# build output relative to
@@ -91,7 +115,7 @@ fn behaviour_lifecycle() {
         return;
     };
     let api = orrin_script::OrrinApi {
-        log: capture_log,
+        log_event: capture_log,
         ..orrin_script::default_api()
     };
     let host = ScriptHost::boot(&api, &dir).expect("CoreCLR failed to boot");
@@ -121,6 +145,18 @@ fn behaviour_lifecycle() {
             "probe:OnDestroy",
         ],
     );
+
+    // A line crosses with where it came from: the script file that logged it,
+    // and a line in that file.
+    let handle = create(&host, probe);
+    orrin_script::destroy_handle(handle);
+    let logs = take_attributed_logs();
+    let (level, source, line, text) = &logs[0];
+    assert_eq!(
+        (*level, source.as_str(), text.as_str()),
+        (2, "LifecycleProbes", "probe:ctor")
+    );
+    assert!(*line > 0, "no line number crossed with {text:?}");
 
     // Destroy while still active owes OnDisable first, then OnDestroy, then
     // the free — the ordering guarantee this branch exists to establish.
@@ -175,11 +211,18 @@ fn behaviour_lifecycle() {
         host.update(handle, 0.016),
         "a throwing OnUpdate must report a fault"
     );
-    let logs = take_logs();
+    let logs = take_attributed_logs();
     assert!(
         logs.iter()
-            .any(|l| l.contains("ThrowingUpdate") && l.contains("OnUpdate")),
+            .any(|(_, _, _, l)| l.contains("ThrowingUpdate") && l.contains("OnUpdate")),
         "expected a fault log naming the script type and hook, got {logs:?}"
+    );
+    // A fault is an error, and it belongs to the Behaviour that threw rather
+    // than to the bindings file that caught it.
+    assert!(
+        logs.iter()
+            .any(|(level, source, _, _)| *level == 4 && source == "ThrowingUpdate"),
+        "expected the fault as an error attributed to the script, got {logs:?}"
     );
     orrin_script::destroy_handle(handle);
 

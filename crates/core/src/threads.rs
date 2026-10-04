@@ -64,8 +64,8 @@ pub fn init() {
             .start_handler(|_| crate::profile::suppress_on_this_thread())
             .build_global();
         if let Err(error) = built {
-            eprintln!(
-                "orrin: the global thread pool was already built ({error}); \
+            tracing::warn!(
+                "the global thread pool was already built ({error}); \
                  ORRIN_THREADS has no effect in this process"
             );
         }

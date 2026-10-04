@@ -278,6 +278,17 @@ PropertyBag.Decode(renamed, Convert.FromHexString(
     "080100000004000000" + Hex("Mode"u8) + "09040000004172656100000000"));
 Check(renamed.Mode == BagMode.Point, "an enum member this build lost leaves the field alone");
 
+// --- log attribution -----------------------------------------------------------
+//
+// A log line names its script from the path the compiler recorded, which is in
+// the build machine's spelling rather than this one's.
+
+Check(Native.ScriptName("/home/dev/game/scripts/Spinner.cs") == "Spinner", "a Unix path names its script");
+Check(Native.ScriptName(@"C:\game\scripts\Spinner.cs") == "Spinner", "a Windows path names its script");
+Check(Native.ScriptName("Spinner.cs") == "Spinner", "a bare file names its script");
+Check(Native.ScriptName("/scripts.v2/Spinner") == "Spinner", "a dot in a directory is not an extension");
+Check(Native.ScriptName("") == "", "no path is no name");
+
 Console.WriteLine($"{passed} passed, {failures} failed");
 return failures == 0 ? 0 : 1;
 

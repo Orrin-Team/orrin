@@ -113,6 +113,13 @@ pub struct OrrinApi {
     // counterparts have had since the beginning.
     pub mouse_button_pressed: extern "C" fn(u32) -> bool,
     pub mouse_button_released: extern "C" fn(u32) -> bool,
+    // Structured logging, appended after the mouse edges. One entry for every
+    // level, and the one the bindings call: `log`, `log_warn` and `log_error`
+    // above predate it and stay only because the table never shrinks.
+    //
+    // Level (0 = trace … 4 = error, C# `Orrin.LogLevel`), the script's name or
+    // null, its line or 0, and the message.
+    pub log_event: extern "C" fn(u32, *const c_char, u32, *const c_char),
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -162,6 +169,22 @@ pub fn default_api() -> OrrinApi {
         axis_value: stub_axis_value,
         mouse_button_pressed: stub_key_query,
         mouse_button_released: stub_key_query,
+        log_event: default_log_event,
+    }
+}
+
+/// With no engine behind the table there is no stream to join, so the level
+/// picks one of the three plain sinks below and the attribution is dropped.
+extern "C" fn default_log_event(
+    level: u32,
+    _source: *const c_char,
+    _line: u32,
+    message: *const c_char,
+) {
+    match level {
+        0..=2 => orrin_log(message),
+        3 => orrin_log_warn(message),
+        _ => orrin_log_error(message),
     }
 }
 

@@ -85,9 +85,9 @@ pub fn build_sponza_scene(world: &mut World, backend: &mut impl RenderBackend) {
             // Loud, and then the rig — the same choice `SceneChoice::from_env`
             // makes for a misspelt scene name. An empty world would be a black
             // window with no explanation in it.
-            eprintln!("ORRIN_SCENE=sponza: {error}");
-            eprintln!("ORRIN_SCENE=sponza: {FETCH_HINT}");
-            eprintln!("ORRIN_SCENE=sponza: opening the demo scene instead");
+            tracing::error!(
+                "ORRIN_SCENE=sponza: {error} — {FETCH_HINT}. Opening the demo scene instead"
+            );
             build_default_scene(world, backend);
             return;
         }
@@ -95,7 +95,7 @@ pub fn build_sponza_scene(world: &mut World, backend: &mut impl RenderBackend) {
 
     let bounds = model.bounds();
     let size = bounds.max - bounds.min;
-    println!(
+    tracing::info!(
         "sponza: {} triangles, {} primitives, {} materials, {} images; measured {:.1} x {:.1} x \
          {:.1} m (Sponza is ~30 x 13 x 18 m — a tenth or a hundred times that is a units \
          mismatch, correctable with ORRIN_SPONZA_SCALE)",

@@ -138,14 +138,14 @@ impl VkContext {
         let compute_family = select_compute_family(&physical_device);
 
         let profile = GpuProfile::detect(&physical_device);
-        println!(
+        tracing::info!(
             "Using device: {} ({:?})",
             physical_device.properties().device_name,
             physical_device.properties().device_type,
         );
         // On the same line of the log as the device it describes, because these
         // are the facts a recorded frame time is only reproducible against.
-        println!("  {}", profile.describe());
+        tracing::info!("{}", profile.describe());
 
         // On portability-subset devices (MoltenVK on macOS) the extension must be
         // enabled if present, and egui's font/texture image views use a
@@ -269,8 +269,8 @@ impl VkContext {
                 .expect("a compute queue was requested but not created")
         });
         if let Some(compute) = &compute_queue {
-            println!(
-                "  async compute: queue family {} beside graphics family {}",
+            tracing::info!(
+                "async compute: queue family {} beside graphics family {}",
                 compute.queue_family_index(),
                 queue.queue_family_index(),
             );

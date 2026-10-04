@@ -423,7 +423,7 @@ mod tests {
                         ui.allocate_ui(cell, |ui| environment::body(ui, world));
                         ui.allocate_ui(cell, |ui| performance::body(ui, world));
                         ui.allocate_ui(cell, |ui| scene::body(ui, world, state));
-                        ui.allocate_ui(cell, |ui| console::body(ui, world));
+                        ui.allocate_ui(cell, |ui| console::body(ui, world, state));
                     });
                 });
             })
@@ -633,6 +633,45 @@ mod tests {
             tool.width(),
             spilling.first()
         );
+    }
+
+    #[test]
+    fn the_console_hides_the_levels_switched_off() {
+        use crate::scene::{LogBuffer, LogLevel};
+
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        {
+            let mut log = editor.world.resource_mut::<LogBuffer>();
+            log.push(LogLevel::Debug, "cache hit".to_owned(), 0);
+            log.push(LogLevel::Error, "parent cycle".to_owned(), 0);
+        }
+        editor.frames(2);
+        assert!(editor.painted_contains("[DEBUG] cache hit"));
+        assert!(editor.painted_contains("[ERROR] parent cycle"));
+
+        editor.state.console_levels.set(LogLevel::Debug, false);
+        editor.frames(2);
+        assert!(!editor.painted_contains("cache hit"));
+        assert!(editor.painted_contains("[ERROR] parent cycle"));
+    }
+
+    #[test]
+    fn the_console_names_the_script_that_logged() {
+        use crate::scene::{LogBuffer, LogEntry, LogLevel};
+
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor
+            .world
+            .resource_mut::<LogBuffer>()
+            .push_entry(LogEntry {
+                level: LogLevel::Warning,
+                message: "too fast".to_owned(),
+                source: "Spinner".into(),
+                line: 14,
+                frame: 0,
+            });
+        editor.frames(2);
+        assert!(editor.painted_contains("[WARN] Spinner:14: too fast"));
     }
 
     /// "Every number, path, id and log line is monospace so columns align by
