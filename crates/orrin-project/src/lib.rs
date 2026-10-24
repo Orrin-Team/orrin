@@ -213,7 +213,13 @@ fn validate(manifest: &Manifest) -> Result<(), ProjectError> {
 }
 
 fn check_path(field: &'static str, path: &Path) -> Result<(), ProjectError> {
-    if path.is_absolute() {
+    // Not `is_absolute`: on Windows that needs a drive *and* a root, yet `\etc`
+    // and `C:etc` both make `join` discard the project root.
+    let anchored = matches!(
+        path.components().next(),
+        Some(Component::Prefix(_) | Component::RootDir)
+    );
+    if anchored {
         return Err(ProjectError::AbsolutePath {
             field,
             value: path.to_path_buf(),
@@ -284,6 +290,27 @@ entry = "MyGame.Main, MyGame"
         let (_dir, root) = project_dir(&body);
 
         let err = Project::locate(&root).expect_err("absolute scripts.dir");
+        assert!(
+            matches!(
+                err,
+                ProjectError::AbsolutePath {
+                    field: "scripts.dir",
+                    ..
+                }
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// On Windows `C:scripts` is relative to drive C's current directory, and
+    /// joining it onto the root discards the root entirely.
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_path_is_rejected() {
+        let body = VALID.replace(r#"dir = "scripts""#, r#"dir = "C:scripts""#);
+        let (_dir, root) = project_dir(&body);
+
+        let err = Project::locate(&root).expect_err("drive-relative scripts.dir");
         assert!(
             matches!(
                 err,
