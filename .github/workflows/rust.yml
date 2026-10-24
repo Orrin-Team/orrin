@@ -122,3 +122,53 @@ jobs:
       # for why that is the right line to draw.
       - name: Cold start benchmark
         run: cargo test -p orrin-core --test cold_start -- --nocapture
+
+  # The engine was developed on macOS and Linux, and the first Windows run found
+  # bugs neither could: `Path::is_absolute` needs a drive *and* a root there, and
+  # Git for Windows checks golden files out as CRLF. Only the steps whose result
+  # can differ by platform run here; fmt, the no-scripting check and the C# half
+  # are the same answer on every OS and stay in the job above.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      # No .NET SDK: netcorehost fetches nethost itself, and the script
+      # lifecycle test skips without a built `Orrin` assembly, as it does above.
+
+      # With no Vulkan SDK on the runner, shaderc-sys builds libshaderc from
+      # source, and on MSVC it refuses to without Ninja. CMake, Python and the
+      # MSVC toolchain are on the image already; the `cmake` crate supplies the
+      # compiler environment itself, so no developer prompt is needed.
+      - name: Install Ninja
+        run: choco install ninja --no-progress -y
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v2-rust"
+
+      # `cfg(windows)` code is only linted where it compiles.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --verbose
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Test
+        run: cargo nextest run --workspace
+
+      - name: Doctests
+        run: cargo test --workspace --doc
+
+      # Release is what ships, and thin LTO with one codegen unit is a different
+      # link from the dev one — the MSVC CRT mix from nethost surfaces here as
+      # LNK4098. This is a second full compile, and the slowest step in the job.
+      - name: Release build
+        run: cargo build --workspace --release
