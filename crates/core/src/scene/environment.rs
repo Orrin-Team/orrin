@@ -193,7 +193,12 @@ impl fmt::Display for HdriError {
 /// that range is the point. Nothing here clamps it.
 pub fn load_hdri(assets_dir: &Path, relative: &str) -> Result<Hdri, HdriError> {
     let relative = Path::new(relative);
-    if relative.is_absolute() {
+    // Not `is_absolute`: on Windows that needs a drive *and* a root, yet `\sky`
+    // and `C:sky` both make `join` discard the assets directory.
+    if matches!(
+        relative.components().next(),
+        Some(Component::Prefix(_) | Component::RootDir)
+    ) {
         return Err(HdriError::AbsolutePath(relative.to_path_buf()));
     }
     if relative
@@ -292,6 +297,15 @@ mod tests {
     #[test]
     fn an_absolute_path_is_rejected() {
         let error = load_hdri(Path::new("/project/assets"), "/Users/someone/sky.hdr");
+        assert!(matches!(error, Err(HdriError::AbsolutePath(_))));
+    }
+
+    /// On Windows `C:sky.hdr` is relative to drive C's current directory, not a
+    /// file name, and joining it discards the assets directory entirely.
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_relative_path_is_rejected() {
+        let error = load_hdri(Path::new(r"C:\project\assets"), "C:sky.hdr");
         assert!(matches!(error, Err(HdriError::AbsolutePath(_))));
     }
 
