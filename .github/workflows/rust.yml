@@ -130,6 +130,11 @@ jobs:
   # are the same answer on every OS and stay in the job above.
   windows:
     runs-on: windows-latest
+    # The image ships CMake 4, which refuses `cmake_minimum_required` below 3.5,
+    # and the shaderc sources vendored in shaderc-sys 0.8 still declare older.
+    # Read by every CMake the build scripts start, nested projects included.
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
 
