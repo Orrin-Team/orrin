@@ -53,10 +53,11 @@ use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
 use orrin_ecs::{Entity, World};
 
 use crate::geom::Aabb;
+use crate::gfx::thumbnail::Albedo;
 use crate::gfx::{BlendMode, Material, RenderBackend, Vertex};
 use crate::scene::{
-    Assets, CpuMesh, LocalTransform, MaterialBlends, MaterialHandle, MeshBounds, MeshHandle, Name,
-    Parent, Transform,
+    AssetPreviews, Assets, CpuMesh, LocalTransform, MaterialBlends, MaterialHandle, MeshBounds,
+    MeshHandle, Name, Parent, Transform, render_mesh,
 };
 
 /// How deep the node walks will follow a file's tree before giving up.
@@ -753,12 +754,17 @@ fn derive_tangents(
 /// blended material registered nowhere draws as an opaque wall. Names are
 /// prefixed with the model's, since [`Assets`] is one flat namespace shared with
 /// the demo library.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one per world-side table an upload registers in; bundling them would only move the list"
+)]
 pub fn instantiate(
     world: &mut World,
     backend: &mut impl RenderBackend,
     assets: &mut Assets,
     bounds: &mut MeshBounds,
     blends: &mut MaterialBlends,
+    previews: &mut AssetPreviews,
     model: &Model,
     root: Transform,
 ) -> Entity {
@@ -811,9 +817,24 @@ pub fn instantiate(
             let handle = backend.load_material(&material);
             assets.insert_material(format!("{}/{}", model.name, imported.name), handle);
             blends.insert(handle, material.blend);
+            let albedo = imported
+                .albedo_image
+                .and_then(|index| model.images.get(index))
+                .and_then(|image| Albedo::reduce(&image.pixels, image.width, image.height));
+            previews.insert_material(handle, &material, albedo);
             handle
         })
         .collect();
+
+    // Rendered ahead of the uploads and across the pool, since the uploads are
+    // serial on the backend and the thumbnails depend on nothing but the
+    // vertices. An exported game has no editor to show them to.
+    let mut rendered = if cfg!(feature = "export") {
+        Vec::new()
+    } else {
+        crate::threads::map(&model.primitives, |primitive| render_mesh(&primitive.mesh))
+    }
+    .into_iter();
 
     let meshes: Vec<MeshHandle> = model
         .primitives
@@ -824,6 +845,9 @@ pub fn instantiate(
             assets.insert_mesh(format!("{}/mesh_{index}", model.name), handle);
             if let Some(aabb) = backend.mesh_bounds(handle) {
                 bounds.insert(handle, aabb);
+            }
+            if let Some(preview) = rendered.next() {
+                previews.insert_rendered_mesh(handle, preview);
             }
             handle
         })

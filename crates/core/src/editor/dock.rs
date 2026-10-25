@@ -22,61 +22,72 @@
 //! nothing: egui hands the whole `CentralPanel` to the UI regardless. See
 //! [`Dock::wants_pointer`], which is what the editor asks in egui's place.
 
-use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
+use egui_dock::{DockArea, DockState, NodeIndex, Style};
 use serde::{Deserialize, Serialize};
 
 use orrin_ecs::World;
 use orrin_registry::Registry;
 
 use super::panels;
+use super::previews::Previews;
 use super::state::EditorState;
 
 /// Fractions rather than pixels, because a split is a proportion of its parent
 /// and the window has no fixed size. Measured to land on the widths the design
-/// system asks for — hierarchy 220, tool dock 300, inspector 280, bottom dock
-/// 200 — at the 1280x800 the editor is designed against.
+/// asks for — hierarchy 240, inspector 320, bottom dock 220 — at the 1280x800
+/// the editor is designed against.
 ///
 /// Mind which side a fraction describes: `split_left` and `split_above` give it
 /// to the *new* node, `split_right` and `split_below` to the old one. The
 /// doc comments on all four say the old node, which is true of only two.
-const HIERARCHY: f32 = 0.172;
-const TOOLS: f32 = 0.453;
-const INSPECTOR: f32 = 0.517;
-const BOTTOM: f32 = 0.699;
+const HIERARCHY: f32 = 0.1875;
+const INSPECTOR: f32 = 0.6923;
+const BOTTOM: f32 = 0.7043;
 
+/// A dockable tool. Scene save and load are not one: they live in the File
+/// menu and the status bar, where they are reachable without a tab open.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Tab {
     Hierarchy,
     Inspector,
     Environment,
     Performance,
-    Scene,
     Console,
     Scripts,
 }
 
 impl Tab {
-    /// Every tool, in the order the Window menu lists them. `Scripts` is here
+    /// Every tool, in the order the View menu lists them. `Scripts` is here
     /// even in a build without the feature: the variant stays so a layout file
     /// written by one build still loads in the other, and the tab says why it
     /// is empty instead of vanishing.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 6] = [
         Self::Hierarchy,
         Self::Inspector,
         Self::Environment,
-        Self::Performance,
-        Self::Scene,
         Self::Console,
+        Self::Performance,
         Self::Scripts,
     ];
+
+    pub fn icon(self) -> super::icons::Icon {
+        use super::icons;
+        match self {
+            Self::Hierarchy => icons::list_tree(),
+            Self::Inspector => icons::sliders(),
+            Self::Environment => icons::mountain_snow(),
+            Self::Performance => icons::activity(),
+            Self::Console => icons::terminal(),
+            Self::Scripts => icons::file_code(),
+        }
+    }
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Hierarchy => "Hierarchy",
             Self::Inspector => "Inspector",
             Self::Environment => "Environment",
-            Self::Performance => "Performance",
-            Self::Scene => "Scene",
+            Self::Performance => "Profiler",
             Self::Console => "Console",
             Self::Scripts => "Scripts",
         }
@@ -90,6 +101,7 @@ pub struct Dock {
     /// until the first frame has drawn, so events before then reach the scene.
     region: egui::Rect,
     tools: Vec<egui::Rect>,
+    viewport: Option<egui::Rect>,
 }
 
 impl Default for Dock {
@@ -111,16 +123,15 @@ pub fn default_layout() -> DockState<Tab> {
     let surface = state.main_surface_mut();
 
     let [viewport, _] = surface.split_left(NodeIndex::root(), HIERARCHY, vec![Tab::Hierarchy]);
-    let [viewport, tools] = surface.split_right(
+    let [viewport, _] =
+        surface.split_right(viewport, INSPECTOR, vec![Tab::Inspector, Tab::Environment]);
+    let [viewport, _] = surface.split_below(
         viewport,
-        TOOLS,
-        vec![Tab::Environment, Tab::Performance, Tab::Scene],
+        BOTTOM,
+        vec![Tab::Console, Tab::Performance, Tab::Scripts],
     );
-    let [viewport, _] = surface.split_below(viewport, BOTTOM, vec![Tab::Console, Tab::Scripts]);
 
     surface[viewport] = Node::Empty;
-
-    surface.split_right(tools, INSPECTOR, vec![Tab::Inspector]);
     state
 }
 
@@ -134,7 +145,14 @@ impl Dock {
             state,
             region: egui::Rect::EVERYTHING,
             tools: Vec::new(),
+            viewport: None,
         }
+    }
+
+    /// The gap the tools leave for the scene, as of the last frame drawn. `None`
+    /// when the user has docked a tool over every part of the window.
+    pub fn viewport(&self) -> Option<egui::Rect> {
+        self.viewport
     }
 
     pub fn state(&self) -> &DockState<Tab> {
@@ -171,28 +189,6 @@ impl Dock {
         }
     }
 
-    /// Pop a tool out into its own floating window, and give a floating one a
-    /// way home. The affordance has to be symmetric or a floated tool is
-    /// stranded.
-    pub fn toggle_float(&mut self, tab: Tab) {
-        let Some(location) = self.state.find_tab(&tab) else {
-            return;
-        };
-        if location.0 == SurfaceIndex::main() {
-            self.state.remove_tab(location);
-            self.state.add_window(vec![tab]);
-        } else {
-            self.state.remove_tab(location);
-            self.restore(tab);
-        }
-    }
-
-    pub fn is_floating(&self, tab: Tab) -> bool {
-        self.state
-            .find_tab(&tab)
-            .is_some_and(|(surface, ..)| surface != SurfaceIndex::main())
-    }
-
     /// Put `tab` back where the default layout keeps it, by finding a tool it
     /// shares a leaf with there. Falling back to the first leaf would drop a
     /// reopened Console on top of the Hierarchy.
@@ -225,11 +221,14 @@ impl Dock {
         world: &mut World,
         state: &mut EditorState,
         registry: &Registry,
+        previews: &mut Previews,
     ) {
         let mut viewer = Viewer {
             world,
             state,
             registry,
+            previews,
+            buttons: Vec::new(),
         };
 
         let style = dock_style(&ctx.style());
@@ -247,15 +246,48 @@ impl Dock {
             .show(ctx, |ui| {
                 DockArea::new(&mut self.state)
                     .style(style)
-                    .show_close_buttons(true)
+                    // Tools open and close from the View menu. A ✕ on every tab
+                    // and a collapse arrow on every strip was chrome repeated
+                    // above each tool for something done a few times a day.
+                    .show_close_buttons(false)
+                    .show_leaf_collapse_buttons(false)
                     .show_add_buttons(false)
                     // One stray click on the far-right ✕ would close every tool
                     // in the region, and it is the same glyph as the per-tab one.
                     .show_leaf_close_all_buttons(false)
                     .show_inside(ui, &mut viewer);
+                // egui_dock titles are text only, so each leaves a gap and the
+                // icon is painted into it here, over the strip just drawn.
+                let weak = ui.visuals().weak_text_color();
+                let text = ui.visuals().strong_text_color();
+                let open: Vec<Tab> = self
+                    .state
+                    .iter_all_nodes()
+                    .filter_map(|(_, node)| match node {
+                        egui_dock::Node::Leaf { tabs, active, .. } => tabs.get(active.0).copied(),
+                        _ => None,
+                    })
+                    .collect();
+                for (tab, rect) in &viewer.buttons {
+                    let open = open.contains(tab);
+                    let colour = if open { text } else { weak };
+                    let glyph = egui::Rect::from_center_size(
+                        egui::pos2(
+                            rect.left() + 8.0 + super::icons::ROW / 2.0 - 1.0,
+                            rect.center().y,
+                        ),
+                        egui::Vec2::splat(super::icons::ROW - 2.0),
+                    );
+                    super::icons::paint(ui, tab.icon(), glyph, colour);
+                }
             });
 
-        let Self { state, tools, .. } = self;
+        let Self {
+            state,
+            tools,
+            viewport,
+            region,
+        } = self;
         tools.clear();
         tools.extend(
             state
@@ -264,6 +296,7 @@ impl Dock {
                 .filter_map(|(_, node)| node.rect())
                 .map(|rect| rect.expand(separator / 2.0)),
         );
+        *viewport = empty_rect(state.main_surface(), *region, separator);
     }
 
     /// Whether a pointer event belongs to the editor rather than to the scene.
@@ -296,6 +329,61 @@ impl Dock {
     }
 }
 
+/// Where the largest empty node of `tree` landed.
+///
+/// egui_dock records a rect for every leaf and split but none for an empty
+/// node, since it draws nothing there. The parent split does have one, and its
+/// other child does, so the empty side is the parent minus the sibling and the
+/// separator between them. An empty root is the whole region.
+fn empty_rect(
+    tree: &egui_dock::Tree<Tab>,
+    region: egui::Rect,
+    separator: f32,
+) -> Option<egui::Rect> {
+    use egui_dock::Node;
+
+    let mut best: Option<egui::Rect> = None;
+    for (index, node) in tree.iter().enumerate() {
+        if !matches!(node, Node::Empty) {
+            continue;
+        }
+        let rect = if index == 0 {
+            region
+        } else {
+            let parent = &tree[NodeIndex((index - 1) / 2)];
+            let is_left = index % 2 == 1;
+            let sibling = NodeIndex(if is_left { index + 1 } else { index - 1 });
+            let (Some(outer), Some(other)) = (parent.rect(), tree[sibling].rect()) else {
+                continue;
+            };
+            let gap = separator;
+            match (parent, is_left) {
+                (Node::Horizontal { .. }, true) => egui::Rect::from_min_max(
+                    outer.min,
+                    egui::pos2(other.left() - gap, outer.bottom()),
+                ),
+                (Node::Horizontal { .. }, false) => egui::Rect::from_min_max(
+                    egui::pos2(other.right() + gap, outer.top()),
+                    outer.max,
+                ),
+                (Node::Vertical { .. }, true) => egui::Rect::from_min_max(
+                    outer.min,
+                    egui::pos2(outer.right(), other.top() - gap),
+                ),
+                (Node::Vertical { .. }, false) => egui::Rect::from_min_max(
+                    egui::pos2(outer.left(), other.bottom() + gap),
+                    outer.max,
+                ),
+                _ => continue,
+            }
+        };
+        if rect.is_positive() && best.is_none_or(|b| rect.area() > b.area()) {
+            best = Some(rect);
+        }
+    }
+    best
+}
+
 /// Dress the dock in the editor's own tokens.
 ///
 /// `Style::from_egui` reads egui's surfaces, but it picks different ones than
@@ -312,15 +400,19 @@ fn dock_style(style: &egui::Style) -> Style {
     dock.dock_area_padding = None;
     dock.main_surface_border_stroke = egui::Stroke::NONE;
 
-    // The same surface as the top bar, so the two read as one chrome.
-    dock.tab_bar.bg_fill = visuals.panel_fill;
+    // The same surface as the top bar, so the two read as one chrome; the
+    // tools are the lighter panels set into it.
+    let strip = visuals
+        .panel_fill
+        .lerp_to_gamma(visuals.extreme_bg_color, 0.5);
+    dock.tab_bar.bg_fill = strip;
     dock.tab_bar.height = super::panels::TAB_BAR_HEIGHT;
     dock.tab_bar.hline_color = outline;
     dock.tab_bar.corner_radius = egui::CornerRadius::ZERO;
 
-    // Idle has fill and no stroke; hover adds the accent stroke; the open tab is
-    // a selection. The same three states every other control in the editor uses.
-    dock.tab.inactive.bg_fill = visuals.panel_fill;
+    // Idle has fill and no stroke; hover adds a light grey one; the open tab is
+    // the panel itself. The accent is left for what the user has picked.
+    dock.tab.inactive.bg_fill = strip;
     dock.tab.inactive.outline_color = egui::Color32::TRANSPARENT;
     dock.tab.inactive.text_color = visuals.weak_text_color();
     dock.tab.inactive.corner_radius = widget;
@@ -334,23 +426,33 @@ fn dock_style(style: &egui::Style) -> Style {
     // come forward, and the accent is kept for what the user has *picked*. A
     // whole tab filled with accent also drowns out the one row in the hierarchy
     // that is genuinely selected.
+    // The open tab is the panel it opens, continuing up into the strip with
+    // square lower corners, so the tool and its tab read as one piece.
+    let tab_top = egui::CornerRadius {
+        nw: widget.nw,
+        ne: widget.ne,
+        sw: 0,
+        se: 0,
+    };
     for open in [&mut dock.tab.active, &mut dock.tab.focused] {
-        open.bg_fill = visuals.widgets.inactive.bg_fill;
+        open.bg_fill = visuals.panel_fill;
         open.outline_color = outline;
-        open.text_color = visuals.text_color();
-        open.corner_radius = widget;
+        open.text_color = visuals.strong_text_color();
+        open.corner_radius = tab_top;
     }
     dock.tab.active_with_kb_focus = dock.tab.active.clone();
     dock.tab.focused_with_kb_focus = dock.tab.focused.clone();
     dock.tab.inactive_with_kb_focus = dock.tab.inactive.clone();
 
-    // A tool body is a panel: panel fill, one hairline outline, no fill change.
+    // A tool body is a panel: panel fill and no outline of its own. The gap
+    // between two tools is the separator, in the strip's colour, so tools are
+    // divided by the frame showing between them rather than by drawn lines.
     dock.tab.tab_body.bg_fill = visuals.panel_fill;
-    dock.tab.tab_body.stroke = egui::Stroke::new(1.0_f32, outline);
+    dock.tab.tab_body.stroke = egui::Stroke::NONE;
     dock.tab.tab_body.corner_radius = egui::CornerRadius::ZERO;
     dock.tab.tab_body.inner_margin = egui::Margin::same(8);
 
-    dock.separator.color_idle = outline;
+    dock.separator.color_idle = strip;
     dock.separator.color_hovered = visuals.widgets.hovered.bg_stroke.color;
     dock.separator.color_dragged = visuals.selection.stroke.color;
 
@@ -377,26 +479,60 @@ struct Viewer<'a> {
     world: &'a mut World,
     state: &'a mut EditorState,
     registry: &'a Registry,
+    previews: &'a mut Previews,
+    /// Where each tab's button landed this frame, and whether it is the open
+    /// one, for the icons painted into them once the area has drawn.
+    buttons: Vec<(Tab, egui::Rect)>,
 }
+
+/// The gap a tab title leaves at its start for the tool's icon.
+const TAB_ICON_GAP: f32 = 20.0;
 
 impl egui_dock::TabViewer for Viewer<'_> {
     type Tab = Tab;
 
     fn title(&mut self, tab: &mut Tab) -> egui::WidgetText {
-        tab.title().into()
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            tab.title(),
+            TAB_ICON_GAP,
+            egui::TextFormat::simple(egui::FontId::proportional(12.5), egui::Color32::PLACEHOLDER),
+        );
+        job.into()
+    }
+
+    fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+        self.buttons.push((*tab, response.rect));
     }
 
     fn id(&mut self, tab: &mut Tab) -> egui::Id {
         egui::Id::new(("orrin_tool", tab.title()))
     }
 
+    /// The inspector and the hierarchy pad their own content: section bars and
+    /// rows run edge to edge and everything else keeps the usual margin, which
+    /// a body margin would apply to both alike.
+    fn tab_style_override(
+        &self,
+        tab: &Tab,
+        global: &egui_dock::TabStyle,
+    ) -> Option<egui_dock::TabStyle> {
+        matches!(tab, Tab::Inspector | Tab::Hierarchy).then(|| {
+            let mut style = global.clone();
+            style.tab_body.inner_margin.left = 0;
+            style.tab_body.inner_margin.right = 0;
+            style
+        })
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         match tab {
             Tab::Hierarchy => panels::hierarchy::body(ui, self.world, self.state),
-            Tab::Inspector => panels::inspector::body(ui, self.world, self.state, self.registry),
+            Tab::Inspector => {
+                panels::inspector::body(ui, self.world, self.state, self.registry, self.previews)
+            }
             Tab::Environment => panels::environment::body(ui, self.world),
             Tab::Performance => panels::performance::body(ui, self.world),
-            Tab::Scene => panels::scene::body(ui, self.world, self.state),
             Tab::Console => panels::console::body(ui, self.world, self.state),
             Tab::Scripts => {
                 #[cfg(feature = "scripting")]
@@ -439,25 +575,24 @@ mod tests {
         let style = ctx.style();
         let dock = dock_style(&style);
 
-        // The strip a tab sits on is the surface the top bar sits on.
-        assert_eq!(dock.tab_bar.bg_fill, style.visuals.panel_fill);
-        assert_eq!(dock.tab.tab_body.bg_fill, style.visuals.panel_fill);
+        // The strip is the window's frame, darker than the tools: the menu
+        // and status bars' colour, between the panel and the field wells.
+        let panel = style.visuals.panel_fill;
+        let strip = dock.tab_bar.bg_fill;
+        assert_eq!(dock.tab.tab_body.bg_fill, panel);
+        assert!(strip.r() < panel.r() && strip.r() > style.visuals.extreme_bg_color.r());
 
-        // Open is elevation: a lighter surface with a hairline outline. The
-        // accent belongs to what the user picked, not to what is merely on top.
-        assert_eq!(
-            dock.tab.active.bg_fill,
-            style.visuals.widgets.inactive.bg_fill
-        );
-        assert_eq!(
-            dock.tab.focused.bg_fill,
-            style.visuals.widgets.inactive.bg_fill
-        );
+        // The open tab is the panel it opens, the same surface continuing up
+        // into the strip, so the tool and its tab read as one piece. A tab of
+        // any other fill sat on the panel like a button.
+        assert_eq!(dock.tab.active.bg_fill, panel);
+        assert_eq!(dock.tab.focused.bg_fill, panel);
+        assert_eq!(dock.tab.inactive.bg_fill, strip);
         assert_ne!(dock.tab.active.bg_fill, style.visuals.selection.bg_fill);
 
         assert_eq!(dock.tab_bar.height, crate::editor::panels::TAB_BAR_HEIGHT);
 
-        // Idle has fill and no stroke; hover adds the accent one.
+        // Idle has fill and no stroke; hover adds a grey one.
         assert_eq!(dock.tab.inactive.outline_color, egui::Color32::TRANSPARENT);
         assert_eq!(
             dock.tab.hovered.outline_color,
@@ -465,15 +600,18 @@ mod tests {
         );
 
         // None of it may be hard-coded: a user theme has to carry through. The
-        // accent reaches the dock through the hover stroke now that no fill
-        // uses it, and the surfaces move with the theme's greys.
+        // accent reaches the dock through a dragged separator, and the
+        // surfaces and the hover outline move with the theme's greys.
         let ember = crate::editor::theme::Theme {
             accent: [255, 120, 60],
             widget: [70, 60, 55],
+            widget_hover: [92, 80, 72],
+            panel: [28, 23, 21],
             ..crate::editor::theme::Theme::default()
         };
         crate::editor::theme::apply(&ctx, &ember);
         let themed = dock_style(&ctx.style());
+        assert_ne!(themed.separator.color_dragged, dock.separator.color_dragged);
         assert_ne!(
             themed.tab.hovered.outline_color,
             dock.tab.hovered.outline_color

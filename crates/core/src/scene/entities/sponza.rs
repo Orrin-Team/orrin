@@ -46,7 +46,8 @@ use super::{build_default_scene, spawn_directional_light};
 use crate::gfx::RenderBackend;
 use crate::scene::model::{self, ImportSettings, Model};
 use crate::scene::{
-    Assets, Camera, EnvironmentSettings, FogSettings, MaterialBlends, MeshBounds, Transform,
+    AssetPreviews, Assets, Camera, EnvironmentSettings, FogSettings, MaterialBlends, MeshBounds,
+    Transform,
 };
 
 /// Where the model is looked for, relative to the working directory, when
@@ -111,6 +112,7 @@ pub fn build_sponza_scene(world: &mut World, backend: &mut impl RenderBackend) {
     let mut assets = Assets::new();
     let mut mesh_bounds = MeshBounds::default();
     let mut material_blends = MaterialBlends::default();
+    let mut asset_previews = AssetPreviews::default();
 
     // Dropped so the floor sits at `y = 0` whatever the file's own origin is,
     // which is what makes the light rig below independent of the download.
@@ -121,6 +123,7 @@ pub fn build_sponza_scene(world: &mut World, backend: &mut impl RenderBackend) {
         &mut assets,
         &mut mesh_bounds,
         &mut material_blends,
+        &mut asset_previews,
         &model,
         root,
     );
@@ -128,6 +131,7 @@ pub fn build_sponza_scene(world: &mut World, backend: &mut impl RenderBackend) {
     world.insert_resource(assets);
     world.insert_resource(mesh_bounds);
     world.insert_resource(material_blends);
+    world.insert_resource(asset_previews);
 
     let frame = Framing::of(&model);
     lights(world, backend, &frame);

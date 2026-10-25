@@ -1,38 +1,51 @@
 //! In-window editor UI (egui overlay). New tools are added as `panels` modules.
+//!
+//! egui lays the editor out and tessellates it; the renderer draws it, in the
+//! phases `phases` cuts it into (see `gfx/vulkan/overlay.rs`).
 
 mod dock;
 mod icons;
+mod kind;
 mod panels;
+mod phases;
 mod prefs;
+mod previews;
 mod state;
 mod theme;
+mod widgets;
 
 use std::sync::Arc;
 
-use egui_winit_vulkano::{Gui, GuiConfig};
 use vulkano::device::Queue;
-use vulkano::format::Format;
-use vulkano::image::view::ImageView;
 use vulkano::swapchain::Surface;
-use vulkano::sync::GpuFuture;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
+use winit::window::Window;
 
 use orrin_ecs::World;
 use orrin_registry::Registry;
 
 use self::dock::Dock;
 use self::prefs::{Prefs, PrefsFile};
+use self::previews::Previews;
 use self::state::EditorState;
 use self::theme::ThemeSet;
+use crate::gfx::vulkan::{Glass, OverlayFrame, OverlayPhase};
 
 pub struct Editor {
-    gui: Gui,
+    ctx: egui::Context,
+    input: egui_winit::State,
+    surface: Arc<Surface>,
     state: EditorState,
     themes: ThemeSet,
     dock: Dock,
     prefs: Prefs,
     prefs_file: PrefsFile,
+    previews: Previews,
+    /// The last frame's translucent surfaces, from `panels::frost`.
+    glass: Vec<phases::Glass>,
+    /// Kept between frames for its allocations.
+    frame: OverlayFrame,
     last_layout_check: std::time::Instant,
 }
 
@@ -49,20 +62,23 @@ impl Editor {
         event_loop: &ActiveEventLoop,
         surface: Arc<Surface>,
         queue: Arc<Queue>,
-        format: Format,
         project: Option<&orrin_project::Project>,
     ) -> Self {
-        let gui = Gui::new(
+        let ctx = egui::Context::default();
+        let max_texture_side = queue
+            .device()
+            .physical_device()
+            .properties()
+            .max_image_dimension2_d as usize;
+        let input = egui_winit::State::new(
+            ctx.clone(),
+            ctx.viewport_id(),
             event_loop,
-            surface,
-            queue,
-            format,
-            GuiConfig {
-                // Load (don't clear) so the UI draws over the rendered scene.
-                is_overlay: true,
-                allow_srgb_render_target: true,
-                ..Default::default()
-            },
+            Some(window(&surface).scale_factor() as f32),
+            // egui's own default, as the system theme it starts from: the
+            // editor's palette is applied over it either way.
+            Some(winit::window::Theme::Dark),
+            Some(max_texture_side),
         );
 
         let mut themes = project.map_or_else(ThemeSet::default, |project| {
@@ -73,16 +89,22 @@ impl Editor {
         if let Some(name) = &prefs.theme {
             themes.select(name);
         }
-        icons::install(&gui.context());
-        theme::apply(&gui.context(), themes.active());
+        icons::install(&ctx);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, themes.active());
 
         Self {
-            gui,
+            ctx,
+            input,
+            surface,
             state: EditorState::new(project),
             themes,
             dock: Dock::from_saved(prefs.layout.take()),
             prefs,
             prefs_file,
+            previews: Previews::default(),
+            glass: Vec::new(),
+            frame: OverlayFrame::default(),
             last_layout_check: std::time::Instant::now(),
         }
     }
@@ -94,31 +116,36 @@ impl Editor {
     /// wheel; those it would claim across the whole window, for the reason
     /// [`Dock::wants_pointer`] describes.
     pub fn on_window_event(&mut self, event: &WindowEvent) -> bool {
-        let consumed = self.gui.update(event);
+        let consumed = self
+            .input
+            .on_window_event(window(&self.surface), event)
+            .consumed;
         match event {
             WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => {
-                self.dock.wants_pointer(&self.gui.context())
+                self.dock.wants_pointer(&self.ctx)
             }
             _ => consumed,
         }
     }
 
     pub fn run(&mut self, world: &mut World, registry: &Registry) {
-        // Destructure for disjoint borrows: `gui` drives egui while the closure
-        // edits `state`/`world`.
         let Editor {
-            gui,
+            ctx,
+            input,
+            surface,
             state,
             themes,
             dock,
             prefs,
             prefs_file,
+            previews,
+            glass,
             ..
         } = self;
-        gui.immediate_ui(|gui| {
-            let ctx = gui.context();
-            panels::draw(&ctx, world, state, registry, themes, dock);
-        });
+        ctx.begin_pass(input.take_egui_input(window(surface)));
+        panels::draw(ctx, world, state, registry, themes, dock, previews);
+        panels::frost(ctx, glass);
+        phases::mark(ctx);
         state.apply(world, registry);
 
         // Restyling mid-frame would leave the panels already drawn on the old
@@ -126,7 +153,7 @@ impl Editor {
         if let Some(name) = state.take_theme_request()
             && themes.select(&name)
         {
-            theme::apply(&gui.context(), themes.active());
+            theme::apply(ctx, themes.active());
             prefs.theme = Some(name);
             prefs_file.save(prefs);
         }
@@ -173,11 +200,49 @@ impl Editor {
         self.state.take_script_reload_request()
     }
 
-    pub fn draw(
-        &mut self,
-        before: Box<dyn GpuFuture>,
-        image: Arc<ImageView>,
-    ) -> Box<dyn GpuFuture> {
-        self.gui.draw_on_image(before, image)
+    /// Finish the frame [`run`](Self::run) began and hand it to the renderer.
+    ///
+    /// Tessellated here rather than in `run`, so the editor's profile scope
+    /// stays the layout alone and this lands in the overlay's.
+    pub fn overlay(&mut self) -> &mut OverlayFrame {
+        let output = self.ctx.end_pass();
+        self.input
+            .handle_platform_output(window(&self.surface), output.platform_output);
+
+        let ppp = output.pixels_per_point;
+        let frame = &mut self.frame;
+        frame.pixels_per_point = ppp;
+        frame.textures.append(output.textures_delta);
+        frame
+            .phases
+            .resize_with(phases::COUNT, OverlayPhase::default);
+        for (index, (phase, shapes)) in frame
+            .phases
+            .iter_mut()
+            .zip(phases::split(output.shapes))
+            .enumerate()
+        {
+            phase.primitives = self.ctx.tessellate(shapes, ppp);
+            phase.glass.clear();
+            phase
+                .glass
+                .extend(
+                    self.glass
+                        .iter()
+                        .filter(|glass| glass.phase == index)
+                        .map(|glass| Glass {
+                            rect: glass.rect,
+                            radius: glass.radius,
+                        }),
+                );
+        }
+        &mut self.frame
     }
+}
+
+fn window(surface: &Surface) -> &Window {
+    surface
+        .object()
+        .and_then(|object| object.downcast_ref::<Window>())
+        .expect("the editor's surface is a winit window")
 }

@@ -20,6 +20,7 @@ pub mod model;
 mod motion_blur;
 mod persist;
 mod present;
+mod previews;
 pub mod registry;
 mod shadow;
 mod ssao;
@@ -58,6 +59,9 @@ pub use mesh::{CpuMesh, MeshBounds};
 pub use motion_blur::MotionBlurSettings;
 pub use persist::{LoadIssue, instantiate, load, save, to_document};
 pub use present::{PresentSettings, VsyncMode};
+pub use previews::{
+    AssetPreviews, MaterialPreview, MeshPreview, apply_material_edits, render_mesh,
+};
 pub use registry::register_components;
 pub use shadow::ShadowSettings;
 pub use ssao::SsaoSettings;

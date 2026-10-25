@@ -16,7 +16,7 @@ use super::textures::{
     brick, bump_normals, checkerboard, foliage, load_rgba, metallic_roughness, scorch,
 };
 use crate::gfx::{BlendMode, Material, RenderBackend};
-use crate::scene::{Assets, CpuMesh, MaterialBlends, MeshBounds};
+use crate::scene::{AssetPreviews, Assets, CpuMesh, MaterialBlends, MeshBounds};
 
 /// The masonry panel the parallax A/B is drawn on: how many texels its maps get,
 /// the metres of wall they are stretched over, and how deep the mortar sits
@@ -42,16 +42,27 @@ pub const WALL_DEPTH: f32 = 0.05;
 /// a bad level shows up as one sphere that does not belong in the row.
 pub const SWEEP: usize = 5;
 
-pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, MaterialBlends) {
+pub fn load_library(
+    backend: &mut impl RenderBackend,
+) -> (Assets, MeshBounds, MaterialBlends, AssetPreviews) {
     let mut assets = Assets::new();
     let mut bounds = MeshBounds::default();
     let mut blends = MaterialBlends::default();
+    let mut previews = AssetPreviews::default();
 
-    load_mesh(backend, &mut assets, &mut bounds, "cube", &CpuMesh::cube());
     load_mesh(
         backend,
         &mut assets,
         &mut bounds,
+        &mut previews,
+        "cube",
+        &CpuMesh::cube(),
+    );
+    load_mesh(
+        backend,
+        &mut assets,
+        &mut bounds,
+        &mut previews,
         "plane",
         &CpuMesh::plane(),
     );
@@ -59,6 +70,7 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
         backend,
         &mut assets,
         &mut bounds,
+        &mut previews,
         "sphere",
         &CpuMesh::sphere(32, 16),
     );
@@ -72,7 +84,14 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
         ("plane_plain", CpuMesh::plane()),
         ("sphere_plain", CpuMesh::sphere(32, 16)),
     ] {
-        load_mesh(backend, &mut assets, &mut bounds, name, &mesh.uncolored());
+        load_mesh(
+            backend,
+            &mut assets,
+            &mut bounds,
+            &mut previews,
+            name,
+            &mesh.uncolored(),
+        );
     }
 
     // A spread across the metallic-roughness range so the PBR BRDF is visible.
@@ -131,7 +150,14 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
         ),
     ];
     for (name, material) in palette {
-        load_material(backend, &mut assets, &mut blends, name, &material);
+        load_material(
+            backend,
+            &mut assets,
+            &mut blends,
+            &mut previews,
+            name,
+            &material,
+        );
     }
 
     // A roughness sweep at both ends of the metallic range: the readout for
@@ -148,6 +174,7 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
             backend,
             &mut assets,
             &mut blends,
+            &mut previews,
             format!("metal_{percent:03}"),
             &Material {
                 base_color: Vec3::new(0.95, 0.93, 0.88),
@@ -160,6 +187,7 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
             backend,
             &mut assets,
             &mut blends,
+            &mut previews,
             format!("dielectric_{percent:03}"),
             &Material {
                 base_color: Vec3::splat(0.5),
@@ -187,6 +215,7 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
         backend,
         &mut assets,
         &mut blends,
+        &mut previews,
         "textured",
         &Material {
             base_color: Vec3::ONE,
@@ -222,6 +251,7 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
         backend,
         &mut assets,
         &mut blends,
+        &mut previews,
         "foliage",
         &Material {
             base_color: Vec3::ONE,
@@ -259,6 +289,7 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
         backend,
         &mut assets,
         &mut blends,
+        &mut previews,
         "rock",
         &Material {
             base_color: Vec3::ONE,
@@ -292,6 +323,7 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
         backend,
         &mut assets,
         &mut blends,
+        &mut previews,
         "stone",
         &Material {
             base_color: Vec3::new(0.86, 0.84, 0.80),
@@ -315,6 +347,7 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
         backend,
         &mut assets,
         &mut blends,
+        &mut previews,
         "ember",
         &Material {
             base_color: Vec3::new(0.25, 0.10, 0.05),
@@ -357,6 +390,7 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
         backend,
         &mut assets,
         &mut blends,
+        &mut previews,
         "brick",
         &Material {
             height_texture: Some(brick_height),
@@ -372,6 +406,7 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
         backend,
         &mut assets,
         &mut blends,
+        &mut previews,
         "brick_flat",
         &brick_material,
     );
@@ -380,6 +415,7 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
         backend,
         &mut assets,
         &mut blends,
+        &mut previews,
         "ground",
         &Material {
             base_color: Vec3::splat(0.7),
@@ -397,6 +433,7 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
         backend,
         &mut assets,
         &mut blends,
+        &mut previews,
         "glass",
         &Material {
             base_color: Vec3::new(0.6, 0.85, 0.9),
@@ -537,25 +574,34 @@ pub fn load_library(backend: &mut impl RenderBackend) -> (Assets, MeshBounds, Ma
             },
         ),
     ] {
-        load_material(backend, &mut assets, &mut blends, name, &material);
+        load_material(
+            backend,
+            &mut assets,
+            &mut blends,
+            &mut previews,
+            name,
+            &material,
+        );
     }
 
-    (assets, bounds, blends)
+    (assets, bounds, blends, previews)
 }
 
-/// Upload a material and register it in both world-side tables at once, so a
+/// Upload a material and register it in every world-side table at once, so a
 /// material can never reach a draw list without the blend mode extraction sorts
 /// it by — a blended one registered nowhere would draw as an opaque wall.
 fn load_material(
     backend: &mut impl RenderBackend,
     assets: &mut Assets,
     blends: &mut MaterialBlends,
+    previews: &mut AssetPreviews,
     name: impl Into<String>,
     material: &Material,
 ) {
     let handle = backend.load_material(material);
     assets.insert_material(name, handle);
     blends.insert(handle, material.blend);
+    previews.insert_material(handle, material, None);
 }
 
 /// Upload a mesh and register it in both world-side tables at once, so a mesh
@@ -564,11 +610,13 @@ fn load_mesh(
     backend: &mut impl RenderBackend,
     assets: &mut Assets,
     bounds: &mut MeshBounds,
+    previews: &mut AssetPreviews,
     name: &str,
     mesh: &CpuMesh,
 ) {
     let handle = backend.load_mesh(mesh);
     assets.insert_mesh(name, handle);
+    previews.insert_mesh(handle, mesh);
     // Read back from the backend's own upload, so the box culling tests is the
     // box the drawn geometry occupies.
     if let Some(aabb) = backend.mesh_bounds(handle) {

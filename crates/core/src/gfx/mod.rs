@@ -3,6 +3,7 @@ pub mod headless;
 pub mod punctual;
 pub mod sh;
 pub mod shadows;
+pub mod thumbnail;
 pub mod vulkan;
 
 pub use headless::HeadlessBackend;
@@ -744,6 +745,10 @@ pub trait RenderBackend {
     /// load, since culling runs before any backend type is in reach.
     fn mesh_bounds(&self, mesh: MeshHandle) -> Option<Aabb>;
     fn load_material(&mut self, material: &Material) -> MaterialHandle;
+    /// Replace an uploaded material's parameters in place, for an edit made in
+    /// the editor. Every draw using `handle` sees the change from the next
+    /// frame; the handle keeps its meaning.
+    fn update_material(&mut self, handle: MaterialHandle, material: &Material);
     fn load_texture(&mut self, pixels: &[u8], width: u32, height: u32, srgb: bool)
     -> TextureHandle;
     /// Replace the environment with one baked from an equirectangular source:

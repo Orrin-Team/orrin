@@ -1,8 +1,18 @@
+//! The scene as a tree: every entity, its kind and its children, with search,
+//! drag to reparent, and the scene's counts at the foot.
+//!
+//! Rows are laid out flat, one fixed-height rect each, rather than as nested
+//! collapsing headers. That is what lets a row fill the panel edge to edge —
+//! selection and hover both cover the whole line, indent included — and what
+//! keeps the pointer from moving anything: the hover affordances are painted
+//! over a row that is already the size it will ever be. It is also what lets
+//! the list draw only the rows on screen, which a tree of nested `Ui`s cannot.
+
 use orrin_ecs::{Entity, World};
 
-use crate::editor::icons;
-use crate::editor::state::{EditorState, SpawnKind};
-use crate::editor::theme;
+use crate::editor::kind::Kind;
+use crate::editor::state::EditorState;
+use crate::editor::{icons, widgets};
 use crate::scene::{Hierarchy, Name};
 
 /// One row of the tree, resolved before any drawing starts.
@@ -13,6 +23,7 @@ use crate::scene::{Hierarchy, Name};
 struct Node {
     entity: Entity,
     label: String,
+    kind: Kind,
     children: Vec<usize>,
     is_root: bool,
     /// Whether the search query keeps this row. Filtering happens here rather
@@ -21,109 +32,162 @@ struct Node {
     visible: bool,
 }
 
+/// A node as it lands on screen: which one, how deep, and whether it has a
+/// disclosure to draw.
+struct Row {
+    node: usize,
+    depth: u32,
+    parent: bool,
+}
+
+const ROW: f32 = 24.0;
+const INDENT: f32 = 14.0;
+pub(super) const FOOTER: f32 = 24.0;
+
 pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
     let nodes = snapshot(world, &state.hierarchy_query);
+    let searching = !state.hierarchy_query.trim().is_empty();
 
-    // Right-to-left so the Add button is placed first and the field
-    // fills whatever is left. Sizing the field from `available_width`
-    // instead would feed the panel's own width back into its content's
-    // minimum width, and a resizable panel then grows every frame.
-    //
-    // The row has to be allocated at a bounded height: a `with_layout`
-    // here takes the panel's whole remaining rect, which leaves the tree
-    // below it nothing to draw into.
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            add_menu(ui, state);
-            ui.add(
-                egui::TextEdit::singleline(&mut state.hierarchy_query)
-                    .hint_text("Search entities")
-                    .desired_width(f32::INFINITY),
-            );
-        },
+    widgets::padded(ui, |ui| {
+        // Right-to-left so the Add button is placed first and the field fills
+        // whatever is left. Sizing the field from `available_width` instead
+        // would feed the panel's own width back into its content's minimum
+        // width, and a resizable panel then grows every frame.
+        //
+        // The row has to be allocated at a bounded height: a `with_layout`
+        // here takes the panel's whole remaining rect, which leaves the tree
+        // below it nothing to draw into.
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                add_menu(ui, state);
+                widgets::search(ui, &mut state.hierarchy_query, "Filter entities");
+            },
+        );
+    });
+    ui.add_space(4.0);
+
+    let rows = flatten(ui.ctx(), &nodes, searching);
+    // Less the spacing the layout puts between the tree and the footer: the
+    // panel has to end exactly at the tab's bottom, or the dock's own scroll
+    // area takes the overflow and the wheel slides the whole panel.
+    let list = egui::Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(
+            ui.available_width(),
+            (ui.available_height() - FOOTER - ui.spacing().item_spacing.y).max(0.0),
+        ),
     );
+    // Registered before the rows so every row sits above it: a drop that no
+    // row takes lands here, and detaches. That is the only way to get
+    // something back to the top level once it has a parent.
+    let background = ui.interact(list, ui.id().with("tree_background"), egui::Sense::hover());
 
-    ui.separator();
-
-    egui::ScrollArea::vertical()
-        .auto_shrink(false)
-        .show(ui, |ui| {
-            // egui's scroll bars float: they allocate no width and expand over
-            // the content when the pointer nears them. A row that ran to the
-            // edge would put its delete button under the bar — and the bar
-            // appears exactly when the pointer is over the tree, which is
-            // exactly when that button is showing. Reserving the gutter costs a
-            // few pixels and keeps the button in one place.
-            ui.set_max_width((ui.available_width() - scroll_gutter(ui)).max(0.0));
-
-            // Bands follow visible rows rather than depth, so a filtered
-            // tree still stripes every other line.
-            let mut row_index = 0usize;
-            for index in 0..nodes.len() {
-                if nodes[index].is_root && nodes[index].visible {
-                    draw(ui, &nodes, index, state, &mut row_index);
-                }
-            }
-            if row_index == 0 {
+    ui.allocate_ui(list.size(), |ui| {
+        if rows.is_empty() {
+            widgets::padded(ui, |ui| {
                 ui.weak(match state.hierarchy_query.trim() {
                     "" => "Nothing in the scene.".to_owned(),
                     query => format!("No entity matches “{query}”."),
                 });
-            }
-
-            // Dropping below the tree detaches, which is the only way to
-            // get something back to the top level once it has a parent.
-            let empty = ui.available_size_before_wrap();
-            if empty.y > 0.0 {
-                let (_, response) = ui.allocate_exact_size(empty, egui::Sense::hover());
-                if let Some(dragged) = response.dnd_release_payload::<Entity>() {
-                    state.request_reparent(*dragged, None);
+            });
+        }
+        // Zero spacing before `show_rows` measures, not inside it: it works out
+        // which rows are on screen from the row height plus this spacing, and
+        // rows packed tighter than it assumes run out short of the bottom.
+        ui.spacing_mut().item_spacing.y = 0.0;
+        egui::ScrollArea::vertical().auto_shrink(false).show_rows(
+            ui,
+            ROW,
+            rows.len(),
+            |ui, range| {
+                for row in &rows[range] {
+                    draw_row(ui, &nodes, row, state);
                 }
-            }
-        });
+            },
+        );
+    });
+    if let Some(dragged) = background.dnd_release_payload::<Entity>() {
+        state.request_reparent(*dragged, None);
+    }
+
+    footer(ui, world, state);
 }
 
-/// How much room a vertical scroll bar needs at its widest.
-///
-/// `ScrollStyle::allocated_width` reports zero for a floating bar, which is true
-/// of the space it *takes* and useless for the space it *covers*.
-fn scroll_gutter(ui: &egui::Ui) -> f32 {
-    let scroll = &ui.spacing().scroll;
-    if scroll.floating {
-        scroll.bar_width + scroll.bar_inner_margin
-    } else {
-        scroll.allocated_width()
+/// The scene's size and the selection's, under the tree they count.
+fn footer(ui: &mut egui::Ui, world: &World, state: &EditorState) {
+    let size = egui::vec2(ui.available_width(), FOOTER);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let visuals = ui.visuals();
+    ui.painter().hline(
+        rect.x_range(),
+        rect.top(),
+        visuals.widgets.noninteractive.bg_stroke,
+    );
+    let count = world.entities().count();
+    let selected = usize::from(state.selected.is_some_and(|entity| world.is_alive(entity)));
+    ui.painter().text(
+        egui::pos2(rect.left() + widgets::PAD, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{count} entities · {selected} selected"),
+        egui::TextStyle::Monospace.resolve(ui.style()),
+        visuals.weak_text_color(),
+    );
+}
+
+/// Whether a parent row is open. Default-open: a scene that opens fully
+/// collapsed hides everything the panel exists to show. Keyed on the entity
+/// so the state follows a row rather than its position in the list.
+fn open_id(entity: Entity) -> egui::Id {
+    egui::Id::new(("hierarchy_open", entity.index(), entity.generation()))
+}
+
+fn is_open(ctx: &egui::Context, entity: Entity) -> bool {
+    ctx.data(|data| data.get_temp::<bool>(open_id(entity)))
+        .unwrap_or(true)
+}
+
+/// The rows on screen, in order. A search opens every branch on the way to a
+/// match, so a match is never hidden inside a closed parent.
+fn flatten(ctx: &egui::Context, nodes: &[Node], searching: bool) -> Vec<Row> {
+    fn walk(
+        ctx: &egui::Context,
+        nodes: &[Node],
+        index: usize,
+        depth: u32,
+        searching: bool,
+        out: &mut Vec<Row>,
+    ) {
+        let node = &nodes[index];
+        let parent = node.children.iter().any(|&child| nodes[child].visible);
+        out.push(Row {
+            node: index,
+            depth,
+            parent,
+        });
+        if parent && (searching || is_open(ctx, node.entity)) {
+            for &child in &node.children {
+                if nodes[child].visible {
+                    walk(ctx, nodes, child, depth + 1, searching, out);
+                }
+            }
+        }
     }
+    let mut out = Vec::new();
+    for index in 0..nodes.len() {
+        if nodes[index].is_root && nodes[index].visible {
+            walk(ctx, nodes, index, 0, searching, &mut out);
+        }
+    }
+    out
 }
 
 fn add_menu(ui: &mut egui::Ui, state: &mut EditorState) {
-    // Icon-only, because it is a repeated row affordance and the tooltip
-    // carries the name — the rule that keeps icons out of the ribbon's labels.
-    icons::menu_button(ui, icons::plus(), icons::ROW, |ui| {
-        for (label, kind) in [
-            ("Cube", SpawnKind::Cube),
-            ("Sphere", SpawnKind::Sphere),
-            ("Plane", SpawnKind::Plane),
-        ] {
-            if ui.button(label).clicked() {
-                state.request_spawn(kind);
-                ui.close_menu();
-            }
-        }
-        ui.separator();
-        for (label, kind) in [
-            ("Point Light", SpawnKind::PointLight),
-            ("Directional Light", SpawnKind::DirectionalLight),
-        ] {
-            if ui.button(label).clicked() {
-                state.request_spawn(kind);
-                ui.close_menu();
-            }
-        }
-    })
-    .on_hover_text("Add entity");
+    // The entries are the Entity menu's own.
+    widgets::squircle_menu(ui, icons::plus(), "Add entity", |ui| {
+        super::menu_bar::spawn_entries(ui, state);
+    });
 }
 
 /// Read every entity's name and its children once, from the cached hierarchy,
@@ -162,6 +226,7 @@ fn snapshot(world: &mut World, query: &str) -> Vec<Node> {
                 .get::<Name>(entity)
                 .map(|name| name.0.clone())
                 .unwrap_or_else(|| format!("Entity {}", entity.index())),
+            kind: Kind::of(world, entity),
             children,
             // Roots come first in the order, by construction.
             is_root: index < root_count,
@@ -188,139 +253,174 @@ fn snapshot(world: &mut World, query: &str) -> Vec<Node> {
     nodes
 }
 
-fn draw(ui: &mut egui::Ui, nodes: &[Node], index: usize, state: &mut EditorState, row: &mut usize) {
-    let node = &nodes[index];
-    let selected = state.selected == Some(node.entity);
-    let visible_children: Vec<usize> = node
-        .children
-        .iter()
-        .copied()
-        .filter(|&child| nodes[child].visible)
-        .collect();
-
-    if visible_children.is_empty() {
-        let response = row_ui(ui, node, selected, state, row);
-        accept_drop(&response, node.entity, state);
-        return;
+/// How much room a vertical scroll bar needs at its widest.
+///
+/// `ScrollStyle::allocated_width` reports zero for a floating bar, which is true
+/// of the space it *takes* and useless for the space it *covers*.
+fn scroll_gutter(ui: &egui::Ui) -> f32 {
+    let scroll = &ui.spacing().scroll;
+    if scroll.floating {
+        scroll.bar_width + scroll.bar_inner_margin
+    } else {
+        scroll.allocated_width()
     }
-
-    // Default-open: a scene that opens fully collapsed hides everything the
-    // panel exists to show. Keyed on the entity so the open/closed state follows
-    // a row rather than its position in the list.
-    let id = egui::Id::new((
-        "hierarchy_collapse",
-        node.entity.index(),
-        node.entity.generation(),
-    ));
-    let collapsing =
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
-    collapsing
-        .show_header(ui, |ui| {
-            let response = row_ui(ui, node, selected, state, row);
-            accept_drop(&response, node.entity, state);
-        })
-        .body(|ui| {
-            for child in visible_children {
-                draw(ui, nodes, child, state, row);
-            }
-        });
 }
 
+/// One row: the full width of the panel, selected or hovered as a whole.
+///
 /// A row is both clickable and draggable, which rules out `Ui::dnd_drag_source`:
 /// that lays a second `Sense::drag()` interaction over the same rect, and it
-/// claims the press before the label beneath can read it as a click. Selecting
+/// claims the press before the row beneath can read it as a click. Selecting
 /// an entity would then be impossible — every press would begin a drag.
 ///
 /// `Response::dnd_set_drag_payload` is the API for this case; it stores the
 /// payload only once a drag has actually started, so a press that never moves
 /// stays a click.
-fn row_ui(
-    ui: &mut egui::Ui,
-    node: &Node,
-    selected: bool,
-    state: &mut EditorState,
-    row: &mut usize,
-) -> egui::Response {
-    let index = *row;
-    *row += 1;
+fn draw_row(ui: &mut egui::Ui, nodes: &[Node], row: &Row, state: &mut EditorState) {
+    let node = &nodes[row.node];
+    let selected = state.selected == Some(node.entity);
+    let (rect, mut response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW),
+        egui::Sense::click_and_drag(),
+    );
 
-    ui.horizontal(|ui| {
-        // A horizontal layout extends rather than wraps, and a `SidePanel`'s
-        // reported width is its content's, not the width it was asked for. One
-        // long entity name would therefore push the panel out over the viewport
-        // and squeeze whatever sits between the two side panels. Truncating is
-        // also what a tree row should do with a name too long to show.
-        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+    let visuals = ui.visuals().clone();
+    let hovered = ui.rect_contains_pointer(rect);
+    let dropping = response
+        .dnd_hover_payload::<Entity>()
+        .is_some_and(|dragged| *dragged != node.entity);
+    let fill = if selected {
+        Some(visuals.selection.bg_fill)
+    } else if hovered || dropping {
+        Some(visuals.widgets.hovered.weak_bg_fill)
+    } else {
+        None
+    };
+    if let Some(fill) = fill {
+        ui.painter().rect_filled(rect, 0.0, fill);
+    }
+    // Without the floating preview `dnd_drag_source` would have painted, the
+    // drop target is the only feedback about where the row will land.
+    if dropping {
+        ui.painter().rect_stroke(
+            rect,
+            0.0,
+            visuals.selection.stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
 
-        // The band has to land under the label, and the label's rect is only
-        // known once it is laid out. Reserving the shape now and filling it in
-        // afterwards is how egui paints behind something it has already drawn.
-        let band = ui.painter().add(egui::Shape::Noop);
+    // Indent guides: a hairline down the middle of each ancestor's chevron
+    // column, the full height of the row, so the rows of one subtree join into
+    // an unbroken line and how deep a row sits reads without counting indents.
+    let guide = egui::Stroke::new(1.0_f32, visuals.widgets.inactive.bg_stroke.color);
+    for level in 0..row.depth {
+        let x = (rect.left() + widgets::PAD + level as f32 * INDENT + 6.0).round() + 0.5;
+        ui.painter().vline(x, rect.y_range(), guide);
+    }
 
-        let room = ui.available_width();
-        let mut response = ui
-            .selectable_label(selected, &node.label)
-            .interact(egui::Sense::click_and_drag());
-
-        // A label that used everything it was offered is the one that got cut,
-        // and it is the only one worth a tooltip: repeating a name already fully
-        // on screen would pop a bubble over every row the pointer crosses.
-        if response.rect.width() >= room {
-            response = response.on_hover_text(&node.label);
+    let weak = visuals.weak_text_color();
+    let mut x = rect.left() + widgets::PAD + row.depth as f32 * INDENT;
+    if row.parent {
+        let chevron = egui::Rect::from_center_size(
+            egui::pos2(x + 6.0, rect.center().y),
+            egui::Vec2::splat(12.0),
+        );
+        let id = open_id(node.entity).with("toggle");
+        let toggle = ui.interact(chevron.expand(3.0), id, egui::Sense::click());
+        let open = is_open(ui.ctx(), node.entity);
+        let glyph = if open {
+            icons::chevron_down()
+        } else {
+            icons::chevron_right()
+        };
+        let colour = if toggle.hovered() {
+            visuals.text_color()
+        } else {
+            weak
+        };
+        icons::paint(ui, glyph, chevron, colour);
+        if toggle.clicked() {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(open_id(node.entity), !open));
         }
+    }
+    x += 16.0;
+    let glyph = egui::Rect::from_center_size(
+        egui::pos2(x + 7.0, rect.center().y),
+        egui::Vec2::splat(icons::ROW - 2.0),
+    );
+    icons::paint(ui, node.kind.icon(), glyph, node.kind.tint(weak));
+    x = glyph.right() + 6.0;
 
-        if response.clicked() {
-            state.selected = Some(node.entity);
-        }
-        response.dnd_set_drag_payload(node.entity);
+    // The delete affordance sits clear of the floating scroll bar, which
+    // appears exactly when the pointer is over the tree — exactly when this
+    // button is showing.
+    let cross = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - scroll_gutter(ui) - 10.0, rect.center().y),
+        egui::Vec2::splat(18.0),
+    );
+    let text_right = if hovered {
+        cross.left() - 4.0
+    } else {
+        rect.right() - widgets::PAD
+    };
 
-        // The full-width strip the row occupies: what the band paints, and what
-        // decides whether the delete affordance is showing. Taking hover from
-        // the label alone would hide the ✕ the moment the pointer reached it.
-        let strip = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), response.rect.y_range())
-            .expand2(egui::vec2(0.0, 1.0));
-        if index % 2 == 1 && !selected {
-            ui.painter().set(
-                band,
-                egui::epaint::RectShape::filled(strip, 0.0, theme::ROW_BAND),
-            );
-        }
+    let colour = if selected {
+        visuals.strong_text_color()
+    } else {
+        visuals.text_color()
+    };
+    let galley = egui::WidgetText::from(node.label.as_str()).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        (text_right - x).max(0.0),
+        egui::TextStyle::Body,
+    );
+    // A row whose name was cut is the only one worth a tooltip: repeating a
+    // name already fully on screen would pop a bubble over every row the
+    // pointer crosses.
+    let elided = galley.elided;
+    ui.painter().galley(
+        egui::pos2(x, rect.center().y - galley.size().y / 2.0),
+        galley,
+        colour,
+    );
+    if !node.children.is_empty() && !hovered {
+        ui.painter().text(
+            egui::pos2(rect.right() - widgets::PAD, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            node.children.len().to_string(),
+            egui::TextStyle::Monospace.resolve(ui.style()),
+            weak,
+        );
+    }
 
-        if !node.children.is_empty() {
-            ui.weak(egui::RichText::new(node.children.len().to_string()).small());
-        }
-
-        if ui.rect_contains_pointer(strip) {
-            // Weak rather than full text colour: the affordance should be
-            // reachable without competing with the name it sits beside.
-            let weak = ui.visuals().weak_text_color();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icons::button(ui, icons::x(), 12.0, weak, false)
-                    .on_hover_text(format!("Delete {}", node.label))
-                    .clicked()
-                {
-                    state.request_despawn(node.entity);
-                }
-            });
-        }
-
-        // Without the floating preview `dnd_drag_source` would have painted, the
-        // drop target is the only feedback about where the row will land.
-        if response
-            .dnd_hover_payload::<Entity>()
-            .is_some_and(|d| *d != node.entity)
+    if hovered {
+        let id = open_id(node.entity).with("delete");
+        let delete = ui.interact(cross, id, egui::Sense::click());
+        let colour = if delete.hovered() {
+            visuals.text_color()
+        } else {
+            weak
+        };
+        icons::paint(ui, icons::x(), cross.shrink(3.0), colour);
+        if delete
+            .on_hover_text(format!("Delete {}", node.label))
+            .clicked()
         {
-            ui.painter().rect_stroke(
-                strip,
-                2.0,
-                ui.visuals().selection.stroke,
-                egui::StrokeKind::Inside,
-            );
+            state.request_despawn(node.entity);
         }
+    }
 
-        response
-    })
-    .inner
+    if elided {
+        response = response.on_hover_text(&node.label);
+    }
+    if response.clicked() {
+        state.selected = Some(node.entity);
+    }
+    response.dnd_set_drag_payload(node.entity);
+    accept_drop(&response, node.entity, state);
 }
 
 /// Reparent the dragged entity onto `target`, if one was released here.

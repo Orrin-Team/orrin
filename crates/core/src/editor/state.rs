@@ -10,47 +10,11 @@ use crate::scene::{self, Assets, LogBuffer, LogLevel, MaterialHandle, Time, Tran
 /// `scenes/` directory belong with the asset database.
 pub const DEFAULT_SCENE_PATH: &str = "scene.orrin";
 
-/// Shown where a project name would go when the engine was launched outside
-/// one. Says what the session *is* rather than leaving the slot blank.
-const NO_PROJECT: &str = "built-in demo";
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SceneRequest {
     Save,
     /// Replaces the current contents: every live entity is despawned first.
     Load,
-}
-
-/// Which set of ribbon groups is showing. Plain data with no references, like
-/// the rest of the editor's state — `docs/architecture.md` §2.1 wants this in
-/// the ECS eventually, and that rule is what keeps the move cheap.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum RibbonTab {
-    Home,
-    Scene,
-    Render,
-    Scripts,
-    Assets,
-}
-
-impl RibbonTab {
-    pub const ALL: [Self; 5] = [
-        Self::Home,
-        Self::Scene,
-        Self::Render,
-        Self::Scripts,
-        Self::Assets,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Home => "Home",
-            Self::Scene => "Scene",
-            Self::Render => "Render",
-            Self::Scripts => "Scripts",
-            Self::Assets => "Assets",
-        }
-    }
 }
 
 /// What a transform gizmo would edit. The mode is real state and is remembered;
@@ -115,19 +79,33 @@ pub struct EditorState {
     pub selected: Option<Entity>,
     pub scene_path: String,
     /// What the top bar calls this session. Not the window title and not a
-    /// path — just the name, so a run says which project it is inside.
-    pub project_name: String,
+    /// path — just the name, so a run says which project it is inside. `None`
+    /// outside a project, where the bar shows the scene file alone rather
+    /// than a placeholder.
+    pub project_name: Option<String>,
     /// The hierarchy's search box. Lives here rather than in the panel so it
     /// survives the frame, and so a filtered tree stays filtered.
     pub hierarchy_query: String,
     /// The console's level toggles. Here for the reason the search box is.
     pub console_levels: LevelFilter,
-    pub ribbon_tab: RibbonTab,
+    pub console_query: String,
+    /// The inspector's property filter. Kept across selections, the way a
+    /// search in a property panel usually is: looking for one field on several
+    /// entities is the case it exists for.
+    pub inspector_query: String,
     pub gizmo_mode: GizmoMode,
     pub gizmo_space: GizmoSpace,
     pub snap: bool,
+    /// Whether dragging one scale axis moves all three by the same ratio.
+    pub scale_linked: bool,
+    /// The frame-time readout floating in the viewport's corner.
+    pub show_stats: bool,
     spawn_request: Option<SpawnKind>,
     despawn_request: Option<Entity>,
+    /// A registered component to add to an entity, at its default. Deferred
+    /// like the rest: the inspector is mid-way through drawing that entity's
+    /// components when the menu is clicked.
+    add_request: Option<(Entity, orrin_registry::ComponentId)>,
     /// `(child, new parent)`, with `None` meaning "detach to a root". Requested
     /// rather than applied inline for the same reason as the two above: the
     /// hierarchy panel is iterating a snapshot of the tree while it builds, and
@@ -153,15 +131,19 @@ impl Default for EditorState {
         Self {
             selected: None,
             scene_path: DEFAULT_SCENE_PATH.to_owned(),
-            project_name: NO_PROJECT.to_owned(),
+            project_name: None,
             hierarchy_query: String::new(),
             console_levels: LevelFilter::default(),
-            ribbon_tab: RibbonTab::Home,
+            console_query: String::new(),
+            inspector_query: String::new(),
             gizmo_mode: GizmoMode::Select,
             gizmo_space: GizmoSpace::World,
             snap: false,
+            scale_linked: false,
+            show_stats: false,
             spawn_request: None,
             despawn_request: None,
+            add_request: None,
             reparent_request: None,
             theme_request: None,
             scene_request: None,
@@ -174,10 +156,7 @@ impl Default for EditorState {
 impl EditorState {
     pub fn new(project: Option<&orrin_project::Project>) -> Self {
         Self {
-            project_name: project.map_or_else(
-                || NO_PROJECT.to_owned(),
-                |project| project.name().to_owned(),
-            ),
+            project_name: project.map(|project| project.name().to_owned()),
             ..Self::default()
         }
     }
@@ -196,6 +175,10 @@ impl EditorState {
 
     pub fn request_reparent(&mut self, child: Entity, parent: Option<Entity>) {
         self.reparent_request = Some((child, parent));
+    }
+
+    pub fn request_add_component(&mut self, entity: Entity, id: orrin_registry::ComponentId) {
+        self.add_request = Some((entity, id));
     }
 
     pub fn request_theme(&mut self, name: impl Into<String>) {
@@ -227,6 +210,18 @@ impl EditorState {
             if self.selected == Some(entity) {
                 self.selected = None;
             }
+        }
+        if let Some((entity, id)) = self.add_request.take()
+            && world.is_alive(entity)
+            && let Some(vtable) = registry.get(&id)
+            && !vtable.has(world, entity)
+            && let Err(error) = vtable.write(world, entity, &vtable.default())
+        {
+            log(
+                world,
+                LogLevel::Error,
+                format!("adding {id} to entity {}: {error}", entity.index()),
+            );
         }
         if let Some((child, parent)) = self.reparent_request.take() {
             // `keep_world`: a drag in the tree changes who owns an object, not
