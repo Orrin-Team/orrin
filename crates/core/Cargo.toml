@@ -71,3 +71,7 @@ harness = false
 [[bench]]
 name = "collision"
 harness = false
+
+[[bench]]
+name = "sh"
+harness = false
