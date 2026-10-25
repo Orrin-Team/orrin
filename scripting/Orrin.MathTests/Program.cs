@@ -295,6 +295,15 @@ Check(!noDoor.Door.IsValid, "a default AssetRef is the null reference");
 PropertyBag.Decode(noDoor, Convert.FromHexString(AssetGolden));
 Check(noDoor.Door == door.Door, "bag round trip: AssetRef");
 
+// The kinds `find_asset` answers with, pinned to `ASSET_*` in orrin-script.
+Check(AssetKinds.Of<Prefab>() == 1, "a prefab is asset kind 1");
+Check(AssetKinds.Of<Mesh>() == 2, "a mesh is asset kind 2");
+Check(AssetKinds.Of<Texture>() == 3, "a texture is asset kind 3");
+Check(
+    (uint)AssetState.Loading == 0 && (uint)AssetState.Ready == 1 && (uint)AssetState.Failed == 2,
+    "AssetState matches LOAD_* in orrin-script");
+Check(default(AssetRef<Mesh>).State == AssetState.Failed, "the null reference never loads");
+
 var stepped = new BagProbe { Speed = 99f };
 PropertyBag.Decode(stepped, Convert.FromHexString(AssetGolden));
 Check(stepped.Speed == 99f, "an asset field this type lacks is stepped over");

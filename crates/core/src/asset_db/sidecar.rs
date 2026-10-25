@@ -49,12 +49,27 @@ impl AssetKind {
     /// The kind a file is imported as, or `None` for a file that is not an
     /// asset — a glTF's `.bin`, a sidecar, a readme. Never [`Folder`](Self::Folder).
     pub fn of_path(path: &str) -> Option<Self> {
-        todo!("{path}")
+        let file = path.rsplit('/').next().unwrap_or(path);
+        let (stem, extension) = file.rsplit_once('.')?;
+        if stem.is_empty() {
+            return None;
+        }
+        match extension.to_ascii_lowercase().as_str() {
+            "png" | "jpg" | "jpeg" => Some(Self::Texture),
+            "gltf" | "glb" => Some(Self::Mesh),
+            "fprefab" => Some(Self::Prefab),
+            _ => None,
+        }
     }
 
     /// The word an error or the editor uses for it.
     pub fn label(self) -> &'static str {
-        todo!("{self:?}")
+        match self {
+            Self::Texture => "texture",
+            Self::Mesh => "mesh",
+            Self::Prefab => "prefab",
+            Self::Folder => "folder",
+        }
     }
 }
 
@@ -88,14 +103,94 @@ impl Settings {
     /// what is read from then on, so a wrong guess is corrected by editing one
     /// line rather than by renaming the file.
     pub fn defaults_for(kind: AssetKind, rel: &str) -> Self {
-        todo!("{kind:?} {rel}")
+        match kind {
+            AssetKind::Texture => Self::Texture(TextureSettings {
+                srgb: !holds_data(rel),
+                max_size: 0,
+            }),
+            AssetKind::Mesh => Self::Mesh(MeshSettings { scale: 1.0 }),
+            AssetKind::Prefab | AssetKind::Folder => Self::None,
+        }
     }
 
     /// The settings as one deterministic string: what the cache key hashes, so
     /// two spellings of the same settings in two sidecars share one artifact.
     pub fn canonical(&self) -> String {
-        todo!()
+        match self {
+            Self::Texture(texture) => {
+                format!("srgb={};max_size={}", texture.srgb, texture.max_size)
+            }
+            Self::Mesh(mesh) => format!("scale={:?}", mesh.scale),
+            Self::None => String::new(),
+        }
     }
+
+    /// The keys `[import]` may hold, in the order a new sidecar writes them.
+    fn keys(&self) -> &'static [&'static str] {
+        match self {
+            Self::Texture(_) => &["srgb", "max_size"],
+            Self::Mesh(_) => &["scale"],
+            Self::None => &[],
+        }
+    }
+
+    /// Set `key` from a sidecar's value, or say why it cannot be.
+    fn set(&mut self, key: &str, value: &toml::Value) -> Result<(), String> {
+        let wrong = |expected: &str| format!("`{key}` must be {expected}, not {value}");
+        match (self, key) {
+            (Self::Texture(texture), "srgb") => {
+                texture.srgb = value.as_bool().ok_or_else(|| wrong("true or false"))?;
+            }
+            (Self::Texture(texture), "max_size") => {
+                texture.max_size = value
+                    .as_integer()
+                    .and_then(|size| u32::try_from(size).ok())
+                    .ok_or_else(|| wrong("a whole number of texels, 0 for no limit"))?;
+            }
+            (Self::Mesh(mesh), "scale") => {
+                let scale = match value {
+                    toml::Value::Float(scale) => *scale as f32,
+                    toml::Value::Integer(scale) => *scale as f32,
+                    _ => return Err(wrong("a number")),
+                };
+                if !(scale.is_finite() && scale > 0.0) {
+                    return Err(wrong("a positive number"));
+                }
+                mesh.scale = scale;
+            }
+            _ => unreachable!("checked against `keys`"),
+        }
+        Ok(())
+    }
+
+    /// `[import]` as a new sidecar writes it, or nothing for a kind without
+    /// settings.
+    fn import_table(&self) -> String {
+        match self {
+            Self::Texture(texture) => format!(
+                "\n[import]\nsrgb = {}\nmax_size = {}\n",
+                texture.srgb, texture.max_size
+            ),
+            Self::Mesh(mesh) => format!("\n[import]\nscale = {:?}\n", mesh.scale),
+            Self::None => String::new(),
+        }
+    }
+}
+
+/// Whether a texture's name says it holds data rather than colour. Matched on
+/// the lower-cased file name, by the words texture sets use.
+fn holds_data(rel: &str) -> bool {
+    let file = rel.rsplit('/').next().unwrap_or(rel).to_ascii_lowercase();
+    const WORDS: [&str; 7] = [
+        "normal",
+        "rough",
+        "height",
+        "displacement",
+        "metal",
+        "occlusion",
+        "bump",
+    ];
+    WORDS.iter().any(|word| file.contains(word))
 }
 
 /// An sRGB colour a folder's icon is drawn in.
@@ -105,11 +200,17 @@ pub struct Tint(pub [u8; 3]);
 impl Tint {
     /// `"#rrggbb"`, the form a sidecar stores.
     pub fn parse(text: &str) -> Option<Self> {
-        todo!("{text}")
+        let hex = text.strip_prefix('#')?;
+        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).ok();
+        Some(Self([channel(0)?, channel(2)?, channel(4)?]))
     }
 
     pub fn to_hex(self) -> String {
-        todo!()
+        let [r, g, b] = self.0;
+        format!("#{r:02x}{g:02x}{b:02x}")
     }
 }
 
@@ -132,18 +233,133 @@ pub fn path_of(source: &Path) -> PathBuf {
 /// Read the sidecar of the source at `source` (`rel` from the assets
 /// directory, for messages), writing one first if there is none.
 pub fn read_or_create(source: &Path, rel: &str, kind: AssetKind) -> Result<Sidecar, String> {
-    todo!("{} {rel} {kind:?}", source.display())
+    let path = path_of(source);
+    if let Some(text) = read(&path, rel)? {
+        return parse(&text, rel, kind);
+    }
+    let settings = Settings::defaults_for(kind, rel);
+    let id = AssetId::new();
+    let text = format!("id = \"{id}\"\n{}", settings.import_table());
+    // `create_new`, so a sidecar another process wrote since the read above —
+    // a second editor on the same project — is read rather than replaced.
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()));
+    match created {
+        Ok(()) => Ok(Sidecar {
+            id,
+            settings,
+            tint: None,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let text = read(&path, rel)?.unwrap_or_default();
+            parse(&text, rel, kind)
+        }
+        Err(error) => Err(format!(
+            "{rel} has no sidecar, and writing {rel}.meta failed: {error}"
+        )),
+    }
 }
 
 /// A folder's sidecar, which exists only once a tint has been set.
 pub fn read_folder(dir: &Path, rel: &str) -> Result<Option<Sidecar>, String> {
-    todo!("{} {rel}", dir.display())
+    match read(&path_of(dir), rel)? {
+        Some(text) => parse(&text, rel, AssetKind::Folder).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// Set or clear a folder's tint, keeping the id it already has. Returns the
 /// folder's id.
 pub fn write_folder_tint(dir: &Path, rel: &str, tint: Option<Tint>) -> Result<AssetId, String> {
-    todo!("{} {rel} {tint:?}", dir.display())
+    let id = read_folder(dir, rel)?.map_or_else(AssetId::new, |sidecar| sidecar.id);
+    let mut text = format!("id = \"{id}\"\n");
+    if let Some(tint) = tint {
+        text.push_str(&format!("tint = \"{}\"\n", tint.to_hex()));
+    }
+    std::fs::write(path_of(dir), text).map_err(|error| format!("{rel}.meta: {error}"))?;
+    Ok(id)
+}
+
+/// The sidecar's text, or `None` when there is none.
+fn read(path: &Path, rel: &str) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{rel}.meta: {error}")),
+    }
+}
+
+fn parse(text: &str, rel: &str, kind: AssetKind) -> Result<Sidecar, String> {
+    let table: toml::Table =
+        toml::from_str(text).map_err(|error| format!("{rel}.meta: {}", error.message()))?;
+    let id = table
+        .get("id")
+        .and_then(toml::Value::as_str)
+        .and_then(|id| id.parse::<AssetId>().ok())
+        .filter(|id| !id.is_nil())
+        .ok_or_else(|| {
+            format!(
+                "{rel}.meta has no valid `id`. Restore it from version control: deleting it \
+                 gives the {} a new id, and everything that references the old one loses it",
+                kind.label()
+            )
+        })?;
+
+    let mut sidecar = Sidecar {
+        id,
+        settings: Settings::defaults_for(kind, rel),
+        tint: None,
+    };
+    for (key, value) in &table {
+        match (key.as_str(), kind) {
+            ("id", _) => {}
+            ("tint", AssetKind::Folder) => {
+                let tint = value.as_str().and_then(Tint::parse).ok_or_else(|| {
+                    format!("{rel}.meta: `tint` must be a colour written \"#rrggbb\", not {value}")
+                })?;
+                sidecar.tint = Some(tint);
+            }
+            ("import", kind) if kind != AssetKind::Folder => {
+                let import = value
+                    .as_table()
+                    .ok_or_else(|| format!("{rel}.meta: `import` must be a table"))?;
+                for (key, value) in import {
+                    if !sidecar.settings.keys().contains(&key.as_str()) {
+                        return Err(unknown_setting(rel, kind, key, sidecar.settings.keys()));
+                    }
+                    sidecar
+                        .settings
+                        .set(key, value)
+                        .map_err(|error| format!("{rel}.meta: {error}"))?;
+                }
+            }
+            (key, _) => {
+                return Err(format!(
+                    "{rel}.meta: `{key}` is not something a {} sidecar holds",
+                    kind.label()
+                ));
+            }
+        }
+    }
+    Ok(sidecar)
+}
+
+fn unknown_setting(rel: &str, kind: AssetKind, key: &str, keys: &[&str]) -> String {
+    if keys.is_empty() {
+        return format!(
+            "{rel}.meta: `{key}` is not a {} import setting; a {} has none",
+            kind.label(),
+            kind.label()
+        );
+    }
+    format!(
+        "{rel}.meta: `{key}` is not a {} import setting; the settings are {}",
+        kind.label(),
+        keys.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -225,7 +441,10 @@ mod tests {
 
         let sidecar = read_or_create(&source, "tree.gltf", AssetKind::Mesh).unwrap();
         assert_eq!(sidecar.id, id.parse().unwrap());
-        assert_eq!(sidecar.settings, Settings::Mesh(MeshSettings { scale: 1.0 }));
+        assert_eq!(
+            sidecar.settings,
+            Settings::Mesh(MeshSettings { scale: 1.0 })
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("tree.gltf.meta")).unwrap(),
             format!("id = \"{id}\"\n")

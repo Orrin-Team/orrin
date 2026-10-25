@@ -68,6 +68,9 @@ public unsafe struct OrrinApi
     // owns.
     public delegate* unmanaged<byte*, byte*, uint> FindAsset;
     public delegate* unmanaged<byte*, Entity> InstantiatePrefab;
+    // Load state, appended after InstantiatePrefab, matching the Rust struct:
+    // an id's sixteen bytes in, an `AssetState` out.
+    public delegate* unmanaged<byte*, uint> AssetState;
 }
 
 public static unsafe class Native
@@ -217,6 +220,14 @@ public static unsafe class Native
         prefab.TryWriteBytes(id, bigEndian: true, out _);
         fixed (byte* idPtr = id)
             return _api.InstantiatePrefab(idPtr);
+    }
+
+    internal static AssetState GetAssetState(Guid asset)
+    {
+        Span<byte> id = stackalloc byte[16];
+        asset.TryWriteBytes(id, bigEndian: true, out _);
+        fixed (byte* idPtr = id)
+            return (AssetState)_api.AssetState(idPtr);
     }
 
     public static float TimeDelta() => _api.TimeDelta();

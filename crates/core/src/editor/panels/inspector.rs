@@ -10,9 +10,10 @@
 use glam::{EulerRot, Quat, Vec3};
 
 use orrin_ecs::{Entity, World};
-use orrin_registry::Registry;
+use orrin_registry::{AssetId, Registry};
 
 use super::{color_row, figures};
+use crate::asset_db::AssetDatabase;
 use crate::editor::icons;
 use crate::editor::kind::Kind;
 use crate::editor::previews::Previews;
@@ -63,7 +64,7 @@ pub fn body(
         .show(ui, |ui| {
             prefab_section(ui, world, registry, entity, &filter);
             transform_section(ui, world, state, entity, &filter);
-            mesh_section(ui, world, entity, previews, &filter);
+            mesh_section(ui, world, registry, entity, previews, &filter);
             material_section(ui, world, entity, previews, &filter);
             light_section(ui, world, entity, &filter);
             #[cfg(feature = "scripting")]
@@ -343,10 +344,12 @@ fn prefab_section(
 /// which is what makes a component the engine has never heard of, registered by
 /// a game assembly after a hot reload, inspectable without a panel being written
 /// for it.
-const HAND_DRAWN: [orrin_registry::ComponentId; 3] = [
+const HAND_DRAWN: [orrin_registry::ComponentId; 5] = [
     crate::scene::registry::TRANSFORM,
     crate::scene::registry::NAME,
     crate::scene::registry::LIGHT,
+    crate::scene::registry::MESH,
+    crate::scene::registry::MATERIAL,
 ];
 
 /// Draw every registered component that has no section of its own.
@@ -661,6 +664,7 @@ fn uniform(before: [f32; 3], after: [f32; 3]) -> [f32; 3] {
 fn mesh_section(
     ui: &mut egui::Ui,
     world: &mut World,
+    registry: &Registry,
     entity: Entity,
     previews: &mut Previews,
     filter: &Filter,
@@ -673,7 +677,9 @@ fn mesh_section(
     };
     let id = ui.id().with("mesh_renderer");
     let mut picked_mesh = None;
+    let mut dropped_mesh = None;
     let mut picked_material = None;
+    let mut dropped_texture = None;
     widgets::section(
         ui,
         id,
@@ -684,12 +690,13 @@ fn mesh_section(
         |ui| {
             if rows.shows("Mesh") {
                 widgets::property(ui, "Mesh", |ui| {
-                    picked_mesh = mesh_picker(ui, world, entity, previews);
+                    picked_mesh = mesh_picker(ui, world, entity, previews, &mut dropped_mesh);
                 });
             }
             if rows.shows("Material") && world.has::<MaterialHandle>(entity) {
                 widgets::property(ui, "Material", |ui| {
-                    picked_material = material_picker(ui, world, entity, previews);
+                    picked_material =
+                        material_picker(ui, world, entity, previews, &mut dropped_texture);
                 });
             }
         },
@@ -700,6 +707,72 @@ fn mesh_section(
     if let Some(handle) = picked_material {
         world.insert(entity, handle);
     }
+    if let Some(id) = dropped_mesh {
+        assign_mesh(world, registry, entity, id);
+    }
+    if let Some(texture) = dropped_texture
+        && let Some(material) = world.get::<MaterialHandle>(entity).map(|h| *h)
+    {
+        let result = world
+            .get_resource_mut::<AssetDatabase>()
+            .map(|mut db| db.assign_albedo(material, texture));
+        if let Some(Err(error)) = result {
+            log_error(
+                world,
+                format!("albedo on entity {}: {error}", entity.index()),
+            );
+        }
+    }
+}
+
+/// Point `entity`'s mesh at asset `id` through the registry's diff and apply,
+/// like any other inspector edit, so an asset that is not a mesh is refused by
+/// name rather than drawn as one.
+fn assign_mesh(world: &mut World, registry: &Registry, entity: Entity, id: AssetId) {
+    let Some(vtable) = registry.get(&crate::scene::registry::MESH) else {
+        return;
+    };
+    let after = orrin_registry::Value::Asset(id);
+    let result = match vtable.read(world, entity) {
+        Some(before) => vtable
+            .apply(world, entity, &orrin_registry::diff(&before, &after))
+            .map_err(|error| error.to_string()),
+        None => vtable
+            .write(world, entity, &after)
+            .map_err(|error| error.to_string()),
+    };
+    if let Err(error) = result {
+        log_error(
+            world,
+            format!("{} on entity {}: {error}", vtable.id, entity.index()),
+        );
+    }
+}
+
+fn log_error(world: &World, message: String) {
+    let frame = world
+        .get_resource::<Time>()
+        .map_or(0, |time| time.frame_count());
+    if let Some(mut log) = world.get_resource_mut::<LogBuffer>() {
+        log.push(LogLevel::Error, message, frame);
+    }
+}
+
+/// Take an asset dropped on `slot`, if one was.
+fn take_drop(slot: &egui::Response, dropped: &mut Option<AssetId>) {
+    if !egui::DragAndDrop::has_payload_of_type::<AssetId>(&slot.ctx) {
+        return;
+    }
+    if let Some(id) = slot.dnd_release_payload::<AssetId>() {
+        *dropped = Some(*id);
+    }
+}
+
+/// The file name of the asset a database-issued handle draws, for a slot that
+/// names it.
+fn database_name(world: &World, id: Option<AssetId>) -> Option<String> {
+    let db = world.get_resource::<AssetDatabase>()?;
+    db.get(id?).map(|entry| entry.name().to_owned())
 }
 
 /// One choice in a picker: the asset's name, its handle, and the text the
@@ -720,13 +793,15 @@ fn picker<H: Copy + PartialEq>(
     id: &str,
     choices: Vec<Choice<H>>,
     current: Option<H>,
+    fallback: Option<String>,
     slot: impl FnOnce(&mut egui::Ui, &str) -> egui::Response,
     thumbnail: &mut dyn FnMut(&egui::Context, H) -> Option<egui::TextureHandle>,
 ) -> Option<H> {
     let name = current
         .and_then(|h| choices.iter().find(|choice| choice.handle == h))
-        .map_or("—", |choice| choice.name.as_str())
-        .to_owned();
+        .map(|choice| choice.name.clone())
+        .or(fallback)
+        .unwrap_or_else(|| "—".to_owned());
     let response = slot(ui, &name);
     let popup = ui.make_persistent_id(("picker", id));
     if response.clicked() {
@@ -797,6 +872,7 @@ fn mesh_picker(
     world: &World,
     entity: Entity,
     previews: &mut Previews,
+    dropped: &mut Option<AssetId>,
 ) -> Option<MeshHandle> {
     let mut choices: Vec<Choice<MeshHandle>> = world
         .resource::<Assets>()
@@ -812,13 +888,22 @@ fn mesh_picker(
     let subtitle = current
         .and_then(|handle| previews.mesh_summary(world, handle))
         .unwrap_or_default();
+    let imported = current.and_then(|handle| {
+        let id = world.get_resource::<AssetDatabase>()?.mesh_id(handle);
+        database_name(world, id)
+    });
 
     picker(
         ui,
         "mesh",
         choices,
         current,
-        |ui, name| widgets::asset_slot(ui, texture.as_ref(), icons::box_(), name, &subtitle),
+        imported,
+        |ui, name| {
+            let slot = widgets::asset_slot(ui, texture.as_ref(), icons::box_(), name, &subtitle);
+            take_drop(&slot, dropped);
+            slot.on_hover_text("Click to pick an engine mesh, or drop a mesh asset here")
+        },
         &mut |ctx, handle| previews.mesh(ctx, world, handle),
     )
 }
@@ -828,6 +913,7 @@ fn material_picker(
     world: &World,
     entity: Entity,
     previews: &mut Previews,
+    dropped: &mut Option<AssetId>,
 ) -> Option<MaterialHandle> {
     let mut choices: Vec<Choice<MaterialHandle>> = world
         .resource::<Assets>()
@@ -849,7 +935,18 @@ fn material_picker(
         "material",
         choices,
         current,
-        |ui, name| widgets::asset_slot(ui, texture.as_ref(), icons::palette(), name, &subtitle),
+        None,
+        |ui, name| {
+            let slot = widgets::asset_slot(ui, texture.as_ref(), icons::palette(), name, &subtitle);
+            if world.get_resource::<AssetDatabase>().is_none() {
+                return slot;
+            }
+            take_drop(&slot, dropped);
+            slot.on_hover_text(
+                "Click to pick a material, or drop a texture asset here to use it as this \
+                 material's albedo for the session",
+            )
+        },
         &mut |ctx, handle| previews.material(ctx, world, handle),
     )
 }
@@ -1188,6 +1285,50 @@ mod tests {
             generic,
             ["orrin.tag", "orrin.collider", "orrin.spin"],
             "registration order changed, or a component gained/lost a section"
+        );
+    }
+
+    /// A dropped asset goes through the registry like any other edit, so an
+    /// asset that is not a mesh is refused by its path and the mesh stays.
+    #[test]
+    fn a_dropped_mesh_asset_is_assigned_and_anything_else_is_refused_by_name() {
+        let registry = registry();
+        let dir = crate::asset_db::tests::Dir::new("inspector-drop");
+        dir.write("rock.png", b"");
+        dir.write("tree.glb", b"");
+        let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let rock = db.find("rock.png").unwrap().id;
+        let tree = db.find("tree.glb").unwrap().id;
+
+        let mut world = World::new();
+        world.insert_resource(db);
+        world.insert_resource(LogBuffer::default());
+        let mut assets = Assets::new();
+        assets.insert_mesh("cube", MeshHandle(0));
+        world.insert_resource(assets);
+        let entity = world.spawn();
+        world.insert(entity, MeshHandle(0));
+
+        assign_mesh(&mut world, &registry, entity, rock);
+        assert_eq!(*world.get::<MeshHandle>(entity).unwrap(), MeshHandle(0));
+        let logged: Vec<String> = world
+            .resource::<LogBuffer>()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        assert_eq!(
+            logged,
+            [format!(
+                "orrin.mesh on entity {}: expected a mesh asset, found `rock.png`, which is a texture",
+                entity.index()
+            )]
+        );
+
+        assign_mesh(&mut world, &registry, entity, tree);
+        let handle = *world.get::<MeshHandle>(entity).unwrap();
+        assert_eq!(
+            world.resource::<AssetDatabase>().mesh_id(handle),
+            Some(tree)
         );
     }
 

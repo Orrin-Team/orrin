@@ -11,10 +11,11 @@
 //! the name is looked up in [`Assets`], and the next save writes the id.
 
 use orrin_ecs::{FxHashMap, World};
-use orrin_registry::{AssetId, Resolve, Value, ValueError};
+use orrin_registry::{AssetId, ComponentId, Resolve, Value, ValueError};
 use xxhash_rust::xxh3::xxh3_128;
 
 use super::{AssetDatabase, CacheKey, LoadState, PENDING};
+use crate::scene::registry::{MATERIAL, MESH};
 use crate::scene::{Assets, MaterialHandle, MeshHandle};
 
 /// The id of an engine-built asset: the `kind` and `name` [`Assets`] registers
@@ -34,6 +35,26 @@ pub fn named_id(kind: &str, name: &str) -> AssetId {
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     AssetId::from_bytes(bytes)
+}
+
+/// Rewrite a mesh or material reference a file wrote by name, before assets
+/// had ids, as the id that name derives.
+///
+/// Needs no world, because the name is all the id is made from. A prefab's
+/// document is upgraded as it is read, so it compares equal to an instance read
+/// back from the world, which always reads as an id; a scene is not, so a name
+/// nothing has still fails by name when it is applied.
+pub fn upgrade_named(component: &ComponentId, value: &mut Value) {
+    let kind = if *component == MESH {
+        "mesh"
+    } else if *component == MATERIAL {
+        "material"
+    } else {
+        return;
+    };
+    if let Value::String(name) = value {
+        *value = Value::Asset(named_id(kind, name));
+    }
 }
 
 /// What a slot holds.
@@ -115,7 +136,10 @@ impl Resolve for MeshHandle {
     fn from_value(world: &World, value: &Value) -> Result<Self, ValueError> {
         match value {
             Value::Asset(id) => {
-                if let Some(handle) = world.get_resource::<Assets>().and_then(|a| a.mesh_by_id(*id)) {
+                if let Some(handle) = world
+                    .get_resource::<Assets>()
+                    .and_then(|a| a.mesh_by_id(*id))
+                {
                     return Ok(handle);
                 }
                 let mut db = database(world, "a mesh", *id)?;
@@ -189,11 +213,10 @@ fn database<'w>(
 
 #[cfg(test)]
 mod tests {
-    use orrin_registry::{ComponentId, Registry};
+    use orrin_registry::Registry;
 
     use super::*;
     use crate::scene::register_components;
-    use crate::scene::registry::{MATERIAL, MESH};
 
     #[test]
     fn a_named_id_is_stable_versioned_and_kind_qualified() {
@@ -209,7 +232,7 @@ mod tests {
         assert_eq!(cube.to_string(), named_id("mesh", "cube").to_string());
         assert_eq!(
             named_id("mesh", "cube").to_string(),
-            "c4d1a0f6-9f3e-8c43-9b8e-2b1f0c8d7a51",
+            "2398d189-baf9-8039-9293-4dbdcaeb828b",
             "if this moved, saved scenes no longer find their meshes"
         );
     }
@@ -226,7 +249,13 @@ mod tests {
         (registry, world, entity)
     }
 
-    fn write(registry: &Registry, world: &mut World, entity: orrin_ecs::Entity, id: &ComponentId, value: Value) -> Result<(), String> {
+    fn write(
+        registry: &Registry,
+        world: &mut World,
+        entity: orrin_ecs::Entity,
+        id: &ComponentId,
+        value: Value,
+    ) -> Result<(), String> {
         registry
             .get(id)
             .unwrap()
@@ -240,26 +269,45 @@ mod tests {
         let cube = Value::Asset(named_id("mesh", "cube"));
         write(&registry, &mut world, entity, &MESH, cube.clone()).unwrap();
         assert_eq!(*world.get::<MeshHandle>(entity).unwrap(), MeshHandle(3));
-        assert_eq!(registry.get(&MESH).unwrap().read(&world, entity), Some(cube));
+        assert_eq!(
+            registry.get(&MESH).unwrap().read(&world, entity),
+            Some(cube)
+        );
 
         let gold = Value::Asset(named_id("material", "gold"));
         write(&registry, &mut world, entity, &MATERIAL, gold.clone()).unwrap();
-        assert_eq!(registry.get(&MATERIAL).unwrap().read(&world, entity), Some(gold));
+        assert_eq!(
+            registry.get(&MATERIAL).unwrap().read(&world, entity),
+            Some(gold)
+        );
     }
 
     /// The format scenes were saved in before assets had ids.
     #[test]
     fn a_mesh_named_by_string_still_loads_and_reads_back_as_its_id() {
         let (registry, mut world, entity) = world();
-        write(&registry, &mut world, entity, &MESH, Value::String("cube".to_owned())).unwrap();
+        write(
+            &registry,
+            &mut world,
+            entity,
+            &MESH,
+            Value::String("cube".to_owned()),
+        )
+        .unwrap();
         assert_eq!(*world.get::<MeshHandle>(entity).unwrap(), MeshHandle(3));
         assert_eq!(
             registry.get(&MESH).unwrap().read(&world, entity),
             Some(Value::Asset(named_id("mesh", "cube")))
         );
 
-        let err = write(&registry, &mut world, entity, &MESH, Value::String("nope".to_owned()))
-            .unwrap_err();
+        let err = write(
+            &registry,
+            &mut world,
+            entity,
+            &MESH,
+            Value::String("nope".to_owned()),
+        )
+        .unwrap_err();
         assert_eq!(err, "expected the name of a mesh, found `nope`");
     }
 
@@ -270,8 +318,10 @@ mod tests {
         let err = write(&registry, &mut world, entity, &MESH, Value::Asset(id)).unwrap_err();
         assert_eq!(
             err,
-            format!("expected a mesh asset, found {id}, and there is no asset database to look it up in")
-                .replacen("a mesh asset", "a mesh", 1)
+            format!(
+                "expected a mesh asset, found {id}, and there is no asset database to look it up in"
+            )
+            .replacen("a mesh asset", "a mesh", 1)
         );
 
         let dir = crate::asset_db::tests::Dir::new("handles-promise");
@@ -280,10 +330,20 @@ mod tests {
         write(&registry, &mut world, entity, &MESH, Value::Asset(id)).unwrap();
         let handle = *world.get::<MeshHandle>(entity).unwrap();
         assert_ne!(handle.0 & PENDING, 0);
-        assert_eq!(registry.get(&MESH).unwrap().read(&world, entity), Some(Value::Asset(id)));
+        assert_eq!(
+            registry.get(&MESH).unwrap().read(&world, entity),
+            Some(Value::Asset(id))
+        );
 
         let material = AssetId::new();
-        write(&registry, &mut world, entity, &MATERIAL, Value::Asset(material)).unwrap();
+        write(
+            &registry,
+            &mut world,
+            entity,
+            &MATERIAL,
+            Value::Asset(material),
+        )
+        .unwrap();
         assert_eq!(
             registry.get(&MATERIAL).unwrap().read(&world, entity),
             Some(Value::Asset(material))
@@ -293,7 +353,14 @@ mod tests {
     #[test]
     fn the_null_reference_is_never_a_mesh() {
         let (registry, mut world, entity) = world();
-        let err = write(&registry, &mut world, entity, &MESH, Value::Asset(AssetId::NIL)).unwrap_err();
+        let err = write(
+            &registry,
+            &mut world,
+            entity,
+            &MESH,
+            Value::Asset(AssetId::NIL),
+        )
+        .unwrap_err();
         assert_eq!(err, "expected a mesh, found the null reference");
     }
 

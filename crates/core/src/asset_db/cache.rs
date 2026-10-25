@@ -28,6 +28,9 @@
 //! variant and [`FORMAT`] moves, which reimports everything once.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::gfx::Vertex;
 use crate::scene::CpuMesh;
@@ -60,8 +63,31 @@ pub struct Importer {
 /// Every field is length-prefixed, so no two different input lists can hash
 /// the same stream.
 pub fn key(importer: Importer, settings: &str, inputs: &[(&str, &[u8])]) -> CacheKey {
-    todo!("{importer:?} {settings} {}", inputs.len())
+    let mut hasher = Xxh3::new();
+    let mut field = |bytes: &[u8]| {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    field(&FORMAT.to_le_bytes());
+    field(importer.name.as_bytes());
+    field(&importer.version.to_le_bytes());
+    field(settings.as_bytes());
+    field(&(inputs.len() as u64).to_le_bytes());
+    for (name, bytes) in inputs {
+        field(name.as_bytes());
+        field(bytes);
+    }
+    CacheKey(hasher.digest128())
 }
+
+/// What every artifact file starts with.
+const MAGIC: &[u8; 4] = b"ORRA";
+const TEXTURE: u8 = 1;
+const MESH: u8 = 2;
+/// Magic, format, kind and three bytes of padding.
+const HEADER: usize = 12;
+/// `f32`s per vertex: position, normal, colour, uv, tangent.
+const VERTEX_FLOATS: usize = 15;
 
 /// A decoded texture, tightly packed RGBA8 from the top-left.
 #[derive(Clone, Debug, PartialEq)]
@@ -78,16 +104,121 @@ pub enum Artifact {
     Mesh(CpuMesh),
 }
 
+impl std::fmt::Debug for Artifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Texture(t) => write!(f, "Texture({}x{})", t.width, t.height),
+            Self::Mesh(m) => write!(
+                f,
+                "Mesh({} vertices, {} indices)",
+                m.vertices.len(),
+                m.indices.len()
+            ),
+        }
+    }
+}
+
 impl Artifact {
     pub fn encode(&self) -> Vec<u8> {
-        todo!()
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&FORMAT.to_le_bytes());
+        match self {
+            Self::Texture(texture) => {
+                out.extend_from_slice(&[TEXTURE, 0, 0, 0]);
+                out.extend_from_slice(&texture.width.to_le_bytes());
+                out.extend_from_slice(&texture.height.to_le_bytes());
+                out.extend_from_slice(&texture.pixels);
+            }
+            Self::Mesh(mesh) => {
+                out.extend_from_slice(&[MESH, 0, 0, 0]);
+                out.extend_from_slice(&(mesh.vertices.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(mesh.indices.len() as u32).to_le_bytes());
+                out.reserve(mesh.vertices.len() * VERTEX_FLOATS * 4 + mesh.indices.len() * 4);
+                for vertex in &mesh.vertices {
+                    for float in vertex_floats(vertex) {
+                        out.extend_from_slice(&float.to_le_bytes());
+                    }
+                }
+                for index in &mesh.indices {
+                    out.extend_from_slice(&index.to_le_bytes());
+                }
+            }
+        }
+        out
     }
 
     /// Read an artifact back. A file that is short, from another layout or
     /// otherwise not one of ours is an error, never a panic: the directory is
     /// one a person can delete files from by hand.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        todo!("{}", bytes.len())
+        if bytes.len() < 4 || &bytes[..4] != MAGIC {
+            return Err("not an Orrin cache artifact".to_owned());
+        }
+        let mut reader = Reader { bytes, at: 4 };
+        let format = reader.u32()?;
+        if format != FORMAT {
+            return Err(format!(
+                "written by artifact format {format}, and this engine reads format {FORMAT}"
+            ));
+        }
+        let kind = reader.take(4)?[0];
+        debug_assert_eq!(reader.at, HEADER);
+        let artifact = match kind {
+            TEXTURE => {
+                let width = reader.u32()?;
+                let height = reader.u32()?;
+                let len = (width as usize)
+                    .checked_mul(height as usize)
+                    .and_then(|texels| texels.checked_mul(4))
+                    .ok_or_else(cut_short)?;
+                let pixels = reader.take(len)?.to_vec();
+                Self::Texture(TextureArtifact {
+                    width,
+                    height,
+                    pixels,
+                })
+            }
+            MESH => {
+                let vertex_count = reader.u32()? as usize;
+                let index_count = reader.u32()? as usize;
+                let floats = reader.take(
+                    vertex_count
+                        .checked_mul(VERTEX_FLOATS * 4)
+                        .ok_or_else(cut_short)?,
+                )?;
+                let vertices = floats
+                    .as_chunks::<{ VERTEX_FLOATS * 4 }>()
+                    .0
+                    .iter()
+                    .map(|chunk| {
+                        let f = |i: usize| {
+                            f32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap())
+                        };
+                        Vertex {
+                            position: [f(0), f(1), f(2)],
+                            normal: [f(3), f(4), f(5)],
+                            color: [f(6), f(7), f(8)],
+                            uv: [f(9), f(10)],
+                            tangent: [f(11), f(12), f(13), f(14)],
+                        }
+                    })
+                    .collect();
+                let indices = reader
+                    .take(index_count.checked_mul(4).ok_or_else(cut_short)?)?
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| u32::from_le_bytes(*chunk))
+                    .collect();
+                Self::Mesh(CpuMesh::new(vertices, indices))
+            }
+            other => return Err(format!("holds an artifact of unknown kind {other}")),
+        };
+        if reader.at != bytes.len() {
+            return Err("has bytes past the end of its artifact".to_owned());
+        }
+        Ok(artifact)
     }
 }
 
@@ -112,14 +243,68 @@ impl Cache {
 
     /// `None` when there is no artifact for `key`.
     pub fn load(&self, key: CacheKey) -> Option<Result<Artifact, String>> {
-        todo!("{key}")
+        match std::fs::read(self.path(key)) {
+            Ok(bytes) => Some(Artifact::decode(&bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(Err(error.to_string())),
+        }
     }
 
     /// Write `artifact` under `key`, through a temporary file and a rename, so
     /// a crash or a second process never leaves a half-written artifact under
     /// a name a later run would trust.
     pub fn store(&self, key: CacheKey, artifact: &Artifact) -> Result<(), String> {
-        todo!("{key} {}", artifact.encode().len())
+        static TEMPORARY: AtomicU32 = AtomicU32::new(0);
+        let failed = |error: std::io::Error| {
+            format!(
+                "could not write to the asset cache {}: {error}",
+                self.dir.display()
+            )
+        };
+        std::fs::create_dir_all(&self.dir).map_err(failed)?;
+        let temporary = self.dir.join(format!(
+            ".{key}.{}-{}",
+            std::process::id(),
+            TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&temporary, artifact.encode()).map_err(failed)?;
+        std::fs::rename(&temporary, self.path(key)).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            failed(error)
+        })
+    }
+}
+
+fn vertex_floats(vertex: &Vertex) -> impl Iterator<Item = f32> + '_ {
+    vertex
+        .position
+        .into_iter()
+        .chain(vertex.normal)
+        .chain(vertex.color)
+        .chain(vertex.uv)
+        .chain(vertex.tangent)
+}
+
+fn cut_short() -> String {
+    "is cut short".to_owned()
+}
+
+/// A cursor over an artifact that fails rather than panics past the end.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self.at.checked_add(len).ok_or_else(cut_short)?;
+        let slice = self.bytes.get(self.at..end).ok_or_else(cut_short)?;
+        self.at = end;
+        Ok(slice)
+    }
+
+    fn u32(&mut self) -> Result<u32, String> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 }
 
@@ -142,10 +327,7 @@ mod tests {
             key(PNG, "srgb=true", &[("rock.png", b"abd")]),
             key(PNG, "srgb=false", &[("rock.png", b"abc")]),
             key(
-                Importer {
-                    version: 2,
-                    ..PNG
-                },
+                Importer { version: 2, ..PNG },
                 "srgb=true",
                 &[("rock.png", b"abc")],
             ),
@@ -186,7 +368,10 @@ mod tests {
             uv: [x, 0.75],
             tangent: [1.0, 0.0, 0.0, -1.0],
         };
-        CpuMesh::new(vec![vertex(0.0), vertex(1.0), vertex(f32::MIN_POSITIVE)], vec![0, 1, 2])
+        CpuMesh::new(
+            vec![vertex(0.0), vertex(1.0), vertex(f32::MIN_POSITIVE)],
+            vec![0, 1, 2],
+        )
     }
 
     #[test]
@@ -196,15 +381,16 @@ mod tests {
             height: 1,
             pixels: vec![1, 2, 3, 4, 250, 251, 252, 253],
         };
-        let Artifact::Texture(back) = Artifact::decode(&Artifact::Texture(texture.clone()).encode())
-            .unwrap()
+        let Artifact::Texture(back) =
+            Artifact::decode(&Artifact::Texture(texture.clone()).encode()).unwrap()
         else {
             panic!("a texture decodes as a texture");
         };
         assert_eq!(back, texture);
 
         let mesh = triangle();
-        let Artifact::Mesh(back) = Artifact::decode(&Artifact::Mesh(mesh.clone()).encode()).unwrap()
+        let Artifact::Mesh(back) =
+            Artifact::decode(&Artifact::Mesh(mesh.clone()).encode()).unwrap()
         else {
             panic!("a mesh decodes as a mesh");
         };

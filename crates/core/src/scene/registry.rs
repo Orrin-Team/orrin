@@ -1,6 +1,6 @@
 use orrin_registry::{ComponentId, Registry};
 
-use super::{Collider, Light, LocalTransform, Name, Spin, Tag};
+use super::{Collider, Light, LocalTransform, MaterialHandle, MeshHandle, Name, Spin, Tag};
 
 pub const TRANSFORM: ComponentId = ComponentId::new("orrin.transform");
 pub const NAME: ComponentId = ComponentId::new("orrin.name");
@@ -9,14 +9,11 @@ pub const LIGHT: ComponentId = ComponentId::new("orrin.light");
 pub const COLLIDER: ComponentId = ComponentId::new("orrin.collider");
 pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
 
-/// Reserved, not registered. `MeshHandle` and `MaterialHandle` are upload
-/// indices, so a scene stores the asset's *name* instead — a translation that
-/// needs the `Assets` resource, which `Reflect::to_value` deliberately cannot
-/// reach. `scene::persist` does it one level up, where the world is in scope.
-///
-/// The ids live here anyway so the namespace stays auditable in one place, and
-/// so that when assets gain stable ids these two can register properly and take
-/// the same ids — scenes written today keep parsing.
+/// `MeshHandle` and `MaterialHandle` are upload indices, so a scene stores the
+/// asset's [`AssetId`](orrin_registry::AssetId) instead — a translation that
+/// needs the world, which `Reflect::to_value` deliberately cannot reach. They
+/// register through `Resolve` (see `asset_db::handles`), under the ids scenes
+/// stored their names under before assets had ids, so those scenes still load.
 pub const MESH: ComponentId = ComponentId::new("orrin.mesh");
 pub const MATERIAL: ComponentId = ComponentId::new("orrin.material");
 
@@ -41,12 +38,9 @@ pub const PREFAB: ComponentId = ComponentId::new("orrin.prefab");
 /// whole situation this exists for.
 ///
 /// Deliberately absent for now:
-/// - `MeshHandle` / `MaterialHandle` index a runtime asset table, so writing
-///   one to disk would bake a session-local number into a scene. They register
-///   once assets have stable ids.
 /// - `Decal` names its three maps by `TextureHandle`, which is an upload index
-///   and so session-local for exactly the reason the two handles above are. It
-///   registers alongside them, once assets have stable ids.
+///   and so session-local for exactly the reason `MeshHandle` is. It registers
+///   once it holds texture asset ids.
 /// - `ScriptComponent` owns a `GCHandle` whose `Drop` is the single managed
 ///   teardown path. It joins as a *bridge* to the C# property bag, never as an
 ///   ordinary component — a registry `write` replaces the component wholesale,
@@ -66,6 +60,8 @@ pub fn register_components(registry: &mut Registry) {
     registry.register::<Light>(LIGHT, "Light");
     registry.register::<Collider>(COLLIDER, "Collider");
     registry.register::<Spin>(SPIN, "Spin");
+    registry.register_resolved::<MeshHandle>(MESH, "Mesh");
+    registry.register_resolved::<MaterialHandle>(MATERIAL, "Material");
     registry.end_engine_registration();
 }
 

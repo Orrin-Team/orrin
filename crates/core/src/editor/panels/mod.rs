@@ -768,6 +768,32 @@ mod tests {
         assert!(editor.painted_contains("props"), "the folder it is in");
     }
 
+    /// With a project, the browser opens on the assets directory's folders and
+    /// says how many imports failed, so a broken file is seen without opening
+    /// the console.
+    #[test]
+    fn the_assets_tool_browses_the_projects_folders_and_counts_failures() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let dir = crate::asset_db::tests::Dir::new("panel-browser");
+        dir.write("props/door.fprefab", b"orrin-scene 1\n");
+        dir.write("rocks/bad.png", b"not a png");
+        let (mut db, _) =
+            crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        assert!(db.wait_idle(std::time::Duration::from_secs(20)));
+        db.update(&editor.world, &mut crate::gfx::HeadlessBackend::new());
+        editor.world.insert_resource(db);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+
+        assert!(editor.painted_contains("props"));
+        assert!(editor.painted_contains("rocks"));
+        assert!(editor.painted_contains("1 failed"));
+        assert!(
+            !editor.painted_contains("door"),
+            "inside a folder, not at the root"
+        );
+    }
+
     /// The gesture the issue asks for: drag a prefab out of the browser and let
     /// go over an entity, and the instance lands under it, selected.
     #[test]

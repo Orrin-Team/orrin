@@ -15,11 +15,12 @@
 
 use std::path::Path;
 
-use glam::{Mat3, Mat4, Quat, Vec3, Vec4};
+use glam::{Mat3, Mat4, Vec3, Vec4};
 
 use super::cache::{Artifact, Importer, TextureArtifact};
 use super::sidecar::{AssetKind, MeshSettings, Settings, TextureSettings};
 use crate::scene::CpuMesh;
+use crate::scene::model::{import_primitive, percent_decode};
 
 pub const TEXTURE: Importer = Importer {
     name: "texture",
@@ -47,7 +48,25 @@ pub fn read_inputs(
     source: &Path,
     rel: &str,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    todo!("{kind:?} {} {rel}", source.display())
+    let bytes =
+        std::fs::read(source).map_err(|error| format!("{rel} could not be read: {error}"))?;
+    let mut inputs = Vec::new();
+    if kind == AssetKind::Mesh {
+        let document = parse_gltf(rel, &bytes)?.document;
+        let base = source.parent().unwrap_or(Path::new("."));
+        for buffer in document.buffers() {
+            let gltf::buffer::Source::Uri(uri) = buffer.source() else {
+                continue;
+            };
+            let name = buffer_name(rel, uri)?;
+            let read = std::fs::read(base.join(&name)).map_err(|error| {
+                format!("{rel} reads `{uri}`, which could not be read: {error}")
+            })?;
+            inputs.push((name, read));
+        }
+    }
+    inputs.insert(0, (rel.to_owned(), bytes));
+    Ok(inputs)
 }
 
 /// Build `kind`'s artifact from what [`read_inputs`] read.
@@ -57,7 +76,185 @@ pub fn import(
     settings: &Settings,
     inputs: &[(String, Vec<u8>)],
 ) -> Result<Artifact, String> {
-    todo!("{kind:?} {rel} {settings:?} {}", inputs.len())
+    match (kind, settings) {
+        (AssetKind::Texture, Settings::Texture(settings)) => {
+            texture(rel, settings, &inputs[0].1).map(Artifact::Texture)
+        }
+        (AssetKind::Mesh, Settings::Mesh(settings)) => {
+            mesh(rel, settings, inputs).map(Artifact::Mesh)
+        }
+        _ => Err(format!(
+            "{rel} is a {}, which is not imported",
+            kind.label()
+        )),
+    }
+}
+
+fn texture(rel: &str, settings: &TextureSettings, bytes: &[u8]) -> Result<TextureArtifact, String> {
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|error| format!("{rel} is not a PNG or JPEG this engine can decode: {error}"))?;
+    let mut rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let longest = width.max(height);
+    if settings.max_size > 0 && longest > settings.max_size {
+        let fit = |side: u32| {
+            ((u64::from(side) * u64::from(settings.max_size)) / u64::from(longest)).max(1) as u32
+        };
+        rgba = shrink(&rgba, fit(width), fit(height), settings.srgb);
+    }
+    let (width, height) = rgba.dimensions();
+    Ok(TextureArtifact {
+        width,
+        height,
+        pixels: rgba.into_raw(),
+    })
+}
+
+/// Resize in linear light: a colour texture is decoded from sRGB first, so
+/// averaging texels averages light rather than encoded values. Alpha and a
+/// data texture's channels are linear already.
+fn shrink(image: &image::RgbaImage, width: u32, height: u32, srgb: bool) -> image::RgbaImage {
+    let filter = image::imageops::FilterType::Triangle;
+    if !srgb {
+        return image::imageops::resize(image, width, height, filter);
+    }
+    let linear = image::Rgba32FImage::from_fn(image.width(), image.height(), |x, y| {
+        let [r, g, b, a] = image.get_pixel(x, y).0;
+        image::Rgba([
+            to_linear(r),
+            to_linear(g),
+            to_linear(b),
+            f32::from(a) / 255.0,
+        ])
+    });
+    let small = image::imageops::resize(&linear, width, height, filter);
+    image::RgbaImage::from_fn(width, height, |x, y| {
+        let [r, g, b, a] = small.get_pixel(x, y).0;
+        image::Rgba([
+            to_srgb(r),
+            to_srgb(g),
+            to_srgb(b),
+            (a * 255.0).round().clamp(0.0, 255.0) as u8,
+        ])
+    })
+}
+
+fn to_linear(code: u8) -> f32 {
+    let c = f32::from(code) / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn to_srgb(linear: f32) -> u8 {
+    let l = linear.clamp(0.0, 1.0);
+    let c = if l <= 0.003_130_8 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    };
+    (c * 255.0).round() as u8
+}
+
+fn parse_gltf(rel: &str, bytes: &[u8]) -> Result<gltf::Gltf, String> {
+    gltf::Gltf::from_slice(bytes).map_err(|error| format!("{rel} is not a glTF 2.0 file: {error}"))
+}
+
+/// The file a buffer URI names, relative to the glTF's directory.
+fn buffer_name(rel: &str, uri: &str) -> Result<String, String> {
+    if uri.starts_with("data:") {
+        return Err(format!(
+            "{rel} embeds a buffer as a `data:` URI, which is not supported; export it as a \
+             .glb, or as a .gltf beside its .bin"
+        ));
+    }
+    Ok(percent_decode(uri))
+}
+
+fn mesh(
+    rel: &str,
+    settings: &MeshSettings,
+    inputs: &[(String, Vec<u8>)],
+) -> Result<CpuMesh, String> {
+    let gltf::Gltf { document, mut blob } = parse_gltf(rel, &inputs[0].1)?;
+    let buffers = document
+        .buffers()
+        .map(|buffer| match buffer.source() {
+            gltf::buffer::Source::Bin => blob
+                .take()
+                .ok_or_else(|| format!("{rel} names the GLB binary chunk, but the file has none")),
+            gltf::buffer::Source::Uri(uri) => {
+                let name = buffer_name(rel, uri)?;
+                inputs[1..]
+                    .iter()
+                    .find(|(input, _)| *input == name)
+                    .map(|(_, bytes)| bytes.clone())
+                    .ok_or_else(|| format!("{rel} reads `{uri}`, which was not read with it"))
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let roots: Vec<gltf::Node> = match document
+        .default_scene()
+        .or_else(|| document.scenes().next())
+    {
+        Some(scene) => scene.nodes().collect(),
+        None => Vec::new(),
+    };
+    let mut merged = CpuMesh::default();
+    let scale = Mat4::from_scale(Vec3::splat(settings.scale));
+    let mut stack: Vec<(gltf::Node, Mat4)> = roots.into_iter().map(|node| (node, scale)).collect();
+    while let Some((node, parent)) = stack.pop() {
+        let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
+        if let Some(mesh) = node.mesh() {
+            for primitive in mesh.primitives() {
+                if primitive.mode() != gltf::mesh::Mode::Triangles {
+                    continue;
+                }
+                let part = import_primitive(&primitive, &buffers, 1.0);
+                append(&mut merged, part, world);
+            }
+        }
+        stack.extend(node.children().map(|child| (child, world)));
+    }
+    if merged.indices.is_empty() {
+        return Err(format!(
+            "{rel} draws no triangles: no node in its scene has a triangle mesh"
+        ));
+    }
+    Ok(merged)
+}
+
+/// Add `part`, drawn at `world`, to `into`.
+fn append(into: &mut CpuMesh, mut part: CpuMesh, world: Mat4) {
+    let linear = Mat3::from_mat4(world);
+    let normals = linear.inverse().transpose();
+    let mirrored = linear.determinant() < 0.0;
+    for vertex in &mut part.vertices {
+        vertex.position = world
+            .transform_point3(Vec3::from(vertex.position))
+            .to_array();
+        vertex.normal = (normals * Vec3::from(vertex.normal))
+            .normalize_or(Vec3::Y)
+            .to_array();
+        let tangent = Vec4::from(vertex.tangent);
+        let handedness = if mirrored { -tangent.w } else { tangent.w };
+        vertex.tangent = (linear * tangent.truncate())
+            .normalize_or(Vec3::X)
+            .extend(handedness)
+            .to_array();
+    }
+    if mirrored {
+        for triangle in part.indices.as_chunks_mut::<3>().0 {
+            triangle.swap(1, 2);
+        }
+    }
+    let base = into.vertices.len() as u32;
+    into.vertices.extend(part.vertices);
+    into.indices
+        .extend(part.indices.into_iter().map(|index| index + base));
 }
 
 #[cfg(test)]
@@ -67,7 +264,11 @@ pub(super) mod tests {
     use super::*;
     use crate::asset_db::tests::Dir;
 
-    pub(in crate::asset_db) fn png(width: u32, height: u32, pixel: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+    pub(in crate::asset_db) fn png(
+        width: u32,
+        height: u32,
+        pixel: impl Fn(u32, u32) -> [u8; 4],
+    ) -> Vec<u8> {
         let image = image::RgbaImage::from_fn(width, height, |x, y| image::Rgba(pixel(x, y)));
         let mut bytes = Cursor::new(Vec::new());
         image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
@@ -94,7 +295,13 @@ pub(super) mod tests {
 
     #[test]
     fn a_png_imports_as_rgba8_from_the_top_left() {
-        let bytes = png(2, 1, |x, _| if x == 0 { [255, 0, 0, 255] } else { [0, 0, 255, 128] });
+        let bytes = png(2, 1, |x, _| {
+            if x == 0 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 128]
+            }
+        });
         let texture = texture(bytes, AS_IS).unwrap();
         assert_eq!((texture.width, texture.height), (2, 1));
         assert_eq!(texture.pixels, vec![255, 0, 0, 255, 0, 0, 255, 128]);
@@ -132,20 +339,33 @@ pub(super) mod tests {
     /// average of the codes would give a visibly darker 128.
     #[test]
     fn a_colour_texture_is_filtered_in_linear_light() {
-        let stripes = png(2, 1, |x, _| if x == 0 { [0, 0, 0, 255] } else { [255, 255, 255, 255] });
+        let stripes = png(2, 1, |x, _| {
+            if x == 0 {
+                [0, 0, 0, 255]
+            } else {
+                [255, 255, 255, 255]
+            }
+        });
         let settings = TextureSettings {
             srgb: true,
             max_size: 1,
         };
         let texture = texture(stripes, settings).unwrap();
         assert_eq!((texture.width, texture.height), (1, 1));
-        assert!((186..=190).contains(&texture.pixels[0]), "{:?}", texture.pixels);
+        assert!(
+            (186..=190).contains(&texture.pixels[0]),
+            "{:?}",
+            texture.pixels
+        );
     }
 
     #[test]
     fn a_file_that_is_not_an_image_says_which_file() {
         let err = texture(b"definitely not a png".to_vec(), AS_IS).unwrap_err();
-        assert!(err.starts_with("rock.png is not a PNG or JPEG this engine can decode:"), "{err}");
+        assert!(
+            err.starts_with("rock.png is not a PNG or JPEG this engine can decode:"),
+            "{err}"
+        );
     }
 
     /// A triangle in an external buffer: positions, `u16` indices, then UVs.
@@ -268,7 +488,10 @@ pub(super) mod tests {
         let dir = Dir::new("import-missing-bin");
         let source = dir.write("tree.gltf", triangle_gltf("").as_bytes());
         let err = read_inputs(AssetKind::Mesh, &source, "tree.gltf").unwrap_err();
-        assert!(err.starts_with("tree.gltf reads `tri%20angle.bin`, which could not be read:"), "{err}");
+        assert!(
+            err.starts_with("tree.gltf reads `tri%20angle.bin`, which could not be read:"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -226,6 +226,7 @@ impl App {
         Self::install_default_resources(&mut app.world);
         app.load_input_config();
         app.load_prefabs();
+        app.open_asset_database();
 
         event_loop.run_app(&mut app).unwrap();
     }
@@ -341,6 +342,37 @@ impl App {
             tracing::info!("{count} prefab(s) under {}", dir.display());
         }
         self.world.insert_resource(prefabs);
+    }
+
+    /// Index and start importing the project's assets, and reimport them as
+    /// they change.
+    ///
+    /// Only for a project: the engine's own `assets/` holds the demo's
+    /// environment and the fetched Sponza, which the demo loads by path, and
+    /// indexing it would write a sidecar beside every file in a directory the
+    /// engine does not own. Opened here rather than with the default resources
+    /// for the reason the prefab scan is — the cold-start gate measures scene
+    /// construction, not the project's disk.
+    fn open_asset_database(&mut self) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let dir = project.assets_dir();
+        let (mut db, issues) =
+            crate::asset_db::AssetDatabase::open(&dir, crate::asset_db::cache_dir(Some(project)));
+        for issue in issues {
+            tracing::warn!("{issue}");
+        }
+        if dir.is_dir()
+            && let Err(error) = db.watch()
+        {
+            tracing::warn!("{error}; asset changes will need the browser's rescan button");
+        }
+        let count = db.iter().count();
+        if count > 0 {
+            tracing::info!("{count} asset(s) under {}", dir.display());
+        }
+        self.world.insert_resource(db);
     }
 
     /// Boot the script host and attach the project's entry Behaviour.
@@ -730,6 +762,15 @@ impl ApplicationHandler for App {
                 {
                     profile_scope!("propagate");
                     crate::scene::propagate_transforms(&mut self.world);
+                }
+
+                // After everything that can issue an asset handle — a scene the
+                // editor loaded, a mesh dropped in the inspector, the script
+                // tick — and before extraction, so no pending handle reaches a
+                // draw and a reimported asset draws from this frame on.
+                {
+                    profile_scope!("assets");
+                    crate::asset_db::service(&self.world, &mut active.renderer);
                 }
 
                 {

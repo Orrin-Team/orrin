@@ -47,7 +47,8 @@ impl Prefab {
         mut document: SceneDocument,
     ) -> Result<Self, String> {
         for entity in &mut document.entities {
-            for (_, value) in &mut entity.components {
+            for (component, value) in &mut entity.components {
+                crate::asset_db::upgrade_named(component, value);
                 super::canonical(value);
             }
         }

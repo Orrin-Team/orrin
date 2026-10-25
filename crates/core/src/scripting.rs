@@ -16,6 +16,7 @@ use orrin_ecs::{Entity, FxHashMap, World};
 use orrin_registry::{AssetId, ComponentId, Registry, ScriptBridge, Value, ValueError};
 use orrin_script::{CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi, ScriptHost};
 
+use crate::asset_db::{AssetDatabase, AssetKind, LoadState};
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::prefab::{self, Prefabs};
 use crate::scene::{
@@ -649,15 +650,52 @@ extern "C" fn find_asset(path: *const c_char, out: *mut u8) -> u32 {
     // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
     orrin_script::with_world(orrin_script::ASSET_NONE, |world| {
-        let Some(id) = world
-            .get_resource::<Prefabs>()
-            .and_then(|prefabs| prefabs.find(&path))
-        else {
+        let in_database = world.get_resource::<AssetDatabase>().and_then(|db| {
+            let entry = db.find(&path)?;
+            let kind = match entry.kind {
+                AssetKind::Prefab => orrin_script::ASSET_PREFAB,
+                AssetKind::Mesh => orrin_script::ASSET_MESH,
+                AssetKind::Texture => orrin_script::ASSET_TEXTURE,
+                AssetKind::Folder => return None,
+            };
+            Some((entry.id, kind))
+        });
+        // Without a project there is no database, and prefabs are indexed on
+        // their own.
+        let found = in_database.or_else(|| {
+            let id = world.get_resource::<Prefabs>()?.find(&path)?;
+            Some((id, orrin_script::ASSET_PREFAB))
+        });
+        let Some((id, kind)) = found else {
             return orrin_script::ASSET_NONE;
         };
         // SAFETY: `out` is the 16-byte buffer C# reserved for the id.
         unsafe { std::ptr::copy_nonoverlapping(id.to_bytes().as_ptr(), out, 16) };
-        orrin_script::ASSET_PREFAB
+        kind
+    })
+}
+
+extern "C" fn asset_state(id: *const u8) -> u32 {
+    if id.is_null() {
+        return orrin_script::LOAD_FAILED;
+    }
+    // SAFETY: `id` is the 16 bytes of an `AssetRef` C# holds.
+    let id = AssetId::from_bytes(unsafe { *id.cast::<[u8; 16]>() });
+    orrin_script::with_world(orrin_script::LOAD_FAILED, |world| {
+        let engine_built = world.get_resource::<Assets>().is_some_and(|assets| {
+            assets.mesh_by_id(id).is_some() || assets.material_by_id(id).is_some()
+        });
+        let indexed = world
+            .get_resource::<Prefabs>()
+            .is_some_and(|prefabs| prefabs.get(id).is_some());
+        if engine_built || indexed {
+            return orrin_script::LOAD_READY;
+        }
+        match world.get_resource::<AssetDatabase>().map(|db| db.state(id)) {
+            Some(LoadState::Loading) => orrin_script::LOAD_LOADING,
+            Some(LoadState::Ready) => orrin_script::LOAD_READY,
+            Some(LoadState::Failed) | None => orrin_script::LOAD_FAILED,
+        }
     })
 }
 
@@ -937,6 +975,7 @@ fn build_api() -> OrrinApi {
         log_event,
         find_asset,
         instantiate_prefab,
+        asset_state,
         ..orrin_script::default_api()
     }
 }
@@ -1766,5 +1805,53 @@ mod tests {
         assert_eq!((root.index, root.generation), (0, 0));
         assert_eq!(world.entities().count(), 0);
         assert!(COMMANDS.with(|c| c.borrow().is_empty()));
+    }
+
+    /// A project's textures and meshes are found by path like its prefabs, and
+    /// a script can ask whether one is drawable yet.
+    #[test]
+    fn a_script_finds_a_mesh_or_texture_by_path_and_reads_its_load_state() {
+        let dir = crate::asset_db::tests::Dir::new("script-assets");
+        dir.write("models/tree.glb", b"not a glb");
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        dir.write("rocks/rock.png", png.get_ref());
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let mut world = World::new();
+        world.insert_resource(db);
+
+        let find = |world: &mut World, path: &std::ffi::CStr| {
+            let mut out = [0u8; 16];
+            let kind = orrin_script::with_active_world(world, || {
+                find_asset(path.as_ptr(), out.as_mut_ptr())
+            });
+            (kind, AssetId::from_bytes(out))
+        };
+        let state = |world: &mut World, id: AssetId| {
+            let bytes = id.to_bytes();
+            orrin_script::with_active_world(world, || asset_state(bytes.as_ptr()))
+        };
+
+        let (kind, tree) = find(&mut world, c"models/tree.glb");
+        assert_eq!(kind, orrin_script::ASSET_MESH);
+        let (kind, rock) = find(&mut world, c"rocks/rock.png");
+        assert_eq!(kind, orrin_script::ASSET_TEXTURE);
+
+        let db = world.resource::<crate::asset_db::AssetDatabase>();
+        assert!(db.wait_idle(std::time::Duration::from_secs(20)));
+        drop(db);
+        world
+            .resource_mut::<crate::asset_db::AssetDatabase>()
+            .update(&world, &mut crate::gfx::HeadlessBackend::new());
+
+        assert_eq!(state(&mut world, rock), orrin_script::LOAD_READY);
+        assert_eq!(
+            state(&mut world, tree),
+            orrin_script::LOAD_FAILED,
+            "not a glb"
+        );
+        assert_eq!(state(&mut world, AssetId::new()), orrin_script::LOAD_FAILED);
     }
 }

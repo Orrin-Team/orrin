@@ -36,6 +36,9 @@ pub struct Job {
     pub settings: Settings,
     /// Whether to bring the artifact back, for an asset something is drawing.
     pub payload: bool,
+    /// The artifact the asset's slot already holds, which is not brought back
+    /// again.
+    pub known: Option<CacheKey>,
 }
 
 /// An artifact on its way to the GPU, with anything derived from it that is
@@ -64,11 +67,17 @@ pub struct Done {
 /// Run `job` against `cache`: read the inputs, hash them, and import only when
 /// the cache has no artifact under that key.
 ///
-/// An artifact that is in the cache but does not read is rebuilt rather than
+/// An artifact nothing is waiting for is only checked to exist, so a startup
+/// with everything cached reads sources and no artifacts. One that is in the
+/// cache but does not read is rebuilt when it is brought back, rather than
 /// trusted or reported, since a damaged cache file is never the user's problem.
 pub fn run(job: &Job, cache: &Cache) -> Result<Imported, String> {
     let Some(importer) = import::importer(job.kind) else {
-        return Err(format!("{} is a {}, which is not imported", job.rel, job.kind.label()));
+        return Err(format!(
+            "{} is a {}, which is not imported",
+            job.rel,
+            job.kind.label()
+        ));
     };
     let inputs = import::read_inputs(job.kind, &job.source, &job.rel)?;
     // The source is hashed under a fixed name, so renaming or moving a file
@@ -78,29 +87,45 @@ pub fn run(job: &Job, cache: &Cache) -> Result<Imported, String> {
         .iter()
         .enumerate()
         .map(|(index, (name, bytes))| {
-            (if index == 0 { "" } else { name.as_str() }, bytes.as_slice())
+            (
+                if index == 0 { "" } else { name.as_str() },
+                bytes.as_slice(),
+            )
         })
         .collect();
     let key = super::cache::key(importer, &job.settings.canonical(), &named);
+    let read = || {
+        inputs
+            .iter()
+            .skip(1)
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+
+    let wanted = job.payload && job.known != Some(key);
+    if !wanted && cache.path(key).is_file() {
+        return Ok(Imported {
+            key,
+            cached: true,
+            inputs: read(),
+            payload: None,
+        });
+    }
 
     let (artifact, cached) = match cache.load(key) {
-        Some(Ok(artifact)) => (Some(artifact), true),
-        Some(Err(_)) | None => (None, false),
-    };
-    let artifact = match artifact {
-        Some(artifact) => artifact,
-        None => {
+        Some(Ok(artifact)) => (artifact, true),
+        Some(Err(_)) | None => {
             let artifact = import::import(job.kind, &job.rel, &job.settings, &inputs)?;
             if let Err(error) = cache.store(key, &artifact) {
                 // Imported fine and only the write failed: the asset still
                 // loads, and the next run imports it again.
                 tracing::warn!("{}: {error}", job.rel);
             }
-            artifact
+            (artifact, false)
         }
     };
 
-    let payload = job.payload.then(|| match artifact {
+    let payload = wanted.then(|| match artifact {
         Artifact::Texture(texture) => Payload::Texture(texture),
         Artifact::Mesh(mesh) => {
             let preview = render_mesh(&mesh);
@@ -110,7 +135,7 @@ pub fn run(job: &Job, cache: &Cache) -> Result<Imported, String> {
     Ok(Imported {
         key,
         cached,
-        inputs: inputs.into_iter().skip(1).map(|(name, _)| name).collect(),
+        inputs: read(),
         payload,
     })
 }
@@ -201,7 +226,10 @@ fn serve(shared: &Shared, cache: &Cache, results: &Sender<Done>) {
                 if queue.closed {
                     return;
                 }
-                if let Some(job) = queue.urgent.pop_front().or_else(|| queue.background.pop_front())
+                if let Some(job) = queue
+                    .urgent
+                    .pop_front()
+                    .or_else(|| queue.background.pop_front())
                 {
                     break job;
                 }

@@ -1021,10 +1021,7 @@ mod tests {
             value: Value::String("third".to_owned()),
         }];
         let err = slot.apply(&mut world, entity, &unknown).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "expected a known name, found third"
-        );
+        assert_eq!(err.to_string(), "expected a known name, found third");
         assert_eq!(*world.get::<Slot>(entity).unwrap(), Slot(1));
     }
 }

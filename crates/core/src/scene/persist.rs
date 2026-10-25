@@ -10,8 +10,8 @@ use orrin_registry::{
 };
 
 use super::prefab::{PrefabInstance, Prefabs};
-use super::registry::{MATERIAL, MESH, PARENT, PREFAB};
-use super::{Assets, MaterialHandle, MeshHandle, Parent, UnknownComponents};
+use super::registry::{PARENT, PREFAB};
+use super::{Parent, UnknownComponents};
 
 /// A component a load could not apply. The data is preserved on the entity (see
 /// [`UnknownComponents`]); this is what the editor console should say about it.
@@ -71,7 +71,6 @@ pub(super) fn scene_entity(
         .filter_map(|c| c.read(world, entity).map(|value| (c.id.clone(), value)))
         .collect();
 
-    components.extend(asset_refs(world, entity));
     components.extend(parent_ref(world, entity));
 
     if let Some(unknown) = world.get::<UnknownComponents>(entity) {
@@ -308,9 +307,9 @@ pub(super) fn spawn(
     issues
 }
 
-/// Give `entity` one component from its file form: an asset reference by name,
-/// or a registered component through its vtable. Not the parent link, which
-/// needs every entity of a load spawned first.
+/// Give `entity` one registered component from its file form, through its
+/// vtable. Not the parent link, which needs every entity of a load spawned
+/// first.
 fn apply_component(
     world: &mut World,
     registry: &orrin_registry::Registry,
@@ -318,9 +317,6 @@ fn apply_component(
     id: &ComponentId,
     value: &Value,
 ) -> Result<(), String> {
-    if *id == MESH || *id == MATERIAL {
-        return apply_asset_ref(world, entity, id, value);
-    }
     match registry.get(id) {
         Some(vtable) => vtable
             .write(world, entity, value)
@@ -352,7 +348,7 @@ pub(super) fn write_component(
             .ok_or_else(|| format!("no entity has the id {parent_id}"))?;
         return super::reparent(world, entity, Some(parent), false).map_err(|e| e.to_string());
     }
-    if *id != MESH && *id != MATERIAL && registry.get(id).is_none() {
+    if registry.get(id).is_none() {
         remove_component(world, registry, entity, id);
         keep_unapplied(world, entity, (id.clone(), value.clone()));
         return Ok(());
@@ -369,10 +365,6 @@ pub(super) fn remove_component(
 ) {
     if *id == PARENT {
         let _ = super::reparent(world, entity, None, false);
-    } else if *id == MESH {
-        world.remove::<MeshHandle>(entity);
-    } else if *id == MATERIAL {
-        world.remove::<MaterialHandle>(entity);
     } else if let Some(vtable) = registry.get(id) {
         vtable.remove(world, entity);
     } else if let Some(mut unknown) = world.get_mut::<UnknownComponents>(entity) {
@@ -388,86 +380,6 @@ fn keep_unapplied(world: &mut World, entity: Entity, component: (ComponentId, Va
         return;
     }
     world.insert(entity, UnknownComponents(vec![component]));
-}
-
-/// Mesh and material references, stored by asset name rather than by handle.
-///
-/// A `MeshHandle` is an index into the backend's upload table: correct for the
-/// session that produced it and meaningless in any other. Writing one to disk
-/// would attach a scene to whatever happens to occupy that slot next time the
-/// assets are registered in a different order — wrong silently, with no error
-/// anywhere. The name is the only part that means the same thing twice.
-///
-/// This lives outside the registry because resolving a handle to a name needs
-/// the `Assets` resource, and `Reflect::to_value` sees only `&self`. That
-/// restriction is deliberate — it keeps conversions pure — so the translation
-/// happens here, where the world is in scope. It goes away when assets gain
-/// stable ids and these components can hold one directly.
-fn asset_refs(world: &World, entity: Entity) -> Vec<(ComponentId, Value)> {
-    let mesh = world.get::<MeshHandle>(entity).map(|h| *h);
-    let material = world.get::<MaterialHandle>(entity).map(|h| *h);
-    if mesh.is_none() && material.is_none() {
-        return Vec::new();
-    }
-    let Some(assets) = world.get_resource::<Assets>() else {
-        return Vec::new();
-    };
-
-    // A handle `Assets` cannot name was fabricated outside it, which nothing
-    // does; there is no id to write for it, so it is left out rather than
-    // written as a number that will mean something else later.
-    let mut refs = Vec::new();
-    if let Some(name) = mesh.and_then(|h| assets.mesh_name(h)) {
-        refs.push((MESH, Value::String(name.to_owned())));
-    }
-    if let Some(name) = material.and_then(|h| assets.material_name(h)) {
-        refs.push((MATERIAL, Value::String(name.to_owned())));
-    }
-    refs
-}
-
-fn apply_asset_ref(
-    world: &mut World,
-    entity: Entity,
-    id: &ComponentId,
-    value: &Value,
-) -> Result<(), String> {
-    let Value::String(name) = value else {
-        return Err(format!(
-            "expected an asset name, found {}",
-            value.type_name()
-        ));
-    };
-
-    // Resolved before inserting: the lookup borrows the `Assets` resource and
-    // the insert needs the world mutably.
-    let handle = {
-        let Some(assets) = world.get_resource::<Assets>() else {
-            return Err("no asset registry is loaded".to_owned());
-        };
-        if *id == MESH {
-            assets.mesh(name).map(Asset::Mesh)
-        } else {
-            assets.material(name).map(Asset::Material)
-        }
-    };
-
-    match handle {
-        Some(Asset::Mesh(handle)) => {
-            world.insert(entity, handle);
-            Ok(())
-        }
-        Some(Asset::Material(handle)) => {
-            world.insert(entity, handle);
-            Ok(())
-        }
-        None => Err(format!("no asset named `{name}`")),
-    }
-}
-
-enum Asset {
-    Mesh(MeshHandle),
-    Material(MaterialHandle),
 }
 
 fn assign_missing_ids(world: &mut World) {
@@ -488,7 +400,11 @@ mod tests {
     use orrin_registry::{ComponentId, Registry, Value};
 
     use super::*;
-    use crate::scene::{Light, LocalTransform, Name, Tag, Transform, register_components};
+    use crate::asset_db::named_id;
+    use crate::scene::{
+        Assets, Light, LocalTransform, MaterialHandle, MeshHandle, Name, Tag, Transform,
+        register_components,
+    };
 
     fn registry() -> Registry {
         let mut registry = Registry::new();
@@ -530,8 +446,16 @@ mod tests {
         let registry = registry();
         let mut world = populated();
         let text = save(&mut world, &registry);
-        assert!(text.contains("orrin.mesh = \"cube\""), "{text}");
-        assert!(text.contains("orrin.material = \"gold\""), "{text}");
+        let cube = named_id("mesh", "cube");
+        let gold = named_id("material", "gold");
+        assert!(
+            text.contains(&format!("orrin.mesh = asset({cube})")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("orrin.material = asset({gold})")),
+            "{text}"
+        );
 
         // A different session, where the same names uploaded to different slots.
         let mut loaded = World::new();
@@ -566,11 +490,48 @@ mod tests {
         let issues = load(&text, &mut world, &registry).unwrap();
 
         assert_eq!(issues.len(), 1);
-        assert!(issues[0].message.contains("no asset named `teapot`"));
+        assert!(
+            issues[0]
+                .message
+                .contains("expected the name of a mesh, found `teapot`"),
+            "{}",
+            issues[0].message
+        );
 
         let entity = world.entities().next().unwrap();
         assert!(world.get::<MeshHandle>(entity).is_none());
         assert_eq!(save(&mut world, &registry), text);
+    }
+
+    /// A scene saved before assets had ids names its mesh and material by
+    /// string. It has to keep loading, and the next save writes the ids, so the
+    /// old form is read for as long as such files exist and never written.
+    #[test]
+    fn a_scene_naming_its_assets_by_string_loads_and_saves_back_with_ids() {
+        let registry = registry();
+        let id = EntityId::new();
+        let old = format!(
+            "orrin-scene 1\n\nentity {id}\n  orrin.material = \"gold\"\n  orrin.mesh = \"cube\"\n"
+        );
+        let mut world = World::new();
+        world.insert_resource(assets());
+        let issues = load(&old, &mut world, &registry).unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+
+        let entity = world.entities().next().unwrap();
+        assert_eq!(*world.get::<MeshHandle>(entity).unwrap(), MeshHandle(3));
+        assert_eq!(
+            *world.get::<MaterialHandle>(entity).unwrap(),
+            MaterialHandle(7)
+        );
+        assert_eq!(
+            save(&mut world, &registry),
+            format!(
+                "orrin-scene 1\n\nentity {id}\n  orrin.material = asset({})\n  orrin.mesh = asset({})\n",
+                named_id("material", "gold"),
+                named_id("mesh", "cube")
+            )
+        );
     }
 
     #[test]

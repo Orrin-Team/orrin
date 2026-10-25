@@ -25,6 +25,8 @@ pub struct HeadlessBackend {
     materials: u32,
     material_updates: u32,
     textures: u32,
+    mesh_replacements: u32,
+    texture_replacements: u32,
 }
 
 impl HeadlessBackend {
@@ -42,6 +44,15 @@ impl HeadlessBackend {
     pub fn material_updates(&self) -> u32 {
         self.material_updates
     }
+
+    /// How many meshes were swapped in place, as a reimport does.
+    pub fn mesh_replacements(&self) -> u32 {
+        self.mesh_replacements
+    }
+
+    pub fn texture_replacements(&self) -> u32 {
+        self.texture_replacements
+    }
 }
 
 impl RenderBackend for HeadlessBackend {
@@ -51,6 +62,13 @@ impl RenderBackend for HeadlessBackend {
         // upload: culling reads it out of the world, never out of a backend.
         self.mesh_bounds.push(mesh.bounds());
         handle
+    }
+
+    fn replace_mesh(&mut self, handle: MeshHandle, mesh: &CpuMesh) {
+        if let Some(bounds) = self.mesh_bounds.get_mut(handle.0 as usize) {
+            *bounds = mesh.bounds();
+            self.mesh_replacements += 1;
+        }
     }
 
     fn mesh_bounds(&self, mesh: MeshHandle) -> Option<Aabb> {
@@ -77,6 +95,19 @@ impl RenderBackend for HeadlessBackend {
         let handle = TextureHandle(self.textures);
         self.textures += 1;
         handle
+    }
+
+    fn replace_texture(
+        &mut self,
+        handle: TextureHandle,
+        _pixels: &[u8],
+        _width: u32,
+        _height: u32,
+        _srgb: bool,
+    ) {
+        if handle.0 < self.textures {
+            self.texture_replacements += 1;
+        }
     }
 
     fn load_environment(&mut self, _pixels: &[f32], _width: u32, _height: u32) {}
