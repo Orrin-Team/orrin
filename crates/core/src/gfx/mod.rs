@@ -120,10 +120,6 @@ pub struct RenderItem {
     /// reads as stationary rather than as having flown in from wherever the
     /// slot's previous occupant stood.
     pub prev_model: Mat4,
-    /// Inverse-transpose of `model`'s upper 3x3, so normals stay perpendicular
-    /// under non-uniform scale. Derived from the transform's rotation and scale
-    /// at extraction rather than inverted out of `model` per pass per frame.
-    pub normal_matrix: Mat3,
     /// World-space bounds: what the camera frustum tested, and what a shadow
     /// cascade tests against its own frustum without re-deriving anything.
     pub bounds: Aabb,
@@ -799,13 +795,12 @@ pub trait RenderBackend {
 mod draw_list_tests {
     use super::{DrawList, MaterialHandle, MeshHandle, RenderItem};
     use crate::geom::Aabb;
-    use glam::{Mat3, Mat4, Vec3A};
+    use glam::{Mat4, Vec3A};
 
     fn item(mesh: u32, material: u32) -> RenderItem {
         RenderItem {
             model: Mat4::IDENTITY,
             prev_model: Mat4::IDENTITY,
-            normal_matrix: Mat3::IDENTITY,
             bounds: Aabb {
                 min: Vec3A::splat(-0.5),
                 max: Vec3A::splat(0.5),

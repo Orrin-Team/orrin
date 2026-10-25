@@ -19,7 +19,6 @@ const uint VIEW_CASCADE = 1;
 
 struct Object {
     mat4 model;
-    mat4 normal_matrix;
     mat4 prev_model;
 };
 

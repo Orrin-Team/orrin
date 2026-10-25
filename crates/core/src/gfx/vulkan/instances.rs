@@ -1,7 +1,8 @@
 //! Per-object matrices that live on the GPU between frames.
 //!
-//! Every geometry pass reads the same three matrices per object — the model, its
-//! inverse-transpose, and where the object stood last frame. The old shape wrote
+//! Every geometry pass reads the same two matrices per object — the model and
+//! where the object stood last frame. The normal matrix is derived from the
+//! model in the vertex shader (`normal_matrix.glsl`) rather than carried. The old shape wrote
 //! all three into a fresh streaming buffer every frame, once per *list the object
 //! appeared in*: an object the camera can see that also casts into four cascades
 //! was written five times, 192 bytes each, whether or not it had moved since the
@@ -51,10 +52,6 @@ use super::record::Recorder;
 #[repr(C)]
 pub(super) struct GpuObject {
     model: [[f32; 4]; 4],
-    /// Inverse-transpose of `model`'s rotation/scale, for transforming normals
-    /// correctly under non-uniform scaling. Stored as a mat4; only the upper-left
-    /// 3x3 is used in the shader.
-    normal_matrix: [[f32; 4]; 4],
     /// Last frame's `model`, for the motion vector the prepass writes. Uploaded
     /// for every pass rather than only the one that reads it: the buffer is
     /// shared, so the row's stride is shared too, and a second layout for the
@@ -217,7 +214,6 @@ impl InstanceStore {
                 item.instance,
                 GpuObject {
                     model: item.model.to_cols_array_2d(),
-                    normal_matrix: Mat4::from_mat3(item.normal_matrix).to_cols_array_2d(),
                     prev_model: item.prev_model.to_cols_array_2d(),
                 },
             ));
@@ -356,4 +352,122 @@ fn allocate_rows(ctx: &VkContext, rows: u32) -> Subbuffer<[GpuObject]> {
         u64::from(rows),
     )
     .expect("failed to allocate the instance row buffer")
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::{Mat3, Quat, Vec3};
+
+    use super::*;
+    use crate::scene::Transform;
+
+    /// `normal_matrix` in `normal_matrix.glsl`, here so its algebra can be
+    /// asserted without a GPU. The two are a lock-step pair.
+    fn shader_normal_matrix(model: &Mat4) -> Mat3 {
+        let m = Mat3::from_mat4(*model);
+        let cofactor = Mat3::from_cols(
+            m.y_axis.cross(m.z_axis),
+            m.z_axis.cross(m.x_axis),
+            m.x_axis.cross(m.y_axis),
+        );
+        cofactor * m.determinant().signum_or_zero()
+    }
+
+    trait SignumOrZero {
+        fn signum_or_zero(self) -> f32;
+    }
+
+    /// GLSL's `sign`, which is zero at zero where Rust's `signum` is one.
+    impl SignumOrZero for f32 {
+        fn signum_or_zero(self) -> f32 {
+            if self == 0.0 { 0.0 } else { self.signum() }
+        }
+    }
+
+    fn assert_same_direction(a: Vec3, b: Vec3) {
+        assert!(
+            (a.normalize() - b.normalize()).length() < 1e-5,
+            "{a} and {b} point different ways",
+        );
+    }
+
+    /// The shader's matrix differs from the inverse-transpose by a positive
+    /// scale only, which the shader's `normalize` removes — so wherever the
+    /// `R * S^-1` closed form was valid, the lit normal is the same.
+    #[test]
+    fn the_normal_matrix_matches_the_closed_form_for_a_trs() {
+        let transform = Transform {
+            translation: Vec3::new(3.0, -2.0, 7.0),
+            rotation: Quat::from_euler(glam::EulerRot::YXZ, 0.6, -1.1, 0.3),
+            scale: Vec3::new(0.5, 4.0, 2.0),
+        };
+        let oracle =
+            Mat3::from_quat(transform.rotation) * Mat3::from_diagonal(transform.scale.recip());
+        let derived = shader_normal_matrix(&transform.matrix());
+        for normal in [Vec3::X, Vec3::Y, Vec3::Z, Vec3::new(0.3, -0.8, 0.5)] {
+            assert_same_direction(derived * normal, oracle * normal);
+        }
+    }
+
+    /// The cofactor matrix is the inverse-transpose times the determinant, and
+    /// a mirrored transform's determinant is negative — without the sign every
+    /// normal on a mirrored object would face inward.
+    #[test]
+    fn a_mirrored_transform_keeps_its_normals_facing_out() {
+        let mirrored = Transform {
+            rotation: Quat::from_rotation_y(0.4),
+            scale: Vec3::new(-1.0, 2.0, 1.0),
+            ..Default::default()
+        }
+        .matrix();
+        let oracle = Mat3::from_mat4(mirrored).inverse().transpose();
+        let derived = shader_normal_matrix(&mirrored);
+        for normal in [Vec3::X, Vec3::Y, Vec3::Z] {
+            assert_same_direction(derived * normal, oracle * normal);
+        }
+    }
+
+    /// A flattened object has no normal to speak of; the matrix must still be
+    /// finite, because NaNs would spread through the shader's lighting math.
+    #[test]
+    fn a_zero_scale_axis_stays_finite() {
+        let transform = Transform {
+            scale: Vec3::new(1.0, 0.0, 1.0),
+            ..Default::default()
+        };
+        assert!(
+            shader_normal_matrix(&transform.matrix())
+                .to_cols_array()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    /// A shear that no translation/rotation/scale triple can express still
+    /// yields correct normals.
+    #[test]
+    fn the_normal_matrix_handles_a_sheared_matrix() {
+        let sheared = Mat4::from_cols_array_2d(&[
+            [1.0, 0.0, 0.0, 0.0],
+            [0.7, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]);
+        let derived = shader_normal_matrix(&sheared);
+        // A normal is correct when it stays perpendicular to a tangent the same
+        // matrix carried: n' . (M t) == 0 for every tangent t of the surface.
+        let tangent = Mat3::from_mat4(sheared) * Vec3::new(1.0, 0.0, 0.0);
+        let normal = derived * Vec3::new(0.0, 1.0, 0.0);
+        assert!(
+            normal.dot(tangent).abs() < 1e-5,
+            "normal {normal:?} is not perpendicular to tangent {tangent:?}"
+        );
+    }
+
+    /// Two matrices per row, and std430 lays them out with no padding — the
+    /// stride every `Object` declaration in the shaders has to agree with.
+    #[test]
+    fn an_object_row_is_two_matrices() {
+        assert_eq!(std::mem::size_of::<GpuObject>(), 128);
+    }
 }

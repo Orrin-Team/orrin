@@ -269,7 +269,6 @@ pub fn extract_geometry(
             out.items.push(RenderItem {
                 model,
                 prev_model: out.motion.record(entity, model),
-                normal_matrix: normal_matrix(&model),
                 bounds: world_bounds,
                 mesh: *mesh,
                 material,
@@ -622,36 +621,6 @@ mod shadow_culling_tests {
     }
 }
 
-/// The inverse-transpose of a transform's upper 3x3, without inverting anything.
-///
-/// For `M = R * S` with `R` a rotation and `S` diagonal, `(R*S)^-T` is
-/// `R * S^-1` — orthonormality makes `R^-T = R`, and a diagonal matrix's
-/// inverse-transpose is its reciprocal. That turns a general 3x3 inverse, per
-/// object per frame, into a quaternion conversion and three divides.
-///
-/// A zero scale component has no inverse; it collapses the object onto a plane,
-/// where no normal is meaningful. Zero keeps the result finite instead of
-/// pushing NaNs into the shader.
-/// The inverse transpose of `model`'s linear part, which is what a normal has to
-/// be transformed by: the model matrix itself tilts normals off the surface
-/// wherever the scale is non-uniform.
-///
-/// Computed generally rather than as `rotation * scale.recip()`, which is only
-/// equal to it while the matrix decomposes into a rotation and a diagonal scale.
-/// A composed hierarchy transform need not — a non-uniformly scaled parent with
-/// a rotated child produces shear, and the closed form assumes that away.
-fn normal_matrix(model: &Mat4) -> Mat3 {
-    let normal = Mat3::from_mat4(*model).inverse().transpose();
-    // A singular linear part inverts to infinities. That means a transform which
-    // flattens the object to zero volume, so there is no surface to shade and a
-    // zero matrix is the benign answer.
-    if normal.is_finite() {
-        normal
-    } else {
-        Mat3::ZERO
-    }
-}
-
 pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
     let defaults = SceneLighting::default();
     out.ambient_color = defaults.ambient_color;
@@ -737,7 +706,7 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameGeometry, extract_decals, extract_geometry, normal_matrix};
+    use super::{FrameGeometry, extract_decals, extract_geometry};
     use crate::gfx::punctual::ShadowAtlas;
     use crate::gfx::shadows::CascadeSet;
     use crate::gfx::{DecalInstance, MAX_DECALS, RenderItem};
@@ -746,7 +715,7 @@ mod tests {
         Camera, CpuMesh, Culling, Decal, DecalSettings, LocalTransform, MeshBounds, MeshHandle,
         Transform, WorldTransform,
     };
-    use glam::{Mat3, Mat4, Quat, Vec3, Vec3A};
+    use glam::{Mat4, Quat, Vec3, Vec3A};
     use orrin_ecs::World;
 
     const ASPECT: f32 = 16.0 / 9.0;
@@ -1180,68 +1149,6 @@ mod tests {
         let twice = world.get::<WorldTransform>(entity).unwrap().0;
 
         assert_eq!(once, twice);
-    }
-
-    /// The general inverse-transpose has to agree with the `R * S^-1` closed
-    /// form it replaced, wherever that form was valid — which is any transform
-    /// that decomposes into a rotation and a diagonal scale. Under a hierarchy
-    /// it need not, and only the general form stays right there.
-    #[test]
-    fn the_normal_matrix_matches_the_closed_form_for_a_trs() {
-        let transform = Transform {
-            translation: Vec3::new(3.0, -2.0, 7.0),
-            rotation: Quat::from_euler(glam::EulerRot::YXZ, 0.6, -1.1, 0.3),
-            scale: Vec3::new(0.5, 4.0, 2.0),
-        };
-        let oracle =
-            Mat3::from_quat(transform.rotation) * Mat3::from_diagonal(transform.scale.recip());
-        let derived = normal_matrix(&transform.matrix());
-
-        for (a, b) in derived
-            .to_cols_array()
-            .iter()
-            .zip(oracle.to_cols_array().iter())
-        {
-            assert!((a - b).abs() < 1e-5, "{derived:?} != {oracle:?}");
-        }
-    }
-
-    /// A flattened object has no normal to speak of; the result must still be
-    /// finite, because NaNs would spread through the shader's lighting math.
-    #[test]
-    fn a_zero_scale_axis_stays_finite() {
-        let transform = Transform {
-            scale: Vec3::new(1.0, 0.0, 1.0),
-            ..Default::default()
-        };
-        assert!(
-            normal_matrix(&transform.matrix())
-                .to_cols_array()
-                .iter()
-                .all(|v| v.is_finite())
-        );
-    }
-
-    /// The whole point of a separate world transform: a shear that no
-    /// translation/rotation/scale triple can express still yields correct
-    /// normals, where the closed form would have had to invent a decomposition.
-    #[test]
-    fn the_normal_matrix_handles_a_sheared_matrix() {
-        let sheared = Mat4::from_cols_array_2d(&[
-            [1.0, 0.0, 0.0, 0.0],
-            [0.7, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ]);
-        let derived = normal_matrix(&sheared);
-        // A normal is correct when it stays perpendicular to a tangent the same
-        // matrix carried: n' . (M t) == 0 for every tangent t of the surface.
-        let tangent = Mat3::from_mat4(sheared) * Vec3::new(1.0, 0.0, 0.0);
-        let normal = derived * Vec3::new(0.0, 1.0, 0.0);
-        assert!(
-            normal.dot(tangent).abs() < 1e-5,
-            "normal {normal:?} is not perpendicular to tangent {tangent:?}"
-        );
     }
 
     #[test]

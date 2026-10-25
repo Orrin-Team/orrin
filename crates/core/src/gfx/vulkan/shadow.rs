@@ -738,13 +738,12 @@ mod tests {
     use crate::geom::Aabb;
     use crate::gfx::RenderItem;
     use crate::scene::{MaterialHandle, MeshHandle};
-    use glam::{Mat3, Vec3A};
+    use glam::Vec3A;
 
     fn item(x: f32) -> RenderItem {
         RenderItem {
             model: Mat4::IDENTITY,
             prev_model: Mat4::IDENTITY,
-            normal_matrix: Mat3::IDENTITY,
             bounds: Aabb {
                 min: Vec3A::new(x - 0.1, -0.1, 0.4),
                 max: Vec3A::new(x + 0.1, 0.1, 0.6),
