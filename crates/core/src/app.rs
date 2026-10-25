@@ -225,6 +225,7 @@ impl App {
         crate::scene::register_components(&mut app.registry);
         Self::install_default_resources(&mut app.world);
         app.load_input_config();
+        app.load_prefabs();
 
         event_loop.run_app(&mut app).unwrap();
     }
@@ -277,6 +278,9 @@ impl App {
         world.insert_resource(LogBuffer::default());
         world.insert_resource(DebugLines::default());
         world.insert_resource(Culling::default());
+        // Empty until `load_prefabs` scans the project: the scan reads the disk,
+        // and its cost belongs to the run rather than to the cold-start gate.
+        world.insert_resource(crate::scene::Prefabs::default());
         // Inserted whether or not a watcher ever starts: the Scripts panel reads
         // it either way, and `Off` is how it explains itself.
         #[cfg(feature = "scripting")]
@@ -316,6 +320,27 @@ impl App {
                 }
             };
         }
+    }
+
+    /// Index the prefabs under the assets directory — the project's, or
+    /// `assets/` beside the working directory without one, as the environment
+    /// map resolves.
+    ///
+    /// A prefab that cannot be indexed is named and left out; the rest load.
+    fn load_prefabs(&mut self) {
+        let dir = self
+            .project
+            .as_ref()
+            .map_or_else(|| PathBuf::from("assets"), |project| project.assets_dir());
+        let (prefabs, issues) = crate::scene::Prefabs::scan(&dir);
+        for issue in issues {
+            tracing::warn!("{issue}");
+        }
+        let count = prefabs.iter().count();
+        if count > 0 {
+            tracing::info!("{count} prefab(s) under {}", dir.display());
+        }
+        self.world.insert_resource(prefabs);
     }
 
     /// Boot the script host and attach the project's entry Behaviour.
@@ -669,7 +694,7 @@ impl ApplicationHandler for App {
                         }
                         {
                             profile_scope!("script tick");
-                            scripting.tick(&mut self.world, delta);
+                            scripting.tick(&mut self.world, &self.registry, delta);
                         }
                     }
                 }

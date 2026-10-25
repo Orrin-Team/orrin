@@ -1,9 +1,11 @@
 use glam::Vec3;
 
 use orrin_ecs::{Entity, World};
-use orrin_registry::Registry;
+use orrin_registry::{AssetId, Registry};
 
-use crate::scene::{self, Assets, LogBuffer, LogLevel, MaterialHandle, Time, Transform, entities};
+use crate::scene::{
+    self, Assets, LogBuffer, LogLevel, MaterialHandle, Prefabs, Time, Transform, entities,
+};
 
 /// Where the editor's Save/Load buttons read and write. Relative to the
 /// process's working directory — a real file picker and a project-relative
@@ -111,6 +113,13 @@ pub struct EditorState {
     /// hierarchy panel is iterating a snapshot of the tree while it builds, and
     /// a reparent reshapes exactly that.
     reparent_request: Option<(Entity, Option<Entity>)>,
+    /// A prefab to place under an entity, or at the top level for `None`.
+    /// Requested for the reason a reparent is: it reshapes the tree the
+    /// hierarchy is iterating.
+    instantiate_request: Option<(AssetId, Option<Entity>)>,
+    /// Serviced by `apply`, because a rescan replaces the index the asset
+    /// browser is drawing from.
+    rescan_request: bool,
     /// Not serviced by `apply` either: restyling has to happen between frames,
     /// so the editor drains it after the UI pass rather than during it.
     theme_request: Option<String>,
@@ -145,6 +154,8 @@ impl Default for EditorState {
             despawn_request: None,
             add_request: None,
             reparent_request: None,
+            instantiate_request: None,
+            rescan_request: false,
             theme_request: None,
             scene_request: None,
             #[cfg(feature = "scripting")]
@@ -175,6 +186,14 @@ impl EditorState {
 
     pub fn request_reparent(&mut self, child: Entity, parent: Option<Entity>) {
         self.reparent_request = Some((child, parent));
+    }
+
+    pub fn request_instantiate(&mut self, prefab: AssetId, parent: Option<Entity>) {
+        self.instantiate_request = Some((prefab, parent));
+    }
+
+    pub fn request_prefab_rescan(&mut self) {
+        self.rescan_request = true;
     }
 
     pub fn request_add_component(&mut self, entity: Entity, id: orrin_registry::ComponentId) {
@@ -229,6 +248,33 @@ impl EditorState {
             // would fling it across the scene.
             if let Err(error) = crate::scene::reparent(world, child, parent, true) {
                 log(world, LogLevel::Warning, error.to_string());
+            }
+        }
+        if let Some((prefab, parent)) = self.instantiate_request.take() {
+            match scene::prefab::instantiate(world, registry, prefab) {
+                Ok((root, issues)) => {
+                    for issue in issues {
+                        log(world, LogLevel::Warning, issue.to_string());
+                    }
+                    // Not `keep_world`: a prefab sits where it was authored to,
+                    // relative to whatever it was dropped on.
+                    if let Some(parent) = parent
+                        && let Err(error) = scene::reparent(world, root, Some(parent), false)
+                    {
+                        log(world, LogLevel::Warning, error.to_string());
+                    }
+                    self.selected = Some(root);
+                }
+                Err(error) => log(world, LogLevel::Error, error),
+            }
+        }
+        if std::mem::take(&mut self.rescan_request) {
+            let issues = world
+                .get_resource_mut::<Prefabs>()
+                .map(|mut prefabs| prefabs.rescan())
+                .unwrap_or_default();
+            for issue in issues {
+                log(world, LogLevel::Warning, issue);
             }
         }
         if let Some(request) = self.scene_request.take() {

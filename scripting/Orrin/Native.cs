@@ -63,6 +63,11 @@ public unsafe struct OrrinApi
     // Every log goes through this one; Log/LogWarn/LogError above are what the
     // table carried before it and are no longer called.
     public delegate* unmanaged<uint, byte*, uint, byte*, void> LogEvent;
+    // Assets, appended after LogEvent, matching the Rust struct. An id crosses
+    // as its sixteen bytes in canonical UUID order, through a buffer this side
+    // owns.
+    public delegate* unmanaged<byte*, byte*, uint> FindAsset;
+    public delegate* unmanaged<byte*, Entity> InstantiatePrefab;
 }
 
 public static unsafe class Native
@@ -192,6 +197,27 @@ public static unsafe class Native
     }
 
     public static bool Despawn(Entity entity) => _api.Despawn(entity) != 0;
+
+    /// The id and kind (`AssetKinds`) of the asset at `path`; kind `None` if
+    /// there is none.
+    internal static (Guid Id, uint Kind) FindAsset(string path)
+    {
+        Span<byte> id = stackalloc byte[16];
+        var pathBytes = NulTerminated(path);
+        uint kind;
+        fixed (byte* pathPtr = pathBytes)
+        fixed (byte* idPtr = id)
+            kind = _api.FindAsset(pathPtr, idPtr);
+        return kind == AssetKinds.None ? (Guid.Empty, kind) : (new Guid(id, bigEndian: true), kind);
+    }
+
+    internal static Entity InstantiatePrefab(Guid prefab)
+    {
+        Span<byte> id = stackalloc byte[16];
+        prefab.TryWriteBytes(id, bigEndian: true, out _);
+        fixed (byte* idPtr = id)
+            return _api.InstantiatePrefab(idPtr);
+    }
 
     public static float TimeDelta() => _api.TimeDelta();
 

@@ -1,4 +1,5 @@
 // Visible to the dock, which mounts each tool's `body` into a tab.
+pub(super) mod assets;
 pub(super) mod console;
 pub(super) mod environment;
 pub(super) mod hierarchy;
@@ -718,6 +719,122 @@ mod tests {
         assert!(editor.world.is_alive(entity));
     }
 
+    /// Put a one-entity door prefab in the harness's index.
+    fn door(editor: &mut Harness) -> orrin_registry::AssetId {
+        let id = orrin_registry::AssetId::new();
+        let text = "orrin-scene 1\n\nentity 00000000-0000-4000-8000-000000000001\n  \
+                    orrin.name = \"Door\"\n  orrin.transform\n    rotation = (0.0, 0.0, 0.0, 1.0)\n    \
+                    scale = (1.0, 1.0, 1.0)\n    translation = (0.0, 0.0, 0.0)\n";
+        let prefab = crate::scene::prefab::Prefab::parse(id, "props/door.fprefab", text).unwrap();
+        editor
+            .world
+            .resource_mut::<crate::scene::Prefabs>()
+            .insert(prefab);
+        id
+    }
+
+    /// Let go of a drag carrying `payload` at `at`, as the asset browser's
+    /// rows hand one over.
+    fn drop_payload<T: Send + Sync + 'static>(editor: &mut Harness, payload: T, at: egui::Pos2) {
+        egui::DragAndDrop::set_payload(&editor.ctx, payload);
+        editor.input.events.push(egui::Event::PointerMoved(at));
+        editor.input.events.push(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        editor.frames(1);
+        editor.input.events.clear();
+        editor.state.apply(&mut editor.world, &editor.registry);
+    }
+
+    fn the_door(editor: &Harness) -> orrin_ecs::Entity {
+        editor
+            .world
+            .entities()
+            .find(|&e| editor.world.get::<Name>(e).is_some_and(|n| n.0 == "Door"))
+            .expect("the door was placed")
+    }
+
+    #[test]
+    fn the_assets_tool_lists_the_projects_prefabs() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        door(&mut editor);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+
+        assert!(editor.painted_contains("door"));
+        assert!(editor.painted_contains("props"), "the folder it is in");
+    }
+
+    /// The gesture the issue asks for: drag a prefab out of the browser and let
+    /// go over an entity, and the instance lands under it, selected.
+    #[test]
+    fn a_prefab_dropped_on_a_row_is_placed_under_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let room = editor.spawn("Room");
+        let id = door(&mut editor);
+        editor.frames(2);
+        let row = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| text == "Room")
+            .expect("the row is drawn")
+            .1;
+
+        drop_payload(&mut editor, id, row.center());
+        let door = the_door(&editor);
+        assert_eq!(
+            editor
+                .world
+                .get::<crate::scene::Parent>(door)
+                .map(|p| p.get()),
+            Some(room)
+        );
+        assert_eq!(editor.state.selected, Some(door));
+    }
+
+    #[test]
+    fn a_prefab_dropped_below_the_rows_is_placed_at_the_top_level() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Room");
+        let id = door(&mut editor);
+        editor.frames(2);
+        let tree = editor.tab_body(Tab::Hierarchy);
+
+        drop_payload(
+            &mut editor,
+            id,
+            egui::pos2(tree.center().x, tree.bottom() - 60.0),
+        );
+        let door = the_door(&editor);
+        assert!(editor.world.get::<crate::scene::Parent>(door).is_none());
+    }
+
+    /// A member of an instance says which prefab it is from and what it
+    /// overrides — the field, not just that something changed.
+    #[test]
+    fn the_inspector_shows_what_an_instance_overrides() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let id = door(&mut editor);
+        let (root, _) =
+            crate::scene::prefab::instantiate(&mut editor.world, &editor.registry, id).unwrap();
+        editor.state.selected = Some(root);
+        editor.frames(2);
+        assert!(editor.painted_contains("door"), "names its prefab");
+        assert!(!editor.painted_contains("translation"));
+
+        editor
+            .world
+            .get_mut::<LocalTransform>(root)
+            .unwrap()
+            .translation
+            .x = 2.0;
+        editor.frames(1);
+        assert!(editor.painted_contains("translation"));
+    }
+
     /// Every menu has to lay out: one that borrows a resource the others do not
     /// touch only fails when it is opened.
     #[test]
@@ -1313,6 +1430,7 @@ mod tests {
                         ui.allocate_ui(cell, |ui| environment::body(ui, world));
                         ui.allocate_ui(cell, |ui| performance::body(ui, world));
                         ui.allocate_ui(cell, |ui| console::body(ui, world, state));
+                        ui.allocate_ui(cell, |ui| assets::body(ui, world, state));
                     });
                 });
             })
@@ -1337,6 +1455,7 @@ mod tests {
             "SSAO",         // environment
             "FPS",          // performance
             "Filter log",   // console
+            "prefab(s)",    // assets
         ] {
             assert!(painted.contains(expected), "no body painted {expected:?}");
         }

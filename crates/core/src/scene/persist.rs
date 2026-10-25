@@ -9,7 +9,8 @@ use orrin_registry::{
     ComponentId, EntityId, ParseError, SceneDocument, SceneEntity, Value, write_document,
 };
 
-use super::registry::{MATERIAL, MESH, PARENT};
+use super::prefab::{PrefabInstance, Prefabs};
+use super::registry::{MATERIAL, MESH, PARENT, PREFAB};
 use super::{Assets, MaterialHandle, MeshHandle, Parent, UnknownComponents};
 
 /// A component a load could not apply. The data is preserved on the entity (see
@@ -48,28 +49,36 @@ pub fn save(world: &mut World, registry: &orrin_registry::Registry) -> String {
 pub fn to_document(world: &mut World, registry: &orrin_registry::Registry) -> SceneDocument {
     assign_missing_ids(world);
 
-    let entities = save_order(world)
+    let mut entities: Vec<SceneEntity> = save_order(world)
         .into_iter()
-        .map(|entity| {
-            let id = *world.get::<EntityId>(entity).expect("just assigned");
-
-            let mut components: Vec<(ComponentId, orrin_registry::Value)> = registry
-                .components()
-                .filter_map(|c| c.read(world, entity).map(|value| (c.id.clone(), value)))
-                .collect();
-
-            components.extend(asset_refs(world, entity));
-            components.extend(parent_ref(world, entity));
-
-            if let Some(unknown) = world.get::<UnknownComponents>(entity) {
-                components.extend(unknown.0.iter().cloned());
-            }
-
-            SceneEntity { id, components }
-        })
+        .map(|entity| scene_entity(world, registry, entity).expect("just assigned"))
         .collect();
+    super::prefab::fold(world, &mut entities);
 
     SceneDocument { entities }
+}
+
+/// One entity as a scene file writes it, or `None` if it has no [`EntityId`].
+pub(super) fn scene_entity(
+    world: &World,
+    registry: &orrin_registry::Registry,
+    entity: Entity,
+) -> Option<SceneEntity> {
+    let id = *world.get::<EntityId>(entity)?;
+
+    let mut components: Vec<(ComponentId, orrin_registry::Value)> = registry
+        .components()
+        .filter_map(|c| c.read(world, entity).map(|value| (c.id.clone(), value)))
+        .collect();
+
+    components.extend(asset_refs(world, entity));
+    components.extend(parent_ref(world, entity));
+
+    if let Some(unknown) = world.get::<UnknownComponents>(entity) {
+        components.extend(unknown.0.iter().cloned());
+    }
+
+    Some(SceneEntity { id, components })
 }
 
 /// Depth-first pre-order, siblings by [`EntityId`] — parents before children,
@@ -163,12 +172,63 @@ pub fn instantiate(
     world: &mut World,
     registry: &orrin_registry::Registry,
 ) -> Vec<LoadIssue> {
+    spawn(&document.entities, world, registry, &FxHashMap::default())
+}
+
+/// [`instantiate`] over a slice, spawning an id found in `reserved` into the
+/// entity it names rather than a new one — which is how a prefab instance a
+/// script asked for lands on the handle the script was already given.
+///
+/// A prefab instance's record is expanded into its members first, so from the
+/// spawning loop on they are ordinary entities.
+pub(super) fn spawn(
+    entities: &[SceneEntity],
+    world: &mut World,
+    registry: &orrin_registry::Registry,
+    reserved: &FxHashMap<EntityId, Entity>,
+) -> Vec<LoadIssue> {
     let mut issues = Vec::new();
+    let mut plain: Vec<&SceneEntity> = Vec::with_capacity(entities.len());
+    let mut members: Vec<SceneEntity> = Vec::new();
+    let mut instances: Vec<(EntityId, PrefabInstance)> = Vec::new();
+    {
+        let prefabs = world.get_resource::<Prefabs>();
+        for scene_entity in entities {
+            let Some((_, record)) = scene_entity.components.iter().find(|(id, _)| *id == PREFAB)
+            else {
+                plain.push(scene_entity);
+                continue;
+            };
+            match super::prefab::expand(prefabs.as_deref(), scene_entity, record) {
+                Ok(expansion) => {
+                    members.extend(expansion.members);
+                    instances.push((scene_entity.id, expansion.instance));
+                    issues.extend(expansion.issues.into_iter().map(|message| LoadIssue {
+                        entity: scene_entity.id,
+                        component: PREFAB,
+                        message,
+                    }));
+                }
+                Err(message) => {
+                    issues.push(LoadIssue {
+                        entity: scene_entity.id,
+                        component: PREFAB,
+                        message,
+                    });
+                    plain.push(scene_entity);
+                }
+            }
+        }
+    }
+
     let mut spawned: FxHashMap<EntityId, Entity> = FxHashMap::default();
     let mut deferred_parents: Vec<(Entity, EntityId, Value)> = Vec::new();
 
-    for scene_entity in &document.entities {
-        let entity = world.spawn();
+    for scene_entity in plain.into_iter().chain(&members) {
+        let entity = reserved
+            .get(&scene_entity.id)
+            .copied()
+            .unwrap_or_else(|| world.spawn());
         world.insert(entity, scene_entity.id);
         spawned.insert(scene_entity.id, entity);
 
@@ -193,44 +253,32 @@ pub fn instantiate(
                 }
                 continue;
             }
-            if *id == MESH || *id == MATERIAL {
-                if let Err(message) = apply_asset_ref(world, entity, id, value) {
-                    issues.push(LoadIssue {
-                        entity: scene_entity.id,
-                        component: id.clone(),
-                        message,
-                    });
-                    unknown.push((id.clone(), value.clone()));
-                }
+            // A record that could not be expanded, reported above, or one
+            // inside a prefab, which is kept but not expanded.
+            if *id == PREFAB {
+                unknown.push((id.clone(), value.clone()));
                 continue;
             }
-            match registry.get(id) {
-                Some(vtable) => {
-                    if let Err(error) = vtable.write(world, entity, value) {
-                        // Kept as well as reported: a field the current build
-                        // rejects is exactly the data a save must not silently
-                        // drop.
-                        issues.push(LoadIssue {
-                            entity: scene_entity.id,
-                            component: id.clone(),
-                            message: error.to_string(),
-                        });
-                        unknown.push((id.clone(), value.clone()));
-                    }
-                }
-                None => {
-                    issues.push(LoadIssue {
-                        entity: scene_entity.id,
-                        component: id.clone(),
-                        message: "no component type is registered under this id".to_owned(),
-                    });
-                    unknown.push((id.clone(), value.clone()));
-                }
+            if let Err(message) = apply_component(world, registry, entity, id, value) {
+                // Kept as well as reported: a field the current build rejects
+                // is exactly the data a save must not silently drop.
+                issues.push(LoadIssue {
+                    entity: scene_entity.id,
+                    component: id.clone(),
+                    message,
+                });
+                unknown.push((id.clone(), value.clone()));
             }
         }
 
         if !unknown.is_empty() {
             world.insert(entity, UnknownComponents(unknown));
+        }
+    }
+
+    for (root, instance) in instances {
+        if let Some(&entity) = spawned.get(&root) {
+            world.insert(entity, instance);
         }
     }
 
@@ -258,6 +306,78 @@ pub fn instantiate(
     }
 
     issues
+}
+
+/// Give `entity` one component from its file form: an asset reference by name,
+/// or a registered component through its vtable. Not the parent link, which
+/// needs every entity of a load spawned first.
+fn apply_component(
+    world: &mut World,
+    registry: &orrin_registry::Registry,
+    entity: Entity,
+    id: &ComponentId,
+    value: &Value,
+) -> Result<(), String> {
+    if *id == MESH || *id == MATERIAL {
+        return apply_asset_ref(world, entity, id, value);
+    }
+    match registry.get(id) {
+        Some(vtable) => vtable
+            .write(world, entity, value)
+            .map_err(|error| error.to_string()),
+        None => Err("no component type is registered under this id".to_owned()),
+    }
+}
+
+/// [`apply_component`] for an entity already live, where a parent link resolves
+/// against the whole world and an unregistered component replaces its entry in
+/// the [`UnknownComponents`].
+pub(super) fn write_component(
+    world: &mut World,
+    registry: &orrin_registry::Registry,
+    entity: Entity,
+    id: &ComponentId,
+    value: &Value,
+) -> Result<(), String> {
+    if *id == PARENT {
+        let Value::Entity(parent_id) = value else {
+            return Err(format!(
+                "expected an entity reference, found {}",
+                value.type_name()
+            ));
+        };
+        let parent = world
+            .entities()
+            .find(|&e| world.get::<EntityId>(e).is_some_and(|id| *id == *parent_id))
+            .ok_or_else(|| format!("no entity has the id {parent_id}"))?;
+        return super::reparent(world, entity, Some(parent), false).map_err(|e| e.to_string());
+    }
+    if *id != MESH && *id != MATERIAL && registry.get(id).is_none() {
+        remove_component(world, registry, entity, id);
+        keep_unapplied(world, entity, (id.clone(), value.clone()));
+        return Ok(());
+    }
+    apply_component(world, registry, entity, id, value)
+}
+
+/// Take one component, in its file form, off a live entity.
+pub(super) fn remove_component(
+    world: &mut World,
+    registry: &orrin_registry::Registry,
+    entity: Entity,
+    id: &ComponentId,
+) {
+    if *id == PARENT {
+        let _ = super::reparent(world, entity, None, false);
+    } else if *id == MESH {
+        world.remove::<MeshHandle>(entity);
+    } else if *id == MATERIAL {
+        world.remove::<MaterialHandle>(entity);
+    } else if let Some(vtable) = registry.get(id) {
+        vtable.remove(world, entity);
+    } else if let Some(mut unknown) = world.get_mut::<UnknownComponents>(entity) {
+        unknown.0.retain(|(kept, _)| kept != id);
+    }
 }
 
 /// Preserve a component the load could not apply, so a later save does not drop

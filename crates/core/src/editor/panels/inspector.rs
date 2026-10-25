@@ -20,9 +20,10 @@ use crate::editor::state::EditorState;
 use crate::editor::widgets;
 #[cfg(feature = "scripting")]
 use crate::scene::ScriptComponent;
+use crate::scene::prefab;
 use crate::scene::{
     AssetPreviews, Assets, Light, LocalTransform, LogBuffer, LogLevel, MaterialHandle, MeshHandle,
-    Name, Time, WorldTransform,
+    Name, Prefabs, Time, WorldTransform,
 };
 
 pub fn body(
@@ -60,6 +61,7 @@ pub fn body(
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
+            prefab_section(ui, world, registry, entity, &filter);
             transform_section(ui, world, state, entity, &filter);
             mesh_section(ui, world, entity, previews, &filter);
             material_section(ui, world, entity, previews, &filter);
@@ -196,6 +198,143 @@ pub fn entity_menu(
     {
         state.request_despawn(entity);
         ui.close_menu();
+    }
+}
+
+/// Which prefab the entity came from and what it holds differently, each with
+/// a way back. Shown on every member of an instance, not only its root: an
+/// override belongs to the entity it is on.
+fn prefab_section(
+    ui: &mut egui::Ui,
+    world: &mut World,
+    registry: &Registry,
+    entity: Entity,
+    filter: &Filter,
+) {
+    let Some(overrides) = prefab::member_overrides(world, registry, entity) else {
+        return;
+    };
+    let (name, path) = world
+        .get_resource::<Prefabs>()
+        .and_then(|prefabs| {
+            let prefab = prefabs.get(overrides.prefab)?;
+            Some((prefab.name().to_owned(), prefab.path.clone()))
+        })
+        .unwrap_or_else(|| (overrides.prefab.to_string(), String::new()));
+
+    // The reserved ids have no vtable to name them.
+    let named = |id: &orrin_registry::ComponentId| match id {
+        id if *id == crate::scene::registry::PARENT => "Parent".to_owned(),
+        id if *id == crate::scene::registry::MESH => "Mesh".to_owned(),
+        id if *id == crate::scene::registry::MATERIAL => "Material".to_owned(),
+        id => registry
+            .get(id)
+            .map_or_else(|| id.to_string(), |vtable| vtable.name.to_string()),
+    };
+    let mut rows: Vec<(
+        String,
+        String,
+        orrin_registry::ComponentId,
+        orrin_registry::FieldPath,
+    )> = overrides
+        .fields
+        .iter()
+        .map(|o| {
+            let what = if o.path.is_empty() {
+                "added".to_owned()
+            } else {
+                o.path.to_string()
+            };
+            (
+                named(&o.component),
+                what,
+                o.component.clone(),
+                o.path.clone(),
+            )
+        })
+        .collect();
+    rows.extend(overrides.removed.iter().map(|component| {
+        let whole = orrin_registry::FieldPath::empty();
+        (
+            named(component),
+            "removed".to_owned(),
+            component.clone(),
+            whole,
+        )
+    }));
+
+    let mut labels: Vec<&str> = rows.iter().map(|(label, ..)| label.as_str()).collect();
+    labels.push("Source");
+    let Some(shown) = filter.section("Prefab", &labels) else {
+        return;
+    };
+
+    let mut revert_all = false;
+    let mut revert = Vec::new();
+    let mut menu = |ui: &mut egui::Ui| {
+        if ui
+            .add_enabled(!rows.is_empty(), egui::Button::new("Revert all"))
+            .clicked()
+        {
+            revert_all = true;
+            ui.close_menu();
+        }
+    };
+    let weak = ui.visuals().weak_text_color();
+    widgets::section(
+        ui,
+        ui.id().with("prefab"),
+        icons::box_(),
+        weak,
+        "Prefab",
+        Some(&mut menu),
+        |ui| {
+            if shown.shows("Source") {
+                widgets::property(ui, "Source", |ui| ui.label(&name).on_hover_text(&path));
+            }
+            if rows.is_empty() {
+                widgets::padded(ui, |ui| ui.weak("Matches the prefab."));
+            }
+            for (label, what, component, path) in &rows {
+                if !shown.shows(label) {
+                    continue;
+                }
+                widgets::property_with(
+                    ui,
+                    label,
+                    |ui| ui.label(what),
+                    |ui| {
+                        if icons::button(ui, icons::rotate_ccw(), 12.0, weak, false)
+                            .on_hover_text("Revert to the prefab's value")
+                            .clicked()
+                        {
+                            revert.push((component.clone(), path.clone()));
+                        }
+                    },
+                );
+            }
+        },
+    );
+
+    if revert_all {
+        revert = rows.into_iter().map(|(_, _, c, p)| (c, p)).collect();
+    }
+    for (component, path) in revert {
+        if let Err(error) = prefab::revert(world, registry, entity, &component, &path) {
+            let frame = world
+                .get_resource::<Time>()
+                .map_or(0, |time| time.frame_count());
+            if let Some(mut log) = world.get_resource_mut::<LogBuffer>() {
+                log.push(
+                    LogLevel::Error,
+                    format!(
+                        "reverting {component} on entity {}: {error}",
+                        entity.index()
+                    ),
+                    frame,
+                );
+            }
+        }
     }
 }
 

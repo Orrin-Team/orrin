@@ -120,12 +120,28 @@ pub struct OrrinApi {
     // Level (0 = trace … 4 = error, C# `Orrin.LogLevel`), the script's name or
     // null, its line or 0, and the message.
     pub log_event: extern "C" fn(u32, *const c_char, u32, *const c_char),
+    // Assets, appended after `log_event`; never reordered above it.
+    //
+    // An asset id crosses as 16 bytes in canonical UUID order, through a buffer
+    // the caller owns. `find_asset` resolves a path relative to the assets
+    // directory, writes the id and returns the asset's kind (`ASSET_*`), or
+    // returns `ASSET_NONE` and writes nothing. `instantiate_prefab` reserves and
+    // returns the root at once and builds the tree after the dispatch window,
+    // like `spawn_renderable`; it returns `CEntity::NULL` for an id that names
+    // no prefab.
+    pub find_asset: extern "C" fn(*const c_char, *mut u8) -> u32,
+    pub instantiate_prefab: extern "C" fn(*const u8) -> CEntity,
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
 /// Distinct from a real id so a stubbed query cannot be mistaken for action
 /// zero.
 pub const NO_ACTION: u32 = u32::MAX;
+
+/// What `find_asset` found. Lock-step with C# `Orrin.AssetKinds`: append,
+/// never renumber.
+pub const ASSET_NONE: u32 = 0;
+pub const ASSET_PREFAB: u32 = 1;
 
 /// A table with the generic functions wired and the rest stubbed; the engine
 /// overrides `get_transform`/`set_transform` and the input functions with real
@@ -170,7 +186,17 @@ pub fn default_api() -> OrrinApi {
         mouse_button_pressed: stub_key_query,
         mouse_button_released: stub_key_query,
         log_event: default_log_event,
+        find_asset: stub_find_asset,
+        instantiate_prefab: stub_instantiate_prefab,
     }
+}
+
+extern "C" fn stub_find_asset(_path: *const c_char, _out: *mut u8) -> u32 {
+    ASSET_NONE
+}
+
+extern "C" fn stub_instantiate_prefab(_id: *const u8) -> CEntity {
+    CEntity::NULL
 }
 
 /// With no engine behind the table there is no stream to join, so the level

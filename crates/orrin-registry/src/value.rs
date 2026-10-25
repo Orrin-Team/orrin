@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fmt;
+use std::str::FromStr;
 
 /// A component's data in a form nothing needs the concrete type to work with.
 ///
@@ -32,6 +33,8 @@ pub enum Value {
     /// deliberately no variant for a raw `orrin_ecs::Entity` — see
     /// [`EntityId`](crate::EntityId).
     Entity(crate::EntityId),
+    /// A reference to an asset, by its persistent identity — never by path.
+    Asset(crate::AssetId),
     /// Fields in declaration order — the order an inspector should draw them.
     /// Canonical (sorted) ordering is the text writer's job, not the data's.
     Struct(Vec<(String, Value)>),
@@ -82,6 +85,7 @@ impl Value {
             Value::Vec3(_) => "vec3",
             Value::Quat(_) => "quat",
             Value::Entity(_) => "entity",
+            Value::Asset(_) => "asset",
             Value::Struct(_) => "struct",
             Value::Enum { .. } => "enum",
             Value::List(_) => "list",
@@ -188,6 +192,46 @@ impl fmt::Display for FieldPath {
     }
 }
 
+/// The inverse of `Display`: `translation.x`, `points[2]`, or the empty string
+/// for the whole value.
+impl FromStr for FieldPath {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut path = FieldPath::empty();
+        let mut rest = text;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix('[') {
+                let (index, tail) = after
+                    .split_once(']')
+                    .ok_or_else(|| format!("`{text}` has an unclosed `[`"))?;
+                let index = index
+                    .parse()
+                    .map_err(|_| format!("`{index}` in `{text}` is not an index"))?;
+                path.push(PathSegment::Index(index));
+                rest = tail;
+            } else {
+                // A field follows the start of the path or a `.`; directly after
+                // an index it would be `[1]y`, which nothing prints.
+                let after = if path.is_empty() {
+                    rest
+                } else {
+                    rest.strip_prefix('.')
+                        .ok_or_else(|| format!("`{text}` is missing a `.` before a field"))?
+                };
+                let end = after.find(['.', '[']).unwrap_or(after.len());
+                let name = &after[..end];
+                if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    return Err(format!("`{text}` names a field that cannot exist"));
+                }
+                path.push(PathSegment::Field(name.to_owned()));
+                rest = &after[end..];
+            }
+        }
+        Ok(path)
+    }
+}
+
 impl ValueError {
     /// The leaf case: the value is the wrong shape. The path starts empty and
     /// is filled in by the callers this error passes through on its way out.
@@ -285,6 +329,39 @@ mod tests {
             err.to_string(),
             "field `translation.x`: expected f32, found bool"
         );
+    }
+
+    /// A prefab override stores its path as text, so the printed form has to
+    /// read back as the path it was printed from.
+    #[test]
+    fn a_path_parses_back_from_what_it_prints() {
+        for text in [
+            "",
+            "scale",
+            "translation.x",
+            "points[2]",
+            "light.points[0].x",
+            "[3]",
+        ] {
+            let path: FieldPath = text.parse().unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(path.to_string(), text);
+        }
+        let path: FieldPath = "points[2].x".parse().unwrap();
+        assert_eq!(
+            path.segments(),
+            [
+                PathSegment::Field("points".to_owned()),
+                PathSegment::Index(2),
+                PathSegment::Field("x".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_path_is_refused() {
+        for text in [".x", "x.", "x..y", "x[", "x[a]", "x[1]y", "x y"] {
+            assert!(text.parse::<FieldPath>().is_err(), "`{text}` parsed");
+        }
     }
 
     #[test]

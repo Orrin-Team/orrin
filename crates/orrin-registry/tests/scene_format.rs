@@ -3,7 +3,7 @@
 
 use glam::{Quat, Vec3};
 use orrin_registry::{
-    ComponentId, EntityId, SceneDocument, SceneEntity, Value, parse, write_document,
+    AssetId, ComponentId, EntityId, SceneDocument, SceneEntity, Value, parse, write_document,
 };
 
 fn entity(components: Vec<(&str, Value)>) -> SceneEntity {
@@ -45,10 +45,34 @@ fn every_leaf_survives_the_round_trip() {
             ("test.position", Value::Vec3(Vec3::new(0.0, 1.5, -2.0))),
             ("test.rotation", Value::Quat(Quat::IDENTITY)),
             ("test.target", Value::Entity(EntityId::new())),
+            ("test.prefab", Value::Asset(AssetId::new())),
         ])],
     });
 
     assert!(text.starts_with("orrin-scene 1\n"));
+}
+
+/// An asset reference has its own spelling rather than being a string that
+/// happens to hold a UUID, so a reader — a merge tool, the sync protocol — can
+/// tell it from a name without knowing the component.
+#[test]
+fn an_asset_reference_is_written_as_one() {
+    let id: AssetId = "6f1c0d2e-8a4b-4c3d-9e5f-0a1b2c3d4e5f".parse().unwrap();
+    let text = round_trip(SceneDocument {
+        entities: vec![entity(vec![("test.prefab", Value::Asset(id))])],
+    });
+    assert!(
+        text.contains("test.prefab = asset(6f1c0d2e-8a4b-4c3d-9e5f-0a1b2c3d4e5f)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_malformed_asset_reference_names_itself() {
+    let base = "orrin-scene 1\n\nentity 00000000-0000-0000-0000-000000000001\n";
+    let err = parse(&format!("{base}  test.prefab = asset(door)\n")).unwrap_err();
+    assert_eq!(err.line, 4);
+    assert_eq!(err.message, "`door` is not an asset id");
 }
 
 #[test]

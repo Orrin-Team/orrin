@@ -7,9 +7,9 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::EntityId;
 use crate::registry::ComponentId;
 use crate::value::Value;
+use crate::{AssetId, EntityId};
 
 /// Bumped whenever the grammar changes in a way older files don't satisfy.
 /// Migrations are explicit functions kept in the repo; a file whose version
@@ -248,6 +248,15 @@ fn parse_scalar(text: &str, line: usize) -> Result<Value, ParseError> {
         return EntityId::from_str(body)
             .map(Value::Entity)
             .map_err(|_| ParseError::new(line, format!("`{body}` is not an entity id")));
+    }
+
+    if let Some(rest) = text.strip_prefix("asset(") {
+        let body = rest
+            .strip_suffix(')')
+            .ok_or_else(|| ParseError::new(line, "unterminated asset reference"))?;
+        return AssetId::from_str(body)
+            .map(Value::Asset)
+            .map_err(|_| ParseError::new(line, format!("`{body}` is not an asset id")));
     }
 
     if let Some(rest) = text.strip_prefix('(') {

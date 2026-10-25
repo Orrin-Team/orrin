@@ -325,6 +325,29 @@ fn leaf(ui: &mut egui::Ui, value: &mut Value) -> bool {
             ui.weak(id.to_string());
             false
         }
+        // Assigned by dropping an asset from the editor's browser onto the row,
+        // which hands over an `AssetId` payload. There is no picker because this
+        // function cannot see the asset index.
+        Value::Asset(id) => {
+            let text = if id.is_nil() {
+                "None — drop an asset here".to_owned()
+            } else {
+                id.to_string()
+            };
+            let response = ui.add(egui::Label::new(egui::RichText::new(text).weak()).truncate());
+            // Checked first: taking a payload discards it whatever its type,
+            // and an entity dragged across this row is not ours to drop.
+            if !egui::DragAndDrop::has_payload_of_type::<crate::AssetId>(ui.ctx()) {
+                return false;
+            }
+            match response.dnd_release_payload::<crate::AssetId>() {
+                Some(dropped) if *dropped != *id => {
+                    *id = *dropped;
+                    true
+                }
+                _ => false,
+            }
+        }
         // Routed to `value` by `row` and never reached here.
         Value::Struct(_) | Value::Enum { .. } | Value::List(_) => false,
     }

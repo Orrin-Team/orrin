@@ -13,6 +13,7 @@
 //! (`inventory`, `ctor`) does not survive a dynamic library boundary, which is
 //! exactly the configuration hot reload creates.
 
+mod asset_id;
 mod diff;
 mod entity_id;
 #[cfg(feature = "egui")]
@@ -24,6 +25,7 @@ mod text;
 mod value;
 pub mod wire;
 
+pub use asset_id::AssetId;
 pub use diff::{FieldChange, apply, diff};
 pub use entity_id::EntityId;
 pub use scene::{FORMAT_VERSION, ParseError, SceneDocument, SceneEntity, parse};

@@ -19,6 +19,7 @@ mod mesh;
 pub mod model;
 mod motion_blur;
 mod persist;
+pub mod prefab;
 mod present;
 mod previews;
 pub mod registry;
@@ -58,6 +59,7 @@ pub use material::MaterialBlends;
 pub use mesh::{CpuMesh, MeshBounds};
 pub use motion_blur::MotionBlurSettings;
 pub use persist::{LoadIssue, instantiate, load, save, to_document};
+pub use prefab::{PrefabInstance, Prefabs};
 pub use present::{PresentSettings, VsyncMode};
 pub use previews::{
     AssetPreviews, MaterialPreview, MeshPreview, apply_material_edits, render_mesh,

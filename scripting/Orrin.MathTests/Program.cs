@@ -278,6 +278,27 @@ PropertyBag.Decode(renamed, Convert.FromHexString(
     "080100000004000000" + Hex("Mode"u8) + "09040000004172656100000000"));
 Check(renamed.Mode == BagMode.Point, "an enum member this build lost leaves the field alone");
 
+// An asset reference crosses as tag 11 and its id's sixteen bytes in canonical
+// UUID order — the bytes `wire::tests::an_asset_reference_crosses_as_its_canonical_bytes`
+// pins on the Rust side. Kept out of `BagGolden`, so that string keeps meaning
+// what it meant.
+const string AssetGolden =
+    "0801000000"
+    + "04000000446f6f72" + "0b00112233445566778899aabbccddeeff";
+
+var door = new AssetProbe { Door = new AssetRef<Prefab>(Guid.Parse("00112233-4455-6677-8899-aabbccddeeff")) };
+Check(Hex(PropertyBag.Encode(door)) == AssetGolden, "an AssetRef field encodes to the golden bytes");
+Check(door.Door.ToString() == "00112233-4455-6677-8899-aabbccddeeff", "an AssetRef prints its id");
+
+var noDoor = new AssetProbe();
+Check(!noDoor.Door.IsValid, "a default AssetRef is the null reference");
+PropertyBag.Decode(noDoor, Convert.FromHexString(AssetGolden));
+Check(noDoor.Door == door.Door, "bag round trip: AssetRef");
+
+var stepped = new BagProbe { Speed = 99f };
+PropertyBag.Decode(stepped, Convert.FromHexString(AssetGolden));
+Check(stepped.Speed == 99f, "an asset field this type lacks is stepped over");
+
 // --- log attribution -----------------------------------------------------------
 //
 // A log line names its script from the path the compiler recorded, which is in
@@ -311,4 +332,9 @@ sealed class BagProbe : Behaviour
     public float Cache = 3f;
     public readonly int Constant = 5;
     public Vector2 Unrepresentable = new(1, 2);
+}
+
+sealed class AssetProbe : Behaviour
+{
+    public AssetRef<Prefab> Door;
 }

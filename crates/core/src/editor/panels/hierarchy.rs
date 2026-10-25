@@ -1,5 +1,6 @@
 //! The scene as a tree: every entity, its kind and its children, with search,
-//! drag to reparent, and the scene's counts at the foot.
+//! drag to reparent, and the scene's counts at the foot. A prefab dragged in
+//! from the asset browser is placed under whatever row it is let go over.
 //!
 //! Rows are laid out flat, one fixed-height rect each, rather than as nested
 //! collapsing headers. That is what lets a row fill the panel edge to edge —
@@ -9,6 +10,7 @@
 //! the list draw only the rows on screen, which a tree of nested `Ui`s cannot.
 
 use orrin_ecs::{Entity, World};
+use orrin_registry::AssetId;
 
 use crate::editor::kind::Kind;
 use crate::editor::state::EditorState;
@@ -108,8 +110,11 @@ pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
             },
         );
     });
-    if let Some(dragged) = background.dnd_release_payload::<Entity>() {
+    if let Some(dragged) = released::<Entity>(&background) {
         state.request_reparent(*dragged, None);
+    }
+    if let Some(prefab) = released::<AssetId>(&background) {
+        state.request_instantiate(*prefab, None);
     }
 
     footer(ui, world, state);
@@ -288,7 +293,8 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], row: &Row, state: &mut EditorStat
     let hovered = ui.rect_contains_pointer(rect);
     let dropping = response
         .dnd_hover_payload::<Entity>()
-        .is_some_and(|dragged| *dragged != node.entity);
+        .is_some_and(|dragged| *dragged != node.entity)
+        || response.dnd_hover_payload::<AssetId>().is_some();
     let fill = if selected {
         Some(visuals.selection.bg_fill)
     } else if hovered || dropping {
@@ -423,15 +429,28 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], row: &Row, state: &mut EditorStat
     accept_drop(&response, node.entity, state);
 }
 
-/// Reparent the dragged entity onto `target`, if one was released here.
+/// Reparent the dragged entity onto `target`, or place a dragged prefab under
+/// it, if one was released here.
 ///
 /// Nothing is validated at this end. `reparent` refuses a self-parent or a
 /// cycle by itself, and the editor should not carry a second copy of that rule
 /// for it to drift out of step with — the refusal reaches the console.
 fn accept_drop(response: &egui::Response, target: Entity, state: &mut EditorState) {
-    if let Some(dragged) = response.dnd_release_payload::<Entity>()
+    if let Some(dragged) = released::<Entity>(response)
         && *dragged != target
     {
         state.request_reparent(*dragged, Some(target));
     }
+    if let Some(prefab) = released::<AssetId>(response) {
+        state.request_instantiate(*prefab, Some(target));
+    }
+}
+
+/// [`egui::Response::dnd_release_payload`], asked only for the type actually
+/// being carried: it takes the payload *before* checking its type, so asking
+/// for an entity first would throw a dragged prefab away.
+fn released<T: Send + Sync + 'static>(response: &egui::Response) -> Option<std::sync::Arc<T>> {
+    egui::DragAndDrop::has_payload_of_type::<T>(&response.ctx)
+        .then(|| response.dnd_release_payload::<T>())
+        .flatten()
 }

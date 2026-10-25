@@ -54,6 +54,7 @@ pub enum Tab {
     Performance,
     Console,
     Scripts,
+    Assets,
 }
 
 impl Tab {
@@ -61,11 +62,12 @@ impl Tab {
     /// even in a build without the feature: the variant stays so a layout file
     /// written by one build still loads in the other, and the tab says why it
     /// is empty instead of vanishing.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Hierarchy,
         Self::Inspector,
         Self::Environment,
         Self::Console,
+        Self::Assets,
         Self::Performance,
         Self::Scripts,
     ];
@@ -79,6 +81,7 @@ impl Tab {
             Self::Performance => icons::activity(),
             Self::Console => icons::terminal(),
             Self::Scripts => icons::file_code(),
+            Self::Assets => icons::box_(),
         }
     }
 
@@ -90,6 +93,7 @@ impl Tab {
             Self::Performance => "Profiler",
             Self::Console => "Console",
             Self::Scripts => "Scripts",
+            Self::Assets => "Assets",
         }
     }
 }
@@ -128,7 +132,7 @@ pub fn default_layout() -> DockState<Tab> {
     let [viewport, _] = surface.split_below(
         viewport,
         BOTTOM,
-        vec![Tab::Console, Tab::Performance, Tab::Scripts],
+        vec![Tab::Console, Tab::Assets, Tab::Performance, Tab::Scripts],
     );
 
     surface[viewport] = Node::Empty;
@@ -534,6 +538,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
             Tab::Environment => panels::environment::body(ui, self.world),
             Tab::Performance => panels::performance::body(ui, self.world),
             Tab::Console => panels::console::body(ui, self.world, self.state),
+            Tab::Assets => panels::assets::body(ui, self.world, self.state),
             Tab::Scripts => {
                 #[cfg(feature = "scripting")]
                 panels::scripts::body(ui, self.world, self.state);

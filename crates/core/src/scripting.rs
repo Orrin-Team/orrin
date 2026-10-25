@@ -13,10 +13,11 @@ use std::time::SystemTime;
 use glam::{Mat4, Quat, Vec3};
 
 use orrin_ecs::{Entity, FxHashMap, World};
-use orrin_registry::{ComponentId, Registry, ScriptBridge, Value, ValueError};
+use orrin_registry::{AssetId, ComponentId, Registry, ScriptBridge, Value, ValueError};
 use orrin_script::{CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi, ScriptHost};
 
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
+use crate::scene::prefab::{self, Prefabs};
 use crate::scene::{
     ActionId, Actions, Assets, Collider, ColliderShape, DebugLines, InputState, LocalTransform,
     LogLevel, MaterialHandle, MeshHandle, Name, Parent, ScriptComponent, Tag, Time, Transform,
@@ -579,6 +580,11 @@ enum Command {
         parent: Option<Entity>,
         keep_world: bool,
     },
+    // `root` was reserved at the call; the instance is built into it here.
+    InstantiatePrefab {
+        root: Entity,
+        prefab: AssetId,
+    },
 }
 
 thread_local! {
@@ -634,6 +640,69 @@ extern "C" fn spawn_renderable(
             generation: entity.generation,
         }
     })
+}
+
+extern "C" fn find_asset(path: *const c_char, out: *mut u8) -> u32 {
+    if path.is_null() || out.is_null() {
+        return orrin_script::ASSET_NONE;
+    }
+    // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
+    let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
+    orrin_script::with_world(orrin_script::ASSET_NONE, |world| {
+        let Some(id) = world
+            .get_resource::<Prefabs>()
+            .and_then(|prefabs| prefabs.find(&path))
+        else {
+            return orrin_script::ASSET_NONE;
+        };
+        // SAFETY: `out` is the 16-byte buffer C# reserved for the id.
+        unsafe { std::ptr::copy_nonoverlapping(id.to_bytes().as_ptr(), out, 16) };
+        orrin_script::ASSET_PREFAB
+    })
+}
+
+extern "C" fn instantiate_prefab(id: *const u8) -> CEntity {
+    if id.is_null() {
+        return CEntity::NULL;
+    }
+    // SAFETY: `id` is the 16 bytes of an `AssetRef` C# holds.
+    let prefab = AssetId::from_bytes(unsafe { *id.cast::<[u8; 16]>() });
+    orrin_script::with_world(CEntity::NULL, |world| {
+        // Checked now so a bad reference fails loudly at the call, the rule
+        // `spawn_renderable` follows for a bad name.
+        let known = world
+            .get_resource::<Prefabs>()
+            .is_some_and(|prefabs| prefabs.get(prefab).is_some());
+        if !known {
+            tracing::warn!("Prefab.Instantiate: no prefab in the project has the id {prefab}");
+            return CEntity::NULL;
+        }
+        let root = world.spawn();
+        COMMANDS.with(|commands| {
+            commands
+                .borrow_mut()
+                .push(Command::InstantiatePrefab { root, prefab })
+        });
+        CEntity {
+            index: root.index,
+            generation: root.generation,
+        }
+    })
+}
+
+/// Build a queued instance into the root its script was handed.
+fn build_prefab(world: &mut World, registry: &Registry, root: Entity, prefab: AssetId) {
+    match prefab::instantiate_into(world, registry, prefab, root) {
+        Ok(issues) => {
+            for issue in issues {
+                tracing::warn!("Prefab.Instantiate: {issue}");
+            }
+        }
+        Err(error) => {
+            tracing::warn!("Prefab.Instantiate: {error}");
+            world.despawn(root);
+        }
+    }
 }
 
 extern "C" fn despawn(entity: CEntity) -> bool {
@@ -866,6 +935,8 @@ fn build_api() -> OrrinApi {
         mouse_button_pressed,
         mouse_button_released,
         log_event,
+        find_asset,
+        instantiate_prefab,
         ..orrin_script::default_api()
     }
 }
@@ -1349,7 +1420,7 @@ impl Scripting {
     /// Dispatch order inside the window mirrors Unity: activation transitions
     /// (OnEnable/OnStart/OnDisable), then this frame's collision callbacks,
     /// then OnUpdate.
-    pub fn tick(&self, world: &mut World, delta_time: f32) {
+    pub fn tick(&self, world: &mut World, registry: &Registry, delta_time: f32) {
         let mut pending = self.pending.take();
         pending.clear();
         world
@@ -1469,7 +1540,7 @@ impl Scripting {
 
         // Structural changes the scripts queued land now, after every script
         // has run — so this frame's extraction already sees new renderables.
-        self.apply_commands(world);
+        self.apply_commands(world, registry);
 
         for script in &pending {
             if let Some(mut component) = world.get_mut::<ScriptComponent>(script.entity) {
@@ -1488,7 +1559,7 @@ impl Scripting {
     /// Apply the structural changes scripts queued during a dispatch. Runs
     /// with no other world borrows held, so a despawn can drop a
     /// `ScriptComponent` (and free its GCHandle) safely.
-    fn apply_commands(&self, world: &mut World) {
+    fn apply_commands(&self, world: &mut World, registry: &Registry) {
         let commands: Vec<Command> = COMMANDS.with(|c| c.borrow_mut().drain(..).collect());
         for command in commands {
             match command {
@@ -1536,6 +1607,9 @@ impl Scripting {
                     // an earlier command in this same drain.
                     let _ = crate::scene::reparent(world, child, parent, keep_world);
                 }
+                Command::InstantiatePrefab { root, prefab } => {
+                    build_prefab(world, registry, root, prefab);
+                }
                 Command::AttachScript { entity, type_name } => {
                     // Creates the managed instance now; the enable/start pair
                     // dispatches on the next tick, outside any window.
@@ -1551,6 +1625,8 @@ mod tests {
     use super::*;
     use crate::logging::{LogConfig, Stream};
     use crate::scene::LogBuffer;
+    use crate::scene::prefab::{Prefab, PrefabInstance};
+    use orrin_registry::AssetId;
 
     /// What `emit` put on the stream, as `(level, line)`.
     fn logged(emit: impl FnOnce()) -> Vec<(LogLevel, String)> {
@@ -1613,5 +1689,82 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// A world whose prefab index holds one crate, as the FFI sees it.
+    fn prefab_world() -> (World, Registry, AssetId) {
+        let id = AssetId::new();
+        let mut prefabs = Prefabs::default();
+        prefabs.insert(
+            Prefab::parse(
+                id,
+                "props/crate.fprefab",
+                "orrin-scene 1\n\nentity 00000000-0000-4000-8000-000000000001\n  orrin.name = \"Crate\"\n",
+            )
+            .unwrap(),
+        );
+        let mut world = World::new();
+        world.insert_resource(prefabs);
+        let mut registry = Registry::new();
+        crate::scene::register_components(&mut registry);
+        (world, registry, id)
+    }
+
+    #[test]
+    fn a_script_finds_a_prefab_by_its_path() {
+        let (mut world, _, id) = prefab_world();
+        let mut out = [0u8; 16];
+        let kind = orrin_script::with_active_world(&mut world, || {
+            find_asset(c"props/crate.fprefab".as_ptr(), out.as_mut_ptr())
+        });
+        assert_eq!(kind, orrin_script::ASSET_PREFAB);
+        assert_eq!(AssetId::from_bytes(out), id);
+
+        let kind = orrin_script::with_active_world(&mut world, || {
+            find_asset(c"props/barrel.fprefab".as_ptr(), out.as_mut_ptr())
+        });
+        assert_eq!(kind, orrin_script::ASSET_NONE);
+    }
+
+    /// The root comes back at once, as `spawn_renderable`'s entity does; the
+    /// tree under it is built when the dispatch's commands drain.
+    #[test]
+    fn a_script_gets_the_root_at_once_and_the_tree_after_the_dispatch() {
+        let (mut world, registry, id) = prefab_world();
+        let bytes = id.to_bytes();
+        let root =
+            orrin_script::with_active_world(&mut world, || instantiate_prefab(bytes.as_ptr()));
+        let root = Entity {
+            index: root.index,
+            generation: root.generation,
+        };
+        assert!(world.is_alive(root));
+        assert!(world.get::<Name>(root).is_none());
+
+        let commands: Vec<Command> = COMMANDS.with(|c| c.borrow_mut().drain(..).collect());
+        assert_eq!(commands.len(), 1);
+        let Command::InstantiatePrefab {
+            root: queued,
+            prefab,
+        } = commands[0]
+        else {
+            panic!("expected the instantiation to be queued");
+        };
+        assert_eq!((queued, prefab), (root, id));
+
+        build_prefab(&mut world, &registry, root, prefab);
+        assert_eq!(world.get::<Name>(root).unwrap().0, "Crate");
+        assert_eq!(world.get::<PrefabInstance>(root).unwrap().prefab, id);
+    }
+
+    #[test]
+    fn an_unknown_prefab_gives_a_script_the_null_entity() {
+        let (mut world, _, _) = prefab_world();
+        let bytes = AssetId::new().to_bytes();
+        let root =
+            orrin_script::with_active_world(&mut world, || instantiate_prefab(bytes.as_ptr()));
+        assert_eq!((root.index, root.generation), (0, 0));
+        assert_eq!(world.entities().count(), 0);
+        assert!(COMMANDS.with(|c| c.borrow().is_empty()));
     }
 }

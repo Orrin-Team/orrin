@@ -21,7 +21,8 @@ namespace Orrin;
 /// worse, could observe a Behaviour halfway through its own `OnUpdate`.
 ///
 /// The visible set is closed to the types that have a `Value` variant on the
-/// Rust side: bool, int, uint, float, string, Vector3, Quaternion, and enums.
+/// Rust side: bool, int, uint, float, string, Vector3, Quaternion, enums, and
+/// `AssetRef<T>`.
 /// Deliberately absent for now:
 /// - `Entity`, because a slot handle means nothing in a saved file. Persisting
 ///   one needs the engine's slot-to-EntityId translation, which lives where the
@@ -53,6 +54,7 @@ public static unsafe class PropertyBag
         public const byte Struct = 8;
         public const byte Enum = 9;
         public const byte List = 10;
+        public const byte Asset = 11;
     }
 
     /// Negative returns from every entry point below. A non-negative result is
@@ -265,6 +267,10 @@ public static unsafe class PropertyBag
                 writer.F32(v.z);
                 writer.F32(v.w);
                 break;
+            case IAssetRef v:
+                writer.Byte(Tag.Asset);
+                writer.Guid(v.Id);
+                break;
             // A null string is the one visible-typed value that can be null.
             // Written as empty rather than skipped: the field count is already
             // in the buffer, so a hole would desynchronize the reader.
@@ -352,6 +358,15 @@ public static unsafe class PropertyBag
                 reader.Skip(16);
                 return null;
             }
+            case Tag.Asset:
+            {
+                var id = reader.Guid();
+                // Any `AssetRef<T>` takes any id: the kind is the field's
+                // declaration, and the bytes carry none.
+                return target is { IsGenericType: true } && target.GetGenericTypeDefinition() == typeof(AssetRef<>)
+                    ? Activator.CreateInstance(target, id)
+                    : null;
+            }
             case Tag.Enum:
             {
                 var member = reader.Str();
@@ -425,7 +440,8 @@ public static unsafe class PropertyBag
         || type == typeof(float)
         || type == typeof(string)
         || type == typeof(Vector3)
-        || type == typeof(Quaternion);
+        || type == typeof(Quaternion)
+        || (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(AssetRef<>));
 
     /// Grows by doubling and copies out once, so an entry point never has to
     /// guess a size and the caller never sees a partial buffer.
@@ -478,6 +494,15 @@ public static unsafe class PropertyBag
             _len += bytes.Length;
         }
 
+        /// The sixteen bytes in canonical UUID order, which `Guid`'s default
+        /// byte layout is not.
+        public void Guid(Guid value)
+        {
+            Need(16);
+            value.TryWriteBytes(_bytes.AsSpan(_len, 16), bigEndian: true, out _);
+            _len += 16;
+        }
+
         /// A field name followed by its value's tag, for the hand-built buffers
         /// in [Components].
         public void Field(string name, byte tag)
@@ -525,5 +550,7 @@ public static unsafe class PropertyBag
         public float F32() => BitConverter.Int32BitsToSingle(unchecked((int)U32()));
 
         public string Str() => Encoding.UTF8.GetString(Take(checked((int)U32())));
+
+        public Guid Guid() => new(Take(16), bigEndian: true);
     }
 }
