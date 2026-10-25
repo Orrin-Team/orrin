@@ -458,6 +458,8 @@ impl ApplicationHandler for App {
             *self.world.resource::<PresentSettings>(),
         );
 
+        let device = renderer.device_label();
+        self.world.resource_mut::<FrameStats>().set_device(device);
         self.scene.build(&mut self.world, &mut renderer);
         if let Some(spec) = self.stress {
             spawn_stress_scene(&mut self.world, &spec);
@@ -476,13 +478,7 @@ impl ApplicationHandler for App {
             self.build_watcher = scripts.watcher;
         }
 
-        let editor = Editor::new(
-            event_loop,
-            surface,
-            renderer.queue(),
-            renderer.color_format(),
-            self.project.as_ref(),
-        );
+        let editor = Editor::new(event_loop, surface, renderer.queue(), self.project.as_ref());
 
         print_run_banner(&self.world, &renderer, self.scene);
 
@@ -790,6 +786,9 @@ impl ApplicationHandler for App {
                         &environment.hdri,
                     );
                 }
+                // Between the editor's pass and this frame's recording, so a
+                // material dragged in the inspector draws changed this frame.
+                crate::scene::apply_material_edits(&mut self.world, &mut active.renderer);
                 // Stamped into this frame's GPU queries so the readback, some
                 // frames later, can file its spans against the right frame.
                 let profiler_frame = self.world.resource::<Profiler>().frame_index();
@@ -806,12 +805,8 @@ impl ApplicationHandler for App {
                 let Active {
                     renderer, editor, ..
                 } = active;
-                let mut draw_overlay = |before, image| editor.draw(before, image);
-                let overlay: Option<crate::gfx::vulkan::Overlay<'_>> = if overlay_on {
-                    Some(&mut draw_overlay)
-                } else {
-                    None
-                };
+                let overlay: Option<crate::gfx::vulkan::Overlay<'_>> =
+                    overlay_on.then(|| editor.overlay());
                 {
                     profile_scope!("render submit");
                     // Borrowed once here: `ShadowFrame` holds `DrawList`s into

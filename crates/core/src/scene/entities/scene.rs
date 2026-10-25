@@ -28,7 +28,7 @@ const GRID: i32 = 10;
 const SPACING: f32 = 2.0;
 
 pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) {
-    let (assets, mesh_bounds, material_blends) = load_library(backend);
+    let (assets, mesh_bounds, material_blends, asset_previews) = load_library(backend);
 
     let cube = assets.mesh("cube").unwrap();
     let plane = assets.mesh("plane").unwrap();
@@ -61,6 +61,7 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
     world.insert_resource(assets);
     world.insert_resource(mesh_bounds);
     world.insert_resource(material_blends);
+    world.insert_resource(asset_previews);
 
     let half = (GRID - 1) as f32 * SPACING * 0.5;
     let mut index = 0;

@@ -43,7 +43,8 @@ rayon = "1"
 # without the default `attributes` feature it adds no proc macro either.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 egui = "0.31"
-egui_winit_vulkano = "0.28"
+# Window events into egui. Rendering is the engine's own (`gfx/vulkan/overlay.rs`).
+egui-winit = { version = "0.31", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 uuid = { version = "1", features = ["v4"] }

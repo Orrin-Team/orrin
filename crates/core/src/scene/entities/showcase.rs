@@ -115,7 +115,7 @@ struct Kit {
 }
 
 pub fn build_showcase_scene(world: &mut World, backend: &mut impl RenderBackend) {
-    let (assets, mesh_bounds, material_blends) = load_library(backend);
+    let (assets, mesh_bounds, material_blends, asset_previews) = load_library(backend);
 
     let kit = Kit {
         // The neutral primitives throughout. The rig's cube and sphere carry
@@ -144,6 +144,7 @@ pub fn build_showcase_scene(world: &mut World, backend: &mut impl RenderBackend)
     world.insert_resource(assets);
     world.insert_resource(mesh_bounds);
     world.insert_resource(material_blends);
+    world.insert_resource(asset_previews);
 
     paving(world, &kit);
     walls(world, &kit);

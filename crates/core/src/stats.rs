@@ -21,6 +21,7 @@ pub struct FrameStats {
     gpu_ms_history: VecDeque<f32>,
     vram_used: Option<u64>,
     vram_total: u64,
+    device: Option<String>,
 }
 
 impl Default for FrameStats {
@@ -43,6 +44,7 @@ impl FrameStats {
             gpu_ms_history: VecDeque::with_capacity(HISTORY),
             vram_used: None,
             vram_total: 0,
+            device: None,
         }
     }
 
@@ -75,6 +77,16 @@ impl FrameStats {
         if let Some(proc) = self.sys.process(pid) {
             self.memory_bytes = proc.memory();
         }
+    }
+
+    /// The graphics API and the adapter, as one line for the status bar. Set
+    /// once, when the renderer is created; a headless run has none.
+    pub fn set_device(&mut self, device: String) {
+        self.device = Some(device);
+    }
+
+    pub fn device(&self) -> Option<&str> {
+        self.device.as_deref()
     }
 
     pub fn set_gpu_stats(&mut self, gpu_ms: Option<f32>, vram_used: Option<u64>, vram_total: u64) {

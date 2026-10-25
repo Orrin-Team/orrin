@@ -275,7 +275,7 @@ pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
 /// `ENUMERATE_PORTABILITY` is the one flag that still matters without a window:
 /// MoltenVK is a portability driver, and an instance that does not enumerate
 /// those finds no device at all on macOS.
-fn headless_instance() -> Arc<Instance> {
+pub(crate) fn headless_instance() -> Arc<Instance> {
     let library = VulkanLibrary::new().expect("failed to load vulkan library");
     Instance::new(
         library,

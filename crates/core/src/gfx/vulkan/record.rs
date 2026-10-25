@@ -7,7 +7,7 @@
 //! records raw instead, and [`emit_plan`] submits the barriers the graph
 //! actually compiled.
 //!
-//! Four constraints shape what is here, none of them visible from the API:
+//! Three constraints shape what is here, none of them visible from the API:
 //!
 //! - **Submission must go through `ash`.** A raw `CommandBuffer` cannot
 //!   implement `PrimaryCommandBufferAbstract` from outside vulkano — that trait
@@ -16,12 +16,6 @@
 //!   take it, so neither will accept one.
 //! - **Nothing is kept alive.** Every object a recorded command names must
 //!   outlive its execution; that is [`KeepAlive`]'s job.
-//! - **A raw and an auto command buffer cannot share an image.** Vulkano tracks
-//!   per-`Image` whether any command buffer has declared a use of it. The first
-//!   auto one assumes `Undefined` and *discards*; later ones assume the image's
-//!   fixed layout requirement. A raw buffer declares nothing, so an image it
-//!   wrote must reach an auto buffer in the layout that buffer expects — for a
-//!   swapchain image, `PresentSrc`.
 //! - **Barriers need `synchronization2`.** Without it vulkano narrows
 //!   `AccessFlags2` to 32 bits, and every shader-read bit the plan uses sits at
 //!   32 or above: they truncate to an empty access mask. `context.rs` requires
@@ -35,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use ash::vk;
 use vulkano::VulkanObject;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
-use vulkano::buffer::{Buffer, BufferContents, IndexBuffer, Subbuffer};
+use vulkano::buffer::{BufferContents, IndexBuffer, Subbuffer};
 use vulkano::command_buffer::{
     BlitImageInfo, ClearAttachment, ClearDepthStencilImageInfo, ClearRect, CommandBuffer,
     CommandBufferBeginInfo, CommandBufferInheritanceInfo, CommandBufferLevel, CommandBufferUsage,
@@ -51,15 +45,13 @@ use vulkano::pipeline::{ComputePipeline, GraphicsPipeline, PipelineBindPoint, Pi
 use vulkano::query::QueryPool;
 use vulkano::sync::PipelineStage;
 use vulkano::sync::fence::{Fence, FenceCreateInfo};
-use vulkano::sync::future::{AccessCheckError, FenceSignalFuture, GpuFuture, SubmitAnyBuilder};
 use vulkano::sync::semaphore::Semaphore;
 use vulkano::sync::{
     AccessFlags, DependencyInfo, ImageMemoryBarrier, MemoryBarrier, PipelineStages,
 };
 
-use vulkano::device::{Device, DeviceOwned, Queue};
-use vulkano::swapchain::Swapchain;
-use vulkano::{DeviceSize, Validated, VulkanError};
+use vulkano::DeviceSize;
+use vulkano::device::Queue;
 
 use crate::gfx::graph::{Barrier, ResourceId};
 use crate::profile_scope;
@@ -779,10 +771,8 @@ impl InFlight {
 
 /// Work the CPU has handed the queue and cannot yet prove is finished.
 ///
-/// A frame submits either one of these or two: its own recording, and — with an
-/// editor overlay — the second submission vulkano makes for it. The two are
-/// different types and are retired identically, which is the whole reason this
-/// is a trait rather than a method on [`InFlight`].
+/// A trait rather than a method on [`InFlight`] so the run-ahead ring can be
+/// tested against submissions whose completion the test decides.
 pub(super) trait Pending {
     /// Whether the GPU has finished, asked rather than waited for.
     ///
@@ -807,24 +797,6 @@ impl Pending for InFlight {
         for fence in &self.fences {
             fence.wait(None).expect("failed to wait on the frame fence");
         }
-    }
-}
-
-/// The overlay's submission, which vulkano owns because it is vulkano that made
-/// it — `Gui::draw_on_image` builds and flushes its own command buffer.
-///
-/// Held for the same reason [`InFlight`] is, and with one extra hazard:
-/// `FenceSignalFuture`'s destructor waits on the fence. Dropping one the GPU has
-/// not reached is therefore a silent CPU stall, so this must be polled through
-/// [`Pending::is_complete`] rather than replaced.
-impl Pending for FenceSignalFuture<Box<dyn GpuFuture>> {
-    fn is_complete(&self) -> bool {
-        self.is_signaled().unwrap_or(true)
-    }
-
-    fn retire(self) {
-        self.wait(None)
-            .expect("failed to wait on the overlay fence");
     }
 }
 
@@ -1056,116 +1028,6 @@ pub(super) fn color_to_shader_read(
         new_layout: ImageLayout::ShaderReadOnlyOptimal,
         subresource_range,
         ..ImageMemoryBarrier::image(image)
-    }
-}
-
-/// A [`GpuFuture`] that is nothing but a wait on a semaphore this crate signalled.
-///
-/// The bridge between the raw frame and the editor overlay, which
-/// `egui_winit_vulkano` submits itself from a `GpuFuture` it is handed. Vulkano
-/// ships no such future, but [`SubmitAnyBuilder::SemaphoresWait`] is public, so
-/// the whole bridge is one `build_submission` — and the overlay is ordered on
-/// the GPU rather than by blocking the CPU on the frame's fence.
-///
-/// `acquired` names the swapchain image the signalling submission rendered into.
-/// Vulkano validates a present by walking the chain for the acquire it came
-/// from; this future stands in for a submission it cannot see, and without that
-/// field the present behind it is refused as unacquired.
-pub(super) struct SemaphoreWait {
-    queue: Arc<Queue>,
-    semaphore: Arc<Semaphore>,
-    acquired: Option<(Arc<Swapchain>, u32)>,
-}
-
-impl SemaphoreWait {
-    pub(super) fn new(
-        queue: Arc<Queue>,
-        semaphore: Arc<Semaphore>,
-        acquired: Option<(Arc<Swapchain>, u32)>,
-    ) -> Self {
-        Self {
-            queue,
-            semaphore,
-            acquired,
-        }
-    }
-}
-
-unsafe impl DeviceOwned for SemaphoreWait {
-    fn device(&self) -> &Arc<Device> {
-        self.queue.device()
-    }
-}
-
-unsafe impl GpuFuture for SemaphoreWait {
-    fn cleanup_finished(&mut self) {}
-
-    unsafe fn build_submission(&self) -> Result<SubmitAnyBuilder, Validated<VulkanError>> {
-        Ok(SubmitAnyBuilder::SemaphoresWait(
-            [self.semaphore.clone()].into_iter().collect(),
-        ))
-    }
-
-    fn flush(&self) -> Result<(), Validated<VulkanError>> {
-        Ok(())
-    }
-
-    unsafe fn signal_finished(&self) {}
-
-    fn queue_change_allowed(&self) -> bool {
-        false
-    }
-
-    fn queue(&self) -> Option<Arc<Queue>> {
-        Some(self.queue.clone())
-    }
-
-    /// `Unknown` for both, as `NowFuture` answers them: this future tracks no
-    /// resource, so it can say nothing about one. What it expresses is an
-    /// execution dependency, and the layouts on either side of it are the
-    /// compiled plan's business.
-    fn check_buffer_access(
-        &self,
-        _buffer: &Buffer,
-        _range: Range<DeviceSize>,
-        _exclusive: bool,
-        _queue: &Queue,
-    ) -> Result<(), AccessCheckError> {
-        Err(AccessCheckError::Unknown)
-    }
-
-    fn check_image_access(
-        &self,
-        _image: &Image,
-        _range: Range<DeviceSize>,
-        _exclusive: bool,
-        _expected_layout: ImageLayout,
-        _queue: &Queue,
-    ) -> Result<(), AccessCheckError> {
-        Err(AccessCheckError::Unknown)
-    }
-
-    /// Answered exactly as [`SwapchainAcquireFuture`] answers it, because it
-    /// stands for a submission that waited on that acquire's semaphore: the
-    /// image really has been acquired, and really is free to be drawn into and
-    /// presented behind this future.
-    ///
-    /// [`SwapchainAcquireFuture`]: vulkano::swapchain::SwapchainAcquireFuture
-    fn check_swapchain_image_acquired(
-        &self,
-        swapchain: &Swapchain,
-        image_index: u32,
-        before: bool,
-    ) -> Result<(), AccessCheckError> {
-        if before {
-            return Ok(());
-        }
-        match &self.acquired {
-            Some((acquired, index)) if acquired.as_ref() == swapchain && *index == image_index => {
-                Ok(())
-            }
-            _ => Err(AccessCheckError::Unknown),
-        }
     }
 }
 

@@ -1,0 +1,16 @@
+<!-- Orrin mark: a ring broken in three around a point. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600">
+  <defs>
+    <linearGradient id="disc" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b162b"/>
+      <stop offset="1" stop-color="#071a20"/>
+    </linearGradient>
+  </defs>
+  <circle cx="300" cy="300" r="300" fill="url(#disc)"/>
+  <g fill="none" stroke="#ffffff" stroke-width="44" stroke-linecap="round">
+    <path d="M347.4 66.8A238 238 0 0 1 525.7 375.5"/>
+    <path d="M478.3 457.7A238 238 0 0 1 121.7 457.7"/>
+    <path d="M74.3 375.5A238 238 0 0 1 252.6 66.8"/>
+  </g>
+  <circle cx="300" cy="300" r="53" fill="#ffffff"/>
+</svg>

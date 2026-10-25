@@ -23,6 +23,7 @@ use crate::scene::{
 pub struct HeadlessBackend {
     mesh_bounds: Vec<Aabb>,
     materials: u32,
+    material_updates: u32,
     textures: u32,
 }
 
@@ -35,6 +36,11 @@ impl HeadlessBackend {
     /// benchmark to assert it measured a real scene rather than an empty one.
     pub fn upload_counts(&self) -> (usize, u32, u32) {
         (self.mesh_bounds.len(), self.materials, self.textures)
+    }
+
+    /// How many in-place material edits reached this backend.
+    pub fn material_updates(&self) -> u32 {
+        self.material_updates
     }
 }
 
@@ -55,6 +61,10 @@ impl RenderBackend for HeadlessBackend {
         let handle = MaterialHandle(self.materials);
         self.materials += 1;
         handle
+    }
+
+    fn update_material(&mut self, _handle: MaterialHandle, _material: &Material) {
+        self.material_updates += 1;
     }
 
     fn load_texture(
