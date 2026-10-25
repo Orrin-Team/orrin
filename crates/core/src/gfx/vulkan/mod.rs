@@ -2450,14 +2450,11 @@ impl FrameRecord<'_> {
                     // One self.view per level, because a storage image descriptor
                     // takes exactly one — the sampled self.view the trace reads
                     // spans the whole pyramid instead.
-                    let mips: Vec<_> = (0..self.images.mip_levels(ids.hiz))
-                        .map(|level| self.images.mip_view(ids.hiz, level))
-                        .collect();
                     self.ssr.record_hiz(
                         builder,
                         self.ctx,
                         self.images.view(prepass.depth),
-                        &mips,
+                        self.images.mip_views(ids.hiz),
                         self.extent,
                     );
                 }
@@ -2467,11 +2464,12 @@ impl FrameRecord<'_> {
                         .ids
                         .ssr
                         .expect("reflections without their images");
-                    let mips: Vec<_> = (0..self.images.mip_levels(ids.source_pyramid))
-                        .map(|level| self.images.mip_view(ids.source_pyramid, level))
-                        .collect();
-                    self.ssr
-                        .record_source(builder, self.ctx, self.view_of(ids.source), &mips);
+                    self.ssr.record_source(
+                        builder,
+                        self.ctx,
+                        self.view_of(ids.source),
+                        self.images.mip_views(ids.source_pyramid),
+                    );
                 }
                 PassBody::SsrTrace => {
                     let ids = self
@@ -2595,14 +2593,11 @@ impl FrameRecord<'_> {
                         .ids
                         .refraction
                         .expect("refraction without its images");
-                    let mips: Vec<_> = (0..self.images.mip_levels(ids.scene))
-                        .map(|level| self.images.mip_view(ids.scene, level))
-                        .collect();
                     self.refraction.record_pyramid(
                         builder,
                         self.ctx,
                         self.view_of(ids.source),
-                        &mips,
+                        self.images.mip_views(ids.scene),
                     );
                 }
                 PassBody::RefractionComposite => {

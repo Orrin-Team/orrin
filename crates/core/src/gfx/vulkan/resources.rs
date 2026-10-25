@@ -87,6 +87,19 @@ struct BlockKey {
     memory_type_index: u32,
 }
 
+/// One allocation's views: the whole image, which is what a pass samples, and
+/// for a pyramid one view per level, which is what a storage descriptor takes.
+///
+/// Built with the image rather than when a pass asks for them, because they
+/// change exactly when the image does — and asking per frame was a
+/// `vkCreateImageView` per level, per pyramid pass, per frame.
+#[derive(Clone)]
+struct Views {
+    whole: Arc<ImageView>,
+    /// Empty for an image of one level, whose whole view already is its level.
+    levels: Vec<Arc<ImageView>>,
+}
+
 /// Graph-owned images, indexed by [`ResourceId`].
 pub(super) struct GraphImages {
     /// One set of views per frame in flight, indexed `[slot][resource]`.
@@ -99,7 +112,7 @@ pub(super) struct GraphImages {
     /// the ones that do are most of them, and "which transients does frame
     /// `n + 1` share with frame `n`" is a derivation whose failure mode is
     /// corruption rather than a compile error.
-    views: Vec<Vec<Option<Arc<ImageView>>>>,
+    views: Vec<Vec<Option<Views>>>,
     /// Which set the frame now recording uses.
     slot: usize,
     /// Every image allocated at the current extent, for any graph, keyed by what
@@ -119,7 +132,7 @@ pub(super) struct GraphImages {
     /// Cleared on resize rather than allowed to accumulate: `Extent::Frame`
     /// resolves differently then, so every entry keyed at the old size is dead
     /// weight no lookup will ever hit again.
-    cache: HashMap<ImageKey, Arc<ImageView>>,
+    cache: HashMap<ImageKey, Views>,
     /// The memory the graph's alias groups share, so that a structural toggle
     /// re-binds the group it already allocated rather than allocating a second
     /// one beside it. Cleared on resize with `cache`, and for the same reason.
@@ -327,7 +340,7 @@ impl GraphImages {
                         // A storage image descriptor takes exactly one level, so a
                         // view spanning the whole pyramid cannot claim that usage —
                         // it is the one a shader samples with `textureLod`, and the
-                        // per-level storage views come from `mip_view`.
+                        // per-level storage views come from `mip_views`.
                         usage: if mip_levels > 1 {
                             image.usage - ImageUsage::STORAGE
                         } else {
@@ -337,8 +350,19 @@ impl GraphImages {
                     },
                 )
                 .unwrap();
-                self.cache.insert(key, view.clone());
-                views[id.index()] = Some(view);
+                let levels = if mip_levels > 1 {
+                    (0..mip_levels)
+                        .map(|level| level_view(&allocated, level))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let entry = Views {
+                    whole: view,
+                    levels,
+                };
+                self.cache.insert(key, entry.clone());
+                views[id.index()] = Some(entry);
             }
             sets.push(views);
         }
@@ -361,12 +385,18 @@ impl GraphImages {
     /// things from a miss: a pass binding a resource it declared has hit a bug,
     /// while the barrier resolver is *asking* which kind of resource this is.
     pub fn try_view(&self, id: ResourceId) -> Option<Arc<ImageView>> {
-        self.views[self.slot][id.index()].clone()
+        self.views[self.slot][id.index()]
+            .as_ref()
+            .map(|views| views.whole.clone())
     }
 
     pub fn view(&self, id: ResourceId) -> Arc<ImageView> {
+        self.views_of(id).whole.clone()
+    }
+
+    fn views_of(&self, id: ResourceId) -> &Views {
         self.views[self.slot][id.index()]
-            .clone()
+            .as_ref()
             .expect("render graph resource is not a graph-owned image")
     }
 
@@ -399,22 +429,19 @@ impl GraphImages {
         ImageView::new(image, info).unwrap()
     }
 
-    /// A single-level view of one mip of a pyramid, which is what a storage
-    /// image descriptor requires. The whole-pyramid view `view` hands back is
-    /// the one to sample.
-    pub fn mip_view(&self, id: ResourceId, level: u32) -> Arc<ImageView> {
-        let image = self.view(id).image().clone();
-
-        let info = ImageViewCreateInfo {
-            view_type: ImageViewType::Dim2d,
-            subresource_range: ImageSubresourceRange {
-                mip_levels: level..level + 1,
-                ..image.subresource_range()
-            },
-            ..ImageViewCreateInfo::from_image(&image)
-        };
-
-        ImageView::new(image, info).unwrap()
+    /// One single-level view per mip the image actually has, which is what a
+    /// storage image descriptor requires. The whole-pyramid view `view` hands
+    /// back is the one to sample.
+    ///
+    /// An image a small window clamped to one level has no separate level
+    /// views: its whole view is that level, and kept `STORAGE` for it.
+    pub fn mip_views(&self, id: ResourceId) -> &[Arc<ImageView>] {
+        let views = self.views_of(id);
+        if views.levels.is_empty() {
+            std::slice::from_ref(&views.whole)
+        } else {
+            &views.levels
+        }
     }
 
     /// How many levels the allocated image actually has, which is what a pass
@@ -503,7 +530,92 @@ fn share_allocations() -> bool {
     *SHARE.get_or_init(|| !std::env::var("ORRIN_ALIAS").is_ok_and(|value| value.trim() == "0"))
 }
 
+/// A 2D view of mip `level` of `image` alone.
+fn level_view(image: &Arc<Image>, level: u32) -> Arc<ImageView> {
+    let info = ImageViewCreateInfo {
+        view_type: ImageViewType::Dim2d,
+        subresource_range: ImageSubresourceRange {
+            mip_levels: level..level + 1,
+            ..image.subresource_range()
+        },
+        ..ImageViewCreateInfo::from_image(image)
+    };
+    ImageView::new(image.clone(), info).unwrap()
+}
+
 /// The deepest pyramid an extent can carry: halving stops at one texel.
 fn max_mip_levels(extent: [u32; 2]) -> u32 {
     32 - extent[0].max(extent[1]).max(1).leading_zeros()
+}
+
+#[cfg(test)]
+mod tests {
+    use vulkano::VulkanLibrary;
+    use vulkano::format::Format;
+    use vulkano::image::ImageLayout;
+    use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
+
+    use super::*;
+    use crate::gfx::graph::{Access, GraphBuilder, ImageDesc, PassKind, compile};
+    use crate::gfx::vulkan::context::VkContext;
+
+    /// A pyramid written per level by storage and then sampled whole: the
+    /// shape the SSR and refraction pyramids take. The import is what keeps
+    /// the passes, and so the pyramid, from being culled.
+    fn pyramid_graph(levels: u32) -> (FrameGraph, ResourceId) {
+        let mut builder = GraphBuilder::new();
+        let pyramid = builder.create_image(
+            "pyramid",
+            ImageDesc::new(Format::R16G16B16A16_SFLOAT).mip_levels(levels),
+        );
+        let target = builder.import_image(
+            "target",
+            ImageDesc::new(Format::R16G16B16A16_SFLOAT),
+            ImageLayout::Undefined,
+            ImageLayout::General,
+        );
+        builder
+            .pass("build", PassKind::Compute)
+            .access(pyramid, Access::StorageWrite)
+            .build();
+        builder
+            .pass("read", PassKind::Compute)
+            .access(pyramid, Access::Sampled)
+            .access(target, Access::StorageWrite)
+            .build();
+        (compile(builder).expect("a pyramid graph"), pyramid)
+    }
+
+    /// The per-level storage views are part of the allocation, not of the
+    /// frame: every recording sees the same views, and a recompile that hits the
+    /// image cache keeps them. Creating them per frame was a `vkCreateImageView`
+    /// per level per pass per frame for views that only change on resize.
+    #[test]
+    #[ignore = "needs a Vulkan device"]
+    fn a_pyramid_keeps_one_view_per_level_across_frames_and_recompiles() {
+        let instance = Instance::new(
+            VulkanLibrary::new().expect("a Vulkan library"),
+            InstanceCreateInfo {
+                flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+                ..Default::default()
+            },
+        )
+        .expect("a headless instance");
+        let ctx = VkContext::new(&instance, None);
+        let (graph, pyramid) = pyramid_graph(5);
+
+        let mut images = GraphImages::allocate(&ctx.memory_allocator, &ctx, &graph, [64, 64], 1);
+        let first: Vec<_> = images.mip_views(pyramid).to_vec();
+        assert_eq!(first.len(), 5);
+        for (level, view) in first.iter().enumerate() {
+            let level = level as u32;
+            assert_eq!(view.subresource_range().mip_levels, level..level + 1);
+        }
+
+        let (recompiled, pyramid) = pyramid_graph(5);
+        images.rebuild(&ctx.memory_allocator, &ctx, &recompiled, [64, 64], 1);
+        for (before, after) in first.iter().zip(images.mip_views(pyramid)) {
+            assert!(Arc::ptr_eq(before, after), "a cache hit rebuilt a mip view");
+        }
+    }
 }
