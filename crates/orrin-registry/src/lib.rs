@@ -34,7 +34,7 @@ pub use scene::{FORMAT_VERSION, ParseError, SceneDocument, SceneEntity, parse};
 /// `serde::Serialize` does — the derive lives in the macro namespace and the
 /// trait in the type namespace, so one import brings both.
 pub use orrin_macros::Reflect;
-pub use reflect::{Reflect, take, take_or};
+pub use reflect::{Reflect, Resolve, take, take_or};
 pub use registry::{
     ApplyError, ComponentId, ComponentVtable, Registry, ScriptBinding, ScriptBridge,
 };

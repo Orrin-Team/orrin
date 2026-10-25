@@ -7,7 +7,7 @@ use std::sync::Arc;
 use orrin_ecs::{Entity, World};
 
 use crate::diff::FieldChange;
-use crate::reflect::Reflect;
+use crate::reflect::{Reflect, Resolve};
 use crate::value::{Value, ValueError};
 
 /// Why a batch of [`FieldChange`]s could not land on a component.
@@ -292,6 +292,58 @@ impl Registry {
             #[cfg(feature = "egui")]
             inspect: crate::inspect::value,
             default: |_| T::default().to_value(),
+        });
+        self.by_type.insert(type_id, index);
+    }
+
+    /// Describe `T`, whose file form the world translates, under `id`.
+    ///
+    /// Every operation goes through [`Resolve`] rather than [`Reflect`], and is
+    /// otherwise what [`register`](Self::register) builds: `write` and `apply`
+    /// convert before touching the world, so a value that does not resolve
+    /// leaves the component as it was.
+    ///
+    /// # Panics
+    /// As [`register`](Self::register) does.
+    pub fn register_resolved<T: Resolve>(&mut self, id: ComponentId, name: &'static str) {
+        let type_id = TypeId::of::<T>();
+        if let Some(&existing) = self.by_type.get(&type_id) {
+            panic!(
+                "`{name}` is already registered as `{}`; a type gets exactly one id",
+                self.entries[existing].id
+            );
+        }
+
+        let index = self.claim(&id, name);
+        self.entries.push(ComponentVtable {
+            id,
+            name: Cow::Borrowed(name),
+            type_id: Some(type_id),
+            script: None,
+            has: |_, world, entity| world.has::<T>(entity),
+            read: |_, world, entity| world.get::<T>(entity)?.to_value(world),
+            write: |_, world, entity, value| {
+                let component = T::from_value(world, value)?;
+                let _ = world.insert(entity, component);
+                Ok(())
+            },
+            remove: |_, world, entity| {
+                let _ = world.remove::<T>(entity);
+            },
+            diff: |v, world, entity, target| {
+                v.read(world, entity)
+                    .map(|live| crate::diff::diff(&live, target))
+            },
+            apply: |v, world, entity, changes| {
+                let Some(mut value) = v.read(world, entity) else {
+                    return Err(ApplyError::Absent);
+                };
+                crate::diff::apply(&mut value, changes).map_err(ApplyError::Value)?;
+                v.write(world, entity, &value).map_err(ApplyError::Value)
+            },
+            #[cfg(feature = "egui")]
+            inspect: crate::inspect::value,
+            default: |_| T::default_value(),
         });
         self.by_type.insert(type_id, index);
     }
@@ -880,5 +932,99 @@ mod tests {
     fn registering_a_type_twice_panics() {
         let mut registry = registry();
         registry.register::<Speed>(ComponentId::new("test.speed2"), "Speed");
+    }
+
+    /// A session-local slot that the file names by what it stands for, the
+    /// shape `MeshHandle` has: the number means nothing in another session, and
+    /// only the world knows what it stands for in this one.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Slot(u32);
+
+    /// The world's table for [`Slot`]: index is the slot, entry its name.
+    struct Names(Vec<&'static str>);
+
+    impl Resolve for Slot {
+        fn to_value(&self, world: &World) -> Option<Value> {
+            let names = world.get_resource::<Names>()?;
+            let name = names.0.get(self.0 as usize)?;
+            Some(Value::String((*name).to_owned()))
+        }
+
+        fn from_value(world: &World, value: &Value) -> Result<Self, ValueError> {
+            let name = String::from_value(value)?;
+            let names = world.resource::<Names>();
+            names
+                .0
+                .iter()
+                .position(|known| *known == name)
+                .map(|slot| Self(slot as u32))
+                .ok_or_else(|| ValueError::invalid("a known name", name))
+        }
+
+        fn default_value() -> Value {
+            Value::String("first".to_owned())
+        }
+    }
+
+    fn resolving() -> (Registry, World, Entity) {
+        let mut registry = Registry::new();
+        registry.register_resolved::<Slot>(ComponentId::new("test.slot"), "Slot");
+        let mut world = World::new();
+        world.insert_resource(Names(vec!["first", "second"]));
+        let entity = world.spawn();
+        (registry, world, entity)
+    }
+
+    #[test]
+    fn a_resolved_component_is_read_and_written_in_the_worlds_terms() {
+        let (registry, mut world, entity) = resolving();
+        let slot = registry.get(&ComponentId::new("test.slot")).unwrap();
+
+        slot.write(&mut world, entity, &Value::String("second".to_owned()))
+            .unwrap();
+        assert_eq!(*world.get::<Slot>(entity).unwrap(), Slot(1));
+        assert_eq!(
+            slot.read(&world, entity),
+            Some(Value::String("second".to_owned()))
+        );
+        assert!(registry.of::<Slot>().is_some());
+        assert_eq!(slot.default(), Value::String("first".to_owned()));
+    }
+
+    #[test]
+    fn a_resolved_component_the_world_cannot_name_reads_as_absent() {
+        let (registry, mut world, entity) = resolving();
+        world.insert(entity, Slot(9));
+        let slot = registry.get(&ComponentId::new("test.slot")).unwrap();
+        assert!(slot.has(&world, entity));
+        assert_eq!(slot.read(&world, entity), None);
+        assert_eq!(
+            slot.diff(&world, entity, &Value::String("first".to_owned())),
+            None
+        );
+    }
+
+    #[test]
+    fn a_resolved_component_diffs_and_applies_through_the_world() {
+        let (registry, mut world, entity) = resolving();
+        world.insert(entity, Slot(0));
+        let slot = registry.get(&ComponentId::new("test.slot")).unwrap();
+
+        let target = Value::String("second".to_owned());
+        let changes = slot.diff(&world, entity, &target).unwrap();
+        assert_eq!(changes.len(), 1);
+        slot.apply(&mut world, entity, &changes).unwrap();
+        assert_eq!(*world.get::<Slot>(entity).unwrap(), Slot(1));
+
+        let unknown = [FieldChange {
+            path: FieldPath::empty(),
+            value: Value::String("third".to_owned()),
+        }];
+        let err = slot.apply(&mut world, entity, &unknown).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "expected a known name, found third"
+        );
+        assert_eq!(*world.get::<Slot>(entity).unwrap(), Slot(1));
     }
 }

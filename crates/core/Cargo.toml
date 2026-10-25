@@ -27,8 +27,14 @@ serde.workspace = true
 toml.workspace = true
 ron = "0.10"
 sysinfo = "0.33"
-# Filesystem watching for rebuild-on-save; only pulled in with `scripting`.
-notify = { version = "8", optional = true }
+# Filesystem watching: rebuild-on-save, and reimport-on-save for assets, which
+# every build shape has — architecture §6 asks that asset edits never need a
+# restart, with or without .NET.
+notify = "8"
+# The asset cache's content hash. xxh3 only: one crate, no dependencies of its
+# own, and no build script. Not a cryptographic hash, which is right for a cache
+# no one else writes into — see `asset_db::cache` for when that changes.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Raw VK_EXT_memory_budget query for VRAM usage; pinned to vulkano 0.35's ash.
 ash = "0.38"
 egui_dock = { version = "0.16", features = ["serde"] }
@@ -54,7 +60,7 @@ default = ["scripting"]
 #
 # The build watcher rides along: rebuild-on-save has nothing to reload without
 # scripting.
-scripting = ["dep:orrin-script", "dep:orrin-build", "dep:notify"]
+scripting = ["dep:orrin-script", "dep:orrin-build"]
 # An exported game rather than the editor: trace and debug events are compiled
 # out, and warnings and errors are also written to a log file beside the
 # executable — see `logging::LogConfig::for_this_build`.
