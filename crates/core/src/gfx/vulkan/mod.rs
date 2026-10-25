@@ -2,6 +2,7 @@ mod bloom;
 mod contact_shadows;
 mod context;
 mod cull;
+mod descriptors;
 mod dof;
 mod environment;
 mod exposure;
@@ -1307,6 +1308,7 @@ impl VulkanRenderer {
         // still reading the other.
         self.images.set_slot(self.frame_index);
         self.frame_index = self.frame_index.wrapping_add(1);
+        self.ctx.descriptor_sets.next_frame();
 
         // Taken out of `self` for the duration of recording: the pass brackets
         // below interleave with calls that borrow `self` immutably, and a field

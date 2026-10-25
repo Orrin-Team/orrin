@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use vulkano::buffer::BufferContents;
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
@@ -187,17 +187,15 @@ impl DofPass {
         depth: Arc<ImageView>,
         target: Arc<ImageView>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.prefilter_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.prefilter_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, color, self.linear_clamp.clone()),
                 WriteDescriptorSet::image_view_sampler(1, depth, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view(2, target.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.prefilter_pipeline)
@@ -230,16 +228,14 @@ impl DofPass {
         prefiltered: Arc<ImageView>,
         target: Arc<ImageView>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.tile_max_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.tile_max_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, prefiltered, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view(1, target.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.tile_max_pipeline)
@@ -261,18 +257,16 @@ impl DofPass {
         near: Arc<ImageView>,
         far: Arc<ImageView>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.gather_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.gather_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, prefiltered, self.linear_clamp.clone()),
                 WriteDescriptorSet::image_view_sampler(1, tiles, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view(2, near.clone()),
                 WriteDescriptorSet::image_view(3, far),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.gather_pipeline)
@@ -299,9 +293,9 @@ impl DofPass {
         far: Arc<ImageView>,
         target: Arc<ImageView>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.composite_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.composite_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, color, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view_sampler(1, depth, self.nearest_clamp.clone()),
@@ -309,9 +303,7 @@ impl DofPass {
                 WriteDescriptorSet::image_view_sampler(3, far, self.linear_clamp.clone()),
                 WriteDescriptorSet::image_view(4, target.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.composite_pipeline)

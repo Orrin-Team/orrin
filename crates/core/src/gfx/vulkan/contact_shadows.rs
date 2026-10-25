@@ -218,16 +218,14 @@ impl ContactShadowPass {
             [],
         )
         .unwrap();
-        let texture_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[1].clone(),
+        let texture_set = renderer.ctx.descriptor_sets.get(
+            &renderer.ctx.descriptor_set_allocator,
+            &self.pipeline.layout().set_layouts()[1],
             [
                 WriteDescriptorSet::image_view_sampler(0, depth_view, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view_sampler(1, normal_view, self.nearest_clamp.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .set_viewport(

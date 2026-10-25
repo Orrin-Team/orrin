@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use vulkano::buffer::{BufferContents, Subbuffer};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -117,17 +117,15 @@ impl HdrPass {
         exposure: Subbuffer<GpuExposure>,
         bloom_view: Arc<ImageView>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.tonemap_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.tonemap_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, hdr_view, self.sampler.clone()),
                 WriteDescriptorSet::buffer(1, exposure),
                 WriteDescriptorSet::image_view_sampler(2, bloom_view, self.sampler.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .set_viewport(

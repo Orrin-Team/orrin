@@ -18,6 +18,7 @@ use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::swapchain::Surface;
 use vulkano::{Version, VulkanObject};
 
+use super::descriptors::DescriptorCache;
 use super::pipeline_cache::ShaderCache;
 use super::vendor::GpuProfile;
 
@@ -41,6 +42,9 @@ pub struct VkContext {
     pub memory_allocator: Arc<StandardMemoryAllocator>,
     pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     pub descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+    /// Sets reused across frames while what they point at is unchanged; see
+    /// [`descriptors`](super::descriptors).
+    pub(super) descriptor_sets: DescriptorCache,
     /// What the device is and how its memory is shaped. Read by
     /// [`upload_mesh`](super::forward::upload_mesh) to decide whether static
     /// geometry can be written straight into video memory; reported at startup
@@ -301,6 +305,7 @@ impl VkContext {
             memory_allocator,
             command_buffer_allocator,
             descriptor_set_allocator,
+            descriptor_sets: DescriptorCache::default(),
             profile,
             pipelines,
             partially_bound,
