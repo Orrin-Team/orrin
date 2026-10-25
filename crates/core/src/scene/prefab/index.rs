@@ -1,9 +1,13 @@
 //! Which `.fprefab` files the project has, under which ids.
 //!
 //! The slice of the asset database (issue #22) that prefabs need, in the shape
-//! that database is to take: identity lives in a `<file>.meta` sidecar beside
-//! the source, the index is derived state rebuilt by scanning, and a path turns
-//! into an id here and nowhere else.
+//! that database takes: identity lives in a `<file>.meta` sidecar beside the
+//! source, read through `asset_db::sidecar`; the index is derived state rebuilt
+//! by scanning, and a path turns into an id here and nowhere else.
+//!
+//! Kept beside the database rather than inside it because it holds what the
+//! database does not — each prefab parsed and checked to be one tree — and
+//! because a run without a project has prefabs and no database.
 
 use std::path::{Path, PathBuf};
 
@@ -272,39 +276,12 @@ fn collect(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, issues: &m
 
 /// The id in `<file>.meta`, writing a fresh one when there is no sidecar.
 ///
-/// Only `id` is read. The rest of the table belongs to the import settings the
-/// asset pipeline will add, which is also why an existing sidecar is never
-/// rewritten, and why one that cannot be read is refused rather than replaced:
-/// replacing it would give the prefab a new identity and orphan every instance
-/// that names the old one.
+/// Read by the asset database's own rules (`asset_db::sidecar`), so the two
+/// indexes cannot disagree about what a sidecar says, or give one new prefab
+/// two ids.
 fn sidecar_id(file: &Path, rel: &str) -> Result<AssetId, String> {
-    let mut meta = file.as_os_str().to_owned();
-    meta.push(".meta");
-    let meta = PathBuf::from(meta);
-
-    match std::fs::read_to_string(&meta) {
-        Ok(text) => toml::from_str::<toml::Table>(&text)
-            .map_err(|error| format!("{rel}.meta: {error}"))?
-            .get("id")
-            .and_then(|id| id.as_str())
-            .and_then(|id| id.parse::<AssetId>().ok())
-            .filter(|id| !id.is_nil())
-            .ok_or_else(|| {
-                format!(
-                    "{rel}.meta has no valid `id`. Restore it from version control: deleting it \
-                     gives the prefab a new id, and scenes that use the old one lose their \
-                     instances"
-                )
-            }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let id = AssetId::new();
-            std::fs::write(&meta, format!("id = \"{id}\"\n")).map_err(|error| {
-                format!("{rel} has no sidecar, and writing {rel}.meta failed: {error}")
-            })?;
-            Ok(id)
-        }
-        Err(error) => Err(format!("{rel}.meta: {error}")),
-    }
+    crate::asset_db::sidecar::read_or_create(file, rel, crate::asset_db::AssetKind::Prefab)
+        .map(|sidecar| sidecar.id)
 }
 
 #[cfg(test)]
@@ -448,6 +425,32 @@ entity {HANDLE}
         let prefab = prefabs.get(door_id()).unwrap();
         assert_eq!(prefab.path, "props/door.fprefab");
         assert_eq!(prefab.name(), "door");
+    }
+
+    /// One sidecar format for every asset: a prefab's is read by the asset
+    /// database's rules, so a setting a prefab does not have is an error by
+    /// name rather than ignored, and the database and the index give a new
+    /// prefab the same id whichever reads it first.
+    #[test]
+    fn a_prefab_sidecar_follows_the_asset_databases_rules() {
+        let dir = Dir::new("shared-sidecar");
+        dir.write("props/door.fprefab", &door_text("handle", 1.0));
+        dir.write("props/gate.fprefab", &door_text("handle", 1.0));
+        dir.write(
+            "props/door.fprefab.meta",
+            &format!("id = \"{DOOR_ID}\"\n\n[import]\nscale = 2.0\n"),
+        );
+
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let (prefabs, issues) = Prefabs::scan(dir.path());
+        assert_eq!(
+            issues,
+            ["props/door.fprefab.meta: `scale` is not a prefab import setting; a prefab has none"]
+        );
+        assert_eq!(
+            prefabs.find("props/gate.fprefab"),
+            db.find("props/gate.fprefab").map(|entry| entry.id)
+        );
     }
 
     /// Duplicating a file in an explorer copies its sidecar too, and two
