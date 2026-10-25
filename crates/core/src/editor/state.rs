@@ -3,8 +3,9 @@ use glam::Vec3;
 use orrin_ecs::{Entity, World};
 use orrin_registry::{AssetId, Registry};
 
+use super::selection::Selection;
 use crate::scene::{
-    self, Assets, LogBuffer, LogLevel, MaterialHandle, Prefabs, Time, Transform, entities,
+    self, Assets, LogBuffer, LogLevel, MaterialHandle, Name, Prefabs, Time, Transform, entities,
 };
 
 /// Where the editor's Save/Load buttons read and write. Relative to the
@@ -78,7 +79,7 @@ pub enum SpawnKind {
 /// by `apply` afterwards, so we never mutate the entity set while a panel is
 /// iterating it.
 pub struct EditorState {
-    pub selected: Option<Entity>,
+    pub selection: Selection,
     pub scene_path: String,
     /// What the top bar calls this session. Not the window title and not a
     /// path — just the name, so a run says which project it is inside. `None`
@@ -103,7 +104,7 @@ pub struct EditorState {
     /// The frame-time readout floating in the viewport's corner.
     pub show_stats: bool,
     spawn_request: Option<SpawnKind>,
-    despawn_request: Option<Entity>,
+    despawn_request: Vec<Entity>,
     /// A registered component to add to an entity, at its default. Deferred
     /// like the rest: the inspector is mid-way through drawing that entity's
     /// components when the menu is clicked.
@@ -112,7 +113,7 @@ pub struct EditorState {
     /// rather than applied inline for the same reason as the two above: the
     /// hierarchy panel is iterating a snapshot of the tree while it builds, and
     /// a reparent reshapes exactly that.
-    reparent_request: Option<(Entity, Option<Entity>)>,
+    reparent_request: Vec<(Entity, Option<Entity>)>,
     /// A prefab to place under an entity, or at the top level for `None`.
     /// Requested for the reason a reparent is: it reshapes the tree the
     /// hierarchy is iterating.
@@ -120,6 +121,9 @@ pub struct EditorState {
     /// Serviced by `apply`, because a rescan replaces the index the asset
     /// browser is drawing from.
     rescan_request: bool,
+    /// Save the selection as a new prefab. Deferred because it can give the
+    /// selection a new root, which reshapes the tree.
+    save_prefab_request: bool,
     /// Not serviced by `apply` either: restyling has to happen between frames,
     /// so the editor drains it after the UI pass rather than during it.
     theme_request: Option<String>,
@@ -138,7 +142,7 @@ pub struct EditorState {
 impl Default for EditorState {
     fn default() -> Self {
         Self {
-            selected: None,
+            selection: Selection::default(),
             scene_path: DEFAULT_SCENE_PATH.to_owned(),
             project_name: None,
             hierarchy_query: String::new(),
@@ -151,11 +155,12 @@ impl Default for EditorState {
             scale_linked: false,
             show_stats: false,
             spawn_request: None,
-            despawn_request: None,
+            despawn_request: Vec::new(),
             add_request: None,
-            reparent_request: None,
+            reparent_request: Vec::new(),
             instantiate_request: None,
             rescan_request: false,
+            save_prefab_request: false,
             theme_request: None,
             scene_request: None,
             #[cfg(feature = "scripting")]
@@ -181,11 +186,20 @@ impl EditorState {
     }
 
     pub fn request_despawn(&mut self, entity: Entity) {
-        self.despawn_request = Some(entity);
+        self.despawn_request.push(entity);
+    }
+
+    pub fn request_despawn_selection(&mut self) {
+        self.despawn_request
+            .extend_from_slice(self.selection.entities());
     }
 
     pub fn request_reparent(&mut self, child: Entity, parent: Option<Entity>) {
-        self.reparent_request = Some((child, parent));
+        self.reparent_request.push((child, parent));
+    }
+
+    pub fn request_save_prefab(&mut self) {
+        self.save_prefab_request = true;
     }
 
     pub fn request_instantiate(&mut self, prefab: AssetId, parent: Option<Entity>) {
@@ -222,13 +236,13 @@ impl EditorState {
         if let Some(kind) = self.spawn_request.take()
             && let Some(entity) = spawn(world, kind)
         {
-            self.selected = Some(entity);
+            self.selection.set(entity);
         }
-        if let Some(entity) = self.despawn_request.take() {
-            crate::scene::despawn_recursive(world, entity);
-            if self.selected == Some(entity) {
-                self.selected = None;
+        if !self.despawn_request.is_empty() {
+            for entity in std::mem::take(&mut self.despawn_request) {
+                crate::scene::despawn_recursive(world, entity);
             }
+            self.selection.retain_alive(world);
         }
         if let Some((entity, id)) = self.add_request.take()
             && world.is_alive(entity)
@@ -242,7 +256,16 @@ impl EditorState {
                 format!("adding {id} to entity {}: {error}", entity.index()),
             );
         }
-        if let Some((child, parent)) = self.reparent_request.take() {
+        let moves = std::mem::take(&mut self.reparent_request);
+        for &(child, parent) in &moves {
+            // One dragged along with an ancestor that is also moving keeps its
+            // place under that ancestor, as a file does in a moved folder.
+            if moves
+                .iter()
+                .any(|&(other, _)| other != child && is_under(world, child, other))
+            {
+                continue;
+            }
             // `keep_world`: a drag in the tree changes who owns an object, not
             // where it is. Without it, dropping something onto a distant parent
             // would fling it across the scene.
@@ -263,17 +286,16 @@ impl EditorState {
                     {
                         log(world, LogLevel::Warning, error.to_string());
                     }
-                    self.selected = Some(root);
+                    self.selection.set(root);
                 }
                 Err(error) => log(world, LogLevel::Error, error),
             }
         }
+        if std::mem::take(&mut self.save_prefab_request) {
+            self.save_prefab(world, registry);
+        }
         if std::mem::take(&mut self.rescan_request) {
-            let issues = world
-                .get_resource_mut::<Prefabs>()
-                .map(|mut prefabs| prefabs.rescan())
-                .unwrap_or_default();
-            for issue in issues {
+            for issue in scene::prefab::rescan(world, registry) {
                 log(world, LogLevel::Warning, issue);
             }
         }
@@ -281,13 +303,66 @@ impl EditorState {
             let (level, message) = match request {
                 SceneRequest::Save => save_scene(world, registry, &self.scene_path),
                 SceneRequest::Load => {
-                    self.selected = None;
+                    self.selection.clear();
                     load_scene(world, registry, &self.scene_path)
                 }
             };
             log(world, level, message);
         }
     }
+}
+
+impl EditorState {
+    /// Save the selection as a prefab in the assets directory, named after the
+    /// entity when there is one and `Group` when there are several, and select
+    /// the instance it became.
+    fn save_prefab(&mut self, world: &mut World, registry: &Registry) {
+        self.selection.retain_alive(world);
+        let selection = self.selection.entities().to_vec();
+        let name = match selection[..] {
+            [] => return,
+            [one] => world
+                .get::<Name>(one)
+                .map_or_else(|| "Prefab".to_owned(), |name| name.0.clone()),
+            _ => "Group".to_owned(),
+        };
+        let Some(dir) = world
+            .get_resource::<Prefabs>()
+            .and_then(|prefabs| prefabs.dir().map(std::path::Path::to_owned))
+        else {
+            log(
+                world,
+                LogLevel::Error,
+                "there is no assets directory to save a prefab into".to_owned(),
+            );
+            return;
+        };
+        let rel = scene::prefab::unused_path(&dir, &name);
+        match scene::prefab::create(world, registry, &selection, &rel) {
+            Ok((root, _)) => {
+                self.selection.set(root);
+                log(world, LogLevel::Info, format!("saved {rel}"));
+            }
+            Err(error) => log(world, LogLevel::Error, error),
+        }
+    }
+}
+
+/// Whether `ancestor` is above `entity` in the tree.
+fn is_under(world: &World, entity: Entity, ancestor: Entity) -> bool {
+    let mut cursor = entity;
+    // Bounded: a cycle the hierarchy has not broken yet would otherwise spin.
+    for _ in 0..4096 {
+        match world
+            .get::<scene::Parent>(cursor)
+            .map(|parent| parent.get())
+        {
+            Some(parent) if parent == ancestor => return true,
+            Some(parent) => cursor = parent,
+            None => return false,
+        }
+    }
+    false
 }
 
 fn save_scene(world: &mut World, registry: &Registry, path: &str) -> (LogLevel, String) {

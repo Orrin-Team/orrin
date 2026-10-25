@@ -18,7 +18,7 @@ mod material;
 mod mesh;
 pub mod model;
 mod motion_blur;
-mod persist;
+pub(crate) mod persist;
 pub mod prefab;
 mod present;
 mod previews;
@@ -39,7 +39,8 @@ pub use camera::Camera;
 pub use components::ScriptComponent;
 pub use components::{
     AmbientLight, Collider, ColliderShape, Light, LocalTransform, MAX_CONE_ANGLE, MIN_CONE_ANGLE,
-    MaterialHandle, MeshHandle, Name, Parent, Spin, Tag, UnknownComponents, WorldTransform,
+    MaterialHandle, MeshHandle, Name, Parent, PendingScripts, Spin, Tag, UnknownComponents,
+    WorldTransform,
 };
 pub use contact_shadows::ContactShadowSettings;
 pub use culling::Culling;

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use orrin_ecs::FxHashMap;
 use orrin_registry::{AssetId, EntityId, SceneDocument, SceneEntity, Value};
 
-use crate::scene::registry::PARENT;
+use crate::scene::registry::{PARENT, PREFAB};
 
 /// The extension a prefab file is recognised by.
 pub const EXTENSION: &str = "fprefab";
@@ -84,6 +84,17 @@ impl Prefab {
                 ));
             }
         };
+
+        if document.entities[by_id[&root]]
+            .components
+            .iter()
+            .any(|(component, _)| *component == PREFAB)
+        {
+            return Err(format!(
+                "{path}: the root of a prefab cannot itself be an instance of another prefab; \
+                 parent it under an entity of its own"
+            ));
+        }
 
         Ok(Self {
             id,
@@ -189,19 +200,24 @@ impl Prefabs {
     /// [`find`](Self::find) and [`iter`](Self::iter): an instance of it may
     /// still be in the open scene, and saving that instance needs the prefab
     /// it was built from.
-    pub fn rescan(&mut self) -> Vec<String> {
+    pub fn rescan(&mut self) -> Rescan {
         let Some(dir) = self.dir.clone() else {
-            return Vec::new();
+            return Rescan::default();
         };
         let (fresh, issues) = Self::scan(dir);
         let old = std::mem::replace(self, fresh);
+        let mut replaced = Vec::new();
         for mut prefab in old.entries {
-            if self.get(prefab.id).is_none() {
-                prefab.on_disk = false;
-                self.insert(prefab);
+            match self.get(prefab.id) {
+                Some(now) if now.document != prefab.document => replaced.push(prefab),
+                Some(_) => {}
+                None => {
+                    prefab.on_disk = false;
+                    self.insert(prefab);
+                }
             }
         }
-        issues
+        Rescan { issues, replaced }
     }
 
     pub fn dir(&self) -> Option<&Path> {
@@ -210,11 +226,21 @@ impl Prefabs {
 
     /// Add `prefab`, replacing any with the same id.
     pub fn insert(&mut self, prefab: Prefab) {
-        self.entries.retain(|existing| existing.id != prefab.id);
+        self.replace(prefab);
+    }
+
+    /// [`insert`](Self::insert), handing back the version it replaced.
+    pub fn replace(&mut self, prefab: Prefab) -> Option<Prefab> {
+        let old = self
+            .entries
+            .iter()
+            .position(|existing| existing.id == prefab.id)
+            .map(|at| self.entries.remove(at));
         let at = self
             .entries
             .partition_point(|existing| existing.path < prefab.path);
         self.entries.insert(at, prefab);
+        old
     }
 
     /// Linear: an index holds tens of prefabs, and every caller is a load, a
@@ -235,6 +261,17 @@ impl Prefabs {
     pub fn iter(&self) -> impl Iterator<Item = &Prefab> {
         self.entries.iter().filter(|prefab| prefab.on_disk)
     }
+}
+
+/// What a [`Prefabs::rescan`] found.
+#[derive(Default)]
+pub struct Rescan {
+    /// Files that could not be indexed.
+    pub issues: Vec<String>,
+    /// The versions the index held, before the rescan, of every prefab whose
+    /// file now says something different — what live instances were built
+    /// from.
+    pub replaced: Vec<Prefab>,
 }
 
 /// Every `.fprefab` below `dir`, as `(relative path, path)`. Dotfiles and
@@ -375,6 +412,27 @@ entity {HANDLE}
         );
     }
 
+    /// One entity cannot be the root of two instances, and the root of a prefab
+    /// is the root of every instance of it.
+    #[test]
+    fn a_prefab_whose_root_is_an_instance_is_refused() {
+        let text = format!(
+            "orrin-scene 1
+
+entity {ROOT}
+  orrin.prefab
+    source = asset({DOOR_ID})
+"
+        );
+        let err = Prefab::parse(AssetId::new(), "props/variant.fprefab", &text)
+            .err()
+            .unwrap();
+        assert!(
+            err.contains("root of a prefab cannot itself be an instance"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn a_prefab_that_does_not_parse_names_its_file_and_line() {
         let err = Prefab::parse(
@@ -499,7 +557,7 @@ entity {HANDLE}
         let (mut prefabs, _) = Prefabs::scan(dir.path());
 
         std::fs::remove_file(dir.path().join("props/door.fprefab")).unwrap();
-        assert!(prefabs.rescan().is_empty());
+        assert!(prefabs.rescan().issues.is_empty());
         assert_eq!(prefabs.find("props/door.fprefab"), None);
         assert_eq!(prefabs.iter().count(), 0);
         assert!(prefabs.get(door_id()).is_some());

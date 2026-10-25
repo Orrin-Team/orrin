@@ -33,7 +33,7 @@ pub fn body(
     registry: &Registry,
     previews: &mut Previews,
 ) {
-    let Some(entity) = state.selected else {
+    let Some(entity) = state.selection.primary() else {
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
             ui.label(icons::text(
@@ -46,7 +46,7 @@ pub fn body(
         return;
     };
     if !world.is_alive(entity) {
-        state.selected = None;
+        state.selection.retain_alive(world);
         return;
     }
 
@@ -156,7 +156,13 @@ fn header(
                 } else {
                     ui.heading(format!("Entity {}", entity.index()));
                 }
-                ui.label(figures(format!("{} · id {}", kind.label(), entity.index())).weak());
+                let others = match state.selection.len() {
+                    0 | 1 => String::new(),
+                    n => format!(" · {n} selected"),
+                };
+                ui.label(
+                    figures(format!("{} · id {}{others}", kind.label(), entity.index())).weak(),
+                );
             });
         });
     });

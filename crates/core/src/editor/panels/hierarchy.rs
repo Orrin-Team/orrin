@@ -105,13 +105,15 @@ pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
             rows.len(),
             |ui, range| {
                 for row in &rows[range] {
-                    draw_row(ui, &nodes, row, state);
+                    draw_row(ui, &nodes, &rows, row, state);
                 }
             },
         );
     });
-    if let Some(dragged) = released::<Entity>(&background) {
-        state.request_reparent(*dragged, None);
+    if let Some(dragged) = released::<Vec<Entity>>(&background) {
+        for &entity in dragged.iter() {
+            state.request_reparent(entity, None);
+        }
     }
     if let Some(prefab) = released::<AssetId>(&background) {
         state.request_instantiate(*prefab, None);
@@ -131,7 +133,12 @@ fn footer(ui: &mut egui::Ui, world: &World, state: &EditorState) {
         visuals.widgets.noninteractive.bg_stroke,
     );
     let count = world.entities().count();
-    let selected = usize::from(state.selected.is_some_and(|entity| world.is_alive(entity)));
+    let selected = state
+        .selection
+        .entities()
+        .iter()
+        .filter(|&&entity| world.is_alive(entity))
+        .count();
     ui.painter().text(
         egui::pos2(rect.left() + widgets::PAD, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -281,9 +288,9 @@ fn scroll_gutter(ui: &egui::Ui) -> f32 {
 /// `Response::dnd_set_drag_payload` is the API for this case; it stores the
 /// payload only once a drag has actually started, so a press that never moves
 /// stays a click.
-fn draw_row(ui: &mut egui::Ui, nodes: &[Node], row: &Row, state: &mut EditorState) {
+fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &mut EditorState) {
     let node = &nodes[row.node];
-    let selected = state.selected == Some(node.entity);
+    let selected = state.selection.contains(node.entity);
     let (rect, mut response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ROW),
         egui::Sense::click_and_drag(),
@@ -292,8 +299,8 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], row: &Row, state: &mut EditorStat
     let visuals = ui.visuals().clone();
     let hovered = ui.rect_contains_pointer(rect);
     let dropping = response
-        .dnd_hover_payload::<Entity>()
-        .is_some_and(|dragged| *dragged != node.entity)
+        .dnd_hover_payload::<Vec<Entity>>()
+        .is_some_and(|dragged| !dragged.contains(&node.entity))
         || response.dnd_hover_payload::<AssetId>().is_some();
     let fill = if selected {
         Some(visuals.selection.bg_fill)
@@ -423,9 +430,27 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], row: &Row, state: &mut EditorStat
         response = response.on_hover_text(&node.label);
     }
     if response.clicked() {
-        state.selected = Some(node.entity);
+        let modifiers = ui.input(|input| input.modifiers);
+        if modifiers.command {
+            state.selection.toggle(node.entity);
+        } else if modifiers.shift {
+            // The run is the rows as they are on screen.
+            let order: Vec<Entity> = rows.iter().map(|row| nodes[row.node].entity).collect();
+            state.selection.extend_to(node.entity, &order);
+        } else {
+            state.selection.set(node.entity);
+        }
     }
-    response.dnd_set_drag_payload(node.entity);
+    // A selected row carries the whole selection. Built only when a drag
+    // starts, which is the one frame the payload is read.
+    if response.drag_started() {
+        let dragged = if selected {
+            state.selection.entities().to_vec()
+        } else {
+            vec![node.entity]
+        };
+        response.dnd_set_drag_payload(dragged);
+    }
     accept_drop(&response, node.entity, state);
 }
 
@@ -436,10 +461,10 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], row: &Row, state: &mut EditorStat
 /// cycle by itself, and the editor should not carry a second copy of that rule
 /// for it to drift out of step with — the refusal reaches the console.
 fn accept_drop(response: &egui::Response, target: Entity, state: &mut EditorState) {
-    if let Some(dragged) = released::<Entity>(response)
-        && *dragged != target
-    {
-        state.request_reparent(*dragged, Some(target));
+    if let Some(dragged) = released::<Vec<Entity>>(response) {
+        for &entity in dragged.iter().filter(|&&entity| entity != target) {
+            state.request_reparent(entity, Some(target));
+        }
     }
     if let Some(prefab) = released::<AssetId>(response) {
         state.request_instantiate(*prefab, Some(target));

@@ -20,8 +20,8 @@ use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::prefab::{self, Prefabs};
 use crate::scene::{
     ActionId, Actions, Assets, Collider, ColliderShape, DebugLines, InputState, LocalTransform,
-    LogLevel, MaterialHandle, MeshHandle, Name, Parent, ScriptComponent, Tag, Time, Transform,
-    WorldTransform,
+    LogLevel, MaterialHandle, MeshHandle, Name, Parent, PendingScripts, ScriptComponent, Tag, Time,
+    Transform, WorldTransform,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -1276,6 +1276,51 @@ impl Scripting {
             restored,
             lost,
             leaked,
+        }
+    }
+
+    /// Create the Behaviours a load left waiting (see [`PendingScripts`]) and
+    /// give each its saved fields.
+    ///
+    /// Run outside any dispatch window, since it creates managed objects, and
+    /// before the tick, so they get their OnEnable and OnStart on it. One that
+    /// cannot be created is kept as data, never dropped: a type renamed since
+    /// the save, a game assembly that is not loaded, or a second Behaviour on an
+    /// entity that can carry only one.
+    pub fn attach_pending(&self, world: &mut World, registry: &Registry) {
+        let mut waiting = Vec::new();
+        world
+            .query::<&PendingScripts>()
+            .for_each(|entity, _| waiting.push(entity));
+        for entity in waiting {
+            let Some(PendingScripts(scripts)) = world.remove::<PendingScripts>(entity) else {
+                continue;
+            };
+            for (id, value) in scripts {
+                let binding = registry
+                    .get(&id)
+                    .and_then(|vtable| vtable.script.as_ref().map(|b| (vtable, b)));
+                let Some((vtable, binding)) = binding else {
+                    crate::scene::persist::keep_unapplied(world, entity, (id, value));
+                    continue;
+                };
+                if world.has::<ScriptComponent>(entity) {
+                    tracing::warn!(
+                        "entity {} already has a Behaviour, and carries one at most; `{id}` was \
+                         kept but not attached",
+                        entity.index()
+                    );
+                    crate::scene::persist::keep_unapplied(world, entity, (id, value));
+                    continue;
+                }
+                if self.attach_with(world, entity, &binding.type_name, false, true) == 0 {
+                    crate::scene::persist::keep_unapplied(world, entity, (id, value));
+                    continue;
+                }
+                if let Err(error) = vtable.write(world, entity, &value) {
+                    tracing::warn!("`{id}` on entity {}: {error}", entity.index());
+                }
+            }
         }
     }
 

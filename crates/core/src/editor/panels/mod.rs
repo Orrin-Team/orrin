@@ -100,16 +100,17 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
     if ctx.wants_keyboard_input() {
         return;
     }
-    let selected = state.selected.filter(|&entity| world.is_alive(entity));
-    if let Some(entity) = selected
+    state.selection.retain_alive(world);
+    let selected = !state.selection.is_empty();
+    if selected
         && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
     {
-        state.request_despawn(entity);
+        state.request_despawn_selection();
     }
-    if selected.is_some()
+    if selected
         && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
-        state.selected = None;
+        state.selection.clear();
     }
 }
 
@@ -499,6 +500,24 @@ mod tests {
             self
         }
 
+        /// [`click`](Self::click) with `modifiers` held.
+        fn click_with(&mut self, at: egui::Pos2, modifiers: egui::Modifiers) -> &mut Self {
+            self.input.modifiers = modifiers;
+            self.input.events.push(egui::Event::PointerMoved(at));
+            for pressed in [true, false] {
+                self.input.events.push(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers,
+                });
+            }
+            self.frames(1);
+            self.input.events.clear();
+            self.input.modifiers = egui::Modifiers::NONE;
+            self
+        }
+
         fn key(&mut self, key: egui::Key) -> &mut Self {
             for pressed in [true, false] {
                 self.input.events.push(egui::Event::Key {
@@ -588,7 +607,7 @@ mod tests {
         editor
             .world
             .insert(entity, crate::scene::Spin::new(glam::Vec3::Y, 1.0));
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.frames(3);
 
         // Both edges of the vector columns: the X chips start on one line, and
@@ -618,7 +637,7 @@ mod tests {
     fn inspector_sections_span_the_panel() {
         let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
         let entity = editor.spawn("Crate");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.frames(3);
 
         let body = editor.tab_body(Tab::Inspector);
@@ -650,7 +669,7 @@ mod tests {
             .entities()
             .find(|&e| editor.world.has::<crate::scene::MaterialHandle>(e))
             .expect("the demo scene draws something");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.frames(3);
 
         let clashes: Vec<String> = editor
@@ -667,7 +686,7 @@ mod tests {
     fn the_inspector_menu_offers_delete_for_the_selection() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let entity = editor.spawn("Ground plane");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         let Harness {
             world,
             registry,
@@ -694,12 +713,12 @@ mod tests {
     fn the_delete_key_despawns_the_selection() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let entity = editor.spawn("Ground plane");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.frames(1).key(egui::Key::Delete);
         editor.state.apply(&mut editor.world, &editor.registry);
 
         assert!(!editor.world.is_alive(entity));
-        assert_eq!(editor.state.selected, None);
+        assert!(editor.state.selection.is_empty());
     }
 
     /// …but not while the user is typing: Delete in a name field deletes a
@@ -708,7 +727,7 @@ mod tests {
     fn the_delete_key_is_left_alone_while_a_field_has_focus() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let entity = editor.spawn("Ground plane");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.frames(1);
         editor
             .ctx
@@ -792,7 +811,7 @@ mod tests {
                 .map(|p| p.get()),
             Some(room)
         );
-        assert_eq!(editor.state.selected, Some(door));
+        assert_eq!(editor.state.selection.primary(), Some(door));
     }
 
     #[test]
@@ -820,7 +839,7 @@ mod tests {
         let id = door(&mut editor);
         let (root, _) =
             crate::scene::prefab::instantiate(&mut editor.world, &editor.registry, id).unwrap();
-        editor.state.selected = Some(root);
+        editor.state.selection.set(root);
         editor.frames(2);
         assert!(editor.painted_contains("door"), "names its prefab");
         assert!(!editor.painted_contains("translation"));
@@ -833,6 +852,133 @@ mod tests {
             .x = 2.0;
         editor.frames(1);
         assert!(editor.painted_contains("translation"));
+    }
+
+    /// Where the row naming `name` was painted.
+    fn row_of(editor: &Harness, name: &str) -> egui::Pos2 {
+        editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| text == name)
+            .unwrap_or_else(|| panic!("no row for {name}"))
+            .1
+            .center()
+    }
+
+    #[test]
+    fn ctrl_click_adds_rows_to_the_selection() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let alpha = editor.spawn("Alpha");
+        let beta = editor.spawn("Beta");
+        editor.spawn("Gamma");
+        editor.frames(2);
+        let (a, b) = (row_of(&editor, "Alpha"), row_of(&editor, "Beta"));
+
+        editor
+            .click(a)
+            .click_with(b, egui::Modifiers::COMMAND)
+            .frames(1);
+        assert_eq!(editor.state.selection.entities(), [alpha, beta]);
+        assert!(editor.painted_contains("3 entities · 2 selected"));
+
+        editor.click_with(a, egui::Modifiers::COMMAND);
+        assert_eq!(editor.state.selection.entities(), [beta]);
+    }
+
+    #[test]
+    fn shift_click_selects_the_rows_between() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Alpha");
+        let beta = editor.spawn("Beta");
+        let gamma = editor.spawn("Gamma");
+        editor.frames(2);
+        let (a, c) = (row_of(&editor, "Alpha"), row_of(&editor, "Gamma"));
+
+        editor.click(a).click_with(c, egui::Modifiers::SHIFT);
+        assert_eq!(editor.state.selection.len(), 3);
+        assert!(editor.state.selection.contains(beta));
+        assert_eq!(editor.state.selection.primary(), Some(gamma));
+    }
+
+    #[test]
+    fn delete_takes_every_selected_entity() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let alpha = editor.spawn("Alpha");
+        let beta = editor.spawn("Beta");
+        let gamma = editor.spawn("Gamma");
+        editor.state.selection.set(alpha);
+        editor.state.selection.toggle(beta);
+        editor.frames(1).key(egui::Key::Delete);
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        assert!(!editor.world.is_alive(alpha));
+        assert!(!editor.world.is_alive(beta));
+        assert!(editor.world.is_alive(gamma));
+        assert!(editor.state.selection.is_empty());
+    }
+
+    /// A real drag, frame by frame: press on a selected row, move past egui's
+    /// drag threshold, and let go over another row.
+    #[test]
+    fn dragging_a_selected_row_moves_the_whole_selection() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let room = editor.spawn("Room");
+        let alpha = editor.spawn("Alpha");
+        let beta = editor.spawn("Beta");
+        editor.state.selection.set(alpha);
+        editor.state.selection.toggle(beta);
+        editor.frames(2);
+        let (from, to) = (row_of(&editor, "Alpha"), row_of(&editor, "Room"));
+
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(from), button(from, true)],
+            vec![egui::Event::PointerMoved(from + egui::vec2(0.0, 12.0))],
+            vec![egui::Event::PointerMoved(to)],
+            vec![button(to, false)],
+        ] {
+            editor.input.events = events;
+            editor.frames(1);
+        }
+        editor.input.events.clear();
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        let parent = |e| editor.world.get::<crate::scene::Parent>(e).map(|p| p.get());
+        assert_eq!(parent(alpha), Some(room));
+        assert_eq!(parent(beta), Some(room));
+    }
+
+    #[test]
+    fn save_as_prefab_saves_the_whole_selection() {
+        let dir = std::env::temp_dir().join(format!("orrin-save-prefab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor
+            .world
+            .insert_resource(crate::scene::Prefabs::scan(&dir).0);
+        let alpha = editor.spawn("Alpha");
+        let beta = editor.spawn("Beta");
+        editor.state.selection.set(alpha);
+        editor.state.selection.toggle(beta);
+
+        editor.state.request_save_prefab();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let saved = dir.join("Group.fprefab").is_file();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(saved, "the selection was saved under its new root's name");
+        let root = editor
+            .state
+            .selection
+            .primary()
+            .expect("the new root is selected");
+        assert!(editor.world.has::<crate::scene::PrefabInstance>(root));
     }
 
     /// Every menu has to lay out: one that borrows a resource the others do not
@@ -1039,7 +1185,7 @@ mod tests {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let ground = editor.spawn("Ground plane");
         editor.spawn("Key light");
-        editor.state.selected = Some(ground);
+        editor.state.selection.set(ground);
         editor.frames(2);
 
         let tree = editor.tab(Tab::Hierarchy);
@@ -1061,7 +1207,7 @@ mod tests {
         for n in 0..6 {
             editor.spawn(&format!("Cube {n}"));
         }
-        editor.state.selected = Some(first);
+        editor.state.selection.set(first);
         editor.frames(3);
 
         let body = editor.tab_body(Tab::Hierarchy);
@@ -1181,7 +1327,7 @@ mod tests {
     fn inspector_section_bars_are_square() {
         let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
         let entity = editor.spawn("Crate");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.frames(3);
 
         let body = editor.tab_body(Tab::Inspector);
@@ -1404,7 +1550,7 @@ mod tests {
         // one does — and that shifts everything after it.
         let mut editor = Harness::new(egui::vec2(4200.0, 700.0));
         let entity = editor.spawn("Ground plane");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
 
         let Harness {
             world,
@@ -1760,7 +1906,7 @@ mod tests {
     fn figures_are_monospace() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let entity = editor.spawn("Ground plane");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.world.resource_mut::<crate::scene::LogBuffer>().push(
             crate::scene::LogLevel::Info,
             "saved 3 entities".to_owned(),
@@ -1862,7 +2008,7 @@ mod tests {
                 crate::scene::reparent(&mut editor.world, entity, Some(parent), false).unwrap();
             }
         }
-        editor.state.selected = Some(parent);
+        editor.state.selection.set(parent);
         editor.frames(20);
 
         let start = std::time::Instant::now();

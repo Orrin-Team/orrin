@@ -203,22 +203,24 @@ fn file(ui: &mut egui::Ui, state: &mut EditorState) {
 }
 
 fn edit(ui: &mut egui::Ui, world: &mut World, registry: &Registry, state: &mut EditorState) {
-    let selected = state.selected.filter(|&entity| world.is_alive(entity));
-    ui.add_enabled_ui(selected.is_some(), |ui| {
-        if command(ui, "Delete", "Del")
-            && let Some(entity) = selected
-        {
-            state.request_despawn(entity);
+    state.selection.retain_alive(world);
+    let primary = state.selection.primary();
+    ui.add_enabled_ui(primary.is_some(), |ui| {
+        if command(ui, "Delete", "Del") {
+            state.request_despawn_selection();
+        }
+        if command(ui, "Save as prefab", "") {
+            state.request_save_prefab();
         }
         if command(ui, "Dump to console", "")
-            && let Some(entity) = selected
+            && let Some(entity) = primary
         {
             super::inspector::dump(world, registry, entity);
         }
     });
-    ui.add_enabled_ui(selected.is_some(), |ui| {
+    ui.add_enabled_ui(primary.is_some(), |ui| {
         if command(ui, "Select none", "Esc") {
-            state.selected = None;
+            state.selection.clear();
         }
     });
     ui.separator();

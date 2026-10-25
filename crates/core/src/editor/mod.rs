@@ -10,6 +10,7 @@ mod panels;
 mod phases;
 mod prefs;
 mod previews;
+mod selection;
 mod state;
 mod theme;
 mod widgets;

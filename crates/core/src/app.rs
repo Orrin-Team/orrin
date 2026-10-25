@@ -86,6 +86,10 @@ pub struct App {
     /// without the file, or in a build with no `notify`.
     #[cfg(feature = "scripting")]
     input_watcher: Option<crate::scene::input::ConfigWatcher>,
+    /// Rescan-on-save for the prefab index. `None` without an assets
+    /// directory, or in a build with no `notify`.
+    #[cfg(feature = "scripting")]
+    prefab_watcher: Option<crate::scene::prefab::Watcher>,
     /// The gamepad backend. `None` when the machine has no gamepad subsystem
     /// to open, which is a session on keyboard and mouse rather than a failure.
     gamepads: Option<crate::scene::input::Gamepads>,
@@ -215,6 +219,8 @@ impl App {
             build_watcher: None,
             #[cfg(feature = "scripting")]
             input_watcher: None,
+            #[cfg(feature = "scripting")]
+            prefab_watcher: None,
             gamepads,
             project,
             scene: SceneChoice::from_env(),
@@ -341,6 +347,17 @@ impl App {
             tracing::info!("{count} prefab(s) under {}", dir.display());
         }
         self.world.insert_resource(prefabs);
+
+        #[cfg(feature = "scripting")]
+        if dir.is_dir() {
+            self.prefab_watcher = match crate::scene::prefab::Watcher::new(&dir) {
+                Ok(watcher) => Some(watcher),
+                Err(error) => {
+                    tracing::warn!("{error}");
+                    None
+                }
+            };
+        }
     }
 
     /// Boot the script host and attach the project's entry Behaviour.
@@ -601,6 +618,18 @@ impl ApplicationHandler for App {
                     watcher.service(&self.world);
                 }
 
+                // Before anything reads the scene, so a prefab saved this frame
+                // is what the frame draws.
+                #[cfg(feature = "scripting")]
+                if let Some(watcher) = &mut self.prefab_watcher
+                    && watcher.due()
+                {
+                    profile_scope!("prefab rescan");
+                    for issue in crate::scene::prefab::rescan(&mut self.world, &self.registry) {
+                        tracing::warn!("{issue}");
+                    }
+                }
+
                 // Pads are polled, so their frame starts here — before the
                 // resolve that reads them, and gated on focus so a stick held
                 // in a background window drives nothing.
@@ -692,6 +721,7 @@ impl ApplicationHandler for App {
                                     .reloaded();
                             }
                         }
+                        scripting.attach_pending(&mut self.world, &self.registry);
                         {
                             profile_scope!("script tick");
                             scripting.tick(&mut self.world, &self.registry, delta);

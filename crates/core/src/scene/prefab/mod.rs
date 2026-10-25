@@ -27,11 +27,20 @@
 //! instance id back into the prefab entity it came from. Not a UUIDv5 hash:
 //! nothing here needs a one-way function, and one would cost a SHA-1 dependency.
 //!
-//! Not yet: a prefab containing an instance of another (its record is kept as
-//! data but not expanded), and live instances following an edit to their prefab
-//! before the scene is reloaded.
+//! A prefab edited on disk reaches the open scene at the next rescan, which
+//! updates each instance in place (see [`refresh`]).
+//!
+//! A prefab may hold instances of others, written as records exactly as a scene
+//! writes them, and they expand in turn. Its root may not be one: one entity
+//! cannot root two instances.
 
+mod create;
 mod index;
+mod refresh;
+#[cfg(feature = "scripting")]
+mod watch;
+
+use std::borrow::Cow;
 
 use orrin_ecs::{Entity, FxHashMap, World};
 use orrin_registry::{
@@ -39,11 +48,15 @@ use orrin_registry::{
     Value,
 };
 
-pub use index::{Prefab, Prefabs};
+pub use create::{create, unused_path};
+pub use index::{Prefab, Prefabs, Rescan};
+pub use refresh::{apply_edits, rescan};
+#[cfg(feature = "scripting")]
+pub use watch::Watcher;
 
 use super::Parent;
 use super::persist::{self, LoadIssue};
-use super::registry::PREFAB;
+use super::registry::{PARENT, PREFAB};
 
 /// The root of a prefab instance. Members carry nothing: they are recognised
 /// by their derived ids.
@@ -290,20 +303,18 @@ pub(super) struct Expansion {
 /// the index lacks — and the caller keeps the record as unapplied data. Any
 /// component written beside the record replaces the prefab root's whole, which
 /// is how a hand-edited scene reads.
-pub(super) fn expand(
-    prefabs: Option<&Prefabs>,
+pub(super) fn expand<'p>(
+    lookup: &dyn Fn(AssetId) -> Option<&'p Prefab>,
     scene_entity: &SceneEntity,
     record: &Value,
 ) -> Result<Expansion, String> {
     let (source, changes) = Changes::from_record(record)?;
-    let prefab = prefabs
-        .and_then(|prefabs| prefabs.get(source))
-        .ok_or_else(|| {
-            format!(
-                "no prefab in the project has the id {source}, so the instance was kept but not \
+    let prefab = lookup(source).ok_or_else(|| {
+        format!(
+            "no prefab in the project has the id {source}, so the instance was kept but not \
              built; restore the prefab or its sidecar"
-            )
-        })?;
+        )
+    })?;
     let ids = Ids {
         root: scene_entity.id,
         prefab_root: prefab.root(),
@@ -398,27 +409,123 @@ pub(super) fn expand(
     })
 }
 
+/// Everything a set of record holders stands for: each record expanded, and
+/// every instance nested in what that expands to, until only plain entities
+/// are left.
+#[derive(Default)]
+pub(super) struct Expanded {
+    pub entities: Vec<SceneEntity>,
+    pub instances: Vec<(EntityId, PrefabInstance)>,
+    pub issues: Vec<LoadIssue>,
+}
+
+/// Expand `holders` — entities carrying an `orrin.prefab` record — and every
+/// instance nested inside them.
+///
+/// A holder that cannot be expanded, or whose prefab would expand inside
+/// itself, is reported and passed through with its record kept as data: the
+/// alternative to the second is a load that never finishes.
+pub(super) fn expand_all<'a, 'p>(
+    lookup: &dyn Fn(AssetId) -> Option<&'p Prefab>,
+    holders: impl IntoIterator<Item = &'a SceneEntity>,
+) -> Expanded {
+    let mut out = Expanded::default();
+    let mut queue: Vec<(Cow<'a, SceneEntity>, Vec<AssetId>)> = holders
+        .into_iter()
+        .map(|holder| (Cow::Borrowed(holder), Vec::new()))
+        .collect();
+
+    while let Some((holder, chain)) = queue.pop() {
+        let Some(record) = record_of(&holder) else {
+            out.entities.push(holder.into_owned());
+            continue;
+        };
+        let issue = |message| LoadIssue {
+            entity: holder.id,
+            component: PREFAB,
+            message,
+        };
+        if let Some(Value::Asset(source)) = record.field("source")
+            && chain.contains(source)
+        {
+            let path =
+                lookup(*source).map_or_else(|| source.to_string(), |prefab| prefab.path.clone());
+            out.issues.push(issue(format!(
+                "{path} contains an instance of itself, which was kept but not built"
+            )));
+            out.entities.push(holder.into_owned());
+            continue;
+        }
+        match expand(lookup, &holder, record) {
+            Ok(expansion) => {
+                out.issues.extend(expansion.issues.into_iter().map(&issue));
+                let mut chain = chain;
+                chain.push(expansion.instance.prefab);
+                out.instances.push((holder.id, expansion.instance));
+                queue.extend(
+                    expansion
+                        .members
+                        .into_iter()
+                        .map(|member| (Cow::Owned(member), chain.clone())),
+                );
+            }
+            Err(message) => {
+                out.issues.push(issue(message));
+                out.entities.push(holder.into_owned());
+            }
+        }
+    }
+    out
+}
+
+pub(super) fn record_of(entity: &SceneEntity) -> Option<&Value> {
+    entity
+        .components
+        .iter()
+        .find_map(|(id, value)| (*id == PREFAB).then_some(value))
+}
+
 /// Replace every instance's members in `entities` with its root's record.
 ///
 /// Members are found by the ids they must have, so one dragged out of its
 /// instance is still folded, and its new parent becomes an override. A member
-/// with no entity in the document was despawned.
+/// with no entity in the document was despawned. Instances nested in others
+/// fold first, so an outer instance compares them as records — the form its
+/// prefab holds them in. The root's parent is where the instance was placed,
+/// not something it overrides, so it is written beside the record.
 pub(super) fn fold(world: &World, entities: &mut Vec<SceneEntity>) {
-    let mut instances: Vec<(EntityId, PrefabInstance)> = Vec::new();
+    match world.get_resource::<Prefabs>() {
+        Some(prefabs) => fold_with(world, entities, &|id| prefabs.get(id)),
+        None => {
+            if world.query::<&PrefabInstance>().count() > 0 {
+                tracing::warn!(
+                    "saving prefab instances with no prefab index; they are written expanded"
+                );
+            }
+        }
+    }
+}
+
+/// [`fold`] against prefabs found through `lookup`, which is how a rescan
+/// folds an instance against the version of its prefab it was built from.
+/// Instances whose root is not in `entities` are left alone.
+pub(super) fn fold_with<'p>(
+    world: &World,
+    entities: &mut Vec<SceneEntity>,
+    lookup: &dyn Fn(AssetId) -> Option<&'p Prefab>,
+) {
+    let mut instances: Vec<(usize, EntityId, PrefabInstance)> = Vec::new();
     world
         .query::<&PrefabInstance>()
         .for_each(|entity, instance| {
             if let Some(id) = world.get::<EntityId>(entity) {
-                instances.push((*id, instance.clone()));
+                instances.push((nesting(world, entity), *id, instance.clone()));
             }
         });
     if instances.is_empty() {
         return;
     }
-    let Some(prefabs) = world.get_resource::<Prefabs>() else {
-        tracing::warn!("saving prefab instances with no prefab index; they are written expanded");
-        return;
-    };
+    instances.sort_by_key(|&(depth, ..)| std::cmp::Reverse(depth));
 
     let index: FxHashMap<EntityId, usize> = entities
         .iter()
@@ -427,8 +534,11 @@ pub(super) fn fold(world: &World, entities: &mut Vec<SceneEntity>) {
         .collect();
     let mut folded = vec![false; entities.len()];
 
-    for (root, instance) in instances {
-        let Some(prefab) = prefabs.get(instance.prefab) else {
+    for (_, root, instance) in instances {
+        let Some(&root_index) = index.get(&root) else {
+            continue;
+        };
+        let Some(prefab) = lookup(instance.prefab) else {
             tracing::warn!(
                 "entity {root} is an instance of prefab {}, which the index does not have; it \
                  is written expanded",
@@ -448,7 +558,10 @@ pub(super) fn fold(world: &World, entities: &mut Vec<SceneEntity>) {
                 continue;
             };
             folded[i] = true;
-            let live = local_components(&entities[i].components, ids, prefab);
+            let mut live = local_components(&entities[i].components, ids, prefab);
+            if base.id == prefab.root() {
+                live.retain(|(component, _)| *component != PARENT);
+            }
             compare(base, &live, &mut changes);
         }
         for stale in instance.unapplied {
@@ -461,9 +574,17 @@ pub(super) fn fold(world: &World, entities: &mut Vec<SceneEntity>) {
         }
         changes.sort();
 
-        let i = index[&root];
-        entities[i].components = vec![(PREFAB, changes.to_record(instance.prefab))];
-        folded[i] = false;
+        let root_entity = &mut entities[root_index];
+        let placement = root_entity
+            .components
+            .iter()
+            .find(|(component, _)| *component == PARENT)
+            .cloned();
+        root_entity.components = placement
+            .into_iter()
+            .chain([(PREFAB, changes.to_record(instance.prefab))])
+            .collect();
+        folded[root_index] = false;
     }
 
     let mut i = 0;
@@ -471,6 +592,27 @@ pub(super) fn fold(world: &World, entities: &mut Vec<SceneEntity>) {
         i += 1;
         !folded[i - 1]
     });
+}
+
+/// How many instance roots sit above `entity`.
+fn nesting(world: &World, entity: Entity) -> usize {
+    let mut depth = 0;
+    let mut cursor = entity;
+    // Bounded: a cycle the hierarchy has not broken yet would otherwise spin.
+    for _ in 0..4096 {
+        let Some(parent) = world
+            .get::<Parent>(cursor)
+            .map(|parent| parent.get())
+            .filter(|&parent| world.is_alive(parent))
+        else {
+            break;
+        };
+        if world.has::<PrefabInstance>(parent) {
+            depth += 1;
+        }
+        cursor = parent;
+    }
+    depth
 }
 
 fn local_components(
@@ -628,7 +770,10 @@ pub fn member_overrides(
     let base = prefab.entity(membership.local)?;
 
     let mut changes = Changes::default();
-    let live = local_components(&live.components, membership.ids, prefab);
+    let mut live = local_components(&live.components, membership.ids, prefab);
+    if base.id == prefab.root() {
+        live.retain(|(component, _)| *component != PARENT);
+    }
     compare(base, &live, &mut changes);
     Some(MemberOverrides {
         root: membership.root,
@@ -734,9 +879,11 @@ mod tests {
         registry
     }
 
+    /// The door, and a house holding one.
     fn library(door: &str) -> Prefabs {
         let mut prefabs = Prefabs::default();
         prefabs.insert(Prefab::parse(door_id(), "props/door.fprefab", door).unwrap());
+        prefabs.insert(Prefab::parse(house_id(), "props/house.fprefab", &house_text()).unwrap());
         prefabs
     }
 
@@ -1091,5 +1238,261 @@ mod tests {
         let panel = named(&world, "Panel");
         crate::scene::reparent(&mut world, loose, Some(panel), false).unwrap();
         assert!(member_overrides(&world, &registry, loose).is_none());
+    }
+
+    const HOUSE_ID: &str = "40c5e000-0000-4000-8000-000000000002";
+    const HOUSE_ROOT: &str = "00000000-0000-4000-8000-0000000000f0";
+    const HOUSE_DOOR: &str = "00000000-0000-4000-8000-0000000000f1";
+
+    /// A house holding a door, whose handle the house makes brass.
+    fn house_text() -> String {
+        format!(
+            "\
+orrin-scene 1
+
+entity {HOUSE_ROOT}
+  orrin.name = \"House\"
+
+entity {HOUSE_DOOR}
+  orrin.parent = entity({HOUSE_ROOT})
+  orrin.prefab
+    overrides
+      [0]
+        component = \"orrin.tag\"
+        entity = entity({HANDLE})
+        path = \"\"
+        value = \"brass\"
+    source = asset({DOOR_ID})
+"
+        )
+    }
+
+    fn house_id() -> AssetId {
+        HOUSE_ID.parse().unwrap()
+    }
+
+    #[test]
+    fn a_prefab_can_hold_an_instance_of_another() {
+        let mut world = world();
+        let (house, issues) = instantiate(&mut world, &registry(), house_id()).unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+
+        assert_eq!(world.entities().count(), 4);
+        let door = named(&world, "Door");
+        assert_eq!(parent_of(&world, door), Some(house));
+        assert_eq!(world.get::<PrefabInstance>(door).unwrap().prefab, door_id());
+        assert_eq!(
+            world.get::<Tag>(named(&world, "Handle")).unwrap().0,
+            "brass"
+        );
+    }
+
+    #[test]
+    fn an_edit_inside_a_nested_instance_survives_a_round_trip() {
+        let mut world = world();
+        instantiate(&mut world, &registry(), house_id()).unwrap();
+        move_panel(&mut world, Vec3::new(0.0, 2.0, 0.0));
+        let first = save(&mut world, &registry());
+        assert_eq!(first.matches("\nentity ").count(), 1, "{first}");
+
+        let mut loaded = reload(&first, &door_text("handle", 1.0));
+        assert_eq!(
+            loaded
+                .get::<LocalTransform>(named(&loaded, "Panel"))
+                .unwrap()
+                .translation,
+            Vec3::new(0.0, 2.0, 0.0)
+        );
+        assert_eq!(
+            loaded.get::<Tag>(named(&loaded, "Handle")).unwrap().0,
+            "brass"
+        );
+        assert_eq!(save(&mut loaded, &registry()), first);
+    }
+
+    /// An edit to the door reaches the doors inside houses too, except where a
+    /// house overrides it.
+    #[test]
+    fn a_door_edit_reaches_the_doors_inside_houses() {
+        let mut world = world();
+        instantiate(&mut world, &registry(), house_id()).unwrap();
+        let text = save(&mut world, &registry());
+
+        let loaded = reload(&text, &door_text("knob", 5.0));
+        assert_eq!(
+            loaded
+                .get::<LocalTransform>(named(&loaded, "Panel"))
+                .unwrap()
+                .translation,
+            Vec3::new(0.0, 5.0, 0.0)
+        );
+        assert_eq!(
+            loaded.get::<Tag>(named(&loaded, "Handle")).unwrap().0,
+            "brass"
+        );
+    }
+
+    #[test]
+    fn a_prefab_that_contains_itself_is_reported_rather_than_followed() {
+        let looped = format!(
+            "{}\nentity {HOUSE_DOOR}\n  orrin.parent = entity({ROOT})\n  orrin.prefab\n    \
+             source = asset({DOOR_ID})\n",
+            door_text("handle", 1.0)
+        );
+        let mut world = world_with(&looped);
+        let (_, issues) = instantiate(&mut world, &registry(), door_id()).unwrap();
+
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0].message.contains("an instance of itself"),
+            "{}",
+            issues[0]
+        );
+        assert_eq!(
+            world.entities().count(),
+            4,
+            "the loop's entry point is kept, not expanded"
+        );
+    }
+
+    /// Placement belongs to the instance, and sits beside its record where a
+    /// reader of the scene file — and the prefab index, finding a tree's root —
+    /// looks for a parent.
+    #[test]
+    fn an_instance_root_keeps_its_parent_beside_its_record() {
+        let mut world = world();
+        let room = world.spawn();
+        world.insert(room, Name::new("Room"));
+        let (root, _) = instantiate(&mut world, &registry(), door_id()).unwrap();
+        crate::scene::reparent(&mut world, root, Some(room), false).unwrap();
+        save(&mut world, &registry());
+        let room_id = entity_id(&world, room);
+
+        let text = save(&mut world, &registry());
+        let root_id = entity_id(&world, root);
+        assert!(
+            text.contains(&format!(
+                "entity {root_id}\n  orrin.parent = entity({room_id})\n  orrin.prefab\n"
+            )),
+            "{text}"
+        );
+    }
+
+    /// Replace the door in the index with `door`, and bring live instances up
+    /// to date — what a rescan does after the file changed on disk.
+    fn edit_door(world: &mut World, door: &str) -> Vec<String> {
+        let old = {
+            let mut prefabs = world.resource_mut::<Prefabs>();
+            let new = Prefab::parse(door_id(), "props/door.fprefab", door).unwrap();
+            prefabs.replace(new).expect("the door was indexed")
+        };
+        apply_edits(world, &registry(), vec![old])
+    }
+
+    /// The door with a hinge under its root and without its handle.
+    fn rehung_door() -> String {
+        let door = door_text("handle", 1.0);
+        let without_handle = &door[..door.find(&format!("entity {HANDLE}")).unwrap()];
+        format!(
+            "{without_handle}entity {HINGE}\n  orrin.name = \"Hinge\"\n  orrin.parent = entity({ROOT})\n"
+        )
+    }
+
+    const HINGE: &str = "00000000-0000-4000-8000-00000000000d";
+
+    #[test]
+    fn a_prefab_edit_reaches_live_instances_in_place() {
+        let mut world = world();
+        let (root, _) = instantiate(&mut world, &registry(), door_id()).unwrap();
+        let panel = named(&world, "Panel");
+        let handle = named(&world, "Handle");
+        move_panel(&mut world, Vec3::new(0.0, 2.0, 0.0));
+
+        let issues = edit_door(&mut world, &door_text("knob", 5.0));
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(world.get::<Tag>(handle).unwrap().0, "knob");
+        assert_eq!(
+            world.get::<LocalTransform>(panel).unwrap().translation,
+            Vec3::new(0.0, 2.0, 0.0),
+            "the instance's own value still wins"
+        );
+        assert_eq!(
+            parent_of(&world, panel),
+            Some(root),
+            "the same entities, edited"
+        );
+    }
+
+    #[test]
+    fn a_member_the_prefab_gains_appears_and_one_it_loses_goes() {
+        let mut world = world();
+        let (root, _) = instantiate(&mut world, &registry(), door_id()).unwrap();
+
+        let issues = edit_door(&mut world, &rehung_door());
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(parent_of(&world, named(&world, "Hinge")), Some(root));
+        assert!(
+            !world
+                .entities()
+                .any(|e| world.get::<Name>(e).is_some_and(|n| n.0 == "Handle"))
+        );
+        assert_eq!(world.entities().count(), 3);
+    }
+
+    #[test]
+    fn a_scene_entity_under_a_member_outlives_the_edit() {
+        let mut world = world();
+        instantiate(&mut world, &registry(), door_id()).unwrap();
+        let sticker = world.spawn();
+        world.insert(sticker, Name::new("Sticker"));
+        let panel = named(&world, "Panel");
+        crate::scene::reparent(&mut world, sticker, Some(panel), false).unwrap();
+
+        edit_door(&mut world, &door_text("knob", 5.0));
+        assert_eq!(parent_of(&world, sticker), Some(panel));
+    }
+
+    #[test]
+    fn a_prefab_edit_reaches_the_doors_inside_live_houses() {
+        let mut world = world();
+        instantiate(&mut world, &registry(), house_id()).unwrap();
+
+        edit_door(&mut world, &door_text("knob", 5.0));
+        assert_eq!(
+            world
+                .get::<LocalTransform>(named(&world, "Panel"))
+                .unwrap()
+                .translation,
+            Vec3::new(0.0, 5.0, 0.0)
+        );
+        assert_eq!(
+            world.get::<Tag>(named(&world, "Handle")).unwrap().0,
+            "brass"
+        );
+    }
+
+    /// End to end, through the disk: edit the file, rescan, and the instance
+    /// in the open scene changes.
+    #[test]
+    fn rescanning_after_a_file_edit_updates_the_scene() {
+        let dir = std::env::temp_dir().join(format!("orrin-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("door.fprefab"), door_text("handle", 1.0)).unwrap();
+        std::fs::write(
+            dir.join("door.fprefab.meta"),
+            format!("id = \"{DOOR_ID}\"\n"),
+        )
+        .unwrap();
+
+        let mut world = world();
+        world.insert_resource(Prefabs::scan(&dir).0);
+        instantiate(&mut world, &registry(), door_id()).unwrap();
+        std::fs::write(dir.join("door.fprefab"), door_text("knob", 1.0)).unwrap();
+
+        let issues = rescan(&mut world, &registry());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(world.get::<Tag>(named(&world, "Handle")).unwrap().0, "knob");
     }
 }
