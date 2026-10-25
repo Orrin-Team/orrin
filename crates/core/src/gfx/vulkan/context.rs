@@ -79,7 +79,7 @@ pub struct VkContext {
     /// Both halves are what GPU culling draws through: a view's batches are one
     /// multi-draw, and a batch finds its instances through the `firstInstance`
     /// the cull dispatch wrote into its command. A device without them keeps the
-    /// CPU sweep, which is the default path anyway — see `read_gpu_culling`.
+    /// CPU sweep whatever `ORRIN_GPU_CULL` asks — see `read_gpu_culling`.
     pub multi_draw: bool,
 }
 
