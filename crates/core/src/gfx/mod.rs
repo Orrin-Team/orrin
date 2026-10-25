@@ -122,6 +122,9 @@ pub struct RenderItem {
     pub prev_model: Mat4,
     /// World-space bounds: what the camera frustum tested, and what a shadow
     /// cascade tests against its own frustum without re-deriving anything.
+    ///
+    /// [`Aabb::EMPTY`] for an opaque object under GPU culling, whose
+    /// visibility the dispatch decides from its mesh's own bounds.
     pub bounds: Aabb,
     pub mesh: MeshHandle,
     pub material: MaterialHandle,

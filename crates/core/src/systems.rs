@@ -188,14 +188,6 @@ pub fn extract_geometry(
         .for_each(|entity, (transform, mesh, material)| {
             total += 1;
             let model = transform.0;
-            // A mesh with no registered bounds is unmeasurable, so it is drawn
-            // rather than culled; the frustum test says the same of an invalid
-            // box, which keeps the fallback in one place.
-            let world_bounds = bounds
-                .as_ref()
-                .and_then(|table| table.get(*mesh))
-                .unwrap_or(Aabb::EMPTY)
-                .transformed(&model);
 
             let material = material.copied().unwrap_or(MaterialHandle(0));
             // A blended or refractive surface leaves no depth for anything to
@@ -207,22 +199,36 @@ pub fn extract_geometry(
                 .as_ref()
                 .map_or(BlendMode::Opaque, |table| table.get(material));
             let blended = !mode.is_opaque();
-
-            let in_frustum = !cull
-                || frustum
-                    .as_ref()
-                    .is_none_or(|frustum| frustum.intersects(&world_bounds));
             // Under GPU culling every *opaque* renderable is offered to the
             // dispatch and the frustum decides there, per view — this is the
             // test the whole feature exists to move. The blended and refractive
             // queues are culled here either way: they are drawn from the order
             // this list is in, and a refractive surface has to be drawn back to
             // front, which is a correctness requirement no atomic append meets.
-            let visible = if gpu_culling && !blended {
-                true
+            let offered = gpu_culling && !blended;
+
+            // A mesh with no registered bounds is unmeasurable, so it is drawn
+            // rather than culled; the frustum test says the same of an invalid
+            // box, which keeps the fallback in one place.
+            //
+            // Not derived for an object the dispatch decides on: it transforms
+            // the mesh's own bounds itself, and nothing on the CPU reads these
+            // for an offered object, so the transform would be a 3x3 multiply
+            // per entity per frame for nothing.
+            let world_bounds = if offered {
+                Aabb::EMPTY
             } else {
-                in_frustum
+                bounds
+                    .as_ref()
+                    .and_then(|table| table.get(*mesh))
+                    .unwrap_or(Aabb::EMPTY)
+                    .transformed(&model)
             };
+            let visible = offered
+                || !cull
+                || frustum
+                    .as_ref()
+                    .is_none_or(|frustum| frustum.intersects(&world_bounds));
             // The cascades share a rotation, so a box's half-extent in light
             // space is a property of the box and the light — not of which
             // cascade is asking. Derived once here; each cascade then costs one
@@ -1291,11 +1297,12 @@ pub fn extract_decals(world: &World, aspect: f32, out: &mut Vec<DecalInstance>) 
 #[cfg(test)]
 mod geometry_tests {
     use super::{FrameGeometry, extract_geometry};
+    use crate::gfx::BlendMode;
     use crate::gfx::punctual::ShadowAtlas;
     use crate::gfx::shadows::{CascadeConfig, CascadeSet, cascades};
     use crate::scene::{
-        Camera, CpuMesh, Culling, LocalTransform, MaterialHandle, MeshBounds, MeshHandle,
-        Transform, WorldTransform,
+        Camera, CpuMesh, Culling, LocalTransform, MaterialBlends, MaterialHandle, MeshBounds,
+        MeshHandle, Transform, WorldTransform,
     };
     use glam::Vec3;
     use orrin_ecs::World;
@@ -1392,6 +1399,57 @@ mod geometry_tests {
             geometry.items.len(),
             0,
             "an object nothing draws still took a row",
+        );
+    }
+
+    fn extract_gpu_culled(world: &World) -> FrameGeometry {
+        let mut geometry = FrameGeometry::default();
+        extract_geometry(
+            world,
+            ASPECT,
+            &CascadeSet::default(),
+            &ShadowAtlas::default(),
+            true,
+            &mut geometry,
+        );
+        geometry
+    }
+
+    /// Under GPU culling the dispatch decides an opaque object's visibility
+    /// from its mesh's own bounds, so the sweep offers it whatever the frustum
+    /// says and derives no world bounds for it — nothing on the CPU reads them.
+    #[test]
+    fn under_gpu_culling_an_opaque_object_is_offered_without_cpu_bounds() {
+        // Behind the camera, where the CPU sweep would have culled it.
+        let world = world_with(&[(Vec3::new(0.0, 0.0, 5000.0), CUBE, 0)]);
+        let geometry = extract_gpu_culled(&world);
+
+        assert_eq!(geometry.visible.len(), 1, "the dispatch was not offered it");
+        assert!(!geometry.items[0].bounds.is_valid());
+    }
+
+    /// The blended queues are still culled and ordered on the CPU under GPU
+    /// culling, so a blended object keeps real bounds and the frustum test.
+    #[test]
+    fn under_gpu_culling_a_blended_object_is_still_culled_on_the_cpu() {
+        let mut world = world_with(&[
+            (Vec3::new(0.0, 0.0, -5.0), CUBE, 1),
+            (Vec3::new(0.0, 0.0, 5000.0), CUBE, 1),
+        ]);
+        let mut blends = MaterialBlends::default();
+        blends.insert(MaterialHandle(1), BlendMode::Blend);
+        world.insert_resource(blends);
+        let geometry = extract_gpu_culled(&world);
+
+        assert_eq!(
+            geometry.transparent.len(),
+            1,
+            "the one behind was not culled"
+        );
+        assert!(
+            geometry.items[geometry.transparent[0] as usize]
+                .bounds
+                .is_valid()
         );
     }
 
