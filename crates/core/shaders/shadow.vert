@@ -25,7 +25,6 @@ layout(push_constant) uniform Push {
 // `model` is used here, because dropping one would halve every index.
 struct Object {
     mat4 model;
-    mat4 normal_matrix;
     mat4 prev_model; // read only by the prepass; here to keep the stride in step
 };
 layout(set = 0, binding = 0, std430) readonly buffer Objects {
@@ -35,7 +34,7 @@ layout(set = 0, binding = 0, std430) readonly buffer Objects {
 // This pass's slice of the frame's draw order: for each entry, the row into
 // `objects` and the material to draw it with. The indirection is what lets a row
 // be shared — an object the camera sees and four cascades also draw occupies one
-// row named five times, rather than five copies of the same three matrices.
+// row named five times, rather than five copies of the same two matrices.
 // `gl_InstanceIndex` already counts from the draw's `firstInstance`, which is
 // where its slice starts. See `vulkan::instances`.
 layout(set = 0, binding = 1, std430) readonly buffer Instances {

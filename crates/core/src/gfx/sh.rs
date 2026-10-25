@@ -10,6 +10,13 @@
 //!
 //! Everything here is device-free and runs on the equirectangular source before
 //! it is ever uploaded, so there is no GPU readback anywhere in the path.
+//!
+//! Every scan over the source splits by row across the pool. A row is
+//! independent given its latitude, and its partial sum comes back to be added
+//! in row order on the calling thread — so the result is bit-identical whatever
+//! the pool size. Not a rayon `fold`/`reduce`, whose association depends on how
+//! the work happened to be stolen and would make the lighting differ, in the
+//! last bits, between two runs of the same scene.
 
 use std::f32::consts::{FRAC_2_PI, PI, TAU};
 
@@ -64,22 +71,40 @@ const SUN_CLAMP: f32 = 100.0;
 
 const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
 
+/// `row(y)` for every row in `rows`, across the pool, in order.
+fn per_row<T: Send>(
+    rows: std::ops::Range<usize>,
+    row: impl Fn(usize) -> T + Send + Sync,
+) -> Vec<T> {
+    let rows: Vec<usize> = rows.collect();
+    crate::threads::map(&rows, |&y| row(y))
+}
+
+/// The luminance of every texel in row `y`.
+fn row_luminance(pixels: &[f32], width: usize, y: usize) -> impl Iterator<Item = f32> + '_ {
+    pixels[y * width * 4..(y + 1) * width * 4]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&[r, g, b, _]| Vec3::new(r, g, b).dot(LUMA))
+}
+
 /// Solid-angle-weighted mean luminance, counting nothing above `ceiling`.
 fn mean_luminance(pixels: &[f32], extent: [u32; 2], ceiling: f32) -> f32 {
     let (width, height) = (extent[0] as usize, extent[1] as usize);
-    let mut total = 0.0f64;
-    let mut measure = 0.0f64;
 
-    for y in 0..height {
+    let rows = per_row(0..height, |y| {
         let theta = (y as f32 + 0.5) / height as f32 * PI;
         let weight = theta.sin() as f64;
-        for x in 0..width {
-            let texel = (y * width + x) * 4;
-            let luminance =
-                Vec3::new(pixels[texel], pixels[texel + 1], pixels[texel + 2]).dot(LUMA);
-            total += luminance.min(ceiling) as f64 * weight;
-        }
-        measure += weight * width as f64;
+        let sum: f64 = row_luminance(pixels, width, y)
+            .map(|luminance| luminance.min(ceiling) as f64)
+            .sum();
+        (sum * weight, weight * width as f64)
+    });
+    let (mut total, mut measure) = (0.0f64, 0.0f64);
+    for (row_total, row_measure) in rows {
+        total += row_total;
+        measure += row_measure;
     }
 
     if measure > 0.0 {
@@ -133,23 +158,21 @@ pub fn sky_luminance(pixels: &[f32], extent: [u32; 2]) -> f32 {
     let (width, height) = (extent[0] as usize, extent[1] as usize);
     // Row 0 is the zenith — `basis`'s `cos_theta` is +Y at theta 0 — so the sky
     // is the first half of the rows.
-    let rows = 0..height / 2;
-
-    let mut total = 0.0f64;
-    let mut measure = 0.0f64;
-    for y in rows {
+    let rows = per_row(0..height / 2, |y| {
         let theta = (y as f32 + 0.5) / height as f32 * PI;
         let weight = theta.sin() as f64;
-        for x in 0..width {
-            let texel = (y * width + x) * 4;
-            let luminance =
-                Vec3::new(pixels[texel], pixels[texel + 1], pixels[texel + 2]).dot(LUMA);
-            // Floored rather than skipped: a black pixel is information about how
-            // dark this sky is, and dropping it would report a night sky as
-            // whatever few stars it has.
-            total += (luminance.max(1e-6) as f64).ln() * weight;
-            measure += weight;
-        }
+        // Floored rather than skipped: a black pixel is information about how
+        // dark this sky is, and dropping it would report a night sky as
+        // whatever few stars it has.
+        let sum: f64 = row_luminance(pixels, width, y)
+            .map(|luminance| (luminance.max(1e-6) as f64).ln())
+            .sum();
+        (sum * weight, weight * width as f64)
+    });
+    let (mut total, mut measure) = (0.0f64, 0.0f64);
+    for (row_total, row_measure) in rows {
+        total += row_total;
+        measure += row_measure;
     }
 
     if measure > 0.0 {
@@ -195,7 +218,6 @@ fn convolve(mut coefficients: [Vec3; SH9]) -> [Vec3; SH9] {
 /// the same scene the cubemap is drawn behind.
 pub fn project_equirect(pixels: &[f32], extent: [u32; 2]) -> [Vec3; SH9] {
     let (width, height) = (extent[0] as usize, extent[1] as usize);
-    let mut coefficients = [Vec3::ZERO; SH9];
     let ceiling = diffuse_ceiling(pixels, extent);
 
     // A texel's solid angle varies only with latitude: sin(theta) d(theta)
@@ -211,19 +233,23 @@ pub fn project_equirect(pixels: &[f32], extent: [u32; 2]) -> [Vec3; SH9] {
     // back out below rather than assumed.
     let mut measure = 0.0;
 
-    for y in 0..height {
+    // Longitude depends only on the column, so its sine and cosine are one row's
+    // worth of transcendentals rather than one per texel.
+    let longitudes: Vec<(f32, f32)> = (0..width)
+        .map(|x| (((x as f32 + 0.5) / width as f32 - 0.5) * TAU).sin_cos())
+        .collect();
+
+    // Each row sums unweighted, and takes its solid angle once at the end: the
+    // weight is constant along a row.
+    let rows = per_row(0..height, |y| {
         let theta = (y as f32 + 0.5) * d_theta;
         let (sin_theta, cos_theta) = theta.sin_cos();
-        let solid_angle = sin_theta * d_theta * d_phi;
-        measure += solid_angle * width as f32;
+        let (row, _) = pixels[y * width * 4..(y + 1) * width * 4].as_chunks::<4>();
 
-        for x in 0..width {
-            let phi = ((x as f32 + 0.5) / width as f32 - 0.5) * TAU;
-            let (sin_phi, cos_phi) = phi.sin_cos();
+        let mut sums = [Vec3::ZERO; SH9];
+        for (&[r, g, b, _], &(sin_phi, cos_phi)) in row.iter().zip(&longitudes) {
             let direction = Vec3::new(cos_phi * sin_theta, cos_theta, sin_phi * sin_theta);
-
-            let texel = (y * width + x) * 4;
-            let mut radiance = Vec3::new(pixels[texel], pixels[texel + 1], pixels[texel + 2]);
+            let mut radiance = Vec3::new(r, g, b);
 
             // Scaled rather than clamped per channel, so a clipped sun keeps
             // its colour instead of drifting toward whichever channel was
@@ -233,10 +259,19 @@ pub fn project_equirect(pixels: &[f32], extent: [u32; 2]) -> [Vec3; SH9] {
                 radiance *= ceiling / luminance;
             }
 
-            for (coefficient, harmonic) in coefficients.iter_mut().zip(basis(direction)) {
-                *coefficient += radiance * (harmonic * solid_angle);
+            for (sum, harmonic) in sums.iter_mut().zip(basis(direction)) {
+                *sum += radiance * harmonic;
             }
         }
+        (sums, sin_theta * d_theta * d_phi)
+    });
+
+    let mut coefficients = [Vec3::ZERO; SH9];
+    for (sums, solid_angle) in rows {
+        for (coefficient, sum) in coefficients.iter_mut().zip(sums) {
+            *coefficient += sum * solid_angle;
+        }
+        measure += solid_angle * width as f32;
     }
 
     let correction = 2.0 * TAU / measure;
@@ -452,6 +487,93 @@ mod tests {
             "a 50000:0.05 sun left {with_sun} against a sunless {without}; \
              the disc is still dominating the irradiance",
         );
+    }
+
+    /// A source with every feature the projection treats specially: a gradient
+    /// for the solid-angle weighting, a sun over the clamp, and a dark ground.
+    fn awkward_sky() -> Vec<f32> {
+        let to_sun = Vec3::new(0.3, 0.9, -0.4).normalize();
+        equirect(256, 128, |d| {
+            if d.dot(to_sun) > 0.999 {
+                Vec3::new(60_000.0, 55_000.0, 50_000.0)
+            } else if d.y < 0.0 {
+                Vec3::new(0.02, 0.015, 0.01)
+            } else {
+                Vec3::new(0.2, 0.3, 0.6) * (0.5 + d.y) + Vec3::splat(d.x * 0.1)
+            }
+        })
+    }
+
+    /// The bake sums per-row partials in row order whichever path runs, so the
+    /// pool changes how fast it finishes and nothing else. Bit equality is the
+    /// claim, not a tolerance: an environment that lit a scene differently
+    /// under `ORRIN_THREADS=1` would make every A/B against it meaningless.
+    #[test]
+    fn the_bake_does_not_depend_on_the_thread_count() {
+        let pixels = awkward_sky();
+        let run = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("a pool")
+                .install(|| {
+                    (
+                        project_equirect(&pixels, [256, 128]),
+                        sky_luminance(&pixels, [256, 128]),
+                    )
+                })
+        };
+        assert_eq!(run(1), run(4));
+    }
+
+    /// The projection as one running sum over every texel, with `phi` evaluated
+    /// per texel — the definition the row-parallel version has to agree with.
+    fn reference_projection(pixels: &[f32], extent: [u32; 2]) -> [Vec3; SH9] {
+        let (width, height) = (extent[0] as usize, extent[1] as usize);
+        let ceiling = diffuse_ceiling(pixels, extent);
+        let (d_theta, d_phi) = (PI / height as f32, TAU / width as f32);
+        let mut coefficients = [Vec3::ZERO; SH9];
+        let mut measure = 0.0;
+        for y in 0..height {
+            let (sin_theta, cos_theta) = ((y as f32 + 0.5) * d_theta).sin_cos();
+            let solid_angle = sin_theta * d_theta * d_phi;
+            measure += solid_angle * width as f32;
+            for x in 0..width {
+                let phi = ((x as f32 + 0.5) / width as f32 - 0.5) * TAU;
+                let (sin_phi, cos_phi) = phi.sin_cos();
+                let direction = Vec3::new(cos_phi * sin_theta, cos_theta, sin_phi * sin_theta);
+                let texel = (y * width + x) * 4;
+                let mut radiance = Vec3::new(pixels[texel], pixels[texel + 1], pixels[texel + 2]);
+                let luminance = radiance.dot(LUMA);
+                if ceiling > 0.0 && luminance > ceiling {
+                    radiance *= ceiling / luminance;
+                }
+                for (c, h) in coefficients.iter_mut().zip(basis(direction)) {
+                    *c += radiance * (h * solid_angle);
+                }
+            }
+        }
+        convolve(coefficients.map(|c| c * (2.0 * TAU / measure)))
+    }
+
+    /// Summing per row then across rows reorders the floating-point additions,
+    /// so agreement is to a tolerance: one part in 10^4 of the largest
+    /// coefficient, far below anything a lit surface could show.
+    #[test]
+    fn the_bake_matches_a_texel_by_texel_reference() {
+        let pixels = awkward_sky();
+        let baked = project_equirect(&pixels, [256, 128]);
+        let reference = reference_projection(&pixels, [256, 128]);
+        let scale = reference
+            .iter()
+            .map(|c| c.abs().max_element())
+            .fold(0.0, f32::max);
+        for (index, (a, b)) in baked.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                (*a - *b).abs().max_element() <= scale * 1e-4,
+                "coefficient {index}: baked {a}, reference {b}",
+            );
+        }
     }
 
     /// Ringing is what the window exists to contain, and the shader's clamp is

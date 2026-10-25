@@ -25,7 +25,7 @@
 use std::sync::Arc;
 
 use vulkano::buffer::BufferContents;
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -168,17 +168,15 @@ impl SubsurfacePass {
         target: Arc<ImageView>,
         vertical: bool,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.blur_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.blur_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, source, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view_sampler(1, depth, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view(2, target.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.blur_pipeline)
@@ -200,17 +198,15 @@ impl SubsurfacePass {
         diffused: Arc<ImageView>,
         target: Arc<ImageView>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.composite_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.composite_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, source, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view_sampler(1, diffused, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view(2, target.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.composite_pipeline)

@@ -298,16 +298,14 @@ impl SsrPass {
         // zero. `levels` is what stops anything from storing through them.
         let bound = (0..HIZ_LEVELS as usize).map(|level| mips[level.min(mips.len() - 1)].clone());
 
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.hiz_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.hiz_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, depth, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view_array(1, 0, bound),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.hiz_pipeline)
@@ -351,18 +349,16 @@ impl SsrPass {
         let bound =
             (0..SOURCE_LEVELS as usize).map(|level| mips[level.min(mips.len() - 1)].clone());
 
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.source_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.source_pipeline.layout().set_layouts()[0],
             [
                 // Linear, because level 0 is a 2:1 reduction of the frame and
                 // one bilinear fetch between four texels *is* their average.
                 WriteDescriptorSet::image_view_sampler(0, source, self.linear_clamp.clone()),
                 WriteDescriptorSet::image_view_array(1, 0, bound),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.source_pipeline)

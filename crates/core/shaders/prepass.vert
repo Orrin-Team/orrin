@@ -65,7 +65,6 @@ invariant gl_Position;
 // Mirrors GpuObject in forward.rs.
 struct Object {
     mat4 model;
-    mat4 normal_matrix;
     mat4 prev_model;
 };
 layout(set = 1, binding = 0, std430) readonly buffer Objects {
@@ -75,12 +74,14 @@ layout(set = 1, binding = 0, std430) readonly buffer Objects {
 // This pass's slice of the frame's draw order: for each entry, the row into
 // `objects` and the material to draw it with. The indirection is what lets a row
 // be shared — an object the camera sees and four cascades also draw occupies one
-// row named five times, rather than five copies of the same three matrices.
+// row named five times, rather than five copies of the same two matrices.
 // `gl_InstanceIndex` already counts from the draw's `firstInstance`, which is
 // where its slice starts. See `vulkan::instances`.
 layout(set = 1, binding = 1, std430) readonly buffer Instances {
     uvec2 instances[];
 };
+
+#include "normal_matrix.glsl"
 
 void main() {
     uvec2 entry = instances[uint(gl_InstanceIndex)];
@@ -90,7 +91,7 @@ void main() {
 
     // Same construction as forward.vert, one space along: Gram-Schmidt against
     // the normal, handedness from the tangent's w.
-    vec3 world_n = mat3(objects[object].normal_matrix) * normal;
+    vec3 world_n = normal_matrix(model) * normal;
     vec3 world_t = mat3(model) * tangent.xyz;
     vec3 N = normalize(mat3(frame.view) * world_n); // view is rigid → pure rotation
     vec3 T = normalize(mat3(frame.view) * world_t);

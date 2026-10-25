@@ -274,9 +274,9 @@ impl SsaoPass {
             [],
         )
         .unwrap();
-        let texture_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.ssao_pipeline.layout().set_layouts()[1].clone(),
+        let texture_set = renderer.ctx.descriptor_sets.get(
+            &renderer.ctx.descriptor_set_allocator,
+            &self.ssao_pipeline.layout().set_layouts()[1],
             [
                 WriteDescriptorSet::image_view_sampler(0, depth_view, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view_sampler(1, normal_view, self.nearest_clamp.clone()),
@@ -286,9 +286,7 @@ impl SsaoPass {
                     self.nearest_repeat.clone(),
                 ),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         set_viewport(builder, extent);
         builder
@@ -315,9 +313,9 @@ impl SsaoPass {
         depth_view: Arc<ImageView>,
         uniforms: &SsaoUniforms,
     ) {
-        let input = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.blur_pipeline.layout().set_layouts()[0].clone(),
+        let input = renderer.ctx.descriptor_sets.get(
+            &renderer.ctx.descriptor_set_allocator,
+            &self.blur_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, raw_ao_view, self.nearest_clamp.clone()),
                 // Nearest, like every other read of this depth: interpolating
@@ -325,9 +323,7 @@ impl SsaoPass {
                 // the weighting below exists to stop.
                 WriteDescriptorSet::image_view_sampler(1, depth_view, self.nearest_clamp.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
         let frame_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
             self.blur_pipeline.layout().set_layouts()[1].clone(),

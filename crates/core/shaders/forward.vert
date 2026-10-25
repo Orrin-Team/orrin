@@ -28,7 +28,6 @@ layout(push_constant) uniform Push {
 // forward.rs; std430 packs it exactly like the Rust struct (all mat4 fields).
 struct Object {
     mat4 model;
-    mat4 normal_matrix;
     mat4 prev_model; // read only by the prepass; here to keep the stride in step
 };
 layout(set = 4, binding = 0, std430) readonly buffer Objects {
@@ -38,7 +37,7 @@ layout(set = 4, binding = 0, std430) readonly buffer Objects {
 // This pass's slice of the frame's draw order: for each entry, the row into
 // `objects` and the material to draw it with. The indirection is what lets a row
 // be shared — an object the camera sees and four cascades also draw occupies one
-// row named five times, rather than five copies of the same three matrices.
+// row named five times, rather than five copies of the same two matrices.
 // `gl_InstanceIndex` already counts from the draw's `firstInstance`, which is
 // where its slice starts. See `vulkan::instances`.
 layout(set = 4, binding = 1, std430) readonly buffer Instances {
@@ -51,18 +50,19 @@ layout(set = 4, binding = 1, std430) readonly buffer Instances {
 // world_pos` there have to round identically.
 invariant gl_Position;
 
+#include "normal_matrix.glsl"
+
 void main() {
     uvec2 entry = instances[uint(gl_InstanceIndex)];
     uint object = entry.x;
     v_material = entry.y;
     mat4 model = objects[object].model;
-    mat4 normal_matrix = objects[object].normal_matrix;
 
     vec4 world = model * vec4(position, 1.0);
     v_world_pos = world.xyz;
 
     // World-space TBN basis for tangent-space normal mapping.
-    vec3 N = normalize(mat3(normal_matrix) * normal);
+    vec3 N = normalize(normal_matrix(model) * normal);
     vec3 T = normalize(mat3(model) * tangent.xyz);
     T = normalize(T - dot(T, N) * N);          // Gram-Schmidt
     vec3 B = cross(N, T) * tangent.w;          // handedness from w

@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use vulkano::buffer::{BufferContents, Subbuffer};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -170,17 +170,15 @@ impl BloomPass {
         target: Arc<ImageView>,
         exposure: Subbuffer<GpuExposure>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.prefilter_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.prefilter_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, source, self.sampler.clone()),
                 WriteDescriptorSet::image_view(1, target.clone()),
                 WriteDescriptorSet::buffer(2, exposure),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.prefilter_pipeline)
@@ -208,16 +206,14 @@ impl BloomPass {
         source: Arc<ImageView>,
         target: Arc<ImageView>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.downsample_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.downsample_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, source, self.sampler.clone()),
                 WriteDescriptorSet::image_view(1, target.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.downsample_pipeline)
@@ -240,17 +236,15 @@ impl BloomPass {
         same_level: Arc<ImageView>,
         target: Arc<ImageView>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.upsample_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.upsample_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, coarse, self.sampler.clone()),
                 WriteDescriptorSet::image_view_sampler(1, same_level, self.sampler.clone()),
                 WriteDescriptorSet::image_view(2, target.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.upsample_pipeline)

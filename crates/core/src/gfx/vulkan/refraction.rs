@@ -35,7 +35,7 @@
 use std::sync::Arc;
 
 use vulkano::buffer::BufferContents;
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::format::Format;
 use vulkano::image::sampler::{
     LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
@@ -157,16 +157,14 @@ impl RefractionPass {
         // is what stops those slots from being stored to.
         let bound = (0..SCENE_LEVELS as usize).map(|level| mips[level.min(levels - 1)].clone());
 
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.pyramid_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.pyramid_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, source, self.linear_clamp.clone()),
                 WriteDescriptorSet::image_view_array(1, 0, bound),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.pyramid_pipeline)
@@ -211,18 +209,16 @@ impl RefractionPass {
         extent: [u32; 2],
         object_base: u32,
     ) {
-        let scene_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[SCENE_SET].clone(),
+        let scene_set = renderer.ctx.descriptor_sets.get(
+            &renderer.ctx.descriptor_set_allocator,
+            &self.pipeline.layout().set_layouts()[SCENE_SET],
             [
                 WriteDescriptorSet::image_view_sampler(0, blur, self.linear_mip.clone()),
                 // The frame itself, for the smooth end of the roughness range —
                 // no mips to step between, so the plain linear sampler.
                 WriteDescriptorSet::image_view_sampler(1, sharp, self.linear_clamp.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         let mut bound = sets.as_vec();
         bound.push(scene_set);
@@ -282,17 +278,15 @@ impl RefractionPass {
         accum: Arc<ImageView>,
         target: Arc<ImageView>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.composite_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.composite_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, scene, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view_sampler(1, accum, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view(2, target.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.composite_pipeline)

@@ -207,16 +207,14 @@ impl MotionBlurPass {
         tiles: Arc<ImageView>,
         target: Arc<ImageView>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.neighbour_max_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.neighbour_max_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, tiles, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view(1, target.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.neighbour_max_pipeline)

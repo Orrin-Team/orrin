@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
@@ -174,18 +174,16 @@ impl OitPass {
         reveal: Arc<ImageView>,
         target: Arc<ImageView>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.composite_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.composite_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, scene, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view_sampler(1, accum, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view_sampler(2, reveal, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view(3, target.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.composite_pipeline)

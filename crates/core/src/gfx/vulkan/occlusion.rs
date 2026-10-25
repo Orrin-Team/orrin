@@ -39,7 +39,7 @@
 use std::sync::Arc;
 
 use vulkano::buffer::BufferContents;
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
@@ -235,16 +235,14 @@ impl OcclusionPass {
         let bound =
             (0..OCCLUSION_LEVELS as usize).map(|level| mips[level.min(mips.len() - 1)].clone());
 
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, depth, self.nearest_clamp.clone()),
                 WriteDescriptorSet::image_view_array(1, 0, bound),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.pipeline)

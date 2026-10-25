@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
@@ -207,16 +207,14 @@ impl ExposurePass {
         extent: [u32; 2],
         hdr_view: Arc<ImageView>,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.histogram_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.histogram_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::image_view_sampler(0, hdr_view, self.sampler.clone()),
                 WriteDescriptorSet::buffer(1, self.histogram.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.histogram_pipeline)
@@ -245,16 +243,14 @@ impl ExposurePass {
     }
 
     pub fn record_average(&self, builder: &mut Recorder, ctx: &VkContext, extent: [u32; 2]) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.average_pipeline.layout().set_layouts()[0].clone(),
+        let set = ctx.descriptor_sets.get(
+            &ctx.descriptor_set_allocator,
+            &self.average_pipeline.layout().set_layouts()[0],
             [
                 WriteDescriptorSet::buffer(0, self.histogram.clone()),
                 WriteDescriptorSet::buffer(1, self.exposure.clone()),
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         builder
             .bind_pipeline_compute(&self.average_pipeline)

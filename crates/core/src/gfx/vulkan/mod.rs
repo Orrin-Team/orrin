@@ -2,6 +2,7 @@ mod bloom;
 mod contact_shadows;
 mod context;
 mod cull;
+mod descriptors;
 mod dof;
 mod environment;
 mod exposure;
@@ -1307,6 +1308,7 @@ impl VulkanRenderer {
         // still reading the other.
         self.images.set_slot(self.frame_index);
         self.frame_index = self.frame_index.wrapping_add(1);
+        self.ctx.descriptor_sets.next_frame();
 
         // Taken out of `self` for the duration of recording: the pass brackets
         // below interleave with calls that borrow `self` immutably, and a field
@@ -2166,16 +2168,17 @@ struct PendingTail {
 
 /// Whether the frame decides its visible set on the GPU.
 ///
-/// Off unless asked for, which is the opposite of how `ORRIN_ASYNC_COMPUTE`
-/// reads and deliberately so: the CPU sweep is still the path every scene has
-/// been looked at through, and this is the one being measured against it.
+/// On unless `ORRIN_GPU_CULL=0`, which reads the way `ORRIN_ASYNC_COMPUTE`
+/// does. At 4000 stress entities the dispatch halves extraction against the
+/// CPU sweep, and at demo scale it costs nothing measurable; the sweep stays as
+/// the control the two are measured against on one binary.
 ///
 /// A device that cannot multi-draw keeps the sweep whatever the variable says,
 /// and says so rather than drawing one batch per view and calling it the same
-/// thing: the path exists to be measured, and a silently different one is not a
-/// measurement. See [`VkContext::multi_draw`].
+/// thing: a silently different path is not a measurement. See
+/// [`VkContext::multi_draw`].
 fn read_gpu_culling(ctx: &VkContext) -> bool {
-    let asked = std::env::var("ORRIN_GPU_CULL").is_ok_and(|value| value.trim() == "1");
+    let asked = gpu_culling_requested(std::env::var("ORRIN_GPU_CULL").ok().as_deref());
     if asked && !ctx.multi_draw {
         tracing::warn!(
             "GPU culling: unavailable — this device has no multi-draw indirect \
@@ -2183,6 +2186,11 @@ fn read_gpu_culling(ctx: &VkContext) -> bool {
         );
     }
     asked && ctx.multi_draw
+}
+
+/// `ORRIN_GPU_CULL` read as a request: anything but `0` asks for the dispatch.
+fn gpu_culling_requested(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.trim() != "0")
 }
 
 /// Whether the cull also drops what the previous frame's depth already covered.
@@ -2450,14 +2458,11 @@ impl FrameRecord<'_> {
                     // One self.view per level, because a storage image descriptor
                     // takes exactly one — the sampled self.view the trace reads
                     // spans the whole pyramid instead.
-                    let mips: Vec<_> = (0..self.images.mip_levels(ids.hiz))
-                        .map(|level| self.images.mip_view(ids.hiz, level))
-                        .collect();
                     self.ssr.record_hiz(
                         builder,
                         self.ctx,
                         self.images.view(prepass.depth),
-                        &mips,
+                        self.images.mip_views(ids.hiz),
                         self.extent,
                     );
                 }
@@ -2467,11 +2472,12 @@ impl FrameRecord<'_> {
                         .ids
                         .ssr
                         .expect("reflections without their images");
-                    let mips: Vec<_> = (0..self.images.mip_levels(ids.source_pyramid))
-                        .map(|level| self.images.mip_view(ids.source_pyramid, level))
-                        .collect();
-                    self.ssr
-                        .record_source(builder, self.ctx, self.view_of(ids.source), &mips);
+                    self.ssr.record_source(
+                        builder,
+                        self.ctx,
+                        self.view_of(ids.source),
+                        self.images.mip_views(ids.source_pyramid),
+                    );
                 }
                 PassBody::SsrTrace => {
                     let ids = self
@@ -2595,14 +2601,11 @@ impl FrameRecord<'_> {
                         .ids
                         .refraction
                         .expect("refraction without its images");
-                    let mips: Vec<_> = (0..self.images.mip_levels(ids.scene))
-                        .map(|level| self.images.mip_view(ids.scene, level))
-                        .collect();
                     self.refraction.record_pyramid(
                         builder,
                         self.ctx,
                         self.view_of(ids.source),
-                        &mips,
+                        self.images.mip_views(ids.scene),
                     );
                 }
                 PassBody::RefractionComposite => {
@@ -3100,4 +3103,19 @@ fn swapchain_color_format(ctx: &VkContext, surface: &Arc<Surface>) -> vulkano::f
         })
         .map(|(f, _)| f)
         .unwrap_or(Format::B8G8R8A8_SRGB)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gpu_culling_requested;
+
+    /// On unless switched off: the dispatch is the path, and `0` is the
+    /// control every measurement of it is read against.
+    #[test]
+    fn gpu_culling_is_on_unless_switched_off() {
+        assert!(gpu_culling_requested(None));
+        assert!(gpu_culling_requested(Some("1")));
+        assert!(!gpu_culling_requested(Some("0")));
+        assert!(!gpu_culling_requested(Some(" 0 ")));
+    }
 }
