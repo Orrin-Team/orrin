@@ -142,6 +142,9 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
     {
         state.selection.clear();
     }
+    if selected && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F)) {
+        state.request_frame();
+    }
 }
 
 /// Every number, path, id and log line is monospace, so columns of figures
@@ -2098,6 +2101,54 @@ mod tests {
         assert!(!editor.state.gizmo_strokes.is_empty());
     }
 
+    /// The selection is outlined in the scene in every tool, Select included,
+    /// where there are no handles to say what is selected.
+    #[test]
+    fn a_selected_mesh_is_outlined_by_its_bounds() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        editor.frames(1);
+        assert!(editor.state.gizmo_strokes.is_empty(), "nothing selected");
+        editor.state.selection.set(cube);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Select;
+        editor.frames(1);
+        assert_eq!(editor.state.gizmo_strokes.len(), 12 * 6);
+    }
+
+    /// While the button is held the drag says what it has done, by the pointer.
+    #[test]
+    fn a_drag_shows_its_readout_by_the_pointer() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        editor.state.selection.set(cube);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Move;
+        editor.frames(2);
+
+        let grab = x_shaft(&editor, cube, 0.5);
+        let outward = (grab - x_shaft(&editor, cube, 0.0)).normalized();
+        pointer(&mut editor, egui::Event::PointerMoved(grab));
+        pointer(&mut editor, button(grab, true));
+        pointer(
+            &mut editor,
+            egui::Event::PointerMoved(grab + outward * 40.0),
+        );
+        assert!(
+            editor
+                .painted()
+                .iter()
+                .any(|text| text.starts_with('+') && text.ends_with(" m")),
+            "{:?}",
+            editor.painted()
+        );
+        pointer(&mut editor, button(grab + outward * 40.0, false));
+        assert!(
+            !editor
+                .painted()
+                .iter()
+                .any(|text| text.ends_with(" m") && text.starts_with('+'))
+        );
+    }
+
     /// A click on a handle is the start of a drag that went nowhere, not a
     /// click on whatever is behind it — here, empty space, which would clear
     /// the selection.
@@ -2115,6 +2166,48 @@ mod tests {
         editor.state.apply(&mut editor.world, &editor.registry);
         assert_eq!(editor.state.selection.entities(), [cube]);
         assert_eq!(editor.state.history.undo_label(), None, "nothing moved");
+    }
+
+    /// F turns the camera on the selection from where it already looks, and
+    /// backs off until the selection fits.
+    #[test]
+    fn f_frames_the_selection() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        let away = glam::Vec3::new(20.0, 3.0, -15.0);
+        editor.world.insert(
+            cube,
+            LocalTransform::new(crate::scene::Transform::from_translation(away)),
+        );
+        crate::scene::propagate_transforms(&mut editor.world);
+        let before = *editor.world.resource::<crate::scene::Camera>();
+        let heading = (before.target - before.position).normalize();
+        editor.state.selection.set(cube);
+        editor.frames(1).key(egui::Key::F);
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        let after = *editor.world.resource::<crate::scene::Camera>();
+        assert!((after.target - away).length() < 1e-4, "{}", after.target);
+        let now = (after.target - after.position).normalize();
+        assert!(now.dot(heading) > 0.9999, "the heading is kept");
+        // A unit cube's bounding sphere, inside the vertical field of view.
+        let radius = glam::Vec3::splat(0.5).length();
+        let distance = (after.target - after.position).length();
+        assert!(distance * (after.fov_y * 0.5).sin() >= radius, "{distance}");
+        assert!(distance < 10.0, "near enough to fill the view: {distance}");
+        assert!(editor.state.take_camera_moved());
+        assert!(!editor.state.take_camera_moved(), "drained");
+    }
+
+    #[test]
+    fn f_with_nothing_selected_leaves_the_camera_alone() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let before = *editor.world.resource::<crate::scene::Camera>();
+        editor.frames(1).key(egui::Key::F);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let after = *editor.world.resource::<crate::scene::Camera>();
+        assert_eq!(after.position, before.position);
+        assert!(!editor.state.take_camera_moved());
     }
 
     /// Picking the tool is a per-second interaction, so it has keys — numbers,
@@ -2158,6 +2251,41 @@ mod tests {
         assert_eq!(state.snap_step(false), Some(SCALE_SNAP));
         state.gizmo_mode = GizmoMode::Select;
         assert_eq!(state.snap_step(true), None);
+    }
+
+    #[test]
+    fn the_snap_steps_are_the_user_s_to_set() {
+        use crate::editor::state::GizmoMode;
+        let mut state = EditorState::default();
+        state.snap = true;
+        state.snap_steps.translate = 0.5;
+        state.snap_steps.rotate = 5.0;
+        state.gizmo_mode = GizmoMode::Move;
+        assert_eq!(state.snap_step(false), Some(0.5));
+        state.gizmo_mode = GizmoMode::Rotate;
+        assert_eq!(state.snap_step(false), Some(5.0));
+    }
+
+    /// The chevron beside the snap button opens the steps for every tool.
+    #[test]
+    fn the_snap_steps_are_set_from_the_bar() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let tools = editor.area("viewport_tools").expect("toolbar drawn");
+        let chevron = crate::editor::icons::chevron_down().glyph();
+        let at = editor
+            .painted_icons()
+            .into_iter()
+            .find(|(glyph, rect, _)| *glyph == chevron && tools.contains(rect.center()))
+            .expect("a chevron on the toolbar")
+            .1
+            .center();
+        assert!(!editor.painted_contains("Rotate"));
+        editor.click(at);
+        editor.frames(1);
+        for row in ["Move", "Rotate", "Scale"] {
+            assert!(editor.painted_contains(row), "no {row} row");
+        }
     }
 
     /// The snap button says the increment the current tool would use.

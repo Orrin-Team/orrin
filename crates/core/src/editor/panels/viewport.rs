@@ -13,13 +13,11 @@ use glam::{Mat4, Vec3};
 use orrin_ecs::{Entity, World};
 
 use crate::editor::gizmo::{Drag, Gizmo, Target};
-use crate::editor::state::{
-    EditorState, GizmoMode, GizmoSpace, MOVE_SNAP, ROTATE_SNAP, SCALE_SNAP,
-};
+use crate::editor::state::{EditorState, GizmoMode, GizmoSpace};
 use crate::editor::theme::{self, ThemeSet};
 use crate::editor::widgets;
 use crate::editor::{icons, pick};
-use crate::scene::{Camera, LocalTransform, Parent, WorldTransform};
+use crate::scene::{Camera, LocalTransform, MeshBounds, MeshHandle, Parent, WorldTransform};
 use crate::stats::FrameStats;
 use orrin_registry::Reflect;
 
@@ -124,13 +122,69 @@ fn space_and_snap(ui: &mut egui::Ui, state: &mut EditorState) {
         Some(step) if state.snap => step.as_str(),
         _ => "Snap",
     };
+    let steps = state.snap_steps;
     let hint = format!(
-        "Quantise moves to {MOVE_SNAP} m, turns to {ROTATE_SNAP}° and scales to steps of \
-         {SCALE_SNAP}. Hold Ctrl while dragging to snap with this off"
+        "Quantise moves to {} m, turns to {}° and scales to steps of {}. Hold Ctrl while \
+         dragging to snap with this off",
+        steps.translate, steps.rotate, steps.scale
     );
     if widgets::icon_label_button(ui, icons::grid(), word, state.snap, &hint).clicked() {
         state.snap = !state.snap;
     }
+    snap_steps(ui, state);
+}
+
+/// The chevron beside the snap button, and the steps it opens.
+fn snap_steps(ui: &mut egui::Ui, state: &mut EditorState) {
+    let weak = ui.visuals().weak_text_color();
+    let chevron =
+        icons::button(ui, icons::chevron_down(), 12.0, weak, false).on_hover_text("Snap steps");
+    let popup = ui.make_persistent_id("snap_steps");
+    if chevron.clicked() {
+        ui.memory_mut(|memory| memory.toggle_popup(popup));
+    }
+    egui::popup_below_widget(
+        ui,
+        popup,
+        &chevron,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(170.0);
+            let steps = &mut state.snap_steps;
+            let row = |ui: &mut egui::Ui, label: &str, drag: egui::DragValue| {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(drag);
+                    });
+                });
+            };
+            row(
+                ui,
+                "Move",
+                egui::DragValue::new(&mut steps.translate)
+                    .speed(0.01)
+                    .range(0.001..=100.0)
+                    .suffix(" m"),
+            );
+            row(
+                ui,
+                "Rotate",
+                egui::DragValue::new(&mut steps.rotate)
+                    .speed(0.5)
+                    .range(0.1..=180.0)
+                    .suffix("°"),
+            );
+            row(
+                ui,
+                "Scale",
+                egui::DragValue::new(&mut steps.scale)
+                    .speed(0.01)
+                    .range(0.01..=10.0)
+                    .prefix("×"),
+            );
+        },
+    );
 }
 
 fn stats_readout(ui: &mut egui::Ui, stats: &FrameStats) {
@@ -218,6 +272,39 @@ pub fn gizmo(
             let selected = state.selection.contains(entity);
             crate::editor::gizmo::marker(&mut state.gizmo_strokes, on_screen, kind, selected, ppp);
         });
+        // What is selected, outlined: the only sign of it in Select, where
+        // there are no handles.
+        if let Some(meshes) = world.get_resource::<MeshBounds>() {
+            for &entity in state.selection.entities() {
+                let measured = world
+                    .get::<MeshHandle>(entity)
+                    .and_then(|mesh| meshes.get(*mesh))
+                    .filter(|bounds| bounds.is_valid());
+                let (Some(bounds), Some(model)) = (measured, world.get::<WorldTransform>(entity))
+                else {
+                    continue;
+                };
+                let corners: [Vec3; 8] = std::array::from_fn(|i| {
+                    let pick = |bit: usize, axis: usize| {
+                        if i & bit == 0 {
+                            bounds.min[axis]
+                        } else {
+                            bounds.max[axis]
+                        }
+                    };
+                    model.transform_point3(Vec3::new(pick(1, 0), pick(2, 1), pick(4, 2)))
+                });
+                // A box partly behind the camera would project inside out.
+                if corners
+                    .iter()
+                    .any(|&corner| (corner - camera.position).dot(forward) <= camera.near)
+                {
+                    continue;
+                }
+                let corners = corners.map(|corner| pick::to_screen(view_proj, screen, corner));
+                crate::editor::gizmo::bounds(&mut state.gizmo_strokes, &corners, ppp);
+            }
+        }
     }
     let placed = primary
         .zip(camera)
@@ -249,8 +336,15 @@ pub fn gizmo(
             // click would otherwise land on whatever is behind the handle.
             state.gizmo_hot = Some(drag.handle);
             if let Some(pos) = pointer.filter(|_| down) {
-                for (target, moved) in drag.update(ray(pos), state.snap_step(ctrl)) {
+                let snap = state.snap_step(ctrl);
+                for (target, moved) in drag.update(ray(pos), snap) {
                     state.edit(target, crate::scene::registry::TRANSFORM, moved.to_value());
+                }
+                if let Some(sweep) = drag.sweep(ray(pos), snap) {
+                    handles.sweep(sweep, ctx.pixels_per_point(), &mut state.gizmo_strokes);
+                }
+                if let Some(text) = drag.readout(ray(pos), snap) {
+                    readout(ctx, pos, text);
                 }
                 state.gizmo_drag = Some((dragged, drag));
             }
@@ -272,9 +366,29 @@ pub fn gizmo(
     handles.strokes(
         state.gizmo_mode,
         state.gizmo_hot,
+        state.gizmo_drag.is_some(),
         ctx.pixels_per_point(),
         &mut state.gizmo_strokes,
     );
+}
+
+/// What the drag has done, beside the pointer and above everything else, so
+/// the hand on the mouse and the number stay in one place for the eye.
+fn readout(ctx: &egui::Context, pointer: egui::Pos2, text: String) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("gizmo_readout"),
+    ));
+    let visuals = ctx.style().visuals.clone();
+    let galley = painter.layout_no_wrap(
+        text,
+        egui::FontId::monospace(12.0),
+        visuals.strong_text_color(),
+    );
+    let at = pointer + egui::vec2(18.0, 14.0);
+    let plate = egui::Rect::from_min_size(at, galley.size()).expand2(egui::vec2(6.0, 3.0));
+    painter.rect_filled(plate, 4.0, visuals.extreme_bg_color.gamma_multiply(0.9));
+    painter.galley(at, galley, visuals.strong_text_color());
 }
 
 /// What a drag of the selection moves: each selected entity with a transform,

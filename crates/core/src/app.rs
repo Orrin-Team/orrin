@@ -746,6 +746,10 @@ impl ApplicationHandler for App {
                 if overlay_on {
                     profile_scope!("editor");
                     active.editor.run(&mut self.world, &self.registry);
+                    if active.editor.take_camera_moved() {
+                        self.camera_controller
+                            .sync_from(&self.world.resource::<Camera>());
+                    }
                 }
 
                 // After the UI, so the editor's own camera edits are the

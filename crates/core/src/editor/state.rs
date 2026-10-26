@@ -48,6 +48,29 @@ pub const ROTATE_SNAP: f32 = 15.0;
 /// What a scale drag quantises its factor to when snapping.
 pub const SCALE_SNAP: f32 = 0.1;
 
+/// What each tool snaps to. The user's to set from the snap button's menu,
+/// and remembered with their other preferences.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SnapSteps {
+    /// Metres.
+    pub translate: f32,
+    /// Degrees.
+    pub rotate: f32,
+    /// A plain ratio.
+    pub scale: f32,
+}
+
+impl Default for SnapSteps {
+    fn default() -> Self {
+        Self {
+            translate: MOVE_SNAP,
+            rotate: ROTATE_SNAP,
+            scale: SCALE_SNAP,
+        }
+    }
+}
+
 /// Which log levels the console shows: one bit per [`LogLevel`], all set to
 /// begin with.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -138,6 +161,7 @@ pub struct EditorState {
     pub gizmo_mode: GizmoMode,
     pub gizmo_space: GizmoSpace,
     pub snap: bool,
+    pub snap_steps: SnapSteps,
     /// Whether dragging one scale axis moves all three by the same ratio.
     pub scale_linked: bool,
     /// The frame-time readout floating in the viewport's corner.
@@ -163,6 +187,10 @@ pub struct EditorState {
     holding: bool,
     undo_request: bool,
     redo_request: bool,
+    /// Not an edit: the camera is the editor's, not the scene's, so framing
+    /// writes it directly rather than through the pipeline.
+    frame_request: bool,
+    camera_moved: bool,
     remove_request: Option<(Entity, orrin_registry::ComponentId)>,
     /// Overrides to give back to the prefab: entity, component, path.
     revert_request: Vec<(
@@ -226,6 +254,7 @@ impl Default for EditorState {
             gizmo_mode: GizmoMode::Select,
             gizmo_space: GizmoSpace::World,
             snap: false,
+            snap_steps: SnapSteps::default(),
             scale_linked: false,
             show_stats: false,
             gizmo_drag: None,
@@ -236,6 +265,8 @@ impl Default for EditorState {
             holding: false,
             undo_request: false,
             redo_request: false,
+            frame_request: false,
+            camera_moved: false,
             remove_request: None,
             revert_request: Vec::new(),
             spawn_request: None,
@@ -326,9 +357,9 @@ impl EditorState {
             return None;
         }
         match self.gizmo_mode {
-            GizmoMode::Move => Some(MOVE_SNAP),
-            GizmoMode::Rotate => Some(ROTATE_SNAP),
-            GizmoMode::Scale => Some(SCALE_SNAP),
+            GizmoMode::Move => Some(self.snap_steps.translate),
+            GizmoMode::Rotate => Some(self.snap_steps.rotate),
+            GizmoMode::Scale => Some(self.snap_steps.scale),
             GizmoMode::Select => None,
         }
     }
@@ -336,6 +367,18 @@ impl EditorState {
     /// Keep the open gesture open through this frame, or let it close.
     pub fn hold(&mut self, holding: bool) {
         self.holding = holding;
+    }
+
+    /// Point the camera at the selection, near enough to fill the view.
+    pub fn request_frame(&mut self) {
+        self.frame_request = true;
+    }
+
+    /// Whether the editor moved the camera since the last call. The app
+    /// drains it to bring the fly camera's own heading in line, which would
+    /// otherwise turn the view straight back.
+    pub fn take_camera_moved(&mut self) -> bool {
+        std::mem::take(&mut self.camera_moved)
     }
 
     pub fn request_undo(&mut self) {
@@ -390,6 +433,12 @@ impl EditorState {
         }
         if std::mem::take(&mut self.save_prefab_request) {
             self.save_prefab(world, registry);
+        }
+        if std::mem::take(&mut self.frame_request)
+            && let Some(camera) = framed(world, self.selection.entities())
+        {
+            *world.resource_mut::<scene::Camera>() = camera;
+            self.camera_moved = true;
         }
         // Not an edit: the prefabs changed on disk, and their instances follow.
         if std::mem::take(&mut self.rescan_request) {
@@ -531,6 +580,50 @@ impl EditorState {
         }
         self.selection.retain_alive(editor.world());
     }
+}
+
+/// The camera turned on `selection` from where it already looks, and backed
+/// off until the sphere around the selection's bounds fits the view — or
+/// `None` when nothing selected has a place.
+///
+/// A mesh is measured by its bounds and anything else by its origin, given a
+/// half-metre of room so a lone light is not framed from a hair's breadth.
+fn framed(world: &World, selection: &[Entity]) -> Option<scene::Camera> {
+    let camera = *world.get_resource::<scene::Camera>()?;
+    let meshes = world.get_resource::<scene::MeshBounds>();
+    let mut bounds = crate::geom::Aabb::EMPTY;
+    for &entity in selection {
+        let Some(model) = world.get::<scene::WorldTransform>(entity).map(|w| w.0) else {
+            continue;
+        };
+        let measured = meshes
+            .as_ref()
+            .zip(world.get::<scene::MeshHandle>(entity))
+            .and_then(|(meshes, mesh)| meshes.get(*mesh))
+            .filter(|bounds| bounds.is_valid());
+        let piece = measured.map_or_else(
+            || {
+                let at = glam::Vec3A::from(model.w_axis.truncate());
+                crate::geom::Aabb { min: at, max: at }
+            },
+            |bounds| bounds.transformed(&model),
+        );
+        bounds = bounds.union(&piece);
+    }
+    if !bounds.is_valid() {
+        return None;
+    }
+    let centre = Vec3::from(bounds.center());
+    let radius = bounds.half_extents().length().max(0.5);
+    let heading = (camera.target - camera.position).normalize();
+    // The sphere's tangent at the edge of the vertical field of view, and a
+    // little more, so the selection is not drawn touching the frame.
+    let distance = radius / (camera.fov_y * 0.5).sin() * 1.15;
+    Some(scene::Camera {
+        position: centre - heading * distance,
+        target: centre,
+        ..camera
+    })
 }
 
 /// Spawn an instance of `prefab`, under `parent` when there is one and

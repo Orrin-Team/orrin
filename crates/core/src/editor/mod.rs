@@ -92,6 +92,10 @@ impl Editor {
         if let Some(name) = &prefs.theme {
             themes.select(name);
         }
+        let mut state = EditorState::new(project);
+        if let Some(steps) = prefs.snap {
+            state.snap_steps = steps;
+        }
         icons::install(&ctx);
         theme::install_fonts(&ctx);
         theme::apply(&ctx, themes.active());
@@ -100,7 +104,7 @@ impl Editor {
             ctx,
             input,
             surface,
-            state: EditorState::new(project),
+            state,
             themes,
             dock: Dock::from_saved(prefs.layout.take()),
             prefs,
@@ -154,6 +158,14 @@ impl Editor {
             dock.activate(dock::Tab::Assets);
         }
 
+        // Kept once the pointer lets go, rather than on every frame a step is
+        // dragged through.
+        let steps = state.snap_steps;
+        if prefs.snap.unwrap_or_default() != steps && !ctx.input(|input| input.pointer.any_down()) {
+            prefs.snap = Some(steps);
+            prefs_file.save(prefs);
+        }
+
         // Restyling mid-frame would leave the panels already drawn on the old
         // palette, so a pick takes effect on the next one.
         if let Some(name) = state.take_theme_request()
@@ -196,6 +208,12 @@ impl Editor {
         }
         self.prefs.layout = Some(current.clone());
         self.prefs_file.save(&self.prefs);
+    }
+
+    /// Whether the editor moved the camera since the last call — see
+    /// `EditorState::take_camera_moved`.
+    pub fn take_camera_moved(&mut self) -> bool {
+        self.state.take_camera_moved()
     }
 
     /// Whether the user asked for a script reload since the last call. Drained

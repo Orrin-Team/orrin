@@ -25,6 +25,8 @@ pub struct Prefs {
     /// by a build whose tab set no longer parses — [`PrefsFile::load`] falls
     /// back to defaults rather than refusing to open the editor.
     pub layout: Option<egui_dock::DockState<super::dock::Tab>>,
+    /// What the gizmo snaps to; `None` until the user first changes it.
+    pub snap: Option<super::state::SnapSteps>,
     /// Which [`LAYOUT_VERSION`] `layout` was saved under. Absent, and so zero,
     /// in every file written before the field existed.
     layout_version: u32,
@@ -82,6 +84,7 @@ impl PrefsFile {
             layout_version: LAYOUT_VERSION,
             theme: prefs.theme.clone(),
             layout: prefs.layout.clone(),
+            snap: prefs.snap,
         };
         let text = match ron::ser::to_string_pretty(prefs, ron::ser::PrettyConfig::default()) {
             Ok(text) => text,
@@ -123,6 +126,24 @@ mod tests {
         let prefs = PrefsFile::new(Some(dir.clone())).load();
         assert_eq!(prefs.theme.as_deref(), Some("Void"));
         assert!(prefs.layout.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn snap_steps_round_trip() {
+        let dir = scratch("snap-steps");
+        let file = PrefsFile::new(Some(dir.clone()));
+        let steps = super::super::state::SnapSteps {
+            translate: 0.5,
+            rotate: 22.5,
+            scale: 0.25,
+        };
+        file.save(&Prefs {
+            snap: Some(steps),
+            ..Prefs::default()
+        });
+
+        assert_eq!(file.load().snap, Some(steps));
         let _ = std::fs::remove_dir_all(dir);
     }
 

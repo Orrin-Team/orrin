@@ -222,6 +222,9 @@ fn edit(ui: &mut egui::Ui, world: &mut World, registry: &Registry, state: &mut E
         if command(ui, "Select none", "Esc") {
             state.selection.clear();
         }
+        if command(ui, "Frame selection", "F") {
+            state.request_frame();
+        }
     });
     ui.separator();
     // Named by what they would do, so the menu answers "undo what?" before
