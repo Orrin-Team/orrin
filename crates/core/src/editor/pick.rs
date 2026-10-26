@@ -14,7 +14,7 @@
 use glam::{Mat4, Vec3};
 use orrin_ecs::{Entity, World};
 
-use crate::scene::{Camera, Light, MeshBounds, MeshHandle, WorldTransform};
+use crate::scene::{Camera, Light, Locked, MeshBounds, MeshHandle, Parent, WorldTransform};
 
 /// The ray through `ndc` (−1 to 1, y down, as the scene's projection has it):
 /// its start on the near plane, and a direction reaching the far plane.
@@ -31,6 +31,23 @@ pub enum Marker {
     Light,
     /// Anything else with no mesh: a group, an anchor, a script's holder.
     Empty,
+}
+
+/// Whether `entity` is out of reach in the viewport: [`Locked`] itself, or
+/// under something that is.
+pub fn is_locked(world: &World, entity: Entity) -> bool {
+    let mut cursor = entity;
+    // Bounded: a cycle the hierarchy has not broken yet would otherwise spin.
+    for _ in 0..4096 {
+        if world.has::<Locked>(cursor) {
+            return true;
+        }
+        match world.get::<Parent>(cursor).map(|parent| parent.get()) {
+            Some(parent) => cursor = parent,
+            None => return false,
+        }
+    }
+    false
 }
 
 /// How far from a marker's centre a click still picks it, in points.
@@ -85,7 +102,11 @@ pub fn pick_at(
         // In the ray's own units, so it compares with a mesh's entry.
         let t = (at - origin).dot(direction) / direction.length_squared();
         let reached = (to_screen(view_proj, screen, at) - pointer).length() <= MARKER_REACH;
-        if t >= 0.0 && reached && nearest.is_none_or(|(best, _)| t < best) {
+        if t >= 0.0
+            && reached
+            && nearest.is_none_or(|(best, _)| t < best)
+            && !is_locked(world, entity)
+        {
             nearest = Some((t, entity));
         }
     });
@@ -103,6 +124,9 @@ fn mesh_hit(world: &World, origin: Vec3, direction: Vec3) -> Option<(f32, Entity
             let Some(aabb) = bounds.get(*mesh) else {
                 return;
             };
+            if is_locked(world, entity) {
+                return;
+            }
             let inverse = model.0.inverse();
             let hit = aabb.ray_entry(
                 inverse.transform_point3(origin),
@@ -257,6 +281,39 @@ mod tests {
             Some(cube),
             "behind"
         );
+    }
+
+    /// A locked mesh lets the click through to what is behind it, and so does
+    /// anything under it in the hierarchy, and a locked light's marker.
+    #[test]
+    fn a_click_passes_through_what_is_locked() {
+        let camera = Camera::default();
+        let toward = (camera.position - camera.target).normalize();
+        let middle = on_screen(Vec3::ZERO);
+
+        let mut world = world();
+        let behind = mesh(&mut world, Mat4::from_translation(-toward * 3.0));
+        let front = mesh(&mut world, Mat4::IDENTITY);
+        assert_eq!(pick_at(&world, &camera, screen(), middle), Some(front));
+        world.insert(front, Locked);
+        assert_eq!(pick_at(&world, &camera, screen(), middle), Some(behind));
+
+        world.remove::<Locked>(front);
+        let holder = world.spawn();
+        world.insert(holder, Locked);
+        crate::scene::reparent(&mut world, front, Some(holder), false).unwrap();
+        assert!(is_locked(&world, front));
+        assert_eq!(
+            pick_at(&world, &camera, screen(), middle),
+            Some(behind),
+            "under a lock"
+        );
+
+        world.despawn(behind);
+        world.despawn(front);
+        let lamp = light(&mut world, Vec3::ZERO);
+        world.insert(lamp, Locked);
+        assert_eq!(pick_at(&world, &camera, screen(), middle), None);
     }
 
     #[test]

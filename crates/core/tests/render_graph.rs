@@ -1337,6 +1337,64 @@ fn the_gizmo_draws_between_the_tonemap_and_the_overlay() {
     assert!(!names.contains(&"gizmo"), "{names:?}");
 }
 
+/// The selection outline is drawn from a mask of the outlined meshes, over
+/// the tonemapped frame and under the gizmo, whose handles stay on top.
+#[test]
+fn the_selection_outline_is_masked_then_drawn_under_the_gizmo() {
+    let config = |overlay| FrameConfig {
+        color_format: COLOR_FORMAT,
+        msaa: false,
+        ssao: false,
+        ssao_half_res: false,
+        contact_shadows: false,
+        ssr: false,
+        subsurface: false,
+        transparency: false,
+        refraction: false,
+        taa: true,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        volumetric_fog: false,
+        bloom_mips: BLOOM_MIPS,
+        overlay,
+        shadow_cascades: 0,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+        async_compute: false,
+        gpu_culling: false,
+        occlusion_culling: false,
+    };
+    let frame = declare(config(true)).unwrap();
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&id| frame.graph.pass_name(id))
+        .collect();
+    let at = |name: &str| {
+        order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| panic!("{name} is not in the frame: {order:?}"))
+    };
+    assert!(at("outline_mask") < at("outline"), "{order:?}");
+    assert!(at("tonemap") < at("outline"), "{order:?}");
+    assert!(at("outline") < at("gizmo"), "{order:?}");
+
+    let headless = declare(config(false)).unwrap();
+    let names: Vec<&str> = headless
+        .graph
+        .order()
+        .iter()
+        .map(|&id| headless.graph.pass_name(id))
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.starts_with("outline")),
+        "{names:?}"
+    );
+}
+
 /// The accumulation pass *attaches* the prepass depth rather than sampling it,
 /// and read-only at that. Both halves are load-bearing.
 ///

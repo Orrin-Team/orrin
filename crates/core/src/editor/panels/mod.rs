@@ -53,8 +53,10 @@ pub fn draw(
     if let Some(rect) = dock.viewport() {
         viewport::show(ctx, world, state, themes, rect);
         viewport::accept_prefab(ctx, world, state, dock, rect);
+        viewport::hover(ctx, world, state, dock, rect);
         // Before the click: a click on a handle is not a click on the scene.
         viewport::gizmo(ctx, world, state, dock, rect);
+        viewport::marquee(ctx, world, state, dock, rect);
         viewport::select_on_click(ctx, world, state, dock, rect);
     }
     // A drag ends with the button and a typed edit with the field, so the
@@ -2101,52 +2103,56 @@ mod tests {
         assert!(!editor.state.gizmo_strokes.is_empty());
     }
 
-    /// The selection is outlined in the scene in every tool, Select included,
-    /// where there are no handles to say what is selected.
+    /// What the outline pass draws: every selected mesh and every mesh under a
+    /// selected entity, in every tool — Select included, where there are no
+    /// handles to say what is selected.
     #[test]
-    fn a_selected_mesh_is_outlined_by_its_bounds() {
+    fn a_selection_and_what_is_under_it_are_outlined() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        let lid = editor.spawn("Lid");
+        editor.world.insert(lid, crate::scene::MeshHandle(0));
+        crate::scene::reparent(&mut editor.world, lid, Some(cube), false).unwrap();
+        crate::scene::propagate_transforms(&mut editor.world);
         editor.frames(1);
-        assert!(editor.state.gizmo_strokes.is_empty(), "nothing selected");
+        assert!(editor.state.outline.is_empty(), "nothing selected");
+
         editor.state.selection.set(cube);
         editor.state.gizmo_mode = crate::editor::state::GizmoMode::Select;
         editor.frames(1);
-        assert_eq!(editor.state.gizmo_strokes.len(), 12 * 6);
+        let outlined: Vec<bool> = editor
+            .state
+            .outline
+            .iter()
+            .map(|item| item.selected)
+            .collect();
+        assert_eq!(outlined, [true, true], "the cube and its lid");
     }
 
-    /// While the button is held the drag says what it has done, by the pointer.
+    /// The hovered mesh is outlined too, as hovered — unless it is selected,
+    /// which says more.
     #[test]
-    fn a_drag_shows_its_readout_by_the_pointer() {
+    fn the_hovered_mesh_is_outlined_as_hovered() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
-        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
-        editor.state.selection.set(cube);
-        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Move;
-        editor.frames(2);
+        let (cube, at) = cube_under_the_viewport_centre(&mut editor);
+        editor.hover(at).frames(1);
+        let outlined: Vec<bool> = editor
+            .state
+            .outline
+            .iter()
+            .map(|item| item.selected)
+            .collect();
+        assert_eq!(outlined, [false]);
 
-        let grab = x_shaft(&editor, cube, 0.5);
-        let outward = (grab - x_shaft(&editor, cube, 0.0)).normalized();
-        pointer(&mut editor, egui::Event::PointerMoved(grab));
-        pointer(&mut editor, button(grab, true));
-        pointer(
-            &mut editor,
-            egui::Event::PointerMoved(grab + outward * 40.0),
-        );
-        assert!(
-            editor
-                .painted()
-                .iter()
-                .any(|text| text.starts_with('+') && text.ends_with(" m")),
-            "{:?}",
-            editor.painted()
-        );
-        pointer(&mut editor, button(grab + outward * 40.0, false));
-        assert!(
-            !editor
-                .painted()
-                .iter()
-                .any(|text| text.ends_with(" m") && text.starts_with('+'))
-        );
+        editor.state.selection.set(cube);
+        editor.hover(at).frames(1);
+        let outlined: Vec<bool> = editor
+            .state
+            .outline
+            .iter()
+            .map(|item| item.selected)
+            .collect();
+        assert_eq!(outlined, [true], "once, as selected");
     }
 
     /// A click on a handle is the start of a drag that went nowhere, not a
@@ -2208,6 +2214,219 @@ mod tests {
         let after = *editor.world.resource::<crate::scene::Camera>();
         assert_eq!(after.position, before.position);
         assert!(!editor.state.take_camera_moved());
+    }
+
+    /// Where an icon was painted inside `within`, if it was.
+    fn icon_in(
+        editor: &Harness,
+        icon: crate::editor::icons::Icon,
+        within: egui::Rect,
+    ) -> Option<egui::Pos2> {
+        let glyph = icon.glyph();
+        editor
+            .painted_icons()
+            .into_iter()
+            .find(|(g, rect, _)| *g == glyph && within.contains(rect.center()))
+            .map(|(_, rect, _)| rect.center())
+    }
+
+    fn row_band(editor: &Harness, name: &str) -> egui::Rect {
+        let at = row_of(editor, name);
+        let tree = editor.tab(Tab::Hierarchy);
+        egui::Rect::from_x_y_ranges(tree.x_range(), (at.y - 8.0)..=(at.y + 8.0))
+    }
+
+    /// The lock sits on the row, shown while the pointer is there, and is an
+    /// edit like any other: undone with Ctrl+Z.
+    #[test]
+    fn a_row_s_lock_locks_its_entity_undoably() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let crate_ = editor.spawn("Crate");
+        editor.frames(2);
+        let band = row_band(&editor, "Crate");
+        editor.hover(band.center()).frames(1);
+        let lock = icon_in(&editor, crate::editor::icons::lock_open(), band)
+            .expect("an open lock on the hovered row");
+        editor.click(lock);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(editor.world.has::<crate::scene::Locked>(crate_));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(!editor.world.has::<crate::scene::Locked>(crate_));
+    }
+
+    /// A locked row says so without being hovered, and its children say they
+    /// are locked through it.
+    #[test]
+    fn a_locked_row_and_its_children_show_the_lock() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let crate_ = editor.spawn("Crate");
+        let lid = editor.spawn("Lid");
+        crate::scene::reparent(&mut editor.world, lid, Some(crate_), false).unwrap();
+        editor.world.insert(crate_, crate::scene::Locked);
+        editor.frames(2);
+        for name in ["Crate", "Lid"] {
+            let band = row_band(&editor, name);
+            assert!(
+                icon_in(&editor, crate::editor::icons::lock(), band).is_some(),
+                "{name} shows no lock"
+            );
+        }
+    }
+
+    #[test]
+    fn the_entity_under_the_pointer_is_hovered_unless_locked() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, at) = cube_under_the_viewport_centre(&mut editor);
+        editor.hover(at).frames(1);
+        assert_eq!(editor.state.hovered, Some(cube));
+
+        let empty = editor.viewport().left_bottom() + egui::vec2(40.0, -40.0);
+        editor.hover(empty).frames(1);
+        assert_eq!(editor.state.hovered, None);
+
+        editor.world.insert(cube, crate::scene::Locked);
+        editor.hover(at).frames(1);
+        assert_eq!(editor.state.hovered, None);
+    }
+
+    /// A handle is in front of everything: over one, nothing behind it is
+    /// hovered.
+    #[test]
+    fn nothing_is_hovered_through_a_handle() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        editor.state.selection.set(cube);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Move;
+        editor.frames(2);
+        let middle = x_shaft(&editor, cube, 0.0);
+        editor.hover(middle).frames(2);
+        assert_eq!(
+            editor.state.gizmo_hot,
+            Some(crate::editor::gizmo::Handle::Centre)
+        );
+        assert_eq!(editor.state.hovered, None);
+    }
+
+    /// Three cubes: two in the middle of the viewport, one well to the left.
+    fn three_cubes(editor: &mut Harness) -> [orrin_ecs::Entity; 3] {
+        let (a, _) = cube_under_the_viewport_centre(editor);
+        let centre = translation(editor, a);
+        let mut beside = |name: &str, offset: glam::Vec3| {
+            let entity = editor.spawn(name);
+            editor.world.insert(entity, crate::scene::MeshHandle(0));
+            editor.world.insert(
+                entity,
+                LocalTransform::new(crate::scene::Transform::from_translation(centre + offset)),
+            );
+            entity
+        };
+        let b = beside("Near", glam::Vec3::new(0.0, 0.6, 0.0));
+        let c = beside("Far", glam::Vec3::new(-3.5, 0.0, 0.0));
+        crate::scene::propagate_transforms(&mut editor.world);
+        editor.frames(1);
+        [a, b, c]
+    }
+
+    /// Press at `from`, drag to `to` in steps, let go — with `modifiers` held.
+    fn drag_rectangle(
+        editor: &mut Harness,
+        from: egui::Pos2,
+        to: egui::Pos2,
+        modifiers: egui::Modifiers,
+    ) {
+        editor.input.modifiers = modifiers;
+        let press = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        };
+        pointer(editor, egui::Event::PointerMoved(from));
+        pointer(editor, press(from, true));
+        for step in 1..=4 {
+            pointer(
+                editor,
+                egui::Event::PointerMoved(from + (to - from) * (step as f32 / 4.0)),
+            );
+        }
+        pointer(editor, press(to, false));
+        editor.input.modifiers = egui::Modifiers::NONE;
+    }
+
+    #[test]
+    fn dragging_on_the_scene_selects_what_the_rectangle_holds() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let [a, b, c] = three_cubes(&mut editor);
+        editor.state.selection.set(c);
+        let middle = editor.viewport().center();
+        let corner = egui::vec2(150.0, 150.0);
+        drag_rectangle(
+            &mut editor,
+            middle - corner,
+            middle + corner,
+            egui::Modifiers::NONE,
+        );
+
+        let mut selected = editor.state.selection.entities().to_vec();
+        selected.sort_by_key(|e| e.index());
+        assert_eq!(selected, [a, b]);
+    }
+
+    #[test]
+    fn a_ctrl_drag_adds_and_a_lock_keeps_out() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let [a, b, c] = three_cubes(&mut editor);
+        editor.world.insert(b, crate::scene::Locked);
+        editor.state.selection.set(c);
+        let middle = editor.viewport().center();
+        let corner = egui::vec2(150.0, 150.0);
+        drag_rectangle(
+            &mut editor,
+            middle - corner,
+            middle + corner,
+            egui::Modifiers::COMMAND,
+        );
+
+        let mut selected = editor.state.selection.entities().to_vec();
+        selected.sort_by_key(|e| e.index());
+        assert_eq!(selected, [a, c]);
+    }
+
+    /// The rectangle is drawn while it is being dragged out, and gone after.
+    #[test]
+    fn the_rectangle_shows_while_it_is_drawn() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        three_cubes(&mut editor);
+        let middle = editor.viewport().center();
+        let from = middle - egui::vec2(150.0, 150.0);
+        pointer(&mut editor, egui::Event::PointerMoved(from));
+        pointer(&mut editor, button(from, true));
+        pointer(
+            &mut editor,
+            egui::Event::PointerMoved(middle + egui::vec2(150.0, 150.0)),
+        );
+        let drawn = |editor: &Harness| {
+            editor.painted_fills().iter().any(|(rect, _)| {
+                (rect.width() - 300.0).abs() < 2.0 && (rect.height() - 300.0).abs() < 2.0
+            })
+        };
+        assert!(drawn(&editor), "no rectangle while dragging");
+        pointer(
+            &mut editor,
+            button(middle + egui::vec2(150.0, 150.0), false),
+        );
+        assert!(!drawn(&editor), "the rectangle outlived the drag");
+    }
+
+    #[test]
+    fn a_locked_mesh_cannot_be_clicked_in_the_scene() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, at) = cube_under_the_viewport_centre(&mut editor);
+        editor.world.insert(cube, crate::scene::Locked);
+        editor.click(at);
+        assert!(editor.state.selection.is_empty());
     }
 
     /// Picking the tool is a per-second interaction, so it has keys — numbers,

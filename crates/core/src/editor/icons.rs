@@ -99,6 +99,8 @@ icons! {
     layers => '\u{e466}',
     lightbulb => '\u{e2dc}',
     list_tree => '\u{ee48}',
+    lock => '\u{e308}',
+    lock_open => '\u{e30a}',
     mountain_snow => '\u{e7ae}',
     move_ => '\u{e0a4}',
     palette => '\u{e6c8}',

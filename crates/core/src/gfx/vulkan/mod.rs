@@ -17,6 +17,7 @@ mod mesh;
 mod motion_blur;
 mod occlusion;
 mod oit;
+mod outline;
 mod overlay;
 mod parallel;
 mod pipeline_cache;
@@ -84,6 +85,7 @@ use self::gizmo::GizmoPass;
 use self::hdr::HdrPass;
 use self::line::LinePass;
 use self::motion_blur::MotionBlurPass;
+use self::outline::OutlinePass;
 use self::prepass::GeometryPrepass;
 use self::record::{InFlight, Recorder, RunAhead};
 use vulkano::command_buffer::CommandBuffer;
@@ -144,6 +146,7 @@ pub(crate) const MSAA_SAMPLES: vulkano::image::SampleCount = vulkano::image::Sam
 pub(crate) const OFFSCREEN_FORMAT: Format = Format::R8G8B8A8_SRGB;
 
 pub use gizmo::GizmoVertex;
+pub use outline::OutlineItem;
 pub use overlay::{Glass, OverlayFrame, OverlayPhase};
 
 /// What draws over the final swapchain image between the tonemap pass and
@@ -265,6 +268,8 @@ pub struct VulkanRenderer {
     /// The transform gizmo, over the tonemapped frame. Fed only through an
     /// overlay, so a frame without the editor declares no such pass.
     gizmo: GizmoPass,
+    /// The selection outline, over the tonemapped frame; fed like the gizmo.
+    outline: OutlinePass,
     /// The environment cubemap and the skybox that draws it. Also recorded into
     /// the forward pass, for the reason its module documents.
     environment: EnvironmentPass,
@@ -401,6 +406,7 @@ impl VulkanRenderer {
         let arena = MeshArena::new(&ctx);
         let hdr = HdrPass::new(&ctx, format);
         let gizmo = GizmoPass::new(&ctx, format);
+        let outline = OutlinePass::new(&ctx, format);
         let exposure = ExposurePass::new(&ctx);
         let bloom = BloomPass::new(&ctx);
         let prepass = GeometryPrepass::new(&ctx);
@@ -498,6 +504,7 @@ impl VulkanRenderer {
             shadow,
             line,
             gizmo,
+            outline,
             environment,
             meshes: Vec::new(),
             arena,
@@ -1766,6 +1773,7 @@ impl VulkanRenderer {
             hdr: &self.hdr,
             line: &self.line,
             gizmo: &self.gizmo,
+            outline: &self.outline,
             motion_blur: &self.motion_blur,
             oit: &self.oit,
             prepass: &self.prepass,
@@ -1804,6 +1812,9 @@ impl VulkanRenderer {
             gizmo_strokes: overlay
                 .as_deref()
                 .map_or(&[], |frame| frame.gizmo.as_slice()),
+            outline_items: overlay
+                .as_deref()
+                .map_or(&[], |frame| frame.outline.as_slice()),
         };
 
         // One command buffer per compiled segment, each bound for the queue the
@@ -2104,6 +2115,7 @@ struct FrameRecord<'a> {
     hdr: &'a HdrPass,
     line: &'a LinePass,
     gizmo: &'a GizmoPass,
+    outline: &'a OutlinePass,
     motion_blur: &'a MotionBlurPass,
     oit: &'a OitPass,
     prepass: &'a GeometryPrepass,
@@ -2153,6 +2165,7 @@ struct FrameRecord<'a> {
     shadow_view: Arc<ImageView>,
     debug_lines: &'a [DebugLine],
     gizmo_strokes: &'a [GizmoVertex],
+    outline_items: &'a [OutlineItem],
 }
 
 /// A frame's trailing graphics segment, held back a frame on purpose.
@@ -3066,6 +3079,28 @@ impl FrameRecord<'_> {
                 },
             ),
             PassBody::Gizmo => self.gizmo.record(builder, self.gizmo_strokes, self.extent),
+            PassBody::OutlineMask => self.outline.record_mask(
+                builder,
+                self.outline_items,
+                self.meshes,
+                self.arena,
+                self.view.unjittered_view_proj,
+                self.extent,
+            ),
+            PassBody::Outline => {
+                let mask = self
+                    .frame
+                    .ids
+                    .outline_mask
+                    .expect("an outline pass without its mask");
+                self.outline.record_outline(
+                    builder,
+                    self.ctx,
+                    self.images.view(mask),
+                    self.extent,
+                    !self.outline_items.is_empty(),
+                );
+            }
             PassBody::Overlay
             | PassBody::SsrHiz
             | PassBody::SsrSource

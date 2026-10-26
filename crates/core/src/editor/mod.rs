@@ -237,6 +237,8 @@ impl Editor {
         let frame = &mut self.frame;
         std::mem::swap(&mut frame.gizmo, &mut self.state.gizmo_strokes);
         self.state.gizmo_strokes.clear();
+        std::mem::swap(&mut frame.outline, &mut self.state.outline);
+        self.state.outline.clear();
         frame.pixels_per_point = ppp;
         frame.textures.append(output.textures_delta);
         frame

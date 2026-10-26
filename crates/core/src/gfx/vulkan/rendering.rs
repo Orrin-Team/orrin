@@ -332,8 +332,16 @@ pub(super) fn rendering_info(
         },
         // The acquired swapchain image, every pixel of which the tonemap writes.
         PassBody::Tonemap => color_only(overwritten(swapchain.clone())),
-        // The tonemapped frame, which the handles are drawn over.
-        PassBody::Gizmo => color_only(drawn_over(swapchain.clone())),
+        // Cleared to "nothing outlined".
+        PassBody::OutlineMask => color_only(cleared(
+            images.view(
+                ids.outline_mask
+                    .expect("an outline mask pass without its mask"),
+            ),
+            ClearValue::Float([0.0; 4]),
+        )),
+        // The tonemapped frame, which the outline and the handles are drawn over.
+        PassBody::Outline | PassBody::Gizmo => color_only(drawn_over(swapchain.clone())),
         // Dispatches, and the overlay, which records its own command buffer.
         PassBody::Overlay
         | PassBody::OcclusionHiz

@@ -172,6 +172,15 @@ pub struct EditorState {
     /// The handle under the pointer, or being dragged: drawn lit, and what
     /// keeps a click on a handle from also selecting what is behind it.
     pub gizmo_hot: Option<Handle>,
+    /// What the pointer is over in the scene, picked as a click would pick
+    /// it: outlined, so the click's result is known before it is made.
+    pub hovered: Option<Entity>,
+    /// Where a drag on the scene began, while it is drawing a selection
+    /// rectangle.
+    pub marquee: Option<egui::Pos2>,
+    /// This frame's outlined meshes, for the renderer. Swapped into the
+    /// overlay frame rather than copied, as the strokes are.
+    pub outline: Vec<crate::gfx::vulkan::OutlineItem>,
     /// This frame's handles, for the renderer. Swapped into the overlay frame
     /// rather than copied.
     pub gizmo_strokes: Vec<crate::gfx::vulkan::GizmoVertex>,
@@ -259,7 +268,10 @@ impl Default for EditorState {
             show_stats: false,
             gizmo_drag: None,
             gizmo_hot: None,
+            hovered: None,
+            marquee: None,
             gizmo_strokes: Vec::new(),
+            outline: Vec::new(),
             history: History::default(),
             edits: Vec::new(),
             holding: false,

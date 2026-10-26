@@ -12,12 +12,13 @@
 use glam::{Mat4, Vec3};
 use orrin_ecs::{Entity, World};
 
-use crate::editor::gizmo::{Drag, Gizmo, Target};
+use crate::editor::gizmo::{Drag, Emphasis, Gizmo, Target};
 use crate::editor::state::{EditorState, GizmoMode, GizmoSpace};
 use crate::editor::theme::{self, ThemeSet};
 use crate::editor::widgets;
 use crate::editor::{icons, pick};
-use crate::scene::{Camera, LocalTransform, MeshBounds, MeshHandle, Parent, WorldTransform};
+use crate::gfx::vulkan::OutlineItem;
+use crate::scene::{Camera, Hierarchy, LocalTransform, MeshHandle, Parent, WorldTransform};
 use crate::stats::FrameStats;
 use orrin_registry::Reflect;
 
@@ -238,6 +239,31 @@ pub fn accept_prefab(
     state.request_instantiate_at(*prefab, at);
 }
 
+/// Find what the pointer is over in the scene. Run before [`gizmo`], whose
+/// handle under the pointer from the last frame keeps a hover from showing
+/// through it.
+pub fn hover(
+    ctx: &egui::Context,
+    world: &World,
+    state: &mut EditorState,
+    dock: &crate::editor::dock::Dock,
+    viewport: egui::Rect,
+) {
+    state.hovered = None;
+    if state.gizmo_drag.is_some() || state.gizmo_hot.is_some() || state.marquee.is_some() {
+        return;
+    }
+    let Some(pos) = ctx.input(|input| input.pointer.latest_pos()) else {
+        return;
+    };
+    if !viewport.contains(pos) || !dock.over_scene(ctx, pos) {
+        return;
+    }
+    if let Some(camera) = world.get_resource::<Camera>().map(|camera| *camera) {
+        state.hovered = pick::pick_at(world, &camera, ctx.screen_rect(), pos);
+    }
+}
+
 /// The transform gizmo on the selection: which handle the pointer is on, a
 /// drag of one, and this frame's strokes for the renderer.
 ///
@@ -259,6 +285,7 @@ pub fn gizmo(
     let camera = world.get_resource::<Camera>().map(|camera| *camera);
     let targets = targets(world, state.selection.entities());
     let screen = ctx.screen_rect();
+    outline(world, state);
     // Under the handles: drawn first.
     if let Some(camera) = camera {
         let view_proj = camera.view_projection(screen.aspect_ratio());
@@ -269,42 +296,15 @@ pub fn gizmo(
                 return;
             }
             let on_screen = pick::to_screen(view_proj, screen, at);
-            let selected = state.selection.contains(entity);
-            crate::editor::gizmo::marker(&mut state.gizmo_strokes, on_screen, kind, selected, ppp);
+            let emphasis = if state.selection.contains(entity) {
+                Emphasis::Selected
+            } else if state.hovered == Some(entity) {
+                Emphasis::Hovered
+            } else {
+                Emphasis::Rest
+            };
+            crate::editor::gizmo::marker(&mut state.gizmo_strokes, on_screen, kind, emphasis, ppp);
         });
-        // What is selected, outlined: the only sign of it in Select, where
-        // there are no handles.
-        if let Some(meshes) = world.get_resource::<MeshBounds>() {
-            for &entity in state.selection.entities() {
-                let measured = world
-                    .get::<MeshHandle>(entity)
-                    .and_then(|mesh| meshes.get(*mesh))
-                    .filter(|bounds| bounds.is_valid());
-                let (Some(bounds), Some(model)) = (measured, world.get::<WorldTransform>(entity))
-                else {
-                    continue;
-                };
-                let corners: [Vec3; 8] = std::array::from_fn(|i| {
-                    let pick = |bit: usize, axis: usize| {
-                        if i & bit == 0 {
-                            bounds.min[axis]
-                        } else {
-                            bounds.max[axis]
-                        }
-                    };
-                    model.transform_point3(Vec3::new(pick(1, 0), pick(2, 1), pick(4, 2)))
-                });
-                // A box partly behind the camera would project inside out.
-                if corners
-                    .iter()
-                    .any(|&corner| (corner - camera.position).dot(forward) <= camera.near)
-                {
-                    continue;
-                }
-                let corners = corners.map(|corner| pick::to_screen(view_proj, screen, corner));
-                crate::editor::gizmo::bounds(&mut state.gizmo_strokes, &corners, ppp);
-            }
-        }
     }
     let placed = primary
         .zip(camera)
@@ -391,6 +391,40 @@ fn readout(ctx: &egui::Context, pointer: egui::Pos2, text: String) {
     painter.galley(at, galley, visuals.strong_text_color());
 }
 
+/// What the outline pass is drawn round: every mesh selected or under a
+/// selected entity — so a model selected by its root shows whole — and the
+/// hovered mesh, unless it is already among them.
+fn outline(world: &World, state: &mut EditorState) {
+    state.outline.clear();
+    let hierarchy = world.get_resource::<Hierarchy>();
+    let item = |entity: Entity, selected: bool| {
+        let mesh = *world.get::<MeshHandle>(entity)?;
+        let model = world.get::<WorldTransform>(entity)?.0;
+        Some(OutlineItem {
+            mesh,
+            model,
+            selected,
+        })
+    };
+    let mut seen = Vec::new();
+    let mut stack: Vec<Entity> = state.selection.entities().to_vec();
+    while let Some(entity) = stack.pop() {
+        if seen.contains(&entity) || !world.is_alive(entity) {
+            continue;
+        }
+        seen.push(entity);
+        state.outline.extend(item(entity, true));
+        if let Some(hierarchy) = &hierarchy {
+            stack.extend_from_slice(hierarchy.children_of(entity));
+        }
+    }
+    if let Some(hovered) = state.hovered
+        && !seen.contains(&hovered)
+    {
+        state.outline.extend(item(hovered, false));
+    }
+}
+
 /// What a drag of the selection moves: each selected entity with a transform,
 /// except one under another that is selected — that one already moves with
 /// it, through the hierarchy, and moving it as well would move it twice.
@@ -435,6 +469,91 @@ fn pivot(world: &World, primary: Entity, targets: &[Target]) -> Option<Mat4> {
         .map_or(first.world, |world| world.0);
     let (_, rotation, _) = turned.to_scale_rotation_translation();
     Some(Mat4::from_rotation_translation(rotation, centre))
+}
+
+/// A drag on the scene that did not start on a handle draws a rectangle, and
+/// letting go selects what stands inside it.
+pub fn marquee(
+    ctx: &egui::Context,
+    world: &World,
+    state: &mut EditorState,
+    dock: &crate::editor::dock::Dock,
+    viewport: egui::Rect,
+) {
+    let (pointer, down, pressed, add) = ctx.input(|input| {
+        (
+            input.pointer.latest_pos(),
+            input.pointer.primary_down(),
+            input.pointer.primary_pressed(),
+            input.modifiers.command,
+        )
+    });
+    // A press on a handle is the gizmo's, which has already taken it.
+    if pressed
+        && state.gizmo_drag.is_none()
+        && state.gizmo_hot.is_none()
+        && let Some(pos) = pointer
+        && viewport.contains(pos)
+        && dock.over_scene(ctx, pos)
+    {
+        state.marquee = Some(pos);
+    }
+    let (Some(from), Some(to)) = (state.marquee, pointer) else {
+        return;
+    };
+    let rect = egui::Rect::from_two_pos(from, to);
+    // Short of this it is a click, which `select_on_click` answers.
+    let drawn = rect.width().max(rect.height()) > 4.0;
+    if down {
+        if drawn {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("marquee"),
+            ));
+            let selection = ctx.style().visuals.selection;
+            painter.rect(
+                rect,
+                0.0,
+                selection.bg_fill.gamma_multiply(0.25),
+                selection.stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        return;
+    }
+    state.marquee = None;
+    let Some(camera) = world.get_resource::<Camera>().map(|camera| *camera) else {
+        return;
+    };
+    if !drawn {
+        return;
+    }
+    let screen = ctx.screen_rect();
+    let view_proj = camera.view_projection(screen.aspect_ratio());
+    let forward = (camera.target - camera.position).normalize();
+    // By where each entity stands, not by any part of it: a floor reaching
+    // under every rectangle would otherwise join every selection.
+    let mut inside = Vec::new();
+    world
+        .query::<&WorldTransform>()
+        .for_each(|entity, transform| {
+            let at = transform.translation();
+            if (at - camera.position).dot(forward) > camera.near
+                && rect.contains(pick::to_screen(view_proj, screen, at))
+            {
+                inside.push(entity);
+            }
+        });
+    inside.retain(|&entity| !pick::is_locked(world, entity));
+    inside.sort_by_key(|entity| entity.index());
+    if !add {
+        state.selection.clear();
+    }
+    for entity in inside {
+        if !state.selection.contains(entity) {
+            state.selection.toggle(entity);
+        }
+    }
 }
 
 /// Select what a plain click on the scene lands on, or nothing when it lands

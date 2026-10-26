@@ -35,6 +35,17 @@ struct Node {
     /// visible — drop it and the tree collapses out from under the match.
     visible: bool,
     prefab: Role,
+    lock: Lock,
+}
+
+/// Whether a row can be picked in the scene.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Lock {
+    Open,
+    /// [`Locked`](crate::scene::Locked) itself.
+    Own,
+    /// Under something that is.
+    Inherited,
 }
 
 /// Where a row stands in a prefab instance.
@@ -256,8 +267,25 @@ fn snapshot(world: &mut World, query: &str) -> Vec<Node> {
             is_root: index < root_count,
             visible: true,
             prefab: Role::None,
+            lock: if world.has::<crate::scene::Locked>(entity) {
+                Lock::Own
+            } else {
+                Lock::Open
+            },
         })
         .collect();
+    // Parents come before children in this order, so one pass carries a lock
+    // down every subtree.
+    for index in 0..nodes.len() {
+        if nodes[index].lock == Lock::Open {
+            continue;
+        }
+        for child in nodes[index].children.clone() {
+            if nodes[child].lock == Lock::Open {
+                nodes[child].lock = Lock::Inherited;
+            }
+        }
+    }
     roles(world, &mut nodes);
 
     let query = query.trim().to_lowercase();
@@ -430,8 +458,16 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
         egui::pos2(rect.right() - scroll_gutter(ui) - 10.0, rect.center().y),
         egui::Vec2::splat(18.0),
     );
-    let text_right = if hovered {
-        cross.left() - 4.0
+    // The lock sits beside the cross while the row is hovered, and at the end
+    // of a locked row otherwise, so what is locked reads down the column.
+    let lock_slot = if hovered {
+        cross.translate(egui::vec2(-20.0, 0.0))
+    } else {
+        cross
+    };
+    let shows_lock = hovered || node.lock != Lock::Open;
+    let text_right = if shows_lock {
+        lock_slot.left() - 4.0
     } else {
         rect.right() - widgets::PAD
     };
@@ -463,13 +499,53 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
         colour,
     );
     if !node.children.is_empty() && !hovered {
+        let right = if shows_lock {
+            lock_slot.left() - 4.0
+        } else {
+            rect.right() - widgets::PAD
+        };
         ui.painter().text(
-            egui::pos2(rect.right() - widgets::PAD, rect.center().y),
+            egui::pos2(right, rect.center().y),
             egui::Align2::RIGHT_CENTER,
             node.children.len().to_string(),
             egui::TextStyle::Monospace.resolve(ui.style()),
             weak,
         );
+    }
+
+    if shows_lock {
+        let glyph = match node.lock {
+            Lock::Open => icons::lock_open(),
+            Lock::Own | Lock::Inherited => icons::lock(),
+        };
+        let resting = match node.lock {
+            Lock::Own => visuals.text_color(),
+            Lock::Open | Lock::Inherited => weak,
+        };
+        if hovered && node.lock != Lock::Inherited {
+            let id = open_id(node.entity).with("lock");
+            let toggle = ui.interact(lock_slot, id, egui::Sense::click());
+            let colour = if toggle.hovered() {
+                visuals.strong_text_color()
+            } else {
+                resting
+            };
+            icons::paint(ui, glyph, lock_slot.shrink(3.0), colour);
+            let hint = if node.lock == Lock::Own {
+                "Unlock: let it be picked in the scene again"
+            } else {
+                "Lock: keep it from being picked in the scene"
+            };
+            if toggle.on_hover_text(hint).clicked() {
+                if node.lock == Lock::Own {
+                    state.request_remove_component(node.entity, crate::scene::registry::LOCKED);
+                } else {
+                    state.request_add_component(node.entity, crate::scene::registry::LOCKED);
+                }
+            }
+        } else {
+            icons::paint(ui, glyph, lock_slot.shrink(3.0), resting);
+        }
     }
 
     if hovered {

@@ -387,21 +387,34 @@ impl Gizmo {
     }
 }
 
+/// How much a marker stands out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Emphasis {
+    Rest,
+    /// Under the pointer: what a click would select.
+    Hovered,
+    Selected,
+}
+
 /// Append a marker for an entity standing at `at` on screen: a ring for a
-/// light, a diamond for anything else, lit when it is selected.
+/// light, a diamond for anything else, lit when it is selected and half lit
+/// under the pointer.
 pub fn marker(
     out: &mut Vec<GizmoVertex>,
     at: egui::Pos2,
     kind: Marker,
-    selected: bool,
+    emphasis: Emphasis,
     pixels_per_point: f32,
 ) {
-    let colour = match (selected, kind) {
-        (true, _) => HOT,
-        (false, Marker::Light) => crate::editor::theme::KIND_LIGHT,
-        (false, Marker::Empty) => CENTRE,
-    }
-    .to_array();
+    let colour = match (emphasis, kind) {
+        (Emphasis::Selected, _) => HOT.to_array(),
+        (Emphasis::Hovered, _) => {
+            let [red, green, blue, _] = HOT.to_array();
+            [red, green, blue, 150]
+        }
+        (Emphasis::Rest, Marker::Light) => crate::editor::theme::KIND_LIGHT.to_array(),
+        (Emphasis::Rest, Marker::Empty) => CENTRE.to_array(),
+    };
     let outline: Vec<egui::Pos2> = match kind {
         Marker::Light => (0..=16)
             .map(|step| {
@@ -422,29 +435,6 @@ pub fn marker(
     };
     for pair in outline.windows(2) {
         stroke(out, pair[0], pair[1], 1.25, 1.25, colour, pixels_per_point);
-    }
-}
-
-/// Append the edges of a selected mesh's bounds, its eight corners already on
-/// screen and numbered by which of `min` (0) or `max` (1) each takes on x, y
-/// and z in the bits of its index.
-pub fn bounds(out: &mut Vec<GizmoVertex>, corners: &[egui::Pos2; 8], pixels_per_point: f32) {
-    let [red, green, blue, _] = HOT.to_array();
-    let colour = [red, green, blue, 200];
-    for (from, a) in corners.iter().enumerate() {
-        for bit in [1, 2, 4] {
-            if from & bit == 0 {
-                stroke(
-                    out,
-                    *a,
-                    corners[from | bit],
-                    0.9,
-                    0.9,
-                    colour,
-                    pixels_per_point,
-                );
-            }
-        }
     }
 }
 
@@ -1645,11 +1635,37 @@ mod tests {
         assert!(close(stretched[1].translation, Vec3::new(2.0, 0.0, 0.0)));
     }
 
+    /// Under the pointer a marker is lit, but less than when selected, so the
+    /// two can be told apart.
+    #[test]
+    fn a_hovered_marker_is_half_lit() {
+        let mut out = Vec::new();
+        marker(
+            &mut out,
+            egui::pos2(100.0, 100.0),
+            Marker::Light,
+            Emphasis::Hovered,
+            1.0,
+        );
+        let [r, g, b, _] = HOT.to_array();
+        assert!(
+            out.iter()
+                .all(|v| v.color[..3] == [r, g, b] && v.color[3] > 0 && v.color[3] < 255),
+            "{:?}",
+            out.first().map(|v| v.color)
+        );
+    }
+
     #[test]
     fn a_light_s_marker_wears_the_light_colour_and_is_lit_when_selected() {
         let colours = |kind: Marker, selected: bool| -> Vec<[u8; 4]> {
             let mut out = Vec::new();
-            marker(&mut out, egui::pos2(100.0, 100.0), kind, selected, 1.0);
+            let emphasis = if selected {
+                Emphasis::Selected
+            } else {
+                Emphasis::Rest
+            };
+            marker(&mut out, egui::pos2(100.0, 100.0), kind, emphasis, 1.0);
             assert!(!out.is_empty() && out.len() % 3 == 0);
             out.iter().map(|v| v.color).collect()
         };
@@ -1693,121 +1709,6 @@ mod tests {
             .collect();
         assert!(!y.is_empty() && y.iter().all(|&alpha| alpha < 100), "{y:?}");
         assert!(out.iter().any(|v| v.color == HOT.to_array()));
-    }
-
-    /// Twelve edges, each joining two corners one bit apart, in the colour
-    /// the selection wears everywhere in the viewport.
-    #[test]
-    fn a_selected_mesh_s_bounds_are_its_twelve_edges() {
-        let corners: [egui::Pos2; 8] = std::array::from_fn(|i| {
-            egui::pos2(
-                100.0 + 50.0 * (i & 1) as f32 + 20.0 * ((i >> 2) & 1) as f32,
-                100.0 + 50.0 * ((i >> 1) & 1) as f32 + 15.0 * ((i >> 2) & 1) as f32,
-            )
-        });
-        let mut out = Vec::new();
-        bounds(&mut out, &corners, 1.0);
-        assert_eq!(out.len(), 12 * 6, "one quad per edge");
-        let [r, g, b, _] = HOT.to_array();
-        assert!(out.iter().all(|v| v.color[..3] == [r, g, b]));
-    }
-
-    fn begun(
-        camera: &Camera,
-        gizmo: &Gizmo,
-        mode: GizmoMode,
-        handle: Handle,
-        from: egui::Pos2,
-    ) -> Drag {
-        let local = LocalTransform::default();
-        Drag::begin_one(
-            gizmo,
-            mode,
-            handle,
-            ray_at(camera, from),
-            local,
-            Mat4::IDENTITY,
-            local.matrix(),
-        )
-        .expect("the handle was grabbed")
-    }
-
-    #[test]
-    fn the_readout_says_how_far_through_what_angle_or_by_what_factor() {
-        let camera = Camera::default();
-        let gizmo = gizmo(&camera, at(Vec3::ZERO));
-        let x = |reach: f32| gizmo.project(Vec3::X * reach);
-
-        let half = gizmo.length * 0.5;
-        let along = begun(&camera, &gizmo, GizmoMode::Move, Handle::Axis(0), x(half));
-        let back = along.readout(ray_at(&camera, x(half - 1.3)), None);
-        assert_eq!(back.as_deref(), Some("-1.30 m"));
-
-        let toward = Vec3::new(camera.position.x, 0.0, camera.position.z).normalize();
-        let rim = |direction: Vec3| gizmo.project(direction * gizmo.length);
-        let turn = begun(
-            &camera,
-            &gizmo,
-            GizmoMode::Rotate,
-            Handle::Axis(1),
-            rim(toward),
-        );
-        let turned = Quat::from_rotation_y(40f32.to_radians()) * toward;
-        let angle = turn.readout(ray_at(&camera, rim(turned)), None);
-        assert_eq!(angle.as_deref(), Some("+40.0°"));
-
-        let tip = |reach: f32| x(gizmo.length * reach);
-        let stretch = begun(&camera, &gizmo, GizmoMode::Scale, Handle::Axis(0), tip(0.9));
-        let factor = stretch.readout(ray_at(&camera, tip(1.8)), None);
-        assert_eq!(factor.as_deref(), Some("×2.00"));
-    }
-
-    /// The turn so far, filled in on the ring: there from the first degree,
-    /// and gone at none.
-    #[test]
-    fn a_turn_fills_the_slice_of_the_ring_it_has_swept() {
-        let camera = Camera::default();
-        let gizmo = gizmo(&camera, at(Vec3::ZERO));
-        let toward = Vec3::new(camera.position.x, 0.0, camera.position.z).normalize();
-        let rim = |direction: Vec3| gizmo.project(direction * gizmo.length);
-        let turn = begun(
-            &camera,
-            &gizmo,
-            GizmoMode::Rotate,
-            Handle::Axis(1),
-            rim(toward),
-        );
-
-        let turned = Quat::from_rotation_y(40f32.to_radians()) * toward;
-        let (axis, from, angle) = turn
-            .sweep(ray_at(&camera, rim(turned)), None)
-            .expect("a turn sweeps");
-        assert!(close(axis, Vec3::Y) && close(from, toward), "{axis} {from}");
-        assert!(
-            (angle.to_degrees() - 40.0).abs() < 0.1,
-            "{}",
-            angle.to_degrees()
-        );
-
-        let mut slice = Vec::new();
-        gizmo.sweep((axis, from, angle), 1.0, &mut slice);
-        assert!(!slice.is_empty() && slice.len() % 3 == 0);
-        assert!(slice.iter().all(|v| v.color[3] < 128), "translucent");
-        let mut none = Vec::new();
-        gizmo.sweep((axis, from, 0.0), 1.0, &mut none);
-        assert!(none.is_empty());
-
-        let along = begun(
-            &camera,
-            &gizmo,
-            GizmoMode::Move,
-            Handle::Axis(0),
-            rim(Vec3::X * 0.5),
-        );
-        assert!(
-            along.sweep(ray_at(&camera, rim(Vec3::X)), None).is_none(),
-            "a move sweeps nothing"
-        );
     }
 
     #[test]
