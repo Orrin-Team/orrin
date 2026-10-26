@@ -12,7 +12,7 @@ use orrin_ecs::{Entity, FxBuildHasher, FxHashMap, World};
 use orrin_registry::{AssetId, EntityId, Registry, SceneDocument, write_document};
 
 use super::index::EXTENSION;
-use super::{Ids, Prefab, PrefabInstance, Prefabs, fold, membership, remap};
+use super::{Ids, Prefab, PrefabInstance, Prefabs, fold_with, membership, remap};
 use crate::scene::persist;
 use crate::scene::registry::PARENT;
 use crate::scene::{LocalTransform, Name, Parent, propagate_transforms, reparent};
@@ -67,6 +67,38 @@ pub fn create(
         _ => wrap(world, &tops, stem(rel))?,
     };
 
+    if !world.has::<EntityId>(root) {
+        world.insert(root, EntityId::new());
+    }
+    let document = document_of(world, registry, root, EntityId::new());
+
+    let id = AssetId::new();
+    write(&file, rel, &document, Some(id))?;
+    let prefab = Prefab::from_document(id, rel.to_owned(), document)?;
+    world
+        .get_resource_mut::<Prefabs>()
+        .expect("read above")
+        .insert(prefab);
+    world.insert(
+        root,
+        PrefabInstance {
+            prefab: id,
+            unapplied: Vec::new(),
+        },
+    );
+    Ok((root, id))
+}
+
+/// The tree under `root` as a prefab document whose root has the id
+/// `prefab_root`, every other entity the id an instance at `root` derives back
+/// to it — so the tree is that instance already. Instances inside the tree are
+/// folded to records, except one rooted at `root` itself, which is the tree.
+pub(super) fn document_of(
+    world: &mut World,
+    registry: &Registry,
+    root: Entity,
+    prefab_root: EntityId,
+) -> SceneDocument {
     let tree = subtree(&children_of(world), root);
     for &entity in &tree {
         if !world.has::<EntityId>(entity) {
@@ -77,12 +109,14 @@ pub fn create(
         .iter()
         .filter_map(|&entity| persist::scene_entity(world, registry, entity))
         .collect();
-    fold(world, &mut entities);
-
     let root_id = *world.get::<EntityId>(root).expect("given one above");
+    if let Some(prefabs) = world.get_resource::<Prefabs>() {
+        fold_with(world, &mut entities, &|id| prefabs.get(id), Some(root_id));
+    }
+
     let ids = Ids {
         root: root_id,
-        prefab_root: EntityId::new(),
+        prefab_root,
     };
     let members: FxHashSet<EntityId> = entities.iter().map(|entity| entity.id).collect();
     for entity in &mut entities {
@@ -98,23 +132,7 @@ pub fn create(
             });
         }
     }
-    let document = SceneDocument { entities };
-
-    let id = AssetId::new();
-    write(&file, rel, &document, id)?;
-    let prefab = Prefab::from_document(id, rel.to_owned(), document)?;
-    world
-        .get_resource_mut::<Prefabs>()
-        .expect("read above")
-        .insert(prefab);
-    world.insert(
-        root,
-        PrefabInstance {
-            prefab: id,
-            unapplied: Vec::new(),
-        },
-    );
-    Ok((root, id))
+    SceneDocument { entities }
 }
 
 /// A path for a new prefab called `name` that no file under `dir` has yet:
@@ -221,7 +239,7 @@ pub(super) fn subtree(children: &FxHashMap<Entity, Vec<Entity>>, root: Entity) -
     tree
 }
 
-fn label(world: &World, entity: Entity) -> String {
+pub(super) fn label(world: &World, entity: Entity) -> String {
     world.get::<Name>(entity).map_or_else(
         || format!("entity {}", entity.index()),
         |name| name.0.clone(),
@@ -235,10 +253,15 @@ fn stem(rel: &str) -> &str {
         .unwrap_or(file)
 }
 
-/// The prefab file and its sidecar. The sidecar goes second, so a failure
-/// part-way leaves a prefab the next scan gives an id to rather than a sidecar
-/// pointing at nothing.
-fn write(file: &Path, rel: &str, document: &SceneDocument, id: AssetId) -> Result<(), String> {
+/// The prefab file, and its sidecar when `id` is a new one. The sidecar goes
+/// second, so a failure part-way leaves a prefab the next scan gives an id to
+/// rather than a sidecar pointing at nothing.
+pub(super) fn write(
+    file: &Path,
+    rel: &str,
+    document: &SceneDocument,
+    id: Option<AssetId>,
+) -> Result<(), String> {
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
@@ -246,6 +269,9 @@ fn write(file: &Path, rel: &str, document: &SceneDocument, id: AssetId) -> Resul
     let mut text = String::new();
     write_document(&mut text, document);
     std::fs::write(file, text).map_err(|e| format!("could not write {rel}: {e}"))?;
+    let Some(id) = id else {
+        return Ok(());
+    };
     let mut meta = file.as_os_str().to_owned();
     meta.push(".meta");
     std::fs::write(PathBuf::from(meta), format!("id = \"{id}\"\n"))

@@ -6,12 +6,15 @@
 //! exactly its overrides — and that record is expanded against the new
 //! version. Members both versions have are edited component by component,
 //! members only the new one has are spawned, and members it dropped go.
+//!
+//! The same rebuild serves an instance's own Revert, which expands the record
+//! with its overrides taken out.
 
-use orrin_ecs::{Entity, FxBuildHasher, World};
+use orrin_ecs::{Entity, FxBuildHasher, FxHashMap, World};
 use orrin_registry::{EntityId, Registry, SceneEntity, Value};
 
 use super::create::{children_of, subtree};
-use super::{Prefab, PrefabInstance, Prefabs, canonical, expand_all, fold_with, nesting};
+use super::{Ids, Prefab, PrefabInstance, Prefabs, canonical, expand_all, fold_with, nesting};
 use crate::scene::persist;
 
 type FxHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
@@ -51,34 +54,42 @@ pub fn apply_edits(world: &mut World, registry: &Registry, replaced: Vec<Prefab>
 
     let mut issues = Vec::new();
     for (_, root, old) in roots {
-        if world.is_alive(root) {
-            issues.extend(refresh(world, registry, root, &replaced[old]));
+        if !world.is_alive(root) {
+            continue;
+        }
+        let built_from = &replaced[old];
+        if let Some(holder) = snapshot(world, registry, root, built_from) {
+            issues.extend(rebuild(world, registry, built_from, &holder, &holder));
         }
     }
     issues
 }
 
-/// Rebuild one instance, built from `old`, against the index's current version.
-fn refresh(world: &mut World, registry: &Registry, root: Entity, old: &Prefab) -> Vec<String> {
-    let Some(root_id) = world.get::<EntityId>(root).map(|id| *id) else {
-        return Vec::new();
-    };
+/// The instance rooted at `root` as the one record a scene would save for it,
+/// folded against `built_from` — the version of its prefab it was built from.
+///
+/// Every member is gathered wherever it was dragged, with whatever the scene
+/// hung under it, since the fold has to see them all.
+pub(super) fn snapshot(
+    world: &mut World,
+    registry: &Registry,
+    root: Entity,
+    built_from: &Prefab,
+) -> Option<SceneEntity> {
+    let root_id = *world.get::<EntityId>(root)?;
     let by_id = persist::ids_of(world);
+    let ids = Ids {
+        root: root_id,
+        prefab_root: built_from.root(),
+    };
 
-    // Every member the instance still has, wherever it was dragged, with what
-    // the scene hung under it — what the fold needs to see.
     let children = children_of(world);
     let mut seen = FxHashSet::default();
     let mut tree = Vec::new();
-    let members = old.entities().iter().filter_map(|base| {
-        by_id.get(
-            &super::Ids {
-                root: root_id,
-                prefab_root: old.root(),
-            }
-            .member(base.id),
-        )
-    });
+    let members = built_from
+        .entities()
+        .iter()
+        .filter_map(|base| by_id.get(&ids.member(base.id)));
     for &start in std::iter::once(&root).chain(members) {
         for entity in subtree(&children, start) {
             if seen.insert(entity) {
@@ -96,24 +107,43 @@ fn refresh(world: &mut World, registry: &Registry, root: Entity, old: &Prefab) -
         .filter_map(|&entity| persist::scene_entity(world, registry, entity))
         .collect();
 
+    let prefabs = world.get_resource::<Prefabs>()?;
+    let lookup = |id| {
+        if id == built_from.id {
+            Some(built_from)
+        } else {
+            prefabs.get(id)
+        }
+    };
+    fold_with(world, &mut entities, &lookup, None);
+    entities.into_iter().find(|entity| entity.id == root_id)
+}
+
+/// Make the live instance that `was` describes — a record folded against
+/// `built_from` — into what `now` describes against the index as it is, in
+/// place: shared members edited, new ones spawned, dropped ones despawned.
+pub(super) fn rebuild(
+    world: &mut World,
+    registry: &Registry,
+    built_from: &Prefab,
+    was: &SceneEntity,
+    now: &SceneEntity,
+) -> Vec<String> {
+    let by_id: FxHashMap<EntityId, Entity> = persist::ids_of(world);
     let (was, now) = {
         let Some(prefabs) = world.get_resource::<Prefabs>() else {
             return Vec::new();
         };
         let before = |id| {
-            if id == old.id {
-                Some(old)
+            if id == built_from.id {
+                Some(built_from)
             } else {
                 prefabs.get(id)
             }
         };
-        fold_with(world, &mut entities, &before);
-        let Some(holder) = entities.into_iter().find(|entity| entity.id == root_id) else {
-            return Vec::new();
-        };
         (
-            expand_all(&before, [&holder]),
-            expand_all(&|id| prefabs.get(id), [&holder]),
+            expand_all(&before, [was]),
+            expand_all(&|id| prefabs.get(id), [now]),
         )
     };
 

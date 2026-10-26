@@ -1,6 +1,8 @@
 //! The scene as a tree: every entity, its kind and its children, with search,
 //! drag to reparent, and the scene's counts at the foot. A prefab dragged in
-//! from the asset browser is placed under whatever row it is let go over.
+//! from the asset browser is placed under whatever row it is let go over, and
+//! the rows of a prefab instance wear the prefab colour, with what can be done
+//! to the instance on the right-click menu.
 //!
 //! Rows are laid out flat, one fixed-height rect each, rather than as nested
 //! collapsing headers. That is what lets a row fill the panel edge to edge —
@@ -13,9 +15,9 @@ use orrin_ecs::{Entity, World};
 use orrin_registry::AssetId;
 
 use crate::editor::kind::Kind;
-use crate::editor::state::EditorState;
-use crate::editor::{icons, widgets};
-use crate::scene::{Hierarchy, Name};
+use crate::editor::state::{EditorState, PrefabAction};
+use crate::editor::{icons, theme, widgets};
+use crate::scene::{Hierarchy, Name, PrefabInstance, Prefabs};
 
 /// One row of the tree, resolved before any drawing starts.
 ///
@@ -32,6 +34,16 @@ struct Node {
     /// than in `snapshot` because a node whose *child* matches has to stay
     /// visible — drop it and the tree collapses out from under the match.
     visible: bool,
+    prefab: Role,
+}
+
+/// Where a row stands in a prefab instance.
+#[derive(Clone, Debug, PartialEq)]
+enum Role {
+    None,
+    /// The instance root, with its prefab's name for the tooltip.
+    Root(String),
+    Member,
 }
 
 /// A node as it lands on screen: which one, how deep, and whether it has a
@@ -243,8 +255,10 @@ fn snapshot(world: &mut World, query: &str) -> Vec<Node> {
             // Roots come first in the order, by construction.
             is_root: index < root_count,
             visible: true,
+            prefab: Role::None,
         })
         .collect();
+    roles(world, &mut nodes);
 
     let query = query.trim().to_lowercase();
     if !query.is_empty() {
@@ -263,6 +277,49 @@ fn snapshot(world: &mut World, query: &str) -> Vec<Node> {
         }
     }
     nodes
+}
+
+/// Mark each node's place in a prefab instance.
+///
+/// Top-down over `Hierarchy::order`, which puts parents first, so each node
+/// inherits the nearest instance above it and is tested against that one
+/// alone — one lookup a row, where asking `prefab::instance_of` per row would
+/// walk to the root from every one of them.
+fn roles(world: &World, nodes: &mut [Node]) {
+    // A scene with no instance has no roles to find, and asking costs a
+    // component lookup on every row each frame.
+    if world.query::<&PrefabInstance>().find(|_, _| true).is_none() {
+        return;
+    }
+    let Some(prefabs) = world.get_resource::<Prefabs>() else {
+        return;
+    };
+    let mut parent = vec![None; nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        for &child in &node.children {
+            parent[child] = Some(index);
+        }
+    }
+    let mut instance = vec![None; nodes.len()];
+    for index in 0..nodes.len() {
+        let entity = nodes[index].entity;
+        let inherited = parent[index].and_then(|p| instance[p]);
+        let id = world.get::<orrin_registry::EntityId>(entity).map(|id| *id);
+        if let Some(root) = world.get::<PrefabInstance>(entity)
+            && let Some(prefab) = prefabs.get(root.prefab)
+        {
+            nodes[index].prefab = Role::Root(prefab.name().to_owned());
+            instance[index] = id.map(|id| (id, root.prefab));
+            continue;
+        }
+        instance[index] = inherited;
+        if let (Some((root, prefab)), Some(id)) = (inherited, id)
+            && let Some(prefab) = prefabs.get(prefab)
+            && crate::scene::prefab::is_member(prefab, root, id)
+        {
+            nodes[index].prefab = Role::Member;
+        }
+    }
 }
 
 /// How much room a vertical scroll bar needs at its widest.
@@ -381,15 +438,21 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
 
     let colour = if selected {
         visuals.strong_text_color()
+    } else if node.prefab != Role::None {
+        theme::PREFAB
     } else {
         visuals.text_color()
     };
-    let galley = egui::WidgetText::from(node.label.as_str()).into_galley(
-        ui,
-        Some(egui::TextWrapMode::Truncate),
-        (text_right - x).max(0.0),
-        egui::TextStyle::Body,
-    );
+    // Coloured in the layout, not at the paint: a plain `WidgetText` bakes the
+    // style's text colour into its galley, and the painter's colour then only
+    // reaches parts with none — of which there are none.
+    let galley = egui::WidgetText::from(egui::RichText::new(&node.label).color(colour))
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            (text_right - x).max(0.0),
+            egui::TextStyle::Body,
+        );
     // A row whose name was cut is the only one worth a tooltip: repeating a
     // name already fully on screen would pop a bubble over every row the
     // pointer crosses.
@@ -426,9 +489,21 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
         }
     }
 
-    if elided {
-        response = response.on_hover_text(&node.label);
+    match (&node.prefab, elided) {
+        (Role::Root(prefab), true) => {
+            response = response.on_hover_text(format!("{}\nInstance of {prefab}", node.label));
+        }
+        (Role::Root(prefab), false) => {
+            response = response.on_hover_text(format!("Instance of {prefab}"));
+        }
+        (_, true) => response = response.on_hover_text(&node.label),
+        (_, false) => {}
     }
+    // The menu acts on the selection, so the row it opened on joins it.
+    if response.secondary_clicked() && !selected {
+        state.selection.set(node.entity);
+    }
+    response.context_menu(|ui| row_menu(ui, node, state));
     if response.clicked() {
         let modifiers = ui.input(|input| input.modifiers);
         if modifiers.command {
@@ -452,6 +527,34 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
         response.dnd_set_drag_payload(dragged);
     }
     accept_drop(&response, node.entity, state);
+}
+
+/// What a right-click on a row offers: the selection as a new prefab, the
+/// whole-instance actions when the row is part of one, and Delete.
+fn row_menu(ui: &mut egui::Ui, node: &Node, state: &mut EditorState) {
+    if ui.button("Save as prefab").clicked() {
+        state.request_save_prefab();
+        ui.close_menu();
+    }
+    if node.prefab != Role::None {
+        ui.separator();
+        for (label, action) in [
+            ("Apply to prefab", PrefabAction::Apply),
+            ("Revert to prefab", PrefabAction::Revert),
+            ("Unpack", PrefabAction::Unpack),
+            ("Show in Assets", PrefabAction::Reveal),
+        ] {
+            if ui.button(label).clicked() {
+                state.request_prefab_action(action, node.entity);
+                ui.close_menu();
+            }
+        }
+    }
+    ui.separator();
+    if ui.button("Delete").clicked() {
+        state.request_despawn_selection();
+        ui.close_menu();
+    }
 }
 
 /// Reparent the dragged entity onto `target`, or place a dragged prefab under

@@ -9,9 +9,12 @@
 
 use orrin_ecs::World;
 
+use orrin_ecs::FxHashMap;
+use orrin_registry::AssetId;
+
 use crate::editor::state::EditorState;
 use crate::editor::{icons, widgets};
-use crate::scene::Prefabs;
+use crate::scene::{PrefabInstance, Prefabs};
 
 const ROW: f32 = 24.0;
 
@@ -31,6 +34,7 @@ pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
         }
         ui.weak(format!("{} prefab(s)", prefabs.iter().count()));
     });
+    widgets::search(ui, &mut state.assets_query, "Filter prefabs");
     ui.add_space(4.0);
 
     if prefabs.iter().next().is_none() {
@@ -44,26 +48,79 @@ pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
         return;
     }
 
+    let mut in_scene: FxHashMap<AssetId, usize> = FxHashMap::default();
+    world
+        .query::<&PrefabInstance>()
+        .for_each(|_, instance| *in_scene.entry(instance.prefab).or_default() += 1);
+    let query = state.assets_query.trim().to_lowercase();
+    let shown: Vec<_> = prefabs
+        .iter()
+        .filter(|prefab| query.is_empty() || prefab.path.to_lowercase().contains(&query))
+        .collect();
+    if shown.is_empty() {
+        ui.weak(format!(
+            "No prefab matches “{}”.",
+            state.assets_query.trim()
+        ));
+        return;
+    }
+
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            for prefab in prefabs.iter() {
+            for prefab in shown {
                 let folder = prefab
                     .path
                     .rsplit_once('/')
                     .map_or("", |(folder, _)| folder);
-                row(ui, prefab.name(), folder, &prefab.path).dnd_set_drag_payload(prefab.id);
+                let count = in_scene.get(&prefab.id).copied().unwrap_or(0);
+                let marked = state.revealed_asset == Some(prefab.id);
+                let response = row(ui, prefab.name(), folder, &prefab.path, count, marked);
+                if response.clicked() {
+                    state.revealed_asset = Some(prefab.id);
+                }
+                if response.double_clicked() {
+                    state.request_instantiate(prefab.id, None);
+                }
+                if response.drag_started() {
+                    response.dnd_set_drag_payload(prefab.id);
+                }
+                if response.dragged()
+                    && let Some(pointer) = ui.ctx().pointer_latest_pos()
+                {
+                    // What is being carried, beside the pointer, since the
+                    // row itself stays put.
+                    egui::Area::new(ui.id().with("dragged_prefab"))
+                        .order(egui::Order::Tooltip)
+                        .fixed_pos(pointer + egui::vec2(14.0, 6.0))
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(prefab.name()));
+                        });
+                }
             }
         });
 }
 
-/// One prefab: its icon and name, and the folder it is in at the far end.
-fn row(ui: &mut egui::Ui, name: &str, folder: &str, path: &str) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW), egui::Sense::drag());
+/// One prefab: its icon and name, the folder it is in, and how many of it the
+/// scene holds at the far end.
+fn row(
+    ui: &mut egui::Ui,
+    name: &str,
+    folder: &str,
+    path: &str,
+    in_scene: usize,
+    marked: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW),
+        egui::Sense::click_and_drag(),
+    );
     let visuals = ui.visuals();
-    if response.hovered() || response.dragged() {
+    if marked {
+        ui.painter()
+            .rect_filled(rect, 0.0, visuals.selection.bg_fill);
+    } else if response.hovered() || response.dragged() {
         ui.painter()
             .rect_filled(rect, 0.0, visuals.widgets.hovered.weak_bg_fill);
     }
@@ -76,7 +133,7 @@ fn row(ui: &mut egui::Ui, name: &str, folder: &str, path: &str) -> egui::Respons
     icons::paint(ui, icons::box_(), glyph, weak);
     let font = egui::TextStyle::Body.resolve(ui.style());
     let text = visuals.text_color();
-    ui.painter().text(
+    let label = ui.painter().text(
         egui::pos2(glyph.right() + 6.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         name,
@@ -84,12 +141,23 @@ fn row(ui: &mut egui::Ui, name: &str, folder: &str, path: &str) -> egui::Respons
         text,
     );
     ui.painter().text(
-        egui::pos2(rect.right() - widgets::PAD, rect.center().y),
-        egui::Align2::RIGHT_CENTER,
+        egui::pos2(label.right() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
         folder,
-        font,
+        font.clone(),
         weak,
     );
+    if in_scene > 0 {
+        ui.painter().text(
+            egui::pos2(rect.right() - widgets::PAD, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{in_scene} in scene"),
+            font,
+            weak,
+        );
+    }
 
-    response.on_hover_text(format!("{path}\nDrag onto the hierarchy to place it"))
+    response.on_hover_text(format!(
+        "{path}\nDrag onto the hierarchy or the scene to place it, or double-click"
+    ))
 }

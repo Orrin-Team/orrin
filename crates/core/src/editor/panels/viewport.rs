@@ -9,12 +9,14 @@
 //! makes a click on one belong to the editor rather than to the fly camera:
 //! `Dock::wants_pointer` claims any layer above the background.
 
+use glam::Vec3;
 use orrin_ecs::World;
 
 use crate::editor::icons;
 use crate::editor::state::{EditorState, GizmoMode, GizmoSpace, SNAP_STEP};
 use crate::editor::theme::{self, ThemeSet};
 use crate::editor::widgets;
+use crate::scene::Camera;
 use crate::stats::FrameStats;
 
 const INSET: f32 = 8.0;
@@ -127,4 +129,80 @@ fn stats_readout(ui: &mut egui::Ui, stats: &FrameStats) {
         .gpu_ms()
         .map_or_else(|| "GPU n/a".to_owned(), |ms| format!("GPU {ms:.2} ms"));
     ui.label(super::figures(gpu).color(theme::GPU));
+}
+
+/// Take a prefab let go over the scene, and place it on the ground under the
+/// pointer — or at the camera's focus when the pointer is above the horizon.
+///
+/// Read off the pointer rather than through a widget: the centre claims no
+/// input (see `dock`), and a widget there would take the fly camera's clicks.
+pub fn accept_prefab(
+    ctx: &egui::Context,
+    world: &World,
+    state: &mut EditorState,
+    dock: &crate::editor::dock::Dock,
+    viewport: egui::Rect,
+) {
+    if !egui::DragAndDrop::has_payload_of_type::<orrin_registry::AssetId>(ctx) {
+        return;
+    }
+    let Some(pos) = ctx.input(|input| {
+        input
+            .pointer
+            .any_released()
+            .then(|| input.pointer.latest_pos())
+            .flatten()
+    }) else {
+        return;
+    };
+    if !viewport.contains(pos) || !dock.over_scene(ctx, pos) {
+        return;
+    }
+    let Some(prefab) = egui::DragAndDrop::take_payload::<orrin_registry::AssetId>(ctx) else {
+        return;
+    };
+    let Some(camera) = world.get_resource::<Camera>().map(|camera| *camera) else {
+        state.request_instantiate(*prefab, None);
+        return;
+    };
+    // The scene is drawn across the whole window, behind the tools.
+    let screen = ctx.screen_rect();
+    let ndc = (pos - screen.min) / screen.size() * 2.0 - egui::Vec2::splat(1.0);
+    let at = ground_point(&camera, screen.aspect_ratio(), ndc).unwrap_or(camera.target);
+    state.request_instantiate_at(*prefab, at);
+}
+
+/// Where the ray through `ndc` (−1 to 1, y down, as the scene's projection
+/// has it) meets the ground plane `y = 0`, if it does in front of the camera.
+pub fn ground_point(camera: &Camera, aspect: f32, ndc: egui::Vec2) -> Option<Vec3> {
+    let inverse = camera.view_projection(aspect).inverse();
+    let near = inverse.project_point3(Vec3::new(ndc.x, ndc.y, 0.0));
+    let far = inverse.project_point3(Vec3::new(ndc.x, ndc.y, 1.0));
+    let direction = far - near;
+    if direction.y.abs() < 1e-6 {
+        return None;
+    }
+    let t = -near.y / direction.y;
+    (t >= 0.0).then(|| near + direction * t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_middle_of_the_screen_lands_on_what_the_camera_looks_at() {
+        let camera = Camera::default();
+        let at = ground_point(&camera, 1.6, egui::Vec2::ZERO).unwrap();
+        assert!((at - camera.target).length() < 1e-3, "{at}");
+    }
+
+    #[test]
+    fn a_ray_into_the_sky_meets_no_ground() {
+        let camera = Camera {
+            target: Vec3::new(0.0, 5.0, 0.0),
+            ..Camera::default()
+        };
+        assert_eq!(ground_point(&camera, 1.6, egui::Vec2::ZERO), None);
+    }
 }

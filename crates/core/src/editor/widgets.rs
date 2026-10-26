@@ -299,6 +299,22 @@ pub fn section<R>(
     menu: Option<&mut dyn FnMut(&mut egui::Ui)>,
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
+    section_titled(ui, id, icon, tint, title, None, menu, body)
+}
+
+/// [`section`] with its title in `title_colour` rather than the strong text
+/// colour — how the inspector marks a component a prefab instance overrides.
+#[allow(clippy::too_many_arguments)]
+pub fn section_titled<R>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    icon: Icon,
+    tint: egui::Color32,
+    title: &str,
+    title_colour: Option<egui::Color32>,
+    menu: Option<&mut dyn FnMut(&mut egui::Ui)>,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
     let mut state =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
 
@@ -313,7 +329,7 @@ pub fn section<R>(
         visuals.window_fill.to_opaque()
     };
     let weak = visuals.weak_text_color();
-    let strong = visuals.strong_text_color();
+    let strong = title_colour.unwrap_or_else(|| visuals.strong_text_color());
     let painter = ui.painter();
     // Square: a band across the panel, not a button laid over it.
     painter.rect_filled(rect, 0.0, fill);

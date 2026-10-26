@@ -58,17 +58,34 @@ pub fn body(
     ui.add_space(6.0);
 
     let filter = Filter::new(&state.inspector_query);
+    // What the selected entity holds differently from its prefab, by
+    // component, so each section can say so. Where an instance root stands is
+    // its own, not an override worth marking.
+    let overridden: Vec<orrin_registry::ComponentId> =
+        prefab::member_overrides(world, registry, entity)
+            .map(|overrides| {
+                overrides
+                    .fields
+                    .into_iter()
+                    .filter(|o| {
+                        !(overrides.root == entity
+                            && o.component == crate::scene::registry::TRANSFORM)
+                    })
+                    .map(|o| o.component)
+                    .collect()
+            })
+            .unwrap_or_default();
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
-            prefab_section(ui, world, registry, entity, &filter);
+            prefab_section(ui, world, registry, state, entity, &filter);
             transform_section(ui, world, state, entity, &filter);
             mesh_section(ui, world, entity, previews, &filter);
             material_section(ui, world, entity, previews, &filter);
             light_section(ui, world, entity, &filter);
             #[cfg(feature = "scripting")]
             script_section(ui, world, entity, &filter);
-            registered_sections(ui, world, registry, entity, &filter);
+            registered_sections(ui, world, registry, entity, &filter, &overridden);
             if filter.is_empty() {
                 ui.add_space(8.0);
                 widgets::padded(ui, |ui| add_component(ui, world, registry, state, entity));
@@ -214,6 +231,7 @@ fn prefab_section(
     ui: &mut egui::Ui,
     world: &mut World,
     registry: &Registry,
+    state: &mut EditorState,
     entity: Entity,
     filter: &Filter,
 ) {
@@ -275,17 +293,8 @@ fn prefab_section(
         return;
     };
 
-    let mut revert_all = false;
     let mut revert = Vec::new();
-    let mut menu = |ui: &mut egui::Ui| {
-        if ui
-            .add_enabled(!rows.is_empty(), egui::Button::new("Revert all"))
-            .clicked()
-        {
-            revert_all = true;
-            ui.close_menu();
-        }
-    };
+    let mut action = None;
     let weak = ui.visuals().weak_text_color();
     widgets::section(
         ui,
@@ -293,11 +302,38 @@ fn prefab_section(
         icons::box_(),
         weak,
         "Prefab",
-        Some(&mut menu),
+        None,
         |ui| {
             if shown.shows("Source") {
                 widgets::property(ui, "Source", |ui| ui.label(&name).on_hover_text(&path));
             }
+            widgets::padded(ui, |ui| {
+                ui.horizontal(|ui| {
+                    use crate::editor::state::PrefabAction;
+                    for (label, hint, chosen) in [
+                        (
+                            "Apply",
+                            "Write this instance into the prefab, for every instance",
+                            PrefabAction::Apply,
+                        ),
+                        (
+                            "Revert all",
+                            "Give back everything this instance overrides",
+                            PrefabAction::Revert,
+                        ),
+                        (
+                            "Unpack",
+                            "Make this instance plain entities",
+                            PrefabAction::Unpack,
+                        ),
+                        ("Show", "Show the prefab in Assets", PrefabAction::Reveal),
+                    ] {
+                        if ui.button(label).on_hover_text(hint).clicked() {
+                            action = Some(chosen);
+                        }
+                    }
+                });
+            });
             if rows.is_empty() {
                 widgets::padded(ui, |ui| ui.weak("Matches the prefab."));
             }
@@ -322,8 +358,8 @@ fn prefab_section(
         },
     );
 
-    if revert_all {
-        revert = rows.into_iter().map(|(_, _, c, p)| (c, p)).collect();
+    if let Some(action) = action {
+        state.request_prefab_action(action, entity);
     }
     for (component, path) in revert {
         if let Err(error) = prefab::revert(world, registry, entity, &component, &path) {
@@ -370,6 +406,7 @@ fn registered_sections(
     registry: &Registry,
     entity: Entity,
     filter: &Filter,
+    overridden: &[orrin_registry::ComponentId],
 ) {
     for vtable in registry.components() {
         if HAND_DRAWN.contains(&vtable.id) {
@@ -407,9 +444,19 @@ fn registered_sections(
                 ui.close_menu();
             }
         };
-        let touched = widgets::section(ui, id, icon, tint, &vtable.name, Some(&mut menu), |ui| {
-            (vtable.inspect)(ui, &mut after)
-        })
+        let title = overridden
+            .contains(&vtable.id)
+            .then_some(crate::editor::theme::PREFAB);
+        let touched = widgets::section_titled(
+            ui,
+            id,
+            icon,
+            tint,
+            &vtable.name,
+            title,
+            Some(&mut menu),
+            |ui| (vtable.inspect)(ui, &mut after),
+        )
         .unwrap_or(false);
         if remove {
             vtable.remove(world, entity);

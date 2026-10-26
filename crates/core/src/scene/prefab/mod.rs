@@ -34,6 +34,7 @@
 //! writes them, and they expand in turn. Its root may not be one: one entity
 //! cannot root two instances.
 
+mod actions;
 mod create;
 mod index;
 mod refresh;
@@ -48,6 +49,7 @@ use orrin_registry::{
     Value,
 };
 
+pub use actions::{apply, instance_of, revert_all, unpack};
 pub use create::{create, unused_path};
 pub use index::{Prefab, Prefabs, Rescan};
 pub use refresh::{apply_edits, rescan};
@@ -495,7 +497,7 @@ pub(super) fn record_of(entity: &SceneEntity) -> Option<&Value> {
 /// not something it overrides, so it is written beside the record.
 pub(super) fn fold(world: &World, entities: &mut Vec<SceneEntity>) {
     match world.get_resource::<Prefabs>() {
-        Some(prefabs) => fold_with(world, entities, &|id| prefabs.get(id)),
+        Some(prefabs) => fold_with(world, entities, &|id| prefabs.get(id), None),
         None => {
             if world.query::<&PrefabInstance>().count() > 0 {
                 tracing::warn!(
@@ -508,11 +510,12 @@ pub(super) fn fold(world: &World, entities: &mut Vec<SceneEntity>) {
 
 /// [`fold`] against prefabs found through `lookup`, which is how a rescan
 /// folds an instance against the version of its prefab it was built from.
-/// Instances whose root is not in `entities` are left alone.
+/// Instances whose root is not in `entities`, or is `keep`, are left expanded.
 pub(super) fn fold_with<'p>(
     world: &World,
     entities: &mut Vec<SceneEntity>,
     lookup: &dyn Fn(AssetId) -> Option<&'p Prefab>,
+    keep: Option<EntityId>,
 ) {
     let mut instances: Vec<(usize, EntityId, PrefabInstance)> = Vec::new();
     world
@@ -535,6 +538,9 @@ pub(super) fn fold_with<'p>(
     let mut folded = vec![false; entities.len()];
 
     for (_, root, instance) in instances {
+        if keep == Some(root) {
+            continue;
+        }
         let Some(&root_index) = index.get(&root) else {
             continue;
         };
@@ -706,6 +712,16 @@ pub fn instantiate_into(
         registry,
         &reserved,
     ))
+}
+
+/// Whether `id` is a member of the instance of `prefab` rooted at `root` — the
+/// test the hierarchy makes per row, without walking up from each one.
+pub fn is_member(prefab: &Prefab, root: EntityId, id: EntityId) -> bool {
+    let ids = Ids {
+        root,
+        prefab_root: prefab.root(),
+    };
+    prefab.contains(ids.local(id))
 }
 
 /// Where a live entity sits in a prefab instance.

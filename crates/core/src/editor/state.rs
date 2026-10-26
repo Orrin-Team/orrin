@@ -66,6 +66,20 @@ impl LevelFilter {
     }
 }
 
+/// What can be done to a prefab instance as a whole, from the tree's menu or
+/// the inspector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefabAction {
+    /// Write the instance back into its prefab.
+    Apply,
+    /// Throw away everything it overrides.
+    Revert,
+    /// Make it plain entities.
+    Unpack,
+    /// Point at its prefab in the asset browser.
+    Reveal,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SpawnKind {
     Cube,
@@ -96,6 +110,11 @@ pub struct EditorState {
     /// search in a property panel usually is: looking for one field on several
     /// entities is the case it exists for.
     pub inspector_query: String,
+    /// The asset browser's filter, kept for the reason the others are.
+    pub assets_query: String,
+    /// The prefab the asset browser marks: the last one clicked there, or the
+    /// one "Show in Assets" pointed at.
+    pub revealed_asset: Option<AssetId>,
     pub gizmo_mode: GizmoMode,
     pub gizmo_space: GizmoSpace,
     pub snap: bool,
@@ -117,7 +136,12 @@ pub struct EditorState {
     /// A prefab to place under an entity, or at the top level for `None`.
     /// Requested for the reason a reparent is: it reshapes the tree the
     /// hierarchy is iterating.
-    instantiate_request: Option<(AssetId, Option<Entity>)>,
+    instantiate_request: Option<(AssetId, Option<Entity>, Option<Vec3>)>,
+    /// A whole-instance action, on the instance this entity is part of.
+    prefab_request: Option<(PrefabAction, Entity)>,
+    /// Not serviced by `apply`: bringing the asset browser forward is the
+    /// dock's, which the editor drains after the UI pass.
+    reveal_request: bool,
     /// Serviced by `apply`, because a rescan replaces the index the asset
     /// browser is drawing from.
     rescan_request: bool,
@@ -149,6 +173,8 @@ impl Default for EditorState {
             console_levels: LevelFilter::default(),
             console_query: String::new(),
             inspector_query: String::new(),
+            assets_query: String::new(),
+            revealed_asset: None,
             gizmo_mode: GizmoMode::Select,
             gizmo_space: GizmoSpace::World,
             snap: false,
@@ -159,6 +185,8 @@ impl Default for EditorState {
             add_request: None,
             reparent_request: Vec::new(),
             instantiate_request: None,
+            prefab_request: None,
+            reveal_request: false,
             rescan_request: false,
             save_prefab_request: false,
             theme_request: None,
@@ -203,7 +231,20 @@ impl EditorState {
     }
 
     pub fn request_instantiate(&mut self, prefab: AssetId, parent: Option<Entity>) {
-        self.instantiate_request = Some((prefab, parent));
+        self.instantiate_request = Some((prefab, parent, None));
+    }
+
+    /// Place a prefab at the top level, standing at `at`.
+    pub fn request_instantiate_at(&mut self, prefab: AssetId, at: Vec3) {
+        self.instantiate_request = Some((prefab, None, Some(at)));
+    }
+
+    pub fn request_prefab_action(&mut self, action: PrefabAction, entity: Entity) {
+        self.prefab_request = Some((action, entity));
+    }
+
+    pub fn take_reveal_request(&mut self) -> bool {
+        std::mem::take(&mut self.reveal_request)
     }
 
     pub fn request_prefab_rescan(&mut self) {
@@ -273,7 +314,7 @@ impl EditorState {
                 log(world, LogLevel::Warning, error.to_string());
             }
         }
-        if let Some((prefab, parent)) = self.instantiate_request.take() {
+        if let Some((prefab, parent, at)) = self.instantiate_request.take() {
             match scene::prefab::instantiate(world, registry, prefab) {
                 Ok((root, issues)) => {
                     for issue in issues {
@@ -286,10 +327,23 @@ impl EditorState {
                     {
                         log(world, LogLevel::Warning, error.to_string());
                     }
+                    if let Some(at) = at {
+                        let mut local = world
+                            .get::<scene::LocalTransform>(root)
+                            .map(|local| *local)
+                            .unwrap_or_default();
+                        local.translation = at;
+                        world.insert(root, local);
+                    }
                     self.selection.set(root);
                 }
                 Err(error) => log(world, LogLevel::Error, error),
             }
+        }
+        if let Some((action, entity)) = self.prefab_request.take()
+            && world.is_alive(entity)
+        {
+            self.prefab_action(world, registry, action, entity);
         }
         if std::mem::take(&mut self.save_prefab_request) {
             self.save_prefab(world, registry);
@@ -313,6 +367,52 @@ impl EditorState {
 }
 
 impl EditorState {
+    fn prefab_action(
+        &mut self,
+        world: &mut World,
+        registry: &Registry,
+        action: PrefabAction,
+        entity: Entity,
+    ) {
+        let Some((_, prefab)) = scene::prefab::instance_of(world, entity) else {
+            log(
+                world,
+                LogLevel::Warning,
+                "that entity is not part of a prefab instance".to_owned(),
+            );
+            return;
+        };
+        let path = world
+            .get_resource::<Prefabs>()
+            .and_then(|prefabs| prefabs.get(prefab).map(|p| p.path.clone()))
+            .unwrap_or_else(|| prefab.to_string());
+        let outcome = match action {
+            PrefabAction::Apply => {
+                scene::prefab::apply(world, registry, entity).map(|issues| (issues, "applied to"))
+            }
+            PrefabAction::Revert => scene::prefab::revert_all(world, registry, entity)
+                .map(|issues| (issues, "reverted to")),
+            PrefabAction::Unpack => {
+                scene::prefab::unpack(world, entity);
+                Ok((Vec::new(), "unpacked from"))
+            }
+            PrefabAction::Reveal => {
+                self.revealed_asset = Some(prefab);
+                self.reveal_request = true;
+                return;
+            }
+        };
+        match outcome {
+            Ok((issues, done)) => {
+                for issue in issues {
+                    log(world, LogLevel::Warning, issue);
+                }
+                log(world, LogLevel::Info, format!("{done} {path}"));
+            }
+            Err(error) => log(world, LogLevel::Error, error),
+        }
+    }
+
     /// Save the selection as a prefab in the assets directory, named after the
     /// entity when there is one and `Group` when there are several, and select
     /// the instance it became.

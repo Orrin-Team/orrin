@@ -16,6 +16,7 @@ use crate::scene::registry::{PARENT, PREFAB};
 pub const EXTENSION: &str = "fprefab";
 
 /// One prefab file, parsed and checked to be a single tree.
+#[derive(Clone)]
 pub struct Prefab {
     pub id: AssetId,
     /// Relative to the assets directory and `/`-separated on every platform, so
@@ -124,6 +125,11 @@ impl Prefab {
 
     pub fn contains(&self, id: EntityId) -> bool {
         self.by_id.contains_key(&id)
+    }
+
+    /// Whether its file was there at the last scan.
+    pub fn on_disk(&self) -> bool {
+        self.on_disk
     }
 
     /// The file name without its directory or extension, for display.
@@ -395,6 +401,20 @@ entity {HANDLE}
 
     pub(in crate::scene::prefab) fn door_id() -> AssetId {
         DOOR_ID.parse().unwrap()
+    }
+
+    /// The door's `game.follow`, so loading it reports nothing.
+    #[derive(Default, orrin_registry::Reflect)]
+    struct Follow {
+        target: EntityId,
+    }
+
+    /// The engine's components and the door's game one.
+    pub(in crate::scene::prefab) fn registry() -> orrin_registry::Registry {
+        let mut registry = orrin_registry::Registry::new();
+        crate::scene::register_components(&mut registry);
+        registry.register::<Follow>(orrin_registry::ComponentId::new("game.follow"), "Follow");
+        registry
     }
 
     #[test]

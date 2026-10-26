@@ -323,13 +323,20 @@ impl Dock {
         let Some(pos) = ctx.pointer_interact_pos() else {
             return false;
         };
+        !self.over_scene(ctx, pos)
+    }
+
+    /// Whether `pos` is on the scene itself rather than on a tool, a menu or a
+    /// floating control. Unlike [`wants_pointer`](Self::wants_pointer) it does
+    /// not count a drag in progress, which is what a drop onto the scene is.
+    pub fn over_scene(&self, ctx: &egui::Context, pos: egui::Pos2) -> bool {
         if ctx
             .layer_id_at(pos)
             .is_some_and(|layer| layer.order != egui::Order::Background)
         {
-            return true;
+            return false;
         }
-        !self.region.contains(pos) || self.tools.iter().any(|tool| tool.contains(pos))
+        self.region.contains(pos) && !self.tools.iter().any(|tool| tool.contains(pos))
     }
 }
 
