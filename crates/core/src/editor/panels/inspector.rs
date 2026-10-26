@@ -10,7 +10,7 @@
 use glam::{EulerRot, Quat, Vec3};
 
 use orrin_ecs::{Entity, World};
-use orrin_registry::Registry;
+use orrin_registry::{Reflect, Registry};
 
 use super::{color_row, figures};
 use crate::editor::icons;
@@ -80,12 +80,12 @@ pub fn body(
         .show(ui, |ui| {
             prefab_section(ui, world, registry, state, entity, &filter);
             transform_section(ui, world, state, entity, &filter);
-            mesh_section(ui, world, entity, previews, &filter);
+            mesh_section(ui, world, state, entity, previews, &filter);
             material_section(ui, world, entity, previews, &filter);
-            light_section(ui, world, entity, &filter);
+            light_section(ui, world, state, entity, &filter);
             #[cfg(feature = "scripting")]
             script_section(ui, world, entity, &filter);
-            registered_sections(ui, world, registry, entity, &filter, &overridden);
+            registered_sections(ui, world, registry, state, entity, &filter, &overridden);
             if filter.is_empty() {
                 ui.add_space(8.0);
                 widgets::padded(ui, |ui| add_component(ui, world, registry, state, entity));
@@ -164,12 +164,17 @@ fn header(
 
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                if let Some(mut name) = world.get_mut::<Name>(entity) {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut name.0)
-                            .font(egui::TextStyle::Heading)
-                            .desired_width(f32::INFINITY),
-                    );
+                if let Some(mut name) = world.get::<Name>(entity).map(|name| name.clone()) {
+                    let renamed = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut name.0)
+                                .font(egui::TextStyle::Heading)
+                                .desired_width(f32::INFINITY),
+                        )
+                        .changed();
+                    if renamed {
+                        state.edit(entity, crate::scene::registry::NAME, name.to_value());
+                    }
                 } else {
                     ui.heading(format!("Entity {}", entity.index()));
                 }
@@ -362,21 +367,7 @@ fn prefab_section(
         state.request_prefab_action(action, entity);
     }
     for (component, path) in revert {
-        if let Err(error) = prefab::revert(world, registry, entity, &component, &path) {
-            let frame = world
-                .get_resource::<Time>()
-                .map_or(0, |time| time.frame_count());
-            if let Some(mut log) = world.get_resource_mut::<LogBuffer>() {
-                log.push(
-                    LogLevel::Error,
-                    format!(
-                        "reverting {component} on entity {}: {error}",
-                        entity.index()
-                    ),
-                    frame,
-                );
-            }
-        }
+        state.request_revert(entity, component, path);
     }
 }
 
@@ -393,17 +384,19 @@ const HAND_DRAWN: [orrin_registry::ComponentId; 3] = [
 
 /// Draw every registered component that has no section of its own.
 ///
-/// The edit is made on a detached copy and posted back as the [`diff`] between
-/// the two, rather than written straight into storage. That is the discipline
-/// architecture §4.4 asks for: one mutation stream, so undo, prefab overrides
-/// and eventually sync all see the same changes an inspector drag produced,
-/// rather than each having to observe the world for them.
+/// The edit is made on a detached copy and handed to the edit pipeline, which
+/// applies the [`diff`] between the two, rather than written straight into
+/// storage. That is the discipline architecture §4.4 asks for: one mutation
+/// stream, so undo, prefab overrides and eventually sync all see the same
+/// changes an inspector drag produced, rather than each having to observe the
+/// world for them. The hand-drawn sections above follow it too.
 ///
 /// [`diff`]: orrin_registry::diff
 fn registered_sections(
     ui: &mut egui::Ui,
-    world: &mut World,
+    world: &World,
     registry: &Registry,
+    state: &mut EditorState,
     entity: Entity,
     filter: &Filter,
     overridden: &[orrin_registry::ComponentId],
@@ -459,25 +452,9 @@ fn registered_sections(
         )
         .unwrap_or(false);
         if remove {
-            vtable.remove(world, entity);
-            continue;
-        }
-        if !touched {
-            continue;
-        }
-
-        let changes = orrin_registry::diff(&before, &after);
-        if let Err(error) = vtable.apply(world, entity, &changes) {
-            let frame = world
-                .get_resource::<Time>()
-                .map_or(0, |time| time.frame_count());
-            if let Some(mut log) = world.get_resource_mut::<LogBuffer>() {
-                log.push(
-                    LogLevel::Error,
-                    format!("{} on entity {}: {error}", vtable.id, entity.index()),
-                    frame,
-                );
-            }
+            state.request_remove_component(entity, vtable.id.clone());
+        } else if touched {
+            state.edit(entity, vtable.id.clone(), after);
         }
     }
 }
@@ -601,9 +578,10 @@ fn transform_section(
     else {
         return;
     };
-    let Some(mut t) = world.get_mut::<LocalTransform>(entity) else {
+    let Some(mut t) = world.get::<LocalTransform>(entity).map(|t| *t) else {
         return;
     };
+    let mut edited = false;
     // Read once for the rows; the menu below is what may change it.
     let uniform_scale = state.scale_linked;
     let linked = &mut state.scale_linked;
@@ -628,6 +606,7 @@ fn transform_section(
                 let mut position = t.translation.to_array();
                 if transform_row(ui, "Position", &mut position, [0.0; 3], 0.05, "") {
                     t.translation = Vec3::from(position);
+                    edited = true;
                 }
             }
 
@@ -652,6 +631,7 @@ fn transform_section(
                         euler[0].to_radians(), // pitch (X)
                         euler[2].to_radians(), // roll  (Z)
                     );
+                    edited = true;
                 }
             }
 
@@ -669,6 +649,7 @@ fn transform_section(
                     } else {
                         scale
                     });
+                    edited = true;
                 }
             }
 
@@ -694,7 +675,11 @@ fn transform_section(
         },
     );
     if reset {
-        *t = LocalTransform::default();
+        t = LocalTransform::default();
+        edited = true;
+    }
+    if edited {
+        state.edit(entity, crate::scene::registry::TRANSFORM, t.to_value());
     }
 }
 
@@ -713,7 +698,8 @@ fn uniform(before: [f32; 3], after: [f32; 3]) -> [f32; 3] {
 
 fn mesh_section(
     ui: &mut egui::Ui,
-    world: &mut World,
+    world: &World,
+    state: &mut EditorState,
     entity: Entity,
     previews: &mut Previews,
     filter: &Filter,
@@ -747,11 +733,16 @@ fn mesh_section(
             }
         },
     );
-    if let Some(handle) = picked_mesh {
-        world.insert(entity, handle);
+    // Posted by name, the form a scene file holds them in, for the reason
+    // `persist::asset_refs` gives.
+    let assets = world.resource::<Assets>();
+    if let Some(name) = picked_mesh.and_then(|handle| assets.mesh_name(handle)) {
+        let value = orrin_registry::Value::String(name.to_owned());
+        state.edit(entity, crate::scene::registry::MESH, value);
     }
-    if let Some(handle) = picked_material {
-        world.insert(entity, handle);
+    if let Some(name) = picked_material.and_then(|handle| assets.material_name(handle)) {
+        let value = orrin_registry::Value::String(name.to_owned());
+        state.edit(entity, crate::scene::registry::MATERIAL, value);
     }
 }
 
@@ -1090,8 +1081,14 @@ fn shadows_row(ui: &mut egui::Ui, casts_shadows: &mut bool, hint: &str) {
     });
 }
 
-fn light_section(ui: &mut egui::Ui, world: &World, entity: Entity, filter: &Filter) {
-    let Some(mut light) = world.get_mut::<Light>(entity) else {
+fn light_section(
+    ui: &mut egui::Ui,
+    world: &World,
+    state: &mut EditorState,
+    entity: Entity,
+    filter: &Filter,
+) {
+    let Some(before) = world.get::<Light>(entity).map(|light| *light) else {
         return;
     };
     let labels = [
@@ -1107,7 +1104,8 @@ fn light_section(ui: &mut egui::Ui, world: &World, entity: Entity, filter: &Filt
     if filter.section("Light", &labels).is_none() {
         return;
     }
-    let (icon, title) = match *light {
+    let mut light = before;
+    let (icon, title) = match light {
         Light::Directional { .. } => (icons::sun(), "Sun"),
         Light::Point { .. } => (icons::lightbulb(), "Point light"),
         Light::Spot { .. } => (icons::lightbulb(), "Spot light"),
@@ -1120,7 +1118,7 @@ fn light_section(ui: &mut egui::Ui, world: &World, entity: Entity, filter: &Filt
         crate::editor::theme::KIND_LIGHT,
         title,
         None,
-        |ui| match &mut *light {
+        |ui| match &mut light {
             Light::Directional { color, lux } => {
                 color_row(ui, "Colour", color);
                 // Logarithmic, as every one of these is: the useful range spans
@@ -1197,6 +1195,10 @@ fn light_section(ui: &mut egui::Ui, world: &World, entity: Entity, filter: &Filt
             }
         },
     );
+    let after = light.to_value();
+    if !orrin_registry::diff(&before.to_value(), &after).is_empty() {
+        state.edit(entity, crate::scene::registry::LIGHT, after);
+    }
 }
 
 #[cfg(test)]

@@ -54,6 +54,12 @@ pub fn draw(
         viewport::show(ctx, world, state, themes, rect);
         viewport::accept_prefab(ctx, world, state, dock, rect);
     }
+    // A drag ends with the button and a typed edit with the field, so the
+    // gesture they make stays open while either is still held. Read after the
+    // widgets, which are what let go of the focus.
+    let holding = ctx.input(|input| input.pointer.any_down())
+        || ctx.memory(|memory| memory.focused().is_some());
+    state.hold(holding);
 }
 
 /// Every surface above the panels — the viewport's floating controls, menus,
@@ -100,6 +106,16 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
     }
     if ctx.wants_keyboard_input() {
         return;
+    }
+    // Redo first: egui matches Ctrl+Z whether or not Shift is also down.
+    let shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    if ctx.input_mut(|input| {
+        input.consume_key(shift, egui::Key::Z)
+            || input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+    }) {
+        state.request_redo();
+    } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+        state.request_undo();
     }
     state.selection.retain_alive(world);
     let selected = !state.selection.is_empty();
@@ -520,17 +536,23 @@ mod tests {
         }
 
         fn key(&mut self, key: egui::Key) -> &mut Self {
+            self.key_with(egui::Modifiers::NONE, key)
+        }
+
+        fn key_with(&mut self, modifiers: egui::Modifiers, key: egui::Key) -> &mut Self {
+            self.input.modifiers = modifiers;
             for pressed in [true, false] {
                 self.input.events.push(egui::Event::Key {
                     key,
                     physical_key: None,
                     pressed,
                     repeat: false,
-                    modifiers: Default::default(),
+                    modifiers,
                 });
             }
             self.frames(1);
             self.input.events.clear();
+            self.input.modifiers = egui::Modifiers::NONE;
             self
         }
     }
@@ -737,6 +759,211 @@ mod tests {
         editor.state.apply(&mut editor.world, &editor.registry);
 
         assert!(editor.world.is_alive(entity));
+    }
+
+    /// The live entity called `name`. Undo respawns into new slots, so a
+    /// handle taken before it is no longer the one to look for.
+    fn named(world: &World, name: &str) -> Option<orrin_ecs::Entity> {
+        world
+            .entities()
+            .find(|&entity| world.get::<Name>(entity).is_some_and(|n| n.0 == name))
+    }
+
+    fn delete_by_key(editor: &mut Harness, name: &str) {
+        let entity = editor.spawn(name);
+        editor.state.selection.set(entity);
+        editor.frames(1).key(egui::Key::Delete);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(named(&editor.world, name).is_none());
+    }
+
+    #[test]
+    fn ctrl_z_undoes_and_ctrl_shift_z_or_ctrl_y_redoes() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        delete_by_key(&mut editor, "Ground plane");
+        let mut press = |modifiers, key| {
+            editor.key_with(modifiers, key);
+            editor.state.apply(&mut editor.world, &editor.registry);
+            named(&editor.world, "Ground plane").is_some()
+        };
+        let shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+
+        assert!(press(egui::Modifiers::COMMAND, egui::Key::Z), "undone");
+        assert!(!press(shift, egui::Key::Z), "redone");
+        assert!(
+            press(egui::Modifiers::COMMAND, egui::Key::Z),
+            "undone again"
+        );
+        assert!(
+            !press(egui::Modifiers::COMMAND, egui::Key::Y),
+            "redone again"
+        );
+    }
+
+    /// A text field has an undo of its own, and Ctrl+Z there is that one.
+    #[test]
+    fn ctrl_z_is_left_to_a_field_that_has_focus() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        delete_by_key(&mut editor, "Ground plane");
+        editor
+            .ctx
+            .memory_mut(|memory| memory.request_focus(egui::Id::new("some field")));
+        editor.key_with(egui::Modifiers::COMMAND, egui::Key::Z);
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        assert!(named(&editor.world, "Ground plane").is_none());
+    }
+
+    fn edit_menu(editor: &mut Harness) -> Vec<String> {
+        let Harness {
+            world,
+            registry,
+            state,
+            themes,
+            dock,
+            ctx,
+            input,
+            ..
+        } = editor;
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                menu_bar::menu_body(
+                    menu_bar::Menu::Edit,
+                    ui,
+                    world,
+                    registry,
+                    state,
+                    themes,
+                    dock,
+                );
+            });
+        });
+        painted_text(&output)
+    }
+
+    #[test]
+    fn the_edit_menu_names_what_undo_and_redo_would_do() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        delete_by_key(&mut editor, "Ground plane");
+        let painted = edit_menu(&mut editor);
+        assert!(
+            painted.iter().any(|t| t == "Undo Delete Ground plane"),
+            "{painted:?}"
+        );
+        assert!(painted.iter().any(|t| t == "Redo"), "{painted:?}");
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let painted = edit_menu(&mut editor);
+        assert!(
+            painted.iter().any(|t| t == "Redo Delete Ground plane"),
+            "{painted:?}"
+        );
+    }
+
+    /// The case the pipeline's gestures exist for, driven through the real
+    /// widget: a drag shows on every frame and undoes in one step.
+    #[test]
+    fn dragging_a_transform_field_is_one_undo_step() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let entity = editor.spawn("Cube");
+        editor.state.selection.set(entity);
+        editor.frames(2);
+        let rects = editor.painted_text_rects();
+        let row = rects.iter().find(|(text, _)| text == "Position").unwrap().1;
+        let chip = rects
+            .iter()
+            .find(|(text, rect)| text == "X" && (rect.center().y - row.center().y).abs() < 4.0)
+            .expect("the position row has an X chip")
+            .1
+            .center();
+
+        let frame = |editor: &mut Harness, event: egui::Event| {
+            editor.input.events.push(event);
+            editor.frames(1);
+            editor.input.events.clear();
+            editor.state.apply(&mut editor.world, &editor.registry);
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut editor, egui::Event::PointerMoved(chip));
+        frame(&mut editor, button(chip, true));
+        let mut at = chip;
+        for _ in 0..3 {
+            at += egui::vec2(20.0, 0.0);
+            frame(&mut editor, egui::Event::PointerMoved(at));
+        }
+        let x = |editor: &Harness| {
+            editor
+                .world
+                .get::<LocalTransform>(entity)
+                .unwrap()
+                .translation
+                .x
+        };
+        assert!(x(&editor) > 0.0, "the drag shows while it is held");
+        frame(&mut editor, button(at, false));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(x(&editor), 0.0);
+        assert_eq!(editor.state.history.undo_label(), None, "one step");
+    }
+
+    #[test]
+    fn spawning_a_light_can_be_undone() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor
+            .state
+            .request_spawn(crate::editor::state::SpawnKind::PointLight);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(named(&editor.world, "Point Light").is_some());
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(named(&editor.world, "Point Light").is_none());
+        assert!(editor.state.selection.is_empty());
+    }
+
+    #[test]
+    fn a_reparent_in_the_tree_can_be_undone() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let parent = editor.spawn("Parent");
+        let child = editor.spawn("Child");
+        editor.state.request_reparent(child, Some(parent));
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(editor.world.has::<crate::scene::Parent>(child));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(!editor.world.has::<crate::scene::Parent>(child));
+    }
+
+    #[test]
+    fn adding_and_removing_a_component_can_be_undone() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let entity = editor.spawn("Cube");
+        editor
+            .state
+            .request_add_component(entity, crate::scene::registry::TAG);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor
+            .state
+            .request_remove_component(entity, crate::scene::registry::TRANSFORM);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(editor.world.has::<crate::scene::Tag>(entity));
+        assert!(!editor.world.has::<LocalTransform>(entity));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(editor.world.has::<LocalTransform>(entity));
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(!editor.world.has::<crate::scene::Tag>(entity));
     }
 
     /// Put a one-entity door prefab in the harness's index.
@@ -1075,6 +1302,32 @@ mod tests {
             .request_prefab_action(crate::editor::state::PrefabAction::Unpack, door);
         editor.state.apply(&mut editor.world, &editor.registry);
         assert!(!editor.world.has::<crate::scene::PrefabInstance>(door));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let door = named(&editor.world, "Door").unwrap();
+        assert!(editor.world.has::<crate::scene::PrefabInstance>(door));
+    }
+
+    #[test]
+    fn reverting_an_instance_can_be_undone() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (door, _) = place_door(&mut editor);
+        editor
+            .world
+            .insert(door, crate::scene::Tag::new("entrance"));
+        editor
+            .state
+            .request_prefab_action(crate::editor::state::PrefabAction::Revert, door);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let door = named(&editor.world, "Door").unwrap();
+        assert!(!editor.world.has::<crate::scene::Tag>(door));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let door = named(&editor.world, "Door").unwrap();
+        assert!(editor.world.has::<crate::scene::Tag>(door));
+        assert!(editor.world.has::<crate::scene::PrefabInstance>(door));
     }
 
     #[test]

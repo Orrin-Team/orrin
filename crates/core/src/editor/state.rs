@@ -4,6 +4,7 @@ use orrin_ecs::{Entity, World};
 use orrin_registry::{AssetId, Registry};
 
 use super::selection::Selection;
+use crate::scene::edit::{EditError, History, SceneEditor};
 use crate::scene::{
     self, Assets, LogBuffer, LogLevel, MaterialHandle, Name, Prefabs, Time, Transform, entities,
 };
@@ -89,6 +90,19 @@ pub enum SpawnKind {
     DirectionalLight,
 }
 
+impl SpawnKind {
+    /// What the new entity is called.
+    pub fn name(self) -> &'static str {
+        match self {
+            SpawnKind::Cube => "Cube",
+            SpawnKind::Sphere => "Sphere",
+            SpawnKind::Plane => "Plane",
+            SpawnKind::PointLight => "Point Light",
+            SpawnKind::DirectionalLight => "Directional Light",
+        }
+    }
+}
+
 /// Spawn/despawn are *requested* by the panels during UI building and applied
 /// by `apply` afterwards, so we never mutate the entity set while a panel is
 /// iterating it.
@@ -122,6 +136,25 @@ pub struct EditorState {
     pub scale_linked: bool,
     /// The frame-time readout floating in the viewport's corner.
     pub show_stats: bool,
+    /// Every scene edit the panels make goes through this, by way of the
+    /// requests below; see `scene::edit`.
+    pub history: History,
+    /// Component values the panels edited on detached copies this frame,
+    /// applied by `apply` as part of the open gesture.
+    edits: Vec<(Entity, orrin_registry::ComponentId, orrin_registry::Value)>,
+    /// Whether the pointer is down or a field has focus — while it is, the
+    /// open gesture stays open. Set by the panels once a frame's widgets
+    /// have run.
+    holding: bool,
+    undo_request: bool,
+    redo_request: bool,
+    remove_request: Option<(Entity, orrin_registry::ComponentId)>,
+    /// Overrides to give back to the prefab: entity, component, path.
+    revert_request: Vec<(
+        Entity,
+        orrin_registry::ComponentId,
+        orrin_registry::FieldPath,
+    )>,
     spawn_request: Option<SpawnKind>,
     despawn_request: Vec<Entity>,
     /// A registered component to add to an entity, at its default. Deferred
@@ -180,6 +213,13 @@ impl Default for EditorState {
             snap: false,
             scale_linked: false,
             show_stats: false,
+            history: History::default(),
+            edits: Vec::new(),
+            holding: false,
+            undo_request: false,
+            redo_request: false,
+            remove_request: None,
+            revert_request: Vec::new(),
             spawn_request: None,
             despawn_request: Vec::new(),
             add_request: None,
@@ -251,6 +291,42 @@ impl EditorState {
         self.rescan_request = true;
     }
 
+    /// Give `component` the value a panel edited a detached copy of.
+    pub fn edit(
+        &mut self,
+        entity: Entity,
+        component: orrin_registry::ComponentId,
+        value: orrin_registry::Value,
+    ) {
+        self.edits.push((entity, component, value));
+    }
+
+    /// Keep the open gesture open through this frame, or let it close.
+    pub fn hold(&mut self, holding: bool) {
+        self.holding = holding;
+    }
+
+    pub fn request_undo(&mut self) {
+        self.undo_request = true;
+    }
+
+    pub fn request_redo(&mut self) {
+        self.redo_request = true;
+    }
+
+    pub fn request_remove_component(&mut self, entity: Entity, id: orrin_registry::ComponentId) {
+        self.remove_request = Some((entity, id));
+    }
+
+    pub fn request_revert(
+        &mut self,
+        entity: Entity,
+        component: orrin_registry::ComponentId,
+        path: orrin_registry::FieldPath,
+    ) {
+        self.revert_request.push((entity, component, path));
+    }
+
     pub fn request_add_component(&mut self, entity: Entity, id: orrin_registry::ComponentId) {
         self.add_request = Some((entity, id));
     }
@@ -274,72 +350,7 @@ impl EditorState {
     }
 
     pub fn apply(&mut self, world: &mut World, registry: &Registry) {
-        if let Some(kind) = self.spawn_request.take()
-            && let Some(entity) = spawn(world, kind)
-        {
-            self.selection.set(entity);
-        }
-        if !self.despawn_request.is_empty() {
-            for entity in std::mem::take(&mut self.despawn_request) {
-                crate::scene::despawn_recursive(world, entity);
-            }
-            self.selection.retain_alive(world);
-        }
-        if let Some((entity, id)) = self.add_request.take()
-            && world.is_alive(entity)
-            && let Some(vtable) = registry.get(&id)
-            && !vtable.has(world, entity)
-            && let Err(error) = vtable.write(world, entity, &vtable.default())
-        {
-            log(
-                world,
-                LogLevel::Error,
-                format!("adding {id} to entity {}: {error}", entity.index()),
-            );
-        }
-        let moves = std::mem::take(&mut self.reparent_request);
-        for &(child, parent) in &moves {
-            // One dragged along with an ancestor that is also moving keeps its
-            // place under that ancestor, as a file does in a moved folder.
-            if moves
-                .iter()
-                .any(|&(other, _)| other != child && is_under(world, child, other))
-            {
-                continue;
-            }
-            // `keep_world`: a drag in the tree changes who owns an object, not
-            // where it is. Without it, dropping something onto a distant parent
-            // would fling it across the scene.
-            if let Err(error) = crate::scene::reparent(world, child, parent, true) {
-                log(world, LogLevel::Warning, error.to_string());
-            }
-        }
-        if let Some((prefab, parent, at)) = self.instantiate_request.take() {
-            match scene::prefab::instantiate(world, registry, prefab) {
-                Ok((root, issues)) => {
-                    for issue in issues {
-                        log(world, LogLevel::Warning, issue.to_string());
-                    }
-                    // Not `keep_world`: a prefab sits where it was authored to,
-                    // relative to whatever it was dropped on.
-                    if let Some(parent) = parent
-                        && let Err(error) = scene::reparent(world, root, Some(parent), false)
-                    {
-                        log(world, LogLevel::Warning, error.to_string());
-                    }
-                    if let Some(at) = at {
-                        let mut local = world
-                            .get::<scene::LocalTransform>(root)
-                            .map(|local| *local)
-                            .unwrap_or_default();
-                        local.translation = at;
-                        world.insert(root, local);
-                    }
-                    self.selection.set(root);
-                }
-                Err(error) => log(world, LogLevel::Error, error),
-            }
-        }
+        self.apply_edits(world, registry);
         if let Some((action, entity)) = self.prefab_request.take()
             && world.is_alive(entity)
         {
@@ -348,6 +359,7 @@ impl EditorState {
         if std::mem::take(&mut self.save_prefab_request) {
             self.save_prefab(world, registry);
         }
+        // Not an edit: the prefabs changed on disk, and their instances follow.
         if std::mem::take(&mut self.rescan_request) {
             for issue in scene::prefab::rescan(world, registry) {
                 log(world, LogLevel::Warning, issue);
@@ -355,18 +367,174 @@ impl EditorState {
         }
         if let Some(request) = self.scene_request.take() {
             let (level, message) = match request {
-                SceneRequest::Save => save_scene(world, registry, &self.scene_path),
+                SceneRequest::Save => {
+                    SceneEditor::new(world, registry, &mut self.history).commit();
+                    let saved = save_scene(world, registry, &self.scene_path);
+                    if saved.0 != LogLevel::Error {
+                        self.history.mark_saved();
+                    }
+                    saved
+                }
                 SceneRequest::Load => {
                     self.selection.clear();
-                    load_scene(world, registry, &self.scene_path)
+                    let loaded = load_scene(world, registry, &self.scene_path);
+                    if loaded.0 != LogLevel::Error {
+                        self.history.clear();
+                    }
+                    loaded
                 }
             };
             log(world, level, message);
         }
     }
+
+    /// What the panels asked of the scene this frame, through the edit
+    /// pipeline.
+    fn apply_edits(&mut self, world: &mut World, registry: &Registry) {
+        let mut editor = SceneEditor::new(world, registry, &mut self.history);
+        let mut failed: Vec<(LogLevel, String)> = Vec::new();
+        let fail = |error: EditError| (LogLevel::Error, error.to_string());
+
+        for (entity, component, value) in self.edits.drain(..) {
+            failed.extend(editor.set(entity, &component, value).err().map(fail));
+        }
+        if !self.holding {
+            editor.commit();
+        }
+        if std::mem::take(&mut self.undo_request) {
+            failed.extend(editor.undo().err().map(fail));
+        }
+        if std::mem::take(&mut self.redo_request) {
+            failed.extend(editor.redo().err().map(fail));
+        }
+
+        if let Some(kind) = self.spawn_request.take() {
+            let label = format!("Create {}", kind.name());
+            let spawned = editor.replace(label, &[], |world, _| {
+                let entity = spawn(world, kind);
+                (entity, entity.into_iter().collect())
+            });
+            if let Some(entity) = spawned {
+                self.selection.set(entity);
+            }
+        }
+        if !self.despawn_request.is_empty() {
+            let doomed = std::mem::take(&mut self.despawn_request);
+            failed.extend(editor.despawn(&doomed).err().map(fail));
+        }
+        if let Some((entity, id)) = self.add_request.take()
+            && editor.world().is_alive(entity)
+            && let Some(vtable) = registry.get(&id)
+            && !vtable.has(editor.world(), entity)
+        {
+            let added = editor.add_component(entity, &id, vtable.default());
+            failed.extend(added.err().map(fail));
+        }
+        if let Some((entity, id)) = self.remove_request.take() {
+            failed.extend(editor.remove_component(entity, &id).err().map(fail));
+        }
+        for (entity, component, path) in std::mem::take(&mut self.revert_request) {
+            let reverted =
+                editor.changed("Revert override", entity, &component, |world, registry| {
+                    scene::prefab::revert(world, registry, entity, &component, &path)
+                });
+            if let Err(error) = reverted {
+                let message = format!(
+                    "reverting {component} on entity {}: {error}",
+                    entity.index()
+                );
+                failed.push((LogLevel::Error, message));
+            }
+        }
+
+        let moves = std::mem::take(&mut self.reparent_request);
+        // One dragged along with an ancestor that is also moving keeps its
+        // place under that ancestor, as a file does in a moved folder.
+        let moves: Vec<(Entity, Option<Entity>)> = moves
+            .iter()
+            .copied()
+            .filter(|&(child, _)| {
+                !moves
+                    .iter()
+                    .any(|&(other, _)| other != child && is_under(editor.world(), child, other))
+            })
+            .collect();
+        let mut reparent_all = |editor: &mut SceneEditor| {
+            for &(child, parent) in &moves {
+                // `keep_world`: a drag in the tree changes who owns an object,
+                // not where it is. Without it, dropping something onto a
+                // distant parent would fling it across the scene.
+                if let Err(error) = editor.reparent(child, parent, true) {
+                    failed.push((LogLevel::Warning, error.to_string()));
+                }
+            }
+        };
+        match moves.len() {
+            0 => {}
+            1 => reparent_all(&mut editor),
+            n => editor.batch(format!("Reparent {n} entities"), reparent_all),
+        }
+
+        if let Some((prefab, parent, at)) = self.instantiate_request.take() {
+            let name = editor
+                .world()
+                .get_resource::<Prefabs>()
+                .and_then(|prefabs| prefabs.get(prefab).map(|p| p.name().to_owned()))
+                .unwrap_or_else(|| prefab.to_string());
+            let placed =
+                editor.replace(format!("Place {name}"), &[], |world, registry| match place(
+                    world, registry, prefab, parent, at,
+                ) {
+                    Ok(root) => (Ok(root), vec![root]),
+                    Err(error) => (Err(error), Vec::new()),
+                });
+            match placed {
+                Ok(root) => self.selection.set(root),
+                Err(error) => failed.push((LogLevel::Error, error)),
+            }
+        }
+
+        for (level, message) in failed {
+            log(editor.world(), level, message);
+        }
+        self.selection.retain_alive(editor.world());
+    }
+}
+
+/// Spawn an instance of `prefab`, under `parent` when there is one and
+/// standing at `at` when that is given.
+fn place(
+    world: &mut World,
+    registry: &Registry,
+    prefab: AssetId,
+    parent: Option<Entity>,
+    at: Option<Vec3>,
+) -> Result<Entity, String> {
+    let (root, issues) = scene::prefab::instantiate(world, registry, prefab)?;
+    for issue in issues {
+        log(world, LogLevel::Warning, issue.to_string());
+    }
+    // Not `keep_world`: a prefab sits where it was authored to, relative to
+    // whatever it was dropped on.
+    if let Some(parent) = parent
+        && let Err(error) = scene::reparent(world, root, Some(parent), false)
+    {
+        log(world, LogLevel::Warning, error.to_string());
+    }
+    if let Some(at) = at {
+        let mut local = world
+            .get::<scene::LocalTransform>(root)
+            .map(|local| *local)
+            .unwrap_or_default();
+        local.translation = at;
+        world.insert(root, local);
+    }
+    Ok(root)
 }
 
 impl EditorState {
+    /// Revert and unpack are edits to this scene and can be undone. Apply is
+    /// not: it writes the prefab's file, and every other instance follows.
     fn prefab_action(
         &mut self,
         world: &mut World,
@@ -374,7 +542,7 @@ impl EditorState {
         action: PrefabAction,
         entity: Entity,
     ) {
-        let Some((_, prefab)) = scene::prefab::instance_of(world, entity) else {
+        let Some((root, prefab)) = scene::prefab::instance_of(world, entity) else {
             log(
                 world,
                 LogLevel::Warning,
@@ -390,10 +558,18 @@ impl EditorState {
             PrefabAction::Apply => {
                 scene::prefab::apply(world, registry, entity).map(|issues| (issues, "applied to"))
             }
-            PrefabAction::Revert => scene::prefab::revert_all(world, registry, entity)
+            PrefabAction::Revert => SceneEditor::new(world, registry, &mut self.history)
+                .replace("Revert to prefab", &[root], |world, registry| {
+                    let reverted = scene::prefab::revert_all(world, registry, entity);
+                    (reverted, vec![root])
+                })
                 .map(|issues| (issues, "reverted to")),
             PrefabAction::Unpack => {
-                scene::prefab::unpack(world, entity);
+                SceneEditor::new(world, registry, &mut self.history).replace(
+                    "Unpack prefab",
+                    &[root],
+                    |world, _| (scene::prefab::unpack(world, entity), vec![root]),
+                );
                 Ok((Vec::new(), "unpacked from"))
             }
             PrefabAction::Reveal => {
@@ -416,6 +592,8 @@ impl EditorState {
     /// Save the selection as a prefab in the assets directory, named after the
     /// entity when there is one and `Group` when there are several, and select
     /// the instance it became.
+    ///
+    /// Undoing it gives the selection back as it was; the file stays written.
     fn save_prefab(&mut self, world: &mut World, registry: &Registry) {
         self.selection.retain_alive(world);
         let selection = self.selection.entities().to_vec();
@@ -438,8 +616,17 @@ impl EditorState {
             return;
         };
         let rel = scene::prefab::unused_path(&dir, &name);
-        match scene::prefab::create(world, registry, &selection, &rel) {
-            Ok((root, _)) => {
+        let label = format!("Save {name} as prefab");
+        let created = SceneEditor::new(world, registry, &mut self.history).replace(
+            label,
+            &selection,
+            |world, registry| match scene::prefab::create(world, registry, &selection, &rel) {
+                Ok((root, _)) => (Ok(root), vec![root]),
+                Err(error) => (Err(error), selection.clone()),
+            },
+        );
+        match created {
+            Ok(root) => {
                 self.selection.set(root);
                 log(world, LogLevel::Info, format!("saved {rel}"));
             }
@@ -523,17 +710,17 @@ fn log(world: &World, level: LogLevel, message: String) {
 fn spawn(world: &mut World, kind: SpawnKind) -> Option<Entity> {
     match kind {
         SpawnKind::Cube | SpawnKind::Sphere | SpawnKind::Plane => {
-            let (mesh_name, label) = match kind {
-                SpawnKind::Cube => ("cube", "Cube"),
-                SpawnKind::Sphere => ("sphere", "Sphere"),
-                _ => ("plane", "Plane"),
+            let mesh_name = match kind {
+                SpawnKind::Cube => "cube",
+                SpawnKind::Sphere => "sphere",
+                _ => "plane",
             };
             // Copy the handles out before mutating the world (drops the borrows).
             let mesh = world.resource::<Assets>().mesh(mesh_name)?;
             let material = default_material(world)?;
             Some(entities::spawn_mesh(
                 world,
-                label,
+                kind.name(),
                 Transform::default(),
                 mesh,
                 material,
@@ -545,7 +732,7 @@ fn spawn(world: &mut World, kind: SpawnKind) -> Option<Entity> {
         // which is a feature that looks broken rather than a light that looks dim.
         SpawnKind::PointLight => Some(entities::spawn_point_light(
             world,
-            "Point Light",
+            kind.name(),
             Vec3::new(0.0, 3.0, 0.0),
             Vec3::ONE,
             4000.0,
@@ -553,7 +740,7 @@ fn spawn(world: &mut World, kind: SpawnKind) -> Option<Entity> {
         )),
         SpawnKind::DirectionalLight => Some(entities::spawn_directional_light(
             world,
-            "Directional Light",
+            kind.name(),
             Vec3::new(-0.4, -1.0, -0.6),
             Vec3::ONE,
             20_000.0,

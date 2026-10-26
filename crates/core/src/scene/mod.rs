@@ -8,6 +8,7 @@ mod debug;
 mod decal;
 mod diagnostics;
 mod dof;
+pub mod edit;
 pub mod entities;
 mod environment;
 mod fog;
