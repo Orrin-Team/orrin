@@ -1,0 +1,36 @@
+orrin-scene 2 min-reader 2
+
+entity 00000000-0000-4000-8000-000000000001 "Door \"North\"\tété"
+  orrin.collider
+    is_trigger = false
+    shape = Box
+      half_extents = (0.5, 1.0, 0.05)
+  test.asset = asset(6f1c0d2e-8a4b-4c3d-9e5f-0a1b2c3d4e5f)
+  test.floats
+    [0] = 3.1415927
+    [1] = 1e-7
+    [2] = 1e16
+    [3] = 123456.79
+    [4] = 3.4028235e38
+    [5] = 1.1754944e-38
+    [6] = 1e-45
+    [7] = -2.5
+    [8] = nan
+    [9] = -inf
+  test.ints
+    [0] = -2147483648
+    [1] = 4294967295
+
+entity 00000000-0000-4000-8000-000000000002
+  orrin.name = 4
+  test.empty_list = []
+  test.empty_string = ""
+  test.empty_struct
+  test.unit_variant = None
+
+entity 00000000-0000-4000-8000-000000000003 "Handle"
+  orrin.parent = entity(00000000-0000-4000-8000-000000000001)
+  orrin.transform
+    rotation = (0.0, 0.14943814, 0.0, 0.9887711)
+    scale = (1.0, 1.0, 1.0)
+    translation = (0.1, 0.0, 0.33333334)

@@ -11,7 +11,7 @@ use orrin_ecs::{Entity, World};
 
 use crate::EntityId;
 use crate::registry::Registry;
-use crate::scene::{FORMAT_VERSION, SceneDocument};
+use crate::scene::{FORMAT_VERSION, MIN_READER_VERSION, NAME_COMPONENT, SceneDocument};
 use crate::value::Value;
 
 const INDENT: &str = "  ";
@@ -23,19 +23,22 @@ const INDENT: &str = "  ";
 /// their entities in different orders. Identity is the only stable sort key,
 /// and without one "identical scenes produce identical files" is false.
 pub fn write_document(out: &mut String, document: &SceneDocument) {
-    let _ = writeln!(out, "orrin-scene {FORMAT_VERSION}");
+    let _ = writeln!(
+        out,
+        "orrin-scene {FORMAT_VERSION} min-reader {MIN_READER_VERSION}"
+    );
 
     let mut entities: Vec<_> = document.entities.iter().collect();
     entities.sort_by_key(|entity| entity.id);
 
     for entity in entities {
-        let _ = writeln!(out, "\nentity {}", entity.id);
-
-        let mut components: Vec<_> = entity.components.iter().collect();
-        components.sort_by(|a, b| a.0.cmp(&b.0));
-        for (id, value) in components {
-            write_named(out, id.as_str(), value, 1);
-        }
+        out.push('\n');
+        let components = entity
+            .components
+            .iter()
+            .map(|(id, value)| (id.as_str(), value))
+            .collect();
+        write_block(out, &entity.id, components);
     }
 }
 
@@ -57,22 +60,40 @@ pub fn write_world(out: &mut String, registry: &Registry, world: &World) {
 /// of any type-erased iteration API. It costs one `has` call per registered
 /// type per entity, which is nothing at the scale this runs.
 pub fn write_entity(out: &mut String, registry: &Registry, world: &World, entity: Entity) {
-    match world.get::<EntityId>(entity) {
-        Some(id) => {
-            let _ = writeln!(out, "entity {}", *id);
-        }
-        None => {
-            let _ = writeln!(out, "entity #{}", entity.index());
-        }
-    }
-
-    let mut components: Vec<(&str, Value)> = registry
+    let header = match world.get::<EntityId>(entity) {
+        Some(id) => id.to_string(),
+        None => format!("#{}", entity.index()),
+    };
+    let components: Vec<(&str, Value)> = registry
         .components()
         .filter_map(|c| c.read(world, entity).map(|value| (c.id.as_str(), value)))
         .collect();
+    write_block(
+        out,
+        &header,
+        components.iter().map(|(id, value)| (*id, value)).collect(),
+    );
+}
+
+/// `entity <header> "<name>"`, then the remaining components sorted by id.
+fn write_block(
+    out: &mut String,
+    header: &dyn std::fmt::Display,
+    mut components: Vec<(&str, &Value)>,
+) {
     components.sort_by_key(|(id, _)| *id);
 
-    for (id, value) in &components {
+    let _ = write!(out, "entity {header}");
+    let name = components.iter().position(|(id, value)| {
+        *id == NAME_COMPONENT.as_str() && matches!(value, Value::String(_))
+    });
+    if let Some((_, Value::String(name))) = name.map(|index| components.remove(index)) {
+        out.push(' ');
+        write_string(out, name);
+    }
+    out.push('\n');
+
+    for (id, value) in components {
         write_named(out, id, value, 1);
     }
 }

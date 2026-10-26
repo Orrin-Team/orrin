@@ -3,7 +3,8 @@
 
 use glam::{Quat, Vec3};
 use orrin_registry::{
-    AssetId, ComponentId, EntityId, SceneDocument, SceneEntity, Value, parse, write_document,
+    AssetId, ComponentId, EntityId, FORMAT_VERSION, MIN_READER_VERSION, SceneDocument, SceneEntity,
+    Value, parse, write_document,
 };
 
 fn entity(components: Vec<(&str, Value)>) -> SceneEntity {
@@ -49,7 +50,7 @@ fn every_leaf_survives_the_round_trip() {
         ])],
     });
 
-    assert!(text.starts_with("orrin-scene 1\n"));
+    assert!(text.starts_with("orrin-scene 2 min-reader 2\n"));
 }
 
 /// An asset reference has its own spelling rather than being a string that
@@ -69,7 +70,7 @@ fn an_asset_reference_is_written_as_one() {
 
 #[test]
 fn a_malformed_asset_reference_names_itself() {
-    let base = "orrin-scene 1\n\nentity 00000000-0000-0000-0000-000000000001\n";
+    let base = "orrin-scene 2 min-reader 2\n\nentity 00000000-0000-0000-0000-000000000001\n";
     let err = parse(&format!("{base}  test.prefab = asset(door)\n")).unwrap_err();
     assert_eq!(err.line, 4);
     assert_eq!(err.message, "`door` is not an asset id");
@@ -168,7 +169,7 @@ fn entities_are_written_in_id_order_whatever_order_they_arrived_in() {
 fn an_empty_scene_is_just_a_header() {
     let mut text = String::new();
     write_document(&mut text, &SceneDocument::default());
-    assert_eq!(text, "orrin-scene 1\n");
+    assert_eq!(text, "orrin-scene 2 min-reader 2\n");
     assert_eq!(parse(&text).unwrap(), SceneDocument::default());
 }
 
@@ -180,24 +181,153 @@ fn a_missing_header_is_reported_on_line_one() {
 }
 
 #[test]
-fn an_unsupported_version_names_itself() {
-    let err = parse("orrin-scene 99\n").unwrap_err();
+fn a_file_needing_a_newer_reader_names_both_versions() {
+    let err = parse("orrin-scene 99 min-reader 98\n").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "line 1: scene format version 99 is not supported (this build reads 1)"
+        "line 1: scene format version 99 needs a reader of version 98 or later \
+         (this build reads up to 2)"
+    );
+}
+
+/// The point of the second number: a format change an older reader can
+/// tolerate bumps the version without locking that reader out.
+#[test]
+fn a_newer_file_an_older_reader_may_read_is_read() {
+    let text = format!(
+        "orrin-scene {} min-reader {}\n\nentity 00000000-0000-0000-0000-000000000001\n  test.n = 1\n",
+        FORMAT_VERSION + 1,
+        MIN_READER_VERSION,
+    );
+    let document = parse(&text).unwrap();
+    assert_eq!(document.entities.len(), 1);
+}
+
+#[test]
+fn a_header_must_name_its_minimum_reader() {
+    let err = parse("orrin-scene 2\n").unwrap_err();
+    assert_eq!(err.line, 1);
+    assert!(err.message.contains("min-reader"), "{}", err.message);
+}
+
+#[test]
+fn a_minimum_reader_newer_than_the_file_is_malformed() {
+    let err = parse("orrin-scene 2 min-reader 3\n").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 1: a file cannot need a reader newer than its own version (2 < 3)"
     );
 }
 
 #[test]
+fn version_zero_does_not_exist() {
+    let err = parse("orrin-scene 0 min-reader 0\n").unwrap_err();
+    assert_eq!(err.line, 1);
+    assert!(err.message.contains("version 0"), "{}", err.message);
+}
+
+/// Version 1 kept the name among the components; reading one goes through the
+/// migration and comes out as the document a version 2 file would have given.
+#[test]
+fn a_version_one_file_is_migrated_on_read() {
+    let v1 = r#"orrin-scene 1
+
+entity 00000000-0000-0000-0000-000000000001
+  orrin.name = "Door \"A\""
+  orrin.tag = 7
+"#;
+    let document = parse(v1).unwrap();
+    let mut text = String::new();
+    write_document(&mut text, &document);
+    assert_eq!(
+        text,
+        r#"orrin-scene 2 min-reader 2
+
+entity 00000000-0000-0000-0000-000000000001 "Door \"A\""
+  orrin.tag = 7
+"#
+    );
+}
+
+/// An error in a migrated file must still point at the line its author sees.
+#[test]
+fn a_migrated_file_reports_errors_on_its_own_lines() {
+    let v1 = r#"orrin-scene 1
+
+entity 00000000-0000-0000-0000-000000000001
+  orrin.name = "Door"
+  orrin.tag = (1.0, 2.0)
+"#;
+    let err = parse(v1).unwrap_err();
+    assert_eq!(err.line, 5);
+}
+
+/// The name rides on the header line, which is the line git shows as a hunk's
+/// context — so a diff says which entity changed, not just that a UUID did.
+#[test]
+fn an_entity_header_carries_its_name() {
+    let id: EntityId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+    let name = (
+        ComponentId::owned("orrin.name"),
+        Value::String("Door \"A\"".to_owned()),
+    );
+    let text = round_trip(SceneDocument {
+        entities: vec![SceneEntity {
+            id,
+            components: vec![
+                (ComponentId::owned("orrin.tag"), Value::I32(7)),
+                name.clone(),
+            ],
+        }],
+    });
+    assert_eq!(
+        text,
+        r#"orrin-scene 2 min-reader 2
+
+entity 00000000-0000-0000-0000-000000000001 "Door \"A\""
+  orrin.tag = 7
+"#
+    );
+    assert!(parse(&text).unwrap().entities[0].components.contains(&name));
+}
+
+#[test]
+fn a_name_that_is_not_a_string_stays_a_component() {
+    let text = round_trip(SceneDocument {
+        entities: vec![entity(vec![("orrin.name", Value::I32(3))])],
+    });
+    assert!(text.contains("\n  orrin.name = 3\n"), "{text}");
+}
+
+#[test]
+fn a_header_name_must_be_quoted() {
+    let err =
+        parse("orrin-scene 2 min-reader 2\n\nentity 00000000-0000-0000-0000-000000000001 Door\n")
+            .unwrap_err();
+    assert_eq!(err.line, 3);
+    assert!(err.message.contains("quoted"), "{}", err.message);
+}
+
+#[test]
+fn an_entity_cannot_be_named_twice() {
+    let err = parse(
+        "orrin-scene 2 min-reader 2\n\nentity 00000000-0000-0000-0000-000000000001 \"A\"\n  orrin.name = \"B\"\n",
+    )
+    .unwrap_err();
+    assert_eq!(err.line, 4);
+    assert!(err.message.contains("named"), "{}", err.message);
+}
+
+#[test]
 fn a_debug_dump_is_refused_with_a_hint() {
-    let err = parse("orrin-scene 1\n\nentity #3\n").unwrap_err();
+    let err = parse("orrin-scene 2 min-reader 2\n\nentity #3\n").unwrap_err();
     assert_eq!(err.line, 3);
     assert!(err.message.contains("debug dump"), "{}", err.message);
 }
 
 #[test]
 fn syntax_errors_carry_their_line() {
-    let base = "orrin-scene 1\n\nentity 00000000-0000-0000-0000-000000000001\n";
+    let base = "orrin-scene 2 min-reader 2\n\nentity 00000000-0000-0000-0000-000000000001\n";
 
     let err = parse(&format!("{base}   name = 1\n")).unwrap_err();
     assert_eq!(err.line, 4);
@@ -223,7 +353,7 @@ fn integers_read_back_into_whichever_width_the_field_wants() {
     // The file has one integer syntax, so the parser cannot know the width. The
     // numeric leaves coerce instead of rejecting.
     let parsed = parse(&format!(
-        "orrin-scene 1\n\nentity {}\n  test.n = 7\n",
+        "orrin-scene 2 min-reader 2\n\nentity {}\n  test.n = 7\n",
         EntityId::new()
     ))
     .unwrap();

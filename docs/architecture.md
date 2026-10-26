@@ -48,7 +48,7 @@ This registry is the highest-leverage piece of infrastructure in the whole engin
 
 Scenes serialize to a line-oriented, deterministic text format: one entity per block, components sorted by type, fields sorted by name, floats printed canonically. Determinism matters more than the syntax. Identical scenes must produce byte-identical files, so that git diffs are meaningful and CRDT snapshots are stable.
 
-Binary payloads (baked lightmaps, navmesh data) never live in the scene file; they're assets referenced by AssetId. Every file starts with a version number, and migrations between versions are explicit functions kept in the repo. A project on this timescale will change its formats, and ad-hoc migration is how engines rot.
+Binary payloads (baked lightmaps, navmesh data) never live in the scene file; they're assets referenced by AssetId. Every file starts with its version and the oldest reader version that can read it, and migrations between versions are explicit, forward-only text-to-text functions kept in the repo. A project on this timescale will change its formats, and ad-hoc migration is how engines rot.
 
 ## 3. Renderer
 
