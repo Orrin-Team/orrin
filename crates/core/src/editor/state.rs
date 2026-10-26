@@ -3,6 +3,7 @@ use glam::Vec3;
 use orrin_ecs::{Entity, World};
 use orrin_registry::{AssetId, Registry};
 
+use super::gizmo::{Drag, Handle};
 use super::selection::Selection;
 use crate::scene::edit::{EditError, History, SceneEditor};
 use crate::scene::{
@@ -21,10 +22,9 @@ pub enum SceneRequest {
     Load,
 }
 
-/// What a transform gizmo would edit. The mode is real state and is remembered;
-/// the handles that would read it are Phase 3, so today it drives a readout and
-/// nothing else.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// What the transform gizmo edits. Move and rotate have handles (see
+/// `editor::gizmo`); scale is the same machinery and is still to come.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GizmoMode {
     Select,
     Move,
@@ -39,8 +39,11 @@ pub enum GizmoSpace {
     World,
 }
 
-/// What a gizmo drag would quantise to, when snapping is on.
-pub const SNAP_STEP: f32 = 0.25;
+/// What a move drag quantises to when snapping, in metres.
+pub const MOVE_SNAP: f32 = 0.25;
+
+/// What a rotate drag quantises to when snapping, in degrees.
+pub const ROTATE_SNAP: f32 = 15.0;
 
 /// Which log levels the console shows: one bit per [`LogLevel`], all set to
 /// begin with.
@@ -136,6 +139,15 @@ pub struct EditorState {
     pub scale_linked: bool,
     /// The frame-time readout floating in the viewport's corner.
     pub show_stats: bool,
+    /// The handle being dragged, on which entity. Dropped when the button is
+    /// released or the selection moves on.
+    pub gizmo_drag: Option<(Entity, Drag)>,
+    /// The handle under the pointer, or being dragged: drawn lit, and what
+    /// keeps a click on a handle from also selecting what is behind it.
+    pub gizmo_hot: Option<Handle>,
+    /// This frame's handles, for the renderer. Swapped into the overlay frame
+    /// rather than copied.
+    pub gizmo_strokes: Vec<crate::gfx::vulkan::GizmoVertex>,
     /// Every scene edit the panels make goes through this, by way of the
     /// requests below; see `scene::edit`.
     pub history: History,
@@ -213,6 +225,9 @@ impl Default for EditorState {
             snap: false,
             scale_linked: false,
             show_stats: false,
+            gizmo_drag: None,
+            gizmo_hot: None,
+            gizmo_strokes: Vec::new(),
             history: History::default(),
             edits: Vec::new(),
             holding: false,
@@ -299,6 +314,19 @@ impl EditorState {
         value: orrin_registry::Value,
     ) {
         self.edits.push((entity, component, value));
+    }
+
+    /// The increment a drag of the current tool snaps to: when the toggle is
+    /// on, or while `held` (Ctrl) is down.
+    pub fn snap_step(&self, held: bool) -> Option<f32> {
+        if !(self.snap || held) {
+            return None;
+        }
+        match self.gizmo_mode {
+            GizmoMode::Move => Some(MOVE_SNAP),
+            GizmoMode::Rotate => Some(ROTATE_SNAP),
+            GizmoMode::Select | GizmoMode::Scale => None,
+        }
     }
 
     /// Keep the open gesture open through this frame, or let it close.

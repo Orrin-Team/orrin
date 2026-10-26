@@ -19,7 +19,7 @@ use orrin_registry::Registry;
 use super::dock::Dock;
 use super::phases::{self, Glass};
 use super::previews::Previews;
-use super::state::{EditorState, SceneRequest};
+use super::state::{EditorState, GizmoMode, SceneRequest};
 use super::theme::ThemeSet;
 use super::widgets;
 
@@ -53,6 +53,9 @@ pub fn draw(
     if let Some(rect) = dock.viewport() {
         viewport::show(ctx, world, state, themes, rect);
         viewport::accept_prefab(ctx, world, state, dock, rect);
+        // Before the click: a click on a handle is not a click on the scene.
+        viewport::gizmo(ctx, world, state, dock, rect);
+        viewport::select_on_click(ctx, world, state, dock, rect);
     }
     // A drag ends with the button and a typed edit with the field, so the
     // gesture they make stays open while either is still held. Read after the
@@ -116,6 +119,16 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
         state.request_redo();
     } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
         state.request_undo();
+    }
+    for (key, mode) in [
+        (egui::Key::Num1, GizmoMode::Select),
+        (egui::Key::Num2, GizmoMode::Move),
+        (egui::Key::Num3, GizmoMode::Rotate),
+        (egui::Key::Num4, GizmoMode::Scale),
+    ] {
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
+            state.gizmo_mode = mode;
+        }
     }
     state.selection.retain_alive(world);
     let selected = !state.selection.is_empty();
@@ -1787,6 +1800,227 @@ mod tests {
         );
         assert!(tools.left() - viewport.left() < 20.0);
         assert!(tools.top() - viewport.top() < 20.0);
+    }
+
+    /// A cube the camera sees at the middle of the viewport, measured so it
+    /// can be picked, and where to click to hit it.
+    fn cube_under_the_viewport_centre(editor: &mut Harness) -> (orrin_ecs::Entity, egui::Pos2) {
+        let mut bounds = crate::scene::MeshBounds::default();
+        bounds.insert(
+            crate::scene::MeshHandle(0),
+            crate::geom::Aabb {
+                min: glam::Vec3A::splat(-0.5),
+                max: glam::Vec3A::splat(0.5),
+            },
+        );
+        editor.world.insert_resource(bounds);
+        let mut assets = crate::scene::Assets::new();
+        assets.insert_mesh("cube", crate::scene::MeshHandle(0));
+        editor.world.insert_resource(assets);
+        editor.frames(2);
+        let at = editor.viewport().center();
+        let screen = editor.ctx.screen_rect();
+        let ndc = (at - screen.min) / screen.size() * 2.0 - egui::Vec2::splat(1.0);
+        let camera = *editor.world.resource::<crate::scene::Camera>();
+        let (origin, direction) = crate::editor::pick::ray(&camera, screen.aspect_ratio(), ndc);
+
+        let entity = editor.spawn("Cube");
+        editor.world.insert(entity, crate::scene::MeshHandle(0));
+        editor.world.insert(
+            entity,
+            LocalTransform::new(crate::scene::Transform::from_translation(
+                origin + direction.normalize() * 5.0,
+            )),
+        );
+        crate::scene::propagate_transforms(&mut editor.world);
+        (entity, at)
+    }
+
+    #[test]
+    fn clicking_the_scene_selects_what_is_under_the_pointer() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, at) = cube_under_the_viewport_centre(&mut editor);
+        editor.click(at);
+        assert_eq!(editor.state.selection.entities(), [cube]);
+
+        let empty = editor.viewport().left_bottom() + egui::vec2(40.0, -40.0);
+        editor.click(empty);
+        assert!(
+            editor.state.selection.is_empty(),
+            "empty space selects nothing"
+        );
+    }
+
+    #[test]
+    fn ctrl_clicking_the_scene_adds_to_the_selection() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let other = editor.spawn("Other");
+        let (cube, at) = cube_under_the_viewport_centre(&mut editor);
+        editor.state.selection.set(other);
+        editor.click_with(at, egui::Modifiers::COMMAND);
+        assert_eq!(editor.state.selection.entities(), [other, cube]);
+        editor.click_with(at, egui::Modifiers::COMMAND);
+        assert_eq!(editor.state.selection.entities(), [other]);
+    }
+
+    /// Where a point along the gizmo's X shaft is on screen: `fraction` of the
+    /// way from the entity's origin to the tip.
+    fn x_shaft(editor: &Harness, entity: orrin_ecs::Entity, fraction: f32) -> egui::Pos2 {
+        let camera = *editor.world.resource::<crate::scene::Camera>();
+        let screen = editor.ctx.screen_rect();
+        let view_proj = camera.view_projection(screen.aspect_ratio());
+        let origin = editor
+            .world
+            .get::<crate::scene::WorldTransform>(entity)
+            .unwrap()
+            .translation();
+        let project = |point: glam::Vec3| {
+            let ndc = view_proj.project_point3(point);
+            screen.min
+                + egui::vec2(
+                    (ndc.x * 0.5 + 0.5) * screen.width(),
+                    (ndc.y * 0.5 + 0.5) * screen.height(),
+                )
+        };
+        let start = project(origin);
+        let toward = (project(origin + glam::Vec3::X * 0.01) - start).normalized();
+        start + toward * crate::editor::gizmo::LENGTH * fraction
+    }
+
+    fn pointer(editor: &mut Harness, event: egui::Event) {
+        editor.input.events.push(event);
+        editor.frames(1);
+        editor.input.events.clear();
+        editor.state.apply(&mut editor.world, &editor.registry);
+    }
+
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// The gizmo's reason to exist, through the real pointer: a drag on the X
+    /// shaft moves the selection along X, shows on every frame, and undoes in
+    /// one step.
+    #[test]
+    fn dragging_the_move_handle_moves_the_selection_in_one_undo_step() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        let before = *editor.world.get::<LocalTransform>(cube).unwrap();
+        editor.state.selection.set(cube);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Move;
+        editor.frames(2);
+
+        let grab = x_shaft(&editor, cube, 0.5);
+        pointer(&mut editor, egui::Event::PointerMoved(grab));
+        pointer(&mut editor, button(grab, true));
+        let mut at = grab;
+        for _ in 0..3 {
+            at += (grab - x_shaft(&editor, cube, 0.0)).normalized() * 20.0;
+            pointer(&mut editor, egui::Event::PointerMoved(at));
+        }
+        let during = editor
+            .world
+            .get::<LocalTransform>(cube)
+            .unwrap()
+            .translation;
+        assert!(
+            during.x > before.translation.x + 0.1,
+            "{during} from {}",
+            before.translation
+        );
+        assert!((during.y - before.translation.y).abs() < 1e-4);
+        assert!((during.z - before.translation.z).abs() < 1e-4);
+        pointer(&mut editor, button(at, false));
+        assert_eq!(editor.state.selection.entities(), [cube]);
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let after = editor
+            .world
+            .get::<LocalTransform>(cube)
+            .unwrap()
+            .translation;
+        assert!((after - before.translation).length() < 1e-5, "{after}");
+        assert_eq!(editor.state.history.undo_label(), None, "one step");
+    }
+
+    /// A click on a handle is the start of a drag that went nowhere, not a
+    /// click on whatever is behind it — here, empty space, which would clear
+    /// the selection.
+    #[test]
+    fn a_click_on_a_handle_keeps_the_selection() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        editor.state.selection.set(cube);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Move;
+        editor.frames(2);
+
+        let tip = x_shaft(&editor, cube, 0.9);
+        pointer(&mut editor, egui::Event::PointerMoved(tip));
+        editor.click(tip);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(editor.state.selection.entities(), [cube]);
+        assert_eq!(editor.state.history.undo_label(), None, "nothing moved");
+    }
+
+    /// Picking the tool is a per-second interaction, so it has keys — numbers,
+    /// because the fly camera owns the letters.
+    #[test]
+    fn the_number_keys_pick_the_tool_unless_a_field_has_focus() {
+        use crate::editor::state::GizmoMode;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(1);
+        for (key, mode) in [
+            (egui::Key::Num2, GizmoMode::Move),
+            (egui::Key::Num3, GizmoMode::Rotate),
+            (egui::Key::Num4, GizmoMode::Scale),
+            (egui::Key::Num1, GizmoMode::Select),
+        ] {
+            editor.key(key);
+            assert!(editor.state.gizmo_mode == mode, "{key:?}");
+        }
+
+        editor
+            .ctx
+            .memory_mut(|memory| memory.request_focus(egui::Id::new("some field")));
+        editor.key(egui::Key::Num3);
+        assert!(editor.state.gizmo_mode == GizmoMode::Select);
+    }
+
+    /// Each tool snaps by its own increment, and holding Ctrl snaps a drag
+    /// whether or not the toggle is on.
+    #[test]
+    fn the_snap_step_follows_the_tool_and_ctrl_snaps_without_the_toggle() {
+        use crate::editor::state::{GizmoMode, MOVE_SNAP, ROTATE_SNAP};
+        let mut state = EditorState::default();
+        state.gizmo_mode = GizmoMode::Move;
+        assert_eq!(state.snap_step(false), None);
+        assert_eq!(state.snap_step(true), Some(MOVE_SNAP));
+        state.snap = true;
+        assert_eq!(state.snap_step(false), Some(MOVE_SNAP));
+        state.gizmo_mode = GizmoMode::Rotate;
+        assert_eq!(state.snap_step(false), Some(ROTATE_SNAP));
+        state.gizmo_mode = GizmoMode::Select;
+        assert_eq!(state.snap_step(true), None);
+    }
+
+    /// The snap button says the increment the current tool would use.
+    #[test]
+    fn the_snap_button_shows_the_current_tools_increment() {
+        use crate::editor::state::GizmoMode;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.state.snap = true;
+        editor.state.gizmo_mode = GizmoMode::Rotate;
+        editor.frames(2);
+        assert!(editor.painted_contains("15°"));
+        editor.state.gizmo_mode = GizmoMode::Move;
+        editor.frames(1);
+        assert!(editor.painted_contains("0.25"));
     }
 
     /// A section bar is a band across the panel, square at its ends: rounded,

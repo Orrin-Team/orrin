@@ -90,6 +90,25 @@ impl Aabb {
         outside.length_squared()
     }
 
+    /// How far along `direction` from `origin` the ray enters this box, or
+    /// `None` if it misses or the box is behind it. Zero from inside.
+    ///
+    /// `direction` need not be unit length; the result is in its units.
+    pub fn ray_entry(&self, origin: Vec3, direction: Vec3) -> Option<f32> {
+        if !self.is_valid() {
+            return None;
+        }
+        // The slab test. A zero component divides to an infinity of the right
+        // sign, which puts that slab at "always" or "never" without a branch.
+        let origin = Vec3A::from(origin);
+        let inverse = Vec3A::ONE / Vec3A::from(direction);
+        let a = (self.min - origin) * inverse;
+        let b = (self.max - origin) * inverse;
+        let near = a.min(b).max_element().max(0.0);
+        let far = a.max(b).min_element();
+        (far >= near).then_some(near)
+    }
+
     /// The axis-aligned box enclosing this one after `model` — the same
     /// `abs(M) * half_extents` trick the collision side uses for a rotated box:
     /// along each world axis the farthest corner picks the sign of every term,
@@ -189,6 +208,45 @@ mod tests {
             min: Vec3A::splat(-0.5),
             max: Vec3A::splat(0.5),
         }
+    }
+
+    #[test]
+    fn a_ray_enters_a_box_at_its_near_face() {
+        let cube = unit_cube();
+        let t = cube
+            .ray_entry(Vec3::new(0.0, 0.0, 5.0), Vec3::NEG_Z)
+            .unwrap();
+        assert!((t - 4.5).abs() < 1e-5, "{t}");
+        let slanted = cube.ray_entry(Vec3::new(-3.0, 0.2, 0.0), Vec3::new(2.0, 0.0, 0.0));
+        assert!(
+            (slanted.unwrap() - 1.25).abs() < 1e-5,
+            "in the direction's units"
+        );
+    }
+
+    #[test]
+    fn a_ray_misses_a_box_beside_or_behind_it() {
+        let cube = unit_cube();
+        assert_eq!(cube.ray_entry(Vec3::new(2.0, 0.0, 5.0), Vec3::NEG_Z), None);
+        assert_eq!(cube.ray_entry(Vec3::new(0.0, 0.0, 5.0), Vec3::Z), None);
+        assert_eq!(Aabb::EMPTY.ray_entry(Vec3::ZERO, Vec3::X), None);
+    }
+
+    /// Parallel to a face and outside the slab: the division by zero gives
+    /// infinities, which have to land on "miss" rather than NaN.
+    #[test]
+    fn a_ray_parallel_to_a_face_hits_only_inside_the_slab() {
+        let cube = unit_cube();
+        assert_eq!(cube.ray_entry(Vec3::new(0.0, 0.9, 5.0), Vec3::NEG_Z), None);
+        assert!(
+            cube.ray_entry(Vec3::new(0.0, 0.4, 5.0), Vec3::NEG_Z)
+                .is_some()
+        );
+        assert_eq!(
+            cube.ray_entry(Vec3::ZERO, Vec3::X),
+            Some(0.0),
+            "from inside"
+        );
     }
 
     /// A camera at +Z looking at the origin, matching `Camera::default`'s

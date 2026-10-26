@@ -4,10 +4,12 @@
 //! phases `phases` cuts it into (see `gfx/vulkan/overlay.rs`).
 
 mod dock;
+mod gizmo;
 mod icons;
 mod kind;
 mod panels;
 mod phases;
+mod pick;
 mod prefs;
 mod previews;
 mod selection;
@@ -215,6 +217,8 @@ impl Editor {
 
         let ppp = output.pixels_per_point;
         let frame = &mut self.frame;
+        std::mem::swap(&mut frame.gizmo, &mut self.state.gizmo_strokes);
+        self.state.gizmo_strokes.clear();
         frame.pixels_per_point = ppp;
         frame.textures.append(output.textures_delta);
         frame

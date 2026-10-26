@@ -272,6 +272,8 @@ pub enum PassBody {
     /// Writes up-chain level `n`, reading the coarser level and down-chain `n`.
     BloomUpsample(u32),
     Tonemap,
+    /// The editor's transform handles, over the tonemapped frame.
+    Gizmo,
     Overlay,
     ShadowCascade(u32),
     /// Every point and spot light's faces, in one pass over one atlas. A tile is
@@ -1714,6 +1716,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     record(id, PassBody::Tonemap, &mut bodies);
 
     if config.overlay {
+        // Its own node, after the tonemap: see `vulkan::gizmo` for why not
+        // lines in the forward pass. Ordered before the overlay by
+        // registration, the two being writers of the same image.
+        let id = builder
+            .pass("gizmo", PassKind::Inline)
+            .access(swapchain_color, Access::ColorAttachment)
+            .build();
+        record(id, PassBody::Gizmo, &mut bodies);
+
         let id = builder
             .pass("overlay", PassKind::Raw)
             .access(swapchain_color, Access::ColorAttachment)

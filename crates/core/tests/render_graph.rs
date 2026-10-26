@@ -1280,6 +1280,63 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
     assert!(at("oit_composite") < at("taa_resolve"), "{order:?}");
 }
 
+/// The transform gizmo is editor chrome: drawn over the tonemapped frame, so
+/// its colours are exact and nothing in the scene can stand in front of a
+/// handle, and under the editor's own UI. A frame without the editor has none.
+#[test]
+fn the_gizmo_draws_between_the_tonemap_and_the_overlay() {
+    let config = |overlay, async_compute| FrameConfig {
+        color_format: COLOR_FORMAT,
+        msaa: false,
+        ssao: true,
+        ssao_half_res: false,
+        contact_shadows: false,
+        ssr: false,
+        subsurface: false,
+        transparency: false,
+        refraction: false,
+        taa: true,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        volumetric_fog: false,
+        bloom_mips: BLOOM_MIPS,
+        overlay,
+        shadow_cascades: 0,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+        async_compute,
+        gpu_culling: false,
+        occlusion_culling: false,
+    };
+    for async_compute in [false, true] {
+        let frame = declare(config(true, async_compute)).unwrap();
+        let order: Vec<&str> = frame
+            .graph
+            .order()
+            .iter()
+            .map(|&id| frame.graph.pass_name(id))
+            .collect();
+        let at = |name: &str| {
+            order
+                .iter()
+                .position(|&pass| pass == name)
+                .unwrap_or_else(|| panic!("{name} is not in the frame: {order:?}"))
+        };
+        assert!(at("tonemap") < at("gizmo"), "{order:?}");
+        assert!(at("gizmo") < at("overlay"), "{order:?}");
+    }
+
+    let headless = declare(config(false, false)).unwrap();
+    let names: Vec<&str> = headless
+        .graph
+        .order()
+        .iter()
+        .map(|&id| headless.graph.pass_name(id))
+        .collect();
+    assert!(!names.contains(&"gizmo"), "{names:?}");
+}
+
 /// The accumulation pass *attaches* the prepass depth rather than sampling it,
 /// and read-only at that. Both halves are load-bearing.
 ///

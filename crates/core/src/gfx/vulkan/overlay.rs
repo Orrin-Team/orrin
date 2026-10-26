@@ -72,6 +72,9 @@ pub struct OverlayFrame {
     /// In draw order. Glass in the first phase is ignored: nothing is beneath
     /// it yet.
     pub phases: Vec<OverlayPhase>,
+    /// The transform gizmo's triangles, drawn by their own pass before the
+    /// editor's UI rather than by this one — see `vulkan::gizmo`.
+    pub gizmo: Vec<super::gizmo::GizmoVertex>,
 }
 
 #[derive(Default)]
@@ -972,6 +975,7 @@ mod tests {
 
         let delta = |image: egui::ImageData| ImageDelta::full(image, egui::TextureOptions::LINEAR);
         let mut frame = OverlayFrame {
+            gizmo: Vec::new(),
             pixels_per_point: 1.0,
             textures: egui::TexturesDelta {
                 set: vec![
@@ -1037,6 +1041,7 @@ mod tests {
             painter.rect_filled(rect(128.0, 0.0, 256.0, 128.0), 0.0, egui::Color32::BLACK);
         });
         let mut frame = OverlayFrame {
+            gizmo: Vec::new(),
             pixels_per_point: 1.0,
             phases: vec![
                 OverlayPhase {
@@ -1197,6 +1202,7 @@ mod tests {
                     phases[*phase].glass.push(*glass);
                 }
                 let mut frame = OverlayFrame {
+                    gizmo: Vec::new(),
                     pixels_per_point: 1.0,
                     textures: textures.take().unwrap_or_default(),
                     phases,

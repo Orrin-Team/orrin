@@ -65,6 +65,15 @@ fn overwritten(view: Arc<ImageView>) -> RenderingAttachmentInfo {
     }
 }
 
+/// A colour attachment drawn over what an earlier pass left in it.
+fn drawn_over(view: Arc<ImageView>) -> RenderingAttachmentInfo {
+    RenderingAttachmentInfo {
+        load_op: AttachmentLoadOp::Load,
+        store_op: AttachmentStoreOp::Store,
+        ..RenderingAttachmentInfo::image_view(view)
+    }
+}
+
 /// A multisampled colour attachment that is cleared, drawn into, resolved into
 /// `resolve`, and then discarded.
 ///
@@ -323,6 +332,8 @@ pub(super) fn rendering_info(
         },
         // The acquired swapchain image, every pixel of which the tonemap writes.
         PassBody::Tonemap => color_only(overwritten(swapchain.clone())),
+        // The tonemapped frame, which the handles are drawn over.
+        PassBody::Gizmo => color_only(drawn_over(swapchain.clone())),
         // Dispatches, and the overlay, which records its own command buffer.
         PassBody::Overlay
         | PassBody::OcclusionHiz
