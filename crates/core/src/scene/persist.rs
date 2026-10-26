@@ -209,12 +209,21 @@ pub(super) fn spawn(
     issues
 }
 
+/// Every instance of one component type in a load, in file order.
+type Section<'a> = (&'a ComponentId, Vec<(Entity, EntityId, &'a Value)>);
+
 /// Spawn entities that carry no prefab record — the second half of [`spawn`],
 /// and how a refreshed instance gains the members its prefab now has.
 ///
 /// A parent link resolves against the entities spawned here first and then
 /// against the world, which is what lets a new member find a parent that was
 /// already live.
+///
+/// Components are applied a type at a time rather than an entity at a time:
+/// every entity is spawned first, then each component type's vtable is looked
+/// up once and every instance of it in the file streamed through. Per-instance
+/// dispatch is the slow path the format's one-section-per-type layout exists
+/// to avoid (#41).
 pub(super) fn spawn_plain<'a>(
     entities: impl Iterator<Item = &'a SceneEntity>,
     instances: &[(EntityId, PrefabInstance)],
@@ -226,6 +235,10 @@ pub(super) fn spawn_plain<'a>(
     let mut spawned: FxHashMap<EntityId, Entity> = FxHashMap::default();
     let mut deferred_parents: Vec<(Entity, EntityId, Value)> = Vec::new();
 
+    // In the order each type first appears, so a load's issues come out in
+    // the same order every time.
+    let mut sections: Vec<Section> = Vec::new();
+    let mut section_of: FxHashMap<&ComponentId, usize> = FxHashMap::default();
     for scene_entity in entities {
         let entity = reserved
             .get(&scene_entity.id)
@@ -234,47 +247,54 @@ pub(super) fn spawn_plain<'a>(
         world.insert(entity, scene_entity.id);
         spawned.insert(scene_entity.id, entity);
 
-        let mut unknown = Vec::new();
         for (id, value) in &scene_entity.components {
-            if *id == PARENT {
+            let section = *section_of.entry(id).or_insert_with(|| {
+                sections.push((id, Vec::new()));
+                sections.len() - 1
+            });
+            sections[section].1.push((entity, scene_entity.id, value));
+        }
+    }
+
+    for (id, members) in sections {
+        // A record that could not be expanded, reported above, or one inside
+        // a prefab, which is kept but not expanded.
+        if *id == PREFAB {
+            for (entity, _, value) in members {
+                keep_unapplied(world, entity, (id.clone(), value.clone()));
+            }
+            continue;
+        }
+
+        let vtable = registry.get(id);
+        for (entity, entity_id, value) in members {
+            let result = if *id == PARENT {
                 match value {
                     Value::Entity(parent_id) => {
-                        deferred_parents.push((entity, *parent_id, value.clone()))
+                        deferred_parents.push((entity, *parent_id, value.clone()));
+                        continue;
                     }
-                    _ => {
-                        issues.push(LoadIssue {
-                            entity: scene_entity.id,
-                            component: id.clone(),
-                            message: format!(
-                                "expected an entity reference, found {}",
-                                value.type_name()
-                            ),
-                        });
-                        unknown.push((id.clone(), value.clone()));
-                    }
+                    _ => Err(format!(
+                        "expected an entity reference, found {}",
+                        value.type_name()
+                    )),
                 }
-                continue;
-            }
-            // A record that could not be expanded, reported above, or one
-            // inside a prefab, which is kept but not expanded.
-            if *id == PREFAB {
-                unknown.push((id.clone(), value.clone()));
-                continue;
-            }
-            if let Err(message) = apply_component(world, registry, entity, id, value) {
+            } else if *id == MESH || *id == MATERIAL {
+                apply_asset_ref(world, entity, id, value)
+            } else {
+                apply_registered(vtable, world, entity, id, value)
+            };
+
+            if let Err(message) = result {
                 // Kept as well as reported: a field the current build rejects
                 // is exactly the data a save must not silently drop.
                 issues.push(LoadIssue {
-                    entity: scene_entity.id,
+                    entity: entity_id,
                     component: id.clone(),
                     message,
                 });
-                unknown.push((id.clone(), value.clone()));
+                keep_unapplied(world, entity, (id.clone(), value.clone()));
             }
-        }
-
-        if !unknown.is_empty() {
-            world.insert(entity, UnknownComponents(unknown));
         }
     }
 
@@ -337,7 +357,18 @@ fn apply_component(
     if *id == MESH || *id == MATERIAL {
         return apply_asset_ref(world, entity, id, value);
     }
-    match registry.get(id) {
+    apply_registered(registry.get(id), world, entity, id, value)
+}
+
+/// [`apply_component`] for a registered type, with its vtable already looked up.
+fn apply_registered(
+    vtable: Option<&orrin_registry::ComponentVtable>,
+    world: &mut World,
+    entity: Entity,
+    id: &ComponentId,
+    value: &Value,
+) -> Result<(), String> {
+    match vtable {
         Some(vtable) if vtable.script.is_some() && !vtable.has(world, entity) => {
             wait_for_host(world, entity, id, value);
             Ok(())
@@ -631,7 +662,8 @@ mod tests {
     fn an_asset_name_the_registry_lacks_is_reported_and_kept() {
         let registry = registry();
         let id = EntityId::new();
-        let text = format!("orrin-scene 1\n\nentity {id}\n  orrin.mesh = \"teapot\"\n");
+        let text =
+            format!("orrin-scene 2 min-reader 2\n\nentity {id}\n  orrin.mesh = \"teapot\"\n");
 
         let mut world = World::new();
         world.insert_resource(assets());
@@ -699,7 +731,7 @@ mod tests {
         let registry = registry();
         let id = EntityId::new();
         let text = format!(
-            "orrin-scene 1\n\nentity {id}\n  game.enemy\n    aggression = 0.75\n    name = \"Boss\"\n"
+            "orrin-scene 2 min-reader 2\n\nentity {id}\n  game.enemy\n    aggression = 0.75\n    name = \"Boss\"\n"
         );
 
         let mut world = World::new();
@@ -716,8 +748,7 @@ mod tests {
     fn a_value_the_type_rejects_is_kept_rather_than_dropped() {
         let registry = registry();
         let id = EntityId::new();
-        let text =
-            format!("orrin-scene 1\n\nentity {id}\n  orrin.name = \"Cube\"\n  orrin.tag = 7\n");
+        let text = format!("orrin-scene 2 min-reader 2\n\nentity {id} \"Cube\"\n  orrin.tag = 7\n");
 
         let mut world = World::new();
         let issues = load(&text, &mut world, &registry).unwrap();
@@ -730,6 +761,44 @@ mod tests {
 
         let entity = world.entities().next().unwrap();
         assert!(world.get::<Tag>(entity).is_none());
+        assert_eq!(save(&mut world, &registry), text);
+    }
+
+    /// Instances of one type are applied together, so a rejection must still
+    /// land on the entity it belongs to and leave the type's other instances
+    /// applied.
+    #[test]
+    fn a_type_shared_by_several_entities_reports_and_keeps_per_entity() {
+        let registry = registry();
+        let [a, b, c] = [1, 2, 3].map(|n| {
+            format!("00000000-0000-4000-8000-{n:012}")
+                .parse::<EntityId>()
+                .unwrap()
+        });
+        let text = format!(
+            "orrin-scene 2 min-reader 2\n\n\
+             entity {a} \"A\"\n  orrin.tag = 7\n\n\
+             entity {b} \"B\"\n  orrin.tag = \"ok\"\n\n\
+             entity {c} \"C\"\n  game.enemy = 1\n  orrin.tag = 8\n"
+        );
+
+        let mut world = World::new();
+        let issues = load(&text, &mut world, &registry).unwrap();
+        let mut reported: Vec<(EntityId, &str)> = issues
+            .iter()
+            .map(|issue| (issue.entity, issue.component.as_str()))
+            .collect();
+        reported.sort();
+        assert_eq!(
+            reported,
+            [(a, "orrin.tag"), (c, "game.enemy"), (c, "orrin.tag")]
+        );
+
+        let tagged: Vec<String> = world
+            .entities()
+            .filter_map(|entity| world.get::<Tag>(entity).map(|tag| tag.0.clone()))
+            .collect();
+        assert_eq!(tagged, ["ok"]);
         assert_eq!(save(&mut world, &registry), text);
     }
 
@@ -759,7 +828,7 @@ mod tests {
         let registry = registry();
         let mut world = World::new();
         let text = save(&mut world, &registry);
-        assert_eq!(text, "orrin-scene 1\n");
+        assert_eq!(text, "orrin-scene 2 min-reader 2\n");
 
         let mut loaded = World::new();
         assert!(load(&text, &mut loaded, &registry).unwrap().is_empty());
@@ -1023,8 +1092,9 @@ mod tests {
             std::sync::Arc::new(NoHost),
         );
         let id = EntityId::new();
-        let text =
-            format!("orrin-scene 1\n\nentity {id}\n  demo.spinner\n    DegreesPerSecond = 45.0\n");
+        let text = format!(
+            "orrin-scene 2 min-reader 2\n\nentity {id}\n  demo.spinner\n    DegreesPerSecond = 45.0\n"
+        );
 
         let mut world = World::new();
         let issues = load(&text, &mut world, &registry).unwrap();

@@ -18,6 +18,7 @@ mod diff;
 mod entity_id;
 #[cfg(feature = "egui")]
 pub mod inspect;
+mod migrate;
 mod reflect;
 mod registry;
 mod scene;
@@ -28,7 +29,10 @@ pub mod wire;
 pub use asset_id::AssetId;
 pub use diff::{FieldChange, apply, diff};
 pub use entity_id::EntityId;
-pub use scene::{FORMAT_VERSION, ParseError, SceneDocument, SceneEntity, parse};
+pub use scene::{
+    FORMAT_VERSION, MIN_READER_VERSION, NAME_COMPONENT, ParseError, SceneDocument, SceneEntity,
+    parse,
+};
 
 /// Shares its name with the [`Reflect`](trait@Reflect) trait, the way
 /// `serde::Serialize` does — the derive lives in the macro namespace and the

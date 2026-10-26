@@ -52,8 +52,8 @@ fn a_saved_behaviour_comes_back_attached_with_its_fields() {
     // From a scene.
     let id = EntityId::new();
     let text = format!(
-        "orrin-scene 1\n\nentity {id}\n  demo.spinner\n    DegreesPerSecond = 45.0\n  \
-         orrin.name = \"Fan\"\n"
+        "orrin-scene 2 min-reader 2\n\nentity {id} \"Fan\"\n  demo.spinner\n    \
+         DegreesPerSecond = 45.0\n"
     );
     let mut world = World::new();
     let issues = load(&text, &mut world, &registry).unwrap();

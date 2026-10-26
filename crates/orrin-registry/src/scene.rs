@@ -14,7 +14,20 @@ use crate::{AssetId, EntityId};
 /// Bumped whenever the grammar changes in a way older files don't satisfy.
 /// Migrations are explicit functions kept in the repo; a file whose version
 /// isn't handled is refused by name rather than parsed optimistically.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
+
+/// The oldest reader that can read what this build writes, stated in every
+/// header next to the version. A change an older reader can tolerate bumps
+/// [`FORMAT_VERSION`] and leaves this alone, so that reader is not locked out.
+pub const MIN_READER_VERSION: u32 = 2;
+
+/// The component written on an entity's header line rather than among its
+/// components, when it holds a string.
+///
+/// The header is the line git shows as a hunk's context, so carrying the name
+/// there is what makes a diff say which entity changed instead of only which
+/// UUID did.
+pub const NAME_COMPONENT: ComponentId = ComponentId::new("orrin.name");
 
 /// One scene: entities and their components, in the order they were written.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -56,16 +69,19 @@ impl std::error::Error for ParseError {}
 ///
 /// The grammar is the one the writer emits: a version header, then one block
 /// per entity, two spaces of indent per level, `name = value` for scalars and
-/// an indented block for anything structured.
+/// an indented block for anything structured. A file from an older version is
+/// migrated to this one first (see `migrate`).
 pub fn parse(input: &str) -> Result<SceneDocument, ParseError> {
     let lines = collect_lines(input)?;
-    let mut cursor = Cursor { lines, index: 0 };
-
-    let header = cursor
-        .next()
+    let header = lines
+        .first()
         .ok_or_else(|| ParseError::new(1, "empty file; expected an `orrin-scene` header"))?;
-    parse_header(&header)?;
+    let version = parse_header(header)?;
+    if version < FORMAT_VERSION {
+        return parse(&crate::migrate::to_current(input, version));
+    }
 
+    let mut cursor = Cursor { lines, index: 1 };
     let mut entities = Vec::new();
     while let Some(line) = cursor.peek() {
         if line.indent != 0 {
@@ -75,47 +91,92 @@ pub fn parse(input: &str) -> Result<SceneDocument, ParseError> {
             ));
         }
         let line = cursor.next().expect("peeked");
-        let id = parse_entity_header(&line)?;
-        let components = parse_block(&mut cursor, 1)?
-            .into_iter()
-            .map(|(name, value)| (ComponentId::owned(name), value))
-            .collect();
+        let (id, name) = parse_entity_header(&line)?;
+
+        let named = name.is_some();
+        let mut components = Vec::new();
+        if let Some(name) = name {
+            components.push((NAME_COMPONENT, Value::String(name)));
+        }
+        while let Some((number, component, value)) = next_entry(&mut cursor, 1)? {
+            if named && component == NAME_COMPONENT.as_str() {
+                return Err(ParseError::new(
+                    number,
+                    "this entity is already named on its `entity` line",
+                ));
+            }
+            components.push((ComponentId::owned(component), value));
+        }
         entities.push(SceneEntity { id, components });
     }
 
     Ok(SceneDocument { entities })
 }
 
-fn parse_header(line: &Line) -> Result<(), ParseError> {
-    let Some(version) = line.text.strip_prefix("orrin-scene ") else {
-        return Err(ParseError::new(
-            line.number,
-            format!("expected an `orrin-scene {FORMAT_VERSION}` header"),
-        ));
+/// `orrin-scene <version> min-reader <version>`, returning the first.
+///
+/// Version 1 predates the second number and is the one header allowed without
+/// it.
+fn parse_header(line: &Line) -> Result<u32, ParseError> {
+    let error = |message: String| ParseError::new(line.number, message);
+    let expected = format!("orrin-scene {FORMAT_VERSION} min-reader {MIN_READER_VERSION}");
+
+    let Some(rest) = line.text.strip_prefix("orrin-scene ") else {
+        return Err(error(format!("expected an `{expected}` header")));
     };
-    let version: u32 = version.trim().parse().map_err(|_| {
-        ParseError::new(line.number, format!("`{version}` is not a version number"))
-    })?;
-    if version != FORMAT_VERSION {
-        return Err(ParseError::new(
-            line.number,
-            format!(
-                "scene format version {version} is not supported (this build reads {FORMAT_VERSION})"
-            ),
-        ));
+    let mut words = rest.split_whitespace();
+    let number = |word: Option<&str>| -> Result<u32, ParseError> {
+        let word = word.unwrap_or_default();
+        word.parse()
+            .map_err(|_| error(format!("`{word}` is not a version number")))
+    };
+
+    let version = number(words.next())?;
+    if version == 0 {
+        return Err(error("there is no scene format version 0".to_owned()));
     }
-    Ok(())
+    if version == 1 && words.clone().next().is_none() {
+        return Ok(1);
+    }
+    if words.next() != Some("min-reader") {
+        return Err(error(format!(
+            "expected `orrin-scene {version} min-reader <version>`: a header names the \
+             oldest reader that can read the file"
+        )));
+    }
+    let min_reader = number(words.next())?;
+    if let Some(extra) = words.next() {
+        return Err(error(format!("unexpected `{extra}` after the header")));
+    }
+
+    if min_reader > version {
+        return Err(error(format!(
+            "a file cannot need a reader newer than its own version ({version} < {min_reader})"
+        )));
+    }
+    if min_reader > FORMAT_VERSION {
+        return Err(error(format!(
+            "scene format version {version} needs a reader of version {min_reader} or later \
+             (this build reads up to {FORMAT_VERSION})"
+        )));
+    }
+    Ok(version)
 }
 
-fn parse_entity_header(line: &Line) -> Result<EntityId, ParseError> {
-    let Some(id) = line.text.strip_prefix("entity ") else {
+/// `entity <id>`, optionally followed by the entity's quoted name.
+fn parse_entity_header(line: &Line) -> Result<(EntityId, Option<String>), ParseError> {
+    let Some(rest) = line.text.strip_prefix("entity ") else {
         return Err(ParseError::new(
             line.number,
             format!("expected `entity <id>`, found `{}`", line.text),
         ));
     };
-    let id = id.trim();
-    EntityId::from_str(id).map_err(|_| {
+    let (id, name) = match rest.trim().split_once(' ') {
+        Some((id, name)) => (id, Some(name.trim())),
+        None => (rest.trim(), None),
+    };
+
+    let id = EntityId::from_str(id).map_err(|_| {
         // The debug dump writes `entity #3` for an entity with no persistent
         // id. That is a view of live state, not a scene: re-reading it would
         // invent identities that collide with the next session's.
@@ -125,26 +186,53 @@ fn parse_entity_header(line: &Line) -> Result<EntityId, ParseError> {
             ""
         };
         ParseError::new(line.number, format!("`{id}` is not an entity id{hint}"))
-    })
+    })?;
+
+    let Some(name) = name else {
+        return Ok((id, None));
+    };
+    let body = name
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'))
+        .ok_or_else(|| {
+            ParseError::new(
+                line.number,
+                format!("an entity's name is quoted: `entity {id} \"{name}\"`"),
+            )
+        })?;
+    Ok((id, Some(parse_string(body, line.number)?)))
 }
 
 /// Read every line indented exactly `indent` levels, plus their children.
 fn parse_block(cursor: &mut Cursor, indent: usize) -> Result<Vec<(String, Value)>, ParseError> {
     let mut entries = Vec::new();
-    while let Some(line) = cursor.peek() {
-        if line.indent < indent {
-            break;
-        }
-        if line.indent > indent {
-            return Err(ParseError::new(
-                line.number,
-                "unexpected indent; this line is deeper than its parent allows",
-            ));
-        }
-        let line = cursor.next().expect("peeked");
-        entries.push(parse_named(&line, cursor, indent)?);
+    while let Some((_, name, value)) = next_entry(cursor, indent)? {
+        entries.push((name, value));
     }
     Ok(entries)
+}
+
+/// The next line at `indent` with its children, and the line it is on; `None`
+/// once the block has ended.
+fn next_entry(
+    cursor: &mut Cursor,
+    indent: usize,
+) -> Result<Option<(usize, String, Value)>, ParseError> {
+    let Some(line) = cursor.peek() else {
+        return Ok(None);
+    };
+    if line.indent < indent {
+        return Ok(None);
+    }
+    if line.indent > indent {
+        return Err(ParseError::new(
+            line.number,
+            "unexpected indent; this line is deeper than its parent allows",
+        ));
+    }
+    let line = cursor.next().expect("peeked");
+    let (name, value) = parse_named(&line, cursor, indent)?;
+    Ok(Some((line.number, name, value)))
 }
 
 fn parse_named(

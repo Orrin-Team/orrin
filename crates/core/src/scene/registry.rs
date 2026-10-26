@@ -3,7 +3,7 @@ use orrin_registry::{ComponentId, Registry};
 use super::{Collider, Light, LocalTransform, Locked, Name, Spin, Tag};
 
 pub const TRANSFORM: ComponentId = ComponentId::new("orrin.transform");
-pub const NAME: ComponentId = ComponentId::new("orrin.name");
+pub const NAME: ComponentId = orrin_registry::NAME_COMPONENT;
 pub const TAG: ComponentId = ComponentId::new("orrin.tag");
 pub const LIGHT: ComponentId = ComponentId::new("orrin.light");
 pub const COLLIDER: ComponentId = ComponentId::new("orrin.collider");
@@ -136,12 +136,11 @@ mod tests {
         assert_eq!(
             out,
             "\
-entity #1
+entity #1 \"Cube\"
   orrin.collider
     is_trigger = false
     shape = Box
       half_extents = (0.5, 0.5, 0.5)
-  orrin.name = \"Cube\"
   orrin.spin
     axis = (0.0, 1.0, 0.0)
     speed = 1.5

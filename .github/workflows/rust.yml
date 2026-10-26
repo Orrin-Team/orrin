@@ -177,3 +177,24 @@ jobs:
       # LNK4098. This is a second full compile, and the slowest step in the job.
       - name: Release build
         run: cargo build --workspace --release
+
+  # Scene files must be byte-identical whichever machine saved them (#41), and
+  # the two jobs above are both x86-64. This adds arm64 macOS, which the engine
+  # is also developed on, against the same golden file. Only the format crate runs: it has no GPU or native build
+  # dependencies, so the job costs a small compile rather than a second engine
+  # build.
+  scene-format-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v2-rust"
+
+      - name: Scene format tests
+        run: cargo test -p orrin-registry
