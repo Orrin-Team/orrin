@@ -8,3 +8,4 @@ scene.orrin
 # it here on demand.
 /assets/sponza/
 .DS_Store
+.fprefab

@@ -393,6 +393,42 @@ pub(super) fn write_component(
     apply_component(world, registry, entity, id, value)
 }
 
+/// One component of a live entity in its file form: what [`write_component`]
+/// takes and [`scene_entity`] would write for it.
+pub(super) fn read_component(
+    world: &World,
+    registry: &orrin_registry::Registry,
+    entity: Entity,
+    id: &ComponentId,
+) -> Option<Value> {
+    if *id == PARENT {
+        return parent_ref(world, entity).map(|(_, value)| value);
+    }
+    if *id == MESH || *id == MATERIAL {
+        return asset_refs(world, entity)
+            .into_iter()
+            .find_map(|(component, value)| (component == *id).then_some(value));
+    }
+    if let Some(value) = registry
+        .get(id)
+        .and_then(|vtable| vtable.read(world, entity))
+    {
+        return Some(value);
+    }
+    let parked = |list: &[(ComponentId, Value)]| {
+        list.iter()
+            .find_map(|(component, value)| (component == id).then(|| value.clone()))
+    };
+    world
+        .get::<PendingScripts>(entity)
+        .and_then(|pending| parked(&pending.0))
+        .or_else(|| {
+            world
+                .get::<UnknownComponents>(entity)
+                .and_then(|unknown| parked(&unknown.0))
+        })
+}
+
 /// Take one component, in its file form, off a live entity.
 pub(super) fn remove_component(
     world: &mut World,

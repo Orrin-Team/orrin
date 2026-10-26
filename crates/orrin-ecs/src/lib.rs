@@ -97,6 +97,31 @@ impl EntityAllocator {
         }
     }
 
+    /// Linear in the free list, which is fine for what it is for — bringing
+    /// back what an undo respawns — and why `allocate` does not use it.
+    fn allocate_at(&mut self, index: u32) -> Option<Entity> {
+        if index == 0 {
+            return None;
+        }
+        while self.generations.len() <= index as usize {
+            self.free.push(self.generations.len() as u32);
+            self.generations.push(0);
+            self.alive.push(false);
+        }
+        let i = index as usize;
+        if self.alive[i] {
+            return None;
+        }
+        if let Some(at) = self.free.iter().position(|&free| free == index) {
+            self.free.remove(at);
+        }
+        self.alive[i] = true;
+        Some(Entity {
+            index,
+            generation: self.generations[i],
+        })
+    }
+
     fn deallocate(&mut self, entity: Entity) -> bool {
         if !self.is_alive(entity) {
             return false;
@@ -275,6 +300,18 @@ impl World {
     pub fn spawn(&mut self) -> Entity {
         self.structural_version += 1;
         self.entities.allocate()
+    }
+
+    /// [`spawn`](World::spawn) into the slot `index`, or `None` if that slot is
+    /// live or is slot 0.
+    ///
+    /// Iteration follows slots, so this is how something despawned and brought
+    /// back — an undone delete — lands where it was in that order. The handle
+    /// still differs from the old one by its generation.
+    pub fn spawn_at(&mut self, index: u32) -> Option<Entity> {
+        let entity = self.entities.allocate_at(index)?;
+        self.structural_version += 1;
+        Some(entity)
     }
 
     /// Spawn a new entity and return a builder for attaching components to it in
@@ -845,6 +882,55 @@ mod tests {
     struct Frozen; // a marker / tag component
 
     struct DeltaTime(f32); // a resource
+
+    #[test]
+    fn spawn_at_reclaims_a_freed_slot_under_a_new_generation() {
+        let mut world = World::new();
+        let first = world.spawn();
+        let second = world.spawn();
+        world.despawn(first);
+        world.despawn(second);
+
+        let again = world.spawn_at(first.index()).unwrap();
+        assert_eq!(again.index(), first.index());
+        assert_ne!(again, first, "the old handle stays stale");
+        assert!(!world.is_alive(first));
+        assert!(world.is_alive(again));
+        assert_eq!(
+            world.spawn().index(),
+            second.index(),
+            "the other slot is still free"
+        );
+        assert_ne!(
+            world.spawn().index(),
+            first.index(),
+            "and the taken one is not"
+        );
+    }
+
+    #[test]
+    fn spawn_at_refuses_a_live_slot_and_slot_zero() {
+        let mut world = World::new();
+        let live = world.spawn();
+        assert_eq!(world.spawn_at(live.index()), None);
+        assert_eq!(world.spawn_at(0), None);
+        assert_eq!(world.entities().count(), 1);
+    }
+
+    /// A slot past the end grows the table, and the gap it leaves is handed
+    /// out by later spawns rather than lost or handed out twice.
+    #[test]
+    fn spawn_at_past_the_end_leaves_the_gap_free() {
+        let mut world = World::new();
+        let far = world.spawn_at(4).unwrap();
+        let mut seen: Vec<u32> = (0..4).map(|_| world.spawn().index()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, [1, 2, 3, 5]);
+        assert!(world.is_alive(far));
+        let before = world.structural_version();
+        world.spawn_at(9);
+        assert!(world.structural_version() > before);
+    }
 
     #[test]
     fn insert_get_remove() {

@@ -222,10 +222,31 @@ fn edit(ui: &mut egui::Ui, world: &mut World, registry: &Registry, state: &mut E
         if command(ui, "Select none", "Esc") {
             state.selection.clear();
         }
+        if command(ui, "Frame selection", "F") {
+            state.request_frame();
+        }
     });
     ui.separator();
-    unbuilt(ui, "Undo");
-    unbuilt(ui, "Redo");
+    // Named by what they would do, so the menu answers "undo what?" before
+    // the click rather than after.
+    let undo = state
+        .history
+        .undo_label()
+        .map(|label| format!("Undo {label}"));
+    ui.add_enabled_ui(undo.is_some(), |ui| {
+        if command(ui, undo.as_deref().unwrap_or("Undo"), "Ctrl+Z") {
+            state.request_undo();
+        }
+    });
+    let redo = state
+        .history
+        .redo_label()
+        .map(|label| format!("Redo {label}"));
+    ui.add_enabled_ui(redo.is_some(), |ui| {
+        if command(ui, redo.as_deref().unwrap_or("Redo"), "Ctrl+Shift+Z") {
+            state.request_redo();
+        }
+    });
 }
 
 /// What can be spawned. Shared with the hierarchy's add button, so the two

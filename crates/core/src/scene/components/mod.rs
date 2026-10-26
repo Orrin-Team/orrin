@@ -1,6 +1,7 @@
 mod collider;
 mod light;
 mod local_transform;
+mod locked;
 mod material_handle;
 mod mesh_handle;
 mod name;
@@ -16,6 +17,7 @@ mod world_transform;
 pub use collider::{Collider, ColliderShape};
 pub use light::{AmbientLight, Light, MAX_CONE_ANGLE, MIN_CONE_ANGLE};
 pub use local_transform::LocalTransform;
+pub use locked::Locked;
 pub use material_handle::MaterialHandle;
 pub use mesh_handle::MeshHandle;
 pub use name::Name;

@@ -19,7 +19,7 @@ use orrin_registry::Registry;
 use super::dock::Dock;
 use super::phases::{self, Glass};
 use super::previews::Previews;
-use super::state::{EditorState, SceneRequest};
+use super::state::{EditorState, GizmoMode, SceneRequest};
 use super::theme::ThemeSet;
 use super::widgets;
 
@@ -53,7 +53,18 @@ pub fn draw(
     if let Some(rect) = dock.viewport() {
         viewport::show(ctx, world, state, themes, rect);
         viewport::accept_prefab(ctx, world, state, dock, rect);
+        viewport::hover(ctx, world, state, dock, rect);
+        // Before the click: a click on a handle is not a click on the scene.
+        viewport::gizmo(ctx, world, state, dock, rect);
+        viewport::marquee(ctx, world, state, dock, rect);
+        viewport::select_on_click(ctx, world, state, dock, rect);
     }
+    // A drag ends with the button and a typed edit with the field, so the
+    // gesture they make stays open while either is still held. Read after the
+    // widgets, which are what let go of the focus.
+    let holding = ctx.input(|input| input.pointer.any_down())
+        || ctx.memory(|memory| memory.focused().is_some());
+    state.hold(holding);
 }
 
 /// Every surface above the panels — the viewport's floating controls, menus,
@@ -101,6 +112,26 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
     if ctx.wants_keyboard_input() {
         return;
     }
+    // Redo first: egui matches Ctrl+Z whether or not Shift is also down.
+    let shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    if ctx.input_mut(|input| {
+        input.consume_key(shift, egui::Key::Z)
+            || input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+    }) {
+        state.request_redo();
+    } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+        state.request_undo();
+    }
+    for (key, mode) in [
+        (egui::Key::Num1, GizmoMode::Select),
+        (egui::Key::Num2, GizmoMode::Move),
+        (egui::Key::Num3, GizmoMode::Rotate),
+        (egui::Key::Num4, GizmoMode::Scale),
+    ] {
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
+            state.gizmo_mode = mode;
+        }
+    }
     state.selection.retain_alive(world);
     let selected = !state.selection.is_empty();
     if selected
@@ -112,6 +143,9 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
         && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
         state.selection.clear();
+    }
+    if selected && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F)) {
+        state.request_frame();
     }
 }
 
@@ -520,17 +554,23 @@ mod tests {
         }
 
         fn key(&mut self, key: egui::Key) -> &mut Self {
+            self.key_with(egui::Modifiers::NONE, key)
+        }
+
+        fn key_with(&mut self, modifiers: egui::Modifiers, key: egui::Key) -> &mut Self {
+            self.input.modifiers = modifiers;
             for pressed in [true, false] {
                 self.input.events.push(egui::Event::Key {
                     key,
                     physical_key: None,
                     pressed,
                     repeat: false,
-                    modifiers: Default::default(),
+                    modifiers,
                 });
             }
             self.frames(1);
             self.input.events.clear();
+            self.input.modifiers = egui::Modifiers::NONE;
             self
         }
     }
@@ -737,6 +777,211 @@ mod tests {
         editor.state.apply(&mut editor.world, &editor.registry);
 
         assert!(editor.world.is_alive(entity));
+    }
+
+    /// The live entity called `name`. Undo respawns into new slots, so a
+    /// handle taken before it is no longer the one to look for.
+    fn named(world: &World, name: &str) -> Option<orrin_ecs::Entity> {
+        world
+            .entities()
+            .find(|&entity| world.get::<Name>(entity).is_some_and(|n| n.0 == name))
+    }
+
+    fn delete_by_key(editor: &mut Harness, name: &str) {
+        let entity = editor.spawn(name);
+        editor.state.selection.set(entity);
+        editor.frames(1).key(egui::Key::Delete);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(named(&editor.world, name).is_none());
+    }
+
+    #[test]
+    fn ctrl_z_undoes_and_ctrl_shift_z_or_ctrl_y_redoes() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        delete_by_key(&mut editor, "Ground plane");
+        let mut press = |modifiers, key| {
+            editor.key_with(modifiers, key);
+            editor.state.apply(&mut editor.world, &editor.registry);
+            named(&editor.world, "Ground plane").is_some()
+        };
+        let shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+
+        assert!(press(egui::Modifiers::COMMAND, egui::Key::Z), "undone");
+        assert!(!press(shift, egui::Key::Z), "redone");
+        assert!(
+            press(egui::Modifiers::COMMAND, egui::Key::Z),
+            "undone again"
+        );
+        assert!(
+            !press(egui::Modifiers::COMMAND, egui::Key::Y),
+            "redone again"
+        );
+    }
+
+    /// A text field has an undo of its own, and Ctrl+Z there is that one.
+    #[test]
+    fn ctrl_z_is_left_to_a_field_that_has_focus() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        delete_by_key(&mut editor, "Ground plane");
+        editor
+            .ctx
+            .memory_mut(|memory| memory.request_focus(egui::Id::new("some field")));
+        editor.key_with(egui::Modifiers::COMMAND, egui::Key::Z);
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        assert!(named(&editor.world, "Ground plane").is_none());
+    }
+
+    fn edit_menu(editor: &mut Harness) -> Vec<String> {
+        let Harness {
+            world,
+            registry,
+            state,
+            themes,
+            dock,
+            ctx,
+            input,
+            ..
+        } = editor;
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                menu_bar::menu_body(
+                    menu_bar::Menu::Edit,
+                    ui,
+                    world,
+                    registry,
+                    state,
+                    themes,
+                    dock,
+                );
+            });
+        });
+        painted_text(&output)
+    }
+
+    #[test]
+    fn the_edit_menu_names_what_undo_and_redo_would_do() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        delete_by_key(&mut editor, "Ground plane");
+        let painted = edit_menu(&mut editor);
+        assert!(
+            painted.iter().any(|t| t == "Undo Delete Ground plane"),
+            "{painted:?}"
+        );
+        assert!(painted.iter().any(|t| t == "Redo"), "{painted:?}");
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let painted = edit_menu(&mut editor);
+        assert!(
+            painted.iter().any(|t| t == "Redo Delete Ground plane"),
+            "{painted:?}"
+        );
+    }
+
+    /// The case the pipeline's gestures exist for, driven through the real
+    /// widget: a drag shows on every frame and undoes in one step.
+    #[test]
+    fn dragging_a_transform_field_is_one_undo_step() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let entity = editor.spawn("Cube");
+        editor.state.selection.set(entity);
+        editor.frames(2);
+        let rects = editor.painted_text_rects();
+        let row = rects.iter().find(|(text, _)| text == "Position").unwrap().1;
+        let chip = rects
+            .iter()
+            .find(|(text, rect)| text == "X" && (rect.center().y - row.center().y).abs() < 4.0)
+            .expect("the position row has an X chip")
+            .1
+            .center();
+
+        let frame = |editor: &mut Harness, event: egui::Event| {
+            editor.input.events.push(event);
+            editor.frames(1);
+            editor.input.events.clear();
+            editor.state.apply(&mut editor.world, &editor.registry);
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut editor, egui::Event::PointerMoved(chip));
+        frame(&mut editor, button(chip, true));
+        let mut at = chip;
+        for _ in 0..3 {
+            at += egui::vec2(20.0, 0.0);
+            frame(&mut editor, egui::Event::PointerMoved(at));
+        }
+        let x = |editor: &Harness| {
+            editor
+                .world
+                .get::<LocalTransform>(entity)
+                .unwrap()
+                .translation
+                .x
+        };
+        assert!(x(&editor) > 0.0, "the drag shows while it is held");
+        frame(&mut editor, button(at, false));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(x(&editor), 0.0);
+        assert_eq!(editor.state.history.undo_label(), None, "one step");
+    }
+
+    #[test]
+    fn spawning_a_light_can_be_undone() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor
+            .state
+            .request_spawn(crate::editor::state::SpawnKind::PointLight);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(named(&editor.world, "Point Light").is_some());
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(named(&editor.world, "Point Light").is_none());
+        assert!(editor.state.selection.is_empty());
+    }
+
+    #[test]
+    fn a_reparent_in_the_tree_can_be_undone() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let parent = editor.spawn("Parent");
+        let child = editor.spawn("Child");
+        editor.state.request_reparent(child, Some(parent));
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(editor.world.has::<crate::scene::Parent>(child));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(!editor.world.has::<crate::scene::Parent>(child));
+    }
+
+    #[test]
+    fn adding_and_removing_a_component_can_be_undone() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let entity = editor.spawn("Cube");
+        editor
+            .state
+            .request_add_component(entity, crate::scene::registry::TAG);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor
+            .state
+            .request_remove_component(entity, crate::scene::registry::TRANSFORM);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(editor.world.has::<crate::scene::Tag>(entity));
+        assert!(!editor.world.has::<LocalTransform>(entity));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(editor.world.has::<LocalTransform>(entity));
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(!editor.world.has::<crate::scene::Tag>(entity));
     }
 
     /// Put a one-entity door prefab in the harness's index.
@@ -1075,6 +1320,32 @@ mod tests {
             .request_prefab_action(crate::editor::state::PrefabAction::Unpack, door);
         editor.state.apply(&mut editor.world, &editor.registry);
         assert!(!editor.world.has::<crate::scene::PrefabInstance>(door));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let door = named(&editor.world, "Door").unwrap();
+        assert!(editor.world.has::<crate::scene::PrefabInstance>(door));
+    }
+
+    #[test]
+    fn reverting_an_instance_can_be_undone() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (door, _) = place_door(&mut editor);
+        editor
+            .world
+            .insert(door, crate::scene::Tag::new("entrance"));
+        editor
+            .state
+            .request_prefab_action(crate::editor::state::PrefabAction::Revert, door);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let door = named(&editor.world, "Door").unwrap();
+        assert!(!editor.world.has::<crate::scene::Tag>(door));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let door = named(&editor.world, "Door").unwrap();
+        assert!(editor.world.has::<crate::scene::Tag>(door));
+        assert!(editor.world.has::<crate::scene::PrefabInstance>(door));
     }
 
     #[test]
@@ -1534,6 +1805,742 @@ mod tests {
         );
         assert!(tools.left() - viewport.left() < 20.0);
         assert!(tools.top() - viewport.top() < 20.0);
+    }
+
+    /// A cube the camera sees at the middle of the viewport, measured so it
+    /// can be picked, and where to click to hit it.
+    fn cube_under_the_viewport_centre(editor: &mut Harness) -> (orrin_ecs::Entity, egui::Pos2) {
+        let mut bounds = crate::scene::MeshBounds::default();
+        bounds.insert(
+            crate::scene::MeshHandle(0),
+            crate::geom::Aabb {
+                min: glam::Vec3A::splat(-0.5),
+                max: glam::Vec3A::splat(0.5),
+            },
+        );
+        editor.world.insert_resource(bounds);
+        let mut assets = crate::scene::Assets::new();
+        assets.insert_mesh("cube", crate::scene::MeshHandle(0));
+        editor.world.insert_resource(assets);
+        editor.frames(2);
+        let at = editor.viewport().center();
+        let screen = editor.ctx.screen_rect();
+        let ndc = (at - screen.min) / screen.size() * 2.0 - egui::Vec2::splat(1.0);
+        let camera = *editor.world.resource::<crate::scene::Camera>();
+        let (origin, direction) = crate::editor::pick::ray(&camera, screen.aspect_ratio(), ndc);
+
+        let entity = editor.spawn("Cube");
+        editor.world.insert(entity, crate::scene::MeshHandle(0));
+        editor.world.insert(
+            entity,
+            LocalTransform::new(crate::scene::Transform::from_translation(
+                origin + direction.normalize() * 5.0,
+            )),
+        );
+        crate::scene::propagate_transforms(&mut editor.world);
+        (entity, at)
+    }
+
+    #[test]
+    fn clicking_the_scene_selects_what_is_under_the_pointer() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, at) = cube_under_the_viewport_centre(&mut editor);
+        editor.click(at);
+        assert_eq!(editor.state.selection.entities(), [cube]);
+
+        let empty = editor.viewport().left_bottom() + egui::vec2(40.0, -40.0);
+        editor.click(empty);
+        assert!(
+            editor.state.selection.is_empty(),
+            "empty space selects nothing"
+        );
+    }
+
+    #[test]
+    fn ctrl_clicking_the_scene_adds_to_the_selection() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let other = editor.spawn("Other");
+        let (cube, at) = cube_under_the_viewport_centre(&mut editor);
+        editor.state.selection.set(other);
+        editor.click_with(at, egui::Modifiers::COMMAND);
+        assert_eq!(editor.state.selection.entities(), [other, cube]);
+        editor.click_with(at, egui::Modifiers::COMMAND);
+        assert_eq!(editor.state.selection.entities(), [other]);
+    }
+
+    /// Where a point along the gizmo's X shaft is on screen: `fraction` of the
+    /// way from the entity's origin to the tip.
+    fn x_shaft(editor: &Harness, entity: orrin_ecs::Entity, fraction: f32) -> egui::Pos2 {
+        let origin = editor
+            .world
+            .get::<crate::scene::WorldTransform>(entity)
+            .unwrap()
+            .translation();
+        x_shaft_from(editor, origin, fraction)
+    }
+
+    /// [`x_shaft`] for a gizmo standing at `origin`.
+    fn x_shaft_from(editor: &Harness, origin: glam::Vec3, fraction: f32) -> egui::Pos2 {
+        let camera = *editor.world.resource::<crate::scene::Camera>();
+        let screen = editor.ctx.screen_rect();
+        let view_proj = camera.view_projection(screen.aspect_ratio());
+        let project = |point: glam::Vec3| {
+            let ndc = view_proj.project_point3(point);
+            screen.min
+                + egui::vec2(
+                    (ndc.x * 0.5 + 0.5) * screen.width(),
+                    (ndc.y * 0.5 + 0.5) * screen.height(),
+                )
+        };
+        let start = project(origin);
+        let toward = (project(origin + glam::Vec3::X * 0.01) - start).normalized();
+        start + toward * crate::editor::gizmo::LENGTH * fraction
+    }
+
+    fn pointer(editor: &mut Harness, event: egui::Event) {
+        editor.input.events.push(event);
+        editor.frames(1);
+        editor.input.events.clear();
+        editor.state.apply(&mut editor.world, &editor.registry);
+    }
+
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    /// The gizmo's reason to exist, through the real pointer: a drag on the X
+    /// shaft moves the selection along X, shows on every frame, and undoes in
+    /// one step.
+    #[test]
+    fn dragging_the_move_handle_moves_the_selection_in_one_undo_step() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        let before = *editor.world.get::<LocalTransform>(cube).unwrap();
+        editor.state.selection.set(cube);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Move;
+        editor.frames(2);
+
+        let grab = x_shaft(&editor, cube, 0.5);
+        pointer(&mut editor, egui::Event::PointerMoved(grab));
+        pointer(&mut editor, button(grab, true));
+        let mut at = grab;
+        for _ in 0..3 {
+            at += (grab - x_shaft(&editor, cube, 0.0)).normalized() * 20.0;
+            pointer(&mut editor, egui::Event::PointerMoved(at));
+        }
+        let during = editor
+            .world
+            .get::<LocalTransform>(cube)
+            .unwrap()
+            .translation;
+        assert!(
+            during.x > before.translation.x + 0.1,
+            "{during} from {}",
+            before.translation
+        );
+        assert!((during.y - before.translation.y).abs() < 1e-4);
+        assert!((during.z - before.translation.z).abs() < 1e-4);
+        pointer(&mut editor, button(at, false));
+        assert_eq!(editor.state.selection.entities(), [cube]);
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let after = editor
+            .world
+            .get::<LocalTransform>(cube)
+            .unwrap()
+            .translation;
+        assert!((after - before.translation).length() < 1e-5, "{after}");
+        assert_eq!(editor.state.history.undo_label(), None, "one step");
+    }
+
+    #[test]
+    fn dragging_a_scale_tip_scales_the_selection_in_one_undo_step() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        editor.state.selection.set(cube);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Scale;
+        editor.frames(2);
+
+        let grab = x_shaft(&editor, cube, 0.95);
+        let outward = (grab - x_shaft(&editor, cube, 0.0)).normalized();
+        pointer(&mut editor, egui::Event::PointerMoved(grab));
+        pointer(&mut editor, button(grab, true));
+        let mut at = grab;
+        for _ in 0..3 {
+            at += outward * 20.0;
+            pointer(&mut editor, egui::Event::PointerMoved(at));
+        }
+        pointer(&mut editor, button(at, false));
+        let scale = editor.world.get::<LocalTransform>(cube).unwrap().scale;
+        assert!(scale.x > 1.2, "{scale}");
+        assert!(
+            (scale.y - 1.0).abs() < 1e-5 && (scale.z - 1.0).abs() < 1e-5,
+            "{scale}"
+        );
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let scale = editor.world.get::<LocalTransform>(cube).unwrap().scale;
+        assert!((scale - glam::Vec3::ONE).length() < 1e-5, "{scale}");
+        assert_eq!(editor.state.history.undo_label(), None, "one step");
+    }
+
+    /// Drag the X shaft of a gizmo standing at `origin` by three steps.
+    fn drag_x_shaft_from(editor: &mut Harness, origin: glam::Vec3) {
+        let grab = x_shaft_from(editor, origin, 0.5);
+        let outward = (grab - x_shaft_from(editor, origin, 0.0)).normalized();
+        pointer(editor, egui::Event::PointerMoved(grab));
+        pointer(editor, button(grab, true));
+        let mut at = grab;
+        for _ in 0..3 {
+            at += outward * 20.0;
+            pointer(editor, egui::Event::PointerMoved(at));
+        }
+        pointer(editor, button(at, false));
+    }
+
+    fn translation(editor: &Harness, entity: orrin_ecs::Entity) -> glam::Vec3 {
+        editor
+            .world
+            .get::<LocalTransform>(entity)
+            .unwrap()
+            .translation
+    }
+
+    /// With two selected the gizmo stands between them, and moves both.
+    #[test]
+    fn dragging_with_two_selected_moves_both_in_one_undo_step() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (a, _) = cube_under_the_viewport_centre(&mut editor);
+        let b = editor.spawn("Other");
+        editor.world.insert(b, crate::scene::MeshHandle(0));
+        let beside = translation(&editor, a) + glam::Vec3::new(0.0, 0.6, 0.0);
+        editor.world.insert(
+            b,
+            LocalTransform::new(crate::scene::Transform::from_translation(beside)),
+        );
+        crate::scene::propagate_transforms(&mut editor.world);
+        let (a0, b0) = (translation(&editor, a), translation(&editor, b));
+        editor.state.selection.set(a);
+        editor.state.selection.toggle(b);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Move;
+        editor.frames(2);
+
+        drag_x_shaft_from(&mut editor, (a0 + b0) * 0.5);
+        let (da, db) = (translation(&editor, a) - a0, translation(&editor, b) - b0);
+        assert!(da.x > 0.1, "{da}");
+        assert!((da - db).length() < 1e-4, "{da} vs {db}");
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!((translation(&editor, a) - a0).length() < 1e-5);
+        assert!((translation(&editor, b) - b0).length() < 1e-5);
+        assert_eq!(editor.state.history.undo_label(), None, "one step");
+    }
+
+    /// A child selected with its parent already moves with it, through the
+    /// hierarchy. Moving it as well would move it twice.
+    #[test]
+    fn a_child_selected_with_its_parent_moves_only_through_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (parent, _) = cube_under_the_viewport_centre(&mut editor);
+        let child = editor.spawn("Child");
+        crate::scene::reparent(&mut editor.world, child, Some(parent), false).unwrap();
+        crate::scene::propagate_transforms(&mut editor.world);
+        let (parent0, child0) = (translation(&editor, parent), translation(&editor, child));
+        editor.state.selection.set(child);
+        editor.state.selection.toggle(parent);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Move;
+        editor.frames(2);
+
+        drag_x_shaft_from(&mut editor, parent0);
+        assert!(translation(&editor, parent).x > parent0.x + 0.1);
+        assert!((translation(&editor, child) - child0).length() < 1e-6);
+    }
+
+    /// A light where the viewport's middle looks, and where to click on it.
+    fn light_under_the_viewport_centre(editor: &mut Harness) -> (orrin_ecs::Entity, egui::Pos2) {
+        editor.frames(2);
+        let at = editor.viewport().center();
+        let screen = editor.ctx.screen_rect();
+        let ndc = (at - screen.min) / screen.size() * 2.0 - egui::Vec2::splat(1.0);
+        let camera = *editor.world.resource::<crate::scene::Camera>();
+        let (origin, direction) = crate::editor::pick::ray(&camera, screen.aspect_ratio(), ndc);
+        let lamp = editor.spawn("Lamp");
+        editor.world.insert(lamp, crate::scene::Light::default());
+        editor.world.insert(
+            lamp,
+            LocalTransform::new(crate::scene::Transform::from_translation(
+                origin + direction.normalize() * 5.0,
+            )),
+        );
+        crate::scene::propagate_transforms(&mut editor.world);
+        (lamp, at)
+    }
+
+    #[test]
+    fn clicking_a_light_s_marker_selects_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (lamp, at) = light_under_the_viewport_centre(&mut editor);
+        editor.click(at + egui::vec2(3.0, 0.0));
+        assert_eq!(editor.state.selection.entities(), [lamp]);
+    }
+
+    /// Markers are how a light is found in the scene at all, so they are
+    /// there whether or not anything is selected.
+    #[test]
+    fn markers_are_drawn_with_nothing_selected() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        light_under_the_viewport_centre(&mut editor);
+        editor.state.selection.clear();
+        editor.frames(1);
+        assert!(!editor.state.gizmo_strokes.is_empty());
+    }
+
+    /// What the outline pass draws: every selected mesh and every mesh under a
+    /// selected entity, in every tool — Select included, where there are no
+    /// handles to say what is selected.
+    #[test]
+    fn a_selection_and_what_is_under_it_are_outlined() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        let lid = editor.spawn("Lid");
+        editor.world.insert(lid, crate::scene::MeshHandle(0));
+        crate::scene::reparent(&mut editor.world, lid, Some(cube), false).unwrap();
+        crate::scene::propagate_transforms(&mut editor.world);
+        editor.frames(1);
+        assert!(editor.state.outline.is_empty(), "nothing selected");
+
+        editor.state.selection.set(cube);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Select;
+        editor.frames(1);
+        let outlined: Vec<bool> = editor
+            .state
+            .outline
+            .iter()
+            .map(|item| item.selected)
+            .collect();
+        assert_eq!(outlined, [true, true], "the cube and its lid");
+    }
+
+    /// The hovered mesh is outlined too, as hovered — unless it is selected,
+    /// which says more.
+    #[test]
+    fn the_hovered_mesh_is_outlined_as_hovered() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, at) = cube_under_the_viewport_centre(&mut editor);
+        editor.hover(at).frames(1);
+        let outlined: Vec<bool> = editor
+            .state
+            .outline
+            .iter()
+            .map(|item| item.selected)
+            .collect();
+        assert_eq!(outlined, [false]);
+
+        editor.state.selection.set(cube);
+        editor.hover(at).frames(1);
+        let outlined: Vec<bool> = editor
+            .state
+            .outline
+            .iter()
+            .map(|item| item.selected)
+            .collect();
+        assert_eq!(outlined, [true], "once, as selected");
+    }
+
+    /// A click on a handle is the start of a drag that went nowhere, not a
+    /// click on whatever is behind it — here, empty space, which would clear
+    /// the selection.
+    #[test]
+    fn a_click_on_a_handle_keeps_the_selection() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        editor.state.selection.set(cube);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Move;
+        editor.frames(2);
+
+        let tip = x_shaft(&editor, cube, 0.9);
+        pointer(&mut editor, egui::Event::PointerMoved(tip));
+        editor.click(tip);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(editor.state.selection.entities(), [cube]);
+        assert_eq!(editor.state.history.undo_label(), None, "nothing moved");
+    }
+
+    /// F turns the camera on the selection from where it already looks, and
+    /// backs off until the selection fits.
+    #[test]
+    fn f_frames_the_selection() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        let away = glam::Vec3::new(20.0, 3.0, -15.0);
+        editor.world.insert(
+            cube,
+            LocalTransform::new(crate::scene::Transform::from_translation(away)),
+        );
+        crate::scene::propagate_transforms(&mut editor.world);
+        let before = *editor.world.resource::<crate::scene::Camera>();
+        let heading = (before.target - before.position).normalize();
+        editor.state.selection.set(cube);
+        editor.frames(1).key(egui::Key::F);
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        let after = *editor.world.resource::<crate::scene::Camera>();
+        assert!((after.target - away).length() < 1e-4, "{}", after.target);
+        let now = (after.target - after.position).normalize();
+        assert!(now.dot(heading) > 0.9999, "the heading is kept");
+        // A unit cube's bounding sphere, inside the vertical field of view.
+        let radius = glam::Vec3::splat(0.5).length();
+        let distance = (after.target - after.position).length();
+        assert!(distance * (after.fov_y * 0.5).sin() >= radius, "{distance}");
+        assert!(distance < 10.0, "near enough to fill the view: {distance}");
+        assert!(editor.state.take_camera_moved());
+        assert!(!editor.state.take_camera_moved(), "drained");
+    }
+
+    #[test]
+    fn f_with_nothing_selected_leaves_the_camera_alone() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let before = *editor.world.resource::<crate::scene::Camera>();
+        editor.frames(1).key(egui::Key::F);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let after = *editor.world.resource::<crate::scene::Camera>();
+        assert_eq!(after.position, before.position);
+        assert!(!editor.state.take_camera_moved());
+    }
+
+    /// Where an icon was painted inside `within`, if it was.
+    fn icon_in(
+        editor: &Harness,
+        icon: crate::editor::icons::Icon,
+        within: egui::Rect,
+    ) -> Option<egui::Pos2> {
+        let glyph = icon.glyph();
+        editor
+            .painted_icons()
+            .into_iter()
+            .find(|(g, rect, _)| *g == glyph && within.contains(rect.center()))
+            .map(|(_, rect, _)| rect.center())
+    }
+
+    fn row_band(editor: &Harness, name: &str) -> egui::Rect {
+        let at = row_of(editor, name);
+        let tree = editor.tab(Tab::Hierarchy);
+        egui::Rect::from_x_y_ranges(tree.x_range(), (at.y - 8.0)..=(at.y + 8.0))
+    }
+
+    /// The lock sits on the row, shown while the pointer is there, and is an
+    /// edit like any other: undone with Ctrl+Z.
+    #[test]
+    fn a_row_s_lock_locks_its_entity_undoably() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let crate_ = editor.spawn("Crate");
+        editor.frames(2);
+        let band = row_band(&editor, "Crate");
+        editor.hover(band.center()).frames(1);
+        let lock = icon_in(&editor, crate::editor::icons::lock_open(), band)
+            .expect("an open lock on the hovered row");
+        editor.click(lock);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(editor.world.has::<crate::scene::Locked>(crate_));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(!editor.world.has::<crate::scene::Locked>(crate_));
+    }
+
+    /// A locked row says so without being hovered, and its children say they
+    /// are locked through it.
+    #[test]
+    fn a_locked_row_and_its_children_show_the_lock() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let crate_ = editor.spawn("Crate");
+        let lid = editor.spawn("Lid");
+        crate::scene::reparent(&mut editor.world, lid, Some(crate_), false).unwrap();
+        editor.world.insert(crate_, crate::scene::Locked);
+        editor.frames(2);
+        for name in ["Crate", "Lid"] {
+            let band = row_band(&editor, name);
+            assert!(
+                icon_in(&editor, crate::editor::icons::lock(), band).is_some(),
+                "{name} shows no lock"
+            );
+        }
+    }
+
+    #[test]
+    fn the_entity_under_the_pointer_is_hovered_unless_locked() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, at) = cube_under_the_viewport_centre(&mut editor);
+        editor.hover(at).frames(1);
+        assert_eq!(editor.state.hovered, Some(cube));
+
+        let empty = editor.viewport().left_bottom() + egui::vec2(40.0, -40.0);
+        editor.hover(empty).frames(1);
+        assert_eq!(editor.state.hovered, None);
+
+        editor.world.insert(cube, crate::scene::Locked);
+        editor.hover(at).frames(1);
+        assert_eq!(editor.state.hovered, None);
+    }
+
+    /// A handle is in front of everything: over one, nothing behind it is
+    /// hovered.
+    #[test]
+    fn nothing_is_hovered_through_a_handle() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        editor.state.selection.set(cube);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Move;
+        editor.frames(2);
+        let middle = x_shaft(&editor, cube, 0.0);
+        editor.hover(middle).frames(2);
+        assert_eq!(
+            editor.state.gizmo_hot,
+            Some(crate::editor::gizmo::Handle::Centre)
+        );
+        assert_eq!(editor.state.hovered, None);
+    }
+
+    /// Three cubes: two in the middle of the viewport, one well to the left.
+    fn three_cubes(editor: &mut Harness) -> [orrin_ecs::Entity; 3] {
+        let (a, _) = cube_under_the_viewport_centre(editor);
+        let centre = translation(editor, a);
+        let mut beside = |name: &str, offset: glam::Vec3| {
+            let entity = editor.spawn(name);
+            editor.world.insert(entity, crate::scene::MeshHandle(0));
+            editor.world.insert(
+                entity,
+                LocalTransform::new(crate::scene::Transform::from_translation(centre + offset)),
+            );
+            entity
+        };
+        let b = beside("Near", glam::Vec3::new(0.0, 0.6, 0.0));
+        let c = beside("Far", glam::Vec3::new(-3.5, 0.0, 0.0));
+        crate::scene::propagate_transforms(&mut editor.world);
+        editor.frames(1);
+        [a, b, c]
+    }
+
+    /// Press at `from`, drag to `to` in steps, let go — with `modifiers` held.
+    fn drag_rectangle(
+        editor: &mut Harness,
+        from: egui::Pos2,
+        to: egui::Pos2,
+        modifiers: egui::Modifiers,
+    ) {
+        editor.input.modifiers = modifiers;
+        let press = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        };
+        pointer(editor, egui::Event::PointerMoved(from));
+        pointer(editor, press(from, true));
+        for step in 1..=4 {
+            pointer(
+                editor,
+                egui::Event::PointerMoved(from + (to - from) * (step as f32 / 4.0)),
+            );
+        }
+        pointer(editor, press(to, false));
+        editor.input.modifiers = egui::Modifiers::NONE;
+    }
+
+    #[test]
+    fn dragging_on_the_scene_selects_what_the_rectangle_holds() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let [a, b, c] = three_cubes(&mut editor);
+        editor.state.selection.set(c);
+        let middle = editor.viewport().center();
+        let corner = egui::vec2(150.0, 150.0);
+        drag_rectangle(
+            &mut editor,
+            middle - corner,
+            middle + corner,
+            egui::Modifiers::NONE,
+        );
+
+        let mut selected = editor.state.selection.entities().to_vec();
+        selected.sort_by_key(|e| e.index());
+        assert_eq!(selected, [a, b]);
+    }
+
+    #[test]
+    fn a_ctrl_drag_adds_and_a_lock_keeps_out() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let [a, b, c] = three_cubes(&mut editor);
+        editor.world.insert(b, crate::scene::Locked);
+        editor.state.selection.set(c);
+        let middle = editor.viewport().center();
+        let corner = egui::vec2(150.0, 150.0);
+        drag_rectangle(
+            &mut editor,
+            middle - corner,
+            middle + corner,
+            egui::Modifiers::COMMAND,
+        );
+
+        let mut selected = editor.state.selection.entities().to_vec();
+        selected.sort_by_key(|e| e.index());
+        assert_eq!(selected, [a, c]);
+    }
+
+    /// The rectangle is drawn while it is being dragged out, and gone after.
+    #[test]
+    fn the_rectangle_shows_while_it_is_drawn() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        three_cubes(&mut editor);
+        let middle = editor.viewport().center();
+        let from = middle - egui::vec2(150.0, 150.0);
+        pointer(&mut editor, egui::Event::PointerMoved(from));
+        pointer(&mut editor, button(from, true));
+        pointer(
+            &mut editor,
+            egui::Event::PointerMoved(middle + egui::vec2(150.0, 150.0)),
+        );
+        let drawn = |editor: &Harness| {
+            editor.painted_fills().iter().any(|(rect, _)| {
+                (rect.width() - 300.0).abs() < 2.0 && (rect.height() - 300.0).abs() < 2.0
+            })
+        };
+        assert!(drawn(&editor), "no rectangle while dragging");
+        pointer(
+            &mut editor,
+            button(middle + egui::vec2(150.0, 150.0), false),
+        );
+        assert!(!drawn(&editor), "the rectangle outlived the drag");
+    }
+
+    /// Selected, a light shows how far it reaches; unselected it is only its
+    /// marker, so a scene of lights is not a scene of spheres.
+    #[test]
+    fn a_selected_light_shows_its_range() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (lamp, _) = light_under_the_viewport_centre(&mut editor);
+        editor.world.insert(
+            lamp,
+            crate::scene::Light::point(glam::Vec3::ONE, 800.0, 2.0),
+        );
+        editor.frames(1);
+        let resting = editor.state.gizmo_strokes.len();
+        editor.state.selection.set(lamp);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Select;
+        editor.frames(1);
+        assert!(
+            editor.state.gizmo_strokes.len() > resting + 6 * 3 * 32,
+            "{} after, {resting} before",
+            editor.state.gizmo_strokes.len()
+        );
+    }
+
+    #[test]
+    fn a_locked_mesh_cannot_be_clicked_in_the_scene() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, at) = cube_under_the_viewport_centre(&mut editor);
+        editor.world.insert(cube, crate::scene::Locked);
+        editor.click(at);
+        assert!(editor.state.selection.is_empty());
+    }
+
+    /// Picking the tool is a per-second interaction, so it has keys — numbers,
+    /// because the fly camera owns the letters.
+    #[test]
+    fn the_number_keys_pick_the_tool_unless_a_field_has_focus() {
+        use crate::editor::state::GizmoMode;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(1);
+        for (key, mode) in [
+            (egui::Key::Num2, GizmoMode::Move),
+            (egui::Key::Num3, GizmoMode::Rotate),
+            (egui::Key::Num4, GizmoMode::Scale),
+            (egui::Key::Num1, GizmoMode::Select),
+        ] {
+            editor.key(key);
+            assert!(editor.state.gizmo_mode == mode, "{key:?}");
+        }
+
+        editor
+            .ctx
+            .memory_mut(|memory| memory.request_focus(egui::Id::new("some field")));
+        editor.key(egui::Key::Num3);
+        assert!(editor.state.gizmo_mode == GizmoMode::Select);
+    }
+
+    /// Each tool snaps by its own increment, and holding Ctrl snaps a drag
+    /// whether or not the toggle is on.
+    #[test]
+    fn the_snap_step_follows_the_tool_and_ctrl_snaps_without_the_toggle() {
+        use crate::editor::state::{GizmoMode, MOVE_SNAP, ROTATE_SNAP, SCALE_SNAP};
+        let mut state = EditorState::default();
+        state.gizmo_mode = GizmoMode::Move;
+        assert_eq!(state.snap_step(false), None);
+        assert_eq!(state.snap_step(true), Some(MOVE_SNAP));
+        state.snap = true;
+        assert_eq!(state.snap_step(false), Some(MOVE_SNAP));
+        state.gizmo_mode = GizmoMode::Rotate;
+        assert_eq!(state.snap_step(false), Some(ROTATE_SNAP));
+        state.gizmo_mode = GizmoMode::Scale;
+        assert_eq!(state.snap_step(false), Some(SCALE_SNAP));
+        state.gizmo_mode = GizmoMode::Select;
+        assert_eq!(state.snap_step(true), None);
+    }
+
+    #[test]
+    fn the_snap_steps_are_the_user_s_to_set() {
+        use crate::editor::state::GizmoMode;
+        let mut state = EditorState::default();
+        state.snap = true;
+        state.snap_steps.translate = 0.5;
+        state.snap_steps.rotate = 5.0;
+        state.gizmo_mode = GizmoMode::Move;
+        assert_eq!(state.snap_step(false), Some(0.5));
+        state.gizmo_mode = GizmoMode::Rotate;
+        assert_eq!(state.snap_step(false), Some(5.0));
+    }
+
+    /// The chevron beside the snap button opens the steps for every tool.
+    #[test]
+    fn the_snap_steps_are_set_from_the_bar() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let tools = editor.area("viewport_tools").expect("toolbar drawn");
+        let chevron = crate::editor::icons::chevron_down().glyph();
+        let at = editor
+            .painted_icons()
+            .into_iter()
+            .find(|(glyph, rect, _)| *glyph == chevron && tools.contains(rect.center()))
+            .expect("a chevron on the toolbar")
+            .1
+            .center();
+        assert!(!editor.painted_contains("Rotate"));
+        editor.click(at);
+        editor.frames(1);
+        for row in ["Move", "Rotate", "Scale"] {
+            assert!(editor.painted_contains(row), "no {row} row");
+        }
+    }
+
+    /// The snap button says the increment the current tool would use.
+    #[test]
+    fn the_snap_button_shows_the_current_tools_increment() {
+        use crate::editor::state::GizmoMode;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.state.snap = true;
+        editor.state.gizmo_mode = GizmoMode::Rotate;
+        editor.frames(2);
+        assert!(editor.painted_contains("15°"));
+        editor.state.gizmo_mode = GizmoMode::Move;
+        editor.frames(1);
+        assert!(editor.painted_contains("0.25"));
     }
 
     /// A section bar is a band across the panel, square at its ends: rounded,

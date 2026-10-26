@@ -4,10 +4,12 @@
 //! phases `phases` cuts it into (see `gfx/vulkan/overlay.rs`).
 
 mod dock;
+mod gizmo;
 mod icons;
 mod kind;
 mod panels;
 mod phases;
+mod pick;
 mod prefs;
 mod previews;
 mod selection;
@@ -90,6 +92,10 @@ impl Editor {
         if let Some(name) = &prefs.theme {
             themes.select(name);
         }
+        let mut state = EditorState::new(project);
+        if let Some(steps) = prefs.snap {
+            state.snap_steps = steps;
+        }
         icons::install(&ctx);
         theme::install_fonts(&ctx);
         theme::apply(&ctx, themes.active());
@@ -98,7 +104,7 @@ impl Editor {
             ctx,
             input,
             surface,
-            state: EditorState::new(project),
+            state,
             themes,
             dock: Dock::from_saved(prefs.layout.take()),
             prefs,
@@ -152,6 +158,14 @@ impl Editor {
             dock.activate(dock::Tab::Assets);
         }
 
+        // Kept once the pointer lets go, rather than on every frame a step is
+        // dragged through.
+        let steps = state.snap_steps;
+        if prefs.snap.unwrap_or_default() != steps && !ctx.input(|input| input.pointer.any_down()) {
+            prefs.snap = Some(steps);
+            prefs_file.save(prefs);
+        }
+
         // Restyling mid-frame would leave the panels already drawn on the old
         // palette, so a pick takes effect on the next one.
         if let Some(name) = state.take_theme_request()
@@ -196,6 +210,12 @@ impl Editor {
         self.prefs_file.save(&self.prefs);
     }
 
+    /// Whether the editor moved the camera since the last call — see
+    /// `EditorState::take_camera_moved`.
+    pub fn take_camera_moved(&mut self) -> bool {
+        self.state.take_camera_moved()
+    }
+
     /// Whether the user asked for a script reload since the last call. Drained
     /// by the app at the start of the script phase — see
     /// `EditorState::script_reload_request`.
@@ -215,6 +235,10 @@ impl Editor {
 
         let ppp = output.pixels_per_point;
         let frame = &mut self.frame;
+        std::mem::swap(&mut frame.gizmo, &mut self.state.gizmo_strokes);
+        self.state.gizmo_strokes.clear();
+        std::mem::swap(&mut frame.outline, &mut self.state.outline);
+        self.state.outline.clear();
         frame.pixels_per_point = ppp;
         frame.textures.append(output.textures_delta);
         frame

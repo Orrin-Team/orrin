@@ -8,6 +8,7 @@ mod debug;
 mod decal;
 mod diagnostics;
 mod dof;
+pub mod edit;
 pub mod entities;
 mod environment;
 mod fog;
@@ -38,9 +39,9 @@ pub use camera::Camera;
 #[cfg(feature = "scripting")]
 pub use components::ScriptComponent;
 pub use components::{
-    AmbientLight, Collider, ColliderShape, Light, LocalTransform, MAX_CONE_ANGLE, MIN_CONE_ANGLE,
-    MaterialHandle, MeshHandle, Name, Parent, PendingScripts, Spin, Tag, UnknownComponents,
-    WorldTransform,
+    AmbientLight, Collider, ColliderShape, Light, LocalTransform, Locked, MAX_CONE_ANGLE,
+    MIN_CONE_ANGLE, MaterialHandle, MeshHandle, Name, Parent, PendingScripts, Spin, Tag,
+    UnknownComponents, WorldTransform,
 };
 pub use contact_shadows::ContactShadowSettings;
 pub use culling::Culling;

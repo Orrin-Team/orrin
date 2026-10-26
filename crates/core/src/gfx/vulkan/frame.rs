@@ -28,6 +28,7 @@ use super::hdr::{HDR_FORMAT, HDR_WIDE_FORMAT};
 use super::motion_blur::TILE_SHIFT;
 use super::occlusion::{OCCLUSION_FORMAT, OCCLUSION_LEVELS};
 use super::oit::{ACCUM_FORMAT, REVEAL_FORMAT};
+use super::outline::OUTLINE_MASK_FORMAT;
 use super::prepass::{MATERIAL_FORMAT, NORMAL_FORMAT, VELOCITY_FORMAT};
 use super::refraction::{ACCUM_FORMAT as REFRACTION_ACCUM_FORMAT, SCENE_LEVELS};
 use super::ssao::AO_FORMAT;
@@ -272,6 +273,12 @@ pub enum PassBody {
     /// Writes up-chain level `n`, reading the coarser level and down-chain `n`.
     BloomUpsample(u32),
     Tonemap,
+    /// The selected and hovered meshes, flat, into the outline's mask.
+    OutlineMask,
+    /// The outline round the mask's shapes, over the tonemapped frame.
+    Outline,
+    /// The editor's transform handles, over the tonemapped frame.
+    Gizmo,
     Overlay,
     ShadowCascade(u32),
     /// Every point and spot light's faces, in one pass over one atlas. A tile is
@@ -334,6 +341,9 @@ pub struct FrameIds {
     /// struct, like the contact-shadow mask: one pass writes it and the forward
     /// pass reads it.
     pub shadow_atlas: Option<ResourceId>,
+    /// Which pixels the selection outline is drawn around: red where a selected
+    /// mesh covers, green where the hovered one does. With the editor only.
+    pub outline_mask: Option<ResourceId>,
 }
 
 /// The two chains bloom needs, each level a separate image.
@@ -1713,7 +1723,35 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .build();
     record(id, PassBody::Tonemap, &mut bodies);
 
+    let outline_mask = config.overlay.then(|| {
+        // Its own target rather than the depth or stencil of the scene: the
+        // outline is the editor's, drawn after the frame is finished, and the
+        // frame's targets are resolved and gone by then. See `vulkan::outline`.
+        let mask = builder.create_image("outline_mask", ImageDesc::new(OUTLINE_MASK_FORMAT));
+        let id = builder
+            .pass("outline_mask", PassKind::Inline)
+            .access(mask, Access::ColorAttachment)
+            .build();
+        record(id, PassBody::OutlineMask, &mut bodies);
+        let id = builder
+            .pass("outline", PassKind::Inline)
+            .access(mask, Access::Sampled)
+            .access(swapchain_color, Access::ColorAttachment)
+            .build();
+        record(id, PassBody::Outline, &mut bodies);
+        mask
+    });
+
     if config.overlay {
+        // Its own node, after the tonemap: see `vulkan::gizmo` for why not
+        // lines in the forward pass. Ordered before the overlay by
+        // registration, the two being writers of the same image.
+        let id = builder
+            .pass("gizmo", PassKind::Inline)
+            .access(swapchain_color, Access::ColorAttachment)
+            .build();
+        record(id, PassBody::Gizmo, &mut bodies);
+
         let id = builder
             .pass("overlay", PassKind::Raw)
             .access(swapchain_color, Access::ColorAttachment)
@@ -1747,6 +1785,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             motion_blur,
             shadows,
             shadow_atlas,
+            outline_mask,
         },
         bodies,
     })

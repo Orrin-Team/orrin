@@ -643,12 +643,14 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
     }
 
     let mut has_sun = false;
-    world.query::<(&LocalTransform, &Light)>().for_each(
+    // World, not local: a light in a group lights from where the group puts
+    // it. Callers propagate first, as they do for the geometry.
+    world.query::<(&WorldTransform, &Light)>().for_each(
         |_entity, (transform, light)| match *light {
             Light::Directional { color, lux } => {
                 // The shader supports one directional light, so the first wins.
                 if !has_sun {
-                    let direction = (transform.rotation * Vec3::NEG_Z).normalize_or_zero();
+                    let direction = transform.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
                     out.sun.direction = direction;
                     out.sun.color = color;
                     // Straight through: illuminance is already what a surface
@@ -667,7 +669,7 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
             } => {
                 if out.point_lights.len() < MAX_POINT_LIGHTS {
                     out.point_lights.push(PointLight {
-                        position: transform.translation,
+                        position: transform.translation(),
                         color,
                         candela: Light::point_candela(lumens),
                         range,
@@ -692,8 +694,8 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
                     let outer = outer_angle.clamp(MIN_CONE_ANGLE, MAX_CONE_ANGLE);
                     let inner = inner_angle.clamp(0.0, outer);
                     out.spot_lights.push(SpotLight {
-                        position: transform.translation,
-                        direction: (transform.rotation * Vec3::NEG_Z).normalize_or_zero(),
+                        position: transform.translation(),
+                        direction: transform.transform_vector3(Vec3::NEG_Z).normalize_or_zero(),
                         color,
                         // The *clamped* outer angle, so the solid angle the power
                         // is spread over is the one the shader's falloff then
@@ -712,10 +714,12 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameGeometry, extract_decals, extract_geometry};
+    use super::{FrameGeometry, extract_decals, extract_geometry, extract_lighting};
+    use crate::gfx::SceneLighting;
     use crate::gfx::punctual::ShadowAtlas;
     use crate::gfx::shadows::CascadeSet;
     use crate::gfx::{DecalInstance, MAX_DECALS, RenderItem};
+    use crate::scene::Light;
     use crate::scene::propagate_transforms;
     use crate::scene::{
         Camera, CpuMesh, Culling, Decal, DecalSettings, LocalTransform, MeshBounds, MeshHandle,
@@ -1191,6 +1195,93 @@ mod tests {
         spawn(&mut world, Vec3::new(0.0, 0.0, 400.0), CUBE);
 
         assert_eq!(extract(&mut world).len(), 1);
+    }
+
+    /// A light under a parent: the parent moved, turned or scaled, with the
+    /// light at `local` beneath it, propagated as the frame propagates.
+    fn parented_light(parent: Transform, local: Transform, light: Light) -> World {
+        let mut world = World::new();
+        let holder = world.spawn();
+        world.insert(holder, LocalTransform::new(parent));
+        let lamp = world.spawn();
+        world.insert(lamp, LocalTransform::new(local));
+        world.insert(lamp, light);
+        crate::scene::reparent(&mut world, lamp, Some(holder), false).unwrap();
+        propagate_transforms(&mut world);
+        world
+    }
+
+    fn close(a: Vec3, b: Vec3) -> bool {
+        (a - b).length() < 1e-4
+    }
+
+    /// A lamp in a moved group lights from where it stands in the world, not
+    /// from its offset inside the group. Its range is its own: a light's reach
+    /// is authored in metres, not in its parent's units.
+    #[test]
+    fn a_parented_point_light_lights_from_where_it_stands() {
+        let parent = Transform {
+            translation: Vec3::new(10.0, 0.0, 0.0),
+            scale: Vec3::splat(2.0),
+            ..Transform::default()
+        };
+        let world = parented_light(
+            parent,
+            Transform::from_translation(Vec3::new(0.0, 2.0, 0.0)),
+            Light::point(Vec3::ONE, 800.0, 5.0),
+        );
+        let mut lighting = SceneLighting::default();
+        extract_lighting(&world, &mut lighting);
+        let lamp = &lighting.point_lights[0];
+        assert!(
+            close(lamp.position, Vec3::new(10.0, 4.0, 0.0)),
+            "{}",
+            lamp.position
+        );
+        assert_eq!(lamp.range, 5.0);
+    }
+
+    /// A spot shines along its forward as the hierarchy turns it.
+    #[test]
+    fn a_spot_under_a_turned_parent_shines_where_it_is_turned() {
+        let parent = Transform {
+            rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            ..Transform::default()
+        };
+        let world = parented_light(
+            parent,
+            Transform::from_translation(Vec3::new(0.0, 0.0, -3.0)),
+            Light::spot(Vec3::ONE, 800.0, 5.0, 20.0, 30.0),
+        );
+        let mut lighting = SceneLighting::default();
+        extract_lighting(&world, &mut lighting);
+        let spot = &lighting.spot_lights[0];
+        assert!(close(spot.direction, Vec3::NEG_X), "{}", spot.direction);
+        assert!(
+            close(spot.position, Vec3::new(-3.0, 0.0, 0.0)),
+            "{}",
+            spot.position
+        );
+    }
+
+    #[test]
+    fn a_parented_sun_takes_its_parent_s_turn() {
+        let parent = Transform {
+            rotation: Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+            ..Transform::default()
+        };
+        let world = parented_light(
+            parent,
+            Transform::default(),
+            Light::directional(Vec3::ONE, 20_000.0),
+        );
+        let mut lighting = SceneLighting::default();
+        extract_lighting(&world, &mut lighting);
+        assert!(
+            close(lighting.sun.direction, Vec3::NEG_Y),
+            "{}",
+            lighting.sun.direction
+        );
     }
 }
 

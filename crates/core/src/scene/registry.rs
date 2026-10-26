@@ -1,6 +1,6 @@
 use orrin_registry::{ComponentId, Registry};
 
-use super::{Collider, Light, LocalTransform, Name, Spin, Tag};
+use super::{Collider, Light, LocalTransform, Locked, Name, Spin, Tag};
 
 pub const TRANSFORM: ComponentId = ComponentId::new("orrin.transform");
 pub const NAME: ComponentId = ComponentId::new("orrin.name");
@@ -8,6 +8,7 @@ pub const TAG: ComponentId = ComponentId::new("orrin.tag");
 pub const LIGHT: ComponentId = ComponentId::new("orrin.light");
 pub const COLLIDER: ComponentId = ComponentId::new("orrin.collider");
 pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
+pub const LOCKED: ComponentId = ComponentId::new("orrin.locked");
 
 /// Reserved, not registered. `MeshHandle` and `MaterialHandle` are upload
 /// indices, so a scene stores the asset's *name* instead — a translation that
@@ -66,6 +67,7 @@ pub fn register_components(registry: &mut Registry) {
     registry.register::<Light>(LIGHT, "Light");
     registry.register::<Collider>(COLLIDER, "Collider");
     registry.register::<Spin>(SPIN, "Spin");
+    registry.register::<Locked>(LOCKED, "Locked");
     registry.end_engine_registration();
 }
 
@@ -77,6 +79,24 @@ mod tests {
 
     use super::*;
     use crate::scene::{ColliderShape, Transform};
+
+    /// What is locked is how the scene is meant to be worked on, so it is
+    /// saved with it.
+    #[test]
+    fn a_lock_survives_a_save_and_a_load() {
+        let mut registry = Registry::new();
+        register_components(&mut registry);
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(entity, Locked);
+        let text = crate::scene::save(&mut world, &registry);
+        assert!(text.contains("orrin.locked"), "{text}");
+
+        let mut loaded = World::new();
+        crate::scene::load(&text, &mut loaded, &registry).unwrap();
+        let entity = loaded.entities().next().unwrap();
+        assert!(loaded.has::<Locked>(entity));
+    }
 
     fn world() -> (World, orrin_ecs::Entity) {
         let mut world = World::new();
