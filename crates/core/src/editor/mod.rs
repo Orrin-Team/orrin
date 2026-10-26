@@ -10,6 +10,7 @@ mod panels;
 mod phases;
 mod prefs;
 mod previews;
+mod selection;
 mod state;
 mod theme;
 mod widgets;
@@ -147,6 +148,9 @@ impl Editor {
         panels::frost(ctx, glass);
         phases::mark(ctx);
         state.apply(world, registry);
+        if state.take_reveal_request() {
+            dock.activate(dock::Tab::Assets);
+        }
 
         // Restyling mid-frame would leave the panels already drawn on the old
         // palette, so a pick takes effect on the next one.

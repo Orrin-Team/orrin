@@ -86,6 +86,10 @@ pub struct App {
     /// without the file, or in a build with no `notify`.
     #[cfg(feature = "scripting")]
     input_watcher: Option<crate::scene::input::ConfigWatcher>,
+    /// Rescan-on-save for the prefab index. `None` without an assets
+    /// directory, or in a build with no `notify`.
+    #[cfg(feature = "scripting")]
+    prefab_watcher: Option<crate::scene::prefab::Watcher>,
     /// The gamepad backend. `None` when the machine has no gamepad subsystem
     /// to open, which is a session on keyboard and mouse rather than a failure.
     gamepads: Option<crate::scene::input::Gamepads>,
@@ -215,6 +219,8 @@ impl App {
             build_watcher: None,
             #[cfg(feature = "scripting")]
             input_watcher: None,
+            #[cfg(feature = "scripting")]
+            prefab_watcher: None,
             gamepads,
             project,
             scene: SceneChoice::from_env(),
@@ -225,6 +231,7 @@ impl App {
         crate::scene::register_components(&mut app.registry);
         Self::install_default_resources(&mut app.world);
         app.load_input_config();
+        app.load_prefabs();
 
         event_loop.run_app(&mut app).unwrap();
     }
@@ -277,6 +284,9 @@ impl App {
         world.insert_resource(LogBuffer::default());
         world.insert_resource(DebugLines::default());
         world.insert_resource(Culling::default());
+        // Empty until `load_prefabs` scans the project: the scan reads the disk,
+        // and its cost belongs to the run rather than to the cold-start gate.
+        world.insert_resource(crate::scene::Prefabs::default());
         // Inserted whether or not a watcher ever starts: the Scripts panel reads
         // it either way, and `Off` is how it explains itself.
         #[cfg(feature = "scripting")]
@@ -309,6 +319,38 @@ impl App {
         #[cfg(feature = "scripting")]
         {
             self.input_watcher = match crate::scene::input::ConfigWatcher::new(&path) {
+                Ok(watcher) => Some(watcher),
+                Err(error) => {
+                    tracing::warn!("{error}");
+                    None
+                }
+            };
+        }
+    }
+
+    /// Index the prefabs under the assets directory — the project's, or
+    /// `assets/` beside the working directory without one, as the environment
+    /// map resolves.
+    ///
+    /// A prefab that cannot be indexed is named and left out; the rest load.
+    fn load_prefabs(&mut self) {
+        let dir = self
+            .project
+            .as_ref()
+            .map_or_else(|| PathBuf::from("assets"), |project| project.assets_dir());
+        let (prefabs, issues) = crate::scene::Prefabs::scan(&dir);
+        for issue in issues {
+            tracing::warn!("{issue}");
+        }
+        let count = prefabs.iter().count();
+        if count > 0 {
+            tracing::info!("{count} prefab(s) under {}", dir.display());
+        }
+        self.world.insert_resource(prefabs);
+
+        #[cfg(feature = "scripting")]
+        if dir.is_dir() {
+            self.prefab_watcher = match crate::scene::prefab::Watcher::new(&dir) {
                 Ok(watcher) => Some(watcher),
                 Err(error) => {
                     tracing::warn!("{error}");
@@ -576,6 +618,18 @@ impl ApplicationHandler for App {
                     watcher.service(&self.world);
                 }
 
+                // Before anything reads the scene, so a prefab saved this frame
+                // is what the frame draws.
+                #[cfg(feature = "scripting")]
+                if let Some(watcher) = &mut self.prefab_watcher
+                    && watcher.due()
+                {
+                    profile_scope!("prefab rescan");
+                    for issue in crate::scene::prefab::rescan(&mut self.world, &self.registry) {
+                        tracing::warn!("{issue}");
+                    }
+                }
+
                 // Pads are polled, so their frame starts here — before the
                 // resolve that reads them, and gated on focus so a stick held
                 // in a background window drives nothing.
@@ -667,9 +721,10 @@ impl ApplicationHandler for App {
                                     .reloaded();
                             }
                         }
+                        scripting.attach_pending(&mut self.world, &self.registry);
                         {
                             profile_scope!("script tick");
-                            scripting.tick(&mut self.world, delta);
+                            scripting.tick(&mut self.world, &self.registry, delta);
                         }
                     }
                 }

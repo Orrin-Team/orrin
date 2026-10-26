@@ -39,7 +39,7 @@ public sealed class BehaviourFieldAnalyzer : DiagnosticAnalyzer
             "'{0}' is of type '{1}', which the component registry cannot save, and it is not "
             + "marked [Transient] — it will not survive a save, and may not survive a hot reload. "
             + "Mark it [Transient], or use bool, int, uint, float, string, Vector3, Quaternion, "
-            + "or an enum.",
+            + "AssetRef<T>, or an enum.",
         category: "Orrin.Registry",
         defaultSeverity: DiagnosticSeverity.Warning,
         isEnabledByDefault: true,
@@ -67,6 +67,10 @@ public sealed class BehaviourFieldAnalyzer : DiagnosticAnalyzer
         SpecialType.System_UInt32,
         SpecialType.System_Single,
         SpecialType.System_String);
+
+    /// Generic, so matched on its definition: `AssetRef<Prefab>` and every other
+    /// instantiation share it.
+    const string AssetRefType = "Orrin.AssetRef<T>";
 
     const string BehaviourType = "Orrin.Behaviour";
     const string TransientAttribute = "Orrin.TransientAttribute";
@@ -119,7 +123,9 @@ public sealed class BehaviourFieldAnalyzer : DiagnosticAnalyzer
     static bool IsVisible(ITypeSymbol type) =>
         type.TypeKind == TypeKind.Enum
         || VisiblePrimitives.Contains(type.SpecialType)
-        || VisibleEngineTypes.Contains(type.ToDisplayString());
+        || VisibleEngineTypes.Contains(type.ToDisplayString())
+        || (type is INamedTypeSymbol { IsGenericType: true } named
+            && named.OriginalDefinition.ToDisplayString() == AssetRefType);
 
     /// Directly, or through the property this field backs — `[Transient]` sits
     /// on the property, and its compiler-generated storage carries none of the

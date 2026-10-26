@@ -1,4 +1,5 @@
 // Visible to the dock, which mounts each tool's `body` into a tab.
+pub(super) mod assets;
 pub(super) mod console;
 pub(super) mod environment;
 pub(super) mod hierarchy;
@@ -51,6 +52,7 @@ pub fn draw(
     dock.show(ctx, world, state, registry, previews);
     if let Some(rect) = dock.viewport() {
         viewport::show(ctx, world, state, themes, rect);
+        viewport::accept_prefab(ctx, world, state, dock, rect);
     }
 }
 
@@ -99,16 +101,17 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
     if ctx.wants_keyboard_input() {
         return;
     }
-    let selected = state.selected.filter(|&entity| world.is_alive(entity));
-    if let Some(entity) = selected
+    state.selection.retain_alive(world);
+    let selected = !state.selection.is_empty();
+    if selected
         && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
     {
-        state.request_despawn(entity);
+        state.request_despawn_selection();
     }
-    if selected.is_some()
+    if selected
         && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
-        state.selected = None;
+        state.selection.clear();
     }
 }
 
@@ -498,6 +501,24 @@ mod tests {
             self
         }
 
+        /// [`click`](Self::click) with `modifiers` held.
+        fn click_with(&mut self, at: egui::Pos2, modifiers: egui::Modifiers) -> &mut Self {
+            self.input.modifiers = modifiers;
+            self.input.events.push(egui::Event::PointerMoved(at));
+            for pressed in [true, false] {
+                self.input.events.push(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers,
+                });
+            }
+            self.frames(1);
+            self.input.events.clear();
+            self.input.modifiers = egui::Modifiers::NONE;
+            self
+        }
+
         fn key(&mut self, key: egui::Key) -> &mut Self {
             for pressed in [true, false] {
                 self.input.events.push(egui::Event::Key {
@@ -587,7 +608,7 @@ mod tests {
         editor
             .world
             .insert(entity, crate::scene::Spin::new(glam::Vec3::Y, 1.0));
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.frames(3);
 
         // Both edges of the vector columns: the X chips start on one line, and
@@ -617,7 +638,7 @@ mod tests {
     fn inspector_sections_span_the_panel() {
         let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
         let entity = editor.spawn("Crate");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.frames(3);
 
         let body = editor.tab_body(Tab::Inspector);
@@ -649,7 +670,7 @@ mod tests {
             .entities()
             .find(|&e| editor.world.has::<crate::scene::MaterialHandle>(e))
             .expect("the demo scene draws something");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.frames(3);
 
         let clashes: Vec<String> = editor
@@ -666,7 +687,7 @@ mod tests {
     fn the_inspector_menu_offers_delete_for_the_selection() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let entity = editor.spawn("Ground plane");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         let Harness {
             world,
             registry,
@@ -693,12 +714,12 @@ mod tests {
     fn the_delete_key_despawns_the_selection() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let entity = editor.spawn("Ground plane");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.frames(1).key(egui::Key::Delete);
         editor.state.apply(&mut editor.world, &editor.registry);
 
         assert!(!editor.world.is_alive(entity));
-        assert_eq!(editor.state.selected, None);
+        assert!(editor.state.selection.is_empty());
     }
 
     /// …but not while the user is typing: Delete in a name field deletes a
@@ -707,7 +728,7 @@ mod tests {
     fn the_delete_key_is_left_alone_while_a_field_has_focus() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let entity = editor.spawn("Ground plane");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.frames(1);
         editor
             .ctx
@@ -716,6 +737,463 @@ mod tests {
         editor.state.apply(&mut editor.world, &editor.registry);
 
         assert!(editor.world.is_alive(entity));
+    }
+
+    /// Put a one-entity door prefab in the harness's index.
+    fn door(editor: &mut Harness) -> orrin_registry::AssetId {
+        let id = orrin_registry::AssetId::new();
+        let text = "orrin-scene 1\n\nentity 00000000-0000-4000-8000-000000000001\n  \
+                    orrin.name = \"Door\"\n  orrin.transform\n    rotation = (0.0, 0.0, 0.0, 1.0)\n    \
+                    scale = (1.0, 1.0, 1.0)\n    translation = (0.0, 0.0, 0.0)\n";
+        let prefab = crate::scene::prefab::Prefab::parse(id, "props/door.fprefab", text).unwrap();
+        editor
+            .world
+            .resource_mut::<crate::scene::Prefabs>()
+            .insert(prefab);
+        id
+    }
+
+    /// Let go of a drag carrying `payload` at `at`, as the asset browser's
+    /// rows hand one over.
+    fn drop_payload<T: Send + Sync + 'static>(editor: &mut Harness, payload: T, at: egui::Pos2) {
+        egui::DragAndDrop::set_payload(&editor.ctx, payload);
+        editor.input.events.push(egui::Event::PointerMoved(at));
+        editor.input.events.push(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        editor.frames(1);
+        editor.input.events.clear();
+        editor.state.apply(&mut editor.world, &editor.registry);
+    }
+
+    fn the_door(editor: &Harness) -> orrin_ecs::Entity {
+        editor
+            .world
+            .entities()
+            .find(|&e| editor.world.get::<Name>(e).is_some_and(|n| n.0 == "Door"))
+            .expect("the door was placed")
+    }
+
+    #[test]
+    fn the_assets_tool_lists_the_projects_prefabs() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        door(&mut editor);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+
+        assert!(editor.painted_contains("door"));
+        assert!(editor.painted_contains("props"), "the folder it is in");
+    }
+
+    /// The gesture the issue asks for: drag a prefab out of the browser and let
+    /// go over an entity, and the instance lands under it, selected.
+    #[test]
+    fn a_prefab_dropped_on_a_row_is_placed_under_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let room = editor.spawn("Room");
+        let id = door(&mut editor);
+        editor.frames(2);
+        let row = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| text == "Room")
+            .expect("the row is drawn")
+            .1;
+
+        drop_payload(&mut editor, id, row.center());
+        let door = the_door(&editor);
+        assert_eq!(
+            editor
+                .world
+                .get::<crate::scene::Parent>(door)
+                .map(|p| p.get()),
+            Some(room)
+        );
+        assert_eq!(editor.state.selection.primary(), Some(door));
+    }
+
+    #[test]
+    fn a_prefab_dropped_below_the_rows_is_placed_at_the_top_level() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Room");
+        let id = door(&mut editor);
+        editor.frames(2);
+        let tree = editor.tab_body(Tab::Hierarchy);
+
+        drop_payload(
+            &mut editor,
+            id,
+            egui::pos2(tree.center().x, tree.bottom() - 60.0),
+        );
+        let door = the_door(&editor);
+        assert!(editor.world.get::<crate::scene::Parent>(door).is_none());
+    }
+
+    /// A member of an instance says which prefab it is from and what it
+    /// overrides — the field, not just that something changed.
+    #[test]
+    fn the_inspector_shows_what_an_instance_overrides() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let id = door(&mut editor);
+        let (root, _) =
+            crate::scene::prefab::instantiate(&mut editor.world, &editor.registry, id).unwrap();
+        editor.state.selection.set(root);
+        editor.frames(2);
+        assert!(editor.painted_contains("door"), "names its prefab");
+        assert!(!editor.painted_contains("translation"));
+
+        editor
+            .world
+            .get_mut::<LocalTransform>(root)
+            .unwrap()
+            .translation
+            .x = 2.0;
+        editor.frames(1);
+        assert!(editor.painted_contains("translation"));
+    }
+
+    /// Where the row naming `name` was painted.
+    fn row_of(editor: &Harness, name: &str) -> egui::Pos2 {
+        editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| text == name)
+            .unwrap_or_else(|| panic!("no row for {name}"))
+            .1
+            .center()
+    }
+
+    #[test]
+    fn ctrl_click_adds_rows_to_the_selection() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let alpha = editor.spawn("Alpha");
+        let beta = editor.spawn("Beta");
+        editor.spawn("Gamma");
+        editor.frames(2);
+        let (a, b) = (row_of(&editor, "Alpha"), row_of(&editor, "Beta"));
+
+        editor
+            .click(a)
+            .click_with(b, egui::Modifiers::COMMAND)
+            .frames(1);
+        assert_eq!(editor.state.selection.entities(), [alpha, beta]);
+        assert!(editor.painted_contains("3 entities · 2 selected"));
+
+        editor.click_with(a, egui::Modifiers::COMMAND);
+        assert_eq!(editor.state.selection.entities(), [beta]);
+    }
+
+    #[test]
+    fn shift_click_selects_the_rows_between() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Alpha");
+        let beta = editor.spawn("Beta");
+        let gamma = editor.spawn("Gamma");
+        editor.frames(2);
+        let (a, c) = (row_of(&editor, "Alpha"), row_of(&editor, "Gamma"));
+
+        editor.click(a).click_with(c, egui::Modifiers::SHIFT);
+        assert_eq!(editor.state.selection.len(), 3);
+        assert!(editor.state.selection.contains(beta));
+        assert_eq!(editor.state.selection.primary(), Some(gamma));
+    }
+
+    #[test]
+    fn delete_takes_every_selected_entity() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let alpha = editor.spawn("Alpha");
+        let beta = editor.spawn("Beta");
+        let gamma = editor.spawn("Gamma");
+        editor.state.selection.set(alpha);
+        editor.state.selection.toggle(beta);
+        editor.frames(1).key(egui::Key::Delete);
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        assert!(!editor.world.is_alive(alpha));
+        assert!(!editor.world.is_alive(beta));
+        assert!(editor.world.is_alive(gamma));
+        assert!(editor.state.selection.is_empty());
+    }
+
+    /// A real drag, frame by frame: press on a selected row, move past egui's
+    /// drag threshold, and let go over another row.
+    #[test]
+    fn dragging_a_selected_row_moves_the_whole_selection() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let room = editor.spawn("Room");
+        let alpha = editor.spawn("Alpha");
+        let beta = editor.spawn("Beta");
+        editor.state.selection.set(alpha);
+        editor.state.selection.toggle(beta);
+        editor.frames(2);
+        let (from, to) = (row_of(&editor, "Alpha"), row_of(&editor, "Room"));
+
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(from), button(from, true)],
+            vec![egui::Event::PointerMoved(from + egui::vec2(0.0, 12.0))],
+            vec![egui::Event::PointerMoved(to)],
+            vec![button(to, false)],
+        ] {
+            editor.input.events = events;
+            editor.frames(1);
+        }
+        editor.input.events.clear();
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        let parent = |e| editor.world.get::<crate::scene::Parent>(e).map(|p| p.get());
+        assert_eq!(parent(alpha), Some(room));
+        assert_eq!(parent(beta), Some(room));
+    }
+
+    #[test]
+    fn save_as_prefab_saves_the_whole_selection() {
+        let dir = std::env::temp_dir().join(format!("orrin-save-prefab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor
+            .world
+            .insert_resource(crate::scene::Prefabs::scan(&dir).0);
+        let alpha = editor.spawn("Alpha");
+        let beta = editor.spawn("Beta");
+        editor.state.selection.set(alpha);
+        editor.state.selection.toggle(beta);
+
+        editor.state.request_save_prefab();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let saved = dir.join("Group.fprefab").is_file();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(saved, "the selection was saved under its new root's name");
+        let root = editor
+            .state
+            .selection
+            .primary()
+            .expect("the new root is selected");
+        assert!(editor.world.has::<crate::scene::PrefabInstance>(root));
+    }
+
+    /// The colour of every painted string equal to `needle`, as it reaches the
+    /// screen: a section's own colour, or the shape's fallback for one with
+    /// none. Every match, because a label can appear in more than one place.
+    fn colours_of(editor: &Harness, needle: &str) -> Vec<egui::Color32> {
+        fn find(shape: &egui::Shape, needle: &str, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == needle => {
+                    if let Some(section) = text.galley.job.sections.first() {
+                        out.push(if section.format.color == egui::Color32::PLACEHOLDER {
+                            text.fallback_color
+                        } else {
+                            section.format.color
+                        });
+                    }
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, needle, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &editor.output.as_ref().expect("a frame has run").shapes {
+            find(&clipped.shape, needle, &mut out);
+        }
+        out
+    }
+
+    fn secondary_click(editor: &mut Harness, at: egui::Pos2) {
+        editor.input.events.push(egui::Event::PointerMoved(at));
+        for pressed in [true, false] {
+            editor.input.events.push(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        editor.frames(1);
+        editor.input.events.clear();
+        editor.frames(1);
+    }
+
+    fn place_door(editor: &mut Harness) -> (orrin_ecs::Entity, orrin_registry::AssetId) {
+        let id = door(editor);
+        let (root, _) =
+            crate::scene::prefab::instantiate(&mut editor.world, &editor.registry, id).unwrap();
+        (root, id)
+    }
+
+    /// An instance reads as one at a glance: its rows wear the prefab colour.
+    #[test]
+    fn an_instance_reads_as_one_in_the_tree() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Plain");
+        place_door(&mut editor);
+        editor.frames(2);
+
+        assert_eq!(colours_of(&editor, "Door"), [theme::PREFAB]);
+        assert!(!colours_of(&editor, "Plain").contains(&theme::PREFAB));
+    }
+
+    #[test]
+    fn right_clicking_an_instance_offers_what_can_be_done_to_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (door, _) = place_door(&mut editor);
+        editor.frames(2);
+        let row = row_of(&editor, "Door");
+
+        secondary_click(&mut editor, row);
+        assert_eq!(
+            editor.state.selection.primary(),
+            Some(door),
+            "the row is selected"
+        );
+        for item in [
+            "Save as prefab",
+            "Apply to prefab",
+            "Revert to prefab",
+            "Unpack",
+            "Show in Assets",
+        ] {
+            assert!(editor.painted_contains(item), "the menu lacks {item:?}");
+        }
+    }
+
+    #[test]
+    fn an_unpack_request_leaves_plain_entities() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (door, _) = place_door(&mut editor);
+        editor
+            .state
+            .request_prefab_action(crate::editor::state::PrefabAction::Unpack, door);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(!editor.world.has::<crate::scene::PrefabInstance>(door));
+    }
+
+    #[test]
+    fn show_in_assets_marks_the_prefab_and_asks_for_the_tab() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (door, id) = place_door(&mut editor);
+        editor
+            .state
+            .request_prefab_action(crate::editor::state::PrefabAction::Reveal, door);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(editor.state.revealed_asset, Some(id));
+        assert!(editor.state.take_reveal_request());
+        assert!(!editor.state.take_reveal_request(), "asked once");
+    }
+
+    /// A component an instance overrides wears the prefab colour on its bar,
+    /// and the Prefab section offers the whole-instance actions.
+    #[test]
+    fn the_inspector_marks_overridden_components_and_offers_the_actions() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (door, _) = place_door(&mut editor);
+        editor
+            .world
+            .insert(door, crate::scene::Tag::new("entrance"));
+        editor.state.selection.set(door);
+        editor.frames(2);
+
+        // "Tag" is also the label of the Prefab section's row for the override;
+        // it is the section's own title that has to say so.
+        assert!(colours_of(&editor, "Tag").contains(&theme::PREFAB));
+        assert!(!colours_of(&editor, "Transform").contains(&theme::PREFAB));
+        for action in ["Apply", "Revert all", "Unpack"] {
+            assert!(editor.painted_contains(action), "no {action:?} button");
+        }
+    }
+
+    #[test]
+    fn the_assets_tool_counts_instances_and_filters() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (_, id) = place_door(&mut editor);
+        crate::scene::prefab::instantiate(&mut editor.world, &editor.registry, id).unwrap();
+        let crate_ = crate::scene::prefab::Prefab::parse(
+            orrin_registry::AssetId::new(),
+            "props/crate.fprefab",
+            "orrin-scene 1\n\nentity 00000000-0000-4000-8000-000000000002\n  orrin.name = \"Crate\"\n",
+        )
+        .unwrap();
+        editor
+            .world
+            .resource_mut::<crate::scene::Prefabs>()
+            .insert(crate_);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+        assert!(editor.painted_contains("2 in scene"));
+        assert!(editor.painted_contains("crate"));
+
+        editor.state.assets_query = "crate".to_owned();
+        editor.frames(1);
+        assert!(!editor.painted_contains("door"));
+        assert!(editor.painted_contains("crate"));
+
+        editor.state.assets_query = "barrel".to_owned();
+        editor.frames(1);
+        assert!(editor.painted_contains("No prefab matches"));
+    }
+
+    #[test]
+    fn double_clicking_a_prefab_places_one() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        door(&mut editor);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+        let row = row_of(&editor, "door");
+
+        editor.input.events.push(egui::Event::PointerMoved(row));
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                editor.input.events.push(egui::Event::PointerButton {
+                    pos: row,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+        }
+        editor.frames(1);
+        editor.input.events.clear();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        the_door(&editor);
+    }
+
+    /// Let go of a prefab over the scene, and it stands on the ground where the
+    /// pointer was.
+    #[test]
+    fn a_prefab_dropped_on_the_scene_lands_under_the_pointer() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let id = door(&mut editor);
+        editor.frames(2);
+        let at = editor.viewport().center();
+
+        drop_payload(&mut editor, id, at);
+        let door = the_door(&editor);
+        let camera = *editor.world.resource::<crate::scene::Camera>();
+        let expected = super::viewport::ground_point(
+            &camera,
+            1280.0 / 800.0,
+            egui::vec2(at.x / 1280.0 * 2.0 - 1.0, at.y / 800.0 * 2.0 - 1.0),
+        )
+        .expect("the default camera looks down at the ground");
+        let placed = editor
+            .world
+            .get::<LocalTransform>(door)
+            .unwrap()
+            .translation;
+        assert!(
+            (placed - expected).length() < 1e-4,
+            "{placed} vs {expected}"
+        );
+        assert!(placed.y.abs() < 1e-4);
     }
 
     /// Every menu has to lay out: one that borrows a resource the others do not
@@ -922,7 +1400,7 @@ mod tests {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let ground = editor.spawn("Ground plane");
         editor.spawn("Key light");
-        editor.state.selected = Some(ground);
+        editor.state.selection.set(ground);
         editor.frames(2);
 
         let tree = editor.tab(Tab::Hierarchy);
@@ -944,7 +1422,7 @@ mod tests {
         for n in 0..6 {
             editor.spawn(&format!("Cube {n}"));
         }
-        editor.state.selected = Some(first);
+        editor.state.selection.set(first);
         editor.frames(3);
 
         let body = editor.tab_body(Tab::Hierarchy);
@@ -1064,7 +1542,7 @@ mod tests {
     fn inspector_section_bars_are_square() {
         let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
         let entity = editor.spawn("Crate");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.frames(3);
 
         let body = editor.tab_body(Tab::Inspector);
@@ -1287,7 +1765,7 @@ mod tests {
         // one does — and that shifts everything after it.
         let mut editor = Harness::new(egui::vec2(4200.0, 700.0));
         let entity = editor.spawn("Ground plane");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
 
         let Harness {
             world,
@@ -1313,6 +1791,7 @@ mod tests {
                         ui.allocate_ui(cell, |ui| environment::body(ui, world));
                         ui.allocate_ui(cell, |ui| performance::body(ui, world));
                         ui.allocate_ui(cell, |ui| console::body(ui, world, state));
+                        ui.allocate_ui(cell, |ui| assets::body(ui, world, state));
                     });
                 });
             })
@@ -1337,6 +1816,7 @@ mod tests {
             "SSAO",         // environment
             "FPS",          // performance
             "Filter log",   // console
+            "prefab(s)",    // assets
         ] {
             assert!(painted.contains(expected), "no body painted {expected:?}");
         }
@@ -1641,7 +2121,7 @@ mod tests {
     fn figures_are_monospace() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let entity = editor.spawn("Ground plane");
-        editor.state.selected = Some(entity);
+        editor.state.selection.set(entity);
         editor.world.resource_mut::<crate::scene::LogBuffer>().push(
             crate::scene::LogLevel::Info,
             "saved 3 entities".to_owned(),
@@ -1743,7 +2223,7 @@ mod tests {
                 crate::scene::reparent(&mut editor.world, entity, Some(parent), false).unwrap();
             }
         }
-        editor.state.selected = Some(parent);
+        editor.state.selection.set(parent);
         editor.frames(20);
 
         let start = std::time::Instant::now();

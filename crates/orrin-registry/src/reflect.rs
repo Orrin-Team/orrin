@@ -42,6 +42,7 @@ impl_leaf!(String, String, "string");
 impl_leaf!(glam::Vec3, Vec3, "vec3");
 impl_leaf!(glam::Quat, Quat, "quat");
 impl_leaf!(crate::EntityId, Entity, "entity");
+impl_leaf!(crate::AssetId, Asset, "asset");
 
 /// The numeric leaves read leniently across the integer/float boundary.
 ///

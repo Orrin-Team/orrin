@@ -1,9 +1,12 @@
 use glam::Vec3;
 
 use orrin_ecs::{Entity, World};
-use orrin_registry::Registry;
+use orrin_registry::{AssetId, Registry};
 
-use crate::scene::{self, Assets, LogBuffer, LogLevel, MaterialHandle, Time, Transform, entities};
+use super::selection::Selection;
+use crate::scene::{
+    self, Assets, LogBuffer, LogLevel, MaterialHandle, Name, Prefabs, Time, Transform, entities,
+};
 
 /// Where the editor's Save/Load buttons read and write. Relative to the
 /// process's working directory — a real file picker and a project-relative
@@ -63,6 +66,20 @@ impl LevelFilter {
     }
 }
 
+/// What can be done to a prefab instance as a whole, from the tree's menu or
+/// the inspector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefabAction {
+    /// Write the instance back into its prefab.
+    Apply,
+    /// Throw away everything it overrides.
+    Revert,
+    /// Make it plain entities.
+    Unpack,
+    /// Point at its prefab in the asset browser.
+    Reveal,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SpawnKind {
     Cube,
@@ -76,7 +93,7 @@ pub enum SpawnKind {
 /// by `apply` afterwards, so we never mutate the entity set while a panel is
 /// iterating it.
 pub struct EditorState {
-    pub selected: Option<Entity>,
+    pub selection: Selection,
     pub scene_path: String,
     /// What the top bar calls this session. Not the window title and not a
     /// path — just the name, so a run says which project it is inside. `None`
@@ -93,6 +110,11 @@ pub struct EditorState {
     /// search in a property panel usually is: looking for one field on several
     /// entities is the case it exists for.
     pub inspector_query: String,
+    /// The asset browser's filter, kept for the reason the others are.
+    pub assets_query: String,
+    /// The prefab the asset browser marks: the last one clicked there, or the
+    /// one "Show in Assets" pointed at.
+    pub revealed_asset: Option<AssetId>,
     pub gizmo_mode: GizmoMode,
     pub gizmo_space: GizmoSpace,
     pub snap: bool,
@@ -101,7 +123,7 @@ pub struct EditorState {
     /// The frame-time readout floating in the viewport's corner.
     pub show_stats: bool,
     spawn_request: Option<SpawnKind>,
-    despawn_request: Option<Entity>,
+    despawn_request: Vec<Entity>,
     /// A registered component to add to an entity, at its default. Deferred
     /// like the rest: the inspector is mid-way through drawing that entity's
     /// components when the menu is clicked.
@@ -110,7 +132,22 @@ pub struct EditorState {
     /// rather than applied inline for the same reason as the two above: the
     /// hierarchy panel is iterating a snapshot of the tree while it builds, and
     /// a reparent reshapes exactly that.
-    reparent_request: Option<(Entity, Option<Entity>)>,
+    reparent_request: Vec<(Entity, Option<Entity>)>,
+    /// A prefab to place under an entity, or at the top level for `None`.
+    /// Requested for the reason a reparent is: it reshapes the tree the
+    /// hierarchy is iterating.
+    instantiate_request: Option<(AssetId, Option<Entity>, Option<Vec3>)>,
+    /// A whole-instance action, on the instance this entity is part of.
+    prefab_request: Option<(PrefabAction, Entity)>,
+    /// Not serviced by `apply`: bringing the asset browser forward is the
+    /// dock's, which the editor drains after the UI pass.
+    reveal_request: bool,
+    /// Serviced by `apply`, because a rescan replaces the index the asset
+    /// browser is drawing from.
+    rescan_request: bool,
+    /// Save the selection as a new prefab. Deferred because it can give the
+    /// selection a new root, which reshapes the tree.
+    save_prefab_request: bool,
     /// Not serviced by `apply` either: restyling has to happen between frames,
     /// so the editor drains it after the UI pass rather than during it.
     theme_request: Option<String>,
@@ -129,22 +166,29 @@ pub struct EditorState {
 impl Default for EditorState {
     fn default() -> Self {
         Self {
-            selected: None,
+            selection: Selection::default(),
             scene_path: DEFAULT_SCENE_PATH.to_owned(),
             project_name: None,
             hierarchy_query: String::new(),
             console_levels: LevelFilter::default(),
             console_query: String::new(),
             inspector_query: String::new(),
+            assets_query: String::new(),
+            revealed_asset: None,
             gizmo_mode: GizmoMode::Select,
             gizmo_space: GizmoSpace::World,
             snap: false,
             scale_linked: false,
             show_stats: false,
             spawn_request: None,
-            despawn_request: None,
+            despawn_request: Vec::new(),
             add_request: None,
-            reparent_request: None,
+            reparent_request: Vec::new(),
+            instantiate_request: None,
+            prefab_request: None,
+            reveal_request: false,
+            rescan_request: false,
+            save_prefab_request: false,
             theme_request: None,
             scene_request: None,
             #[cfg(feature = "scripting")]
@@ -170,11 +214,41 @@ impl EditorState {
     }
 
     pub fn request_despawn(&mut self, entity: Entity) {
-        self.despawn_request = Some(entity);
+        self.despawn_request.push(entity);
+    }
+
+    pub fn request_despawn_selection(&mut self) {
+        self.despawn_request
+            .extend_from_slice(self.selection.entities());
     }
 
     pub fn request_reparent(&mut self, child: Entity, parent: Option<Entity>) {
-        self.reparent_request = Some((child, parent));
+        self.reparent_request.push((child, parent));
+    }
+
+    pub fn request_save_prefab(&mut self) {
+        self.save_prefab_request = true;
+    }
+
+    pub fn request_instantiate(&mut self, prefab: AssetId, parent: Option<Entity>) {
+        self.instantiate_request = Some((prefab, parent, None));
+    }
+
+    /// Place a prefab at the top level, standing at `at`.
+    pub fn request_instantiate_at(&mut self, prefab: AssetId, at: Vec3) {
+        self.instantiate_request = Some((prefab, None, Some(at)));
+    }
+
+    pub fn request_prefab_action(&mut self, action: PrefabAction, entity: Entity) {
+        self.prefab_request = Some((action, entity));
+    }
+
+    pub fn take_reveal_request(&mut self) -> bool {
+        std::mem::take(&mut self.reveal_request)
+    }
+
+    pub fn request_prefab_rescan(&mut self) {
+        self.rescan_request = true;
     }
 
     pub fn request_add_component(&mut self, entity: Entity, id: orrin_registry::ComponentId) {
@@ -203,13 +277,13 @@ impl EditorState {
         if let Some(kind) = self.spawn_request.take()
             && let Some(entity) = spawn(world, kind)
         {
-            self.selected = Some(entity);
+            self.selection.set(entity);
         }
-        if let Some(entity) = self.despawn_request.take() {
-            crate::scene::despawn_recursive(world, entity);
-            if self.selected == Some(entity) {
-                self.selected = None;
+        if !self.despawn_request.is_empty() {
+            for entity in std::mem::take(&mut self.despawn_request) {
+                crate::scene::despawn_recursive(world, entity);
             }
+            self.selection.retain_alive(world);
         }
         if let Some((entity, id)) = self.add_request.take()
             && world.is_alive(entity)
@@ -223,7 +297,16 @@ impl EditorState {
                 format!("adding {id} to entity {}: {error}", entity.index()),
             );
         }
-        if let Some((child, parent)) = self.reparent_request.take() {
+        let moves = std::mem::take(&mut self.reparent_request);
+        for &(child, parent) in &moves {
+            // One dragged along with an ancestor that is also moving keeps its
+            // place under that ancestor, as a file does in a moved folder.
+            if moves
+                .iter()
+                .any(|&(other, _)| other != child && is_under(world, child, other))
+            {
+                continue;
+            }
             // `keep_world`: a drag in the tree changes who owns an object, not
             // where it is. Without it, dropping something onto a distant parent
             // would fling it across the scene.
@@ -231,17 +314,155 @@ impl EditorState {
                 log(world, LogLevel::Warning, error.to_string());
             }
         }
+        if let Some((prefab, parent, at)) = self.instantiate_request.take() {
+            match scene::prefab::instantiate(world, registry, prefab) {
+                Ok((root, issues)) => {
+                    for issue in issues {
+                        log(world, LogLevel::Warning, issue.to_string());
+                    }
+                    // Not `keep_world`: a prefab sits where it was authored to,
+                    // relative to whatever it was dropped on.
+                    if let Some(parent) = parent
+                        && let Err(error) = scene::reparent(world, root, Some(parent), false)
+                    {
+                        log(world, LogLevel::Warning, error.to_string());
+                    }
+                    if let Some(at) = at {
+                        let mut local = world
+                            .get::<scene::LocalTransform>(root)
+                            .map(|local| *local)
+                            .unwrap_or_default();
+                        local.translation = at;
+                        world.insert(root, local);
+                    }
+                    self.selection.set(root);
+                }
+                Err(error) => log(world, LogLevel::Error, error),
+            }
+        }
+        if let Some((action, entity)) = self.prefab_request.take()
+            && world.is_alive(entity)
+        {
+            self.prefab_action(world, registry, action, entity);
+        }
+        if std::mem::take(&mut self.save_prefab_request) {
+            self.save_prefab(world, registry);
+        }
+        if std::mem::take(&mut self.rescan_request) {
+            for issue in scene::prefab::rescan(world, registry) {
+                log(world, LogLevel::Warning, issue);
+            }
+        }
         if let Some(request) = self.scene_request.take() {
             let (level, message) = match request {
                 SceneRequest::Save => save_scene(world, registry, &self.scene_path),
                 SceneRequest::Load => {
-                    self.selected = None;
+                    self.selection.clear();
                     load_scene(world, registry, &self.scene_path)
                 }
             };
             log(world, level, message);
         }
     }
+}
+
+impl EditorState {
+    fn prefab_action(
+        &mut self,
+        world: &mut World,
+        registry: &Registry,
+        action: PrefabAction,
+        entity: Entity,
+    ) {
+        let Some((_, prefab)) = scene::prefab::instance_of(world, entity) else {
+            log(
+                world,
+                LogLevel::Warning,
+                "that entity is not part of a prefab instance".to_owned(),
+            );
+            return;
+        };
+        let path = world
+            .get_resource::<Prefabs>()
+            .and_then(|prefabs| prefabs.get(prefab).map(|p| p.path.clone()))
+            .unwrap_or_else(|| prefab.to_string());
+        let outcome = match action {
+            PrefabAction::Apply => {
+                scene::prefab::apply(world, registry, entity).map(|issues| (issues, "applied to"))
+            }
+            PrefabAction::Revert => scene::prefab::revert_all(world, registry, entity)
+                .map(|issues| (issues, "reverted to")),
+            PrefabAction::Unpack => {
+                scene::prefab::unpack(world, entity);
+                Ok((Vec::new(), "unpacked from"))
+            }
+            PrefabAction::Reveal => {
+                self.revealed_asset = Some(prefab);
+                self.reveal_request = true;
+                return;
+            }
+        };
+        match outcome {
+            Ok((issues, done)) => {
+                for issue in issues {
+                    log(world, LogLevel::Warning, issue);
+                }
+                log(world, LogLevel::Info, format!("{done} {path}"));
+            }
+            Err(error) => log(world, LogLevel::Error, error),
+        }
+    }
+
+    /// Save the selection as a prefab in the assets directory, named after the
+    /// entity when there is one and `Group` when there are several, and select
+    /// the instance it became.
+    fn save_prefab(&mut self, world: &mut World, registry: &Registry) {
+        self.selection.retain_alive(world);
+        let selection = self.selection.entities().to_vec();
+        let name = match selection[..] {
+            [] => return,
+            [one] => world
+                .get::<Name>(one)
+                .map_or_else(|| "Prefab".to_owned(), |name| name.0.clone()),
+            _ => "Group".to_owned(),
+        };
+        let Some(dir) = world
+            .get_resource::<Prefabs>()
+            .and_then(|prefabs| prefabs.dir().map(std::path::Path::to_owned))
+        else {
+            log(
+                world,
+                LogLevel::Error,
+                "there is no assets directory to save a prefab into".to_owned(),
+            );
+            return;
+        };
+        let rel = scene::prefab::unused_path(&dir, &name);
+        match scene::prefab::create(world, registry, &selection, &rel) {
+            Ok((root, _)) => {
+                self.selection.set(root);
+                log(world, LogLevel::Info, format!("saved {rel}"));
+            }
+            Err(error) => log(world, LogLevel::Error, error),
+        }
+    }
+}
+
+/// Whether `ancestor` is above `entity` in the tree.
+fn is_under(world: &World, entity: Entity, ancestor: Entity) -> bool {
+    let mut cursor = entity;
+    // Bounded: a cycle the hierarchy has not broken yet would otherwise spin.
+    for _ in 0..4096 {
+        match world
+            .get::<scene::Parent>(cursor)
+            .map(|parent| parent.get())
+        {
+            Some(parent) if parent == ancestor => return true,
+            Some(parent) => cursor = parent,
+            None => return false,
+        }
+    }
+    false
 }
 
 fn save_scene(world: &mut World, registry: &Registry, path: &str) -> (LogLevel, String) {

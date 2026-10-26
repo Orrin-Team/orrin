@@ -18,7 +18,8 @@ mod material;
 mod mesh;
 pub mod model;
 mod motion_blur;
-mod persist;
+pub(crate) mod persist;
+pub mod prefab;
 mod present;
 mod previews;
 pub mod registry;
@@ -38,7 +39,8 @@ pub use camera::Camera;
 pub use components::ScriptComponent;
 pub use components::{
     AmbientLight, Collider, ColliderShape, Light, LocalTransform, MAX_CONE_ANGLE, MIN_CONE_ANGLE,
-    MaterialHandle, MeshHandle, Name, Parent, Spin, Tag, UnknownComponents, WorldTransform,
+    MaterialHandle, MeshHandle, Name, Parent, PendingScripts, Spin, Tag, UnknownComponents,
+    WorldTransform,
 };
 pub use contact_shadows::ContactShadowSettings;
 pub use culling::Culling;
@@ -58,6 +60,7 @@ pub use material::MaterialBlends;
 pub use mesh::{CpuMesh, MeshBounds};
 pub use motion_blur::MotionBlurSettings;
 pub use persist::{LoadIssue, instantiate, load, save, to_document};
+pub use prefab::{PrefabInstance, Prefabs};
 pub use present::{PresentSettings, VsyncMode};
 pub use previews::{
     AssetPreviews, MaterialPreview, MeshPreview, apply_material_edits, render_mesh,

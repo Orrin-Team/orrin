@@ -152,6 +152,9 @@ fn write_scalar(out: &mut String, value: &Value) {
         Value::Entity(id) => {
             let _ = write!(out, "entity({id})");
         }
+        Value::Asset(id) => {
+            let _ = write!(out, "asset({id})");
+        }
         Value::List(_) => out.push_str("[]"),
         // Routed to `write_fields` by `write_named` and never reached here.
         Value::Struct(_) | Value::Enum { .. } => out.push_str("{}"),

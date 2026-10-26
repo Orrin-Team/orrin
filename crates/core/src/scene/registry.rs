@@ -29,6 +29,10 @@ pub const MATERIAL: ComponentId = ComponentId::new("orrin.material");
 /// world to translate in both directions and so cannot live in a `Reflect` impl.
 pub const PARENT: ComponentId = ComponentId::new("orrin.parent");
 
+/// Reserved for a prefab instance's record — its source and overrides — which
+/// stands in for the instance's members in a scene file. See `scene::prefab`.
+pub const PREFAB: ComponentId = ComponentId::new("orrin.prefab");
+
 /// Describe every component the engine itself owns to `registry`.
 ///
 /// The counterpart a game assembly exports under the same name, called again

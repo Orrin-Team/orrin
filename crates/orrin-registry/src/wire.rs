@@ -19,8 +19,8 @@
 
 use std::fmt;
 
-use crate::EntityId;
 use crate::value::Value;
+use crate::{AssetId, EntityId};
 
 /// Tag bytes. Numbering is lock-step with `Orrin.PropertyBag.Tag`.
 mod tag {
@@ -35,6 +35,7 @@ mod tag {
     pub const STRUCT: u8 = 8;
     pub const ENUM: u8 = 9;
     pub const LIST: u8 = 10;
+    pub const ASSET: u8 = 11;
 }
 
 /// How deep a decoded value may nest.
@@ -123,6 +124,10 @@ pub fn encode(value: &Value, out: &mut Vec<u8>) {
         }
         Value::Entity(id) => {
             out.push(tag::ENTITY);
+            out.extend_from_slice(&id.to_bytes());
+        }
+        Value::Asset(id) => {
+            out.push(tag::ASSET);
             out.extend_from_slice(&id.to_bytes());
         }
         Value::Struct(fields) => {
@@ -253,6 +258,10 @@ impl Reader<'_> {
             tag::ENTITY => {
                 let bytes: [u8; 16] = self.take(16)?.try_into().expect("took sixteen bytes");
                 Ok(Value::Entity(EntityId::from_bytes(bytes)))
+            }
+            tag::ASSET => {
+                let bytes: [u8; 16] = self.take(16)?.try_into().expect("took sixteen bytes");
+                Ok(Value::Asset(AssetId::from_bytes(bytes)))
             }
             tag::STRUCT => Ok(Value::Struct(self.fields(depth)?)),
             tag::ENUM => {
@@ -447,6 +456,19 @@ mod tests {
             ("Rotation", Value::Quat(Quat::IDENTITY)),
             ("Mode", Value::enumeration("Spot", [])),
         ])
+    }
+
+    /// The asset tag was appended after the original eleven, so it is pinned on
+    /// its own rather than folded into [`GOLDEN`] — which `Orrin.MathTests` also
+    /// holds, and which must keep meaning what it meant. The C# side asserts
+    /// these same bytes for an `AssetRef<T>` field.
+    #[test]
+    fn an_asset_reference_crosses_as_its_canonical_bytes() {
+        let id: crate::AssetId = "00112233-4455-6677-8899-aabbccddeeff".parse().unwrap();
+        let mut bytes = Vec::new();
+        encode(&Value::Asset(id), &mut bytes);
+        assert_eq!(hex(&bytes), "0b00112233445566778899aabbccddeeff");
+        round_trip(&Value::Asset(id));
     }
 
     fn hex(bytes: &[u8]) -> String {

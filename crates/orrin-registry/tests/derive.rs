@@ -55,6 +55,23 @@ fn round_trip<T: Reflect + PartialEq + std::fmt::Debug>(value: T) -> Value {
     encoded
 }
 
+/// An asset handle is a leaf like an entity id, so a component can hold one
+/// with no hand-written conversion.
+#[test]
+fn an_asset_id_field_is_a_leaf() {
+    #[derive(Reflect, Debug, PartialEq)]
+    struct Spawner {
+        prefab: orrin_registry::AssetId,
+    }
+
+    let spawner = Spawner {
+        prefab: orrin_registry::AssetId::new(),
+    };
+    let value = spawner.to_value();
+    assert_eq!(value.field("prefab"), Some(&Value::Asset(spawner.prefab)));
+    assert_eq!(Spawner::from_value(&value).unwrap(), spawner);
+}
+
 #[test]
 fn named_struct_fields_keep_declaration_order() {
     let encoded = round_trip(Health {

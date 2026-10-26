@@ -1,5 +1,8 @@
 //! The scene as a tree: every entity, its kind and its children, with search,
-//! drag to reparent, and the scene's counts at the foot.
+//! drag to reparent, and the scene's counts at the foot. A prefab dragged in
+//! from the asset browser is placed under whatever row it is let go over, and
+//! the rows of a prefab instance wear the prefab colour, with what can be done
+//! to the instance on the right-click menu.
 //!
 //! Rows are laid out flat, one fixed-height rect each, rather than as nested
 //! collapsing headers. That is what lets a row fill the panel edge to edge —
@@ -9,11 +12,12 @@
 //! the list draw only the rows on screen, which a tree of nested `Ui`s cannot.
 
 use orrin_ecs::{Entity, World};
+use orrin_registry::AssetId;
 
 use crate::editor::kind::Kind;
-use crate::editor::state::EditorState;
-use crate::editor::{icons, widgets};
-use crate::scene::{Hierarchy, Name};
+use crate::editor::state::{EditorState, PrefabAction};
+use crate::editor::{icons, theme, widgets};
+use crate::scene::{Hierarchy, Name, PrefabInstance, Prefabs};
 
 /// One row of the tree, resolved before any drawing starts.
 ///
@@ -30,6 +34,16 @@ struct Node {
     /// than in `snapshot` because a node whose *child* matches has to stay
     /// visible — drop it and the tree collapses out from under the match.
     visible: bool,
+    prefab: Role,
+}
+
+/// Where a row stands in a prefab instance.
+#[derive(Clone, Debug, PartialEq)]
+enum Role {
+    None,
+    /// The instance root, with its prefab's name for the tooltip.
+    Root(String),
+    Member,
 }
 
 /// A node as it lands on screen: which one, how deep, and whether it has a
@@ -103,13 +117,18 @@ pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
             rows.len(),
             |ui, range| {
                 for row in &rows[range] {
-                    draw_row(ui, &nodes, row, state);
+                    draw_row(ui, &nodes, &rows, row, state);
                 }
             },
         );
     });
-    if let Some(dragged) = background.dnd_release_payload::<Entity>() {
-        state.request_reparent(*dragged, None);
+    if let Some(dragged) = released::<Vec<Entity>>(&background) {
+        for &entity in dragged.iter() {
+            state.request_reparent(entity, None);
+        }
+    }
+    if let Some(prefab) = released::<AssetId>(&background) {
+        state.request_instantiate(*prefab, None);
     }
 
     footer(ui, world, state);
@@ -126,7 +145,12 @@ fn footer(ui: &mut egui::Ui, world: &World, state: &EditorState) {
         visuals.widgets.noninteractive.bg_stroke,
     );
     let count = world.entities().count();
-    let selected = usize::from(state.selected.is_some_and(|entity| world.is_alive(entity)));
+    let selected = state
+        .selection
+        .entities()
+        .iter()
+        .filter(|&&entity| world.is_alive(entity))
+        .count();
     ui.painter().text(
         egui::pos2(rect.left() + widgets::PAD, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -231,8 +255,10 @@ fn snapshot(world: &mut World, query: &str) -> Vec<Node> {
             // Roots come first in the order, by construction.
             is_root: index < root_count,
             visible: true,
+            prefab: Role::None,
         })
         .collect();
+    roles(world, &mut nodes);
 
     let query = query.trim().to_lowercase();
     if !query.is_empty() {
@@ -251,6 +277,49 @@ fn snapshot(world: &mut World, query: &str) -> Vec<Node> {
         }
     }
     nodes
+}
+
+/// Mark each node's place in a prefab instance.
+///
+/// Top-down over `Hierarchy::order`, which puts parents first, so each node
+/// inherits the nearest instance above it and is tested against that one
+/// alone — one lookup a row, where asking `prefab::instance_of` per row would
+/// walk to the root from every one of them.
+fn roles(world: &World, nodes: &mut [Node]) {
+    // A scene with no instance has no roles to find, and asking costs a
+    // component lookup on every row each frame.
+    if world.query::<&PrefabInstance>().find(|_, _| true).is_none() {
+        return;
+    }
+    let Some(prefabs) = world.get_resource::<Prefabs>() else {
+        return;
+    };
+    let mut parent = vec![None; nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        for &child in &node.children {
+            parent[child] = Some(index);
+        }
+    }
+    let mut instance = vec![None; nodes.len()];
+    for index in 0..nodes.len() {
+        let entity = nodes[index].entity;
+        let inherited = parent[index].and_then(|p| instance[p]);
+        let id = world.get::<orrin_registry::EntityId>(entity).map(|id| *id);
+        if let Some(root) = world.get::<PrefabInstance>(entity)
+            && let Some(prefab) = prefabs.get(root.prefab)
+        {
+            nodes[index].prefab = Role::Root(prefab.name().to_owned());
+            instance[index] = id.map(|id| (id, root.prefab));
+            continue;
+        }
+        instance[index] = inherited;
+        if let (Some((root, prefab)), Some(id)) = (inherited, id)
+            && let Some(prefab) = prefabs.get(prefab)
+            && crate::scene::prefab::is_member(prefab, root, id)
+        {
+            nodes[index].prefab = Role::Member;
+        }
+    }
 }
 
 /// How much room a vertical scroll bar needs at its widest.
@@ -276,9 +345,9 @@ fn scroll_gutter(ui: &egui::Ui) -> f32 {
 /// `Response::dnd_set_drag_payload` is the API for this case; it stores the
 /// payload only once a drag has actually started, so a press that never moves
 /// stays a click.
-fn draw_row(ui: &mut egui::Ui, nodes: &[Node], row: &Row, state: &mut EditorState) {
+fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &mut EditorState) {
     let node = &nodes[row.node];
-    let selected = state.selected == Some(node.entity);
+    let selected = state.selection.contains(node.entity);
     let (rect, mut response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ROW),
         egui::Sense::click_and_drag(),
@@ -287,8 +356,9 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], row: &Row, state: &mut EditorStat
     let visuals = ui.visuals().clone();
     let hovered = ui.rect_contains_pointer(rect);
     let dropping = response
-        .dnd_hover_payload::<Entity>()
-        .is_some_and(|dragged| *dragged != node.entity);
+        .dnd_hover_payload::<Vec<Entity>>()
+        .is_some_and(|dragged| !dragged.contains(&node.entity))
+        || response.dnd_hover_payload::<AssetId>().is_some();
     let fill = if selected {
         Some(visuals.selection.bg_fill)
     } else if hovered || dropping {
@@ -368,15 +438,21 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], row: &Row, state: &mut EditorStat
 
     let colour = if selected {
         visuals.strong_text_color()
+    } else if node.prefab != Role::None {
+        theme::PREFAB
     } else {
         visuals.text_color()
     };
-    let galley = egui::WidgetText::from(node.label.as_str()).into_galley(
-        ui,
-        Some(egui::TextWrapMode::Truncate),
-        (text_right - x).max(0.0),
-        egui::TextStyle::Body,
-    );
+    // Coloured in the layout, not at the paint: a plain `WidgetText` bakes the
+    // style's text colour into its galley, and the painter's colour then only
+    // reaches parts with none — of which there are none.
+    let galley = egui::WidgetText::from(egui::RichText::new(&node.label).color(colour))
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            (text_right - x).max(0.0),
+            egui::TextStyle::Body,
+        );
     // A row whose name was cut is the only one worth a tooltip: repeating a
     // name already fully on screen would pop a bubble over every row the
     // pointer crosses.
@@ -413,25 +489,96 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], row: &Row, state: &mut EditorStat
         }
     }
 
-    if elided {
-        response = response.on_hover_text(&node.label);
+    match (&node.prefab, elided) {
+        (Role::Root(prefab), true) => {
+            response = response.on_hover_text(format!("{}\nInstance of {prefab}", node.label));
+        }
+        (Role::Root(prefab), false) => {
+            response = response.on_hover_text(format!("Instance of {prefab}"));
+        }
+        (_, true) => response = response.on_hover_text(&node.label),
+        (_, false) => {}
     }
+    // The menu acts on the selection, so the row it opened on joins it.
+    if response.secondary_clicked() && !selected {
+        state.selection.set(node.entity);
+    }
+    response.context_menu(|ui| row_menu(ui, node, state));
     if response.clicked() {
-        state.selected = Some(node.entity);
+        let modifiers = ui.input(|input| input.modifiers);
+        if modifiers.command {
+            state.selection.toggle(node.entity);
+        } else if modifiers.shift {
+            // The run is the rows as they are on screen.
+            let order: Vec<Entity> = rows.iter().map(|row| nodes[row.node].entity).collect();
+            state.selection.extend_to(node.entity, &order);
+        } else {
+            state.selection.set(node.entity);
+        }
     }
-    response.dnd_set_drag_payload(node.entity);
+    // A selected row carries the whole selection. Built only when a drag
+    // starts, which is the one frame the payload is read.
+    if response.drag_started() {
+        let dragged = if selected {
+            state.selection.entities().to_vec()
+        } else {
+            vec![node.entity]
+        };
+        response.dnd_set_drag_payload(dragged);
+    }
     accept_drop(&response, node.entity, state);
 }
 
-/// Reparent the dragged entity onto `target`, if one was released here.
+/// What a right-click on a row offers: the selection as a new prefab, the
+/// whole-instance actions when the row is part of one, and Delete.
+fn row_menu(ui: &mut egui::Ui, node: &Node, state: &mut EditorState) {
+    if ui.button("Save as prefab").clicked() {
+        state.request_save_prefab();
+        ui.close_menu();
+    }
+    if node.prefab != Role::None {
+        ui.separator();
+        for (label, action) in [
+            ("Apply to prefab", PrefabAction::Apply),
+            ("Revert to prefab", PrefabAction::Revert),
+            ("Unpack", PrefabAction::Unpack),
+            ("Show in Assets", PrefabAction::Reveal),
+        ] {
+            if ui.button(label).clicked() {
+                state.request_prefab_action(action, node.entity);
+                ui.close_menu();
+            }
+        }
+    }
+    ui.separator();
+    if ui.button("Delete").clicked() {
+        state.request_despawn_selection();
+        ui.close_menu();
+    }
+}
+
+/// Reparent the dragged entity onto `target`, or place a dragged prefab under
+/// it, if one was released here.
 ///
 /// Nothing is validated at this end. `reparent` refuses a self-parent or a
 /// cycle by itself, and the editor should not carry a second copy of that rule
 /// for it to drift out of step with — the refusal reaches the console.
 fn accept_drop(response: &egui::Response, target: Entity, state: &mut EditorState) {
-    if let Some(dragged) = response.dnd_release_payload::<Entity>()
-        && *dragged != target
-    {
-        state.request_reparent(*dragged, Some(target));
+    if let Some(dragged) = released::<Vec<Entity>>(response) {
+        for &entity in dragged.iter().filter(|&&entity| entity != target) {
+            state.request_reparent(entity, Some(target));
+        }
     }
+    if let Some(prefab) = released::<AssetId>(response) {
+        state.request_instantiate(*prefab, Some(target));
+    }
+}
+
+/// [`egui::Response::dnd_release_payload`], asked only for the type actually
+/// being carried: it takes the payload *before* checking its type, so asking
+/// for an entity first would throw a dragged prefab away.
+fn released<T: Send + Sync + 'static>(response: &egui::Response) -> Option<std::sync::Arc<T>> {
+    egui::DragAndDrop::has_payload_of_type::<T>(&response.ctx)
+        .then(|| response.dnd_release_payload::<T>())
+        .flatten()
 }
