@@ -11,10 +11,10 @@
 //! into the world-aligned one culling uses. An affine map keeps the ray's
 //! parameter, so the hit distances still compare across entities.
 
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use orrin_ecs::{Entity, World};
 
-use crate::scene::{Camera, MeshBounds, MeshHandle, WorldTransform};
+use crate::scene::{Camera, Light, MeshBounds, MeshHandle, WorldTransform};
 
 /// The ray through `ndc` (−1 to 1, y down, as the scene's projection has it):
 /// its start on the near plane, and a direction reaching the far plane.
@@ -25,9 +25,76 @@ pub fn ray(camera: &Camera, aspect: f32, ndc: egui::Vec2) -> (Vec3, Vec3) {
     (near, far - near)
 }
 
+/// How an entity with nothing drawn at its place is shown, and picked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Marker {
+    Light,
+    /// Anything else with no mesh: a group, an anchor, a script's holder.
+    Empty,
+}
+
+/// How far from a marker's centre a click still picks it, in points.
+pub const MARKER_REACH: f32 = 9.0;
+
+/// Every entity shown as a marker, with where it stands: it has a place in
+/// the world and no mesh to see or pick it by.
+///
+/// A walk over every placed entity each time it is asked. The editor asks
+/// once a frame to draw them and once a click to pick them, and the cost is a
+/// component check per entity; an index kept beside the world would have to
+/// be kept right through every path that adds or removes a mesh.
+pub fn each_marker(world: &World, mut visit: impl FnMut(Entity, Vec3, Marker)) {
+    world
+        .query::<&WorldTransform>()
+        .for_each(|entity, transform| {
+            if world.has::<MeshHandle>(entity) {
+                return;
+            }
+            let marker = if world.has::<Light>(entity) {
+                Marker::Light
+            } else {
+                Marker::Empty
+            };
+            visit(entity, transform.translation(), marker);
+        });
+}
+
+/// Where a world point lands on `screen`, in points, through `view_proj`.
+pub fn to_screen(view_proj: Mat4, screen: egui::Rect, point: Vec3) -> egui::Pos2 {
+    let ndc = view_proj.project_point3(point);
+    screen.min
+        + egui::vec2(
+            (ndc.x * 0.5 + 0.5) * screen.width(),
+            (ndc.y * 0.5 + 0.5) * screen.height(),
+        )
+}
+
+/// What is under `pointer`: the nearest of the meshes the ray from it enters
+/// and the markers within [`MARKER_REACH`] of it.
+pub fn pick_at(
+    world: &World,
+    camera: &Camera,
+    screen: egui::Rect,
+    pointer: egui::Pos2,
+) -> Option<Entity> {
+    let ndc = (pointer - screen.min) / screen.size() * 2.0 - egui::Vec2::splat(1.0);
+    let (origin, direction) = ray(camera, screen.aspect_ratio(), ndc);
+    let view_proj = camera.view_projection(screen.aspect_ratio());
+    let mut nearest = mesh_hit(world, origin, direction);
+    each_marker(world, |entity, at, _| {
+        // In the ray's own units, so it compares with a mesh's entry.
+        let t = (at - origin).dot(direction) / direction.length_squared();
+        let reached = (to_screen(view_proj, screen, at) - pointer).length() <= MARKER_REACH;
+        if t >= 0.0 && reached && nearest.is_none_or(|(best, _)| t < best) {
+            nearest = Some((t, entity));
+        }
+    });
+    nearest.map(|(_, entity)| entity)
+}
+
 /// The nearest entity whose mesh bounds the ray from `origin` along
-/// `direction` enters, if any.
-pub fn pick(world: &World, origin: Vec3, direction: Vec3) -> Option<Entity> {
+/// `direction` enters, and how far along the ray, in its own units.
+fn mesh_hit(world: &World, origin: Vec3, direction: Vec3) -> Option<(f32, Entity)> {
     let bounds = world.get_resource::<MeshBounds>()?;
     let mut nearest: Option<(f32, Entity)> = None;
     world
@@ -47,15 +114,19 @@ pub fn pick(world: &World, origin: Vec3, direction: Vec3) -> Option<Entity> {
                 nearest = Some((t, entity));
             }
         });
-    nearest.map(|(_, entity)| entity)
+    nearest
 }
 
 #[cfg(test)]
 mod tests {
-    use glam::{Mat4, Quat, Vec3A};
+    use glam::{Quat, Vec3A};
 
     use super::*;
     use crate::geom::Aabb;
+
+    fn pick(world: &World, origin: Vec3, direction: Vec3) -> Option<Entity> {
+        mesh_hit(world, origin, direction).map(|(_, entity)| entity)
+    }
 
     fn world() -> World {
         let mut world = World::new();
@@ -111,6 +182,80 @@ mod tests {
         assert_eq!(
             pick(&world, Vec3::new(1.0, 5.0, -1.0), Vec3::NEG_Y),
             Some(plank)
+        );
+    }
+
+    fn screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0))
+    }
+
+    /// Where `point` lands on screen through the default camera.
+    fn on_screen(point: Vec3) -> egui::Pos2 {
+        let screen = screen();
+        let ndc = Camera::default()
+            .view_projection(screen.aspect_ratio())
+            .project_point3(point);
+        egui::pos2(
+            (ndc.x * 0.5 + 0.5) * screen.width(),
+            (ndc.y * 0.5 + 0.5) * screen.height(),
+        )
+    }
+
+    fn light(world: &mut World, at: Vec3) -> Entity {
+        let entity = world.spawn();
+        world.insert(entity, crate::scene::Light::default());
+        world.insert(entity, WorldTransform(Mat4::from_translation(at)));
+        entity
+    }
+
+    #[test]
+    fn a_light_is_picked_by_its_marker() {
+        let mut world = world();
+        let lamp = light(&mut world, Vec3::ZERO);
+        let camera = Camera::default();
+        let near = on_screen(Vec3::ZERO) + egui::vec2(4.0, 0.0);
+        assert_eq!(pick_at(&world, &camera, screen(), near), Some(lamp));
+        let far = on_screen(Vec3::ZERO) + egui::vec2(30.0, 0.0);
+        assert_eq!(pick_at(&world, &camera, screen(), far), None);
+    }
+
+    #[test]
+    fn markers_are_what_has_a_place_and_no_mesh() {
+        let mut world = world();
+        let lamp = light(&mut world, Vec3::ZERO);
+        let group = world.spawn();
+        world.insert(group, WorldTransform(Mat4::IDENTITY));
+        mesh(&mut world, Mat4::IDENTITY);
+        world.spawn();
+        let mut seen = Vec::new();
+        each_marker(&world, |entity, _, marker| seen.push((entity, marker)));
+        seen.sort_by_key(|(entity, _)| entity.index());
+        assert_eq!(seen, [(lamp, Marker::Light), (group, Marker::Empty)]);
+    }
+
+    /// A marker is behind or in front of a mesh like anything else: the
+    /// nearer of the two along the ray is what the click meant.
+    #[test]
+    fn the_nearer_of_a_mesh_and_a_marker_is_picked() {
+        let camera = Camera::default();
+        let toward = (camera.position - camera.target).normalize();
+        let middle = on_screen(Vec3::ZERO);
+
+        let mut world = world();
+        let cube = mesh(&mut world, Mat4::IDENTITY);
+        let lamp = light(&mut world, toward * 2.0);
+        assert_eq!(
+            pick_at(&world, &camera, screen(), middle),
+            Some(lamp),
+            "in front"
+        );
+
+        world.despawn(lamp);
+        light(&mut world, -toward * 2.0);
+        assert_eq!(
+            pick_at(&world, &camera, screen(), middle),
+            Some(cube),
+            "behind"
         );
     }
 

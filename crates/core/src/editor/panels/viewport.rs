@@ -9,15 +9,17 @@
 //! makes a click on one belong to the editor rather than to the fly camera:
 //! `Dock::wants_pointer` claims any layer above the background.
 
-use glam::Vec3;
-use orrin_ecs::World;
+use glam::{Mat4, Vec3};
+use orrin_ecs::{Entity, World};
 
-use crate::editor::gizmo::{Drag, Gizmo};
-use crate::editor::state::{EditorState, GizmoMode, GizmoSpace, MOVE_SNAP, ROTATE_SNAP};
+use crate::editor::gizmo::{Drag, Gizmo, Target};
+use crate::editor::state::{
+    EditorState, GizmoMode, GizmoSpace, MOVE_SNAP, ROTATE_SNAP, SCALE_SNAP,
+};
 use crate::editor::theme::{self, ThemeSet};
 use crate::editor::widgets;
 use crate::editor::{icons, pick};
-use crate::scene::{Camera, LocalTransform, WorldTransform};
+use crate::scene::{Camera, LocalTransform, Parent, WorldTransform};
 use crate::stats::FrameStats;
 use orrin_registry::Reflect;
 
@@ -93,15 +95,7 @@ fn gizmo_modes(ui: &mut egui::Ui, state: &mut EditorState) {
         (GizmoMode::Rotate, "Rotate", 3, icons::rotate()),
         (GizmoMode::Scale, "Scale", 4, icons::scaling()),
     ] {
-        // Scale is remembered like the rest, but has no handles yet, which the
-        // hint says rather than the button pretending by being disabled.
-        let hint = match mode {
-            GizmoMode::Scale => {
-                let not_yet = super::menu_bar::NOT_IMPLEMENTED.to_lowercase();
-                format!("{name} ({key}) — handles {not_yet}")
-            }
-            _ => format!("{name} ({key})"),
-        };
+        let hint = format!("{name} ({key})");
         if widgets::toggle_icon(ui, icon, state.gizmo_mode == mode, &hint).clicked() {
             state.gizmo_mode = mode;
         }
@@ -123,6 +117,7 @@ fn space_and_snap(ui: &mut egui::Ui, state: &mut EditorState) {
     // "by how much?" without opening anything.
     let step = state.snap_step(true).map(|step| match state.gizmo_mode {
         GizmoMode::Rotate => format!("{step}°"),
+        GizmoMode::Scale => format!("×{step}"),
         _ => format!("{step}"),
     });
     let word = match &step {
@@ -130,7 +125,8 @@ fn space_and_snap(ui: &mut egui::Ui, state: &mut EditorState) {
         _ => "Snap",
     };
     let hint = format!(
-        "Quantise moves to {MOVE_SNAP} m and turns to {ROTATE_SNAP}°. Hold Ctrl while          dragging to snap with this off"
+        "Quantise moves to {MOVE_SNAP} m, turns to {ROTATE_SNAP}° and scales to steps of \
+         {SCALE_SNAP}. Hold Ctrl while dragging to snap with this off"
     );
     if widgets::icon_label_button(ui, icons::grid(), word, state.snap, &hint).clicked() {
         state.snap = !state.snap;
@@ -188,12 +184,14 @@ pub fn accept_prefab(
     state.request_instantiate_at(*prefab, at);
 }
 
-/// The transform gizmo on the primary selection: which handle the pointer is
-/// on, a drag of one, and this frame's strokes for the renderer.
+/// The transform gizmo on the selection: which handle the pointer is on, a
+/// drag of one, and this frame's strokes for the renderer.
 ///
-/// Each frame of a drag posts the transform it has reached as an edit, so the
-/// drag shows as it happens and, the button being held, stays one gesture
-/// until it is let go — one undo step (see `scene::edit`).
+/// The gizmo stands at the centre of everything selected, turned as the
+/// primary is, and a drag moves the whole selection about that centre. Each
+/// frame of a drag posts the transforms it has reached as edits, so the drag
+/// shows as it happens and, the button being held, stays one gesture until it
+/// is let go — one undo step (see `scene::edit`).
 pub fn gizmo(
     ctx: &egui::Context,
     world: &World,
@@ -203,19 +201,32 @@ pub fn gizmo(
 ) {
     state.gizmo_strokes.clear();
     state.gizmo_hot = None;
-    let entity = state.selection.primary().filter(|&e| world.is_alive(e));
+    let primary = state.selection.primary().filter(|&e| world.is_alive(e));
     let camera = world.get_resource::<Camera>().map(|camera| *camera);
-    let placed = entity.zip(camera).and_then(|(entity, camera)| {
-        let world_matrix = world.get::<WorldTransform>(entity)?.0;
-        let local = *world.get::<LocalTransform>(entity)?;
-        Some((entity, camera, world_matrix, local))
-    });
+    let targets = targets(world, state.selection.entities());
     let screen = ctx.screen_rect();
-    let Some((entity, camera, world_matrix, local)) = placed else {
+    // Under the handles: drawn first.
+    if let Some(camera) = camera {
+        let view_proj = camera.view_projection(screen.aspect_ratio());
+        let forward = (camera.target - camera.position).normalize();
+        let ppp = ctx.pixels_per_point();
+        pick::each_marker(world, |entity, at, kind| {
+            if (at - camera.position).dot(forward) <= camera.near {
+                return;
+            }
+            let on_screen = pick::to_screen(view_proj, screen, at);
+            let selected = state.selection.contains(entity);
+            crate::editor::gizmo::marker(&mut state.gizmo_strokes, on_screen, kind, selected, ppp);
+        });
+    }
+    let placed = primary
+        .zip(camera)
+        .and_then(|(primary, camera)| Some((primary, camera, pivot(world, primary, &targets)?)));
+    let Some((primary, camera, pivot)) = placed else {
         state.gizmo_drag = None;
         return;
     };
-    let Some(handles) = Gizmo::new(&camera, screen, world_matrix, state.gizmo_space) else {
+    let Some(handles) = Gizmo::new(&camera, screen, pivot, state.gizmo_space) else {
         state.gizmo_drag = None;
         return;
     };
@@ -232,38 +243,28 @@ pub fn gizmo(
         pick::ray(&camera, screen.aspect_ratio(), ndc)
     };
 
-    match state.gizmo_drag {
-        Some((dragged, drag)) if dragged == entity => {
+    match state.gizmo_drag.take() {
+        Some((dragged, drag)) if dragged == primary => {
             // Lit through the frame that lets go too, which is the frame a
             // click would otherwise land on whatever is behind the handle.
             state.gizmo_hot = Some(drag.handle);
-            match pointer.filter(|_| down) {
-                Some(pos) => {
-                    let moved = drag.update(ray(pos), state.snap_step(ctrl));
-                    state.edit(entity, crate::scene::registry::TRANSFORM, moved.to_value());
+            if let Some(pos) = pointer.filter(|_| down) {
+                for (target, moved) in drag.update(ray(pos), state.snap_step(ctrl)) {
+                    state.edit(target, crate::scene::registry::TRANSFORM, moved.to_value());
                 }
-                None => state.gizmo_drag = None,
+                state.gizmo_drag = Some((dragged, drag));
             }
         }
         _ => {
-            state.gizmo_drag = None;
             if let Some(pos) = pointer
                 && viewport.contains(pos)
                 && dock.over_scene(ctx, pos)
             {
                 state.gizmo_hot = handles.hit(state.gizmo_mode, pos);
                 if pressed && let Some(handle) = state.gizmo_hot {
-                    let parent = crate::scene::parent_world_matrix(world, entity);
-                    state.gizmo_drag = Drag::begin(
-                        &handles,
-                        state.gizmo_mode,
-                        handle,
-                        ray(pos),
-                        local,
-                        parent,
-                        world_matrix,
-                    )
-                    .map(|drag| (entity, drag));
+                    state.gizmo_drag =
+                        Drag::begin(&handles, state.gizmo_mode, handle, ray(pos), targets)
+                            .map(|drag| (primary, drag));
                 }
             }
         }
@@ -274,6 +275,52 @@ pub fn gizmo(
         ctx.pixels_per_point(),
         &mut state.gizmo_strokes,
     );
+}
+
+/// What a drag of the selection moves: each selected entity with a transform,
+/// except one under another that is selected — that one already moves with
+/// it, through the hierarchy, and moving it as well would move it twice.
+fn targets(world: &World, selection: &[Entity]) -> Vec<Target> {
+    let selected_above = |entity: Entity| {
+        let mut cursor = entity;
+        // Bounded: a cycle the hierarchy has not broken yet would otherwise spin.
+        for _ in 0..4096 {
+            match world.get::<Parent>(cursor).map(|parent| parent.get()) {
+                Some(parent) if selection.contains(&parent) => return true,
+                Some(parent) => cursor = parent,
+                None => return false,
+            }
+        }
+        false
+    };
+    selection
+        .iter()
+        .filter(|&&entity| world.is_alive(entity) && !selected_above(entity))
+        .filter_map(|&entity| {
+            Some(Target {
+                entity,
+                local: *world.get::<LocalTransform>(entity)?,
+                world: world.get::<WorldTransform>(entity)?.0,
+                parent: crate::scene::parent_world_matrix(world, entity),
+            })
+        })
+        .collect()
+}
+
+/// Where the gizmo stands: at the centre of `targets`, turned as `primary`
+/// is — or as the first target is, when the primary is not one of them.
+fn pivot(world: &World, primary: Entity, targets: &[Target]) -> Option<Mat4> {
+    let first = targets.first()?;
+    let centre = targets
+        .iter()
+        .map(|target| target.world.w_axis.truncate())
+        .sum::<Vec3>()
+        / targets.len() as f32;
+    let turned = world
+        .get::<WorldTransform>(primary)
+        .map_or(first.world, |world| world.0);
+    let (_, rotation, _) = turned.to_scale_rotation_translation();
+    Some(Mat4::from_rotation_translation(rotation, centre))
 }
 
 /// Select what a plain click on the scene lands on, or nothing when it lands
@@ -299,10 +346,10 @@ pub fn select_on_click(
         return;
     };
     // The scene is drawn across the whole window, behind the tools.
-    let screen = ctx.screen_rect();
-    let ndc = (pos - screen.min) / screen.size() * 2.0 - egui::Vec2::splat(1.0);
-    let (origin, direction) = pick::ray(&camera, screen.aspect_ratio(), ndc);
-    match (pick::pick(world, origin, direction), toggle) {
+    match (
+        pick::pick_at(world, &camera, ctx.screen_rect(), pos),
+        toggle,
+    ) {
         (Some(entity), true) => state.selection.toggle(entity),
         (Some(entity), false) => state.selection.set(entity),
         (None, true) => {}

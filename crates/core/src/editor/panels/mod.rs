@@ -1866,14 +1866,19 @@ mod tests {
     /// Where a point along the gizmo's X shaft is on screen: `fraction` of the
     /// way from the entity's origin to the tip.
     fn x_shaft(editor: &Harness, entity: orrin_ecs::Entity, fraction: f32) -> egui::Pos2 {
-        let camera = *editor.world.resource::<crate::scene::Camera>();
-        let screen = editor.ctx.screen_rect();
-        let view_proj = camera.view_projection(screen.aspect_ratio());
         let origin = editor
             .world
             .get::<crate::scene::WorldTransform>(entity)
             .unwrap()
             .translation();
+        x_shaft_from(editor, origin, fraction)
+    }
+
+    /// [`x_shaft`] for a gizmo standing at `origin`.
+    fn x_shaft_from(editor: &Harness, origin: glam::Vec3, fraction: f32) -> egui::Pos2 {
+        let camera = *editor.world.resource::<crate::scene::Camera>();
+        let screen = editor.ctx.screen_rect();
+        let view_proj = camera.view_projection(screen.aspect_ratio());
         let project = |point: glam::Vec3| {
             let ndc = view_proj.project_point3(point);
             screen.min
@@ -1949,6 +1954,150 @@ mod tests {
         assert_eq!(editor.state.history.undo_label(), None, "one step");
     }
 
+    #[test]
+    fn dragging_a_scale_tip_scales_the_selection_in_one_undo_step() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        editor.state.selection.set(cube);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Scale;
+        editor.frames(2);
+
+        let grab = x_shaft(&editor, cube, 0.95);
+        let outward = (grab - x_shaft(&editor, cube, 0.0)).normalized();
+        pointer(&mut editor, egui::Event::PointerMoved(grab));
+        pointer(&mut editor, button(grab, true));
+        let mut at = grab;
+        for _ in 0..3 {
+            at += outward * 20.0;
+            pointer(&mut editor, egui::Event::PointerMoved(at));
+        }
+        pointer(&mut editor, button(at, false));
+        let scale = editor.world.get::<LocalTransform>(cube).unwrap().scale;
+        assert!(scale.x > 1.2, "{scale}");
+        assert!(
+            (scale.y - 1.0).abs() < 1e-5 && (scale.z - 1.0).abs() < 1e-5,
+            "{scale}"
+        );
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let scale = editor.world.get::<LocalTransform>(cube).unwrap().scale;
+        assert!((scale - glam::Vec3::ONE).length() < 1e-5, "{scale}");
+        assert_eq!(editor.state.history.undo_label(), None, "one step");
+    }
+
+    /// Drag the X shaft of a gizmo standing at `origin` by three steps.
+    fn drag_x_shaft_from(editor: &mut Harness, origin: glam::Vec3) {
+        let grab = x_shaft_from(editor, origin, 0.5);
+        let outward = (grab - x_shaft_from(editor, origin, 0.0)).normalized();
+        pointer(editor, egui::Event::PointerMoved(grab));
+        pointer(editor, button(grab, true));
+        let mut at = grab;
+        for _ in 0..3 {
+            at += outward * 20.0;
+            pointer(editor, egui::Event::PointerMoved(at));
+        }
+        pointer(editor, button(at, false));
+    }
+
+    fn translation(editor: &Harness, entity: orrin_ecs::Entity) -> glam::Vec3 {
+        editor
+            .world
+            .get::<LocalTransform>(entity)
+            .unwrap()
+            .translation
+    }
+
+    /// With two selected the gizmo stands between them, and moves both.
+    #[test]
+    fn dragging_with_two_selected_moves_both_in_one_undo_step() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (a, _) = cube_under_the_viewport_centre(&mut editor);
+        let b = editor.spawn("Other");
+        editor.world.insert(b, crate::scene::MeshHandle(0));
+        let beside = translation(&editor, a) + glam::Vec3::new(0.0, 0.6, 0.0);
+        editor.world.insert(
+            b,
+            LocalTransform::new(crate::scene::Transform::from_translation(beside)),
+        );
+        crate::scene::propagate_transforms(&mut editor.world);
+        let (a0, b0) = (translation(&editor, a), translation(&editor, b));
+        editor.state.selection.set(a);
+        editor.state.selection.toggle(b);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Move;
+        editor.frames(2);
+
+        drag_x_shaft_from(&mut editor, (a0 + b0) * 0.5);
+        let (da, db) = (translation(&editor, a) - a0, translation(&editor, b) - b0);
+        assert!(da.x > 0.1, "{da}");
+        assert!((da - db).length() < 1e-4, "{da} vs {db}");
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!((translation(&editor, a) - a0).length() < 1e-5);
+        assert!((translation(&editor, b) - b0).length() < 1e-5);
+        assert_eq!(editor.state.history.undo_label(), None, "one step");
+    }
+
+    /// A child selected with its parent already moves with it, through the
+    /// hierarchy. Moving it as well would move it twice.
+    #[test]
+    fn a_child_selected_with_its_parent_moves_only_through_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (parent, _) = cube_under_the_viewport_centre(&mut editor);
+        let child = editor.spawn("Child");
+        crate::scene::reparent(&mut editor.world, child, Some(parent), false).unwrap();
+        crate::scene::propagate_transforms(&mut editor.world);
+        let (parent0, child0) = (translation(&editor, parent), translation(&editor, child));
+        editor.state.selection.set(child);
+        editor.state.selection.toggle(parent);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Move;
+        editor.frames(2);
+
+        drag_x_shaft_from(&mut editor, parent0);
+        assert!(translation(&editor, parent).x > parent0.x + 0.1);
+        assert!((translation(&editor, child) - child0).length() < 1e-6);
+    }
+
+    /// A light where the viewport's middle looks, and where to click on it.
+    fn light_under_the_viewport_centre(editor: &mut Harness) -> (orrin_ecs::Entity, egui::Pos2) {
+        editor.frames(2);
+        let at = editor.viewport().center();
+        let screen = editor.ctx.screen_rect();
+        let ndc = (at - screen.min) / screen.size() * 2.0 - egui::Vec2::splat(1.0);
+        let camera = *editor.world.resource::<crate::scene::Camera>();
+        let (origin, direction) = crate::editor::pick::ray(&camera, screen.aspect_ratio(), ndc);
+        let lamp = editor.spawn("Lamp");
+        editor.world.insert(lamp, crate::scene::Light::default());
+        editor.world.insert(
+            lamp,
+            LocalTransform::new(crate::scene::Transform::from_translation(
+                origin + direction.normalize() * 5.0,
+            )),
+        );
+        crate::scene::propagate_transforms(&mut editor.world);
+        (lamp, at)
+    }
+
+    #[test]
+    fn clicking_a_light_s_marker_selects_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (lamp, at) = light_under_the_viewport_centre(&mut editor);
+        editor.click(at + egui::vec2(3.0, 0.0));
+        assert_eq!(editor.state.selection.entities(), [lamp]);
+    }
+
+    /// Markers are how a light is found in the scene at all, so they are
+    /// there whether or not anything is selected.
+    #[test]
+    fn markers_are_drawn_with_nothing_selected() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        light_under_the_viewport_centre(&mut editor);
+        editor.state.selection.clear();
+        editor.frames(1);
+        assert!(!editor.state.gizmo_strokes.is_empty());
+    }
+
     /// A click on a handle is the start of a drag that went nowhere, not a
     /// click on whatever is behind it — here, empty space, which would clear
     /// the selection.
@@ -1996,7 +2145,7 @@ mod tests {
     /// whether or not the toggle is on.
     #[test]
     fn the_snap_step_follows_the_tool_and_ctrl_snaps_without_the_toggle() {
-        use crate::editor::state::{GizmoMode, MOVE_SNAP, ROTATE_SNAP};
+        use crate::editor::state::{GizmoMode, MOVE_SNAP, ROTATE_SNAP, SCALE_SNAP};
         let mut state = EditorState::default();
         state.gizmo_mode = GizmoMode::Move;
         assert_eq!(state.snap_step(false), None);
@@ -2005,6 +2154,8 @@ mod tests {
         assert_eq!(state.snap_step(false), Some(MOVE_SNAP));
         state.gizmo_mode = GizmoMode::Rotate;
         assert_eq!(state.snap_step(false), Some(ROTATE_SNAP));
+        state.gizmo_mode = GizmoMode::Scale;
+        assert_eq!(state.snap_step(false), Some(SCALE_SNAP));
         state.gizmo_mode = GizmoMode::Select;
         assert_eq!(state.snap_step(true), None);
     }

@@ -22,8 +22,8 @@ pub enum SceneRequest {
     Load,
 }
 
-/// What the transform gizmo edits. Move and rotate have handles (see
-/// `editor::gizmo`); scale is the same machinery and is still to come.
+/// What the transform gizmo edits. Select has no handles; the rest do (see
+/// `editor::gizmo`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GizmoMode {
     Select,
@@ -44,6 +44,9 @@ pub const MOVE_SNAP: f32 = 0.25;
 
 /// What a rotate drag quantises to when snapping, in degrees.
 pub const ROTATE_SNAP: f32 = 15.0;
+
+/// What a scale drag quantises its factor to when snapping.
+pub const SCALE_SNAP: f32 = 0.1;
 
 /// Which log levels the console shows: one bit per [`LogLevel`], all set to
 /// begin with.
@@ -139,8 +142,8 @@ pub struct EditorState {
     pub scale_linked: bool,
     /// The frame-time readout floating in the viewport's corner.
     pub show_stats: bool,
-    /// The handle being dragged, on which entity. Dropped when the button is
-    /// released or the selection moves on.
+    /// The handle being dragged, and the primary selection it was grabbed
+    /// under. Dropped when the button is released or the primary changes.
     pub gizmo_drag: Option<(Entity, Drag)>,
     /// The handle under the pointer, or being dragged: drawn lit, and what
     /// keeps a click on a handle from also selecting what is behind it.
@@ -325,7 +328,8 @@ impl EditorState {
         match self.gizmo_mode {
             GizmoMode::Move => Some(MOVE_SNAP),
             GizmoMode::Rotate => Some(ROTATE_SNAP),
-            GizmoMode::Select | GizmoMode::Scale => None,
+            GizmoMode::Scale => Some(SCALE_SNAP),
+            GizmoMode::Select => None,
         }
     }
 
