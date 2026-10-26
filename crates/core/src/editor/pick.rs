@@ -28,7 +28,7 @@ pub fn ray(camera: &Camera, aspect: f32, ndc: egui::Vec2) -> (Vec3, Vec3) {
 /// How an entity with nothing drawn at its place is shown, and picked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Marker {
-    Light,
+    Light(LightKind),
     /// Anything else with no mesh: a group, an anchor, a script's holder.
     Empty,
 }
@@ -50,6 +50,14 @@ pub fn is_locked(world: &World, entity: Entity) -> bool {
     false
 }
 
+/// Which of the three a light is, which its marker says at a glance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LightKind {
+    Point,
+    Spot,
+    Sun,
+}
+
 /// How far from a marker's centre a click still picks it, in points.
 pub const MARKER_REACH: f32 = 9.0;
 
@@ -67,10 +75,11 @@ pub fn each_marker(world: &World, mut visit: impl FnMut(Entity, Vec3, Marker)) {
             if world.has::<MeshHandle>(entity) {
                 return;
             }
-            let marker = if world.has::<Light>(entity) {
-                Marker::Light
-            } else {
-                Marker::Empty
+            let marker = match world.get::<Light>(entity).map(|light| *light) {
+                Some(Light::Point { .. }) => Marker::Light(LightKind::Point),
+                Some(Light::Spot { .. }) => Marker::Light(LightKind::Spot),
+                Some(Light::Directional { .. }) => Marker::Light(LightKind::Sun),
+                None => Marker::Empty,
             };
             visit(entity, transform.translation(), marker);
         });
@@ -243,6 +252,31 @@ mod tests {
         assert_eq!(pick_at(&world, &camera, screen(), far), None);
     }
 
+    /// A marker says which kind of light it stands for.
+    #[test]
+    fn a_light_s_marker_names_its_kind() {
+        let mut world = world();
+        let lights = [
+            (Light::point(Vec3::ONE, 800.0, 5.0), LightKind::Point),
+            (
+                Light::spot(Vec3::ONE, 800.0, 5.0, 20.0, 30.0),
+                LightKind::Spot,
+            ),
+            (Light::directional(Vec3::ONE, 20_000.0), LightKind::Sun),
+        ];
+        let mut expected = Vec::new();
+        for (light, kind) in lights {
+            let entity = world.spawn();
+            world.insert(entity, light);
+            world.insert(entity, WorldTransform(Mat4::IDENTITY));
+            expected.push((entity, Marker::Light(kind)));
+        }
+        let mut seen = Vec::new();
+        each_marker(&world, |entity, _, marker| seen.push((entity, marker)));
+        seen.sort_by_key(|(entity, _)| entity.index());
+        assert_eq!(seen, expected);
+    }
+
     #[test]
     fn markers_are_what_has_a_place_and_no_mesh() {
         let mut world = world();
@@ -254,7 +288,13 @@ mod tests {
         let mut seen = Vec::new();
         each_marker(&world, |entity, _, marker| seen.push((entity, marker)));
         seen.sort_by_key(|(entity, _)| entity.index());
-        assert_eq!(seen, [(lamp, Marker::Light), (group, Marker::Empty)]);
+        assert_eq!(
+            seen,
+            [
+                (lamp, Marker::Light(LightKind::Sun)),
+                (group, Marker::Empty)
+            ]
+        );
     }
 
     /// A marker is behind or in front of a mesh like anything else: the

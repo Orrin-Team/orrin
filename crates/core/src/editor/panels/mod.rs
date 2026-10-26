@@ -2420,6 +2420,28 @@ mod tests {
         assert!(!drawn(&editor), "the rectangle outlived the drag");
     }
 
+    /// Selected, a light shows how far it reaches; unselected it is only its
+    /// marker, so a scene of lights is not a scene of spheres.
+    #[test]
+    fn a_selected_light_shows_its_range() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (lamp, _) = light_under_the_viewport_centre(&mut editor);
+        editor.world.insert(
+            lamp,
+            crate::scene::Light::point(glam::Vec3::ONE, 800.0, 2.0),
+        );
+        editor.frames(1);
+        let resting = editor.state.gizmo_strokes.len();
+        editor.state.selection.set(lamp);
+        editor.state.gizmo_mode = crate::editor::state::GizmoMode::Select;
+        editor.frames(1);
+        assert!(
+            editor.state.gizmo_strokes.len() > resting + 6 * 3 * 32,
+            "{} after, {resting} before",
+            editor.state.gizmo_strokes.len()
+        );
+    }
+
     #[test]
     fn a_locked_mesh_cannot_be_clicked_in_the_scene() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));

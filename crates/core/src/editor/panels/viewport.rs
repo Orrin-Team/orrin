@@ -12,13 +12,13 @@
 use glam::{Mat4, Vec3};
 use orrin_ecs::{Entity, World};
 
-use crate::editor::gizmo::{Drag, Emphasis, Gizmo, Target};
+use crate::editor::gizmo::{Drag, Emphasis, Gizmo, LENGTH, Target};
 use crate::editor::state::{EditorState, GizmoMode, GizmoSpace};
 use crate::editor::theme::{self, ThemeSet};
 use crate::editor::widgets;
 use crate::editor::{icons, pick};
 use crate::gfx::vulkan::OutlineItem;
-use crate::scene::{Camera, Hierarchy, LocalTransform, MeshHandle, Parent, WorldTransform};
+use crate::scene::{Camera, Hierarchy, Light, LocalTransform, MeshHandle, Parent, WorldTransform};
 use crate::stats::FrameStats;
 use orrin_registry::Reflect;
 
@@ -305,6 +305,29 @@ pub fn gizmo(
             };
             crate::editor::gizmo::marker(&mut state.gizmo_strokes, on_screen, kind, emphasis, ppp);
         });
+        // A selected light's reach: its range, its cone, its direction.
+        let mut lines = Vec::new();
+        for &entity in state.selection.entities() {
+            let (Some(light), Some(model)) = (
+                world.get::<Light>(entity).map(|light| *light),
+                world.get::<WorldTransform>(entity).map(|world| world.0),
+            ) else {
+                continue;
+            };
+            let depth = (model.w_axis.truncate() - camera.position).dot(forward);
+            let per_point =
+                2.0 * depth.max(camera.near) * (camera.fov_y * 0.5).tan() / screen.height();
+            lines.clear();
+            crate::editor::gizmo::light_lines(&light, model, LENGTH * per_point, &mut lines);
+            crate::editor::gizmo::world_lines(
+                &mut state.gizmo_strokes,
+                &lines,
+                &camera,
+                screen,
+                crate::editor::theme::KIND_LIGHT,
+                ppp,
+            );
+        }
     }
     let placed = primary
         .zip(camera)

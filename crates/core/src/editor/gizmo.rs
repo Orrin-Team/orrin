@@ -37,10 +37,10 @@ use glam::{Mat4, Quat, Vec3};
 
 use orrin_ecs::Entity;
 
-use crate::editor::pick::{Marker, to_screen};
+use crate::editor::pick::{LightKind, Marker, to_screen};
 use crate::editor::state::{GizmoMode, GizmoSpace};
 use crate::gfx::vulkan::GizmoVertex;
-use crate::scene::{Camera, LocalTransform};
+use crate::scene::{Camera, Light, LocalTransform, MAX_CONE_ANGLE, MIN_CONE_ANGLE};
 
 /// How long an axis is on screen, and the radius of a ring, in points.
 pub const LENGTH: f32 = 90.0;
@@ -397,7 +397,8 @@ pub enum Emphasis {
 }
 
 /// Append a marker for an entity standing at `at` on screen: a ring for a
-/// light, a diamond for anything else, lit when it is selected and half lit
+/// point light, a ring with its beam for a spot, a sun for a directional
+/// light, a diamond for anything else — lit when it is selected and half lit
 /// under the pointer.
 pub fn marker(
     out: &mut Vec<GizmoVertex>,
@@ -412,29 +413,152 @@ pub fn marker(
             let [red, green, blue, _] = HOT.to_array();
             [red, green, blue, 150]
         }
-        (Emphasis::Rest, Marker::Light) => crate::editor::theme::KIND_LIGHT.to_array(),
+        (Emphasis::Rest, Marker::Light(_)) => crate::editor::theme::KIND_LIGHT.to_array(),
         (Emphasis::Rest, Marker::Empty) => CENTRE.to_array(),
     };
-    let outline: Vec<egui::Pos2> = match kind {
-        Marker::Light => (0..=16)
+    let ring = |radius: f32, centre: egui::Pos2| -> Vec<egui::Pos2> {
+        (0..=16)
             .map(|step| {
                 let angle = step as f32 / 16.0 * std::f32::consts::TAU;
-                at + egui::vec2(angle.cos(), angle.sin()) * 6.0
+                centre + egui::vec2(angle.cos(), angle.sin()) * radius
             })
-            .collect(),
-        Marker::Empty => [
-            (0.0, -6.0),
-            (6.0, 0.0),
-            (0.0, 6.0),
-            (-6.0, 0.0),
-            (0.0, -6.0),
-        ]
-        .into_iter()
-        .map(|(x, y)| at + egui::vec2(x, y))
-        .collect(),
+            .collect()
     };
-    for pair in outline.windows(2) {
-        stroke(out, pair[0], pair[1], 1.25, 1.25, colour, pixels_per_point);
+    let spoke = |angle: f32, from: f32, to: f32| {
+        let direction = egui::vec2(angle.cos(), angle.sin());
+        vec![at + direction * from, at + direction * to]
+    };
+    // Glyph-like, square to the screen: a bulb, a bulb with its beam, a sun.
+    let lines: Vec<Vec<egui::Pos2>> = match kind {
+        Marker::Light(LightKind::Point) => vec![ring(6.0, at)],
+        Marker::Light(LightKind::Spot) => {
+            let bulb = at - egui::vec2(0.0, 3.0);
+            vec![
+                ring(5.0, bulb),
+                vec![bulb + egui::vec2(-3.0, 4.0), bulb + egui::vec2(-7.0, 11.0)],
+                vec![bulb + egui::vec2(3.0, 4.0), bulb + egui::vec2(7.0, 11.0)],
+            ]
+        }
+        Marker::Light(LightKind::Sun) => std::iter::once(ring(4.0, at))
+            .chain((0..8).map(|ray| spoke(ray as f32 * std::f32::consts::FRAC_PI_4, 6.5, 9.5)))
+            .collect(),
+        Marker::Empty => vec![
+            [
+                (0.0, -6.0),
+                (6.0, 0.0),
+                (0.0, 6.0),
+                (-6.0, 0.0),
+                (0.0, -6.0),
+            ]
+            .into_iter()
+            .map(|(x, y)| at + egui::vec2(x, y))
+            .collect(),
+        ],
+    };
+    for line in &lines {
+        for pair in line.windows(2) {
+            stroke(out, pair[0], pair[1], 1.25, 1.25, colour, pixels_per_point);
+        }
+    }
+}
+
+/// The shape of a light in the world, as lines, each marked strong or faint:
+/// a point light's range as a sphere, a spot's cone out to its range with its
+/// inner angle faint, and a sun's direction as a bundle of arrows `scale` long.
+///
+/// The spot's cone is capped where the range sphere cuts it, which is the
+/// volume the shader actually lights, and its angles are clamped as the
+/// renderer clamps them.
+pub fn light_lines(light: &Light, world: Mat4, scale: f32, out: &mut Vec<(Vec3, Vec3, bool)>) {
+    const STEPS: usize = 48;
+    let (_, rotation, at) = world.to_scale_rotation_translation();
+    let forward = (rotation * Vec3::NEG_Z).normalize();
+    let (u, v) = forward.any_orthonormal_pair();
+    let mut circle = |centre: Vec3, (a, b): (Vec3, Vec3), radius: f32, faint: bool| {
+        let point = |step: usize| {
+            let angle = step as f32 / STEPS as f32 * std::f32::consts::TAU;
+            centre + (a * angle.cos() + b * angle.sin()) * radius
+        };
+        out.extend((0..STEPS).map(|step| (point(step), point(step + 1), faint)));
+    };
+    match *light {
+        Light::Point { range, .. } => {
+            for plane in [(Vec3::X, Vec3::Y), (Vec3::Y, Vec3::Z), (Vec3::Z, Vec3::X)] {
+                circle(at, plane, range, false);
+            }
+        }
+        Light::Spot {
+            range,
+            inner_angle,
+            outer_angle,
+            ..
+        } => {
+            let outer = outer_angle.clamp(MIN_CONE_ANGLE, MAX_CONE_ANGLE);
+            let inner = inner_angle.clamp(0.0, outer);
+            // Where the range sphere meets the cone of a half angle.
+            let rim = |degrees: f32| {
+                let angle = degrees.to_radians();
+                (at + forward * range * angle.cos(), range * angle.sin())
+            };
+            let (centre, radius) = rim(outer);
+            circle(centre, (u, v), radius, false);
+            if inner > 0.0 {
+                let (centre, radius) = rim(inner);
+                circle(centre, (u, v), radius, true);
+            }
+            for side in [u, v, -u, -v] {
+                out.push((at, centre + side * radius, false));
+            }
+        }
+        Light::Directional { .. } => {
+            // A sun has a direction and no place, so its arrows are a size on
+            // screen rather than in the world.
+            for offset in [Vec3::ZERO, u, -u, v, -v] {
+                let start = at + offset * scale * 0.3;
+                let end = start + forward * scale;
+                out.push((start, end, false));
+                let back = end - forward * scale * 0.2;
+                let across = if offset == Vec3::ZERO { u } else { offset };
+                for side in [across, -across] {
+                    out.push((end, back + side * scale * 0.08, false));
+                }
+            }
+        }
+    }
+}
+
+/// Append world-space `lines` as strokes in `colour`, the faint ones fainter.
+/// A line with an end behind the camera is left out rather than clipped.
+pub fn world_lines(
+    out: &mut Vec<GizmoVertex>,
+    lines: &[(Vec3, Vec3, bool)],
+    camera: &Camera,
+    screen: egui::Rect,
+    colour: egui::Color32,
+    pixels_per_point: f32,
+) {
+    let view_proj = camera.view_projection(screen.aspect_ratio());
+    let forward = (camera.target - camera.position).normalize();
+    let ahead = |point: Vec3| (point - camera.position).dot(forward) > camera.near;
+    let [red, green, blue, _] = colour.to_array();
+    for &(a, b, faint) in lines {
+        if !ahead(a) || !ahead(b) {
+            continue;
+        }
+        let alpha = if faint { 110 } else { 230 };
+        let (a, b) = (
+            to_screen(view_proj, screen, a),
+            to_screen(view_proj, screen, b),
+        );
+        stroke(
+            out,
+            a,
+            b,
+            1.0,
+            1.0,
+            [red, green, blue, alpha],
+            pixels_per_point,
+        );
     }
 }
 
@@ -1643,7 +1767,7 @@ mod tests {
         marker(
             &mut out,
             egui::pos2(100.0, 100.0),
-            Marker::Light,
+            Marker::Light(LightKind::Point),
             Emphasis::Hovered,
             1.0,
         );
@@ -1670,9 +1794,10 @@ mod tests {
             out.iter().map(|v| v.color).collect()
         };
         let light = crate::editor::theme::KIND_LIGHT.to_array();
-        assert!(colours(Marker::Light, false).contains(&light));
+        let lamp = Marker::Light(LightKind::Point);
+        assert!(colours(lamp, false).contains(&light));
         assert!(!colours(Marker::Empty, false).contains(&light));
-        assert!(colours(Marker::Light, true).contains(&HOT.to_array()));
+        assert!(colours(lamp, true).contains(&HOT.to_array()));
         assert!(colours(Marker::Empty, true).contains(&HOT.to_array()));
     }
 
@@ -1709,6 +1834,103 @@ mod tests {
             .collect();
         assert!(!y.is_empty() && y.iter().all(|&alpha| alpha < 100), "{y:?}");
         assert!(out.iter().any(|v| v.color == HOT.to_array()));
+    }
+
+    /// Three kinds, three shapes: told apart without selecting anything.
+    #[test]
+    fn each_kind_of_light_has_a_marker_of_its_own() {
+        let count = |kind: LightKind| {
+            let mut out = Vec::new();
+            marker(
+                &mut out,
+                egui::pos2(100.0, 100.0),
+                Marker::Light(kind),
+                Emphasis::Rest,
+                1.0,
+            );
+            out.len()
+        };
+        let [point, spot, sun] = [LightKind::Point, LightKind::Spot, LightKind::Sun].map(count);
+        assert!(
+            point != spot && spot != sun && point != sun,
+            "{point} {spot} {sun}"
+        );
+    }
+
+    #[test]
+    fn a_point_light_s_range_is_a_sphere_of_that_radius() {
+        let light = Light::point(Vec3::ONE, 800.0, 4.0);
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        let mut lines = Vec::new();
+        light_lines(&light, Mat4::from_translation(at), 1.0, &mut lines);
+        assert!(lines.len() >= 3 * 32, "three circles: {}", lines.len());
+        for (a, b, _) in &lines {
+            assert!(((*a - at).length() - 4.0).abs() < 1e-3);
+            assert!(((*b - at).length() - 4.0).abs() < 1e-3);
+        }
+    }
+
+    /// Turned to face +X: the cone opens along it, its rim where the range
+    /// sphere meets the outer angle, the inner angle drawn faint.
+    #[test]
+    fn a_spot_s_cone_opens_along_its_forward_to_its_range() {
+        let light = Light::spot(Vec3::ONE, 800.0, 6.0, 20.0, 30.0);
+        let at = Vec3::new(0.0, 1.0, 0.0);
+        let world = Mat4::from_rotation_translation(
+            Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2),
+            at,
+        );
+        let mut lines = Vec::new();
+        light_lines(&light, world, 1.0, &mut lines);
+
+        let angle = |p: Vec3| (p - at).normalize().dot(Vec3::X).acos().to_degrees();
+        let rim: Vec<Vec3> = lines
+            .iter()
+            .flat_map(|(a, b, _)| [*a, *b])
+            .filter(|p| (*p - at).length() > 1e-3)
+            .collect();
+        assert!(!rim.is_empty());
+        for p in &rim {
+            assert!(
+                ((*p - at).length() - 6.0).abs() < 1e-3,
+                "on the range sphere"
+            );
+        }
+        let strong = lines.iter().filter(|(.., faint)| !faint);
+        assert!(
+            strong
+                .flat_map(|(a, b, _)| [*a, *b])
+                .filter(|p| (*p - at).length() > 1e-3)
+                .all(|p| (angle(p) - 30.0).abs() < 0.01)
+        );
+        let faint: Vec<_> = lines.iter().filter(|(.., faint)| *faint).collect();
+        assert!(!faint.is_empty());
+        assert!(
+            faint
+                .iter()
+                .flat_map(|(a, b, _)| [*a, *b])
+                .all(|p| (angle(p) - 20.0).abs() < 0.01)
+        );
+        assert!(
+            lines.iter().any(|(a, ..)| (*a - at).length() < 1e-6),
+            "edges run from the apex"
+        );
+    }
+
+    #[test]
+    fn a_sun_is_arrows_along_its_direction() {
+        let light = Light::directional(Vec3::ONE, 20_000.0);
+        let world = Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        let down = Vec3::NEG_Y;
+        let mut lines = Vec::new();
+        light_lines(&light, world, 2.0, &mut lines);
+        let rays = lines
+            .iter()
+            .filter(|(a, b, _)| {
+                (*b - *a).normalize().dot(down) > 0.9999 && ((*b - *a).length() - 2.0).abs() < 1e-3
+            })
+            .count();
+        assert!(rays >= 5, "{rays} rays of the asked length along the light");
     }
 
     #[test]
