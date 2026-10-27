@@ -42,6 +42,21 @@ pub fn write_document(out: &mut String, document: &SceneDocument) {
     }
 }
 
+/// Write a document holding one value — see
+/// [`parse_value_document`](crate::parse_value_document) — its fields sorted by
+/// name, like every block a scene writes.
+pub fn write_value_document(
+    out: &mut String,
+    kind: &str,
+    version: u32,
+    min_reader: u32,
+    fields: &[(String, Value)],
+) {
+    let _ = writeln!(out, "{kind} {version} min-reader {min_reader}");
+    out.push('\n');
+    write_fields(out, fields, 0);
+}
+
 /// Dump every live entity, in ascending slot order.
 pub fn write_world(out: &mut String, registry: &Registry, world: &World) {
     for entity in world.entities() {

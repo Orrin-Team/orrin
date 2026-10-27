@@ -50,6 +50,10 @@ pub struct VkContext {
     /// geometry can be written straight into video memory; reported at startup
     /// so a frame-time number has the hardware beside it.
     pub profile: GpuProfile,
+    /// Whether BC5 and BC7 can be sampled, and so whether imported textures
+    /// are uploaded compressed. Every desktop GPU and lavapipe have it; the
+    /// asset database imports plain RGBA8 for a device that does not.
+    pub samples_bc: bool,
     /// The driver's compiled-shader cache, reloaded from disk and written back
     /// when this context is dropped. Passed to every pipeline constructor
     /// through [`pipeline_cache`](Self::pipeline_cache).
@@ -234,6 +238,8 @@ impl VkContext {
             device_extensions.khr_dynamic_rendering = true;
         }
 
+        let samples_bc = physical_device.supported_features().texture_compression_bc;
+
         // The compute-only family second, so `queues` yields the graphics queue
         // first whether or not there is one.
         let queue_create_infos = [Some(queue_family_index), compute_family]
@@ -259,6 +265,7 @@ impl VkContext {
                     draw_indirect_first_instance: multi_draw,
                     dynamic_rendering: true,
                     synchronization2: true,
+                    texture_compression_bc: samples_bc,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()
@@ -307,6 +314,7 @@ impl VkContext {
             descriptor_set_allocator,
             descriptor_sets: DescriptorCache::default(),
             profile,
+            samples_bc,
             pipelines,
             partially_bound,
             multi_draw,

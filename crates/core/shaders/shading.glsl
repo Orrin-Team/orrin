@@ -205,6 +205,7 @@ float parallax_height(uint index, vec2 uv, vec2 dx, vec2 dy) {
     return textureGrad(sampler2D(textures[index], tex_sampler), uv, dx, dy).r;
 }
 #include "parallax.glsl"
+#include "normal_map.glsl"
 
 // The decal projector's one texture read, gradients handed in for the reason the
 // march's are. See decals.glsl.
@@ -906,7 +907,7 @@ Surface read_surface(GpuMaterial m, out float alpha) {
     float reflectance = m.params.z;
 
     // Tangent-space normal map -> world space via the TBN basis.
-    vec3 n_tangent = sample_tex(m.tex_indices.y, s.uv).xyz * 2.0 - 1.0;
+    vec3 n_tangent = tangent_normal(sample_tex(m.tex_indices.y, s.uv));
     s.N = normalize(TBN * n_tangent);
 
     // Decals, here and not a line either side of it. After the normal, because
@@ -986,7 +987,7 @@ Surface read_surface(GpuMaterial m, out float alpha) {
         // normal rather than the base layer's normal-mapped one. That is glTF's
         // rule and the physical one: a smooth film over a grained surface still
         // reflects flat.
-        vec3 coat_tangent = sample_tex(m.tex_indices_ext.y, s.uv).xyz * 2.0 - 1.0;
+        vec3 coat_tangent = tangent_normal(sample_tex(m.tex_indices_ext.y, s.uv));
         s.coat_N = normalize(TBN * coat_tangent);
     }
 

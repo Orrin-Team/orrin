@@ -40,6 +40,26 @@ impl AssetId {
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(Uuid::from_bytes(bytes))
     }
+
+    /// The id of an asset with no file to keep an assigned id in — an
+    /// engine-built mesh or material — derived from the `kind` and `name` it is
+    /// registered under.
+    ///
+    /// A version-8 UUID, the custom-UUID version, so no derived id can equal a
+    /// random (version 4) one from a sidecar. Frozen: the scene migration to
+    /// format 3 writes these into files, so the hash and its input can never
+    /// change.
+    pub fn named(kind: &str, name: &str) -> Self {
+        let mut input = Vec::with_capacity(kind.len() + name.len() + 13);
+        input.extend_from_slice(b"orrin.asset\0");
+        input.extend_from_slice(kind.as_bytes());
+        input.push(0);
+        input.extend_from_slice(name.as_bytes());
+        let mut bytes = xxhash_rust::xxh3::xxh3_128(&input).to_be_bytes();
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self::from_bytes(bytes)
+    }
 }
 
 impl fmt::Display for AssetId {
@@ -53,5 +73,35 @@ impl FromStr for AssetId {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Uuid::parse_str(s).map(Self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pinned, because files hold these: a change to the derivation would
+    /// silently detach every migrated scene from its meshes.
+    #[test]
+    fn a_named_id_is_frozen() {
+        assert_eq!(
+            AssetId::named("mesh", "cube").to_string(),
+            "2398d189-baf9-8039-9293-4dbdcaeb828b"
+        );
+    }
+
+    #[test]
+    fn a_named_id_is_version_8_and_depends_on_kind_and_name() {
+        let cube = AssetId::named("mesh", "cube");
+        assert_eq!(cube.0.get_version_num(), 8);
+        assert_eq!(cube.0.get_variant(), uuid::Variant::RFC4122);
+        assert_eq!(cube, AssetId::named("mesh", "cube"));
+        assert_ne!(cube, AssetId::named("material", "cube"));
+        assert_ne!(cube, AssetId::named("mesh", "cubes"));
+        assert_ne!(
+            AssetId::named("mes", "hcube"),
+            cube,
+            "the parts are separated"
+        );
     }
 }

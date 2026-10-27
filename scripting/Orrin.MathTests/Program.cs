@@ -295,6 +295,28 @@ Check(!noDoor.Door.IsValid, "a default AssetRef is the null reference");
 PropertyBag.Decode(noDoor, Convert.FromHexString(AssetGolden));
 Check(noDoor.Door == door.Door, "bag round trip: AssetRef");
 
+// The bytes name no kind, so an `AssetRef<Material>` crosses exactly as the
+// prefab reference above does.
+const string SkinGolden =
+    "0801000000"
+    + "04000000536b696e" + "0b00112233445566778899aabbccddeeff";
+
+var skin = new SkinProbe { Skin = new AssetRef<Material>(door.Door.Id) };
+Check(Hex(PropertyBag.Encode(skin)) == SkinGolden, "an AssetRef<Material> field encodes to the golden bytes");
+var noSkin = new SkinProbe();
+PropertyBag.Decode(noSkin, Convert.FromHexString(SkinGolden));
+Check(noSkin.Skin == skin.Skin, "bag round trip: AssetRef<Material>");
+
+// The kinds `find_asset` answers with, pinned to `ASSET_*` in orrin-script.
+Check(AssetKinds.Of<Prefab>() == 1, "a prefab is asset kind 1");
+Check(AssetKinds.Of<Mesh>() == 2, "a mesh is asset kind 2");
+Check(AssetKinds.Of<Texture>() == 3, "a texture is asset kind 3");
+Check(AssetKinds.Of<Material>() == 4, "a material is asset kind 4");
+Check(
+    (uint)AssetState.Loading == 0 && (uint)AssetState.Ready == 1 && (uint)AssetState.Failed == 2,
+    "AssetState matches LOAD_* in orrin-script");
+Check(default(AssetRef<Mesh>).State == AssetState.Failed, "the null reference never loads");
+
 var stepped = new BagProbe { Speed = 99f };
 PropertyBag.Decode(stepped, Convert.FromHexString(AssetGolden));
 Check(stepped.Speed == 99f, "an asset field this type lacks is stepped over");
@@ -337,4 +359,9 @@ sealed class BagProbe : Behaviour
 sealed class AssetProbe : Behaviour
 {
     public AssetRef<Prefab> Door;
+}
+
+sealed class SkinProbe : Behaviour
+{
+    public AssetRef<Material> Skin;
 }

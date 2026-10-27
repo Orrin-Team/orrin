@@ -4,7 +4,7 @@
 use glam::{Quat, Vec3};
 use orrin_registry::{
     AssetId, ComponentId, EntityId, FORMAT_VERSION, MIN_READER_VERSION, SceneDocument, SceneEntity,
-    Value, parse, write_document,
+    Value, parse, parse_value_document, write_document, write_value_document,
 };
 
 fn entity(components: Vec<(&str, Value)>) -> SceneEntity {
@@ -50,7 +50,7 @@ fn every_leaf_survives_the_round_trip() {
         ])],
     });
 
-    assert!(text.starts_with("orrin-scene 2 min-reader 2\n"));
+    assert!(text.starts_with("orrin-scene 3 min-reader 3\n"));
 }
 
 /// An asset reference has its own spelling rather than being a string that
@@ -169,7 +169,7 @@ fn entities_are_written_in_id_order_whatever_order_they_arrived_in() {
 fn an_empty_scene_is_just_a_header() {
     let mut text = String::new();
     write_document(&mut text, &SceneDocument::default());
-    assert_eq!(text, "orrin-scene 2 min-reader 2\n");
+    assert_eq!(text, "orrin-scene 3 min-reader 3\n");
     assert_eq!(parse(&text).unwrap(), SceneDocument::default());
 }
 
@@ -186,7 +186,7 @@ fn a_file_needing_a_newer_reader_names_both_versions() {
     assert_eq!(
         err.to_string(),
         "line 1: scene format version 99 needs a reader of version 98 or later \
-         (this build reads up to 2)"
+         (this build reads up to 3)"
     );
 }
 
@@ -241,7 +241,7 @@ entity 00000000-0000-0000-0000-000000000001
     write_document(&mut text, &document);
     assert_eq!(
         text,
-        r#"orrin-scene 2 min-reader 2
+        r#"orrin-scene 3 min-reader 3
 
 entity 00000000-0000-0000-0000-000000000001 "Door \"A\""
   orrin.tag = 7
@@ -282,7 +282,7 @@ fn an_entity_header_carries_its_name() {
     });
     assert_eq!(
         text,
-        r#"orrin-scene 2 min-reader 2
+        r#"orrin-scene 3 min-reader 3
 
 entity 00000000-0000-0000-0000-000000000001 "Door \"A\""
   orrin.tag = 7
@@ -370,4 +370,67 @@ fn a_negative_integer_is_not_a_u32() {
 
     let err = u32::from_value(&Value::I32(-1)).unwrap_err();
     assert_eq!(err.to_string(), "expected a u32, found -1");
+}
+
+/// A material is one value under a header of its own: the scene grammar at the
+/// left margin, fields sorted, read back as written.
+#[test]
+fn a_value_document_round_trips_under_its_own_header() {
+    let fields = vec![
+        ("roughness".to_owned(), Value::F32(0.25)),
+        (
+            "base_color".to_owned(),
+            Value::Vec3(Vec3::new(1.0, 0.5, 0.0)),
+        ),
+        (
+            "blend".to_owned(),
+            Value::Enum {
+                variant: "Masked".to_owned(),
+                fields: Vec::new(),
+            },
+        ),
+        (
+            "textures".to_owned(),
+            Value::strukt([(
+                "albedo",
+                Value::Asset("00000000-0000-4000-8000-000000000007".parse().unwrap()),
+            )]),
+        ),
+    ];
+    let mut text = String::new();
+    write_value_document(&mut text, "orrin-material", 1, 1, &fields);
+    assert_eq!(
+        text,
+        "orrin-material 1 min-reader 1\n\nbase_color = (1.0, 0.5, 0.0)\nblend = Masked\nroughness = 0.25\ntextures\n  albedo = asset(00000000-0000-4000-8000-000000000007)\n"
+    );
+    let mut sorted = fields.clone();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        parse_value_document(&text, "orrin-material", 1).unwrap(),
+        sorted
+    );
+}
+
+#[test]
+fn a_value_document_of_another_kind_or_a_newer_reader_is_refused_by_name() {
+    let err =
+        parse_value_document("orrin-scene 3 min-reader 3\n", "orrin-material", 1).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 1: expected an `orrin-material 1 min-reader 1` header"
+    );
+    let err =
+        parse_value_document("orrin-material 4 min-reader 2\n", "orrin-material", 1).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 1: orrin-material version 4 needs a reader of version 2 or later (this build reads \
+         up to 1)"
+    );
+    let err = parse_value_document(
+        "orrin-material 1 min-reader 1\n\n  roughness = 1\n",
+        "orrin-material",
+        1,
+    )
+    .unwrap_err();
+    assert_eq!(err.line, 3);
 }

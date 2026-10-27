@@ -23,7 +23,7 @@ use glam::{Mat3, Mat4, Vec3, Vec3A, Vec4};
 /// min of five runs, A/B'd back to back and then again in the other direction:
 /// the sweep goes 2.676 -> 2.634 ms with shadows on and 1.677 -> 1.643 ms with
 /// them off. A consistent 2%, against a run-to-run spread of about 0.01 ms.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Aabb {
     pub min: Vec3A,
     pub max: Vec3A,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::{
-    BlitImageInfo, CopyBufferToImageInfo, ImageBlit, RecordingCommandBuffer,
+    BlitImageInfo, BufferImageCopy, CopyBufferToImageInfo, ImageBlit, RecordingCommandBuffer,
 };
 use vulkano::format::{Format, FormatFeatures};
 use vulkano::image::sampler::Filter;
@@ -92,6 +92,114 @@ fn generate_mips(recording: &mut RecordingCommandBuffer, image: &Arc<Image>) {
 
 // `format` chooses how the shader interprets the bytes (e.g. `R8G8B8A8_SRGB`
 // for color, `R8G8B8A8_UNORM` for data maps).
+/// Upload a whole mip chain as it is, level 0 first: every level copied from
+/// one staging buffer, none generated.
+///
+/// What an imported texture takes. Its chain was made at import, filtered for
+/// what it holds, and a block-compressed one could not be made here anyway: a
+/// BC image cannot be the target of a blit.
+pub(super) fn upload_levels(
+    ctx: &VkContext,
+    format: Format,
+    extent: [u32; 2],
+    levels: &[Vec<u8>],
+) -> Arc<ImageView> {
+    let mip_levels = levels.len() as u32;
+    let total: usize = levels.iter().map(Vec::len).sum();
+    let staging = Buffer::new_slice::<u8>(
+        ctx.memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        total as u64,
+    )
+    .expect("failed to allocate texture staging buffer");
+    {
+        let mut mapped = staging.write().expect("a new staging buffer is not in use");
+        let mut at = 0;
+        for level in levels {
+            mapped[at..at + level.len()].copy_from_slice(level);
+            at += level.len();
+        }
+    }
+
+    let image = Image::new(
+        ctx.memory_allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format,
+            extent: [extent[0], extent[1], 1],
+            mip_levels,
+            usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+    )
+    .expect("failed to create texture image");
+
+    // Each level starts where the last ended. Every level's length is a whole
+    // number of blocks, so every offset is one too, which is all a copy into a
+    // block-compressed image asks of it.
+    let mut offset = 0;
+    let regions = levels
+        .iter()
+        .enumerate()
+        .map(|(level, bytes)| {
+            let region = BufferImageCopy {
+                buffer_offset: offset,
+                image_subresource: ImageSubresourceLayers {
+                    aspects: ImageAspects::COLOR,
+                    mip_level: level as u32,
+                    array_layers: 0..1,
+                },
+                image_extent: mip_level_extent([extent[0], extent[1], 1], level as u32)
+                    .expect("no more levels than the extent has"),
+                ..Default::default()
+            };
+            offset += bytes.len() as u64;
+            region
+        })
+        .collect();
+    let copy = CopyBufferToImageInfo {
+        regions,
+        ..CopyBufferToImageInfo::buffer_image(staging, image.clone())
+    };
+
+    record::submit_one_shot(ctx, |recording| {
+        record::image_barrier(
+            recording,
+            record::to_transfer_dst(
+                image.clone(),
+                record::whole_image(&image),
+                ImageLayout::Undefined,
+            ),
+        );
+        // SAFETY: the transition above put every level in the layout the copy
+        // names, and the staging buffer is written and never touched again
+        // before `submit_one_shot` returns.
+        unsafe { recording.copy_buffer_to_image(&copy) }.expect("invalid texture copy");
+        record::image_barrier(
+            recording,
+            record::to_shader_read(
+                image.clone(),
+                record::whole_image(&image),
+                ImageLayout::TransferDstOptimal,
+            ),
+        );
+    });
+
+    ImageView::new_default(image).expect("failed to create texture image view")
+}
+
 pub(super) fn upload_texture(
     ctx: &VkContext,
     pixels: &[u8],

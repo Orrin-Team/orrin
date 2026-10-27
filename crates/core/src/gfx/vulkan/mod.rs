@@ -124,7 +124,10 @@ use self::swapchain::SwapchainState;
 use self::taa::TaaPass;
 use self::timestamps::GpuTimestamps;
 
-use super::{DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TextureHandle};
+use super::{
+    DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TexelFormat, TextureHandle,
+    TextureLevels,
+};
 use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::DebugLine;
@@ -883,6 +886,21 @@ impl RenderBackend for VulkanRenderer {
         handle
     }
 
+    /// The new geometry is appended to the arena like any upload and the slot
+    /// pointed at it. The old span is left where it is rather than reused:
+    /// frames still in flight may be drawing from it, and the arena has no
+    /// free list to return it to. A reimport therefore costs its size in arena
+    /// space until the session ends, which is an editor's cost and not a
+    /// game's — an exported game never reimports.
+    fn replace_mesh(&mut self, handle: MeshHandle, mesh: &CpuMesh) {
+        let Some(slot) = self.meshes.get_mut(handle.0 as usize) else {
+            tracing::warn!("mesh {} was never loaded; reimport ignored", handle.0);
+            return;
+        };
+        let (span, bounds) = self.arena.upload(&self.ctx, &mesh.vertices, &mesh.indices);
+        *slot = GpuMesh { span, bounds };
+    }
+
     fn mesh_bounds(&self, mesh: MeshHandle) -> Option<Aabb> {
         self.meshes.get(mesh.0 as usize).map(|gpu| gpu.bounds)
     }
@@ -951,6 +969,46 @@ impl RenderBackend for VulkanRenderer {
         self.prepass_texture_set = None;
         self.shadow_texture_set = None;
         handle
+    }
+
+    /// A fresh image in the same array slot. The old view stays alive for as
+    /// long as a recorded frame's descriptor set holds it, so a frame in
+    /// flight finishes with the pixels it started with.
+    fn replace_texture(&mut self, handle: TextureHandle, levels: &TextureLevels) {
+        // The two defaults are what every unset material slot samples.
+        let index = handle.0 as usize;
+        if index < 2 || index >= self.textures.len() {
+            tracing::warn!("texture {} cannot be replaced; reimport ignored", handle.0);
+            return;
+        }
+        if levels.format.block_side() > 1 && !self.ctx.samples_bc {
+            tracing::warn!(
+                "texture {} is {}, which this device cannot sample; reimport ignored",
+                handle.0,
+                levels.format.label()
+            );
+            return;
+        }
+        let format = match levels.format {
+            TexelFormat::Rgba8Srgb => Format::R8G8B8A8_SRGB,
+            TexelFormat::Rgba8Unorm => Format::R8G8B8A8_UNORM,
+            TexelFormat::Bc5Unorm => Format::BC5_UNORM_BLOCK,
+            TexelFormat::Bc7Unorm => Format::BC7_UNORM_BLOCK,
+            TexelFormat::Bc7Srgb => Format::BC7_SRGB_BLOCK,
+        };
+        self.textures[index] = texture::upload_levels(
+            &self.ctx,
+            format,
+            [levels.width, levels.height],
+            &levels.levels,
+        );
+        self.texture_set = None;
+        self.prepass_texture_set = None;
+        self.shadow_texture_set = None;
+    }
+
+    fn samples_bc(&self) -> bool {
+        self.ctx.samples_bc
     }
 
     fn load_environment(&mut self, pixels: &[f32], width: u32, height: u32) {

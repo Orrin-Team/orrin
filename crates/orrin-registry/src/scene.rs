@@ -14,12 +14,12 @@ use crate::{AssetId, EntityId};
 /// Bumped whenever the grammar changes in a way older files don't satisfy.
 /// Migrations are explicit functions kept in the repo; a file whose version
 /// isn't handled is refused by name rather than parsed optimistically.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The oldest reader that can read what this build writes, stated in every
 /// header next to the version. A change an older reader can tolerate bumps
 /// [`FORMAT_VERSION`] and leaves this alone, so that reader is not locked out.
-pub const MIN_READER_VERSION: u32 = 2;
+pub const MIN_READER_VERSION: u32 = 3;
 
 /// The component written on an entity's header line rather than among its
 /// components, when it holds a string.
@@ -113,15 +113,80 @@ pub fn parse(input: &str) -> Result<SceneDocument, ParseError> {
     Ok(SceneDocument { entities })
 }
 
+/// Read a document that holds one value rather than entities — a material —
+/// under a header naming its own `kind`: `<kind> <version> min-reader
+/// <version>`, then the value's fields at the left margin.
+///
+/// The scene grammar, parser and rules, so a material reads and diffs the way
+/// a scene does. `version` is the newest this build reads; a file needing a
+/// newer reader is refused by name.
+pub fn parse_value_document(
+    input: &str,
+    kind: &str,
+    version: u32,
+) -> Result<Vec<(String, Value)>, ParseError> {
+    let lines = collect_lines(input)?;
+    let header = lines
+        .first()
+        .ok_or_else(|| ParseError::new(1, format!("empty file; expected a `{kind}` header")))?;
+    let format = Format {
+        kind,
+        label: kind,
+        version,
+        min_reader: version,
+    };
+    parse_header_of(header, &format, false)?;
+    let mut cursor = Cursor { lines, index: 1 };
+    let fields = parse_block(&mut cursor, 0)?;
+    if let Some(line) = cursor.peek() {
+        return Err(ParseError::new(
+            line.number,
+            "unexpected indent; a field at the left margin was expected",
+        ));
+    }
+    Ok(fields)
+}
+
+/// What a header names and what this build reads of it.
+struct Format<'a> {
+    kind: &'a str,
+    /// How an error names the format.
+    label: &'a str,
+    version: u32,
+    min_reader: u32,
+}
+
 /// `orrin-scene <version> min-reader <version>`, returning the first.
 ///
 /// Version 1 predates the second number and is the one header allowed without
 /// it.
 fn parse_header(line: &Line) -> Result<u32, ParseError> {
-    let error = |message: String| ParseError::new(line.number, message);
-    let expected = format!("orrin-scene {FORMAT_VERSION} min-reader {MIN_READER_VERSION}");
+    let format = Format {
+        kind: "orrin-scene",
+        label: "scene format",
+        version: FORMAT_VERSION,
+        min_reader: MIN_READER_VERSION,
+    };
+    parse_header_of(line, &format, true)
+}
 
-    let Some(rest) = line.text.strip_prefix("orrin-scene ") else {
+/// `<kind> <version> min-reader <version>` for `format`, returning the first.
+/// `bare_v1` allows the scene's first version, which predates the second number.
+fn parse_header_of(line: &Line, format: &Format, bare_v1: bool) -> Result<u32, ParseError> {
+    let error = |message: String| ParseError::new(line.number, message);
+    let Format {
+        kind,
+        label,
+        version: current,
+        min_reader: current_min,
+    } = *format;
+    let expected = format!("{kind} {current} min-reader {current_min}");
+
+    let Some(rest) = line
+        .text
+        .strip_prefix(kind)
+        .and_then(|rest| rest.strip_prefix(' '))
+    else {
         return Err(error(format!("expected an `{expected}` header")));
     };
     let mut words = rest.split_whitespace();
@@ -133,9 +198,9 @@ fn parse_header(line: &Line) -> Result<u32, ParseError> {
 
     let version = number(words.next())?;
     if version == 0 {
-        return Err(error("there is no scene format version 0".to_owned()));
+        return Err(error(format!("there is no {label} version 0")));
     }
-    if version == 1 && words.clone().next().is_none() {
+    if bare_v1 && version == 1 && words.clone().next().is_none() {
         return Ok(1);
     }
     if words.next() != Some("min-reader") {
@@ -154,10 +219,10 @@ fn parse_header(line: &Line) -> Result<u32, ParseError> {
             "a file cannot need a reader newer than its own version ({version} < {min_reader})"
         )));
     }
-    if min_reader > FORMAT_VERSION {
+    if min_reader > current {
         return Err(error(format!(
-            "scene format version {version} needs a reader of version {min_reader} or later \
-             (this build reads up to {FORMAT_VERSION})"
+            "{label} version {version} needs a reader of version {min_reader} or later \
+             (this build reads up to {current})"
         )));
     }
     Ok(version)
@@ -406,7 +471,7 @@ fn parse_f32(text: &str, line: usize) -> Result<f32, ParseError> {
     }
 }
 
-fn parse_string(body: &str, line: usize) -> Result<String, ParseError> {
+pub(crate) fn parse_string(body: &str, line: usize) -> Result<String, ParseError> {
     let mut out = String::with_capacity(body.len());
     let mut chars = body.chars();
     while let Some(ch) = chars.next() {

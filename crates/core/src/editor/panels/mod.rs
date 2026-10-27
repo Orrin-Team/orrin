@@ -3,6 +3,7 @@ pub(super) mod assets;
 pub(super) mod console;
 pub(super) mod environment;
 pub(super) mod hierarchy;
+pub(super) mod import;
 pub(super) mod inspector;
 mod menu_bar;
 pub(super) mod performance;
@@ -1031,6 +1032,414 @@ mod tests {
 
         assert!(editor.painted_contains("door"));
         assert!(editor.painted_contains("props"), "the folder it is in");
+    }
+
+    /// With a project, the browser opens on the assets directory's folders and
+    /// says how many imports failed, so a broken file is seen without opening
+    /// the console.
+    #[test]
+    fn the_assets_tool_browses_the_projects_folders_and_counts_failures() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let dir = crate::asset_db::tests::Dir::new("panel-browser");
+        dir.write("props/door.fprefab", b"orrin-scene 1\n");
+        dir.write("rocks/bad.png", b"not a png");
+        let (mut db, _) =
+            crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        assert!(db.wait_idle(std::time::Duration::from_secs(20)));
+        db.update(&editor.world, &mut crate::gfx::HeadlessBackend::new());
+        editor.world.insert_resource(db);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+
+        assert!(editor.painted_contains("props"));
+        assert!(editor.painted_contains("rocks"));
+        assert!(editor.painted_contains("1 failed"));
+        assert!(
+            !editor.painted_contains("door"),
+            "inside a folder, not at the root"
+        );
+    }
+
+    /// A list stacks rows tall enough for a picture beside each name; a grid
+    /// lays tiles side by side, each name under its picture.
+    #[test]
+    fn the_browser_lays_a_folder_out_as_a_list_or_a_grid() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let dir = crate::asset_db::tests::Dir::new("panel-browser-layout");
+        dir.write("alpha.fprefab", b"orrin-scene 1\n");
+        dir.write("bravo.fprefab", b"orrin-scene 1\n");
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        editor.world.insert_resource(db);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+        let label = |editor: &Harness, name: &str| {
+            editor
+                .painted_text_rects()
+                .into_iter()
+                .find(|(text, _)| text == name)
+                .unwrap_or_else(|| panic!("{name} is painted"))
+                .1
+        };
+
+        let (a, b) = (
+            label(&editor, "alpha.fprefab"),
+            label(&editor, "bravo.fprefab"),
+        );
+        assert!(
+            (a.left() - b.left()).abs() < 2.0,
+            "a list stacks: {a:?} {b:?}"
+        );
+        assert!(
+            b.center().y - a.center().y >= 32.0,
+            "rows of 32 or more: {a:?} {b:?}"
+        );
+
+        editor.state.assets_view.layout = crate::editor::state::AssetLayout::Grid;
+        editor.frames(2);
+        let (a, b) = (
+            label(&editor, "alpha.fprefab"),
+            label(&editor, "bravo.fprefab"),
+        );
+        assert!(
+            (a.center().y - b.center().y).abs() < 1.0,
+            "a grid lines up: {a:?} {b:?}"
+        );
+        assert!(b.left() > a.right(), "side by side: {a:?} {b:?}");
+    }
+
+    /// Where the browser is, the filter, and how it lays out, orders and
+    /// narrows the folder are one bar, so the folder gets the height.
+    #[test]
+    fn the_browsers_controls_are_one_row() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let dir = crate::asset_db::tests::Dir::new("panel-browser-bar");
+        dir.write("alpha.fprefab", b"orrin-scene 1\n");
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        editor.world.insert_resource(db);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+        let rects = editor.painted_text_rects();
+        let middle = |start: &str| {
+            rects
+                .iter()
+                .find(|(text, _)| text.starts_with(start))
+                .unwrap_or_else(|| panic!("{start} is painted: {rects:?}"))
+                .1
+                .center()
+                .y
+        };
+        let bar = middle("assets");
+        for control in ["Filter assets", "By name", "All kinds"] {
+            assert!(
+                (middle(control) - bar).abs() < 3.0,
+                "{control} is off the bar"
+            );
+        }
+    }
+
+    /// A click marks any asset, not only a prefab, in a list and in a grid:
+    /// the mark is what the Import tab shows.
+    #[test]
+    fn a_click_marks_any_kind_of_asset() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let dir = crate::asset_db::tests::Dir::new("panel-browser-mark");
+        dir.write("rock.png", b"");
+        dir.write("brick.fmat", b"orrin-material 1 min-reader 1\n");
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let rock = db.find("rock.png").unwrap().id;
+        let brick = db.find("brick.fmat").unwrap().id;
+        editor.world.insert_resource(db);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+
+        editor.click(row_of(&editor, "rock.png"));
+        assert_eq!(editor.state.revealed_asset, Some(rock));
+        editor.state.assets_view.layout = crate::editor::state::AssetLayout::Grid;
+        editor.frames(2);
+        editor.click(row_of(&editor, "brick.fmat"));
+        assert_eq!(editor.state.revealed_asset, Some(brick));
+    }
+
+    /// Rename, from a row's menu or F2 over the browser, edits the name in
+    /// place with its extension kept aside; Enter renames the file, Escape
+    /// leaves it as it was.
+    #[test]
+    fn an_asset_or_a_folder_is_renamed_in_place() {
+        use crate::asset_db::AssetDatabase;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let dir = crate::asset_db::tests::Dir::new("panel-rename");
+        dir.write("rock.png", b"");
+        dir.write("props/door.fprefab", b"orrin-scene 1\n");
+        let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let rock = db.find("rock.png").unwrap().id;
+        editor.world.insert_resource(db);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+        let type_text = |editor: &mut Harness, text: &str| {
+            editor.input.events.push(egui::Event::Text(text.to_owned()));
+            editor.frames(1);
+            editor.input.events.clear();
+        };
+
+        let at = row_of(&editor, "rock.png");
+        secondary_click(&mut editor, at);
+        editor.click(row_of(&editor, "Rename"));
+        editor.frames(1);
+        type_text(&mut editor, "boulder");
+        editor.key(egui::Key::Enter);
+        let db = editor.world.resource::<AssetDatabase>();
+        assert_eq!(
+            db.find("boulder.png").map(|e| e.id),
+            Some(rock),
+            "the stem was replaced"
+        );
+        drop(db);
+
+        editor.frames(1);
+        let at = row_of(&editor, "props");
+        secondary_click(&mut editor, at);
+        editor.click(row_of(&editor, "Rename"));
+        editor.frames(1);
+        type_text(&mut editor, "junk");
+        editor.key(egui::Key::Escape);
+        let db = editor.world.resource::<AssetDatabase>();
+        assert!(
+            db.folders().iter().any(|f| f.path == "props"),
+            "Escape renames nothing"
+        );
+        drop(db);
+
+        editor.frames(1);
+        editor.state.revealed_asset = Some(rock);
+        let at = row_of(&editor, "boulder.png");
+        editor.hover(at).frames(1);
+        editor.key(egui::Key::F2);
+        editor.frames(1);
+        type_text(&mut editor, "stone");
+        editor.key(egui::Key::Enter);
+        let db = editor.world.resource::<AssetDatabase>();
+        assert_eq!(
+            db.find("stone.png").map(|e| e.id),
+            Some(rock),
+            "F2 renames the marked one"
+        );
+    }
+
+    /// A project holding one imported texture, `rocks/rock.png`, 8 by 8.
+    fn imported_rock(
+        editor: &Harness,
+        dir: &crate::asset_db::tests::Dir,
+    ) -> crate::asset_db::AssetDatabase {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 40, 40, 255]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        dir.write("rocks/rock.png", png.get_ref());
+        let (mut db, _) =
+            crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        assert!(db.wait_idle(std::time::Duration::from_secs(20)));
+        db.update(&editor.world, &mut crate::gfx::HeadlessBackend::new());
+        db
+    }
+
+    /// The Import tab shows the asset the browser marks — what it is and what
+    /// its import made — and its settings, which Apply writes to the sidecar
+    /// and Revert puts back.
+    #[test]
+    fn the_import_tab_shows_the_marked_asset_and_applies_its_settings() {
+        use crate::asset_db::{AssetDatabase, Settings};
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let dir = crate::asset_db::tests::Dir::new("panel-import");
+        let db = imported_rock(&editor, &dir);
+        let rock = db.find("rocks/rock.png").unwrap().id;
+        editor.world.insert_resource(db);
+        editor.dock.activate(Tab::Import);
+        editor.frames(2);
+        assert!(
+            editor.painted_contains("Select an asset"),
+            "{:?}",
+            editor.painted()
+        );
+
+        editor.state.revealed_asset = Some(rock);
+        editor.frames(2);
+        let id = rock.to_string();
+        for shown in [
+            "rock.png", "rocks", &id, "Texture", "Imported", "RGBA8", "8 × 8",
+        ] {
+            assert!(
+                editor.painted_contains(shown),
+                "{shown}: {:?}",
+                editor.painted()
+            );
+        }
+        let compress = |editor: &Harness| {
+            let db = editor.world.resource::<AssetDatabase>();
+            match db.get(rock).unwrap().settings {
+                Settings::Texture(texture) => texture.compress,
+                other => panic!("{other:?}"),
+            }
+        };
+
+        editor.click(row_of(&editor, "Compress"));
+        editor.click(row_of(&editor, "Revert"));
+        editor.click(row_of(&editor, "Apply"));
+        assert!(compress(&editor), "reverted, so nothing to apply");
+
+        editor.click(row_of(&editor, "Compress"));
+        editor.click(row_of(&editor, "Apply"));
+        assert!(!compress(&editor));
+        let meta = std::fs::read_to_string(dir.path().join("rocks/rock.png.meta")).unwrap();
+        assert!(
+            meta.contains("compress = false") && meta.contains(&id),
+            "{meta}"
+        );
+    }
+
+    /// Files dropped from a file explorer are copied into the open folder, or
+    /// into the folder under the pointer, and the first to come in is marked.
+    /// Where the pointer is not known — Windows reports no motion during an
+    /// explorer's drag — the open folder takes them.
+    #[test]
+    fn files_dropped_on_the_browser_are_copied_into_a_folder_and_marked() {
+        use crate::asset_db::AssetDatabase;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let outside = crate::asset_db::tests::Dir::new("panel-drop-source");
+        let rock = outside.write("rock.png", b"");
+        let door = outside.write("door.fprefab", b"orrin-scene 1\n");
+        let dir = crate::asset_db::tests::Dir::new("panel-drop");
+        dir.write("props/chair.fprefab", b"orrin-scene 1\n");
+        let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        editor.world.insert_resource(db);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+        let drop_file = |editor: &mut Harness, file: &std::path::Path| {
+            editor.input.dropped_files = vec![egui::DroppedFile {
+                path: Some(file.to_owned()),
+                ..Default::default()
+            }];
+            editor.frames(1);
+            editor.input.dropped_files.clear();
+        };
+
+        drop_file(&mut editor, &rock);
+        let db = editor.world.resource::<AssetDatabase>();
+        let copied = db.find("rock.png").expect("copied into the open folder").id;
+        assert_eq!(editor.state.revealed_asset, Some(copied));
+        drop(db);
+
+        editor.frames(1);
+        let props = row_of(&editor, "props");
+        editor.hover(props).frames(1);
+        drop_file(&mut editor, &door);
+        let db = editor.world.resource::<AssetDatabase>();
+        let copied = db
+            .find("props/door.fprefab")
+            .expect("copied into the folder")
+            .id;
+        assert_eq!(editor.state.revealed_asset, Some(copied));
+    }
+
+    /// The bar's import button opens a file dialog, and what is picked there
+    /// is copied into the open folder as a drop is. The dialog is the
+    /// operating system's, stood in for here by `assets::PICKED`.
+    #[test]
+    fn files_picked_from_the_bar_are_copied_into_the_open_folder() {
+        use crate::asset_db::AssetDatabase;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let outside = crate::asset_db::tests::Dir::new("panel-pick-source");
+        let rock = outside.write("rock.png", b"");
+        let dir = crate::asset_db::tests::Dir::new("panel-pick");
+        dir.write("props/chair.fprefab", b"orrin-scene 1\n");
+        let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        editor.world.insert_resource(db);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+        let browser = editor.tab_body(Tab::Assets);
+        let plus = crate::editor::icons::plus().glyph();
+        let button = editor
+            .painted_icons()
+            .into_iter()
+            .find(|(glyph, rect, _)| *glyph == plus && browser.contains(rect.center()))
+            .expect("the bar has an import button")
+            .1;
+
+        *assets::PICKED.lock().unwrap() = Some(vec![rock]);
+        editor.click(button.center());
+        let mut copied = None;
+        for _ in 0..200 {
+            editor.frames(1);
+            copied = editor
+                .world
+                .resource::<AssetDatabase>()
+                .find("rock.png")
+                .map(|e| e.id);
+            if copied.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(copied.is_some(), "copied into the open folder");
+        assert_eq!(editor.state.revealed_asset, copied);
+    }
+
+    /// An old saved layout has no Import tab, so the browser's menu can bring
+    /// it back for the asset it was opened on.
+    #[test]
+    fn an_assets_menu_opens_its_import_settings() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let dir = crate::asset_db::tests::Dir::new("panel-import-menu");
+        let db = imported_rock(&editor, &dir);
+        let rock = db.find("rocks/rock.png").unwrap().id;
+        editor.world.insert_resource(db);
+        editor.dock.toggle(Tab::Import);
+        assert!(!editor.dock.is_open(Tab::Import));
+        editor.dock.activate(Tab::Assets);
+        editor.state.revealed_asset = Some(rock);
+        editor.frames(2);
+
+        let at = row_of(&editor, "rock.png");
+        secondary_click(&mut editor, at);
+        editor.click(row_of(&editor, "Import settings"));
+        assert!(editor.state.take_import_request());
+        editor.dock.show_import();
+        assert!(editor.dock.is_open(Tab::Import));
+    }
+
+    /// What the prefab list does survives into the project's browser: a
+    /// prefab row counts its instances, the filter finds an asset in any
+    /// folder, and "Show in Assets" opens the folder the prefab is in.
+    #[test]
+    fn the_project_browser_counts_filters_and_reveals_prefabs() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let dir = crate::asset_db::tests::Dir::new("panel-browser-prefabs");
+        dir.write(
+            "props/door.fprefab",
+            b"orrin-scene 3 min-reader 3\n\nentity 00000000-0000-4000-8000-000000000001 \"Door\"\n",
+        );
+        dir.write("rocks/rock.png", b"");
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let (prefabs, issues) = crate::scene::Prefabs::scan(dir.path());
+        assert!(issues.is_empty(), "{issues:?}");
+        let door = db.find("props/door.fprefab").unwrap().id;
+        editor.world.insert_resource(db);
+        editor.world.insert_resource(prefabs);
+        crate::scene::prefab::instantiate(&mut editor.world, &editor.registry, door).unwrap();
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+        assert!(!editor.painted_contains("1 in scene"), "inside a folder");
+
+        editor.state.assets_query = "door".to_owned();
+        editor.frames(1);
+        assert!(editor.painted_contains("door"));
+        assert!(editor.painted_contains("1 in scene"));
+        assert!(!editor.painted_contains("rocks"), "{:?}", editor.painted());
+
+        editor.state.assets_query.clear();
+        editor.state.revealed_asset = Some(door);
+        editor.frames(2);
+        assert!(editor.painted_contains("door"), "opened `props`");
+        assert!(!editor.painted_contains("rocks"));
     }
 
     /// The gesture the issue asks for: drag a prefab out of the browser and let
@@ -2798,7 +3207,7 @@ mod tests {
                         ui.allocate_ui(cell, |ui| environment::body(ui, world));
                         ui.allocate_ui(cell, |ui| performance::body(ui, world));
                         ui.allocate_ui(cell, |ui| console::body(ui, world, state));
-                        ui.allocate_ui(cell, |ui| assets::body(ui, world, state));
+                        ui.allocate_ui(cell, |ui| assets::body(ui, world, state, previews));
                     });
                 });
             })
@@ -3206,6 +3615,172 @@ mod tests {
     #[test]
     fn a_window_too_narrow_for_any_panel_still_lays_out() {
         Harness::new(egui::vec2(120.0, 400.0)).frames(4);
+    }
+
+    /// An editor drawing `brick.fmat` on a selected crate, beside a texture and
+    /// a mesh, with the material bound as a frame's service would bind it.
+    fn material_editor(
+        name: &str,
+    ) -> (
+        Harness,
+        crate::asset_db::tests::Dir,
+        orrin_ecs::Entity,
+        orrin_registry::AssetId,
+    ) {
+        use crate::asset_db::{AssetDatabase, material};
+        let mut editor = Harness::new(egui::vec2(1280.0, 1400.0));
+        let dir = crate::asset_db::tests::Dir::new(name);
+        dir.write(
+            "brick.fmat",
+            material::write(&Default::default()).as_bytes(),
+        );
+        dir.write("rock.png", b"");
+        dir.write("tree.glb", b"");
+        let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let brick = db.find("brick.fmat").unwrap().id;
+        let world = &mut editor.world;
+        world.insert_resource(db);
+        world.insert_resource(crate::scene::Assets::new());
+        world.insert_resource(crate::scene::AssetPreviews::default());
+        world.insert_resource(crate::scene::MaterialBlends::default());
+        world.insert_resource(crate::scene::MeshBounds::default());
+        let handle = world
+            .resource_mut::<AssetDatabase>()
+            .material(brick)
+            .unwrap();
+        let entity = editor.spawn("Crate");
+        editor.world.insert(entity, crate::scene::MeshHandle(0));
+        editor.world.insert(entity, handle);
+        let errors = editor
+            .world
+            .resource_mut::<AssetDatabase>()
+            .update(&editor.world, &mut crate::gfx::HeadlessBackend::new());
+        assert!(errors.is_empty(), "{errors:?}");
+        editor.state.selection.set(entity);
+        editor.frames(2);
+        (editor, dir, entity, brick)
+    }
+
+    /// Where the value of the inspector row labelled `label` is drawn.
+    fn value_of(editor: &Harness, label: &str) -> egui::Pos2 {
+        let row = row_of(editor, label);
+        egui::pos2(editor.tab_body(Tab::Inspector).right() - 40.0, row.y)
+    }
+
+    /// The material section of a material asset edits the file, through the
+    /// same undo history as the scene: a texture dropped on a slot is saved at
+    /// once and undone in one step, and a mesh dropped there is refused.
+    #[test]
+    fn a_texture_dropped_on_a_material_assets_slot_is_saved_and_undoable() {
+        use crate::asset_db::{AssetDatabase, material};
+        let (mut editor, dir, _, brick) = material_editor("panel-fmat-slot");
+        let (rock, tree) = {
+            let db = editor.world.resource::<AssetDatabase>();
+            (
+                db.find("rock.png").unwrap().id,
+                db.find("tree.glb").unwrap().id,
+            )
+        };
+        let saved = || {
+            let text = std::fs::read_to_string(dir.path().join("brick.fmat")).unwrap();
+            material::parse(&text, "brick.fmat").unwrap().textures
+        };
+
+        let slot = value_of(&editor, "Albedo map");
+        drop_payload(&mut editor, rock, slot);
+        assert_eq!(saved().albedo, Some(rock));
+        assert_eq!(editor.state.history.undo_label(), Some("Edit brick"));
+
+        // Away from the slot just dropped on, whose tooltip would otherwise
+        // cover the next one down; a real drag comes from the browser.
+        editor.hover(egui::pos2(10.0, 400.0)).frames(1);
+        let slot = value_of(&editor, "Normal map");
+        drop_payload(&mut editor, tree, slot);
+        assert_eq!(saved().normal, None);
+        let logged: Vec<String> = editor
+            .world
+            .resource::<crate::scene::LogBuffer>()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        assert_eq!(
+            logged,
+            ["brick.fmat: the `normal` slot takes a texture, not `tree.glb`, which is a mesh"]
+        );
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(saved().albedo, None);
+        let db = editor.world.resource::<AssetDatabase>();
+        assert_eq!(db.material_file(brick).unwrap().textures.albedo, None);
+    }
+
+    /// The Material slot of a mesh renderer takes a material asset.
+    #[test]
+    fn a_material_asset_dropped_on_the_mesh_renderer_draws_with_it() {
+        use crate::asset_db::{AssetDatabase, material};
+        let (mut editor, dir, entity, _) = material_editor("panel-fmat-renderer");
+        dir.write(
+            "glass.fmat",
+            material::write(&Default::default()).as_bytes(),
+        );
+        editor.world.resource_mut::<AssetDatabase>().rescan();
+        let glass = editor
+            .world
+            .resource::<AssetDatabase>()
+            .find("glass.fmat")
+            .unwrap()
+            .id;
+        editor.frames(1);
+
+        let slot = value_of(&editor, "Material");
+        drop_payload(&mut editor, glass, slot);
+        let handle = *editor
+            .world
+            .get::<crate::scene::MaterialHandle>(entity)
+            .unwrap();
+        assert_eq!(
+            editor.world.resource::<AssetDatabase>().material_id(handle),
+            Some(glass)
+        );
+        assert_eq!(editor.state.history.undo_label(), Some("Edit Material"));
+    }
+
+    /// Right-clicking the empty part of the open folder, or a folder's row,
+    /// offers "New material": a file at the default parameters, indexed as a
+    /// material at once and marked in the list.
+    #[test]
+    fn new_material_in_the_browser_writes_one_and_marks_it() {
+        use crate::asset_db::{AssetDatabase, AssetKind};
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let dir = crate::asset_db::tests::Dir::new("panel-new-material");
+        dir.write("props/door.fprefab", b"orrin-scene 1\n");
+        let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        editor.world.insert_resource(db);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+        let props = row_of(&editor, "props");
+
+        let below = egui::pos2(props.x, editor.tab_body(Tab::Assets).bottom() - 30.0);
+        secondary_click(&mut editor, below);
+        let item = row_of(&editor, "New material");
+        editor.click(item);
+        let db = editor.world.resource::<AssetDatabase>();
+        let created = db.find("New Material.fmat").expect("written and indexed");
+        assert_eq!(created.kind, AssetKind::Material);
+        assert_eq!(editor.state.revealed_asset, Some(created.id));
+        drop(db);
+        editor.frames(1);
+        assert!(editor.painted_contains("New Material.fmat"));
+
+        secondary_click(&mut editor, props);
+        let item = row_of(&editor, "New material");
+        editor.click(item);
+        let db = editor.world.resource::<AssetDatabase>();
+        let inside = db
+            .find("props/New Material.fmat")
+            .expect("made in the folder");
+        assert_eq!(editor.state.revealed_asset, Some(inside.id));
     }
 
     /// What the editor's own layout pass costs the CPU each frame — the part of

@@ -1,6 +1,6 @@
 use orrin_registry::{ComponentId, Registry};
 
-use super::{Collider, Light, LocalTransform, Locked, Name, Spin, Tag};
+use super::{Collider, Light, LocalTransform, Locked, MaterialHandle, MeshHandle, Name, Spin, Tag};
 
 pub const TRANSFORM: ComponentId = ComponentId::new("orrin.transform");
 pub const NAME: ComponentId = orrin_registry::NAME_COMPONENT;
@@ -10,18 +10,16 @@ pub const COLLIDER: ComponentId = ComponentId::new("orrin.collider");
 pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
 pub const LOCKED: ComponentId = ComponentId::new("orrin.locked");
 
-/// Reserved, not registered. `MeshHandle` and `MaterialHandle` are upload
-/// indices, so a scene stores the asset's *name* instead — a translation that
-/// needs the `Assets` resource, which `Reflect::to_value` deliberately cannot
-/// reach. `scene::persist` does it one level up, where the world is in scope.
-///
-/// The ids live here anyway so the namespace stays auditable in one place, and
-/// so that when assets gain stable ids these two can register properly and take
-/// the same ids — scenes written today keep parsing.
+/// `MeshHandle` and `MaterialHandle` are upload indices, so a scene stores the
+/// asset's [`AssetId`](orrin_registry::AssetId) instead — a translation that
+/// needs the world, which `Reflect::to_value` deliberately cannot reach. They
+/// register through `Resolve` (see `asset_db::handles`), under the ids scenes
+/// stored their names under before assets had ids, so those scenes still load.
 pub const MESH: ComponentId = ComponentId::new("orrin.mesh");
 pub const MATERIAL: ComponentId = ComponentId::new("orrin.material");
 
-/// Reserved for the same reason, and resolved the same way one level up.
+/// Reserved, not registered: resolved one level up, for the reason the two
+/// above go through `Resolve`.
 ///
 /// `Parent` holds an `orrin_ecs::Entity` — a slot handle whose meaning is this
 /// session's spawn history — so writing one to disk would name a different
@@ -42,12 +40,9 @@ pub const PREFAB: ComponentId = ComponentId::new("orrin.prefab");
 /// whole situation this exists for.
 ///
 /// Deliberately absent for now:
-/// - `MeshHandle` / `MaterialHandle` index a runtime asset table, so writing
-///   one to disk would bake a session-local number into a scene. They register
-///   once assets have stable ids.
 /// - `Decal` names its three maps by `TextureHandle`, which is an upload index
-///   and so session-local for exactly the reason the two handles above are. It
-///   registers alongside them, once assets have stable ids.
+///   and so session-local for exactly the reason `MeshHandle` is. It registers
+///   once it holds texture asset ids.
 /// - `ScriptComponent` owns a `GCHandle` whose `Drop` is the single managed
 ///   teardown path. It joins as a *bridge* to the C# property bag, never as an
 ///   ordinary component — a registry `write` replaces the component wholesale,
@@ -58,8 +53,7 @@ pub const PREFAB: ComponentId = ComponentId::new("orrin.prefab");
 ///   is the kind of redundancy a file format cannot keep consistent.
 /// - `Parent` holds a session-local entity handle. It *is* persisted, under the
 ///   reserved [`PARENT`] id, but as the parent's `EntityId` — a translation that
-///   needs the world in both directions, so it happens in `scene::persist`
-///   alongside the asset references, for exactly the same reason.
+///   needs the world in both directions, so it happens in `scene::persist`.
 pub fn register_components(registry: &mut Registry) {
     registry.register::<LocalTransform>(TRANSFORM, "Transform");
     registry.register::<Name>(NAME, "Name");
@@ -68,6 +62,8 @@ pub fn register_components(registry: &mut Registry) {
     registry.register::<Collider>(COLLIDER, "Collider");
     registry.register::<Spin>(SPIN, "Spin");
     registry.register::<Locked>(LOCKED, "Locked");
+    registry.register_resolved::<MeshHandle>(MESH, "Mesh");
+    registry.register_resolved::<MaterialHandle>(MATERIAL, "Material");
     registry.end_engine_registration();
 }
 

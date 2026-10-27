@@ -16,6 +16,22 @@ pub trait Reflect: 'static + Sized {
     fn from_value(value: &Value) -> Result<Self, ValueError>;
 }
 
+/// How a component converts when its file form needs the world to work out.
+///
+/// For a session-local handle that stands for something with a stable identity
+/// — `MeshHandle` is an upload slot, and a scene names the mesh's `AssetId` —
+/// the translation needs a table only the world holds. [`Reflect`] stays pure,
+/// which is what lets leaves and ordinary components be converted anywhere;
+/// this is the separate, explicit door for the few types that cannot be.
+pub trait Resolve: 'static + Sized {
+    /// `None` when the world cannot name this value, which readers treat as
+    /// the component being absent: there is nothing true to write for it.
+    fn to_value(&self, world: &orrin_ecs::World) -> Option<Value>;
+    fn from_value(world: &orrin_ecs::World, value: &Value) -> Result<Self, ValueError>;
+    /// What the inspector's "add component" starts from.
+    fn default_value() -> Value;
+}
+
 /// Both directions are generated from one `$variant`, so they cannot disagree
 /// about which representation a type uses — the failure mode being a value that
 /// writes fine and silently refuses to read back.

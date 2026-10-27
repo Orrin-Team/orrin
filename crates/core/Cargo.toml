@@ -19,6 +19,8 @@ gltf.workspace = true
 image.workspace = true
 egui.workspace = true
 egui-winit.workspace = true
+rfd.workspace = true
+pollster.workspace = true
 # SVG image loader for the editor's logo. egui renders no SVG itself.
 egui_extras = { version = "0.31", features = ["svg"] }
 serde.workspace = true
@@ -27,17 +29,36 @@ serde.workspace = true
 toml.workspace = true
 ron = "0.10"
 sysinfo = "0.33"
-# Filesystem watching for rebuild-on-save; only pulled in with `scripting`.
-notify = { version = "8", optional = true }
+# Filesystem watching: rebuild-on-save, and reimport-on-save for assets, which
+# every build shape has — architecture §6 asks that asset edits never need a
+# restart, with or without .NET.
+notify = "8"
+# The asset cache's content hash. xxh3 only: one crate, no dependencies of its
+# own, and no build script. Not a cryptographic hash, which is right for a cache
+# no one else writes into — see `asset_db::cache` for when that changes.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Raw VK_EXT_memory_budget query for VRAM usage; pinned to vulkano 0.35's ash.
 ash = "0.38"
 egui_dock = { version = "0.16", features = ["serde"] }
 rayon = { workspace = true }
 tracing.workspace = true
 gilrs = "0.11.2"
+# BC7 and BC5 compression for imported textures (`asset_db::texture`). `simd`
+# adds AVX2 kernels, picked at run time and byte-identical to the scalar ones:
+# 3.7x on a 2048² BC7 chain (744 -> 200 ms on one thread). `decode` stays off;
+# the engine never decodes BC. Brings two crates besides itself, one of them a
+# second major version of `syn` (1.x, through enum-primitive-derive) — compile
+# time, not cold start.
+rusty_dds = { version = "0.9", default-features = false, features = ["encode", "simd"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# The texture tests decode what they encode, to hold compression to a quality.
+rusty_dds = { version = "0.9", default-features = false, features = ["encode", "simd", "decode"] }
+# A KTX2 reader and Khronos' descriptor table, so the cache's own KTX2 writer
+# is checked against the spec rather than against itself.
+ktx2 = "0.5.0"
+vk2dfd = "0.1.0"
 # Already a dependency above; the input tests need it to build the focus-loss
 # window event, which is the one part of `InputState` with no other door in.
 winit.workspace = true
@@ -54,7 +75,7 @@ default = ["scripting"]
 #
 # The build watcher rides along: rebuild-on-save has nothing to reload without
 # scripting.
-scripting = ["dep:orrin-script", "dep:orrin-build", "dep:notify"]
+scripting = ["dep:orrin-script", "dep:orrin-build"]
 # An exported game rather than the editor: trace and debug events are compiled
 # out, and warnings and errors are also written to a log file beside the
 # executable — see `logging::LogConfig::for_this_build`.

@@ -84,6 +84,7 @@ macro_rules! icons {
 // Phosphor's codepoints, from its `style.css` at 2.1.1.
 icons! {
     activity => '\u{e000}',
+    arrow_up => '\u{e08e}',
     box_ => '\u{e1da}',
     check => '\u{e182}',
     chevron_down => '\u{e136}',
@@ -93,8 +94,11 @@ icons! {
     circle_x => '\u{e4f8}',
     ellipsis => '\u{e1fe}',
     file_code => '\u{e914}',
+    folder => '\u{e25a}',
     globe => '\u{e288}',
     grid => '\u{e296}',
+    hourglass => '\u{e2b2}',
+    image => '\u{e2ca}',
     info => '\u{e2ce}',
     layers => '\u{e466}',
     lightbulb => '\u{e2dc}',

@@ -27,6 +27,9 @@ pub struct Prefs {
     pub layout: Option<egui_dock::DockState<super::dock::Tab>>,
     /// What the gizmo snaps to; `None` until the user first changes it.
     pub snap: Option<super::state::SnapSteps>,
+    /// How the asset browser lays out and orders a folder; `None` until the
+    /// user first changes it.
+    pub assets: Option<super::state::AssetView>,
     /// Which [`LAYOUT_VERSION`] `layout` was saved under. Absent, and so zero,
     /// in every file written before the field existed.
     layout_version: u32,
@@ -85,6 +88,7 @@ impl PrefsFile {
             theme: prefs.theme.clone(),
             layout: prefs.layout.clone(),
             snap: prefs.snap,
+            assets: prefs.assets,
         };
         let text = match ron::ser::to_string_pretty(prefs, ron::ser::PrettyConfig::default()) {
             Ok(text) => text,
@@ -144,6 +148,26 @@ mod tests {
         });
 
         assert_eq!(file.load().snap, Some(steps));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_asset_browsers_view_round_trips_without_its_filter() {
+        use super::super::state::{AssetLayout, AssetSort, AssetView};
+        let dir = scratch("asset-view");
+        let file = PrefsFile::new(Some(dir.clone()));
+        let view = AssetView {
+            layout: AssetLayout::Grid,
+            sort: AssetSort::Modified,
+            descending: true,
+            kind: Some(crate::asset_db::AssetKind::Texture),
+        };
+        file.save(&Prefs {
+            assets: Some(view),
+            ..Prefs::default()
+        });
+        let back = file.load().assets.unwrap();
+        assert_eq!(back, AssetView { kind: None, ..view });
         let _ = std::fs::remove_dir_all(dir);
     }
 

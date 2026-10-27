@@ -487,7 +487,7 @@ fn read_uri(uri: &str, base: &Path) -> Result<Vec<u8>, ModelError> {
     })
 }
 
-fn percent_decode(uri: &str) -> String {
+pub(crate) fn percent_decode(uri: &str) -> String {
     let bytes = uri.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -558,7 +558,11 @@ fn image_index(info: gltf::texture::Info) -> usize {
     info.texture().source().index()
 }
 
-fn import_primitive(primitive: &gltf::Primitive, buffers: &[Vec<u8>], scale: f32) -> CpuMesh {
+pub(crate) fn import_primitive(
+    primitive: &gltf::Primitive,
+    buffers: &[Vec<u8>],
+    scale: f32,
+) -> CpuMesh {
     let reader = primitive.reader(|buffer| buffers.get(buffer.index()).map(|data| data.as_slice()));
 
     let positions: Vec<Vec3> = reader

@@ -22,7 +22,7 @@ use crate::scene::FORMAT_VERSION;
 type Migration = fn(&str) -> String;
 
 /// `MIGRATIONS[n]` takes version `n + 1` to `n + 2`.
-const MIGRATIONS: [Migration; FORMAT_VERSION as usize - 1] = [v1_to_v2];
+const MIGRATIONS: [Migration; FORMAT_VERSION as usize - 1] = [v1_to_v2, v2_to_v3];
 
 /// Bring `text`, written at `version`, up to [`FORMAT_VERSION`]. `version` is
 /// at least 1 and below the current one; the header parser has checked both.
@@ -70,6 +70,84 @@ fn v1_to_v2(text: &str) -> String {
     out
 }
 
+/// Version 3 names an engine-built mesh or material by the id derived from
+/// its name ([`AssetId::named`]) where version 2 wrote the name itself, so that
+/// every asset reference in a file is an `asset(…)` whatever made the asset.
+///
+/// Rewritten in two places: an `orrin.mesh` or `orrin.material` component, and
+/// the `value` of a prefab instance's override of one. A string that does not
+/// unescape is left as it is, for the parser to report on its own line.
+///
+/// [`AssetId::named`]: crate::AssetId::named
+fn v2_to_v3(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let mut seen_header = false;
+    let mut in_prefab = false;
+    // The kind of asset the override being read replaces, once its
+    // `component` field has said; fields are written sorted, so before `value`.
+    let mut overriding: Option<&str> = None;
+
+    for line in &mut lines {
+        if !seen_header {
+            if !line.trim().is_empty() {
+                *line = "orrin-scene 3 min-reader 3".to_owned();
+                seen_header = true;
+            }
+            continue;
+        }
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let Some((field, value)) = line[indent..].split_once(" = ") else {
+            if indent <= 2 {
+                in_prefab = indent == 2 && line[indent..].trim_end() == "orrin.prefab";
+            }
+            if indent < 8 {
+                overriding = None;
+            }
+            continue;
+        };
+        let rewritten = match indent {
+            2 => {
+                in_prefab = false;
+                overriding = None;
+                asset_kind(field).and_then(|kind| named_asset(kind, value))
+            }
+            8 if in_prefab && field == "component" => {
+                overriding = unquote(value).as_deref().and_then(asset_kind);
+                None
+            }
+            8 if in_prefab && field == "value" => {
+                overriding.and_then(|kind| named_asset(kind, value))
+            }
+            _ => None,
+        };
+        if let Some(rewritten) = rewritten {
+            *line = format!("{}{field} = {rewritten}", &line[..indent]);
+        }
+    }
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+fn asset_kind(component: &str) -> Option<&'static str> {
+    match component {
+        "orrin.mesh" => Some("mesh"),
+        "orrin.material" => Some("material"),
+        _ => None,
+    }
+}
+
+fn unquote(value: &str) -> Option<String> {
+    let body = value.trim_end().strip_prefix('"')?.strip_suffix('"')?;
+    crate::scene::parse_string(body, 0).ok()
+}
+
+fn named_asset(kind: &str, value: &str) -> Option<String> {
+    let name = unquote(value)?;
+    Some(format!("asset({})", crate::AssetId::named(kind, &name)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +180,91 @@ entity 00000000-0000-0000-0000-000000000002
     orrin.name = \"not a component\"
   orrin.name = 3
 "
+        );
+    }
+
+    #[test]
+    fn v2_to_v3_names_engine_assets_by_their_derived_ids() {
+        let cube = crate::AssetId::named("mesh", "cube");
+        let gold = crate::AssetId::named("material", "go\"ld");
+        let v2 = "orrin-scene 2 min-reader 2
+
+entity 00000000-0000-0000-0000-000000000001 \"Cube\"
+  orrin.material = \"go\\\"ld\"
+  orrin.mesh = \"cube\"
+  game.sign
+    orrin.mesh = \"a field, not the component\"
+  orrin.tag = \"cube\"
+
+entity 00000000-0000-0000-0000-000000000002
+  orrin.mesh = asset(00000000-0000-4000-8000-000000000009)
+  orrin.prefab
+    overrides
+      [0]
+        component = \"orrin.mesh\"
+        entity = entity(00000000-0000-0000-0000-000000000003)
+        path = \"\"
+        value = \"cube\"
+      [1]
+        component = \"orrin.tag\"
+        entity = entity(00000000-0000-0000-0000-000000000003)
+        path = \"\"
+        value = \"cube\"
+    source = asset(00000000-0000-4000-8000-000000000004)
+  orrin.material = \"bad \\q escape\"
+";
+        assert_eq!(
+            v2_to_v3(v2),
+            format!(
+                "orrin-scene 3 min-reader 3
+
+entity 00000000-0000-0000-0000-000000000001 \"Cube\"
+  orrin.material = asset({gold})
+  orrin.mesh = asset({cube})
+  game.sign
+    orrin.mesh = \"a field, not the component\"
+  orrin.tag = \"cube\"
+
+entity 00000000-0000-0000-0000-000000000002
+  orrin.mesh = asset(00000000-0000-4000-8000-000000000009)
+  orrin.prefab
+    overrides
+      [0]
+        component = \"orrin.mesh\"
+        entity = entity(00000000-0000-0000-0000-000000000003)
+        path = \"\"
+        value = asset({cube})
+      [1]
+        component = \"orrin.tag\"
+        entity = entity(00000000-0000-0000-0000-000000000003)
+        path = \"\"
+        value = \"cube\"
+    source = asset(00000000-0000-4000-8000-000000000004)
+  orrin.material = \"bad \\q escape\"
+"
+            )
+        );
+    }
+
+    /// A version 1 file runs the whole chain, and comes out parsing with its
+    /// mesh as an id.
+    #[test]
+    fn a_version_1_scene_reaches_the_current_version_with_ids() {
+        let v1 = "orrin-scene 1
+
+entity 00000000-0000-0000-0000-000000000001
+  orrin.mesh = \"cube\"
+  orrin.name = \"A\"
+";
+        let document = crate::parse(v1).unwrap();
+        let mesh = document.entities[0]
+            .components
+            .iter()
+            .find(|(id, _)| id.as_str() == "orrin.mesh")
+            .map(|(_, value)| value.clone());
+        assert_eq!(
+            mesh,
+            Some(crate::Value::Asset(crate::AssetId::named("mesh", "cube")))
         );
     }
 

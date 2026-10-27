@@ -76,6 +76,7 @@ float parallax_height(uint index, vec2 uv, vec2 dx, vec2 dy) {
     return textureGrad(sampler2D(u_textures[index], u_sampler), uv, dx, dy).r;
 }
 #include "parallax.glsl"
+#include "normal_map.glsl"
 
 vec4 decal_sample(uint index, vec2 uv, vec2 dx, vec2 dy) {
     return textureGrad(sampler2D(u_textures[index], u_sampler), uv, dx, dy);
@@ -150,7 +151,7 @@ void main() {
     float roughness  = clamp(m.params.y * mr_tex.g, 0.04, 1.0);
     float reflectance = m.params.z;
 
-    vec3 n_tangent = sample_tex(m.tex_indices.y, uv).xyz * 2.0 - 1.0;
+    vec3 n_tangent = tangent_normal(sample_tex(m.tex_indices.y, uv));
     vec3 view_normal = normalize(TBN * n_tangent);
 
     // The same stamp `read_surface` applies, in the same order, to the same four

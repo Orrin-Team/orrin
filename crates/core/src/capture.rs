@@ -126,15 +126,33 @@ impl Default for CaptureSettings {
 /// is a developer tool driven from a test, and a `Result` nobody can act on
 /// would only push the same panic one frame up the stack.
 pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
-    let instance = headless_instance();
-    let mut renderer = VulkanRenderer::offscreen(&instance, settings.extent);
+    let mut renderer = offscreen_renderer(settings.extent);
+    let mut world = World::new();
+    prepare(&mut world, &mut renderer, settings);
+    let (pixels, extent) = render(&mut world, &mut renderer, settings);
+    image::save_buffer(
+        path.as_ref(),
+        &pixels,
+        extent[0],
+        extent[1],
+        image::ColorType::Rgba8,
+    )
+    .expect("failed to write the capture");
+}
 
+/// A renderer drawing into an image of `extent` rather than a window.
+pub fn offscreen_renderer(extent: [u32; 2]) -> VulkanRenderer {
+    VulkanRenderer::offscreen(&headless_instance(), extent)
+}
+
+/// Build `settings.scene` into `world` with everything the frame reads, for a
+/// caller that changes the world before [`render`]ing it.
+pub fn prepare(world: &mut World, renderer: &mut VulkanRenderer, settings: &CaptureSettings) {
     // Default, then scene, then capture override — in that order, and the order
     // is the contract. The baseline goes in *first* so a scene that describes its
     // own air, exposure or environment is photographed as itself rather than as
     // the engine's defaults; the explicit fields below then still win, because a
     // capture that is an A/B has to be able to state both halves of it.
-    let mut world = World::new();
     world.insert_resource(MotionBlurSettings::default());
     world.insert_resource(DofSettings::default());
     world.insert_resource(BloomSettings::default());
@@ -142,7 +160,7 @@ pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
     world.insert_resource(EnvironmentSettings::default());
     world.insert_resource(FogSettings::default());
 
-    settings.scene.build(&mut world, &mut renderer);
+    settings.scene.build(world, renderer);
     if let Some(camera) = settings.camera {
         world.insert_resource(camera);
     }
@@ -170,7 +188,15 @@ pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
     if let Some(fog) = settings.fog {
         world.insert_resource(fog);
     }
+}
 
+/// Render `settings.frames` frames of `world` and read the last one back as
+/// tightly packed RGBA8.
+pub fn render(
+    world: &mut World,
+    renderer: &mut VulkanRenderer,
+    settings: &CaptureSettings,
+) -> (Vec<u8>, [u32; 2]) {
     let mut lighting = SceneLighting::default();
     let mut geometry = FrameGeometry::default();
     let mut decals = Vec::new();
@@ -186,8 +212,8 @@ pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
         // only local ones — the propagation that derives them is a system, not
         // something spawning does. Without it every renderable fails the query
         // and the frame is a skybox with nothing in front of it.
-        crate::scene::propagate_transforms(&mut world);
-        systems::extract_lighting(&world, &mut lighting);
+        crate::scene::propagate_transforms(world);
+        systems::extract_lighting(world, &mut lighting);
         let camera = *world.resource::<Camera>();
         // Fitted before extraction and after the lighting, exactly as `app.rs`
         // orders it: the boxes are built around the sun that extraction just
@@ -203,14 +229,14 @@ pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
             CascadeSet::default()
         };
         systems::extract_geometry(
-            &world,
+            world,
             aspect,
             &cascade_set,
             &atlas,
             renderer.gpu_culling(),
             &mut geometry,
         );
-        systems::extract_decals(&world, aspect, &mut decals);
+        systems::extract_decals(world, aspect, &mut decals);
 
         let caster_lists: [DrawList<'_>; MAX_CASCADES] =
             std::array::from_fn(|i| geometry.cascade(i));
@@ -257,17 +283,9 @@ pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
         );
     }
 
-    let (pixels, extent) = renderer
+    renderer
         .capture()
-        .expect("an offscreen renderer must have a readable target");
-    image::save_buffer(
-        path.as_ref(),
-        &pixels,
-        extent[0],
-        extent[1],
-        image::ColorType::Rgba8,
-    )
-    .expect("failed to write the capture");
+        .expect("an offscreen renderer must have a readable target")
 }
 
 /// An instance with no surface extensions.

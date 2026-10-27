@@ -157,8 +157,8 @@ Where tests live:
   they cover. This is the default and where most of the ~400 tests are.
 - **`crates/core/tests/`** for cross-module behaviour: `render_graph.rs` (barrier
   sequences, no GPU needed), `cold_start.rs` (the §6 startup gate),
-  `culling.rs`, `hierarchy_probe.rs`, `offscreen.rs` and `perf.rs` (both
-  `#[ignore]`d — they need a GPU).
+  `culling.rs`, `hierarchy_probe.rs`, `offscreen.rs`, `perf.rs` and
+  `asset_reload.rs` (the last three `#[ignore]`d — they need a GPU).
 - **Golden files** in `crates/core/tests/golden/`, refreshed with
   `ORRIN_UPDATE_GOLDEN=1`. Read the diff before you accept a new golden.
 - **`benches/`** with criterion, for anything on the frame's critical path.

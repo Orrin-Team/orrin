@@ -16,4 +16,7 @@ orrin-ecs.workspace=true
 orrin-macros.workspace = true
 glam.workspace = true
 uuid.workspace = true
+# `AssetId::named`. One crate with no dependencies of its own and no build
+# script, already in the tree for the asset cache's content hash.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 egui = { workspace = true, optional = true }

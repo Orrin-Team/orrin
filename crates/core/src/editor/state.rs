@@ -5,6 +5,7 @@ use orrin_registry::{AssetId, Registry};
 
 use super::gizmo::{Drag, Handle};
 use super::selection::Selection;
+use crate::asset_db::material::MaterialFile;
 use crate::scene::edit::{EditError, History, SceneEditor};
 use crate::scene::{
     self, Assets, LogBuffer, LogLevel, MaterialHandle, Name, Prefabs, Time, Transform, entities,
@@ -47,6 +48,41 @@ pub const ROTATE_SNAP: f32 = 15.0;
 
 /// What a scale drag quantises its factor to when snapping.
 pub const SCALE_SNAP: f32 = 0.1;
+
+/// How the asset browser shows a folder. The user's to set from the
+/// browser's bar, and remembered with their other preferences.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AssetView {
+    pub layout: AssetLayout,
+    pub sort: AssetSort,
+    pub descending: bool,
+    /// Only assets of this kind; `None` lists every kind. A filter for the
+    /// session, so not remembered.
+    #[serde(skip)]
+    pub kind: Option<crate::asset_db::AssetKind>,
+}
+
+/// Rows with a small picture, or tiles with a large one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AssetLayout {
+    #[default]
+    List,
+    Grid,
+}
+
+/// What a folder's assets are ordered by. Folders always come first, by name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AssetSort {
+    #[default]
+    Name,
+    /// By extension, then name: every texture together, every mesh together.
+    Type,
+    /// The source file's size.
+    Size,
+    /// When the source file was last written.
+    Modified,
+}
 
 /// What each tool snaps to. The user's to set from the snap button's menu,
 /// and remembered with their other preferences.
@@ -155,8 +191,9 @@ pub struct EditorState {
     pub inspector_query: String,
     /// The asset browser's filter, kept for the reason the others are.
     pub assets_query: String,
-    /// The prefab the asset browser marks: the last one clicked there, or the
-    /// one "Show in Assets" pointed at.
+    pub assets_view: AssetView,
+    /// The asset the browser marks, and the Import tab shows: the last one
+    /// clicked there, or the prefab "Show in Assets" pointed at.
     pub revealed_asset: Option<AssetId>,
     pub gizmo_mode: GizmoMode,
     pub gizmo_space: GizmoSpace,
@@ -190,6 +227,8 @@ pub struct EditorState {
     /// Component values the panels edited on detached copies this frame,
     /// applied by `apply` as part of the open gesture.
     edits: Vec<(Entity, orrin_registry::ComponentId, orrin_registry::Value)>,
+    /// Material assets the inspector edited this frame, the same way.
+    material_edits: Vec<(AssetId, MaterialFile)>,
     /// Whether the pointer is down or a field has focus — while it is, the
     /// open gesture stays open. Set by the panels once a frame's widgets
     /// have run.
@@ -227,6 +266,8 @@ pub struct EditorState {
     /// Not serviced by `apply`: bringing the asset browser forward is the
     /// dock's, which the editor drains after the UI pass.
     reveal_request: bool,
+    /// Bring the Import tab forward: the dock's, like `reveal_request`.
+    import_request: bool,
     /// Serviced by `apply`, because a rescan replaces the index the asset
     /// browser is drawing from.
     rescan_request: bool,
@@ -259,6 +300,7 @@ impl Default for EditorState {
             console_query: String::new(),
             inspector_query: String::new(),
             assets_query: String::new(),
+            assets_view: AssetView::default(),
             revealed_asset: None,
             gizmo_mode: GizmoMode::Select,
             gizmo_space: GizmoSpace::World,
@@ -274,6 +316,7 @@ impl Default for EditorState {
             outline: Vec::new(),
             history: History::default(),
             edits: Vec::new(),
+            material_edits: Vec::new(),
             holding: false,
             undo_request: false,
             redo_request: false,
@@ -288,6 +331,7 @@ impl Default for EditorState {
             instantiate_request: None,
             prefab_request: None,
             reveal_request: false,
+            import_request: false,
             rescan_request: false,
             save_prefab_request: false,
             theme_request: None,
@@ -348,6 +392,14 @@ impl EditorState {
         std::mem::take(&mut self.reveal_request)
     }
 
+    pub fn request_import_page(&mut self) {
+        self.import_request = true;
+    }
+
+    pub fn take_import_request(&mut self) -> bool {
+        std::mem::take(&mut self.import_request)
+    }
+
     pub fn request_prefab_rescan(&mut self) {
         self.rescan_request = true;
     }
@@ -360,6 +412,12 @@ impl EditorState {
         value: orrin_registry::Value,
     ) {
         self.edits.push((entity, component, value));
+    }
+
+    /// Give material asset `id` the parameters and slots of `file`, saved to
+    /// its file when the gesture ends.
+    pub fn edit_material(&mut self, id: AssetId, file: MaterialFile) {
+        self.material_edits.push((id, file));
     }
 
     /// The increment a drag of the current tool snaps to: when the toggle is
@@ -491,8 +549,11 @@ impl EditorState {
         for (entity, component, value) in self.edits.drain(..) {
             failed.extend(editor.set(entity, &component, value).err().map(fail));
         }
+        for (id, file) in self.material_edits.drain(..) {
+            failed.extend(editor.set_material(id, file).err().map(fail));
+        }
         if !self.holding {
-            editor.commit();
+            failed.extend(editor.try_commit().err().map(fail));
         }
         if std::mem::take(&mut self.undo_request) {
             failed.extend(editor.undo().err().map(fail));

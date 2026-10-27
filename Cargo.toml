@@ -45,6 +45,12 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 egui = "0.31"
 # Window events into egui. Rendering is the engine's own (`gfx/vulkan/overlay.rs`).
 egui-winit = { version = "0.31", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+# The Assets tab's file dialog. Without `wayland`, which only parents the
+# dialog on a Wayland compositor; everything else it uses is already in the
+# tree through winit, and `pollster`, which drives its async dialog, through
+# `rfd` itself.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 uuid = { version = "1", features = ["v4"] }
@@ -59,6 +65,13 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# rusty_dds 0.9's BC7 encoder `debug_assert!`s that a block never offers a
+# sixth endpoint seed, and ordinary gradients do. Release builds take the path
+# the assertion guards — the seed is not tried, and the block is still valid
+# BC7 — so dev builds are made to take it too, rather than panic mid-import.
+[profile.dev.package.rusty_dds]
+debug-assertions = false
 
 [profile.release]
 lto = "thin"

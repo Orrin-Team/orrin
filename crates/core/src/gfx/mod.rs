@@ -3,10 +3,12 @@ pub mod headless;
 pub mod punctual;
 pub mod sh;
 pub mod shadows;
+mod texel;
 pub mod thumbnail;
 pub mod vulkan;
 
 pub use headless::HeadlessBackend;
+pub use texel::{TexelFormat, TextureLevels};
 
 use crate::geom::Aabb;
 use crate::scene::{
@@ -739,6 +741,10 @@ pub trait RenderBackend {
     }
 
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle;
+    /// Replace what an uploaded mesh's slot draws, for a reimported asset. The
+    /// handle keeps its meaning, so nothing naming it changes; the bounds
+    /// [`mesh_bounds`](Self::mesh_bounds) reports are the new mesh's.
+    fn replace_mesh(&mut self, handle: MeshHandle, mesh: &CpuMesh);
     /// Object-space bounds derived at upload; `None` for a handle this backend
     /// never issued. Mirrored into [`MeshBounds`](crate::scene::MeshBounds) at
     /// load, since culling runs before any backend type is in reach.
@@ -750,6 +756,14 @@ pub trait RenderBackend {
     fn update_material(&mut self, handle: MaterialHandle, material: &Material);
     fn load_texture(&mut self, pixels: &[u8], width: u32, height: u32, srgb: bool)
     -> TextureHandle;
+    /// [`replace_mesh`](Self::replace_mesh) for a texture: every material
+    /// sampling `handle` samples `texture`'s chain from the next frame. A
+    /// block-compressed chain is only ever asked of a backend that
+    /// [`samples_bc`](Self::samples_bc).
+    fn replace_texture(&mut self, handle: TextureHandle, texture: &TextureLevels);
+    /// Whether the device samples BC5 and BC7, so an imported texture can be
+    /// uploaded compressed.
+    fn samples_bc(&self) -> bool;
     /// Replace the environment with one baked from an equirectangular source:
     /// tightly packed RGBA f32, row-major from the top-left.
     ///

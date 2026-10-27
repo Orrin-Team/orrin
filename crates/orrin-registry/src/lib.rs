@@ -31,16 +31,16 @@ pub use diff::{FieldChange, apply, diff};
 pub use entity_id::EntityId;
 pub use scene::{
     FORMAT_VERSION, MIN_READER_VERSION, NAME_COMPONENT, ParseError, SceneDocument, SceneEntity,
-    parse,
+    parse, parse_value_document,
 };
 
 /// Shares its name with the [`Reflect`](trait@Reflect) trait, the way
 /// `serde::Serialize` does — the derive lives in the macro namespace and the
 /// trait in the type namespace, so one import brings both.
 pub use orrin_macros::Reflect;
-pub use reflect::{Reflect, take, take_or};
+pub use reflect::{Reflect, Resolve, take, take_or};
 pub use registry::{
     ApplyError, ComponentId, ComponentVtable, Registry, ScriptBinding, ScriptBridge,
 };
-pub use text::{write_document, write_entity, write_world};
+pub use text::{write_document, write_entity, write_value_document, write_world};
 pub use value::{FieldPath, PathSegment, Value, ValueError};
