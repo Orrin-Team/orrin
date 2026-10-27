@@ -5,15 +5,17 @@
 //! material's are rendered here from the numbers kept for it. Either way the
 //! work happens once per asset, on the first frame that draws it — a picker
 //! listing a thousand meshes pays for the dozen rows on screen, not the rest —
-//! and every later frame is a texture id. Nothing is ever invalidated, because
-//! a handle never changes meaning (see `AssetPreviews`).
+//! and every later frame is a texture id. A mesh's is never invalidated,
+//! because a handle never changes meaning (see `AssetPreviews`); a material's
+//! is kept with the surface it was rendered from and rendered again when that
+//! changes, since a material asset is edited, saved and undone in place.
 
 use std::collections::HashMap;
 
 use orrin_ecs::World;
 
 use crate::gfx::BlendMode;
-use crate::gfx::thumbnail::{self, Pixels, Thumbnail};
+use crate::gfx::thumbnail::{self, Pixels, Surface, Thumbnail};
 use crate::scene::{AssetPreviews, MaterialHandle, MeshHandle};
 
 #[derive(Default)]
@@ -21,7 +23,8 @@ pub struct Previews {
     /// `None` is remembered too: an asset with nothing to show is asked about
     /// every frame its slot is on screen.
     meshes: HashMap<u32, Option<egui::TextureHandle>>,
-    materials: HashMap<u32, Option<egui::TextureHandle>>,
+    /// With the surface each was rendered from.
+    materials: HashMap<u32, (Option<Surface>, Option<egui::TextureHandle>)>,
 }
 
 /// What a material slot's subtitle and the Blend row read out.
@@ -52,27 +55,31 @@ impl Previews {
             .clone()
     }
 
+    /// Rendered again when the kept copy is no longer what was rendered: a
+    /// material asset changes under its handle when its file is saved, edited
+    /// or an edit is undone.
     pub fn material(
         &mut self,
         ctx: &egui::Context,
         world: &World,
         handle: MaterialHandle,
     ) -> Option<egui::TextureHandle> {
+        let previews = world.get_resource::<AssetPreviews>();
+        let surface = previews
+            .as_ref()
+            .and_then(|p| Some(&p.material(handle)?.surface));
+        if let Some((drawn, texture)) = self.materials.get(&handle.0)
+            && drawn.as_ref() == surface
+        {
+            return texture.clone();
+        }
+        let texture = surface.map(|surface| {
+            let rendered = thumbnail::material(surface);
+            upload(ctx, &format!("material {}", handle.0), &rendered)
+        });
         self.materials
-            .entry(handle.0)
-            .or_insert_with(|| {
-                let previews = world.get_resource::<AssetPreviews>()?;
-                let preview = previews.material(handle)?;
-                let rendered = thumbnail::material(&preview.surface);
-                Some(upload(ctx, &format!("material {}", handle.0), &rendered))
-            })
-            .clone()
-    }
-
-    /// Drop a material's texture so the next ask renders it again — after an
-    /// edit, the one thing that does change what a handle looks like.
-    pub fn forget_material(&mut self, handle: MaterialHandle) {
-        self.materials.remove(&handle.0);
+            .insert(handle.0, (surface.cloned(), texture.clone()));
+        texture
     }
 
     pub fn mesh_summary(&self, world: &World, handle: MeshHandle) -> Option<String> {
@@ -172,6 +179,28 @@ mod tests {
 
         let material = previews.material(&ctx, &world, MaterialHandle(0));
         assert!(material.is_some());
+    }
+
+    /// A material asset's kept copy changes under the same handle when its
+    /// file is saved, edited or an edit undone; its thumbnail follows.
+    #[test]
+    fn a_material_whose_kept_copy_changed_is_rendered_again() {
+        let world = world();
+        let ctx = egui::Context::default();
+        let mut previews = Previews::default();
+        let first = previews.material(&ctx, &world, MaterialHandle(0)).unwrap();
+
+        let red = Material {
+            base_color: glam::Vec3::X,
+            ..Material::default()
+        };
+        world
+            .resource_mut::<AssetPreviews>()
+            .insert_material(MaterialHandle(0), &red, None);
+        let after = previews.material(&ctx, &world, MaterialHandle(0)).unwrap();
+        assert_ne!(first.id(), after.id());
+        let again = previews.material(&ctx, &world, MaterialHandle(0)).unwrap();
+        assert_eq!(after.id(), again.id(), "and kept again");
     }
 
     #[test]

@@ -87,8 +87,7 @@ pub struct App {
     #[cfg(feature = "scripting")]
     input_watcher: Option<crate::scene::input::ConfigWatcher>,
     /// Rescan-on-save for the prefab index. `None` without an assets
-    /// directory, or in a build with no `notify`.
-    #[cfg(feature = "scripting")]
+    /// directory.
     prefab_watcher: Option<crate::scene::prefab::Watcher>,
     /// The gamepad backend. `None` when the machine has no gamepad subsystem
     /// to open, which is a session on keyboard and mouse rather than a failure.
@@ -219,7 +218,6 @@ impl App {
             build_watcher: None,
             #[cfg(feature = "scripting")]
             input_watcher: None,
-            #[cfg(feature = "scripting")]
             prefab_watcher: None,
             gamepads,
             project,
@@ -348,7 +346,6 @@ impl App {
         }
         self.world.insert_resource(prefabs);
 
-        #[cfg(feature = "scripting")]
         if dir.is_dir() {
             self.prefab_watcher = match crate::scene::prefab::Watcher::new(&dir) {
                 Ok(watcher) => Some(watcher),
@@ -358,6 +355,40 @@ impl App {
                 }
             };
         }
+    }
+
+    /// Index and start importing the project's assets, and reimport them as
+    /// they change.
+    ///
+    /// Only for a project: the engine's own `assets/` holds the demo's
+    /// environment and the fetched Sponza, which the demo loads by path, and
+    /// indexing it would write a sidecar beside every file in a directory the
+    /// engine does not own. Opened once the renderer exists and before the
+    /// scene is built: the device decides what format every texture is imported
+    /// in, and the scene is the first thing to ask for one.
+    fn open_asset_database(&mut self, target: crate::asset_db::Target) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let dir = project.assets_dir();
+        let (mut db, issues) = crate::asset_db::AssetDatabase::open_for(
+            &dir,
+            crate::asset_db::cache_dir(Some(project)),
+            target,
+        );
+        for issue in issues {
+            tracing::warn!("{issue}");
+        }
+        if dir.is_dir()
+            && let Err(error) = db.watch()
+        {
+            tracing::warn!("{error}; asset changes will need the browser's rescan button");
+        }
+        let count = db.iter().count();
+        if count > 0 {
+            tracing::info!("{count} asset(s) under {}", dir.display());
+        }
+        self.world.insert_resource(db);
     }
 
     /// Boot the script host and attach the project's entry Behaviour.
@@ -502,6 +533,7 @@ impl ApplicationHandler for App {
 
         let device = renderer.device_label();
         self.world.resource_mut::<FrameStats>().set_device(device);
+        self.open_asset_database(crate::asset_db::Target::of(&renderer));
         self.scene.build(&mut self.world, &mut renderer);
         if let Some(spec) = self.stress {
             spawn_stress_scene(&mut self.world, &spec);
@@ -620,7 +652,6 @@ impl ApplicationHandler for App {
 
                 // Before anything reads the scene, so a prefab saved this frame
                 // is what the frame draws.
-                #[cfg(feature = "scripting")]
                 if let Some(watcher) = &mut self.prefab_watcher
                     && watcher.due()
                 {
@@ -764,6 +795,15 @@ impl ApplicationHandler for App {
                 {
                     profile_scope!("propagate");
                     crate::scene::propagate_transforms(&mut self.world);
+                }
+
+                // After everything that can issue an asset handle — a scene the
+                // editor loaded, a mesh dropped in the inspector, the script
+                // tick — and before extraction, so no pending handle reaches a
+                // draw and a reimported asset draws from this frame on.
+                {
+                    profile_scope!("assets");
+                    crate::asset_db::service(&self.world, &mut active.renderer);
                 }
 
                 {

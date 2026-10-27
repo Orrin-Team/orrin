@@ -17,6 +17,16 @@
 //! arrive back at one thread. A pool of one would fold that overhead into the
 //! baseline and make every speed-up look better than it is.
 //!
+//! **Imports are the one other place work runs in parallel, and never here.**
+//! A texture import compresses on threads of its own, a quarter of the machine
+//! and at most four ([`import_threads`]), and stays out of the pool entirely:
+//! rayon workers drain their own queued splits before they take new work, so
+//! an import's tiles queued on the pool put every parallel step of the frame
+//! behind the whole import. Measured on a 7800X3D (16 threads) with a 2048²
+//! BC7 chain encoding in a loop beside a 4000-object stress frame: through the
+//! pool, frame p95 went from 1.1 to 16.4 ms; on 15 threads of its own, 3.0 ms;
+//! on 4, 1.17 ms, where one thread's 200 ms became 54 ms.
+//!
 //! Workers are named `orrin-worker-N`, so a `perf` profile or a RenderDoc
 //! capture says which thread a sample came from, and they are taken out of
 //! profile collection as they start — see
@@ -80,6 +90,21 @@ pub fn count() -> usize {
     rayon::current_num_threads()
 }
 
+/// How many threads an import shares its texture compression across, for a
+/// machine of `cores` logical cores whose pool has `pool` workers.
+pub fn import_threads_for(cores: usize, pool: usize) -> usize {
+    if pool <= 1 {
+        return 1;
+    }
+    (cores / 4).clamp(1, 4)
+}
+
+/// [`import_threads_for`] this machine and this pool.
+pub fn import_threads() -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
+    import_threads_for(cores, count())
+}
+
 /// Whether dispatching is worth anything at all. False under `ORRIN_THREADS=1`,
 /// which is the contract the serial baseline rests on.
 pub fn is_parallel() -> bool {
@@ -122,6 +147,18 @@ mod tests {
         for (index, value) in doubled.iter().enumerate() {
             assert_eq!(*value, index * 2);
         }
+    }
+
+    /// A quarter of the machine, never more than four, never none; and
+    /// serial when the pool is, so `ORRIN_THREADS=1` stays a serial build.
+    #[test]
+    fn an_import_takes_a_quarter_of_the_machine_up_to_four_threads() {
+        assert_eq!(import_threads_for(16, 15), 4);
+        assert_eq!(import_threads_for(8, 7), 2);
+        assert_eq!(import_threads_for(4, 3), 1);
+        assert_eq!(import_threads_for(2, 1), 1);
+        assert_eq!(import_threads_for(64, 63), 4);
+        assert_eq!(import_threads_for(16, 1), 1);
     }
 
     /// An empty input must not reach for a pool at all, which is the shape a

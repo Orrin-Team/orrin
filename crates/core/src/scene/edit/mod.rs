@@ -8,11 +8,21 @@
 //! dies with the session — the selection, the camera, a panel's filter. The
 //! rule is the scene file's: if it would be saved, it is an op.
 //!
+//! **Asset files** the editor writes fall under the same rule. An edit to a
+//! material asset is a [`WriteAsset`](Op::WriteAsset) in the same history as
+//! the scene's, holding the file's text before and after: the material is drawn
+//! as it changes, the file is written once when the gesture commits, and undo
+//! and redo write it again. There is no separate "save" for an asset, because a
+//! material is shared by every scene that uses it and an edit nobody saved
+//! would be drawn in one session and lost to every other. A write that fails
+//! names the file and puts the material back as the file still has it.
+//!
 //! **Gestures.** A drag changes a value every frame, but is one edit. [`set`]
-//! applies each frame's value at once, so the world shows the drag, and
-//! remembers each component's value from before the gesture began; [`commit`]
-//! turns the lot into one step, from the first value to the last. The editor
-//! commits when the pointer is released and nothing has keyboard focus.
+//! (and [`set_material`]) applies each frame's value at once, so the world
+//! shows the drag, and remembers each component's value from before the
+//! gesture began; [`commit`] turns the lot into one step, from the first value
+//! to the last. The editor commits when the pointer is released and nothing
+//! has keyboard focus.
 //!
 //! **Recorded state.** A despawn records the subtree it removes, through the
 //! same path a save takes — prefab instances folded to their records — and an
@@ -30,6 +40,7 @@
 //! despawn and a spawn of the same ids is exactly what it is.
 //!
 //! [`set`]: SceneEditor::set
+//! [`set_material`]: SceneEditor::set_material
 //! [`commit`]: SceneEditor::commit
 //! [`spawned`]: SceneEditor::spawned
 //! [`replace`]: SceneEditor::replace
@@ -41,11 +52,13 @@ pub use history::{History, LIMIT};
 pub use op::{EditError, Op};
 
 use orrin_ecs::{Entity, FxBuildHasher, World};
-use orrin_registry::{ComponentId, EntityId, Registry, SceneEntity, Value};
+use orrin_registry::{AssetId, ComponentId, EntityId, Registry, SceneEntity, Value};
 
 use super::registry::{MATERIAL, MESH, PARENT, TRANSFORM};
 use super::{Name, Parent, persist};
-use history::Pending;
+use crate::asset_db::AssetDatabase;
+use crate::asset_db::material::{self, MaterialFile};
+use history::{Pending, PendingAsset};
 
 type FxHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
 
@@ -112,9 +125,114 @@ impl<'a> SceneEditor<'a> {
             .map_err(|reason| fail(self.world, &reason))
     }
 
+    /// Give material asset `id` the parameters and texture slots of `file`, as
+    /// part of the open gesture: drawn from the next frame, and written to the
+    /// asset's file when the gesture commits. A slot given anything but a
+    /// texture is refused by path.
+    pub fn set_material(&mut self, id: AssetId, file: MaterialFile) -> Result<(), EditError> {
+        let Some(mut db) = self.world.get_resource_mut::<AssetDatabase>() else {
+            return Err(EditError(format!(
+                "material asset {id}: there is no asset database"
+            )));
+        };
+        let current = db.material_file(id).copied().ok_or_else(|| {
+            let name = db
+                .get(id)
+                .map_or_else(|| id.to_string(), |e| e.path.clone());
+            EditError(format!("{name}: there is no read of it to edit"))
+        })?;
+        if material::write(&current) == material::write(&file) {
+            return Ok(());
+        }
+        db.check_material(id, &file).map_err(EditError)?;
+        db.preview_material(id, file).map_err(EditError)?;
+        if !self.history.assets.iter().any(|pending| pending.id == id) {
+            let before = db
+                .material_text(id)
+                .map_or_else(|| material::write(&current), str::to_owned);
+            self.history.assets.push(PendingAsset {
+                id,
+                before,
+                file: current,
+            });
+        }
+        Ok(())
+    }
+
+    /// [`commit`](Self::commit), returning the failure it would log rather
+    /// than logging it.
+    pub fn try_commit(&mut self) -> Result<(), EditError> {
+        let mut ops = self.close_components();
+        let mut failed = Ok(());
+        for pending in std::mem::take(&mut self.history.assets) {
+            match self.write_material(pending) {
+                Ok(op) => ops.extend(op),
+                Err(error) => failed = failed.and(Err(error)),
+            }
+        }
+        let label = match &ops[..] {
+            [] => return failed,
+            [Op::WriteAsset { asset, .. }] => format!("Edit {}", self.asset_name(*asset)),
+            [Op::SetField { component, .. }, rest @ ..]
+                if rest.iter().all(
+                    |op| matches!(op, Op::SetField { component: c, .. } if c == component),
+                ) =>
+            {
+                format!("Edit {}", self.component_name(component))
+            }
+            _ => "Edit".to_owned(),
+        };
+        self.record(label, ops);
+        failed
+    }
+
     /// Close the open gesture into one step, from each component's value
-    /// before the gesture to its value now.
+    /// before the gesture to its value now, and each material asset's file
+    /// text before to the text written now.
+    ///
+    /// A material file that cannot be written is the one way this fails: the
+    /// error is logged, names the file, and the material goes back to what
+    /// the file still holds. [`try_commit`](Self::try_commit) returns it
+    /// instead.
     pub fn commit(&mut self) {
+        if let Err(error) = self.try_commit() {
+            tracing::error!("{error}");
+        }
+    }
+
+    /// Write one material the gesture changed, as the op that did it; `None`
+    /// when the gesture left it as it was.
+    fn write_material(&mut self, pending: PendingAsset) -> Result<Option<Op>, EditError> {
+        let after = self
+            .world
+            .get_resource::<AssetDatabase>()
+            .and_then(|db| db.material_file(pending.id).copied());
+        let Some(after) = after else {
+            return Ok(None);
+        };
+        let new = material::write(&after);
+        if new == material::write(&pending.file) {
+            return Ok(None);
+        }
+        let op = Op::WriteAsset {
+            asset: pending.id,
+            old: pending.before,
+            new,
+        };
+        match op.apply(self.world, self.registry) {
+            Ok(()) => Ok(Some(op)),
+            Err(error) => {
+                if let Some(mut db) = self.world.get_resource_mut::<AssetDatabase>() {
+                    let _ = db.preview_material(pending.id, pending.file);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The open gesture's component changes, as ops from the value before it
+    /// to the value now.
+    fn close_components(&mut self) -> Vec<Op> {
         let mut ops = Vec::new();
         for pending in std::mem::take(&mut self.history.gesture) {
             let same = self
@@ -145,18 +263,7 @@ impl<'a> SceneEditor<'a> {
                 new,
             });
         }
-        let Some(Op::SetField { component, .. }) = ops.first() else {
-            return;
-        };
-        let alike = ops
-            .iter()
-            .all(|op| matches!(op, Op::SetField { component: c, .. } if c == component));
-        let label = if alike {
-            format!("Edit {}", self.component_name(component))
-        } else {
-            "Edit".to_owned()
-        };
-        self.record(label, ops);
+        ops
     }
 
     pub fn add_component(
@@ -463,6 +570,14 @@ impl<'a> SceneEditor<'a> {
         (entities, slots)
     }
 
+    /// What a material asset is called in a step's label: its file's name.
+    fn asset_name(&self, id: AssetId) -> String {
+        self.world
+            .get_resource::<AssetDatabase>()
+            .and_then(|db| db.get(id).map(|entry| entry.name().to_owned()))
+            .unwrap_or_else(|| id.to_string())
+    }
+
     fn component_name(&self, id: &ComponentId) -> String {
         match id {
             id if *id == MESH => "Mesh".to_owned(),
@@ -499,6 +614,7 @@ mod tests {
     use orrin_registry::{EntityId, Reflect};
 
     use super::*;
+    use crate::asset_db::tests::Dir;
     use crate::scene::registry::{MESH, TAG, TRANSFORM};
     use crate::scene::{
         Assets, LocalTransform, MaterialHandle, MeshHandle, Name, Parent, Prefabs, Tag, Transform,
@@ -922,5 +1038,145 @@ mod tests {
         }
         assert_eq!(undone, LIMIT);
         assert_eq!(x_of(&world, entity), 1.0, "the oldest step was forgotten");
+    }
+
+    /// Written by hand, not in the layout the editor writes, so an undo that
+    /// rewrote the values instead of the text would show.
+    const HAND_WRITTEN: &str = "orrin-material 1 min-reader 1\n\nroughness = 0.25\n";
+
+    /// `brick.fmat` beside a texture and a mesh, in a world holding their
+    /// database. Neither file needs to import: a slot is checked by kind.
+    fn material_world(name: &str) -> (Dir, World, AssetId) {
+        let dir = Dir::new(name);
+        dir.write("brick.fmat", HAND_WRITTEN.as_bytes());
+        dir.write("rock.png", b"");
+        dir.write("tree.glb", b"");
+        let (db, issues) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        assert!(issues.is_empty(), "{issues:?}");
+        let id = db.find("brick.fmat").unwrap().id;
+        let mut world = world();
+        world.insert_resource(db);
+        (dir, world, id)
+    }
+
+    fn brick_with(
+        world: &World,
+        id: AssetId,
+        edit: impl FnOnce(&mut MaterialFile),
+    ) -> MaterialFile {
+        let mut file = *world.resource::<AssetDatabase>().material_file(id).unwrap();
+        edit(&mut file);
+        file
+    }
+
+    fn on_disk(dir: &Dir) -> String {
+        std::fs::read_to_string(dir.path().join("brick.fmat")).unwrap()
+    }
+
+    fn drawn(world: &World, id: AssetId) -> MaterialFile {
+        *world.resource::<AssetDatabase>().material_file(id).unwrap()
+    }
+
+    #[test]
+    fn an_undone_material_edit_leaves_its_file_as_it_was_byte_for_byte() {
+        let registry = registry();
+        let (dir, mut world, id) = material_world("edit-fmat-undo");
+        let mut history = History::default();
+        let rough = brick_with(&world, id, |file| file.material.roughness = 0.75);
+
+        let mut editor = SceneEditor::new(&mut world, &registry, &mut history);
+        editor.set_material(id, rough).unwrap();
+        editor.try_commit().unwrap();
+        let edited = on_disk(&dir);
+        assert_eq!(edited, material::write(&rough), "written when it commits");
+
+        assert_eq!(editor.undo().unwrap().as_deref(), Some("Edit brick"));
+        assert_eq!(on_disk(&dir), HAND_WRITTEN);
+        assert_eq!(drawn(editor.world(), id).material.roughness, 0.25);
+        editor.redo().unwrap();
+        assert_eq!(on_disk(&dir), edited);
+        assert_eq!(drawn(editor.world(), id).material.roughness, 0.75);
+    }
+
+    /// A slider drag draws every frame and writes the file once, as one step.
+    #[test]
+    fn a_material_drag_is_one_step_and_one_write() {
+        let registry = registry();
+        let (dir, mut world, id) = material_world("edit-fmat-drag");
+        let mut history = History::default();
+
+        let mut editor = SceneEditor::new(&mut world, &registry, &mut history);
+        for roughness in [0.4, 0.5, 0.6] {
+            let file = brick_with(editor.world(), id, |file| {
+                file.material.roughness = roughness
+            });
+            editor.set_material(id, file).unwrap();
+            assert_eq!(drawn(editor.world(), id).material.roughness, roughness);
+            assert_eq!(on_disk(&dir), HAND_WRITTEN, "nothing is written mid-drag");
+        }
+        editor.try_commit().unwrap();
+        let saved = material::parse(&on_disk(&dir), "brick.fmat").unwrap();
+        assert_eq!(saved.material.roughness, 0.6);
+
+        assert_eq!(editor.undo().unwrap().as_deref(), Some("Edit brick"));
+        assert_eq!(on_disk(&dir), HAND_WRITTEN);
+        assert_eq!(editor.undo().unwrap(), None, "the drag was one step");
+    }
+
+    #[test]
+    fn a_dropped_texture_fills_a_slot_and_anything_else_is_refused_by_path() {
+        let registry = registry();
+        let (dir, mut world, id) = material_world("edit-fmat-slot");
+        let mut history = History::default();
+        let (rock, tree) = {
+            let db = world.resource::<AssetDatabase>();
+            (
+                db.find("rock.png").unwrap().id,
+                db.find("tree.glb").unwrap().id,
+            )
+        };
+
+        let mut editor = SceneEditor::new(&mut world, &registry, &mut history);
+        let textured = brick_with(editor.world(), id, |file| file.textures.albedo = Some(rock));
+        editor.set_material(id, textured).unwrap();
+        editor.try_commit().unwrap();
+        let saved = material::parse(&on_disk(&dir), "brick.fmat").unwrap();
+        assert_eq!(saved.textures.albedo, Some(rock));
+
+        let meshed = brick_with(editor.world(), id, |file| file.textures.normal = Some(tree));
+        let error = editor.set_material(id, meshed).unwrap_err();
+        assert_eq!(
+            error.0,
+            "brick.fmat: the `normal` slot takes a texture, not `tree.glb`, which is a mesh"
+        );
+        editor.try_commit().unwrap();
+        assert_eq!(drawn(editor.world(), id).textures.normal, None);
+        assert_eq!(editor.undo().unwrap().as_deref(), Some("Edit brick"));
+        assert_eq!(editor.undo().unwrap(), None, "a refused drop is no step");
+        assert_eq!(on_disk(&dir), HAND_WRITTEN);
+    }
+
+    /// A write that fails names the file, and the material goes back to what
+    /// the file still holds rather than drawing an edit nothing saved.
+    #[test]
+    fn a_material_that_cannot_be_written_is_named_and_drawn_as_before() {
+        let registry = registry();
+        let (dir, mut world, id) = material_world("edit-fmat-fail");
+        let mut history = History::default();
+        let rough = brick_with(&world, id, |file| file.material.roughness = 0.75);
+
+        let mut editor = SceneEditor::new(&mut world, &registry, &mut history);
+        editor.set_material(id, rough).unwrap();
+        // A directory where the file was: a rename onto it fails everywhere.
+        std::fs::remove_file(dir.path().join("brick.fmat")).unwrap();
+        std::fs::create_dir(dir.path().join("brick.fmat")).unwrap();
+        let error = editor.try_commit().unwrap_err();
+
+        assert!(
+            error.0.starts_with("could not write brick.fmat: "),
+            "{error}"
+        );
+        assert_eq!(drawn(editor.world(), id).material.roughness, 0.25);
+        assert_eq!(history.undo_label(), None);
     }
 }

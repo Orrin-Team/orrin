@@ -38,7 +38,6 @@ mod actions;
 mod create;
 mod index;
 mod refresh;
-#[cfg(feature = "scripting")]
 mod watch;
 
 use std::borrow::Cow;
@@ -53,7 +52,6 @@ pub use actions::{apply, instance_of, revert_all, unpack};
 pub use create::{create, unused_path};
 pub use index::{Prefab, Prefabs, Rescan};
 pub use refresh::{apply_edits, rescan};
-#[cfg(feature = "scripting")]
 pub use watch::Watcher;
 
 use super::Parent;
@@ -699,7 +697,19 @@ pub fn instantiate_into(
         .get_resource::<Prefabs>()
         .is_some_and(|prefabs| prefabs.get(prefab).is_some());
     if !known {
-        return Err(format!("no prefab in the project has the id {prefab}"));
+        let other = world
+            .get_resource::<crate::asset_db::AssetDatabase>()
+            .and_then(|db| {
+                let entry = db.get(prefab)?;
+                Some(format!(
+                    "`{}` is a {}, and only a prefab can be placed in the scene",
+                    entry.path,
+                    entry.kind.label()
+                ))
+            });
+        return Err(
+            other.unwrap_or_else(|| format!("no prefab in the project has the id {prefab}"))
+        );
     }
     let record = SceneEntity {
         id: EntityId::new(),
@@ -895,6 +905,26 @@ mod tests {
         registry
     }
 
+    /// The asset browser drags any asset's id, so a texture can be let go over
+    /// the hierarchy. The refusal names the file, not the id.
+    #[test]
+    fn placing_an_asset_that_is_not_a_prefab_names_it() {
+        let dir = crate::asset_db::tests::Dir::new("place-texture");
+        dir.write("rocks/rock.png", b"");
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let rock = db.find("rocks/rock.png").unwrap().id;
+        let mut world = World::new();
+        world.insert_resource(db);
+        world.insert_resource(Prefabs::default());
+
+        let err = instantiate(&mut world, &registry(), rock).unwrap_err();
+        assert_eq!(
+            err,
+            "`rocks/rock.png` is a texture, and only a prefab can be placed in the scene"
+        );
+        assert_eq!(world.entities().count(), 0);
+    }
+
     /// The door, and a house holding one.
     fn library(door: &str) -> Prefabs {
         let mut prefabs = Prefabs::default();
@@ -1007,7 +1037,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "orrin-scene 2 min-reader 2\n\nentity {root_id}\n  orrin.prefab\n    source = asset({DOOR_ID})\n"
+                "orrin-scene 3 min-reader 3\n\nentity {root_id}\n  orrin.prefab\n    source = asset({DOOR_ID})\n"
             )
         );
     }
@@ -1135,7 +1165,7 @@ mod tests {
         let root = EntityId::new();
         let missing = AssetId::new();
         let text = format!(
-            "orrin-scene 2 min-reader 2\n\nentity {root}\n  orrin.prefab\n    overrides\n      [0]\n        \
+            "orrin-scene 3 min-reader 3\n\nentity {root}\n  orrin.prefab\n    overrides\n      [0]\n        \
              component = \"orrin.tag\"\n        entity = entity({ROOT})\n        path = \"\"\n        \
              value = \"x\"\n    source = asset({missing})\n"
         );
@@ -1159,7 +1189,7 @@ mod tests {
     fn an_override_that_no_longer_fits_is_reported_and_kept() {
         let root = EntityId::new();
         let text = format!(
-            "orrin-scene 2 min-reader 2\n\nentity {root}\n  orrin.prefab\n    overrides\n      [0]\n        \
+            "orrin-scene 3 min-reader 3\n\nentity {root}\n  orrin.prefab\n    overrides\n      [0]\n        \
              component = \"orrin.transform\"\n        entity = entity({PANEL})\n        \
              path = \"skew\"\n        value = 0.5\n    source = asset({DOOR_ID})\n"
         );

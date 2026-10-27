@@ -4,9 +4,10 @@
 use std::collections::VecDeque;
 
 use orrin_ecs::Entity;
-use orrin_registry::{ComponentId, EntityId, Value};
+use orrin_registry::{AssetId, ComponentId, EntityId, Value};
 
 use super::op::Op;
+use crate::asset_db::material::MaterialFile;
 
 /// How many steps undo reaches back. A step holding a despawned subtree holds
 /// all of it, so the stack is bounded rather than left to grow for a session.
@@ -30,6 +31,15 @@ pub(super) struct Pending {
     pub before: Value,
 }
 
+/// A material asset an unfinished gesture has changed: its file's text before,
+/// and the material that text drew, to go back to if the write fails.
+#[derive(Debug)]
+pub(super) struct PendingAsset {
+    pub id: AssetId,
+    pub before: String,
+    pub file: MaterialFile,
+}
+
 /// Everything the edit pipeline keeps between frames. Owned by whoever runs
 /// edit mode; a [`SceneEditor`](super::SceneEditor) borrows it.
 #[derive(Debug, Default)]
@@ -37,6 +47,7 @@ pub struct History {
     pub(super) undo: VecDeque<Step>,
     pub(super) redo: Vec<Step>,
     pub(super) gesture: Vec<Pending>,
+    pub(super) assets: Vec<PendingAsset>,
     /// The batch a [`SceneEditor::batch`](super::SceneEditor::batch) call is
     /// collecting, if one is open.
     pub(super) batch: Option<(String, Vec<Op>)>,
@@ -76,6 +87,7 @@ impl History {
         self.undo.clear();
         self.redo.clear();
         self.gesture.clear();
+        self.assets.clear();
         self.batch = None;
         self.floor = self.next;
         self.saved = self.next;

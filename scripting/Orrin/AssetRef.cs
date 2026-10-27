@@ -30,8 +30,13 @@ public readonly struct AssetRef<T> : IAssetRef, IEquatable<AssetRef<T>> where T 
     public Guid Id => _id;
 
     /// False for the null reference. Says nothing about whether the asset still
-    /// exists.
+    /// exists; [State] does.
     public bool IsValid => _id != Guid.Empty;
+
+    /// Whether the asset is drawable yet. A missing or broken asset is
+    /// `Failed` rather than an exception: it draws as a placeholder, and the
+    /// engine has already logged its name.
+    public AssetState State => IsValid ? Native.GetAssetState(_id) : AssetState.Failed;
 
     public static bool operator ==(AssetRef<T> a, AssetRef<T> b) => a._id == b._id;
 

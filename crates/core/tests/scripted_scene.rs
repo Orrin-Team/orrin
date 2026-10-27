@@ -52,7 +52,7 @@ fn a_saved_behaviour_comes_back_attached_with_its_fields() {
     // From a scene.
     let id = EntityId::new();
     let text = format!(
-        "orrin-scene 2 min-reader 2\n\nentity {id} \"Fan\"\n  demo.spinner\n    \
+        "orrin-scene 3 min-reader 3\n\nentity {id} \"Fan\"\n  demo.spinner\n    \
          DegreesPerSecond = 45.0\n"
     );
     let mut world = World::new();

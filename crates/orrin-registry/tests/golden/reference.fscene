@@ -1,4 +1,4 @@
-orrin-scene 2 min-reader 2
+orrin-scene 3 min-reader 3
 
 entity 00000000-0000-4000-8000-000000000001 "Door \"North\"\tété"
   orrin.collider

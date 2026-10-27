@@ -2,16 +2,18 @@
 //! applied and inverted.
 
 use orrin_ecs::{Entity, FxHashMap, World};
-use orrin_registry::{ComponentId, EntityId, FieldChange, Registry, SceneEntity, Value};
+use orrin_registry::{AssetId, ComponentId, EntityId, FieldChange, Registry, SceneEntity, Value};
 
+use crate::asset_db::AssetDatabase;
 use crate::scene::{despawn_recursive, persist, reparent};
 
-/// One change to the scene, addressed by [`EntityId`] so it still means the
-/// same entity after an undo has despawned and respawned it under a new slot.
+/// One change to the scene or to an asset file the editor writes, addressed by
+/// [`EntityId`] or [`AssetId`] so it still means the same thing after an undo
+/// has despawned and respawned an entity under a new slot.
 ///
 /// Closed and small on purpose. A gesture — a drag, a paste, a revert — is a
 /// [`Batch`](Op::Batch) of these, never an op of its own, so undo, dirty
-/// tracking and later sync each handle seven cases rather than one per tool.
+/// tracking and later sync each handle eight cases rather than one per tool.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     /// New values at paths inside one component, with the values they
@@ -57,6 +59,14 @@ pub enum Op {
         entity: EntityId,
         from: Option<EntityId>,
         to: Option<EntityId>,
+    },
+    /// An asset file's whole text, before and after. A `.fmat` is a few
+    /// hundred bytes, and keeping the text rather than the values is what lets
+    /// an undo leave the file exactly as it was, however it had been written.
+    WriteAsset {
+        asset: AssetId,
+        old: String,
+        new: String,
     },
     /// Applies whole or not at all, and undoes as one step under its label.
     Batch { label: String, ops: Vec<Op> },
@@ -113,6 +123,11 @@ impl Op {
                 entity,
                 from: to,
                 to: from,
+            },
+            Op::WriteAsset { asset, old, new } => Op::WriteAsset {
+                asset,
+                old: new,
+                new: old,
             },
             Op::Batch { label, ops } => Op::Batch {
                 label,
@@ -235,6 +250,14 @@ impl Op {
                     reparent(world, child, parent, false).map_err(|error| error.to_string())
                 });
                 moved.map_err(|reason| EditError(format!("reparenting entity {entity}: {reason}")))
+            }
+            Op::WriteAsset { asset, new, .. } => {
+                let Some(mut db) = world.get_resource_mut::<AssetDatabase>() else {
+                    return Err(EditError(format!(
+                        "writing asset {asset}: there is no asset database"
+                    )));
+                };
+                db.write_asset(*asset, new).map_err(EditError)
             }
         }
     }

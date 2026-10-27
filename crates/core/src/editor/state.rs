@@ -5,6 +5,7 @@ use orrin_registry::{AssetId, Registry};
 
 use super::gizmo::{Drag, Handle};
 use super::selection::Selection;
+use crate::asset_db::material::MaterialFile;
 use crate::scene::edit::{EditError, History, SceneEditor};
 use crate::scene::{
     self, Assets, LogBuffer, LogLevel, MaterialHandle, Name, Prefabs, Time, Transform, entities,
@@ -190,6 +191,8 @@ pub struct EditorState {
     /// Component values the panels edited on detached copies this frame,
     /// applied by `apply` as part of the open gesture.
     edits: Vec<(Entity, orrin_registry::ComponentId, orrin_registry::Value)>,
+    /// Material assets the inspector edited this frame, the same way.
+    material_edits: Vec<(AssetId, MaterialFile)>,
     /// Whether the pointer is down or a field has focus — while it is, the
     /// open gesture stays open. Set by the panels once a frame's widgets
     /// have run.
@@ -274,6 +277,7 @@ impl Default for EditorState {
             outline: Vec::new(),
             history: History::default(),
             edits: Vec::new(),
+            material_edits: Vec::new(),
             holding: false,
             undo_request: false,
             redo_request: false,
@@ -360,6 +364,12 @@ impl EditorState {
         value: orrin_registry::Value,
     ) {
         self.edits.push((entity, component, value));
+    }
+
+    /// Give material asset `id` the parameters and slots of `file`, saved to
+    /// its file when the gesture ends.
+    pub fn edit_material(&mut self, id: AssetId, file: MaterialFile) {
+        self.material_edits.push((id, file));
     }
 
     /// The increment a drag of the current tool snaps to: when the toggle is
@@ -491,8 +501,11 @@ impl EditorState {
         for (entity, component, value) in self.edits.drain(..) {
             failed.extend(editor.set(entity, &component, value).err().map(fail));
         }
+        for (id, file) in self.material_edits.drain(..) {
+            failed.extend(editor.set_material(id, file).err().map(fail));
+        }
         if !self.holding {
-            editor.commit();
+            failed.extend(editor.try_commit().err().map(fail));
         }
         if std::mem::take(&mut self.undo_request) {
             failed.extend(editor.undo().err().map(fail));

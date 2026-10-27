@@ -131,6 +131,11 @@ pub struct OrrinApi {
     // no prefab.
     pub find_asset: extern "C" fn(*const c_char, *mut u8) -> u32,
     pub instantiate_prefab: extern "C" fn(*const u8) -> CEntity,
+    // Load state, appended after `instantiate_prefab`; never reordered above
+    // it. Takes an id's 16 bytes and returns `LOAD_*`: whether what the id
+    // draws is the asset yet, a placeholder while it imports, or a placeholder
+    // for good.
+    pub asset_state: extern "C" fn(*const u8) -> u32,
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -142,6 +147,15 @@ pub const NO_ACTION: u32 = u32::MAX;
 /// never renumber.
 pub const ASSET_NONE: u32 = 0;
 pub const ASSET_PREFAB: u32 = 1;
+pub const ASSET_MESH: u32 = 2;
+pub const ASSET_TEXTURE: u32 = 3;
+pub const ASSET_MATERIAL: u32 = 4;
+
+/// What `asset_state` reports. Lock-step with C# `Orrin.AssetState`: append,
+/// never renumber.
+pub const LOAD_LOADING: u32 = 0;
+pub const LOAD_READY: u32 = 1;
+pub const LOAD_FAILED: u32 = 2;
 
 /// A table with the generic functions wired and the rest stubbed; the engine
 /// overrides `get_transform`/`set_transform` and the input functions with real
@@ -188,6 +202,7 @@ pub fn default_api() -> OrrinApi {
         log_event: default_log_event,
         find_asset: stub_find_asset,
         instantiate_prefab: stub_instantiate_prefab,
+        asset_state: stub_asset_state,
     }
 }
 
@@ -197,6 +212,10 @@ extern "C" fn stub_find_asset(_path: *const c_char, _out: *mut u8) -> u32 {
 
 extern "C" fn stub_instantiate_prefab(_id: *const u8) -> CEntity {
     CEntity::NULL
+}
+
+extern "C" fn stub_asset_state(_id: *const u8) -> u32 {
+    LOAD_FAILED
 }
 
 /// With no engine behind the table there is no stream to join, so the level

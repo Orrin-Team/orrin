@@ -60,6 +60,13 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 3
 
+# rusty_dds 0.9's BC7 encoder `debug_assert!`s that a block never offers a
+# sixth endpoint seed, and ordinary gradients do. Release builds take the path
+# the assertion guards — the seed is not tried, and the block is still valid
+# BC7 — so dev builds are made to take it too, rather than panic mid-import.
+[profile.dev.package.rusty_dds]
+debug-assertions = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

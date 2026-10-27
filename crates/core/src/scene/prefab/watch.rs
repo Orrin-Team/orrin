@@ -8,9 +8,6 @@
 //!
 //! The scan a rescan runs can itself write a sidecar, which is heard as one
 //! more change; that second scan finds nothing new and is the whole cost.
-//!
-//! Live rescans need `notify`, which this build only has with the `scripting`
-//! feature; without it the editor's Rescan button is the way in.
 
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
