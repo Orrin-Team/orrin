@@ -32,7 +32,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use xxhash_rust::xxh3::Xxh3;
 
 use super::ktx;
-use crate::gfx::Vertex;
+use crate::gfx::thumbnail::{Pixels, Thumbnail};
+use crate::gfx::{TexelFormat, Vertex};
 use crate::scene::CpuMesh;
 
 /// The artifact layout's version, hashed into every key: bumping it makes every
@@ -79,6 +80,11 @@ pub fn key(importer: Importer, settings: &str, inputs: &[(&str, &[u8])]) -> Cach
     }
     CacheKey(hasher.digest128())
 }
+
+/// What a thumbnail file starts with, then its edge as a `u32` and its layout.
+const THUMBNAIL: &[u8; 4] = b"ORRT";
+const GREY_ALPHA: u8 = 1;
+const RGBA: u8 = 2;
 
 /// What every artifact file starts with.
 const MAGIC: &[u8; 4] = b"ORRA";
@@ -238,6 +244,73 @@ impl Cache {
     /// a crash or a second process never leaves a half-written artifact under
     /// a name a later run would trust.
     pub fn store(&self, key: CacheKey, artifact: &Artifact) -> Result<(), String> {
+        self.write(&self.path(key), &artifact.encode())
+    }
+
+    /// The thumbnail stored beside `key`'s artifact, if there is one that reads.
+    pub fn load_thumbnail(&self, key: CacheKey) -> Option<Thumbnail> {
+        let bytes = std::fs::read(self.thumbnail_path(key)).ok()?;
+        let rest = bytes.strip_prefix(THUMBNAIL)?;
+        let (size, rest) = rest.split_first_chunk::<4>()?;
+        let size = u32::from_le_bytes(*size);
+        let (&layout, pixels) = rest.split_first()?;
+        let texels = (size as usize).checked_mul(size as usize)?;
+        let pixels = match layout {
+            GREY_ALPHA if pixels.len() == texels * 2 => Pixels::GreyAlpha(pixels.to_vec()),
+            RGBA if pixels.len() == texels * 4 => Pixels::Rgba(pixels.to_vec()),
+            _ => return None,
+        };
+        Some(Thumbnail { size, pixels })
+    }
+
+    /// Store `thumbnail` beside `key`'s artifact, the way [`store`](Self::store)
+    /// stores the artifact.
+    pub fn store_thumbnail(&self, key: CacheKey, thumbnail: &Thumbnail) -> Result<(), String> {
+        let (layout, pixels) = match &thumbnail.pixels {
+            Pixels::GreyAlpha(pixels) => (GREY_ALPHA, pixels),
+            Pixels::Rgba(pixels) => (RGBA, pixels),
+        };
+        let mut bytes = Vec::with_capacity(THUMBNAIL.len() + 5 + pixels.len());
+        bytes.extend_from_slice(THUMBNAIL);
+        bytes.extend_from_slice(&thumbnail.size.to_le_bytes());
+        bytes.push(layout);
+        bytes.extend_from_slice(pixels);
+        self.write(&self.thumbnail_path(key), &bytes)
+    }
+
+    /// What `key`'s artifact is, read from its header alone: a texture's is a
+    /// few dozen bytes into a file of megabytes.
+    pub fn summary(&self, key: CacheKey) -> Option<Summary> {
+        use std::io::Read;
+        let path = self.path(key);
+        let bytes = std::fs::metadata(&path).ok()?.len();
+        let mut head = [0u8; 48];
+        std::fs::File::open(&path)
+            .ok()?
+            .read_exact(&mut head)
+            .ok()?;
+        let word = |at: usize| u32::from_le_bytes(head[at..at + 4].try_into().unwrap());
+        if head.starts_with(&ktx::IDENTIFIER) {
+            return Some(Summary::Texture {
+                format: TexelFormat::from_vk_format(word(12))?,
+                width: word(20),
+                height: word(24),
+                levels: word(40),
+                bytes,
+            });
+        }
+        (head.starts_with(MAGIC) && head[8] == MESH).then(|| Summary::Mesh {
+            vertices: word(HEADER),
+            triangles: word(HEADER + 4) / 3,
+            bytes,
+        })
+    }
+
+    fn thumbnail_path(&self, key: CacheKey) -> PathBuf {
+        self.path(key).with_extension("thumb")
+    }
+
+    fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), String> {
         static TEMPORARY: AtomicU32 = AtomicU32::new(0);
         let failed = |error: std::io::Error| {
             format!(
@@ -247,16 +320,34 @@ impl Cache {
         };
         std::fs::create_dir_all(&self.dir).map_err(failed)?;
         let temporary = self.dir.join(format!(
-            ".{key}.{}-{}",
+            ".{}.{}-{}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
             std::process::id(),
             TEMPORARY.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::write(&temporary, artifact.encode()).map_err(failed)?;
-        std::fs::rename(&temporary, self.path(key)).map_err(|error| {
+        std::fs::write(&temporary, bytes).map_err(failed)?;
+        std::fs::rename(&temporary, path).map_err(|error| {
             let _ = std::fs::remove_file(&temporary);
             failed(error)
         })
     }
+}
+
+/// What an artifact is, in the numbers a person asks about it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Summary {
+    Texture {
+        format: TexelFormat,
+        width: u32,
+        height: u32,
+        levels: u32,
+        bytes: u64,
+    },
+    Mesh {
+        vertices: u32,
+        triangles: u32,
+        bytes: u64,
+    },
 }
 
 fn vertex_floats(vertex: &Vertex) -> impl Iterator<Item = f32> + '_ {
@@ -296,7 +387,6 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use crate::asset_db::tests::Dir;
-    use crate::gfx::TexelFormat;
 
     const PNG: Importer = Importer {
         name: "texture",
@@ -414,6 +504,72 @@ mod tests {
             Artifact::decode(b"PNG.............").unwrap_err(),
             "not an Orrin cache artifact"
         );
+    }
+
+    /// A thumbnail sits beside its artifact and comes back as it went in, in
+    /// either pixel layout; a missing or damaged one is simply not there.
+    #[test]
+    fn a_thumbnail_is_stored_beside_its_artifact() {
+        let dir = Dir::new("cache-thumbnail");
+        let cache = Cache::new(dir.path().join("cache"));
+        let rgba = Thumbnail {
+            size: 2,
+            pixels: Pixels::Rgba((0..16).collect()),
+        };
+        let grey = Thumbnail {
+            size: 2,
+            pixels: Pixels::GreyAlpha((0..8).collect()),
+        };
+        assert_eq!(cache.load_thumbnail(CacheKey(1)), None);
+        cache.store_thumbnail(CacheKey(1), &rgba).unwrap();
+        cache.store_thumbnail(CacheKey(2), &grey).unwrap();
+        assert_eq!(cache.load_thumbnail(CacheKey(1)), Some(rgba));
+        assert_eq!(cache.load_thumbnail(CacheKey(2)), Some(grey));
+
+        let thumb = cache.path(CacheKey(1)).with_extension("thumb");
+        let bytes = std::fs::read(&thumb).unwrap();
+        std::fs::write(&thumb, &bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(cache.load_thumbnail(CacheKey(1)), None, "cut short");
+    }
+
+    /// The Import page reads these without loading a texture's megabytes.
+    #[test]
+    fn an_artifact_is_summarised_from_its_header() {
+        let dir = Dir::new("cache-summary");
+        let cache = Cache::new(dir.path().join("cache"));
+        let texture = TextureArtifact {
+            format: TexelFormat::Bc7Srgb,
+            width: 8,
+            height: 4,
+            levels: vec![vec![0; 32], vec![0; 16], vec![0; 16], vec![0; 16]],
+        };
+        cache
+            .store(CacheKey(1), &Artifact::Texture(texture))
+            .unwrap();
+        cache
+            .store(CacheKey(2), &Artifact::Mesh(triangle()))
+            .unwrap();
+        let bytes = |key| std::fs::metadata(cache.path(key)).unwrap().len();
+
+        assert_eq!(
+            cache.summary(CacheKey(1)),
+            Some(Summary::Texture {
+                format: TexelFormat::Bc7Srgb,
+                width: 8,
+                height: 4,
+                levels: 4,
+                bytes: bytes(CacheKey(1)),
+            })
+        );
+        assert_eq!(
+            cache.summary(CacheKey(2)),
+            Some(Summary::Mesh {
+                vertices: 3,
+                triangles: 1,
+                bytes: bytes(CacheKey(2)),
+            })
+        );
+        assert_eq!(cache.summary(CacheKey(3)), None);
     }
 
     #[test]

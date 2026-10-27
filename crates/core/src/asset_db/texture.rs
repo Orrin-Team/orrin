@@ -28,6 +28,7 @@ use image::imageops::FilterType;
 use image::{Rgba32FImage, RgbaImage};
 
 use super::sidecar::Usage;
+use crate::gfx::thumbnail::{self, Pixels, Thumbnail};
 
 /// The side of a compression tile, in texels: 16x16 blocks, 256 of them.
 const TILE: u32 = 64;
@@ -94,6 +95,33 @@ pub fn mip_chain(level0: RgbaImage, usage: Usage) -> Vec<RgbaImage> {
         chain.push(to_bytes(&above, usage));
     }
     chain
+}
+
+/// The asset browser's picture of a texture: the chain's smallest level that
+/// still covers the thumbnail, fitted into its square on a transparent
+/// background, so a wide texture reads as wide.
+pub fn thumbnail(chain: &[RgbaImage], usage: Usage) -> Thumbnail {
+    let edge = thumbnail::SIZE;
+    let source = chain
+        .iter()
+        .rev()
+        .find(|level| level.width().max(level.height()) >= edge)
+        .unwrap_or(&chain[0]);
+    let (width, height) = source.dimensions();
+    let longest = width.max(height);
+    let fit = |side: u32| ((u64::from(side) * u64::from(edge)) / u64::from(longest)).max(1) as u32;
+    let fitted = resize(source, fit(width), fit(height), usage);
+    let (width, height) = fitted.dimensions();
+    let (left, top) = ((edge - width) / 2, (edge - height) / 2);
+    let mut pixels = vec![0; (edge * edge * 4) as usize];
+    for (y, row) in fitted.as_raw().chunks((width * 4) as usize).enumerate() {
+        let at = (((top + y as u32) * edge + left) * 4) as usize;
+        pixels[at..at + row.len()].copy_from_slice(row);
+    }
+    Thumbnail {
+        size: edge,
+        pixels: Pixels::Rgba(pixels),
+    }
 }
 
 /// Scale `image` to `width` by `height`, filtered for `usage`: what `max_size`
@@ -534,6 +562,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Fitted, not stretched: a 4:1 texture fills the middle quarter of the
+    /// square's height and leaves the rest clear.
+    #[test]
+    fn a_thumbnail_fits_the_texture_in_its_square() {
+        let wide = flat(256, 64, [200, 30, 40, 255]);
+        let chain = mip_chain(wide, Usage::Color);
+        let picture = thumbnail(&chain, Usage::Color);
+        let edge = thumbnail::SIZE;
+        assert_eq!(picture.size, edge);
+        assert_eq!(picture.rgba(edge / 2, edge / 2), [200, 30, 40, 255]);
+        assert_eq!(picture.rgba(edge / 2, 2)[3], 0, "clear above");
+        assert_eq!(picture.rgba(edge / 2, edge - 3)[3], 0, "and below");
+
+        let tiny = mip_chain(flat(2, 2, [9, 8, 7, 255]), Usage::Data);
+        let picture = thumbnail(&tiny, Usage::Data);
+        assert_eq!(picture.size, edge);
+        assert_eq!(
+            picture.rgba(0, 0),
+            [9, 8, 7, 255],
+            "a small one is scaled up"
+        );
     }
 
     #[test]

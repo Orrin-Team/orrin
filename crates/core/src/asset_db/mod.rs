@@ -81,7 +81,7 @@ use orrin_ecs::{FxBuildHasher, FxHashMap, World};
 use orrin_registry::AssetId;
 
 pub use cache::CacheKey;
-pub use sidecar::{AssetKind, Settings, Tint, Usage};
+pub use sidecar::{AssetKind, MeshSettings, Settings, TextureSettings, Tint, Usage};
 pub use texture::{Target, TexelFormat};
 
 use crate::gfx::{RenderBackend, TextureHandle};
@@ -128,6 +128,12 @@ pub struct Entry {
     inputs: Vec<String>,
     /// False once a rescan no longer finds the file; see [`AssetDatabase::iter`].
     on_disk: bool,
+    /// What the last import made, once there is one.
+    pub summary: Option<cache::Summary>,
+    /// The source file's size in bytes, as of the last scan.
+    pub bytes: u64,
+    /// When the source file was last written, as of the last scan.
+    pub modified: Option<std::time::SystemTime>,
 }
 
 impl Entry {
@@ -172,6 +178,8 @@ pub struct AssetDatabase {
     reports: Vec<String>,
     /// What texture artifacts are made for.
     target: Target,
+    /// Each imported asset's thumbnail, with the artifact it pictures.
+    thumbnails: FxHashMap<AssetId, (CacheKey, crate::gfx::thumbnail::Thumbnail)>,
     /// Assets with an import on its way back for a slot.
     awaiting: HashSet<AssetId, FxBuildHasher>,
 }
@@ -218,6 +226,7 @@ impl AssetDatabase {
             wrong_kind: None,
             reports: Vec::new(),
             target,
+            thumbnails: FxHashMap::default(),
             awaiting: HashSet::default(),
         };
         issues.extend(db.scan(&[]));
@@ -302,6 +311,15 @@ impl AssetDatabase {
 
     pub fn material_id(&self, handle: MaterialHandle) -> Option<AssetId> {
         self.materials.id(handle.0)
+    }
+
+    /// The asset browser's picture of `id`, with the artifact it was made from,
+    /// which changes when the asset is reimported. `None` for a kind with no
+    /// artifact — a prefab, a material — and before the first import lands.
+    pub fn thumbnail(&self, id: AssetId) -> Option<(CacheKey, &crate::gfx::thumbnail::Thumbnail)> {
+        self.thumbnails
+            .get(&id)
+            .map(|(key, picture)| (*key, picture))
     }
 
     /// The texture slot texture `id` was loaded into, if anything has asked
@@ -451,6 +469,198 @@ impl AssetDatabase {
         Ok(())
     }
 
+    /// Rename the asset or folder at `path` to `name`, returning its new path.
+    ///
+    /// The sidecar goes with it, so the id does, and every scene naming the
+    /// asset still finds it. An asset keeps its extension, since that is what
+    /// makes it the kind it is; typing the extension too is not doubling it.
+    /// A file operation rather than an edit, so it has no undo — as a rename
+    /// in an explorer has none.
+    pub fn rename(&mut self, path: &str, name: &str) -> Result<String, String> {
+        let folder = self.folders.iter().any(|folder| folder.path == path);
+        if !folder && self.find(path).is_none() {
+            return Err(format!(
+                "there is no asset or folder `{path}` in {}",
+                self.dir.display()
+            ));
+        }
+        let refuse = |why: String| format!("could not rename {path}: {why}");
+        let name = name.trim();
+        let extension = match folder {
+            true => None,
+            false => path.rsplit_once('.').map(|(_, extension)| extension),
+        };
+        let stem = extension
+            .and_then(|extension| {
+                let (stem, typed) = name.rsplit_once('.')?;
+                typed.eq_ignore_ascii_case(extension).then_some(stem)
+            })
+            .unwrap_or(name);
+        check_name(stem).map_err(refuse)?;
+        let file = match extension {
+            Some(extension) => format!("{stem}.{extension}"),
+            None => stem.to_owned(),
+        };
+        let rel = match path.rsplit_once('/') {
+            Some((parent, _)) => format!("{parent}/{file}"),
+            None => file,
+        };
+        if rel == path {
+            return Ok(rel);
+        }
+        let (from, to) = (self.dir.join(path), self.dir.join(&rel));
+        // On a case-insensitive file system a change of case finds itself.
+        if to.exists() && !rel.eq_ignore_ascii_case(path) {
+            return Err(refuse(format!("{rel} already exists")));
+        }
+        std::fs::rename(&from, &to).map_err(|error| refuse(error.to_string()))?;
+        let meta = sidecar::path_of(&from);
+        if meta.exists()
+            && let Err(error) = std::fs::rename(&meta, sidecar::path_of(&to))
+        {
+            let _ = std::fs::rename(&to, &from);
+            return Err(refuse(format!("its sidecar would not move: {error}")));
+        }
+        self.rescan();
+        Ok(rel)
+    }
+
+    /// Import asset `id` with `settings` from now on, writing them to its
+    /// sidecar.
+    ///
+    /// The sidecar is rewritten whole, with the id it had: an asset's holds
+    /// nothing else. Settings that do not fit the asset's kind, or a scale
+    /// that is not a positive number, are refused before anything is written.
+    pub fn set_settings(&mut self, id: AssetId, settings: Settings) -> Result<(), String> {
+        let Some(entry) = self.get(id) else {
+            return Err(format!("asset {id} is not in the project"));
+        };
+        let rel = entry.path.clone();
+        let fits = matches!(
+            (entry.kind, settings),
+            (AssetKind::Texture, Settings::Texture(_)) | (AssetKind::Mesh, Settings::Mesh(_))
+        );
+        if !fits {
+            return Err(format!(
+                "{rel} is a {}, which does not take these import settings",
+                entry.kind.label()
+            ));
+        }
+        if let Settings::Mesh(mesh) = settings
+            && !(mesh.scale.is_finite() && mesh.scale > 0.0)
+        {
+            return Err(format!(
+                "{rel}: `scale` must be a positive number, not {}",
+                mesh.scale
+            ));
+        }
+        let meta = sidecar::path_of(&self.dir.join(&rel));
+        write_atomically(&meta, &sidecar::text(id, &settings))
+            .map_err(|error| format!("could not write {rel}.meta: {error}"))?;
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.settings = settings;
+        }
+        self.queue(id);
+        Ok(())
+    }
+
+    /// Import asset `id` again, even when the cache holds what it would make:
+    /// for an artifact suspected of being stale, or an importer being worked on.
+    pub fn reimport(&mut self, id: AssetId) -> Result<(), String> {
+        let Some(entry) = self.get(id) else {
+            return Err(format!("asset {id} is not in the project"));
+        };
+        if import::importer(entry.kind).is_none() {
+            return Err(format!(
+                "{} is a {}, which is read as it is rather than imported",
+                entry.path,
+                entry.kind.label()
+            ));
+        }
+        self.enqueue(id, true);
+        Ok(())
+    }
+
+    /// Copy `files` from outside the project into `folder`, each under its own
+    /// name or, where that is taken, numbered past it — `rock 2.png`. Returns
+    /// the assets that came in, by path, and what could not, each by name.
+    ///
+    /// A `.meta` is never copied: the copy is a new asset, and its original's
+    /// sidecar would give it an id another asset may answer to. A `.gltf`
+    /// brings the buffers and images it names, at the paths it names them by,
+    /// since those cannot be renumbered without rewriting it; one that would
+    /// overwrite a different file of the same name is refused whole. A folder
+    /// is refused rather than its whole tree copied.
+    pub fn bring_in(&mut self, files: &[PathBuf], folder: &str) -> (Vec<String>, Vec<String>) {
+        let mut brought = Vec::new();
+        let mut errors = Vec::new();
+        let into = self.dir.join(folder);
+        let shown = if folder.is_empty() { "assets" } else { folder };
+        for source in files {
+            let name = source.file_name().map_or_else(
+                || source.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            if source.is_dir() {
+                errors.push(format!(
+                    "{name} is a folder; bring in the files inside it instead"
+                ));
+                continue;
+            }
+            if name.to_ascii_lowercase().ends_with(".meta") {
+                continue;
+            }
+            let rel = self.free_name(folder, &name);
+            let copy = |from: &Path, to: &Path| {
+                to.parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| std::fs::copy(from, to))
+                    .map_err(|error| format!("could not copy {name} into {shown}: {error}"))
+            };
+            let copied = companions(source, &name, &into, folder).and_then(|companions| {
+                for (from, to) in companions {
+                    copy(&from, &to)?;
+                }
+                copy(source, &self.dir.join(&rel))
+            });
+            match copied {
+                Ok(_) if AssetKind::of_path(&rel).is_some() => brought.push(rel),
+                Ok(_) => {}
+                Err(error) => errors.push(error),
+            }
+        }
+        if !files.is_empty() {
+            self.rescan();
+        }
+        (brought, errors)
+    }
+
+    /// `name` in `folder`, numbered past any file there — or any sidecar left
+    /// without one, which would otherwise be read as the copy's.
+    fn free_name(&self, folder: &str, name: &str) -> String {
+        let (stem, extension) = match name.rsplit_once('.') {
+            Some((stem, extension)) if !stem.is_empty() => (stem, Some(extension)),
+            _ => (name, None),
+        };
+        (1..)
+            .map(|n| {
+                let file = match (n, extension) {
+                    (1, _) => name.to_owned(),
+                    (n, Some(extension)) => format!("{stem} {n}.{extension}"),
+                    (n, None) => format!("{stem} {n}"),
+                };
+                match folder {
+                    "" => file,
+                    folder => format!("{folder}/{file}"),
+                }
+            })
+            .find(|rel| {
+                let path = self.dir.join(rel);
+                !path.exists() && !sidecar::path_of(&path).exists()
+            })
+            .expect("an unbounded range finds one")
+    }
+
     /// Record that `path` changed, for [`apply_changes`](Self::apply_changes).
     pub fn notice(&mut self, path: PathBuf) {
         self.noticed.push(path);
@@ -523,7 +733,7 @@ impl AssetDatabase {
         if self.dir.is_dir() {
             walk(&self.dir, &self.dir, &mut files, &mut dirs, &mut issues);
         }
-        files.sort();
+        files.sort_by(|a, b| a.rel.cmp(&b.rel));
         dirs.sort();
 
         self.folders = dirs
@@ -546,7 +756,14 @@ impl AssetDatabase {
         for entry in &mut self.entries {
             entry.on_disk = false;
         }
-        for (rel, path, kind) in files {
+        for Found {
+            rel,
+            path,
+            kind,
+            bytes,
+            modified,
+        } in files
+        {
             let sidecar = match sidecar::read_or_create(&path, &rel, kind) {
                 Ok(sidecar) => sidecar,
                 Err(issue) => {
@@ -572,11 +789,18 @@ impl AssetDatabase {
             };
             match self.entries.iter_mut().find(|entry| entry.id == sidecar.id) {
                 Some(entry) => {
-                    let changed = entry.kind != kind || entry.settings != sidecar.settings;
+                    // A moved asset is imported again: the files it reads are
+                    // known by path. Its source is hashed under no name, so a
+                    // moved texture finds the artifact it had.
+                    let changed = entry.kind != kind
+                        || entry.settings != sidecar.settings
+                        || entry.path != rel;
                     entry.path = rel;
                     entry.kind = kind;
                     entry.settings = sidecar.settings;
                     entry.on_disk = true;
+                    entry.bytes = bytes;
+                    entry.modified = modified;
                     if changed || is_touched(entry) {
                         queue.push(entry.id);
                     }
@@ -590,6 +814,9 @@ impl AssetDatabase {
                         status: Status::Queued,
                         inputs: Vec::new(),
                         on_disk: true,
+                        summary: None,
+                        bytes,
+                        modified,
                     });
                     queue.push(sidecar.id);
                 }
@@ -605,6 +832,11 @@ impl AssetDatabase {
     /// Put `id` on the import thread: urgently, bringing the artifact back,
     /// when something draws it.
     fn queue(&mut self, id: AssetId) {
+        self.enqueue(id, false);
+    }
+
+    /// [`queue`](Self::queue), past the cache when `fresh`.
+    fn enqueue(&mut self, id: AssetId, fresh: bool) {
         let payload = self.resident(id).is_some();
         let known = self.resident(id).and_then(|resident| resident.key);
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
@@ -638,6 +870,7 @@ impl AssetDatabase {
             target: self.target,
             payload,
             known,
+            fresh,
         });
     }
 
@@ -713,6 +946,10 @@ impl AssetDatabase {
                     key: imported.key,
                     cached: imported.cached,
                 };
+                entry.summary = imported.summary;
+                if let Some(picture) = imported.thumbnail {
+                    self.thumbnails.insert(id, (imported.key, picture));
+                }
                 match imported.payload {
                     Some(payload) => self.install(id, imported.key, payload, world, backend),
                     None => {
@@ -1124,10 +1361,95 @@ fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
 
 /// Every asset file and directory below `dir`, relative to `base`. Dotfiles
 /// and symlinks are skipped, as the prefab index skips them.
+/// The files a `.gltf` at `source` names, each with where it goes in `into`
+/// beside the copy, leaving out any already there byte for byte. Nothing for
+/// any other file.
+fn companions(
+    source: &Path,
+    name: &str,
+    into: &Path,
+    folder: &str,
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    if !name.to_ascii_lowercase().ends_with(".gltf") {
+        return Ok(Vec::new());
+    }
+    let bytes =
+        std::fs::read(source).map_err(|error| format!("{name} could not be read: {error}"))?;
+    let base = source.parent().unwrap_or(Path::new("."));
+    let mut out = Vec::new();
+    for uri in import::referenced_files(name, &bytes)? {
+        let relative = Path::new(&uri);
+        let inside = relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+        if !inside {
+            return Err(format!(
+                "{name} reads `{uri}`, which is outside its own folder; copy the two in by hand"
+            ));
+        }
+        let (from, to) = (base.join(relative), into.join(relative));
+        let wanted = std::fs::read(&from)
+            .map_err(|error| format!("{name} reads `{uri}`, which could not be read: {error}"))?;
+        match std::fs::read(&to) {
+            Ok(there) if there == wanted => {}
+            Ok(_) => {
+                let rel = match folder {
+                    "" => uri.clone(),
+                    folder => format!("{folder}/{uri}"),
+                };
+                return Err(format!(
+                    "{name} reads `{uri}`, and {rel} is already there with other contents. Bring \
+                     {name} into a folder of its own"
+                ));
+            }
+            Err(_) => out.push((from, to)),
+        }
+    }
+    Ok(out)
+}
+
+/// Why `name` cannot be a file or folder name on every system a project may
+/// be opened on, or be seen by the scan at all.
+fn check_name(name: &str) -> Result<(), String> {
+    const RESERVED: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    if name.is_empty() || name.chars().all(|c| c == '.') {
+        return Err("it needs a name".to_owned());
+    }
+    let forbidden = |c: char| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|');
+    if let Some(c) = name.chars().find(|&c| forbidden(c) || c.is_control()) {
+        return Err(format!("a name cannot hold `{}`", c.escape_default()));
+    }
+    if name.starts_with('.') {
+        return Err("a name starting with `.` is hidden from the asset scan".to_owned());
+    }
+    if name.ends_with('.') {
+        return Err("Windows drops a dot at the end of a name".to_owned());
+    }
+    let device = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    let numbered = |prefix: &str| {
+        device
+            .strip_prefix(prefix)
+            .is_some_and(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
+    };
+    if RESERVED.contains(&device.as_str()) || numbered("COM") || numbered("LPT") {
+        return Err(format!("`{name}` is reserved on Windows"));
+    }
+    Ok(())
+}
+
+/// A source file [`walk`] found.
+struct Found {
+    rel: String,
+    path: PathBuf,
+    kind: AssetKind,
+    bytes: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
 fn walk(
     base: &Path,
     dir: &Path,
-    files: &mut Vec<(String, PathBuf, AssetKind)>,
+    files: &mut Vec<Found>,
     dirs: &mut Vec<(String, PathBuf)>,
     issues: &mut Vec<String>,
 ) {
@@ -1159,7 +1481,16 @@ fn walk(
         } else if file_type.is_file()
             && let Some(kind) = AssetKind::of_path(&rel)
         {
-            files.push((rel, path, kind));
+            // The listing's own metadata: on Windows it came with the directory
+            // read, so this is not another call per file.
+            let metadata = entry.metadata().ok();
+            files.push(Found {
+                rel,
+                path,
+                kind,
+                bytes: metadata.as_ref().map_or(0, |m| m.len()),
+                modified: metadata.and_then(|m| m.modified().ok()),
+            });
         }
     }
 }
@@ -1288,6 +1619,84 @@ pub(crate) mod tests {
                 "rock.png has the same id as rock copy.png, most likely because it is a copy that \
               kept the original's sidecar. Delete rock.png.meta to give it an id of its own"
             ]
+        );
+    }
+
+    /// A rename takes the sidecar along, so the asset keeps its id and every
+    /// scene naming it still finds it; the extension stays, since it is what
+    /// makes the file the kind of asset it is.
+    #[test]
+    fn a_rename_moves_the_file_with_its_sidecar_and_keeps_the_id() {
+        let dir = Dir::new("db-rename");
+        project(&dir);
+        dir.write("rocks/pebble.png", &png(1, 1, |_, _| [0; 4]));
+        let mut db = open(&dir);
+        let rock = db.find("rocks/rock.png").unwrap().id;
+
+        assert_eq!(
+            db.rename("rocks/rock.png", " boulder "),
+            Ok("rocks/boulder.png".into())
+        );
+        assert_eq!(db.find("rocks/boulder.png").map(|e| e.id), Some(rock));
+        assert!(db.find("rocks/rock.png").is_none());
+        assert!(dir.path().join("rocks/boulder.png.meta").is_file());
+        assert!(!dir.path().join("rocks/rock.png.meta").exists());
+        assert_eq!(
+            db.rename("rocks/boulder.png", "stone.PNG"),
+            Ok("rocks/stone.png".into()),
+            "its own extension typed is not doubled"
+        );
+        assert_eq!(
+            db.rename("rocks/stone.png", "Stone"),
+            Ok("rocks/Stone.png".into()),
+            "a change of case is not the name being taken"
+        );
+
+        for (name, why) in [
+            ("", "a name"),
+            ("a/b", "/"),
+            ("a\\b", "\\"),
+            ("a:b", ":"),
+            ("pebble", "rocks/pebble.png already exists"),
+            (".", "a name"),
+            ("con", "reserved"),
+        ] {
+            let error = db.rename("rocks/Stone.png", name).unwrap_err();
+            assert!(
+                error.contains("rocks/Stone.png") && error.contains(why),
+                "{name}: {error}"
+            );
+        }
+        assert!(
+            db.rename("rocks/nothing.png", "x")
+                .unwrap_err()
+                .contains("rocks/nothing.png")
+        );
+
+        db.set_folder_tint("rocks", Some(Tint([1, 2, 3]))).unwrap();
+        assert_eq!(db.rename("rocks", "stones"), Ok("stones".into()));
+        assert_eq!(db.find("stones/Stone.png").map(|e| e.id), Some(rock));
+        let stones = db.folders().iter().find(|f| f.path == "stones").unwrap();
+        assert_eq!(stones.tint, Some(Tint([1, 2, 3])), "with its sidecar");
+        assert!(!dir.path().join("rocks.meta").exists());
+        assert!(db.folders().iter().all(|f| f.path != "rocks"));
+        assert!(
+            db.rename("stones", "props")
+                .unwrap_err()
+                .contains("props already exists")
+        );
+
+        // A moved glTF imports again, so the buffers it reads are known by
+        // where they are now and a save to one still reimports it.
+        assert!(db.wait_idle(WAIT));
+        db.update(&World::new(), &mut HeadlessBackend::new());
+        db.rename("models", "trees").unwrap();
+        assert_eq!(db.find("trees/tree.gltf").unwrap().status, Status::Queued);
+        assert!(db.wait_idle(WAIT));
+        db.update(&World::new(), &mut HeadlessBackend::new());
+        assert_eq!(
+            db.find("trees/tree.gltf").unwrap().inputs,
+            ["trees/tri angle.bin"]
         );
     }
 
@@ -1546,6 +1955,205 @@ pub(crate) mod tests {
         bin[12..16].copy_from_slice(&3.0f32.to_le_bytes());
         change(&world, &dir, "models/tri angle.bin", &bin, &mut backend);
         assert_eq!(backend.mesh_bounds(slot).unwrap().max.x, 6.0);
+    }
+
+    fn imported_key(db: &AssetDatabase, path: &str) -> (CacheKey, bool) {
+        match db.find(path).unwrap().status {
+            Status::Imported { key, cached } => (key, cached),
+            ref other => panic!("{path} is {other:?}"),
+        }
+    }
+
+    /// Files from outside the project are copied in under names of their own.
+    /// A copy is a new asset, so a sidecar dropped with it is left behind; a
+    /// glTF brings the buffers and images it names, where it names them.
+    #[test]
+    fn files_brought_in_are_copied_with_unique_names_and_what_a_gltf_reads() {
+        let outside = Dir::new("bring-in-source");
+        let rock = outside.write("rock.png", &png(1, 1, |_, _| [9; 4]));
+        let foreign = "5f0c3a4e-0000-4000-8000-0000000000aa";
+        let meta = outside.write("rock.png.meta", format!("id = \"{foreign}\"\n").as_bytes());
+        let gltf = triangle_gltf("").replace(
+            "\"buffers\"",
+            "\"images\": [{\"uri\": \"tex/bark%201.png\"}],\n  \"buffers\"",
+        );
+        let tree = outside.write("tree.gltf", gltf.as_bytes());
+        let bin = outside.write("tri angle.bin", &triangle_bin());
+        outside.write("tex/bark 1.png", &png(1, 1, |_, _| [1; 4]));
+        let folder = outside
+            .write("loose/notes.txt", b"")
+            .parent()
+            .unwrap()
+            .to_owned();
+
+        let dir = Dir::new("bring-in");
+        project(&dir);
+        dir.write("props/rock.png", &png(1, 1, |_, _| [0; 4]));
+        let mut db = open(&dir);
+        let (brought, errors) = db.bring_in(&[rock, meta, tree.clone(), folder], "props");
+        assert_eq!(brought, ["props/rock 2.png", "props/tree.gltf"]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("loose"), "{errors:?}");
+        assert!(dir.path().join("props/tri angle.bin").is_file());
+        assert!(dir.path().join("props/tex/bark 1.png").is_file());
+        let copy = db.find("props/rock 2.png").expect("indexed");
+        assert_ne!(
+            copy.id.to_string(),
+            foreign,
+            "a copy is an asset of its own"
+        );
+        assert!(db.find("props/tree.gltf").is_some());
+
+        let (brought, errors) = db.bring_in(std::slice::from_ref(&tree), "props");
+        assert_eq!(brought, ["props/tree 2.gltf"], "{errors:?}");
+        assert!(errors.is_empty(), "the same buffer is shared: {errors:?}");
+
+        let mut other = triangle_bin();
+        other[0] ^= 1;
+        std::fs::write(&bin, other).unwrap();
+        let (brought, errors) = db.bring_in(&[tree], "props");
+        assert!(brought.is_empty());
+        assert!(errors[0].contains("props/tri angle.bin"), "{errors:?}");
+        assert!(
+            !dir.path().join("props/tree 3.gltf").exists(),
+            "nothing half copied"
+        );
+    }
+
+    /// The Import page's Apply: the sidecar is rewritten with the id it had and
+    /// the new settings, which a fresh scan reads back, and the asset imports
+    /// again under them. Settings that do not fit the asset are refused by name.
+    #[test]
+    fn new_settings_are_written_to_the_sidecar_with_the_id_kept_and_imported() {
+        use sidecar::{MeshSettings, TextureSettings};
+        let dir = Dir::new("db-set-settings");
+        project(&dir);
+        let mut db = open(&dir);
+        assert!(db.wait_idle(WAIT));
+        db.update(&World::new(), &mut HeadlessBackend::new());
+        let rock = db.find("rocks/rock.png").unwrap().id;
+        let (before, _) = imported_key(&db, "rocks/rock.png");
+
+        let settings = Settings::Texture(TextureSettings {
+            usage: Usage::Data,
+            compress: false,
+            max_size: 1,
+        });
+        db.set_settings(rock, settings).unwrap();
+        assert_eq!(db.get(rock).unwrap().settings, settings);
+        assert_eq!(db.get(rock).unwrap().status, Status::Queued);
+        assert!(db.wait_idle(WAIT));
+        db.update(&World::new(), &mut HeadlessBackend::new());
+        assert_ne!(imported_key(&db, "rocks/rock.png"), (before, false));
+        let reopened = open(&dir);
+        let entry = reopened.find("rocks/rock.png").unwrap();
+        assert_eq!((entry.id, entry.settings), (rock, settings));
+
+        let tree = db.find("models/tree.gltf").unwrap().id;
+        let door = db.find("props/door.fprefab").unwrap().id;
+        let mesh = |scale| Settings::Mesh(MeshSettings { scale });
+        for (id, settings, named) in [
+            (rock, mesh(2.0), "rocks/rock.png"),
+            (tree, mesh(-1.0), "models/tree.gltf"),
+            (tree, mesh(f32::NAN), "models/tree.gltf"),
+            (door, mesh(1.0), "props/door.fprefab"),
+        ] {
+            let error = db.set_settings(id, settings).unwrap_err();
+            assert!(error.contains(named), "{error}");
+        }
+        assert_eq!(db.get(tree).unwrap().settings, mesh(1.0), "left as it was");
+    }
+
+    /// Reimport goes past the cache: the same artifact, imported rather than
+    /// found.
+    #[test]
+    fn a_reimport_imports_again_rather_than_reading_the_cache() {
+        let dir = Dir::new("db-reimport");
+        project(&dir);
+        let first = open(&dir);
+        assert!(first.wait_idle(WAIT));
+        drop(first);
+        let mut db = open(&dir);
+        assert!(db.wait_idle(WAIT));
+        db.update(&World::new(), &mut HeadlessBackend::new());
+        let (key, cached) = imported_key(&db, "rocks/rock.png");
+        assert!(cached);
+
+        let rock = db.find("rocks/rock.png").unwrap().id;
+        db.reimport(rock).unwrap();
+        assert_eq!(db.get(rock).unwrap().status, Status::Queued);
+        assert!(db.wait_idle(WAIT));
+        db.update(&World::new(), &mut HeadlessBackend::new());
+        assert_eq!(imported_key(&db, "rocks/rock.png"), (key, false));
+        let door = db.find("props/door.fprefab").unwrap().id;
+        assert!(
+            db.reimport(door)
+                .unwrap_err()
+                .contains("props/door.fprefab")
+        );
+    }
+
+    /// A cache written before thumbnails existed holds artifacts and no
+    /// pictures: such an artifact is imported once more to make one, rather
+    /// than leaving the browser a glyph for as long as the cache lasts.
+    #[test]
+    fn an_artifact_cached_without_a_thumbnail_is_imported_again_for_one() {
+        let dir = Dir::new("db-thumbless-cache");
+        project(&dir);
+        let first = open(&dir);
+        assert!(first.wait_idle(WAIT));
+        drop(first);
+        for file in std::fs::read_dir(dir.path().join(".cache")).unwrap() {
+            let path = file.unwrap().path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "thumb")
+            {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+
+        let mut db = open(&dir);
+        assert!(db.wait_idle(WAIT));
+        db.update(&World::new(), &mut HeadlessBackend::new());
+        for path in ["rocks/rock.png", "models/tree.gltf"] {
+            let id = db.find(path).unwrap().id;
+            assert!(db.thumbnail(id).is_some(), "{path}");
+            assert!(!imported_key(&db, path).1, "{path} imported, not found");
+        }
+    }
+
+    /// Every import leaves the browser a thumbnail and the Import page a
+    /// summary, and a second run that finds the artifacts cached finds both
+    /// beside them rather than importing again.
+    #[test]
+    fn an_import_leaves_a_thumbnail_and_a_summary_that_a_cached_run_finds() {
+        let dir = Dir::new("db-thumbnails");
+        project(&dir);
+        for run in ["first", "cached"] {
+            let mut world = World::new();
+            world.insert_resource(open(&dir));
+            assert!(world.resource::<AssetDatabase>().wait_idle(WAIT));
+            update(&world, &mut HeadlessBackend::new());
+            let db = world.resource::<AssetDatabase>();
+            for (path, layout) in [("rocks/rock.png", "rgba"), ("models/tree.gltf", "grey")] {
+                let entry = db.find(path).unwrap();
+                assert_eq!(
+                    entry.status,
+                    Status::Imported {
+                        key: db.thumbnail(entry.id).expect(path).0,
+                        cached: run == "cached",
+                    },
+                    "{run}: {path}"
+                );
+                let (_, picture) = db.thumbnail(entry.id).unwrap();
+                let rgba = matches!(picture.pixels, crate::gfx::thumbnail::Pixels::Rgba(_));
+                assert_eq!(rgba, layout == "rgba", "{run}: {path}");
+                assert!(entry.summary.is_some(), "{run}: {path}");
+            }
+            let door = db.find("props/door.fprefab").unwrap().id;
+            assert!(db.thumbnail(door).is_none(), "a prefab has no artifact");
+        }
     }
 
     /// A device that samples BC is given each texture's compressed chain; one

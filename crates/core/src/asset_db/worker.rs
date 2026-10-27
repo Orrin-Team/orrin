@@ -22,10 +22,11 @@ use std::time::Duration;
 
 use orrin_registry::AssetId;
 
-use super::cache::{Artifact, Cache, CacheKey};
+use super::cache::{Artifact, Cache, CacheKey, Summary};
 use super::import;
 use super::sidecar::{AssetKind, Settings};
 use super::texture::Target;
+use crate::gfx::thumbnail::Thumbnail;
 use crate::scene::{MeshPreview, render_mesh};
 
 /// One import to run.
@@ -44,6 +45,8 @@ pub struct Job {
     /// The artifact the asset's slot already holds, which is not brought back
     /// again.
     pub known: Option<CacheKey>,
+    /// Import even when the cache holds the artifact: a Reimport.
+    pub fresh: bool,
 }
 
 /// An artifact on its way to the GPU, with anything derived from it that is
@@ -61,6 +64,10 @@ pub struct Imported {
     /// The files read besides the source, relative to the source's directory.
     pub inputs: Vec<String>,
     pub payload: Option<Payload>,
+    /// The asset browser's picture of it, stored beside the artifact.
+    pub thumbnail: Option<Thumbnail>,
+    /// What the artifact is, for the Import page.
+    pub summary: Option<Summary>,
 }
 
 /// A job's outcome, sent back to the database.
@@ -76,6 +83,8 @@ pub struct Done {
 /// with everything cached reads sources and no artifacts. One that is in the
 /// cache but does not read is rebuilt when it is brought back, rather than
 /// trusted or reported, since a damaged cache file is never the user's problem.
+/// One without its thumbnail — a cache written before there were any — is
+/// imported again to make one.
 pub fn run(job: &Job, cache: &Cache) -> Result<Imported, String> {
     let Some(importer) = import::importer(job.kind) else {
         return Err(format!(
@@ -109,27 +118,46 @@ pub fn run(job: &Job, cache: &Cache) -> Result<Imported, String> {
     };
 
     let wanted = job.payload && job.known != Some(key);
-    if !wanted && cache.path(key).is_file() {
+    let pictured = if job.fresh {
+        None
+    } else {
+        cache.load_thumbnail(key)
+    };
+    if pictured.is_some() && !wanted && cache.path(key).is_file() {
         return Ok(Imported {
             key,
             cached: true,
             inputs: read(),
             payload: None,
+            thumbnail: pictured,
+            summary: cache.summary(key),
         });
     }
 
-    let (artifact, cached) = match cache.load(key) {
-        Some(Ok(artifact)) => (artifact, true),
+    let found = pictured.is_some().then(|| cache.load(key)).flatten();
+    let (artifact, cached, thumbnail) = match found {
+        Some(Ok(artifact)) => (artifact, true, pictured),
         Some(Err(_)) | None => {
-            let artifact = import::import(job.kind, &job.rel, &job.settings, job.target, &inputs)?;
-            if let Err(error) = cache.store(key, &artifact) {
+            let (artifact, thumbnail) = import::import_with_thumbnail(
+                job.kind,
+                &job.rel,
+                &job.settings,
+                job.target,
+                &inputs,
+            )?;
+            let stored = cache.store(key, &artifact).and_then(|()| match &thumbnail {
+                Some(thumbnail) => cache.store_thumbnail(key, thumbnail),
+                None => Ok(()),
+            });
+            if let Err(error) = stored {
                 // Imported fine and only the write failed: the asset still
                 // loads, and the next run imports it again.
                 tracing::warn!("{}: {error}", job.rel);
             }
-            (artifact, false)
+            (artifact, false, thumbnail)
         }
     };
+    let summary = cache.summary(key);
 
     let payload = wanted.then(|| match artifact {
         Artifact::Texture(texture) => Payload::Texture(texture),
@@ -143,6 +171,8 @@ pub fn run(job: &Job, cache: &Cache) -> Result<Imported, String> {
         cached,
         inputs: read(),
         payload,
+        thumbnail,
+        summary,
     })
 }
 

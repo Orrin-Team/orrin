@@ -24,6 +24,7 @@ use glam::{Mat3, Mat4, Vec3, Vec4};
 use super::cache::{Artifact, Importer, TextureArtifact};
 use super::sidecar::{AssetKind, MeshSettings, Settings, TextureSettings};
 use super::texture::{self, Target, TexelFormat};
+use crate::gfx::thumbnail::Thumbnail;
 use crate::scene::CpuMesh;
 use crate::scene::model::{import_primitive, percent_decode};
 
@@ -83,20 +84,24 @@ pub fn read_inputs(
     Ok(inputs)
 }
 
-/// Build `kind`'s artifact from what [`read_inputs`] read.
-pub fn import(
+/// [`import`], with the asset browser's thumbnail made while the source is
+/// still decoded: a texture's before compression, a mesh's from its vertices.
+pub fn import_with_thumbnail(
     kind: AssetKind,
     rel: &str,
     settings: &Settings,
     target: Target,
     inputs: &[(String, Vec<u8>)],
-) -> Result<Artifact, String> {
+) -> Result<(Artifact, Option<Thumbnail>), String> {
     match (kind, settings) {
         (AssetKind::Texture, Settings::Texture(settings)) => {
-            texture(rel, settings, target, &inputs[0].1).map(Artifact::Texture)
+            let (texture, picture) = texture(rel, settings, target, &inputs[0].1)?;
+            Ok((Artifact::Texture(texture), Some(picture)))
         }
         (AssetKind::Mesh, Settings::Mesh(settings)) => {
-            mesh(rel, settings, inputs).map(Artifact::Mesh)
+            let mesh = mesh(rel, settings, inputs)?;
+            let picture = crate::scene::render_mesh(&mesh).thumbnail;
+            Ok((Artifact::Mesh(mesh), Some(picture)))
         }
         _ => Err(format!(
             "{rel} is a {}, which is not imported",
@@ -105,12 +110,23 @@ pub fn import(
     }
 }
 
+/// Build `kind`'s artifact from what [`read_inputs`] read.
+pub fn import(
+    kind: AssetKind,
+    rel: &str,
+    settings: &Settings,
+    target: Target,
+    inputs: &[(String, Vec<u8>)],
+) -> Result<Artifact, String> {
+    import_with_thumbnail(kind, rel, settings, target, inputs).map(|(artifact, _)| artifact)
+}
+
 fn texture(
     rel: &str,
     settings: &TextureSettings,
     target: Target,
     bytes: &[u8],
-) -> Result<TextureArtifact, String> {
+) -> Result<(TextureArtifact, Thumbnail), String> {
     let decoded = image::load_from_memory(bytes)
         .map_err(|error| format!("{rel} is not a PNG or JPEG this engine can decode: {error}"))?;
     let mut rgba = decoded.to_rgba8();
@@ -125,17 +141,40 @@ fn texture(
     let (width, height) = rgba.dimensions();
     let format = TexelFormat::choose(settings.usage, settings.compress, target);
     let chain = texture::mip_chain(rgba, settings.usage);
+    let picture = texture::thumbnail(&chain, settings.usage);
     let levels = texture::encode_chain(&chain, format, crate::threads::import_threads());
-    Ok(TextureArtifact {
+    let texture = TextureArtifact {
         format,
         width,
         height,
         levels,
-    })
+    };
+    Ok((texture, picture))
 }
 
 fn parse_gltf(rel: &str, bytes: &[u8]) -> Result<gltf::Gltf, String> {
     gltf::Gltf::from_slice(bytes).map_err(|error| format!("{rel} is not a glTF 2.0 file: {error}"))
+}
+
+/// The files a `.gltf` names by URI — its buffers and its images — relative
+/// to its directory. A `data:` URI is not a file, and is left out.
+pub fn referenced_files(rel: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
+    let document = parse_gltf(rel, bytes)?.document;
+    let buffers = document
+        .buffers()
+        .filter_map(|buffer| match buffer.source() {
+            gltf::buffer::Source::Uri(uri) => Some(uri),
+            gltf::buffer::Source::Bin => None,
+        });
+    let images = document.images().filter_map(|image| match image.source() {
+        gltf::image::Source::Uri { uri, .. } => Some(uri),
+        gltf::image::Source::View { .. } => None,
+    });
+    Ok(buffers
+        .chain(images)
+        .filter(|uri| !uri.starts_with("data:"))
+        .map(percent_decode)
+        .collect())
 }
 
 /// The file a buffer URI names, relative to the glTF's directory.
@@ -240,6 +279,7 @@ pub(super) mod tests {
     use super::*;
     use crate::asset_db::sidecar::Usage;
     use crate::asset_db::tests::Dir;
+    use crate::gfx::thumbnail::Pixels;
 
     pub(in crate::asset_db) fn png(
         width: u32,
@@ -320,6 +360,43 @@ pub(super) mod tests {
         let plain = texture_for(bytes, plain, Target::Bc).unwrap();
         assert_eq!(plain.format, TexelFormat::Rgba8Srgb);
         assert_eq!(plain.levels[0].len(), 16 * 8 * 4);
+    }
+
+    /// A thumbnail comes with every artifact: in colour for a texture, in clay
+    /// for a mesh.
+    #[test]
+    fn an_import_brings_its_thumbnail() {
+        let bytes = png(16, 8, |_, _| [20, 200, 90, 255]);
+        let inputs = [("rock.png".to_owned(), bytes)];
+        let (_, picture) = import_with_thumbnail(
+            AssetKind::Texture,
+            "rock.png",
+            &Settings::Texture(AS_IS),
+            Target::Bc,
+            &inputs,
+        )
+        .unwrap();
+        let picture = picture.expect("a texture has a thumbnail");
+        assert!(matches!(picture.pixels, Pixels::Rgba(_)));
+        let middle = picture.size / 2;
+        assert_eq!(picture.rgba(middle, middle), [20, 200, 90, 255]);
+
+        let dir = Dir::new("import-thumbnail");
+        let source = dir.write("tree.gltf", triangle_gltf("").as_bytes());
+        dir.write("tri angle.bin", &triangle_bin());
+        let inputs = read_inputs(AssetKind::Mesh, &source, "tree.gltf").unwrap();
+        let (_, picture) = import_with_thumbnail(
+            AssetKind::Mesh,
+            "tree.gltf",
+            &Settings::Mesh(MeshSettings { scale: 1.0 }),
+            Target::Rgba8,
+            &inputs,
+        )
+        .unwrap();
+        assert!(matches!(
+            picture.expect("a mesh has a thumbnail").pixels,
+            Pixels::GreyAlpha(_)
+        ));
     }
 
     #[test]

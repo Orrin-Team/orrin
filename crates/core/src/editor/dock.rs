@@ -55,6 +55,7 @@ pub enum Tab {
     Console,
     Scripts,
     Assets,
+    Import,
 }
 
 impl Tab {
@@ -62,12 +63,13 @@ impl Tab {
     /// even in a build without the feature: the variant stays so a layout file
     /// written by one build still loads in the other, and the tab says why it
     /// is empty instead of vanishing.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Hierarchy,
         Self::Inspector,
         Self::Environment,
         Self::Console,
         Self::Assets,
+        Self::Import,
         Self::Performance,
         Self::Scripts,
     ];
@@ -82,6 +84,7 @@ impl Tab {
             Self::Console => icons::terminal(),
             Self::Scripts => icons::file_code(),
             Self::Assets => icons::box_(),
+            Self::Import => icons::info(),
         }
     }
 
@@ -94,6 +97,7 @@ impl Tab {
             Self::Console => "Console",
             Self::Scripts => "Scripts",
             Self::Assets => "Assets",
+            Self::Import => "Import",
         }
     }
 }
@@ -127,8 +131,11 @@ pub fn default_layout() -> DockState<Tab> {
     let surface = state.main_surface_mut();
 
     let [viewport, _] = surface.split_left(NodeIndex::root(), HIERARCHY, vec![Tab::Hierarchy]);
-    let [viewport, _] =
-        surface.split_right(viewport, INSPECTOR, vec![Tab::Inspector, Tab::Environment]);
+    let [viewport, _] = surface.split_right(
+        viewport,
+        INSPECTOR,
+        vec![Tab::Inspector, Tab::Environment, Tab::Import],
+    );
     let [viewport, _] = surface.split_below(
         viewport,
         BOTTOM,
@@ -176,6 +183,15 @@ impl Dock {
             self.state
                 .set_focused_node_and_surface((location.0, location.1));
         }
+    }
+
+    /// Bring the Import tab forward, restoring it first if it was closed — as
+    /// it is in every layout saved before it existed.
+    pub fn show_import(&mut self) {
+        if !self.is_open(Tab::Import) {
+            self.restore(Tab::Import);
+        }
+        self.activate(Tab::Import);
     }
 
     pub fn is_open(&self, tab: Tab) -> bool {
@@ -545,7 +561,8 @@ impl egui_dock::TabViewer for Viewer<'_> {
             Tab::Environment => panels::environment::body(ui, self.world),
             Tab::Performance => panels::performance::body(ui, self.world),
             Tab::Console => panels::console::body(ui, self.world, self.state),
-            Tab::Assets => panels::assets::body(ui, self.world, self.state),
+            Tab::Assets => panels::assets::body(ui, self.world, self.state, self.previews),
+            Tab::Import => panels::import::body(ui, self.world, self.state, self.previews),
             Tab::Scripts => {
                 #[cfg(feature = "scripting")]
                 panels::scripts::body(ui, self.world, self.state);

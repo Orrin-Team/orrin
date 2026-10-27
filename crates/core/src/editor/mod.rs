@@ -96,6 +96,9 @@ impl Editor {
         if let Some(steps) = prefs.snap {
             state.snap_steps = steps;
         }
+        if let Some(view) = prefs.assets {
+            state.assets_view = view;
+        }
         icons::install(&ctx);
         theme::install_fonts(&ctx);
         theme::apply(&ctx, themes.active());
@@ -157,12 +160,23 @@ impl Editor {
         if state.take_reveal_request() {
             dock.activate(dock::Tab::Assets);
         }
+        if state.take_import_request() {
+            dock.show_import();
+        }
 
         // Kept once the pointer lets go, rather than on every frame a step is
         // dragged through.
         let steps = state.snap_steps;
         if prefs.snap.unwrap_or_default() != steps && !ctx.input(|input| input.pointer.any_down()) {
             prefs.snap = Some(steps);
+            prefs_file.save(prefs);
+        }
+        let view = self::state::AssetView {
+            kind: None,
+            ..state.assets_view
+        };
+        if prefs.assets.unwrap_or_default() != view {
+            prefs.assets = Some(view);
             prefs_file.save(prefs);
         }
 

@@ -10,13 +10,14 @@
 //! max_size = 0
 //! ```
 //!
-//! **Written once, then only read.** A sidecar is created with a fresh id and
-//! the kind's default settings the first time a source is seen, and never
-//! rewritten after that: it is committed, so a rewrite would be a diff nobody
-//! made, and one that cannot be read is refused rather than replaced, because
-//! replacing it would give the asset a new identity and orphan every scene that
-//! names the old one. The one exception is a folder's tint, which the editor
-//! writes because the user asked it to.
+//! **Written when created, then only when asked.** A sidecar is created with a
+//! fresh id and the kind's default settings the first time a source is seen,
+//! and after that rewritten only on the user's say: a folder's tint, or import
+//! settings applied from the Import tab, each keeping the id. It is committed,
+//! so a rewrite nobody asked for would be a diff nobody made; and one that
+//! cannot be read is refused rather than replaced, because replacing it would
+//! give the asset a new identity and orphan every scene that names the old
+//! one.
 //!
 //! **Settings are checked, not tolerated.** An unknown key under `[import]` is
 //! an error naming the key and the ones that exist; a typo that silently fell
@@ -301,7 +302,7 @@ pub fn read_or_create(source: &Path, rel: &str, kind: AssetKind) -> Result<Sidec
     }
     let settings = Settings::defaults_for(kind, rel);
     let id = AssetId::new();
-    let text = format!("id = \"{id}\"\n{}", settings.import_table());
+    let text = text(id, &settings);
     // `create_new`, so a sidecar another process wrote since the read above —
     // a second editor on the same project — is read rather than replaced.
     let created = std::fs::OpenOptions::new()
@@ -323,6 +324,11 @@ pub fn read_or_create(source: &Path, rel: &str, kind: AssetKind) -> Result<Sidec
             "{rel} has no sidecar, and writing {rel}.meta failed: {error}"
         )),
     }
+}
+
+/// An asset's whole sidecar: its id, and its settings in `[import]`.
+pub fn text(id: AssetId, settings: &Settings) -> String {
+    format!("id = \"{id}\"\n{}", settings.import_table())
 }
 
 /// A folder's sidecar, which exists only once a tint has been set.

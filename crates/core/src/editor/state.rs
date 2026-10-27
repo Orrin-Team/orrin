@@ -49,6 +49,41 @@ pub const ROTATE_SNAP: f32 = 15.0;
 /// What a scale drag quantises its factor to when snapping.
 pub const SCALE_SNAP: f32 = 0.1;
 
+/// How the asset browser shows a folder. The user's to set from the
+/// browser's bar, and remembered with their other preferences.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AssetView {
+    pub layout: AssetLayout,
+    pub sort: AssetSort,
+    pub descending: bool,
+    /// Only assets of this kind; `None` lists every kind. A filter for the
+    /// session, so not remembered.
+    #[serde(skip)]
+    pub kind: Option<crate::asset_db::AssetKind>,
+}
+
+/// Rows with a small picture, or tiles with a large one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AssetLayout {
+    #[default]
+    List,
+    Grid,
+}
+
+/// What a folder's assets are ordered by. Folders always come first, by name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AssetSort {
+    #[default]
+    Name,
+    /// By extension, then name: every texture together, every mesh together.
+    Type,
+    /// The source file's size.
+    Size,
+    /// When the source file was last written.
+    Modified,
+}
+
 /// What each tool snaps to. The user's to set from the snap button's menu,
 /// and remembered with their other preferences.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -156,8 +191,9 @@ pub struct EditorState {
     pub inspector_query: String,
     /// The asset browser's filter, kept for the reason the others are.
     pub assets_query: String,
-    /// The prefab the asset browser marks: the last one clicked there, or the
-    /// one "Show in Assets" pointed at.
+    pub assets_view: AssetView,
+    /// The asset the browser marks, and the Import tab shows: the last one
+    /// clicked there, or the prefab "Show in Assets" pointed at.
     pub revealed_asset: Option<AssetId>,
     pub gizmo_mode: GizmoMode,
     pub gizmo_space: GizmoSpace,
@@ -230,6 +266,8 @@ pub struct EditorState {
     /// Not serviced by `apply`: bringing the asset browser forward is the
     /// dock's, which the editor drains after the UI pass.
     reveal_request: bool,
+    /// Bring the Import tab forward: the dock's, like `reveal_request`.
+    import_request: bool,
     /// Serviced by `apply`, because a rescan replaces the index the asset
     /// browser is drawing from.
     rescan_request: bool,
@@ -262,6 +300,7 @@ impl Default for EditorState {
             console_query: String::new(),
             inspector_query: String::new(),
             assets_query: String::new(),
+            assets_view: AssetView::default(),
             revealed_asset: None,
             gizmo_mode: GizmoMode::Select,
             gizmo_space: GizmoSpace::World,
@@ -292,6 +331,7 @@ impl Default for EditorState {
             instantiate_request: None,
             prefab_request: None,
             reveal_request: false,
+            import_request: false,
             rescan_request: false,
             save_prefab_request: false,
             theme_request: None,
@@ -350,6 +390,14 @@ impl EditorState {
 
     pub fn take_reveal_request(&mut self) -> bool {
         std::mem::take(&mut self.reveal_request)
+    }
+
+    pub fn request_import_page(&mut self) {
+        self.import_request = true;
+    }
+
+    pub fn take_import_request(&mut self) -> bool {
+        std::mem::take(&mut self.import_request)
     }
 
     pub fn request_prefab_rescan(&mut self) {
