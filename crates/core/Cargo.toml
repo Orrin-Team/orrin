@@ -19,6 +19,8 @@ gltf.workspace = true
 image.workspace = true
 egui.workspace = true
 egui-winit.workspace = true
+rfd.workspace = true
+pollster.workspace = true
 # SVG image loader for the editor's logo. egui renders no SVG itself.
 egui_extras = { version = "0.31", features = ["svg"] }
 serde.workspace = true

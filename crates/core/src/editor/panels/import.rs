@@ -54,7 +54,8 @@ pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews:
     let Some(entry) = state.revealed_asset.and_then(|id| db.get(id)) else {
         ui.weak(
             "Select an asset in the Assets tab to see how it is imported. Files dropped on the \
-             Assets tab from your file explorer are copied into the project.",
+             Assets tab from your file explorer, or picked with its + button, are copied into \
+             the project.",
         );
         return;
     };

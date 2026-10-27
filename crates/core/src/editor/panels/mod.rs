@@ -1340,6 +1340,49 @@ mod tests {
         assert_eq!(editor.state.revealed_asset, Some(copied));
     }
 
+    /// The bar's import button opens a file dialog, and what is picked there
+    /// is copied into the open folder as a drop is. The dialog is the
+    /// operating system's, stood in for here by `assets::PICKED`.
+    #[test]
+    fn files_picked_from_the_bar_are_copied_into_the_open_folder() {
+        use crate::asset_db::AssetDatabase;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let outside = crate::asset_db::tests::Dir::new("panel-pick-source");
+        let rock = outside.write("rock.png", b"");
+        let dir = crate::asset_db::tests::Dir::new("panel-pick");
+        dir.write("props/chair.fprefab", b"orrin-scene 1\n");
+        let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        editor.world.insert_resource(db);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+        let browser = editor.tab_body(Tab::Assets);
+        let plus = crate::editor::icons::plus().glyph();
+        let button = editor
+            .painted_icons()
+            .into_iter()
+            .find(|(glyph, rect, _)| *glyph == plus && browser.contains(rect.center()))
+            .expect("the bar has an import button")
+            .1;
+
+        *assets::PICKED.lock().unwrap() = Some(vec![rock]);
+        editor.click(button.center());
+        let mut copied = None;
+        for _ in 0..200 {
+            editor.frames(1);
+            copied = editor
+                .world
+                .resource::<AssetDatabase>()
+                .find("rock.png")
+                .map(|e| e.id);
+            if copied.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(copied.is_some(), "copied into the open folder");
+        assert_eq!(editor.state.revealed_asset, copied);
+    }
+
     /// An old saved layout has no Import tab, so the browser's menu can bring
     /// it back for the asset it was opened on.
     #[test]

@@ -45,6 +45,12 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 egui = "0.31"
 # Window events into egui. Rendering is the engine's own (`gfx/vulkan/overlay.rs`).
 egui-winit = { version = "0.31", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+# The Assets tab's file dialog. Without `wayland`, which only parents the
+# dialog on a Wayland compositor; everything else it uses is already in the
+# tree through winit, and `pollster`, which drives its async dialog, through
+# `rfd` itself.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 uuid = { version = "1", features = ["v4"] }

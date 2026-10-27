@@ -23,6 +23,9 @@
 //! Without a project there is no asset database, and the tab lists the
 //! prefabs under `assets/` as it always has.
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
 use orrin_ecs::{FxHashMap, World};
 use orrin_registry::AssetId;
 
@@ -32,6 +35,10 @@ use crate::editor::state::{AssetLayout, AssetSort, AssetView, EditorState};
 use crate::editor::theme;
 use crate::editor::{icons, widgets};
 use crate::scene::{LogBuffer, LogLevel, PrefabInstance, Prefabs, Time};
+
+/// What the stand-in for the file dialog picks, in tests.
+#[cfg(test)]
+pub(super) static PICKED: Mutex<Option<Vec<PathBuf>>> = Mutex::new(None);
 
 /// A row of the project-less prefab list.
 const ROW: f32 = 24.0;
@@ -76,17 +83,29 @@ enum Action {
     Rename(String, String),
     CancelRename,
     /// Copy these files from outside the project into this folder.
-    BringIn(Vec<std::path::PathBuf>, String),
+    BringIn(Vec<PathBuf>, String),
+    /// Open a file dialog for files to copy into the open folder.
+    PickFiles,
 }
 
 /// The browser's place, kept in egui's memory rather than the editor state:
 /// which folder is open, which revealed asset it last opened a folder for,
-/// and the name being edited, if one is.
+/// the name being edited, if one is, and the file dialog, if one is open.
 #[derive(Clone, Default)]
 struct Place {
     folder: String,
     revealed: Option<AssetId>,
     renaming: Option<Renaming>,
+    picking: Option<Picking>,
+}
+
+/// A file dialog open on a thread of its own, so the editor goes on drawing
+/// behind it, and the folder what it picks is copied into.
+#[derive(Clone)]
+struct Picking {
+    folder: String,
+    /// Empty until the dialog closes; then what was picked, or nothing.
+    picked: Arc<Mutex<Option<Vec<PathBuf>>>>,
 }
 
 /// A name being edited in place: an asset's without its extension, which the
@@ -120,6 +139,7 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
             ui,
             &db,
             &place.folder,
+            place.picking.is_some(),
             &mut state.assets_query,
             &mut state.assets_view,
             &mut action,
@@ -255,26 +275,27 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
             });
         }
         Some(Action::CancelRename) => place.renaming = None,
-        Some(Action::BringIn(files, folder)) => {
-            let (brought, errors) = world
-                .resource_mut::<AssetDatabase>()
-                .bring_in(&files, &folder);
-            for error in errors {
-                log_error(world, error);
-            }
-            let kind = |rel: &String| AssetKind::of_path(rel);
-            if brought
-                .iter()
-                .any(|rel| kind(rel) == Some(AssetKind::Prefab))
-            {
-                state.request_prefab_rescan();
-            }
-            let first = brought.first().and_then(|rel| {
-                let db = world.resource::<AssetDatabase>();
-                db.find(rel).map(|entry| entry.id)
-            });
-            if first.is_some() {
-                state.revealed_asset = first;
+        Some(Action::BringIn(files, folder)) => bring_in(world, state, &files, &folder),
+        Some(Action::PickFiles) => {
+            let picked = Arc::new(Mutex::new(None));
+            let (into, ctx) = (picked.clone(), ui.ctx().clone());
+            let dialog = std::thread::Builder::new()
+                .name("orrin-file-dialog".to_owned())
+                .spawn(move || {
+                    let files = pick_files();
+                    if let Ok(mut slot) = into.lock() {
+                        *slot = Some(files);
+                    }
+                    ctx.request_repaint();
+                });
+            match dialog {
+                Ok(_) => {
+                    place.picking = Some(Picking {
+                        folder: place.folder.clone(),
+                        picked,
+                    });
+                }
+                Err(error) => log_error(world, format!("could not open a file dialog: {error}")),
             }
         }
         Some(Action::Rename(path, name)) => {
@@ -297,7 +318,67 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
         }
         None => {}
     }
+    let picked = place.picking.as_ref().and_then(|picking| {
+        let files = picking.picked.lock().ok()?.take()?;
+        Some((files, picking.folder.clone()))
+    });
+    if let Some((files, folder)) = picked {
+        place.picking = None;
+        bring_in(world, state, &files, &folder);
+    }
     ui.data_mut(|data| data.insert_temp(memory, place));
+}
+
+/// Copy `files` into `folder`, naming what could not come in, and mark the
+/// first that did.
+fn bring_in(world: &World, state: &mut EditorState, files: &[PathBuf], folder: &str) {
+    if files.is_empty() {
+        return;
+    }
+    let (brought, errors) = world
+        .resource_mut::<AssetDatabase>()
+        .bring_in(files, folder);
+    for error in errors {
+        log_error(world, error);
+    }
+    let kind = |rel: &String| AssetKind::of_path(rel);
+    if brought
+        .iter()
+        .any(|rel| kind(rel) == Some(AssetKind::Prefab))
+    {
+        state.request_prefab_rescan();
+    }
+    let first = brought.first().and_then(|rel| {
+        let db = world.resource::<AssetDatabase>();
+        db.find(rel).map(|entry| entry.id)
+    });
+    if first.is_some() {
+        state.revealed_asset = first;
+    }
+}
+
+/// The files picked in the operating system's dialog; none if it was
+/// cancelled. Blocks, so it runs on a thread of its own. The async dialog,
+/// because macOS shows one only from its main thread, which the async form
+/// arranges itself where the blocking one would fail.
+#[cfg(not(test))]
+fn pick_files() -> Vec<PathBuf> {
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_title("Import files into the project")
+        .add_filter(
+            "Assets",
+            &["png", "jpg", "jpeg", "gltf", "glb", "fmat", "fprefab"],
+        );
+    pollster::block_on(dialog.pick_files())
+        .unwrap_or_default()
+        .iter()
+        .map(|file| file.path().to_owned())
+        .collect()
+}
+
+#[cfg(test)]
+fn pick_files() -> Vec<PathBuf> {
+    PICKED.lock().unwrap().take().unwrap_or_default()
 }
 
 /// Take files dropped from outside the editor, into the folder drawn under the
@@ -373,6 +454,7 @@ fn header(
     ui: &mut egui::Ui,
     db: &AssetDatabase,
     folder: &str,
+    picking: bool,
     query: &mut String,
     view: &mut AssetView,
     action: &mut Option<Action>,
@@ -393,6 +475,15 @@ fn header(
             .on_hover_text("Up one folder");
         if up.clicked() {
             *action = Some(Action::Open(parent(folder).to_owned()));
+        }
+        let import = ui
+            .add_enabled_ui(!picking, |ui| {
+                icons::button(ui, icons::plus(), icons::ROW - 2.0, weak, false)
+            })
+            .inner
+            .on_hover_text("Copy files from disk into this folder. Dropping them here does too");
+        if import.clicked() {
+            *action = Some(Action::PickFiles);
         }
         ui.label(if folder.is_empty() { "assets" } else { folder });
 
