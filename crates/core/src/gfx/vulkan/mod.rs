@@ -431,7 +431,7 @@ impl VulkanRenderer {
         let oit = OitPass::new(&device, forward.layout_source());
         let refraction = RefractionPass::new(&device, forward.layout_source());
         let taa = TaaPass::new(&device);
-        let dof = DofPass::new(&ctx);
+        let dof = DofPass::new(&device);
         let motion_blur = MotionBlurPass::new(&device);
         let shadow = ShadowPass::new(&ctx, &device);
         let line = LinePass::new(&device, &forward.targets);
@@ -2809,13 +2809,13 @@ impl FrameRecord<'_> {
                         .ids
                         .prepass
                         .expect("the graph scheduled depth of field with no prepass");
-                    self.dof.record_prefilter(
-                        builder,
-                        self.ctx,
-                        self.view_of(ids.source),
-                        self.images.view(prepass.depth),
-                        self.images.view(ids.prefiltered),
-                    );
+                    let Device::Vulkan(driver) = self.device;
+                    let color = driver.import_view(self.view_of(ids.source));
+                    let depth = driver.import_view(self.images.view(prepass.depth));
+                    let target = driver.import_view(self.images.view(ids.prefiltered));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                    self.dof
+                        .record_prefilter(self.device, &mut encoder, color, depth, target);
                 }
                 PassBody::DofTileMax => {
                     let ids = self
@@ -2823,12 +2823,12 @@ impl FrameRecord<'_> {
                         .ids
                         .dof
                         .expect("depth of field without its images");
-                    self.dof.record_tile_max(
-                        builder,
-                        self.ctx,
-                        self.images.view(ids.prefiltered),
-                        self.images.view(ids.tile),
-                    );
+                    let Device::Vulkan(driver) = self.device;
+                    let prefiltered = driver.import_view(self.images.view(ids.prefiltered));
+                    let target = driver.import_view(self.images.view(ids.tile));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                    self.dof
+                        .record_tile_max(self.device, &mut encoder, prefiltered, target);
                 }
                 PassBody::DofGather => {
                     let ids = self
@@ -2836,13 +2836,19 @@ impl FrameRecord<'_> {
                         .ids
                         .dof
                         .expect("depth of field without its images");
+                    let Device::Vulkan(driver) = self.device;
+                    let prefiltered = driver.import_view(self.images.view(ids.prefiltered));
+                    let tiles = driver.import_view(self.images.view(ids.tile));
+                    let near = driver.import_view(self.images.view(ids.near));
+                    let far = driver.import_view(self.images.view(ids.far));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.dof.record_gather(
-                        builder,
-                        self.ctx,
-                        self.images.view(ids.prefiltered),
-                        self.images.view(ids.tile),
-                        self.images.view(ids.near),
-                        self.images.view(ids.far),
+                        self.device,
+                        &mut encoder,
+                        prefiltered,
+                        tiles,
+                        near,
+                        far,
                     );
                 }
                 PassBody::DofComposite => {
@@ -2856,14 +2862,21 @@ impl FrameRecord<'_> {
                         .ids
                         .prepass
                         .expect("the graph scheduled depth of field with no prepass");
+                    let Device::Vulkan(driver) = self.device;
+                    let color = driver.import_view(self.view_of(ids.source));
+                    let depth = driver.import_view(self.images.view(prepass.depth));
+                    let near = driver.import_view(self.images.view(ids.near));
+                    let far = driver.import_view(self.images.view(ids.far));
+                    let target = driver.import_view(self.images.view(ids.output));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.dof.record_composite(
-                        builder,
-                        self.ctx,
-                        self.view_of(ids.source),
-                        self.images.view(prepass.depth),
-                        self.images.view(ids.near),
-                        self.images.view(ids.far),
-                        self.images.view(ids.output),
+                        self.device,
+                        &mut encoder,
+                        color,
+                        depth,
+                        near,
+                        far,
+                        target,
                     );
                 }
                 PassBody::MotionBlurTileMax => {
