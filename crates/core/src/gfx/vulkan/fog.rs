@@ -27,20 +27,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use glam::{Mat4, Vec3};
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
-use vulkano::memory::allocator::AllocationCreateInfo;
 
 use crate::gfx::SceneLighting;
+use crate::gfx::format::SampleCount;
+use crate::gfx::graph::ImageUsage;
 use crate::gfx::rhi::{
     Binding, BindingResource, BlockKind, BufferId, ComputePipelineDesc, Device, Encoder,
-    PipelineId, SamplerDesc, SamplerId, TextureViewId,
+    PipelineId, SamplerDesc, SamplerId, TextureDesc, TextureDimension, TextureViewId,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::scene::FogSettings;
 
 use super::ShadowFrame;
 use super::context::VkContext;
-use super::convert::vk_format;
 use super::forward::GpuCascades;
 use super::taa::FrameView;
 
@@ -133,11 +132,11 @@ pub struct FogPass {
     shading_sampler: Arc<Sampler>,
     /// Ping-ponged: `frame & 1` is this frame's scatter target and the other is
     /// the history. Empty until the first frame the effect is enabled for.
-    history: Option<[Arc<ImageView>; 2]>,
+    history: Option<[TextureViewId; 2]>,
     /// A 1x1x1 volume of "no in-scatter, full transmittance", bound wherever the
     /// real one is absent so every shader has one path rather than two — the
     /// same trick the 1x1 white ambient-occlusion view plays.
-    fallback: Arc<ImageView>,
+    fallback: TextureViewId,
     extent: [u32; 3],
     frame: u64,
     /// Set whenever the history cannot be trusted — first frame, a resize, or
@@ -208,7 +207,7 @@ impl FogPass {
             )
             .unwrap(),
             history: None,
-            fallback: allocate_fallback(ctx),
+            fallback: allocate_fallback(device),
             extent: [0; 3],
             frame: 0,
             reset: AtomicBool::new(true),
@@ -238,7 +237,6 @@ impl FogPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn begin_frame(
         &mut self,
-        ctx: &VkContext,
         device: &Device,
         settings: &FogSettings,
         lighting: &SceneLighting,
@@ -253,7 +251,8 @@ impl FogPass {
 
         if live {
             if self.history.is_none() || self.extent != froxels {
-                self.history = Some(allocate_history(ctx, froxels));
+                self.release(device);
+                self.history = Some(allocate_history(device, froxels));
                 self.extent = froxels;
                 self.reset.store(true, Ordering::Relaxed);
             }
@@ -261,7 +260,7 @@ impl FogPass {
         } else {
             // Freed rather than kept: two volumes is real memory, and what they
             // hold is stale the moment a frame renders without them.
-            self.history = None;
+            self.release(device);
             self.reset.store(true, Ordering::Relaxed);
         }
 
@@ -342,8 +341,19 @@ impl FogPass {
 
     /// What shaders sample to apply the fog: the integrated volume where the
     /// passes ran, and the inert 1x1x1 stand-in where they did not.
-    pub(super) fn volume_or_fallback(&self, volume: Option<Arc<ImageView>>) -> Arc<ImageView> {
-        volume.unwrap_or_else(|| self.fallback.clone())
+    pub(super) fn volume_or_fallback(
+        &self,
+        device: &Device,
+        volume: Option<Arc<ImageView>>,
+    ) -> Arc<ImageView> {
+        let Device::Vulkan(driver) = device;
+        volume.unwrap_or_else(|| driver.vk_view(self.fallback))
+    }
+
+    fn release(&mut self, device: &Device) {
+        for view in self.history.take().into_iter().flatten() {
+            device.destroy_texture(view);
+        }
     }
 
     pub(super) fn sampler(&self) -> Arc<Sampler> {
@@ -351,15 +361,15 @@ impl FogPass {
     }
 
     /// This frame's scatter target, which is next frame's history.
-    pub(super) fn scatter_view(&self) -> Arc<ImageView> {
-        self.pair()[(self.frame & 1) as usize].clone()
+    pub(super) fn scatter_view(&self) -> TextureViewId {
+        self.pair()[(self.frame & 1) as usize]
     }
 
-    fn history_view(&self) -> Arc<ImageView> {
-        self.pair()[((self.frame + 1) & 1) as usize].clone()
+    fn history_view(&self) -> TextureViewId {
+        self.pair()[((self.frame + 1) & 1) as usize]
     }
 
-    fn pair(&self) -> &[Arc<ImageView>; 2] {
+    fn pair(&self) -> &[TextureViewId; 2] {
         self.history
             .as_ref()
             .expect("the graph scheduled the fog scatter with no history allocated")
@@ -372,7 +382,7 @@ impl FogPass {
         shadow_maps: TextureViewId,
     ) {
         let Device::Vulkan(driver) = device;
-        let target = self.scatter_view();
+        let target = driver.vk_view(self.scatter_view());
         let extent = target.image().extent();
 
         let set = device.create_transient_bind_group(
@@ -393,7 +403,7 @@ impl FogPass {
                 Binding {
                     binding: 3,
                     resource: BindingResource::SampledTexture {
-                        view: driver.import_view(self.history_view()),
+                        view: self.history_view(),
                         sampler: self.linear_clamp,
                     },
                 },
@@ -426,7 +436,6 @@ impl FogPass {
         builder: &mut Encoder,
         target: TextureViewId,
     ) {
-        let Device::Vulkan(driver) = device;
         let extent = device.view_extent(target);
         let extent = [extent[0], extent[1]];
 
@@ -441,7 +450,7 @@ impl FogPass {
                 Binding {
                     binding: 1,
                     resource: BindingResource::SampledTexture {
-                        view: driver.import_view(self.scatter_view()),
+                        view: self.scatter_view(),
                         sampler: self.nearest_clamp,
                     },
                 },
@@ -486,24 +495,21 @@ fn jitter(index: u64) -> f32 {
     result
 }
 
-fn allocate_history(ctx: &VkContext, extent: [u32; 3]) -> [Arc<ImageView>; 2] {
+fn allocate_history(device: &Device, extent: [u32; 3]) -> [TextureViewId; 2] {
     std::array::from_fn(|_| {
-        let image = Image::new(
-            ctx.memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim3d,
-                format: vk_format(FOG_FORMAT),
-                extent,
-                // Written as a storage image by the scatter pass, read as a
-                // sampled one by the integration this frame and by the scatter
-                // pass's next frame.
-                usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .expect("failed to allocate the fog scattering history");
-        ImageView::new_default(image).unwrap()
+        device.create_texture(&TextureDesc {
+            format: FOG_FORMAT,
+            dimension: TextureDimension::D3,
+            extent,
+            mip_levels: 1,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            // Written as a storage image by the scatter pass, read as a
+            // sampled one by the integration this frame and by the scatter
+            // pass's next frame.
+            usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
+            memoryless: false,
+        })
     })
 }
 
@@ -514,20 +520,17 @@ fn allocate_history(ctx: &VkContext, extent: [u32; 3]) -> [Arc<ImageView>; 2] {
 /// transmittance — zero as well. So the fallback would *hide* the frame rather
 /// than leave it alone, which is why `fog_term` gates the fetch on the block's
 /// own "volume is live" flag and this exists only to satisfy the binding.
-fn allocate_fallback(ctx: &VkContext) -> Arc<ImageView> {
-    let image = Image::new(
-        ctx.memory_allocator.clone(),
-        ImageCreateInfo {
-            image_type: ImageType::Dim3d,
-            format: vk_format(FOG_FORMAT),
-            extent: [1, 1, 1],
-            usage: ImageUsage::SAMPLED,
-            ..Default::default()
-        },
-        AllocationCreateInfo::default(),
-    )
-    .expect("failed to allocate the fog fallback volume");
-    ImageView::new_default(image).unwrap()
+fn allocate_fallback(device: &Device) -> TextureViewId {
+    device.create_texture(&TextureDesc {
+        format: FOG_FORMAT,
+        dimension: TextureDimension::D3,
+        extent: [1, 1, 1],
+        mip_levels: 1,
+        array_layers: 1,
+        samples: SampleCount::Sample1,
+        usage: ImageUsage::SAMPLED,
+        memoryless: false,
+    })
 }
 
 #[cfg(test)]

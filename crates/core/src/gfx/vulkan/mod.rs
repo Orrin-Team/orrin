@@ -827,7 +827,7 @@ impl VulkanRenderer {
         {
             // Imported and ping-ponged like the TAA history below, and for the
             // same reason: the scatter pass reads its own previous frame.
-            return self.fog.scatter_view();
+            return self.vk_view(self.fog.scatter_view());
         }
         if let Some(ids) = self.frame.ids.occlusion {
             // Imported and ping-ponged like the TAA history, and for a stronger
@@ -873,7 +873,7 @@ impl VulkanRenderer {
             && id == fog.scatter
         {
             return Some(record::Target::Image(
-                self.fog.scatter_view().image().clone(),
+                self.vk_view(self.fog.scatter_view()).image().clone(),
             ));
         }
         if let Some(occlusion) = ids.occlusion {
@@ -1512,7 +1512,6 @@ impl VulkanRenderer {
         // ambient is the same product the lighting block falls back to, so the
         // air and the surfaces standing in it agree about how bright the sky is.
         self.fog.begin_frame(
-            &self.ctx,
             &self.device,
             fog,
             lighting,
@@ -1826,8 +1825,10 @@ impl VulkanRenderer {
             // stand-in volume when they did not run: one description of the
             // medium, three places that read it.
             self.fog.uniforms(),
-            self.fog
-                .volume_or_fallback(self.frame.ids.fog.map(|ids| self.images.view(ids.volume))),
+            self.fog.volume_or_fallback(
+                &self.device,
+                self.frame.ids.fog.map(|ids| self.images.view(ids.volume)),
+            ),
             self.fog.sampler(),
         );
 
@@ -2499,7 +2500,7 @@ impl FrameRecord<'_> {
         if let Some(fog) = self.frame.ids.fog
             && id == fog.scatter
         {
-            return self.fog.scatter_view();
+            return self.vk_view(self.fog.scatter_view());
         }
         match self.frame.ids.taa {
             Some(taa) if id == taa.output => self.vk_view(self.taa.output_view()),
@@ -2534,7 +2535,7 @@ impl FrameRecord<'_> {
             && id == fog.scatter
         {
             return Some(record::Target::Image(
-                self.fog.scatter_view().image().clone(),
+                self.vk_view(self.fog.scatter_view()).image().clone(),
             ));
         }
         if let Some(occlusion) = ids.occlusion {
@@ -3283,6 +3284,7 @@ impl FrameRecord<'_> {
                     msaa,
                     self.fog.uniforms(),
                     self.fog.volume_or_fallback(
+                        &self.device,
                         self.frame.ids.fog.map(|ids| self.images.view(ids.volume)),
                     ),
                     self.fog.sampler(),
