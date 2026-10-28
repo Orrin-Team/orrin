@@ -34,12 +34,12 @@ const float BACKDROP_SCALE = 0.25;
 
 // How far inside the outline the lens reaches, capped so a large corner radius
 // does not turn the whole surface into rim.
-const float RIM_WIDTH = 24.0;
+const float RIM_WIDTH = 14.0;
 // The most the edge bends the backdrop, in framebuffer pixels.
-const float REFRACTION = 22.0;
+const float REFRACTION = 7.0;
 // Red and blue bend a little less and a little more than green, which is what
 // fringes a bright edge seen through a real piece of glass.
-const float DISPERSION = 0.18;
+const float DISPERSION = 0.10;
 const float SATURATION = 1.18;
 const float LIFT = 1.03;
 // Toward the light, which sits above and to the left.
@@ -111,10 +111,10 @@ void main() {
     // fainter echo on the far side where the light has passed through.
     float facing = max(dot(n, LIGHT), 0.0);
     float echo = max(dot(n, -LIGHT), 0.0);
-    float rim_light = pow(t, 4.0) * (0.05 + 0.26 * facing + 0.08 * echo);
+    float rim_light = pow(t, 5.0) * (0.01 + 0.07 * facing + 0.02 * echo);
     // A hairline on the outline itself, so the edge stays defined over a
     // backdrop of the same colour.
-    float hairline = clamp(1.0 - abs(d + 0.75), 0.0, 1.0) * (0.05 + 0.12 * facing);
+    float hairline = clamp(1.0 - abs(d + 0.75), 0.0, 1.0) * (0.02 + 0.05 * facing);
     colour = clamp(colour + vec3(rim_light + hairline), 0.0, 1.0);
 
     float coverage = clamp(0.5 - d, 0.0, 1.0);
