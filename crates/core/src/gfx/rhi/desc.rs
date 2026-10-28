@@ -93,6 +93,7 @@ pub enum BindingResource {
         sampler: SamplerId,
     },
     StorageBuffer(BufferId),
+    StorageTexture(TextureViewId),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

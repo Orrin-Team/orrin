@@ -112,6 +112,22 @@ impl VkDriver {
         TextureViewId(index)
     }
 
+    pub fn create_solid_texture(&self, rgba: [u8; 4]) -> TextureViewId {
+        let view = super::texture::upload_texture(
+            &self.ctx,
+            &rgba,
+            [1, 1],
+            vk_format(crate::gfx::format::Format::Rgba8Unorm),
+            super::texture::MipPolicy::None,
+        );
+        TextureViewId(self.views.lock().unwrap().insert(view))
+    }
+
+    pub fn view_extent(&self, view: TextureViewId) -> [u32; 2] {
+        let extent = lookup(&self.views, view.0, "texture view").image().extent();
+        [extent[0], extent[1]]
+    }
+
     pub fn import_buffer(&self, buffer: Subbuffer<[u8]>) -> BufferId {
         let mut pool = self.buffers.lock().unwrap();
         let index = pool.insert(buffer);
@@ -267,6 +283,10 @@ impl VkDriver {
                         lookup(&self.samplers, sampler.0, "sampler"),
                     )
                 }
+                BindingResource::StorageTexture(view) => WriteDescriptorSet::image_view(
+                    binding.binding,
+                    lookup(&self.views, view.0, "texture view"),
+                ),
                 BindingResource::StorageBuffer(buffer) => WriteDescriptorSet::buffer(
                     binding.binding,
                     lookup(&self.buffers, buffer.0, "buffer"),

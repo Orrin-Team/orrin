@@ -69,6 +69,19 @@ impl Device {
         }
     }
 
+    /// A persistent one-texel RGBA8 texture, for the pass that needs a stand-in.
+    pub fn create_solid_texture(&self, rgba: [u8; 4]) -> TextureViewId {
+        match self {
+            Device::Vulkan(driver) => driver.create_solid_texture(rgba),
+        }
+    }
+
+    pub fn view_extent(&self, view: TextureViewId) -> [u32; 2] {
+        match self {
+            Device::Vulkan(driver) => driver.view_extent(view),
+        }
+    }
+
     /// A set of bindings for set `set` of `pipeline`. Equal bindings give back
     /// the same underlying set, as the descriptor cache did before the RHI.
     pub fn create_bind_group(

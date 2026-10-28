@@ -425,7 +425,7 @@ impl VulkanRenderer {
         let gizmo = GizmoPass::new(&ctx, format);
         let outline = OutlinePass::new(&ctx, format);
         let exposure = ExposurePass::new(&device);
-        let bloom = BloomPass::new(&ctx);
+        let bloom = BloomPass::new(&device);
         let prepass = GeometryPrepass::new(&ctx);
         let ssao = SsaoPass::new(&ctx);
         let contact_shadows = ContactShadowPass::new(&ctx);
@@ -2914,26 +2914,27 @@ impl FrameRecord<'_> {
                 }
                 PassBody::BloomPrefilter => {
                     let ids = self.frame.ids.bloom.expect("bloom pass without levels");
+                    let Device::Vulkan(driver) = self.device;
+                    let source = driver.import_view(self.scene_color.clone());
+                    let target = driver.import_view(self.images.view(ids.down(0)));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.bloom.record_prefilter(
-                        builder,
-                        self.ctx,
-                        self.scene_color.clone(),
-                        self.images.view(ids.down(0)),
-                        {
-                            let Device::Vulkan(driver) = self.device;
-                            driver.buffer(self.exposure.exposure_buffer())
-                        },
+                        self.device,
+                        &mut encoder,
+                        source,
+                        target,
+                        self.exposure.exposure_buffer(),
                     );
                 }
                 PassBody::BloomDownsample(level) => {
                     let ids = self.frame.ids.bloom.expect("bloom pass without levels");
                     let level = level as usize;
-                    self.bloom.record_downsample(
-                        builder,
-                        self.ctx,
-                        self.images.view(ids.down(level - 1)),
-                        self.images.view(ids.down(level)),
-                    );
+                    let Device::Vulkan(driver) = self.device;
+                    let source = driver.import_view(self.images.view(ids.down(level - 1)));
+                    let target = driver.import_view(self.images.view(ids.down(level)));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                    self.bloom
+                        .record_downsample(self.device, &mut encoder, source, target);
                 }
                 PassBody::BloomUpsample(level) => {
                     let ids = self.frame.ids.bloom.expect("bloom pass without levels");
@@ -2946,12 +2947,17 @@ impl FrameRecord<'_> {
                     } else {
                         ids.down(level + 1)
                     };
+                    let Device::Vulkan(driver) = self.device;
+                    let coarse = driver.import_view(self.images.view(coarse));
+                    let same_level = driver.import_view(self.images.view(ids.down(level)));
+                    let target = driver.import_view(self.images.view(ids.up(level)));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.bloom.record_upsample(
-                        builder,
-                        self.ctx,
-                        self.images.view(coarse),
-                        self.images.view(ids.down(level)),
-                        self.images.view(ids.up(level)),
+                        self.device,
+                        &mut encoder,
+                        coarse,
+                        same_level,
+                        target,
                     );
                 }
                 other => unreachable!("{other:?} is not a compute pass"),
@@ -3153,12 +3159,11 @@ impl FrameRecord<'_> {
                 // pass samples a 1x1 black self.view at a zero strength: "no
                 // bloom" with no second shader path.
                 let bloom = match self.frame.ids.bloom {
-                    Some(ids) => self.images.view(ids.result()),
+                    Some(ids) => driver.import_view(self.images.view(ids.result())),
                     None => self.bloom.black_view(),
                 };
                 let hdr = driver.import_view(self.scene_color.clone());
                 let exposure = self.exposure.exposure_buffer();
-                let bloom = driver.import_view(bloom);
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.hdr.record_tonemap(
                     self.device,
