@@ -321,14 +321,6 @@ impl Arena {
         )))
     }
 
-    pub(super) fn allocate_sized<T: BufferContents>(&self) -> Subbuffer<T> {
-        self.0
-            .lock()
-            .expect("a pass panicked while recording")
-            .allocate_sized()
-            .expect("failed to suballocate a frame uniform")
-    }
-
     pub(super) fn allocate_slice<T: BufferContents>(&self, len: DeviceSize) -> Subbuffer<[T]> {
         self.0
             .lock()

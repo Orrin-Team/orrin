@@ -221,9 +221,12 @@ impl VkDriver {
     }
 
     /// A sampler built outside the RHI, for a pass that binds it beside RHI
-    /// resources. Lives as long as the driver.
+    /// resources. Valid for the frame being recorded, like the other imports.
     pub fn import_sampler(&self, sampler: Arc<Sampler>) -> SamplerId {
-        SamplerId(self.samplers.lock().unwrap().insert(sampler))
+        let mut pool = self.samplers.lock().unwrap();
+        let index = pool.insert(sampler);
+        pool.remove(index, self.frame.load(Ordering::Relaxed));
+        SamplerId(index)
     }
 
     pub fn import_buffer(&self, buffer: Subbuffer<[u8]>) -> BufferId {

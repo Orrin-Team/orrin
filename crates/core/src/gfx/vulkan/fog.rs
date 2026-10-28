@@ -25,17 +25,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use glam::{Mat4, Vec3};
-use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
-use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
+use vulkano::memory::allocator::AllocationCreateInfo;
 
 use crate::gfx::SceneLighting;
 use crate::gfx::rhi::{
-    Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId, SamplerDesc,
-    SamplerId, TextureViewId,
+    Binding, BindingResource, BlockKind, BufferId, ComputePipelineDesc, Device, Encoder,
+    PipelineId, SamplerDesc, SamplerId, TextureViewId,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::scene::FogSettings;
@@ -44,7 +42,6 @@ use super::ShadowFrame;
 use super::context::VkContext;
 use super::convert::vk_format;
 use super::forward::GpuCascades;
-use super::record::Arena;
 use super::taa::FrameView;
 
 /// How far the froxel grid is reduced from the frame in each screen axis.
@@ -97,7 +94,7 @@ const SHADOW_SAMPLER_BINDING: u32 = 2;
 /// that applies the result. That is the decal precedent: a medium described in
 /// two buffers is a medium two passes can disagree about, and the disagreement
 /// would show up as fog that does not match the air it is standing in.
-#[derive(BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(super) struct GpuFog {
     inv_view_proj: [[f32; 4]; 4],
@@ -134,7 +131,6 @@ pub struct FogPass {
     /// The same linear clamped sampler, as the shading passes bind it beside the
     /// volume they apply the fog from.
     shading_sampler: Arc<Sampler>,
-    uniform_allocator: Arena,
     /// Ping-ponged: `frame & 1` is this frame's scatter target and the other is
     /// the history. Empty until the first frame the effect is enabled for.
     history: Option<[Arc<ImageView>; 2]>,
@@ -157,7 +153,7 @@ pub struct FogPass {
     /// This frame's block, resolved once in `begin_frame`. Both dispatches and
     /// every shader that applies the fog bind the same allocation, so the medium
     /// cannot differ between the pass that lit it and the pass that reads it.
-    uniforms: Option<Subbuffer<GpuFog>>,
+    uniforms: Option<BufferId>,
 }
 
 impl FogPass {
@@ -198,16 +194,6 @@ impl FogPass {
         let linear_clamp = sampler(true);
         let nearest_clamp = sampler(false);
 
-        let uniform_allocator = Arena::new(
-            ctx.memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
-
         Self {
             scatter_pipeline,
             integrate_pipeline,
@@ -221,7 +207,6 @@ impl FogPass {
                 },
             )
             .unwrap(),
-            uniform_allocator,
             history: None,
             fallback: allocate_fallback(ctx),
             extent: [0; 3],
@@ -254,6 +239,7 @@ impl FogPass {
     pub(super) fn begin_frame(
         &mut self,
         ctx: &VkContext,
+        device: &Device,
         settings: &FogSettings,
         lighting: &SceneLighting,
         shadows: Option<ShadowFrame<'_>>,
@@ -284,8 +270,7 @@ impl FogPass {
         let to_sun = (-lighting.sun.direction).normalize_or_zero();
         let previous_view_proj = self.previous_view_proj.unwrap_or(view.unjittered_view_proj);
 
-        let uniforms = self.uniform_allocator.allocate_sized::<GpuFog>();
-        *uniforms.write().unwrap() = GpuFog {
+        let block = GpuFog {
             // Unjittered, both of them: the volume is reprojected against its own
             // history rather than resolved by TAA, so the raster's subpixel
             // jitter would fight the reprojection for a sixteenth of a froxel.
@@ -334,7 +319,7 @@ impl FogPass {
             // be looking at different matrices.
             cascades: GpuCascades::new(shadows),
         };
-        self.uniforms = Some(uniforms);
+        self.uniforms = Some(device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&block)));
 
         // Tracked whether or not the effect is on, for the reason TAA tracks its
         // own: otherwise the first frame after it is switched back on reprojects
@@ -350,9 +335,8 @@ impl FogPass {
         settings.volumetric && settings.density > 0.0
     }
 
-    pub(super) fn uniforms(&self) -> Subbuffer<GpuFog> {
+    pub(super) fn uniforms(&self) -> BufferId {
         self.uniforms
-            .clone()
             .expect("the frame bound the fog block before begin_frame")
     }
 
@@ -397,9 +381,7 @@ impl FogPass {
             &[
                 Binding {
                     binding: 0,
-                    resource: BindingResource::UniformBuffer(
-                        driver.import_buffer(self.uniforms().into_bytes()),
-                    ),
+                    resource: BindingResource::UniformBuffer(self.uniforms()),
                 },
                 // No write for binding 2: the comparison sampler is immutable in
                 // this layout, which is what a portability-subset device requires
@@ -454,9 +436,7 @@ impl FogPass {
             &[
                 Binding {
                     binding: 0,
-                    resource: BindingResource::UniformBuffer(
-                        driver.import_buffer(self.uniforms().into_bytes()),
-                    ),
+                    resource: BindingResource::UniformBuffer(self.uniforms()),
                 },
                 Binding {
                     binding: 1,

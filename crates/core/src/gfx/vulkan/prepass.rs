@@ -23,8 +23,8 @@ use vulkano::image::view::ImageView;
 
 use crate::gfx::format::SampleCount;
 use crate::gfx::rhi::{
-    Binding, BindingResource, Blend, BlockKind, BufferId, CullMode, DepthCompare, DepthTest,
-    Device, Encoder, GraphicsPipelineDesc, PipelineId, Topology, Viewport,
+    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferId, CullMode, DepthCompare,
+    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{PositionVertex, SurfaceVertex};
@@ -32,7 +32,6 @@ use crate::gfx::{PositionVertex, SurfaceVertex};
 use super::PassCtx;
 use super::context::VkContext;
 use super::cull::Draws;
-use super::instances::{GpuObject, InstanceEntry};
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -194,29 +193,26 @@ impl GeometryPrepass {
     /// The set-1 per-object descriptor set this pass binds.
     pub(super) fn build_object_set(
         &self,
-        ctx: &VkContext,
         device: &Device,
-        rows: &Subbuffer<[GpuObject]>,
-        indices: &Subbuffer<[InstanceEntry]>,
-    ) -> Arc<DescriptorSet> {
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            layout(device, self.pipeline, 1),
-            [
-                WriteDescriptorSet::buffer(0, rows.clone()),
-                WriteDescriptorSet::buffer(1, indices.clone()),
+        rows: BufferId,
+        indices: BufferId,
+    ) -> BindGroupId {
+        device.create_transient_bind_group(
+            self.pipeline,
+            1,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::StorageBuffer(rows),
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageBuffer(indices),
+                },
             ],
-            [],
         )
-        .unwrap()
     }
 
-    /// The set-2 material table, over the same buffer the forward pass reads.
-    ///
-    /// Its own set rather than the forward pass's, for the reason the object
-    /// sets are kept apart: set compatibility is a property of the layout each
-    /// pipeline declares, not of the buffer written into it. The *data* is
-    /// shared, which is what keeps the two passes agreeing about a material.
     pub(super) fn build_material_set(
         &self,
         ctx: &VkContext,
@@ -273,9 +269,9 @@ impl GeometryPrepass {
         extent: [u32; 2],
         frame: BufferId,
         decals: BufferId,
-        object_set: Arc<DescriptorSet>,
-        material_set: Arc<DescriptorSet>,
-        texture_set: Arc<DescriptorSet>,
+        object_set: BindGroupId,
+        material_set: BindGroupId,
+        texture_set: BindGroupId,
     ) {
         let Device::Vulkan(driver) = device;
         let frame_set = device.create_transient_bind_group(
@@ -303,12 +299,7 @@ impl GeometryPrepass {
             depth_range: [0.0, 1.0],
         });
 
-        let sets = [
-            frame_set,
-            driver.import_set(object_set),
-            driver.import_set(material_set),
-            driver.import_set(texture_set),
-        ];
+        let sets = [frame_set, object_set, material_set, texture_set];
         let bind_all = |encoder: &mut Encoder, pipeline: PipelineId| {
             encoder.bind_pipeline(pipeline);
             for (set, group) in sets.iter().enumerate() {

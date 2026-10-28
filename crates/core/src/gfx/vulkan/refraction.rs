@@ -215,7 +215,6 @@ impl RefractionPass {
         extent: [u32; 2],
         object_base: u32,
     ) {
-        let Device::Vulkan(driver) = device;
         let scene_set = device.create_bind_group(
             self.pipeline,
             SCENE_SET as u32,
@@ -245,8 +244,8 @@ impl RefractionPass {
             depth_range: [0.0, 1.0],
         });
         builder.bind_pipeline(self.pipeline);
-        for (set, group) in sets.as_vec().into_iter().enumerate() {
-            builder.bind_group(set as u32, driver.import_set(group));
+        for (set, group) in sets.groups().into_iter().enumerate() {
+            builder.bind_group(set as u32, group);
         }
         builder.bind_group(SCENE_SET as u32, scene_set);
 

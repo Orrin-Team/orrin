@@ -131,7 +131,7 @@ use super::{
     DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TexelFormat, TextureHandle,
     TextureLevels,
 };
-use crate::gfx::rhi::{BufferId, Device, Encoder};
+use crate::gfx::rhi::{BindGroupId, BufferId, Device, Encoder};
 use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::DebugLine;
@@ -1481,6 +1481,7 @@ impl VulkanRenderer {
         // air and the surfaces standing in it agree about how bright the sky is.
         self.fog.begin_frame(
             &self.ctx,
+            &self.device,
             fog,
             lighting,
             shadows,
@@ -1554,10 +1555,15 @@ impl VulkanRenderer {
                 self.prepass.material_sampler(),
             ));
         }
-        let material_set = self.material_set.clone().unwrap();
-        let texture_set = self.texture_set.clone().unwrap();
-        let prepass_material_set = self.prepass_material_set.clone().unwrap();
-        let prepass_texture_set = self.prepass_texture_set.clone().unwrap();
+        // The material and texture sets outlive the frame — they are rebuilt only
+        // when the table changes — so each frame hands them to the device afresh.
+        let Device::Vulkan(driver) = &self.device;
+        let material_set = driver.import_set(self.material_set.clone().unwrap());
+        let texture_set = driver.import_set(self.texture_set.clone().unwrap());
+        let prepass_material_set = driver.import_set(self.prepass_material_set.clone().unwrap());
+        let prepass_texture_set = driver.import_set(self.prepass_texture_set.clone().unwrap());
+        let shadow_material_set = driver.import_set(self.shadow_material_set.clone().unwrap());
+        let shadow_texture_set = driver.import_set(self.shadow_texture_set.clone().unwrap());
 
         // Every list a frame draws is an ordering over one shared `RenderItem`
         // array, so any non-empty list carries the whole of it. Taking the
@@ -1602,7 +1608,7 @@ impl VulkanRenderer {
             shadows.map_or(&no_casters, |s| s.casters),
             shadows.map_or(&no_casters, |s| s.punctual_casters),
         );
-        let object_rows = self.instances.rows().clone();
+        let object_rows = driver.import_buffer(self.instances.rows().clone().into_bytes());
 
         // The views the compute path culls against, in the numbering `cull.rs`
         // documents: the camera, then each cascade, then each punctual face.
@@ -1664,29 +1670,26 @@ impl VulkanRenderer {
         // is the one the dispatch wrote; the blended and refractive queues are
         // still CPU-culled and keep the host-written one, which is why the
         // graph names the two apart. See `blended_index` in `frame::declare`.
-        let opaque_indices = match &cull_frame {
-            Some(_) => self.cull.indices().clone(),
-            None => objects.indices.clone(),
-        };
+        let opaque_indices = driver.import_buffer(match &cull_frame {
+            Some(_) => self.cull.indices().clone().into_bytes(),
+            None => objects.indices.clone().into_bytes(),
+        });
         let forward_object_set =
             self.forward
-                .build_object_set(&self.ctx, &self.device, &object_rows, &opaque_indices);
+                .build_object_set(&self.device, object_rows, opaque_indices);
         // One block for the whole frame, bound by the forward pass's set 0 and
         // the prepass's alike. See `ForwardPass::upload_decals`.
         let decal_block = self.forward.upload_decals(&self.device, decals);
         let caster_sets = shadows.is_some().then(|| shadow::CasterSets {
-            objects: self.shadow.build_object_set(
-                &self.ctx,
-                &self.device,
-                &object_rows,
-                &opaque_indices,
-            ),
-            materials: self.shadow_material_set.clone().unwrap(),
-            textures: self.shadow_texture_set.clone().unwrap(),
+            objects: self
+                .shadow
+                .build_object_set(&self.device, object_rows, opaque_indices),
+            materials: shadow_material_set,
+            textures: shadow_texture_set,
         });
         let prepass_object_set = self.frame.ids.prepass.map(|_| {
             self.prepass
-                .build_object_set(&self.ctx, &self.device, &object_rows, &opaque_indices)
+                .build_object_set(&self.device, object_rows, opaque_indices)
         });
 
         // Uploaded once even though the prepass and the SSAO resolve both read
@@ -1785,9 +1788,9 @@ impl VulkanRenderer {
             atlas_view.clone(),
             shadows,
             atlas,
-            material_set.clone(),
-            texture_set.clone(),
-            forward_object_set.clone(),
+            material_set,
+            texture_set,
+            forward_object_set,
             decal_block,
             environment,
             // The same allocation both fog dispatches bind, and the same
@@ -1838,13 +1841,12 @@ impl VulkanRenderer {
         // the opaque ones took, which is the same buffer on the CPU path and a
         // different one under GPU culling.
         let blended_sets = forward_sets.with_object_set(match &cull_frame {
-            Some(_) => self.forward.build_object_set(
-                &self.ctx,
-                &self.device,
-                &object_rows,
-                &objects.indices,
-            ),
-            None => forward_object_set.clone(),
+            Some(_) => {
+                let host_indices = driver.import_buffer(objects.indices.clone().into_bytes());
+                self.forward
+                    .build_object_set(&self.device, object_rows, host_indices)
+            }
+            None => forward_object_set,
         });
 
         let record = FrameRecord {
@@ -1887,7 +1889,7 @@ impl VulkanRenderer {
             shadows,
             objects,
             cull: &self.cull,
-            object_rows: object_rows.clone(),
+            object_rows,
             cull_frame,
             cull_views: &cull_views,
             occlusion_test: self.occlusion.test(occlusion_live),
@@ -2233,7 +2235,7 @@ struct FrameRecord<'a> {
     cull: &'a CullPass,
     /// The persistent object rows, which the cull dispatch reads for the model
     /// matrix that turns a batch's object-space box into a world one.
-    object_rows: vulkano::buffer::Subbuffer<[instances::GpuObject]>,
+    object_rows: BufferId,
     /// The batch table this frame was prepared with, and `None` on the CPU path.
     /// Every opaque geometry pass reads it to decide whether it draws runs or
     /// indirect commands, so the two cannot half-switch.
@@ -2253,9 +2255,9 @@ struct FrameRecord<'a> {
     frame_uniforms: Option<BufferId>,
     ssao_uniforms: Option<ssao::SsaoUniforms>,
     contact_shadow_uniforms: Option<contact_shadows::ContactShadowUniforms>,
-    prepass_object_set: Option<Arc<DescriptorSet>>,
-    prepass_material_set: Arc<DescriptorSet>,
-    prepass_texture_set: Arc<DescriptorSet>,
+    prepass_object_set: Option<BindGroupId>,
+    prepass_material_set: BindGroupId,
+    prepass_texture_set: BindGroupId,
     decal_block: BufferId,
     scene_color: Arc<ImageView>,
     shadow_view: Arc<ImageView>,
@@ -2988,7 +2990,7 @@ impl FrameRecord<'_> {
                     self.cull.record_cull(
                         self.device,
                         &mut encoder,
-                        &self.object_rows,
+                        self.object_rows,
                         frame,
                         self.cull_views,
                         &self.occlusion_test,
@@ -3147,9 +3149,9 @@ impl FrameRecord<'_> {
                     self.extent,
                     self.frame_uniforms.unwrap(),
                     self.decal_block,
-                    self.prepass_object_set.clone().unwrap(),
-                    self.prepass_material_set.clone(),
-                    self.prepass_texture_set.clone(),
+                    self.prepass_object_set.unwrap(),
+                    self.prepass_material_set,
+                    self.prepass_texture_set,
                 );
             }
             // Both AO passes take their viewport from the target they draw
@@ -3269,7 +3271,6 @@ impl FrameRecord<'_> {
                 let Device::Vulkan(driver) = self.device;
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.oit.record(
-                    self.device,
                     &mut encoder,
                     &self.pass_ctx(),
                     self.transparent,

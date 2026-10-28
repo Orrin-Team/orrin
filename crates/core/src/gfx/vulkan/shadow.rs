@@ -16,8 +16,8 @@ use crate::geom::Frustum;
 use crate::gfx::format::SampleCount;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::rhi::{
-    Blend, CullMode, DepthCompare, DepthRect, DepthTest, Device, Encoder, GraphicsPipelineDesc,
-    PipelineId, Topology, Viewport,
+    BindGroupId, Binding, BindingResource, Blend, BufferId, CullMode, DepthCompare, DepthRect,
+    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex};
@@ -26,7 +26,6 @@ use super::PassCtx;
 use super::context::VkContext;
 use super::convert::vk_format;
 use super::cull::{CullFrame, Draws};
-use super::instances::{GpuObject, InstanceEntry};
 use super::record::{self, Recorder};
 use super::swapchain::DEPTH_FORMAT;
 
@@ -148,27 +147,26 @@ impl ShadowPass {
     /// cascade: all of them read the same buffer through the same layout.
     pub(super) fn build_object_set(
         &self,
-        ctx: &VkContext,
         device: &Device,
-        rows: &Subbuffer<[GpuObject]>,
-        indices: &Subbuffer<[InstanceEntry]>,
-    ) -> Arc<DescriptorSet> {
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            layout(device, self.pipeline, 0),
-            [
-                WriteDescriptorSet::buffer(0, rows.clone()),
-                WriteDescriptorSet::buffer(1, indices.clone()),
+        rows: BufferId,
+        indices: BufferId,
+    ) -> BindGroupId {
+        device.create_transient_bind_group(
+            self.pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::StorageBuffer(rows),
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageBuffer(indices),
+                },
             ],
-            [],
         )
-        .unwrap()
     }
 
-    /// The set-1 material table and set-2 texture array the cutout pipeline
-    /// alpha-tests against, over the same buffer and the same views every other
-    /// pass reads. Cached by the renderer beside the prepass's, and rebuilt on
-    /// the same invalidations.
     pub(super) fn build_material_set(
         &self,
         ctx: &VkContext,
@@ -421,7 +419,7 @@ impl ShadowPass {
                 .materials
                 .get(unit.material as usize)
                 .is_some_and(super::forward::GpuMaterial::is_masked);
-            self.bind(device, builder, sets, bound, wants_masked, view_proj);
+            self.bind(builder, sets, bound, wants_masked, view_proj);
             builder.draw_indexed(
                 mesh.span.index_count,
                 unit.instances,
@@ -434,7 +432,7 @@ impl ShadowPass {
         // The compute path's two multi-draws over this view's commands. A face
         // culled to nothing still records them, with every instance count zero.
         for region in casters.regions() {
-            self.bind(device, builder, sets, bound, region.masked, view_proj);
+            self.bind(builder, sets, bound, region.masked, view_proj);
             let Device::Vulkan(driver) = device;
             builder.draw_indexed_indirect(driver.import_buffer(region.commands.into_bytes()));
         }
@@ -447,14 +445,12 @@ impl ShadowPass {
     /// and three descriptor sets on each of its nineteen tiles.
     fn bind(
         &self,
-        device: &Device,
         builder: &mut Encoder,
         sets: &CasterSets,
         bound: &mut Bound,
         wants_masked: bool,
         view_proj: Mat4,
     ) {
-        let Device::Vulkan(driver) = device;
         let pipeline = if wants_masked {
             self.masked_pipeline
         } else {
@@ -463,7 +459,7 @@ impl ShadowPass {
         if bound.needs_pipeline(wants_masked) {
             builder.bind_pipeline(pipeline);
             for (set, group) in sets.for_pipeline(wants_masked).into_iter().enumerate() {
-                builder.bind_group(set as u32, driver.import_set(group));
+                builder.bind_group(set as u32, group);
             }
         }
         // Per-pass push constants: 64 bytes, comfortably inside the 128-byte
@@ -521,21 +517,17 @@ impl Bound {
 /// here forces the alpha-testing pipeline into existence for a scene with no
 /// foliage in it.
 pub(super) struct CasterSets {
-    pub objects: Arc<DescriptorSet>,
-    pub materials: Arc<DescriptorSet>,
-    pub textures: Arc<DescriptorSet>,
+    pub objects: BindGroupId,
+    pub materials: BindGroupId,
+    pub textures: BindGroupId,
 }
 
 impl CasterSets {
-    fn for_pipeline(&self, masked: bool) -> Vec<Arc<DescriptorSet>> {
+    fn for_pipeline(&self, masked: bool) -> Vec<BindGroupId> {
         if masked {
-            vec![
-                self.objects.clone(),
-                self.materials.clone(),
-                self.textures.clone(),
-            ]
+            vec![self.objects, self.materials, self.textures]
         } else {
-            vec![self.objects.clone()]
+            vec![self.objects]
         }
     }
 }

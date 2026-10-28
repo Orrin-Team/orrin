@@ -49,7 +49,9 @@ use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Sub
 use vulkano::command_buffer::DrawIndexedIndirectCommand;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 
-use crate::gfx::rhi::{Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId};
+use crate::gfx::rhi::{
+    Binding, BindingResource, BufferId, ComputePipelineDesc, Device, Encoder, PipelineId,
+};
 use crate::gfx::shaders::ShaderId;
 
 use super::context::VkContext;
@@ -568,7 +570,7 @@ impl CullPass {
         &self,
         device: &Device,
         builder: &mut Encoder,
-        rows: &Subbuffer<[super::instances::GpuObject]>,
+        rows: BufferId,
         frame: &CullFrame,
         views: &[CullView],
         occlusion: &OcclusionTest,
@@ -583,7 +585,10 @@ impl CullPass {
             self.cull_pipeline,
             0,
             &[
-                storage(0, rows.clone().into_bytes()),
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::StorageBuffer(rows),
+                },
                 storage(1, self.upload_instances().into_bytes()),
                 storage(2, self.upload_batches(frame).into_bytes()),
                 storage(3, self.upload_views(frame, views).into_bytes()),

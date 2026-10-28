@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use glam::{Mat3, Mat4, Vec3};
-use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
+use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::{BlitImageInfo, CopyBufferToImageInfo, ImageBlit};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format;
@@ -43,7 +43,6 @@ use crate::gfx::sh::{self, SH9};
 use crate::scene::EnvironmentSettings;
 
 use super::convert::vk_format;
-use super::fog::GpuFog;
 
 use super::MSAA_SAMPLES;
 use super::context::VkContext;
@@ -53,8 +52,8 @@ use super::record::{self, Recorder};
 use super::rendering;
 use super::taa::FrameView;
 use crate::gfx::rhi::{
-    Binding, BindingResource, DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc,
-    PipelineId, SamplerDesc, SamplerId, Viewport as RhiViewport,
+    Binding, BindingResource, BufferId, DepthCompare, DepthTest, Device, Encoder,
+    GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, Viewport as RhiViewport,
 };
 use crate::gfx::shaders::ShaderId;
 use vulkano::command_buffer::{RenderingAttachmentInfo, RenderingInfo};
@@ -344,7 +343,7 @@ impl EnvironmentPass {
         settings: &EnvironmentSettings,
         subsurface: bool,
         msaa: bool,
-        fog: Subbuffer<GpuFog>,
+        fog: BufferId,
         fog_volume: Arc<ImageView>,
         fog_sampler: Arc<Sampler>,
     ) {
@@ -382,9 +381,7 @@ impl EnvironmentPass {
                 },
                 Binding {
                     binding: 3,
-                    resource: BindingResource::UniformBuffer(
-                        driver.import_buffer(fog.into_bytes()),
-                    ),
+                    resource: BindingResource::UniformBuffer(fog),
                 },
             ],
         );

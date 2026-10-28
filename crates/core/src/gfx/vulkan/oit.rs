@@ -121,7 +121,6 @@ impl OitPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record(
         &self,
-        device: &Device,
         builder: &mut Encoder,
         renderer: &PassCtx<'_>,
         draws: DrawList<'_>,
@@ -130,15 +129,14 @@ impl OitPass {
         extent: [u32; 2],
         object_base: u32,
     ) {
-        let Device::Vulkan(driver) = device;
         builder.set_viewport(Viewport {
             origin: [0.0, 0.0],
             extent: [extent[0] as f32, extent[1] as f32],
             depth_range: [0.0, 1.0],
         });
         builder.bind_pipeline(self.pipeline);
-        for (set, group) in sets.as_vec().into_iter().enumerate() {
-            builder.bind_group(set as u32, driver.import_set(group));
+        for (set, group) in sets.groups().into_iter().enumerate() {
+            builder.bind_group(set as u32, group);
         }
 
         // The arena is bound for the pass, not per draw: a mesh is a span into

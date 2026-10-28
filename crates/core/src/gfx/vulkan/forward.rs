@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
 use glam::Vec3;
-use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
+use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 
@@ -20,9 +19,6 @@ use crate::scene::{Camera, EnvironmentSettings};
 
 use super::context::VkContext;
 use super::cull::Draws;
-use super::fog::GpuFog;
-use super::instances::{GpuObject, InstanceEntry};
-use super::record::Arena;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
@@ -30,8 +26,9 @@ use super::{MSAA_SAMPLES, PassCtx, ShadowFrame, VulkanRenderer};
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::rhi::MeshSpan;
 use crate::gfx::rhi::{
-    Blend, BlockKind, BufferId, CullMode, DepthCompare, DepthTest, Device, Encoder,
-    GraphicsPipelineDesc, PipelineId, SamplerDesc, Topology, Viewport,
+    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferId, CullMode, DepthCompare,
+    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, Topology,
+    Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -261,7 +258,7 @@ fn to_gpu_lighting(
 /// std140 gives a struct of a `mat4` array and three `vec4`s exactly the offsets
 /// it gave these fields written out flat, which is why nesting them changed no
 /// layout.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(super) struct GpuCascades {
     /// Per-cascade light view-projection. std140 lays a `mat4` out as four
@@ -320,7 +317,7 @@ impl GpuCascades {
 
 /// GPU mirror of a [`PointLight`](crate::gfx::PointLight), padded to std140
 /// (three `vec4`s).
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuPointLight {
     /// xyz = world position, w = range.
@@ -342,7 +339,7 @@ impl GpuPointLight {
 }
 
 /// GPU mirror of a [`SpotLight`](crate::gfx::SpotLight), padded to std140.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuSpotLight {
     /// xyz = world position, w = range.
@@ -371,7 +368,7 @@ impl GpuSpotLight {
 /// GPU layout of the per-frame lighting uniform buffer (set 0, binding 0).
 /// Every field is a `vec4` so the Rust `#[repr(C)]` layout matches std140 with
 /// no hidden padding.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuLighting {
     /// xyz = camera world position.
@@ -483,7 +480,7 @@ pub(crate) struct GpuDecals {
 /// the shader projects with *the same* matrix the tile was rasterised with, so
 /// the two cannot disagree about a near plane, a border, or a handedness — the
 /// only thing left to get right is which face, and that is one comparison.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuShadowFace {
     view_proj: [[f32; 4]; 4],
@@ -505,12 +502,12 @@ impl GpuShadowFace {
 /// this pass's own pipeline layout, so it can and must. Bundling them is what
 /// keeps that from being a comment somebody has to keep true.
 pub(super) struct ForwardSets {
-    sets: Vec<Arc<DescriptorSet>>,
+    groups: [BindGroupId; 5],
 }
 
 impl ForwardSets {
-    pub(super) fn as_vec(&self) -> Vec<Arc<DescriptorSet>> {
-        self.sets.clone()
+    pub(super) fn groups(&self) -> [BindGroupId; 5] {
+        self.groups
     }
 
     /// The same five with the object set swapped, for a pass that indexes
@@ -520,10 +517,10 @@ impl ForwardSets {
     /// the blended queues read what the host wrote, and the two are different
     /// allocations. Rebuilding the other four sets to say so would be four
     /// descriptor writes a frame for a difference in one of them.
-    pub(super) fn with_object_set(&self, object_set: Arc<DescriptorSet>) -> ForwardSets {
-        let mut sets = self.sets.clone();
-        *sets.last_mut().expect("the object set is the last of five") = object_set;
-        ForwardSets { sets }
+    pub(super) fn with_object_set(&self, object_set: BindGroupId) -> ForwardSets {
+        let mut groups = self.groups;
+        groups[4] = object_set;
+        ForwardSets { groups }
     }
 }
 
@@ -628,17 +625,12 @@ pub struct ForwardPass {
     /// five descriptor sets bind to any of them.
     multisampled: ForwardPipelines,
     single: ForwardPipelines,
-    uniform_buffer_allocator: Arena,
-    /// Per-frame storage for the atlas face table. A storage buffer rather than
-    /// more of the lighting uniform: forty-eight matrices is three kilobytes,
-    /// and the guaranteed uniform-buffer range is sixteen.
-    shadow_face_allocator: Arena,
     /// Per-frame storage for the decal block. Owned here rather than by a decal
     /// module because there is no decal *pass* to own it — the block is frame
     /// data that two existing passes read, which is exactly what the shadow face
     /// table above is.
     sampler: Arc<Sampler>,
-    ao_sampler: Arc<Sampler>,
+    ao_sampler: SamplerId,
 }
 
 fn layout(
@@ -662,7 +654,6 @@ impl ForwardPass {
         msaa_color_format: Format,
     ) -> Self {
         let device = &ctx.device;
-        let memory_allocator = &ctx.memory_allocator;
         let targets = ForwardTargets::new(color_format, msaa_color_format);
 
         // One sampler for all eight pipelines. Vulkan compares immutable samplers
@@ -781,26 +772,6 @@ impl ForwardPass {
             ),
         };
 
-        let uniform_buffer_allocator = Arena::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
-
-        let shadow_face_allocator = Arena::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::STORAGE_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
-
         // Material textures are the only ones with a mip chain to sample; the
         // AO and tonemap inputs are screen-space targets read at 1:1.
         let anisotropy = device.enabled_features().sampler_anisotropy.then(|| {
@@ -820,21 +791,19 @@ impl ForwardPass {
         )
         .unwrap();
 
-        let ao_sampler = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
-            },
-        )
-        .unwrap();
+        let ao_sampler = rhi.create_sampler(SamplerDesc {
+            linear: true,
+            mipmap_linear: false,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+            max_lod: Some(1.0),
+        });
 
         Self {
             targets,
             multisampled,
             single,
-            uniform_buffer_allocator,
-            shadow_face_allocator,
             sampler,
             ao_sampler,
         }
@@ -865,21 +834,24 @@ impl ForwardPass {
     /// but nothing needs to be rebuilt within one either.
     pub(super) fn build_object_set(
         &self,
-        ctx: &VkContext,
         device: &Device,
-        rows: &Subbuffer<[GpuObject]>,
-        indices: &Subbuffer<[InstanceEntry]>,
-    ) -> Arc<DescriptorSet> {
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            layout(device, self.single.plain, 4),
-            [
-                WriteDescriptorSet::buffer(0, rows.clone()),
-                WriteDescriptorSet::buffer(1, indices.clone()),
+        rows: BufferId,
+        indices: BufferId,
+    ) -> BindGroupId {
+        device.create_transient_bind_group(
+            self.single.plain,
+            4,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::StorageBuffer(rows),
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageBuffer(indices),
+                },
             ],
-            [],
         )
-        .unwrap()
     }
 
     /// Build the set-1 material descriptor set over the shared table. Cached by
@@ -1016,18 +988,16 @@ impl ForwardPass {
         atlas_view: Arc<ImageView>,
         shadows: Option<ShadowFrame<'_>>,
         atlas: &ShadowAtlas,
-        material_set: Arc<DescriptorSet>,
-        texture_set: Arc<DescriptorSet>,
-        object_set: Arc<DescriptorSet>,
+        material_set: BindGroupId,
+        texture_set: BindGroupId,
+        object_set: BindGroupId,
         decals: BufferId,
         environment: &EnvironmentSettings,
-        fog: Subbuffer<GpuFog>,
+        fog: BufferId,
         fog_volume: Arc<ImageView>,
         fog_sampler: Arc<Sampler>,
     ) -> ForwardSets {
-        let lighting_buffer = self
-            .uniform_buffer_allocator
-            .allocate_sized::<GpuLighting>();
+        let Device::Vulkan(driver) = device;
         // Both halves fall back to the scene's flat ambient when nothing is
         // loaded — the diffuse as a band-0-only series, the specular as a tint
         // on a white cube. Two descriptions of the same uniform environment,
@@ -1035,7 +1005,7 @@ impl ForwardPass {
         let ambient = lighting.ambient_color * lighting.ambient_nits;
         let irradiance = renderer.environment.irradiance(ambient, environment);
         let env_specular = renderer.environment.specular_tint(ambient, environment);
-        *lighting_buffer.write().unwrap() = to_gpu_lighting(
+        let lighting_block = to_gpu_lighting(
             lighting,
             camera.position,
             extent,
@@ -1045,94 +1015,107 @@ impl ForwardPass {
             environment.yaw,
             env_specular,
         );
+        let lighting_buffer =
+            device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&lighting_block));
 
-        // Always at least one entry: `allocate_slice` rejects a length of zero,
-        // and a frame where nothing punctual casts still has to bind something
-        // for the descriptor. Every light's face index is -1 in that frame, so
-        // the row is never read.
+        // Always at least one entry: a frame where nothing punctual casts still
+        // has to bind something for the descriptor. Every light's face index is
+        // -1 in that frame, so the row is never read.
         let face_count = atlas.faces.len().clamp(1, MAX_ATLAS_FACES);
-        let shadow_faces = self
-            .shadow_face_allocator
-            .allocate_slice::<GpuShadowFace>(face_count as u64);
-        {
-            let mut rows = shadow_faces.write().unwrap();
-            rows.fill(GpuShadowFace::ZERO);
-            for (row, face) in rows.iter_mut().zip(&atlas.faces) {
-                *row = GpuShadowFace {
-                    view_proj: face.view_proj.to_cols_array_2d(),
-                    rect: face.tile.uv_rect(atlas.resolution),
-                };
-            }
+        let mut shadow_faces = vec![GpuShadowFace::ZERO; face_count];
+        for (row, face) in shadow_faces.iter_mut().zip(&atlas.faces) {
+            *row = GpuShadowFace {
+                view_proj: face.view_proj.to_cols_array_2d(),
+                rect: face.tile.uv_rect(atlas.resolution),
+            };
         }
+        let shadow_faces =
+            device.upload_block(BlockKind::Storage, bytemuck::cast_slice(&shadow_faces));
 
-        let lighting_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            layout(device, self.single.plain, 0),
-            [
-                WriteDescriptorSet::buffer(0, lighting_buffer),
+        let lighting_set = device.create_transient_bind_group(
+            self.single.plain,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::UniformBuffer(lighting_buffer),
+                },
                 // The same buffer object the prepass binds. Not a copy: what a
                 // decal does to a normal, an `f0` and a roughness has to be the
                 // same in both passes or `ssr_resolve.comp` subtracts an
                 // environment term belonging to the surface as it was before the
                 // stamp landed — the identical argument the parallax march makes
                 // about *where* a map is sampled.
-                WriteDescriptorSet::buffer(1, {
-                    let Device::Vulkan(driver) = device;
-                    driver.buffer(decals)
-                }),
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageBuffer(decals),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
-        // Set 3 is the screen-space and shadow inputs. The cascades are kept as
-        // a separate image and comparison sampler rather than a combined one,
-        // for the same reason the texture array is: Metal caps samplers per
-        // stage far lower than sampled images.
-        let ao_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            layout(device, self.single.plain, 3),
-            [
-                WriteDescriptorSet::image_view_sampler(0, ao_view, self.ao_sampler.clone()),
-                WriteDescriptorSet::image_view(1, shadow_view),
-                WriteDescriptorSet::image_view(3, renderer.environment.specular_view()),
-                WriteDescriptorSet::sampler(4, renderer.environment.sampler()),
-                WriteDescriptorSet::image_view_sampler(
-                    5,
-                    contact_shadow_view,
-                    self.ao_sampler.clone(),
-                ),
+        // Set 3 is the screen-space and shadow inputs. The cascades are kept as a
+        // separate image and comparison sampler rather than a combined one, for
+        // the same reason the texture array is: Metal caps samplers per stage far
+        // lower than sampled images.
+        let sampled = |binding, view: Arc<ImageView>| Binding {
+            binding,
+            resource: BindingResource::SampledTexture {
+                view: driver.import_view(view),
+                sampler: self.ao_sampler,
+            },
+        };
+        let texture = |binding, view: Arc<ImageView>| Binding {
+            binding,
+            resource: BindingResource::Texture(driver.import_view(view)),
+        };
+        let ao_set = device.create_transient_bind_group(
+            self.single.plain,
+            3,
+            &[
+                sampled(0, ao_view),
+                texture(1, shadow_view),
+                texture(3, renderer.environment.specular_view()),
+                Binding {
+                    binding: 4,
+                    resource: BindingResource::Sampler(
+                        driver.import_sampler(renderer.environment.sampler()),
+                    ),
+                },
+                sampled(5, contact_shadow_view),
                 // The atlas reads through the cascades' comparison sampler at
                 // binding 2 — same conventions, same `Less` against a map
                 // cleared to 1.0 — so it needs no sampler of its own. Which
                 // matters: Metal caps samplers per stage far below sampled
                 // images, and this shader is already at five.
-                WriteDescriptorSet::image_view(6, atlas_view),
-                WriteDescriptorSet::buffer(7, shadow_faces),
+                texture(6, atlas_view),
+                Binding {
+                    binding: 7,
+                    resource: BindingResource::StorageBuffer(shadow_faces),
+                },
                 // The fog volume and the medium that produced it. Both are bound
                 // in every frame — the volume as a 1x1x1 stand-in when the two
                 // dispatches did not run — because the analytic term past the
                 // froxels reads the same block, so there is one path in the
                 // shader rather than a second pipeline.
-                WriteDescriptorSet::image_view_sampler(8, fog_volume, fog_sampler),
-                WriteDescriptorSet::buffer(9, fog),
+                Binding {
+                    binding: 8,
+                    resource: BindingResource::SampledTexture {
+                        view: driver.import_view(fog_volume),
+                        sampler: driver.import_sampler(fog_sampler),
+                    },
+                },
+                Binding {
+                    binding: 9,
+                    resource: BindingResource::UniformBuffer(fog),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         ForwardSets {
-            sets: vec![lighting_set, material_set, texture_set, ao_set, object_set],
+            groups: [lighting_set, material_set, texture_set, ao_set, object_set],
         }
     }
 
-    /// Draw the opaque geometry. `sets` is what
-    /// [`begin_frame`](Self::begin_frame) built.
-    /// `subsurface` picks the variant that splits the diffusible radiance into a
-    /// second target. It is the graph's answer, not this pass's — the executor
-    /// reads it off the frame's ids, so the pipeline bound here and the
-    /// framebuffer already bound around it cannot disagree about how many
-    /// attachments there are.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw(
         &self,
@@ -1175,11 +1158,7 @@ impl ForwardPass {
         // layouts are built from the same stages and the same immutable shadow
         // sampler, so they are set compatible and this is a formality — but it
         // is the formality that keeps it true if one of them ever stops being.
-        let groups: Vec<_> = sets
-            .as_vec()
-            .into_iter()
-            .map(|set| driver.import_set(set))
-            .collect();
+        let groups = sets.groups();
         let bind_all = |builder: &mut Encoder, pipeline: PipelineId| {
             builder.bind_pipeline(pipeline);
             for (set, group) in groups.iter().enumerate() {
