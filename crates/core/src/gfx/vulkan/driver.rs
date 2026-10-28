@@ -13,7 +13,7 @@
 //! vulkano call.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{Buffer, BufferCreateInfo, Subbuffer};
@@ -53,11 +53,13 @@ use super::convert::{vk_buffer_usage, vk_format, vk_samples};
 use super::mesh::MeshArena;
 use super::record::{Arena, Recorder};
 use super::rendering;
+use crate::geom::Aabb;
+use crate::gfx::Vertex;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BufferDesc, BufferId, ComputePipelineDesc,
-    CullMode, DepthCompare, DepthRect, GraphicsPipelineDesc, PipelineId, Pool, SamplerDesc,
-    SamplerId, TextureViewId, Topology, VertexFormat, VertexStream, Viewport,
+    CullMode, DepthCompare, DepthRect, GraphicsPipelineDesc, MeshSpan, PipelineId, Pool,
+    SamplerDesc, SamplerId, TextureViewId, Topology, VertexFormat, VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -76,8 +78,6 @@ impl PipelineObject {
     }
 }
 
-pub(crate) use super::mesh::MeshArena as GeometryArena;
-
 pub struct VkDriver {
     ctx: Arc<VkContext>,
     frame: AtomicU64,
@@ -87,6 +87,10 @@ pub struct VkDriver {
     pipelines: Mutex<Pool<PipelineObject>>,
     uniforms: Arena,
     vertices: Arena,
+    /// The shared geometry every mesh is a span into. Owned by the device
+    /// because every pass binds the same buffers; a pass names a mesh by its
+    /// span and never holds the arena.
+    arena: RwLock<MeshArena>,
     bind_groups: Mutex<Pool<Arc<DescriptorSet>>>,
 }
 
@@ -118,9 +122,11 @@ impl VkDriver {
                 ..Default::default()
             },
         );
+        let arena = RwLock::new(MeshArena::new(&ctx));
         Self {
             ctx,
             frame: AtomicU64::new(0),
+            arena,
             views: Mutex::new(Pool::new(frames_in_flight)),
             buffers: Mutex::new(Pool::new(frames_in_flight)),
             samplers: Mutex::new(Pool::new(frames_in_flight)),
@@ -129,6 +135,15 @@ impl VkDriver {
             vertices,
             bind_groups: Mutex::new(Pool::new(frames_in_flight)),
         }
+    }
+
+    /// Put a mesh into the shared arena and say where it landed, with its
+    /// object-space bounds.
+    pub fn upload_mesh(&self, vertices: &[Vertex], indices: &[u32]) -> (MeshSpan, Aabb) {
+        self.arena
+            .write()
+            .expect("a pass panicked while using the device")
+            .upload(&self.ctx, vertices, indices)
     }
 
     pub fn begin_frame(&self, frame: u64) {
@@ -780,7 +795,12 @@ impl<'a> VkEncoder<'a> {
         self.recorder.push_constants(&layout, 0, &block);
     }
 
-    pub(crate) fn bind_geometry(&mut self, arena: &MeshArena, positions_only: bool) {
+    pub fn bind_geometry(&mut self, positions_only: bool) {
+        let arena = self
+            .driver
+            .arena
+            .read()
+            .expect("a pass panicked while using the device");
         if positions_only {
             arena.bind_positions(self.recorder);
         } else {

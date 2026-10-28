@@ -23,7 +23,6 @@ use crate::gfx::rhi::{
 use crate::gfx::shaders::ShaderId;
 
 use super::forward::GpuMesh;
-use super::mesh::MeshArena;
 use crate::gfx::PositionVertex;
 use crate::scene::MeshHandle;
 
@@ -90,7 +89,6 @@ impl OutlinePass {
         builder: &mut Encoder,
         items: &[OutlineItem],
         meshes: &[GpuMesh],
-        arena: &MeshArena,
         view_proj: Mat4,
         extent: [u32; 2],
     ) {
@@ -99,7 +97,7 @@ impl OutlinePass {
         }
         builder.set_viewport(viewport(extent));
         builder.bind_pipeline(self.mask);
-        builder.bind_geometry(arena, true);
+        builder.bind_geometry(true);
         for item in items {
             let Some(mesh) = meshes.get(item.mesh.0 as usize) else {
                 continue;

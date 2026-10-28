@@ -17,7 +17,11 @@
 //! The drivers and the encoder arrive with the passes that need them.
 
 mod desc;
+mod geometry;
 mod pool;
+
+pub use geometry::MeshSpan;
+pub(crate) use geometry::{Placement, grown};
 
 pub(crate) use pool::Pool;
 
@@ -28,7 +32,9 @@ pub use desc::{
 };
 
 use super::format::Format;
-use super::vulkan::driver::{GeometryArena, VkDriver, VkEncoder};
+use super::vulkan::driver::{VkDriver, VkEncoder};
+use crate::geom::Aabb;
+use crate::gfx::Vertex;
 
 /// The device a pass creates its resources on. One variant today; Metal joins it
 /// with the pass that first needs it recorded there.
@@ -42,6 +48,14 @@ impl Device {
     pub fn begin_frame(&self, frame: u64) {
         match self {
             Device::Vulkan(driver) => driver.begin_frame(frame),
+        }
+    }
+
+    /// Put a mesh into the device's shared geometry arena and say where it
+    /// landed, with its object-space bounds.
+    pub fn upload_mesh(&self, vertices: &[Vertex], indices: &[u32]) -> (MeshSpan, Aabb) {
+        match self {
+            Device::Vulkan(driver) => driver.upload_mesh(vertices, indices),
         }
     }
 
@@ -208,9 +222,9 @@ impl Encoder<'_> {
     }
 
     /// Bind the shared vertex and index buffers every mesh is a span into.
-    pub(crate) fn bind_geometry(&mut self, arena: &GeometryArena, positions_only: bool) {
+    pub fn bind_geometry(&mut self, positions_only: bool) {
         match self {
-            Encoder::Vulkan(encoder) => encoder.bind_geometry(arena, positions_only),
+            Encoder::Vulkan(encoder) => encoder.bind_geometry(positions_only),
         }
     }
 

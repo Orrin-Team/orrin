@@ -145,7 +145,7 @@ impl OitPass {
         // it. The matrix is pushed once for the same reason — what used to vary
         // per run, the material and the first object row, travels with the
         // instance now.
-        builder.bind_geometry(renderer.arena, false);
+        builder.bind_geometry(false);
         let mut words = [0u32; 16];
         for (word, float) in words
             .iter_mut()

@@ -22,13 +22,13 @@ use super::context::VkContext;
 use super::cull::Draws;
 use super::fog::GpuFog;
 use super::instances::{GpuObject, InstanceEntry};
-use super::mesh::MeshSpan;
 use super::record::Arena;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 use super::{MSAA_SAMPLES, PassCtx, ShadowFrame, VulkanRenderer};
 use crate::gfx::format::{Format, SampleCount};
+use crate::gfx::rhi::MeshSpan;
 use crate::gfx::rhi::{
     Blend, CullMode, DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId,
     SamplerDesc, Topology, Viewport,
@@ -1205,7 +1205,7 @@ impl ForwardPass {
         // Every draw below names its geometry through `firstIndex` and
         // `vertexOffset` into the arena, so the three buffers are bound once
         // for the pass rather than once per mesh. See `mesh`.
-        builder.bind_geometry(renderer.arena, false);
+        builder.bind_geometry(false);
 
         // Nothing is bound yet, so the first run always binds. `None` rather
         // than "the plain one" so that a frame of nothing but foliage does not

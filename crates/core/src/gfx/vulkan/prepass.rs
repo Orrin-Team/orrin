@@ -335,7 +335,7 @@ impl GeometryPrepass {
 
         // Bound once for the pass: a mesh is a span into the arena, so nothing
         // between draws changes them. See `mesh`.
-        encoder.bind_geometry(renderer.arena, false);
+        encoder.bind_geometry(false);
 
         let mut bound: Option<bool> = None;
 

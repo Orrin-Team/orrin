@@ -230,7 +230,7 @@ impl ShadowPass {
         // Position alone: a depth-only pass reads no surface stream. Bound here
         // rather than in `draw` because vertex bindings are command-buffer
         // state that outlives a draw, and a secondary starts with none.
-        builder.bind_geometry(renderer.arena, true);
+        builder.bind_geometry(true);
         // Dynamic so the editor's bias sliders tune acne live instead of
         // rebuilding the pipeline on every drag. `clamp` stays 0.0: a nonzero
         // one needs the `depth_bias_clamp` device feature. Set before any
@@ -312,7 +312,7 @@ impl ShadowPass {
             return;
         }
         builder.clear_depth(&tiles);
-        builder.bind_geometry(renderer.arena, true);
+        builder.bind_geometry(true);
 
         builder.set_depth_bias(self.punctual_constant_bias, 0.0, self.punctual_slope_bias);
 

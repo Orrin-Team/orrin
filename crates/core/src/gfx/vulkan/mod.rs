@@ -72,7 +72,6 @@ use self::cull::{CullPass, CullView, Draws};
 use self::environment::EnvironmentPass;
 use self::forward::{ForwardPass, GpuMaterial, GpuMesh};
 use self::instances::InstanceStore;
-use self::mesh::MeshArena;
 use self::occlusion::OcclusionPass;
 use self::oit::OitPass;
 use self::refraction::RefractionPass;
@@ -201,7 +200,6 @@ pub(super) struct PassCtx<'a> {
     pub(crate) ctx: &'a VkContext,
     pub(crate) meshes: &'a [GpuMesh],
     /// The shared geometry a pass binds once, before its first draw.
-    pub(crate) arena: &'a MeshArena,
     pub(crate) materials: &'a [GpuMaterial],
 }
 
@@ -288,7 +286,6 @@ pub struct VulkanRenderer {
     /// The geometry every [`GpuMesh`] is a span into. One allocation per stream
     /// rather than three per mesh, which is what lets a pass bind geometry once
     /// and draw every batch from one command buffer. See `mesh`.
-    arena: MeshArena,
     pub(crate) materials: Vec<GpuMaterial>,
     /// Texture views indexed by `TextureHandle`. Index 0 is a 1x1 white texture
     /// and index 1 a flat normal map; materials without a given map point here.
@@ -416,7 +413,6 @@ impl VulkanRenderer {
         let ctx = Arc::new(ctx);
         let device = Device::Vulkan(VkDriver::new(ctx.clone(), FRAMES_IN_FLIGHT as u64));
         let forward = ForwardPass::new(&ctx, &device, hdr::HDR_FORMAT, hdr::HDR_WIDE_FORMAT);
-        let arena = MeshArena::new(&ctx);
         let hdr = HdrPass::new(&device, engine_format(format));
         let gizmo = GizmoPass::new(&device, engine_format(format));
         let outline = OutlinePass::new(&device, engine_format(format));
@@ -520,7 +516,6 @@ impl VulkanRenderer {
             outline,
             environment,
             meshes: Vec::new(),
-            arena,
             materials: vec![forward::to_gpu_material(&Material::default())],
             textures,
             material_buffer: None,
@@ -891,7 +886,10 @@ impl RenderBackend for VulkanRenderer {
     }
 
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle {
-        let (span, bounds) = self.arena.upload(&self.ctx, &mesh.vertices, &mesh.indices);
+        let (span, bounds) = {
+            let Device::Vulkan(driver) = &self.device;
+            driver.upload_mesh(&mesh.vertices, &mesh.indices)
+        };
         let handle = MeshHandle(self.meshes.len() as u32);
         self.meshes.push(GpuMesh { span, bounds });
         handle
@@ -908,7 +906,10 @@ impl RenderBackend for VulkanRenderer {
             tracing::warn!("mesh {} was never loaded; reimport ignored", handle.0);
             return;
         };
-        let (span, bounds) = self.arena.upload(&self.ctx, &mesh.vertices, &mesh.indices);
+        let (span, bounds) = {
+            let Device::Vulkan(driver) = &self.device;
+            driver.upload_mesh(&mesh.vertices, &mesh.indices)
+        };
         *slot = GpuMesh { span, bounds };
     }
 
@@ -1856,7 +1857,6 @@ impl VulkanRenderer {
             ctx: &self.ctx,
             device: &self.device,
             meshes: &self.meshes,
-            arena: &self.arena,
             materials: &self.materials,
             frame: &self.frame,
             images: &self.images,
@@ -2195,7 +2195,6 @@ struct FrameRecord<'a> {
     ctx: &'a VkContext,
     device: &'a Device,
     meshes: &'a [GpuMesh],
-    arena: &'a MeshArena,
     materials: &'a [GpuMaterial],
     frame: &'a Frame,
     images: &'a GraphImages,
@@ -2455,7 +2454,6 @@ impl FrameRecord<'_> {
         PassCtx {
             ctx: self.ctx,
             meshes: self.meshes,
-            arena: self.arena,
             materials: self.materials,
         }
     }
@@ -3345,7 +3343,6 @@ impl FrameRecord<'_> {
                     &mut encoder,
                     self.outline_items,
                     self.meshes,
-                    self.arena,
                     self.view.unjittered_view_proj,
                     self.extent,
                 );

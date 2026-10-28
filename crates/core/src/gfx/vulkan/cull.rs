@@ -54,9 +54,9 @@ use crate::gfx::shaders::ShaderId;
 
 use super::context::VkContext;
 use super::instances::InstanceEntry;
-use super::mesh::MeshSpan;
 use super::occlusion::OcclusionTest;
 use super::record::Arena;
+use crate::gfx::rhi::MeshSpan;
 
 /// Invocations per workgroup, in both shaders. The cull dispatch is
 /// `local_size_x` instances by one view, so a view is a workgroup row rather
