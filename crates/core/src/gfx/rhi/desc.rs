@@ -250,6 +250,17 @@ pub struct DepthRect {
     pub extent: [u32; 2],
 }
 
+/// Something a device may or may not be able to do, asked before a pass
+/// commits to a path that needs it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Feature {
+    /// Blitting a render target of this format down and sampling the result.
+    BackdropCapture(Format),
+    /// A two-channel texture read as premultiplied white and alpha, which is
+    /// what `TextureSwizzle::CoverageToWhite` needs.
+    CoverageTexture,
+}
+
 /// Which kind of buffer a per-frame block is bound as.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockKind {

@@ -664,18 +664,18 @@ impl VulkanRenderer {
                             );
                             let pass = self.overlay.get_or_insert_with(|| {
                                 overlay::OverlayPass::new(
-                                    &self.ctx,
                                     &self.device,
-                                    self.swapchain.format,
+                                    engine_format(self.swapchain.format),
                                     self.swapchain.capturable,
                                 )
                             });
-                            pass.record(
-                                &self.device,
-                                &mut recorder,
-                                &self.swapchain.image_views[image_index as usize],
-                                frame,
+                            let Device::Vulkan(driver) = &self.device;
+                            let target = driver.import_view(
+                                self.swapchain.image_views[image_index as usize].clone(),
                             );
+                            let mut encoder =
+                                Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
+                            pass.record(&self.device, &mut encoder, target, frame);
                         }
                         other => unreachable!("{other:?} is not a raw pass"),
                     }

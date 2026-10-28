@@ -27,7 +27,7 @@ pub(crate) use pool::Pool;
 
 pub use desc::{
     Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, ComputePipelineDesc,
-    CullMode, DepthCompare, DepthRect, DepthTest, GraphicsPipelineDesc, MemoryLocation,
+    CullMode, DepthCompare, DepthRect, DepthTest, Feature, GraphicsPipelineDesc, MemoryLocation,
     SamplerDesc, TextureDesc, TextureDimension, TextureSwizzle, Topology, VertexAttribute,
     VertexFormat, VertexStream, Viewport,
 };
@@ -169,6 +169,12 @@ impl Device {
     pub fn mip_view(&self, texture: TextureViewId, level: u32) -> TextureViewId {
         match self {
             Device::Vulkan(driver) => driver.mip_view(texture, level),
+        }
+    }
+
+    pub fn supports(&self, feature: Feature) -> bool {
+        match self {
+            Device::Vulkan(driver) => driver.supports(feature),
         }
     }
 
@@ -354,6 +360,48 @@ impl Encoder<'_> {
                 vertex_offset,
                 first_instance,
             ),
+        }
+    }
+
+    /// Take a swapchain image that arrives presentable into rendering, keeping
+    /// what is in it.
+    pub fn open_swapchain(&mut self, target: TextureViewId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.open_swapchain(target),
+        }
+    }
+
+    /// Hand a swapchain image back presentable.
+    pub fn close_swapchain(&mut self, target: TextureViewId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.close_swapchain(target),
+        }
+    }
+
+    /// Open a render pass over `target`, loading what it holds.
+    pub fn begin_rendering(&mut self, target: TextureViewId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.begin_rendering(target),
+        }
+    }
+
+    pub fn end_rendering(&mut self) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.end_rendering(),
+        }
+    }
+
+    /// Downsample the render target into `half` and then `quarter`, leaving
+    /// `quarter` sampleable and the target ready to render into again. Outside
+    /// a render pass; for a pass that blurs what was drawn under it.
+    pub fn capture_backdrop(
+        &mut self,
+        target: TextureViewId,
+        half: TextureViewId,
+        quarter: TextureViewId,
+    ) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.capture_backdrop(target, half, quarter),
         }
     }
 

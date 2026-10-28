@@ -12,45 +12,31 @@
 //! the translucent fill the phase then draws. A frame with no glass captures
 //! nothing, and one with only the viewport's controls captures once.
 //!
-//! Recorded raw like the rest of the frame (`record.rs`) and submitted after
-//! it, behind the frame's semaphore. The barriers are written here rather than
-//! compiled: the graph sees the overlay as one `Raw` pass writing the swapchain
-//! image, and what happens inside it — the image becoming a blit source and a
-//! colour attachment again between phases — is this module's business, the way
-//! a mip chain is `texture.rs`'s.
+//! Recorded on its own encoder and submitted after the frame, behind the
+//! frame's semaphore. The graph sees the overlay as one `Raw` pass writing the
+//! swapchain image; what happens inside it — the image becoming a blit source
+//! and a render target again between phases — is the encoder's
+//! `capture_backdrop`, `begin_rendering` and `end_rendering`, so this module
+//! names no API object and a driver is free to make those transitions however
+//! it must.
 //!
 //! The vertex layout, blend state, font swizzle and mesh shaders are ported
 //! from egui_winit_vulkano 0.28 (Apache-2.0), which drew the editor before
 //! this did and could not draw it in more than one piece.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use egui::epaint::{ImageDelta, Primitive};
-use vulkano::command_buffer::{BlitImageInfo, ImageBlit, RenderingAttachmentInfo, RenderingInfo};
-use vulkano::format::{Format as VkFormat, FormatFeatures};
-use vulkano::image::sampler::Filter;
-use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageAspects, ImageLayout, ImageSubresourceLayers};
-use vulkano::pipeline::graphics::vertex_input::Vertex;
-use vulkano::pipeline::graphics::viewport::Scissor;
-use vulkano::render_pass::{AttachmentLoadOp, AttachmentStoreOp};
-use vulkano::sync::{AccessFlags, ImageMemoryBarrier, PipelineStages};
 
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::graph::ImageUsage;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferId, Device, Encoder,
+    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferId, Device, Encoder, Feature,
     GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, TextureDesc, TextureDimension,
     TextureSwizzle, TextureViewId, VertexAttribute, VertexFormat, VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
-
-use super::context::VkContext;
-use super::convert::engine_format;
-use super::driver::VkEncoder;
-use super::record::{self, Recorder};
 
 /// One frame of the editor, as the renderer draws it.
 #[derive(Default)]
@@ -83,14 +69,15 @@ pub struct Glass {
 }
 
 /// egui's vertex, field for field.
-#[derive(Pod, Zeroable, Vertex, Clone, Copy)]
+#[derive(Pod, Zeroable, Clone, Copy)]
+#[cfg_attr(test, derive(vulkano::pipeline::graphics::vertex_input::Vertex))]
 #[repr(C)]
 struct OverlayVertex {
-    #[format(R32G32_SFLOAT)]
+    #[cfg_attr(test, format(R32G32_SFLOAT))]
     position: [f32; 2],
-    #[format(R32G32_SFLOAT)]
+    #[cfg_attr(test, format(R32G32_SFLOAT))]
     tex_coords: [f32; 2],
-    #[format(R8G8B8A8_UNORM)]
+    #[cfg_attr(test, format(R8G8B8A8_UNORM))]
     color: [u8; 4],
 }
 
@@ -177,38 +164,12 @@ pub(super) struct OverlayPass {
     pixels: Vec<u8>,
 }
 
-/// The recorder under an encoder, for the barriers, blits and render-pass
-/// brackets the RHI has no words for yet.
-fn raw<'e>(encoder: &'e mut Encoder<'_>) -> &'e mut Recorder {
-    let Encoder::Vulkan(encoder) = encoder;
-    encoder.recorder()
-}
-
 impl OverlayPass {
     /// `capturable` is whether the target may be a transfer source — a
     /// swapchain has to have been created with that usage, and the surface may
     /// not offer it.
-    pub(super) fn new(
-        ctx: &VkContext,
-        device: &Device,
-        target_format: VkFormat,
-        capturable: bool,
-    ) -> Self {
-        let physical = ctx.device.physical_device();
-        let blittable = |format: VkFormat, features: FormatFeatures| {
-            physical
-                .format_properties(format)
-                .is_ok_and(|properties| properties.optimal_tiling_features.contains(features))
-        };
-        let format = engine_format(target_format);
-        let frost = (capturable
-            && blittable(
-                target_format,
-                FormatFeatures::BLIT_SRC
-                    | FormatFeatures::BLIT_DST
-                    | FormatFeatures::SAMPLED_IMAGE_FILTER_LINEAR,
-            ))
-        .then(|| {
+    pub(super) fn new(device: &Device, format: Format, capturable: bool) -> Self {
+        let frost = (capturable && device.supports(Feature::BackdropCapture(format))).then(|| {
             device.create_graphics_pipeline(&GraphicsPipelineDesc {
                 blend: Blend::Alpha,
                 ..GraphicsPipelineDesc::fullscreen(
@@ -218,14 +179,7 @@ impl OverlayPass {
                 )
             })
         });
-
-        let swizzle = !ctx.device.enabled_extensions().khr_portability_subset
-            || ctx.device.enabled_features().image_view_format_swizzle;
-        let font_format = if swizzle
-            && blittable(
-                VkFormat::R8G8_UNORM,
-                FormatFeatures::SAMPLED_IMAGE | FormatFeatures::TRANSFER_DST,
-            ) {
+        let font_format = if device.supports(Feature::CoverageTexture) {
             Format::Rg8Unorm
         } else {
             Format::Rgba8Srgb
@@ -268,23 +222,18 @@ impl OverlayPass {
     pub(super) fn record(
         &mut self,
         device: &Device,
-        recorder: &mut Recorder,
-        target: &Arc<ImageView>,
+        encoder: &mut Encoder,
+        target: TextureViewId,
         frame: &mut OverlayFrame,
     ) {
-        let Device::Vulkan(driver) = device;
-        let mut encoder = Encoder::Vulkan(VkEncoder::new(recorder, driver));
-        let encoder = &mut encoder;
-
-        let image = target.image().clone();
-        let extent = [image.extent()[0], image.extent()[1]];
+        let extent = device.view_extent(target);
         let ppp = frame.pixels_per_point;
         let textures = std::mem::take(&mut frame.textures);
 
         self.upload_textures(device, encoder, &textures.set);
         let geometry = self.upload_geometry(device, frame);
 
-        raw(encoder).image_barrier(present_to_color(image.clone()));
+        encoder.open_swapchain(target);
         let mut rendering = false;
         let mut cursor = (0, 0);
         for (index, phase) in frame.phases.iter().enumerate() {
@@ -298,13 +247,13 @@ impl OverlayPass {
                 && !glass.is_empty()
             {
                 if rendering {
-                    raw(encoder).end_rendering();
+                    encoder.end_rendering();
                 }
                 let backdrop = self.backdrop(device, extent);
-                capture(device, raw(encoder), &image, backdrop);
+                encoder.capture_backdrop(target, backdrop.half, backdrop.quarter);
                 let texel = backdrop_texel(backdrop.extent);
                 let set = backdrop.set;
-                begin(raw(encoder), target);
+                encoder.begin_rendering(target);
                 rendering = true;
 
                 encoder.bind_pipeline(frost);
@@ -324,15 +273,15 @@ impl OverlayPass {
                 continue;
             };
             if !rendering {
-                begin(raw(encoder), target);
+                encoder.begin_rendering(target);
                 rendering = true;
             }
             cursor = self.draw_meshes(encoder, &phase.primitives, geometry, cursor, ppp, extent);
         }
         if rendering {
-            raw(encoder).end_rendering();
+            encoder.end_rendering();
         }
-        raw(encoder).image_barrier(color_to_present(image));
+        encoder.close_swapchain(target);
 
         // The sets a recorded draw bound are held by the recording, so a
         // texture freed here outlives every frame still reading it.
@@ -583,120 +532,6 @@ impl OverlayPass {
     }
 }
 
-/// Copy everything drawn so far into `backdrop`'s quarter-resolution image,
-/// through the half one, and hand `target` back to rendering with its
-/// contents.
-fn capture(device: &Device, recorder: &mut Recorder, target: &Arc<Image>, backdrop: &Backdrop) {
-    let Device::Vulkan(driver) = device;
-    let half = &driver.vk_view(backdrop.half).image().clone();
-    let quarter = &driver.vk_view(backdrop.quarter).image().clone();
-    recorder
-        .image_barrier(record::color_to_transfer_src(
-            target.clone(),
-            record::whole_image(target),
-        ))
-        .image_barrier(reuse_as_transfer_dst(half.clone()))
-        .blit_image(downsample(target, half))
-        .image_barrier(record::transfer_dst_to_src(
-            half.clone(),
-            record::whole_image(half),
-        ))
-        .image_barrier(reuse_as_transfer_dst(quarter.clone()))
-        .blit_image(downsample(half, quarter))
-        .image_barrier(record::to_shader_read(
-            quarter.clone(),
-            record::whole_image(quarter),
-            ImageLayout::TransferDstOptimal,
-        ))
-        .image_barrier(ImageMemoryBarrier {
-            src_stages: PipelineStages::ALL_TRANSFER,
-            src_access: AccessFlags::empty(),
-            dst_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
-            dst_access: AccessFlags::COLOR_ATTACHMENT_READ | AccessFlags::COLOR_ATTACHMENT_WRITE,
-            old_layout: ImageLayout::TransferSrcOptimal,
-            new_layout: ImageLayout::ColorAttachmentOptimal,
-            subresource_range: record::whole_image(target),
-            ..ImageMemoryBarrier::image(target.clone())
-        });
-}
-
-/// A capture image about to be rewritten. Its old contents do not matter, but
-/// the previous capture's reads of it — a blit, or the glass sampling it — have
-/// to finish first.
-fn reuse_as_transfer_dst(image: Arc<Image>) -> ImageMemoryBarrier {
-    ImageMemoryBarrier {
-        src_stages: PipelineStages::FRAGMENT_SHADER | PipelineStages::ALL_TRANSFER,
-        ..record::to_transfer_dst(
-            image.clone(),
-            record::whole_image(&image),
-            ImageLayout::Undefined,
-        )
-    }
-}
-
-fn downsample(src: &Arc<Image>, dst: &Arc<Image>) -> BlitImageInfo {
-    let corner = |image: &Arc<Image>| [image.extent()[0], image.extent()[1], 1];
-    BlitImageInfo {
-        regions: [ImageBlit {
-            src_subresource: color_layers(),
-            src_offsets: [[0, 0, 0], corner(src)],
-            dst_subresource: color_layers(),
-            dst_offsets: [[0, 0, 0], corner(dst)],
-            ..Default::default()
-        }]
-        .into(),
-        filter: Filter::Linear,
-        ..BlitImageInfo::images(src.clone(), dst.clone())
-    }
-}
-
-fn color_layers() -> ImageSubresourceLayers {
-    ImageSubresourceLayers {
-        aspects: ImageAspects::COLOR,
-        mip_level: 0,
-        array_layers: 0..1,
-    }
-}
-
-/// Into rendering, keeping what the frame drew. The semaphore the submission
-/// waits on has already made the frame's writes visible.
-fn present_to_color(image: Arc<Image>) -> ImageMemoryBarrier {
-    ImageMemoryBarrier {
-        src_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
-        src_access: AccessFlags::empty(),
-        dst_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
-        dst_access: AccessFlags::COLOR_ATTACHMENT_READ | AccessFlags::COLOR_ATTACHMENT_WRITE,
-        old_layout: ImageLayout::PresentSrc,
-        new_layout: ImageLayout::ColorAttachmentOptimal,
-        subresource_range: record::whole_image(&image),
-        ..ImageMemoryBarrier::image(image)
-    }
-}
-
-fn color_to_present(image: Arc<Image>) -> ImageMemoryBarrier {
-    ImageMemoryBarrier {
-        src_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
-        src_access: AccessFlags::COLOR_ATTACHMENT_WRITE,
-        dst_stages: PipelineStages::BOTTOM_OF_PIPE,
-        dst_access: AccessFlags::empty(),
-        old_layout: ImageLayout::ColorAttachmentOptimal,
-        new_layout: ImageLayout::PresentSrc,
-        subresource_range: record::whole_image(&image),
-        ..ImageMemoryBarrier::image(image)
-    }
-}
-
-fn begin(recorder: &mut Recorder, target: &Arc<ImageView>) {
-    recorder.begin_rendering(RenderingInfo {
-        color_attachments: vec![Some(RenderingAttachmentInfo {
-            load_op: AttachmentLoadOp::Load,
-            store_op: AttachmentStoreOp::Store,
-            ..RenderingAttachmentInfo::image_view(target.clone())
-        })],
-        ..Default::default()
-    });
-}
-
 fn viewport(extent: [u32; 2]) -> Viewport {
     Viewport {
         origin: [0.0, 0.0],
@@ -705,15 +540,22 @@ fn viewport(extent: [u32; 2]) -> Viewport {
     }
 }
 
+/// A scissor rectangle in framebuffer pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Clip {
+    offset: [u32; 2],
+    extent: [u32; 2],
+}
+
 /// A clip rect in points as a scissor in pixels, rounded to the nearest pixel
 /// and clamped to the target. `None` when nothing of it is on screen.
-fn scissor(clip: egui::Rect, ppp: f32, extent: [u32; 2]) -> Option<Scissor> {
+fn scissor(clip: egui::Rect, ppp: f32, extent: [u32; 2]) -> Option<Clip> {
     let [width, height] = extent.map(|side| side as f32);
     let min = (clip.min.to_vec2() * ppp).round();
     let max = (clip.max.to_vec2() * ppp).round();
     let (x0, y0) = (min.x.clamp(0.0, width), min.y.clamp(0.0, height));
     let (x1, y1) = (max.x.clamp(x0, width), max.y.clamp(y0, height));
-    (x1 > x0 && y1 > y0).then_some(Scissor {
+    (x1 > x0 && y1 > y0).then_some(Clip {
         offset: [x0 as u32, y0 as u32],
         extent: [(x1 - x0) as u32, (y1 - y0) as u32],
     })
@@ -721,7 +563,7 @@ fn scissor(clip: egui::Rect, ppp: f32, extent: [u32; 2]) -> Option<Scissor> {
 
 /// The scissor and outline for one surface's glass. Rounded outward so the
 /// blur reaches the surface's antialiased edge; the outline itself stays exact.
-fn frost_draw(glass: &Glass, ppp: f32, extent: [u32; 2]) -> Option<(Scissor, FrostPush)> {
+fn frost_draw(glass: &Glass, ppp: f32, extent: [u32; 2]) -> Option<(Clip, FrostPush)> {
     let rect = egui::Rect::from_min_max(
         (glass.rect.min.to_vec2() * ppp).floor().to_pos2(),
         (glass.rect.max.to_vec2() * ppp).ceil().to_pos2(),
@@ -784,11 +626,19 @@ fn pack(image: &egui::ImageData, format: Format, into: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gfx::vulkan::driver::VkDriver;
+    use crate::gfx::vulkan::context::VkContext;
+    use crate::gfx::vulkan::driver::color_to_present;
+    use crate::gfx::vulkan::driver::{VkDriver, VkEncoder};
+    use crate::gfx::vulkan::record::{self, Recorder};
+    use std::sync::Arc;
     use vulkano::buffer::BufferUsage;
+    use vulkano::format::Format as VkFormat;
     use vulkano::image::view::ImageView;
+    use vulkano::image::{Image, ImageLayout};
     use vulkano::image::{ImageCreateInfo, ImageUsage as VkImageUsage};
     use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
+    use vulkano::pipeline::graphics::vertex_input::Vertex as _;
+    use vulkano::sync::{AccessFlags, ImageMemoryBarrier, PipelineStages};
 
     fn device(ctx: &Arc<VkContext>) -> Device {
         Device::Vulkan(VkDriver::new(ctx.clone(), 2))
@@ -912,13 +762,22 @@ mod tests {
             phases: Vec::new(),
         };
 
-        let mut pass = OverlayPass::new(&ctx, &device, format, false);
+        let mut pass = OverlayPass::new(
+            &device,
+            crate::gfx::vulkan::convert::engine_format(format),
+            false,
+        );
         let mut recorder = Recorder::new(&ctx);
         recorder.image_barrier(ImageMemoryBarrier {
             old_layout: ImageLayout::Undefined,
             ..color_to_present(image)
         });
-        pass.record(&device, &mut recorder, &view, &mut frame);
+        {
+            let Device::Vulkan(driver) = &device;
+            let target = driver.import_view(view.clone());
+            let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
+            pass.record(&device, &mut encoder, target, &mut frame);
+        }
         recorder.submit_and_wait(&ctx);
         assert_eq!(pass.textures.len(), 2);
     }
@@ -977,7 +836,11 @@ mod tests {
             textures: output.textures_delta,
         };
 
-        let mut pass = OverlayPass::new(&ctx, &device, format, true);
+        let mut pass = OverlayPass::new(
+            &device,
+            crate::gfx::vulkan::convert::engine_format(format),
+            true,
+        );
         assert!(pass.frost.is_some(), "this device cannot blit {format:?}");
         let readback = Buffer::new_slice::<u8>(
             ctx.memory_allocator.clone(),
@@ -998,7 +861,12 @@ mod tests {
             old_layout: ImageLayout::Undefined,
             ..color_to_present(image.clone())
         });
-        pass.record(&device, &mut recorder, &view, &mut frame);
+        {
+            let Device::Vulkan(driver) = &device;
+            let target = driver.import_view(view.clone());
+            let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
+            pass.record(&device, &mut encoder, target, &mut frame);
+        }
         recorder
             .image_barrier(ImageMemoryBarrier {
                 src_stages: PipelineStages::ALL_COMMANDS,
@@ -1090,7 +958,11 @@ mod tests {
         let base = egui.tessellate(output.shapes, 1.0);
         let mut textures = Some(output.textures_delta);
 
-        let mut pass = OverlayPass::new(&ctx, &device, format, true);
+        let mut pass = OverlayPass::new(
+            &device,
+            crate::gfx::vulkan::convert::engine_format(format),
+            true,
+        );
         let mut first = true;
         let toolbar = Glass {
             rect: rect(400.0, 40.0, 700.0, 72.0),
@@ -1136,7 +1008,12 @@ mod tests {
                     });
                     first = false;
                 }
-                pass.record(&device, &mut recorder, &view, &mut frame);
+                {
+                    let Device::Vulkan(driver) = &device;
+                    let target = driver.import_view(view.clone());
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
+                    pass.record(&device, &mut encoder, target, &mut frame);
+                }
                 recorder.submit_and_wait(&ctx);
                 if frame_index >= 20 {
                     times.push(start.elapsed().as_secs_f64() * 1e3);

@@ -53,16 +53,16 @@ use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
 use super::context::VkContext;
 use super::convert::{vk_buffer_usage, vk_format, vk_image_usage, vk_samples};
 use super::mesh::MeshArena;
-use super::record::{Arena, Recorder};
+use super::record::{self, Arena, Recorder};
 use super::rendering;
 use crate::geom::Aabb;
 use crate::gfx::Vertex;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, BufferId,
-    ComputePipelineDesc, CullMode, DepthCompare, DepthRect, GraphicsPipelineDesc, MeshSpan,
-    PipelineId, Pool, SamplerDesc, SamplerId, TextureDesc, TextureDimension, TextureSwizzle,
-    TextureViewId, Topology, VertexFormat, VertexStream, Viewport,
+    ComputePipelineDesc, CullMode, DepthCompare, DepthRect, Feature, GraphicsPipelineDesc,
+    MeshSpan, PipelineId, Pool, SamplerDesc, SamplerId, TextureDesc, TextureDimension,
+    TextureSwizzle, TextureViewId, Topology, VertexFormat, VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -203,6 +203,34 @@ impl VkDriver {
 
     pub fn create_texture(&self, desc: &TextureDesc) -> TextureViewId {
         self.create_texture_swizzled(desc, TextureSwizzle::Identity)
+    }
+
+    pub fn supports(&self, feature: Feature) -> bool {
+        use vulkano::format::FormatFeatures;
+        let physical = self.ctx.device.physical_device();
+        let usable = |format, features: FormatFeatures| {
+            physical
+                .format_properties(format)
+                .is_ok_and(|properties| properties.optimal_tiling_features.contains(features))
+        };
+        match feature {
+            Feature::BackdropCapture(format) => usable(
+                vk_format(format),
+                FormatFeatures::BLIT_SRC
+                    | FormatFeatures::BLIT_DST
+                    | FormatFeatures::SAMPLED_IMAGE_FILTER_LINEAR,
+            ),
+            Feature::CoverageTexture => {
+                let device = &self.ctx.device;
+                let swizzle = !device.enabled_extensions().khr_portability_subset
+                    || device.enabled_features().image_view_format_swizzle;
+                swizzle
+                    && usable(
+                        vulkano::format::Format::R8G8_UNORM,
+                        FormatFeatures::SAMPLED_IMAGE | FormatFeatures::TRANSFER_DST,
+                    )
+            }
+        }
     }
 
     pub fn create_texture_swizzled(
@@ -1167,10 +1195,50 @@ impl<'a> VkEncoder<'a> {
             ));
     }
 
-    /// The recorder under this encoder, for a pass that is still recorded raw
-    /// and needs a barrier or a blit the RHI has no word for.
-    pub(super) fn recorder(&mut self) -> &mut Recorder {
-        self.recorder
+    /// Take a swapchain image that arrives presentable into rendering, keeping
+    /// what is in it. The semaphore the submission waits on has already made the
+    /// frame's writes visible.
+    pub fn open_swapchain(&mut self, target: TextureViewId) {
+        let image = lookup(&self.driver.views, target.0, "texture view")
+            .image()
+            .clone();
+        self.recorder.image_barrier(present_to_color(image));
+    }
+
+    /// Hand a swapchain image back presentable.
+    pub fn close_swapchain(&mut self, target: TextureViewId) {
+        let image = lookup(&self.driver.views, target.0, "texture view")
+            .image()
+            .clone();
+        self.recorder.image_barrier(color_to_present(image));
+    }
+
+    /// Open a render pass over `target`, loading what it holds.
+    pub fn begin_rendering(&mut self, target: TextureViewId) {
+        let view = lookup(&self.driver.views, target.0, "texture view");
+        begin(self.recorder, &view);
+    }
+
+    pub fn end_rendering(&mut self) {
+        self.recorder.end_rendering();
+    }
+
+    /// Downsample the render target into `half` and then `quarter`, leaving
+    /// `quarter` sampleable and the target ready to render into again. For a
+    /// pass that blurs what was drawn under it.
+    pub fn capture_backdrop(
+        &mut self,
+        target: TextureViewId,
+        half: TextureViewId,
+        quarter: TextureViewId,
+    ) {
+        let image = |id: TextureViewId| {
+            lookup(&self.driver.views, id.0, "texture view")
+                .image()
+                .clone()
+        };
+        let (target, half, quarter) = (image(target), image(half), image(quarter));
+        capture(self.recorder, &target, &half, &quarter);
     }
 
     pub fn draw_indexed_indirect(&mut self, commands: BufferId, range: std::ops::Range<u32>) {
@@ -1188,6 +1256,120 @@ impl<'a> VkEncoder<'a> {
         self.recorder
             .draw(vertices, instances, first_vertex, first_instance);
     }
+}
+
+/// Copy everything drawn so far into `backdrop`'s quarter-resolution image,
+/// through the half one, and hand `target` back to rendering with its
+/// contents.
+fn capture(recorder: &mut Recorder, target: &Arc<Image>, half: &Arc<Image>, quarter: &Arc<Image>) {
+    recorder
+        .image_barrier(record::color_to_transfer_src(
+            target.clone(),
+            record::whole_image(target),
+        ))
+        .image_barrier(reuse_as_transfer_dst(half.clone()))
+        .blit_image(downsample(target, half))
+        .image_barrier(record::transfer_dst_to_src(
+            half.clone(),
+            record::whole_image(half),
+        ))
+        .image_barrier(reuse_as_transfer_dst(quarter.clone()))
+        .blit_image(downsample(half, quarter))
+        .image_barrier(record::to_shader_read(
+            quarter.clone(),
+            record::whole_image(quarter),
+            vulkano::image::ImageLayout::TransferDstOptimal,
+        ))
+        .image_barrier(vulkano::sync::ImageMemoryBarrier {
+            src_stages: vulkano::sync::PipelineStages::ALL_TRANSFER,
+            src_access: vulkano::sync::AccessFlags::empty(),
+            dst_stages: vulkano::sync::PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+            dst_access: vulkano::sync::AccessFlags::COLOR_ATTACHMENT_READ
+                | vulkano::sync::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            old_layout: vulkano::image::ImageLayout::TransferSrcOptimal,
+            new_layout: vulkano::image::ImageLayout::ColorAttachmentOptimal,
+            subresource_range: record::whole_image(target),
+            ..vulkano::sync::ImageMemoryBarrier::image(target.clone())
+        });
+}
+
+/// A capture image about to be rewritten. Its old contents do not matter, but
+/// the previous capture's reads of it — a blit, or the glass sampling it — have
+/// to finish first.
+fn reuse_as_transfer_dst(image: Arc<Image>) -> vulkano::sync::ImageMemoryBarrier {
+    vulkano::sync::ImageMemoryBarrier {
+        src_stages: vulkano::sync::PipelineStages::FRAGMENT_SHADER
+            | vulkano::sync::PipelineStages::ALL_TRANSFER,
+        ..record::to_transfer_dst(
+            image.clone(),
+            record::whole_image(&image),
+            vulkano::image::ImageLayout::Undefined,
+        )
+    }
+}
+
+fn downsample(src: &Arc<Image>, dst: &Arc<Image>) -> vulkano::command_buffer::BlitImageInfo {
+    let corner = |image: &Arc<Image>| [image.extent()[0], image.extent()[1], 1];
+    vulkano::command_buffer::BlitImageInfo {
+        regions: [vulkano::command_buffer::ImageBlit {
+            src_subresource: color_layers(),
+            src_offsets: [[0, 0, 0], corner(src)],
+            dst_subresource: color_layers(),
+            dst_offsets: [[0, 0, 0], corner(dst)],
+            ..Default::default()
+        }]
+        .into(),
+        filter: vulkano::image::sampler::Filter::Linear,
+        ..vulkano::command_buffer::BlitImageInfo::images(src.clone(), dst.clone())
+    }
+}
+
+fn color_layers() -> vulkano::image::ImageSubresourceLayers {
+    vulkano::image::ImageSubresourceLayers {
+        aspects: vulkano::image::ImageAspects::COLOR,
+        mip_level: 0,
+        array_layers: 0..1,
+    }
+}
+
+/// Into rendering, keeping what the frame drew. The semaphore the submission
+/// waits on has already made the frame's writes visible.
+fn present_to_color(image: Arc<Image>) -> vulkano::sync::ImageMemoryBarrier {
+    vulkano::sync::ImageMemoryBarrier {
+        src_stages: vulkano::sync::PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+        src_access: vulkano::sync::AccessFlags::empty(),
+        dst_stages: vulkano::sync::PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+        dst_access: vulkano::sync::AccessFlags::COLOR_ATTACHMENT_READ
+            | vulkano::sync::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        old_layout: vulkano::image::ImageLayout::PresentSrc,
+        new_layout: vulkano::image::ImageLayout::ColorAttachmentOptimal,
+        subresource_range: record::whole_image(&image),
+        ..vulkano::sync::ImageMemoryBarrier::image(image)
+    }
+}
+
+pub(super) fn color_to_present(image: Arc<Image>) -> vulkano::sync::ImageMemoryBarrier {
+    vulkano::sync::ImageMemoryBarrier {
+        src_stages: vulkano::sync::PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+        src_access: vulkano::sync::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        dst_stages: vulkano::sync::PipelineStages::BOTTOM_OF_PIPE,
+        dst_access: vulkano::sync::AccessFlags::empty(),
+        old_layout: vulkano::image::ImageLayout::ColorAttachmentOptimal,
+        new_layout: vulkano::image::ImageLayout::PresentSrc,
+        subresource_range: record::whole_image(&image),
+        ..vulkano::sync::ImageMemoryBarrier::image(image)
+    }
+}
+
+fn begin(recorder: &mut Recorder, target: &Arc<ImageView>) {
+    recorder.begin_rendering(vulkano::command_buffer::RenderingInfo {
+        color_attachments: vec![Some(vulkano::command_buffer::RenderingAttachmentInfo {
+            load_op: vulkano::render_pass::AttachmentLoadOp::Load,
+            store_op: vulkano::render_pass::AttachmentStoreOp::Store,
+            ..vulkano::command_buffer::RenderingAttachmentInfo::image_view(target.clone())
+        })],
+        ..Default::default()
+    });
 }
 
 #[cfg(test)]
