@@ -14,7 +14,6 @@ orrin-ecs = { path = "crates/orrin-ecs" }
 orrin-registry = { path = "crates/orrin-registry" }
 orrin-macros = { path = "crates/orrin-macros" }
 vulkano = "0.35"
-vulkano-shaders = "0.35"
 winit = "0.30"
 glam = { version = "0.30", features = ["bytemuck"] }
 # `hdr` is the Radiance decoder the environment bake reads; it is what makes an

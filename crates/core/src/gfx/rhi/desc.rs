@@ -259,6 +259,8 @@ pub enum Feature {
     /// A two-channel texture read as premultiplied white and alpha, which is
     /// what `TextureSwizzle::CoverageToWhite` needs.
     CoverageTexture,
+    /// Sampling block-compressed (BC5, BC7) textures.
+    BlockCompression,
 }
 
 /// Which kind of buffer a per-frame block is bound as.

@@ -164,11 +164,73 @@ impl Device {
         }
     }
 
+    /// Like [`create_sampler`](Self::create_sampler) but repeating along u only
+    /// and clamping v: for an equirectangular map, whose seam wraps and whose
+    /// poles must not fold across to the opposite hemisphere.
+    pub fn create_sampler_wrap_u(&self, desc: SamplerDesc) -> SamplerId {
+        match self {
+            Device::Vulkan(driver) => driver.create_sampler_wrap_u(desc),
+        }
+    }
+
+    /// A persistent cube texture of `face` texels a side holding `pixels`, six
+    /// faces tightly packed in +X, -X, +Y, -Y, +Z, -Z order.
+    pub fn create_texture_cube(&self, pixels: &[u8], face: u32, format: Format) -> TextureViewId {
+        match self {
+            Device::Vulkan(driver) => driver.create_texture_cube(pixels, face, format),
+        }
+    }
+
+    /// A single-face, single-level 2D view of `texture`, for rendering into one
+    /// face of a cube at one level.
+    pub fn face_view(&self, texture: TextureViewId, face: u32, level: u32) -> TextureViewId {
+        match self {
+            Device::Vulkan(driver) => driver.face_view(texture, face, level),
+        }
+    }
+
+    /// Record with `record` on a fresh encoder and wait for the GPU to finish.
+    /// For load-time work whose result the next frame must not see half done.
+    pub fn record_blocking(&self, record: impl FnOnce(&mut Encoder)) {
+        match self {
+            Device::Vulkan(driver) => driver.record_blocking(record),
+        }
+    }
+
     /// A view of one mip level of `texture`, with the texture's full usage, for
     /// a pass that writes the levels one at a time.
     pub fn mip_view(&self, texture: TextureViewId, level: u32) -> TextureViewId {
         match self {
             Device::Vulkan(driver) => driver.mip_view(texture, level),
+        }
+    }
+
+    /// The most anisotropic filtering the device offers, capped at sixteen, or
+    /// `None` where it offers none.
+    pub fn max_anisotropy(&self) -> Option<f32> {
+        match self {
+            Device::Vulkan(driver) => driver.max_anisotropy(),
+        }
+    }
+
+    /// A persistent 2D colour texture whose full mip chain is generated from
+    /// `pixels` at upload.
+    pub fn create_texture_mipped(
+        &self,
+        pixels: &[u8],
+        extent: [u32; 2],
+        format: Format,
+    ) -> TextureViewId {
+        match self {
+            Device::Vulkan(driver) => driver.create_texture_mipped(pixels, extent, format),
+        }
+    }
+
+    /// A persistent texture from levels already authored, which may be block
+    /// compressed. Check [`Feature::BlockCompression`] first for those.
+    pub fn create_texture_levels(&self, levels: &super::TextureLevels) -> TextureViewId {
+        match self {
+            Device::Vulkan(driver) => driver.create_texture_levels(levels),
         }
     }
 
@@ -402,6 +464,31 @@ impl Encoder<'_> {
     ) {
         match self {
             Encoder::Vulkan(encoder) => encoder.capture_backdrop(target, half, quarter),
+        }
+    }
+
+    /// Open a render pass over `target` whose contents do not matter and need
+    /// not be kept from before, for a texture rendered once. A face view's own
+    /// level sets the area.
+    pub fn begin_rendering_fresh(&mut self, target: TextureViewId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.begin_rendering_fresh(target),
+        }
+    }
+
+    /// Halve each level of a cube into the next with a linear blit, all six
+    /// faces at once. Level 0 arrives freshly rendered, and the whole chain
+    /// leaves sampleable.
+    pub fn generate_cube_mips(&mut self, texture: TextureViewId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.generate_cube_mips(texture),
+        }
+    }
+
+    /// Make every level of a texture just rendered into sampleable.
+    pub fn publish_render_target(&mut self, texture: TextureViewId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.publish_render_target(texture),
         }
     }
 

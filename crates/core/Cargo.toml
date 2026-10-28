@@ -12,7 +12,6 @@ orrin-ecs.workspace = true
 # egui is already below.
 orrin-registry = { workspace = true, features = ["egui"] }
 vulkano.workspace = true
-vulkano-shaders.workspace = true
 winit.workspace = true
 glam.workspace = true
 gltf.workspace = true

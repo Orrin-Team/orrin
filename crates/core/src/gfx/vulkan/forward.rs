@@ -1,8 +1,4 @@
-use std::sync::Arc;
-
 use glam::Vec3;
-use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
 
 use crate::geom::Aabb;
 use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, ShadowAtlas};
@@ -24,8 +20,8 @@ use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::rhi::MeshSpan;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferId, CullMode, DepthCompare,
-    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, Topology,
-    Viewport,
+    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId,
+    TextureViewId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -626,7 +622,7 @@ pub struct ForwardPass {
     /// module because there is no decal *pass* to own it — the block is frame
     /// data that two existing passes read, which is exactly what the shadow face
     /// table above is.
-    sampler: Arc<Sampler>,
+    sampler: SamplerId,
     ao_sampler: SamplerId,
 }
 
@@ -641,7 +637,7 @@ impl ForwardPass {
         color_format: Format,
         msaa_color_format: Format,
     ) -> Self {
-        let device = &ctx.device;
+        let _device = &ctx.device;
         let targets = ForwardTargets::new(color_format, msaa_color_format);
 
         // One sampler for all eight pipelines. Vulkan compares immutable samplers
@@ -762,22 +758,14 @@ impl ForwardPass {
 
         // Material textures are the only ones with a mip chain to sample; the
         // AO and tonemap inputs are screen-space targets read at 1:1.
-        let anisotropy = device.enabled_features().sampler_anisotropy.then(|| {
-            device
-                .physical_device()
-                .properties()
-                .max_sampler_anisotropy
-                .min(16.0)
+        let sampler = rhi.create_sampler(SamplerDesc {
+            linear: true,
+            mipmap_linear: true,
+            repeat: true,
+            compare: false,
+            anisotropy: rhi.max_anisotropy(),
+            max_lod: None,
         });
-
-        let sampler = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                anisotropy,
-                ..SamplerCreateInfo::simple_repeat_linear()
-            },
-        )
-        .unwrap();
 
         let ao_sampler = rhi.create_sampler(SamplerDesc {
             linear: true,
@@ -855,17 +843,12 @@ impl ForwardPass {
         )
     }
 
-    pub fn build_texture_set(&self, device: &Device, textures: &[Arc<ImageView>]) -> BindGroupId {
-        let Device::Vulkan(driver) = device;
-        let views: Vec<_> = textures
-            .iter()
-            .map(|texture| driver.import_view(texture.clone()))
-            .collect();
+    pub fn build_texture_set(&self, device: &Device, textures: &[TextureViewId]) -> BindGroupId {
         device.create_texture_array_group(
             self.single.plain,
             TEXTURE_SET as u32,
-            &views,
-            driver.import_sampler(self.sampler.clone()),
+            textures,
+            self.sampler,
         )
     }
 
@@ -944,10 +927,12 @@ impl ForwardPass {
         lighting: &SceneLighting,
         camera: &Camera,
         extent: [u32; 2],
-        ao_view: Arc<ImageView>,
-        contact_shadow_view: Arc<ImageView>,
-        shadow_view: Arc<ImageView>,
-        atlas_view: Arc<ImageView>,
+        ao_view: TextureViewId,
+        contact_shadow_view: TextureViewId,
+        shadow_view: TextureViewId,
+        atlas_view: TextureViewId,
+        env_cube: TextureViewId,
+        env_cube_sampler: SamplerId,
         shadows: Option<ShadowFrame<'_>>,
         atlas: &ShadowAtlas,
         material_set: BindGroupId,
@@ -956,10 +941,9 @@ impl ForwardPass {
         decals: BufferId,
         environment: &EnvironmentSettings,
         fog: BufferId,
-        fog_volume: Arc<ImageView>,
-        fog_sampler: Arc<Sampler>,
+        fog_volume: TextureViewId,
+        fog_sampler: SamplerId,
     ) -> ForwardSets {
-        let Device::Vulkan(driver) = device;
         // Both halves fall back to the scene's flat ambient when nothing is
         // loaded — the diffuse as a band-0-only series, the specular as a tint
         // on a white cube. Two descriptions of the same uniform environment,
@@ -1019,16 +1003,16 @@ impl ForwardPass {
         // separate image and comparison sampler rather than a combined one, for
         // the same reason the texture array is: Metal caps samplers per stage far
         // lower than sampled images.
-        let sampled = |binding, view: Arc<ImageView>| Binding {
+        let sampled = |binding, view: TextureViewId| Binding {
             binding,
             resource: BindingResource::SampledTexture {
-                view: driver.import_view(view),
+                view,
                 sampler: self.ao_sampler,
             },
         };
-        let texture = |binding, view: Arc<ImageView>| Binding {
+        let texture = |binding, view: TextureViewId| Binding {
             binding,
-            resource: BindingResource::Texture(driver.import_view(view)),
+            resource: BindingResource::Texture(view),
         };
         let ao_set = device.create_transient_bind_group(
             self.single.plain,
@@ -1036,12 +1020,10 @@ impl ForwardPass {
             &[
                 sampled(0, ao_view),
                 texture(1, shadow_view),
-                texture(3, renderer.environment.specular_view()),
+                texture(3, env_cube),
                 Binding {
                     binding: 4,
-                    resource: BindingResource::Sampler(
-                        driver.import_sampler(renderer.environment.sampler()),
-                    ),
+                    resource: BindingResource::Sampler(env_cube_sampler),
                 },
                 sampled(5, contact_shadow_view),
                 // The atlas reads through the cascades' comparison sampler at
@@ -1062,8 +1044,8 @@ impl ForwardPass {
                 Binding {
                     binding: 8,
                     resource: BindingResource::SampledTexture {
-                        view: driver.import_view(fog_volume),
-                        sampler: driver.import_sampler(fog_sampler),
+                        view: fog_volume,
+                        sampler: fog_sampler,
                     },
                 },
                 Binding {

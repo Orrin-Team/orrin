@@ -12,9 +12,6 @@
 //! the editor hit-tests the pointer against — the shape grabbed is the shape
 //! drawn.
 
-use vulkano::buffer::BufferContents;
-use vulkano::pipeline::graphics::vertex_input::Vertex;
-
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     Blend, Device, Encoder, GraphicsPipelineDesc, PipelineId, VertexAttribute, VertexFormat,
@@ -23,17 +20,24 @@ use crate::gfx::rhi::{
 use crate::gfx::shaders::ShaderId;
 
 /// One corner of a stroke's quad, in physical pixels from the top left.
-#[derive(BufferContents, Vertex, Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(
+    test,
+    derive(
+        vulkano::buffer::BufferContents,
+        vulkano::pipeline::graphics::vertex_input::Vertex
+    )
+)]
 #[repr(C)]
 pub struct GizmoVertex {
-    #[format(R32G32_SFLOAT)]
+    #[cfg_attr(test, format(R32G32_SFLOAT))]
     pub position: [f32; 2],
     /// Distance across the stroke from its centre line, and its half width,
     /// in pixels. What the fragment shader antialiases the edge from.
-    #[format(R32G32_SFLOAT)]
+    #[cfg_attr(test, format(R32G32_SFLOAT))]
     pub edge: [f32; 2],
     /// sRGB, unpremultiplied.
-    #[format(R8G8B8A8_UNORM)]
+    #[cfg_attr(test, format(R8G8B8A8_UNORM))]
     pub color: [u8; 4],
 }
 
@@ -130,6 +134,7 @@ impl GizmoPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vulkano::pipeline::graphics::vertex_input::Vertex as _;
 
     #[test]
     fn the_gizmo_stream_matches_its_derived_layout() {

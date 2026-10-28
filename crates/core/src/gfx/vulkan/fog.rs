@@ -21,12 +21,9 @@
 //! jitter needs to be averaged by. Two allocations, ping-ponged, so the scatter
 //! pass never reads the volume it is writing.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use glam::{Mat4, Vec3};
-use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
 
 use crate::gfx::SceneLighting;
 use crate::gfx::format::SampleCount;
@@ -129,7 +126,7 @@ pub struct FogPass {
     nearest_clamp: SamplerId,
     /// The same linear clamped sampler, as the shading passes bind it beside the
     /// volume they apply the fog from.
-    shading_sampler: Arc<Sampler>,
+    shading_sampler: SamplerId,
     /// Ping-ponged: `frame & 1` is this frame's scatter target and the other is
     /// the history. Empty until the first frame the effect is enabled for.
     history: Option<[TextureViewId; 2]>,
@@ -156,7 +153,7 @@ pub struct FogPass {
 }
 
 impl FogPass {
-    pub fn new(ctx: &VkContext, device: &Device) -> Self {
+    pub fn new(_ctx: &VkContext, device: &Device) -> Self {
         // The comparison sampler has to be *immutable* — part of the layout
         // rather than something written into a descriptor set — because MoltenVK
         // is a portability-subset device and rejects a written one outright. The
@@ -198,14 +195,14 @@ impl FogPass {
             integrate_pipeline,
             linear_clamp,
             nearest_clamp,
-            shading_sampler: Sampler::new(
-                ctx.device.clone(),
-                SamplerCreateInfo {
-                    address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                    ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
-                },
-            )
-            .unwrap(),
+            shading_sampler: device.create_sampler(SamplerDesc {
+                linear: true,
+                mipmap_linear: false,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(0.0),
+            }),
             history: None,
             fallback: allocate_fallback(device),
             extent: [0; 3],
@@ -341,13 +338,8 @@ impl FogPass {
 
     /// What shaders sample to apply the fog: the integrated volume where the
     /// passes ran, and the inert 1x1x1 stand-in where they did not.
-    pub(super) fn volume_or_fallback(
-        &self,
-        device: &Device,
-        volume: Option<Arc<ImageView>>,
-    ) -> Arc<ImageView> {
-        let Device::Vulkan(driver) = device;
-        volume.unwrap_or_else(|| driver.vk_view(self.fallback))
+    pub(super) fn volume_or_fallback(&self, volume: Option<TextureViewId>) -> TextureViewId {
+        volume.unwrap_or(self.fallback)
     }
 
     fn release(&mut self, device: &Device) {
@@ -356,8 +348,8 @@ impl FogPass {
         }
     }
 
-    pub(super) fn sampler(&self) -> Arc<Sampler> {
-        self.shading_sampler.clone()
+    pub(super) fn sampler(&self) -> SamplerId {
+        self.shading_sampler
     }
 
     /// This frame's scatter target, which is next frame's history.

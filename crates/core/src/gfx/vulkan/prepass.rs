@@ -14,15 +14,11 @@
 //! the mapped one for the same reason, or reflections slide over bumps the lit
 //! image clearly has. SSAO reads the better normals too.
 
-use std::sync::Arc;
-
-use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-
 use crate::gfx::format::SampleCount;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferId, CullMode, DepthCompare,
-    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, Topology, Viewport,
+    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId,
+    TextureViewId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{PositionVertex, SurfaceVertex};
@@ -101,12 +97,12 @@ pub struct GeometryPrepass {
     /// The material maps are sampled at the same texture coordinates and the
     /// same mip selection the forward pass uses, so the two rasterisations
     /// cannot disagree about what a surface is.
-    sampler: Arc<Sampler>,
+    sampler: SamplerId,
 }
 
 impl GeometryPrepass {
     pub fn new(ctx: &VkContext, device_rhi: &Device) -> Self {
-        let device = &ctx.device;
+        let _device = &ctx.device;
         let pipeline = |fragment, cull| {
             device_rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
                 vertex: ShaderId::PrepassVert,
@@ -137,21 +133,14 @@ impl GeometryPrepass {
         // the same triangles or the depth this pass leaves is not the depth the
         // frame was shaded against.
         let masked_pipeline = pipeline(ShaderId::PrepassFragMasked, CullMode::None);
-        let anisotropy = device.enabled_features().sampler_anisotropy.then(|| {
-            device
-                .physical_device()
-                .properties()
-                .max_sampler_anisotropy
-                .min(16.0)
+        let sampler = device_rhi.create_sampler(SamplerDesc {
+            linear: true,
+            mipmap_linear: true,
+            repeat: true,
+            compare: false,
+            anisotropy: device_rhi.max_anisotropy(),
+            max_lod: None,
         });
-        let sampler = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                anisotropy,
-                ..SamplerCreateInfo::simple_repeat_linear()
-            },
-        )
-        .unwrap();
 
         Self {
             pipeline: pipeline_plain,
@@ -173,8 +162,8 @@ impl GeometryPrepass {
         device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&frame))
     }
 
-    pub(super) fn material_sampler(&self) -> &Arc<Sampler> {
-        &self.sampler
+    pub(super) fn material_sampler(&self) -> SamplerId {
+        self.sampler
     }
 
     /// The set-1 per-object descriptor set this pass binds.
@@ -217,19 +206,9 @@ impl GeometryPrepass {
     pub(super) fn build_texture_set(
         &self,
         device: &Device,
-        textures: &[Arc<ImageView>],
+        textures: &[TextureViewId],
     ) -> BindGroupId {
-        let Device::Vulkan(driver) = device;
-        let views: Vec<_> = textures
-            .iter()
-            .map(|texture| driver.import_view(texture.clone()))
-            .collect();
-        device.create_texture_array_group(
-            self.pipeline,
-            TEXTURE_SET as u32,
-            &views,
-            driver.import_sampler(self.sampler.clone()),
-        )
+        device.create_texture_array_group(self.pipeline, TEXTURE_SET as u32, textures, self.sampler)
     }
 
     #[allow(

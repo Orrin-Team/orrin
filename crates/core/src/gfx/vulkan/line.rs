@@ -9,9 +9,6 @@
 //! RGBA the script requested. Drawing post-tonemap would fix the colour but lose
 //! depth occlusion — see the design notes on the issue.
 
-use vulkano::buffer::BufferContents;
-use vulkano::pipeline::graphics::vertex_input::Vertex as VertexTrait;
-
 use crate::gfx::format::SampleCount;
 use crate::gfx::rhi::{
     CullMode, DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, Topology,
@@ -27,12 +24,19 @@ use super::taa::FrameView;
 
 /// One endpoint of a debug line: world-space position + RGBA colour. Two of
 /// these make a segment, drawn with `PrimitiveTopology::LineList`.
-#[derive(BufferContents, VertexTrait, Clone, Copy)]
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    test,
+    derive(
+        vulkano::buffer::BufferContents,
+        vulkano::pipeline::graphics::vertex_input::Vertex
+    )
+)]
 #[repr(C)]
 pub struct LineVertex {
-    #[format(R32G32B32_SFLOAT)]
+    #[cfg_attr(test, format(R32G32B32_SFLOAT))]
     pub position: [f32; 3],
-    #[format(R32G32B32A32_SFLOAT)]
+    #[cfg_attr(test, format(R32G32B32A32_SFLOAT))]
     pub color: [f32; 4],
 }
 
@@ -160,6 +164,7 @@ impl LinePass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vulkano::pipeline::graphics::vertex_input::Vertex as _;
 
     #[test]
     fn the_line_stream_matches_its_derived_layout() {

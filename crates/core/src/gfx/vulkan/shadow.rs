@@ -1,9 +1,6 @@
 use std::ops::Range;
-use std::sync::Arc;
 
 use glam::Mat4;
-use vulkano::image::sampler::Sampler;
-use vulkano::image::view::ImageView;
 
 use crate::geom::Frustum;
 use crate::gfx::format::SampleCount;
@@ -11,8 +8,8 @@ use crate::gfx::graph::ImageUsage;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BufferId, CullMode, DepthCompare, DepthRect,
-    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, TextureDesc, TextureDimension,
-    TextureViewId, Topology, Viewport,
+    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerId, TextureDesc,
+    TextureDimension, TextureViewId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex};
@@ -164,19 +161,14 @@ impl ShadowPass {
     pub(super) fn build_texture_set(
         &self,
         device: &Device,
-        textures: &[Arc<ImageView>],
-        sampler: &Arc<Sampler>,
+        textures: &[TextureViewId],
+        sampler: SamplerId,
     ) -> BindGroupId {
-        let Device::Vulkan(driver) = device;
-        let views: Vec<_> = textures
-            .iter()
-            .map(|texture| driver.import_view(texture.clone()))
-            .collect();
         device.create_texture_array_group(
             self.masked_pipeline,
             TEXTURE_SET as u32,
-            &views,
-            driver.import_sampler(sampler.clone()),
+            textures,
+            sampler,
         )
     }
 

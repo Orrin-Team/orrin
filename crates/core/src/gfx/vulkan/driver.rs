@@ -60,7 +60,7 @@ use crate::gfx::Vertex;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, BufferId,
-    ComputePipelineDesc, CullMode, DepthCompare, DepthRect, Feature, GraphicsPipelineDesc,
+    ComputePipelineDesc, CullMode, DepthCompare, DepthRect, Encoder, Feature, GraphicsPipelineDesc,
     MeshSpan, PipelineId, Pool, SamplerDesc, SamplerId, TextureDesc, TextureDimension,
     TextureSwizzle, TextureViewId, Topology, VertexFormat, VertexStream, Viewport,
 };
@@ -205,6 +205,52 @@ impl VkDriver {
         self.create_texture_swizzled(desc, TextureSwizzle::Identity)
     }
 
+    pub fn max_anisotropy(&self) -> Option<f32> {
+        let device = &self.ctx.device;
+        device.enabled_features().sampler_anisotropy.then(|| {
+            device
+                .physical_device()
+                .properties()
+                .max_sampler_anisotropy
+                .min(16.0)
+        })
+    }
+
+    pub fn create_texture_mipped(
+        &self,
+        pixels: &[u8],
+        extent: [u32; 2],
+        format: Format,
+    ) -> TextureViewId {
+        let view = super::texture::upload_texture(
+            &self.ctx,
+            pixels,
+            extent,
+            vk_format(format),
+            super::texture::MipPolicy::Generate,
+        );
+        TextureViewId(self.views.lock().unwrap().insert(view))
+    }
+
+    pub fn create_texture_levels(&self, levels: &crate::gfx::TextureLevels) -> TextureViewId {
+        use crate::gfx::TexelFormat;
+        use vulkano::format::Format as VkFormat;
+        let format = match levels.format {
+            TexelFormat::Rgba8Srgb => VkFormat::R8G8B8A8_SRGB,
+            TexelFormat::Rgba8Unorm => VkFormat::R8G8B8A8_UNORM,
+            TexelFormat::Bc5Unorm => VkFormat::BC5_UNORM_BLOCK,
+            TexelFormat::Bc7Unorm => VkFormat::BC7_UNORM_BLOCK,
+            TexelFormat::Bc7Srgb => VkFormat::BC7_SRGB_BLOCK,
+        };
+        let view = super::texture::upload_levels(
+            &self.ctx,
+            format,
+            [levels.width, levels.height],
+            &levels.levels,
+        );
+        TextureViewId(self.views.lock().unwrap().insert(view))
+    }
+
     pub fn supports(&self, feature: Feature) -> bool {
         use vulkano::format::FormatFeatures;
         let physical = self.ctx.device.physical_device();
@@ -214,6 +260,7 @@ impl VkDriver {
                 .is_ok_and(|properties| properties.optimal_tiling_features.contains(features))
         };
         match feature {
+            Feature::BlockCompression => self.ctx.samples_bc,
             Feature::BackdropCapture(format) => usable(
                 vk_format(format),
                 FormatFeatures::BLIT_SRC
@@ -242,6 +289,13 @@ impl VkDriver {
         let image = Image::new(
             self.ctx.memory_allocator.clone(),
             ImageCreateInfo {
+                // Without this the *image* creation succeeds and the cube view
+                // fails, which points the error at the wrong line.
+                flags: if desc.dimension == TextureDimension::Cube {
+                    vulkano::image::ImageCreateFlags::CUBE_COMPATIBLE
+                } else {
+                    vulkano::image::ImageCreateFlags::empty()
+                },
                 image_type: match desc.dimension {
                     TextureDimension::D3 => ImageType::Dim3d,
                     _ => ImageType::Dim2d,
@@ -467,6 +521,103 @@ impl VkDriver {
         let sampler =
             Sampler::new(self.ctx.device.clone(), info).expect("failed to create a sampler");
         SamplerId(self.samplers.lock().unwrap().insert(sampler))
+    }
+
+    pub fn create_sampler_wrap_u(&self, desc: SamplerDesc) -> SamplerId {
+        let sampler = Sampler::new(
+            self.ctx.device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                mipmap_mode: SamplerMipmapMode::Nearest,
+                address_mode: [
+                    SamplerAddressMode::Repeat,
+                    SamplerAddressMode::ClampToEdge,
+                    SamplerAddressMode::ClampToEdge,
+                ],
+                lod: 0.0..=desc.max_lod.unwrap_or(0.0),
+                ..Default::default()
+            },
+        )
+        .expect("failed to create a sampler");
+        SamplerId(self.samplers.lock().unwrap().insert(sampler))
+    }
+
+    pub fn create_texture_cube(&self, pixels: &[u8], face: u32, format: Format) -> TextureViewId {
+        let staging = Buffer::from_iter(
+            self.ctx.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: vulkano::buffer::BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            pixels.iter().copied(),
+        )
+        .expect("failed to allocate cube staging");
+        let image = Image::new(
+            self.ctx.memory_allocator.clone(),
+            ImageCreateInfo {
+                flags: vulkano::image::ImageCreateFlags::CUBE_COMPATIBLE,
+                image_type: ImageType::Dim2d,
+                format: vk_format(format),
+                extent: [face, face, 1],
+                array_layers: 6,
+                usage: vulkano::image::ImageUsage::TRANSFER_DST
+                    | vulkano::image::ImageUsage::SAMPLED,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+        )
+        .expect("failed to create a cube texture");
+        let mut recorder = Recorder::new(&self.ctx);
+        recorder.copy_buffer_to_image(
+            vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(staging, image.clone()),
+        );
+        recorder.submit_and_wait(&self.ctx);
+        let view = ImageView::new(
+            image.clone(),
+            ImageViewCreateInfo {
+                view_type: ImageViewType::Cube,
+                ..ImageViewCreateInfo::from_image(&image)
+            },
+        )
+        .expect("failed to create a cube view");
+        TextureViewId(self.views.lock().unwrap().insert(view))
+    }
+
+    pub fn face_view(&self, texture: TextureViewId, face: u32, level: u32) -> TextureViewId {
+        let whole = lookup(&self.views, texture.0, "texture view");
+        let image = whole.image().clone();
+        let view = ImageView::new(
+            image.clone(),
+            ImageViewCreateInfo {
+                view_type: ImageViewType::Dim2d,
+                subresource_range: ImageSubresourceRange {
+                    array_layers: face..face + 1,
+                    mip_levels: level..level + 1,
+                    ..image.subresource_range()
+                },
+                ..ImageViewCreateInfo::from_image(&image)
+            },
+        )
+        .expect("failed to create a face view");
+        TextureViewId(self.views.lock().unwrap().insert(view))
+    }
+
+    pub fn record_blocking(&self, record: impl FnOnce(&mut Encoder)) {
+        let mut recorder = Recorder::new(&self.ctx);
+        {
+            let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, self));
+            record(&mut encoder);
+        }
+        recorder.submit_and_wait(&self.ctx);
     }
 
     pub fn create_graphics_pipeline(&self, desc: &GraphicsPipelineDesc) -> PipelineId {
@@ -1213,6 +1364,47 @@ impl<'a> VkEncoder<'a> {
         self.recorder.image_barrier(color_to_present(image));
     }
 
+    pub fn begin_rendering_fresh(&mut self, target: TextureViewId) {
+        use vulkano::command_buffer::{RenderingAttachmentInfo, RenderingInfo};
+        use vulkano::render_pass::{AttachmentLoadOp, AttachmentStoreOp};
+        let view = lookup(&self.driver.views, target.0, "texture view");
+        let image = view.image().clone();
+        let range = view.subresource_range().clone();
+        let level = range.mip_levels.start;
+        // Fresh from creation, so there is nothing to preserve.
+        self.recorder
+            .image_barrier(record::to_color_attachment(image.clone(), range));
+        let side = |axis: usize| (image.extent()[axis] >> level).max(1);
+        self.recorder.begin_rendering(RenderingInfo {
+            color_attachments: vec![Some(RenderingAttachmentInfo {
+                load_op: AttachmentLoadOp::DontCare,
+                store_op: AttachmentStoreOp::Store,
+                ..RenderingAttachmentInfo::image_view(view)
+            })],
+            // Stated, not derived: left to itself this is taken from the view's
+            // image, which is level 0's, and every level below it is then
+            // smaller than the area claiming to cover it.
+            render_area_extent: [side(0), side(1)],
+            ..Default::default()
+        });
+    }
+
+    pub fn generate_cube_mips(&mut self, texture: TextureViewId) {
+        let image = lookup(&self.driver.views, texture.0, "texture view")
+            .image()
+            .clone();
+        generate_cube_mips(self.recorder, &image);
+    }
+
+    pub fn publish_render_target(&mut self, texture: TextureViewId) {
+        let image = lookup(&self.driver.views, texture.0, "texture view")
+            .image()
+            .clone();
+        let levels = record::levels(&image, 0..image.mip_levels());
+        self.recorder
+            .image_barrier(record::color_to_shader_read(image, levels));
+    }
+
     /// Open a render pass over `target`, loading what it holds.
     pub fn begin_rendering(&mut self, target: TextureViewId) {
         let view = lookup(&self.driver.views, target.0, "texture view");
@@ -1370,6 +1562,86 @@ fn begin(recorder: &mut Recorder, target: &Arc<ImageView>) {
         })],
         ..Default::default()
     });
+}
+
+/// Halve each level into the next with a linear blit, all six layers at once.
+///
+/// Not the same job as the prefilter below: this is a plain box pyramid, and it
+/// exists so the prefilter can *read* from a level matched to how densely its
+/// samples land. `texture.rs` cannot be reused because its chain walks layer 0
+/// alone.
+fn generate_cube_mips(builder: &mut Recorder, image: &Arc<Image>) {
+    let base = image.extent();
+    let aspects = image.subresource_layers().aspects;
+
+    // Level 0 was rendered, not copied, so it enters as a colour attachment;
+    // every level below it has never been touched.
+    builder
+        .image_barrier(record::color_to_transfer_src(
+            image.clone(),
+            record::levels(image, 0..1),
+        ))
+        .image_barrier(record::to_transfer_dst(
+            image.clone(),
+            record::levels(image, 1..image.mip_levels()),
+            vulkano::image::ImageLayout::Undefined,
+        ));
+
+    for level in 1..image.mip_levels() {
+        let region = vulkano::command_buffer::ImageBlit {
+            src_subresource: vulkano::image::ImageSubresourceLayers {
+                aspects,
+                mip_level: level - 1,
+                array_layers: 0..6,
+            },
+            src_offsets: [
+                [0, 0, 0],
+                vulkano::image::mip_level_extent(base, level - 1).unwrap(),
+            ],
+            dst_subresource: vulkano::image::ImageSubresourceLayers {
+                aspects,
+                mip_level: level,
+                array_layers: 0..6,
+            },
+            dst_offsets: [
+                [0, 0, 0],
+                vulkano::image::mip_level_extent(base, level).unwrap(),
+            ],
+            ..Default::default()
+        };
+
+        // Level `level - 1` must finish being written before it is read, and be
+        // in the source layout when it is. Level 0 already is, from the barrier
+        // above; the rest arrive here as this loop's previous destination.
+        if level > 1 {
+            builder.image_barrier(record::transfer_dst_to_src(
+                image.clone(),
+                record::levels(image, level - 1..level),
+            ));
+        }
+
+        builder.blit_image(vulkano::command_buffer::BlitImageInfo {
+            regions: vec![region].into(),
+            filter: Filter::Linear,
+            ..vulkano::command_buffer::BlitImageInfo::images(image.clone(), image.clone())
+        });
+    }
+
+    // What the chain left behind: every level but the last was read as a blit
+    // source, the last was only ever written. The prefilter samples the whole
+    // pyramid as one cube, so both runs have to reach the same layout.
+    let last = image.mip_levels() - 1;
+    builder
+        .image_barrier(record::to_shader_read(
+            image.clone(),
+            record::levels(image, 0..last),
+            vulkano::image::ImageLayout::TransferSrcOptimal,
+        ))
+        .image_barrier(record::to_shader_read(
+            image.clone(),
+            record::levels(image, last..image.mip_levels()),
+            vulkano::image::ImageLayout::TransferDstOptimal,
+        ));
 }
 
 #[cfg(test)]

@@ -127,11 +127,11 @@ use self::timestamps::GpuTimestamps;
 use self::convert::{engine_format, vk_format};
 use self::driver::{VkDriver, VkEncoder};
 use super::{
-    DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TexelFormat, TextureHandle,
-    TextureLevels,
+    DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TextureHandle, TextureLevels,
 };
+use crate::gfx::format::Format as EngineFormat;
 use crate::gfx::rhi::{
-    BindGroupId, BufferDesc, BufferId, Device, Encoder, MemoryLocation, TextureViewId,
+    BindGroupId, BufferDesc, BufferId, Device, Encoder, Feature, MemoryLocation, TextureViewId,
 };
 use crate::profile::Profiler;
 use crate::profile_scope;
@@ -288,7 +288,7 @@ pub struct VulkanRenderer {
     pub(crate) materials: Vec<GpuMaterial>,
     /// Texture views indexed by `TextureHandle`. Index 0 is a 1x1 white texture
     /// and index 1 a flat normal map; materials without a given map point here.
-    pub(crate) textures: Vec<Arc<ImageView>>,
+    pub(crate) textures: Vec<TextureViewId>,
     /// The material table, shared by both geometry passes. `None` = dirty;
     /// rebuilt lazily in `render` after a `load_material`.
     material_buffer: Option<BufferId>,
@@ -466,27 +466,15 @@ impl VulkanRenderer {
         let motion_blur = MotionBlurPass::new(&device);
         let shadow = ShadowPass::new(&device);
         let line = LinePass::new(&device, &forward.targets);
-        let environment = EnvironmentPass::new(&ctx, &device, &forward.targets);
+        let environment = EnvironmentPass::new(&device, &forward.targets);
         let swapchain = make_target(&ctx, format, extent);
         let timestamps = GpuTimestamps::new(&ctx);
 
         // Default textures so every material slot resolves to a valid view:
         // index 0 = white (a no-op multiply), index 1 = flat normal (0,0,1).
         let textures = vec![
-            texture::upload_texture(
-                &ctx,
-                &[255, 255, 255, 255],
-                [1, 1],
-                Format::R8G8B8A8_UNORM,
-                texture::MipPolicy::None,
-            ),
-            texture::upload_texture(
-                &ctx,
-                &[128, 128, 255, 255],
-                [1, 1],
-                Format::R8G8B8A8_UNORM,
-                texture::MipPolicy::None,
-            ),
+            device.create_texture_2d(&[255, 255, 255, 255], [1, 1], EngineFormat::Rgba8Unorm),
+            device.create_texture_2d(&[128, 128, 255, 255], [1, 1], EngineFormat::Rgba8Unorm),
         ];
 
         // Compiled for the editor's frame, which is what all but the headless
@@ -999,17 +987,13 @@ impl RenderBackend for VulkanRenderer {
         // Color maps are authored in sRGB so the GPU decodes them to linear on
         // sample; data maps (normal, metallic-roughness) are already linear.
         let format = if srgb {
-            Format::R8G8B8A8_SRGB
+            EngineFormat::Rgba8Srgb
         } else {
-            Format::R8G8B8A8_UNORM
+            EngineFormat::Rgba8Unorm
         };
-        let view = texture::upload_texture(
-            &self.ctx,
-            pixels,
-            [width, height],
-            format,
-            texture::MipPolicy::Generate,
-        );
+        let view = self
+            .device
+            .create_texture_mipped(pixels, [width, height], format);
         let handle = TextureHandle(self.textures.len() as u32);
         self.textures.push(view);
         self.invalidate_texture_sets();
@@ -1026,7 +1010,7 @@ impl RenderBackend for VulkanRenderer {
             tracing::warn!("texture {} cannot be replaced; reimport ignored", handle.0);
             return;
         }
-        if levels.format.block_side() > 1 && !self.ctx.samples_bc {
+        if levels.format.block_side() > 1 && !self.device.supports(Feature::BlockCompression) {
             tracing::warn!(
                 "texture {} is {}, which this device cannot sample; reimport ignored",
                 handle.0,
@@ -1034,19 +1018,11 @@ impl RenderBackend for VulkanRenderer {
             );
             return;
         }
-        let format = match levels.format {
-            TexelFormat::Rgba8Srgb => Format::R8G8B8A8_SRGB,
-            TexelFormat::Rgba8Unorm => Format::R8G8B8A8_UNORM,
-            TexelFormat::Bc5Unorm => Format::BC5_UNORM_BLOCK,
-            TexelFormat::Bc7Unorm => Format::BC7_UNORM_BLOCK,
-            TexelFormat::Bc7Srgb => Format::BC7_SRGB_BLOCK,
-        };
-        self.textures[index] = texture::upload_levels(
-            &self.ctx,
-            format,
-            [levels.width, levels.height],
-            &levels.levels,
+        let old = std::mem::replace(
+            &mut self.textures[index],
+            self.device.create_texture_levels(levels),
         );
+        self.device.destroy_texture(old);
         self.invalidate_texture_sets();
     }
 
@@ -1056,7 +1032,7 @@ impl RenderBackend for VulkanRenderer {
 
     fn load_environment(&mut self, pixels: &[f32], width: u32, height: u32) {
         self.environment
-            .set_source(&self.ctx, pixels, [width, height]);
+            .set_source(&self.device, pixels, [width, height]);
     }
 
     fn resize(&mut self, extent: [u32; 2]) {
@@ -1761,16 +1737,16 @@ impl VulkanRenderer {
         // With SSAO off the graph has no AO node, so the forward pass samples a
         // 1x1 white view instead: "no occlusion" with no second shader path.
         let ao_view = match self.frame.ids.ssao {
-            Some(ids) => self.images.view(ids.ao),
-            None => self.vk_view(self.ssao.white_view()),
+            Some(ids) => driver.import_view(self.images.view(ids.ao)),
+            None => self.ssao.white_view(),
         };
 
         // And again for the contact-shadow mask: with the march off there is no
         // node to read, so the forward pass samples a 1x1 white view and every
         // pixel reports "lit".
         let contact_shadow_view = match self.frame.ids.contact_shadows {
-            Some(id) => self.images.view(id),
-            None => self.vk_view(self.contact_shadows.lit_view()),
+            Some(id) => driver.import_view(self.images.view(id)),
+            None => self.contact_shadows.lit_view(),
         };
 
         // Same trick for shadows: with them off there is no cascade image to
@@ -1790,8 +1766,8 @@ impl VulkanRenderer {
         // nothing casting there is no atlas to read, so the forward pass samples
         // a 1x1 depth texture of 1.0 and every lookup reports "lit".
         let atlas_view = match self.frame.ids.shadow_atlas {
-            Some(id) => self.images.view(id),
-            None => self.vk_view(self.shadow.lit_atlas_view()),
+            Some(id) => driver.import_view(self.images.view(id)),
+            None => self.shadow.lit_atlas_view(),
         };
         // What the forward pass indexes the face table by. Empty when nothing
         // casts, which is the frame where every light's face index is -1.
@@ -1815,10 +1791,12 @@ impl VulkanRenderer {
             lighting,
             camera,
             self.swapchain.extent,
-            ao_view.clone(),
-            contact_shadow_view.clone(),
-            shadow_view.clone(),
-            atlas_view.clone(),
+            ao_view,
+            contact_shadow_view,
+            driver.import_view(shadow_view.clone()),
+            atlas_view,
+            self.environment.specular_view(),
+            self.environment.sampler(),
             shadows,
             atlas,
             material_set,
@@ -1831,8 +1809,10 @@ impl VulkanRenderer {
             // medium, three places that read it.
             self.fog.uniforms(),
             self.fog.volume_or_fallback(
-                &self.device,
-                self.frame.ids.fog.map(|ids| self.images.view(ids.volume)),
+                self.frame
+                    .ids
+                    .fog
+                    .map(|ids| driver.import_view(self.images.view(ids.volume))),
             ),
             self.fog.sampler(),
         );
@@ -2698,7 +2678,7 @@ impl FrameRecord<'_> {
                     let depth = driver.import_view(self.images.view(prepass.depth));
                     let normal = driver.import_view(self.images.view(prepass.normal));
                     let material = driver.import_view(self.images.view(prepass.material));
-                    let environment = driver.import_view(self.environment.specular_view());
+                    let environment = self.environment.specular_view();
                     let target = driver.import_view(self.images.view(ids.output));
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.ssr.record_resolve(
@@ -3286,8 +3266,10 @@ impl FrameRecord<'_> {
                     msaa,
                     self.fog.uniforms(),
                     self.fog.volume_or_fallback(
-                        self.device,
-                        self.frame.ids.fog.map(|ids| self.images.view(ids.volume)),
+                        self.frame
+                            .ids
+                            .fog
+                            .map(|ids| driver.import_view(self.images.view(ids.volume))),
                     ),
                     self.fog.sampler(),
                 );

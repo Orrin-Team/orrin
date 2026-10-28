@@ -18,8 +18,6 @@
 //! denoises the rays; after shading, so what a ray finds is lit.
 
 use glam::Vec3;
-use std::sync::Arc;
-use vulkano::image::sampler::Sampler;
 
 use crate::gfx::rhi::{
     Binding, BindingResource, BufferId, ComputePipelineDesc, Device, Encoder, PipelineId,
@@ -338,10 +336,10 @@ impl SsrPass {
         normal: TextureViewId,
         material: TextureViewId,
         environment: TextureViewId,
-        environment_sampler: Arc<Sampler>,
+        environment_sampler: SamplerId,
         target: TextureViewId,
     ) {
-        let Device::Vulkan(driver) = device;
+        let Device::Vulkan(_driver) = device;
         let set = device.create_transient_bind_group(
             self.resolve_pipeline,
             0,
@@ -364,7 +362,7 @@ impl SsrPass {
                 },
                 Binding {
                     binding: 7,
-                    resource: BindingResource::Sampler(driver.import_sampler(environment_sampler)),
+                    resource: BindingResource::Sampler(environment_sampler),
                 },
                 Binding {
                     binding: 8,

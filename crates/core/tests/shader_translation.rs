@@ -16,12 +16,6 @@ use orrin_core::gfx::shaders::{
     VERTEX_STREAM_BASE,
 };
 
-/// What the Rust sources ask `vulkano_shaders::shader!` for: the shader file,
-/// its stage and its defines. Parsed from the text, so a pass added without a
-/// manifest row is a failure here rather than a shader Metal never sees.
-/// (shader file, stage, sorted defines)
-type Invocation = (String, String, Vec<(String, String)>);
-
 fn all_sources() -> Vec<String> {
     fn walk(dir: &Path, out: &mut Vec<String>) {
         for entry in fs::read_dir(dir).unwrap() {
@@ -41,119 +35,30 @@ fn all_sources() -> Vec<String> {
     sources
 }
 
-fn invoked_shaders() -> BTreeSet<Invocation> {
-    let sources = all_sources();
-
-    let mut found = BTreeSet::new();
-    for source in &sources {
-        for (at, _) in source.match_indices("shader!") {
-            let Some(open) = source[at..].find('{') else {
-                continue;
-            };
-            let start = at + open + 1;
-            let mut depth = 1;
-            let mut end = start;
-            for (offset, c) in source[start..].char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => depth -= 1,
-                    _ => {}
-                }
-                if depth == 0 {
-                    end = start + offset;
-                    break;
-                }
-            }
-            let body = &source[start..end];
-            let quoted = |key: &str| -> Option<String> {
-                let from = body.find(key)? + key.len();
-                let rest = &body[from..];
-                let open = rest.find('"')? + 1;
-                let close = rest[open..].find('"')? + open;
-                Some(rest[open..close].to_string())
-            };
-            let (Some(stage), Some(path)) = (quoted("ty:"), quoted("path:")) else {
-                continue;
-            };
-            let mut defines = Vec::new();
-            if let Some(from) = body.find("define:") {
-                let list = &body[from..];
-                let list = &list[..list.find(']').unwrap_or(list.len())];
-                let mut parts = list.split('"').skip(1).step_by(2);
-                while let (Some(name), Some(value)) = (parts.next(), parts.next()) {
-                    defines.push((name.to_string(), value.to_string()));
-                }
-            }
-            defines.sort();
-            found.insert((
-                path.trim_start_matches("shaders/").to_string(),
-                stage,
-                defines,
-            ));
-        }
-    }
-    found
-}
-
-fn stage_name(stage: Stage) -> &'static str {
-    match stage {
-        Stage::Vertex => "vertex",
-        Stage::Fragment => "fragment",
-        Stage::Compute => "compute",
-    }
-}
-
+/// Every shader reaches a driver through the manifest and a `ShaderId`, so the
+/// one build produces both the SPIR-V Vulkan loads and the MSL Metal will. A
+/// shader compiled any other way would exist for one backend only.
 #[test]
-fn the_manifest_covers_every_shader_the_passes_compile() {
-    let invoked = invoked_shaders();
-    assert!(
-        !invoked.is_empty(),
-        "found no shader! invocations to compare"
-    );
-    let translated: BTreeSet<_> = SHADERS
-        .iter()
-        .map(|shader| {
-            let mut defines: Vec<_> = shader
-                .defines
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            defines.sort();
-            (
-                shader.path.to_string(),
-                stage_name(shader.stage).to_string(),
-                defines,
-            )
-        })
-        .collect();
-    // A pass ported onto the RHI names its shaders by `ShaderId` instead of
-    // compiling them with the macro, and that is a use too.
+fn every_shader_goes_through_the_manifest() {
     let sources = all_sources();
-    let by_id: BTreeSet<_> = orrin_core::gfx::shaders::ShaderId::ALL
+    let bypassing = sources
+        .iter()
+        .filter(|source| source.contains("vulkano_shaders"))
+        .count();
+    assert_eq!(
+        bypassing, 0,
+        "{bypassing} sources compile shaders themselves"
+    );
+
+    let unused: Vec<_> = orrin_core::gfx::shaders::ShaderId::ALL
         .iter()
         .filter(|id| {
-            sources
+            !sources
                 .iter()
                 .any(|src| src.contains(&format!("ShaderId::{id:?}")))
         })
-        .map(|id| id.blob().name)
         .collect();
-    let missing: Vec<_> = invoked.difference(&translated).collect();
-    let stale: Vec<_> = translated
-        .difference(&invoked)
-        .filter(|(path, stage, defines)| {
-            !SHADERS.iter().any(|shader| {
-                by_id.contains(shader.name)
-                    && shader.path == path
-                    && stage_name(shader.stage) == stage
-                    && shader.defines.len() == defines.len()
-            })
-        })
-        .collect();
-    assert!(
-        missing.is_empty() && stale.is_empty(),
-        "compiled but not translated: {missing:#?}\ntranslated but never compiled: {stale:#?}",
-    );
+    assert!(unused.is_empty(), "translated but never used: {unused:#?}");
 }
 
 #[test]
