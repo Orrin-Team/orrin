@@ -133,6 +133,7 @@ impl GeometryPrepass {
                 cull,
                 depth_test: Some(DepthTest { write: true }),
                 partial_texture_set: Some(TEXTURE_SET as u32),
+                dynamic_depth_bias: false,
             })
         };
         let pipeline_plain = pipeline(ShaderId::PrepassFrag, CullMode::Back);

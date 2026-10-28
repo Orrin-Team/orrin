@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{Buffer, BufferCreateInfo, Subbuffer};
+use vulkano::command_buffer::{ClearAttachment, ClearRect};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format as VkFormat;
 use vulkano::image::sampler::{
@@ -30,11 +31,12 @@ use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorB
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::CullMode as VkCullMode;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
+use vulkano::pipeline::graphics::rasterization::{CullMode as VkCullMode, DepthBiasState};
 use vulkano::pipeline::graphics::vertex_input::{
     VertexBufferDescription, VertexDefinition, VertexInputRate, VertexInputState, VertexMemberInfo,
 };
+use vulkano::pipeline::graphics::viewport::Scissor;
 use vulkano::pipeline::graphics::viewport::ViewportState;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
@@ -51,8 +53,8 @@ use super::rendering;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, BufferDesc, BufferId, ComputePipelineDesc, CullMode,
-    GraphicsPipelineDesc, PipelineId, Pool, SamplerDesc, SamplerId, TextureViewId, VertexFormat,
-    VertexStream, Viewport,
+    DepthRect, GraphicsPipelineDesc, PipelineId, Pool, SamplerDesc, SamplerId, TextureViewId,
+    VertexFormat, VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -242,6 +244,7 @@ impl VkDriver {
                         CullMode::None => VkCullMode::None,
                         CullMode::Back => VkCullMode::Back,
                     },
+                    depth_bias: desc.dynamic_depth_bias.then(DepthBiasState::default),
                     ..Default::default()
                 }),
                 multisample_state: Some(MultisampleState::default()),
@@ -252,11 +255,27 @@ impl VkDriver {
                     }),
                     ..Default::default()
                 }),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    colors.len() as u32,
-                    ColorBlendAttachmentState::default(),
-                )),
-                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                // A depth-only pass has no attachments to blend into.
+                color_blend_state: (!colors.is_empty()).then(|| {
+                    ColorBlendState::with_attachment_states(
+                        colors.len() as u32,
+                        ColorBlendAttachmentState::default(),
+                    )
+                }),
+                dynamic_state: if desc.dynamic_depth_bias {
+                    // Scissor as well as viewport, because the atlas aims the
+                    // pipeline at one tile of a shared attachment and the
+                    // viewport alone does not promise a fragment stays inside it.
+                    [
+                        DynamicState::Viewport,
+                        DynamicState::Scissor,
+                        DynamicState::DepthBias,
+                    ]
+                    .into_iter()
+                    .collect()
+                } else {
+                    [DynamicState::Viewport].into_iter().collect()
+                },
                 subpass: Some(
                     rendering::pipeline_info(&colors, desc.depth_format.map(vk_format)).into(),
                 ),
@@ -499,6 +518,25 @@ impl<'a> VkEncoder<'a> {
                 extent: viewport.extent,
                 depth_range: viewport.depth_range[0]..=viewport.depth_range[1],
             }],
+        );
+    }
+
+    pub fn set_scissor(&mut self, offset: [u32; 2], extent: [u32; 2]) {
+        self.recorder.set_scissor(0, &[Scissor { offset, extent }]);
+    }
+
+    pub fn set_depth_bias(&mut self, constant: f32, clamp: f32, slope: f32) {
+        self.recorder.set_depth_bias(constant, clamp, slope);
+    }
+
+    pub fn clear_depth(&mut self, rects: &[DepthRect]) {
+        self.recorder.clear_attachments(
+            [ClearAttachment::Depth(1.0)],
+            rects.iter().map(|rect| ClearRect {
+                offset: rect.offset,
+                extent: rect.extent,
+                array_layers: 0..1,
+            }),
         );
     }
 

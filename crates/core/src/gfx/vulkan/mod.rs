@@ -437,7 +437,7 @@ impl VulkanRenderer {
         let taa = TaaPass::new(&ctx);
         let dof = DofPass::new(&ctx);
         let motion_blur = MotionBlurPass::new(&ctx);
-        let shadow = ShadowPass::new(&ctx);
+        let shadow = ShadowPass::new(&ctx, &device);
         let line = LinePass::new(&ctx, &forward.targets);
         let environment = EnvironmentPass::new(&ctx, &forward.targets);
         let swapchain = make_target(&ctx, format, extent);
@@ -1536,11 +1536,16 @@ impl VulkanRenderer {
             ));
         }
         if self.shadow_material_set.is_none() {
-            self.shadow_material_set = Some(self.shadow.build_material_set(&self.ctx, &materials));
+            self.shadow_material_set = Some(self.shadow.build_material_set(
+                &self.ctx,
+                &self.device,
+                &materials,
+            ));
         }
         if self.shadow_texture_set.is_none() {
             self.shadow_texture_set = Some(self.shadow.build_texture_set(
                 &self.ctx,
+                &self.device,
                 &self.textures,
                 self.prepass.material_sampler(),
             ));
@@ -1666,9 +1671,12 @@ impl VulkanRenderer {
         // the prepass's alike. See `ForwardPass::upload_decals`.
         let decal_block = self.forward.upload_decals(decals);
         let caster_sets = shadows.is_some().then(|| shadow::CasterSets {
-            objects: self
-                .shadow
-                .build_object_set(&self.ctx, &object_rows, &opaque_indices),
+            objects: self.shadow.build_object_set(
+                &self.ctx,
+                &self.device,
+                &object_rows,
+                &opaque_indices,
+            ),
             materials: self.shadow_material_set.clone().unwrap(),
             textures: self.shadow_texture_set.clone().unwrap(),
         });
@@ -3023,8 +3031,11 @@ impl FrameRecord<'_> {
                     .shadows
                     .expect("the graph scheduled a cascade with no shadows");
                 let cascade_index = cascade as usize;
+                let Device::Vulkan(driver) = self.device;
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.shadow.record(
-                    builder,
+                    self.device,
+                    &mut encoder,
                     &self.pass_ctx(),
                     self.opaque_draws(
                         1 + cascade,
@@ -3046,8 +3057,11 @@ impl FrameRecord<'_> {
                     .cull_frame
                     .as_ref()
                     .map(|frame| (frame, self.cull.commands(), self.first_face_view()));
+                let Device::Vulkan(driver) = self.device;
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.shadow.record_atlas(
-                    builder,
+                    self.device,
+                    &mut encoder,
                     &self.pass_ctx(),
                     shadows.atlas,
                     shadows.punctual_casters,

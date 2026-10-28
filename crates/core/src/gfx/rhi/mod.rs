@@ -22,7 +22,7 @@ mod pool;
 pub(crate) use pool::Pool;
 
 pub use desc::{
-    Binding, BindingResource, BufferDesc, ComputePipelineDesc, CullMode, DepthTest,
+    Binding, BindingResource, BufferDesc, ComputePipelineDesc, CullMode, DepthRect, DepthTest,
     GraphicsPipelineDesc, MemoryLocation, SamplerDesc, TextureDesc, TextureDimension,
     VertexAttribute, VertexFormat, VertexStream, Viewport,
 };
@@ -120,6 +120,25 @@ impl Encoder<'_> {
     pub fn set_viewport(&mut self, viewport: Viewport) {
         match self {
             Encoder::Vulkan(encoder) => encoder.set_viewport(viewport),
+        }
+    }
+
+    pub fn set_scissor(&mut self, offset: [u32; 2], extent: [u32; 2]) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.set_scissor(offset, extent),
+        }
+    }
+
+    pub fn set_depth_bias(&mut self, constant: f32, clamp: f32, slope: f32) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.set_depth_bias(constant, clamp, slope),
+        }
+    }
+
+    /// Clear depth to 1.0 over `rects` of the attachment being rendered into.
+    pub fn clear_depth(&mut self, rects: &[DepthRect]) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.clear_depth(rects),
         }
     }
 

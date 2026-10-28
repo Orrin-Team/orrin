@@ -114,6 +114,8 @@ pub struct GraphicsPipelineDesc<'a> {
     /// The set whose binding 0 is the material texture array, to be created
     /// partially bound where the device allows it.
     pub partial_texture_set: Option<u32>,
+    /// Depth bias, scissor and viewport are dynamic rather than viewport alone.
+    pub dynamic_depth_bias: bool,
 }
 
 impl<'a> GraphicsPipelineDesc<'a> {
@@ -128,6 +130,7 @@ impl<'a> GraphicsPipelineDesc<'a> {
             cull: CullMode::None,
             depth_test: None,
             partial_texture_set: None,
+            dynamic_depth_bias: false,
         }
     }
 }
@@ -152,4 +155,11 @@ pub enum BindingResource {
 pub struct Binding {
     pub binding: u32,
     pub resource: BindingResource,
+}
+
+/// A rectangle of a depth attachment, in texels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DepthRect {
+    pub offset: [u32; 2],
+    pub extent: [u32; 2],
 }
