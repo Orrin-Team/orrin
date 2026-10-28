@@ -108,6 +108,8 @@ impl ShadowPass {
                 blend: Blend::None,
                 topology: Topology::Triangles,
                 mask_extra_attachments: false,
+                attachment_blends: &[],
+                layout_from: None,
             })
         };
         // Back-face culling matches the forward pass, which is only correct

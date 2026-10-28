@@ -1,4 +1,4 @@
-use super::{BufferId, SamplerId, TextureViewId};
+use super::{BufferId, PipelineId, SamplerId, TextureViewId};
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::graph::{BufferUsage, ImageUsage};
 use crate::gfx::shaders::ShaderId;
@@ -103,6 +103,12 @@ pub enum Blend {
     /// Per-channel maximum, for a mask where overlapping draws must not take a
     /// channel back down.
     Max,
+    /// Plain addition of source and destination, which is commutative — the
+    /// property order-independent transparency rests on.
+    Additive,
+    /// `dst = dst * (1 - src)`: a running product, commutative for the same
+    /// reason, and why the target it multiplies into is cleared to one.
+    Revealage,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -160,6 +166,11 @@ pub struct GraphicsPipelineDesc<'a> {
     /// pass whose later attachments belong to someone else and whose shader
     /// declares one output: an undeclared output left unmasked is undefined data.
     pub mask_extra_attachments: bool,
+    /// Blend per colour attachment, overriding `blend` where non-empty.
+    pub attachment_blends: &'a [Blend],
+    /// Use this pipeline's whole layout instead of deriving one, for a pipeline
+    /// that is handed the descriptor sets another pipeline's pass bound.
+    pub layout_from: Option<PipelineId>,
 }
 
 impl<'a> GraphicsPipelineDesc<'a> {
@@ -181,6 +192,8 @@ impl<'a> GraphicsPipelineDesc<'a> {
             blend: Blend::None,
             topology: Topology::Triangles,
             mask_extra_attachments: false,
+            attachment_blends: &[],
+            layout_from: None,
         }
     }
 }

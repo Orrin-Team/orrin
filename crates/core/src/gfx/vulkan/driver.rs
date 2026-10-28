@@ -262,6 +262,11 @@ impl VkDriver {
                 .definition(&vertex)
                 .expect("a vertex stream does not match the shader's inputs")
         };
+        let lifted = desc.layout_from.map(|source| {
+            lookup(&self.pipelines, source.0, "pipeline")
+                .layout()
+                .clone()
+        });
         let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
         if let Some(set) = desc.partial_texture_set {
             self.ctx
@@ -274,13 +279,15 @@ impl VkDriver {
                 .expect("an immutable sampler names a binding the shaders declare")
                 .immutable_samplers = vec![lookup(&self.samplers, sampler.0, "sampler")];
         }
-        let layout = PipelineLayout::new(
-            device.clone(),
-            layout_info
-                .into_pipeline_layout_create_info(device.clone())
-                .unwrap(),
-        )
-        .unwrap();
+        let layout = lifted.unwrap_or_else(|| {
+            PipelineLayout::new(
+                device.clone(),
+                layout_info
+                    .into_pipeline_layout_create_info(device.clone())
+                    .unwrap(),
+            )
+            .unwrap()
+        });
         let colors: Vec<_> = desc.color_formats.iter().map(|&f| vk_format(f)).collect();
         let pipeline = GraphicsPipeline::new(
             device.clone(),
@@ -324,27 +331,16 @@ impl VkDriver {
                 color_blend_state: (!colors.is_empty()).then(|| {
                     let mut state = ColorBlendState::with_attachment_states(
                         colors.len() as u32,
-                        ColorBlendAttachmentState {
-                            blend: match desc.blend {
-                                Blend::None => None,
-                                Blend::Alpha => Some(AttachmentBlend::alpha()),
-                                // Max, so the hovered mesh drawn after a selected
-                                // one it overlaps cannot take the selected channel
-                                // back to zero.
-                                Blend::Max => Some(AttachmentBlend {
-                                    src_color_blend_factor: BlendFactor::One,
-                                    dst_color_blend_factor: BlendFactor::One,
-                                    color_blend_op: BlendOp::Max,
-                                    src_alpha_blend_factor: BlendFactor::One,
-                                    dst_alpha_blend_factor: BlendFactor::One,
-                                    alpha_blend_op: BlendOp::Max,
-                                }),
-                            },
-                            ..Default::default()
-                        },
+                        ColorBlendAttachmentState::default(),
                     );
-                    if desc.mask_extra_attachments {
-                        for attachment in state.attachments.iter_mut().skip(1) {
+                    for (index, attachment) in state.attachments.iter_mut().enumerate() {
+                        let blend = desc
+                            .attachment_blends
+                            .get(index)
+                            .copied()
+                            .unwrap_or(desc.blend);
+                        attachment.blend = attachment_blend(blend);
+                        if desc.mask_extra_attachments && index > 0 {
                             attachment.color_write_mask = ColorComponents::empty();
                         }
                     }
@@ -538,6 +534,35 @@ impl VkDriver {
         let index = pool.insert(set);
         pool.remove(index, self.frame.load(Ordering::Relaxed));
         BindGroupId(index)
+    }
+}
+
+fn attachment_blend(blend: Blend) -> Option<AttachmentBlend> {
+    let factors = |src, dst, op| AttachmentBlend {
+        src_color_blend_factor: src,
+        dst_color_blend_factor: dst,
+        color_blend_op: op,
+        src_alpha_blend_factor: src,
+        dst_alpha_blend_factor: dst,
+        alpha_blend_op: op,
+    };
+    match blend {
+        Blend::None => None,
+        Blend::Alpha => Some(AttachmentBlend::alpha()),
+        // Max, so the hovered mesh drawn after a selected one it overlaps cannot
+        // take the selected channel back to zero.
+        Blend::Max => Some(factors(BlendFactor::One, BlendFactor::One, BlendOp::Max)),
+        Blend::Additive => Some(factors(BlendFactor::One, BlendFactor::One, BlendOp::Add)),
+        // The colour and alpha factors differ here, as the pipeline always had
+        // them: `OneMinusSrcColor` on colour and `OneMinusSrcAlpha` on alpha.
+        Blend::Revealage => Some(AttachmentBlend {
+            src_color_blend_factor: BlendFactor::Zero,
+            dst_color_blend_factor: BlendFactor::OneMinusSrcColor,
+            color_blend_op: BlendOp::Add,
+            src_alpha_blend_factor: BlendFactor::Zero,
+            dst_alpha_blend_factor: BlendFactor::OneMinusSrcAlpha,
+            alpha_blend_op: BlendOp::Add,
+        }),
     }
 }
 

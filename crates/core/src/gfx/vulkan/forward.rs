@@ -769,6 +769,8 @@ impl ForwardPass {
                 blend: Blend::None,
                 topology: Topology::Triangles,
                 mask_extra_attachments: false,
+                attachment_blends: &[],
+                layout_from: None,
             })
         };
         let msaa = MSAA_SAMPLES;
@@ -887,6 +889,12 @@ impl ForwardPass {
     /// The layout the transparency pass builds its own pipeline with. Shared
     /// rather than derived a second time, so the two pipelines cannot disagree
     /// about a binding — see `oit.rs`.
+    /// The pipeline whose layout the blended-geometry passes are handed the
+    /// descriptor sets of.
+    pub(super) fn layout_source(&self) -> PipelineId {
+        self.single.plain
+    }
+
     pub(super) fn pipeline_layout(&self, device: &Device) -> Arc<PipelineLayout> {
         let Device::Vulkan(driver) = device;
         driver.pipeline_layout(self.single.plain)

@@ -428,7 +428,7 @@ impl VulkanRenderer {
         let fog = FogPass::new(&ctx);
         let ssr = SsrPass::new(&ctx);
         let subsurface = SubsurfacePass::new(&device);
-        let oit = OitPass::new(&ctx, &device, &forward.pipeline_layout(&device));
+        let oit = OitPass::new(&device, forward.layout_source());
         let refraction = RefractionPass::new(&ctx, &device, &forward.pipeline_layout(&device));
         let taa = TaaPass::new(&ctx);
         let dof = DofPass::new(&ctx);
@@ -3209,15 +3209,20 @@ impl FrameRecord<'_> {
                     msaa,
                 );
             }
-            PassBody::OitAccumulate => self.oit.record(
-                builder,
-                &self.pass_ctx(),
-                self.transparent,
-                &self.blended_sets,
-                &self.view,
-                self.extent,
-                self.objects.transparent_base,
-            ),
+            PassBody::OitAccumulate => {
+                let Device::Vulkan(driver) = self.device;
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                self.oit.record(
+                    self.device,
+                    &mut encoder,
+                    &self.pass_ctx(),
+                    self.transparent,
+                    &self.blended_sets,
+                    &self.view,
+                    self.extent,
+                    self.objects.transparent_base,
+                );
+            }
             PassBody::RefractionDraw => {
                 let ids = self
                     .frame
