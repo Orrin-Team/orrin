@@ -6,6 +6,14 @@
 //! why the graph is shaped around it.
 
 const DEVICE_FREE: &[(&str, &str)] = &[
+    ("gfx/format.rs", include_str!("../src/gfx/format.rs")),
+    (
+        "gfx/graph/sync.rs",
+        include_str!("../src/gfx/graph/sync.rs"),
+    ),
+    ("gfx/rhi/mod.rs", include_str!("../src/gfx/rhi/mod.rs")),
+    ("gfx/rhi/desc.rs", include_str!("../src/gfx/rhi/desc.rs")),
+    ("gfx/rhi/pool.rs", include_str!("../src/gfx/rhi/pool.rs")),
     (
         "gfx/graph/access.rs",
         include_str!("../src/gfx/graph/access.rs"),

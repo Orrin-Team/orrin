@@ -2,6 +2,7 @@ pub mod format;
 pub mod graph;
 pub mod headless;
 pub mod punctual;
+pub mod rhi;
 pub mod sh;
 pub mod shaders;
 pub mod shadows;
