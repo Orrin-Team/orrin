@@ -17,25 +17,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use glam::{Mat4, Vec2};
-use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
-use vulkano::buffer::{BufferContents, BufferUsage};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
-};
+use vulkano::memory::allocator::AllocationCreateInfo;
 
+use crate::gfx::rhi::{
+    Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId, SamplerDesc,
+    SamplerId, TextureViewId,
+};
+use crate::gfx::shaders::ShaderId;
 use crate::scene::{Camera, TaaSettings};
 
 use super::context::VkContext;
 use super::convert::vk_format;
 use super::hdr::HDR_FORMAT;
-use super::record::{Arena, Recorder};
 
 /// Side of the resolve's compute workgroup.
 const TILE: u32 = 8;
@@ -69,27 +64,15 @@ pub(super) struct FrameView {
     pub jitter: Vec2,
 }
 
-/// Uniforms for the resolve. A buffer rather than push constants because two
-/// mat4s already fill the guaranteed 128-byte push range on their own.
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct TaaUbo {
-    inv_view_proj: [[f32; 4]; 4],
-    prev_view_proj: [[f32; 4]; 4],
-    /// xy = 1/extent, z = history weight, w != 0 to ignore the history.
-    params: [f32; 4],
-}
-
 pub struct TaaPass {
-    pipeline: Arc<ComputePipeline>,
+    pipeline: PipelineId,
     /// Linear and clamped: the history is resampled at a reprojected coordinate
     /// that almost never lands on a texel centre, and the bicubic fetch in the
     /// shader is built out of bilinear taps.
-    linear_clamp: Arc<Sampler>,
+    linear_clamp: SamplerId,
     /// Nearest, because velocity and depth are fetched at exact texels and
     /// interpolating either across a silhouette invents a surface.
-    nearest_clamp: Arc<Sampler>,
-    uniform_allocator: Arena,
+    nearest_clamp: SamplerId,
     /// Ping-ponged: `frame & 1` is this frame's target and the other is the
     /// history. Empty until the first frame TAA is enabled for.
     history: Option<[Arc<ImageView>; 2]>,
@@ -109,50 +92,27 @@ pub struct TaaPass {
 }
 
 impl TaaPass {
-    pub fn new(ctx: &VkContext) -> Self {
-        let device = &ctx.device;
-        let pipeline = build_pipeline(
-            ctx,
-            resolve_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
-
-        let linear_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
-            },
-        )
-        .unwrap();
-        let nearest_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::default()
-            },
-        )
-        .unwrap();
-
-        let uniform_allocator = Arena::new(
-            ctx.memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
+    pub fn new(device: &Device) -> Self {
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
+            shader: ShaderId::TaaResolveComp,
+        });
+        let sampler = |linear: bool| {
+            device.create_sampler(SamplerDesc {
+                linear,
+                mipmap_linear: false,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(if linear { 1.0 } else { 0.0 }),
+            })
+        };
+        let linear_clamp = sampler(true);
+        let nearest_clamp = sampler(false);
 
         Self {
             pipeline,
             linear_clamp,
             nearest_clamp,
-            uniform_allocator,
             history: None,
             extent: [0, 0],
             frame: 0,
@@ -235,61 +195,72 @@ impl TaaPass {
 
     pub(super) fn record(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
+        device: &Device,
+        builder: &mut Encoder,
         view: &FrameView,
-        color: Arc<ImageView>,
-        velocity: Arc<ImageView>,
-        depth: Arc<ImageView>,
+        color: TextureViewId,
+        velocity: TextureViewId,
+        depth: TextureViewId,
     ) {
+        let Device::Vulkan(driver) = device;
         let target = self.output_view();
         let extent = target.image().extent();
 
-        let uniforms = self.uniform_allocator.allocate_sized::<TaaUbo>();
-        *uniforms.write().unwrap() = TaaUbo {
-            inv_view_proj: view.unjittered_view_proj.inverse().to_cols_array_2d(),
-            prev_view_proj: view.prev_view_proj.to_cols_array_2d(),
-            params: [
-                1.0 / extent[0] as f32,
-                1.0 / extent[1] as f32,
-                self.settings.feedback.clamp(0.0, 0.99),
-                self.reset.load(Ordering::Relaxed) as u32 as f32,
-            ],
+        // The resolve's uniforms: a buffer rather than push constants because
+        // two mat4s already fill the guaranteed 128-byte push range on their own.
+        // `params`: xy = 1/extent, z = history weight, w != 0 to ignore the
+        // history.
+        let params = [
+            1.0 / extent[0] as f32,
+            1.0 / extent[1] as f32,
+            self.settings.feedback.clamp(0.0, 0.99),
+            self.reset.load(Ordering::Relaxed) as u32 as f32,
+        ];
+        let mut words = [0u32; 36];
+        let matrices = [
+            view.unjittered_view_proj.inverse().to_cols_array_2d(),
+            view.prev_view_proj.to_cols_array_2d(),
+        ];
+        for (word, float) in words
+            .iter_mut()
+            .zip(matrices.iter().flatten().flatten().chain(&params))
+        {
+            *word = float.to_bits();
+        }
+        let uniforms = driver.upload_uniform(&words);
+
+        let sampled = |binding, view, sampler| Binding {
+            binding,
+            resource: BindingResource::SampledTexture { view, sampler },
         };
-
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::image_view_sampler(0, color, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(
+        let set = device.create_bind_group(
+            self.pipeline,
+            0,
+            &[
+                sampled(0, color, self.nearest_clamp),
+                sampled(
                     1,
-                    self.history_view(),
-                    self.linear_clamp.clone(),
+                    driver.import_view(self.history_view()),
+                    self.linear_clamp,
                 ),
-                WriteDescriptorSet::image_view_sampler(2, velocity, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(3, depth, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(4, target),
-                WriteDescriptorSet::buffer(5, uniforms),
+                sampled(2, velocity, self.nearest_clamp),
+                sampled(3, depth, self.nearest_clamp),
+                Binding {
+                    binding: 4,
+                    resource: BindingResource::StorageTexture(driver.import_view(target)),
+                },
+                Binding {
+                    binding: 5,
+                    resource: BindingResource::UniformBuffer(uniforms),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
-        builder
-            .bind_pipeline_compute(&self.pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.pipeline.layout(),
-                0,
-                &[set],
-            );
+        builder.bind_pipeline(self.pipeline);
+        builder.bind_group(0, set);
 
-        // SAFETY: the dispatch covers exactly the target's extent and the shader
-        // discards invocations past `imageSize(u_target)`, so nothing writes
-        // outside it. The descriptors bound above match the shader's layout, and
-        // the graph declared every resource this pass touches, so its barriers
-        // precede it.
+        // The dispatch covers exactly the target's extent and the shader discards
+        // invocations past `imageSize(u_target)`, so nothing writes outside it.
         builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
 
         // The frame that just resolved is the history the next one reads, so
@@ -354,31 +325,6 @@ fn allocate_history(ctx: &VkContext, extent: [u32; 2]) -> [Arc<ImageView>; 2] {
         .expect("failed to allocate the TAA history");
         ImageView::new_default(image).unwrap()
     })
-}
-
-fn build_pipeline(
-    ctx: &VkContext,
-    entry_point: vulkano::shader::EntryPoint,
-) -> Arc<ComputePipeline> {
-    let device = &ctx.device;
-    let stage = PipelineShaderStageCreateInfo::new(entry_point);
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    ComputePipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )
-    .unwrap()
-}
-
-mod resolve_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/taa_resolve.comp" }
 }
 
 #[cfg(test)]

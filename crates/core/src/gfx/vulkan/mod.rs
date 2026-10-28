@@ -430,7 +430,7 @@ impl VulkanRenderer {
         let subsurface = SubsurfacePass::new(&device);
         let oit = OitPass::new(&device, forward.layout_source());
         let refraction = RefractionPass::new(&device, forward.layout_source());
-        let taa = TaaPass::new(&ctx);
+        let taa = TaaPass::new(&device);
         let dof = DofPass::new(&ctx);
         let motion_blur = MotionBlurPass::new(&ctx);
         let shadow = ShadowPass::new(&ctx, &device);
@@ -2784,13 +2784,18 @@ impl FrameRecord<'_> {
                         .prepass
                         .expect("the graph scheduled TAA with no prepass");
                     let taa = self.frame.ids.taa.expect("TAA without its images");
+                    let Device::Vulkan(driver) = self.device;
+                    let color = driver.import_view(self.view_of(taa.source));
+                    let velocity = driver.import_view(self.images.view(ids.velocity));
+                    let depth = driver.import_view(self.images.view(ids.depth));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.taa.record(
-                        builder,
-                        self.ctx,
+                        self.device,
+                        &mut encoder,
                         &self.view,
-                        self.view_of(taa.source),
-                        self.images.view(ids.velocity),
-                        self.images.view(ids.depth),
+                        color,
+                        velocity,
+                        depth,
                     );
                 }
                 PassBody::DofPrefilter => {
