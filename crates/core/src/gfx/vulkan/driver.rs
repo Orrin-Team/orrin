@@ -15,6 +15,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{Buffer, BufferCreateInfo, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{
@@ -39,8 +40,9 @@ use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
 
 use super::context::VkContext;
 use super::convert::{vk_buffer_usage, vk_format};
-use super::record::Recorder;
+use super::record::{Arena, Recorder};
 use super::rendering;
+use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, BufferDesc, BufferId, ComputePipelineDesc,
     GraphicsPipelineDesc, PipelineId, Pool, SamplerDesc, SamplerId, TextureViewId, Viewport,
@@ -69,6 +71,7 @@ pub struct VkDriver {
     buffers: Mutex<Pool<Subbuffer<[u8]>>>,
     samplers: Mutex<Pool<Arc<Sampler>>>,
     pipelines: Mutex<Pool<PipelineObject>>,
+    uniforms: Arena,
     bind_groups: Mutex<Pool<Arc<DescriptorSet>>>,
 }
 
@@ -82,6 +85,15 @@ fn lookup<T: Clone>(pool: &Mutex<Pool<T>>, index: u32, what: &str) -> T {
 
 impl VkDriver {
     pub fn new(ctx: Arc<VkContext>, frames_in_flight: u64) -> Self {
+        let uniforms = Arena::new(
+            ctx.memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: vulkano::buffer::BufferUsage::UNIFORM_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        );
         Self {
             ctx,
             frame: AtomicU64::new(0),
@@ -89,6 +101,7 @@ impl VkDriver {
             buffers: Mutex::new(Pool::new(frames_in_flight)),
             samplers: Mutex::new(Pool::new(frames_in_flight)),
             pipelines: Mutex::new(Pool::new(frames_in_flight)),
+            uniforms,
             bind_groups: Mutex::new(Pool::new(frames_in_flight)),
         }
     }
@@ -112,15 +125,26 @@ impl VkDriver {
         TextureViewId(index)
     }
 
-    pub fn create_solid_texture(&self, rgba: [u8; 4]) -> TextureViewId {
+    pub fn create_texture_2d(
+        &self,
+        pixels: &[u8],
+        extent: [u32; 2],
+        format: Format,
+    ) -> TextureViewId {
         let view = super::texture::upload_texture(
             &self.ctx,
-            &rgba,
-            [1, 1],
-            vk_format(crate::gfx::format::Format::Rgba8Unorm),
+            pixels,
+            extent,
+            vk_format(format),
             super::texture::MipPolicy::None,
         );
         TextureViewId(self.views.lock().unwrap().insert(view))
+    }
+
+    pub fn upload_uniform(&self, words: &[u32]) -> BufferId {
+        let buffer = self.uniforms.allocate_slice::<u32>(words.len() as u64);
+        buffer.write().unwrap().copy_from_slice(words);
+        self.import_buffer(buffer.into_bytes())
     }
 
     pub fn view_extent(&self, view: TextureViewId) -> [u32; 2] {
@@ -286,6 +310,10 @@ impl VkDriver {
                 BindingResource::StorageTexture(view) => WriteDescriptorSet::image_view(
                     binding.binding,
                     lookup(&self.views, view.0, "texture view"),
+                ),
+                BindingResource::UniformBuffer(buffer) => WriteDescriptorSet::buffer(
+                    binding.binding,
+                    lookup(&self.buffers, buffer.0, "buffer"),
                 ),
                 BindingResource::StorageBuffer(buffer) => WriteDescriptorSet::buffer(
                     binding.binding,

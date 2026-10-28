@@ -9,6 +9,7 @@
 //! otherwise buy, and `an_upsample_cannot_accumulate_into_the_level_it_read`
 //! is the test that pins the reason.
 
+use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     Binding, BindingResource, BufferId, ComputePipelineDesc, Device, Encoder, PipelineId,
     SamplerDesc, SamplerId, TextureViewId,
@@ -78,7 +79,7 @@ impl BloomPass {
                 anisotropy: None,
                 max_lod: Some(1.0),
             }),
-            black: device.create_solid_texture([0, 0, 0, 255]),
+            black: device.create_texture_2d(&[0, 0, 0, 255], [1, 1], Format::Rgba8Unorm),
             settings: BloomSettings::default(),
             hdr: HdrSettings::default(),
         }

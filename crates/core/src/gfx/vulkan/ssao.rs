@@ -1,48 +1,28 @@
 use std::sync::Arc;
 
-use super::PassCtx;
+use vulkano::buffer::Subbuffer;
+use vulkano::image::view::ImageView;
+
 use super::context::VkContext;
 use super::convert::vk_format;
+use super::driver::VkDriver;
 use super::prepass::{FrameUbo, NORMAL_FORMAT};
-use super::record::{Arena, Recorder};
-use super::rendering;
 use super::texture::MipPolicy;
-use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
-use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-use vulkano::memory::allocator::MemoryTypeFilter;
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
-use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::RasterizationState;
-use vulkano::pipeline::graphics::vertex_input::VertexInputState;
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-    PipelineShaderStageCreateInfo,
+use crate::gfx::rhi::{
+    Binding, BindingResource, BufferId, Device, Encoder, GraphicsPipelineDesc, PipelineId,
+    SamplerDesc, SamplerId, TextureViewId, Viewport,
 };
-use vulkano::shader::EntryPoint;
+use crate::gfx::shaders::ShaderId;
 
 pub(super) const AO_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::R8Unorm;
 const NOISE_SIZE: u32 = 4;
 const KERNEL_SIZE: usize = 32;
 const KERNEL_MAX: usize = 64;
 
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct SsaoParamsUbo {
-    kernel: [[f32; 4]; KERNEL_MAX],
-    noise_scale: [f32; 2],
-    radius: f32,
-    bias: f32,
-    power: f32,
-    kernel_size: i32,
-    _pad: [f32; 2], // round 1048 -> 1056 (multiple of 16) for std140
-}
+/// The resolve's tunables, as the words of its std140 block: the kernel, then
+/// the noise scale, radius, bias, power and kernel size, padded from 1048 to 1056
+/// bytes (a multiple of 16).
+const PARAMS_WORDS: usize = KERNEL_MAX * 4 + 8;
 
 fn build_kernel() -> [[f32; 4]; KERNEL_MAX] {
     let mut seed: u64 = 0x2545F491_4F6CDD1D;
@@ -63,7 +43,7 @@ fn build_kernel() -> [[f32; 4]; KERNEL_MAX] {
     kernel
 }
 
-fn build_noise(ctx: &VkContext) -> Arc<ImageView> {
+fn build_noise(device: &Device) -> TextureViewId {
     let mut seed: u64 = 0x9E3779B9_7F4A7C15;
     let mut next = || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -80,53 +60,7 @@ fn build_noise(ctx: &VkContext) -> Arc<ImageView> {
             255,
         ]);
     }
-    super::texture::upload_texture(
-        ctx,
-        &pixels,
-        [NOISE_SIZE, NOISE_SIZE],
-        vk_format(NORMAL_FORMAT),
-        MipPolicy::None,
-    )
-}
-
-fn build_fullscreen_pipeline(
-    ctx: &VkContext,
-    vs: EntryPoint,
-    fs: EntryPoint,
-) -> Arc<GraphicsPipeline> {
-    let device = &ctx.device;
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs),
-        PipelineShaderStageCreateInfo::new(fs),
-    ];
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    GraphicsPipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(VertexInputState::default()),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState::default()),
-            multisample_state: Some(MultisampleState::default()),
-            depth_stencil_state: None,
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                1,
-                ColorBlendAttachmentState::default(),
-            )),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(rendering::pipeline_info(&[vk_format(AO_FORMAT)], None).into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .unwrap()
+    device.create_texture_2d(&pixels, [NOISE_SIZE, NOISE_SIZE], NORMAL_FORMAT)
 }
 
 /// What the resolve binds: the tunables, plus the prepass's camera block. The
@@ -135,17 +69,16 @@ fn build_fullscreen_pipeline(
 /// positions from the depth that pass wrote, so it has to use the projection
 /// that wrote it, jitter and all.
 pub(super) struct SsaoUniforms {
-    frame: Subbuffer<FrameUbo>,
-    params: Subbuffer<SsaoParamsUbo>,
+    frame: BufferId,
+    params: BufferId,
 }
 
 pub struct SsaoPass {
-    ssao_pipeline: Arc<GraphicsPipeline>,
-    blur_pipeline: Arc<GraphicsPipeline>,
-    uniform_allocator: Arena,
-    nearest_clamp: Arc<Sampler>,
-    nearest_repeat: Arc<Sampler>,
-    noise_view: Arc<ImageView>,
+    ssao_pipeline: PipelineId,
+    blur_pipeline: PipelineId,
+    nearest_clamp: SamplerId,
+    nearest_repeat: SamplerId,
+    noise_view: TextureViewId,
     /// 1x1 white (=1.0) AO view bound when SSAO is disabled, so the forward
     /// shader samples "no occlusion" without a separate code path. Not a graph
     /// resource: with SSAO off the graph has no AO node at all, so there is
@@ -158,64 +91,40 @@ pub struct SsaoPass {
 }
 
 impl SsaoPass {
-    pub fn new(ctx: &VkContext) -> Self {
-        let device = &ctx.device;
-        let full_vs = fullscreen_vs::load(device.clone())
-            .unwrap()
-            .entry_point("main")
-            .unwrap();
-        let ssao_fs = ssao_fs::load(device.clone())
-            .unwrap()
-            .entry_point("main")
-            .unwrap();
-        let blur_fs = blur_fs::load(device.clone())
-            .unwrap()
-            .entry_point("main")
-            .unwrap();
+    pub fn new(ctx: &VkContext, device: &Device) -> Self {
         // One description for both, where there were two identical render pass
         // objects: the resolve and the blur write the same format to the same
         // shape of target, and that was always the only thing either declared.
-        let ssao_pipeline = build_fullscreen_pipeline(ctx, full_vs.clone(), ssao_fs);
-        let blur_pipeline = build_fullscreen_pipeline(ctx, full_vs, blur_fs);
+        let pipeline = |fragment| {
+            device.create_graphics_pipeline(&GraphicsPipelineDesc {
+                vertex: ShaderId::FullscreenVert,
+                fragment,
+                color_formats: &[AO_FORMAT],
+                depth_format: None,
+            })
+        };
+        let ssao_pipeline = pipeline(ShaderId::SsaoFrag);
+        let blur_pipeline = pipeline(ShaderId::SsaoBlurFrag);
 
-        let uniform_allocator = Arena::new(
-            ctx.memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
-
-        let nearest_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let nearest_repeat = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                address_mode: [SamplerAddressMode::Repeat; 3],
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let sampler = |repeat| {
+            device.create_sampler(SamplerDesc {
+                linear: false,
+                mipmap_linear: false,
+                repeat,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(0.0),
+            })
+        };
+        let nearest_clamp = sampler(false);
+        let nearest_repeat = sampler(true);
 
         Self {
             ssao_pipeline,
             blur_pipeline,
-            uniform_allocator,
             nearest_clamp,
             nearest_repeat,
-            noise_view: build_noise(ctx),
+            noise_view: build_noise(device),
             white_view: super::texture::upload_texture(
                 ctx,
                 &[255u8],
@@ -235,69 +144,88 @@ impl SsaoPass {
         self.white_view.clone()
     }
 
-    pub(super) fn begin_frame(&self, extent: [u32; 2], frame: Subbuffer<FrameUbo>) -> SsaoUniforms {
-        let params = self.uniform_allocator.allocate_sized::<SsaoParamsUbo>();
-        *params.write().unwrap() = SsaoParamsUbo {
-            kernel: self.kernel,
-            noise_scale: [
-                extent[0] as f32 / NOISE_SIZE as f32,
-                extent[1] as f32 / NOISE_SIZE as f32,
-            ],
-            radius: self.radius,
-            bias: self.bias,
-            power: self.power,
-            kernel_size: KERNEL_SIZE as i32,
-            _pad: [0.0; 2],
-        };
+    pub(super) fn begin_frame(
+        &self,
+        driver: &VkDriver,
+        extent: [u32; 2],
+        frame: Subbuffer<FrameUbo>,
+    ) -> SsaoUniforms {
+        let mut words = [0u32; PARAMS_WORDS];
+        for (word, value) in words.iter_mut().zip(self.kernel.iter().flatten()) {
+            *word = value.to_bits();
+        }
+        let tail = KERNEL_MAX * 4;
+        words[tail] = (extent[0] as f32 / NOISE_SIZE as f32).to_bits();
+        words[tail + 1] = (extent[1] as f32 / NOISE_SIZE as f32).to_bits();
+        words[tail + 2] = self.radius.to_bits();
+        words[tail + 3] = self.bias.to_bits();
+        words[tail + 4] = self.power.to_bits();
+        words[tail + 5] = KERNEL_SIZE as u32;
 
-        SsaoUniforms { frame, params }
+        SsaoUniforms {
+            frame: driver.import_buffer(frame.into_bytes()),
+            params: driver.upload_uniform(&words),
+        }
     }
 
     /// `depth_view` and `normal_view` are the prepass's graph outputs, declared
     /// as this pass's `Sampled` inputs.
     pub(super) fn record_ao(
         &self,
-        builder: &mut Recorder,
-        renderer: &PassCtx<'_>,
+        device: &Device,
+        encoder: &mut Encoder,
         extent: [u32; 2],
         uniforms: &SsaoUniforms,
-        depth_view: Arc<ImageView>,
-        normal_view: Arc<ImageView>,
+        depth_view: TextureViewId,
+        normal_view: TextureViewId,
     ) {
-        let uniform_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.ssao_pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::buffer(0, uniforms.frame.clone()),
-                WriteDescriptorSet::buffer(1, uniforms.params.clone()),
+        let uniform_set = device.create_bind_group(
+            self.ssao_pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::UniformBuffer(uniforms.frame),
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::UniformBuffer(uniforms.params),
+                },
             ],
-            [],
-        )
-        .unwrap();
-        let texture_set = renderer.ctx.descriptor_sets.get(
-            &renderer.ctx.descriptor_set_allocator,
-            &self.ssao_pipeline.layout().set_layouts()[1],
-            [
-                WriteDescriptorSet::image_view_sampler(0, depth_view, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, normal_view, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(
-                    2,
-                    self.noise_view.clone(),
-                    self.nearest_repeat.clone(),
-                ),
+        );
+        let texture_set = device.create_bind_group(
+            self.ssao_pipeline,
+            1,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::SampledTexture {
+                        view: depth_view,
+                        sampler: self.nearest_clamp,
+                    },
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::SampledTexture {
+                        view: normal_view,
+                        sampler: self.nearest_clamp,
+                    },
+                },
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::SampledTexture {
+                        view: self.noise_view,
+                        sampler: self.nearest_repeat,
+                    },
+                },
             ],
         );
 
-        set_viewport(builder, extent);
-        builder
-            .bind_pipeline_graphics(&self.ssao_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.ssao_pipeline.layout(),
-                0,
-                &[uniform_set, texture_set],
-            );
-        builder.draw(3, 1, 0, 0);
+        set_viewport(encoder, extent);
+        encoder.bind_pipeline(self.ssao_pipeline);
+        encoder.bind_group(0, uniform_set);
+        encoder.bind_group(1, texture_set);
+        encoder.draw(3, 1, 0, 0);
     }
 
     /// The blur is also the upsample when the occlusion was resolved at half the
@@ -306,60 +234,57 @@ impl SsaoPass {
     /// bleeding across silhouettes. See `ssao_blur.frag`.
     pub(super) fn record_blur(
         &self,
-        builder: &mut Recorder,
-        renderer: &PassCtx<'_>,
+        device: &Device,
+        encoder: &mut Encoder,
         extent: [u32; 2],
-        raw_ao_view: Arc<ImageView>,
-        depth_view: Arc<ImageView>,
+        raw_ao_view: TextureViewId,
+        depth_view: TextureViewId,
         uniforms: &SsaoUniforms,
     ) {
-        let input = renderer.ctx.descriptor_sets.get(
-            &renderer.ctx.descriptor_set_allocator,
-            &self.blur_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, raw_ao_view, self.nearest_clamp.clone()),
+        let input = device.create_bind_group(
+            self.blur_pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::SampledTexture {
+                        view: raw_ao_view,
+                        sampler: self.nearest_clamp,
+                    },
+                },
                 // Nearest, like every other read of this depth: interpolating
                 // across a silhouette invents a surface, which is precisely what
                 // the weighting below exists to stop.
-                WriteDescriptorSet::image_view_sampler(1, depth_view, self.nearest_clamp.clone()),
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::SampledTexture {
+                        view: depth_view,
+                        sampler: self.nearest_clamp,
+                    },
+                },
             ],
         );
-        let frame_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.blur_pipeline.layout().set_layouts()[1].clone(),
-            [WriteDescriptorSet::buffer(0, uniforms.frame.clone())],
-            [],
-        )
-        .unwrap();
+        let frame_set = device.create_bind_group(
+            self.blur_pipeline,
+            1,
+            &[Binding {
+                binding: 0,
+                resource: BindingResource::UniformBuffer(uniforms.frame),
+            }],
+        );
 
-        set_viewport(builder, extent);
-        builder
-            .bind_pipeline_graphics(&self.blur_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.blur_pipeline.layout(),
-                0,
-                &[input, frame_set],
-            );
-        builder.draw(3, 1, 0, 0);
+        set_viewport(encoder, extent);
+        encoder.bind_pipeline(self.blur_pipeline);
+        encoder.bind_group(0, input);
+        encoder.bind_group(1, frame_set);
+        encoder.draw(3, 1, 0, 0);
     }
 }
 
-fn set_viewport(builder: &mut Recorder, extent: [u32; 2]) {
-    let viewport = Viewport {
-        offset: [0.0, 0.0],
+fn set_viewport(encoder: &mut Encoder, extent: [u32; 2]) {
+    encoder.set_viewport(Viewport {
+        origin: [0.0, 0.0],
         extent: [extent[0] as f32, extent[1] as f32],
-        depth_range: 0.0..=1.0,
-    };
-    builder.set_viewport(0, &[viewport]);
-}
-
-mod fullscreen_vs {
-    vulkano_shaders::shader! { ty: "vertex", path: "shaders/fullscreen.vert" }
-}
-mod ssao_fs {
-    vulkano_shaders::shader! { ty: "fragment", path: "shaders/ssao.frag" }
-}
-mod blur_fs {
-    vulkano_shaders::shader! { ty: "fragment", path: "shaders/ssao_blur.frag" }
+        depth_range: [0.0, 1.0],
+    });
 }

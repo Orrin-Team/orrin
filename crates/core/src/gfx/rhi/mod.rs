@@ -26,6 +26,7 @@ pub use desc::{
     MemoryLocation, SamplerDesc, TextureDesc, TextureDimension, VertexStream, Viewport,
 };
 
+use super::format::Format;
 use super::vulkan::driver::{VkDriver, VkEncoder};
 
 /// The device a pass creates its resources on. One variant today; Metal joins it
@@ -69,10 +70,23 @@ impl Device {
         }
     }
 
-    /// A persistent one-texel RGBA8 texture, for the pass that needs a stand-in.
-    pub fn create_solid_texture(&self, rgba: [u8; 4]) -> TextureViewId {
+    /// A persistent single-level 2D texture holding `pixels`, tightly packed.
+    pub fn create_texture_2d(
+        &self,
+        pixels: &[u8],
+        extent: [u32; 2],
+        format: Format,
+    ) -> TextureViewId {
         match self {
-            Device::Vulkan(driver) => driver.create_solid_texture(rgba),
+            Device::Vulkan(driver) => driver.create_texture_2d(pixels, extent, format),
+        }
+    }
+
+    /// Per-frame uniform data: valid for the frame being recorded, then retired
+    /// with it. The words are the block's std140 bytes.
+    pub fn upload_uniform(&self, words: &[u32]) -> BufferId {
+        match self {
+            Device::Vulkan(driver) => driver.upload_uniform(words),
         }
     }
 

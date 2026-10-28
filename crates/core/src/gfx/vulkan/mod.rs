@@ -427,7 +427,7 @@ impl VulkanRenderer {
         let exposure = ExposurePass::new(&device);
         let bloom = BloomPass::new(&device);
         let prepass = GeometryPrepass::new(&ctx);
-        let ssao = SsaoPass::new(&ctx);
+        let ssao = SsaoPass::new(&ctx, &device);
         let contact_shadows = ContactShadowPass::new(&ctx);
         let fog = FogPass::new(&ctx);
         let ssr = SsrPass::new(&ctx);
@@ -1683,7 +1683,9 @@ impl VulkanRenderer {
         // so a half-res target that scaled the pattern by the window would
         // stretch the rotation across two pixels and band the result.
         let ssao_uniforms = self.frame.ids.ssao.map(|ids| {
+            let Device::Vulkan(driver) = &self.device;
             self.ssao.begin_frame(
+                driver,
                 self.images.extent(ids.raw_ao),
                 frame_uniforms
                     .clone()
@@ -3042,24 +3044,32 @@ impl FrameRecord<'_> {
             PassBody::SsaoResolve => {
                 let prepass = self.frame.ids.prepass.unwrap();
                 let ids = self.frame.ids.ssao.unwrap();
+                let Device::Vulkan(driver) = self.device;
+                let depth = driver.import_view(self.images.view(prepass.depth));
+                let normal = driver.import_view(self.images.view(prepass.normal));
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.ssao.record_ao(
-                    builder,
-                    &self.pass_ctx(),
+                    self.device,
+                    &mut encoder,
                     self.images.extent(ids.raw_ao),
                     self.ssao_uniforms.as_ref().unwrap(),
-                    self.images.view(prepass.depth),
-                    self.images.view(prepass.normal),
+                    depth,
+                    normal,
                 );
             }
             PassBody::SsaoBlur => {
                 let ids = self.frame.ids.ssao.unwrap();
                 let prepass = self.frame.ids.prepass.unwrap();
+                let Device::Vulkan(driver) = self.device;
+                let raw_ao = driver.import_view(self.images.view(ids.raw_ao));
+                let depth = driver.import_view(self.images.view(prepass.depth));
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.ssao.record_blur(
-                    builder,
-                    &self.pass_ctx(),
+                    self.device,
+                    &mut encoder,
                     self.images.extent(ids.ao),
-                    self.images.view(ids.raw_ao),
-                    self.images.view(prepass.depth),
+                    raw_ao,
+                    depth,
                     self.ssao_uniforms.as_ref().unwrap(),
                 );
             }
