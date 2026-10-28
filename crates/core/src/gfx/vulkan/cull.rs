@@ -43,21 +43,18 @@
 use std::collections::HashMap;
 
 use crate::geom::{Aabb, Frustum};
+use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
-use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
-use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::DrawIndexedIndirectCommand;
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 
+use crate::gfx::graph::BufferUsage;
 use crate::gfx::rhi::{
-    Binding, BindingResource, BufferId, ComputePipelineDesc, Device, Encoder, PipelineId,
+    Binding, BindingResource, BlockKind, BufferDesc, BufferId, ComputePipelineDesc, Device,
+    Encoder, MemoryLocation, PipelineId,
 };
 use crate::gfx::shaders::ShaderId;
 
-use super::context::VkContext;
 use super::instances::InstanceEntry;
 use super::occlusion::OcclusionTest;
-use super::record::Arena;
 use crate::gfx::rhi::MeshSpan;
 
 /// Invocations per workgroup, in both shaders. The cull dispatch is
@@ -88,7 +85,7 @@ const KIND_FRUSTUM: u32 = 0;
 const KIND_CASCADE: u32 = 1;
 
 /// Layout-frozen against `View` in `cull.comp`.
-#[derive(BufferContents, Clone, Copy)]
+#[derive(Pod, Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuView {
     light_view: [[f32; 4]; 4],
@@ -100,7 +97,7 @@ struct GpuView {
 }
 
 /// Layout-frozen against `Batch` in both shaders.
-#[derive(BufferContents, Clone, Copy)]
+#[derive(Pod, Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuBatch {
     index_count: u32,
@@ -120,7 +117,7 @@ struct GpuBatch {
 }
 
 /// Layout-frozen against `Instance` in `cull.comp`.
-#[derive(BufferContents, Clone, Copy)]
+#[derive(Pod, Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuInstance {
     row: u32,
@@ -206,7 +203,7 @@ pub(super) enum Draws<'a> {
     Gpu {
         frame: &'a CullFrame,
         view: u32,
-        commands: &'a Subbuffer<[DrawIndexedIndirectCommand]>,
+        commands: BufferId,
     },
 }
 
@@ -229,7 +226,9 @@ pub(super) struct DrawRegion {
     /// contiguous range precisely because batch numbering puts the plain ones
     /// first — see [`BatchIds`].
     pub masked: bool,
-    pub commands: Subbuffer<[DrawIndexedIndirectCommand]>,
+    pub commands: BufferId,
+    /// Which of its commands this region draws.
+    pub range: std::ops::Range<u32>,
 }
 
 impl<'a> Draws<'a> {
@@ -258,17 +257,18 @@ impl<'a> Draws<'a> {
                 frame,
                 view,
                 commands,
-            } => Some((frame.ranges(view), commands.clone())),
+            } => Some((frame.ranges(view), commands)),
         };
         ranges
             .into_iter()
             .flat_map(|(ranges, commands)| {
-                ranges.map(move |(masked, range)| (masked, range, commands.clone()))
+                ranges.map(move |(masked, range)| (masked, range, commands))
             })
             .filter(|(_, range, _)| !range.is_empty())
             .map(|(masked, range, commands)| DrawRegion {
                 masked,
-                commands: commands.slice(range),
+                commands,
+                range: range.start as u32..range.end as u32,
             })
     }
 }
@@ -374,16 +374,13 @@ pub(super) struct CullPass {
     cull_pipeline: PipelineId,
     /// Device-local and indirect: written by the two dispatches, read by the
     /// draw-indirect stage of every opaque geometry pass.
-    commands: Subbuffer<[DrawIndexedIndirectCommand]>,
+    commands: BufferId,
+    commands_len: u64,
     /// The compacted per-view lists. This is the frame's `instance_index`, which
     /// under CPU culling is written by the host instead — see
     /// `instances::InstanceStore::upload_lists`.
-    indices: Subbuffer<[InstanceEntry]>,
-    /// Per-frame scratch for the three tables the dispatches read. An
-    /// [`Arena`] rather than the allocator itself because a `SubbufferAllocator`
-    /// is `!Sync`, and a pass holding one directly cannot be recorded from a
-    /// worker at all.
-    scratch: Arena,
+    indices: BufferId,
+    indices_len: u64,
     /// Batch numbers, kept across frames so that a scene which spawns nothing
     /// assigns none. Keyed by (mesh, material), which is what a batch is.
     ids: BatchIds,
@@ -403,16 +400,7 @@ pub(super) struct CullPass {
 }
 
 impl CullPass {
-    pub(super) fn new(ctx: &VkContext, device: &Device) -> Self {
-        let scratch = Arena::new(
-            ctx.memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::STORAGE_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
+    pub(super) fn new(device: &Device) -> Self {
         Self {
             reset_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
                 shader: ShaderId::CullResetComp,
@@ -420,9 +408,10 @@ impl CullPass {
             cull_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
                 shader: ShaderId::CullComp,
             }),
-            commands: allocate_commands(ctx, 1),
-            indices: allocate_indices(ctx, 1),
-            scratch,
+            commands: allocate_commands(device, 1),
+            commands_len: 1,
+            indices: allocate_indices(device, 1),
+            indices_len: 1,
             ids: BatchIds::default(),
             cached: Vec::new(),
             instances: Vec::new(),
@@ -431,12 +420,12 @@ impl CullPass {
     }
 
     /// What the geometry passes bind as `instance_index`.
-    pub(super) fn indices(&self) -> &Subbuffer<[InstanceEntry]> {
-        &self.indices
+    pub(super) fn indices(&self) -> BufferId {
+        self.indices
     }
 
-    pub(super) fn commands(&self) -> &Subbuffer<[DrawIndexedIndirectCommand]> {
-        &self.commands
+    pub(super) fn commands(&self) -> BufferId {
+        self.commands
     }
 
     /// Sort this frame's renderables into batches and size the two persistent
@@ -448,7 +437,7 @@ impl CullPass {
     /// cost the frame has left.
     pub(super) fn prepare(
         &mut self,
-        ctx: &VkContext,
+        device: &Device,
         items: crate::gfx::DrawList<'_>,
         mesh: impl Fn(u32) -> Option<(MeshSpan, Aabb)>,
         masked: impl Fn(u32) -> bool,
@@ -511,12 +500,16 @@ impl CullPass {
         let stride = base.max(1);
 
         let commands = views.max(1) as u64 * batches.len().max(1) as u64;
-        if self.commands.len() < commands {
-            self.commands = allocate_commands(ctx, commands.next_power_of_two());
+        if self.commands_len < commands {
+            device.destroy_buffer(self.commands);
+            self.commands_len = commands.next_power_of_two();
+            self.commands = allocate_commands(device, self.commands_len);
         }
         let indices = views.max(1) as u64 * stride as u64;
-        if self.indices.len() < indices {
-            self.indices = allocate_indices(ctx, indices.next_power_of_two());
+        if self.indices_len < indices {
+            device.destroy_buffer(self.indices);
+            self.indices_len = indices.next_power_of_two();
+            self.indices = allocate_indices(device, self.indices_len);
         }
 
         CullFrame {
@@ -528,22 +521,17 @@ impl CullPass {
     }
 
     pub(super) fn record_reset(&self, device: &Device, builder: &mut Encoder, frame: &CullFrame) {
-        let Device::Vulkan(driver) = device;
         let set = device.create_transient_bind_group(
             self.reset_pipeline,
             0,
             &[
                 Binding {
                     binding: 0,
-                    resource: BindingResource::StorageBuffer(
-                        driver.import_buffer(self.upload_batches(frame).into_bytes()),
-                    ),
+                    resource: BindingResource::StorageBuffer(self.upload_batches(device, frame)),
                 },
                 Binding {
                     binding: 1,
-                    resource: BindingResource::StorageBuffer(
-                        driver.import_buffer(self.commands.clone().into_bytes()),
-                    ),
+                    resource: BindingResource::StorageBuffer(self.commands),
                 },
             ],
         );
@@ -576,10 +564,9 @@ impl CullPass {
         occlusion: &OcclusionTest,
         prev_view_proj: Mat4,
     ) {
-        let Device::Vulkan(driver) = device;
-        let storage = |binding, buffer: Subbuffer<[u8]>| Binding {
+        let storage = |binding, buffer| Binding {
             binding,
-            resource: BindingResource::StorageBuffer(driver.import_buffer(buffer)),
+            resource: BindingResource::StorageBuffer(buffer),
         };
         let set = device.create_transient_bind_group(
             self.cull_pipeline,
@@ -589,11 +576,11 @@ impl CullPass {
                     binding: 0,
                     resource: BindingResource::StorageBuffer(rows),
                 },
-                storage(1, self.upload_instances().into_bytes()),
-                storage(2, self.upload_batches(frame).into_bytes()),
-                storage(3, self.upload_views(frame, views).into_bytes()),
-                storage(4, self.commands.clone().into_bytes()),
-                storage(5, self.indices.clone().into_bytes()),
+                storage(1, self.upload_instances(device)),
+                storage(2, self.upload_batches(device, frame)),
+                storage(3, self.upload_views(device, frame, views)),
+                storage(4, self.commands),
+                storage(5, self.indices),
                 Binding {
                     binding: 6,
                     resource: BindingResource::SampledTexture {
@@ -637,53 +624,38 @@ impl CullPass {
         ]);
     }
 
-    /// The tables are allocated at length one when empty, because
-    /// `allocate_slice` rejects a zero length and an empty scene still has to
-    /// bind something for the dispatch that will read none of it.
-    fn upload_batches(&self, frame: &CullFrame) -> Subbuffer<[GpuBatch]> {
-        let buffer = self
-            .scratch
-            .allocate_slice::<GpuBatch>(frame.batches.len().max(1) as u64);
-        {
-            let mut write = buffer.write().unwrap();
-            for (slot, batch) in frame.batches.iter().enumerate() {
-                write[slot] = GpuBatch {
-                    index_count: batch.span.index_count,
-                    first_index: batch.span.first_index,
-                    vertex_offset: batch.span.vertex_offset,
-                    instance_base: batch.instance_base,
-                    material: batch.material,
-                    _padding: [0; 3],
-                    bounds_min: batch.bounds.min.extend(0.0).to_array(),
-                    bounds_max: batch.bounds.max.extend(0.0).to_array(),
-                };
-            }
+    fn upload_batches(&self, device: &Device, frame: &CullFrame) -> BufferId {
+        let mut table: Vec<GpuBatch> = frame
+            .batches
+            .iter()
+            .map(|batch| GpuBatch {
+                index_count: batch.span.index_count,
+                first_index: batch.span.first_index,
+                vertex_offset: batch.span.vertex_offset,
+                instance_base: batch.instance_base,
+                material: batch.material,
+                _padding: [0; 3],
+                bounds_min: batch.bounds.min.extend(0.0).to_array(),
+                bounds_max: batch.bounds.max.extend(0.0).to_array(),
+            })
+            .collect();
+        upload_table(device, &mut table)
+    }
+
+    fn upload_instances(&self, device: &Device) -> BufferId {
+        if self.instances.is_empty() {
+            return upload_table::<GpuInstance>(device, &mut Vec::new());
         }
-        buffer
+        device.upload_block(BlockKind::Storage, bytemuck::cast_slice(&self.instances))
     }
 
-    fn upload_instances(&self) -> Subbuffer<[GpuInstance]> {
-        let buffer = self
-            .scratch
-            .allocate_slice::<GpuInstance>(self.instances.len().max(1) as u64);
-        buffer
-            .write()
-            .unwrap()
-            .get_mut(..self.instances.len())
-            .expect("the scratch slice is at least as long as the instances")
-            .copy_from_slice(&self.instances);
-        buffer
-    }
-
-    fn upload_views(&self, frame: &CullFrame, views: &[CullView]) -> Subbuffer<[GpuView]> {
-        let buffer = self
-            .scratch
-            .allocate_slice::<GpuView>(views.len().max(1) as u64);
-        {
-            let mut write = buffer.write().unwrap();
-            for (index, view) in views.iter().enumerate() {
+    fn upload_views(&self, device: &Device, frame: &CullFrame, views: &[CullView]) -> BufferId {
+        let mut table: Vec<GpuView> = views
+            .iter()
+            .enumerate()
+            .map(|(index, view)| {
                 let base = index as u32 * frame.stride;
-                write[index] = match view {
+                match view {
                     CullView::Frustum(frustum) => GpuView {
                         light_view: Mat4::IDENTITY.to_cols_array_2d(),
                         planes: frustum.planes().map(|plane| plane.to_array()),
@@ -704,43 +676,36 @@ impl CullPass {
                         depth_range: *depth_range,
                         base,
                     },
-                };
-            }
-        }
-        buffer
+                }
+            })
+            .collect();
+        upload_table(device, &mut table)
     }
 }
 
-fn allocate_commands(ctx: &VkContext, len: u64) -> Subbuffer<[DrawIndexedIndirectCommand]> {
-    Buffer::new_slice::<DrawIndexedIndirectCommand>(
-        ctx.memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::INDIRECT_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-            ..Default::default()
-        },
-        len,
-    )
-    .expect("failed to allocate the draw command buffer")
+/// An empty table is padded to one zeroed row, because a zero-length buffer is
+/// not one a descriptor can bind and an empty scene still dispatches.
+fn upload_table<T: Pod>(device: &Device, table: &mut Vec<T>) -> BufferId {
+    if table.is_empty() {
+        table.push(T::zeroed());
+    }
+    device.upload_block(BlockKind::Storage, bytemuck::cast_slice(table))
 }
 
-fn allocate_indices(ctx: &VkContext, len: u64) -> Subbuffer<[InstanceEntry]> {
-    Buffer::new_slice::<InstanceEntry>(
-        ctx.memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-            ..Default::default()
-        },
-        len,
-    )
-    .expect("failed to allocate the instance index buffer")
+fn allocate_commands(device: &Device, len: u64) -> BufferId {
+    device.create_buffer(BufferDesc {
+        size: len * std::mem::size_of::<[u32; 5]>() as u64,
+        usage: BufferUsage::STORAGE_BUFFER | BufferUsage::INDIRECT_BUFFER,
+        location: MemoryLocation::GpuOnly,
+    })
+}
+
+fn allocate_indices(device: &Device, len: u64) -> BufferId {
+    device.create_buffer(BufferDesc {
+        size: len * std::mem::size_of::<InstanceEntry>() as u64,
+        usage: BufferUsage::STORAGE_BUFFER,
+        location: MemoryLocation::GpuOnly,
+    })
 }
 
 #[cfg(test)]

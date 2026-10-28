@@ -131,6 +131,14 @@ impl Device {
         }
     }
 
+    /// A buffer that outlives the frame, with no defined contents: for one a
+    /// dispatch writes before anything reads it.
+    pub fn create_buffer(&self, desc: BufferDesc) -> BufferId {
+        match self {
+            Device::Vulkan(driver) => driver.create_buffer(desc),
+        }
+    }
+
     /// A buffer that outlives the frame, holding `bytes` from creation.
     pub fn create_buffer_bytes(&self, desc: BufferDesc, bytes: &[u8]) -> BufferId {
         match self {
@@ -337,10 +345,10 @@ impl Encoder<'_> {
         }
     }
 
-    /// Draw every command in `commands`, a buffer of indexed indirect draws.
-    pub fn draw_indexed_indirect(&mut self, commands: BufferId) {
+    /// Draw commands `range` of `commands`, a buffer of indexed indirect draws.
+    pub fn draw_indexed_indirect(&mut self, commands: BufferId, range: std::ops::Range<u32>) {
         match self {
-            Encoder::Vulkan(encoder) => encoder.draw_indexed_indirect(commands),
+            Encoder::Vulkan(encoder) => encoder.draw_indexed_indirect(commands, range),
         }
     }
 

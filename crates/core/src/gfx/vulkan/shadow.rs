@@ -2,8 +2,6 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use glam::Mat4;
-use vulkano::buffer::Subbuffer;
-use vulkano::command_buffer::DrawIndexedIndirectCommand;
 use vulkano::image::sampler::Sampler;
 use vulkano::image::view::ImageView;
 
@@ -190,7 +188,6 @@ impl ShadowPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record(
         &self,
-        device: &Device,
         builder: &mut Encoder,
         renderer: &PassCtx<'_>,
         casters: Draws<'_>,
@@ -214,7 +211,6 @@ impl ShadowPass {
         // A cascade is one view into a map it owns outright, so its guard starts
         // and ends here.
         self.draw(
-            device,
             builder,
             renderer,
             casters,
@@ -243,13 +239,12 @@ impl ShadowPass {
     )]
     pub(super) fn record_atlas(
         &self,
-        device: &Device,
         builder: &mut Encoder,
         renderer: &PassCtx<'_>,
         atlas: &ShadowAtlas,
         casters: &[DrawList<'_>],
         bases: &[u32],
-        gpu: Option<(&CullFrame, &Subbuffer<[DrawIndexedIndirectCommand]>, u32)>,
+        gpu: Option<(&CullFrame, BufferId, u32)>,
         sets: &CasterSets,
     ) {
         // Every tile this frame assigned, cleared before anything draws — and
@@ -332,7 +327,6 @@ impl ShadowPass {
                 // cascade's box and shadowing into it.
                 let frustum = Frustum::from_view_projection(face.view_proj);
                 self.draw(
-                    device,
                     builder,
                     renderer,
                     draws,
@@ -363,7 +357,6 @@ impl ShadowPass {
     #[allow(clippy::too_many_arguments)]
     fn draw(
         &self,
-        device: &Device,
         builder: &mut Encoder,
         renderer: &PassCtx<'_>,
         casters: Draws<'_>,
@@ -407,8 +400,7 @@ impl ShadowPass {
         // culled to nothing still records them, with every instance count zero.
         for region in casters.regions() {
             self.bind(builder, sets, bound, region.masked, view_proj);
-            let Device::Vulkan(driver) = device;
-            builder.draw_indexed_indirect(driver.import_buffer(region.commands.into_bytes()));
+            builder.draw_indexed_indirect(region.commands, region.range);
         }
     }
 

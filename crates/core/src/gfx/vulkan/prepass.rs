@@ -249,7 +249,6 @@ impl GeometryPrepass {
         material_set: BindGroupId,
         texture_set: BindGroupId,
     ) {
-        let Device::Vulkan(driver) = device;
         let frame_set = device.create_transient_bind_group(
             self.pipeline,
             0,
@@ -335,7 +334,7 @@ impl GeometryPrepass {
                     self.pipeline
                 },
             );
-            encoder.draw_indexed_indirect(driver.import_buffer(region.commands.into_bytes()));
+            encoder.draw_indexed_indirect(region.commands, region.range);
         }
     }
 }

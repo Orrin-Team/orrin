@@ -644,6 +644,23 @@ impl VkDriver {
             .remove(buffer.0, self.frame.load(Ordering::Relaxed));
     }
 
+    pub fn create_buffer(&self, desc: BufferDesc) -> BufferId {
+        let buffer = Buffer::new_slice::<u8>(
+            self.ctx.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: vk_buffer_usage(desc.usage),
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            desc.size,
+        )
+        .expect("failed to allocate a buffer");
+        BufferId(self.buffers.lock().unwrap().insert(buffer.into_bytes()))
+    }
+
     /// A buffer that outlives the frame, holding `bytes` from creation.
     pub fn create_buffer_bytes(&self, desc: BufferDesc, bytes: &[u8]) -> BufferId {
         assert_eq!(
@@ -1020,9 +1037,10 @@ impl<'a> VkEncoder<'a> {
         );
     }
 
-    pub fn draw_indexed_indirect(&mut self, commands: BufferId) {
+    pub fn draw_indexed_indirect(&mut self, commands: BufferId, range: std::ops::Range<u32>) {
         let commands = lookup(&self.driver.buffers, commands.0, "buffer")
-            .reinterpret::<[vulkano::command_buffer::DrawIndexedIndirectCommand]>();
+            .reinterpret::<[vulkano::command_buffer::DrawIndexedIndirectCommand]>()
+            .slice(range.start as u64..range.end as u64);
         self.recorder.draw_indexed_indirect(commands);
     }
 

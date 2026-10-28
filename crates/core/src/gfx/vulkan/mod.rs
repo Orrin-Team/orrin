@@ -524,7 +524,7 @@ impl VulkanRenderer {
 
         Self {
             instances: InstanceStore::new(&ctx),
-            cull: CullPass::new(&ctx, &device),
+            cull: CullPass::new(&device),
             occlusion: OcclusionPass::new(&device),
             gpu_culling,
             occlusion_culling,
@@ -1671,7 +1671,7 @@ impl VulkanRenderer {
             let meshes = &self.meshes;
             let materials = &self.materials;
             self.cull.prepare(
-                &self.ctx,
+                &self.device,
                 draws,
                 |mesh| {
                     meshes
@@ -1698,10 +1698,10 @@ impl VulkanRenderer {
         // is the one the dispatch wrote; the blended and refractive queues are
         // still CPU-culled and keep the host-written one, which is why the
         // graph names the two apart. See `blended_index` in `frame::declare`.
-        let opaque_indices = driver.import_buffer(match &cull_frame {
-            Some(_) => self.cull.indices().clone().into_bytes(),
-            None => objects.indices.clone().into_bytes(),
-        });
+        let opaque_indices = match &cull_frame {
+            Some(_) => self.cull.indices(),
+            None => driver.import_buffer(objects.indices.clone().into_bytes()),
+        };
         let forward_object_set =
             self.forward
                 .build_object_set(&self.device, object_rows, opaque_indices);
@@ -3135,7 +3135,6 @@ impl FrameRecord<'_> {
                 let Device::Vulkan(driver) = self.device;
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.shadow.record(
-                    self.device,
                     &mut encoder,
                     &self.pass_ctx(),
                     self.opaque_draws(
@@ -3161,7 +3160,6 @@ impl FrameRecord<'_> {
                 let Device::Vulkan(driver) = self.device;
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.shadow.record_atlas(
-                    self.device,
                     &mut encoder,
                     &self.pass_ctx(),
                     shadows.atlas,
@@ -3257,7 +3255,6 @@ impl FrameRecord<'_> {
                 let Device::Vulkan(driver) = self.device;
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.forward.draw(
-                    self.device,
                     &mut encoder,
                     &self.pass_ctx(),
                     self.opaque_draws(0, self.draws, 0),

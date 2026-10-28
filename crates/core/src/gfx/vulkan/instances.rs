@@ -90,7 +90,7 @@ struct Resident {
 /// the only thing that varies between them that a shader can read is what the
 /// instance points at. The CPU path writes the same pairs so that one vertex
 /// shader serves both. See [`cull`](super::cull).
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(super) struct InstanceEntry {
     pub row: u32,

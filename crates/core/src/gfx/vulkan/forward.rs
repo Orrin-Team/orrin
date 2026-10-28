@@ -1081,7 +1081,6 @@ impl ForwardPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw(
         &self,
-        device: &Device,
         builder: &mut Encoder,
         renderer: &PassCtx<'_>,
         draws: Draws<'_>,
@@ -1095,7 +1094,6 @@ impl ForwardPass {
         // framebuffer already opened around it.
         msaa: bool,
     ) {
-        let Device::Vulkan(driver) = device;
         // The jittered one, from the frame's shared view: every pass that
         // rasterises geometry has to agree on it to a subpixel.
         let view_proj = view.view_proj;
@@ -1180,7 +1178,7 @@ impl ForwardPass {
         // path.
         for region in draws.regions() {
             bind_all(builder, if region.masked { masked } else { plain });
-            builder.draw_indexed_indirect(driver.import_buffer(region.commands.into_bytes()));
+            builder.draw_indexed_indirect(region.commands, region.range);
         }
     }
 }
