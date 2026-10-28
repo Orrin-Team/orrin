@@ -432,7 +432,7 @@ impl VulkanRenderer {
         let refraction = RefractionPass::new(&device, forward.layout_source());
         let taa = TaaPass::new(&device);
         let dof = DofPass::new(&ctx);
-        let motion_blur = MotionBlurPass::new(&ctx);
+        let motion_blur = MotionBlurPass::new(&device);
         let shadow = ShadowPass::new(&ctx, &device);
         let line = LinePass::new(&device, &forward.targets);
         let environment = EnvironmentPass::new(&ctx, &device, &forward.targets);
@@ -2877,13 +2877,18 @@ impl FrameRecord<'_> {
                         .ids
                         .prepass
                         .expect("the graph scheduled motion blur with no prepass");
+                    let Device::Vulkan(driver) = self.device;
+                    let velocity = driver.import_view(self.images.view(prepass.velocity));
+                    let depth = driver.import_view(self.images.view(prepass.depth));
+                    let target = driver.import_view(self.images.view(ids.tile));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.motion_blur.record_tile_max(
-                        builder,
-                        self.ctx,
+                        self.device,
+                        &mut encoder,
                         &self.view,
-                        self.images.view(prepass.velocity),
-                        self.images.view(prepass.depth),
-                        self.images.view(ids.tile),
+                        velocity,
+                        depth,
+                        target,
                     );
                 }
                 PassBody::MotionBlurNeighbourMax => {
@@ -2892,12 +2897,12 @@ impl FrameRecord<'_> {
                         .ids
                         .motion_blur
                         .expect("motion blur without its images");
-                    self.motion_blur.record_neighbour_max(
-                        builder,
-                        self.ctx,
-                        self.images.view(ids.tile),
-                        self.images.view(ids.neighbour),
-                    );
+                    let Device::Vulkan(driver) = self.device;
+                    let tiles = driver.import_view(self.images.view(ids.tile));
+                    let target = driver.import_view(self.images.view(ids.neighbour));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                    self.motion_blur
+                        .record_neighbour_max(self.device, &mut encoder, tiles, target);
                 }
                 PassBody::MotionBlurGather => {
                     let ids = self
@@ -2910,15 +2915,22 @@ impl FrameRecord<'_> {
                         .ids
                         .prepass
                         .expect("the graph scheduled motion blur with no prepass");
+                    let Device::Vulkan(driver) = self.device;
+                    let color = driver.import_view(self.view_of(ids.source));
+                    let velocity = driver.import_view(self.images.view(prepass.velocity));
+                    let depth = driver.import_view(self.images.view(prepass.depth));
+                    let neighbour = driver.import_view(self.images.view(ids.neighbour));
+                    let target = driver.import_view(self.images.view(ids.output));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.motion_blur.record_gather(
-                        builder,
-                        self.ctx,
+                        self.device,
+                        &mut encoder,
                         &self.view,
-                        self.view_of(ids.source),
-                        self.images.view(prepass.velocity),
-                        self.images.view(prepass.depth),
-                        self.images.view(ids.neighbour),
-                        self.images.view(ids.output),
+                        color,
+                        velocity,
+                        depth,
+                        neighbour,
+                        target,
                     );
                 }
                 PassBody::CullReset => {

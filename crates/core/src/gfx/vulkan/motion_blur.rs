@@ -13,24 +13,13 @@
 //! across the whole frame, and the second runs over an image a two-hundred-and-
 //! fifty-sixth the size.
 
-use std::sync::Arc;
-
-use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
-use vulkano::buffer::{BufferContents, BufferUsage};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-use vulkano::memory::allocator::MemoryTypeFilter;
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
+use crate::gfx::rhi::{
+    Binding, BindingResource, BufferId, ComputePipelineDesc, Device, Encoder, PipelineId,
+    SamplerDesc, SamplerId, TextureViewId,
 };
-
+use crate::gfx::shaders::ShaderId;
 use crate::scene::{Camera, MotionBlurSettings};
 
-use super::context::VkContext;
-use super::record::{Arena, Recorder};
 use super::taa::FrameView;
 
 /// Side of the compute workgroup for every pass here.
@@ -55,83 +44,47 @@ pub(super) const TILE_SHIFT: u32 = 4;
 /// and the tile grid would print itself on the frame.
 const MAX_BLUR_PIXELS: f32 = (2 << TILE_SHIFT) as f32;
 
-/// Uniforms shared by the tile pass and the gather. A buffer rather than push
-/// constants because two mat4s alone fill the guaranteed 128-byte push range.
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct MotionBlurUbo {
-    inv_view_proj: [[f32; 4]; 4],
-    prev_view_proj: [[f32; 4]; 4],
-    /// x = shutter fraction, y = max blur radius in pixels, z = near, w = far.
-    params: [f32; 4],
-}
+/// The uniforms both the tile pass and the gather bind, as the words of their
+/// std140 block: `inv_view_proj`, `prev_view_proj`, then `params` — x = shutter
+/// fraction, y = max blur radius in pixels, z = near, w = far. A buffer rather
+/// than push constants because two mat4s alone fill the guaranteed 128-byte push
+/// range.
+const UBO_WORDS: usize = 36;
 
 pub struct MotionBlurPass {
-    tile_max_pipeline: Arc<ComputePipeline>,
-    neighbour_max_pipeline: Arc<ComputePipeline>,
-    gather_pipeline: Arc<ComputePipeline>,
+    tile_max_pipeline: PipelineId,
+    neighbour_max_pipeline: PipelineId,
+    gather_pipeline: PipelineId,
     /// Nearest throughout. Velocity and depth interpolated across a silhouette
     /// describe a surface that is not there, and a tile maximum averaged with
     /// its neighbour is no longer a maximum.
-    nearest_clamp: Arc<Sampler>,
-    uniform_allocator: Arena,
+    nearest_clamp: SamplerId,
     settings: MotionBlurSettings,
     near: f32,
     far: f32,
 }
 
 impl MotionBlurPass {
-    pub fn new(ctx: &VkContext) -> Self {
-        let device = &ctx.device;
-        let tile_max_pipeline = build_pipeline(
-            ctx,
-            tile_max_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
-        let neighbour_max_pipeline = build_pipeline(
-            ctx,
-            neighbour_max_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
-        let gather_pipeline = build_pipeline(
-            ctx,
-            gather_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
+    pub fn new(device: &Device) -> Self {
+        let pipeline = |shader| device.create_compute_pipeline(&ComputePipelineDesc { shader });
+        let tile_max_pipeline = pipeline(ShaderId::MotionBlurTileMaxComp);
+        let neighbour_max_pipeline = pipeline(ShaderId::MotionBlurNeighbourMaxComp);
+        let gather_pipeline = pipeline(ShaderId::MotionBlurGatherComp);
 
-        let nearest_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::default()
-            },
-        )
-        .unwrap();
-
-        let uniform_allocator = Arena::new(
-            ctx.memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
+        let nearest_clamp = device.create_sampler(SamplerDesc {
+            linear: false,
+            mipmap_linear: false,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+            max_lod: Some(0.0),
+        });
 
         Self {
             tile_max_pipeline,
             neighbour_max_pipeline,
             gather_pipeline,
             nearest_clamp,
-            uniform_allocator,
             settings: MotionBlurSettings::default(),
             near: 0.1,
             far: 1000.0,
@@ -150,163 +103,145 @@ impl MotionBlurPass {
     /// shared, because the two record at different points in the frame — but
     /// derived from the same [`FrameView`], so they cannot disagree about where
     /// the sky went.
-    fn uniforms(&self, view: &FrameView) -> vulkano::buffer::Subbuffer<MotionBlurUbo> {
-        let uniforms = self.uniform_allocator.allocate_sized::<MotionBlurUbo>();
-        *uniforms.write().unwrap() = MotionBlurUbo {
-            // Unjittered, so the sky's reprojection agrees with the motion
-            // vectors the prepass wrote — those are unjittered too.
-            inv_view_proj: view.unjittered_view_proj.inverse().to_cols_array_2d(),
-            prev_view_proj: view.prev_view_proj.to_cols_array_2d(),
-            params: [
-                self.settings.shutter_fraction(),
-                MAX_BLUR_PIXELS,
-                self.near,
-                self.far,
-            ],
-        };
-        uniforms
+    fn uniforms(&self, device: &Device, view: &FrameView) -> BufferId {
+        let Device::Vulkan(driver) = device;
+        // Unjittered, so the sky's reprojection agrees with the motion vectors the
+        // prepass wrote — those are unjittered too.
+        let matrices = [
+            view.unjittered_view_proj.inverse().to_cols_array_2d(),
+            view.prev_view_proj.to_cols_array_2d(),
+        ];
+        let params = [
+            self.settings.shutter_fraction(),
+            MAX_BLUR_PIXELS,
+            self.near,
+            self.far,
+        ];
+        let mut words = [0u32; UBO_WORDS];
+        for (word, float) in words
+            .iter_mut()
+            .zip(matrices.iter().flatten().flatten().chain(&params))
+        {
+            *word = float.to_bits();
+        }
+        driver.upload_uniform(&words)
     }
 
     pub(super) fn record_tile_max(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
+        device: &Device,
+        builder: &mut Encoder,
         view: &FrameView,
-        velocity: Arc<ImageView>,
-        depth: Arc<ImageView>,
-        target: Arc<ImageView>,
+        velocity: TextureViewId,
+        depth: TextureViewId,
+        target: TextureViewId,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.tile_max_pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::image_view_sampler(0, velocity, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, depth, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(2, target.clone()),
-                WriteDescriptorSet::buffer(3, self.uniforms(view)),
+        let sampled = |binding, view| Binding {
+            binding,
+            resource: BindingResource::SampledTexture {
+                view,
+                sampler: self.nearest_clamp,
+            },
+        };
+        let set = device.create_bind_group(
+            self.tile_max_pipeline,
+            0,
+            &[
+                sampled(0, velocity),
+                sampled(1, depth),
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::StorageTexture(target),
+                },
+                Binding {
+                    binding: 3,
+                    resource: BindingResource::UniformBuffer(self.uniforms(device, view)),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
-        builder
-            .bind_pipeline_compute(&self.tile_max_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.tile_max_pipeline.layout(),
-                0,
-                &[set],
-            );
-        dispatch_over(builder, &target);
+        builder.bind_pipeline(self.tile_max_pipeline);
+        builder.bind_group(0, set);
+        dispatch_over(device, builder, target);
     }
 
     pub fn record_neighbour_max(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        tiles: Arc<ImageView>,
-        target: Arc<ImageView>,
+        device: &Device,
+        builder: &mut Encoder,
+        tiles: TextureViewId,
+        target: TextureViewId,
     ) {
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.neighbour_max_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, tiles, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(1, target.clone()),
+        let set = device.create_bind_group(
+            self.neighbour_max_pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::SampledTexture {
+                        view: tiles,
+                        sampler: self.nearest_clamp,
+                    },
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageTexture(target),
+                },
             ],
         );
 
-        builder
-            .bind_pipeline_compute(&self.neighbour_max_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.neighbour_max_pipeline.layout(),
-                0,
-                &[set],
-            );
-        dispatch_over(builder, &target);
+        builder.bind_pipeline(self.neighbour_max_pipeline);
+        builder.bind_group(0, set);
+        dispatch_over(device, builder, target);
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_gather(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
+        device: &Device,
+        builder: &mut Encoder,
         view: &FrameView,
-        color: Arc<ImageView>,
-        velocity: Arc<ImageView>,
-        depth: Arc<ImageView>,
-        neighbour: Arc<ImageView>,
-        target: Arc<ImageView>,
+        color: TextureViewId,
+        velocity: TextureViewId,
+        depth: TextureViewId,
+        neighbour: TextureViewId,
+        target: TextureViewId,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.gather_pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::image_view_sampler(0, color, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, velocity, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(2, depth, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(3, neighbour, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(4, target.clone()),
-                WriteDescriptorSet::buffer(5, self.uniforms(view)),
+        let sampled = |binding, view| Binding {
+            binding,
+            resource: BindingResource::SampledTexture {
+                view,
+                sampler: self.nearest_clamp,
+            },
+        };
+        let set = device.create_bind_group(
+            self.gather_pipeline,
+            0,
+            &[
+                sampled(0, color),
+                sampled(1, velocity),
+                sampled(2, depth),
+                sampled(3, neighbour),
+                Binding {
+                    binding: 4,
+                    resource: BindingResource::StorageTexture(target),
+                },
+                Binding {
+                    binding: 5,
+                    resource: BindingResource::UniformBuffer(self.uniforms(device, view)),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
-        builder
-            .bind_pipeline_compute(&self.gather_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.gather_pipeline.layout(),
-                0,
-                &[set],
-            );
-        dispatch_over(builder, &target);
+        builder.bind_pipeline(self.gather_pipeline);
+        builder.bind_group(0, set);
+        dispatch_over(device, builder, target);
     }
 }
 
-fn dispatch_over(builder: &mut Recorder, target: &Arc<ImageView>) {
-    let extent = target.image().extent();
-
-    // SAFETY: the dispatch covers exactly `extent`, and each shader discards
-    // invocations past `imageSize`, so nothing writes outside the image. The
-    // descriptors bound above match the shader's layout, and the graph declared
-    // every resource this pass touches, so its barriers precede it.
+fn dispatch_over(device: &Device, builder: &mut Encoder, target: TextureViewId) {
+    let extent = device.view_extent(target);
     builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
-}
-
-fn build_pipeline(
-    ctx: &VkContext,
-    entry_point: vulkano::shader::EntryPoint,
-) -> Arc<ComputePipeline> {
-    let device = &ctx.device;
-    let stage = PipelineShaderStageCreateInfo::new(entry_point);
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    ComputePipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )
-    .unwrap()
-}
-
-mod tile_max_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/motion_blur_tile_max.comp" }
-}
-
-mod neighbour_max_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/motion_blur_neighbour_max.comp" }
-}
-
-mod gather_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/motion_blur_gather.comp" }
 }
 
 #[cfg(test)]
