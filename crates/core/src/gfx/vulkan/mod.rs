@@ -525,7 +525,7 @@ impl VulkanRenderer {
         Self {
             instances: InstanceStore::new(&ctx),
             cull: CullPass::new(&ctx, &device),
-            occlusion: OcclusionPass::new(&ctx, &device),
+            occlusion: OcclusionPass::new(&device),
             gpu_culling,
             occlusion_culling,
             ctx,
@@ -834,10 +834,10 @@ impl VulkanRenderer {
             // version of the same reason: what the cull reads is not merely a
             // history, it is the only thing that keeps the frame acyclic.
             if id == ids.hiz {
-                return self.occlusion.hiz_view();
+                return self.vk_view(self.occlusion.hiz_view());
             }
             if id == ids.history {
-                return self.occlusion.history_view();
+                return self.vk_view(self.occlusion.history_view());
             }
         }
         match self.frame.ids.taa {
@@ -879,12 +879,12 @@ impl VulkanRenderer {
         if let Some(occlusion) = ids.occlusion {
             if id == occlusion.hiz {
                 return Some(record::Target::Image(
-                    self.occlusion.hiz_view().image().clone(),
+                    self.vk_view(self.occlusion.hiz_view()).image().clone(),
                 ));
             }
             if id == occlusion.history {
                 return Some(record::Target::Image(
-                    self.occlusion.history_view().image().clone(),
+                    self.vk_view(self.occlusion.history_view()).image().clone(),
                 ));
             }
         }
@@ -1475,7 +1475,7 @@ impl VulkanRenderer {
         // half being read holds anything — a freshly allocated pair does not,
         // and the cull is told to test nothing that frame.
         let occlusion_live = self.occlusion.begin_frame(
-            &self.ctx,
+            &self.device,
             self.gpu_culling && self.occlusion_culling,
             self.swapchain.extent,
         );
@@ -2540,12 +2540,12 @@ impl FrameRecord<'_> {
         if let Some(occlusion) = ids.occlusion {
             if id == occlusion.hiz {
                 return Some(record::Target::Image(
-                    self.occlusion.hiz_view().image().clone(),
+                    self.vk_view(self.occlusion.hiz_view()).image().clone(),
                 ));
             }
             if id == occlusion.history {
                 return Some(record::Target::Image(
-                    self.occlusion.history_view().image().clone(),
+                    self.vk_view(self.occlusion.history_view()).image().clone(),
                 ));
             }
         }

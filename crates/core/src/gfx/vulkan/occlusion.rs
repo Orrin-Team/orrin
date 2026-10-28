@@ -36,21 +36,13 @@
 //! other, and this one is also half the frame at its base and survives the frame
 //! boundary, which a transient by contract does not.
 
-use std::sync::Arc;
-
-use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
-use vulkano::image::{Image, ImageCreateInfo, ImageSubresourceRange, ImageUsage};
-use vulkano::memory::allocator::AllocationCreateInfo;
-
+use crate::gfx::format::SampleCount;
+use crate::gfx::graph::ImageUsage;
 use crate::gfx::rhi::{
     Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId, SamplerDesc,
-    SamplerId, TextureViewId,
+    SamplerId, TextureDesc, TextureDimension, TextureViewId,
 };
 use crate::gfx::shaders::ShaderId;
-
-use super::context::VkContext;
-use super::convert::vk_format;
 
 /// Single-channel float, for the reason the reflection pyramid is: a depth
 /// pyramid stores exactly one number, and `R32_SFLOAT` is a storage format every
@@ -74,8 +66,8 @@ pub(super) const OCCLUSION_LEVELS: u32 = 6;
 const TILE: u32 = 64;
 
 struct Pyramid {
-    sampled: [Arc<ImageView>; 2],
-    mips: [Vec<Arc<ImageView>>; 2],
+    sampled: [TextureViewId; 2],
+    mips: [Vec<TextureViewId>; 2],
 }
 
 /// What the cull binds and what it is allowed to conclude from it.
@@ -83,8 +75,8 @@ struct Pyramid {
 pub(super) struct OcclusionTest {
     /// The whole pyramid as one sampled view, which is what lets the shader
     /// pick a level with `texelFetch`.
-    pub pyramid: Arc<ImageView>,
-    pub sampler: Arc<Sampler>,
+    pub pyramid: TextureViewId,
+    pub sampler: SamplerId,
     /// False when the frame does not test at all, and false for the one frame
     /// after an allocation — the ping-pong has not yet put anything in the half
     /// the cull would read, and a test against uninitialised memory is not a
@@ -94,18 +86,17 @@ pub(super) struct OcclusionTest {
 
 pub(super) struct OcclusionPass {
     pipeline: PipelineId,
-    build_sampler: SamplerId,
-    /// `texelFetch` ignores filtering, so this is a sampler in the sense the
-    /// descriptor requires one and in no other. Clamped rather than repeated so
-    /// that a coordinate the shader has already bounded cannot wrap if that ever
-    /// stops being true.
-    nearest_clamp: Arc<Sampler>,
+    /// Nearest and clamped, for the build's depth fetch and the cull's
+    /// `texelFetch`, which ignores filtering: the descriptor requires a sampler
+    /// and nothing more. Clamped rather than repeated so that a coordinate the
+    /// shader has already bounded cannot wrap if that ever stops being true.
+    sampler: SamplerId,
     /// One texel, bound whenever there is no pyramid. The cull's descriptor set
     /// has the binding whether or not the frame tests — a second pipeline for
     /// the sake of one branch that is uniform across the dispatch would buy
     /// nothing and cost a compile — and a descriptor set with a hole in it is
     /// not one Vulkan will accept.
-    fallback: Arc<ImageView>,
+    fallback: TextureViewId,
     pyramid: Option<Pyramid>,
     /// The frame extent `pyramid` was allocated for.
     extent: [u32; 2],
@@ -116,11 +107,11 @@ pub(super) struct OcclusionPass {
 }
 
 impl OcclusionPass {
-    pub(super) fn new(ctx: &VkContext, device: &Device) -> Self {
+    pub(super) fn new(device: &Device) -> Self {
         let pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
             shader: ShaderId::HizOcclusionComp,
         });
-        let build_sampler = device.create_sampler(SamplerDesc {
+        let sampler = device.create_sampler(SamplerDesc {
             linear: false,
             mipmap_linear: false,
             repeat: false,
@@ -129,24 +120,10 @@ impl OcclusionPass {
             max_lod: None,
         });
 
-        let nearest_clamp = Sampler::new(
-            ctx.device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                mipmap_mode: vulkano::image::sampler::SamplerMipmapMode::Nearest,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                lod: 0.0..=vulkano::image::sampler::LOD_CLAMP_NONE,
-                ..SamplerCreateInfo::default()
-            },
-        )
-        .unwrap();
-
         Self {
             pipeline,
-            build_sampler,
-            nearest_clamp,
-            fallback: allocate(ctx, [1, 1], 1).0,
+            sampler,
+            fallback: allocate(device, [1, 1], 1).0,
             pyramid: None,
             extent: [0, 0],
             frame: 0,
@@ -156,18 +133,19 @@ impl OcclusionPass {
 
     /// Advance one frame: allocate or release the pair, and say whether what the
     /// cull is about to read holds a frame of depth.
-    pub(super) fn begin_frame(&mut self, ctx: &VkContext, enabled: bool, extent: [u32; 2]) -> bool {
+    pub(super) fn begin_frame(&mut self, device: &Device, enabled: bool, extent: [u32; 2]) -> bool {
         if !enabled {
             // Released rather than kept, for the reason the TAA history is: two
             // pyramids is real memory, and what they hold is stale the moment a
             // frame renders without them.
-            self.pyramid = None;
+            self.release(device);
             self.age = 0;
             return false;
         }
 
         if self.pyramid.is_none() || self.extent != extent {
-            self.pyramid = Some(Pyramid::new(ctx, base_extent(extent)));
+            self.release(device);
+            self.pyramid = Some(Pyramid::new(device, base_extent(extent)));
             self.extent = extent;
             self.age = 0;
         }
@@ -177,13 +155,21 @@ impl OcclusionPass {
         live
     }
 
-    /// This frame's target, which is next frame's history.
-    pub(super) fn hiz_view(&self) -> Arc<ImageView> {
-        self.pair().sampled[(self.frame & 1) as usize].clone()
+    fn release(&mut self, device: &Device) {
+        if let Some(pyramid) = self.pyramid.take() {
+            for view in pyramid.mips.into_iter().flatten().chain(pyramid.sampled) {
+                device.destroy_texture(view);
+            }
+        }
     }
 
-    pub(super) fn history_view(&self) -> Arc<ImageView> {
-        self.pair().sampled[((self.frame + 1) & 1) as usize].clone()
+    /// This frame's target, which is next frame's history.
+    pub(super) fn hiz_view(&self) -> TextureViewId {
+        self.pair().sampled[(self.frame & 1) as usize]
+    }
+
+    pub(super) fn history_view(&self) -> TextureViewId {
+        self.pair().sampled[((self.frame + 1) & 1) as usize]
     }
 
     /// What the cull binds. Falls back to the one-texel image whenever there is
@@ -192,12 +178,12 @@ impl OcclusionPass {
         match &self.pyramid {
             Some(_) => OcclusionTest {
                 pyramid: self.history_view(),
-                sampler: self.nearest_clamp.clone(),
+                sampler: self.sampler,
                 live,
             },
             None => OcclusionTest {
-                pyramid: self.fallback.clone(),
-                sampler: self.nearest_clamp.clone(),
+                pyramid: self.fallback,
+                sampler: self.sampler,
                 live: false,
             },
         }
@@ -212,7 +198,6 @@ impl OcclusionPass {
         depth: TextureViewId,
         extent: [u32; 2],
     ) {
-        let Device::Vulkan(driver) = device;
         let mips = &self.pair().mips[(self.frame & 1) as usize];
         // Every slot of the shader's array has to be written even where the
         // pyramid came out shorter than the declaration, so the spares point at
@@ -221,14 +206,12 @@ impl OcclusionPass {
             binding: 0,
             resource: BindingResource::SampledTexture {
                 view: depth,
-                sampler: self.build_sampler,
+                sampler: self.sampler,
             },
         }];
         bindings.extend((0..OCCLUSION_LEVELS as usize).map(|level| Binding {
             binding: 1,
-            resource: BindingResource::StorageTexture(
-                driver.import_view(mips[level.min(mips.len() - 1)].clone()),
-            ),
+            resource: BindingResource::StorageTexture(mips[level.min(mips.len() - 1)]),
         }));
         let set = device.create_bind_group(self.pipeline, 0, &bindings);
 
@@ -250,10 +233,10 @@ impl OcclusionPass {
 }
 
 impl Pyramid {
-    fn new(ctx: &VkContext, base: [u32; 2]) -> Self {
+    fn new(device: &Device, base: [u32; 2]) -> Self {
         let levels = levels_for(base);
-        let (first, first_mips) = allocate(ctx, base, levels);
-        let (second, second_mips) = allocate(ctx, base, levels);
+        let (first, first_mips) = allocate(device, base, levels);
+        let (second, second_mips) = allocate(device, base, levels);
         Self {
             sampled: [first, second],
             mips: [first_mips, second_mips],
@@ -287,56 +270,20 @@ fn levels_for(base: [u32; 2]) -> u32 {
 /// Two kinds of view over one image because a storage image descriptor takes
 /// exactly one mip, so the view that spans the pyramid cannot claim that usage —
 /// the same split `GraphImages` makes for the reflection pyramid.
-fn allocate(
-    ctx: &VkContext,
-    extent: [u32; 2],
-    levels: u32,
-) -> (Arc<ImageView>, Vec<Arc<ImageView>>) {
-    let usage = ImageUsage::SAMPLED | ImageUsage::STORAGE;
-    let image = Image::new(
-        ctx.memory_allocator.clone(),
-        ImageCreateInfo {
-            format: vk_format(OCCLUSION_FORMAT),
-            extent: [extent[0], extent[1], 1],
-            usage,
-            mip_levels: levels,
-            ..Default::default()
-        },
-        AllocationCreateInfo::default(),
-    )
-    .expect("failed to allocate the occlusion depth pyramid");
-
-    let sampled = ImageView::new(
-        image.clone(),
-        ImageViewCreateInfo {
-            view_type: ImageViewType::Dim2d,
-            usage: if levels > 1 {
-                usage - ImageUsage::STORAGE
-            } else {
-                usage
-            },
-            ..ImageViewCreateInfo::from_image(&image)
-        },
-    )
-    .unwrap();
-
+fn allocate(device: &Device, extent: [u32; 2], levels: u32) -> (TextureViewId, Vec<TextureViewId>) {
+    let sampled = device.create_texture(&TextureDesc {
+        format: OCCLUSION_FORMAT,
+        dimension: TextureDimension::D2,
+        extent: [extent[0], extent[1], 1],
+        mip_levels: levels,
+        array_layers: 1,
+        samples: SampleCount::Sample1,
+        usage: ImageUsage::SAMPLED | ImageUsage::STORAGE,
+        memoryless: false,
+    });
     let mips = (0..levels)
-        .map(|level| {
-            ImageView::new(
-                image.clone(),
-                ImageViewCreateInfo {
-                    view_type: ImageViewType::Dim2d,
-                    subresource_range: ImageSubresourceRange {
-                        mip_levels: level..level + 1,
-                        ..image.subresource_range()
-                    },
-                    ..ImageViewCreateInfo::from_image(&image)
-                },
-            )
-            .unwrap()
-        })
+        .map(|level| device.mip_view(sampled, level))
         .collect();
-
     (sampled, mips)
 }
 

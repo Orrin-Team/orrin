@@ -597,8 +597,8 @@ impl CullPass {
                 Binding {
                     binding: 6,
                     resource: BindingResource::SampledTexture {
-                        view: driver.import_view(occlusion.pyramid.clone()),
-                        sampler: driver.import_sampler(occlusion.sampler.clone()),
+                        view: occlusion.pyramid,
+                        sampler: occlusion.sampler,
                     },
                 },
             ],
