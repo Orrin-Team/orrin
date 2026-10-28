@@ -428,7 +428,7 @@ impl VulkanRenderer {
         let bloom = BloomPass::new(&device);
         let prepass = GeometryPrepass::new(&ctx);
         let ssao = SsaoPass::new(&ctx, &device);
-        let contact_shadows = ContactShadowPass::new(&ctx);
+        let contact_shadows = ContactShadowPass::new(&ctx, &device);
         let fog = FogPass::new(&ctx);
         let ssr = SsrPass::new(&ctx);
         let subsurface = SubsurfacePass::new(&ctx);
@@ -1696,7 +1696,9 @@ impl VulkanRenderer {
         // rasterising pass takes its matrices from `FrameView`: the depth this
         // marches was written under that projection's jitter.
         let contact_shadow_uniforms = self.frame.ids.contact_shadows.map(|_| {
+            let Device::Vulkan(driver) = &self.device;
             self.contact_shadows.begin_frame(
+                driver,
                 contact_shadows,
                 &view,
                 lighting.sun.direction_to_light(),
@@ -3079,15 +3081,19 @@ impl FrameRecord<'_> {
                     .ids
                     .prepass
                     .expect("the graph scheduled contact shadows with no prepass");
+                let Device::Vulkan(driver) = self.device;
+                let depth = driver.import_view(self.images.view(ids.depth));
+                let normal = driver.import_view(self.images.view(ids.normal));
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.contact_shadows.record(
-                    builder,
-                    &self.pass_ctx(),
+                    self.device,
+                    &mut encoder,
                     self.extent,
                     self.contact_shadow_uniforms
                         .as_ref()
                         .expect("contact shadows without their uniforms"),
-                    self.images.view(ids.depth),
-                    self.images.view(ids.normal),
+                    depth,
+                    normal,
                 );
             }
             PassBody::Forward => {
