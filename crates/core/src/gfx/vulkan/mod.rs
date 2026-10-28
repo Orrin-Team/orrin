@@ -418,7 +418,7 @@ impl VulkanRenderer {
         let forward = ForwardPass::new(&ctx, &device, hdr::HDR_FORMAT, hdr::HDR_WIDE_FORMAT);
         let arena = MeshArena::new(&ctx);
         let hdr = HdrPass::new(&device, engine_format(format));
-        let gizmo = GizmoPass::new(&ctx, format);
+        let gizmo = GizmoPass::new(&device, engine_format(format));
         let outline = OutlinePass::new(&ctx, format);
         let exposure = ExposurePass::new(&device);
         let bloom = BloomPass::new(&device);
@@ -3252,7 +3252,12 @@ impl FrameRecord<'_> {
                     bloom,
                 );
             }
-            PassBody::Gizmo => self.gizmo.record(builder, self.gizmo_strokes, self.extent),
+            PassBody::Gizmo => {
+                let Device::Vulkan(driver) = self.device;
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                self.gizmo
+                    .record(self.device, &mut encoder, self.gizmo_strokes, self.extent);
+            }
             PassBody::OutlineMask => self.outline.record_mask(
                 builder,
                 self.outline_items,

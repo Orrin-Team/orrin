@@ -768,6 +768,7 @@ impl ForwardPass {
                 // from instead, along the same line.
                 alpha_to_coverage: !cull_back && samples != SampleCount::Sample1,
                 immutable_samplers: &samplers,
+                blend_alpha: false,
             })
         };
         let msaa = MSAA_SAMPLES;

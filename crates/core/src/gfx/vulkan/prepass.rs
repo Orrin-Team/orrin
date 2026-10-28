@@ -141,6 +141,7 @@ impl GeometryPrepass {
                 samples: SampleCount::Sample1,
                 alpha_to_coverage: false,
                 immutable_samplers: &[],
+                blend_alpha: false,
             })
         };
         let pipeline_plain = pipeline(ShaderId::PrepassFrag, CullMode::Back);

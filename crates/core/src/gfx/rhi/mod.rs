@@ -85,6 +85,13 @@ impl Device {
 
     /// Per-frame uniform data: valid for the frame being recorded, then retired
     /// with it. The words are the block's std140 bytes.
+    /// Per-frame vertex data, valid for the frame being recorded.
+    pub fn upload_vertices(&self, bytes: &[u8]) -> BufferId {
+        match self {
+            Device::Vulkan(driver) => driver.upload_vertices(bytes),
+        }
+    }
+
     pub fn upload_uniform(&self, words: &[u32]) -> BufferId {
         match self {
             Device::Vulkan(driver) => driver.upload_uniform(words),
@@ -145,6 +152,13 @@ impl Encoder<'_> {
     pub fn bind_pipeline(&mut self, pipeline: PipelineId) {
         match self {
             Encoder::Vulkan(encoder) => encoder.bind_pipeline(pipeline),
+        }
+    }
+
+    /// Bind `buffer` as vertex stream 0.
+    pub fn bind_vertex_buffer(&mut self, buffer: BufferId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.bind_vertex_buffer(buffer),
         }
     }
 

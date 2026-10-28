@@ -60,6 +60,8 @@ pub enum VertexFormat {
     Float2,
     Float3,
     Float4,
+    /// Four bytes, each an unsigned-normalised channel.
+    Unorm8x4,
 }
 
 /// One attribute of a vertex stream. Matched to the shader by name, as the
@@ -132,6 +134,8 @@ pub struct GraphicsPipelineDesc<'a> {
     /// compares immutable samplers by identity, so pipelines that must be set
     /// compatible are built around the very same `SamplerId`.
     pub immutable_samplers: &'a [(u32, u32, SamplerId)],
+    /// Standard source-alpha blending on every colour attachment.
+    pub blend_alpha: bool,
 }
 
 impl<'a> GraphicsPipelineDesc<'a> {
@@ -150,6 +154,7 @@ impl<'a> GraphicsPipelineDesc<'a> {
             samples: SampleCount::Sample1,
             alpha_to_coverage: false,
             immutable_samplers: &[],
+            blend_alpha: false,
         }
     }
 }

@@ -105,6 +105,7 @@ impl ShadowPass {
                 samples: SampleCount::Sample1,
                 alpha_to_coverage: false,
                 immutable_samplers: &[],
+                blend_alpha: false,
             })
         };
         // Back-face culling matches the forward pass, which is only correct

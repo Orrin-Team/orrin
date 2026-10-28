@@ -27,7 +27,9 @@ use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
+use vulkano::pipeline::graphics::color_blend::{
+    AttachmentBlend, ColorBlendAttachmentState, ColorBlendState,
+};
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
@@ -83,6 +85,7 @@ pub struct VkDriver {
     samplers: Mutex<Pool<Arc<Sampler>>>,
     pipelines: Mutex<Pool<PipelineObject>>,
     uniforms: Arena,
+    vertices: Arena,
     bind_groups: Mutex<Pool<Arc<DescriptorSet>>>,
 }
 
@@ -105,6 +108,15 @@ impl VkDriver {
                 ..Default::default()
             },
         );
+        let vertices = Arena::new(
+            ctx.memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: vulkano::buffer::BufferUsage::VERTEX_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        );
         Self {
             ctx,
             frame: AtomicU64::new(0),
@@ -113,6 +125,7 @@ impl VkDriver {
             samplers: Mutex::new(Pool::new(frames_in_flight)),
             pipelines: Mutex::new(Pool::new(frames_in_flight)),
             uniforms,
+            vertices,
             bind_groups: Mutex::new(Pool::new(frames_in_flight)),
         }
     }
@@ -150,6 +163,12 @@ impl VkDriver {
             super::texture::MipPolicy::None,
         );
         TextureViewId(self.views.lock().unwrap().insert(view))
+    }
+
+    pub fn upload_vertices(&self, bytes: &[u8]) -> BufferId {
+        let buffer = self.vertices.allocate_slice::<u8>(bytes.len() as u64);
+        buffer.write().unwrap().copy_from_slice(bytes);
+        self.import_buffer(buffer)
     }
 
     pub fn upload_uniform(&self, words: &[u32]) -> BufferId {
@@ -291,7 +310,10 @@ impl VkDriver {
                 color_blend_state: (!colors.is_empty()).then(|| {
                     ColorBlendState::with_attachment_states(
                         colors.len() as u32,
-                        ColorBlendAttachmentState::default(),
+                        ColorBlendAttachmentState {
+                            blend: desc.blend_alpha.then(AttachmentBlend::alpha),
+                            ..Default::default()
+                        },
                     )
                 }),
                 dynamic_state: if desc.dynamic_depth_bias {
@@ -487,6 +509,7 @@ fn vertex_buffer(stream: &VertexStream) -> VertexBufferDescription {
                     VertexFormat::Float2 => VkFormat::R32G32_SFLOAT,
                     VertexFormat::Float3 => VkFormat::R32G32B32_SFLOAT,
                     VertexFormat::Float4 => VkFormat::R32G32B32A32_SFLOAT,
+                    VertexFormat::Unorm8x4 => VkFormat::R8G8B8A8_UNORM,
                 };
                 (
                     attribute.name.to_string(),
@@ -587,6 +610,11 @@ impl<'a> VkEncoder<'a> {
             PipelineObject::Compute(compute) => self.recorder.bind_pipeline_compute(compute),
         };
         self.bound = Some(pipeline);
+    }
+
+    pub fn bind_vertex_buffer(&mut self, buffer: BufferId) {
+        let buffer = lookup(&self.driver.buffers, buffer.0, "buffer");
+        self.recorder.bind_vertex_buffers(0, buffer);
     }
 
     pub fn bind_group(&mut self, set: u32, group: BindGroupId) {
