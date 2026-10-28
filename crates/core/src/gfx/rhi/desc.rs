@@ -29,6 +29,7 @@ pub struct TextureDesc {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MemoryLocation {
+    /// Device-preferred memory the CPU may write once, at creation.
     GpuOnly,
     /// Written by the CPU every frame and read by the GPU.
     Upload,
@@ -50,6 +51,8 @@ pub struct SamplerDesc {
     /// Comparison sampler for shadow lookups.
     pub compare: bool,
     pub anisotropy: Option<f32>,
+    /// Upper end of the sampled mip range; `None` is unclamped.
+    pub max_lod: Option<f32>,
 }
 
 /// One vertex buffer binding of a pipeline. Stream `i` binds at Metal buffer
@@ -76,6 +79,11 @@ pub struct GraphicsPipelineDesc<'a> {
     pub fragment: ShaderId,
     pub color_formats: &'a [Format],
     pub depth_format: Option<Format>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ComputePipelineDesc {
+    pub shader: ShaderId,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

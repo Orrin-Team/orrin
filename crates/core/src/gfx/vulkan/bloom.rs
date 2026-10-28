@@ -25,7 +25,6 @@ use vulkano::pipeline::{
 use crate::scene::{BloomSettings, HdrSettings};
 
 use super::context::VkContext;
-use super::exposure::GpuExposure;
 use super::record::Recorder;
 
 /// Most levels the chain will ever have. Six covers a 4K frame down to about
@@ -168,7 +167,7 @@ impl BloomPass {
         ctx: &VkContext,
         source: Arc<ImageView>,
         target: Arc<ImageView>,
-        exposure: Subbuffer<GpuExposure>,
+        exposure: Subbuffer<[u8]>,
     ) {
         let set = ctx.descriptor_sets.get(
             &ctx.descriptor_set_allocator,

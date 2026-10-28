@@ -22,8 +22,8 @@ mod pool;
 pub(crate) use pool::Pool;
 
 pub use desc::{
-    Binding, BindingResource, BufferDesc, GraphicsPipelineDesc, MemoryLocation, SamplerDesc,
-    TextureDesc, TextureDimension, VertexStream, Viewport,
+    Binding, BindingResource, BufferDesc, ComputePipelineDesc, GraphicsPipelineDesc,
+    MemoryLocation, SamplerDesc, TextureDesc, TextureDimension, VertexStream, Viewport,
 };
 
 use super::vulkan::driver::{VkDriver, VkEncoder};
@@ -52,6 +52,20 @@ impl Device {
     pub fn create_graphics_pipeline(&self, desc: &GraphicsPipelineDesc) -> PipelineId {
         match self {
             Device::Vulkan(driver) => driver.create_graphics_pipeline(desc),
+        }
+    }
+
+    pub fn create_compute_pipeline(&self, desc: &ComputePipelineDesc) -> PipelineId {
+        match self {
+            Device::Vulkan(driver) => driver.create_compute_pipeline(desc),
+        }
+    }
+
+    /// A buffer that outlives the frame, holding `initial` from creation. The
+    /// words are the buffer's whole contents: `desc.size` must be their length.
+    pub fn create_buffer_init(&self, desc: BufferDesc, initial: &[u32]) -> BufferId {
+        match self {
+            Device::Vulkan(driver) => driver.create_buffer_init(desc, initial),
         }
     }
 
@@ -98,6 +112,12 @@ impl Encoder<'_> {
     pub fn push_constants(&mut self, words: &[u32]) {
         match self {
             Encoder::Vulkan(encoder) => encoder.push_constants(words),
+        }
+    }
+
+    pub fn dispatch(&mut self, groups: [u32; 3]) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.dispatch(groups),
         }
     }
 

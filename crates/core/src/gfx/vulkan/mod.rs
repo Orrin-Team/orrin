@@ -424,7 +424,7 @@ impl VulkanRenderer {
         let hdr = HdrPass::new(&device, engine_format(format));
         let gizmo = GizmoPass::new(&ctx, format);
         let outline = OutlinePass::new(&ctx, format);
-        let exposure = ExposurePass::new(&ctx);
+        let exposure = ExposurePass::new(&device);
         let bloom = BloomPass::new(&ctx);
         let prepass = GeometryPrepass::new(&ctx);
         let ssao = SsaoPass::new(&ctx);
@@ -2899,14 +2899,18 @@ impl FrameRecord<'_> {
                         self.extent,
                     );
                 }
-                PassBody::LuminanceHistogram => self.exposure.record_histogram(
-                    builder,
-                    self.ctx,
-                    self.extent,
-                    self.scene_color.clone(),
-                ),
+                PassBody::LuminanceHistogram => {
+                    let Device::Vulkan(driver) = self.device;
+                    let hdr = driver.import_view(self.scene_color.clone());
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                    self.exposure
+                        .record_histogram(self.device, &mut encoder, self.extent, hdr);
+                }
                 PassBody::LuminanceAverage => {
-                    self.exposure.record_average(builder, self.ctx, self.extent)
+                    let Device::Vulkan(driver) = self.device;
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                    self.exposure
+                        .record_average(self.device, &mut encoder, self.extent);
                 }
                 PassBody::BloomPrefilter => {
                     let ids = self.frame.ids.bloom.expect("bloom pass without levels");
@@ -2915,7 +2919,10 @@ impl FrameRecord<'_> {
                         self.ctx,
                         self.scene_color.clone(),
                         self.images.view(ids.down(0)),
-                        self.exposure.exposure_buffer(),
+                        {
+                            let Device::Vulkan(driver) = self.device;
+                            driver.buffer(self.exposure.exposure_buffer())
+                        },
                     );
                 }
                 PassBody::BloomDownsample(level) => {
@@ -3150,7 +3157,7 @@ impl FrameRecord<'_> {
                     None => self.bloom.black_view(),
                 };
                 let hdr = driver.import_view(self.scene_color.clone());
-                let exposure = driver.import_buffer(self.exposure.exposure_buffer().into_bytes());
+                let exposure = self.exposure.exposure_buffer();
                 let bloom = driver.import_view(bloom);
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.hdr.record_tonemap(

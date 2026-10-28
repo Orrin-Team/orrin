@@ -15,12 +15,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use vulkano::buffer::Subbuffer;
+use vulkano::buffer::{Buffer, BufferCreateInfo, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{
     Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
 };
 use vulkano::image::view::ImageView;
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
+use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
@@ -30,20 +32,35 @@ use vulkano::pipeline::graphics::vertex_input::VertexInputState;
 use vulkano::pipeline::graphics::viewport::ViewportState;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
-    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+    ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
 use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
 
 use super::context::VkContext;
-use super::convert::vk_format;
+use super::convert::{vk_buffer_usage, vk_format};
 use super::record::Recorder;
 use super::rendering;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BindingResource, BufferId, GraphicsPipelineDesc, PipelineId, Pool,
-    SamplerDesc, SamplerId, TextureViewId, Viewport,
+    BindGroupId, Binding, BindingResource, BufferDesc, BufferId, ComputePipelineDesc,
+    GraphicsPipelineDesc, PipelineId, Pool, SamplerDesc, SamplerId, TextureViewId, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
+
+#[derive(Clone)]
+enum PipelineObject {
+    Graphics(Arc<GraphicsPipeline>),
+    Compute(Arc<ComputePipeline>),
+}
+
+impl PipelineObject {
+    fn layout(&self) -> &Arc<PipelineLayout> {
+        match self {
+            PipelineObject::Graphics(pipeline) => pipeline.layout(),
+            PipelineObject::Compute(pipeline) => pipeline.layout(),
+        }
+    }
+}
 
 pub struct VkDriver {
     ctx: Arc<VkContext>,
@@ -51,7 +68,7 @@ pub struct VkDriver {
     views: Mutex<Pool<Arc<ImageView>>>,
     buffers: Mutex<Pool<Subbuffer<[u8]>>>,
     samplers: Mutex<Pool<Arc<Sampler>>>,
-    pipelines: Mutex<Pool<Arc<GraphicsPipeline>>>,
+    pipelines: Mutex<Pool<PipelineObject>>,
     bind_groups: Mutex<Pool<Arc<DescriptorSet>>>,
 }
 
@@ -172,7 +189,65 @@ impl VkDriver {
             },
         )
         .unwrap();
-        PipelineId(self.pipelines.lock().unwrap().insert(pipeline))
+        PipelineId(
+            self.pipelines
+                .lock()
+                .unwrap()
+                .insert(PipelineObject::Graphics(pipeline)),
+        )
+    }
+
+    pub fn create_compute_pipeline(&self, desc: &ComputePipelineDesc) -> PipelineId {
+        let device = &self.ctx.device;
+        let stage = PipelineShaderStageCreateInfo::new(entry_point(&self.ctx, desc.shader));
+        let layout = PipelineLayout::new(
+            device.clone(),
+            PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
+                .into_pipeline_layout_create_info(device.clone())
+                .unwrap(),
+        )
+        .unwrap();
+        let pipeline = ComputePipeline::new(
+            device.clone(),
+            self.ctx.pipeline_cache(),
+            ComputePipelineCreateInfo::stage_layout(stage, layout),
+        )
+        .unwrap();
+        PipelineId(
+            self.pipelines
+                .lock()
+                .unwrap()
+                .insert(PipelineObject::Compute(pipeline)),
+        )
+    }
+
+    pub fn create_buffer_init(&self, desc: BufferDesc, initial: &[u32]) -> BufferId {
+        assert_eq!(
+            desc.size,
+            initial.len() as u64 * 4,
+            "a buffer's size is its initial words"
+        );
+        let buffer = Buffer::from_iter(
+            self.ctx.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: vk_buffer_usage(desc.usage),
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            initial.iter().copied(),
+        )
+        .expect("failed to allocate a buffer");
+        BufferId(self.buffers.lock().unwrap().insert(buffer.into_bytes()))
+    }
+
+    /// The buffer behind a handle, for a pass still written against vulkano.
+    /// Goes away with the last such pass.
+    pub fn buffer(&self, id: BufferId) -> Subbuffer<[u8]> {
+        lookup(&self.buffers, id.0, "buffer")
     }
 
     pub fn create_bind_group(
@@ -236,7 +311,7 @@ fn entry_point(ctx: &VkContext, shader: ShaderId) -> vulkano::shader::EntryPoint
 pub struct VkEncoder<'a> {
     recorder: &'a mut Recorder,
     driver: &'a VkDriver,
-    bound: Option<Arc<GraphicsPipeline>>,
+    bound: Option<PipelineObject>,
 }
 
 impl<'a> VkEncoder<'a> {
@@ -265,15 +340,22 @@ impl<'a> VkEncoder<'a> {
 
     pub fn bind_pipeline(&mut self, pipeline: PipelineId) {
         let pipeline = lookup(&self.driver.pipelines, pipeline.0, "pipeline");
-        self.recorder.bind_pipeline_graphics(&pipeline);
+        match &pipeline {
+            PipelineObject::Graphics(graphics) => self.recorder.bind_pipeline_graphics(graphics),
+            PipelineObject::Compute(compute) => self.recorder.bind_pipeline_compute(compute),
+        };
         self.bound = Some(pipeline);
     }
 
     pub fn bind_group(&mut self, set: u32, group: BindGroupId) {
         let group = lookup(&self.driver.bind_groups, group.0, "bind group");
         let layout = self.layout().clone();
+        let point = match self.bound {
+            Some(PipelineObject::Compute(_)) => PipelineBindPoint::Compute,
+            _ => PipelineBindPoint::Graphics,
+        };
         self.recorder
-            .bind_descriptor_sets(PipelineBindPoint::Graphics, &layout, set, &[group]);
+            .bind_descriptor_sets(point, &layout, set, &[group]);
     }
 
     pub fn push_constants(&mut self, words: &[u32]) {
@@ -295,6 +377,10 @@ impl<'a> VkEncoder<'a> {
         block.copy_from_slice(words);
         let layout = self.layout().clone();
         self.recorder.push_constants(&layout, 0, &block);
+    }
+
+    pub fn dispatch(&mut self, groups: [u32; 3]) {
+        self.recorder.dispatch(groups);
     }
 
     pub fn draw(&mut self, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
