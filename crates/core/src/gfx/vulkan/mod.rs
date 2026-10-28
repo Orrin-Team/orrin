@@ -425,7 +425,7 @@ impl VulkanRenderer {
         let prepass = GeometryPrepass::new(&ctx, &device);
         let ssao = SsaoPass::new(&ctx, &device);
         let contact_shadows = ContactShadowPass::new(&ctx, &device);
-        let fog = FogPass::new(&ctx);
+        let fog = FogPass::new(&ctx, &device);
         let ssr = SsrPass::new(&device);
         let subsurface = SubsurfacePass::new(&device);
         let oit = OitPass::new(&device, forward.layout_source());
@@ -2682,8 +2682,11 @@ impl FrameRecord<'_> {
                     );
                 }
                 PassBody::FogScatter => {
+                    let Device::Vulkan(driver) = self.device;
+                    let shadow_maps = driver.import_view(self.shadow_view.clone());
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.fog
-                        .record_scatter(builder, self.ctx, self.shadow_view.clone());
+                        .record_scatter(self.device, &mut encoder, shadow_maps);
                 }
                 PassBody::FogIntegrate => {
                     let ids = self
@@ -2691,8 +2694,10 @@ impl FrameRecord<'_> {
                         .ids
                         .fog
                         .expect("fog passes without their volumes");
-                    self.fog
-                        .record_integrate(builder, self.ctx, self.images.view(ids.volume));
+                    let Device::Vulkan(driver) = self.device;
+                    let volume = driver.import_view(self.images.view(ids.volume));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                    self.fog.record_integrate(self.device, &mut encoder, volume);
                 }
                 PassBody::SubsurfaceBlurHorizontal | PassBody::SubsurfaceBlurVertical => {
                     let ids = self

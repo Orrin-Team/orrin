@@ -208,9 +208,17 @@ impl VkDriver {
             SamplerAddressMode::ClampToEdge
         };
         if desc.compare {
-            // The shadow lookup. The comparison happens before the bilinear
-            // filter, so a single tap is already a 2x2 percentage-closer result,
-            // and the border is white so a tap past the map reads as lit.
+            // The sampler the shading passes read the cascades through. It must be
+            // an *immutable* sampler baked into the descriptor set layout, not one
+            // written into a set: Metal makes a sampler's compare function a
+            // compile-time property, so MoltenVK rejects a written comparison
+            // sampler unless `mutable_comparison_samplers` is available, which on
+            // a portability subset device it is not.
+            //
+            // `Less` against a depth map cleared to 1.0, and a white border so a
+            // fragment sampling outside a cascade reads as lit rather than as
+            // shadowed. The comparison happens before the bilinear filter, so a
+            // single tap is already a 2x2 percentage-closer result.
             let sampler = Sampler::new(
                 self.ctx.device.clone(),
                 SamplerCreateInfo {
@@ -413,11 +421,30 @@ impl VkDriver {
     }
 
     pub fn create_compute_pipeline(&self, desc: &ComputePipelineDesc) -> PipelineId {
+        self.create_compute_pipeline_with_samplers(desc, &[])
+    }
+
+    /// A compute pipeline with samplers baked into its set layout, as
+    /// `(set, binding, sampler)`. Needed where a device must not be handed a
+    /// written comparison sampler.
+    pub fn create_compute_pipeline_with_samplers(
+        &self,
+        desc: &ComputePipelineDesc,
+        immutable_samplers: &[(u32, u32, SamplerId)],
+    ) -> PipelineId {
         let device = &self.ctx.device;
         let stage = PipelineShaderStageCreateInfo::new(entry_point(&self.ctx, desc.shader));
+        let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage]);
+        for &(set, binding, sampler) in immutable_samplers {
+            layout_info.set_layouts[set as usize]
+                .bindings
+                .get_mut(&binding)
+                .expect("an immutable sampler names a binding the shader declares")
+                .immutable_samplers = vec![lookup(&self.samplers, sampler.0, "sampler")];
+        }
         let layout = PipelineLayout::new(
             device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
+            layout_info
                 .into_pipeline_layout_create_info(device.clone())
                 .unwrap(),
         )

@@ -63,6 +63,18 @@ impl Device {
         }
     }
 
+    pub fn create_compute_pipeline_with_samplers(
+        &self,
+        desc: &ComputePipelineDesc,
+        immutable_samplers: &[(u32, u32, SamplerId)],
+    ) -> PipelineId {
+        match self {
+            Device::Vulkan(driver) => {
+                driver.create_compute_pipeline_with_samplers(desc, immutable_samplers)
+            }
+        }
+    }
+
     /// A buffer that outlives the frame, holding `initial` from creation. The
     /// words are the buffer's whole contents: `desc.size` must be their length.
     pub fn create_buffer_init(&self, desc: BufferDesc, initial: &[u32]) -> BufferId {

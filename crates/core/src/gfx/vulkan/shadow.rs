@@ -6,15 +6,11 @@ use vulkano::buffer::Subbuffer;
 use vulkano::command_buffer::ClearDepthStencilImageInfo;
 use vulkano::command_buffer::DrawIndexedIndirectCommand;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device as VkDevice;
 use vulkano::format::ClearDepthStencilValue;
-use vulkano::image::sampler::{
-    BorderColor, Filter, Sampler, SamplerAddressMode, SamplerCreateInfo,
-};
+use vulkano::image::sampler::Sampler;
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage};
 use vulkano::memory::allocator::AllocationCreateInfo;
-use vulkano::pipeline::graphics::depth_stencil::CompareOp;
 
 use crate::geom::Frustum;
 use crate::gfx::format::SampleCount;
@@ -542,34 +538,6 @@ impl CasterSets {
             vec![self.objects.clone()]
         }
     }
-}
-
-/// The sampler the forward pass reads the cascades through.
-///
-/// It must be an *immutable* sampler baked into the descriptor set layout, not
-/// one written into a set: Metal makes a sampler's compare function a
-/// compile-time property, so MoltenVK rejects a written comparison sampler
-/// unless `mutable_comparison_samplers` is available, which on a portability
-/// subset device it is not.
-///
-/// The conventions live here because this module owns the map: `Less` against a
-/// depth map cleared to 1.0, and a white border so a fragment sampling outside a
-/// cascade reads as lit rather than as shadowed.
-pub(super) fn comparison_sampler(device: &Arc<VkDevice>) -> Arc<Sampler> {
-    Sampler::new(
-        device.clone(),
-        SamplerCreateInfo {
-            mag_filter: Filter::Linear,
-            min_filter: Filter::Linear,
-            address_mode: [SamplerAddressMode::ClampToBorder; 3],
-            border_color: BorderColor::FloatOpaqueWhite,
-            // The comparison happens before the bilinear filter, so a single tap
-            // is already a 2x2 percentage-closer result.
-            compare: Some(CompareOp::Less),
-            ..Default::default()
-        },
-    )
-    .unwrap()
 }
 
 fn build_lit_view(ctx: &VkContext) -> Arc<ImageView> {
