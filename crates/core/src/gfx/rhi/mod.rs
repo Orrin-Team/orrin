@@ -146,6 +146,39 @@ impl Device {
         }
     }
 
+    /// A texture that outlives the frame, owned by whoever holds the id. The
+    /// view covers the whole image; a sampled view of a mipped image never
+    /// claims storage usage, because a storage descriptor takes one level.
+    pub fn create_texture(&self, desc: &TextureDesc) -> TextureViewId {
+        match self {
+            Device::Vulkan(driver) => driver.create_texture(desc),
+        }
+    }
+
+    /// A view of one mip level of `texture`, with the texture's full usage, for
+    /// a pass that writes the levels one at a time.
+    pub fn mip_view(&self, texture: TextureViewId, level: u32) -> TextureViewId {
+        match self {
+            Device::Vulkan(driver) => driver.mip_view(texture, level),
+        }
+    }
+
+    /// Retire a texture or a view of one once the frames that may still read it
+    /// are done.
+    pub fn destroy_texture(&self, view: TextureViewId) {
+        match self {
+            Device::Vulkan(driver) => driver.destroy_texture(view),
+        }
+    }
+
+    /// Fill a depth texture with one value, once, and leave it readable. For the
+    /// stand-in a pass samples when the real target does not exist this frame.
+    pub fn fill_depth(&self, texture: TextureViewId, depth: f32) {
+        match self {
+            Device::Vulkan(driver) => driver.fill_depth(texture, depth),
+        }
+    }
+
     /// A persistent single-level 2D texture holding `pixels`, tightly packed.
     pub fn create_texture_2d(
         &self,

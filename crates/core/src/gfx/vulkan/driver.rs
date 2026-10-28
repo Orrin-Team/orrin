@@ -23,7 +23,8 @@ use vulkano::format::Format as VkFormat;
 use vulkano::image::sampler::{
     Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
 };
-use vulkano::image::view::ImageView;
+use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
+use vulkano::image::{Image, ImageCreateInfo, ImageSubresourceRange, ImageType};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
@@ -49,7 +50,7 @@ use vulkano::pipeline::{
 use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
 
 use super::context::VkContext;
-use super::convert::{vk_buffer_usage, vk_format, vk_samples};
+use super::convert::{vk_buffer_usage, vk_format, vk_image_usage, vk_samples};
 use super::mesh::MeshArena;
 use super::record::{Arena, Recorder};
 use super::rendering;
@@ -59,8 +60,8 @@ use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferDesc, BufferId,
     ComputePipelineDesc, CullMode, DepthCompare, DepthRect, GraphicsPipelineDesc, MeshSpan,
-    PipelineId, Pool, SamplerDesc, SamplerId, TextureViewId, Topology, VertexFormat, VertexStream,
-    Viewport,
+    PipelineId, Pool, SamplerDesc, SamplerId, TextureDesc, TextureDimension, TextureViewId,
+    Topology, VertexFormat, VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -175,6 +176,105 @@ impl VkDriver {
         let index = pool.insert(view);
         pool.remove(index, self.frame.load(Ordering::Relaxed));
         TextureViewId(index)
+    }
+
+    pub fn create_texture(&self, desc: &TextureDesc) -> TextureViewId {
+        let usage = vk_image_usage(desc.usage);
+        let image = Image::new(
+            self.ctx.memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: match desc.dimension {
+                    TextureDimension::D3 => ImageType::Dim3d,
+                    _ => ImageType::Dim2d,
+                },
+                format: vk_format(desc.format),
+                extent: desc.extent,
+                mip_levels: desc.mip_levels,
+                array_layers: desc.array_layers,
+                samples: vk_samples(desc.samples),
+                usage,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .expect("failed to allocate a texture");
+        let view = ImageView::new(
+            image.clone(),
+            ImageViewCreateInfo {
+                view_type: match desc.dimension {
+                    TextureDimension::D2 => ImageViewType::Dim2d,
+                    TextureDimension::D2Array => ImageViewType::Dim2dArray,
+                    TextureDimension::D3 => ImageViewType::Dim3d,
+                    TextureDimension::Cube => ImageViewType::Cube,
+                },
+                // A storage descriptor takes exactly one level, so a view
+                // spanning a pyramid cannot claim that usage.
+                usage: if desc.mip_levels > 1 {
+                    usage - vulkano::image::ImageUsage::STORAGE
+                } else {
+                    usage
+                },
+                ..ImageViewCreateInfo::from_image(&image)
+            },
+        )
+        .expect("failed to create a texture view");
+        TextureViewId(self.views.lock().unwrap().insert(view))
+    }
+
+    pub fn mip_view(&self, texture: TextureViewId, level: u32) -> TextureViewId {
+        let whole = lookup(&self.views, texture.0, "texture view");
+        let image = whole.image().clone();
+        let view = ImageView::new(
+            image.clone(),
+            ImageViewCreateInfo {
+                view_type: whole.view_type(),
+                subresource_range: ImageSubresourceRange {
+                    mip_levels: level..level + 1,
+                    ..image.subresource_range()
+                },
+                ..ImageViewCreateInfo::from_image(&image)
+            },
+        )
+        .expect("failed to create a mip view");
+        TextureViewId(self.views.lock().unwrap().insert(view))
+    }
+
+    pub fn destroy_texture(&self, view: TextureViewId) {
+        self.views
+            .lock()
+            .unwrap()
+            .remove(view.0, self.frame.load(Ordering::Relaxed));
+    }
+
+    pub fn fill_depth(&self, texture: TextureViewId, depth: f32) {
+        let view = lookup(&self.views, texture.0, "texture view");
+        let image = view.image().clone();
+        let mut builder = Recorder::new(&self.ctx);
+        // Fresh from `create_texture`, so there is nothing to preserve; cleared
+        // once and then only ever sampled, so this is the whole of its
+        // synchronisation.
+        builder
+            .image_barrier(super::record::to_transfer_dst(
+                image.clone(),
+                super::record::whole_image(&image),
+                vulkano::image::ImageLayout::Undefined,
+            ))
+            .clear_depth_stencil_image(vulkano::command_buffer::ClearDepthStencilImageInfo {
+                clear_value: vulkano::format::ClearDepthStencilValue { depth, stencil: 0 },
+                ..vulkano::command_buffer::ClearDepthStencilImageInfo::image(image.clone())
+            })
+            .image_barrier(super::record::to_shader_read(
+                image.clone(),
+                super::record::whole_image(&image),
+                vulkano::image::ImageLayout::TransferDstOptimal,
+            ));
+        builder.submit_and_wait(&self.ctx);
+    }
+
+    /// The vulkano view behind an id, for the Vulkan-side graph executor, which
+    /// resolves graph resources to images and hands them to barriers.
+    pub fn vk_view(&self, view: TextureViewId) -> Arc<ImageView> {
+        lookup(&self.views, view.0, "texture view")
     }
 
     pub fn create_texture_2d(

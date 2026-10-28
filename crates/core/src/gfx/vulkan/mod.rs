@@ -130,7 +130,9 @@ use super::{
     DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TexelFormat, TextureHandle,
     TextureLevels,
 };
-use crate::gfx::rhi::{BindGroupId, BufferDesc, BufferId, Device, Encoder, MemoryLocation};
+use crate::gfx::rhi::{
+    BindGroupId, BufferDesc, BufferId, Device, Encoder, MemoryLocation, TextureViewId,
+};
 use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::DebugLine;
@@ -814,6 +816,11 @@ impl VulkanRenderer {
     /// frame's colour can be handed either, depending on which optical stages
     /// the frame has — so it asks by `ResourceId` and this decides, rather than
     /// each consumer re-deriving which pass ran last.
+    fn vk_view(&self, id: TextureViewId) -> Arc<ImageView> {
+        let Device::Vulkan(driver) = &self.device;
+        driver.vk_view(id)
+    }
+
     fn view_of(&self, id: ResourceId) -> Arc<ImageView> {
         if let Some(fog) = self.frame.ids.fog
             && id == fog.scatter
@@ -834,7 +841,7 @@ impl VulkanRenderer {
             }
         }
         match self.frame.ids.taa {
-            Some(taa) if id == taa.output => self.taa.output_view(),
+            Some(taa) if id == taa.output => self.vk_view(self.taa.output_view()),
             _ => self.images.view(id),
         }
     }
@@ -884,12 +891,12 @@ impl VulkanRenderer {
         if let Some(taa) = ids.taa {
             if id == taa.output {
                 return Some(record::Target::Image(
-                    self.taa.output_view().image().clone(),
+                    self.vk_view(self.taa.output_view()).image().clone(),
                 ));
             }
             if id == taa.history {
                 return Some(record::Target::Image(
-                    self.taa.history_view().image().clone(),
+                    self.vk_view(self.taa.history_view()).image().clone(),
                 ));
             }
         }
@@ -1458,7 +1465,7 @@ impl VulkanRenderer {
         // the matrices it returns rather than deriving its own from `camera`.
         let view = self
             .taa
-            .begin_frame(&self.ctx, taa, camera, self.swapchain.extent);
+            .begin_frame(&self.device, taa, camera, self.swapchain.extent);
         // Both resolve their optics against this frame's camera: the lens takes
         // its focal length from the field of view, and the shutter takes the
         // depth range it linearises with.
@@ -2483,6 +2490,11 @@ impl FrameRecord<'_> {
     /// downstream that reads the frame's colour can be handed either, depending
     /// on which optical stages the frame has — so it asks by `ResourceId` and
     /// this decides, rather than each consumer re-deriving which pass ran last.
+    fn vk_view(&self, id: TextureViewId) -> Arc<ImageView> {
+        let Device::Vulkan(driver) = &self.device;
+        driver.vk_view(id)
+    }
+
     fn view_of(&self, id: ResourceId) -> Arc<ImageView> {
         if let Some(fog) = self.frame.ids.fog
             && id == fog.scatter
@@ -2490,7 +2502,7 @@ impl FrameRecord<'_> {
             return self.fog.scatter_view();
         }
         match self.frame.ids.taa {
-            Some(taa) if id == taa.output => self.taa.output_view(),
+            Some(taa) if id == taa.output => self.vk_view(self.taa.output_view()),
             _ => self.images.view(id),
         }
     }
@@ -2540,12 +2552,12 @@ impl FrameRecord<'_> {
         if let Some(taa) = ids.taa {
             if id == taa.output {
                 return Some(record::Target::Image(
-                    self.taa.output_view().image().clone(),
+                    self.vk_view(self.taa.output_view()).image().clone(),
                 ));
             }
             if id == taa.history {
                 return Some(record::Target::Image(
-                    self.taa.history_view().image().clone(),
+                    self.vk_view(self.taa.history_view()).image().clone(),
                 ));
             }
         }
