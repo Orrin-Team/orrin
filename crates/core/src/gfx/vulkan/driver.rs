@@ -234,11 +234,9 @@ impl VkDriver {
                 SamplerMipmapMode::Nearest
             },
             address_mode: [address; 3],
-            lod: if desc.mipmap_linear {
-                0.0..=vulkano::image::sampler::LOD_CLAMP_NONE
-            } else {
-                0.0..=1.0
-            },
+            lod: 0.0..=desc
+                .max_lod
+                .unwrap_or(vulkano::image::sampler::LOD_CLAMP_NONE),
             anisotropy: desc.anisotropy,
             ..Default::default()
         };
@@ -467,13 +465,7 @@ impl VkDriver {
         lookup(&self.buffers, id.0, "buffer")
     }
 
-    pub fn create_bind_group(
-        &self,
-        pipeline: PipelineId,
-        set: u32,
-        bindings: &[Binding],
-    ) -> BindGroupId {
-        let pipeline = lookup(&self.pipelines, pipeline.0, "pipeline");
+    fn writes(&self, bindings: &[Binding]) -> Vec<WriteDescriptorSet> {
         let mut writes: Vec<WriteDescriptorSet> = Vec::with_capacity(bindings.len());
         let mut index = 0;
         while index < bindings.len() {
@@ -535,15 +527,45 @@ impl VkDriver {
             });
             index += 1;
         }
+        writes
+    }
+
+    /// A bind group the descriptor cache remembers while what it points at is
+    /// unchanged. For sets over images, samplers and buffers that outlive the
+    /// frame.
+    pub fn create_bind_group(
+        &self,
+        pipeline: PipelineId,
+        set: u32,
+        bindings: &[Binding],
+    ) -> BindGroupId {
+        let pipeline = lookup(&self.pipelines, pipeline.0, "pipeline");
         let set = self.ctx.descriptor_sets.get(
             &self.ctx.descriptor_set_allocator,
             &pipeline.layout().set_layouts()[set as usize],
-            writes,
+            self.writes(bindings),
         );
-        let mut pool = self.bind_groups.lock().unwrap();
-        let index = pool.insert(set);
-        pool.remove(index, self.frame.load(Ordering::Relaxed));
-        BindGroupId(index)
+        self.import_set(set)
+    }
+
+    /// A bind group built afresh for this frame and not remembered. For a set
+    /// that binds a buffer suballocated per frame: it would miss the cache every
+    /// frame and pin each frame's buffer for the cache's keep time besides.
+    pub fn create_transient_bind_group(
+        &self,
+        pipeline: PipelineId,
+        set: u32,
+        bindings: &[Binding],
+    ) -> BindGroupId {
+        let pipeline = lookup(&self.pipelines, pipeline.0, "pipeline");
+        let set = DescriptorSet::new(
+            self.ctx.descriptor_set_allocator.clone(),
+            pipeline.layout().set_layouts()[set as usize].clone(),
+            self.writes(bindings),
+            [],
+        )
+        .expect("failed to build a descriptor set");
+        self.import_set(set)
     }
 }
 

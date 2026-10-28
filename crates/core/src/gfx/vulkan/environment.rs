@@ -359,7 +359,7 @@ impl EnvironmentPass {
         // Whichever render pass the executor opened around this call.
         let pipeline = self.skybox_pipelines[msaa as usize][subsurface as usize];
 
-        let set = device.create_bind_group(
+        let set = device.create_transient_bind_group(
             pipeline,
             0,
             &[

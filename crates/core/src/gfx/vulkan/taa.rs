@@ -233,7 +233,7 @@ impl TaaPass {
             binding,
             resource: BindingResource::SampledTexture { view, sampler },
         };
-        let set = device.create_bind_group(
+        let set = device.create_transient_bind_group(
             self.pipeline,
             0,
             &[

@@ -104,6 +104,19 @@ impl Device {
         }
     }
 
+    /// Like [`create_bind_group`](Self::create_bind_group) but never cached, for
+    /// a set that binds a buffer allocated for this frame alone.
+    pub fn create_transient_bind_group(
+        &self,
+        pipeline: PipelineId,
+        set: u32,
+        bindings: &[Binding],
+    ) -> BindGroupId {
+        match self {
+            Device::Vulkan(driver) => driver.create_transient_bind_group(pipeline, set, bindings),
+        }
+    }
+
     /// A set of bindings for set `set` of `pipeline`. Equal bindings give back
     /// the same underlying set, as the descriptor cache did before the RHI.
     pub fn create_bind_group(

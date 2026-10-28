@@ -178,7 +178,7 @@ impl SsaoPass {
         depth_view: TextureViewId,
         normal_view: TextureViewId,
     ) {
-        let uniform_set = device.create_bind_group(
+        let uniform_set = device.create_transient_bind_group(
             self.ssao_pipeline,
             0,
             &[
@@ -263,7 +263,7 @@ impl SsaoPass {
                 },
             ],
         );
-        let frame_set = device.create_bind_group(
+        let frame_set = device.create_transient_bind_group(
             self.blur_pipeline,
             1,
             &[Binding {

@@ -143,7 +143,7 @@ impl MotionBlurPass {
                 sampler: self.nearest_clamp,
             },
         };
-        let set = device.create_bind_group(
+        let set = device.create_transient_bind_group(
             self.tile_max_pipeline,
             0,
             &[
@@ -214,7 +214,7 @@ impl MotionBlurPass {
                 sampler: self.nearest_clamp,
             },
         };
-        let set = device.create_bind_group(
+        let set = device.create_transient_bind_group(
             self.gather_pipeline,
             0,
             &[

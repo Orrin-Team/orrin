@@ -527,7 +527,7 @@ impl CullPass {
 
     pub(super) fn record_reset(&self, device: &Device, builder: &mut Encoder, frame: &CullFrame) {
         let Device::Vulkan(driver) = device;
-        let set = device.create_bind_group(
+        let set = device.create_transient_bind_group(
             self.reset_pipeline,
             0,
             &[
@@ -579,7 +579,7 @@ impl CullPass {
             binding,
             resource: BindingResource::StorageBuffer(driver.import_buffer(buffer)),
         };
-        let set = device.create_bind_group(
+        let set = device.create_transient_bind_group(
             self.cull_pipeline,
             0,
             &[
