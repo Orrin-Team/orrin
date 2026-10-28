@@ -22,8 +22,8 @@ mod pool;
 pub(crate) use pool::Pool;
 
 pub use desc::{
-    Binding, BindingResource, BufferDesc, ComputePipelineDesc, CullMode, DepthRect, DepthTest,
-    GraphicsPipelineDesc, MemoryLocation, SamplerDesc, TextureDesc, TextureDimension,
+    Binding, BindingResource, BufferDesc, ComputePipelineDesc, CullMode, DepthCompare, DepthRect,
+    DepthTest, GraphicsPipelineDesc, MemoryLocation, SamplerDesc, TextureDesc, TextureDimension,
     VertexAttribute, VertexFormat, VertexStream, Viewport,
 };
 

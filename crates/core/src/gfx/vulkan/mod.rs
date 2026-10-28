@@ -415,11 +415,7 @@ impl VulkanRenderer {
     ) -> Self {
         let ctx = Arc::new(ctx);
         let device = Device::Vulkan(VkDriver::new(ctx.clone(), FRAMES_IN_FLIGHT as u64));
-        let forward = ForwardPass::new(
-            &ctx,
-            vk_format(hdr::HDR_FORMAT),
-            vk_format(hdr::HDR_WIDE_FORMAT),
-        );
+        let forward = ForwardPass::new(&ctx, &device, hdr::HDR_FORMAT, hdr::HDR_WIDE_FORMAT);
         let arena = MeshArena::new(&ctx);
         let hdr = HdrPass::new(&device, engine_format(format));
         let gizmo = GizmoPass::new(&ctx, format);
@@ -432,8 +428,8 @@ impl VulkanRenderer {
         let fog = FogPass::new(&ctx);
         let ssr = SsrPass::new(&ctx);
         let subsurface = SubsurfacePass::new(&device);
-        let oit = OitPass::new(&ctx, &device, forward.pipeline_layout());
-        let refraction = RefractionPass::new(&ctx, &device, forward.pipeline_layout());
+        let oit = OitPass::new(&ctx, &device, &forward.pipeline_layout(&device));
+        let refraction = RefractionPass::new(&ctx, &device, &forward.pipeline_layout(&device));
         let taa = TaaPass::new(&ctx);
         let dof = DofPass::new(&ctx);
         let motion_blur = MotionBlurPass::new(&ctx);
@@ -1516,10 +1512,18 @@ impl VulkanRenderer {
         }
         let materials = self.material_buffer.clone().unwrap();
         if self.material_set.is_none() {
-            self.material_set = Some(self.forward.build_material_set(&self.ctx, &materials));
+            self.material_set = Some(self.forward.build_material_set(
+                &self.ctx,
+                &self.device,
+                &materials,
+            ));
         }
         if self.texture_set.is_none() {
-            self.texture_set = Some(self.forward.build_texture_set(&self.ctx, &self.textures));
+            self.texture_set = Some(self.forward.build_texture_set(
+                &self.ctx,
+                &self.device,
+                &self.textures,
+            ));
         }
         if self.prepass_material_set.is_none() {
             self.prepass_material_set = Some(self.prepass.build_material_set(
@@ -1666,7 +1670,7 @@ impl VulkanRenderer {
         };
         let forward_object_set =
             self.forward
-                .build_object_set(&self.ctx, &object_rows, &opaque_indices);
+                .build_object_set(&self.ctx, &self.device, &object_rows, &opaque_indices);
         // One block for the whole frame, bound by the forward pass's set 0 and
         // the prepass's alike. See `ForwardPass::upload_decals`.
         let decal_block = self.forward.upload_decals(decals);
@@ -1775,6 +1779,7 @@ impl VulkanRenderer {
         // either may depend on.
         let forward_sets = self.forward.begin_frame(
             self,
+            &self.device,
             lighting,
             camera,
             self.swapchain.extent,
@@ -1837,9 +1842,12 @@ impl VulkanRenderer {
         // the opaque ones took, which is the same buffer on the CPU path and a
         // different one under GPU culling.
         let blended_sets = forward_sets.with_object_set(match &cull_frame {
-            Some(_) => self
-                .forward
-                .build_object_set(&self.ctx, &object_rows, &objects.indices),
+            Some(_) => self.forward.build_object_set(
+                &self.ctx,
+                &self.device,
+                &object_rows,
+                &objects.indices,
+            ),
             None => forward_object_set.clone(),
         });
 
@@ -3153,8 +3161,11 @@ impl FrameRecord<'_> {
                 // binds follows from the same answer.
                 let subsurface = self.frame.ids.subsurface.is_some();
                 let msaa = self.frame.ids.msaa.is_some();
+                let Device::Vulkan(driver) = self.device;
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.forward.draw(
-                    builder,
+                    self.device,
+                    &mut encoder,
                     &self.pass_ctx(),
                     self.opaque_draws(0, self.draws, 0),
                     &self.view,

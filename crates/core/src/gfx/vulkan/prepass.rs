@@ -23,8 +23,9 @@ use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::MemoryTypeFilter;
 
+use crate::gfx::format::SampleCount;
 use crate::gfx::rhi::{
-    CullMode, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, Viewport,
+    CullMode, DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{PositionVertex, SurfaceVertex};
@@ -131,9 +132,15 @@ impl GeometryPrepass {
                 depth_format: Some(DEPTH_FORMAT),
                 vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
                 cull,
-                depth_test: Some(DepthTest { write: true }),
+                depth_test: Some(DepthTest {
+                    write: true,
+                    compare: DepthCompare::Less,
+                }),
                 partial_texture_set: Some(TEXTURE_SET as u32),
                 dynamic_depth_bias: false,
+                samples: SampleCount::Sample1,
+                alpha_to_coverage: false,
+                immutable_samplers: &[],
             })
         };
         let pipeline_plain = pipeline(ShaderId::PrepassFrag, CullMode::Back);

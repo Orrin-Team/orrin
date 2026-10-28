@@ -17,9 +17,11 @@ use vulkano::memory::allocator::AllocationCreateInfo;
 use vulkano::pipeline::graphics::depth_stencil::CompareOp;
 
 use crate::geom::Frustum;
+use crate::gfx::format::SampleCount;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::rhi::{
-    CullMode, DepthRect, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, Viewport,
+    CullMode, DepthCompare, DepthRect, DepthTest, Device, Encoder, GraphicsPipelineDesc,
+    PipelineId, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex};
@@ -91,12 +93,18 @@ impl ShadowPass {
                 depth_format: Some(DEPTH_FORMAT),
                 vertex_streams: &[PositionVertex::STREAM],
                 cull,
-                depth_test: Some(DepthTest { write: true }),
+                depth_test: Some(DepthTest {
+                    write: true,
+                    compare: DepthCompare::Less,
+                }),
                 // Only the masked variant samples anything — the plain one
                 // writes depth and nothing else — so on that pipeline this finds
                 // no set to mark and does nothing.
                 partial_texture_set: Some(TEXTURE_SET as u32),
                 dynamic_depth_bias: true,
+                samples: SampleCount::Sample1,
+                alpha_to_coverage: false,
+                immutable_samplers: &[],
             })
         };
         // Back-face culling matches the forward pass, which is only correct

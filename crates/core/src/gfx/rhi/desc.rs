@@ -86,10 +86,19 @@ pub enum CullMode {
     Back,
 }
 
-/// Depth testing is always `Less`, the engine's forward-Z convention.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DepthCompare {
+    /// The engine's forward-Z convention.
+    Less,
+    /// Against a depth another pass already wrote, which is how a one-sample
+    /// forward pass gets perfect early-Z from the geometry prepass.
+    Equal,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DepthTest {
     pub write: bool,
+    pub compare: DepthCompare,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -116,6 +125,13 @@ pub struct GraphicsPipelineDesc<'a> {
     pub partial_texture_set: Option<u32>,
     /// Depth bias, scissor and viewport are dynamic rather than viewport alone.
     pub dynamic_depth_bias: bool,
+    pub samples: SampleCount,
+    /// Spend the samples on a cutout's edge instead of testing it hard.
+    pub alpha_to_coverage: bool,
+    /// Samplers baked into the set layout, as `(set, binding, sampler)`. Vulkan
+    /// compares immutable samplers by identity, so pipelines that must be set
+    /// compatible are built around the very same `SamplerId`.
+    pub immutable_samplers: &'a [(u32, u32, SamplerId)],
 }
 
 impl<'a> GraphicsPipelineDesc<'a> {
@@ -131,6 +147,9 @@ impl<'a> GraphicsPipelineDesc<'a> {
             depth_test: None,
             partial_texture_set: None,
             dynamic_depth_bias: false,
+            samples: SampleCount::Sample1,
+            alpha_to_coverage: false,
+            immutable_samplers: &[],
         }
     }
 }

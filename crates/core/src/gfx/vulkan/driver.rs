@@ -28,7 +28,7 @@ use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
-use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
+use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
@@ -46,15 +46,15 @@ use vulkano::pipeline::{
 use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
 
 use super::context::VkContext;
-use super::convert::{vk_buffer_usage, vk_format};
+use super::convert::{vk_buffer_usage, vk_format, vk_samples};
 use super::mesh::MeshArena;
 use super::record::{Arena, Recorder};
 use super::rendering;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, BufferDesc, BufferId, ComputePipelineDesc, CullMode,
-    DepthRect, GraphicsPipelineDesc, PipelineId, Pool, SamplerDesc, SamplerId, TextureViewId,
-    VertexFormat, VertexStream, Viewport,
+    DepthCompare, DepthRect, GraphicsPipelineDesc, PipelineId, Pool, SamplerDesc, SamplerId,
+    TextureViewId, VertexFormat, VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -181,6 +181,24 @@ impl VkDriver {
         } else {
             SamplerAddressMode::ClampToEdge
         };
+        if desc.compare {
+            // The shadow lookup. The comparison happens before the bilinear
+            // filter, so a single tap is already a 2x2 percentage-closer result,
+            // and the border is white so a tap past the map reads as lit.
+            let sampler = Sampler::new(
+                self.ctx.device.clone(),
+                SamplerCreateInfo {
+                    mag_filter: Filter::Linear,
+                    min_filter: Filter::Linear,
+                    address_mode: [SamplerAddressMode::ClampToBorder; 3],
+                    border_color: vulkano::image::sampler::BorderColor::FloatOpaqueWhite,
+                    compare: Some(CompareOp::Less),
+                    ..Default::default()
+                },
+            )
+            .expect("failed to create the comparison sampler");
+            return SamplerId(self.samplers.lock().unwrap().insert(sampler));
+        }
         let info = SamplerCreateInfo {
             mag_filter: filter,
             min_filter: filter,
@@ -223,6 +241,13 @@ impl VkDriver {
             self.ctx
                 .mark_texture_array_partial(&mut layout_info, set as usize);
         }
+        for &(set, binding, sampler) in desc.immutable_samplers {
+            layout_info.set_layouts[set as usize]
+                .bindings
+                .get_mut(&binding)
+                .expect("an immutable sampler names a binding the shaders declare")
+                .immutable_samplers = vec![lookup(&self.samplers, sampler.0, "sampler")];
+        }
         let layout = PipelineLayout::new(
             device.clone(),
             layout_info
@@ -247,11 +272,18 @@ impl VkDriver {
                     depth_bias: desc.dynamic_depth_bias.then(DepthBiasState::default),
                     ..Default::default()
                 }),
-                multisample_state: Some(MultisampleState::default()),
+                multisample_state: Some(MultisampleState {
+                    rasterization_samples: vk_samples(desc.samples),
+                    alpha_to_coverage_enable: desc.alpha_to_coverage,
+                    ..Default::default()
+                }),
                 depth_stencil_state: desc.depth_test.map(|test| DepthStencilState {
                     depth: Some(DepthState {
                         write_enable: test.write,
-                        ..DepthState::simple()
+                        compare_op: match test.compare {
+                            DepthCompare::Less => CompareOp::Less,
+                            DepthCompare::Equal => CompareOp::Equal,
+                        },
                     }),
                     ..Default::default()
                 }),
@@ -301,6 +333,14 @@ impl VkDriver {
         lookup(&self.pipelines, pipeline.0, "pipeline")
             .layout()
             .set_layouts()[set]
+            .clone()
+    }
+
+    /// The whole layout of a pipeline, for a pass whose own pipeline must be set
+    /// compatible with it.
+    pub fn pipeline_layout(&self, pipeline: PipelineId) -> Arc<PipelineLayout> {
+        lookup(&self.pipelines, pipeline.0, "pipeline")
+            .layout()
             .clone()
     }
 
