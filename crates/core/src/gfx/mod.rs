@@ -88,6 +88,51 @@ pub struct SurfaceVertex {
     pub tangent: [f32; 4],
 }
 
+impl PositionVertex {
+    /// This stream as the RHI describes it. A test holds it against the layout
+    /// the `Vertex` derive produces, so the two cannot drift.
+    pub const STREAM: rhi::VertexStream = rhi::VertexStream {
+        stride: 20,
+        per_instance: false,
+        attributes: &[
+            rhi::VertexAttribute {
+                name: "position",
+                format: rhi::VertexFormat::Float3,
+                offset: 0,
+            },
+            rhi::VertexAttribute {
+                name: "uv",
+                format: rhi::VertexFormat::Float2,
+                offset: 12,
+            },
+        ],
+    };
+}
+
+impl SurfaceVertex {
+    pub const STREAM: rhi::VertexStream = rhi::VertexStream {
+        stride: 40,
+        per_instance: false,
+        attributes: &[
+            rhi::VertexAttribute {
+                name: "normal",
+                format: rhi::VertexFormat::Float3,
+                offset: 0,
+            },
+            rhi::VertexAttribute {
+                name: "color",
+                format: rhi::VertexFormat::Float3,
+                offset: 12,
+            },
+            rhi::VertexAttribute {
+                name: "tangent",
+                format: rhi::VertexFormat::Float4,
+                offset: 24,
+            },
+        ],
+    };
+}
+
 impl Vertex {
     /// The two halves this vertex is uploaded as.
     ///

@@ -22,12 +22,13 @@ mod pool;
 pub(crate) use pool::Pool;
 
 pub use desc::{
-    Binding, BindingResource, BufferDesc, ComputePipelineDesc, GraphicsPipelineDesc,
-    MemoryLocation, SamplerDesc, TextureDesc, TextureDimension, VertexStream, Viewport,
+    Binding, BindingResource, BufferDesc, ComputePipelineDesc, CullMode, DepthTest,
+    GraphicsPipelineDesc, MemoryLocation, SamplerDesc, TextureDesc, TextureDimension,
+    VertexAttribute, VertexFormat, VertexStream, Viewport,
 };
 
 use super::format::Format;
-use super::vulkan::driver::{VkDriver, VkEncoder};
+use super::vulkan::driver::{GeometryArena, VkDriver, VkEncoder};
 
 /// The device a pass creates its resources on. One variant today; Metal joins it
 /// with the pass that first needs it recorded there.
@@ -145,6 +146,39 @@ impl Encoder<'_> {
     pub fn dispatch(&mut self, groups: [u32; 3]) {
         match self {
             Encoder::Vulkan(encoder) => encoder.dispatch(groups),
+        }
+    }
+
+    /// Bind the shared vertex and index buffers every mesh is a span into.
+    pub(crate) fn bind_geometry(&mut self, arena: &GeometryArena, positions_only: bool) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.bind_geometry(arena, positions_only),
+        }
+    }
+
+    pub fn draw_indexed(
+        &mut self,
+        index_count: u32,
+        instances: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    ) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.draw_indexed(
+                index_count,
+                instances,
+                first_index,
+                vertex_offset,
+                first_instance,
+            ),
+        }
+    }
+
+    /// Draw every command in `commands`, a buffer of indexed indirect draws.
+    pub fn draw_indexed_indirect(&mut self, commands: BufferId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.draw_indexed_indirect(commands),
         }
     }
 

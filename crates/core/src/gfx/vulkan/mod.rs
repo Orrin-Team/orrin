@@ -426,7 +426,7 @@ impl VulkanRenderer {
         let outline = OutlinePass::new(&ctx, format);
         let exposure = ExposurePass::new(&device);
         let bloom = BloomPass::new(&device);
-        let prepass = GeometryPrepass::new(&ctx);
+        let prepass = GeometryPrepass::new(&ctx, &device);
         let ssao = SsaoPass::new(&ctx, &device);
         let contact_shadows = ContactShadowPass::new(&ctx, &device);
         let fog = FogPass::new(&ctx);
@@ -1522,12 +1522,18 @@ impl VulkanRenderer {
             self.texture_set = Some(self.forward.build_texture_set(&self.ctx, &self.textures));
         }
         if self.prepass_material_set.is_none() {
-            self.prepass_material_set =
-                Some(self.prepass.build_material_set(&self.ctx, &materials));
+            self.prepass_material_set = Some(self.prepass.build_material_set(
+                &self.ctx,
+                &self.device,
+                &materials,
+            ));
         }
         if self.prepass_texture_set.is_none() {
-            self.prepass_texture_set =
-                Some(self.prepass.build_texture_set(&self.ctx, &self.textures));
+            self.prepass_texture_set = Some(self.prepass.build_texture_set(
+                &self.ctx,
+                &self.device,
+                &self.textures,
+            ));
         }
         if self.shadow_material_set.is_none() {
             self.shadow_material_set = Some(self.shadow.build_material_set(&self.ctx, &materials));
@@ -1668,7 +1674,7 @@ impl VulkanRenderer {
         });
         let prepass_object_set = self.frame.ids.prepass.map(|_| {
             self.prepass
-                .build_object_set(&self.ctx, &object_rows, &opaque_indices)
+                .build_object_set(&self.ctx, &self.device, &object_rows, &opaque_indices)
         });
 
         // Uploaded once even though the prepass and the SSAO resolve both read
@@ -3052,17 +3058,22 @@ impl FrameRecord<'_> {
                         .expect("the graph scheduled the atlas with no shadow frame"),
                 );
             }
-            PassBody::GeometryPrepass => self.prepass.record(
-                builder,
-                &self.pass_ctx(),
-                self.opaque_draws(0, self.draws, 0),
-                self.extent,
-                self.frame_uniforms.clone().unwrap(),
-                self.decal_block.clone(),
-                self.prepass_object_set.clone().unwrap(),
-                self.prepass_material_set.clone(),
-                self.prepass_texture_set.clone(),
-            ),
+            PassBody::GeometryPrepass => {
+                let Device::Vulkan(driver) = self.device;
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                self.prepass.record(
+                    self.device,
+                    &mut encoder,
+                    &self.pass_ctx(),
+                    self.opaque_draws(0, self.draws, 0),
+                    self.extent,
+                    self.frame_uniforms.clone().unwrap(),
+                    self.decal_block.clone(),
+                    self.prepass_object_set.clone().unwrap(),
+                    self.prepass_material_set.clone(),
+                    self.prepass_texture_set.clone(),
+                );
+            }
             // Both AO passes take their viewport from the target they draw
             // into rather than from the frame, because that target is the
             // one thing here that is not always the frame's size. They still

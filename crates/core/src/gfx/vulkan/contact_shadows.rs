@@ -72,12 +72,11 @@ pub struct ContactShadowPass {
 
 impl ContactShadowPass {
     pub fn new(ctx: &VkContext, device: &Device) -> Self {
-        let pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-            vertex: ShaderId::FullscreenVert,
-            fragment: ShaderId::ContactShadowsFrag,
-            color_formats: &[MASK_FORMAT],
-            depth_format: None,
-        });
+        let pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc::fullscreen(
+            ShaderId::FullscreenVert,
+            ShaderId::ContactShadowsFrag,
+            &[MASK_FORMAT],
+        ));
 
         let nearest_clamp = device.create_sampler(SamplerDesc {
             linear: false,

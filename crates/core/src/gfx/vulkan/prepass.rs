@@ -22,29 +22,18 @@ use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::MemoryTypeFilter;
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
-use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
-use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
-use vulkano::pipeline::graphics::vertex_input::{Vertex as _, VertexDefinition};
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-    PipelineShaderStageCreateInfo,
-};
 
+use crate::gfx::rhi::{
+    CullMode, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, Viewport,
+};
+use crate::gfx::shaders::ShaderId;
 use crate::gfx::{PositionVertex, SurfaceVertex};
 
 use super::PassCtx;
 use super::context::VkContext;
-use super::convert::vk_format;
 use super::cull::Draws;
 use super::instances::{GpuObject, InstanceEntry};
-use super::record::{Arena, Recorder};
-use super::rendering;
+use super::record::Arena;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -103,7 +92,7 @@ pub(super) struct FrameUbo {
 }
 
 pub struct GeometryPrepass {
-    pipeline: Arc<GraphicsPipeline>,
+    pipeline: PipelineId,
     /// The same pass for a `Masked` run: back faces kept, and a fragment shader
     /// that cuts the texels below the material's cutoff away.
     ///
@@ -112,7 +101,7 @@ pub struct GeometryPrepass {
     /// depth test — and this pass exists to be the depth everything downstream
     /// reads. Two pipelines at startup is the price of keeping that cost on the
     /// foliage alone.
-    masked_pipeline: Arc<GraphicsPipeline>,
+    masked_pipeline: PipelineId,
     /// The material maps are sampled at the same texture coordinates and the
     /// same mip selection the forward pass uses, so the two rasterisations
     /// cannot disagree about what a surface is.
@@ -120,12 +109,37 @@ pub struct GeometryPrepass {
     uniform_allocator: Arena,
 }
 
+/// Set `set` of `pipeline`'s layout, for the builders below that still write
+/// their own descriptor sets.
+fn layout(
+    device: &Device,
+    pipeline: PipelineId,
+    set: usize,
+) -> Arc<vulkano::descriptor_set::layout::DescriptorSetLayout> {
+    let Device::Vulkan(driver) = device;
+    driver.set_layout(pipeline, set)
+}
+
 impl GeometryPrepass {
-    pub fn new(ctx: &VkContext) -> Self {
+    pub fn new(ctx: &VkContext, device_rhi: &Device) -> Self {
         let device = &ctx.device;
-        let pipeline = build_pipeline(ctx, prepass_fs::load(device.clone()).unwrap(), false);
-        let masked_pipeline =
-            build_pipeline(ctx, prepass_fs_masked::load(device.clone()).unwrap(), true);
+        let pipeline = |fragment, cull| {
+            device_rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
+                vertex: ShaderId::PrepassVert,
+                fragment,
+                color_formats: &[NORMAL_FORMAT, VELOCITY_FORMAT, MATERIAL_FORMAT],
+                depth_format: Some(DEPTH_FORMAT),
+                vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
+                cull,
+                depth_test: Some(DepthTest { write: true }),
+                partial_texture_set: Some(TEXTURE_SET as u32),
+            })
+        };
+        let pipeline_plain = pipeline(ShaderId::PrepassFrag, CullMode::Back);
+        // Two-sided for a cutout, matching the forward pass. The two rasterise
+        // the same triangles or the depth this pass leaves is not the depth the
+        // frame was shaded against.
+        let masked_pipeline = pipeline(ShaderId::PrepassFragMasked, CullMode::None);
         let anisotropy = device.enabled_features().sampler_anisotropy.then(|| {
             device
                 .physical_device()
@@ -152,7 +166,7 @@ impl GeometryPrepass {
         );
 
         Self {
-            pipeline,
+            pipeline: pipeline_plain,
             masked_pipeline,
             sampler,
             uniform_allocator,
@@ -187,12 +201,13 @@ impl GeometryPrepass {
     pub(super) fn build_object_set(
         &self,
         ctx: &VkContext,
+        device: &Device,
         rows: &Subbuffer<[GpuObject]>,
         indices: &Subbuffer<[InstanceEntry]>,
     ) -> Arc<DescriptorSet> {
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[1].clone(),
+            layout(device, self.pipeline, 1),
             [
                 WriteDescriptorSet::buffer(0, rows.clone()),
                 WriteDescriptorSet::buffer(1, indices.clone()),
@@ -211,11 +226,12 @@ impl GeometryPrepass {
     pub(super) fn build_material_set(
         &self,
         ctx: &VkContext,
+        device: &Device,
         materials: &Subbuffer<[super::forward::GpuMaterial]>,
     ) -> Arc<DescriptorSet> {
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[2].clone(),
+            layout(device, self.pipeline, 2),
             [WriteDescriptorSet::buffer(0, materials.clone())],
             [],
         )
@@ -228,6 +244,7 @@ impl GeometryPrepass {
     pub(super) fn build_texture_set(
         &self,
         ctx: &VkContext,
+        device: &Device,
         textures: &[Arc<ImageView>],
     ) -> Arc<DescriptorSet> {
         let default_view = textures[0].clone();
@@ -239,7 +256,7 @@ impl GeometryPrepass {
         });
         DescriptorSet::new(
             ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[TEXTURE_SET].clone(),
+            layout(device, self.pipeline, TEXTURE_SET),
             [
                 WriteDescriptorSet::image_view_array(0, 0, texture_array),
                 WriteDescriptorSet::sampler(1, self.sampler.clone()),
@@ -255,7 +272,8 @@ impl GeometryPrepass {
     )]
     pub(super) fn record(
         &self,
-        builder: &mut Recorder,
+        device: &Device,
+        encoder: &mut Encoder,
         renderer: &PassCtx<'_>,
         draws: Draws<'_>,
         extent: [u32; 2],
@@ -265,9 +283,10 @@ impl GeometryPrepass {
         material_set: Arc<DescriptorSet>,
         texture_set: Arc<DescriptorSet>,
     ) {
+        let Device::Vulkan(driver) = device;
         let frame_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[0].clone(),
+            layout(device, self.pipeline, 0),
             [
                 WriteDescriptorSet::buffer(0, frame),
                 // The very buffer object the forward pass's set 0 binds. See
@@ -280,20 +299,28 @@ impl GeometryPrepass {
         )
         .unwrap();
 
-        builder.set_viewport(
-            0,
-            &[Viewport {
-                offset: [0.0, 0.0],
-                extent: [extent[0] as f32, extent[1] as f32],
-                depth_range: 0.0..=1.0,
-            }],
-        );
+        encoder.set_viewport(Viewport {
+            origin: [0.0, 0.0],
+            extent: [extent[0] as f32, extent[1] as f32],
+            depth_range: [0.0, 1.0],
+        });
 
-        let sets = vec![frame_set, object_set, material_set, texture_set];
+        let sets = [
+            driver.import_set(frame_set),
+            driver.import_set(object_set),
+            driver.import_set(material_set),
+            driver.import_set(texture_set),
+        ];
+        let bind_all = |encoder: &mut Encoder, pipeline: PipelineId| {
+            encoder.bind_pipeline(pipeline);
+            for (set, group) in sets.iter().enumerate() {
+                encoder.bind_group(set as u32, *group);
+            }
+        };
 
         // Bound once for the pass: a mesh is a span into the arena, so nothing
         // between draws changes them. See `mesh`.
-        renderer.arena.bind(builder);
+        encoder.bind_geometry(renderer.arena, false);
 
         let mut bound: Option<bool> = None;
 
@@ -312,23 +339,18 @@ impl GeometryPrepass {
                 .materials
                 .get(unit.material as usize)
                 .is_some_and(super::forward::GpuMaterial::is_masked);
-            let pipeline = if wants_masked {
-                &self.masked_pipeline
-            } else {
-                &self.pipeline
-            };
             if bound != Some(wants_masked) {
-                builder
-                    .bind_pipeline_graphics(pipeline)
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        pipeline.layout(),
-                        0,
-                        &sets.clone(),
-                    );
+                bind_all(
+                    encoder,
+                    if wants_masked {
+                        self.masked_pipeline
+                    } else {
+                        self.pipeline
+                    },
+                );
                 bound = Some(wants_masked);
             }
-            builder.draw_indexed(
+            encoder.draw_indexed(
                 mesh.span.index_count,
                 unit.instances,
                 mesh.span.first_index,
@@ -340,115 +362,15 @@ impl GeometryPrepass {
         // The compute path draws the same geometry as two multi-draws, one per
         // pipeline variant. Empty on the CPU path, and vice versa.
         for region in draws.regions() {
-            let pipeline = if region.masked {
-                &self.masked_pipeline
-            } else {
-                &self.pipeline
-            };
-            builder
-                .bind_pipeline_graphics(pipeline)
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    pipeline.layout(),
-                    0,
-                    &sets.clone(),
-                )
-                .draw_indexed_indirect(region.commands);
-        }
-    }
-}
-
-fn build_pipeline(
-    ctx: &VkContext,
-    fragment: Arc<vulkano::shader::ShaderModule>,
-    masked: bool,
-) -> Arc<GraphicsPipeline> {
-    let device = &ctx.device;
-    let vs = prepass_vs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let fs = fragment.entry_point("main").unwrap();
-    let vertex_input_state = [PositionVertex::per_vertex(), SurfaceVertex::per_vertex()]
-        .definition(&vs)
-        .unwrap();
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs),
-        PipelineShaderStageCreateInfo::new(fs),
-    ];
-    let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
-    ctx.mark_texture_array_partial(&mut layout_info, TEXTURE_SET);
-    let layout = PipelineLayout::new(
-        device.clone(),
-        layout_info
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    GraphicsPipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState {
-                // Two-sided for a cutout, matching the forward pass. The two
-                // rasterise the same triangles or the depth this pass leaves is
-                // not the depth the frame was shaded against.
-                cull_mode: if masked {
-                    CullMode::None
+            bind_all(
+                encoder,
+                if region.masked {
+                    self.masked_pipeline
                 } else {
-                    CullMode::Back
+                    self.pipeline
                 },
-                ..Default::default()
-            }),
-            multisample_state: Some(MultisampleState::default()),
-            depth_stencil_state: Some(DepthStencilState {
-                depth: Some(DepthState::simple()),
-                ..Default::default()
-            }),
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                3,
-                ColorBlendAttachmentState::default(),
-            )),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(
-                rendering::pipeline_info(
-                    &[
-                        vk_format(NORMAL_FORMAT),
-                        vk_format(VELOCITY_FORMAT),
-                        vk_format(MATERIAL_FORMAT),
-                    ],
-                    Some(vk_format(DEPTH_FORMAT)),
-                )
-                .into(),
-            ),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .unwrap()
-}
-
-mod prepass_vs {
-    vulkano_shaders::shader! { ty: "vertex", path: "shaders/prepass.vert" }
-}
-mod prepass_fs {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "shaders/prepass.frag",
-        include: ["shaders"],
-    }
-}
-/// The same source with the cutout's `discard` compiled in. Two modules rather
-/// than two files, because the difference really is one define — everything
-/// about what this pass reports stays in the one file both compile from.
-mod prepass_fs_masked {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "shaders/prepass.frag",
-        include: ["shaders"],
-        define: [("ORRIN_MASKED", "1")],
+            );
+            encoder.draw_indexed_indirect(driver.import_buffer(region.commands.into_bytes()));
+        }
     }
 }

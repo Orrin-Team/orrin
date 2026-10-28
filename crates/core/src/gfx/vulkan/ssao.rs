@@ -96,12 +96,11 @@ impl SsaoPass {
         // objects: the resolve and the blur write the same format to the same
         // shape of target, and that was always the only thing either declared.
         let pipeline = |fragment| {
-            device.create_graphics_pipeline(&GraphicsPipelineDesc {
-                vertex: ShaderId::FullscreenVert,
+            device.create_graphics_pipeline(&GraphicsPipelineDesc::fullscreen(
+                ShaderId::FullscreenVert,
                 fragment,
-                color_formats: &[AO_FORMAT],
-                depth_format: None,
-            })
+                &[AO_FORMAT],
+            ))
         };
         let ssao_pipeline = pipeline(ShaderId::SsaoFrag);
         let blur_pipeline = pipeline(ShaderId::SsaoBlurFrag);

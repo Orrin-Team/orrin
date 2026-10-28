@@ -55,12 +55,41 @@ pub struct SamplerDesc {
     pub max_lod: Option<f32>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VertexFormat {
+    Float2,
+    Float3,
+    Float4,
+}
+
+/// One attribute of a vertex stream. Matched to the shader by name, as the
+/// vertex shaders declare their inputs by the names of the structs' fields.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VertexAttribute {
+    pub name: &'static str,
+    pub format: VertexFormat,
+    pub offset: u32,
+}
+
 /// One vertex buffer binding of a pipeline. Stream `i` binds at Metal buffer
 /// index `VERTEX_STREAM_BASE + i`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VertexStream {
     pub stride: u32,
     pub per_instance: bool,
+    pub attributes: &'static [VertexAttribute],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CullMode {
+    None,
+    Back,
+}
+
+/// Depth testing is always `Less`, the engine's forward-Z convention.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DepthTest {
+    pub write: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -79,6 +108,28 @@ pub struct GraphicsPipelineDesc<'a> {
     pub fragment: ShaderId,
     pub color_formats: &'a [Format],
     pub depth_format: Option<Format>,
+    pub vertex_streams: &'a [VertexStream],
+    pub cull: CullMode,
+    pub depth_test: Option<DepthTest>,
+    /// The set whose binding 0 is the material texture array, to be created
+    /// partially bound where the device allows it.
+    pub partial_texture_set: Option<u32>,
+}
+
+impl<'a> GraphicsPipelineDesc<'a> {
+    /// A full-screen triangle pass: no vertex input, no culling, no depth.
+    pub fn fullscreen(vertex: ShaderId, fragment: ShaderId, color_formats: &'a [Format]) -> Self {
+        Self {
+            vertex,
+            fragment,
+            color_formats,
+            depth_format: None,
+            vertex_streams: &[],
+            cull: CullMode::None,
+            depth_test: None,
+            partial_texture_set: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

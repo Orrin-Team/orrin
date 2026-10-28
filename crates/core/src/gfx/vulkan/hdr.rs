@@ -58,12 +58,11 @@ pub struct HdrPass {
 
 impl HdrPass {
     pub fn new(device: &Device, swapchain_format: Format) -> Self {
-        let tonemap_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-            vertex: ShaderId::FullscreenVert,
-            fragment: ShaderId::TonemapFrag,
-            color_formats: &[swapchain_format],
-            depth_format: None,
-        });
+        let tonemap_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc::fullscreen(
+            ShaderId::FullscreenVert,
+            ShaderId::TonemapFrag,
+            &[swapchain_format],
+        ));
         let sampler = device.create_sampler(SamplerDesc {
             linear: true,
             mipmap_linear: false,

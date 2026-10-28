@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{Buffer, BufferCreateInfo, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::format::Format as VkFormat;
 use vulkano::image::sampler::{
     Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
 };
@@ -26,10 +27,14 @@ use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
+use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
+use vulkano::pipeline::graphics::rasterization::CullMode as VkCullMode;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
-use vulkano::pipeline::graphics::vertex_input::VertexInputState;
+use vulkano::pipeline::graphics::vertex_input::{
+    VertexBufferDescription, VertexDefinition, VertexInputRate, VertexInputState, VertexMemberInfo,
+};
 use vulkano::pipeline::graphics::viewport::ViewportState;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
@@ -40,12 +45,14 @@ use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
 
 use super::context::VkContext;
 use super::convert::{vk_buffer_usage, vk_format};
+use super::mesh::MeshArena;
 use super::record::{Arena, Recorder};
 use super::rendering;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BindingResource, BufferDesc, BufferId, ComputePipelineDesc,
-    GraphicsPipelineDesc, PipelineId, Pool, SamplerDesc, SamplerId, TextureViewId, Viewport,
+    BindGroupId, Binding, BindingResource, BufferDesc, BufferId, ComputePipelineDesc, CullMode,
+    GraphicsPipelineDesc, PipelineId, Pool, SamplerDesc, SamplerId, TextureViewId, VertexFormat,
+    VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -63,6 +70,8 @@ impl PipelineObject {
         }
     }
 }
+
+pub(crate) use super::mesh::MeshArena as GeometryArena;
 
 pub struct VkDriver {
     ctx: Arc<VkContext>,
@@ -194,13 +203,27 @@ impl VkDriver {
 
     pub fn create_graphics_pipeline(&self, desc: &GraphicsPipelineDesc) -> PipelineId {
         let device = &self.ctx.device;
+        let vertex = entry_point(&self.ctx, desc.vertex);
         let stages = [
-            PipelineShaderStageCreateInfo::new(entry_point(&self.ctx, desc.vertex)),
+            PipelineShaderStageCreateInfo::new(vertex.clone()),
             PipelineShaderStageCreateInfo::new(entry_point(&self.ctx, desc.fragment)),
         ];
+        let vertex_input = if desc.vertex_streams.is_empty() {
+            VertexInputState::default()
+        } else {
+            let descriptions: Vec<_> = desc.vertex_streams.iter().map(vertex_buffer).collect();
+            descriptions
+                .definition(&vertex)
+                .expect("a vertex stream does not match the shader's inputs")
+        };
+        let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
+        if let Some(set) = desc.partial_texture_set {
+            self.ctx
+                .mark_texture_array_partial(&mut layout_info, set as usize);
+        }
         let layout = PipelineLayout::new(
             device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+            layout_info
                 .into_pipeline_layout_create_info(device.clone())
                 .unwrap(),
         )
@@ -211,12 +234,24 @@ impl VkDriver {
             self.ctx.pipeline_cache(),
             GraphicsPipelineCreateInfo {
                 stages: stages.into_iter().collect(),
-                vertex_input_state: Some(VertexInputState::default()),
+                vertex_input_state: Some(vertex_input),
                 input_assembly_state: Some(InputAssemblyState::default()),
                 viewport_state: Some(ViewportState::default()),
-                rasterization_state: Some(RasterizationState::default()),
+                rasterization_state: Some(RasterizationState {
+                    cull_mode: match desc.cull {
+                        CullMode::None => VkCullMode::None,
+                        CullMode::Back => VkCullMode::Back,
+                    },
+                    ..Default::default()
+                }),
                 multisample_state: Some(MultisampleState::default()),
-                depth_stencil_state: None,
+                depth_stencil_state: desc.depth_test.map(|test| DepthStencilState {
+                    depth: Some(DepthState {
+                        write_enable: test.write,
+                        ..DepthState::simple()
+                    }),
+                    ..Default::default()
+                }),
                 color_blend_state: Some(ColorBlendState::with_attachment_states(
                     colors.len() as u32,
                     ColorBlendAttachmentState::default(),
@@ -235,6 +270,27 @@ impl VkDriver {
                 .unwrap()
                 .insert(PipelineObject::Graphics(pipeline)),
         )
+    }
+
+    /// The set layout `set` of `pipeline` was created with, for a pass that
+    /// still builds its own descriptor sets.
+    pub fn set_layout(
+        &self,
+        pipeline: PipelineId,
+        set: usize,
+    ) -> Arc<vulkano::descriptor_set::layout::DescriptorSetLayout> {
+        lookup(&self.pipelines, pipeline.0, "pipeline")
+            .layout()
+            .set_layouts()[set]
+            .clone()
+    }
+
+    /// A descriptor set built outside the RHI, for the frame being recorded.
+    pub fn import_set(&self, set: Arc<DescriptorSet>) -> BindGroupId {
+        let mut pool = self.bind_groups.lock().unwrap();
+        let index = pool.insert(set);
+        pool.remove(index, self.frame.load(Ordering::Relaxed));
+        BindGroupId(index)
     }
 
     pub fn create_compute_pipeline(&self, desc: &ComputePipelineDesc) -> PipelineId {
@@ -362,6 +418,37 @@ impl VkDriver {
     }
 }
 
+fn vertex_buffer(stream: &VertexStream) -> VertexBufferDescription {
+    VertexBufferDescription {
+        members: stream
+            .attributes
+            .iter()
+            .map(|attribute| {
+                let format = match attribute.format {
+                    VertexFormat::Float2 => VkFormat::R32G32_SFLOAT,
+                    VertexFormat::Float3 => VkFormat::R32G32B32_SFLOAT,
+                    VertexFormat::Float4 => VkFormat::R32G32B32A32_SFLOAT,
+                };
+                (
+                    attribute.name.to_string(),
+                    VertexMemberInfo {
+                        offset: attribute.offset,
+                        format,
+                        num_elements: 1,
+                        stride: 0,
+                    },
+                )
+            })
+            .collect(),
+        stride: stream.stride,
+        input_rate: if stream.per_instance {
+            VertexInputRate::Instance { divisor: 1 }
+        } else {
+            VertexInputRate::Vertex
+        },
+    }
+}
+
 fn entry_point(ctx: &VkContext, shader: ShaderId) -> vulkano::shader::EntryPoint {
     let blob = shader.blob();
     let words: Vec<u32> = blob
@@ -456,6 +543,37 @@ impl<'a> VkEncoder<'a> {
         self.recorder.push_constants(&layout, 0, &block);
     }
 
+    pub(crate) fn bind_geometry(&mut self, arena: &MeshArena, positions_only: bool) {
+        if positions_only {
+            arena.bind_positions(self.recorder);
+        } else {
+            arena.bind(self.recorder);
+        }
+    }
+
+    pub fn draw_indexed(
+        &mut self,
+        index_count: u32,
+        instances: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    ) {
+        self.recorder.draw_indexed(
+            index_count,
+            instances,
+            first_index,
+            vertex_offset,
+            first_instance,
+        );
+    }
+
+    pub fn draw_indexed_indirect(&mut self, commands: BufferId) {
+        let commands = lookup(&self.driver.buffers, commands.0, "buffer")
+            .reinterpret::<[vulkano::command_buffer::DrawIndexedIndirectCommand]>();
+        self.recorder.draw_indexed_indirect(commands);
+    }
+
     pub fn dispatch(&mut self, groups: [u32; 3]) {
         self.recorder.dispatch(groups);
     }
@@ -463,5 +581,43 @@ impl<'a> VkEncoder<'a> {
     pub fn draw(&mut self, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
         self.recorder
             .draw(vertices, instances, first_vertex, first_instance);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vulkano::pipeline::graphics::vertex_input::Vertex as _;
+
+    use super::*;
+    use crate::gfx::{PositionVertex, SurfaceVertex};
+
+    /// The RHI's description of a stream is written by hand beside the vertex
+    /// struct whose `Vertex` derive is what the pipelines used to take. A field
+    /// moved in one and not the other would draw a silently wrong mesh.
+    fn agrees(stream: &VertexStream, derived: VertexBufferDescription) {
+        let described = vertex_buffer(stream);
+        assert_eq!(described.stride, derived.stride);
+        // `stride` on a member is the element stride of an array, which the
+        // derive fills in for a scalar and nothing reads.
+        let layout = |description: &VertexBufferDescription| {
+            let mut members: Vec<_> = description
+                .members
+                .iter()
+                .map(|(name, m)| (name.clone(), m.offset, m.format, m.num_elements))
+                .collect();
+            members.sort_by(|a, b| a.0.cmp(&b.0));
+            members
+        };
+        assert_eq!(layout(&described), layout(&derived));
+    }
+
+    #[test]
+    fn the_position_stream_matches_its_derived_layout() {
+        agrees(&PositionVertex::STREAM, PositionVertex::per_vertex());
+    }
+
+    #[test]
+    fn the_surface_stream_matches_its_derived_layout() {
+        agrees(&SurfaceVertex::STREAM, SurfaceVertex::per_vertex());
     }
 }
