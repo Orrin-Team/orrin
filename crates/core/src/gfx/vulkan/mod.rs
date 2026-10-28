@@ -426,7 +426,7 @@ impl VulkanRenderer {
         let ssao = SsaoPass::new(&ctx, &device);
         let contact_shadows = ContactShadowPass::new(&ctx, &device);
         let fog = FogPass::new(&ctx);
-        let ssr = SsrPass::new(&ctx);
+        let ssr = SsrPass::new(&device);
         let subsurface = SubsurfacePass::new(&device);
         let oit = OitPass::new(&device, forward.layout_source());
         let refraction = RefractionPass::new(&device, forward.layout_source());
@@ -1463,6 +1463,7 @@ impl VulkanRenderer {
         if let Some(ids) = self.frame.ids.ssr {
             let ambient = lighting.ambient_color * lighting.ambient_nits;
             self.ssr.begin_frame(
+                &self.device,
                 ssr,
                 &view,
                 self.swapchain.extent,
@@ -2587,13 +2588,17 @@ impl FrameRecord<'_> {
                     // One self.view per level, because a storage image descriptor
                     // takes exactly one — the sampled self.view the trace reads
                     // spans the whole pyramid instead.
-                    self.ssr.record_hiz(
-                        builder,
-                        self.ctx,
-                        self.images.view(prepass.depth),
-                        self.images.mip_views(ids.hiz),
-                        self.extent,
-                    );
+                    let Device::Vulkan(driver) = self.device;
+                    let depth = driver.import_view(self.images.view(prepass.depth));
+                    let mips: Vec<_> = self
+                        .images
+                        .mip_views(ids.hiz)
+                        .iter()
+                        .map(|view| driver.import_view(view.clone()))
+                        .collect();
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                    self.ssr
+                        .record_hiz(self.device, &mut encoder, depth, &mips, self.extent);
                 }
                 PassBody::SsrSource => {
                     let ids = self
@@ -2601,12 +2606,17 @@ impl FrameRecord<'_> {
                         .ids
                         .ssr
                         .expect("reflections without their images");
-                    self.ssr.record_source(
-                        builder,
-                        self.ctx,
-                        self.view_of(ids.source),
-                        self.images.mip_views(ids.source_pyramid),
-                    );
+                    let Device::Vulkan(driver) = self.device;
+                    let source = driver.import_view(self.view_of(ids.source));
+                    let mips: Vec<_> = self
+                        .images
+                        .mip_views(ids.source_pyramid)
+                        .iter()
+                        .map(|view| driver.import_view(view.clone()))
+                        .collect();
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                    self.ssr
+                        .record_source(self.device, &mut encoder, source, &mips);
                 }
                 PassBody::SsrTrace => {
                     let ids = self
@@ -2619,15 +2629,23 @@ impl FrameRecord<'_> {
                         .ids
                         .prepass
                         .expect("the graph scheduled reflections with no prepass");
+                    let Device::Vulkan(driver) = self.device;
+                    let hiz = driver.import_view(self.images.view(ids.hiz));
+                    let depth = driver.import_view(self.images.view(prepass.depth));
+                    let normal = driver.import_view(self.images.view(prepass.normal));
+                    let material = driver.import_view(self.images.view(prepass.material));
+                    let source = driver.import_view(self.images.view(ids.source_pyramid));
+                    let target = driver.import_view(self.images.view(ids.rays));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.ssr.record_trace(
-                        builder,
-                        self.ctx,
-                        self.images.view(ids.hiz),
-                        self.images.view(prepass.depth),
-                        self.images.view(prepass.normal),
-                        self.images.view(prepass.material),
-                        self.images.view(ids.source_pyramid),
-                        self.images.view(ids.rays),
+                        self.device,
+                        &mut encoder,
+                        hiz,
+                        depth,
+                        normal,
+                        material,
+                        source,
+                        target,
                     );
                 }
                 PassBody::SsrResolve => {
@@ -2641,17 +2659,26 @@ impl FrameRecord<'_> {
                         .ids
                         .prepass
                         .expect("the graph scheduled reflections with no prepass");
+                    let Device::Vulkan(driver) = self.device;
+                    let source = driver.import_view(self.view_of(ids.source));
+                    let rays = driver.import_view(self.images.view(ids.rays));
+                    let depth = driver.import_view(self.images.view(prepass.depth));
+                    let normal = driver.import_view(self.images.view(prepass.normal));
+                    let material = driver.import_view(self.images.view(prepass.material));
+                    let environment = driver.import_view(self.environment.specular_view());
+                    let target = driver.import_view(self.images.view(ids.output));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.ssr.record_resolve(
-                        builder,
-                        self.ctx,
-                        self.view_of(ids.source),
-                        self.images.view(ids.rays),
-                        self.images.view(prepass.depth),
-                        self.images.view(prepass.normal),
-                        self.images.view(prepass.material),
-                        self.environment.specular_view(),
+                        self.device,
+                        &mut encoder,
+                        source,
+                        rays,
+                        depth,
+                        normal,
+                        material,
+                        environment,
                         self.environment.sampler(),
-                        self.images.view(ids.output),
+                        target,
                     );
                 }
                 PassBody::FogScatter => {
