@@ -494,7 +494,7 @@ impl VulkanRenderer {
         Self {
             instances: InstanceStore::new(&ctx),
             cull: CullPass::new(&ctx),
-            occlusion: OcclusionPass::new(&ctx),
+            occlusion: OcclusionPass::new(&ctx, &device),
             gpu_culling,
             occlusion_culling,
             ctx,
@@ -2949,12 +2949,11 @@ impl FrameRecord<'_> {
                         .ids
                         .prepass
                         .expect("the graph scheduled the occlusion pyramid with no prepass");
-                    self.occlusion.record(
-                        builder,
-                        self.ctx,
-                        self.images.view(prepass.depth),
-                        self.extent,
-                    );
+                    let Device::Vulkan(driver) = self.device;
+                    let depth = driver.import_view(self.images.view(prepass.depth));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                    self.occlusion
+                        .record(self.device, &mut encoder, depth, self.extent);
                 }
                 PassBody::LuminanceHistogram => {
                     let Device::Vulkan(driver) = self.device;

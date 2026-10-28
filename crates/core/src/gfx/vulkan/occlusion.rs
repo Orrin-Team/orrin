@@ -38,21 +38,19 @@
 
 use std::sync::Arc;
 
-use vulkano::buffer::BufferContents;
-use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{Image, ImageCreateInfo, ImageSubresourceRange, ImageUsage};
 use vulkano::memory::allocator::AllocationCreateInfo;
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
+
+use crate::gfx::rhi::{
+    Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId, SamplerDesc,
+    SamplerId, TextureViewId,
 };
+use crate::gfx::shaders::ShaderId;
 
 use super::context::VkContext;
 use super::convert::vk_format;
-use super::record::Recorder;
 
 /// Single-channel float, for the reason the reflection pyramid is: a depth
 /// pyramid stores exactly one number, and `R32_SFLOAT` is a storage format every
@@ -75,15 +73,6 @@ pub(super) const OCCLUSION_LEVELS: u32 = 6;
 /// shader.
 const TILE: u32 = 64;
 
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct BuildPush {
-    /// The depth buffer's extent, not the pyramid's.
-    extent: [i32; 2],
-    levels: i32,
-}
-
-/// The two allocations, and the per-level views the build stores through.
 struct Pyramid {
     sampled: [Arc<ImageView>; 2],
     mips: [Vec<Arc<ImageView>>; 2],
@@ -104,7 +93,8 @@ pub(super) struct OcclusionTest {
 }
 
 pub(super) struct OcclusionPass {
-    pipeline: Arc<ComputePipeline>,
+    pipeline: PipelineId,
+    build_sampler: SamplerId,
     /// `texelFetch` ignores filtering, so this is a sampler in the sense the
     /// descriptor requires one and in no other. Clamped rather than repeated so
     /// that a coordinate the shader has already bounded cannot wrap if that ever
@@ -126,26 +116,18 @@ pub(super) struct OcclusionPass {
 }
 
 impl OcclusionPass {
-    pub(super) fn new(ctx: &VkContext) -> Self {
-        let stage = PipelineShaderStageCreateInfo::new(
-            build_cs::load(ctx.device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
-        let layout = PipelineLayout::new(
-            ctx.device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-                .into_pipeline_layout_create_info(ctx.device.clone())
-                .unwrap(),
-        )
-        .unwrap();
-        let pipeline = ComputePipeline::new(
-            ctx.device.clone(),
-            ctx.pipeline_cache(),
-            ComputePipelineCreateInfo::stage_layout(stage, layout),
-        )
-        .unwrap();
+    pub(super) fn new(ctx: &VkContext, device: &Device) -> Self {
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
+            shader: ShaderId::HizOcclusionComp,
+        });
+        let build_sampler = device.create_sampler(SamplerDesc {
+            linear: false,
+            mipmap_linear: false,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+            max_lod: None,
+        });
 
         let nearest_clamp = Sampler::new(
             ctx.device.clone(),
@@ -162,6 +144,7 @@ impl OcclusionPass {
 
         Self {
             pipeline,
+            build_sampler,
             nearest_clamp,
             fallback: allocate(ctx, [1, 1], 1).0,
             pyramid: None,
@@ -224,48 +207,38 @@ impl OcclusionPass {
     /// pair, in one dispatch.
     pub(super) fn record(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        depth: Arc<ImageView>,
+        device: &Device,
+        builder: &mut Encoder,
+        depth: TextureViewId,
         extent: [u32; 2],
     ) {
+        let Device::Vulkan(driver) = device;
         let mips = &self.pair().mips[(self.frame & 1) as usize];
         // Every slot of the shader's array has to be written even where the
         // pyramid came out shorter than the declaration, so the spares point at
         // level zero. `levels` is what stops anything storing through them.
-        let bound =
-            (0..OCCLUSION_LEVELS as usize).map(|level| mips[level.min(mips.len() - 1)].clone());
+        let mut bindings = vec![Binding {
+            binding: 0,
+            resource: BindingResource::SampledTexture {
+                view: depth,
+                sampler: self.build_sampler,
+            },
+        }];
+        bindings.extend((0..OCCLUSION_LEVELS as usize).map(|level| Binding {
+            binding: 1,
+            resource: BindingResource::StorageTexture(
+                driver.import_view(mips[level.min(mips.len() - 1)].clone()),
+            ),
+        }));
+        let set = device.create_bind_group(self.pipeline, 0, &bindings);
 
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, depth, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_array(1, 0, bound),
-            ],
-        );
+        builder.bind_pipeline(self.pipeline);
+        builder.bind_group(0, set);
+        builder.push_constants(&[extent[0], extent[1], mips.len() as u32]);
 
-        builder
-            .bind_pipeline_compute(&self.pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.pipeline.layout(),
-                0,
-                &[set],
-            )
-            .push_constants(
-                self.pipeline.layout(),
-                0,
-                &BuildPush {
-                    extent: [extent[0] as i32, extent[1] as i32],
-                    levels: mips.len() as i32,
-                },
-            );
-
-        // SAFETY: one workgroup per TILE-sized block of the depth buffer covers
-        // it, and every store is bounds-checked against the level it writes, so
-        // nothing lands outside an image. The descriptors match the shader's
-        // layout, and the graph declared every resource this pass touches.
+        // One workgroup per TILE-sized block of the depth buffer covers it, and
+        // every store is bounds-checked against the level it writes, so nothing
+        // lands outside an image.
         builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
     }
 
@@ -365,10 +338,6 @@ fn allocate(
         .collect();
 
     (sampled, mips)
-}
-
-mod build_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/hiz_occlusion.comp" }
 }
 
 #[cfg(test)]
