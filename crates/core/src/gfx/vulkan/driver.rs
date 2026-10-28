@@ -20,6 +20,7 @@ use vulkano::buffer::{Buffer, BufferCreateInfo, Subbuffer};
 use vulkano::command_buffer::{ClearAttachment, ClearRect};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format as VkFormat;
+use vulkano::image::sampler::{ComponentMapping, ComponentSwizzle};
 use vulkano::image::sampler::{
     Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
 };
@@ -60,8 +61,8 @@ use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, BufferId,
     ComputePipelineDesc, CullMode, DepthCompare, DepthRect, GraphicsPipelineDesc, MeshSpan,
-    PipelineId, Pool, SamplerDesc, SamplerId, TextureDesc, TextureDimension, TextureViewId,
-    Topology, VertexFormat, VertexStream, Viewport,
+    PipelineId, Pool, SamplerDesc, SamplerId, TextureDesc, TextureDimension, TextureSwizzle,
+    TextureViewId, Topology, VertexFormat, VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -90,6 +91,7 @@ pub struct VkDriver {
     uniforms: Arena,
     storage: Arena,
     staging: Arena,
+    indices: Arena,
     vertices: Arena,
     /// The shared geometry every mesh is a span into. Owned by the device
     /// because every pass binds the same buffers; a pass names a mesh by its
@@ -135,6 +137,15 @@ impl VkDriver {
                 ..Default::default()
             },
         );
+        let indices = Arena::new(
+            ctx.memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: vulkano::buffer::BufferUsage::INDEX_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        );
         let vertices = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
@@ -155,6 +166,7 @@ impl VkDriver {
             pipelines: Mutex::new(Pool::new(frames_in_flight)),
             uniforms,
             staging,
+            indices,
             storage,
             vertices,
             bind_groups: Mutex::new(Pool::new(frames_in_flight)),
@@ -190,6 +202,14 @@ impl VkDriver {
     }
 
     pub fn create_texture(&self, desc: &TextureDesc) -> TextureViewId {
+        self.create_texture_swizzled(desc, TextureSwizzle::Identity)
+    }
+
+    pub fn create_texture_swizzled(
+        &self,
+        desc: &TextureDesc,
+        swizzle: TextureSwizzle,
+    ) -> TextureViewId {
         let usage = vk_image_usage(desc.usage);
         let image = Image::new(
             self.ctx.memory_allocator.clone(),
@@ -217,6 +237,15 @@ impl VkDriver {
                     TextureDimension::D2Array => ImageViewType::Dim2dArray,
                     TextureDimension::D3 => ImageViewType::Dim3d,
                     TextureDimension::Cube => ImageViewType::Cube,
+                },
+                component_mapping: match swizzle {
+                    TextureSwizzle::Identity => ComponentMapping::identity(),
+                    TextureSwizzle::CoverageToWhite => ComponentMapping {
+                        r: ComponentSwizzle::Red,
+                        g: ComponentSwizzle::Red,
+                        b: ComponentSwizzle::Red,
+                        a: ComponentSwizzle::Green,
+                    },
                 },
                 // A storage descriptor takes exactly one level, so a view
                 // spanning a pyramid cannot claim that usage.
@@ -315,8 +344,15 @@ impl VkDriver {
             BlockKind::Uniform => &self.uniforms,
             BlockKind::Storage => &self.storage,
             BlockKind::Staging => &self.staging,
+            BlockKind::Index => &self.indices,
         };
-        let buffer = arena.allocate_slice::<u8>(bytes.len() as u64);
+        // Whole words, so a copy out of this block starts on a texel of any
+        // format a texture here takes: deltas share one staging arena, and an
+        // odd-sized one would otherwise leave the next off a texel boundary.
+        let buffer = arena
+            .allocate_slice::<u32>((bytes.len() as u64).div_ceil(4))
+            .reinterpret::<[u8]>()
+            .slice(..bytes.len() as u64);
         buffer.write().unwrap().copy_from_slice(bytes);
         self.import_buffer(buffer)
     }
@@ -847,6 +883,12 @@ fn attachment_blend(blend: Blend) -> Option<AttachmentBlend> {
     match blend {
         Blend::None => None,
         Blend::Alpha => Some(AttachmentBlend::alpha()),
+        Blend::PremultipliedCoverage => Some(AttachmentBlend {
+            src_color_blend_factor: BlendFactor::One,
+            src_alpha_blend_factor: BlendFactor::OneMinusDstAlpha,
+            dst_alpha_blend_factor: BlendFactor::One,
+            ..AttachmentBlend::alpha()
+        }),
         Blend::Premultiplied => Some(factors(
             BlendFactor::One,
             BlendFactor::OneMinusSrcAlpha,
@@ -1065,6 +1107,70 @@ impl<'a> VkEncoder<'a> {
                     .collect(),
                 ..vulkano::command_buffer::CopyBufferInfo::buffers(src, dst)
             });
+    }
+
+    pub fn bind_index_buffer(&mut self, buffer: BufferId) {
+        let indices = lookup(&self.driver.buffers, buffer.0, "buffer").reinterpret::<[u32]>();
+        self.recorder.bind_index_buffer(indices);
+    }
+
+    pub fn write_texture(
+        &mut self,
+        texture: TextureViewId,
+        offset: [u32; 2],
+        extent: [u32; 2],
+        staging: BufferId,
+        initial: bool,
+    ) {
+        use vulkano::image::ImageLayout;
+        let image = lookup(&self.driver.views, texture.0, "texture view")
+            .image()
+            .clone();
+        let staging = lookup(&self.driver.buffers, staging.0, "buffer");
+        let range = super::record::whole_image(&image);
+        // Before each copy, a wait on earlier fragment reads: a previous frame's
+        // overlay may still be sampling a texture this one patches.
+        self.recorder
+            .image_barrier(vulkano::sync::ImageMemoryBarrier {
+                src_stages: vulkano::sync::PipelineStages::FRAGMENT_SHADER,
+                ..super::record::to_transfer_dst(
+                    image.clone(),
+                    range.clone(),
+                    if initial {
+                        ImageLayout::Undefined
+                    } else {
+                        ImageLayout::ShaderReadOnlyOptimal
+                    },
+                )
+            })
+            .copy_buffer_to_image(vulkano::command_buffer::CopyBufferToImageInfo {
+                regions: [vulkano::command_buffer::BufferImageCopy {
+                    image_offset: [offset[0], offset[1], 0],
+                    image_extent: [extent[0], extent[1], 1],
+                    image_subresource: vulkano::image::ImageSubresourceLayers {
+                        aspects: vulkano::image::ImageAspects::COLOR,
+                        mip_level: 0,
+                        array_layers: 0..1,
+                    },
+                    ..Default::default()
+                }]
+                .into(),
+                ..vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(
+                    staging,
+                    image.clone(),
+                )
+            })
+            .image_barrier(super::record::to_shader_read(
+                image,
+                range,
+                ImageLayout::TransferDstOptimal,
+            ));
+    }
+
+    /// The recorder under this encoder, for a pass that is still recorded raw
+    /// and needs a barrier or a blit the RHI has no word for.
+    pub(super) fn recorder(&mut self) -> &mut Recorder {
+        self.recorder
     }
 
     pub fn draw_indexed_indirect(&mut self, commands: BufferId, range: std::ops::Range<u32>) {

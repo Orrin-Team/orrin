@@ -28,8 +28,8 @@ pub(crate) use pool::Pool;
 pub use desc::{
     Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, ComputePipelineDesc,
     CullMode, DepthCompare, DepthRect, DepthTest, GraphicsPipelineDesc, MemoryLocation,
-    SamplerDesc, TextureDesc, TextureDimension, Topology, VertexAttribute, VertexFormat,
-    VertexStream, Viewport,
+    SamplerDesc, TextureDesc, TextureDimension, TextureSwizzle, Topology, VertexAttribute,
+    VertexFormat, VertexStream, Viewport,
 };
 
 use super::format::Format;
@@ -169,6 +169,17 @@ impl Device {
     pub fn mip_view(&self, texture: TextureViewId, level: u32) -> TextureViewId {
         match self {
             Device::Vulkan(driver) => driver.mip_view(texture, level),
+        }
+    }
+
+    /// A texture whose channels a shader reads through `swizzle`.
+    pub fn create_texture_swizzled(
+        &self,
+        desc: &TextureDesc,
+        swizzle: TextureSwizzle,
+    ) -> TextureViewId {
+        match self {
+            Device::Vulkan(driver) => driver.create_texture_swizzled(desc, swizzle),
         }
     }
 
@@ -343,6 +354,30 @@ impl Encoder<'_> {
                 vertex_offset,
                 first_instance,
             ),
+        }
+    }
+
+    pub fn bind_index_buffer(&mut self, buffer: BufferId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.bind_index_buffer(buffer),
+        }
+    }
+
+    /// Write `extent` texels at `offset` of `texture` from `staging`, tightly
+    /// packed. `initial` is the first write to a texture just created, whose
+    /// contents are undefined; a later one patches what is there.
+    pub fn write_texture(
+        &mut self,
+        texture: TextureViewId,
+        offset: [u32; 2],
+        extent: [u32; 2],
+        staging: BufferId,
+        initial: bool,
+    ) {
+        match self {
+            Encoder::Vulkan(encoder) => {
+                encoder.write_texture(texture, offset, extent, staging, initial)
+            }
         }
     }
 

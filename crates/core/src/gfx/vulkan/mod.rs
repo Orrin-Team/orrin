@@ -665,12 +665,13 @@ impl VulkanRenderer {
                             let pass = self.overlay.get_or_insert_with(|| {
                                 overlay::OverlayPass::new(
                                     &self.ctx,
+                                    &self.device,
                                     self.swapchain.format,
                                     self.swapchain.capturable,
                                 )
                             });
                             pass.record(
-                                &self.ctx,
+                                &self.device,
                                 &mut recorder,
                                 &self.swapchain.image_views[image_index as usize],
                                 frame,

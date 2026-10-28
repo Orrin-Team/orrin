@@ -112,6 +112,19 @@ pub enum Blend {
     /// Premultiplied `over`: the fragment already composited its background, so
     /// what accumulates is radiance that replaced what was behind it.
     Premultiplied,
+    /// Premultiplied colour over a target whose alpha is coverage accumulated
+    /// front to back: what egui's meshes are drawn with.
+    PremultipliedCoverage,
+}
+
+/// How a texture's channels are read by a shader, for a format whose layout is
+/// not the one the shader wants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextureSwizzle {
+    Identity,
+    /// Two channels read as premultiplied white: red into all of colour, green
+    /// into alpha. egui's glyph coverage at half the size of four channels.
+    CoverageToWhite,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -242,6 +255,7 @@ pub struct DepthRect {
 pub enum BlockKind {
     Uniform,
     Storage,
+    Index,
     /// Host-visible source for a copy into a buffer that is not itself
     /// host-visible; bound as nothing.
     Staging,
