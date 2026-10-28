@@ -111,10 +111,10 @@ void main() {
     // fainter echo on the far side where the light has passed through.
     float facing = max(dot(n, LIGHT), 0.0);
     float echo = max(dot(n, -LIGHT), 0.0);
-    float rim_light = pow(t, 3.0) * (0.18 + 0.62 * facing + 0.22 * echo);
+    float rim_light = pow(t, 4.0) * (0.05 + 0.26 * facing + 0.08 * echo);
     // A hairline on the outline itself, so the edge stays defined over a
     // backdrop of the same colour.
-    float hairline = clamp(1.0 - abs(d + 0.75), 0.0, 1.0) * (0.16 + 0.34 * facing);
+    float hairline = clamp(1.0 - abs(d + 0.75), 0.0, 1.0) * (0.05 + 0.12 * facing);
     colour = clamp(colour + vec3(rim_light + hairline), 0.0, 1.0);
 
     float coverage = clamp(0.5 - d, 0.0, 1.0);
