@@ -1,5 +1,6 @@
-//! The editor's UI, drawn over the finished frame, with frosted glass under
-//! its translucent surfaces.
+//! The editor's UI, drawn over the finished frame, with liquid glass under its
+//! translucent surfaces: a blur of what is beneath, bent and fringed at the
+//! edge like a lens and lit along its rim.
 //!
 //! A menu's glass blurs what is beneath it, and over a panel what is beneath
 //! it is more UI — which has to have been drawn, to the image, before anything
