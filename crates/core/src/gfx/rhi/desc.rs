@@ -242,4 +242,15 @@ pub struct DepthRect {
 pub enum BlockKind {
     Uniform,
     Storage,
+    /// Host-visible source for a copy into a buffer that is not itself
+    /// host-visible; bound as nothing.
+    Staging,
+}
+
+/// One run of bytes in a buffer-to-buffer copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BufferCopy {
+    pub src_offset: u64,
+    pub dst_offset: u64,
+    pub size: u64,
 }

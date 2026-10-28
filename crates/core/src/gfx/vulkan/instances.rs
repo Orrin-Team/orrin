@@ -33,22 +33,19 @@
 //! the ordering against the passes that read the rows is the same
 //! synchronisation everything else in this renderer relies on.
 
+use bytemuck::Zeroable;
 use glam::Mat4;
-use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
-use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::BufferCopy;
-use vulkano::command_buffer::CopyBufferInfoTyped;
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 
 use crate::gfx::RenderItem;
-
-use super::context::VkContext;
-use super::record::Recorder;
+use crate::gfx::graph::BufferUsage;
+use crate::gfx::rhi::{
+    BlockKind, BufferCopy, BufferDesc, BufferId, Device, Encoder, MemoryLocation,
+};
 
 /// Per-object transforms, indexed through [`InstanceLists`] from a storage
 /// buffer. std430 matches this `#[repr(C)]` layout exactly because every field
 /// is a 64-byte `mat4` (a multiple of 16).
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(super) struct GpuObject {
     model: [[f32; 4]; 4],
@@ -104,7 +101,7 @@ pub(super) struct InstanceEntry {
 /// `instance_index` says in the graph. The opaque camera list indexes from zero
 /// and needs no base.
 pub(super) struct InstanceLists {
-    pub indices: Subbuffer<[InstanceEntry]>,
+    pub indices: BufferId,
     /// Where the blended items' indices start.
     pub transparent_base: u32,
     /// Where the refractive items' indices start.
@@ -116,55 +113,34 @@ pub(super) struct InstanceLists {
 /// The persistent row buffer, plus the mirror the dirty test reads.
 pub(super) struct InstanceStore {
     /// Device-local, `TRANSFER_DST`: written only by the staged copy below.
-    rows: Subbuffer<[GpuObject]>,
+    rows: BufferId,
     /// How many rows `rows` holds. Kept alongside rather than read back off the
     /// buffer so that growth is a comparison against a `u32` slot.
     capacity: u32,
     /// What the GPU holds, per row, or `None` for a row never written. Indexed
     /// exactly as `rows` is.
     resident: Vec<Option<Resident>>,
-    /// Host-visible scratch for the dirty rows of one frame. A `SubbufferAllocator`
-    /// rather than a persistent buffer because this *is* per-frame data, and its
-    /// recycling is what makes writing it safe while the previous frame is in
-    /// flight.
-    staging: SubbufferAllocator,
-    /// Per-frame storage for the row numbers each list draws.
-    index_allocator: SubbufferAllocator,
+    /// Reused each frame for the dirty rows and for the row numbers each list
+    /// draws, so a frame that moves nothing allocates nothing.
+    staged: Vec<GpuObject>,
+    entries: Vec<InstanceEntry>,
 }
 
 impl InstanceStore {
-    pub(super) fn new(ctx: &VkContext) -> Self {
-        let staging = SubbufferAllocator::new(
-            ctx.memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::TRANSFER_SRC,
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
-        let index_allocator = SubbufferAllocator::new(
-            ctx.memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::STORAGE_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
+    pub(super) fn new(device: &Device) -> Self {
         Self {
-            rows: allocate_rows(ctx, INITIAL_ROWS),
+            rows: allocate_rows(device, INITIAL_ROWS),
             capacity: INITIAL_ROWS,
             resident: vec![None; INITIAL_ROWS as usize],
-            staging,
-            index_allocator,
+            staged: Vec::new(),
+            entries: Vec::new(),
         }
     }
 
     /// The row buffer every geometry pass binds. Valid only after [`Self::sync`]
     /// has run for this frame, which is where a growth would have replaced it.
-    pub(super) fn rows(&self) -> &Subbuffer<[GpuObject]> {
-        &self.rows
+    pub(super) fn rows(&self) -> BufferId {
+        self.rows
     }
 
     /// Bring the GPU's rows up to date with `items`, recording the copy into
@@ -174,8 +150,8 @@ impl InstanceStore {
     /// reads to tell a static scene from a moving one.
     pub(super) fn sync(
         &mut self,
-        ctx: &VkContext,
-        builder: &mut Recorder,
+        device: &Device,
+        encoder: &mut Encoder,
         items: &[RenderItem],
     ) -> usize {
         // Growth first, because the dirty test below is against the mirror this
@@ -189,7 +165,8 @@ impl InstanceStore {
             // Next power of two, so a scene that spawns steadily reallocates a
             // logarithmic number of times rather than once per growth.
             let capacity = needed.next_power_of_two();
-            self.rows = allocate_rows(ctx, capacity);
+            device.destroy_buffer(self.rows);
+            self.rows = allocate_rows(device, capacity);
             self.capacity = capacity;
             // A new buffer holds nothing, so every row is dirty again. Cleared
             // rather than resized: the old contents describe the old buffer.
@@ -228,20 +205,14 @@ impl InstanceStore {
         // that moved wholesale into one region rather than thousands.
         dirty.sort_unstable_by_key(|&(slot, _)| slot);
 
-        let staging = self
-            .staging
-            .allocate_slice::<GpuObject>(dirty.len() as u64)
-            .unwrap();
-        {
-            let mut write = staging.write().unwrap();
-            for (i, &(_, row)) in dirty.iter().enumerate() {
-                write[i] = row;
-            }
-        }
+        self.staged.clear();
+        self.staged.extend(dirty.iter().map(|&(_, row)| row));
+        let staging = device.upload_block(BlockKind::Staging, bytemuck::cast_slice(&self.staged));
 
         // One region per maximal run of consecutive rows. A frame in which
         // nothing moved records no copy at all; one in which everything moved
         // records a single region.
+        let row_bytes = std::mem::size_of::<GpuObject>() as u64;
         let mut regions: Vec<BufferCopy> = Vec::new();
         let mut start = 0usize;
         while start < dirty.len() {
@@ -250,18 +221,14 @@ impl InstanceStore {
                 end += 1;
             }
             regions.push(BufferCopy {
-                src_offset: start as u64,
-                dst_offset: u64::from(dirty[start].0),
-                size: (end - start) as u64,
-                ..Default::default()
+                src_offset: start as u64 * row_bytes,
+                dst_offset: u64::from(dirty[start].0) * row_bytes,
+                size: (end - start) as u64 * row_bytes,
             });
             start = end;
         }
 
-        builder.copy_buffer(CopyBufferInfoTyped {
-            regions: regions.into_iter().collect(),
-            ..CopyBufferInfoTyped::buffers(staging, self.rows.clone())
-        });
+        encoder.copy_buffer(staging, self.rows, &regions);
 
         dirty.len()
     }
@@ -274,61 +241,49 @@ impl InstanceStore {
     /// One buffer rather than one per list is what keeps `instance_index` a
     /// single resource in the graph rather than a convenient fiction.
     pub(super) fn upload_lists(
-        &self,
+        &mut self,
+        device: &Device,
         visible: crate::gfx::DrawList<'_>,
         transparent: crate::gfx::DrawList<'_>,
         refractive: crate::gfx::DrawList<'_>,
         casters: &[crate::gfx::DrawList<'_>],
         punctual: &[crate::gfx::DrawList<'_>],
     ) -> InstanceLists {
-        let total: usize = visible.len()
-            + transparent.len()
-            + refractive.len()
-            + casters.iter().map(crate::gfx::DrawList::len).sum::<usize>()
-            + punctual
-                .iter()
-                .map(crate::gfx::DrawList::len)
-                .sum::<usize>();
-        // allocate_slice rejects length 0; an empty scene still needs a bindable
-        // buffer, so round up to one (unwritten, unread) slot.
-        let indices = self
-            .index_allocator
-            .allocate_slice::<InstanceEntry>(total.max(1) as u64)
-            .unwrap();
+        let entries = &mut self.entries;
+        entries.clear();
+        let push = |entries: &mut Vec<InstanceEntry>, list: &crate::gfx::DrawList<'_>| {
+            for i in 0..list.len() {
+                let item = list.item(i);
+                entries.push(InstanceEntry {
+                    row: item.instance,
+                    material: item.material.0,
+                });
+            }
+        };
 
-        let transparent_base;
-        let refractive_base;
+        push(entries, &visible);
+        let transparent_base = entries.len() as u32;
+        push(entries, &transparent);
+        let refractive_base = entries.len() as u32;
+        push(entries, &refractive);
         let mut cascade_bases = [0u32; crate::gfx::shadows::MAX_CASCADES];
+        for (base, list) in cascade_bases.iter_mut().zip(casters) {
+            *base = entries.len() as u32;
+            push(entries, list);
+        }
         let mut punctual_bases = [0u32; crate::gfx::punctual::MAX_SHADOW_LIGHTS];
-        {
-            let mut rows = indices.write().unwrap();
-            let mut next = 0usize;
-            let mut write = |list: &crate::gfx::DrawList<'_>, next: &mut usize| {
-                for i in 0..list.len() {
-                    let item = list.item(i);
-                    rows[*next] = InstanceEntry {
-                        row: item.instance,
-                        material: item.material.0,
-                    };
-                    *next += 1;
-                }
-            };
-            write(&visible, &mut next);
-            transparent_base = next as u32;
-            write(&transparent, &mut next);
-            refractive_base = next as u32;
-            write(&refractive, &mut next);
-            for (base, list) in cascade_bases.iter_mut().zip(casters) {
-                *base = next as u32;
-                write(list, &mut next);
-            }
-            for (base, list) in punctual_bases.iter_mut().zip(punctual) {
-                *base = next as u32;
-                write(list, &mut next);
-            }
+        for (base, list) in punctual_bases.iter_mut().zip(punctual) {
+            *base = entries.len() as u32;
+            push(entries, list);
+        }
+
+        // A zero-length buffer is not one a descriptor can bind, and an empty
+        // scene still needs one, so it is padded to a single unread entry.
+        if entries.is_empty() {
+            entries.push(InstanceEntry::zeroed());
         }
         InstanceLists {
-            indices,
+            indices: device.upload_block(BlockKind::Storage, bytemuck::cast_slice(entries)),
             transparent_base,
             refractive_base,
             cascade_bases,
@@ -338,20 +293,12 @@ impl InstanceStore {
 }
 
 /// Device-local rows, written only by the staged copy in [`InstanceStore::sync`].
-fn allocate_rows(ctx: &VkContext, rows: u32) -> Subbuffer<[GpuObject]> {
-    Buffer::new_slice::<GpuObject>(
-        ctx.memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-            ..Default::default()
-        },
-        u64::from(rows),
-    )
-    .expect("failed to allocate the instance row buffer")
+fn allocate_rows(device: &Device, rows: u32) -> BufferId {
+    device.create_buffer(BufferDesc {
+        size: u64::from(rows) * std::mem::size_of::<GpuObject>() as u64,
+        usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+        location: MemoryLocation::GpuOnly,
+    })
 }
 
 #[cfg(test)]

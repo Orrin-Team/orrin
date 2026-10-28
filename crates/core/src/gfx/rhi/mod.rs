@@ -26,9 +26,10 @@ pub(crate) use geometry::{Placement, grown};
 pub(crate) use pool::Pool;
 
 pub use desc::{
-    Binding, BindingResource, Blend, BlockKind, BufferDesc, ComputePipelineDesc, CullMode,
-    DepthCompare, DepthRect, DepthTest, GraphicsPipelineDesc, MemoryLocation, SamplerDesc,
-    TextureDesc, TextureDimension, Topology, VertexAttribute, VertexFormat, VertexStream, Viewport,
+    Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, ComputePipelineDesc,
+    CullMode, DepthCompare, DepthRect, DepthTest, GraphicsPipelineDesc, MemoryLocation,
+    SamplerDesc, TextureDesc, TextureDimension, Topology, VertexAttribute, VertexFormat,
+    VertexStream, Viewport,
 };
 
 use super::format::Format;
@@ -342,6 +343,14 @@ impl Encoder<'_> {
                 vertex_offset,
                 first_instance,
             ),
+        }
+    }
+
+    /// Copy runs of bytes from `src` to `dst`, ahead of every pass recorded
+    /// after it.
+    pub fn copy_buffer(&mut self, src: BufferId, dst: BufferId, regions: &[BufferCopy]) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.copy_buffer(src, dst, regions),
         }
     }
 

@@ -58,7 +58,7 @@ use crate::geom::Aabb;
 use crate::gfx::Vertex;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferDesc, BufferId,
+    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, BufferId,
     ComputePipelineDesc, CullMode, DepthCompare, DepthRect, GraphicsPipelineDesc, MeshSpan,
     PipelineId, Pool, SamplerDesc, SamplerId, TextureDesc, TextureDimension, TextureViewId,
     Topology, VertexFormat, VertexStream, Viewport,
@@ -89,6 +89,7 @@ pub struct VkDriver {
     pipelines: Mutex<Pool<PipelineObject>>,
     uniforms: Arena,
     storage: Arena,
+    staging: Arena,
     vertices: Arena,
     /// The shared geometry every mesh is a span into. Owned by the device
     /// because every pass binds the same buffers; a pass names a mesh by its
@@ -125,6 +126,15 @@ impl VkDriver {
                 ..Default::default()
             },
         );
+        let staging = Arena::new(
+            ctx.memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: vulkano::buffer::BufferUsage::TRANSFER_SRC,
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        );
         let vertices = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
@@ -144,6 +154,7 @@ impl VkDriver {
             samplers: Mutex::new(Pool::new(frames_in_flight)),
             pipelines: Mutex::new(Pool::new(frames_in_flight)),
             uniforms,
+            staging,
             storage,
             vertices,
             bind_groups: Mutex::new(Pool::new(frames_in_flight)),
@@ -303,6 +314,7 @@ impl VkDriver {
         let arena = match kind {
             BlockKind::Uniform => &self.uniforms,
             BlockKind::Storage => &self.storage,
+            BlockKind::Staging => &self.staging,
         };
         let buffer = arena.allocate_slice::<u8>(bytes.len() as u64);
         buffer.write().unwrap().copy_from_slice(bytes);
@@ -1035,6 +1047,24 @@ impl<'a> VkEncoder<'a> {
             vertex_offset,
             first_instance,
         );
+    }
+
+    pub fn copy_buffer(&mut self, src: BufferId, dst: BufferId, regions: &[BufferCopy]) {
+        let src = lookup(&self.driver.buffers, src.0, "buffer");
+        let dst = lookup(&self.driver.buffers, dst.0, "buffer");
+        self.recorder
+            .copy_buffer(vulkano::command_buffer::CopyBufferInfo {
+                regions: regions
+                    .iter()
+                    .map(|region| vulkano::command_buffer::BufferCopy {
+                        src_offset: region.src_offset,
+                        dst_offset: region.dst_offset,
+                        size: region.size,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..vulkano::command_buffer::CopyBufferInfo::buffers(src, dst)
+            });
     }
 
     pub fn draw_indexed_indirect(&mut self, commands: BufferId, range: std::ops::Range<u32>) {

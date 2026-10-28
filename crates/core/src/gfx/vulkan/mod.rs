@@ -523,7 +523,7 @@ impl VulkanRenderer {
             GraphImages::allocate(&ctx.memory_allocator, &ctx, &frame.graph, extent, slots);
 
         Self {
-            instances: InstanceStore::new(&ctx),
+            instances: InstanceStore::new(&device),
             cull: CullPass::new(&device),
             occlusion: OcclusionPass::new(&device),
             gpu_culling,
@@ -1620,7 +1620,10 @@ impl VulkanRenderer {
         // whose object actually moved are written, and the copy that carries
         // them is recorded here — at the top of the frame's command buffer,
         // ahead of every pass that reads them.
-        self.instances.sync(&self.ctx, &mut builder, items);
+        {
+            let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut builder, driver));
+            self.instances.sync(&self.device, &mut encoder, items);
+        }
 
         // The draw orders, as row numbers into those rows. Still per frame,
         // because the orders are: what the camera can see and what casts into
@@ -1630,13 +1633,14 @@ impl VulkanRenderer {
         // still index from zero and the cascades index from
         // `objects.cascade_bases`.
         let objects = self.instances.upload_lists(
+            &self.device,
             draws,
             transparent,
             refractive,
             shadows.map_or(&no_casters, |s| s.casters),
             shadows.map_or(&no_casters, |s| s.punctual_casters),
         );
-        let object_rows = driver.import_buffer(self.instances.rows().clone().into_bytes());
+        let object_rows = self.instances.rows();
 
         // The views the compute path culls against, in the numbering `cull.rs`
         // documents: the camera, then each cascade, then each punctual face.
@@ -1700,7 +1704,7 @@ impl VulkanRenderer {
         // graph names the two apart. See `blended_index` in `frame::declare`.
         let opaque_indices = match &cull_frame {
             Some(_) => self.cull.indices(),
-            None => driver.import_buffer(objects.indices.clone().into_bytes()),
+            None => objects.indices,
         };
         let forward_object_set =
             self.forward
@@ -1872,7 +1876,7 @@ impl VulkanRenderer {
         // different one under GPU culling.
         let blended_sets = forward_sets.with_object_set(match &cull_frame {
             Some(_) => {
-                let host_indices = driver.import_buffer(objects.indices.clone().into_bytes());
+                let host_indices = objects.indices;
                 self.forward
                     .build_object_set(&self.device, object_rows, host_indices)
             }
