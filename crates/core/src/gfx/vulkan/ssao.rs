@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use super::PassCtx;
 use super::context::VkContext;
+use super::convert::vk_format;
 use super::prepass::{FrameUbo, NORMAL_FORMAT};
 use super::record::{Arena, Recorder};
 use super::rendering;
@@ -9,7 +10,6 @@ use super::texture::MipPolicy;
 use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::MemoryTypeFilter;
@@ -27,7 +27,7 @@ use vulkano::pipeline::{
 };
 use vulkano::shader::EntryPoint;
 
-pub(super) const AO_FORMAT: Format = Format::R8_UNORM;
+pub(super) const AO_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::R8Unorm;
 const NOISE_SIZE: u32 = 4;
 const KERNEL_SIZE: usize = 32;
 const KERNEL_MAX: usize = 64;
@@ -84,7 +84,7 @@ fn build_noise(ctx: &VkContext) -> Arc<ImageView> {
         ctx,
         &pixels,
         [NOISE_SIZE, NOISE_SIZE],
-        NORMAL_FORMAT,
+        vk_format(NORMAL_FORMAT),
         MipPolicy::None,
     )
 }
@@ -122,7 +122,7 @@ fn build_fullscreen_pipeline(
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(rendering::pipeline_info(&[AO_FORMAT], None).into()),
+            subpass: Some(rendering::pipeline_info(&[vk_format(AO_FORMAT)], None).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
@@ -220,7 +220,7 @@ impl SsaoPass {
                 ctx,
                 &[255u8],
                 [1, 1],
-                AO_FORMAT,
+                vk_format(AO_FORMAT),
                 MipPolicy::None,
             ),
             kernel: build_kernel(),

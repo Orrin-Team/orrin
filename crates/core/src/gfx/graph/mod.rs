@@ -65,6 +65,7 @@ mod error;
 mod plan;
 mod resource;
 mod schedule;
+mod sync;
 
 pub use access::Access;
 pub use builder::{GraphBuilder, PassBuilder, PassId, PassKind};
@@ -73,6 +74,7 @@ pub use error::GraphError;
 pub use plan::Barrier;
 pub use resource::{Extent, ImageDesc, ImportedLayouts, ResourceId};
 pub use schedule::{Queue, Segment};
+pub use sync::{AccessFlags, BufferUsage, ImageLayout, ImageUsage, PipelineStages};
 
 use builder::PassDecl;
 use resource::{ResourceDecl, ResourceKind};

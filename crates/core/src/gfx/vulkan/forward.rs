@@ -36,6 +36,7 @@ use crate::gfx::{
 use crate::scene::{Camera, EnvironmentSettings};
 
 use super::context::VkContext;
+use super::convert::{vk_format, vk_samples};
 use super::cull::Draws;
 use super::fog::GpuFog;
 use super::instances::{GpuObject, InstanceEntry};
@@ -621,15 +622,18 @@ pub struct ForwardTargets {
 
 impl ForwardTargets {
     fn new(color_format: Format, msaa_color_format: Format) -> Self {
-        let depth = Some(DEPTH_FORMAT);
+        let depth = Some(vk_format(DEPTH_FORMAT));
         Self {
             multisampled: rendering::pipeline_info(&[msaa_color_format], depth),
             multisampled_subsurface: rendering::pipeline_info(
-                &[msaa_color_format, SUBSURFACE_FORMAT],
+                &[msaa_color_format, vk_format(SUBSURFACE_FORMAT)],
                 depth,
             ),
             single: rendering::pipeline_info(&[color_format], depth),
-            single_subsurface: rendering::pipeline_info(&[color_format, SUBSURFACE_FORMAT], depth),
+            single_subsurface: rendering::pipeline_info(
+                &[color_format, vk_format(SUBSURFACE_FORMAT)],
+                depth,
+            ),
         }
     }
 }
@@ -691,7 +695,7 @@ impl ForwardPass {
                 fs::load(device.clone()).unwrap(),
                 &shadow_sampler,
                 true,
-                MSAA_SAMPLES,
+                vk_samples(MSAA_SAMPLES),
             ),
             subsurface: build_pipeline(
                 ctx,
@@ -699,7 +703,7 @@ impl ForwardPass {
                 fs_sss::load(device.clone()).unwrap(),
                 &shadow_sampler,
                 true,
-                MSAA_SAMPLES,
+                vk_samples(MSAA_SAMPLES),
             ),
             masked: build_pipeline(
                 ctx,
@@ -707,7 +711,7 @@ impl ForwardPass {
                 fs::load(device.clone()).unwrap(),
                 &shadow_sampler,
                 false,
-                MSAA_SAMPLES,
+                vk_samples(MSAA_SAMPLES),
             ),
             masked_subsurface: build_pipeline(
                 ctx,
@@ -715,7 +719,7 @@ impl ForwardPass {
                 fs_sss::load(device.clone()).unwrap(),
                 &shadow_sampler,
                 false,
-                MSAA_SAMPLES,
+                vk_samples(MSAA_SAMPLES),
             ),
         };
         // The masked variants take the alpha-testing shader modules rather than

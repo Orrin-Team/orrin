@@ -26,7 +26,6 @@ use std::sync::Arc;
 
 use vulkano::buffer::BufferContents;
 use vulkano::descriptor_set::WriteDescriptorSet;
-use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
@@ -51,7 +50,8 @@ const TILE: u32 = 8;
 /// metre. Sixteen bits carries both comfortably; the alternative, a separate
 /// single-channel target for the radius, would be a second attachment and a second
 /// resolve for one number that is already free here.
-pub(super) const SUBSURFACE_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
+pub(super) const SUBSURFACE_FORMAT: crate::gfx::format::Format =
+    crate::gfx::format::Format::Rgba16Float;
 
 /// Which axis a blur dispatch walks, and everything it needs to size its kernel.
 #[derive(BufferContents, Clone, Copy)]

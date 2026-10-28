@@ -23,7 +23,6 @@ use glam::Vec3;
 use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
@@ -67,12 +66,12 @@ pub(super) const SOURCE_LEVELS: u32 = 7;
 /// and `R32_SFLOAT` is a storage format every Vulkan implementation supports.
 /// Non-linear NDC depth, not linearised: the march compares against the same
 /// values the depth buffer holds, and the comparison only needs monotonicity.
-pub(super) const HIZ_FORMAT: Format = Format::R32_SFLOAT;
+pub(super) const HIZ_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::R32Float;
 
 /// What one ray leaves behind: the radiance it found, and how much of it to
 /// believe. `SFLOAT` because the radiance is HDR and the confidence is a
 /// fraction — the same target has to carry both.
-pub(super) const RAY_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
+pub(super) const RAY_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::Rgba16Float;
 
 /// Shared by the trace and the composite, because they must agree about the
 /// camera, the environment and the settings to the last bit — the composite

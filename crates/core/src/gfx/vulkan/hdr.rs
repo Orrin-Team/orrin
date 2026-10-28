@@ -43,7 +43,7 @@ use super::rendering;
 /// Not in the Vulkan mandatory `STORAGE_IMAGE` list, though every desktop driver
 /// supports it; [`VkContext`](super::context::VkContext) checks at startup rather
 /// than letting a compute pass fail to bind much later.
-pub const HDR_FORMAT: Format = Format::B10G11R11_UFLOAT_PACK32;
+pub const HDR_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::Rg11B10Float;
 
 /// The wider colour format, for the targets [`HDR_FORMAT`] cannot carry.
 ///
@@ -59,7 +59,7 @@ pub const HDR_FORMAT: Format = Format::B10G11R11_UFLOAT_PACK32;
 ///   alpha, and the composite divides by it.
 /// - The depth-of-field and motion-blur tile images, because they carry two
 ///   channels of signed maxima — velocities, and near/far CoC radii.
-pub const HDR_WIDE_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
+pub const HDR_WIDE_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::Rgba16Float;
 
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]

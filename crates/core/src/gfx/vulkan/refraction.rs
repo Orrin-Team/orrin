@@ -36,7 +36,6 @@ use std::sync::Arc;
 
 use vulkano::buffer::BufferContents;
 use vulkano::descriptor_set::WriteDescriptorSet;
-use vulkano::format::Format;
 use vulkano::image::sampler::{
     LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
 };
@@ -62,6 +61,7 @@ use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
 use super::PassCtx;
 use super::context::VkContext;
+use super::convert::vk_format;
 use super::forward::ForwardSets;
 use super::hdr::HDR_WIDE_FORMAT;
 use super::record::Recorder;
@@ -400,7 +400,13 @@ fn build_pipeline(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Arc<
                 ..Default::default()
             }),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(rendering::pipeline_info(&[HDR_WIDE_FORMAT], Some(DEPTH_FORMAT)).into()),
+            subpass: Some(
+                rendering::pipeline_info(
+                    &[vk_format(HDR_WIDE_FORMAT)],
+                    Some(vk_format(DEPTH_FORMAT)),
+                )
+                .into(),
+            ),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
@@ -434,7 +440,7 @@ fn build_compute(
 /// multiplied by has to survive in alpha for `refraction_composite` to put the
 /// scene back underneath it. That is what keeps this off the packed colour
 /// format the rest of the chain moved to.
-pub(super) const ACCUM_FORMAT: Format = HDR_WIDE_FORMAT;
+pub(super) const ACCUM_FORMAT: crate::gfx::format::Format = HDR_WIDE_FORMAT;
 
 mod fs {
     vulkano_shaders::shader! {

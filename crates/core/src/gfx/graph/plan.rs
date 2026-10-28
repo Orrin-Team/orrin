@@ -1,7 +1,6 @@
 use std::fmt;
 
-use vulkano::image::ImageLayout;
-use vulkano::sync::{AccessFlags, PipelineStages};
+use super::sync::{AccessFlags, ImageLayout, PipelineStages};
 
 use super::{FrameGraph, Queue, ResourceId};
 

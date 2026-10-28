@@ -28,7 +28,6 @@ use glam::{Mat4, Vec3};
 use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
@@ -44,6 +43,7 @@ use crate::scene::FogSettings;
 
 use super::ShadowFrame;
 use super::context::VkContext;
+use super::convert::vk_format;
 use super::forward::GpuCascades;
 use super::record::{Arena, Recorder};
 use super::taa::FrameView;
@@ -70,7 +70,7 @@ pub(super) const FROXEL_SLICES: u32 = 64;
 /// radiance, so a sunlit shaft is in the thousands of cd/m² while the shadowed
 /// air beside it is in the ones, and a normalised format would band across
 /// exactly the gradient the effect exists to draw.
-pub(super) const FOG_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
+pub(super) const FOG_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::Rgba16Float;
 
 /// Side of the scatter dispatch's workgroup, matching `fog_scatter.comp`.
 const SCATTER_TILE: u32 = 4;
@@ -497,7 +497,7 @@ fn allocate_history(ctx: &VkContext, extent: [u32; 3]) -> [Arc<ImageView>; 2] {
             ctx.memory_allocator.clone(),
             ImageCreateInfo {
                 image_type: ImageType::Dim3d,
-                format: FOG_FORMAT,
+                format: vk_format(FOG_FORMAT),
                 extent,
                 // Written as a storage image by the scatter pass, read as a
                 // sampled one by the integration this frame and by the scatter
@@ -524,7 +524,7 @@ fn allocate_fallback(ctx: &VkContext) -> Arc<ImageView> {
         ctx.memory_allocator.clone(),
         ImageCreateInfo {
             image_type: ImageType::Dim3d,
-            format: FOG_FORMAT,
+            format: vk_format(FOG_FORMAT),
             extent: [1, 1, 1],
             usage: ImageUsage::SAMPLED,
             ..Default::default()

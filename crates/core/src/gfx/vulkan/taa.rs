@@ -33,6 +33,7 @@ use vulkano::pipeline::{
 use crate::scene::{Camera, TaaSettings};
 
 use super::context::VkContext;
+use super::convert::vk_format;
 use super::hdr::HDR_FORMAT;
 use super::record::{Arena, Recorder};
 
@@ -340,7 +341,7 @@ fn allocate_history(ctx: &VkContext, extent: [u32; 2]) -> [Arc<ImageView>; 2] {
             ctx.memory_allocator.clone(),
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
-                format: HDR_FORMAT,
+                format: vk_format(HDR_FORMAT),
                 extent: [extent[0], extent[1], 1],
                 // Written as a storage image by the resolve, read as a sampled
                 // one by both the resolve's next frame and everything the frame

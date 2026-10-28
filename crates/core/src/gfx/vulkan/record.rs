@@ -53,6 +53,7 @@ use vulkano::sync::{
 use vulkano::DeviceSize;
 use vulkano::device::Queue;
 
+use super::convert::{vk_access, vk_layout, vk_stages};
 use crate::gfx::graph::{Barrier, ResourceId};
 use crate::profile_scope;
 
@@ -255,12 +256,12 @@ pub(super) fn emit_plan(
             Target::Image(image) => {
                 let subresource_range = whole_image(&image);
                 image_memory_barriers.push(ImageMemoryBarrier {
-                    src_stages: barrier.src_stages,
-                    src_access: barrier.src_access,
-                    dst_stages: barrier.dst_stages,
-                    dst_access: barrier.dst_access,
-                    old_layout: barrier.old_layout,
-                    new_layout: barrier.new_layout,
+                    src_stages: vk_stages(barrier.src_stages),
+                    src_access: vk_access(barrier.src_access),
+                    dst_stages: vk_stages(barrier.dst_stages),
+                    dst_access: vk_access(barrier.dst_access),
+                    old_layout: vk_layout(barrier.old_layout),
+                    new_layout: vk_layout(barrier.new_layout),
                     subresource_range,
                     ..ImageMemoryBarrier::image(image)
                 });
@@ -270,10 +271,10 @@ pub(super) fn emit_plan(
             // here to drop on the floor.
             Target::Memory => {
                 memory_barriers.push(MemoryBarrier {
-                    src_stages: barrier.src_stages,
-                    src_access: barrier.src_access,
-                    dst_stages: barrier.dst_stages,
-                    dst_access: barrier.dst_access,
+                    src_stages: vk_stages(barrier.src_stages),
+                    src_access: vk_access(barrier.src_access),
+                    dst_stages: vk_stages(barrier.dst_stages),
+                    dst_access: vk_access(barrier.dst_access),
                     ..Default::default()
                 });
             }

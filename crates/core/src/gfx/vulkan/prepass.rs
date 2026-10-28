@@ -19,7 +19,6 @@ use std::sync::Arc;
 use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::MemoryTypeFilter;
@@ -41,6 +40,7 @@ use crate::gfx::{PositionVertex, SurfaceVertex};
 
 use super::PassCtx;
 use super::context::VkContext;
+use super::convert::vk_format;
 use super::cull::Draws;
 use super::instances::{GpuObject, InstanceEntry};
 use super::record::{Arena, Recorder};
@@ -54,7 +54,7 @@ use super::taa::FrameView;
 /// what [`VkContext::mark_texture_array_partial`] assumes.
 const TEXTURE_SET: usize = 3;
 
-pub(super) const NORMAL_FORMAT: Format = Format::R8G8B8A8_UNORM;
+pub(super) const NORMAL_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::Rgba8Unorm;
 
 /// `rgb` = the surface's normal-incidence specular colour, `a` = perceptual
 /// roughness.
@@ -64,12 +64,14 @@ pub(super) const NORMAL_FORMAT: Format = Format::R8G8B8A8_UNORM;
 /// is done once, next to the material that decides it. Eight bits costs a
 /// dielectric's ~4% about a thousandth in absolute terms, which lands well
 /// inside the error the split-sum approximation already carries.
-pub(super) const MATERIAL_FORMAT: Format = Format::R8G8B8A8_UNORM;
+pub(super) const MATERIAL_FORMAT: crate::gfx::format::Format =
+    crate::gfx::format::Format::Rgba8Unorm;
 
 /// Signed and float, unlike the normal target: a motion vector is a UV *delta*,
 /// so it is negative half the time, and a UNORM encoding would need a bias that
 /// costs precision exactly where the vectors are smallest and matter most.
-pub(super) const VELOCITY_FORMAT: Format = Format::R16G16_SFLOAT;
+pub(super) const VELOCITY_FORMAT: crate::gfx::format::Format =
+    crate::gfx::format::Format::Rg16Float;
 
 /// The per-frame camera block. Shared with the SSAO passes, which reconstruct
 /// view-space positions from the same depth this pass wrote and so must use the
@@ -414,8 +416,12 @@ fn build_pipeline(
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
             subpass: Some(
                 rendering::pipeline_info(
-                    &[NORMAL_FORMAT, VELOCITY_FORMAT, MATERIAL_FORMAT],
-                    Some(DEPTH_FORMAT),
+                    &[
+                        vk_format(NORMAL_FORMAT),
+                        vk_format(VELOCITY_FORMAT),
+                        vk_format(MATERIAL_FORMAT),
+                    ],
+                    Some(vk_format(DEPTH_FORMAT)),
                 )
                 .into(),
             ),

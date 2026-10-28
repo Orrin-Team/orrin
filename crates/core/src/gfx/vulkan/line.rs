@@ -15,6 +15,7 @@ use crate::scene::DebugLine;
 
 use super::MSAA_SAMPLES;
 use super::context::VkContext;
+use super::convert::vk_samples;
 use super::forward::ForwardTargets;
 use super::record::{Arena, Recorder};
 use super::taa::FrameView;
@@ -74,8 +75,12 @@ impl LinePass {
                     build_pipeline(ctx, &targets.single_subsurface, SampleCount::Sample1),
                 ],
                 [
-                    build_pipeline(ctx, &targets.multisampled, MSAA_SAMPLES),
-                    build_pipeline(ctx, &targets.multisampled_subsurface, MSAA_SAMPLES),
+                    build_pipeline(ctx, &targets.multisampled, vk_samples(MSAA_SAMPLES)),
+                    build_pipeline(
+                        ctx,
+                        &targets.multisampled_subsurface,
+                        vk_samples(MSAA_SAMPLES),
+                    ),
                 ],
             ],
             subbuffer_allocator,

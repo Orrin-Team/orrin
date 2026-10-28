@@ -25,7 +25,6 @@
 use std::sync::Arc;
 
 use vulkano::descriptor_set::WriteDescriptorSet;
-use vulkano::format::Format;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
@@ -49,6 +48,7 @@ use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
 use super::PassCtx;
 use super::context::VkContext;
+use super::convert::vk_format;
 use super::forward::ForwardSets;
 use super::hdr::HDR_WIDE_FORMAT;
 use super::record::Recorder;
@@ -65,13 +65,13 @@ const TILE: u32 = 8;
 // The wide format: this target carries *weighted* radiance, and the weight is
 // in alpha. The packed colour format has no alpha channel, so accumulating into
 // it would throw away the divisor the composite needs.
-pub(super) const ACCUM_FORMAT: Format = HDR_WIDE_FORMAT;
+pub(super) const ACCUM_FORMAT: crate::gfx::format::Format = HDR_WIDE_FORMAT;
 
 /// Transmittance: the running product of `1 - alpha`, one channel and eight bits
 /// of it. The paper's own recommendation — the value is a fraction in `[0, 1]`
 /// that a composite multiplies by, and a quarter of a byte per pixel buys
 /// nothing a viewer can see.
-pub(super) const REVEAL_FORMAT: Format = Format::R8_UNORM;
+pub(super) const REVEAL_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::R8Unorm;
 
 pub struct OitPass {
     pipeline: Arc<GraphicsPipeline>,
@@ -283,7 +283,11 @@ fn build_pipeline(ctx: &VkContext, layout: &Arc<PipelineLayout>) -> Arc<Graphics
             }),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
             subpass: Some(
-                rendering::pipeline_info(&[ACCUM_FORMAT, REVEAL_FORMAT], Some(DEPTH_FORMAT)).into(),
+                rendering::pipeline_info(
+                    &[vk_format(ACCUM_FORMAT), vk_format(REVEAL_FORMAT)],
+                    Some(vk_format(DEPTH_FORMAT)),
+                )
+                .into(),
             ),
             ..GraphicsPipelineCreateInfo::layout(layout.clone())
         },

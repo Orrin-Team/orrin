@@ -1,4 +1,4 @@
-use vulkano::image::ImageLayout;
+use super::sync::ImageLayout;
 
 use super::{
     Access, GraphError, ImageDesc, ImportedLayouts, ResourceDecl, ResourceId, ResourceKind,

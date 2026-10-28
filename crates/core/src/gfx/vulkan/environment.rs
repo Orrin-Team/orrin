@@ -43,6 +43,7 @@ use vulkano::pipeline::{
 use crate::gfx::sh::{self, SH9};
 use crate::scene::EnvironmentSettings;
 
+use super::convert::{vk_format, vk_samples};
 use super::fog::GpuFog;
 
 use super::MSAA_SAMPLES;
@@ -63,7 +64,7 @@ use vulkano::render_pass::{AttachmentLoadOp, AttachmentStoreOp};
 // once when an environment is loaded rather than written every frame, so there
 // is no per-frame bandwidth to win here — and the prefilter accumulates weighted
 // taps through the alpha channel the packed format does not have.
-pub const CUBE_FORMAT: Format = HDR_WIDE_FORMAT;
+pub const CUBE_FORMAT: crate::gfx::format::Format = HDR_WIDE_FORMAT;
 
 /// Edge length of one cube face. Enough for a background at ordinary fields of
 /// view; not enough for sharp mirror reflections, which is what would drive
@@ -165,8 +166,12 @@ impl EnvironmentPass {
                 build_skybox_pipeline(ctx, &targets.single_subsurface, SampleCount::Sample1),
             ],
             [
-                build_skybox_pipeline(ctx, &targets.multisampled, MSAA_SAMPLES),
-                build_skybox_pipeline(ctx, &targets.multisampled_subsurface, MSAA_SAMPLES),
+                build_skybox_pipeline(ctx, &targets.multisampled, vk_samples(MSAA_SAMPLES)),
+                build_skybox_pipeline(
+                    ctx,
+                    &targets.multisampled_subsurface,
+                    vk_samples(MSAA_SAMPLES),
+                ),
             ],
         ];
 
@@ -435,7 +440,7 @@ fn create_cube(ctx: &VkContext, mip_levels: u32, usage: ImageUsage) -> Arc<Image
             // fails, which points the error at the wrong line.
             flags: ImageCreateFlags::CUBE_COMPATIBLE,
             image_type: ImageType::Dim2d,
-            format: CUBE_FORMAT,
+            format: vk_format(CUBE_FORMAT),
             extent: [FACE_SIZE, FACE_SIZE, 1],
             array_layers: 6,
             mip_levels,
@@ -795,7 +800,7 @@ fn build_bake_pipeline(ctx: &VkContext) -> Arc<GraphicsPipeline> {
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(rendering::pipeline_info(&[CUBE_FORMAT], None).into()),
+            subpass: Some(rendering::pipeline_info(&[vk_format(CUBE_FORMAT)], None).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
@@ -839,7 +844,7 @@ fn build_prefilter_pipeline(ctx: &VkContext) -> Arc<GraphicsPipeline> {
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(rendering::pipeline_info(&[CUBE_FORMAT], None).into()),
+            subpass: Some(rendering::pipeline_info(&[vk_format(CUBE_FORMAT)], None).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )

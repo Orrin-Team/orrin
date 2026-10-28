@@ -40,7 +40,6 @@ use std::sync::Arc;
 
 use vulkano::buffer::BufferContents;
 use vulkano::descriptor_set::WriteDescriptorSet;
-use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{Image, ImageCreateInfo, ImageSubresourceRange, ImageUsage};
@@ -52,13 +51,15 @@ use vulkano::pipeline::{
 };
 
 use super::context::VkContext;
+use super::convert::vk_format;
 use super::record::Recorder;
 
 /// Single-channel float, for the reason the reflection pyramid is: a depth
 /// pyramid stores exactly one number, and `R32_SFLOAT` is a storage format every
 /// Vulkan implementation supports. Non-linear NDC depth, not linearised — the
 /// test is a comparison, and a comparison needs only monotonicity.
-pub(super) const OCCLUSION_FORMAT: Format = Format::R32_SFLOAT;
+pub(super) const OCCLUSION_FORMAT: crate::gfx::format::Format =
+    crate::gfx::format::Format::R32Float;
 
 /// How deep the pyramid goes, counting its half-resolution base at level 0.
 ///
@@ -322,7 +323,7 @@ fn allocate(
     let image = Image::new(
         ctx.memory_allocator.clone(),
         ImageCreateInfo {
-            format: OCCLUSION_FORMAT,
+            format: vk_format(OCCLUSION_FORMAT),
             extent: [extent[0], extent[1], 1],
             usage,
             mip_levels: levels,

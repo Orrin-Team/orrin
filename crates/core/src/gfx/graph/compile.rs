@@ -2,8 +2,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::ops::Range;
 
-use vulkano::image::{ImageLayout, ImageUsage};
-use vulkano::sync::{AccessFlags, PipelineStages};
+use super::sync::{AccessFlags, ImageLayout, ImageUsage, PipelineStages};
 
 use super::{
     Access, Barrier, GraphBuilder, GraphError, ImageDesc, PassDecl, PassId, PassKind, Queue,

@@ -1,6 +1,7 @@
 mod bloom;
 mod contact_shadows;
 mod context;
+mod convert;
 mod cull;
 mod descriptors;
 mod dof;
@@ -124,6 +125,7 @@ use self::swapchain::SwapchainState;
 use self::taa::TaaPass;
 use self::timestamps::GpuTimestamps;
 
+use self::convert::{engine_format, vk_format};
 use super::{
     DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TexelFormat, TextureHandle,
     TextureLevels,
@@ -136,7 +138,8 @@ use crate::threads;
 /// MSAA sample count for the forward pass. One definition, because the forward
 /// pipeline, its render pass attachments, and the graph's declaration of the
 /// MSAA targets all have to agree or framebuffer creation fails at startup.
-pub(crate) const MSAA_SAMPLES: vulkano::image::SampleCount = vulkano::image::SampleCount::Sample4;
+pub(crate) const MSAA_SAMPLES: crate::gfx::format::SampleCount =
+    crate::gfx::format::SampleCount::Sample4;
 
 /// What an offscreen render targets.
 ///
@@ -146,7 +149,8 @@ pub(crate) const MSAA_SAMPLES: vulkano::image::SampleCount = vulkano::image::Sam
 /// has no channel swap in it to get backwards. The `_SRGB` half matters more —
 /// the tonemap pass writes linear values and relies on the format to encode
 /// them, exactly as it does on a window.
-pub(crate) const OFFSCREEN_FORMAT: Format = Format::R8G8B8A8_SRGB;
+pub(crate) const OFFSCREEN_FORMAT: crate::gfx::format::Format =
+    crate::gfx::format::Format::Rgba8Srgb;
 
 pub use gizmo::GizmoVertex;
 pub use outline::OutlineItem;
@@ -390,7 +394,7 @@ impl VulkanRenderer {
         // to hand an image to, so the default stands and nothing reads it.
         Self::build(
             ctx,
-            OFFSCREEN_FORMAT,
+            vk_format(OFFSCREEN_FORMAT),
             extent,
             PresentSettings::default(),
             SwapchainState::offscreen,
@@ -405,7 +409,11 @@ impl VulkanRenderer {
         present: PresentSettings,
         make_target: impl FnOnce(&VkContext, Format, [u32; 2]) -> SwapchainState,
     ) -> Self {
-        let forward = ForwardPass::new(&ctx, hdr::HDR_FORMAT, hdr::HDR_WIDE_FORMAT);
+        let forward = ForwardPass::new(
+            &ctx,
+            vk_format(hdr::HDR_FORMAT),
+            vk_format(hdr::HDR_WIDE_FORMAT),
+        );
         let arena = MeshArena::new(&ctx);
         let hdr = HdrPass::new(&ctx, format);
         let gizmo = GizmoPass::new(&ctx, format);
@@ -453,7 +461,7 @@ impl VulkanRenderer {
         let gpu_culling = read_gpu_culling(&ctx);
         let occlusion_culling = gpu_culling && read_occlusion_culling();
         let config = FrameConfig {
-            color_format: format,
+            color_format: engine_format(format),
             msaa: false,
             ssao: true,
             ssao_half_res: true,
@@ -1264,7 +1272,7 @@ impl VulkanRenderer {
         // Everything else about this call — how many objects, which camera, what
         // exposure — flows through the same compiled schedule.
         self.ensure_graph(FrameConfig {
-            color_format: self.swapchain.format,
+            color_format: engine_format(self.swapchain.format),
             msaa: taa.msaa,
             ssao: ssao.enabled,
             ssao_half_res: ssao.half_resolution,

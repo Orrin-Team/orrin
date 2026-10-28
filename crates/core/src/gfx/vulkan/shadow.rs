@@ -33,6 +33,7 @@ use crate::gfx::{DrawList, PositionVertex};
 
 use super::PassCtx;
 use super::context::VkContext;
+use super::convert::vk_format;
 use super::cull::{CullFrame, Draws};
 use super::instances::{GpuObject, InstanceEntry};
 use super::record::{self, Recorder};
@@ -634,7 +635,7 @@ fn build_pipeline(ctx: &VkContext, masked: bool) -> Arc<GraphicsPipeline> {
             ]
             .into_iter()
             .collect(),
-            subpass: Some(rendering::pipeline_info(&[], Some(DEPTH_FORMAT)).into()),
+            subpass: Some(rendering::pipeline_info(&[], Some(vk_format(DEPTH_FORMAT))).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
@@ -666,7 +667,7 @@ fn build_lit_depth(ctx: &VkContext, view_type: ImageViewType) -> Arc<ImageView> 
         ctx.memory_allocator.clone(),
         ImageCreateInfo {
             image_type: ImageType::Dim2d,
-            format: DEPTH_FORMAT,
+            format: vk_format(DEPTH_FORMAT),
             extent: [1, 1, 1],
             array_layers: 1,
             usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,

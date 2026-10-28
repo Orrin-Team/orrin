@@ -28,6 +28,7 @@ use vulkano::memory::{
 };
 use vulkano::sync::Sharing;
 
+use super::convert::{vk_format, vk_image_usage, vk_samples};
 use crate::gfx::graph::{FrameGraph, ResourceId};
 
 /// Everything that distinguishes one allocation from another.
@@ -255,10 +256,10 @@ impl GraphImages {
                     // where there is a second family to name — so a single-queue
                     // device creates exactly the images it always did.
                     concurrent: image.concurrent && !shared_families.is_empty(),
-                    format: image.desc.format,
+                    format: vk_format(image.desc.format),
                     extent: [extent[0], extent[1], image.desc.depth.unwrap_or(1)],
-                    usage: image.usage,
-                    samples: image.desc.samples,
+                    usage: vk_image_usage(image.usage),
+                    samples: vk_samples(image.desc.samples),
                     array_layers: image.desc.array_layers.unwrap_or(1),
                     mip_levels,
                     memoryless: image.memoryless,
@@ -282,10 +283,10 @@ impl GraphImages {
                         Some(_) => ImageType::Dim3d,
                         None => ImageType::Dim2d,
                     },
-                    format: image.desc.format,
+                    format: vk_format(image.desc.format),
                     extent: [extent[0], extent[1], image.desc.depth.unwrap_or(1)],
-                    usage: image.usage,
-                    samples: image.desc.samples,
+                    usage: vk_image_usage(image.usage),
+                    samples: vk_samples(image.desc.samples),
                     array_layers: image.desc.array_layers.unwrap_or(1),
                     mip_levels,
                     sharing: if key.concurrent {
@@ -342,9 +343,9 @@ impl GraphImages {
                         // it is the one a shader samples with `textureLod`, and the
                         // per-level storage views come from `mip_views`.
                         usage: if mip_levels > 1 {
-                            image.usage - ImageUsage::STORAGE
+                            vk_image_usage(image.usage) - ImageUsage::STORAGE
                         } else {
-                            image.usage
+                            vk_image_usage(image.usage)
                         },
                         ..ImageViewCreateInfo::from_image(&allocated)
                     },
@@ -550,9 +551,9 @@ fn max_mip_levels(extent: [u32; 2]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::gfx::format::Format;
+    use crate::gfx::graph::ImageLayout;
     use vulkano::VulkanLibrary;
-    use vulkano::format::Format;
-    use vulkano::image::ImageLayout;
     use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 
     use super::*;
@@ -566,11 +567,11 @@ mod tests {
         let mut builder = GraphBuilder::new();
         let pyramid = builder.create_image(
             "pyramid",
-            ImageDesc::new(Format::R16G16B16A16_SFLOAT).mip_levels(levels),
+            ImageDesc::new(Format::Rgba16Float).mip_levels(levels),
         );
         let target = builder.import_image(
             "target",
-            ImageDesc::new(Format::R16G16B16A16_SFLOAT),
+            ImageDesc::new(Format::Rgba16Float),
             ImageLayout::Undefined,
             ImageLayout::General,
         );

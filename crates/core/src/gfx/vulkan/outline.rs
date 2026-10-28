@@ -37,6 +37,7 @@ use vulkano::pipeline::{
 };
 
 use super::context::VkContext;
+use super::convert::vk_format;
 use super::forward::GpuMesh;
 use super::mesh::MeshArena;
 use super::record::Recorder;
@@ -45,7 +46,7 @@ use crate::gfx::PositionVertex;
 use crate::scene::MeshHandle;
 
 /// Two channels: selected and hovered.
-pub const OUTLINE_MASK_FORMAT: Format = Format::R8G8_UNORM;
+pub const OUTLINE_MASK_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::Rg8Unorm;
 
 /// The selection's colour, and the hover's, in sRGB.
 const SELECTED: [f32; 4] = [1.0, 0.62, 0.16, 1.0];
@@ -241,7 +242,7 @@ fn build_mask(ctx: &VkContext) -> Arc<GraphicsPipeline> {
                 },
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(rendering::pipeline_info(&[OUTLINE_MASK_FORMAT], None).into()),
+            subpass: Some(rendering::pipeline_info(&[vk_format(OUTLINE_MASK_FORMAT)], None).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )

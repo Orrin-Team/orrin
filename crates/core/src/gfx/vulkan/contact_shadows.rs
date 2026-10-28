@@ -22,7 +22,6 @@ use glam::Vec3;
 use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::format::Format;
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::MemoryTypeFilter;
@@ -43,6 +42,7 @@ use crate::scene::ContactShadowSettings;
 
 use super::PassCtx;
 use super::context::VkContext;
+use super::convert::vk_format;
 use super::prepass::FrameUbo;
 use super::record::{Arena, Recorder};
 use super::rendering;
@@ -53,7 +53,7 @@ use super::texture::MipPolicy;
 /// uses, and for the same reason it is a colour attachment rather than a storage
 /// image: `R8_UNORM` is only guaranteed as a storage format behind an optional
 /// device feature, while every implementation can render to it.
-pub(super) const MASK_FORMAT: Format = Format::R8_UNORM;
+pub(super) const MASK_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::R8Unorm;
 
 /// How long the dither sequence runs before repeating.
 ///
@@ -135,7 +135,7 @@ impl ContactShadowPass {
                 ctx,
                 &[255u8],
                 [1, 1],
-                MASK_FORMAT,
+                vk_format(MASK_FORMAT),
                 MipPolicy::None,
             ),
             frame: 0,
@@ -284,7 +284,7 @@ fn build_pipeline(ctx: &VkContext) -> Arc<GraphicsPipeline> {
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(rendering::pipeline_info(&[MASK_FORMAT], None).into()),
+            subpass: Some(rendering::pipeline_info(&[vk_format(MASK_FORMAT)], None).into()),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
