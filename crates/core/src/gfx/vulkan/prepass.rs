@@ -16,17 +16,15 @@
 
 use std::sync::Arc;
 
-use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
-use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
+use vulkano::buffer::Subbuffer;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
-use vulkano::memory::allocator::MemoryTypeFilter;
 
 use crate::gfx::format::SampleCount;
 use crate::gfx::rhi::{
-    Blend, CullMode, DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId,
-    Topology, Viewport,
+    Binding, BindingResource, Blend, BlockKind, BufferId, CullMode, DepthCompare, DepthTest,
+    Device, Encoder, GraphicsPipelineDesc, PipelineId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{PositionVertex, SurfaceVertex};
@@ -35,7 +33,6 @@ use super::PassCtx;
 use super::context::VkContext;
 use super::cull::Draws;
 use super::instances::{GpuObject, InstanceEntry};
-use super::record::Arena;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -67,7 +64,7 @@ pub(super) const VELOCITY_FORMAT: crate::gfx::format::Format =
 /// The per-frame camera block. Shared with the SSAO passes, which reconstruct
 /// view-space positions from the same depth this pass wrote and so must use the
 /// same — jittered — projection to do it.
-#[derive(BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(super) struct FrameUbo {
     view: [[f32; 4]; 4],
@@ -108,7 +105,6 @@ pub struct GeometryPrepass {
     /// same mip selection the forward pass uses, so the two rasterisations
     /// cannot disagree about what a surface is.
     sampler: Arc<Sampler>,
-    uniform_allocator: Arena,
 }
 
 /// Set `set` of `pipeline`'s layout, for the builders below that still write
@@ -170,28 +166,17 @@ impl GeometryPrepass {
             },
         )
         .unwrap();
-        let uniform_allocator = Arena::new(
-            ctx.memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
 
         Self {
             pipeline: pipeline_plain,
             masked_pipeline,
             sampler,
-            uniform_allocator,
         }
     }
 
     /// Upload the camera block once for every pass in the frame that reads it.
-    pub(super) fn begin_frame(&self, view: &FrameView) -> Subbuffer<FrameUbo> {
-        let frame = self.uniform_allocator.allocate_sized::<FrameUbo>();
-        *frame.write().unwrap() = FrameUbo {
+    pub(super) fn begin_frame(&self, device: &Device, view: &FrameView) -> BufferId {
+        let frame = FrameUbo {
             view: view.view.to_cols_array_2d(),
             proj: view.proj.to_cols_array_2d(),
             inv_proj: view.proj.inverse().to_cols_array_2d(),
@@ -199,15 +184,9 @@ impl GeometryPrepass {
             jitter: [view.jitter.x, view.jitter.y, 0.0, 0.0],
             view_proj: view.view_proj.to_cols_array_2d(),
         };
-        frame
+        device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&frame))
     }
 
-    /// The sampler this pass reads material maps through.
-    ///
-    /// Lent to the shadow pass's cutout pipeline rather than duplicated there:
-    /// an alpha test that filtered differently from the two passes it has to
-    /// agree with would cut the leaf out at a slightly different place in the
-    /// shadow map than in the frame, which reads as the shadow being offset.
     pub(super) fn material_sampler(&self) -> &Arc<Sampler> {
         &self.sampler
     }
@@ -292,27 +271,31 @@ impl GeometryPrepass {
         renderer: &PassCtx<'_>,
         draws: Draws<'_>,
         extent: [u32; 2],
-        frame: Subbuffer<FrameUbo>,
-        decals: Subbuffer<super::forward::GpuDecals>,
+        frame: BufferId,
+        decals: BufferId,
         object_set: Arc<DescriptorSet>,
         material_set: Arc<DescriptorSet>,
         texture_set: Arc<DescriptorSet>,
     ) {
         let Device::Vulkan(driver) = device;
-        let frame_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            layout(device, self.pipeline, 0),
-            [
-                WriteDescriptorSet::buffer(0, frame),
+        let frame_set = device.create_transient_bind_group(
+            self.pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::UniformBuffer(frame),
+                },
                 // The very buffer object the forward pass's set 0 binds. See
                 // `ForwardPass::upload_decals` — one allocation bound twice is
                 // what keeps the two passes from stamping different decals onto
                 // the same pixel.
-                WriteDescriptorSet::buffer(1, decals),
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageBuffer(decals),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         encoder.set_viewport(Viewport {
             origin: [0.0, 0.0],
@@ -321,7 +304,7 @@ impl GeometryPrepass {
         });
 
         let sets = [
-            driver.import_set(frame_set),
+            frame_set,
             driver.import_set(object_set),
             driver.import_set(material_set),
             driver.import_set(texture_set),

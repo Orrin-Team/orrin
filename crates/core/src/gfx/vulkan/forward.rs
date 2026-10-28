@@ -30,8 +30,8 @@ use super::{MSAA_SAMPLES, PassCtx, ShadowFrame, VulkanRenderer};
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::rhi::MeshSpan;
 use crate::gfx::rhi::{
-    Blend, CullMode, DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId,
-    SamplerDesc, Topology, Viewport,
+    Blend, BlockKind, BufferId, CullMode, DepthCompare, DepthTest, Device, Encoder,
+    GraphicsPipelineDesc, PipelineId, SamplerDesc, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -418,7 +418,7 @@ pub(crate) mod decal_flags {
 
 /// One decal as the shader reads it. 160 bytes; std430 packs this exactly like
 /// the `#[repr(C)]` here because every field is 16 bytes or a `mat4`.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(crate) struct GpuDecal {
     world_to_decal: [[f32; 4]; 4],
@@ -465,7 +465,7 @@ impl GpuDecal {
 /// Fixed-length rather than a runtime-sized array, which costs 2.5 KB a frame
 /// whether the scene has decals or not and buys a `Subbuffer<GpuDecals>` that
 /// both passes can bind with no length to agree on either.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(crate) struct GpuDecals {
     /// `x` = how many of `decals` are live. A `uvec4` because std430 aligns the
@@ -637,7 +637,6 @@ pub struct ForwardPass {
     /// module because there is no decal *pass* to own it — the block is frame
     /// data that two existing passes read, which is exactly what the shadow face
     /// table above is.
-    decal_allocator: Arena,
     sampler: Arc<Sampler>,
     ao_sampler: Arc<Sampler>,
 }
@@ -802,16 +801,6 @@ impl ForwardPass {
             },
         );
 
-        let decal_allocator = Arena::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::STORAGE_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
-
         // Material textures are the only ones with a mip chain to sample; the
         // AO and tonemap inputs are screen-space targets read at 1:1.
         let anisotropy = device.enabled_features().sampler_anisotropy.then(|| {
@@ -846,7 +835,6 @@ impl ForwardPass {
             single,
             uniform_buffer_allocator,
             shadow_face_allocator,
-            decal_allocator,
             sampler,
             ao_sampler,
         }
@@ -947,13 +935,14 @@ impl ForwardPass {
     /// tests. The alternative is a "no decals" buffer kept alive as a second
     /// path through both passes, which is more state to get wrong than the
     /// write costs.
-    pub(super) fn upload_decals(&self, decals: &[DecalInstance]) -> Subbuffer<GpuDecals> {
-        let buffer = self.decal_allocator.allocate_sized::<GpuDecals>();
+    pub(super) fn upload_decals(&self, device: &Device, decals: &[DecalInstance]) -> BufferId {
+        let mut block = GpuDecals {
+            count: [0; 4],
+            decals: [GpuDecal::ZERO; MAX_DECALS],
+        };
         {
-            let mut block = buffer.write().unwrap();
             let count = decals.len().min(MAX_DECALS);
             block.count = [count as u32, 0, 0, 0];
-            block.decals = [GpuDecal::ZERO; MAX_DECALS];
             for (slot, decal) in block.decals.iter_mut().zip(decals.iter().take(count)) {
                 let mut flags = 0u32;
                 if decal.normal.is_some() {
@@ -1003,7 +992,7 @@ impl ForwardPass {
                 };
             }
         }
-        buffer
+        device.upload_block(BlockKind::Storage, bytemuck::bytes_of(&block))
     }
 
     /// Build the five descriptor sets both passes into the lit frame bind, and
@@ -1030,7 +1019,7 @@ impl ForwardPass {
         material_set: Arc<DescriptorSet>,
         texture_set: Arc<DescriptorSet>,
         object_set: Arc<DescriptorSet>,
-        decals: Subbuffer<GpuDecals>,
+        decals: BufferId,
         environment: &EnvironmentSettings,
         fog: Subbuffer<GpuFog>,
         fog_volume: Arc<ImageView>,
@@ -1087,7 +1076,10 @@ impl ForwardPass {
                 // environment term belonging to the surface as it was before the
                 // stamp landed — the identical argument the parallax march makes
                 // about *where* a map is sampled.
-                WriteDescriptorSet::buffer(1, decals),
+                WriteDescriptorSet::buffer(1, {
+                    let Device::Vulkan(driver) = device;
+                    driver.buffer(decals)
+                }),
             ],
             [],
         )

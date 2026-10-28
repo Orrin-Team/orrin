@@ -26,9 +26,9 @@ pub(crate) use geometry::{Placement, grown};
 pub(crate) use pool::Pool;
 
 pub use desc::{
-    Binding, BindingResource, Blend, BufferDesc, ComputePipelineDesc, CullMode, DepthCompare,
-    DepthRect, DepthTest, GraphicsPipelineDesc, MemoryLocation, SamplerDesc, TextureDesc,
-    TextureDimension, Topology, VertexAttribute, VertexFormat, VertexStream, Viewport,
+    Binding, BindingResource, Blend, BlockKind, BufferDesc, ComputePipelineDesc, CullMode,
+    DepthCompare, DepthRect, DepthTest, GraphicsPipelineDesc, MemoryLocation, SamplerDesc,
+    TextureDesc, TextureDimension, Topology, VertexAttribute, VertexFormat, VertexStream, Viewport,
 };
 
 use super::format::Format;
@@ -115,6 +115,14 @@ impl Device {
     pub fn upload_vertices(&self, bytes: &[u8]) -> BufferId {
         match self {
             Device::Vulkan(driver) => driver.upload_vertices(bytes),
+        }
+    }
+
+    /// A per-frame block of plain data, valid for the frame being recorded. The
+    /// bytes are a `#[repr(C)]` struct's, in the layout the shader declares.
+    pub fn upload_block(&self, kind: BlockKind, bytes: &[u8]) -> BufferId {
+        match self {
+            Device::Vulkan(driver) => driver.upload_block(kind, bytes),
         }
     }
 

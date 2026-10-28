@@ -236,3 +236,10 @@ pub struct DepthRect {
     pub offset: [u32; 2],
     pub extent: [u32; 2],
 }
+
+/// Which kind of buffer a per-frame block is bound as.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlockKind {
+    Uniform,
+    Storage,
+}

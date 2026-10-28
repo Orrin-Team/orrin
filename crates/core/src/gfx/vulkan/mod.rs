@@ -131,7 +131,7 @@ use super::{
     DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TexelFormat, TextureHandle,
     TextureLevels,
 };
-use crate::gfx::rhi::{Device, Encoder};
+use crate::gfx::rhi::{BufferId, Device, Encoder};
 use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::DebugLine;
@@ -197,9 +197,7 @@ pub struct ShadowFrame<'a> {
 /// it owns the frames in flight and the overlay's futures, and neither of those
 /// is `Send`.
 pub(super) struct PassCtx<'a> {
-    pub(crate) ctx: &'a VkContext,
     pub(crate) meshes: &'a [GpuMesh],
-    /// The shared geometry a pass binds once, before its first draw.
     pub(crate) materials: &'a [GpuMaterial],
 }
 
@@ -1675,7 +1673,7 @@ impl VulkanRenderer {
                 .build_object_set(&self.ctx, &self.device, &object_rows, &opaque_indices);
         // One block for the whole frame, bound by the forward pass's set 0 and
         // the prepass's alike. See `ForwardPass::upload_decals`.
-        let decal_block = self.forward.upload_decals(decals);
+        let decal_block = self.forward.upload_decals(&self.device, decals);
         let caster_sets = shadows.is_some().then(|| shadow::CasterSets {
             objects: self.shadow.build_object_set(
                 &self.ctx,
@@ -1698,7 +1696,7 @@ impl VulkanRenderer {
             .frame
             .ids
             .prepass
-            .map(|_| self.prepass.begin_frame(&view));
+            .map(|_| self.prepass.begin_frame(&self.device, &view));
         // The AO extent rather than the frame's: the noise tiles per AO texel,
         // so a half-res target that scaled the pattern by the window would
         // stretch the rotation across two pixels and band the result.
@@ -1707,9 +1705,7 @@ impl VulkanRenderer {
             self.ssao.begin_frame(
                 driver,
                 self.images.extent(ids.raw_ao),
-                frame_uniforms
-                    .clone()
-                    .expect("SSAO reads the geometry prepass"),
+                frame_uniforms.expect("SSAO reads the geometry prepass"),
             )
         });
         // The frame's view matrix rather than the camera's, for the reason every
@@ -1722,9 +1718,7 @@ impl VulkanRenderer {
                 contact_shadows,
                 &view,
                 lighting.sun.direction_to_light(),
-                frame_uniforms
-                    .clone()
-                    .expect("contact shadows read the geometry prepass"),
+                frame_uniforms.expect("contact shadows read the geometry prepass"),
             )
         });
 
@@ -1794,7 +1788,7 @@ impl VulkanRenderer {
             material_set.clone(),
             texture_set.clone(),
             forward_object_set.clone(),
-            decal_block.clone(),
+            decal_block,
             environment,
             // The same allocation both fog dispatches bind, and the same
             // stand-in volume when they did not run: one description of the
@@ -2256,13 +2250,13 @@ struct FrameRecord<'a> {
     /// The same sets with the blended queues' own instance buffer bound. Equal
     /// to `forward_sets` on the CPU path, where there is only one such buffer.
     blended_sets: forward::ForwardSets,
-    frame_uniforms: Option<vulkano::buffer::Subbuffer<prepass::FrameUbo>>,
+    frame_uniforms: Option<BufferId>,
     ssao_uniforms: Option<ssao::SsaoUniforms>,
     contact_shadow_uniforms: Option<contact_shadows::ContactShadowUniforms>,
     prepass_object_set: Option<Arc<DescriptorSet>>,
     prepass_material_set: Arc<DescriptorSet>,
     prepass_texture_set: Arc<DescriptorSet>,
-    decal_block: vulkano::buffer::Subbuffer<forward::GpuDecals>,
+    decal_block: BufferId,
     scene_color: Arc<ImageView>,
     shadow_view: Arc<ImageView>,
     debug_lines: &'a [DebugLine],
@@ -2452,7 +2446,6 @@ impl FrameRecord<'_> {
 
     fn pass_ctx(&self) -> PassCtx<'_> {
         PassCtx {
-            ctx: self.ctx,
             meshes: self.meshes,
             materials: self.materials,
         }
@@ -3152,8 +3145,8 @@ impl FrameRecord<'_> {
                     &self.pass_ctx(),
                     self.opaque_draws(0, self.draws, 0),
                     self.extent,
-                    self.frame_uniforms.clone().unwrap(),
-                    self.decal_block.clone(),
+                    self.frame_uniforms.unwrap(),
+                    self.decal_block,
                     self.prepass_object_set.clone().unwrap(),
                     self.prepass_material_set.clone(),
                     self.prepass_texture_set.clone(),

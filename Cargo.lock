@@ -2554,6 +2554,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "bitflags 2.13.0",
+ "bytemuck",
  "criterion",
  "egui",
  "egui-winit",

@@ -39,6 +39,9 @@ notify = "8"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Raw VK_EXT_memory_budget query for VRAM usage; pinned to vulkano 0.35's ash.
 ash = "0.38"
+# GPU blocks are `#[repr(C)]` plain data; `Pod` is how one becomes bytes for an
+# upload without naming a graphics API. Already in the tree through glam.
+bytemuck = { version = "1", features = ["derive"] }
 # The engine-owned synchronisation vocabulary in `gfx::graph`. Already in the
 # tree through vulkano and winit; naming it here adds no crate.
 bitflags = "2"

@@ -19,7 +19,6 @@
 use std::sync::Arc;
 
 use glam::Vec3;
-use vulkano::buffer::Subbuffer;
 use vulkano::image::view::ImageView;
 
 use crate::gfx::rhi::{
@@ -32,7 +31,6 @@ use crate::scene::ContactShadowSettings;
 use super::context::VkContext;
 use super::convert::vk_format;
 use super::driver::VkDriver;
-use super::prepass::FrameUbo;
 use super::taa::FrameView;
 use super::texture::MipPolicy;
 
@@ -120,7 +118,7 @@ impl ContactShadowPass {
         settings: &ContactShadowSettings,
         view: &FrameView,
         to_sun: Vec3,
-        frame: Subbuffer<FrameUbo>,
+        frame: BufferId,
     ) -> ContactShadowUniforms {
         // A direction, so the view matrix's translation must not apply.
         let light_direction = view.view.transform_vector3(to_sun).normalize_or_zero();
@@ -159,10 +157,7 @@ impl ContactShadowPass {
         let params = driver.upload_uniform(&words);
         self.frame = self.frame.wrapping_add(1);
 
-        ContactShadowUniforms {
-            frame: driver.import_buffer(frame.into_bytes()),
-            params,
-        }
+        ContactShadowUniforms { frame, params }
     }
 
     /// `depth_view` and `normal_view` are the prepass's graph outputs, declared

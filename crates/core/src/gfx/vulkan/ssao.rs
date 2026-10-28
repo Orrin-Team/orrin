@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
-use vulkano::buffer::Subbuffer;
 use vulkano::image::view::ImageView;
 
 use super::context::VkContext;
 use super::convert::vk_format;
 use super::driver::VkDriver;
-use super::prepass::{FrameUbo, NORMAL_FORMAT};
+use super::prepass::NORMAL_FORMAT;
 use super::texture::MipPolicy;
 use crate::gfx::rhi::{
     Binding, BindingResource, BufferId, Device, Encoder, GraphicsPipelineDesc, PipelineId,
@@ -147,7 +146,7 @@ impl SsaoPass {
         &self,
         driver: &VkDriver,
         extent: [u32; 2],
-        frame: Subbuffer<FrameUbo>,
+        frame: BufferId,
     ) -> SsaoUniforms {
         let mut words = [0u32; PARAMS_WORDS];
         for (word, value) in words.iter_mut().zip(self.kernel.iter().flatten()) {
@@ -162,7 +161,7 @@ impl SsaoPass {
         words[tail + 5] = KERNEL_SIZE as u32;
 
         SsaoUniforms {
-            frame: driver.import_buffer(frame.into_bytes()),
+            frame,
             params: driver.upload_uniform(&words),
         }
     }

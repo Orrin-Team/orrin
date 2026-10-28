@@ -57,9 +57,10 @@ use crate::geom::Aabb;
 use crate::gfx::Vertex;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BindingResource, Blend, BufferDesc, BufferId, ComputePipelineDesc,
-    CullMode, DepthCompare, DepthRect, GraphicsPipelineDesc, MeshSpan, PipelineId, Pool,
-    SamplerDesc, SamplerId, TextureViewId, Topology, VertexFormat, VertexStream, Viewport,
+    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferDesc, BufferId,
+    ComputePipelineDesc, CullMode, DepthCompare, DepthRect, GraphicsPipelineDesc, MeshSpan,
+    PipelineId, Pool, SamplerDesc, SamplerId, TextureViewId, Topology, VertexFormat, VertexStream,
+    Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -86,6 +87,7 @@ pub struct VkDriver {
     samplers: Mutex<Pool<Arc<Sampler>>>,
     pipelines: Mutex<Pool<PipelineObject>>,
     uniforms: Arena,
+    storage: Arena,
     vertices: Arena,
     /// The shared geometry every mesh is a span into. Owned by the device
     /// because every pass binds the same buffers; a pass names a mesh by its
@@ -113,6 +115,15 @@ impl VkDriver {
                 ..Default::default()
             },
         );
+        let storage = Arena::new(
+            ctx.memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: vulkano::buffer::BufferUsage::STORAGE_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        );
         let vertices = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
@@ -132,6 +143,7 @@ impl VkDriver {
             samplers: Mutex::new(Pool::new(frames_in_flight)),
             pipelines: Mutex::new(Pool::new(frames_in_flight)),
             uniforms,
+            storage,
             vertices,
             bind_groups: Mutex::new(Pool::new(frames_in_flight)),
         }
@@ -183,6 +195,16 @@ impl VkDriver {
 
     pub fn upload_vertices(&self, bytes: &[u8]) -> BufferId {
         let buffer = self.vertices.allocate_slice::<u8>(bytes.len() as u64);
+        buffer.write().unwrap().copy_from_slice(bytes);
+        self.import_buffer(buffer)
+    }
+
+    pub fn upload_block(&self, kind: BlockKind, bytes: &[u8]) -> BufferId {
+        let arena = match kind {
+            BlockKind::Uniform => &self.uniforms,
+            BlockKind::Storage => &self.storage,
+        };
+        let buffer = arena.allocate_slice::<u8>(bytes.len() as u64);
         buffer.write().unwrap().copy_from_slice(bytes);
         self.import_buffer(buffer)
     }
