@@ -431,7 +431,7 @@ impl VulkanRenderer {
         let contact_shadows = ContactShadowPass::new(&ctx, &device);
         let fog = FogPass::new(&ctx);
         let ssr = SsrPass::new(&ctx);
-        let subsurface = SubsurfacePass::new(&ctx);
+        let subsurface = SubsurfacePass::new(&device);
         let oit = OitPass::new(&ctx, forward.pipeline_layout());
         let refraction = RefractionPass::new(&ctx, forward.pipeline_layout());
         let taa = TaaPass::new(&ctx);
@@ -2664,12 +2664,17 @@ impl FrameRecord<'_> {
                     } else {
                         (ids.diffusible, ids.blurred_x)
                     };
+                    let Device::Vulkan(driver) = self.device;
+                    let source = driver.import_view(self.images.view(source));
+                    let depth = driver.import_view(self.images.view(prepass.depth));
+                    let target = driver.import_view(self.images.view(target));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.subsurface.record_blur(
-                        builder,
-                        self.ctx,
-                        self.images.view(source),
-                        self.images.view(prepass.depth),
-                        self.images.view(target),
+                        self.device,
+                        &mut encoder,
+                        source,
+                        depth,
+                        target,
                         vertical,
                     );
                 }
@@ -2679,12 +2684,17 @@ impl FrameRecord<'_> {
                         .ids
                         .subsurface
                         .expect("subsurface diffusion without its targets");
+                    let Device::Vulkan(driver) = self.device;
+                    let source = driver.import_view(self.view_of(ids.source));
+                    let diffused = driver.import_view(self.images.view(ids.blurred_y));
+                    let target = driver.import_view(self.images.view(ids.output));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.subsurface.record_composite(
-                        builder,
-                        self.ctx,
-                        self.view_of(ids.source),
-                        self.images.view(ids.blurred_y),
-                        self.images.view(ids.output),
+                        self.device,
+                        &mut encoder,
+                        source,
+                        diffused,
+                        target,
                     );
                 }
                 PassBody::OitComposite => {
