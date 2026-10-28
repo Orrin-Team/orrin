@@ -297,9 +297,39 @@ impl VkDriver {
         bindings: &[Binding],
     ) -> BindGroupId {
         let pipeline = lookup(&self.pipelines, pipeline.0, "pipeline");
-        let writes: Vec<_> = bindings
-            .iter()
-            .map(|binding| match binding.resource {
+        let mut writes: Vec<WriteDescriptorSet> = Vec::with_capacity(bindings.len());
+        let mut index = 0;
+        while index < bindings.len() {
+            let binding = bindings[index];
+            // Consecutive storage textures at one binding are the elements of
+            // an image array, in order.
+            if let BindingResource::StorageTexture(_) = binding.resource {
+                let run = bindings[index..]
+                    .iter()
+                    .take_while(|b| {
+                        b.binding == binding.binding
+                            && matches!(b.resource, BindingResource::StorageTexture(_))
+                    })
+                    .count();
+                if run > 1 {
+                    let views = bindings[index..index + run]
+                        .iter()
+                        .map(|b| match b.resource {
+                            BindingResource::StorageTexture(view) => {
+                                lookup(&self.views, view.0, "texture view")
+                            }
+                            _ => unreachable!(),
+                        });
+                    writes.push(WriteDescriptorSet::image_view_array(
+                        binding.binding,
+                        0,
+                        views,
+                    ));
+                    index += run;
+                    continue;
+                }
+            }
+            writes.push(match binding.resource {
                 BindingResource::SampledTexture { view, sampler } => {
                     WriteDescriptorSet::image_view_sampler(
                         binding.binding,
@@ -311,16 +341,15 @@ impl VkDriver {
                     binding.binding,
                     lookup(&self.views, view.0, "texture view"),
                 ),
-                BindingResource::UniformBuffer(buffer) => WriteDescriptorSet::buffer(
-                    binding.binding,
-                    lookup(&self.buffers, buffer.0, "buffer"),
-                ),
-                BindingResource::StorageBuffer(buffer) => WriteDescriptorSet::buffer(
-                    binding.binding,
-                    lookup(&self.buffers, buffer.0, "buffer"),
-                ),
-            })
-            .collect();
+                BindingResource::UniformBuffer(buffer) | BindingResource::StorageBuffer(buffer) => {
+                    WriteDescriptorSet::buffer(
+                        binding.binding,
+                        lookup(&self.buffers, buffer.0, "buffer"),
+                    )
+                }
+            });
+            index += 1;
+        }
         let set = self.ctx.descriptor_sets.get(
             &self.ctx.descriptor_set_allocator,
             &pipeline.layout().set_layouts()[set as usize],

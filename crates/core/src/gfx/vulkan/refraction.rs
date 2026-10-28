@@ -34,13 +34,11 @@
 
 use std::sync::Arc;
 
-use vulkano::buffer::BufferContents;
 use vulkano::descriptor_set::WriteDescriptorSet;
 use vulkano::image::sampler::{
     LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
 };
 use vulkano::image::view::ImageView;
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
@@ -53,10 +51,15 @@ use vulkano::pipeline::graphics::vertex_input::{Vertex as _, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
-    ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
 
+use crate::gfx::rhi::{
+    Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId, SamplerDesc,
+    SamplerId, TextureViewId,
+};
+use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
 use super::PassCtx;
@@ -84,17 +87,17 @@ pub(super) const SCENE_LEVELS: u32 = 7;
 /// it shares with the forward pass.
 const SCENE_SET: usize = 5;
 
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct PyramidPush {
-    extent: [i32; 2],
-    levels: i32,
-}
-
 pub struct RefractionPass {
     pipeline: Arc<GraphicsPipeline>,
-    pyramid_pipeline: Arc<ComputePipeline>,
-    composite_pipeline: Arc<ComputePipeline>,
+    /// The same reduction the reflection trace builds its source with, built a
+    /// second time because either pass can run with the other switched off. Two
+    /// pipeline objects, rather than a dependency between two things that are
+    /// structurally independent.
+    pyramid_pipeline: PipelineId,
+    composite_pipeline: PipelineId,
+    /// The pyramid pass's own copy of the clamped linear sampler, on the RHI.
+    pyramid_sampler: SamplerId,
+    composite_sampler: SamplerId,
     /// Linear, because level 0 of the pyramid is a copy of the frame and one
     /// bilinear fetch at a texel centre is exactly that.
     linear_clamp: Arc<Sampler>,
@@ -102,22 +105,19 @@ pub struct RefractionPass {
     /// curved surface whose roughness varies would otherwise step between blurs,
     /// and the step reads as a ring.
     linear_mip: Arc<Sampler>,
-    /// Nearest and clamped: the composite reads both inputs at exactly its own
-    /// pixel, so there is nothing to filter.
-    nearest_clamp: Arc<Sampler>,
 }
 
 impl RefractionPass {
     /// `forward_layout` is the forward pipeline's layout. Not shared outright,
     /// as the transparency pass shares it — this pass needs a sixth set — but its
     /// first five set layouts are lifted from it verbatim; see `build_pipeline`.
-    pub fn new(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Self {
-        let device = &ctx.device;
+    pub fn new(ctx: &VkContext, device: &Device, forward_layout: &Arc<PipelineLayout>) -> Self {
+        let vk_device = &ctx.device;
         let pipeline = build_pipeline(ctx, forward_layout);
 
         let clamp = |info: SamplerCreateInfo| {
             Sampler::new(
-                device.clone(),
+                vk_device.clone(),
                 SamplerCreateInfo {
                     address_mode: [SamplerAddressMode::ClampToEdge; 3],
                     ..info
@@ -128,15 +128,34 @@ impl RefractionPass {
 
         Self {
             pipeline,
-            pyramid_pipeline: build_compute(ctx, pyramid_cs::load(device.clone()).unwrap()),
-            composite_pipeline: build_compute(ctx, composite_cs::load(device.clone()).unwrap()),
+            pyramid_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
+                shader: ShaderId::ColorPyramidComp,
+            }),
+            composite_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
+                shader: ShaderId::RefractionCompositeComp,
+            }),
+            pyramid_sampler: device.create_sampler(SamplerDesc {
+                linear: true,
+                mipmap_linear: false,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(1.0),
+            }),
+            composite_sampler: device.create_sampler(SamplerDesc {
+                linear: false,
+                mipmap_linear: false,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(0.0),
+            }),
             linear_clamp: clamp(SamplerCreateInfo::simple_repeat_linear_no_mipmap()),
             linear_mip: clamp(SamplerCreateInfo {
                 mipmap_mode: SamplerMipmapMode::Linear,
                 lod: 0.0..=LOD_CLAMP_NONE,
                 ..SamplerCreateInfo::simple_repeat_linear()
             }),
-            nearest_clamp: clamp(SamplerCreateInfo::default()),
         }
     }
 
@@ -144,50 +163,37 @@ impl RefractionPass {
     /// background out of.
     pub(super) fn record_pyramid(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        source: Arc<ImageView>,
-        mips: &[Arc<ImageView>],
+        device: &Device,
+        encoder: &mut Encoder,
+        source: TextureViewId,
+        mips: &[TextureViewId],
     ) {
         let levels = mips.len();
-        let extent = mips[0].image().extent();
+        let extent = device.view_extent(mips[0]);
         // The shader's array is sized at `SCENE_LEVELS` whatever the frame's
         // extent produced, so a short chain repeats its last view into the
         // unused slots rather than leaving a descriptor unwritten; `push.levels`
         // is what stops those slots from being stored to.
-        let bound = (0..SCENE_LEVELS as usize).map(|level| mips[level.min(levels - 1)].clone());
+        let mut bindings = vec![Binding {
+            binding: 0,
+            resource: BindingResource::SampledTexture {
+                view: source,
+                sampler: self.pyramid_sampler,
+            },
+        }];
+        bindings.extend((0..SCENE_LEVELS as usize).map(|level| Binding {
+            binding: 1,
+            resource: BindingResource::StorageTexture(mips[level.min(levels - 1)]),
+        }));
+        let set = device.create_bind_group(self.pyramid_pipeline, 0, &bindings);
 
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.pyramid_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, source, self.linear_clamp.clone()),
-                WriteDescriptorSet::image_view_array(1, 0, bound),
-            ],
-        );
+        encoder.bind_pipeline(self.pyramid_pipeline);
+        encoder.bind_group(0, set);
+        encoder.push_constants(&[extent[0], extent[1], levels as u32]);
 
-        builder
-            .bind_pipeline_compute(&self.pyramid_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.pyramid_pipeline.layout(),
-                0,
-                &[set],
-            )
-            .push_constants(
-                self.pyramid_pipeline.layout(),
-                0,
-                &PyramidPush {
-                    extent: [extent[0] as i32, extent[1] as i32],
-                    levels: levels as i32,
-                },
-            );
-
-        // SAFETY: one workgroup owns a 64x64 tile of level 0, and every store
-        // the shader makes is bounds-checked against `imageSize` and against
-        // `push.levels`. The descriptors bound above match the shader's layout,
-        // and the graph declared every resource this pass touches.
-        builder.dispatch([extent[0].div_ceil(64), extent[1].div_ceil(64), 1]);
+        // One workgroup owns a 64x64 tile of level 0, and every store the shader
+        // makes is bounds-checked against `imageSize` and against `push.levels`.
+        encoder.dispatch([extent[0].div_ceil(64), extent[1].div_ceil(64), 1]);
     }
 
     /// Draw the refractive queue, back to front, into the premultiplied target.
@@ -272,37 +278,37 @@ impl RefractionPass {
     /// Put what the draw pass gathered over the lit frame.
     pub(super) fn record_composite(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        scene: Arc<ImageView>,
-        accum: Arc<ImageView>,
-        target: Arc<ImageView>,
+        device: &Device,
+        encoder: &mut Encoder,
+        scene: TextureViewId,
+        accum: TextureViewId,
+        target: TextureViewId,
     ) {
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.composite_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, scene, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, accum, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(2, target.clone()),
+        let sampled = |binding, view| Binding {
+            binding,
+            resource: BindingResource::SampledTexture {
+                view,
+                sampler: self.composite_sampler,
+            },
+        };
+        let set = device.create_bind_group(
+            self.composite_pipeline,
+            0,
+            &[
+                sampled(0, scene),
+                sampled(1, accum),
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::StorageTexture(target),
+                },
             ],
         );
 
-        builder
-            .bind_pipeline_compute(&self.composite_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.composite_pipeline.layout(),
-                0,
-                &[set],
-            );
+        encoder.bind_pipeline(self.composite_pipeline);
+        encoder.bind_group(0, set);
 
-        let extent = target.image().extent();
-        // SAFETY: the dispatch covers exactly `extent`, and the shader discards
-        // invocations past `imageSize`, so nothing writes outside the image. The
-        // descriptors bound above match the shader's layout, and the graph
-        // declared every resource this pass touches, so its barriers precede it.
-        builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
+        let extent = device.view_extent(target);
+        encoder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
     }
 }
 
@@ -413,27 +419,6 @@ fn build_pipeline(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Arc<
     .unwrap()
 }
 
-fn build_compute(
-    ctx: &VkContext,
-    module: Arc<vulkano::shader::ShaderModule>,
-) -> Arc<ComputePipeline> {
-    let device = &ctx.device;
-    let stage = PipelineShaderStageCreateInfo::new(module.entry_point("main").unwrap());
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    ComputePipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )
-    .unwrap()
-}
-
 /// The format the accumulation target is created with. Float and wide because
 /// what it holds is premultiplied HDR radiance, exactly as the frame it will be
 /// composited over holds — and premultiplied means the coverage it was
@@ -448,16 +433,4 @@ mod fs {
         path: "shaders/refraction.frag",
         include: ["shaders"],
     }
-}
-
-/// The same reduction the reflection trace builds its source with, compiled a
-/// second time because either pass can run with the other switched off. One
-/// module and two pipeline objects, rather than a dependency between two things
-/// that are structurally independent.
-mod pyramid_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/color_pyramid.comp" }
-}
-
-mod composite_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/refraction_composite.comp" }
 }
