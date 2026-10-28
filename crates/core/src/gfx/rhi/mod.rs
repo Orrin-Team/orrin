@@ -24,7 +24,7 @@ pub(crate) use pool::Pool;
 pub use desc::{
     Binding, BindingResource, Blend, BufferDesc, ComputePipelineDesc, CullMode, DepthCompare,
     DepthRect, DepthTest, GraphicsPipelineDesc, MemoryLocation, SamplerDesc, TextureDesc,
-    TextureDimension, VertexAttribute, VertexFormat, VertexStream, Viewport,
+    TextureDimension, Topology, VertexAttribute, VertexFormat, VertexStream, Viewport,
 };
 
 use super::format::Format;

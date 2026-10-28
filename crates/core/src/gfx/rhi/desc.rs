@@ -88,6 +88,12 @@ pub enum CullMode {
     Back,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Topology {
+    Triangles,
+    Lines,
+}
+
 /// How a draw combines with what is already in every colour attachment.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Blend {
@@ -146,6 +152,11 @@ pub struct GraphicsPipelineDesc<'a> {
     /// compatible are built around the very same `SamplerId`.
     pub immutable_samplers: &'a [(u32, u32, SamplerId)],
     pub blend: Blend,
+    pub topology: Topology,
+    /// Write only the first colour attachment. For a pass that shares a render
+    /// pass whose later attachments belong to someone else and whose shader
+    /// declares one output: an undeclared output left unmasked is undefined data.
+    pub mask_extra_attachments: bool,
 }
 
 impl<'a> GraphicsPipelineDesc<'a> {
@@ -165,6 +176,8 @@ impl<'a> GraphicsPipelineDesc<'a> {
             alpha_to_coverage: false,
             immutable_samplers: &[],
             blend: Blend::None,
+            topology: Topology::Triangles,
+            mask_extra_attachments: false,
         }
     }
 }

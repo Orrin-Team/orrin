@@ -36,7 +36,7 @@ use super::{MSAA_SAMPLES, PassCtx, ShadowFrame, VulkanRenderer};
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::rhi::{
     Blend, CullMode, DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId,
-    SamplerDesc, Viewport,
+    SamplerDesc, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
@@ -610,12 +610,29 @@ pub struct ForwardTargets {
     pub multisampled_subsurface: PipelineRenderingCreateInfo,
     pub single: PipelineRenderingCreateInfo,
     pub single_subsurface: PipelineRenderingCreateInfo,
+    color_format: Format,
+    msaa_color_format: Format,
 }
 
 impl ForwardTargets {
-    fn new(color_format: Format, msaa_color_format: Format) -> Self {
+    /// The colour formats of one of the four shapes, for a pass that builds its
+    /// pipeline through the RHI rather than from the description above.
+    pub fn colors(&self, msaa: bool, subsurface: bool) -> Vec<Format> {
+        let first = if msaa {
+            self.msaa_color_format
+        } else {
+            self.color_format
+        };
+        if subsurface {
+            vec![first, SUBSURFACE_FORMAT]
+        } else {
+            vec![first]
+        }
+    }
+
+    fn new(engine_color: Format, engine_msaa_color: Format) -> Self {
         let (color_format, msaa_color_format) =
-            (vk_format(color_format), vk_format(msaa_color_format));
+            (vk_format(engine_color), vk_format(engine_msaa_color));
         let depth = Some(vk_format(DEPTH_FORMAT));
         Self {
             multisampled: rendering::pipeline_info(&[msaa_color_format], depth),
@@ -628,6 +645,8 @@ impl ForwardTargets {
                 &[color_format, vk_format(SUBSURFACE_FORMAT)],
                 depth,
             ),
+            color_format: engine_color,
+            msaa_color_format: engine_msaa_color,
         }
     }
 }
@@ -769,6 +788,8 @@ impl ForwardPass {
                 alpha_to_coverage: !cull_back && samples != SampleCount::Sample1,
                 immutable_samplers: &samplers,
                 blend: Blend::None,
+                topology: Topology::Triangles,
+                mask_extra_attachments: false,
             })
         };
         let msaa = MSAA_SAMPLES;

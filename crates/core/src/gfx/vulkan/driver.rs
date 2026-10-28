@@ -29,9 +29,10 @@ use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
+    ColorComponents,
 };
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
-use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
+use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
 use vulkano::pipeline::graphics::rasterization::{CullMode as VkCullMode, DepthBiasState};
@@ -56,7 +57,7 @@ use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BufferDesc, BufferId, ComputePipelineDesc,
     CullMode, DepthCompare, DepthRect, GraphicsPipelineDesc, PipelineId, Pool, SamplerDesc,
-    SamplerId, TextureViewId, VertexFormat, VertexStream, Viewport,
+    SamplerId, TextureViewId, Topology, VertexFormat, VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -281,7 +282,13 @@ impl VkDriver {
             GraphicsPipelineCreateInfo {
                 stages: stages.into_iter().collect(),
                 vertex_input_state: Some(vertex_input),
-                input_assembly_state: Some(InputAssemblyState::default()),
+                input_assembly_state: Some(InputAssemblyState {
+                    topology: match desc.topology {
+                        Topology::Triangles => PrimitiveTopology::TriangleList,
+                        Topology::Lines => PrimitiveTopology::LineList,
+                    },
+                    ..Default::default()
+                }),
                 viewport_state: Some(ViewportState::default()),
                 rasterization_state: Some(RasterizationState {
                     cull_mode: match desc.cull {
@@ -308,7 +315,7 @@ impl VkDriver {
                 }),
                 // A depth-only pass has no attachments to blend into.
                 color_blend_state: (!colors.is_empty()).then(|| {
-                    ColorBlendState::with_attachment_states(
+                    let mut state = ColorBlendState::with_attachment_states(
                         colors.len() as u32,
                         ColorBlendAttachmentState {
                             blend: match desc.blend {
@@ -328,7 +335,13 @@ impl VkDriver {
                             },
                             ..Default::default()
                         },
-                    )
+                    );
+                    if desc.mask_extra_attachments {
+                        for attachment in state.attachments.iter_mut().skip(1) {
+                            attachment.color_write_mask = ColorComponents::empty();
+                        }
+                    }
+                    state
                 }),
                 dynamic_state: if desc.dynamic_depth_bias {
                     // Scissor as well as viewport, because the atlas aims the

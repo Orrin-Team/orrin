@@ -434,7 +434,7 @@ impl VulkanRenderer {
         let dof = DofPass::new(&ctx);
         let motion_blur = MotionBlurPass::new(&ctx);
         let shadow = ShadowPass::new(&ctx, &device);
-        let line = LinePass::new(&ctx, &forward.targets);
+        let line = LinePass::new(&device, &forward.targets);
         let environment = EnvironmentPass::new(&ctx, &forward.targets);
         let swapchain = make_target(&ctx, format, extent);
         let timestamps = GpuTimestamps::new(&ctx);
@@ -3195,8 +3195,11 @@ impl FrameRecord<'_> {
                 );
                 // Debug lines share the forward subpass: depth-tested against
                 // the scene, drawn on top of it, before the pass ends.
+                let Device::Vulkan(driver) = self.device;
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.line.record(
-                    builder,
+                    self.device,
+                    &mut encoder,
                     self.debug_lines,
                     &self.view,
                     self.extent,

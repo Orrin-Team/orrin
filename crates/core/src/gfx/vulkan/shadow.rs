@@ -21,7 +21,7 @@ use crate::gfx::format::SampleCount;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::rhi::{
     Blend, CullMode, DepthCompare, DepthRect, DepthTest, Device, Encoder, GraphicsPipelineDesc,
-    PipelineId, Viewport,
+    PipelineId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex};
@@ -106,6 +106,8 @@ impl ShadowPass {
                 alpha_to_coverage: false,
                 immutable_samplers: &[],
                 blend: Blend::None,
+                topology: Topology::Triangles,
+                mask_extra_attachments: false,
             })
         };
         // Back-face culling matches the forward pass, which is only correct
