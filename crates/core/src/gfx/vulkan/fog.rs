@@ -373,9 +373,9 @@ impl FogPass {
         builder: &mut Encoder,
         shadow_maps: TextureViewId,
     ) {
-        let Device::Vulkan(driver) = device;
-        let target = driver.vk_view(self.scatter_view());
-        let extent = target.image().extent();
+        let target = self.scatter_view();
+        // The volume's own extent, which the history was allocated at.
+        let extent = self.extent;
 
         let set = device.create_transient_bind_group(
             self.scatter_pipeline,
@@ -401,7 +401,7 @@ impl FogPass {
                 },
                 Binding {
                     binding: 4,
-                    resource: BindingResource::StorageTexture(driver.import_view(target)),
+                    resource: BindingResource::StorageTexture(target),
                 },
             ],
         );

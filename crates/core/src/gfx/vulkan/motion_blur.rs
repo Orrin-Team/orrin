@@ -104,7 +104,6 @@ impl MotionBlurPass {
     /// derived from the same [`FrameView`], so they cannot disagree about where
     /// the sky went.
     fn uniforms(&self, device: &Device, view: &FrameView) -> BufferId {
-        let Device::Vulkan(driver) = device;
         // Unjittered, so the sky's reprojection agrees with the motion vectors the
         // prepass wrote — those are unjittered too.
         let matrices = [
@@ -124,7 +123,7 @@ impl MotionBlurPass {
         {
             *word = float.to_bits();
         }
-        driver.upload_uniform(&words)
+        device.upload_uniform(&words)
     }
 
     pub(super) fn record_tile_max(

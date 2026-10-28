@@ -123,7 +123,6 @@ impl LinePass {
         if lines.is_empty() {
             return;
         }
-        let Device::Vulkan(driver) = device;
 
         // Whichever shape the executor opened the rendering instance with.
         let pipeline = self.pipelines[msaa as usize][subsurface as usize];
@@ -137,7 +136,7 @@ impl LinePass {
                 }
             }
         }
-        let buffer = driver.upload_vertices(&bytes);
+        let buffer = device.upload_vertices(&bytes);
 
         // The frame's jittered view-projection, so a line lands on the same
         // subpixel as the geometry it is drawn against.

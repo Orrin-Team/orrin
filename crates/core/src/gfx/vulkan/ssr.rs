@@ -214,8 +214,7 @@ impl SsrPass {
         ) {
             *word = float.to_bits();
         }
-        let Device::Vulkan(driver) = device;
-        let uniforms = driver.upload_uniform(&words);
+        let uniforms = device.upload_uniform(&words);
         self.uniforms = Some(uniforms);
     }
 

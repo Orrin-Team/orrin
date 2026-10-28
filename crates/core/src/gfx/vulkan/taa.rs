@@ -205,7 +205,6 @@ impl TaaPass {
         velocity: TextureViewId,
         depth: TextureViewId,
     ) {
-        let Device::Vulkan(driver) = device;
         let target = self.output_view();
         let extent = device.view_extent(target);
 
@@ -230,7 +229,7 @@ impl TaaPass {
         {
             *word = float.to_bits();
         }
-        let uniforms = driver.upload_uniform(&words);
+        let uniforms = device.upload_uniform(&words);
 
         let sampled = |binding, view, sampler| Binding {
             binding,

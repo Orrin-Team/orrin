@@ -101,7 +101,6 @@ impl GizmoPass {
         if vertices.is_empty() {
             return;
         }
-        let Device::Vulkan(driver) = device;
         // Packed field by field to the stream's declared layout (20 bytes a
         // vertex), which is what `the_gizmo_stream_matches_its_derived_layout`
         // holds against the struct's own.
@@ -112,7 +111,7 @@ impl GizmoPass {
             }
             bytes.extend_from_slice(&vertex.color);
         }
-        let buffer = driver.upload_vertices(&bytes);
+        let buffer = device.upload_vertices(&bytes);
 
         let size = [extent[0] as f32, extent[1] as f32];
         encoder.set_viewport(Viewport {
