@@ -1,11 +1,8 @@
 use std::sync::Arc;
 
 use glam::Vec3;
-use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 
 use crate::geom::Aabb;
 use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, ShadowAtlas};
@@ -92,7 +89,7 @@ pub(crate) mod material_flags {
 /// iterations in register pressure and get none of them.
 const PARALLAX_STEP_LIMIT: u32 = 64;
 
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(crate) struct GpuMaterial {
     /// `rgb` = albedo, `a` = opacity.
@@ -633,15 +630,6 @@ pub struct ForwardPass {
     ao_sampler: SamplerId,
 }
 
-fn layout(
-    device: &Device,
-    pipeline: PipelineId,
-    set: usize,
-) -> Arc<vulkano::descriptor_set::layout::DescriptorSetLayout> {
-    let Device::Vulkan(driver) = device;
-    driver.set_layout(pipeline, set)
-}
-
 impl ForwardPass {
     /// `color_format` is what the one-sample pair writes — the frame's packed
     /// colour format. `msaa_color_format` is the wider one the multisampled pair
@@ -856,57 +844,31 @@ impl ForwardPass {
 
     /// Build the set-1 material descriptor set over the shared table. Cached by
     /// the renderer and only rebuilt when the material table changes.
-    pub fn build_material_set(
-        &self,
-        ctx: &VkContext,
-        device: &Device,
-        buffer: &Subbuffer<[GpuMaterial]>,
-    ) -> Arc<DescriptorSet> {
-        let buffer = buffer.clone();
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            layout(device, self.single.plain, 1),
-            [WriteDescriptorSet::buffer(0, buffer)],
-            [],
+    pub fn build_material_set(&self, device: &Device, materials: BufferId) -> BindGroupId {
+        device.create_persistent_bind_group(
+            self.single.plain,
+            1,
+            &[Binding {
+                binding: 0,
+                resource: BindingResource::StorageBuffer(materials),
+            }],
         )
-        .unwrap()
     }
 
-    /// Build the set-2 texture array + sampler descriptor set. Cached by the
-    /// renderer and only rebuilt when a texture is added.
-    pub fn build_texture_set(
-        &self,
-        ctx: &VkContext,
-        device: &Device,
-        textures: &[Arc<ImageView>],
-    ) -> Arc<DescriptorSet> {
-        let default_view = textures[0].clone();
-        let texture_array = (0..ctx.texture_array_len(textures.len())).map(|i| {
-            textures
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| default_view.clone())
-        });
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            layout(device, self.single.plain, TEXTURE_SET),
-            [
-                WriteDescriptorSet::image_view_array(0, 0, texture_array),
-                WriteDescriptorSet::sampler(1, self.sampler.clone()),
-            ],
-            [],
+    pub fn build_texture_set(&self, device: &Device, textures: &[Arc<ImageView>]) -> BindGroupId {
+        let Device::Vulkan(driver) = device;
+        let views: Vec<_> = textures
+            .iter()
+            .map(|texture| driver.import_view(texture.clone()))
+            .collect();
+        device.create_texture_array_group(
+            self.single.plain,
+            TEXTURE_SET as u32,
+            &views,
+            driver.import_sampler(self.sampler.clone()),
         )
-        .unwrap()
     }
 
-    /// Pack this frame's decals into the block both geometry passes bind.
-    ///
-    /// Uploaded unconditionally, including for a frame with no decals in it —
-    /// 2.5 KB of streaming write against a descriptor that has to be bound
-    /// either way, and a zero count is what the shader's frame-uniform branch
-    /// tests. The alternative is a "no decals" buffer kept alive as a second
-    /// path through both passes, which is more state to get wrong than the
-    /// write costs.
     pub(super) fn upload_decals(&self, device: &Device, decals: &[DecalInstance]) -> BufferId {
         let mut block = GpuDecals {
             count: [0; 4],
@@ -1221,31 +1183,6 @@ impl ForwardPass {
             builder.draw_indexed_indirect(driver.import_buffer(region.commands.into_bytes()));
         }
     }
-}
-
-/// The material table both geometry passes read.
-///
-/// One buffer rather than one per pipeline: the prepass writes the `f0` and
-/// roughness the forward pass shades with, and two uploads of the same table are
-/// two ways for one material to be described differently.
-pub(super) fn material_buffer(
-    ctx: &VkContext,
-    materials: &[GpuMaterial],
-) -> Subbuffer<[GpuMaterial]> {
-    Buffer::from_iter(
-        ctx.memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        materials.iter().copied(),
-    )
-    .expect("failed to allocate material buffer")
 }
 
 pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {

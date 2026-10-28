@@ -43,7 +43,6 @@ use std::sync::Arc;
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::CopyImageToBufferInfo;
-use vulkano::descriptor_set::DescriptorSet;
 use vulkano::device::Queue;
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
@@ -131,7 +130,7 @@ use super::{
     DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TexelFormat, TextureHandle,
     TextureLevels,
 };
-use crate::gfx::rhi::{BindGroupId, BufferId, Device, Encoder};
+use crate::gfx::rhi::{BindGroupId, BufferDesc, BufferId, Device, Encoder, MemoryLocation};
 use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::DebugLine;
@@ -290,22 +289,22 @@ pub struct VulkanRenderer {
     pub(crate) textures: Vec<Arc<ImageView>>,
     /// The material table, shared by both geometry passes. `None` = dirty;
     /// rebuilt lazily in `render` after a `load_material`.
-    material_buffer: Option<vulkano::buffer::Subbuffer<[GpuMaterial]>>,
+    material_buffer: Option<BufferId>,
     /// Cached descriptor sets over that table and the texture array, one pair
     /// per pipeline layout. Two pairs and not one because set compatibility is
     /// a property of the layout each pipeline declares, not of the buffer
     /// written into it — the same reason the object sets are kept apart.
-    material_set: Option<Arc<DescriptorSet>>,
-    texture_set: Option<Arc<DescriptorSet>>,
-    prepass_material_set: Option<Arc<DescriptorSet>>,
-    prepass_texture_set: Option<Arc<DescriptorSet>>,
+    material_set: Option<BindGroupId>,
+    texture_set: Option<BindGroupId>,
+    prepass_material_set: Option<BindGroupId>,
+    prepass_texture_set: Option<BindGroupId>,
     /// The same two again for the shadow pass's cutout pipeline. A third copy
     /// rather than a shared one for the reason the prepass keeps its own: set
     /// compatibility is a property of the layout a pipeline declares, and these
     /// three declare three. The buffer and the views inside them are the same
     /// objects, which is what keeps the three passes agreeing about a material.
-    shadow_material_set: Option<Arc<DescriptorSet>>,
-    shadow_texture_set: Option<Arc<DescriptorSet>>,
+    shadow_material_set: Option<BindGroupId>,
+    shadow_texture_set: Option<BindGroupId>,
     /// Frames the GPU has not finished with, oldest first, bounded by
     /// [`FRAMES_IN_FLIGHT`]. Everything a frame named is held here until its
     /// fence signals.
@@ -367,6 +366,42 @@ pub struct VulkanRenderer {
 }
 
 impl VulkanRenderer {
+    /// Retire the material table and every group that binds it. The device frees
+    /// them once the frames still reading them are done, so an edit costs a
+    /// rebuild on the next frame and nothing once it is let go.
+    fn invalidate_material_sets(&mut self) {
+        let Device::Vulkan(driver) = &self.device;
+        if let Some(buffer) = self.material_buffer.take() {
+            driver.destroy_buffer(buffer);
+        }
+        for group in [
+            self.material_set.take(),
+            self.prepass_material_set.take(),
+            self.shadow_material_set.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            driver.destroy_bind_group(group);
+        }
+    }
+
+    /// The same for the texture array, which a frame in flight keeps reading
+    /// until it finishes, so it sees the pixels it started with.
+    fn invalidate_texture_sets(&mut self) {
+        let Device::Vulkan(driver) = &self.device;
+        for group in [
+            self.texture_set.take(),
+            self.prepass_texture_set.take(),
+            self.shadow_texture_set.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            driver.destroy_bind_group(group);
+        }
+    }
+
     pub fn new(
         instance: &Arc<Instance>,
         surface: Arc<Surface>,
@@ -918,10 +953,7 @@ impl RenderBackend for VulkanRenderer {
     fn load_material(&mut self, material: &Material) -> MaterialHandle {
         let handle = MaterialHandle(self.materials.len() as u32);
         self.materials.push(forward::to_gpu_material(material));
-        self.material_buffer = None;
-        self.material_set = None;
-        self.prepass_material_set = None;
-        self.shadow_material_set = None;
+        self.invalidate_material_sets();
         handle
     }
 
@@ -934,10 +966,7 @@ impl RenderBackend for VulkanRenderer {
         // The same invalidation an upload does: the buffer and the sets that
         // bind it are rebuilt on the next frame. An edit costs a rebuild per
         // frame while a slider is dragged, and nothing once it is let go.
-        self.material_buffer = None;
-        self.material_set = None;
-        self.prepass_material_set = None;
-        self.shadow_material_set = None;
+        self.invalidate_material_sets();
     }
 
     fn load_texture(
@@ -975,9 +1004,7 @@ impl RenderBackend for VulkanRenderer {
         );
         let handle = TextureHandle(self.textures.len() as u32);
         self.textures.push(view);
-        self.texture_set = None;
-        self.prepass_texture_set = None;
-        self.shadow_texture_set = None;
+        self.invalidate_texture_sets();
         handle
     }
 
@@ -1012,9 +1039,7 @@ impl RenderBackend for VulkanRenderer {
             [levels.width, levels.height],
             &levels.levels,
         );
-        self.texture_set = None;
-        self.prepass_texture_set = None;
-        self.shadow_texture_set = None;
+        self.invalidate_texture_sets();
     }
 
     fn samples_bc(&self) -> bool {
@@ -1506,64 +1531,61 @@ impl VulkanRenderer {
             self.shadow.punctual_slope_bias = shadows.settings.punctual_slope_bias;
         }
 
-        // Material table and texture array are static after asset load, so cache
-        // their descriptor sets and rebuild only when invalidated (set to None).
-        if self.material_buffer.is_none() {
-            self.material_buffer = Some(forward::material_buffer(&self.ctx, &self.materials));
-        }
-        let materials = self.material_buffer.clone().unwrap();
+        // Material table and texture array are static after asset load, so keep
+        // their groups and rebuild only when invalidated (set to None).
+        //
+        // The material table both geometry passes read: one buffer rather than
+        // one per pipeline, because the prepass writes the `f0` and roughness the
+        // forward pass shades with, and two uploads of the same table are two ways
+        // for one material to be described differently.
+        let materials = match self.material_buffer {
+            Some(buffer) => buffer,
+            None => {
+                let bytes: &[u8] = bytemuck::cast_slice(&self.materials);
+                let buffer = self.device.create_buffer_bytes(
+                    BufferDesc {
+                        size: bytes.len() as u64,
+                        usage: crate::gfx::graph::BufferUsage::STORAGE_BUFFER,
+                        location: MemoryLocation::GpuOnly,
+                    },
+                    bytes,
+                );
+                self.material_buffer = Some(buffer);
+                buffer
+            }
+        };
         if self.material_set.is_none() {
-            self.material_set = Some(self.forward.build_material_set(
-                &self.ctx,
-                &self.device,
-                &materials,
-            ));
+            self.material_set = Some(self.forward.build_material_set(&self.device, materials));
         }
         if self.texture_set.is_none() {
-            self.texture_set = Some(self.forward.build_texture_set(
-                &self.ctx,
-                &self.device,
-                &self.textures,
-            ));
+            self.texture_set = Some(self.forward.build_texture_set(&self.device, &self.textures));
         }
         if self.prepass_material_set.is_none() {
-            self.prepass_material_set = Some(self.prepass.build_material_set(
-                &self.ctx,
-                &self.device,
-                &materials,
-            ));
+            self.prepass_material_set =
+                Some(self.prepass.build_material_set(&self.device, materials));
         }
         if self.prepass_texture_set.is_none() {
-            self.prepass_texture_set = Some(self.prepass.build_texture_set(
-                &self.ctx,
-                &self.device,
-                &self.textures,
-            ));
+            self.prepass_texture_set =
+                Some(self.prepass.build_texture_set(&self.device, &self.textures));
         }
         if self.shadow_material_set.is_none() {
-            self.shadow_material_set = Some(self.shadow.build_material_set(
-                &self.ctx,
-                &self.device,
-                &materials,
-            ));
+            self.shadow_material_set =
+                Some(self.shadow.build_material_set(&self.device, materials));
         }
         if self.shadow_texture_set.is_none() {
             self.shadow_texture_set = Some(self.shadow.build_texture_set(
-                &self.ctx,
                 &self.device,
                 &self.textures,
                 self.prepass.material_sampler(),
             ));
         }
-        // The material and texture sets outlive the frame — they are rebuilt only
-        // when the table changes — so each frame hands them to the device afresh.
+        let material_set = self.material_set.unwrap();
+        let texture_set = self.texture_set.unwrap();
+        let prepass_material_set = self.prepass_material_set.unwrap();
+        let prepass_texture_set = self.prepass_texture_set.unwrap();
+        let shadow_material_set = self.shadow_material_set.unwrap();
+        let shadow_texture_set = self.shadow_texture_set.unwrap();
         let Device::Vulkan(driver) = &self.device;
-        let material_set = driver.import_set(self.material_set.clone().unwrap());
-        let texture_set = driver.import_set(self.texture_set.clone().unwrap());
-        let prepass_material_set = driver.import_set(self.prepass_material_set.clone().unwrap());
-        let prepass_texture_set = driver.import_set(self.prepass_texture_set.clone().unwrap());
-        let shadow_material_set = driver.import_set(self.shadow_material_set.clone().unwrap());
-        let shadow_texture_set = driver.import_set(self.shadow_texture_set.clone().unwrap());
 
         // Every list a frame draws is an ordering over one shared `RenderItem`
         // array, so any non-empty list carries the whole of it. Taking the

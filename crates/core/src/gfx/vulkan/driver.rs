@@ -431,27 +431,6 @@ impl VkDriver {
         )
     }
 
-    /// The set layout `set` of `pipeline` was created with, for a pass that
-    /// still builds its own descriptor sets.
-    pub fn set_layout(
-        &self,
-        pipeline: PipelineId,
-        set: usize,
-    ) -> Arc<vulkano::descriptor_set::layout::DescriptorSetLayout> {
-        lookup(&self.pipelines, pipeline.0, "pipeline")
-            .layout()
-            .set_layouts()[set]
-            .clone()
-    }
-
-    /// The whole layout of a pipeline, for a pass whose own pipeline must be set
-    /// compatible with it.
-    pub fn pipeline_layout(&self, pipeline: PipelineId) -> Arc<PipelineLayout> {
-        lookup(&self.pipelines, pipeline.0, "pipeline")
-            .layout()
-            .clone()
-    }
-
     /// A descriptor set built outside the RHI, for the frame being recorded.
     pub fn import_set(&self, set: Arc<DescriptorSet>) -> BindGroupId {
         let mut pool = self.bind_groups.lock().unwrap();
@@ -503,6 +482,92 @@ impl VkDriver {
         )
     }
 
+    /// A persistent bind group: built afresh and kept until [`destroy_bind_group`],
+    /// for a set whose resources outlive the frame.
+    ///
+    /// [`destroy_bind_group`]: Self::destroy_bind_group
+    pub fn create_persistent_bind_group(
+        &self,
+        pipeline: PipelineId,
+        set: u32,
+        bindings: &[Binding],
+    ) -> BindGroupId {
+        let pipeline = lookup(&self.pipelines, pipeline.0, "pipeline");
+        let set = DescriptorSet::new(
+            self.ctx.descriptor_set_allocator.clone(),
+            pipeline.layout().set_layouts()[set as usize].clone(),
+            self.writes(bindings),
+            [],
+        )
+        .expect("failed to build a descriptor set");
+        BindGroupId(self.bind_groups.lock().unwrap().insert(set))
+    }
+
+    /// A persistent group binding `textures` as the array at binding 0 and
+    /// `sampler` at binding 1: the material texture table.
+    ///
+    /// Padded with the first texture up to the device's array length, because a
+    /// descriptor array may only be left partly unwritten where the device allows
+    /// it. See [`VkContext::texture_array_len`].
+    pub fn create_texture_array_group(
+        &self,
+        pipeline: PipelineId,
+        set: u32,
+        textures: &[TextureViewId],
+        sampler: SamplerId,
+    ) -> BindGroupId {
+        let default = textures[0];
+        let mut bindings: Vec<Binding> = (0..self.ctx.texture_array_len(textures.len()))
+            .map(|index| Binding {
+                binding: 0,
+                resource: BindingResource::Texture(textures.get(index).copied().unwrap_or(default)),
+            })
+            .collect();
+        bindings.push(Binding {
+            binding: 1,
+            resource: BindingResource::Sampler(sampler),
+        });
+        self.create_persistent_bind_group(pipeline, set, &bindings)
+    }
+
+    pub fn destroy_bind_group(&self, group: BindGroupId) {
+        self.bind_groups
+            .lock()
+            .unwrap()
+            .remove(group.0, self.frame.load(Ordering::Relaxed));
+    }
+
+    pub fn destroy_buffer(&self, buffer: BufferId) {
+        self.buffers
+            .lock()
+            .unwrap()
+            .remove(buffer.0, self.frame.load(Ordering::Relaxed));
+    }
+
+    /// A buffer that outlives the frame, holding `bytes` from creation.
+    pub fn create_buffer_bytes(&self, desc: BufferDesc, bytes: &[u8]) -> BufferId {
+        assert_eq!(
+            desc.size,
+            bytes.len() as u64,
+            "a buffer's size is its initial bytes"
+        );
+        let buffer = Buffer::from_iter(
+            self.ctx.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: vk_buffer_usage(desc.usage),
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            bytes.iter().copied(),
+        )
+        .expect("failed to allocate a buffer");
+        BufferId(self.buffers.lock().unwrap().insert(buffer.into_bytes()))
+    }
+
     pub fn create_buffer_init(&self, desc: BufferDesc, initial: &[u32]) -> BufferId {
         assert_eq!(
             desc.size,
@@ -526,32 +591,37 @@ impl VkDriver {
         BufferId(self.buffers.lock().unwrap().insert(buffer.into_bytes()))
     }
 
-    /// The buffer behind a handle, for a pass still written against vulkano.
-    /// Goes away with the last such pass.
-    pub fn buffer(&self, id: BufferId) -> Subbuffer<[u8]> {
-        lookup(&self.buffers, id.0, "buffer")
-    }
-
     fn writes(&self, bindings: &[Binding]) -> Vec<WriteDescriptorSet> {
         let mut writes: Vec<WriteDescriptorSet> = Vec::with_capacity(bindings.len());
         let mut index = 0;
         while index < bindings.len() {
             let binding = bindings[index];
-            // Consecutive storage textures at one binding are the elements of
-            // an image array, in order.
-            if let BindingResource::StorageTexture(_) = binding.resource {
+            // Consecutive textures at one binding, of one kind, are the elements
+            // of an image array, in order.
+            let same_kind = |a: &BindingResource, b: &BindingResource| {
+                matches!(
+                    (a, b),
+                    (
+                        BindingResource::StorageTexture(_),
+                        BindingResource::StorageTexture(_)
+                    ) | (BindingResource::Texture(_), BindingResource::Texture(_))
+                )
+            };
+            if let BindingResource::StorageTexture(_) | BindingResource::Texture(_) =
+                binding.resource
+            {
                 let run = bindings[index..]
                     .iter()
                     .take_while(|b| {
-                        b.binding == binding.binding
-                            && matches!(b.resource, BindingResource::StorageTexture(_))
+                        b.binding == binding.binding && same_kind(&b.resource, &binding.resource)
                     })
                     .count();
                 if run > 1 {
                     let views = bindings[index..index + run]
                         .iter()
                         .map(|b| match b.resource {
-                            BindingResource::StorageTexture(view) => {
+                            BindingResource::StorageTexture(view)
+                            | BindingResource::Texture(view) => {
                                 lookup(&self.views, view.0, "texture view")
                             }
                             _ => unreachable!(),

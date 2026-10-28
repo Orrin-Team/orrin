@@ -16,8 +16,6 @@
 
 use std::sync::Arc;
 
-use vulkano::buffer::Subbuffer;
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 
@@ -104,17 +102,6 @@ pub struct GeometryPrepass {
     /// same mip selection the forward pass uses, so the two rasterisations
     /// cannot disagree about what a surface is.
     sampler: Arc<Sampler>,
-}
-
-/// Set `set` of `pipeline`'s layout, for the builders below that still write
-/// their own descriptor sets.
-fn layout(
-    device: &Device,
-    pipeline: PipelineId,
-    set: usize,
-) -> Arc<vulkano::descriptor_set::layout::DescriptorSetLayout> {
-    let Device::Vulkan(driver) = device;
-    driver.set_layout(pipeline, set)
 }
 
 impl GeometryPrepass {
@@ -213,19 +200,15 @@ impl GeometryPrepass {
         )
     }
 
-    pub(super) fn build_material_set(
-        &self,
-        ctx: &VkContext,
-        device: &Device,
-        materials: &Subbuffer<[super::forward::GpuMaterial]>,
-    ) -> Arc<DescriptorSet> {
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            layout(device, self.pipeline, 2),
-            [WriteDescriptorSet::buffer(0, materials.clone())],
-            [],
+    pub(super) fn build_material_set(&self, device: &Device, materials: BufferId) -> BindGroupId {
+        device.create_persistent_bind_group(
+            self.pipeline,
+            2,
+            &[Binding {
+                binding: 0,
+                resource: BindingResource::StorageBuffer(materials),
+            }],
         )
-        .unwrap()
     }
 
     /// The set-3 texture array, filled exactly as the forward pass fills its
@@ -233,27 +216,20 @@ impl GeometryPrepass {
     /// left unwritten.
     pub(super) fn build_texture_set(
         &self,
-        ctx: &VkContext,
         device: &Device,
         textures: &[Arc<ImageView>],
-    ) -> Arc<DescriptorSet> {
-        let default_view = textures[0].clone();
-        let texture_array = (0..ctx.texture_array_len(textures.len())).map(|index| {
-            textures
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| default_view.clone())
-        });
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            layout(device, self.pipeline, TEXTURE_SET),
-            [
-                WriteDescriptorSet::image_view_array(0, 0, texture_array),
-                WriteDescriptorSet::sampler(1, self.sampler.clone()),
-            ],
-            [],
+    ) -> BindGroupId {
+        let Device::Vulkan(driver) = device;
+        let views: Vec<_> = textures
+            .iter()
+            .map(|texture| driver.import_view(texture.clone()))
+            .collect();
+        device.create_texture_array_group(
+            self.pipeline,
+            TEXTURE_SET as u32,
+            &views,
+            driver.import_sampler(self.sampler.clone()),
         )
-        .unwrap()
     }
 
     #[allow(

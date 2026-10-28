@@ -89,6 +89,55 @@ impl Device {
         }
     }
 
+    /// A bind group kept until [`destroy_bind_group`](Self::destroy_bind_group),
+    /// for a set whose resources outlive the frame.
+    pub fn create_persistent_bind_group(
+        &self,
+        pipeline: PipelineId,
+        set: u32,
+        bindings: &[Binding],
+    ) -> BindGroupId {
+        match self {
+            Device::Vulkan(driver) => driver.create_persistent_bind_group(pipeline, set, bindings),
+        }
+    }
+
+    /// The material texture table: `textures` as the array at binding 0 and
+    /// `sampler` at binding 1, padded to the device's array length.
+    pub fn create_texture_array_group(
+        &self,
+        pipeline: PipelineId,
+        set: u32,
+        textures: &[TextureViewId],
+        sampler: SamplerId,
+    ) -> BindGroupId {
+        match self {
+            Device::Vulkan(driver) => {
+                driver.create_texture_array_group(pipeline, set, textures, sampler)
+            }
+        }
+    }
+
+    /// Retire a persistent group once the frames that may still use it are done.
+    pub fn destroy_bind_group(&self, group: BindGroupId) {
+        match self {
+            Device::Vulkan(driver) => driver.destroy_bind_group(group),
+        }
+    }
+
+    pub fn destroy_buffer(&self, buffer: BufferId) {
+        match self {
+            Device::Vulkan(driver) => driver.destroy_buffer(buffer),
+        }
+    }
+
+    /// A buffer that outlives the frame, holding `bytes` from creation.
+    pub fn create_buffer_bytes(&self, desc: BufferDesc, bytes: &[u8]) -> BufferId {
+        match self {
+            Device::Vulkan(driver) => driver.create_buffer_bytes(desc, bytes),
+        }
+    }
+
     /// A buffer that outlives the frame, holding `initial` from creation. The
     /// words are the buffer's whole contents: `desc.size` must be their length.
     pub fn create_buffer_init(&self, desc: BufferDesc, initial: &[u32]) -> BufferId {
