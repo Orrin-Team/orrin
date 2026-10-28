@@ -432,7 +432,7 @@ impl VulkanRenderer {
         let fog = FogPass::new(&ctx);
         let ssr = SsrPass::new(&ctx);
         let subsurface = SubsurfacePass::new(&device);
-        let oit = OitPass::new(&ctx, forward.pipeline_layout());
+        let oit = OitPass::new(&ctx, &device, forward.pipeline_layout());
         let refraction = RefractionPass::new(&ctx, forward.pipeline_layout());
         let taa = TaaPass::new(&ctx);
         let dof = DofPass::new(&ctx);
@@ -2703,13 +2703,19 @@ impl FrameRecord<'_> {
                         .ids
                         .transparency
                         .expect("transparency without its targets");
+                    let Device::Vulkan(driver) = self.device;
+                    let scene = driver.import_view(self.view_of(ids.source));
+                    let accum = driver.import_view(self.images.view(ids.accum));
+                    let reveal = driver.import_view(self.images.view(ids.reveal));
+                    let target = driver.import_view(self.images.view(ids.output));
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.oit.record_composite(
-                        builder,
-                        self.ctx,
-                        self.view_of(ids.source),
-                        self.images.view(ids.accum),
-                        self.images.view(ids.reveal),
-                        self.images.view(ids.output),
+                        self.device,
+                        &mut encoder,
+                        scene,
+                        accum,
+                        reveal,
+                        target,
                     );
                 }
                 PassBody::RefractionScene => {

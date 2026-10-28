@@ -24,10 +24,6 @@
 
 use std::sync::Arc;
 
-use vulkano::descriptor_set::WriteDescriptorSet;
-use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
@@ -38,12 +34,16 @@ use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
 use vulkano::pipeline::graphics::vertex_input::{Vertex as _, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
-    ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
 
+use crate::gfx::rhi::{
+    Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId, SamplerDesc,
+    SamplerId, TextureViewId,
+};
+use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
 use super::PassCtx;
@@ -75,27 +75,28 @@ pub(super) const REVEAL_FORMAT: crate::gfx::format::Format = crate::gfx::format:
 
 pub struct OitPass {
     pipeline: Arc<GraphicsPipeline>,
-    composite_pipeline: Arc<ComputePipeline>,
+    composite_pipeline: PipelineId,
     /// Nearest and clamped: the composite reads all three of its inputs at
     /// exactly its own pixel, so there is nothing to filter.
-    nearest_clamp: Arc<Sampler>,
+    nearest_clamp: SamplerId,
 }
 
 impl OitPass {
     /// `forward_layout` is the forward pipeline's layout, shared rather than
     /// derived — see the module docs.
-    pub fn new(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Self {
-        let device = &ctx.device;
+    pub fn new(ctx: &VkContext, device: &Device, forward_layout: &Arc<PipelineLayout>) -> Self {
         let pipeline = build_pipeline(ctx, forward_layout);
-        let composite_pipeline = build_composite_pipeline(ctx);
-        let nearest_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::default()
-            },
-        )
-        .unwrap();
+        let composite_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
+            shader: ShaderId::OitCompositeComp,
+        });
+        let nearest_clamp = device.create_sampler(SamplerDesc {
+            linear: false,
+            mipmap_linear: false,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+            max_lod: Some(0.0),
+        });
 
         Self {
             pipeline,
@@ -167,39 +168,39 @@ impl OitPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_composite(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        scene: Arc<ImageView>,
-        accum: Arc<ImageView>,
-        reveal: Arc<ImageView>,
-        target: Arc<ImageView>,
+        device: &Device,
+        encoder: &mut Encoder,
+        scene: TextureViewId,
+        accum: TextureViewId,
+        reveal: TextureViewId,
+        target: TextureViewId,
     ) {
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.composite_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, scene, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, accum, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(2, reveal, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(3, target.clone()),
+        let sampled = |binding, view| Binding {
+            binding,
+            resource: BindingResource::SampledTexture {
+                view,
+                sampler: self.nearest_clamp,
+            },
+        };
+        let set = device.create_bind_group(
+            self.composite_pipeline,
+            0,
+            &[
+                sampled(0, scene),
+                sampled(1, accum),
+                sampled(2, reveal),
+                Binding {
+                    binding: 3,
+                    resource: BindingResource::StorageTexture(target),
+                },
             ],
         );
 
-        builder
-            .bind_pipeline_compute(&self.composite_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.composite_pipeline.layout(),
-                0,
-                &[set],
-            );
+        encoder.bind_pipeline(self.composite_pipeline);
+        encoder.bind_group(0, set);
 
-        let extent = target.image().extent();
-        // SAFETY: the dispatch covers exactly `extent`, and the shader discards
-        // invocations past `imageSize`, so nothing writes outside the image. The
-        // descriptors bound above match the shader's layout, and the graph
-        // declared every resource this pass touches, so its barriers precede it.
-        builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
+        let extent = device.view_extent(target);
+        encoder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
     }
 }
 
@@ -295,37 +296,10 @@ fn build_pipeline(ctx: &VkContext, layout: &Arc<PipelineLayout>) -> Arc<Graphics
     .unwrap()
 }
 
-fn build_composite_pipeline(ctx: &VkContext) -> Arc<ComputePipeline> {
-    let device = &ctx.device;
-    let stage = PipelineShaderStageCreateInfo::new(
-        composite_cs::load(device.clone())
-            .unwrap()
-            .entry_point("main")
-            .unwrap(),
-    );
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    ComputePipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )
-    .unwrap()
-}
-
 mod fs {
     vulkano_shaders::shader! {
         ty: "fragment",
         path: "shaders/oit.frag",
         include: ["shaders"],
     }
-}
-
-mod composite_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/oit_composite.comp" }
 }
