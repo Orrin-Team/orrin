@@ -88,7 +88,7 @@ impl LinePass {
                 topology: Topology::Lines,
                 // Masked past the first attachment: this shader declares one
                 // output, and the subsurface target shape has two. See
-                // `co_tenant_blend_states`.
+                // `GraphicsPipelineDesc::mask_extra_attachments`.
                 mask_extra_attachments: true,
                 ..GraphicsPipelineDesc::fullscreen(
                     ShaderId::LineVert,

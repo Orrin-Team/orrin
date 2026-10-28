@@ -28,7 +28,6 @@ use vulkano::image::{
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
-use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::RasterizationState;
@@ -43,7 +42,7 @@ use vulkano::pipeline::{
 use crate::gfx::sh::{self, SH9};
 use crate::scene::EnvironmentSettings;
 
-use super::convert::{vk_format, vk_samples};
+use super::convert::vk_format;
 use super::fog::GpuFog;
 
 use super::MSAA_SAMPLES;
@@ -53,9 +52,13 @@ use super::hdr::HDR_WIDE_FORMAT;
 use super::record::{self, Recorder};
 use super::rendering;
 use super::taa::FrameView;
+use crate::gfx::rhi::{
+    Binding, BindingResource, DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc,
+    PipelineId, SamplerDesc, SamplerId, Viewport as RhiViewport,
+};
+use crate::gfx::shaders::ShaderId;
 use vulkano::command_buffer::{RenderingAttachmentInfo, RenderingInfo};
-use vulkano::image::{ImageLayout, SampleCount};
-use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
+use vulkano::image::ImageLayout;
 use vulkano::render_pass::{AttachmentLoadOp, AttachmentStoreOp};
 
 /// The environment carries the same radiance the scene does, so it uses the
@@ -120,13 +123,6 @@ struct PrefilterPush {
     params: [f32; 4],
 }
 
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct SkyboxPush {
-    inv_view_rot_proj: [[f32; 4]; 4],
-    params: [f32; 4],
-}
-
 pub struct EnvironmentPass {
     bake_pipeline: Arc<GraphicsPipeline>,
     prefilter_pipeline: Arc<GraphicsPipeline>,
@@ -134,7 +130,9 @@ pub struct EnvironmentPass {
     /// The skybox against each of the forward pass's four target shapes,
     /// indexed `[msaa][subsurface]`. All four live for the session, for the
     /// reason [`ForwardTargets`](super::forward::ForwardTargets) documents.
-    skybox_pipelines: [[Arc<GraphicsPipeline>; 2]; 2],
+    skybox_pipelines: [[PipelineId; 2]; 2],
+    /// The cube sampler, as the RHI knows it, for the skybox draw.
+    skybox_sampler: SamplerId,
     cube_sampler: Arc<Sampler>,
     /// Bound in place of the prefiltered chain when nothing is loaded.
     fallback_cube: Arc<ImageView>,
@@ -156,24 +154,55 @@ pub struct EnvironmentPass {
 impl EnvironmentPass {
     /// `targets` are the forward pass's: the skybox rasterises into the same
     /// attachments, after the geometry.
-    pub fn new(ctx: &VkContext, targets: &ForwardTargets) -> Self {
+    pub fn new(ctx: &VkContext, rhi: &Device, targets: &ForwardTargets) -> Self {
         let device = &ctx.device;
         let bake_pipeline = build_bake_pipeline(ctx);
         let prefilter_pipeline = build_prefilter_pipeline(ctx);
+        // Passed in rather than read back off a render pass object: a description
+        // carries formats, not a sample count, and a pipeline whose count
+        // disagrees with the attachments it is used with is invalid. The two
+        // travel together from `ForwardTargets` for that reason.
+        let skybox = |msaa: bool, subsurface: bool| {
+            rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
+                // The triangle sits exactly on the far plane, so the test has to
+                // accept equality or the sky is rejected by the depth clear it is
+                // supposed to fill. Writing depth would make it occlude the debug
+                // lines drawn after it.
+                depth_test: Some(DepthTest {
+                    write: false,
+                    compare: DepthCompare::LessOrEqual,
+                }),
+                depth_format: Some(super::swapchain::DEPTH_FORMAT),
+                samples: if msaa {
+                    MSAA_SAMPLES
+                } else {
+                    crate::gfx::format::SampleCount::Sample1
+                },
+                // Masked past the first attachment: this shader declares one
+                // output, and the subsurface target shape has two. The sky covers
+                // most of the frame, so an undeclared output left unmasked would
+                // be undefined data sitting under every blur tap near a
+                // silhouette — see `GraphicsPipelineDesc::mask_extra_attachments`.
+                mask_extra_attachments: true,
+                ..GraphicsPipelineDesc::fullscreen(
+                    ShaderId::SkyboxVert,
+                    ShaderId::SkyboxFrag,
+                    &targets.colors(msaa, subsurface),
+                )
+            })
+        };
         let skybox_pipelines = [
-            [
-                build_skybox_pipeline(ctx, &targets.single, SampleCount::Sample1),
-                build_skybox_pipeline(ctx, &targets.single_subsurface, SampleCount::Sample1),
-            ],
-            [
-                build_skybox_pipeline(ctx, &targets.multisampled, vk_samples(MSAA_SAMPLES)),
-                build_skybox_pipeline(
-                    ctx,
-                    &targets.multisampled_subsurface,
-                    vk_samples(MSAA_SAMPLES),
-                ),
-            ],
+            [skybox(false, false), skybox(false, true)],
+            [skybox(true, false), skybox(true, true)],
         ];
+        let skybox_sampler = rhi.create_sampler(SamplerDesc {
+            linear: true,
+            mipmap_linear: true,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+            max_lod: None,
+        });
 
         // Repeat in u so the seam wraps, clamp in v so the poles do not fold
         // across to the opposite hemisphere.
@@ -206,6 +235,7 @@ impl EnvironmentPass {
             prefilter_pipeline,
             equirect_sampler,
             skybox_pipelines,
+            skybox_sampler,
             fallback_cube: white_cube(ctx),
             cube_sampler,
             cube: None,
@@ -307,8 +337,8 @@ impl EnvironmentPass {
     )]
     pub fn record_skybox(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
+        device: &Device,
+        builder: &mut Encoder,
         view: &FrameView,
         extent: [u32; 2],
         settings: &EnvironmentSettings,
@@ -324,24 +354,40 @@ impl EnvironmentPass {
         if !settings.show_skybox {
             return;
         }
+        let Device::Vulkan(driver) = device;
 
         // Whichever render pass the executor opened around this call.
-        let pipeline = &self.skybox_pipelines[msaa as usize][subsurface as usize];
+        let pipeline = self.skybox_pipelines[msaa as usize][subsurface as usize];
 
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::image_view(0, cube),
-                WriteDescriptorSet::sampler(1, self.cube_sampler.clone()),
+        let set = device.create_bind_group(
+            pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::Texture(driver.import_view(cube)),
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::Sampler(self.skybox_sampler),
+                },
                 // The sky is fogged out of the same volume the geometry is, or
                 // the horizon is a seam — see `skybox.frag`.
-                WriteDescriptorSet::image_view_sampler(2, fog_volume, fog_sampler),
-                WriteDescriptorSet::buffer(3, fog),
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::SampledTexture {
+                        view: driver.import_view(fog_volume),
+                        sampler: driver.import_sampler(fog_sampler),
+                    },
+                },
+                Binding {
+                    binding: 3,
+                    resource: BindingResource::UniformBuffer(
+                        driver.import_buffer(fog.into_bytes()),
+                    ),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         // Translation stripped: what the vertex shader unprojects is then a
         // direction, so the ray needs no camera-relative correction and holds
@@ -355,30 +401,28 @@ impl EnvironmentPass {
         // the shader.
         let matrix = Mat4::from_rotation_y(settings.yaw.to_radians()) * inverse;
 
-        builder
-            .set_viewport(
-                0,
-                &[Viewport {
-                    offset: [0.0, 0.0],
-                    extent: [extent[0] as f32, extent[1] as f32],
-                    depth_range: 0.0..=1.0,
-                }],
-            )
-            .bind_pipeline_graphics(pipeline)
-            .bind_descriptor_sets(PipelineBindPoint::Graphics, pipeline.layout(), 0, &[set])
-            .push_constants(
-                pipeline.layout(),
-                0,
-                &SkyboxPush {
-                    inv_view_rot_proj: matrix.to_cols_array_2d(),
-                    params: [
-                        settings.calibration(self.measured_sky),
-                        1.0 / extent[0] as f32,
-                        1.0 / extent[1] as f32,
-                        0.0,
-                    ],
-                },
-            );
+        let params = [
+            settings.calibration(self.measured_sky),
+            1.0 / extent[0] as f32,
+            1.0 / extent[1] as f32,
+            0.0,
+        ];
+        let mut words = [0u32; 20];
+        for (word, float) in words
+            .iter_mut()
+            .zip(matrix.to_cols_array_2d().iter().flatten().chain(&params))
+        {
+            *word = float.to_bits();
+        }
+
+        builder.set_viewport(RhiViewport {
+            origin: [0.0, 0.0],
+            extent: [extent[0] as f32, extent[1] as f32],
+            depth_range: [0.0, 1.0],
+        });
+        builder.bind_pipeline(pipeline);
+        builder.bind_group(0, set);
+        builder.push_constants(&words);
         builder.draw(3, 1, 0, 0);
     }
 }
@@ -851,74 +895,6 @@ fn build_prefilter_pipeline(ctx: &VkContext) -> Arc<GraphicsPipeline> {
     .unwrap()
 }
 
-fn build_skybox_pipeline(
-    ctx: &VkContext,
-    target: &PipelineRenderingCreateInfo,
-    samples: SampleCount,
-) -> Arc<GraphicsPipeline> {
-    let device = &ctx.device;
-    let vs = skybox_vs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let fs = skybox_fs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs),
-        PipelineShaderStageCreateInfo::new(fs),
-    ];
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    GraphicsPipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(VertexInputState::default()),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState::default()),
-            // Passed in rather than read back off a render pass object: a
-            // description carries formats, not a sample count, and a pipeline
-            // whose count disagrees with the attachments it is used with is
-            // invalid. The two travel together from `ForwardTargets` for that
-            // reason.
-            multisample_state: Some(MultisampleState {
-                rasterization_samples: samples,
-                ..Default::default()
-            }),
-            // The triangle sits exactly on the far plane, so the test has to
-            // accept equality or the sky is rejected by the depth clear it is
-            // supposed to fill. Writing depth would make it occlude the debug
-            // lines drawn after it.
-            depth_stencil_state: Some(DepthStencilState {
-                depth: Some(DepthState {
-                    write_enable: false,
-                    compare_op: CompareOp::LessOrEqual,
-                }),
-                ..Default::default()
-            }),
-            // Masked past the first attachment: this shader declares one output,
-            // and the subsurface target shape has two. The sky covers most of the
-            // frame, so an undeclared output left unmasked would be undefined data
-            // sitting under every blur tap near a silhouette — see
-            // `co_tenant_blend_states`.
-            color_blend_state: Some(super::forward::co_tenant_blend_states(target)),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(target.clone().into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .unwrap()
-}
-
 mod fullscreen_vs {
     vulkano_shaders::shader! { ty: "vertex", path: "shaders/fullscreen.vert" }
 }
@@ -927,20 +903,8 @@ mod equirect_fs {
     vulkano_shaders::shader! { ty: "fragment", path: "shaders/equirect_to_cube.frag" }
 }
 
-mod skybox_vs {
-    vulkano_shaders::shader! { ty: "vertex", path: "shaders/skybox.vert" }
-}
-
 mod prefilter_fs {
     vulkano_shaders::shader! { ty: "fragment", path: "shaders/prefilter_cube.frag" }
-}
-
-mod skybox_fs {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "shaders/skybox.frag",
-        include: ["shaders"],
-    }
 }
 
 #[cfg(test)]

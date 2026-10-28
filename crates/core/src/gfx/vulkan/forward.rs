@@ -9,7 +9,6 @@ use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::pipeline::PipelineLayout;
-use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 
 use crate::geom::Aabb;
 use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, ShadowAtlas};
@@ -22,13 +21,11 @@ use crate::gfx::{
 use crate::scene::{Camera, EnvironmentSettings};
 
 use super::context::VkContext;
-use super::convert::vk_format;
 use super::cull::Draws;
 use super::fog::GpuFog;
 use super::instances::{GpuObject, InstanceEntry};
 use super::mesh::MeshSpan;
 use super::record::Arena;
-use super::rendering;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
@@ -39,7 +36,6 @@ use crate::gfx::rhi::{
     SamplerDesc, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
-use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
 
 pub struct GpuMesh {
     /// Where this mesh's indices and vertices sit in the shared buffers every
@@ -597,7 +593,7 @@ impl ForwardPipelines {
 ///   narrower packed format directly.
 /// - **Diffusing** appends `SUBSURFACE_FORMAT` as a second colour target. The
 ///   skybox and the debug lines rasterise into these same shapes and write
-///   nothing to that attachment, which is what `co_tenant_blend_states` is for.
+///   nothing to that attachment, which is what `GraphicsPipelineDesc::mask_extra_attachments` is for.
 ///
 /// The depth format is the same in all four; what differs is what the pass does
 /// with it, and that is now a record-time decision rather than a property baked
@@ -606,10 +602,6 @@ impl ForwardPipelines {
 /// and tests `EQUAL`. See [`rendering`](super::rendering).
 #[derive(Clone)]
 pub struct ForwardTargets {
-    pub multisampled: PipelineRenderingCreateInfo,
-    pub multisampled_subsurface: PipelineRenderingCreateInfo,
-    pub single: PipelineRenderingCreateInfo,
-    pub single_subsurface: PipelineRenderingCreateInfo,
     color_format: Format,
     msaa_color_format: Format,
 }
@@ -630,23 +622,10 @@ impl ForwardTargets {
         }
     }
 
-    fn new(engine_color: Format, engine_msaa_color: Format) -> Self {
-        let (color_format, msaa_color_format) =
-            (vk_format(engine_color), vk_format(engine_msaa_color));
-        let depth = Some(vk_format(DEPTH_FORMAT));
+    fn new(color_format: Format, msaa_color_format: Format) -> Self {
         Self {
-            multisampled: rendering::pipeline_info(&[msaa_color_format], depth),
-            multisampled_subsurface: rendering::pipeline_info(
-                &[msaa_color_format, vk_format(SUBSURFACE_FORMAT)],
-                depth,
-            ),
-            single: rendering::pipeline_info(&[color_format], depth),
-            single_subsurface: rendering::pipeline_info(
-                &[color_format, vk_format(SUBSURFACE_FORMAT)],
-                depth,
-            ),
-            color_format: engine_color,
-            msaa_color_format: engine_msaa_color,
+            color_format,
+            msaa_color_format,
         }
     }
 }
@@ -1479,30 +1458,6 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
             m.height_texture.map_or(WHITE_TEXTURE, |h| h.0),
         ],
     }
-}
-
-/// Blend states for a pipeline sharing the forward render pass but writing only
-/// its colour target — the skybox and the debug lines.
-///
-/// The subsurface variant of that render pass has a second colour attachment
-/// those two shaders know nothing about, and Vulkan requires a blend state per
-/// attachment regardless. Leaving the extra one at its default would let them
-/// write whatever their fragment shader happened to leave in an output it never
-/// declared, which is undefined — and the sky covers most of the frame, so the
-/// undefined value would be sitting in the scatter target under every blur tap
-/// near a silhouette. An empty write mask is the whole fix, and unlike disabling
-/// the write it needs no device feature: the attachment keeps its clear, and a
-/// clear of zero is exactly "nothing scattered here".
-pub(super) fn co_tenant_blend_states(target: &PipelineRenderingCreateInfo) -> ColorBlendState {
-    let mut state = ColorBlendState::with_attachment_states(
-        target.color_attachment_formats.len() as u32,
-        ColorBlendAttachmentState::default(),
-    );
-    for attachment in state.attachments.iter_mut().skip(1) {
-        attachment.color_write_mask =
-            vulkano::pipeline::graphics::color_blend::ColorComponents::empty();
-    }
-    state
 }
 
 /// The vertex shader both passes into the lit frame rasterise with. A blended

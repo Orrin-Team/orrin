@@ -183,6 +183,12 @@ impl VkDriver {
         [extent[0], extent[1]]
     }
 
+    /// A sampler built outside the RHI, for a pass that binds it beside RHI
+    /// resources. Lives as long as the driver.
+    pub fn import_sampler(&self, sampler: Arc<Sampler>) -> SamplerId {
+        SamplerId(self.samplers.lock().unwrap().insert(sampler))
+    }
+
     pub fn import_buffer(&self, buffer: Subbuffer<[u8]>) -> BufferId {
         let mut pool = self.buffers.lock().unwrap();
         let index = pool.insert(buffer);
@@ -309,6 +315,7 @@ impl VkDriver {
                         compare_op: match test.compare {
                             DepthCompare::Less => CompareOp::Less,
                             DepthCompare::Equal => CompareOp::Equal,
+                            DepthCompare::LessOrEqual => CompareOp::LessOrEqual,
                         },
                     }),
                     ..Default::default()
@@ -501,6 +508,14 @@ impl VkDriver {
                         lookup(&self.samplers, sampler.0, "sampler"),
                     )
                 }
+                BindingResource::Texture(view) => WriteDescriptorSet::image_view(
+                    binding.binding,
+                    lookup(&self.views, view.0, "texture view"),
+                ),
+                BindingResource::Sampler(sampler) => WriteDescriptorSet::sampler(
+                    binding.binding,
+                    lookup(&self.samplers, sampler.0, "sampler"),
+                ),
                 BindingResource::StorageTexture(view) => WriteDescriptorSet::image_view(
                     binding.binding,
                     lookup(&self.views, view.0, "texture view"),

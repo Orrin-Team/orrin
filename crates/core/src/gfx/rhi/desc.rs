@@ -112,6 +112,9 @@ pub enum DepthCompare {
     /// Against a depth another pass already wrote, which is how a one-sample
     /// forward pass gets perfect early-Z from the geometry prepass.
     Equal,
+    /// For geometry that sits exactly on the far plane, which the depth clear
+    /// would otherwise reject.
+    LessOrEqual,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -195,6 +198,9 @@ pub enum BindingResource {
     },
     StorageBuffer(BufferId),
     StorageTexture(TextureViewId),
+    /// A texture bound apart from its sampler, as the shader declares them.
+    Texture(TextureViewId),
+    Sampler(SamplerId),
     UniformBuffer(BufferId),
 }
 

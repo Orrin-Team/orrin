@@ -435,7 +435,7 @@ impl VulkanRenderer {
         let motion_blur = MotionBlurPass::new(&ctx);
         let shadow = ShadowPass::new(&ctx, &device);
         let line = LinePass::new(&device, &forward.targets);
-        let environment = EnvironmentPass::new(&ctx, &forward.targets);
+        let environment = EnvironmentPass::new(&ctx, &device, &forward.targets);
         let swapchain = make_target(&ctx, format, extent);
         let timestamps = GpuTimestamps::new(&ctx);
 
@@ -3179,9 +3179,11 @@ impl FrameRecord<'_> {
                 // wherever something was drawn, and before the lines
                 // because the sky passes its own test at the depth clear
                 // and would otherwise paint over them.
+                let Device::Vulkan(driver) = self.device;
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.environment.record_skybox(
-                    builder,
-                    self.ctx,
+                    self.device,
+                    &mut encoder,
                     &self.view,
                     self.extent,
                     self.env,
