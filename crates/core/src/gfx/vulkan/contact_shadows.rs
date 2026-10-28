@@ -16,10 +16,7 @@
 //! samples occlusion. The march reads the *jittered* projection, because the
 //! depth it reconstructs from was rasterised with it.
 
-use std::sync::Arc;
-
 use glam::Vec3;
-use vulkano::image::view::ImageView;
 
 use crate::gfx::rhi::{
     Binding, BindingResource, BufferId, Device, Encoder, GraphicsPipelineDesc, PipelineId,
@@ -28,11 +25,8 @@ use crate::gfx::rhi::{
 use crate::gfx::shaders::ShaderId;
 use crate::scene::ContactShadowSettings;
 
-use super::context::VkContext;
-use super::convert::vk_format;
 use super::driver::VkDriver;
 use super::taa::FrameView;
-use super::texture::MipPolicy;
 
 /// One channel, because visibility is one number. The same format the AO target
 /// uses, and for the same reason it is a colour attachment rather than a storage
@@ -61,7 +55,7 @@ pub struct ContactShadowPass {
     /// 1x1 white (= fully lit), bound when the pass is off so the forward shader
     /// has one path rather than two. Not a graph resource: with contact shadows
     /// off the graph has no node to declare a read of.
-    lit_view: Arc<ImageView>,
+    lit_view: TextureViewId,
     /// Advanced every frame the pass runs, and what decorrelates the dither
     /// frame to frame. Without it every frame marches from the same offset and
     /// the temporal resolve averages eight copies of one march.
@@ -69,7 +63,7 @@ pub struct ContactShadowPass {
 }
 
 impl ContactShadowPass {
-    pub fn new(ctx: &VkContext, device: &Device) -> Self {
+    pub fn new(device: &Device) -> Self {
         let pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc::fullscreen(
             ShaderId::FullscreenVert,
             ShaderId::ContactShadowsFrag,
@@ -88,20 +82,14 @@ impl ContactShadowPass {
         Self {
             pipeline,
             nearest_clamp,
-            lit_view: super::texture::upload_texture(
-                ctx,
-                &[255u8],
-                [1, 1],
-                vk_format(MASK_FORMAT),
-                MipPolicy::None,
-            ),
+            lit_view: device.create_texture_2d(&[255u8], [1, 1], MASK_FORMAT),
             frame: 0,
         }
     }
 
     /// A 1x1 "fully lit" view, bound when the pass is off.
-    pub fn lit_view(&self) -> Arc<ImageView> {
-        self.lit_view.clone()
+    pub fn lit_view(&self) -> TextureViewId {
+        self.lit_view
     }
 
     /// Resolve this frame's march against the settings and the sun.

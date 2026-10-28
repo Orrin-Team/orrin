@@ -454,8 +454,8 @@ impl VulkanRenderer {
         let exposure = ExposurePass::new(&device);
         let bloom = BloomPass::new(&device);
         let prepass = GeometryPrepass::new(&ctx, &device);
-        let ssao = SsaoPass::new(&ctx, &device);
-        let contact_shadows = ContactShadowPass::new(&ctx, &device);
+        let ssao = SsaoPass::new(&device);
+        let contact_shadows = ContactShadowPass::new(&device);
         let fog = FogPass::new(&ctx, &device);
         let ssr = SsrPass::new(&device);
         let subsurface = SubsurfacePass::new(&device);
@@ -464,7 +464,7 @@ impl VulkanRenderer {
         let taa = TaaPass::new(&device);
         let dof = DofPass::new(&device);
         let motion_blur = MotionBlurPass::new(&device);
-        let shadow = ShadowPass::new(&ctx, &device);
+        let shadow = ShadowPass::new(&device);
         let line = LinePass::new(&device, &forward.targets);
         let environment = EnvironmentPass::new(&ctx, &device, &forward.targets);
         let swapchain = make_target(&ctx, format, extent);
@@ -1757,7 +1757,7 @@ impl VulkanRenderer {
         // 1x1 white view instead: "no occlusion" with no second shader path.
         let ao_view = match self.frame.ids.ssao {
             Some(ids) => self.images.view(ids.ao),
-            None => self.ssao.white_view(),
+            None => self.vk_view(self.ssao.white_view()),
         };
 
         // And again for the contact-shadow mask: with the march off there is no
@@ -1765,7 +1765,7 @@ impl VulkanRenderer {
         // pixel reports "lit".
         let contact_shadow_view = match self.frame.ids.contact_shadows {
             Some(id) => self.images.view(id),
-            None => self.contact_shadows.lit_view(),
+            None => self.vk_view(self.contact_shadows.lit_view()),
         };
 
         // Same trick for shadows: with them off there is no cascade image to
@@ -1773,7 +1773,7 @@ impl VulkanRenderer {
         // comparison reports "lit".
         let shadow_view = match self.frame.ids.shadows {
             Some(id) => self.images.view(id),
-            None => self.shadow.lit_view(),
+            None => self.vk_view(self.shadow.lit_view()),
         };
         debug_assert_eq!(
             shadow_view.view_type(),
@@ -1786,7 +1786,7 @@ impl VulkanRenderer {
         // a 1x1 depth texture of 1.0 and every lookup reports "lit".
         let atlas_view = match self.frame.ids.shadow_atlas {
             Some(id) => self.images.view(id),
-            None => self.shadow.lit_atlas_view(),
+            None => self.vk_view(self.shadow.lit_atlas_view()),
         };
         // What the forward pass indexes the face table by. Empty when nothing
         // casts, which is the frame where every light's face index is -1.
@@ -3284,7 +3284,7 @@ impl FrameRecord<'_> {
                     msaa,
                     self.fog.uniforms(),
                     self.fog.volume_or_fallback(
-                        &self.device,
+                        self.device,
                         self.frame.ids.fog.map(|ids| self.images.view(ids.volume)),
                     ),
                     self.fog.sampler(),

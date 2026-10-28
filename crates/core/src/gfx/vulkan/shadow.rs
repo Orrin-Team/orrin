@@ -3,29 +3,24 @@ use std::sync::Arc;
 
 use glam::Mat4;
 use vulkano::buffer::Subbuffer;
-use vulkano::command_buffer::ClearDepthStencilImageInfo;
 use vulkano::command_buffer::DrawIndexedIndirectCommand;
-use vulkano::format::ClearDepthStencilValue;
 use vulkano::image::sampler::Sampler;
-use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
-use vulkano::image::{Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage};
-use vulkano::memory::allocator::AllocationCreateInfo;
+use vulkano::image::view::ImageView;
 
 use crate::geom::Frustum;
 use crate::gfx::format::SampleCount;
+use crate::gfx::graph::ImageUsage;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BufferId, CullMode, DepthCompare, DepthRect,
-    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, Topology, Viewport,
+    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, TextureDesc, TextureDimension,
+    TextureViewId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex};
 
 use super::PassCtx;
-use super::context::VkContext;
-use super::convert::vk_format;
 use super::cull::{CullFrame, Draws};
-use super::record::{self, Recorder};
 use super::swapchain::DEPTH_FORMAT;
 
 /// Where `shadow.frag` declares the material texture array, in the masked
@@ -50,12 +45,12 @@ pub struct ShadowPass {
     /// forward shader samples "fully lit" with no second code path. Not a graph
     /// resource: with shadows off the graph has no cascade image at all, so
     /// there is nothing for the forward pass to declare a read of.
-    lit_view: Arc<ImageView>,
+    lit_view: TextureViewId,
     /// A 1x1 non-array depth texture of 1.0, bound as the punctual atlas when
     /// there is none. The cascades' `lit_view` cannot serve: the forward shader
     /// declares the atlas as a plain `texture2D` and the cascades as a
     /// `texture2DArray`, and a view satisfies one or the other.
-    lit_atlas_view: Arc<ImageView>,
+    lit_atlas_view: TextureViewId,
     pub constant_bias: f32,
     pub slope_bias: f32,
     /// The punctual maps get their own pair. A cascade is orthographic, so one
@@ -68,7 +63,7 @@ pub struct ShadowPass {
 }
 
 impl ShadowPass {
-    pub fn new(ctx: &VkContext, device: &Device) -> Self {
+    pub fn new(device: &Device) -> Self {
         let pipeline = |vertex, fragment, cull| {
             device.create_graphics_pipeline(&GraphicsPipelineDesc {
                 vertex,
@@ -111,8 +106,8 @@ impl ShadowPass {
         Self {
             pipeline: plain,
             masked_pipeline,
-            lit_view: build_lit_view(ctx),
-            lit_atlas_view: build_lit_atlas_view(ctx),
+            lit_view: build_lit_depth(device, TextureDimension::D2Array),
+            lit_atlas_view: build_lit_depth(device, TextureDimension::D2),
             constant_bias: 1.25,
             slope_bias: 2.5,
             punctual_constant_bias: 2.0,
@@ -121,14 +116,14 @@ impl ShadowPass {
     }
 
     /// The "everything is lit" atlas, bound when nothing punctual casts.
-    pub(super) fn lit_atlas_view(&self) -> Arc<ImageView> {
-        self.lit_atlas_view.clone()
+    pub(super) fn lit_atlas_view(&self) -> TextureViewId {
+        self.lit_atlas_view
     }
 
     /// The "everything is lit" view, bound when shadows are disabled.
     #[allow(dead_code)]
-    pub(super) fn lit_view(&self) -> Arc<ImageView> {
-        self.lit_view.clone()
+    pub(super) fn lit_view(&self) -> TextureViewId {
+        self.lit_view
     }
 
     /// The per-object descriptor set every cascade binds.
@@ -511,67 +506,26 @@ impl CasterSets {
     }
 }
 
-fn build_lit_view(ctx: &VkContext) -> Arc<ImageView> {
-    build_lit_depth(ctx, ImageViewType::Dim2dArray)
-}
-
-/// The same, viewed as a plain 2D image, for the punctual atlas.
+/// A 1x1 single-layer depth texture cleared to 1.0 — "nothing is nearer than
+/// the far plane", which every comparison reads as lit.
 ///
-/// Two views over two allocations rather than one image viewed both ways,
-/// because a view's type is fixed at creation and the two descriptors want
-/// different ones. A pair of one-texel images is not worth avoiding.
-fn build_lit_atlas_view(ctx: &VkContext) -> Arc<ImageView> {
-    build_lit_depth(ctx, ImageViewType::Dim2d)
-}
-
-/// A 1x1 single-layer depth image cleared to 1.0 — "nothing is nearer than the
-/// far plane", which every comparison reads as lit.
-fn build_lit_depth(ctx: &VkContext, view_type: ImageViewType) -> Arc<ImageView> {
-    let image = Image::new(
-        ctx.memory_allocator.clone(),
-        ImageCreateInfo {
-            image_type: ImageType::Dim2d,
-            format: vk_format(DEPTH_FORMAT),
-            extent: [1, 1, 1],
-            array_layers: 1,
-            usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
-            ..Default::default()
-        },
-        AllocationCreateInfo::default(),
-    )
-    .expect("failed to allocate the shadows-off depth texture");
-
-    let mut builder = Recorder::new(ctx);
-    // Fresh from `Image::new`, so there is nothing to preserve; cleared once and
-    // then only ever sampled, so this is the whole of its synchronisation.
-    builder
-        .image_barrier(record::to_transfer_dst(
-            image.clone(),
-            record::whole_image(&image),
-            ImageLayout::Undefined,
-        ))
-        .clear_depth_stencil_image(ClearDepthStencilImageInfo {
-            clear_value: ClearDepthStencilValue {
-                depth: 1.0,
-                stencil: 0,
-            },
-            ..ClearDepthStencilImageInfo::image(image.clone())
-        })
-        .image_barrier(record::to_shader_read(
-            image.clone(),
-            record::whole_image(&image),
-            ImageLayout::TransferDstOptimal,
-        ));
-    builder.submit_and_wait(ctx);
-
-    ImageView::new(
-        image.clone(),
-        ImageViewCreateInfo {
-            view_type,
-            ..ImageViewCreateInfo::from_image(&image)
-        },
-    )
-    .unwrap()
+/// Built once per view type rather than one image viewed both ways, because a
+/// view's type is fixed at creation and the cascades' array and the punctual
+/// atlas's plain 2D want different ones. A pair of one-texel images is not worth
+/// avoiding.
+fn build_lit_depth(device: &Device, dimension: TextureDimension) -> TextureViewId {
+    let texture = device.create_texture(&TextureDesc {
+        format: DEPTH_FORMAT,
+        dimension,
+        extent: [1, 1, 1],
+        mip_levels: 1,
+        array_layers: 1,
+        samples: SampleCount::Sample1,
+        usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
+        memoryless: false,
+    });
+    device.fill_depth(texture, 1.0);
+    texture
 }
 
 #[cfg(test)]

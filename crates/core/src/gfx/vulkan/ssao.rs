@@ -1,12 +1,5 @@
-use std::sync::Arc;
-
-use vulkano::image::view::ImageView;
-
-use super::context::VkContext;
-use super::convert::vk_format;
 use super::driver::VkDriver;
 use super::prepass::NORMAL_FORMAT;
-use super::texture::MipPolicy;
 use crate::gfx::rhi::{
     Binding, BindingResource, BufferId, Device, Encoder, GraphicsPipelineDesc, PipelineId,
     SamplerDesc, SamplerId, TextureViewId, Viewport,
@@ -82,7 +75,7 @@ pub struct SsaoPass {
     /// shader samples "no occlusion" without a separate code path. Not a graph
     /// resource: with SSAO off the graph has no AO node at all, so there is
     /// nothing for the forward pass to declare a read of.
-    white_view: Arc<ImageView>,
+    white_view: TextureViewId,
     kernel: [[f32; 4]; KERNEL_MAX],
     pub radius: f32,
     pub bias: f32,
@@ -90,7 +83,7 @@ pub struct SsaoPass {
 }
 
 impl SsaoPass {
-    pub fn new(ctx: &VkContext, device: &Device) -> Self {
+    pub fn new(device: &Device) -> Self {
         // One description for both, where there were two identical render pass
         // objects: the resolve and the blur write the same format to the same
         // shape of target, and that was always the only thing either declared.
@@ -123,13 +116,7 @@ impl SsaoPass {
             nearest_clamp,
             nearest_repeat,
             noise_view: build_noise(device),
-            white_view: super::texture::upload_texture(
-                ctx,
-                &[255u8],
-                [1, 1],
-                vk_format(AO_FORMAT),
-                MipPolicy::None,
-            ),
+            white_view: device.create_texture_2d(&[255u8], [1, 1], AO_FORMAT),
             kernel: build_kernel(),
             radius: 1.0,
             bias: 0.025,
@@ -138,8 +125,8 @@ impl SsaoPass {
     }
 
     /// A 1x1 white (=1.0) view, bound when SSAO is disabled.
-    pub fn white_view(&self) -> Arc<ImageView> {
-        self.white_view.clone()
+    pub fn white_view(&self) -> TextureViewId {
+        self.white_view
     }
 
     pub(super) fn begin_frame(
