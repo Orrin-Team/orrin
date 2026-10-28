@@ -99,3 +99,16 @@ harness = false
 [[bench]]
 name = "sh"
 harness = false
+
+[build-dependencies]
+# Compile every shader once to SPIR-V and translate it to MSL (see build.rs).
+# shaderc is the compiler vulkano-shaders already builds; spirv-cross2 is the
+# translator MoltenVK runs these shaders through today. Neither is linked into
+# the engine, so neither can move the cold-start gate.
+shaderc = "0.8"
+spirv-cross2 = { version = "0.7", default-features = false, features = ["msl"] }
+
+# The ignored test that compiles every MSL translation against a real device.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSError"] }
+objc2-metal = { version = "0.3", default-features = false, features = ["MTLDevice", "MTLLibrary", "std"] }

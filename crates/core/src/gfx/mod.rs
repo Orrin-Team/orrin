@@ -3,6 +3,7 @@ pub mod graph;
 pub mod headless;
 pub mod punctual;
 pub mod sh;
+pub mod shaders;
 pub mod shadows;
 mod texel;
 pub mod thumbnail;
