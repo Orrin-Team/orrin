@@ -1,14 +1,12 @@
 use std::sync::Arc;
 
-use glam::{Mat4, Vec3};
+use glam::Vec3;
 use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device as VkDevice;
 use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::pipeline::PipelineLayout;
 
 use crate::geom::Aabb;
 use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, ShadowAtlas};
@@ -45,30 +43,6 @@ pub struct GpuMesh {
     /// vertex data exists on the CPU. Culling reads them through
     /// [`RenderBackend::mesh_bounds`](crate::gfx::RenderBackend::mesh_bounds).
     pub bounds: Aabb,
-}
-
-/// The one value a geometry draw still pushes. The fat per-object matrices are
-/// in the set-4 storage buffer, and what used to sit beside `view_proj` here —
-/// the run's material and its first object row — moved into the instance list
-/// and into `firstInstance`, because a multi-draw has no per-draw push. See
-/// [`instances`](super::instances) and [`cull`](super::cull).
-///
-/// `view_proj` replaced a pre-multiplied `mvp` when draws became instanced: a
-/// run covers many models, so the model half has to be applied in the shader.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
-#[repr(C)]
-pub(super) struct PushConstants {
-    view_proj: [[f32; 4]; 4],
-}
-
-impl PushConstants {
-    /// Also what the transparency pass pushes: it draws the same geometry
-    /// through the same pipeline layout, so it pushes the same range.
-    pub(super) fn new(view_proj: Mat4) -> Self {
-        Self {
-            view_proj: view_proj.to_cols_array_2d(),
-        }
-    }
 }
 
 /// Where `forward.frag` declares the cascade comparison sampler. It is bound
@@ -771,6 +745,7 @@ impl ForwardPass {
                 mask_extra_attachments: false,
                 attachment_blends: &[],
                 layout_from: None,
+                layout_prefix_from: None,
             })
         };
         let msaa = MSAA_SAMPLES;
@@ -893,11 +868,6 @@ impl ForwardPass {
     /// descriptor sets of.
     pub(super) fn layout_source(&self) -> PipelineId {
         self.single.plain
-    }
-
-    pub(super) fn pipeline_layout(&self, device: &Device) -> Arc<PipelineLayout> {
-        let Device::Vulkan(driver) = device;
-        driver.pipeline_layout(self.single.plain)
     }
 
     /// The set-4 per-object descriptor set for this frame's object buffer.
@@ -1193,6 +1163,15 @@ impl ForwardPass {
         // rasterises geometry has to agree on it to a subpixel.
         let view_proj = view.view_proj;
         let (plain, masked) = self.pipelines(msaa).for_frame(subsurface);
+        // The one value a geometry draw still pushes. The fat per-object matrices
+        // are in the set-4 storage buffer, and what used to sit beside
+        // `view_proj` here — the run's material and its first object row — moved
+        // into the instance list and into `firstInstance`, because a multi-draw
+        // has no per-draw push. See [`instances`](super::instances) and
+        // [`cull`](super::cull). `view_proj` replaced a pre-multiplied `mvp` when
+        // draws became instanced: a run covers many models, so the model half has
+        // to be applied in the shader. The transparency and refraction passes push
+        // the same range through the same layout.
         let mut words = [0u32; 16];
         for (word, value) in words
             .iter_mut()
@@ -1465,24 +1444,6 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
             // texture gives its lobe.
             m.height_texture.map_or(WHITE_TEXTURE, |h| h.0),
         ],
-    }
-}
-
-/// The vertex shader both passes into the lit frame rasterise with. A blended
-/// surface is the same geometry read from the same per-object rows, and
-/// `shading.glsl` reads the same varyings out of it whichever fragment shader
-/// includes it.
-pub(super) fn vertex_shader(device: &Arc<VkDevice>) -> vulkano::shader::EntryPoint {
-    vs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap()
-}
-
-mod vs {
-    vulkano_shaders::shader! {
-        ty: "vertex",
-        path: "shaders/forward.vert",
     }
 }
 

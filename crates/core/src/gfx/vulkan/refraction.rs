@@ -32,43 +32,17 @@
 //! the first five are identical binding for binding, which is all Vulkan's set
 //! compatibility rule asks.
 
-use std::sync::Arc;
-
-use vulkano::descriptor_set::WriteDescriptorSet;
-use vulkano::image::sampler::{
-    LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
-};
-use vulkano::image::view::ImageView;
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::graphics::color_blend::{
-    AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
-};
-use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
-use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
-use vulkano::pipeline::graphics::vertex_input::{Vertex as _, VertexDefinition};
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-    PipelineShaderStageCreateInfo,
-};
-
 use crate::gfx::rhi::{
-    Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId, SamplerDesc,
-    SamplerId, TextureViewId,
+    Binding, BindingResource, Blend, ComputePipelineDesc, CullMode, DepthCompare, DepthTest,
+    Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, TextureViewId,
+    Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
 use super::PassCtx;
-use super::context::VkContext;
-use super::convert::vk_format;
 use super::forward::ForwardSets;
 use super::hdr::HDR_WIDE_FORMAT;
-use super::record::Recorder;
-use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -88,7 +62,7 @@ pub(super) const SCENE_LEVELS: u32 = 7;
 const SCENE_SET: usize = 5;
 
 pub struct RefractionPass {
-    pipeline: Arc<GraphicsPipeline>,
+    pipeline: PipelineId,
     /// The same reduction the reflection trace builds its source with, built a
     /// second time because either pass can run with the other switched off. Two
     /// pipeline objects, rather than a dependency between two things that are
@@ -98,36 +72,67 @@ pub struct RefractionPass {
     /// The pyramid pass's own copy of the clamped linear sampler, on the RHI.
     pyramid_sampler: SamplerId,
     composite_sampler: SamplerId,
-    /// Linear, because level 0 of the pyramid is a copy of the frame and one
-    /// bilinear fetch at a texel centre is exactly that.
-    linear_clamp: Arc<Sampler>,
     /// Linear across levels too, because roughness picks a fractional one: a
     /// curved surface whose roughness varies would otherwise step between blurs,
     /// and the step reads as a ring.
-    linear_mip: Arc<Sampler>,
+    mip_sampler: SamplerId,
 }
 
 impl RefractionPass {
     /// `forward_layout` is the forward pipeline's layout. Not shared outright,
     /// as the transparency pass shares it — this pass needs a sixth set — but its
     /// first five set layouts are lifted from it verbatim; see `build_pipeline`.
-    pub fn new(ctx: &VkContext, device: &Device, forward_layout: &Arc<PipelineLayout>) -> Self {
-        let vk_device = &ctx.device;
-        let pipeline = build_pipeline(ctx, forward_layout);
-
-        let clamp = |info: SamplerCreateInfo| {
-            Sampler::new(
-                vk_device.clone(),
-                SamplerCreateInfo {
-                    address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                    ..info
-                },
+    pub fn new(device: &Device, forward: PipelineId) -> Self {
+        let pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            // Front faces only, unlike the transparency accumulation, which draws
+            // both. There the two faces of a glass sphere are two surfaces that
+            // each scatter light; here the material's *thickness* already stands
+            // for the far side, so drawing the back face would refract the same
+            // volume a second time and composite it over the first.
+            cull: CullMode::Back,
+            // Tested against the opaque scene, never written. Two refractive
+            // surfaces are ordered by the back-to-front sort instead, which is
+            // what the premultiplied blend expects — a depth write would let the
+            // nearer of two glass panes reject the farther before it had been
+            // composited under it.
+            depth_test: Some(DepthTest {
+                write: false,
+                compare: DepthCompare::Less,
+            }),
+            depth_format: Some(DEPTH_FORMAT),
+            vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
+            // Premultiplied `over`. The fragment already composited its own
+            // background, so what accumulates here is radiance that has replaced
+            // what was behind it, carrying the coverage that says how much of the
+            // pixel it replaced.
+            blend: Blend::Premultiplied,
+            // Sets 0 through 4 are *the forward pipeline's own objects*, not a
+            // second set derived from the same declarations. Deriving them would
+            // produce layouts that match binding for binding and still fail to
+            // bind: set 3 holds the shadow comparison sampler immutably, and
+            // Vulkan compares immutable samplers by identity. Lifting the objects
+            // is what makes the five sets the executor already built bind to this
+            // pipeline at all.
+            layout_prefix_from: Some((forward, SCENE_SET as u32)),
+            // The forward pass's vertex shader, unchanged: a refractive surface is
+            // the same geometry read from the same per-object rows.
+            ..GraphicsPipelineDesc::fullscreen(
+                ShaderId::ForwardVert,
+                ShaderId::RefractionFrag,
+                &[ACCUM_FORMAT],
             )
-            .unwrap()
-        };
+        });
 
         Self {
             pipeline,
+            mip_sampler: device.create_sampler(SamplerDesc {
+                linear: true,
+                mipmap_linear: true,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: None,
+            }),
             pyramid_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
                 shader: ShaderId::ColorPyramidComp,
             }),
@@ -149,12 +154,6 @@ impl RefractionPass {
                 compare: false,
                 anisotropy: None,
                 max_lod: Some(0.0),
-            }),
-            linear_clamp: clamp(SamplerCreateInfo::simple_repeat_linear_no_mipmap()),
-            linear_mip: clamp(SamplerCreateInfo {
-                mipmap_mode: SamplerMipmapMode::Linear,
-                lod: 0.0..=LOD_CLAMP_NONE,
-                ..SamplerCreateInfo::simple_repeat_linear()
             }),
         }
     }
@@ -205,57 +204,65 @@ impl RefractionPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record(
         &self,
-        builder: &mut Recorder,
+        device: &Device,
+        builder: &mut Encoder,
         renderer: &PassCtx<'_>,
         draws: DrawList<'_>,
         sets: &ForwardSets,
-        blur: Arc<ImageView>,
-        sharp: Arc<ImageView>,
+        blur: TextureViewId,
+        sharp: TextureViewId,
         view: &FrameView,
         extent: [u32; 2],
         object_base: u32,
     ) {
-        let scene_set = renderer.ctx.descriptor_sets.get(
-            &renderer.ctx.descriptor_set_allocator,
-            &self.pipeline.layout().set_layouts()[SCENE_SET],
-            [
-                WriteDescriptorSet::image_view_sampler(0, blur, self.linear_mip.clone()),
+        let Device::Vulkan(driver) = device;
+        let scene_set = device.create_bind_group(
+            self.pipeline,
+            SCENE_SET as u32,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::SampledTexture {
+                        view: blur,
+                        sampler: self.mip_sampler,
+                    },
+                },
                 // The frame itself, for the smooth end of the roughness range —
                 // no mips to step between, so the plain linear sampler.
-                WriteDescriptorSet::image_view_sampler(1, sharp, self.linear_clamp.clone()),
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::SampledTexture {
+                        view: sharp,
+                        sampler: self.pyramid_sampler,
+                    },
+                },
             ],
         );
 
-        let mut bound = sets.as_vec();
-        bound.push(scene_set);
-
-        builder
-            .set_viewport(
-                0,
-                &[Viewport {
-                    offset: [0.0, 0.0],
-                    extent: [extent[0] as f32, extent[1] as f32],
-                    depth_range: 0.0..=1.0,
-                }],
-            )
-            .bind_pipeline_graphics(&self.pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.pipeline.layout(),
-                0,
-                &bound,
-            );
+        builder.set_viewport(Viewport {
+            origin: [0.0, 0.0],
+            extent: [extent[0] as f32, extent[1] as f32],
+            depth_range: [0.0, 1.0],
+        });
+        builder.bind_pipeline(self.pipeline);
+        for (set, group) in sets.as_vec().into_iter().enumerate() {
+            builder.bind_group(set as u32, driver.import_set(group));
+        }
+        builder.bind_group(SCENE_SET as u32, scene_set);
 
         // The arena is bound for the pass, not per draw: a mesh is a span into
         // it. The matrix is pushed once for the same reason — what used to vary
         // per run, the material and the first object row, travels with the
         // instance now.
-        renderer.arena.bind(builder);
-        builder.push_constants(
-            self.pipeline.layout(),
-            0,
-            &super::forward::PushConstants::new(view.view_proj),
-        );
+        builder.bind_geometry(renderer.arena, false);
+        let mut words = [0u32; 16];
+        for (word, float) in words
+            .iter_mut()
+            .zip(view.view_proj.to_cols_array_2d().iter().flatten())
+        {
+            *word = float.to_bits();
+        }
+        builder.push_constants(&words);
 
         for run in draws.runs() {
             let item = draws.item(run.start);
@@ -312,113 +319,6 @@ impl RefractionPass {
     }
 }
 
-fn build_pipeline(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Arc<GraphicsPipeline> {
-    let device = &ctx.device;
-    // The forward pass's vertex shader, unchanged: a refractive surface is the
-    // same geometry read from the same per-object rows, and `shading.glsl` reads
-    // the same varyings from it.
-    let vs = super::forward::vertex_shader(device);
-    let fs = fs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-
-    let vertex_input_state = [PositionVertex::per_vertex(), SurfaceVertex::per_vertex()]
-        .definition(&vs)
-        .unwrap();
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs),
-        PipelineShaderStageCreateInfo::new(fs),
-    ];
-
-    // Sets 0 through 4 are *the forward pipeline's own objects*, not a second
-    // set derived from the same declarations. Deriving them would produce
-    // layouts that match binding for binding and still fail to bind: set 3 holds
-    // the shadow comparison sampler immutably — part of the layout rather than
-    // written into a descriptor set, because MoltenVK cannot accept a written
-    // one — and Vulkan compares immutable samplers by identity, so a second
-    // `Sampler::new` of the identical description is a different sampler and
-    // therefore an incompatible set. Lifting the objects is what makes the five
-    // sets the executor already built bind to this pipeline at all.
-    let layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
-    layout_info
-        .set_layouts
-        .get(SCENE_SET)
-        .expect("refraction.frag must declare the scene pyramid in set 5");
-
-    let mut create_info = layout_info
-        .into_pipeline_layout_create_info(device.clone())
-        .unwrap();
-    create_info.set_layouts.splice(
-        ..SCENE_SET,
-        forward_layout.set_layouts()[..SCENE_SET].iter().cloned(),
-    );
-
-    let layout = PipelineLayout::new(device.clone(), create_info).unwrap();
-
-    GraphicsPipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState {
-                // Front faces only, unlike the transparency accumulation, which
-                // draws both. There the two faces of a glass sphere are two
-                // surfaces that each scatter light; here the material's
-                // *thickness* already stands for the far side, so drawing the
-                // back face would refract the same volume a second time and
-                // composite it over the first.
-                cull_mode: CullMode::Back,
-                ..Default::default()
-            }),
-            multisample_state: Some(MultisampleState::default()),
-            depth_stencil_state: Some(DepthStencilState {
-                // Tested against the opaque scene, never written. Two refractive
-                // surfaces are ordered by the back-to-front sort instead, which
-                // is what the premultiplied blend below expects — a depth write
-                // would let the nearer of two glass panes reject the farther
-                // before it had been composited under it.
-                depth: Some(DepthState {
-                    write_enable: false,
-                    compare_op: CompareOp::Less,
-                }),
-                ..Default::default()
-            }),
-            color_blend_state: Some(ColorBlendState {
-                attachments: vec![ColorBlendAttachmentState {
-                    // Premultiplied `over`. The fragment already composited its
-                    // own background, so what accumulates here is radiance that
-                    // has replaced what was behind it, carrying the coverage
-                    // that says how much of the pixel it replaced.
-                    blend: Some(AttachmentBlend {
-                        src_color_blend_factor: BlendFactor::One,
-                        dst_color_blend_factor: BlendFactor::OneMinusSrcAlpha,
-                        color_blend_op: BlendOp::Add,
-                        src_alpha_blend_factor: BlendFactor::One,
-                        dst_alpha_blend_factor: BlendFactor::OneMinusSrcAlpha,
-                        alpha_blend_op: BlendOp::Add,
-                    }),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(
-                rendering::pipeline_info(
-                    &[vk_format(HDR_WIDE_FORMAT)],
-                    Some(vk_format(DEPTH_FORMAT)),
-                )
-                .into(),
-            ),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .unwrap()
-}
-
 /// The format the accumulation target is created with. Float and wide because
 /// what it holds is premultiplied HDR radiance, exactly as the frame it will be
 /// composited over holds — and premultiplied means the coverage it was
@@ -426,11 +326,3 @@ fn build_pipeline(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Arc<
 /// scene back underneath it. That is what keeps this off the packed colour
 /// format the rest of the chain moved to.
 pub(super) const ACCUM_FORMAT: crate::gfx::format::Format = HDR_WIDE_FORMAT;
-
-mod fs {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "shaders/refraction.frag",
-        include: ["shaders"],
-    }
-}

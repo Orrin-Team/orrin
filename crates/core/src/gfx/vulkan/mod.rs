@@ -429,7 +429,7 @@ impl VulkanRenderer {
         let ssr = SsrPass::new(&ctx);
         let subsurface = SubsurfacePass::new(&device);
         let oit = OitPass::new(&device, forward.layout_source());
-        let refraction = RefractionPass::new(&ctx, &device, &forward.pipeline_layout(&device));
+        let refraction = RefractionPass::new(&device, forward.layout_source());
         let taa = TaaPass::new(&ctx);
         let dof = DofPass::new(&ctx);
         let motion_blur = MotionBlurPass::new(&ctx);
@@ -3229,13 +3229,18 @@ impl FrameRecord<'_> {
                     .ids
                     .refraction
                     .expect("refraction without its images");
+                let Device::Vulkan(driver) = self.device;
+                let blur = driver.import_view(self.images.view(ids.scene));
+                let sharp = driver.import_view(self.view_of(ids.source));
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.refraction.record(
-                    builder,
+                    self.device,
+                    &mut encoder,
                     &self.pass_ctx(),
                     self.refractive,
                     &self.blended_sets,
-                    self.images.view(ids.scene),
-                    self.view_of(ids.source),
+                    blur,
+                    sharp,
                     &self.view,
                     self.extent,
                     self.objects.refractive_base,

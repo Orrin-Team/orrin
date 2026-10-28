@@ -109,6 +109,9 @@ pub enum Blend {
     /// `dst = dst * (1 - src)`: a running product, commutative for the same
     /// reason, and why the target it multiplies into is cleared to one.
     Revealage,
+    /// Premultiplied `over`: the fragment already composited its background, so
+    /// what accumulates is radiance that replaced what was behind it.
+    Premultiplied,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -171,6 +174,9 @@ pub struct GraphicsPipelineDesc<'a> {
     /// Use this pipeline's whole layout instead of deriving one, for a pipeline
     /// that is handed the descriptor sets another pipeline's pass bound.
     pub layout_from: Option<PipelineId>,
+    /// Take the first `n` set layouts from this pipeline verbatim and derive the
+    /// rest, for a pipeline that extends another's sets with its own.
+    pub layout_prefix_from: Option<(PipelineId, u32)>,
 }
 
 impl<'a> GraphicsPipelineDesc<'a> {
@@ -194,6 +200,7 @@ impl<'a> GraphicsPipelineDesc<'a> {
             mask_extra_attachments: false,
             attachment_blends: &[],
             layout_from: None,
+            layout_prefix_from: None,
         }
     }
 }

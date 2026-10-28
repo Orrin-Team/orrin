@@ -110,6 +110,7 @@ impl ShadowPass {
                 mask_extra_attachments: false,
                 attachment_blends: &[],
                 layout_from: None,
+                layout_prefix_from: None,
             })
         };
         // Back-face culling matches the forward pass, which is only correct

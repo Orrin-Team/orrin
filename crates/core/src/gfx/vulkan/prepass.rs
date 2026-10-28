@@ -147,6 +147,7 @@ impl GeometryPrepass {
                 mask_extra_attachments: false,
                 attachment_blends: &[],
                 layout_from: None,
+                layout_prefix_from: None,
             })
         };
         let pipeline_plain = pipeline(ShaderId::PrepassFrag, CullMode::Back);

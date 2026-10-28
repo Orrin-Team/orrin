@@ -105,6 +105,7 @@ impl LinePass {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
         device: &Device,

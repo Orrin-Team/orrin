@@ -280,13 +280,23 @@ impl VkDriver {
                 .immutable_samplers = vec![lookup(&self.samplers, sampler.0, "sampler")];
         }
         let layout = lifted.unwrap_or_else(|| {
-            PipelineLayout::new(
-                device.clone(),
-                layout_info
-                    .into_pipeline_layout_create_info(device.clone())
-                    .unwrap(),
-            )
-            .unwrap()
+            let mut info = layout_info
+                .into_pipeline_layout_create_info(device.clone())
+                .unwrap();
+            if let Some((source, count)) = desc.layout_prefix_from {
+                // The source's own objects, not a second set derived from the
+                // same declarations: deriving them would give layouts that match
+                // binding for binding and still fail to bind, because an
+                // immutable sampler is compared by identity.
+                let source = lookup(&self.pipelines, source.0, "pipeline");
+                info.set_layouts.splice(
+                    ..count as usize,
+                    source.layout().set_layouts()[..count as usize]
+                        .iter()
+                        .cloned(),
+                );
+            }
+            PipelineLayout::new(device.clone(), info).unwrap()
         });
         let colors: Vec<_> = desc.color_formats.iter().map(|&f| vk_format(f)).collect();
         let pipeline = GraphicsPipeline::new(
@@ -549,6 +559,11 @@ fn attachment_blend(blend: Blend) -> Option<AttachmentBlend> {
     match blend {
         Blend::None => None,
         Blend::Alpha => Some(AttachmentBlend::alpha()),
+        Blend::Premultiplied => Some(factors(
+            BlendFactor::One,
+            BlendFactor::OneMinusSrcAlpha,
+            BlendOp::Add,
+        )),
         // Max, so the hovered mesh drawn after a selected one it overlaps cannot
         // take the selected channel back to zero.
         Blend::Max => Some(factors(BlendFactor::One, BlendFactor::One, BlendOp::Max)),

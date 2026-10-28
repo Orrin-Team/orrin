@@ -90,6 +90,7 @@ impl OitPass {
             attachment_blends: &[Blend::Additive, Blend::Revealage],
             topology: Topology::Triangles,
             layout_from: Some(forward),
+            layout_prefix_from: None,
             ..GraphicsPipelineDesc::fullscreen(
                 ShaderId::ForwardVert,
                 ShaderId::OitFrag,
