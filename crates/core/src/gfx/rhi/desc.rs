@@ -1,5 +1,7 @@
+use super::{BufferId, SamplerId, TextureViewId};
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::graph::{BufferUsage, ImageUsage};
+use crate::gfx::shaders::ShaderId;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TextureDimension {
@@ -56,4 +58,37 @@ pub struct SamplerDesc {
 pub struct VertexStream {
     pub stride: u32,
     pub per_instance: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Viewport {
+    pub origin: [f32; 2],
+    pub extent: [f32; 2],
+    pub depth_range: [f32; 2],
+}
+
+/// A graphics pipeline as the pilot passes need it: two shaders, the formats
+/// they render into, and fixed-function state at its defaults. It grows with the
+/// passes that need more, never ahead of them.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct GraphicsPipelineDesc<'a> {
+    pub vertex: ShaderId,
+    pub fragment: ShaderId,
+    pub color_formats: &'a [Format],
+    pub depth_format: Option<Format>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BindingResource {
+    SampledTexture {
+        view: TextureViewId,
+        sampler: SamplerId,
+    },
+    StorageBuffer(BufferId),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Binding {
+    pub binding: u32,
+    pub resource: BindingResource,
 }

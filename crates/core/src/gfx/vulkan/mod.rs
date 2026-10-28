@@ -5,6 +5,7 @@ mod convert;
 mod cull;
 mod descriptors;
 mod dof;
+pub mod driver;
 mod environment;
 mod exposure;
 mod fog;
@@ -126,10 +127,12 @@ use self::taa::TaaPass;
 use self::timestamps::GpuTimestamps;
 
 use self::convert::{engine_format, vk_format};
+use self::driver::{VkDriver, VkEncoder};
 use super::{
     DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TexelFormat, TextureHandle,
     TextureLevels,
 };
+use crate::gfx::rhi::{Device, Encoder};
 use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::DebugLine;
@@ -203,7 +206,8 @@ pub(super) struct PassCtx<'a> {
 }
 
 pub struct VulkanRenderer {
-    pub(crate) ctx: VkContext,
+    pub(crate) ctx: Arc<VkContext>,
+    device: Device,
     swapchain: SwapchainState,
     forward: ForwardPass,
     /// The per-object matrices, which live on the GPU between frames rather than
@@ -409,13 +413,15 @@ impl VulkanRenderer {
         present: PresentSettings,
         make_target: impl FnOnce(&VkContext, Format, [u32; 2]) -> SwapchainState,
     ) -> Self {
+        let ctx = Arc::new(ctx);
+        let device = Device::Vulkan(VkDriver::new(ctx.clone(), FRAMES_IN_FLIGHT as u64));
         let forward = ForwardPass::new(
             &ctx,
             vk_format(hdr::HDR_FORMAT),
             vk_format(hdr::HDR_WIDE_FORMAT),
         );
         let arena = MeshArena::new(&ctx);
-        let hdr = HdrPass::new(&ctx, format);
+        let hdr = HdrPass::new(&device, engine_format(format));
         let gizmo = GizmoPass::new(&ctx, format);
         let outline = OutlinePass::new(&ctx, format);
         let exposure = ExposurePass::new(&ctx);
@@ -528,6 +534,7 @@ impl VulkanRenderer {
             prepass_texture_set: None,
             shadow_material_set: None,
             shadow_texture_set: None,
+            device,
             in_flight: RunAhead::new(FRAMES_IN_FLIGHT),
             frame_chain: None,
             frame_index: 0,
@@ -1390,6 +1397,7 @@ impl VulkanRenderer {
         self.images.set_slot(self.frame_index);
         self.frame_index = self.frame_index.wrapping_add(1);
         self.ctx.descriptor_sets.next_frame();
+        self.device.begin_frame(self.frame_index);
 
         // Taken out of `self` for the duration of recording: the pass brackets
         // below interleave with calls that borrow `self` immutably, and a field
@@ -1819,6 +1827,7 @@ impl VulkanRenderer {
 
         let record = FrameRecord {
             ctx: &self.ctx,
+            device: &self.device,
             meshes: &self.meshes,
             arena: &self.arena,
             materials: &self.materials,
@@ -2157,6 +2166,7 @@ impl VulkanRenderer {
 /// thread. What is here is the subset that may.
 struct FrameRecord<'a> {
     ctx: &'a VkContext,
+    device: &'a Device,
     meshes: &'a [GpuMesh],
     arena: &'a MeshArena,
     materials: &'a [GpuMaterial],
@@ -3130,20 +3140,28 @@ impl FrameRecord<'_> {
                     self.objects.refractive_base,
                 );
             }
-            PassBody::Tonemap => self.hdr.record_tonemap(
-                builder,
-                self.ctx,
-                self.extent,
-                self.scene_color.clone(),
-                self.exposure.exposure_buffer(),
+            PassBody::Tonemap => {
+                let Device::Vulkan(driver) = self.device;
                 // With bloom off the graph has no chain, so the tonemap
                 // pass samples a 1x1 black self.view at a zero strength: "no
                 // bloom" with no second shader path.
-                match self.frame.ids.bloom {
+                let bloom = match self.frame.ids.bloom {
                     Some(ids) => self.images.view(ids.result()),
                     None => self.bloom.black_view(),
-                },
-            ),
+                };
+                let hdr = driver.import_view(self.scene_color.clone());
+                let exposure = driver.import_buffer(self.exposure.exposure_buffer().into_bytes());
+                let bloom = driver.import_view(bloom);
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                self.hdr.record_tonemap(
+                    self.device,
+                    &mut encoder,
+                    self.extent,
+                    hdr,
+                    exposure,
+                    bloom,
+                );
+            }
             PassBody::Gizmo => self.gizmo.record(builder, self.gizmo_strokes, self.extent),
             PassBody::OutlineMask => self.outline.record_mask(
                 builder,

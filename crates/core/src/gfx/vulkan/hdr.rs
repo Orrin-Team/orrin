@@ -1,27 +1,9 @@
-use std::sync::Arc;
-
-use vulkano::buffer::{BufferContents, Subbuffer};
-use vulkano::descriptor_set::WriteDescriptorSet;
-use vulkano::format::Format;
-use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
-use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::RasterizationState;
-use vulkano::pipeline::graphics::vertex_input::VertexInputState;
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-    PipelineShaderStageCreateInfo,
+use crate::gfx::format::Format;
+use crate::gfx::rhi::{
+    Binding, BindingResource, BufferId, Device, Encoder, GraphicsPipelineDesc, PipelineId,
+    SamplerDesc, SamplerId, TextureViewId, Viewport,
 };
-
-use super::context::VkContext;
-use super::exposure::GpuExposure;
-use super::record::Recorder;
-use super::rendering;
+use crate::gfx::shaders::ShaderId;
 
 /// Offscreen colour format the frame's radiance is carried in. Float, so values
 /// can exceed 1.0 before tonemapping clamps them back to displayable range.
@@ -61,17 +43,9 @@ pub const HDR_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::R
 ///   channels of signed maxima — velocities, and near/far CoC radii.
 pub const HDR_WIDE_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::Rgba16Float;
 
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct TonemapPush {
-    manual_exposure: f32,
-    use_auto: u32,
-    bloom_strength: f32,
-}
-
 pub struct HdrPass {
-    tonemap_pipeline: Arc<GraphicsPipeline>,
-    sampler: Arc<Sampler>,
+    tonemap_pipeline: PipelineId,
+    sampler: SamplerId,
     /// The exposure applied when metering is off, already carrying the
     /// compensation dial. With metering on the shader ignores it and reads the
     /// value the averaging pass wrote instead.
@@ -83,18 +57,20 @@ pub struct HdrPass {
 }
 
 impl HdrPass {
-    pub fn new(ctx: &VkContext, swapchain_format: Format) -> Self {
-        let device = &ctx.device;
-        let tonemap_pipeline = build_tonemap_pipeline(ctx, swapchain_format);
-
-        let sampler = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
-            },
-        )
-        .unwrap();
+    pub fn new(device: &Device, swapchain_format: Format) -> Self {
+        let tonemap_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            vertex: ShaderId::FullscreenVert,
+            fragment: ShaderId::TonemapFrag,
+            color_formats: &[swapchain_format],
+            depth_format: None,
+        });
+        let sampler = device.create_sampler(SamplerDesc {
+            linear: true,
+            mipmap_linear: false,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+        });
 
         Self {
             tonemap_pipeline,
@@ -110,100 +86,50 @@ impl HdrPass {
     /// wrote, declared as its `StorageRead`.
     pub fn record_tonemap(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
+        device: &Device,
+        encoder: &mut Encoder,
         extent: [u32; 2],
-        hdr_view: Arc<ImageView>,
-        exposure: Subbuffer<GpuExposure>,
-        bloom_view: Arc<ImageView>,
+        hdr_view: TextureViewId,
+        exposure: BufferId,
+        bloom_view: TextureViewId,
     ) {
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.tonemap_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, hdr_view, self.sampler.clone()),
-                WriteDescriptorSet::buffer(1, exposure),
-                WriteDescriptorSet::image_view_sampler(2, bloom_view, self.sampler.clone()),
+        let set = device.create_bind_group(
+            self.tonemap_pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::SampledTexture {
+                        view: hdr_view,
+                        sampler: self.sampler,
+                    },
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageBuffer(exposure),
+                },
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::SampledTexture {
+                        view: bloom_view,
+                        sampler: self.sampler,
+                    },
+                },
             ],
         );
 
-        builder
-            .set_viewport(
-                0,
-                &[Viewport {
-                    offset: [0.0, 0.0],
-                    extent: [extent[0] as f32, extent[1] as f32],
-                    depth_range: 0.0..=1.0,
-                }],
-            )
-            .bind_pipeline_graphics(&self.tonemap_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.tonemap_pipeline.layout(),
-                0,
-                &[set],
-            )
-            .push_constants(
-                self.tonemap_pipeline.layout(),
-                0,
-                &TonemapPush {
-                    manual_exposure: self.manual_exposure,
-                    use_auto: self.auto_exposure as u32,
-                    bloom_strength: self.bloom_strength,
-                },
-            );
-        builder.draw(3, 1, 0, 0);
+        encoder.set_viewport(Viewport {
+            origin: [0.0, 0.0],
+            extent: [extent[0] as f32, extent[1] as f32],
+            depth_range: [0.0, 1.0],
+        });
+        encoder.bind_pipeline(self.tonemap_pipeline);
+        encoder.bind_group(0, set);
+        encoder.push_constants(&[
+            self.manual_exposure.to_bits(),
+            self.auto_exposure as u32,
+            self.bloom_strength.to_bits(),
+        ]);
+        encoder.draw(3, 1, 0, 0);
     }
-}
-
-fn build_tonemap_pipeline(ctx: &VkContext, color_format: Format) -> Arc<GraphicsPipeline> {
-    let device = &ctx.device;
-    let vs = fullscreen_vs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let fs = tonemap_fs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs),
-        PipelineShaderStageCreateInfo::new(fs),
-    ];
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    GraphicsPipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(VertexInputState::default()),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState::default()),
-            multisample_state: Some(MultisampleState::default()),
-            depth_stencil_state: None,
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                1,
-                ColorBlendAttachmentState::default(),
-            )),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(rendering::pipeline_info(&[color_format], None).into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .unwrap()
-}
-
-mod fullscreen_vs {
-    vulkano_shaders::shader! { ty: "vertex", path: "shaders/fullscreen.vert" }
-}
-
-mod tonemap_fs {
-    vulkano_shaders::shader! { ty: "fragment", path: "shaders/tonemap.frag" }
 }

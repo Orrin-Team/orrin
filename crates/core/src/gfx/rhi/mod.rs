@@ -17,12 +17,98 @@
 //! The drivers and the encoder arrive with the passes that need them.
 
 mod desc;
-#[allow(dead_code)]
 mod pool;
 
+pub(crate) use pool::Pool;
+
 pub use desc::{
-    BufferDesc, MemoryLocation, SamplerDesc, TextureDesc, TextureDimension, VertexStream,
+    Binding, BindingResource, BufferDesc, GraphicsPipelineDesc, MemoryLocation, SamplerDesc,
+    TextureDesc, TextureDimension, VertexStream, Viewport,
 };
+
+use super::vulkan::driver::{VkDriver, VkEncoder};
+
+/// The device a pass creates its resources on. One variant today; Metal joins it
+/// with the pass that first needs it recorded there.
+pub enum Device {
+    Vulkan(VkDriver),
+}
+
+impl Device {
+    /// Frees whatever `frame - frames_in_flight` retired. Called once per frame,
+    /// before anything records.
+    pub fn begin_frame(&self, frame: u64) {
+        match self {
+            Device::Vulkan(driver) => driver.begin_frame(frame),
+        }
+    }
+
+    pub fn create_sampler(&self, desc: SamplerDesc) -> SamplerId {
+        match self {
+            Device::Vulkan(driver) => driver.create_sampler(desc),
+        }
+    }
+
+    pub fn create_graphics_pipeline(&self, desc: &GraphicsPipelineDesc) -> PipelineId {
+        match self {
+            Device::Vulkan(driver) => driver.create_graphics_pipeline(desc),
+        }
+    }
+
+    /// A set of bindings for set `set` of `pipeline`. Equal bindings give back
+    /// the same underlying set, as the descriptor cache did before the RHI.
+    pub fn create_bind_group(
+        &self,
+        pipeline: PipelineId,
+        set: u32,
+        bindings: &[Binding],
+    ) -> BindGroupId {
+        match self {
+            Device::Vulkan(driver) => driver.create_bind_group(pipeline, set, bindings),
+        }
+    }
+}
+
+/// Records commands. Every method is one `match` over the driver's encoder.
+pub enum Encoder<'a> {
+    Vulkan(VkEncoder<'a>),
+}
+
+impl Encoder<'_> {
+    pub fn set_viewport(&mut self, viewport: Viewport) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.set_viewport(viewport),
+        }
+    }
+
+    pub fn bind_pipeline(&mut self, pipeline: PipelineId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.bind_pipeline(pipeline),
+        }
+    }
+
+    pub fn bind_group(&mut self, set: u32, group: BindGroupId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.bind_group(set, group),
+        }
+    }
+
+    /// Up to 32 words: a driver's push-constant budget is far above any block
+    /// this renderer has, and a fixed bound keeps the call allocation-free.
+    pub fn push_constants(&mut self, words: &[u32]) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.push_constants(words),
+        }
+    }
+
+    pub fn draw(&mut self, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+        match self {
+            Encoder::Vulkan(encoder) => {
+                encoder.draw(vertices, instances, first_vertex, first_instance)
+            }
+        }
+    }
+}
 
 macro_rules! handles {
     ($($(#[$meta:meta])* $name:ident),+ $(,)?) => {$(

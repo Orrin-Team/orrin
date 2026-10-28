@@ -22,7 +22,7 @@ use orrin_core::gfx::shaders::{
 /// (shader file, stage, sorted defines)
 type Invocation = (String, String, Vec<(String, String)>);
 
-fn invoked_shaders() -> BTreeSet<Invocation> {
+fn all_sources() -> Vec<String> {
     fn walk(dir: &Path, out: &mut Vec<String>) {
         for entry in fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -38,6 +38,11 @@ fn invoked_shaders() -> BTreeSet<Invocation> {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut sources,
     );
+    sources
+}
+
+fn invoked_shaders() -> BTreeSet<Invocation> {
+    let sources = all_sources();
 
     let mut found = BTreeSet::new();
     for source in &sources {
@@ -121,8 +126,30 @@ fn the_manifest_covers_every_shader_the_passes_compile() {
             )
         })
         .collect();
+    // A pass ported onto the RHI names its shaders by `ShaderId` instead of
+    // compiling them with the macro, and that is a use too.
+    let sources = all_sources();
+    let by_id: BTreeSet<_> = orrin_core::gfx::shaders::ShaderId::ALL
+        .iter()
+        .filter(|id| {
+            sources
+                .iter()
+                .any(|src| src.contains(&format!("ShaderId::{id:?}")))
+        })
+        .map(|id| id.blob().name)
+        .collect();
     let missing: Vec<_> = invoked.difference(&translated).collect();
-    let stale: Vec<_> = translated.difference(&invoked).collect();
+    let stale: Vec<_> = translated
+        .difference(&invoked)
+        .filter(|(path, stage, defines)| {
+            !SHADERS.iter().any(|shader| {
+                by_id.contains(shader.name)
+                    && shader.path == path
+                    && stage_name(shader.stage) == stage
+                    && shader.defines.len() == defines.len()
+            })
+        })
+        .collect();
     assert!(
         missing.is_empty() && stale.is_empty(),
         "compiled but not translated: {missing:#?}\ntranslated but never compiled: {stale:#?}",

@@ -72,6 +72,7 @@ impl<T> Pool<T> {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn live(&self) -> usize {
         self.slots.iter().filter(|slot| slot.is_some()).count()
     }
