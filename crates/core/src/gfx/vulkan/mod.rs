@@ -493,7 +493,7 @@ impl VulkanRenderer {
 
         Self {
             instances: InstanceStore::new(&ctx),
-            cull: CullPass::new(&ctx),
+            cull: CullPass::new(&ctx, &device),
             occlusion: OcclusionPass::new(&ctx, &device),
             gpu_culling,
             occlusion_culling,
@@ -2926,16 +2926,20 @@ impl FrameRecord<'_> {
                         .cull_frame
                         .as_ref()
                         .expect("the graph scheduled the cull with no batch table");
-                    self.cull.record_reset(builder, self.ctx, frame);
+                    let Device::Vulkan(driver) = self.device;
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                    self.cull.record_reset(self.device, &mut encoder, frame);
                 }
                 PassBody::Cull => {
                     let frame = self
                         .cull_frame
                         .as_ref()
                         .expect("the graph scheduled the cull with no batch table");
+                    let Device::Vulkan(driver) = self.device;
+                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.cull.record_cull(
-                        builder,
-                        self.ctx,
+                        self.device,
+                        &mut encoder,
                         &self.object_rows,
                         frame,
                         self.cull_views,

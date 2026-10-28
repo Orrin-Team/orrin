@@ -41,27 +41,22 @@
 //! lookup.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
+use crate::geom::{Aabb, Frustum};
 use glam::Mat4;
 use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::DrawIndexedIndirectCommand;
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
-};
 
-use crate::geom::{Aabb, Frustum};
+use crate::gfx::rhi::{Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId};
+use crate::gfx::shaders::ShaderId;
 
 use super::context::VkContext;
 use super::instances::InstanceEntry;
 use super::mesh::MeshSpan;
 use super::occlusion::OcclusionTest;
-use super::record::{Arena, Recorder};
+use super::record::Arena;
 
 /// Invocations per workgroup, in both shaders. The cull dispatch is
 /// `local_size_x` instances by one view, so a view is a workgroup row rather
@@ -128,35 +123,6 @@ struct GpuBatch {
 struct GpuInstance {
     row: u32,
     batch: u32,
-}
-
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct ResetPush {
-    batch_count: u32,
-    command_count: u32,
-    /// How wide one view's block of `instance_index` is, which is what turns a
-    /// command's index into the view base its `firstInstance` starts from.
-    stride: u32,
-}
-
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct CullPush {
-    instance_count: u32,
-    view_count: u32,
-    batch_count: u32,
-    /// Where the masked batches begin, which is what turns the class and index
-    /// an instance carries into the batch's slot. See [`slot`].
-    plain_count: u32,
-    /// The camera the bound pyramid was rasterised through — the *previous*
-    /// frame's, because that is the frame whose depth survived to be reduced.
-    /// See [`occlusion`](super::occlusion).
-    prev_view_proj: [[f32; 4]; 4],
-    /// Whether the depth test runs at all. A push rather than a second pipeline
-    /// because the branch is uniform across the dispatch, so what it would buy
-    /// is a shader compile.
-    occlusion: u32,
 }
 
 /// One batch as the passes need it: which geometry it draws, beside where its
@@ -402,8 +368,8 @@ impl BatchIds {
 }
 
 pub(super) struct CullPass {
-    reset_pipeline: Arc<ComputePipeline>,
-    cull_pipeline: Arc<ComputePipeline>,
+    reset_pipeline: PipelineId,
+    cull_pipeline: PipelineId,
     /// Device-local and indirect: written by the two dispatches, read by the
     /// draw-indirect stage of every opaque geometry pass.
     commands: Subbuffer<[DrawIndexedIndirectCommand]>,
@@ -435,7 +401,7 @@ pub(super) struct CullPass {
 }
 
 impl CullPass {
-    pub(super) fn new(ctx: &VkContext) -> Self {
+    pub(super) fn new(ctx: &VkContext, device: &Device) -> Self {
         let scratch = Arena::new(
             ctx.memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
@@ -446,8 +412,12 @@ impl CullPass {
             },
         );
         Self {
-            reset_pipeline: build_pipeline(ctx, reset_cs::load(ctx.device.clone()).unwrap()),
-            cull_pipeline: build_pipeline(ctx, cull_cs::load(ctx.device.clone()).unwrap()),
+            reset_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
+                shader: ShaderId::CullResetComp,
+            }),
+            cull_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
+                shader: ShaderId::CullComp,
+            }),
             commands: allocate_commands(ctx, 1),
             indices: allocate_indices(ctx, 1),
             scratch,
@@ -555,37 +525,35 @@ impl CullPass {
         }
     }
 
-    pub(super) fn record_reset(&self, builder: &mut Recorder, ctx: &VkContext, frame: &CullFrame) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.reset_pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::buffer(0, self.upload_batches(frame)),
-                WriteDescriptorSet::buffer(1, self.commands.clone()),
+    pub(super) fn record_reset(&self, device: &Device, builder: &mut Encoder, frame: &CullFrame) {
+        let Device::Vulkan(driver) = device;
+        let set = device.create_bind_group(
+            self.reset_pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::StorageBuffer(
+                        driver.import_buffer(self.upload_batches(frame).into_bytes()),
+                    ),
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageBuffer(
+                        driver.import_buffer(self.commands.clone().into_bytes()),
+                    ),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         let count = frame.views * frame.batches.len() as u32;
-        builder
-            .bind_pipeline_compute(&self.reset_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.reset_pipeline.layout(),
-                0,
-                &[set],
-            )
-            .push_constants(
-                self.reset_pipeline.layout(),
-                0,
-                &ResetPush {
-                    batch_count: frame.batches.len() as u32,
-                    command_count: count,
-                    stride: frame.stride,
-                },
-            )
-            .dispatch([count.div_ceil(GROUP).max(1), 1, 1]);
+        builder.bind_pipeline(self.reset_pipeline);
+        builder.bind_group(0, set);
+        // `stride` is how wide one view's block of `instance_index` is, which is
+        // what turns a command's index into the view base its `firstInstance`
+        // starts from.
+        builder.push_constants(&[frame.batches.len() as u32, count, frame.stride]);
+        builder.dispatch([count.div_ceil(GROUP).max(1), 1, 1]);
     }
 
     /// One invocation per (instance, view). The view axis is the dispatch's `y`
@@ -598,59 +566,70 @@ impl CullPass {
     )]
     pub(super) fn record_cull(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
+        device: &Device,
+        builder: &mut Encoder,
         rows: &Subbuffer<[super::instances::GpuObject]>,
         frame: &CullFrame,
         views: &[CullView],
         occlusion: &OcclusionTest,
         prev_view_proj: Mat4,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.cull_pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::buffer(0, rows.clone()),
-                WriteDescriptorSet::buffer(1, self.upload_instances()),
-                WriteDescriptorSet::buffer(2, self.upload_batches(frame)),
-                WriteDescriptorSet::buffer(3, self.upload_views(frame, views)),
-                WriteDescriptorSet::buffer(4, self.commands.clone()),
-                WriteDescriptorSet::buffer(5, self.indices.clone()),
-                WriteDescriptorSet::image_view_sampler(
-                    6,
-                    occlusion.pyramid.clone(),
-                    occlusion.sampler.clone(),
-                ),
-            ],
-            [],
-        )
-        .unwrap();
-
-        builder
-            .bind_pipeline_compute(&self.cull_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.cull_pipeline.layout(),
-                0,
-                &[set],
-            )
-            .push_constants(
-                self.cull_pipeline.layout(),
-                0,
-                &CullPush {
-                    instance_count: self.instances.len() as u32,
-                    view_count: frame.views,
-                    batch_count: frame.batches.len() as u32,
-                    plain_count: frame.plain as u32,
-                    prev_view_proj: prev_view_proj.to_cols_array_2d(),
-                    occlusion: u32::from(occlusion.live),
+        let Device::Vulkan(driver) = device;
+        let storage = |binding, buffer: Subbuffer<[u8]>| Binding {
+            binding,
+            resource: BindingResource::StorageBuffer(driver.import_buffer(buffer)),
+        };
+        let set = device.create_bind_group(
+            self.cull_pipeline,
+            0,
+            &[
+                storage(0, rows.clone().into_bytes()),
+                storage(1, self.upload_instances().into_bytes()),
+                storage(2, self.upload_batches(frame).into_bytes()),
+                storage(3, self.upload_views(frame, views).into_bytes()),
+                storage(4, self.commands.clone().into_bytes()),
+                storage(5, self.indices.clone().into_bytes()),
+                Binding {
+                    binding: 6,
+                    resource: BindingResource::SampledTexture {
+                        view: driver.import_view(occlusion.pyramid.clone()),
+                        sampler: driver.import_sampler(occlusion.sampler.clone()),
+                    },
                 },
-            )
-            .dispatch([
-                (self.instances.len() as u32).div_ceil(GROUP).max(1),
-                frame.views.max(1),
-                1,
-            ]);
+            ],
+        );
+
+        builder.bind_pipeline(self.cull_pipeline);
+        builder.bind_group(0, set);
+        // `prev_view_proj` is the camera the bound pyramid was rasterised
+        // through — the *previous* frame's, because that is the frame whose depth
+        // survived to be reduced. `occlusion` is whether the depth test runs at
+        // all: a push rather than a second pipeline because the branch is uniform
+        // across the dispatch, so what it would buy is a shader compile.
+        let mut words = [0u32; 21];
+        words[0] = self.instances.len() as u32;
+        words[1] = frame.views;
+        words[2] = frame.batches.len() as u32;
+        // Where the masked batches begin, which is what turns the class and index
+        // an instance carries into the batch's slot. See [`slot`].
+        words[3] = frame.plain as u32;
+        for (word, float) in words[4..20]
+            .iter_mut()
+            .zip(prev_view_proj.to_cols_array_2d().iter().flatten())
+        {
+            *word = float.to_bits();
+        }
+        words[20] = u32::from(occlusion.live);
+        builder.push_constants(&words);
+        // One invocation per (instance, view). The view axis is the dispatch's
+        // `y` so that a workgroup stays within one view — every invocation in it
+        // then takes the same branch through the two view kinds and reads the
+        // same `View`.
+        builder.dispatch([
+            (self.instances.len() as u32).div_ceil(GROUP).max(1),
+            frame.views.max(1),
+            1,
+        ]);
     }
 
     /// The tables are allocated at length one when empty, because
@@ -757,33 +736,6 @@ fn allocate_indices(ctx: &VkContext, len: u64) -> Subbuffer<[InstanceEntry]> {
         len,
     )
     .expect("failed to allocate the instance index buffer")
-}
-
-fn build_pipeline(
-    ctx: &VkContext,
-    module: Arc<vulkano::shader::ShaderModule>,
-) -> Arc<ComputePipeline> {
-    let stage = PipelineShaderStageCreateInfo::new(module.entry_point("main").unwrap());
-    let layout = PipelineLayout::new(
-        ctx.device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-            .into_pipeline_layout_create_info(ctx.device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    ComputePipeline::new(
-        ctx.device.clone(),
-        ctx.pipeline_cache(),
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )
-    .unwrap()
-}
-
-mod reset_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/cull_reset.comp" }
-}
-mod cull_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/cull.comp" }
 }
 
 #[cfg(test)]
