@@ -20,7 +20,7 @@ use crate::geom::Frustum;
 use crate::gfx::format::SampleCount;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::rhi::{
-    CullMode, DepthCompare, DepthRect, DepthTest, Device, Encoder, GraphicsPipelineDesc,
+    Blend, CullMode, DepthCompare, DepthRect, DepthTest, Device, Encoder, GraphicsPipelineDesc,
     PipelineId, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
@@ -105,7 +105,7 @@ impl ShadowPass {
                 samples: SampleCount::Sample1,
                 alpha_to_coverage: false,
                 immutable_samplers: &[],
-                blend_alpha: false,
+                blend: Blend::None,
             })
         };
         // Back-face culling matches the forward pass, which is only correct

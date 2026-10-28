@@ -22,9 +22,9 @@ mod pool;
 pub(crate) use pool::Pool;
 
 pub use desc::{
-    Binding, BindingResource, BufferDesc, ComputePipelineDesc, CullMode, DepthCompare, DepthRect,
-    DepthTest, GraphicsPipelineDesc, MemoryLocation, SamplerDesc, TextureDesc, TextureDimension,
-    VertexAttribute, VertexFormat, VertexStream, Viewport,
+    Binding, BindingResource, Blend, BufferDesc, ComputePipelineDesc, CullMode, DepthCompare,
+    DepthRect, DepthTest, GraphicsPipelineDesc, MemoryLocation, SamplerDesc, TextureDesc,
+    TextureDimension, VertexAttribute, VertexFormat, VertexStream, Viewport,
 };
 
 use super::format::Format;

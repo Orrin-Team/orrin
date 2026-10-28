@@ -419,7 +419,7 @@ impl VulkanRenderer {
         let arena = MeshArena::new(&ctx);
         let hdr = HdrPass::new(&device, engine_format(format));
         let gizmo = GizmoPass::new(&device, engine_format(format));
-        let outline = OutlinePass::new(&ctx, format);
+        let outline = OutlinePass::new(&device, engine_format(format));
         let exposure = ExposurePass::new(&device);
         let bloom = BloomPass::new(&device);
         let prepass = GeometryPrepass::new(&ctx, &device);
@@ -3258,24 +3258,31 @@ impl FrameRecord<'_> {
                 self.gizmo
                     .record(self.device, &mut encoder, self.gizmo_strokes, self.extent);
             }
-            PassBody::OutlineMask => self.outline.record_mask(
-                builder,
-                self.outline_items,
-                self.meshes,
-                self.arena,
-                self.view.unjittered_view_proj,
-                self.extent,
-            ),
+            PassBody::OutlineMask => {
+                let Device::Vulkan(driver) = self.device;
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                self.outline.record_mask(
+                    &mut encoder,
+                    self.outline_items,
+                    self.meshes,
+                    self.arena,
+                    self.view.unjittered_view_proj,
+                    self.extent,
+                );
+            }
             PassBody::Outline => {
                 let mask = self
                     .frame
                     .ids
                     .outline_mask
                     .expect("an outline pass without its mask");
+                let Device::Vulkan(driver) = self.device;
+                let mask = driver.import_view(self.images.view(mask));
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.outline.record_outline(
-                    builder,
-                    self.ctx,
-                    self.images.view(mask),
+                    self.device,
+                    &mut encoder,
+                    mask,
                     self.extent,
                     !self.outline_items.is_empty(),
                 );

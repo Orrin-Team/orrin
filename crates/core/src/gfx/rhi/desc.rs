@@ -88,6 +88,17 @@ pub enum CullMode {
     Back,
 }
 
+/// How a draw combines with what is already in every colour attachment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Blend {
+    None,
+    /// Source-alpha over.
+    Alpha,
+    /// Per-channel maximum, for a mask where overlapping draws must not take a
+    /// channel back down.
+    Max,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DepthCompare {
     /// The engine's forward-Z convention.
@@ -134,8 +145,7 @@ pub struct GraphicsPipelineDesc<'a> {
     /// compares immutable samplers by identity, so pipelines that must be set
     /// compatible are built around the very same `SamplerId`.
     pub immutable_samplers: &'a [(u32, u32, SamplerId)],
-    /// Standard source-alpha blending on every colour attachment.
-    pub blend_alpha: bool,
+    pub blend: Blend,
 }
 
 impl<'a> GraphicsPipelineDesc<'a> {
@@ -154,7 +164,7 @@ impl<'a> GraphicsPipelineDesc<'a> {
             samples: SampleCount::Sample1,
             alpha_to_coverage: false,
             immutable_samplers: &[],
-            blend_alpha: false,
+            blend: Blend::None,
         }
     }
 }

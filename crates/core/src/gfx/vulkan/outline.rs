@@ -13,35 +13,17 @@
 //! scene's targets are resolved, aliased or gone, and a frame without the
 //! editor declares neither node.
 
-use std::sync::Arc;
-
 use glam::Mat4;
-use vulkano::buffer::BufferContents;
-use vulkano::descriptor_set::WriteDescriptorSet;
-use vulkano::format::{Format, NumericFormat};
-use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::graphics::color_blend::{
-    AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
-};
-use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::RasterizationState;
-use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition, VertexInputState};
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-    PipelineShaderStageCreateInfo,
-};
 
-use super::context::VkContext;
-use super::convert::vk_format;
+use crate::gfx::format::Format;
+use crate::gfx::rhi::{
+    Binding, BindingResource, Blend, CullMode, Device, Encoder, GraphicsPipelineDesc, PipelineId,
+    SamplerDesc, SamplerId, TextureViewId, Viewport,
+};
+use crate::gfx::shaders::ShaderId;
+
 use super::forward::GpuMesh;
 use super::mesh::MeshArena;
-use super::record::Recorder;
-use super::rendering;
 use crate::gfx::PositionVertex;
 use crate::scene::MeshHandle;
 
@@ -61,43 +43,51 @@ pub struct OutlineItem {
     pub selected: bool,
 }
 
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct MaskPush {
-    mvp: [[f32; 4]; 4],
-    value: [f32; 4],
-}
-
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct OutlinePush {
-    selected: [f32; 4],
-    hovered: [f32; 4],
-    output_in_linear_colorspace: i32,
-}
-
 pub struct OutlinePass {
-    mask: Arc<GraphicsPipeline>,
-    outline: Arc<GraphicsPipeline>,
-    sampler: Arc<Sampler>,
+    mask: PipelineId,
+    outline: PipelineId,
+    sampler: SamplerId,
     linear_output: bool,
 }
 
 impl OutlinePass {
-    pub fn new(ctx: &VkContext, swapchain_format: Format) -> Self {
+    pub fn new(device: &Device, swapchain_format: Format) -> Self {
         Self {
-            mask: build_mask(ctx),
-            outline: build_outline(ctx, swapchain_format),
-            sampler: Sampler::new(ctx.device.clone(), SamplerCreateInfo::default()).unwrap(),
-            linear_output: swapchain_format.numeric_format_color() == Some(NumericFormat::SRGB),
+            // Both faces: a mask of coverage, and a mesh seen from inside still
+            // covers what it covers.
+            mask: device.create_graphics_pipeline(&GraphicsPipelineDesc {
+                vertex_streams: &[PositionVertex::STREAM],
+                cull: CullMode::None,
+                blend: Blend::Max,
+                ..GraphicsPipelineDesc::fullscreen(
+                    ShaderId::OutlineMaskVert,
+                    ShaderId::OutlineMaskFrag,
+                    &[OUTLINE_MASK_FORMAT],
+                )
+            }),
+            outline: device.create_graphics_pipeline(&GraphicsPipelineDesc {
+                blend: Blend::Alpha,
+                ..GraphicsPipelineDesc::fullscreen(
+                    ShaderId::FullscreenVert,
+                    ShaderId::OutlineFrag,
+                    &[swapchain_format],
+                )
+            }),
+            sampler: device.create_sampler(SamplerDesc {
+                linear: false,
+                mipmap_linear: false,
+                repeat: true,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(0.0),
+            }),
+            linear_output: swapchain_format.is_srgb(),
         }
     }
 
-    /// Draw `items` into the mask the executor opened, cleared. `view_proj` is
-    /// the unjittered one: this is drawn over the resolved frame.
     pub fn record_mask(
         &self,
-        builder: &mut Recorder,
+        builder: &mut Encoder,
         items: &[OutlineItem],
         meshes: &[GpuMesh],
         arena: &MeshArena,
@@ -107,10 +97,9 @@ impl OutlinePass {
         if items.is_empty() {
             return;
         }
-        builder
-            .set_viewport(0, &[viewport(extent)])
-            .bind_pipeline_graphics(&self.mask);
-        arena.bind_positions(builder);
+        builder.set_viewport(viewport(extent));
+        builder.bind_pipeline(self.mask);
+        builder.bind_geometry(arena, true);
         for item in items {
             let Some(mesh) = meshes.get(item.mesh.0 as usize) else {
                 continue;
@@ -120,11 +109,12 @@ impl OutlinePass {
             } else {
                 [0.0, 1.0, 0.0, 0.0]
             };
-            let push = MaskPush {
-                mvp: (view_proj * item.model).to_cols_array_2d(),
-                value,
-            };
-            builder.push_constants(self.mask.layout(), 0, &push);
+            let mvp = (view_proj * item.model).to_cols_array_2d();
+            let mut words = [0u32; 20];
+            for (word, float) in words.iter_mut().zip(mvp.iter().flatten().chain(&value)) {
+                *word = float.to_bits();
+            }
+            builder.push_constants(&words);
             builder.draw_indexed(
                 mesh.span.index_count,
                 1,
@@ -135,171 +125,45 @@ impl OutlinePass {
         }
     }
 
-    /// Paint the outline round the mask onto the swapchain image the executor
-    /// opened. Nothing is drawn when nothing was outlined.
     pub fn record_outline(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        mask: Arc<ImageView>,
+        device: &Device,
+        builder: &mut Encoder,
+        mask: TextureViewId,
         extent: [u32; 2],
         any: bool,
     ) {
         if !any {
             return;
         }
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.outline.layout().set_layouts()[0],
-            [WriteDescriptorSet::image_view_sampler(
-                0,
-                mask,
-                self.sampler.clone(),
-            )],
-        );
-        builder
-            .set_viewport(0, &[viewport(extent)])
-            .bind_pipeline_graphics(&self.outline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.outline.layout(),
-                0,
-                &[set],
-            )
-            .push_constants(
-                self.outline.layout(),
-                0,
-                &OutlinePush {
-                    selected: SELECTED,
-                    hovered: HOVERED,
-                    output_in_linear_colorspace: self.linear_output as i32,
+        let set = device.create_bind_group(
+            self.outline,
+            0,
+            &[Binding {
+                binding: 0,
+                resource: BindingResource::SampledTexture {
+                    view: mask,
+                    sampler: self.sampler,
                 },
-            );
+            }],
+        );
+        builder.set_viewport(viewport(extent));
+        builder.bind_pipeline(self.outline);
+        builder.bind_group(0, set);
+        let mut words = [0u32; 9];
+        for (word, float) in words.iter_mut().zip(SELECTED.iter().chain(&HOVERED)) {
+            *word = float.to_bits();
+        }
+        words[8] = self.linear_output as u32;
+        builder.push_constants(&words);
         builder.draw(3, 1, 0, 0);
     }
 }
 
 fn viewport(extent: [u32; 2]) -> Viewport {
     Viewport {
-        offset: [0.0, 0.0],
+        origin: [0.0, 0.0],
         extent: [extent[0] as f32, extent[1] as f32],
-        depth_range: 0.0..=1.0,
+        depth_range: [0.0, 1.0],
     }
-}
-
-fn layout_for(ctx: &VkContext, stages: &[PipelineShaderStageCreateInfo]) -> Arc<PipelineLayout> {
-    PipelineLayout::new(
-        ctx.device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages(stages)
-            .into_pipeline_layout_create_info(ctx.device.clone())
-            .unwrap(),
-    )
-    .unwrap()
-}
-
-fn build_mask(ctx: &VkContext) -> Arc<GraphicsPipeline> {
-    let vs = mask_vs::load(ctx.device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let fs = mask_fs::load(ctx.device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let vertex_input_state = PositionVertex::per_vertex().definition(&vs).unwrap();
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs),
-        PipelineShaderStageCreateInfo::new(fs),
-    ];
-    let layout = layout_for(ctx, &stages);
-    // Max, so the hovered mesh drawn after a selected one it overlaps cannot
-    // take the selected channel back to zero.
-    let max = AttachmentBlend {
-        src_color_blend_factor: BlendFactor::One,
-        dst_color_blend_factor: BlendFactor::One,
-        color_blend_op: BlendOp::Max,
-        src_alpha_blend_factor: BlendFactor::One,
-        dst_alpha_blend_factor: BlendFactor::One,
-        alpha_blend_op: BlendOp::Max,
-    };
-    GraphicsPipeline::new(
-        ctx.device.clone(),
-        ctx.pipeline_cache(),
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            // Both faces: a mask of coverage, and a mesh seen from inside
-            // still covers what it covers.
-            rasterization_state: Some(RasterizationState::default()),
-            multisample_state: Some(MultisampleState::default()),
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                1,
-                ColorBlendAttachmentState {
-                    blend: Some(max),
-                    ..Default::default()
-                },
-            )),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(rendering::pipeline_info(&[vk_format(OUTLINE_MASK_FORMAT)], None).into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .unwrap()
-}
-
-fn build_outline(ctx: &VkContext, swapchain_format: Format) -> Arc<GraphicsPipeline> {
-    let vs = fullscreen_vs::load(ctx.device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let fs = outline_fs::load(ctx.device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs),
-        PipelineShaderStageCreateInfo::new(fs),
-    ];
-    let layout = layout_for(ctx, &stages);
-    GraphicsPipeline::new(
-        ctx.device.clone(),
-        ctx.pipeline_cache(),
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(VertexInputState::default()),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState::default()),
-            multisample_state: Some(MultisampleState::default()),
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                1,
-                ColorBlendAttachmentState {
-                    blend: Some(AttachmentBlend::alpha()),
-                    ..Default::default()
-                },
-            )),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(rendering::pipeline_info(&[swapchain_format], None).into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .unwrap()
-}
-
-mod mask_vs {
-    vulkano_shaders::shader! { ty: "vertex", path: "shaders/outline_mask.vert" }
-}
-
-mod mask_fs {
-    vulkano_shaders::shader! { ty: "fragment", path: "shaders/outline_mask.frag" }
-}
-
-mod fullscreen_vs {
-    vulkano_shaders::shader! { ty: "vertex", path: "shaders/fullscreen.vert" }
-}
-
-mod outline_fs {
-    vulkano_shaders::shader! { ty: "fragment", path: "shaders/outline.frag" }
 }

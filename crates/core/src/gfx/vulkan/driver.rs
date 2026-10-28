@@ -28,7 +28,7 @@ use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
-    AttachmentBlend, ColorBlendAttachmentState, ColorBlendState,
+    AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
 };
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
@@ -54,9 +54,9 @@ use super::record::{Arena, Recorder};
 use super::rendering;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BindingResource, BufferDesc, BufferId, ComputePipelineDesc, CullMode,
-    DepthCompare, DepthRect, GraphicsPipelineDesc, PipelineId, Pool, SamplerDesc, SamplerId,
-    TextureViewId, VertexFormat, VertexStream, Viewport,
+    BindGroupId, Binding, BindingResource, Blend, BufferDesc, BufferId, ComputePipelineDesc,
+    CullMode, DepthCompare, DepthRect, GraphicsPipelineDesc, PipelineId, Pool, SamplerDesc,
+    SamplerId, TextureViewId, VertexFormat, VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -311,7 +311,21 @@ impl VkDriver {
                     ColorBlendState::with_attachment_states(
                         colors.len() as u32,
                         ColorBlendAttachmentState {
-                            blend: desc.blend_alpha.then(AttachmentBlend::alpha),
+                            blend: match desc.blend {
+                                Blend::None => None,
+                                Blend::Alpha => Some(AttachmentBlend::alpha()),
+                                // Max, so the hovered mesh drawn after a selected
+                                // one it overlaps cannot take the selected channel
+                                // back to zero.
+                                Blend::Max => Some(AttachmentBlend {
+                                    src_color_blend_factor: BlendFactor::One,
+                                    dst_color_blend_factor: BlendFactor::One,
+                                    color_blend_op: BlendOp::Max,
+                                    src_alpha_blend_factor: BlendFactor::One,
+                                    dst_alpha_blend_factor: BlendFactor::One,
+                                    alpha_blend_op: BlendOp::Max,
+                                }),
+                            },
                             ..Default::default()
                         },
                     )

@@ -35,7 +35,7 @@ use super::taa::FrameView;
 use super::{MSAA_SAMPLES, PassCtx, ShadowFrame, VulkanRenderer};
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::rhi::{
-    CullMode, DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId,
+    Blend, CullMode, DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId,
     SamplerDesc, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
@@ -768,7 +768,7 @@ impl ForwardPass {
                 // from instead, along the same line.
                 alpha_to_coverage: !cull_back && samples != SampleCount::Sample1,
                 immutable_samplers: &samplers,
-                blend_alpha: false,
+                blend: Blend::None,
             })
         };
         let msaa = MSAA_SAMPLES;

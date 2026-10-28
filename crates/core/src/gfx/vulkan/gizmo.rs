@@ -17,8 +17,8 @@ use vulkano::pipeline::graphics::vertex_input::Vertex;
 
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
-    Device, Encoder, GraphicsPipelineDesc, PipelineId, VertexAttribute, VertexFormat, VertexStream,
-    Viewport,
+    Blend, Device, Encoder, GraphicsPipelineDesc, PipelineId, VertexAttribute, VertexFormat,
+    VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -73,7 +73,7 @@ impl GizmoPass {
         Self {
             pipeline: device.create_graphics_pipeline(&GraphicsPipelineDesc {
                 vertex_streams: &[GizmoVertex::STREAM],
-                blend_alpha: true,
+                blend: Blend::Alpha,
                 ..GraphicsPipelineDesc::fullscreen(
                     ShaderId::GizmoVert,
                     ShaderId::GizmoFrag,
