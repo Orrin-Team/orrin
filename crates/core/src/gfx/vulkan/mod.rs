@@ -316,6 +316,10 @@ pub struct VulkanRenderer {
     frame: Frame,
     /// The same images by id, which is how every pass reads them.
     table: ImageTable,
+    /// The overlay's pipelines on a Metal frame, built on the first one that has
+    /// an overlay. The Vulkan backend keeps its own beside its submission state.
+    #[cfg(target_os = "macos")]
+    metal_overlay: Option<overlay::OverlayPass>,
     /// Everything that is Vulkan's: the context, the swapchain, the images and
     /// the submission state that run ahead of the GPU.
     backend: Backend,
@@ -373,6 +377,15 @@ impl Backend {
             Backend::Vulkan(vk) => vk,
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => unreachable!("a Vulkan-only path ran on the Metal backend"),
+        }
+    }
+
+    /// The window a Metal frame ends in, if it has one.
+    #[cfg(target_os = "macos")]
+    fn metal_window(&self) -> Option<&crate::gfx::metal::backend::Windowed> {
+        match self {
+            Backend::Metal(mtl) => mtl.windowed.as_ref(),
+            Backend::Vulkan(_) => None,
         }
     }
 
@@ -564,6 +577,36 @@ impl VulkanRenderer {
         ))
     }
 
+    /// A renderer whose frames end in a window's `CAMetalLayer`.
+    ///
+    /// `view` is the window's `NSView`, which must outlive the renderer.
+    #[cfg(target_os = "macos")]
+    pub fn windowed_metal(
+        view: std::ptr::NonNull<std::ffi::c_void>,
+        extent: [u32; 2],
+        present: PresentSettings,
+    ) -> Result<Self, String> {
+        let device = Device::Metal(crate::gfx::metal::MtlDriver::new()?);
+        let gpu_culling = gpu_culling_requested(std::env::var("ORRIN_GPU_CULL").ok().as_deref());
+        Ok(Self::assemble(
+            device,
+            EngineFormat::Bgra8Srgb,
+            extent,
+            gpu_culling,
+            false,
+            |device, frame, _slots| {
+                let (backend, table) = crate::gfx::metal::backend::MtlBackend::windowed(
+                    device.metal(),
+                    view,
+                    extent,
+                    present,
+                    &frame.graph,
+                );
+                (Backend::Metal(Box::new(backend)), table)
+            },
+        ))
+    }
+
     /// The half of construction that does not know where the frame ends up.
     fn build(
         ctx: VkContext,
@@ -726,6 +769,8 @@ impl VulkanRenderer {
             config,
             frame,
             table,
+            #[cfg(target_os = "macos")]
+            metal_overlay: None,
             backend,
         }
     }
@@ -756,6 +801,9 @@ impl VulkanRenderer {
     pub fn capture(&mut self) -> Option<(Vec<u8>, [u32; 2])> {
         #[cfg(target_os = "macos")]
         if let Backend::Metal(mtl) = &self.backend {
+            if mtl.windowed.is_some() {
+                return None;
+            }
             let crate::gfx::rhi::Device::Metal(driver) = &self.device else {
                 unreachable!("the Metal backend runs on the Metal device");
             };
@@ -1217,6 +1265,11 @@ impl RenderBackend for VulkanRenderer {
     }
 
     fn resize(&mut self, extent: [u32; 2]) {
+        #[cfg(target_os = "macos")]
+        if let Backend::Metal(mtl) = &mut self.backend {
+            mtl.resize(extent);
+            return;
+        }
         self.backend.vk_mut().pending_extent = extent;
         self.backend.vk_mut().recreate_swapchain = true;
     }
@@ -1289,17 +1342,34 @@ impl VulkanRenderer {
     /// window's, which can already be a resize ahead of it. Culling has to use
     /// this one or its side planes won't be the ones on screen.
     pub fn extent(&self) -> [u32; 2] {
-        self.backend.vk().swapchain.extent
+        self.backend.extent()
+    }
+
+    /// The largest texture side the device accepts, for the editor's texture
+    /// uploads.
+    pub fn max_texture_side(&self) -> usize {
+        match &self.backend {
+            Backend::Vulkan(vk) => {
+                vk.ctx
+                    .device
+                    .physical_device()
+                    .properties()
+                    .max_image_dimension2_d as usize
+            }
+            // Every Apple GPU family 7 device takes 16384.
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => 16384,
+        }
     }
 
     /// Whole-frame GPU time in milliseconds, or `None` if the device doesn't
     /// support timestamp queries. Trails the displayed frame by one.
     pub fn gpu_frame_ms(&self) -> Option<f32> {
-        self.backend
-            .vk()
-            .timestamps
-            .as_ref()
-            .map(GpuTimestamps::last_frame_ms)
+        match &self.backend {
+            Backend::Vulkan(vk) => vk.timestamps.as_ref().map(GpuTimestamps::last_frame_ms),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => None,
+        }
     }
 
     /// Ask for a different present mode or image count.
@@ -1309,6 +1379,11 @@ impl VulkanRenderer {
     /// presenting from its images. A call that changes nothing does nothing, so
     /// the app may hand over the resource every frame without recreating one.
     pub fn set_present(&mut self, present: PresentSettings) {
+        #[cfg(target_os = "macos")]
+        if let Backend::Metal(mtl) = &mut self.backend {
+            mtl.set_present(present);
+            return;
+        }
         if self.backend.vk().present != present {
             self.backend.vk_mut().present = present;
             self.backend.vk_mut().recreate_swapchain = true;
@@ -1318,15 +1393,24 @@ impl VulkanRenderer {
     /// What the surface honoured of [`set_present`](Self::set_present), or `None`
     /// offscreen. Not necessarily what was asked for — see
     /// [`SwapchainState::applied_present`].
-    pub fn applied_present(&self) -> Option<(vulkano::swapchain::PresentMode, u32)> {
-        self.backend.vk().swapchain.applied_present()
+    pub fn applied_present(&self) -> Option<String> {
+        match &self.backend {
+            Backend::Vulkan(vk) => vk
+                .swapchain
+                .applied_present()
+                .map(|(mode, images)| format!("{mode:?}, {images} images")),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(mtl) => mtl.applied_present(),
+        }
     }
 
     /// File the GPU spans of frames that have completed since the last call.
     /// Separate from rendering because the profiler lives in the world, which
     /// the renderer deliberately can't reach.
     pub fn drain_gpu_spans(&mut self, profiler: &mut Profiler) {
-        if let Some(timestamps) = self.backend.vk_mut().timestamps.as_mut() {
+        if let Backend::Vulkan(vk) = &mut self.backend
+            && let Some(timestamps) = vk.timestamps.as_mut()
+        {
             timestamps.drain_completed(profiler);
         }
     }
@@ -1334,12 +1418,20 @@ impl VulkanRenderer {
     /// Live device-local VRAM as `(used, total)` bytes; `used` is `None` when the
     /// driver doesn't expose `VK_EXT_memory_budget`.
     pub fn gpu_memory(&self) -> (Option<u64>, u64) {
-        self.backend.vk().ctx.vram_bytes()
+        match &self.backend {
+            Backend::Vulkan(vk) => vk.ctx.vram_bytes(),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => self.device.metal().memory(),
+        }
     }
 
     /// The API version the device supports and its name, for the editor's
     /// status bar: `Vulkan 1.3 · AMD Radeon RX 9070 XT`.
     pub fn device_label(&self) -> String {
+        #[cfg(target_os = "macos")]
+        if let Backend::Metal(_) = &self.backend {
+            return format!("Metal · {}", self.device.metal().name());
+        }
         let properties = self.backend.vk().ctx.device.physical_device().properties();
         let version = properties.api_version;
         format!(
@@ -1442,12 +1534,19 @@ impl VulkanRenderer {
         debug_lines: &[DebugLine],
         profiler_frame: Option<u64>,
         shadows: Option<ShadowFrame<'_>>,
-        overlay: Option<Overlay<'_>>,
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))] mut overlay: Option<Overlay<'_>>,
     ) {
         if let Backend::Vulkan(vk) = &self.backend
             && (vk.pending_extent[0] == 0 || vk.pending_extent[1] == 0)
         {
             return;
+        }
+        #[cfg(target_os = "macos")]
+        if let Backend::Metal(mtl) = &mut self.backend {
+            if mtl.is_collapsed() {
+                return;
+            }
+            mtl.adopt_resize(self.device.metal());
         }
 
         if matches!(&self.backend, Backend::Vulkan(vk) if vk.recreate_swapchain) {
@@ -1582,7 +1681,14 @@ impl VulkanRenderer {
                     None => (0, false, None),
                 }
             } else {
-                // One image, always available, and nothing to wait on.
+                // One image, always available, and nothing to wait on — except
+                // that a window's frames overlap, and the one whose arenas this
+                // frame is about to reuse has to be done with them.
+                #[cfg(target_os = "macos")]
+                if let Backend::Metal(mtl) = &mut self.backend {
+                    profile_scope!("wait");
+                    mtl.wait_for_room(self.frame_index);
+                }
                 (0, false, None)
             };
         if suboptimal {
@@ -2142,16 +2248,41 @@ impl VulkanRenderer {
             Commands::Vulkan(builder) => builder,
             #[cfg(target_os = "macos")]
             Commands::Metal(mut state) => {
+                let drawable;
                 {
                     let mut encoder = Encoder::Metal(crate::gfx::metal::MtlEncoder::new(
                         self.device.metal(),
                         &mut state,
                     ));
-                    record.walk(&mut encoder);
+                    let window = self.backend.metal_window();
+                    let frame =
+                        window.map(|window| window.frame(self.device.metal(), swapchain_id));
+                    let target = || frame.as_ref().map_or(swapchain_id, |frame| frame.target());
+                    record.walk(&mut encoder, &target);
+                    if raw_passes.contains(&PassBody::Overlay) {
+                        profile_scope!("overlay");
+                        let overlay = overlay
+                            .take()
+                            .expect("the graph scheduled an overlay pass but none was supplied");
+                        let format = self.backend.format();
+                        let pass = self.metal_overlay.get_or_insert_with(|| {
+                            overlay::OverlayPass::new(&self.device, format, true)
+                        });
+                        pass.record(&self.device, &mut encoder, target(), overlay);
+                    }
+                    drawable = frame.and_then(|frame| frame.into_drawable());
                 }
-                // Offscreen, so the frame is waited for rather than presented.
-                state.finish_blocking();
                 drop(recording);
+                match self.backend.metal_window() {
+                    Some(_) => {
+                        let command_buffer = state.finish(drawable);
+                        if let Backend::Metal(mtl) = &mut self.backend {
+                            mtl.submitted(self.frame_index.wrapping_sub(1), command_buffer);
+                        }
+                    }
+                    // Offscreen, so the frame is waited for rather than presented.
+                    None => state.finish_blocking(),
+                }
                 return;
             }
         };
@@ -2868,7 +2999,7 @@ impl FrameRecord<'_> {
     /// its own hazards: the plan's barriers are not consulted, and nothing is
     /// timed.
     #[cfg(target_os = "macos")]
-    fn walk(&self, encoder: &mut Encoder) {
+    fn walk(&self, encoder: &mut Encoder, swapchain: &dyn Fn() -> TextureViewId) {
         for slot in 0..self.frame.graph.order().len() {
             let pass = self.frame.graph.order()[slot];
             let body = self.frame.bodies[pass.index()];
@@ -2878,10 +3009,21 @@ impl FrameRecord<'_> {
                 PassKind::Raw => {}
                 PassKind::Compute => self.record_compute(encoder, body),
                 _ => {
+                    // Asked for only by the passes that draw into it, so a window's
+                    // drawable is acquired when the first of them records and not
+                    // while the shadows are still being drawn.
+                    let swapchain = if matches!(
+                        body,
+                        PassBody::Tonemap | PassBody::Outline | PassBody::Gizmo
+                    ) {
+                        swapchain()
+                    } else {
+                        self.swapchain_id
+                    };
                     let targets = rendering::rendering_info(
                         &self.frame.ids,
                         self.table,
-                        self.swapchain_id,
+                        swapchain,
                         body,
                         self.env.background,
                     )

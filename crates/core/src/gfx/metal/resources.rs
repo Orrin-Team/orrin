@@ -596,7 +596,6 @@ impl MtlDriver {
         }
     }
 
-    /// Whether a texture lives in tile memory only.
     /// Register a texture the driver did not make (a drawable's) for the frame
     /// being recorded; the id retires with the frame.
     pub(crate) fn import_texture(
@@ -609,6 +608,7 @@ impl MtlDriver {
         TextureViewId(index)
     }
 
+    /// Whether a texture lives in tile memory only.
     pub(super) fn is_memoryless(&self, view: TextureViewId) -> bool {
         use objc2_metal::MTLResource;
         self.texture(view).storageMode() == MTLStorageMode::Memoryless

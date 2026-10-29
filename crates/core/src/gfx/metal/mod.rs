@@ -122,6 +122,15 @@ impl MtlDriver {
         state.finish_blocking();
     }
 
+    /// `(allocated, budget)` in bytes: what this process holds of the GPU's
+    /// working set, and the most the system recommends it use.
+    pub fn memory(&self) -> (Option<u64>, u64) {
+        (
+            Some(self.device.currentAllocatedSize() as u64),
+            self.device.recommendedMaxWorkingSetSize(),
+        )
+    }
+
     /// The device's name, for the run banner.
     pub fn name(&self) -> String {
         self.device.name().to_string()
