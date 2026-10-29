@@ -5,6 +5,7 @@
 //! MSL, then the encoder. A method that is still `unimplemented!` names itself
 //! in the panic, so a pass that reaches one says which operation it needs next.
 
+mod backdrop;
 pub(crate) mod backend;
 mod bind;
 mod convert;
@@ -66,6 +67,7 @@ pub struct MtlDriver {
     functions: Mutex<pipeline::Functions>,
     bind_groups: Mutex<Pool<bind::Group>>,
     geometry: Mutex<Shared<geometry::Geometry>>,
+    downsamples: Mutex<backdrop::Downsamples>,
 }
 
 pub struct MtlEncoder<'a> {
@@ -106,6 +108,7 @@ impl MtlDriver {
             functions: Mutex::new(Default::default()),
             bind_groups: Mutex::new(Pool::new(FRAME_SLOTS)),
             geometry: Mutex::new(Shared(geometry)),
+            downsamples: Mutex::new(Vec::new()),
         })
     }
 

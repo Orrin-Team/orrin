@@ -536,21 +536,30 @@ impl<'a> MtlEncoder<'a> {
     /// clear.
     pub fn clear_depth(&mut self, _rects: &[DepthRect]) {}
 
-    pub fn open_swapchain(&mut self, _target: TextureViewId) {
-        unimplemented!("metal: open_swapchain")
-    }
+    /// A drawable needs no transition into rendering: hazards are Metal's own.
+    pub fn open_swapchain(&mut self, _target: TextureViewId) {}
 
-    pub fn close_swapchain(&mut self, _target: TextureViewId) {
-        unimplemented!("metal: close_swapchain")
-    }
+    /// Presenting is the command buffer's job, once the frame is finished.
+    pub fn close_swapchain(&mut self, _target: TextureViewId) {}
 
+    /// Reduce what is drawn so far into `half`, then `quarter`. A render pass
+    /// each, because a blit cannot scale.
     pub fn capture_backdrop(
         &mut self,
-        _target: TextureViewId,
-        _half: TextureViewId,
-        _quarter: TextureViewId,
+        target: TextureViewId,
+        half: TextureViewId,
+        quarter: TextureViewId,
     ) {
-        unimplemented!("metal: capture_backdrop")
+        self.state.close();
+        let (target, half, quarter) = (
+            self.driver.texture(target),
+            self.driver.texture(half),
+            self.driver.texture(quarter),
+        );
+        self.driver
+            .downsample(&self.state.command_buffer, &target, &half);
+        self.driver
+            .downsample(&self.state.command_buffer, &half, &quarter);
     }
 
     pub fn generate_cube_mips(&mut self, texture: TextureViewId) {
