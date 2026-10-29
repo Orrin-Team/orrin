@@ -12,6 +12,7 @@ mod encoder;
 mod geometry;
 mod pipeline;
 mod resources;
+pub(crate) mod window;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};

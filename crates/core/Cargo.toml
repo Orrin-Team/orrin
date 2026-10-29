@@ -117,3 +117,9 @@ spirv-cross2 = { version = "0.7", default-features = false, features = ["msl"] }
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-metal = "0.3"
+# The window half of the Metal backend: a CAMetalLayer on the winit view
+# (`raw-window-metal` makes or reuses one) and the layer's own API. Both are
+# already in the tree through winit's dependencies, so this adds one small crate
+# and a feature of another.
+raw-window-metal = "1.1"
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["CAMetalLayer", "objc2-metal", "std"] }
