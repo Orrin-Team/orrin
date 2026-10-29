@@ -204,9 +204,7 @@ pub(super) struct PassCtx<'a> {
 }
 
 pub struct VulkanRenderer {
-    pub(crate) ctx: Arc<VkContext>,
     device: Device,
-    swapchain: SwapchainState,
     forward: ForwardPass,
     /// The per-object matrices, which live on the GPU between frames rather than
     /// being repacked into a fresh buffer every one. Owned here rather than by
@@ -308,6 +306,47 @@ pub struct VulkanRenderer {
     /// objects, which is what keeps the three passes agreeing about a material.
     shadow_material_set: Option<BindGroupId>,
     shadow_texture_set: Option<BindGroupId>,
+    /// Which frame this is, counted from the first. Picks the frame's set of
+    /// graph images, and nothing else.
+    frame_index: u64,
+    /// The structure this frame's graph was compiled for. A frame whose config
+    /// still matches reuses the compiled graph — recompiling is for a change of
+    /// *shape* (SSAO on or off, overlay or not), never for a change of contents.
+    config: FrameConfig,
+    frame: Frame,
+    /// The same images by id, which is how every pass reads them.
+    table: ImageTable,
+    /// Everything that is Vulkan's: the context, the swapchain, the images and
+    /// the submission state that run ahead of the GPU.
+    backend: Backend,
+}
+
+/// What the renderer is drawing with.
+///
+/// The passes, the tables and the frame's compiled plan are the renderer's and
+/// do not change; what executes the plan and owns the images it renders into
+/// does.
+enum Backend {
+    Vulkan(Box<VkBackend>),
+}
+
+impl Backend {
+    fn vk(&self) -> &VkBackend {
+        match self {
+            Backend::Vulkan(vk) => vk,
+        }
+    }
+
+    fn vk_mut(&mut self) -> &mut VkBackend {
+        match self {
+            Backend::Vulkan(vk) => vk,
+        }
+    }
+}
+
+pub(crate) struct VkBackend {
+    pub(crate) ctx: Arc<VkContext>,
+    swapchain: SwapchainState,
     /// Frames the GPU has not finished with, oldest first, bounded by
     /// [`FRAMES_IN_FLIGHT`]. Everything a frame named is held here until its
     /// fence signals.
@@ -322,9 +361,6 @@ pub struct VulkanRenderer {
     /// per-segment semaphores in [`PendingTail`] instead, because "the whole of
     /// the last frame" is exactly the dependency the split exists to remove.
     frame_chain: Option<Arc<Semaphore>>,
-    /// Which frame this is, counted from the first. Picks the frame's set of
-    /// graph images, and nothing else.
-    frame_index: u64,
     /// The previous frame's trailing graphics segment, recorded and waiting to
     /// be submitted behind *this* frame's head. See [`PendingTail`].
     pending: Option<PendingTail>,
@@ -360,14 +396,7 @@ pub struct VulkanRenderer {
     present: PresentSettings,
     /// Per-pass GPU timing; `None` if the device lacks timestamp support.
     timestamps: Option<GpuTimestamps>,
-    /// The structure this frame's graph was compiled for. A frame whose config
-    /// still matches reuses the compiled graph — recompiling is for a change of
-    /// *shape* (SSAO on or off, overlay or not), never for a change of contents.
-    config: FrameConfig,
-    frame: Frame,
     images: GraphImages,
-    /// The same images by id, which is how every pass reads them.
-    table: ImageTable,
 }
 
 impl VulkanRenderer {
@@ -528,8 +557,6 @@ impl VulkanRenderer {
             occlusion: OcclusionPass::new(&device),
             gpu_culling,
             occlusion_culling,
-            ctx,
-            swapchain,
             forward,
             hdr,
             exposure,
@@ -561,22 +588,26 @@ impl VulkanRenderer {
             shadow_material_set: None,
             shadow_texture_set: None,
             device,
-            in_flight: RunAhead::new(FRAMES_IN_FLIGHT),
-            frame_chain: None,
             frame_index: 0,
-            pending: None,
-            head_gate: None,
-            overlay_present: RunAhead::new(FRAMES_IN_FLIGHT),
-            overlay: None,
-            present_waits: Vec::new(),
-            recreate_swapchain: false,
-            pending_extent: extent,
-            present,
-            timestamps,
             config,
             frame,
             table: images.table(),
-            images,
+            backend: Backend::Vulkan(Box::new(VkBackend {
+                ctx,
+                swapchain,
+                in_flight: RunAhead::new(FRAMES_IN_FLIGHT),
+                frame_chain: None,
+                pending: None,
+                head_gate: None,
+                overlay_present: RunAhead::new(FRAMES_IN_FLIGHT),
+                overlay: None,
+                present_waits: Vec::new(),
+                recreate_swapchain: false,
+                pending_extent: extent,
+                present,
+                timestamps,
+                images,
+            })),
         }
     }
 
@@ -587,7 +618,12 @@ impl VulkanRenderer {
         if self.config != config {
             self.frame = frame::declare(config).expect("the engine's frame must compile");
             self.config = config;
-        } else if !self.images.is_stale(self.swapchain.extent) {
+        } else if !self
+            .backend
+            .vk()
+            .images
+            .is_stale(self.backend.vk().swapchain.extent)
+        {
             return;
         }
         self.reallocate();
@@ -604,20 +640,20 @@ impl VulkanRenderer {
     /// `render_frame` already signalled a fence, and the copy is submitted after
     /// it has been reached, so nothing here can read a half-written image.
     pub fn capture(&mut self) -> Option<(Vec<u8>, [u32; 2])> {
-        let image = self.swapchain.readback.first()?.clone();
+        let image = self.backend.vk().swapchain.readback.first()?.clone();
 
         // A split frame holds its last segment back a frame on purpose, so
         // without this the readback copies the frame *before* the one the caller
         // just rendered. See [`PendingTail`].
         self.flush_pending_tail();
-        self.in_flight.drain();
+        self.backend.vk_mut().in_flight.drain();
         // The overlay is the last thing to write the target when there is one,
         // so a readback that skipped it would copy the frame underneath it.
-        self.overlay_present.drain();
+        self.backend.vk_mut().overlay_present.drain();
 
-        let extent = self.swapchain.extent;
+        let extent = self.backend.vk().swapchain.extent;
         let buffer = Buffer::new_slice::<u8>(
-            self.ctx.memory_allocator.clone(),
+            self.backend.vk().ctx.memory_allocator.clone(),
             BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_DST,
                 ..Default::default()
@@ -633,7 +669,7 @@ impl VulkanRenderer {
 
         let mut builder = self.new_command_buffer();
         builder.copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(image, buffer.clone()));
-        builder.submit_and_wait(&self.ctx);
+        builder.submit_and_wait(&self.backend.vk().ctx);
 
         let pixels = buffer.read().unwrap().to_vec();
         Some((pixels, extent))
@@ -655,7 +691,7 @@ impl VulkanRenderer {
         let render_finished = match overlay_ready {
             Some(ready) => {
                 let mut overlay = overlay;
-                let mut recorder = Recorder::new(&self.ctx);
+                let mut recorder = Recorder::new(&self.backend.vk().ctx);
                 for body in raw_passes {
                     match body {
                         PassBody::Overlay => {
@@ -663,17 +699,16 @@ impl VulkanRenderer {
                             let frame = overlay.take().expect(
                                 "the graph scheduled an overlay pass but none was supplied",
                             );
-                            let pass = self.overlay.get_or_insert_with(|| {
-                                overlay::OverlayPass::new(
-                                    &self.device,
-                                    engine_format(self.swapchain.format),
-                                    self.swapchain.capturable,
-                                )
+                            let vk = self.backend.vk_mut();
+                            let format = engine_format(vk.swapchain.format);
+                            let capturable = vk.swapchain.capturable;
+                            let target_view =
+                                vk.swapchain.image_views[image_index as usize].clone();
+                            let pass = vk.overlay.get_or_insert_with(|| {
+                                overlay::OverlayPass::new(&self.device, format, capturable)
                             });
                             let driver = self.device.vulkan();
-                            let target = driver.import_view(
-                                self.swapchain.image_views[image_index as usize].clone(),
-                            );
+                            let target = driver.import_view(target_view);
                             let mut encoder =
                                 Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
                             pass.record(&self.device, &mut encoder, target, frame);
@@ -684,21 +719,21 @@ impl VulkanRenderer {
                 // The overlay is the last writer, so the present waits on it
                 // instead of on the frame.
                 let (command_buffer, keep) = recorder.end();
-                let finished = self.swapchain.swapchain.is_some().then(|| {
+                let finished = self.backend.vk().swapchain.swapchain.is_some().then(|| {
                     Arc::new(
-                        Semaphore::from_pool(self.ctx.device.clone())
+                        Semaphore::from_pool(self.backend.vk().ctx.device.clone())
                             .expect("failed to create the overlay semaphore"),
                     )
                 });
                 let in_flight = record::submit_frame(
-                    &self.ctx,
-                    &self.ctx.queue.clone(),
+                    &self.backend.vk().ctx,
+                    &self.backend.vk().ctx.queue.clone(),
                     command_buffer,
                     keep,
                     &[(ready, ash::vk::PipelineStageFlags::ALL_COMMANDS)],
                     finished.as_slice(),
                 );
-                self.overlay_present.push(in_flight);
+                self.backend.vk_mut().overlay_present.push(in_flight);
                 finished
             }
             None => {
@@ -707,7 +742,7 @@ impl VulkanRenderer {
             }
         };
 
-        let Some(swapchain) = self.swapchain.swapchain.clone() else {
+        let Some(swapchain) = self.backend.vk().swapchain.swapchain.clone() else {
             return;
         };
         // Raw, like the submit — but for the opposite reason: this one is
@@ -718,10 +753,10 @@ impl VulkanRenderer {
             .map(|semaphore| SemaphorePresentInfo::new(semaphore.clone()))
             .collect();
         let slot = image_index as usize;
-        if self.present_waits.len() <= slot {
-            self.present_waits.resize(slot + 1, None);
+        if self.backend.vk().present_waits.len() <= slot {
+            self.backend.vk_mut().present_waits.resize(slot + 1, None);
         }
-        self.present_waits[slot] = render_finished;
+        self.backend.vk_mut().present_waits[slot] = render_finished;
         let present_info = PresentInfo {
             wait_semaphores,
             swapchain_infos: vec![SwapchainPresentInfo::swapchain_image_index(
@@ -730,7 +765,7 @@ impl VulkanRenderer {
             )],
             ..Default::default()
         };
-        let result = self.ctx.queue.clone().with(|mut queue| {
+        let result = self.backend.vk().ctx.queue.clone().with(|mut queue| {
             // SAFETY: the image was acquired from this swapchain and has not
             // been presented since; the wait semaphore is the one the image's
             // last writer signals — the overlay's submission when there is one,
@@ -742,13 +777,15 @@ impl VulkanRenderer {
             Ok(results) => {
                 for result in results {
                     match result {
-                        Ok(suboptimal) => self.recreate_swapchain |= suboptimal,
-                        Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
+                        Ok(suboptimal) => self.backend.vk_mut().recreate_swapchain |= suboptimal,
+                        Err(VulkanError::OutOfDate) => {
+                            self.backend.vk_mut().recreate_swapchain = true
+                        }
                         Err(e) => tracing::error!("failed to present: {e}"),
                     }
                 }
             }
-            Err(VulkanError::OutOfDate) => self.recreate_swapchain = true,
+            Err(VulkanError::OutOfDate) => self.backend.vk_mut().recreate_swapchain = true,
             Err(e) => tracing::error!("failed to present: {e}"),
         }
     }
@@ -761,7 +798,7 @@ impl VulkanRenderer {
     /// reason it waits. Presents nothing — a caller that wanted the image on
     /// screen would have rendered another frame.
     fn flush_pending_tail(&mut self) {
-        let Some(pending) = self.pending.take() else {
+        let Some(pending) = self.backend.vk_mut().pending.take() else {
             return;
         };
         let mut waits = vec![(
@@ -775,18 +812,18 @@ impl VulkanRenderer {
             ));
         }
         let in_flight = record::submit_frame(
-            &self.ctx,
-            &self.ctx.queue.clone(),
+            &self.backend.vk().ctx,
+            &self.backend.vk().ctx.queue.clone(),
             pending.command_buffer,
             pending.keep,
             &waits,
             &[],
         );
-        self.in_flight.push(in_flight);
+        self.backend.vk_mut().in_flight.push(in_flight);
     }
 
     fn new_command_buffer(&self) -> Recorder {
-        Recorder::new(&self.ctx)
+        Recorder::new(&self.backend.vk().ctx)
     }
 
     /// The queue a segment is submitted to.
@@ -797,8 +834,10 @@ impl VulkanRenderer {
     /// here is unreachable rather than a silent downgrade.
     fn queue_of(&self, queue: GraphQueue) -> &Arc<vulkano::device::Queue> {
         match queue {
-            GraphQueue::Graphics => &self.ctx.queue,
+            GraphQueue::Graphics => &self.backend.vk().ctx.queue,
             GraphQueue::AsyncCompute => self
+                .backend
+                .vk()
                 .ctx
                 .compute_queue
                 .as_ref()
@@ -900,7 +939,9 @@ impl VulkanRenderer {
             }
         }
 
-        self.images
+        self.backend
+            .vk()
+            .images
             .try_view(id)
             .map(|view| record::Target::Image(view.image().clone()))
     }
@@ -910,15 +951,16 @@ impl VulkanRenderer {
         // structural toggle re-points `views` at allocations that already exist
         // instead of recreating every image in the frame. See `GraphImages`.
         let driver = self.device.vulkan();
-        self.images.rebuild(
-            &self.ctx.memory_allocator,
-            &self.ctx,
+        let vk = self.backend.vk_mut();
+        vk.images.rebuild(
+            &vk.ctx.memory_allocator,
+            &vk.ctx,
             driver,
             &self.frame.graph,
-            self.swapchain.extent,
+            vk.swapchain.extent,
             image_slots(&self.frame.graph),
         );
-        self.table = self.images.table();
+        self.table = self.backend.vk().images.table();
     }
 }
 
@@ -1040,7 +1082,7 @@ impl RenderBackend for VulkanRenderer {
     }
 
     fn samples_bc(&self) -> bool {
-        self.ctx.samples_bc
+        self.backend.vk().ctx.samples_bc
     }
 
     fn load_environment(&mut self, pixels: &[f32], width: u32, height: u32) {
@@ -1049,8 +1091,8 @@ impl RenderBackend for VulkanRenderer {
     }
 
     fn resize(&mut self, extent: [u32; 2]) {
-        self.pending_extent = extent;
-        self.recreate_swapchain = true;
+        self.backend.vk_mut().pending_extent = extent;
+        self.backend.vk_mut().recreate_swapchain = true;
     }
 
     fn render(
@@ -1110,24 +1152,28 @@ impl RenderBackend for VulkanRenderer {
 
 impl VulkanRenderer {
     pub fn queue(&self) -> Arc<Queue> {
-        self.ctx.queue.clone()
+        self.backend.vk().ctx.queue.clone()
     }
 
     pub fn color_format(&self) -> Format {
-        self.swapchain.format
+        self.backend.vk().swapchain.format
     }
 
     /// The extent the next frame will be drawn at — the swapchain's, not the
     /// window's, which can already be a resize ahead of it. Culling has to use
     /// this one or its side planes won't be the ones on screen.
     pub fn extent(&self) -> [u32; 2] {
-        self.swapchain.extent
+        self.backend.vk().swapchain.extent
     }
 
     /// Whole-frame GPU time in milliseconds, or `None` if the device doesn't
     /// support timestamp queries. Trails the displayed frame by one.
     pub fn gpu_frame_ms(&self) -> Option<f32> {
-        self.timestamps.as_ref().map(GpuTimestamps::last_frame_ms)
+        self.backend
+            .vk()
+            .timestamps
+            .as_ref()
+            .map(GpuTimestamps::last_frame_ms)
     }
 
     /// Ask for a different present mode or image count.
@@ -1137,9 +1183,9 @@ impl VulkanRenderer {
     /// presenting from its images. A call that changes nothing does nothing, so
     /// the app may hand over the resource every frame without recreating one.
     pub fn set_present(&mut self, present: PresentSettings) {
-        if self.present != present {
-            self.present = present;
-            self.recreate_swapchain = true;
+        if self.backend.vk().present != present {
+            self.backend.vk_mut().present = present;
+            self.backend.vk_mut().recreate_swapchain = true;
         }
     }
 
@@ -1147,14 +1193,14 @@ impl VulkanRenderer {
     /// offscreen. Not necessarily what was asked for — see
     /// [`SwapchainState::applied_present`].
     pub fn applied_present(&self) -> Option<(vulkano::swapchain::PresentMode, u32)> {
-        self.swapchain.applied_present()
+        self.backend.vk().swapchain.applied_present()
     }
 
     /// File the GPU spans of frames that have completed since the last call.
     /// Separate from rendering because the profiler lives in the world, which
     /// the renderer deliberately can't reach.
     pub fn drain_gpu_spans(&mut self, profiler: &mut Profiler) {
-        if let Some(timestamps) = self.timestamps.as_mut() {
+        if let Some(timestamps) = self.backend.vk_mut().timestamps.as_mut() {
             timestamps.drain_completed(profiler);
         }
     }
@@ -1162,13 +1208,13 @@ impl VulkanRenderer {
     /// Live device-local VRAM as `(used, total)` bytes; `used` is `None` when the
     /// driver doesn't expose `VK_EXT_memory_budget`.
     pub fn gpu_memory(&self) -> (Option<u64>, u64) {
-        self.ctx.vram_bytes()
+        self.backend.vk().ctx.vram_bytes()
     }
 
     /// The API version the device supports and its name, for the editor's
     /// status bar: `Vulkan 1.3 · AMD Radeon RX 9070 XT`.
     pub fn device_label(&self) -> String {
-        let properties = self.ctx.device.physical_device().properties();
+        let properties = self.backend.vk().ctx.device.physical_device().properties();
         let version = properties.api_version;
         format!(
             "Vulkan {}.{} · {}",
@@ -1272,21 +1318,22 @@ impl VulkanRenderer {
         shadows: Option<ShadowFrame<'_>>,
         overlay: Option<Overlay<'_>>,
     ) {
-        if self.pending_extent[0] == 0 || self.pending_extent[1] == 0 {
+        if self.backend.vk().pending_extent[0] == 0 || self.backend.vk().pending_extent[1] == 0 {
             return;
         }
 
-        if self.recreate_swapchain {
+        if self.backend.vk().recreate_swapchain {
             // Whatever is held back is held back against the *old* swapchain: it
             // writes an image acquired from it, and the index it was acquired at
             // means nothing in the replacement. Submitted and waited for here so
             // the images it names are finished with, and then dropped
             // unpresented — which is what a resize does to a frame anyway.
             self.flush_pending_tail();
-            self.in_flight.drain();
-            self.overlay_present.drain();
-            if self.swapchain.recreate(self.pending_extent, self.present) {
-                self.recreate_swapchain = false;
+            self.backend.vk_mut().in_flight.drain();
+            self.backend.vk_mut().overlay_present.drain();
+            let vk = self.backend.vk_mut();
+            if vk.swapchain.recreate(vk.pending_extent, vk.present) {
+                vk.recreate_swapchain = false;
             } else {
                 return;
             }
@@ -1296,7 +1343,7 @@ impl VulkanRenderer {
         // Everything else about this call — how many objects, which camera, what
         // exposure — flows through the same compiled schedule.
         self.ensure_graph(FrameConfig {
-            color_format: engine_format(self.swapchain.format),
+            color_format: engine_format(self.backend.vk().swapchain.format),
             msaa: taa.msaa,
             ssao: ssao.enabled,
             ssao_half_res: ssao.half_resolution,
@@ -1326,7 +1373,7 @@ impl VulkanRenderer {
             // a chain — so a frame dragged to a sliver drops the passes rather
             // than dispatching over one-texel levels.
             bloom_mips: if bloom.enabled {
-                bloom::mip_count(self.swapchain.extent)
+                bloom::mip_count(self.backend.vk().swapchain.extent)
             } else {
                 0
             },
@@ -1351,7 +1398,7 @@ impl VulkanRenderer {
             // frame is actually split is then the compiler's call — a
             // configuration with no compute tail to move gets the plan it always
             // had, on a device with two queues as much as on one.
-            async_compute: self.ctx.compute_queue.is_some(),
+            async_compute: self.backend.vk().ctx.compute_queue.is_some(),
             gpu_culling: self.gpu_culling,
             occlusion_culling: self.occlusion_culling,
         });
@@ -1359,62 +1406,63 @@ impl VulkanRenderer {
         // Release what the GPU has already finished and block only if the CPU
         // is [`FRAMES_IN_FLIGHT`] frames ahead: recording raw means this crate
         // owns those lifetimes, and the bound is what caps the list.
-        self.in_flight.wait_for_room();
-        self.overlay_present.wait_for_room();
+        self.backend.vk_mut().in_flight.wait_for_room();
+        self.backend.vk_mut().overlay_present.wait_for_room();
 
         // Split out because under Fifo this blocks until the presentation engine
         // hands back an image — a vsync wait, not work. Folded into a single
         // "render" scope it swamps the numbers and hides real regressions.
-        let (image_index, suboptimal, acquire_semaphore) = match self.swapchain.swapchain.clone() {
-            Some(swapchain) => {
-                profile_scope!("acquire");
-                // The raw form, because the frame is submitted raw: the
-                // `SwapchainAcquireFuture` the safe one returns owns its
-                // semaphore privately, and nothing can read it back out to put
-                // in a `VkSubmitInfo`.
-                let semaphore = Arc::new(
-                    Semaphore::from_pool(self.ctx.device.clone())
-                        .expect("failed to create the acquire semaphore"),
-                );
-                // SAFETY: the semaphore is unsignalled and has no pending wait
-                // — it was made a line above, and the frame that ends up waiting
-                // on it holds it until its own fence signals. The previous frame
-                // may still be executing, which acquire allows: the presentation
-                // engine hands back only an image it has finished with.
-                let acquired = unsafe {
-                    swapchain.acquire_next_image(&AcquireNextImageInfo {
-                        semaphore: Some(semaphore.clone()),
-                        ..Default::default()
-                    })
-                };
-                match acquired.map_err(Validated::unwrap) {
-                    Ok(acquired) => (
-                        acquired.image_index,
-                        acquired.is_suboptimal,
-                        Some(semaphore),
-                    ),
-                    Err(VulkanError::OutOfDate) => {
-                        self.recreate_swapchain = true;
-                        return;
+        let (image_index, suboptimal, acquire_semaphore) =
+            match self.backend.vk().swapchain.swapchain.clone() {
+                Some(swapchain) => {
+                    profile_scope!("acquire");
+                    // The raw form, because the frame is submitted raw: the
+                    // `SwapchainAcquireFuture` the safe one returns owns its
+                    // semaphore privately, and nothing can read it back out to put
+                    // in a `VkSubmitInfo`.
+                    let semaphore = Arc::new(
+                        Semaphore::from_pool(self.backend.vk().ctx.device.clone())
+                            .expect("failed to create the acquire semaphore"),
+                    );
+                    // SAFETY: the semaphore is unsignalled and has no pending wait
+                    // — it was made a line above, and the frame that ends up waiting
+                    // on it holds it until its own fence signals. The previous frame
+                    // may still be executing, which acquire allows: the presentation
+                    // engine hands back only an image it has finished with.
+                    let acquired = unsafe {
+                        swapchain.acquire_next_image(&AcquireNextImageInfo {
+                            semaphore: Some(semaphore.clone()),
+                            ..Default::default()
+                        })
+                    };
+                    match acquired.map_err(Validated::unwrap) {
+                        Ok(acquired) => (
+                            acquired.image_index,
+                            acquired.is_suboptimal,
+                            Some(semaphore),
+                        ),
+                        Err(VulkanError::OutOfDate) => {
+                            self.backend.vk_mut().recreate_swapchain = true;
+                            return;
+                        }
+                        Err(e) => panic!("failed to acquire next image: {e}"),
                     }
-                    Err(e) => panic!("failed to acquire next image: {e}"),
                 }
-            }
-            // Offscreen: one image, always available, and nothing to wait on —
-            // no presentation engine owns it, so there is no hand-back to time.
-            None => (0, false, None),
-        };
+                // Offscreen: one image, always available, and nothing to wait on —
+                // no presentation engine owns it, so there is no hand-back to time.
+                None => (0, false, None),
+            };
         if suboptimal {
-            self.recreate_swapchain = true;
+            self.backend.vk_mut().recreate_swapchain = true;
         }
 
         // Which set of the graph's images this frame writes. One set unless the
         // frame was split, in which case the previous frame's compute tail is
         // still reading the other.
-        self.images.set_slot(self.frame_index);
+        self.backend.vk_mut().images.set_slot(self.frame_index);
         self.table.set_slot(self.frame_index);
         self.frame_index = self.frame_index.wrapping_add(1);
-        self.ctx.descriptor_sets.next_frame();
+        self.backend.vk().ctx.descriptor_sets.next_frame();
         self.device.begin_frame(self.frame_index);
 
         // Taken out of `self` for the duration of recording: the pass brackets
@@ -1423,7 +1471,7 @@ impl VulkanRenderer {
         // and only if it was taken — every early return above happens first.
         let mut timestamps = match profiler_frame {
             Some(frame) => {
-                let mut taken = self.timestamps.take();
+                let mut taken = self.backend.vk_mut().timestamps.take();
                 if let Some(timestamps) = taken.as_mut() {
                     timestamps.begin_frame(frame);
                 }
@@ -1454,9 +1502,12 @@ impl VulkanRenderer {
         // Before anything records: this is where the frame's subpixel jitter is
         // chosen, and every pass that rasterises geometry has to be drawn with
         // the matrices it returns rather than deriving its own from `camera`.
-        let view = self
-            .taa
-            .begin_frame(&self.device, taa, camera, self.swapchain.extent);
+        let view = self.taa.begin_frame(
+            &self.device,
+            taa,
+            camera,
+            self.backend.vk().swapchain.extent,
+        );
         // Both resolve their optics against this frame's camera: the lens takes
         // its focal length from the field of view, and the shutter takes the
         // depth range it linearises with.
@@ -1468,14 +1519,15 @@ impl VulkanRenderer {
         let occlusion_live = self.occlusion.begin_frame(
             &self.device,
             self.gpu_culling && self.occlusion_culling,
-            self.swapchain.extent,
+            self.backend.vk().swapchain.extent,
         );
-        self.dof.begin_frame(dof, camera, self.swapchain.extent);
+        self.dof
+            .begin_frame(dof, camera, self.backend.vk().swapchain.extent);
         // Resolved against the camera for the reason the lens is: the kernel's
         // width in pixels is a world length divided by a view depth, so both
         // dispatches have to be handed one projection and one depth range.
         self.subsurface
-            .begin_frame(subsurface, camera, self.swapchain.extent);
+            .begin_frame(subsurface, camera, self.backend.vk().swapchain.extent);
         // Reflections resolve against the camera *and* the environment: the
         // composite subtracts the environment term the forward pass added, so
         // it has to be handed the same rotation and the same tint that pass
@@ -1488,7 +1540,7 @@ impl VulkanRenderer {
                 &self.device,
                 ssr,
                 &view,
-                self.swapchain.extent,
+                self.backend.vk().swapchain.extent,
                 self.table.mip_levels(ids.hiz),
                 environment.yaw,
                 environment::SPECULAR_MIPS,
@@ -1510,7 +1562,7 @@ impl VulkanRenderer {
             &view,
             camera.position,
             lighting.ambient_color * lighting.ambient_nits,
-            self.swapchain.extent,
+            self.backend.vk().swapchain.extent,
         );
         // Sourced from the compiled frame, not from the setting: a window too
         // small for a chain leaves bloom enabled but unbuilt, and a non-zero
@@ -1767,7 +1819,7 @@ impl VulkanRenderer {
         // read, so the forward pass samples a 1x1 depth texture of 1.0 and every
         // comparison reports "lit".
         let shadow_view = match self.frame.ids.shadows {
-            Some(id) => self.images.view(id),
+            Some(id) => self.backend.vk().images.view(id),
             None => self.vk_view(self.shadow.lit_view()),
         };
         debug_assert_eq!(
@@ -1806,7 +1858,7 @@ impl VulkanRenderer {
             &self.device,
             lighting,
             camera,
-            self.swapchain.extent,
+            self.backend.vk().swapchain.extent,
             ao_view,
             contact_shadow_view,
             shadow_id,
@@ -1833,8 +1885,8 @@ impl VulkanRenderer {
         // decides what runs next, what an image's layout is, or what has to
         // finish before what — a pass that needs a different place in the frame
         // gets there by changing its declarations, not by being moved here.
-        let extent = self.swapchain.extent;
-        let swapchain_view = self.swapchain.image_views[image_index as usize].clone();
+        let extent = self.backend.vk().swapchain.extent;
+        let swapchain_view = self.backend.vk().swapchain.image_views[image_index as usize].clone();
         // Passes that own their submission, gathered before anything records:
         // they run on the future after this command buffer rather than inside
         // it, and the walk below skips them.
@@ -1877,12 +1929,12 @@ impl VulkanRenderer {
         });
 
         let record = FrameRecord {
-            ctx: &self.ctx,
+            ctx: &self.backend.vk().ctx,
             device: &self.device,
             meshes: &self.meshes,
             materials: &self.materials,
             frame: &self.frame,
-            images: &self.images,
+            images: &self.backend.vk().images,
             table: &self.table,
             swapchain_view: swapchain_view.clone(),
             swapchain_id: driver.import_view(swapchain_view.clone()),
@@ -1963,7 +2015,7 @@ impl VulkanRenderer {
             if index > 0 {
                 let (commands, keep) = builder.end();
                 recorded.push((ranges[index - 1].0, commands, keep));
-                builder = Recorder::for_family(&self.ctx, self.queue_family(*queue));
+                builder = Recorder::for_family(&self.backend.vk().ctx, self.queue_family(*queue));
             }
             // Only the graphics head is worth spreading over the pool: the
             // compute tail is a handful of commands per dispatch, and a
@@ -1988,7 +2040,7 @@ impl VulkanRenderer {
             timestamps.end_frame(&mut builder);
         }
         if timestamps.is_some() {
-            self.timestamps = timestamps;
+            self.backend.vk_mut().timestamps = timestamps;
         }
 
         let (commands, keep) = builder.end();
@@ -2010,7 +2062,7 @@ impl VulkanRenderer {
         // Cloned out of `self` because the submission below takes `&mut self`
         // to present, and a closure holding a field borrow across that would
         // not compile.
-        let device = self.ctx.device.clone();
+        let device = self.backend.vk().ctx.device.clone();
         let semaphore = move || {
             Arc::new(
                 Semaphore::from_pool(device.clone()).expect("failed to create a frame semaphore"),
@@ -2029,7 +2081,7 @@ impl VulkanRenderer {
             // With an overlay, the present is the overlay's to make, so the
             // frame signals a semaphore for *it* to wait on instead.
             let render_finished =
-                (self.swapchain.swapchain.is_some() && !overlay_pass).then(&semaphore);
+                (self.backend.vk().swapchain.swapchain.is_some() && !overlay_pass).then(&semaphore);
             let overlay_ready = overlay_pass.then(&semaphore);
             let chain = semaphore();
 
@@ -2046,7 +2098,7 @@ impl VulkanRenderer {
                     ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 ));
             }
-            if let Some(previous) = self.frame_chain.take() {
+            if let Some(previous) = self.backend.vk_mut().frame_chain.take() {
                 // What the old `GpuFuture` chain did, and for the same reason:
                 // one set of graph images means this frame writes what the last
                 // one is still reading. The dependency is on the GPU, so the CPU
@@ -2062,15 +2114,15 @@ impl VulkanRenderer {
                 .collect();
 
             let in_flight = record::submit_frame(
-                &self.ctx,
-                &self.ctx.queue.clone(),
+                &self.backend.vk().ctx,
+                &self.backend.vk().ctx.queue.clone(),
                 command_buffer,
                 keep,
                 &waits,
                 &signals,
             );
-            self.frame_chain = Some(chain);
-            self.in_flight.push(in_flight);
+            self.backend.vk_mut().frame_chain = Some(chain);
+            self.backend.vk_mut().in_flight.push(in_flight);
             self.finish_frame(
                 overlay_ready,
                 render_finished,
@@ -2100,12 +2152,12 @@ impl VulkanRenderer {
         //    not guarantee is execution order.
         let head_done = semaphore();
         let mut head_waits = Vec::new();
-        if let Some(gate) = self.head_gate.take() {
+        if let Some(gate) = self.backend.vk_mut().head_gate.take() {
             head_waits.push((gate, ash::vk::PipelineStageFlags::ALL_COMMANDS));
         }
         let mut in_flight = record::submit_frame(
-            &self.ctx,
-            &self.ctx.queue.clone(),
+            &self.backend.vk().ctx,
+            &self.backend.vk().ctx.queue.clone(),
             head_commands,
             head_keep,
             &head_waits,
@@ -2114,10 +2166,11 @@ impl VulkanRenderer {
 
         // 2. The previous frame's trailing segment, behind this frame's head.
         //    Its compute tail has had a whole frame to run.
-        let (previous_tail_done, next_head_gate) = match self.pending.take() {
+        let (previous_tail_done, next_head_gate) = match self.backend.vk_mut().pending.take() {
             Some(pending) => {
-                let render_finished =
-                    (self.swapchain.swapchain.is_some() && !pending.overlay).then(&semaphore);
+                let render_finished = (self.backend.vk().swapchain.swapchain.is_some()
+                    && !pending.overlay)
+                    .then(&semaphore);
                 let overlay_ready = pending.overlay.then(&semaphore);
                 // Two, not one: a binary semaphore's signal may be waited
                 // exactly once, and this segment has two waiters — this frame's
@@ -2141,8 +2194,8 @@ impl VulkanRenderer {
                     .chain([done.clone(), gate.clone()])
                     .collect();
                 in_flight = in_flight.and(record::submit_frame(
-                    &self.ctx,
-                    &self.ctx.queue.clone(),
+                    &self.backend.vk().ctx,
+                    &self.backend.vk().ctx.queue.clone(),
                     pending.command_buffer,
                     pending.keep,
                     &waits,
@@ -2177,22 +2230,22 @@ impl VulkanRenderer {
         }
         let (_, compute_commands, compute_keep) = compute;
         in_flight = in_flight.and(record::submit_frame(
-            &self.ctx,
+            &self.backend.vk().ctx,
             &self.queue_of(GraphQueue::AsyncCompute).clone(),
             compute_commands,
             compute_keep,
             &compute_waits,
             std::slice::from_ref(&compute_done),
         ));
-        self.in_flight.push(in_flight);
+        self.backend.vk_mut().in_flight.push(in_flight);
 
         // What the *next* frame's head waits on: this call submitted the frame
         // two back's last work, so its completion is when this frame's images
         // become the next-but-one frame's to write.
-        self.head_gate = next_head_gate;
+        self.backend.vk_mut().head_gate = next_head_gate;
 
         let (_, tail_commands, tail_keep) = tail;
-        self.pending = Some(PendingTail {
+        self.backend.vk_mut().pending = Some(PendingTail {
             command_buffer: tail_commands,
             keep: tail_keep,
             compute_done,
