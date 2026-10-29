@@ -12,7 +12,7 @@ mod fog;
 mod forward;
 pub mod frame;
 mod gizmo;
-mod hdr;
+pub(crate) mod hdr;
 mod instances;
 mod line;
 mod mesh;

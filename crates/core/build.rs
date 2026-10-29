@@ -429,7 +429,7 @@ fn main() {
         "pub const MAX_DESCRIPTOR_SETS: u32 = {MAX_DESCRIPTOR_SETS};\n\
          pub const PUSH_CONSTANT_BUFFER: u32 = {PUSH_CONSTANT_BUFFER};\n\
          pub const VERTEX_STREAM_BASE: u32 = {VERTEX_STREAM_BASE};\n\n\
-         #[derive(Clone, Copy, PartialEq, Eq, Debug)]\n\
+         #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]\n\
          pub enum ShaderId {{\n{ids}}}\n\n\
          impl ShaderId {{\n    pub const ALL: &'static [ShaderId] = &[\n{all}    ];\n}}\n\n\
          pub static SHADERS: &[ShaderBlob] = &[\n{table}];\n"

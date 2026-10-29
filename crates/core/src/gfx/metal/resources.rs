@@ -381,6 +381,56 @@ impl MtlDriver {
         self.insert_texture(view)
     }
 
+    /// The texels of level 0 of a 2D texture, tightly packed, once the GPU has
+    /// finished with it. It stalls, which is fine for a test.
+    #[cfg(test)]
+    pub(crate) fn read_texture(&self, view: TextureViewId) -> Vec<u8> {
+        use objc2_metal::{
+            MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+        };
+        let texture = self.texture(view);
+        let (width, height) = (texture.width(), texture.height());
+        let texel = match texture.pixelFormat() {
+            f if f == pixel_format(Format::Rgba32Float) => 16,
+            f if f == pixel_format(Format::Rgba16Float) => 8,
+            f if f == pixel_format(Format::R8Unorm) => 1,
+            _ => 4,
+        };
+        let row = width * texel;
+        let buffer = self
+            .device
+            .newBufferWithLength_options(row * height, MTLResourceOptions::StorageModeShared)
+            .expect("failed to allocate a readback buffer");
+        let command_buffer = self.queue.commandBuffer().expect("no command buffer");
+        let blit = command_buffer
+            .blitCommandEncoder()
+            .expect("failed to open a blit encoder");
+        // SAFETY: the origin and size lie inside level 0, and the buffer holds
+        // `row * height` bytes.
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                &texture,
+                0,
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLSize { width, height, depth: 1 },
+                &buffer,
+                0,
+                row,
+                row * height,
+            );
+        }
+        blit.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+        // SAFETY: a shared buffer of `row * height` bytes the GPU has finished
+        // writing.
+        unsafe {
+            std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<u8>(), row * height)
+                .to_vec()
+        }
+    }
+
     pub(super) fn texture(&self, view: TextureViewId) -> Retained<ProtocolObject<dyn MTLTexture>> {
         self.textures
             .lock()
@@ -444,7 +494,7 @@ impl Arena {
         self.cursor = 0;
     }
 
-    fn allocate(
+    pub(super) fn allocate(
         &mut self,
         device: &Retained<ProtocolObject<dyn MTLDevice>>,
         len: u64,

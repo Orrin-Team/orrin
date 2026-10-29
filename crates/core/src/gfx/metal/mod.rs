@@ -5,10 +5,12 @@
 //! MSL, then the encoder. A method that is still `unimplemented!` names itself
 //! in the panic, so a pass that reaches one says which operation it needs next.
 
+mod bind;
 mod convert;
+mod encoder;
+mod pipeline;
 mod resources;
 
-use std::marker::PhantomData;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,10 +24,7 @@ use objc2_metal::{
 use crate::geom::Aabb;
 use crate::gfx::Vertex;
 use crate::gfx::format::Format;
-use crate::gfx::rhi::{
-    BindGroupId, Binding, BufferCopy, BufferId, ComputePipelineDesc, DepthRect, Encoder,
-    GraphicsPipelineDesc, MeshSpan, PipelineId, Pool, SamplerId, TextureViewId, Viewport,
-};
+use crate::gfx::rhi::{Encoder, MeshSpan, Pool, TextureViewId};
 
 use resources::Arena;
 
@@ -39,6 +38,9 @@ pub(crate) const FRAME_SLOTS: u64 = 2;
 /// states as safe to use from any thread; only command encoders are not, and an
 /// encoder is never wrapped in this.
 pub(crate) struct Shared<T>(pub(crate) T);
+
+/// A shared Metal object, by its protocol.
+pub(crate) type Held<P> = Shared<Retained<ProtocolObject<P>>>;
 unsafe impl<T> Send for Shared<T> {}
 unsafe impl<T> Sync for Shared<T> {}
 
@@ -53,16 +55,20 @@ pub struct MtlDriver {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     frame: AtomicU64,
-    textures: Mutex<Pool<Shared<Retained<ProtocolObject<dyn MTLTexture>>>>>,
+    textures: Mutex<Pool<Held<dyn MTLTexture>>>,
     buffers: Mutex<Pool<Buf>>,
-    samplers: Mutex<Pool<Shared<Retained<ProtocolObject<dyn MTLSamplerState>>>>>,
+    samplers: Mutex<Pool<Held<dyn MTLSamplerState>>>,
     /// Per-frame data, one arena per kind per frame slot: vertices, uniforms,
-    /// storage, indices, staging.
-    arenas: Mutex<[[Arena; FRAME_SLOTS as usize]; 5]>,
+    /// storage, indices, staging, argument buffers.
+    arenas: Mutex<[[Arena; FRAME_SLOTS as usize]; 6]>,
+    pipelines: Mutex<Pool<pipeline::Pipe>>,
+    functions: Mutex<pipeline::Functions>,
+    bind_groups: Mutex<Pool<bind::Group>>,
 }
 
 pub struct MtlEncoder<'a> {
-    _driver: PhantomData<&'a MtlDriver>,
+    driver: &'a MtlDriver,
+    state: &'a mut encoder::State,
 }
 
 impl MtlDriver {
@@ -93,7 +99,20 @@ impl MtlDriver {
             arenas: Mutex::new(std::array::from_fn(|_| {
                 std::array::from_fn(|_| Arena::new())
             })),
+            pipelines: Mutex::new(Pool::new(FRAME_SLOTS)),
+            functions: Mutex::new(Default::default()),
+            bind_groups: Mutex::new(Pool::new(FRAME_SLOTS)),
         })
+    }
+
+    /// Record with `record` on a fresh encoder and wait for the GPU to finish.
+    pub fn record_blocking(&self, record: impl FnOnce(&mut Encoder)) {
+        let mut state = encoder::State::new(self);
+        {
+            let mut encoder = Encoder::Metal(MtlEncoder::new(self, &mut state));
+            record(&mut encoder);
+        }
+        state.finish_blocking();
     }
 
     /// The device's name, for the run banner.
@@ -108,6 +127,8 @@ impl MtlDriver {
         self.textures.lock().unwrap().collect(frame);
         self.buffers.lock().unwrap().collect(frame);
         self.samplers.lock().unwrap().collect(frame);
+        self.pipelines.lock().unwrap().collect(frame);
+        self.bind_groups.lock().unwrap().collect(frame);
         let slot = (frame % FRAME_SLOTS) as usize;
         for kind in self.arenas.lock().unwrap().iter_mut() {
             kind[slot].reset();
@@ -124,51 +145,8 @@ impl MtlDriver {
         unimplemented!("metal: upload_mesh")
     }
 
-    pub fn create_graphics_pipeline(&self, desc: &GraphicsPipelineDesc) -> PipelineId {
-        unimplemented!("metal: create_graphics_pipeline")
-    }
-
-    pub fn create_compute_pipeline(&self, desc: &ComputePipelineDesc) -> PipelineId {
-        unimplemented!("metal: create_compute_pipeline")
-    }
-
-    pub fn create_compute_pipeline_with_samplers(
-        &self,
-        desc: &ComputePipelineDesc,
-        immutable_samplers: &[(u32, u32, SamplerId)],
-    ) -> PipelineId {
-        unimplemented!("metal: create_compute_pipeline_with_samplers")
-    }
-
-    pub fn create_persistent_bind_group(
-        &self,
-        pipeline: PipelineId,
-        set: u32,
-        bindings: &[Binding],
-    ) -> BindGroupId {
-        unimplemented!("metal: create_persistent_bind_group")
-    }
-
-    pub fn create_texture_array_group(
-        &self,
-        pipeline: PipelineId,
-        set: u32,
-        textures: &[TextureViewId],
-        sampler: SamplerId,
-    ) -> BindGroupId {
-        unimplemented!("metal: create_texture_array_group")
-    }
-
-    pub fn destroy_bind_group(&self, group: BindGroupId) {
-        unimplemented!("metal: destroy_bind_group")
-    }
-
     pub fn create_texture_cube(&self, pixels: &[u8], face: u32, format: Format) -> TextureViewId {
         unimplemented!("metal: create_texture_cube")
-    }
-
-    pub fn record_blocking(&self, record: impl FnOnce(&mut Encoder)) {
-        unimplemented!("metal: record_blocking")
     }
 
     pub fn create_texture_mipped(
@@ -187,143 +165,10 @@ impl MtlDriver {
     pub fn fill_depth(&self, texture: TextureViewId, depth: f32) {
         unimplemented!("metal: fill_depth")
     }
-
-    pub fn create_transient_bind_group(
-        &self,
-        pipeline: PipelineId,
-        set: u32,
-        bindings: &[Binding],
-    ) -> BindGroupId {
-        unimplemented!("metal: create_transient_bind_group")
-    }
-
-    pub fn create_bind_group(
-        &self,
-        pipeline: PipelineId,
-        set: u32,
-        bindings: &[Binding],
-    ) -> BindGroupId {
-        unimplemented!("metal: create_bind_group")
-    }
 }
 
 #[allow(
     unused_variables,
     reason = "operations land one at a time; a stub names itself in its panic"
 )]
-impl MtlEncoder<'_> {
-    pub fn set_viewport(&mut self, viewport: Viewport) {
-        unimplemented!("metal: set_viewport")
-    }
-
-    pub fn set_scissor(&mut self, offset: [u32; 2], extent: [u32; 2]) {
-        unimplemented!("metal: set_scissor")
-    }
-
-    pub fn set_depth_bias(&mut self, constant: f32, clamp: f32, slope: f32) {
-        unimplemented!("metal: set_depth_bias")
-    }
-
-    pub fn clear_depth(&mut self, rects: &[DepthRect]) {
-        unimplemented!("metal: clear_depth")
-    }
-
-    pub fn bind_pipeline(&mut self, pipeline: PipelineId) {
-        unimplemented!("metal: bind_pipeline")
-    }
-
-    pub fn bind_vertex_buffer(&mut self, buffer: BufferId) {
-        unimplemented!("metal: bind_vertex_buffer")
-    }
-
-    pub fn bind_group(&mut self, set: u32, group: BindGroupId) {
-        unimplemented!("metal: bind_group")
-    }
-
-    pub fn push_constants(&mut self, words: &[u32]) {
-        unimplemented!("metal: push_constants")
-    }
-
-    pub fn dispatch(&mut self, groups: [u32; 3]) {
-        unimplemented!("metal: dispatch")
-    }
-
-    pub fn bind_geometry(&mut self, positions_only: bool) {
-        unimplemented!("metal: bind_geometry")
-    }
-
-    pub fn draw_indexed(
-        &mut self,
-        index_count: u32,
-        instances: u32,
-        first_index: u32,
-        vertex_offset: i32,
-        first_instance: u32,
-    ) {
-        unimplemented!("metal: draw_indexed")
-    }
-
-    pub fn open_swapchain(&mut self, target: TextureViewId) {
-        unimplemented!("metal: open_swapchain")
-    }
-
-    pub fn close_swapchain(&mut self, target: TextureViewId) {
-        unimplemented!("metal: close_swapchain")
-    }
-
-    pub fn begin_rendering(&mut self, target: TextureViewId) {
-        unimplemented!("metal: begin_rendering")
-    }
-
-    pub fn end_rendering(&mut self) {
-        unimplemented!("metal: end_rendering")
-    }
-
-    pub fn capture_backdrop(
-        &mut self,
-        target: TextureViewId,
-        half: TextureViewId,
-        quarter: TextureViewId,
-    ) {
-        unimplemented!("metal: capture_backdrop")
-    }
-
-    pub fn begin_rendering_fresh(&mut self, target: TextureViewId) {
-        unimplemented!("metal: begin_rendering_fresh")
-    }
-
-    pub fn generate_cube_mips(&mut self, texture: TextureViewId) {
-        unimplemented!("metal: generate_cube_mips")
-    }
-
-    pub fn publish_render_target(&mut self, texture: TextureViewId) {
-        unimplemented!("metal: publish_render_target")
-    }
-
-    pub fn bind_index_buffer(&mut self, buffer: BufferId) {
-        unimplemented!("metal: bind_index_buffer")
-    }
-
-    pub fn write_texture(
-        &mut self,
-        texture: TextureViewId,
-        offset: [u32; 2],
-        extent: [u32; 2],
-        staging: BufferId,
-        initial: bool,
-    ) {
-        unimplemented!("metal: write_texture")
-    }
-
-    pub fn copy_buffer(&mut self, src: BufferId, dst: BufferId, regions: &[BufferCopy]) {
-        unimplemented!("metal: copy_buffer")
-    }
-
-    pub fn draw_indexed_indirect(&mut self, commands: BufferId, range: std::ops::Range<u32>) {
-        unimplemented!("metal: draw_indexed_indirect")
-    }
-
-    pub fn draw(&mut self, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
-        unimplemented!("metal: draw")
-    }
-}
+impl MtlEncoder<'_> {}
