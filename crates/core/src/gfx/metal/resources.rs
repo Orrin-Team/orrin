@@ -597,6 +597,18 @@ impl MtlDriver {
     }
 
     /// Whether a texture lives in tile memory only.
+    /// Register a texture the driver did not make (a drawable's) for the frame
+    /// being recorded; the id retires with the frame.
+    pub(crate) fn import_texture(
+        &self,
+        texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    ) -> TextureViewId {
+        let mut pool = self.textures.lock().unwrap();
+        let index = pool.insert(super::Shared(texture));
+        pool.remove(index, self.frame.load(Ordering::Relaxed));
+        TextureViewId(index)
+    }
+
     pub(super) fn is_memoryless(&self, view: TextureViewId) -> bool {
         use objc2_metal::MTLResource;
         self.texture(view).storageMode() == MTLStorageMode::Memoryless

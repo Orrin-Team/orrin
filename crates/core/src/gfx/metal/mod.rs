@@ -53,7 +53,7 @@ pub(crate) struct Buf {
 }
 
 pub struct MtlDriver {
-    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    pub(crate) device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     frame: AtomicU64,
     textures: Mutex<Pool<Held<dyn MTLTexture>>>,

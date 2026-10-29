@@ -64,6 +64,21 @@ impl State {
         }
     }
 
+    /// End recording and hand the frame to the GPU without waiting: the drawable,
+    /// if there is one, is presented when the work reaches it. The command buffer
+    /// comes back so the caller can wait on it when the frame's slot is needed.
+    pub(crate) fn finish(
+        mut self,
+        drawable: Option<Retained<ProtocolObject<dyn objc2_metal::MTLDrawable>>>,
+    ) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
+        self.close();
+        if let Some(drawable) = drawable {
+            self.command_buffer.presentDrawable(&drawable);
+        }
+        self.command_buffer.commit();
+        self.command_buffer
+    }
+
     /// End recording and wait for the GPU.
     pub(crate) fn finish_blocking(mut self) {
         self.close();
@@ -73,7 +88,6 @@ impl State {
         // never ran, and every pixel after it is silently wrong.
         if let Some(error) = self.command_buffer.error() {
             tracing::error!("a Metal command buffer failed: {error}");
-            eprintln!("a Metal command buffer failed: {error}");
         }
     }
 }
