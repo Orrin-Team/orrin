@@ -1,6 +1,7 @@
 //! Which graphics API a run uses.
 
-/// `ORRIN_BACKEND` names it; Vulkan is the default and Metal is macOS only.
+/// `ORRIN_BACKEND` names it. Metal is macOS only and the default on Apple
+/// silicon; everywhere else Vulkan is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendChoice {
     Vulkan,
@@ -8,12 +9,19 @@ pub enum BackendChoice {
 }
 
 impl BackendChoice {
+    /// What an unset `ORRIN_BACKEND` means.
+    pub const DEFAULT: Self = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Self::Metal
+    } else {
+        Self::Vulkan
+    };
+
     /// What `ORRIN_BACKEND` asks for. A name that cannot be honoured is an error
     /// for the caller to report before it falls back to Vulkan, rather than a
     /// silent substitution a frame-time comparison would then be mislabelled by.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-            return Ok(Self::Vulkan);
+            return Ok(Self::DEFAULT);
         };
         match value.to_ascii_lowercase().as_str() {
             "vulkan" => Ok(Self::Vulkan),
@@ -28,10 +36,22 @@ impl BackendChoice {
     /// The choice the environment makes, warning and using Vulkan when it
     /// cannot be honoured.
     pub fn from_env() -> Self {
-        Self::parse(std::env::var("ORRIN_BACKEND").ok().as_deref()).unwrap_or_else(|reason| {
+        let named = std::env::var("ORRIN_BACKEND").ok();
+        let choice = Self::parse(named.as_deref()).unwrap_or_else(|reason| {
             tracing::warn!("{reason}; using Vulkan");
             Self::Vulkan
-        })
+        });
+        // A default that this machine cannot honour falls back; a named one
+        // fails loudly at startup instead, so a comparison is never mislabelled.
+        #[cfg(target_os = "macos")]
+        if choice == Self::Metal
+            && named.as_deref().is_none_or(|name| name.trim().is_empty())
+            && let Err(reason) = crate::gfx::metal::MtlDriver::new()
+        {
+            tracing::warn!("Metal is unavailable ({reason}); using Vulkan");
+            return Self::Vulkan;
+        }
+        choice
     }
 
     pub fn label(self) -> &'static str {
@@ -47,9 +67,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vulkan_is_the_default() {
-        assert_eq!(BackendChoice::parse(None), Ok(BackendChoice::Vulkan));
-        assert_eq!(BackendChoice::parse(Some("  ")), Ok(BackendChoice::Vulkan));
+    fn an_unset_backend_is_the_platform_default() {
+        assert_eq!(BackendChoice::parse(None), Ok(BackendChoice::DEFAULT));
+        assert_eq!(BackendChoice::parse(Some("  ")), Ok(BackendChoice::DEFAULT));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn apple_silicon_defaults_to_metal() {
+        assert_eq!(BackendChoice::DEFAULT, BackendChoice::Metal);
     }
 
     #[test]
