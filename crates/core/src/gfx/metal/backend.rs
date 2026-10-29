@@ -3,8 +3,8 @@
 //!
 //! The graph's transient images are allocated one texture each. Vulkan aliases
 //! memory between transients that are never alive together; Metal could with
-//! heaps, but heap resources are untracked (trap T2), so until synchronisation
-//! is lowered by hand each one is an ordinary tracked texture and the hazards are
+//! heaps, but a heap's resources are untracked, so until synchronisation is
+//! lowered by hand each one is an ordinary tracked texture and the hazards are
 //! Metal's own.
 
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ use crate::scene::PresentSettings;
 /// reallocate every image in the frame.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
-    name: String,
+    name: &'static str,
     format: Format,
     extent: [u32; 3],
     usage: u32,
@@ -43,8 +43,9 @@ pub(crate) struct Windowed {
     pub(crate) window: MtlWindow,
     pending_extent: [u32; 2],
     present: PresentSettings,
-    /// The command buffer of each recent frame by slot, so the CPU can wait for
-    /// the one whose arenas it is about to reuse.
+    /// The command buffer of each recent frame, indexed by the frame number the
+    /// driver recorded it under, which is the number that picks its arenas, so
+    /// the CPU can wait for the one whose arenas it is about to reuse.
     ring: [Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>; FRAME_SLOTS as usize],
 }
 
@@ -70,6 +71,10 @@ pub(crate) struct MtlBackend {
     pub(crate) gpu_ms: f32,
     /// Frames whose samples wait on the GPU to finish.
     timed: Vec<(Timing, Retained<ProtocolObject<dyn MTLCommandBuffer>>)>,
+    /// Sample buffers whose frames have been read, ready for the next.
+    spare_timing: Vec<Timing>,
+    /// Set once the device has said it cannot sample timestamps.
+    untimeable: bool,
 }
 
 /// Seconds in, milliseconds out; a buffer that never ran reports zero for both.
@@ -107,6 +112,8 @@ impl MtlBackend {
             windowed: None,
             gpu_ms: 0.0,
             timed: Vec::new(),
+            spare_timing: Vec::new(),
+            untimeable: false,
         };
         let table = backend.rebuild(driver, graph);
         (backend, table)
@@ -192,12 +199,14 @@ impl MtlBackend {
         self.extent = extent;
     }
 
-    /// Block until the frame that last used this slot's arenas has finished.
+    /// Block until the frame whose arenas `frame` is about to reuse has
+    /// finished. Called with the number `begin_frame` is about to be given.
     pub(crate) fn wait_for_room(&mut self, frame: u64) {
         if let Some(windowed) = &mut self.windowed
             && let Some(previous) = windowed.ring[(frame % FRAME_SLOTS) as usize].take()
         {
             previous.waitUntilCompleted();
+            super::encoder::report_failure(&previous);
             self.gpu_ms = span_ms(previous.GPUStartTime(), previous.GPUEndTime());
         }
     }
@@ -212,6 +221,20 @@ impl MtlBackend {
         }
     }
 
+    /// A sample buffer to time `frame` into, reusing one already read.
+    pub(crate) fn timing(&mut self, driver: &MtlDriver, frame: u64) -> Option<Timing> {
+        if let Some(mut timing) = self.spare_timing.pop() {
+            timing.reset(frame);
+            return Some(timing);
+        }
+        if self.untimeable {
+            return None;
+        }
+        let timing = Timing::new(driver, frame);
+        self.untimeable = timing.is_none();
+        timing
+    }
+
     pub(crate) fn timed(
         &mut self,
         timing: Timing,
@@ -222,27 +245,34 @@ impl MtlBackend {
 
     /// File the samples of every frame the GPU has finished, without waiting.
     pub(crate) fn drain_spans(&mut self, profiler: &mut crate::profile::Profiler) {
+        use objc2_metal::MTLCommandBufferStatus;
         let current = profiler.frame_index();
-        self.timed.retain(|(timing, command_buffer)| {
-            if timing.frame >= current {
-                return true;
+        let mut index = 0;
+        while index < self.timed.len() {
+            let (timing, command_buffer) = &self.timed[index];
+            let status = command_buffer.status();
+            // A buffer that failed has no samples to read, but its sample
+            // buffer is as reusable as a finished one's.
+            if timing.frame >= current || status < MTLCommandBufferStatus::Completed {
+                index += 1;
+                continue;
             }
-            if command_buffer.status() != objc2_metal::MTLCommandBufferStatus::Completed {
-                return command_buffer.status() < objc2_metal::MTLCommandBufferStatus::Completed;
+            if status == MTLCommandBufferStatus::Completed {
+                for (name, start_ns, end_ns) in timing.resolve() {
+                    profiler.push_gpu_span(
+                        timing.frame,
+                        crate::profile::Span {
+                            name,
+                            depth: 0,
+                            start_ns,
+                            end_ns,
+                        },
+                    );
+                }
             }
-            for (name, start_ns, end_ns) in timing.resolve() {
-                profiler.push_gpu_span(
-                    timing.frame,
-                    crate::profile::Span {
-                        name,
-                        depth: 0,
-                        start_ns,
-                        end_ns,
-                    },
-                );
-            }
-            false
-        });
+            let (timing, _) = self.timed.swap_remove(index);
+            self.spare_timing.push(timing);
+        }
     }
 
     pub(crate) fn is_stale(&self) -> bool {
@@ -250,21 +280,11 @@ impl MtlBackend {
     }
 
     /// Point a table at the images `graph` declares, allocating only the ones
-    /// the cache does not already hold.
+    /// the cache does not already hold and freeing the ones `graph` no longer
+    /// declares. A resize changes every key, so it frees everything.
     pub(crate) fn rebuild(&mut self, driver: &MtlDriver, graph: &FrameGraph) -> ImageTable {
-        if self.images != self.extent {
-            for entry in self.cache.values() {
-                for id in std::iter::once(&entry.whole)
-                    .chain(&entry.levels)
-                    .chain(&entry.layers)
-                {
-                    driver.destroy_texture(*id);
-                }
-            }
-            self.cache.clear();
-            self.images = self.extent;
-        }
-
+        self.images = self.extent;
+        let mut previous = std::mem::take(&mut self.cache);
         let mut entries: Vec<Option<ImageEntry>> = vec![None; graph.resource_count()];
         for (id, image) in graph.transient_images() {
             let extent = image.desc.extent.resolve(self.extent);
@@ -273,7 +293,7 @@ impl MtlBackend {
             let mip_levels = image.desc.mip_levels.min(largest.ilog2() + 1).max(1);
             let layers = image.desc.array_layers.unwrap_or(1);
             let key = Key {
-                name: graph.resource_name(id).to_string(),
+                name: graph.resource_name(id),
                 format: image.desc.format,
                 extent: [extent[0], extent[1], depth],
                 usage: image.usage.bits(),
@@ -282,8 +302,9 @@ impl MtlBackend {
                 mip_levels,
                 memoryless: image.memoryless,
             };
-            if let Some(entry) = self.cache.get(&key) {
+            if let Some(entry) = previous.remove(&key) {
                 entries[id.index()] = Some(entry.clone());
+                self.cache.insert(key, entry);
                 continue;
             }
             let whole = driver.create_texture(&TextureDesc {
@@ -320,6 +341,14 @@ impl MtlBackend {
             self.cache.insert(key, entry.clone());
             entries[id.index()] = Some(entry);
         }
+        for entry in previous.into_values() {
+            for id in std::iter::once(entry.whole)
+                .chain(entry.levels)
+                .chain(entry.layers)
+            {
+                driver.destroy_texture(id);
+            }
+        }
         ImageTable::new(vec![entries])
     }
 }
@@ -332,5 +361,95 @@ mod span_tests {
     fn a_span_is_in_milliseconds_and_never_negative() {
         assert!((span_ms(1.0, 1.0025) - 2.5).abs() < 1e-3);
         assert_eq!(span_ms(2.0, 0.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx::graph::{Access, GraphBuilder, ImageDesc, ImageLayout, PassKind, compile};
+    use crate::profile::Profiler;
+
+    /// A target fed by `kept`, and with `extra` a second image feeding it too.
+    fn graph(extra: bool) -> FrameGraph {
+        let image = || ImageDesc::new(Format::Rgba8Unorm);
+        let mut builder = GraphBuilder::new();
+        let target = builder.import_image(
+            "target",
+            image(),
+            ImageLayout::Undefined,
+            ImageLayout::PresentSrc,
+        );
+        let kept = builder.create_image("kept", image());
+        builder
+            .pass("draw", PassKind::Inline)
+            .access(kept, Access::ColorAttachment)
+            .build();
+        let extra = extra.then(|| {
+            let extra = builder.create_image("extra", image());
+            builder
+                .pass("draw_extra", PassKind::Inline)
+                .access(extra, Access::ColorAttachment)
+                .build();
+            extra
+        });
+        let mut resolve = builder
+            .pass("resolve", PassKind::Inline)
+            .access(kept, Access::Sampled)
+            .access(target, Access::ColorAttachment);
+        if let Some(extra) = extra {
+            resolve = resolve.access(extra, Access::Sampled);
+        }
+        resolve.build();
+        compile(builder).unwrap()
+    }
+
+    fn live_textures(driver: &MtlDriver) -> usize {
+        driver.textures.lock().unwrap().live()
+    }
+
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn an_image_the_graph_stopped_declaring_is_freed() {
+        let driver = MtlDriver::new().expect("this machine runs the Metal backend");
+        let (mut backend, _) = MtlBackend::new(&driver, Format::Rgba8Unorm, [16, 16], &graph(true));
+        let with_extra = live_textures(&driver);
+
+        backend.rebuild(&driver, &graph(false));
+        driver.begin_frame(FRAME_SLOTS);
+        assert_eq!(live_textures(&driver), with_extra - 1);
+
+        backend.rebuild(&driver, &graph(false));
+        driver.begin_frame(2 * FRAME_SLOTS);
+        assert_eq!(
+            live_textures(&driver),
+            with_extra - 1,
+            "a rebuild of the same graph frees nothing it still uses"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_drained_frame_hands_its_sample_buffer_to_the_next() {
+        let driver = MtlDriver::new().expect("this machine runs the Metal backend");
+        let (mut backend, _) =
+            MtlBackend::new(&driver, Format::Rgba8Unorm, [16, 16], &graph(false));
+        let mut profiler = Profiler::new(4);
+
+        let first = backend
+            .timing(&driver, 0)
+            .expect("this device samples timestamps");
+        let buffer = Retained::as_ptr(&first.buffer);
+        let mut state = super::super::State::new(&driver);
+        state.time(first);
+        let timing = state.take_timing().unwrap();
+        let (_, command_buffer) = state.finish_blocking();
+        backend.timed(timing, command_buffer);
+        profiler.end_frame();
+        backend.drain_spans(&mut profiler);
+
+        let second = backend.timing(&driver, 1).unwrap();
+        assert!(std::ptr::eq(Retained::as_ptr(&second.buffer), buffer));
+        assert_eq!(second.frame, 1);
     }
 }

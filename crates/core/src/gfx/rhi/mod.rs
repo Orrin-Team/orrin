@@ -13,8 +13,9 @@
 //! the largest crate, and a `Box<dyn Driver>` pays the same dispatch with less
 //! inlining.
 //!
-//! Only the device-free surface exists so far: handles, descriptions and the pool.
-//! The drivers and the encoder arrive with the passes that need them.
+//! The drivers are `gfx/vulkan/driver.rs` and, on macOS, `gfx/metal`. What is
+//! in this module takes no device, so its descriptions and the pool are tested
+//! without a GPU.
 
 mod desc;
 mod geometry;

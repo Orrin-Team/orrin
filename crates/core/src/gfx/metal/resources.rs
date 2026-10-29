@@ -271,7 +271,7 @@ impl MtlDriver {
         }
         descriptor.setUsage(usage);
         // Only what the graph's usage allows: a memoryless texture that is read
-        // back is undefined data (trap T9).
+        // back is undefined data.
         descriptor.setStorageMode(if desc.memoryless && may_be_memoryless(desc.usage) {
             MTLStorageMode::Memoryless
         } else {

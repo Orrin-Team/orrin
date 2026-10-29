@@ -1,9 +1,8 @@
 //! Every shader the engine compiles is also translated to MSL, with a binding
-//! map, by `build.rs` (docs/metal-backend-plan.md M2).
+//! map, by `build.rs`, and the Metal driver runs that MSL.
 //!
-//! Nothing consumes the output yet. These tests are what stops a shader that
-//! only translates on the machine that wrote it from being the first thing a
-//! Metal driver finds out: they take no GPU, so Linux CI runs them, and the one
+//! These tests are what stops a shader that only translates on the machine
+//! that wrote it from being the first thing the Metal driver finds out: they take no GPU, so Linux CI runs them, and the one
 //! that needs Metal is `#[ignore]`d.
 
 use std::collections::BTreeSet;

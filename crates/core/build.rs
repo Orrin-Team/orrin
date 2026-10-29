@@ -1,6 +1,6 @@
 //! Compiles every shader in `shaders/manifest.txt` to SPIR-V once, then
 //! translates that same SPIR-V to MSL with a binding map, and writes both into
-//! `OUT_DIR` behind a generated `SHADERS` table (docs/metal-backend-plan.md M2).
+//! `OUT_DIR` behind a generated `SHADERS` table.
 //!
 //! A shader that fails to compile or translate fails the build, on whichever
 //! machine builds it. That is the point: MoltenVK translates these shaders at

@@ -315,3 +315,26 @@ impl GeometryPrepass {
         }
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod metal_tests {
+    use super::*;
+    use crate::gfx::format::Format;
+
+    /// The material array is padded to its full length with the white default,
+    /// and binding it declares each texture it holds to Metal once, not once
+    /// per slot.
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_padded_texture_array_declares_each_texture_once() {
+        let device = Device::Metal(
+            crate::gfx::metal::MtlDriver::new().expect("this machine runs the Metal backend"),
+        );
+        device.begin_frame(0);
+        let prepass = GeometryPrepass::new(&device);
+        let white = device.create_texture_2d(&[255; 4], [1, 1], Format::Rgba8Unorm);
+        let black = device.create_texture_2d(&[0, 0, 0, 255], [1, 1], Format::Rgba8Unorm);
+        let group = prepass.build_texture_set(&device, &[white, black, white]);
+        assert_eq!(device.metal().declared_uses(group), 2);
+    }
+}

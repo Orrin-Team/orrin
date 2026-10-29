@@ -2,8 +2,8 @@
 //!
 //! A pass opens a render pass (or just dispatches, or copies) and the encoder
 //! opens whichever Metal encoder that needs, closing the one before it. Hazards
-//! are Metal's own while resources are tracked, so there is no barrier to record
-//! (decision D6): the graph's plan is simply not consulted here.
+//! are Metal's own while resources are tracked, so there is no barrier to
+//! record: the graph's plan is simply not consulted here.
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -27,7 +27,7 @@ use crate::gfx::shaders::PUSH_CONSTANT_BUFFER;
 /// Which way a front face winds, in the window space Metal rasterises in. The
 /// translator flips clip-space Y so the image lands upright, which leaves
 /// window-space winding as Vulkan's; `a_single_sided_quad_is_visible` is the
-/// test that holds this (trap T5).
+/// test that holds this.
 const FRONT_FACING: MTLWinding = MTLWinding::CounterClockwise;
 
 enum Open {
@@ -40,8 +40,11 @@ enum Open {
 /// Two timestamp samples around each Metal encoder, named for the pass that
 /// opened it. Metal samples at encoder boundaries only, so the encoder is ended
 /// at every pass boundary while timing is on.
+///
+/// A frame's `Timing` is handed back once its samples are read and reused for a
+/// later frame, so a steady frame allocates no sample buffer.
 pub(crate) struct Timing {
-    buffer: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
+    pub(super) buffer: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
     names: Vec<&'static str>,
     pub(crate) frame: u64,
 }
@@ -54,6 +57,41 @@ const MAX_TIMED: usize = 128;
 pub(crate) type Spans = Vec<(&'static str, u64, u64)>;
 
 impl Timing {
+    /// A sample buffer for `frame`, or `None` on a device that cannot sample
+    /// timestamps at encoder boundaries.
+    pub(crate) fn new(driver: &MtlDriver, frame: u64) -> Option<Self> {
+        if !driver
+            .device
+            .supportsCounterSampling(objc2_metal::MTLCounterSamplingPoint::AtStageBoundary)
+        {
+            return None;
+        }
+        let sets = driver.device.counterSets()?;
+        let set = sets
+            .iter()
+            .find(|set| set.name().to_string() == "timestamp")?;
+        let descriptor = MTLCounterSampleBufferDescriptor::new();
+        descriptor.setCounterSet(Some(&set));
+        // SAFETY: a count of at least one sample.
+        unsafe { descriptor.setSampleCount(2 * MAX_TIMED) };
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        let buffer = driver
+            .device
+            .newCounterSampleBufferWithDescriptor_error(&descriptor)
+            .ok()?;
+        Some(Self {
+            buffer,
+            names: Vec::with_capacity(MAX_TIMED),
+            frame,
+        })
+    }
+
+    /// Reuse this buffer for `frame`, once the frame it last timed is resolved.
+    pub(crate) fn reset(&mut self, frame: u64) {
+        self.names.clear();
+        self.frame = frame;
+    }
+
     pub(crate) fn resolve(&self) -> Spans {
         let count = self.names.len() * 2;
         if count == 0 {
@@ -85,10 +123,24 @@ impl Timing {
     }
 }
 
+/// What a draw or dispatch needs from the bound pipeline, read once when it is
+/// bound rather than out of the locked pool on every command.
+#[derive(Clone, Copy)]
+struct Bound {
+    kind: BoundKind,
+    push_constant_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+enum BoundKind {
+    Render(objc2_metal::MTLPrimitiveType),
+    Compute(MTLSize),
+}
+
 pub(crate) struct State {
     command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     open: Open,
-    pipeline: Option<PipelineId>,
+    pipeline: Option<Bound>,
     index_buffer: Option<(Retained<ProtocolObject<dyn MTLBuffer>>, u64)>,
     timing: Option<Timing>,
     pass_name: &'static str,
@@ -109,39 +161,9 @@ impl State {
         }
     }
 
-    /// Time every encoder this frame records. A device that cannot sample at
-    /// encoder boundaries just stays untimed.
-    pub(crate) fn time(&mut self, driver: &MtlDriver, frame: u64) {
-        if !driver
-            .device
-            .supportsCounterSampling(objc2_metal::MTLCounterSamplingPoint::AtStageBoundary)
-        {
-            return;
-        }
-        let Some(sets) = driver.device.counterSets() else {
-            return;
-        };
-        let Some(set) = sets
-            .iter()
-            .find(|set| set.name().to_string() == "timestamp")
-        else {
-            return;
-        };
-        let descriptor = MTLCounterSampleBufferDescriptor::new();
-        descriptor.setCounterSet(Some(&set));
-        // SAFETY: a count of at least one sample.
-        unsafe { descriptor.setSampleCount(2 * MAX_TIMED) };
-        descriptor.setStorageMode(MTLStorageMode::Shared);
-        if let Ok(buffer) = driver
-            .device
-            .newCounterSampleBufferWithDescriptor_error(&descriptor)
-        {
-            self.timing = Some(Timing {
-                buffer,
-                names: Vec::new(),
-                frame,
-            });
-        }
+    /// Time every encoder this frame records into `timing`.
+    pub(crate) fn time(&mut self, timing: Timing) {
+        self.timing = Some(timing);
     }
 
     pub(crate) fn take_timing(&mut self) -> Option<Timing> {
@@ -191,13 +213,18 @@ impl State {
         self.close();
         self.command_buffer.commit();
         self.command_buffer.waitUntilCompleted();
-        // A GPU fault does not fail the call that caused it: the buffer simply
-        // never ran, and every pixel after it is silently wrong.
-        if let Some(error) = self.command_buffer.error() {
-            tracing::error!("a Metal command buffer failed: {error}");
-        }
+        report_failure(&self.command_buffer);
         let seconds = self.command_buffer.GPUEndTime() - self.command_buffer.GPUStartTime();
         (seconds, self.command_buffer)
+    }
+}
+
+/// Log why a finished command buffer failed, if it did. A GPU fault does not
+/// fail the call that caused it: the buffer simply never ran, and every pixel
+/// after it is silently wrong.
+pub(super) fn report_failure(command_buffer: &ProtocolObject<dyn MTLCommandBuffer>) {
+    if let Some(error) = command_buffer.error() {
+        tracing::error!("a Metal command buffer failed: {error}");
     }
 }
 
@@ -431,22 +458,30 @@ impl<'a> MtlEncoder<'a> {
     }
 
     pub fn bind_pipeline(&mut self, pipeline: PipelineId) {
-        self.state.pipeline = Some(pipeline);
-        self.driver.with_pipe(pipeline, |pipe| match pipe {
-            Pipe::Render(render) => {
-                let encoder = self.render();
-                encoder.setRenderPipelineState(&render.state.0);
-                if let Some(depth) = &render.depth {
-                    encoder.setDepthStencilState(Some(&depth.0));
+        let bound = self.driver.with_pipe(pipeline, |pipe| {
+            let kind = match pipe {
+                Pipe::Render(render) => {
+                    let encoder = self.render();
+                    encoder.setRenderPipelineState(&render.state.0);
+                    if let Some(depth) = &render.depth {
+                        encoder.setDepthStencilState(Some(&depth.0));
+                    }
+                    encoder.setCullMode(render.cull);
+                    encoder.setFrontFacingWinding(FRONT_FACING);
+                    BoundKind::Render(render.topology)
                 }
-                encoder.setCullMode(render.cull);
-                encoder.setFrontFacingWinding(FRONT_FACING);
-            }
-            Pipe::Compute(compute) => {
-                let encoder = self.compute();
-                encoder.setComputePipelineState(&compute.state.0);
+                Pipe::Compute(compute) => {
+                    let encoder = self.compute();
+                    encoder.setComputePipelineState(&compute.state.0);
+                    BoundKind::Compute(compute.threads)
+                }
+            };
+            Bound {
+                kind,
+                push_constant_bytes: pipe.push_constant_bytes(),
             }
         });
+        self.state.pipeline = Some(bound);
     }
 
     pub fn bind_vertex_buffer(&mut self, buffer: BufferId) {
@@ -471,7 +506,7 @@ impl<'a> MtlEncoder<'a> {
             .expect("a pass panicked while using the device");
         let geometry = &geometry.0;
         let base = crate::gfx::shaders::VERTEX_STREAM_BASE as usize;
-        let encoder = self.render().clone();
+        let encoder = self.render();
         // SAFETY: live buffers at offset zero.
         unsafe {
             encoder.setVertexBuffer_offset_atIndex(Some(&geometry.positions), 0, base);
@@ -488,41 +523,38 @@ impl<'a> MtlEncoder<'a> {
     }
 
     pub fn bind_group(&mut self, set: u32, group: BindGroupId) {
-        let (buffer, offset, uses) = self.driver.group(group);
-        match &self.state.open {
-            Open::Render(encoder) => {
-                // SAFETY: a live argument buffer at the index its set names.
-                unsafe {
-                    encoder.setVertexBuffer_offset_atIndex(
-                        Some(&buffer),
-                        offset as usize,
-                        set as usize,
-                    );
-                    encoder.setFragmentBuffer_offset_atIndex(
-                        Some(&buffer),
-                        offset as usize,
-                        set as usize,
-                    );
+        let open = &self.state.open;
+        self.driver.with_group(group, |group| {
+            let (buffer, offset) = (&*group.buffer.0, group.offset as usize);
+            match open {
+                Open::Render(encoder) => {
+                    // SAFETY: a live argument buffer at the index its set names.
+                    unsafe {
+                        encoder.setVertexBuffer_offset_atIndex(Some(buffer), offset, set as usize);
+                        encoder.setFragmentBuffer_offset_atIndex(
+                            Some(buffer),
+                            offset,
+                            set as usize,
+                        );
+                    }
+                    for used in &group.uses {
+                        encoder.useResource_usage_stages(
+                            &used.resource.0,
+                            used.usage,
+                            MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+                        );
+                    }
                 }
-                for (resource, usage) in &uses {
-                    encoder.useResource_usage_stages(
-                        resource,
-                        *usage,
-                        MTLRenderStages::Vertex | MTLRenderStages::Fragment,
-                    );
+                Open::Compute(encoder) => {
+                    // SAFETY: as above.
+                    unsafe { encoder.setBuffer_offset_atIndex(Some(buffer), offset, set as usize) };
+                    for used in &group.uses {
+                        encoder.useResource_usage(&used.resource.0, used.usage);
+                    }
                 }
+                _ => panic!("a bind group was bound outside a pass"),
             }
-            Open::Compute(encoder) => {
-                // SAFETY: as above.
-                unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&buffer), offset as usize, set as usize);
-                }
-                for (resource, usage) in &uses {
-                    encoder.useResource_usage(resource, *usage);
-                }
-            }
-            _ => panic!("a bind group was bound outside a pass"),
-        }
+        });
     }
 
     pub fn push_constants(&mut self, words: &[u32]) {
@@ -533,7 +565,7 @@ impl<'a> MtlEncoder<'a> {
         let declared = self
             .state
             .pipeline
-            .map_or(0, |pipeline| self.driver.push_constant_bytes(pipeline))
+            .map_or(0, |bound| bound.push_constant_bytes)
             // The struct's size is rounded up to its widest member's alignment.
             .next_multiple_of(16);
         let mut padded = [0u8; 512];
@@ -573,14 +605,13 @@ impl<'a> MtlEncoder<'a> {
     }
 
     pub fn dispatch(&mut self, groups: [u32; 3]) {
-        let pipeline = self
+        let bound = self
             .state
             .pipeline
             .expect("a dispatch with no pipeline bound");
-        let threads = self.driver.with_pipe(pipeline, |pipe| match pipe {
-            Pipe::Compute(compute) => compute.threads,
-            Pipe::Render(_) => panic!("a dispatch with a render pipeline bound"),
-        });
+        let BoundKind::Compute(threads) = bound.kind else {
+            panic!("a dispatch with a render pipeline bound")
+        };
         self.compute().dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
                 width: groups[0] as usize,
@@ -592,11 +623,15 @@ impl<'a> MtlEncoder<'a> {
     }
 
     fn topology(&self) -> objc2_metal::MTLPrimitiveType {
-        let pipeline = self.state.pipeline.expect("a draw with no pipeline bound");
-        self.driver.with_pipe(pipeline, |pipe| match pipe {
-            Pipe::Render(render) => render.topology,
-            Pipe::Compute(_) => panic!("a draw with a compute pipeline bound"),
-        })
+        match self
+            .state
+            .pipeline
+            .expect("a draw with no pipeline bound")
+            .kind
+        {
+            BoundKind::Render(topology) => topology,
+            BoundKind::Compute(_) => panic!("a draw with a compute pipeline bound"),
+        }
     }
 
     pub fn draw(&mut self, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
@@ -816,7 +851,7 @@ mod tests {
             depth: None,
         };
         let mut state = State::new(driver);
-        state.time(driver, 7);
+        state.time(Timing::new(driver, 7).expect("this device samples timestamps"));
         {
             let mut encoder = crate::gfx::rhi::Encoder::Metal(MtlEncoder::new(driver, &mut state));
             for name in ["first", "second"] {
@@ -825,7 +860,7 @@ mod tests {
                 encoder.end_rendering();
             }
         }
-        let timing = state.take_timing().expect("this device samples timestamps");
+        let timing = state.take_timing().unwrap();
         let _ = state.finish_blocking();
         let spans = timing.resolve();
         let names: Vec<_> = spans.iter().map(|span| span.0).collect();

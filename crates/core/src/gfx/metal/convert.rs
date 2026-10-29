@@ -51,7 +51,7 @@ pub(super) fn texture_usage(usage: ImageUsage) -> MTLTextureUsage {
 }
 
 /// Whether the graph's usage lets a texture live in tile memory only: it is an
-/// attachment and nothing reads it back (trap T9).
+/// attachment and nothing reads it back.
 pub(super) fn may_be_memoryless(usage: ImageUsage) -> bool {
     usage.intersects(ImageUsage::COLOR_ATTACHMENT | ImageUsage::DEPTH_STENCIL_ATTACHMENT)
         && !usage.intersects(

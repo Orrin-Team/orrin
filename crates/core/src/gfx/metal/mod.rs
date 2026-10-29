@@ -1,9 +1,11 @@
 //! The native Metal driver, beside the Vulkan one behind the same RHI.
 //!
-//! Brought up in the order `docs/metal-backend-plan.md` M4 gives: the device and
-//! its capability gate first, then resources, then pipelines from the embedded
-//! MSL, then the encoder. A method that is still `unimplemented!` names itself
-//! in the panic, so a pass that reaches one says which operation it needs next.
+//! Resources live in pools addressed by the RHI's ids and are freed
+//! `FRAME_SLOTS` frames after they are retired. Per-frame data (uniforms,
+//! staging, transient argument buffers) is suballocated from one arena per kind
+//! per slot, so a frame's slot is reusable only once the GPU has finished the
+//! frame that last wrote it. Every resource is tracked, so Metal orders hazards
+//! itself and nothing here records a barrier.
 
 mod backdrop;
 pub(crate) mod backend;
@@ -153,15 +155,3 @@ impl MtlDriver {
         }
     }
 }
-
-#[allow(
-    unused_variables,
-    reason = "operations land one at a time; a stub names itself in its panic"
-)]
-impl MtlDriver {}
-
-#[allow(
-    unused_variables,
-    reason = "operations land one at a time; a stub names itself in its panic"
-)]
-impl MtlEncoder<'_> {}

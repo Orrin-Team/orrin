@@ -32,6 +32,21 @@ pub(super) enum Pipe {
     Compute(ComputePipe),
 }
 
+impl Pipe {
+    /// The most push-constant bytes any stage declares.
+    pub(super) fn push_constant_bytes(&self) -> usize {
+        (match self {
+            Pipe::Render(render) => render
+                .vertex
+                .blob()
+                .bindings
+                .push_constant_bytes
+                .max(render.fragment.blob().bindings.push_constant_bytes),
+            Pipe::Compute(compute) => compute.shader.blob().bindings.push_constant_bytes,
+        }) as usize
+    }
+}
+
 pub(super) struct RenderPipe {
     pub state: Shared<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     pub depth: Option<Shared<Retained<ProtocolObject<dyn MTLDepthStencilState>>>>,
@@ -231,19 +246,6 @@ impl MtlDriver {
             Pipe::Render(render) => render.immutable.clone(),
             Pipe::Compute(compute) => compute.immutable.clone(),
         })
-    }
-
-    /// The most push-constant bytes any stage of a pipeline declares.
-    pub(super) fn push_constant_bytes(&self, id: PipelineId) -> usize {
-        self.with_pipe(id, |pipe| match pipe {
-            Pipe::Render(render) => render
-                .vertex
-                .blob()
-                .bindings
-                .push_constant_bytes
-                .max(render.fragment.blob().bindings.push_constant_bytes),
-            Pipe::Compute(compute) => compute.shader.blob().bindings.push_constant_bytes,
-        }) as usize
     }
 
     pub(super) fn with_pipe<R>(&self, id: PipelineId, f: impl FnOnce(&Pipe) -> R) -> R {

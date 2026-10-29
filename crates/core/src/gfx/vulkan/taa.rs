@@ -371,10 +371,6 @@ mod tests {
         let Device::Metal(driver) = &device else {
             unreachable!()
         };
-        eprintln!(
-            "input colour bytes: {:?}",
-            &driver.read_texture(color)[..16]
-        );
         let pixels = driver.read_texture(pass.output_view());
         assert!(
             pixels.iter().any(|&byte| byte != 0),

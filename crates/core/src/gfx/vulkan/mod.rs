@@ -1685,14 +1685,8 @@ impl VulkanRenderer {
                     None => (0, false, None),
                 }
             } else {
-                // One image, always available, and nothing to wait on — except
-                // that a window's frames overlap, and the one whose arenas this
-                // frame is about to reuse has to be done with them.
-                #[cfg(target_os = "macos")]
-                if let Backend::Metal(mtl) = &mut self.backend {
-                    profile_scope!("wait");
-                    mtl.wait_for_room(self.frame_index);
-                }
+                // One image, always available: Metal hands out drawables when
+                // the frame is recorded, not here.
                 (0, false, None)
             };
         if suboptimal {
@@ -1709,6 +1703,13 @@ impl VulkanRenderer {
         }
         self.table.set_slot(self.frame_index);
         self.frame_index = self.frame_index.wrapping_add(1);
+        // A window's Metal frames overlap, and `begin_frame` is about to reuse
+        // the arenas of the frame `FRAME_SLOTS` back, so that one has to finish.
+        #[cfg(target_os = "macos")]
+        if let Backend::Metal(mtl) = &mut self.backend {
+            profile_scope!("wait");
+            mtl.wait_for_room(self.frame_index);
+        }
         self.device.begin_frame(self.frame_index);
 
         // Taken out of `self` for the duration of recording: the pass brackets
@@ -1735,8 +1736,10 @@ impl VulkanRenderer {
                 if let Some(frame) = profiler_frame
                     && crate::profile::is_enabled()
                     && crate::profile::gpu_passes_enabled()
+                    && let Backend::Metal(mtl) = &mut self.backend
+                    && let Some(timing) = mtl.timing(driver, frame)
                 {
-                    state.time(driver, frame);
+                    state.time(timing);
                 }
                 Commands::Metal(state)
             }
@@ -2300,7 +2303,7 @@ impl VulkanRenderer {
                             if let Some(timing) = timing {
                                 mtl.timed(timing, command_buffer.clone());
                             }
-                            mtl.submitted(self.frame_index.wrapping_sub(1), command_buffer);
+                            mtl.submitted(self.frame_index, command_buffer);
                         }
                     }
                     // Offscreen, so the frame is waited for rather than presented.

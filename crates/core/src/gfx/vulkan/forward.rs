@@ -452,8 +452,8 @@ impl GpuDecal {
 /// there is one array and one length, in one allocation, bound to both.
 ///
 /// Fixed-length rather than a runtime-sized array, which costs 2.5 KB a frame
-/// whether the scene has decals or not and buys a `Subbuffer<GpuDecals>` that
-/// both passes can bind with no length to agree on either.
+/// whether the scene has decals or not and buys one buffer that both passes
+/// can bind with no length to agree on either.
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(crate) struct GpuDecals {
@@ -845,6 +845,14 @@ impl ForwardPass {
         )
     }
 
+    /// Pack this frame's decals into the block both geometry passes bind.
+    ///
+    /// Uploaded unconditionally, including for a frame with no decals in it —
+    /// 2.5 KB of streaming write against a binding that has to be bound either
+    /// way, and a zero count is what the shader's frame-uniform branch tests.
+    /// The alternative is a "no decals" buffer kept alive as a second path
+    /// through both passes, which is more state to get wrong than the write
+    /// costs.
     pub(super) fn upload_decals(&self, device: &Device, decals: &[DecalInstance]) -> BufferId {
         let mut block = GpuDecals {
             count: [0; 4],
