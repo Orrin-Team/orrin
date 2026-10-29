@@ -13,28 +13,20 @@
 //! needs. Two allocations, ping-ponged, so the resolve never reads the image it
 //! is writing.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use glam::{Mat4, Vec2};
-use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
-use vulkano::buffer::{BufferContents, BufferUsage};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
-};
 
+use crate::gfx::format::SampleCount;
+use crate::gfx::graph::ImageUsage;
+use crate::gfx::rhi::{
+    Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId, SamplerDesc,
+    SamplerId, TextureDesc, TextureDimension, TextureViewId,
+};
+use crate::gfx::shaders::ShaderId;
 use crate::scene::{Camera, TaaSettings};
 
-use super::context::VkContext;
 use super::hdr::HDR_FORMAT;
-use super::record::{Arena, Recorder};
 
 /// Side of the resolve's compute workgroup.
 const TILE: u32 = 8;
@@ -68,30 +60,18 @@ pub(super) struct FrameView {
     pub jitter: Vec2,
 }
 
-/// Uniforms for the resolve. A buffer rather than push constants because two
-/// mat4s already fill the guaranteed 128-byte push range on their own.
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct TaaUbo {
-    inv_view_proj: [[f32; 4]; 4],
-    prev_view_proj: [[f32; 4]; 4],
-    /// xy = 1/extent, z = history weight, w != 0 to ignore the history.
-    params: [f32; 4],
-}
-
 pub struct TaaPass {
-    pipeline: Arc<ComputePipeline>,
+    pipeline: PipelineId,
     /// Linear and clamped: the history is resampled at a reprojected coordinate
     /// that almost never lands on a texel centre, and the bicubic fetch in the
     /// shader is built out of bilinear taps.
-    linear_clamp: Arc<Sampler>,
+    linear_clamp: SamplerId,
     /// Nearest, because velocity and depth are fetched at exact texels and
     /// interpolating either across a silhouette invents a surface.
-    nearest_clamp: Arc<Sampler>,
-    uniform_allocator: Arena,
+    nearest_clamp: SamplerId,
     /// Ping-ponged: `frame & 1` is this frame's target and the other is the
     /// history. Empty until the first frame TAA is enabled for.
-    history: Option<[Arc<ImageView>; 2]>,
+    history: Option<[TextureViewId; 2]>,
     extent: [u32; 2],
     frame: u64,
     /// Set whenever the history cannot be trusted — first frame, a resize, or
@@ -108,50 +88,27 @@ pub struct TaaPass {
 }
 
 impl TaaPass {
-    pub fn new(ctx: &VkContext) -> Self {
-        let device = &ctx.device;
-        let pipeline = build_pipeline(
-            ctx,
-            resolve_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
-
-        let linear_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
-            },
-        )
-        .unwrap();
-        let nearest_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::default()
-            },
-        )
-        .unwrap();
-
-        let uniform_allocator = Arena::new(
-            ctx.memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
+    pub fn new(device: &Device) -> Self {
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
+            shader: ShaderId::TaaResolveComp,
+        });
+        let sampler = |linear: bool| {
+            device.create_sampler(SamplerDesc {
+                linear,
+                mipmap_linear: false,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(if linear { 1.0 } else { 0.0 }),
+            })
+        };
+        let linear_clamp = sampler(true);
+        let nearest_clamp = sampler(false);
 
         Self {
             pipeline,
             linear_clamp,
             nearest_clamp,
-            uniform_allocator,
             history: None,
             extent: [0, 0],
             frame: 0,
@@ -170,7 +127,7 @@ impl TaaPass {
     /// switched off.
     pub(super) fn begin_frame(
         &mut self,
-        ctx: &VkContext,
+        device: &Device,
         settings: &TaaSettings,
         camera: &Camera,
         extent: [u32; 2],
@@ -179,7 +136,8 @@ impl TaaPass {
 
         if settings.enabled {
             if self.history.is_none() || self.extent != extent {
-                self.history = Some(allocate_history(ctx, extent));
+                self.release(device);
+                self.history = Some(allocate_history(device, extent));
                 self.extent = extent;
                 self.reset.store(true, Ordering::Relaxed);
             }
@@ -188,7 +146,7 @@ impl TaaPass {
             // Freed rather than kept: two full-resolution HDR targets is real
             // memory, and anything they held is stale the moment a frame renders
             // without them.
-            self.history = None;
+            self.release(device);
             self.reset.store(true, Ordering::Relaxed);
         }
 
@@ -217,16 +175,22 @@ impl TaaPass {
         }
     }
 
+    fn release(&mut self, device: &Device) {
+        for view in self.history.take().into_iter().flatten() {
+            device.destroy_texture(view);
+        }
+    }
+
     /// This frame's resolve target, which is next frame's history.
-    pub(super) fn output_view(&self) -> Arc<ImageView> {
-        self.pair()[(self.frame & 1) as usize].clone()
+    pub(super) fn output_view(&self) -> TextureViewId {
+        self.pair()[(self.frame & 1) as usize]
     }
 
-    pub(super) fn history_view(&self) -> Arc<ImageView> {
-        self.pair()[((self.frame + 1) & 1) as usize].clone()
+    pub(super) fn history_view(&self) -> TextureViewId {
+        self.pair()[((self.frame + 1) & 1) as usize]
     }
 
-    fn pair(&self) -> &[Arc<ImageView>; 2] {
+    fn pair(&self) -> &[TextureViewId; 2] {
         self.history
             .as_ref()
             .expect("the graph scheduled a TAA resolve with no history allocated")
@@ -234,61 +198,67 @@ impl TaaPass {
 
     pub(super) fn record(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
+        device: &Device,
+        builder: &mut Encoder,
         view: &FrameView,
-        color: Arc<ImageView>,
-        velocity: Arc<ImageView>,
-        depth: Arc<ImageView>,
+        color: TextureViewId,
+        velocity: TextureViewId,
+        depth: TextureViewId,
     ) {
         let target = self.output_view();
-        let extent = target.image().extent();
+        let extent = device.view_extent(target);
 
-        let uniforms = self.uniform_allocator.allocate_sized::<TaaUbo>();
-        *uniforms.write().unwrap() = TaaUbo {
-            inv_view_proj: view.unjittered_view_proj.inverse().to_cols_array_2d(),
-            prev_view_proj: view.prev_view_proj.to_cols_array_2d(),
-            params: [
-                1.0 / extent[0] as f32,
-                1.0 / extent[1] as f32,
-                self.settings.feedback.clamp(0.0, 0.99),
-                self.reset.load(Ordering::Relaxed) as u32 as f32,
-            ],
+        // The resolve's uniforms: a buffer rather than push constants because
+        // two mat4s already fill the guaranteed 128-byte push range on their own.
+        // `params`: xy = 1/extent, z = history weight, w != 0 to ignore the
+        // history.
+        let params = [
+            1.0 / extent[0] as f32,
+            1.0 / extent[1] as f32,
+            self.settings.feedback.clamp(0.0, 0.99),
+            self.reset.load(Ordering::Relaxed) as u32 as f32,
+        ];
+        let mut words = [0u32; 36];
+        let matrices = [
+            view.unjittered_view_proj.inverse().to_cols_array_2d(),
+            view.prev_view_proj.to_cols_array_2d(),
+        ];
+        for (word, float) in words
+            .iter_mut()
+            .zip(matrices.iter().flatten().flatten().chain(&params))
+        {
+            *word = float.to_bits();
+        }
+        let uniforms = device.upload_uniform(&words);
+
+        let sampled = |binding, view, sampler| Binding {
+            binding,
+            resource: BindingResource::SampledTexture { view, sampler },
         };
-
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::image_view_sampler(0, color, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(
-                    1,
-                    self.history_view(),
-                    self.linear_clamp.clone(),
-                ),
-                WriteDescriptorSet::image_view_sampler(2, velocity, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(3, depth, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(4, target),
-                WriteDescriptorSet::buffer(5, uniforms),
+        let set = device.create_transient_bind_group(
+            self.pipeline,
+            0,
+            &[
+                sampled(0, color, self.nearest_clamp),
+                sampled(1, self.history_view(), self.linear_clamp),
+                sampled(2, velocity, self.nearest_clamp),
+                sampled(3, depth, self.nearest_clamp),
+                Binding {
+                    binding: 4,
+                    resource: BindingResource::StorageTexture(target),
+                },
+                Binding {
+                    binding: 5,
+                    resource: BindingResource::UniformBuffer(uniforms),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
-        builder
-            .bind_pipeline_compute(&self.pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.pipeline.layout(),
-                0,
-                &[set],
-            );
+        builder.bind_pipeline(self.pipeline);
+        builder.bind_group(0, set);
 
-        // SAFETY: the dispatch covers exactly the target's extent and the shader
-        // discards invocations past `imageSize(u_target)`, so nothing writes
-        // outside it. The descriptors bound above match the shader's layout, and
-        // the graph declared every resource this pass touches, so its barriers
-        // precede it.
+        // The dispatch covers exactly the target's extent and the shader discards
+        // invocations past `imageSize(u_target)`, so nothing writes outside it.
         builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
 
         // The frame that just resolved is the history the next one reads, so
@@ -334,55 +304,79 @@ fn jittered(mut projection: Mat4, jitter: Vec2) -> Mat4 {
     projection
 }
 
-fn allocate_history(ctx: &VkContext, extent: [u32; 2]) -> [Arc<ImageView>; 2] {
+fn allocate_history(device: &Device, extent: [u32; 2]) -> [TextureViewId; 2] {
     std::array::from_fn(|_| {
-        let image = Image::new(
-            ctx.memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: HDR_FORMAT,
-                extent: [extent[0], extent[1], 1],
-                // Written as a storage image by the resolve, read as a sampled
-                // one by both the resolve's next frame and everything the frame
-                // composites afterwards.
-                usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .expect("failed to allocate the TAA history");
-        ImageView::new_default(image).unwrap()
+        device.create_texture(&TextureDesc {
+            format: HDR_FORMAT,
+            dimension: TextureDimension::D2,
+            extent: [extent[0], extent[1], 1],
+            mip_levels: 1,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            // Written as a storage image by the resolve, read as a sampled
+            // one by both the resolve's next frame and everything the frame
+            // composites afterwards.
+            usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
+            memoryless: false,
+        })
     })
-}
-
-fn build_pipeline(
-    ctx: &VkContext,
-    entry_point: vulkano::shader::EntryPoint,
-) -> Arc<ComputePipeline> {
-    let device = &ctx.device;
-    let stage = PipelineShaderStageCreateInfo::new(entry_point);
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    ComputePipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )
-    .unwrap()
-}
-
-mod resolve_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/taa_resolve.comp" }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first resolve after the history is allocated passes the frame
+    /// through untouched, which is the simplest thing a compute pass can be
+    /// held to on a real device: whatever went in comes out.
+    #[test]
+    #[ignore = "needs a Metal device"]
+    #[cfg(target_os = "macos")]
+    fn the_first_resolve_passes_the_frame_through_on_metal() {
+        use crate::gfx::format::{Format, SampleCount};
+        use crate::gfx::graph::ImageUsage;
+        use crate::gfx::rhi::{TextureDesc, TextureDimension};
+        let device = Device::Metal(crate::gfx::metal::MtlDriver::new().expect("a Metal device"));
+        device.begin_frame(0);
+        let mut pass = TaaPass::new(&device);
+        let settings = TaaSettings {
+            enabled: true,
+            ..TaaSettings::default()
+        };
+        let camera = Camera::default();
+        let view = pass.begin_frame(&device, &settings, &camera, [8, 8]);
+
+        let floats = |values: &[f32]| -> Vec<u8> { bytemuck::cast_slice(values).to_vec() };
+        let color = device.create_texture_2d(
+            &floats(&[0.5, 0.25, 0.125, 1.0].repeat(64)),
+            [8, 8],
+            Format::Rgba32Float,
+        );
+        let velocity = device.create_texture_2d(&vec![0u8; 8 * 8 * 4], [8, 8], Format::Rg16Float);
+        let depth = device.create_texture(&TextureDesc {
+            format: Format::D32Float,
+            dimension: TextureDimension::D2,
+            extent: [8, 8, 1],
+            mip_levels: 1,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
+            memoryless: false,
+        });
+        device.fill_depth(depth, 1.0);
+
+        device.record_blocking(|encoder| {
+            pass.record(&device, encoder, &view, color, velocity, depth);
+        });
+        let Device::Metal(driver) = &device else {
+            unreachable!()
+        };
+        let pixels = driver.read_texture(pass.output_view());
+        assert!(
+            pixels.iter().any(|&byte| byte != 0),
+            "the resolve wrote nothing: {pixels:?}"
+        );
+    }
 
     /// Every offset has to land inside the pixel, or the frame is sampling a
     /// neighbour and the resolve accumulates a blur rather than a reconstruction.

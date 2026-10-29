@@ -22,23 +22,13 @@
 //! should show the face as the frame will show it, and the trace samples whatever
 //! colour it is handed.
 
-use std::sync::Arc;
-
-use vulkano::buffer::BufferContents;
-use vulkano::descriptor_set::WriteDescriptorSet;
-use vulkano::format::Format;
-use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
-};
-
 use crate::scene::{Camera, SubsurfaceSettings};
 
-use super::context::VkContext;
-use super::record::Recorder;
+use crate::gfx::rhi::{
+    Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId, SamplerDesc,
+    SamplerId, TextureViewId,
+};
+use crate::gfx::shaders::ShaderId;
 
 /// Side of the compute workgroup, matching both shaders' `local_size`.
 const TILE: u32 = 8;
@@ -51,11 +41,11 @@ const TILE: u32 = 8;
 /// metre. Sixteen bits carries both comfortably; the alternative, a separate
 /// single-channel target for the radius, would be a second attachment and a second
 /// resolve for one number that is already free here.
-pub(super) const SUBSURFACE_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
+pub(super) const SUBSURFACE_FORMAT: crate::gfx::format::Format =
+    crate::gfx::format::Format::Rgba16Float;
 
 /// Which axis a blur dispatch walks, and everything it needs to size its kernel.
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
+#[derive(Clone, Copy)]
 struct BlurPush {
     /// xy = the axis in texels, z = near plane, w = far plane.
     direction: [f32; 4],
@@ -67,44 +57,30 @@ struct BlurPush {
 }
 
 pub struct SubsurfacePass {
-    blur_pipeline: Arc<ComputePipeline>,
-    composite_pipeline: Arc<ComputePipeline>,
+    blur_pipeline: PipelineId,
+    composite_pipeline: PipelineId,
     /// Nearest, and it matters. Every fetch in both shaders is a `texelFetch` at
     /// an exact texel — the kernel does its own weighting, and a bilinear tap
     /// would average across the silhouettes the depth term exists to reject
     /// *before* that term ever sees them.
-    nearest_clamp: Arc<Sampler>,
+    nearest_clamp: SamplerId,
     push: Option<BlurPush>,
 }
 
 impl SubsurfacePass {
-    pub fn new(ctx: &VkContext) -> Self {
-        let device = &ctx.device;
-        let blur_pipeline = build_pipeline(
-            ctx,
-            blur_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
-        let composite_pipeline = build_pipeline(
-            ctx,
-            composite_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
+    pub fn new(device: &Device) -> Self {
+        let pipeline = |shader| device.create_compute_pipeline(&ComputePipelineDesc { shader });
+        let blur_pipeline = pipeline(ShaderId::SssBlurComp);
+        let composite_pipeline = pipeline(ShaderId::SssCompositeComp);
 
-        let nearest_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::default()
-            },
-        )
-        .unwrap();
+        let nearest_clamp = device.create_sampler(SamplerDesc {
+            linear: false,
+            mipmap_linear: false,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+            max_lod: Some(0.0),
+        });
 
         Self {
             blur_pipeline,
@@ -161,100 +137,94 @@ impl SubsurfacePass {
     /// two dispatches, which is why they share a pipeline.
     pub(super) fn record_blur(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        source: Arc<ImageView>,
-        depth: Arc<ImageView>,
-        target: Arc<ImageView>,
+        device: &Device,
+        encoder: &mut Encoder,
+        source: TextureViewId,
+        depth: TextureViewId,
+        target: TextureViewId,
         vertical: bool,
     ) {
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.blur_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, source, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, depth, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(2, target.clone()),
+        let set = device.create_bind_group(
+            self.blur_pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::SampledTexture {
+                        view: source,
+                        sampler: self.nearest_clamp,
+                    },
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::SampledTexture {
+                        view: depth,
+                        sampler: self.nearest_clamp,
+                    },
+                },
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::StorageTexture(target),
+                },
             ],
         );
 
-        builder
-            .bind_pipeline_compute(&self.blur_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.blur_pipeline.layout(),
-                0,
-                &[set],
-            )
-            .push_constants(self.blur_pipeline.layout(), 0, &self.push_for(vertical));
-        dispatch_over(builder, &target);
+        encoder.bind_pipeline(self.blur_pipeline);
+        encoder.bind_group(0, set);
+        let push = self.push_for(vertical);
+        let mut words = [0u32; 12];
+        for (word, value) in words.iter_mut().zip(
+            push.direction
+                .iter()
+                .chain(&push.profile)
+                .chain(&push.params),
+        ) {
+            *word = value.to_bits();
+        }
+        encoder.push_constants(&words);
+        dispatch_over(device, encoder, target);
     }
 
     pub(super) fn record_composite(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        source: Arc<ImageView>,
-        diffused: Arc<ImageView>,
-        target: Arc<ImageView>,
+        device: &Device,
+        encoder: &mut Encoder,
+        source: TextureViewId,
+        diffused: TextureViewId,
+        target: TextureViewId,
     ) {
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.composite_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, source, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, diffused, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(2, target.clone()),
+        let set = device.create_bind_group(
+            self.composite_pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::SampledTexture {
+                        view: source,
+                        sampler: self.nearest_clamp,
+                    },
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::SampledTexture {
+                        view: diffused,
+                        sampler: self.nearest_clamp,
+                    },
+                },
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::StorageTexture(target),
+                },
             ],
         );
 
-        builder
-            .bind_pipeline_compute(&self.composite_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.composite_pipeline.layout(),
-                0,
-                &[set],
-            );
-        dispatch_over(builder, &target);
+        encoder.bind_pipeline(self.composite_pipeline);
+        encoder.bind_group(0, set);
+        dispatch_over(device, encoder, target);
     }
 }
 
-fn dispatch_over(builder: &mut Recorder, target: &Arc<ImageView>) {
-    let extent = target.image().extent();
-
-    // SAFETY: the dispatch covers exactly `extent`, and both shaders discard
-    // invocations past `imageSize`, so nothing writes outside the image. The
-    // descriptors bound above match the shader's layout, and the graph declared
-    // every resource these passes touch, so its barriers precede them.
-    builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
-}
-
-fn build_pipeline(
-    ctx: &VkContext,
-    entry_point: vulkano::shader::EntryPoint,
-) -> Arc<ComputePipeline> {
-    let device = &ctx.device;
-    let stage = PipelineShaderStageCreateInfo::new(entry_point);
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    ComputePipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )
-    .unwrap()
-}
-
-mod blur_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/sss_blur.comp" }
-}
-
-mod composite_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/sss_composite.comp" }
+fn dispatch_over(device: &Device, encoder: &mut Encoder, target: TextureViewId) {
+    let extent = device.view_extent(target);
+    encoder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
 }

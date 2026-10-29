@@ -1,11 +1,9 @@
-use vulkano::format::Format;
-use vulkano::image::ImageLayout;
-use vulkano::sync::{AccessFlags, PipelineStages};
+use crate::gfx::format::Format;
 
 use super::*;
 
 fn image() -> ImageDesc {
-    ImageDesc::new(Format::R8G8B8A8_UNORM)
+    ImageDesc::new(Format::Rgba8Unorm)
 }
 
 fn names(graph: &FrameGraph) -> Vec<&'static str> {
@@ -240,7 +238,7 @@ fn image_usage_is_the_union_of_declared_accesses() {
     let (_, created) = graph.transient_images().next().unwrap();
     assert_eq!(
         created.usage,
-        vulkano::image::ImageUsage::COLOR_ATTACHMENT | vulkano::image::ImageUsage::SAMPLED
+        ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED
     );
     assert!(!created.memoryless);
 }
@@ -267,11 +265,7 @@ fn an_attachment_only_image_is_marked_memoryless() {
     let graph = compile(builder).unwrap();
     let (_, created) = graph.transient_images().next().unwrap();
     assert!(created.memoryless);
-    assert!(
-        created
-            .usage
-            .contains(vulkano::image::ImageUsage::TRANSIENT_ATTACHMENT)
-    );
+    assert!(created.usage.contains(ImageUsage::TRANSIENT_ATTACHMENT));
 }
 
 #[test]
@@ -383,7 +377,7 @@ fn a_transition_waits_for_the_readers_it_moves_the_layout_out_from_under() {
     // culled reader is not in the schedule and has no layout to be moved out
     // from under.
     let probe = builder.import_buffer("probe");
-    let depth = builder.create_image("depth", ImageDesc::new(Format::D32_SFLOAT));
+    let depth = builder.create_image("depth", ImageDesc::new(Format::D32Float));
     builder
         .pass("write_depth", PassKind::Inline)
         .access(depth, Access::DepthAttachment)
@@ -1262,7 +1256,7 @@ fn transients_alive_in_the_same_slot_are_never_aliased() {
 /// `Device` to ask for memory requirements.
 #[test]
 fn transients_of_different_shape_are_never_aliased() {
-    let graph = aliasable_chain(ImageDesc::new(Format::R16G16B16A16_SFLOAT));
+    let graph = aliasable_chain(ImageDesc::new(Format::Rgba16Float));
     assert!(group_names(&graph).is_empty());
 }
 
@@ -1328,7 +1322,7 @@ fn the_first_write_of_an_aliased_image_waits_for_the_reader_before_it() {
 /// one above a dependency the graph added rather than one it already had.
 #[test]
 fn the_first_write_of_an_unaliased_image_waits_for_nothing() {
-    let graph = aliasable_chain(ImageDesc::new(Format::R16G16B16A16_SFLOAT));
+    let graph = aliasable_chain(ImageDesc::new(Format::Rgba16Float));
     let [barrier] = graph.barriers_before(2) else {
         panic!("expected one barrier before `write_second`");
     };

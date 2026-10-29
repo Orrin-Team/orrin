@@ -10,8 +10,8 @@
 //! what makes the shadow cascades of Part 1 a loop over `declare` rather than
 //! surgery on a fixed pipeline.
 
-use vulkano::format::Format;
-use vulkano::image::ImageLayout;
+use crate::gfx::format::Format;
+use crate::gfx::graph::ImageLayout;
 
 use crate::gfx::graph::{
     Access, Extent, FrameGraph, GraphBuilder, GraphError, ImageDesc, PassBuilder, PassId, PassKind,

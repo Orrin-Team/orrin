@@ -16,6 +16,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::camera_controller::CameraController;
 use crate::editor::Editor;
+use crate::gfx::BackendChoice;
 use crate::gfx::punctual::{MAX_SHADOW_LIGHTS, ShadowAtlas};
 use crate::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
 use crate::gfx::vulkan::ShadowFrame;
@@ -44,7 +45,9 @@ struct Active {
 }
 
 pub struct App {
-    instance: Arc<Instance>,
+    /// `None` on a run that does not draw through Vulkan.
+    instance: Option<Arc<Instance>>,
+    backend: BackendChoice,
     active: Option<Active>,
     world: World,
     /// Not a world resource: it has to survive the world being cleared, and a
@@ -127,42 +130,14 @@ impl App {
         let event_loop = EventLoop::new().unwrap();
         event_loop.set_control_flow(ControlFlow::Poll);
 
-        let library = VulkanLibrary::new().expect("failed to load vulkan library");
-        let mut enabled_extensions = Surface::required_extensions(&event_loop).unwrap();
-
-        // Architecture §3.5: validation on in every dev build. Silently skipped
-        // when the layer isn't installed, so a machine without the Vulkan SDK
-        // (and CI) still runs — a GPU crash with no named cause is the thing
-        // this exists to prevent.
-        let validation = should_validate() && has_validation_layer(&library);
-        if validation {
-            enabled_extensions.ext_debug_utils = true;
-        }
-
-        let instance = Instance::new(
-            library,
-            InstanceCreateInfo {
-                flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
-                enabled_extensions,
-                enabled_layers: if validation {
-                    vec![VALIDATION_LAYER.to_owned()]
-                } else {
-                    Vec::new()
-                },
-                ..Default::default()
-            },
-        )
-        .expect("failed to create instance");
-
-        let debug_messenger = validation.then(|| attach_debug_messenger(&instance));
-        if validation {
-            tracing::info!("Vulkan validation layer enabled");
-        } else if should_validate() {
-            tracing::warn!(
-                "validation requested but `{VALIDATION_LAYER}` isn't installed; \
-                 GPU errors will not be named (install the Vulkan SDK)"
-            );
-        }
+        let backend = BackendChoice::from_env();
+        let (instance, debug_messenger) = match backend {
+            BackendChoice::Vulkan => {
+                let (instance, messenger) = create_vulkan_instance(&event_loop);
+                (Some(instance), messenger)
+            }
+            BackendChoice::Metal => (None, None),
+        };
 
         let cwd = std::env::current_dir().unwrap_or_else(|err| {
             tracing::error!("cannot read the current directory: {err}");
@@ -200,6 +175,7 @@ impl App {
 
         let mut app = App {
             instance,
+            backend,
             active: None,
             world: World::default(),
             registry: Registry::new(),
@@ -522,14 +498,15 @@ impl ApplicationHandler for App {
                 .create_window(Window::default_attributes().with_title("Orrin"))
                 .unwrap(),
         );
-        let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
         let size = window.inner_size();
-        let mut renderer = VulkanRenderer::new(
-            &self.instance,
-            surface.clone(),
-            [size.width, size.height],
-            *self.world.resource::<PresentSettings>(),
-        );
+        let present = *self.world.resource::<PresentSettings>();
+        let mut renderer = match self.instance.as_ref() {
+            Some(instance) => {
+                let surface = Surface::from_window(instance.clone(), window.clone()).unwrap();
+                VulkanRenderer::new(instance, surface, [size.width, size.height], present)
+            }
+            None => metal_renderer(&window, [size.width, size.height], present),
+        };
 
         let device = renderer.device_label();
         self.world.resource_mut::<FrameStats>().set_device(device);
@@ -552,9 +529,14 @@ impl ApplicationHandler for App {
             self.build_watcher = scripts.watcher;
         }
 
-        let editor = Editor::new(event_loop, surface, renderer.queue(), self.project.as_ref());
+        let editor = Editor::new(
+            event_loop,
+            window.clone(),
+            renderer.max_texture_side(),
+            self.project.as_ref(),
+        );
 
-        print_run_banner(&self.world, &renderer, self.scene);
+        print_run_banner(&self.world, &renderer, self.backend, self.scene);
 
         self.active = Some(Active {
             window,
@@ -1025,6 +1007,72 @@ fn pressed_overlay_toggle(event: &WindowEvent) -> bool {
     )
 }
 
+/// The Vulkan instance a Vulkan run draws through, with the validation
+/// messenger that has to live as long as it does.
+fn create_vulkan_instance(
+    event_loop: &EventLoop<()>,
+) -> (Arc<Instance>, Option<DebugUtilsMessenger>) {
+    let library = VulkanLibrary::new().expect("failed to load vulkan library");
+    let mut enabled_extensions = Surface::required_extensions(event_loop).unwrap();
+
+    // Architecture §3.5: validation on in every dev build. Silently skipped
+    // when the layer isn't installed, so a machine without the Vulkan SDK
+    // (and CI) still runs — a GPU crash with no named cause is the thing
+    // this exists to prevent.
+    let validation = should_validate() && has_validation_layer(&library);
+    if validation {
+        enabled_extensions.ext_debug_utils = true;
+    }
+
+    let instance = Instance::new(
+        library,
+        InstanceCreateInfo {
+            flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+            enabled_extensions,
+            enabled_layers: if validation {
+                vec![VALIDATION_LAYER.to_owned()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("failed to create instance");
+
+    let debug_messenger = validation.then(|| attach_debug_messenger(&instance));
+    if validation {
+        tracing::info!("Vulkan validation layer enabled");
+    } else if should_validate() {
+        tracing::warn!(
+            "validation requested but `{VALIDATION_LAYER}` isn't installed; \
+             GPU errors will not be named (install the Vulkan SDK)"
+        );
+    }
+    (instance, debug_messenger)
+}
+
+/// A renderer whose frames end in `window`'s Metal layer.
+#[cfg(target_os = "macos")]
+fn metal_renderer(window: &Window, extent: [u32; 2], present: PresentSettings) -> VulkanRenderer {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let RawWindowHandle::AppKit(handle) = window
+        .window_handle()
+        .expect("the window has no native handle")
+        .as_raw()
+    else {
+        unreachable!("a macOS window is an AppKit one");
+    };
+    VulkanRenderer::windowed_metal(handle.ns_view, extent, present).unwrap_or_else(|reason| {
+        tracing::error!("ORRIN_BACKEND=metal cannot start: {reason}");
+        std::process::exit(1);
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn metal_renderer(_: &Window, _: [u32; 2], _: PresentSettings) -> VulkanRenderer {
+    unreachable!("BackendChoice never picks Metal off macOS")
+}
+
 /// Print what this run measures with, once, at startup.
 ///
 /// Every one of these changes a frame-time number without changing a pixel, so a
@@ -1032,23 +1080,28 @@ fn pressed_overlay_toggle(event: &WindowEvent) -> bool {
 /// on and a release build with it off differ by more than most of the work in the
 /// renderer. The banner exists so a pasted log is a complete description of the
 /// run it came from.
-fn print_run_banner(world: &World, renderer: &VulkanRenderer, scene: SceneChoice) {
-    let present = match renderer.applied_present() {
-        Some((mode, images)) => format!("{mode:?}, {images} images"),
-        None => "offscreen".to_string(),
-    };
+fn print_run_banner(
+    world: &World,
+    renderer: &VulkanRenderer,
+    backend: BackendChoice,
+    scene: SceneChoice,
+) {
+    let present = renderer
+        .applied_present()
+        .unwrap_or_else(|| "offscreen".to_string());
     let extent = renderer.extent();
 
     tracing::info!(
-        "run config: {} build | debug assertions {} | validation {} | present {} | \
+        "run config: {} build | {} | debug assertions {} | validation {} | present {} | \
          {}x{} | MSAA {} | overlay {} | GPU pass timings {} | scene {}",
         if cfg!(debug_assertions) {
             "unoptimised"
         } else {
             "optimised"
         },
+        renderer.device_label(),
         on_off(cfg!(debug_assertions)),
-        on_off(should_validate()),
+        on_off(should_validate() && backend == BackendChoice::Vulkan),
         present,
         extent[0],
         extent[1],

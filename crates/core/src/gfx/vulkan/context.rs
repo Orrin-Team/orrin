@@ -18,6 +18,7 @@ use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::swapchain::Surface;
 use vulkano::{Version, VulkanObject};
 
+use super::convert::vk_format;
 use super::descriptors::DescriptorCache;
 use super::pipeline_cache::ShaderCache;
 use super::vendor::GpuProfile;
@@ -479,7 +480,7 @@ fn select_physical_device(
 fn assert_packed_color_is_storable(device: &Arc<Device>) {
     let supported = device
         .physical_device()
-        .format_properties(super::hdr::HDR_FORMAT)
+        .format_properties(vk_format(super::hdr::HDR_FORMAT))
         .map(|properties| {
             properties
                 .optimal_tiling_features

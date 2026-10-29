@@ -28,7 +28,11 @@ use vulkano::memory::{
 };
 use vulkano::sync::Sharing;
 
+use super::convert::{vk_format, vk_image_usage, vk_samples};
+use super::driver::VkDriver;
 use crate::gfx::graph::{FrameGraph, ResourceId};
+use crate::gfx::images::{ImageEntry, ImageTable};
+use crate::gfx::rhi::TextureViewId;
 
 /// Everything that distinguishes one allocation from another.
 ///
@@ -96,8 +100,13 @@ struct BlockKey {
 #[derive(Clone)]
 struct Views {
     whole: Arc<ImageView>,
-    /// Empty for an image of one level, whose whole view already is its level.
-    levels: Vec<Arc<ImageView>>,
+    /// The same views as the device knows them, which is what a pass binds.
+    whole_id: TextureViewId,
+    level_ids: Vec<TextureViewId>,
+    /// One single-layer view per layer of an array image, which is what a
+    /// framebuffer attachment takes while the whole array is what a shader
+    /// samples.
+    layer_ids: Vec<TextureViewId>,
 }
 
 /// Graph-owned images, indexed by [`ResourceId`].
@@ -147,6 +156,7 @@ impl GraphImages {
     pub fn allocate(
         memory: &Arc<StandardMemoryAllocator>,
         ctx: &super::context::VkContext,
+        driver: &VkDriver,
         graph: &FrameGraph,
         extent: [u32; 2],
         slots: usize,
@@ -158,7 +168,7 @@ impl GraphImages {
             blocks: HashMap::new(),
             extent,
         };
-        images.rebuild(memory, ctx, graph, extent, slots);
+        images.rebuild(memory, ctx, driver, graph, extent, slots);
         images
     }
 
@@ -182,6 +192,7 @@ impl GraphImages {
         &mut self,
         memory: &Arc<StandardMemoryAllocator>,
         ctx: &super::context::VkContext,
+        driver: &VkDriver,
         graph: &FrameGraph,
         extent: [u32; 2],
         slots: usize,
@@ -209,6 +220,12 @@ impl GraphImages {
         };
 
         if self.extent != extent {
+            for views in self.cache.values() {
+                driver.destroy_texture(views.whole_id);
+                for &level in views.level_ids.iter().chain(&views.layer_ids) {
+                    driver.destroy_texture(level);
+                }
+            }
             self.cache.clear();
             self.blocks.clear();
             self.extent = extent;
@@ -255,10 +272,10 @@ impl GraphImages {
                     // where there is a second family to name — so a single-queue
                     // device creates exactly the images it always did.
                     concurrent: image.concurrent && !shared_families.is_empty(),
-                    format: image.desc.format,
+                    format: vk_format(image.desc.format),
                     extent: [extent[0], extent[1], image.desc.depth.unwrap_or(1)],
-                    usage: image.usage,
-                    samples: image.desc.samples,
+                    usage: vk_image_usage(image.usage),
+                    samples: vk_samples(image.desc.samples),
                     array_layers: image.desc.array_layers.unwrap_or(1),
                     mip_levels,
                     memoryless: image.memoryless,
@@ -282,10 +299,10 @@ impl GraphImages {
                         Some(_) => ImageType::Dim3d,
                         None => ImageType::Dim2d,
                     },
-                    format: image.desc.format,
+                    format: vk_format(image.desc.format),
                     extent: [extent[0], extent[1], image.desc.depth.unwrap_or(1)],
-                    usage: image.usage,
-                    samples: image.desc.samples,
+                    usage: vk_image_usage(image.usage),
+                    samples: vk_samples(image.desc.samples),
                     array_layers: image.desc.array_layers.unwrap_or(1),
                     mip_levels,
                     sharing: if key.concurrent {
@@ -342,9 +359,9 @@ impl GraphImages {
                         // it is the one a shader samples with `textureLod`, and the
                         // per-level storage views come from `mip_views`.
                         usage: if mip_levels > 1 {
-                            image.usage - ImageUsage::STORAGE
+                            vk_image_usage(image.usage) - ImageUsage::STORAGE
                         } else {
-                            image.usage
+                            vk_image_usage(image.usage)
                         },
                         ..ImageViewCreateInfo::from_image(&allocated)
                     },
@@ -357,9 +374,17 @@ impl GraphImages {
                 } else {
                     Vec::new()
                 };
+                let layer_ids = (0..image.desc.array_layers.unwrap_or(0))
+                    .map(|layer| driver.adopt_view(layer_view(&allocated, layer)))
+                    .collect();
                 let entry = Views {
+                    layer_ids,
+                    whole_id: driver.adopt_view(view.clone()),
+                    level_ids: levels
+                        .iter()
+                        .map(|level| driver.adopt_view(level.clone()))
+                        .collect(),
                     whole: view,
-                    levels,
                 };
                 self.cache.insert(key, entry.clone());
                 views[id.index()] = Some(entry);
@@ -390,66 +415,46 @@ impl GraphImages {
             .map(|views| views.whole.clone())
     }
 
-    pub fn view(&self, id: ResourceId) -> Arc<ImageView> {
-        self.views_of(id).whole.clone()
+    /// The images as the device names them, for everything that records a pass.
+    pub fn table(&self) -> ImageTable {
+        ImageTable::new(
+            self.views
+                .iter()
+                .map(|set| {
+                    set.iter()
+                        .map(|views| {
+                            views.as_ref().map(|views| {
+                                let image = views.whole.image();
+                                ImageEntry {
+                                    whole: views.whole_id,
+                                    levels: views.level_ids.clone(),
+                                    layers: views.layer_ids.clone(),
+                                    extent: [image.extent()[0], image.extent()[1]],
+                                    mip_levels: image.mip_levels(),
+                                }
+                            })
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
     }
+}
 
-    fn views_of(&self, id: ResourceId) -> &Views {
-        self.views[self.slot][id.index()]
-            .as_ref()
-            .expect("render graph resource is not a graph-owned image")
-    }
-
-    /// The width and height a graph-owned image was allocated at, which is what
-    /// a pass drawing into one at less than the frame's extent has to set its
-    /// viewport to — the framebuffer's render area follows the attachment, but
-    /// the viewport is dynamic state nothing derives.
-    pub fn extent(&self, id: ResourceId) -> [u32; 2] {
-        let extent = self.view(id).image().extent();
-        [extent[0], extent[1]]
-    }
-
-    /// A single-layer 2D view of one layer of an array image.
-    ///
-    /// A framebuffer attachment has to be one layer, while the same image is
-    /// sampled as a whole array — so the cascades need both kinds of view over
-    /// the same allocation.
-    pub fn layer_view(&self, id: ResourceId, layer: u32) -> Arc<ImageView> {
-        let image = self.view(id).image().clone();
-
-        let info = ImageViewCreateInfo {
+/// One layer of an array image, as a plain 2D view.
+fn layer_view(image: &Arc<Image>, layer: u32) -> Arc<ImageView> {
+    ImageView::new(
+        image.clone(),
+        ImageViewCreateInfo {
             view_type: ImageViewType::Dim2d,
             subresource_range: ImageSubresourceRange {
                 array_layers: layer..layer + 1,
                 ..image.subresource_range()
             },
-            ..ImageViewCreateInfo::from_image(&image)
-        };
-
-        ImageView::new(image, info).unwrap()
-    }
-
-    /// One single-level view per mip the image actually has, which is what a
-    /// storage image descriptor requires. The whole-pyramid view `view` hands
-    /// back is the one to sample.
-    ///
-    /// An image a small window clamped to one level has no separate level
-    /// views: its whole view is that level, and kept `STORAGE` for it.
-    pub fn mip_views(&self, id: ResourceId) -> &[Arc<ImageView>] {
-        let views = self.views_of(id);
-        if views.levels.is_empty() {
-            std::slice::from_ref(&views.whole)
-        } else {
-            &views.levels
-        }
-    }
-
-    /// How many levels the allocated image actually has, which is what a pass
-    /// writing a pyramid must loop over — the declaration is a request, and a
-    /// small window cannot honour it.
-    pub fn mip_levels(&self, id: ResourceId) -> u32 {
-        self.view(id).image().mip_levels()
-    }
+            ..ImageViewCreateInfo::from_image(image)
+        },
+    )
+    .unwrap()
 }
 
 /// Create an image on the block its alias group shares, allocating the block if
@@ -550,9 +555,9 @@ fn max_mip_levels(extent: [u32; 2]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::gfx::format::Format;
+    use crate::gfx::graph::ImageLayout;
     use vulkano::VulkanLibrary;
-    use vulkano::format::Format;
-    use vulkano::image::ImageLayout;
     use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 
     use super::*;
@@ -566,11 +571,11 @@ mod tests {
         let mut builder = GraphBuilder::new();
         let pyramid = builder.create_image(
             "pyramid",
-            ImageDesc::new(Format::R16G16B16A16_SFLOAT).mip_levels(levels),
+            ImageDesc::new(Format::Rgba16Float).mip_levels(levels),
         );
         let target = builder.import_image(
             "target",
-            ImageDesc::new(Format::R16G16B16A16_SFLOAT),
+            ImageDesc::new(Format::Rgba16Float),
             ImageLayout::Undefined,
             ImageLayout::General,
         );
@@ -601,21 +606,34 @@ mod tests {
             },
         )
         .expect("a headless instance");
-        let ctx = VkContext::new(&instance, None);
+        let ctx = Arc::new(VkContext::new(&instance, None));
+        let driver = VkDriver::new(ctx.clone(), 2);
         let (graph, pyramid) = pyramid_graph(5);
 
-        let mut images = GraphImages::allocate(&ctx.memory_allocator, &ctx, &graph, [64, 64], 1);
-        let first: Vec<_> = images.mip_views(pyramid).to_vec();
+        let mut images =
+            GraphImages::allocate(&ctx.memory_allocator, &ctx, &driver, &graph, [64, 64], 1);
+        let first: Vec<_> = images.table().mip_textures(pyramid).to_vec();
         assert_eq!(first.len(), 5);
-        for (level, view) in first.iter().enumerate() {
+        for (level, id) in first.iter().enumerate() {
             let level = level as u32;
-            assert_eq!(view.subresource_range().mip_levels, level..level + 1);
+            assert_eq!(
+                driver.vk_view(*id).subresource_range().mip_levels,
+                level..level + 1
+            );
         }
 
         let (recompiled, pyramid) = pyramid_graph(5);
-        images.rebuild(&ctx.memory_allocator, &ctx, &recompiled, [64, 64], 1);
-        for (before, after) in first.iter().zip(images.mip_views(pyramid)) {
-            assert!(Arc::ptr_eq(before, after), "a cache hit rebuilt a mip view");
+        images.rebuild(
+            &ctx.memory_allocator,
+            &ctx,
+            &driver,
+            &recompiled,
+            [64, 64],
+            1,
+        );
+        let after = images.table();
+        for (before, after) in first.iter().zip(after.mip_textures(pyramid)) {
+            assert_eq!(before, after, "a cache hit rebuilt a mip view");
         }
     }
 }

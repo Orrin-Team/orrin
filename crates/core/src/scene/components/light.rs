@@ -19,9 +19,8 @@ use std::f32::consts::{PI, TAU};
 /// also why the old `intensity` is gone rather than reinterpreted. A scene
 /// authored against that field fails to load and says which field it is missing;
 /// silently reading `intensity = 3` as three lumens would load a scene that is
-/// black for a reason nothing reports. Retrofitting this later is what
-/// `docs/architecture.md` §3.3 rules out, since it would re-tune every scene
-/// anyone had authored.
+/// black for a reason nothing reports. Retrofitting this later would
+/// re-tune every scene anyone had authored.
 ///
 /// The unit differs per light type because the *fixture* differs, which is the
 /// convention glTF, Filament and Unity's HDRP all share:

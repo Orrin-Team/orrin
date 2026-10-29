@@ -1,5 +1,5 @@
-use vulkano::format::Format;
-use vulkano::image::{ImageLayout, SampleCount};
+use super::sync::ImageLayout;
+use crate::gfx::format::{Format, SampleCount};
 
 /// Handle to a resource declared on a [`GraphBuilder`](super::GraphBuilder).
 /// Valid only against the graph that issued it.

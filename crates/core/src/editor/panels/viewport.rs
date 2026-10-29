@@ -132,6 +132,9 @@ fn space_and_snap(ui: &mut egui::Ui, state: &mut EditorState) {
     if widgets::icon_label_button(ui, icons::grid(), word, state.snap, &hint).clicked() {
         state.snap = !state.snap;
     }
+    // The chevron opens a menu rather than toggling, so it sits apart from the
+    // button it belongs to instead of reading as part of its label.
+    ui.add_space(6.0);
     snap_steps(ui, state);
 }
 

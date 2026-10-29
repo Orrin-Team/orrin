@@ -3,10 +3,9 @@
 Working guide for Orrin. It applies to humans and to AI agents equally; where a
 rule exists only because an agent is doing the work, it says so.
 
-Read [`docs/architecture.md`](docs/architecture.md) before making a design
-decision. It is the ten-year plan, and most "why is it like this?" questions are
-answered there. This file is the day-to-day: layout, commands, and the standards
-a change is held to.
+Most "why is it like this?" questions are answered in the `//!` header of the
+module concerned, so read that before making a design decision. This file is the
+day-to-day: layout, commands, and the standards a change is held to.
 
 ---
 

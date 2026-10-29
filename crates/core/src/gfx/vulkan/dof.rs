@@ -12,22 +12,12 @@
 //! five floats — see [`DofSettings`] for where they come from, and why the focal
 //! length is not among them.
 
-use std::sync::Arc;
-
-use vulkano::buffer::BufferContents;
-use vulkano::descriptor_set::WriteDescriptorSet;
-use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
+use crate::gfx::rhi::{
+    Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId, SamplerDesc,
+    SamplerId, TextureViewId,
 };
-
+use crate::gfx::shaders::ShaderId;
 use crate::scene::{Camera, DofSettings};
-
-use super::context::VkContext;
-use super::record::Recorder;
 
 /// Side of the compute workgroup for every pass here.
 const TILE: u32 = 8;
@@ -60,37 +50,18 @@ pub(super) const COC_TILE_SHIFT: u32 = 6;
 #[cfg(test)]
 const COC_TILE: u32 = 1 << (COC_TILE_SHIFT - 1);
 
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct PrefilterPush {
-    coc_scale: f32,
-    focus_distance: f32,
-    near: f32,
-    far: f32,
-    max_radius: f32,
-}
-
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct CompositePush {
-    coc_scale: f32,
-    focus_distance: f32,
-    near: f32,
-    far: f32,
-}
-
 pub struct DofPass {
-    prefilter_pipeline: Arc<ComputePipeline>,
-    tile_max_pipeline: Arc<ComputePipeline>,
-    gather_pipeline: Arc<ComputePipeline>,
-    composite_pipeline: Arc<ComputePipeline>,
+    prefilter_pipeline: PipelineId,
+    tile_max_pipeline: PipelineId,
+    gather_pipeline: PipelineId,
+    composite_pipeline: PipelineId,
     /// Linear and clamped: the composite reads the half-resolution fields at
     /// full-resolution positions, which land between texels by construction.
-    linear_clamp: Arc<Sampler>,
+    linear_clamp: SamplerId,
     /// Nearest, because depth interpolated across a silhouette is a distance no
     /// surface is at, and the circle of confusion derived from it would ring the
     /// edge with a focus that belongs to neither side.
-    nearest_clamp: Arc<Sampler>,
+    nearest_clamp: SamplerId,
     settings: DofSettings,
     /// Derived once per frame from the settings and the camera, because the
     /// prefilter and the composite must agree on it exactly.
@@ -100,55 +71,25 @@ pub struct DofPass {
 }
 
 impl DofPass {
-    pub fn new(ctx: &VkContext) -> Self {
-        let device = &ctx.device;
-        let prefilter_pipeline = build_pipeline(
-            ctx,
-            prefilter_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
-        let tile_max_pipeline = build_pipeline(
-            ctx,
-            tile_max_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
-        let gather_pipeline = build_pipeline(
-            ctx,
-            gather_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
-        let composite_pipeline = build_pipeline(
-            ctx,
-            composite_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
+    pub fn new(device: &Device) -> Self {
+        let pipeline = |shader| device.create_compute_pipeline(&ComputePipelineDesc { shader });
+        let prefilter_pipeline = pipeline(ShaderId::DofPrefilterComp);
+        let tile_max_pipeline = pipeline(ShaderId::DofTileMaxComp);
+        let gather_pipeline = pipeline(ShaderId::DofGatherComp);
+        let composite_pipeline = pipeline(ShaderId::DofCompositeComp);
 
-        let linear_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
-            },
-        )
-        .unwrap();
-        let nearest_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::default()
-            },
-        )
-        .unwrap();
+        let sampler = |linear: bool| {
+            device.create_sampler(SamplerDesc {
+                linear,
+                mipmap_linear: false,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(if linear { 1.0 } else { 0.0 }),
+            })
+        };
+        let linear_clamp = sampler(true);
+        let nearest_clamp = sampler(false);
 
         Self {
             prefilter_pipeline,
@@ -181,102 +122,78 @@ impl DofPass {
 
     pub fn record_prefilter(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        color: Arc<ImageView>,
-        depth: Arc<ImageView>,
-        target: Arc<ImageView>,
+        device: &Device,
+        builder: &mut Encoder,
+        color: TextureViewId,
+        depth: TextureViewId,
+        target: TextureViewId,
     ) {
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.prefilter_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, color, self.linear_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, depth, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(2, target.clone()),
+        let set = device.create_bind_group(
+            self.prefilter_pipeline,
+            0,
+            &[
+                self.sampled(0, color, self.linear_clamp),
+                self.sampled(1, depth, self.nearest_clamp),
+                self.storage(2, target),
             ],
         );
 
-        builder
-            .bind_pipeline_compute(&self.prefilter_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.prefilter_pipeline.layout(),
-                0,
-                &[set],
-            )
-            .push_constants(
-                self.prefilter_pipeline.layout(),
-                0,
-                &PrefilterPush {
-                    coc_scale: self.coc_scale,
-                    focus_distance: self.settings.focus_distance,
-                    near: self.near,
-                    far: self.far,
-                    max_radius: MAX_COC_RADIUS,
-                },
-            );
-        dispatch_over(builder, &target);
+        builder.bind_pipeline(self.prefilter_pipeline);
+        builder.bind_group(0, set);
+        builder.push_constants(&[
+            self.coc_scale.to_bits(),
+            self.settings.focus_distance.to_bits(),
+            self.near.to_bits(),
+            self.far.to_bits(),
+            MAX_COC_RADIUS.to_bits(),
+        ]);
+        dispatch_over(device, builder, target);
     }
 
-    /// The widest near and far circle in each tile, which is what the gather
-    /// sizes its kernel from.
     pub fn record_tile_max(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        prefiltered: Arc<ImageView>,
-        target: Arc<ImageView>,
+        device: &Device,
+        builder: &mut Encoder,
+        prefiltered: TextureViewId,
+        target: TextureViewId,
     ) {
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.tile_max_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, prefiltered, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(1, target.clone()),
+        let set = device.create_bind_group(
+            self.tile_max_pipeline,
+            0,
+            &[
+                self.sampled(0, prefiltered, self.nearest_clamp),
+                self.storage(1, target),
             ],
         );
 
-        builder
-            .bind_pipeline_compute(&self.tile_max_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.tile_max_pipeline.layout(),
-                0,
-                &[set],
-            );
-        dispatch_over(builder, &target);
+        builder.bind_pipeline(self.tile_max_pipeline);
+        builder.bind_group(0, set);
+        dispatch_over(device, builder, target);
     }
 
     pub fn record_gather(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        prefiltered: Arc<ImageView>,
-        tiles: Arc<ImageView>,
-        near: Arc<ImageView>,
-        far: Arc<ImageView>,
+        device: &Device,
+        builder: &mut Encoder,
+        prefiltered: TextureViewId,
+        tiles: TextureViewId,
+        near: TextureViewId,
+        far: TextureViewId,
     ) {
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.gather_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, prefiltered, self.linear_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, tiles, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(2, near.clone()),
-                WriteDescriptorSet::image_view(3, far),
+        let set = device.create_bind_group(
+            self.gather_pipeline,
+            0,
+            &[
+                self.sampled(0, prefiltered, self.linear_clamp),
+                self.sampled(1, tiles, self.nearest_clamp),
+                self.storage(2, near),
+                self.storage(3, far),
             ],
         );
 
-        builder
-            .bind_pipeline_compute(&self.gather_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.gather_pipeline.layout(),
-                0,
-                &[set],
-            );
-        dispatch_over(builder, &near);
+        builder.bind_pipeline(self.gather_pipeline);
+        builder.bind_group(0, set);
+        dispatch_over(device, builder, near);
     }
 
     #[allow(
@@ -285,93 +202,55 @@ impl DofPass {
     )]
     pub fn record_composite(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        color: Arc<ImageView>,
-        depth: Arc<ImageView>,
-        near: Arc<ImageView>,
-        far: Arc<ImageView>,
-        target: Arc<ImageView>,
+        device: &Device,
+        builder: &mut Encoder,
+        color: TextureViewId,
+        depth: TextureViewId,
+        near: TextureViewId,
+        far: TextureViewId,
+        target: TextureViewId,
     ) {
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.composite_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, color, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, depth, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(2, near, self.linear_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(3, far, self.linear_clamp.clone()),
-                WriteDescriptorSet::image_view(4, target.clone()),
+        let set = device.create_bind_group(
+            self.composite_pipeline,
+            0,
+            &[
+                self.sampled(0, color, self.nearest_clamp),
+                self.sampled(1, depth, self.nearest_clamp),
+                self.sampled(2, near, self.linear_clamp),
+                self.sampled(3, far, self.linear_clamp),
+                self.storage(4, target),
             ],
         );
 
-        builder
-            .bind_pipeline_compute(&self.composite_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.composite_pipeline.layout(),
-                0,
-                &[set],
-            )
-            .push_constants(
-                self.composite_pipeline.layout(),
-                0,
-                &CompositePush {
-                    coc_scale: self.coc_scale,
-                    focus_distance: self.settings.focus_distance,
-                    near: self.near,
-                    far: self.far,
-                },
-            );
-        dispatch_over(builder, &target);
+        builder.bind_pipeline(self.composite_pipeline);
+        builder.bind_group(0, set);
+        builder.push_constants(&[
+            self.coc_scale.to_bits(),
+            self.settings.focus_distance.to_bits(),
+            self.near.to_bits(),
+            self.far.to_bits(),
+        ]);
+        dispatch_over(device, builder, target);
+    }
+
+    fn sampled(&self, binding: u32, view: TextureViewId, sampler: SamplerId) -> Binding {
+        Binding {
+            binding,
+            resource: BindingResource::SampledTexture { view, sampler },
+        }
+    }
+
+    fn storage(&self, binding: u32, view: TextureViewId) -> Binding {
+        Binding {
+            binding,
+            resource: BindingResource::StorageTexture(view),
+        }
     }
 }
 
-fn dispatch_over(builder: &mut Recorder, target: &Arc<ImageView>) {
-    let extent = target.image().extent();
-
-    // SAFETY: the dispatch covers exactly `extent`, and each shader discards
-    // invocations past `imageSize`, so nothing writes outside the image. The
-    // descriptors bound above match the shader's layout, and the graph declared
-    // every resource this pass touches, so its barriers precede it.
+fn dispatch_over(device: &Device, builder: &mut Encoder, target: TextureViewId) {
+    let extent = device.view_extent(target);
     builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
-}
-
-fn build_pipeline(
-    ctx: &VkContext,
-    entry_point: vulkano::shader::EntryPoint,
-) -> Arc<ComputePipeline> {
-    let device = &ctx.device;
-    let stage = PipelineShaderStageCreateInfo::new(entry_point);
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    ComputePipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )
-    .unwrap()
-}
-
-mod prefilter_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/dof_prefilter.comp" }
-}
-
-mod tile_max_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/dof_tile_max.comp" }
-}
-
-mod gather_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/dof_gather.comp" }
-}
-
-mod composite_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/dof_composite.comp" }
 }
 
 #[cfg(test)]

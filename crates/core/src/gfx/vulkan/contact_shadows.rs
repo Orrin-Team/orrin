@@ -16,44 +16,22 @@
 //! samples occlusion. The march reads the *jittered* projection, because the
 //! depth it reconstructs from was rasterised with it.
 
-use std::sync::Arc;
-
 use glam::Vec3;
-use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
-use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::format::Format;
-use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-use vulkano::memory::allocator::MemoryTypeFilter;
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
-use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::RasterizationState;
-use vulkano::pipeline::graphics::vertex_input::VertexInputState;
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-    PipelineShaderStageCreateInfo,
-};
 
+use crate::gfx::rhi::{
+    Binding, BindingResource, BufferId, Device, Encoder, GraphicsPipelineDesc, PipelineId,
+    SamplerDesc, SamplerId, TextureViewId, Viewport,
+};
+use crate::gfx::shaders::ShaderId;
 use crate::scene::ContactShadowSettings;
 
-use super::PassCtx;
-use super::context::VkContext;
-use super::prepass::FrameUbo;
-use super::record::{Arena, Recorder};
-use super::rendering;
 use super::taa::FrameView;
-use super::texture::MipPolicy;
 
 /// One channel, because visibility is one number. The same format the AO target
 /// uses, and for the same reason it is a colour attachment rather than a storage
 /// image: `R8_UNORM` is only guaranteed as a storage format behind an optional
 /// device feature, while every implementation can render to it.
-pub(super) const MASK_FORMAT: Format = Format::R8_UNORM;
+pub(super) const MASK_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::R8Unorm;
 
 /// How long the dither sequence runs before repeating.
 ///
@@ -62,39 +40,21 @@ pub(super) const MASK_FORMAT: Format = Format::R8_UNORM;
 /// finishes integrating, and a shorter one would hand it the same ray twice.
 const DITHER_PHASES: u64 = 8;
 
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct ContactShadowUbo {
-    /// xyz = view-space direction toward the sun.
-    light_direction: [f32; 4],
-    /// x = ray length, y = min depth separation, z = max depth separation,
-    /// w = steps.
-    march: [f32; 4],
-    /// x = intensity, y = fade start, z = fade end, w = frame index.
-    fade: [f32; 4],
-}
-
-/// What the pass binds: the tunables, plus the prepass's camera block. The
-/// camera half is uploaded by the prepass rather than here, for the reason the
-/// SSAO resolve shares it — the march reconstructs view positions from the depth
-/// that pass wrote, so it has to use the projection that wrote it, jitter and
-/// all.
 pub(super) struct ContactShadowUniforms {
-    frame: Subbuffer<FrameUbo>,
-    params: Subbuffer<ContactShadowUbo>,
+    frame: BufferId,
+    params: BufferId,
 }
 
 pub struct ContactShadowPass {
-    pipeline: Arc<GraphicsPipeline>,
-    uniform_allocator: Arena,
+    pipeline: PipelineId,
     /// Nearest, because depth and normals are fetched at exact texels: filtering
     /// either invents a surface between two that are really there, and the march
     /// would stop on it.
-    nearest_clamp: Arc<Sampler>,
+    nearest_clamp: SamplerId,
     /// 1x1 white (= fully lit), bound when the pass is off so the forward shader
     /// has one path rather than two. Not a graph resource: with contact shadows
     /// off the graph has no node to declare a read of.
-    lit_view: Arc<ImageView>,
+    lit_view: TextureViewId,
     /// Advanced every frame the pass runs, and what decorrelates the dither
     /// frame to frame. Without it every frame marches from the same offset and
     /// the temporal resolve averages eight copies of one march.
@@ -102,49 +62,33 @@ pub struct ContactShadowPass {
 }
 
 impl ContactShadowPass {
-    pub fn new(ctx: &VkContext) -> Self {
-        let device = &ctx.device;
-        let pipeline = build_pipeline(ctx);
+    pub fn new(device: &Device) -> Self {
+        let pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc::fullscreen(
+            ShaderId::FullscreenVert,
+            ShaderId::ContactShadowsFrag,
+            &[MASK_FORMAT],
+        ));
 
-        let uniform_allocator = Arena::new(
-            ctx.memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
-
-        let nearest_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let nearest_clamp = device.create_sampler(SamplerDesc {
+            linear: false,
+            mipmap_linear: false,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+            max_lod: Some(0.0),
+        });
 
         Self {
             pipeline,
-            uniform_allocator,
             nearest_clamp,
-            lit_view: super::texture::upload_texture(
-                ctx,
-                &[255u8],
-                [1, 1],
-                MASK_FORMAT,
-                MipPolicy::None,
-            ),
+            lit_view: device.create_texture_2d(&[255u8], [1, 1], MASK_FORMAT),
             frame: 0,
         }
     }
 
     /// A 1x1 "fully lit" view, bound when the pass is off.
-    pub fn lit_view(&self) -> Arc<ImageView> {
-        self.lit_view.clone()
+    pub fn lit_view(&self) -> TextureViewId {
+        self.lit_view
     }
 
     /// Resolve this frame's march against the settings and the sun.
@@ -157,10 +101,11 @@ impl ContactShadowPass {
     /// takes its matrices from `FrameView`.
     pub(super) fn begin_frame(
         &mut self,
+        device: &Device,
         settings: &ContactShadowSettings,
         view: &FrameView,
         to_sun: Vec3,
-        frame: Subbuffer<FrameUbo>,
+        frame: BufferId,
     ) -> ContactShadowUniforms {
         // A direction, so the view matrix's translation must not apply.
         let light_direction = view.view.transform_vector3(to_sun).normalize_or_zero();
@@ -171,27 +116,32 @@ impl ContactShadowPass {
         let fade_end = settings.fade_distance.max(1e-4);
         let fade_start = fade_end * 0.75;
 
-        let params = self.uniform_allocator.allocate_sized::<ContactShadowUbo>();
-        *params.write().unwrap() = ContactShadowUbo {
-            light_direction: [light_direction.x, light_direction.y, light_direction.z, 0.0],
-            march: [
-                settings.ray_length.max(0.0),
-                settings.bias.max(0.0),
-                // The far end of the window, summed here rather than in the
-                // shader so the two dials stay independent: a thickness below
-                // the bias would otherwise close the window entirely, and the
-                // pass would spend a full march per pixel to produce a mask of
-                // ones.
-                settings.bias.max(0.0) + settings.thickness.max(0.0),
-                settings.steps.max(1) as f32,
-            ],
-            fade: [
-                settings.intensity.clamp(0.0, 1.0),
-                fade_start,
-                fade_end,
-                (self.frame % DITHER_PHASES) as f32,
-            ],
-        };
+        let march = [
+            settings.ray_length.max(0.0),
+            settings.bias.max(0.0),
+            // The far end of the window, summed here rather than in the
+            // shader so the two dials stay independent: a thickness below
+            // the bias would otherwise close the window entirely, and the
+            // pass would spend a full march per pixel to produce a mask of
+            // ones.
+            settings.bias.max(0.0) + settings.thickness.max(0.0),
+            settings.steps.max(1) as f32,
+        ];
+        let fade = [
+            settings.intensity.clamp(0.0, 1.0),
+            fade_start,
+            fade_end,
+            (self.frame % DITHER_PHASES) as f32,
+        ];
+        let direction = [light_direction.x, light_direction.y, light_direction.z, 0.0];
+        let mut words = [0u32; 12];
+        for (word, value) in words
+            .iter_mut()
+            .zip(direction.iter().chain(&march).chain(&fade))
+        {
+            *word = value.to_bits();
+        }
+        let params = device.upload_uniform(&words);
         self.frame = self.frame.wrapping_add(1);
 
         ContactShadowUniforms { frame, params }
@@ -201,99 +151,56 @@ impl ContactShadowPass {
     /// as this pass's `Sampled` inputs.
     pub(super) fn record(
         &self,
-        builder: &mut Recorder,
-        renderer: &PassCtx<'_>,
+        device: &Device,
+        encoder: &mut Encoder,
         extent: [u32; 2],
         uniforms: &ContactShadowUniforms,
-        depth_view: Arc<ImageView>,
-        normal_view: Arc<ImageView>,
+        depth_view: TextureViewId,
+        normal_view: TextureViewId,
     ) {
-        let uniform_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::buffer(0, uniforms.frame.clone()),
-                WriteDescriptorSet::buffer(1, uniforms.params.clone()),
+        let uniform_set = device.create_transient_bind_group(
+            self.pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::UniformBuffer(uniforms.frame),
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::UniformBuffer(uniforms.params),
+                },
             ],
-            [],
-        )
-        .unwrap();
-        let texture_set = renderer.ctx.descriptor_sets.get(
-            &renderer.ctx.descriptor_set_allocator,
-            &self.pipeline.layout().set_layouts()[1],
-            [
-                WriteDescriptorSet::image_view_sampler(0, depth_view, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, normal_view, self.nearest_clamp.clone()),
+        );
+        let texture_set = device.create_bind_group(
+            self.pipeline,
+            1,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::SampledTexture {
+                        view: depth_view,
+                        sampler: self.nearest_clamp,
+                    },
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::SampledTexture {
+                        view: normal_view,
+                        sampler: self.nearest_clamp,
+                    },
+                },
             ],
         );
 
-        builder
-            .set_viewport(
-                0,
-                &[Viewport {
-                    offset: [0.0, 0.0],
-                    extent: [extent[0] as f32, extent[1] as f32],
-                    depth_range: 0.0..=1.0,
-                }],
-            )
-            .bind_pipeline_graphics(&self.pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.pipeline.layout(),
-                0,
-                &[uniform_set, texture_set],
-            );
-        builder.draw(3, 1, 0, 0);
+        encoder.set_viewport(Viewport {
+            origin: [0.0, 0.0],
+            extent: [extent[0] as f32, extent[1] as f32],
+            depth_range: [0.0, 1.0],
+        });
+        encoder.bind_pipeline(self.pipeline);
+        encoder.bind_group(0, uniform_set);
+        encoder.bind_group(1, texture_set);
+        encoder.draw(3, 1, 0, 0);
     }
-}
-
-fn build_pipeline(ctx: &VkContext) -> Arc<GraphicsPipeline> {
-    let device = &ctx.device;
-    let vs = fullscreen_vs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let fs = contact_fs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs),
-        PipelineShaderStageCreateInfo::new(fs),
-    ];
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    GraphicsPipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(VertexInputState::default()),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState::default()),
-            multisample_state: Some(MultisampleState::default()),
-            depth_stencil_state: None,
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                1,
-                ColorBlendAttachmentState::default(),
-            )),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(rendering::pipeline_info(&[MASK_FORMAT], None).into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .unwrap()
-}
-
-mod fullscreen_vs {
-    vulkano_shaders::shader! { ty: "vertex", path: "shaders/fullscreen.vert" }
-}
-mod contact_fs {
-    vulkano_shaders::shader! { ty: "fragment", path: "shaders/contact_shadows.frag" }
 }

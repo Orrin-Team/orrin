@@ -1,0 +1,966 @@
+//! The Metal encoder: one command buffer, and one Metal encoder at a time.
+//!
+//! A pass opens a render pass (or just dispatches, or copies) and the encoder
+//! opens whichever Metal encoder that needs, closing the one before it. Hazards
+//! are Metal's own while resources are tracked, so there is no barrier to
+//! record: the graph's plan is simply not consulted here.
+
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLBlitPassDescriptor, MTLBuffer, MTLClearColor, MTLCommandBuffer,
+    MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePassDescriptor,
+    MTLCounterDontSample, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor, MTLCounterSet,
+    MTLDevice, MTLIndexType, MTLLoadAction, MTLOrigin, MTLRenderCommandEncoder,
+    MTLRenderPassDescriptor, MTLRenderStages, MTLScissorRect, MTLSize, MTLStorageMode,
+    MTLStoreAction, MTLViewport, MTLWinding,
+};
+
+use super::pipeline::Pipe;
+use super::{MtlDriver, MtlEncoder};
+use crate::gfx::rhi::{
+    BindGroupId, BufferCopy, BufferId, DepthRect, LoadOp, PipelineId, RenderTargets, StoreOp,
+    TextureViewId, Viewport,
+};
+use crate::gfx::shaders::PUSH_CONSTANT_BUFFER;
+
+/// Which way a front face winds, in the window space Metal rasterises in. The
+/// translator flips clip-space Y so the image lands upright, which leaves
+/// window-space winding as Vulkan's; `a_single_sided_quad_is_visible` is the
+/// test that holds this.
+const FRONT_FACING: MTLWinding = MTLWinding::CounterClockwise;
+
+enum Open {
+    None,
+    Render(Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>),
+    Compute(Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>),
+    Blit(Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>),
+}
+
+/// Two timestamp samples around each Metal encoder, named for the pass that
+/// opened it. Metal samples at encoder boundaries only, so the encoder is ended
+/// at every pass boundary while timing is on.
+///
+/// A frame's `Timing` is handed back once its samples are read and reused for a
+/// later frame, so a steady frame allocates no sample buffer.
+pub(crate) struct Timing {
+    pub(super) buffer: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
+    names: Vec<&'static str>,
+    pub(crate) frame: u64,
+}
+
+/// Encoders timed in one frame; the sample buffer holds two samples each.
+const MAX_TIMED: usize = 128;
+
+/// A finished frame's samples as `(name, start_ns, end_ns)`, relative to the
+/// frame's first sample.
+pub(crate) type Spans = Vec<(&'static str, u64, u64)>;
+
+impl Timing {
+    /// A sample buffer for `frame`, or `None` on a device that cannot sample
+    /// timestamps at encoder boundaries.
+    pub(crate) fn new(driver: &MtlDriver, frame: u64) -> Option<Self> {
+        if !driver
+            .device
+            .supportsCounterSampling(objc2_metal::MTLCounterSamplingPoint::AtStageBoundary)
+        {
+            return None;
+        }
+        let sets = driver.device.counterSets()?;
+        let set = sets
+            .iter()
+            .find(|set| set.name().to_string() == "timestamp")?;
+        let descriptor = MTLCounterSampleBufferDescriptor::new();
+        descriptor.setCounterSet(Some(&set));
+        // SAFETY: a count of at least one sample.
+        unsafe { descriptor.setSampleCount(2 * MAX_TIMED) };
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        let buffer = driver
+            .device
+            .newCounterSampleBufferWithDescriptor_error(&descriptor)
+            .ok()?;
+        Some(Self {
+            buffer,
+            names: Vec::with_capacity(MAX_TIMED),
+            frame,
+        })
+    }
+
+    /// Reuse this buffer for `frame`, once the frame it last timed is resolved.
+    pub(crate) fn reset(&mut self, frame: u64) {
+        self.names.clear();
+        self.frame = frame;
+    }
+
+    pub(crate) fn resolve(&self) -> Spans {
+        let count = self.names.len() * 2;
+        if count == 0 {
+            return Vec::new();
+        }
+        // SAFETY: the range is within the samples the frame recorded.
+        let Some(data) = (unsafe {
+            self.buffer
+                .resolveCounterRange(objc2_foundation::NSRange::new(0, count))
+        }) else {
+            return Vec::new();
+        };
+        // SAFETY: the timestamp counter set resolves to one u64 per sample.
+        let ticks: &[u64] =
+            unsafe { std::slice::from_raw_parts(data.as_bytes_unchecked().as_ptr().cast(), count) };
+        let origin = ticks.iter().copied().filter(|t| *t != 0).min().unwrap_or(0);
+        self.names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| {
+                let (start, end) = (ticks[2 * index], ticks[2 * index + 1]);
+                (start >= origin && end > start && start != 0).then_some((
+                    *name,
+                    start - origin,
+                    end - origin,
+                ))
+            })
+            .collect()
+    }
+}
+
+/// What a draw or dispatch needs from the bound pipeline, read once when it is
+/// bound rather than out of the locked pool on every command.
+#[derive(Clone, Copy)]
+struct Bound {
+    kind: BoundKind,
+    push_constant_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+enum BoundKind {
+    Render(objc2_metal::MTLPrimitiveType),
+    Compute(MTLSize),
+}
+
+pub(crate) struct State {
+    command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    open: Open,
+    pipeline: Option<Bound>,
+    index_buffer: Option<(Retained<ProtocolObject<dyn MTLBuffer>>, u64)>,
+    timing: Option<Timing>,
+    pass_name: &'static str,
+}
+
+impl State {
+    pub(crate) fn new(driver: &MtlDriver) -> Self {
+        Self {
+            command_buffer: driver
+                .queue
+                .commandBuffer()
+                .expect("the queue gave no command buffer"),
+            open: Open::None,
+            pipeline: None,
+            index_buffer: None,
+            timing: None,
+            pass_name: "",
+        }
+    }
+
+    /// Time every encoder this frame records into `timing`.
+    pub(crate) fn time(&mut self, timing: Timing) {
+        self.timing = Some(timing);
+    }
+
+    pub(crate) fn take_timing(&mut self) -> Option<Timing> {
+        self.timing.take()
+    }
+
+    /// The sample pair for the encoder about to open, if there is room.
+    fn next_pair(
+        &mut self,
+    ) -> Option<(Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>, usize)> {
+        let timing = self.timing.as_mut()?;
+        if timing.names.len() >= MAX_TIMED {
+            return None;
+        }
+        timing.names.push(self.pass_name);
+        Some((timing.buffer.clone(), 2 * (timing.names.len() - 1)))
+    }
+
+    fn close(&mut self) {
+        match std::mem::replace(&mut self.open, Open::None) {
+            Open::None => {}
+            Open::Render(encoder) => encoder.endEncoding(),
+            Open::Compute(encoder) => encoder.endEncoding(),
+            Open::Blit(encoder) => encoder.endEncoding(),
+        }
+    }
+
+    /// End recording and hand the frame to the GPU without waiting: the drawable,
+    /// if there is one, is presented when the work reaches it. The command buffer
+    /// comes back so the caller can wait on it when the frame's slot is needed.
+    pub(crate) fn finish(
+        mut self,
+        drawable: Option<Retained<ProtocolObject<dyn objc2_metal::MTLDrawable>>>,
+    ) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
+        self.close();
+        if let Some(drawable) = drawable {
+            self.command_buffer.presentDrawable(&drawable);
+        }
+        self.command_buffer.commit();
+        self.command_buffer
+    }
+
+    /// End recording and wait for the GPU.
+    pub(crate) fn finish_blocking(
+        mut self,
+    ) -> (f64, Retained<ProtocolObject<dyn MTLCommandBuffer>>) {
+        self.close();
+        self.command_buffer.commit();
+        self.command_buffer.waitUntilCompleted();
+        report_failure(&self.command_buffer);
+        let seconds = self.command_buffer.GPUEndTime() - self.command_buffer.GPUStartTime();
+        (seconds, self.command_buffer)
+    }
+}
+
+/// Log why a finished command buffer failed, if it did. A GPU fault does not
+/// fail the call that caused it: the buffer simply never ran, and every pixel
+/// after it is silently wrong.
+pub(super) fn report_failure(command_buffer: &ProtocolObject<dyn MTLCommandBuffer>) {
+    if let Some(error) = command_buffer.error() {
+        tracing::error!("a Metal command buffer failed: {error}");
+    }
+}
+
+impl<'a> MtlEncoder<'a> {
+    pub(crate) fn new(driver: &'a MtlDriver, state: &'a mut State) -> Self {
+        Self { driver, state }
+    }
+
+    fn render(&self) -> &Retained<ProtocolObject<dyn MTLRenderCommandEncoder>> {
+        match &self.state.open {
+            Open::Render(encoder) => encoder,
+            _ => panic!("a draw was recorded outside a render pass"),
+        }
+    }
+
+    fn compute(&mut self) -> Retained<ProtocolObject<dyn MTLComputeCommandEncoder>> {
+        if let Open::Compute(encoder) = &self.state.open {
+            return encoder.clone();
+        }
+        assert!(
+            !matches!(self.state.open, Open::Render(_)),
+            "a dispatch was recorded inside a render pass"
+        );
+        self.state.close();
+        let encoder = match self.state.next_pair() {
+            Some((buffer, at)) => {
+                let pass = MTLComputePassDescriptor::computePassDescriptor();
+                // SAFETY: attachment 0 of a descriptor is always valid to address.
+                let attachment =
+                    unsafe { pass.sampleBufferAttachments().objectAtIndexedSubscript(0) };
+                attachment.setSampleBuffer(Some(&buffer));
+                // SAFETY: the index is inside the sample buffer the pass was given.
+                unsafe { attachment.setStartOfEncoderSampleIndex(at) };
+                // SAFETY: the index is inside the sample buffer the pass was given.
+                unsafe { attachment.setEndOfEncoderSampleIndex(at + 1) };
+                self.state
+                    .command_buffer
+                    .computeCommandEncoderWithDescriptor(&pass)
+            }
+            None => self.state.command_buffer.computeCommandEncoder(),
+        }
+        .expect("failed to open a compute encoder");
+        self.state.open = Open::Compute(encoder.clone());
+        encoder
+    }
+
+    fn blit(&mut self) -> Retained<ProtocolObject<dyn MTLBlitCommandEncoder>> {
+        if let Open::Blit(encoder) = &self.state.open {
+            return encoder.clone();
+        }
+        assert!(
+            !matches!(self.state.open, Open::Render(_)),
+            "a copy was recorded inside a render pass"
+        );
+        self.state.close();
+        let encoder = match self.state.next_pair() {
+            Some((buffer, at)) => {
+                let pass = MTLBlitPassDescriptor::blitPassDescriptor();
+                // SAFETY: attachment 0 of a descriptor is always valid to address.
+                let attachment =
+                    unsafe { pass.sampleBufferAttachments().objectAtIndexedSubscript(0) };
+                attachment.setSampleBuffer(Some(&buffer));
+                // SAFETY: the index is inside the sample buffer the pass was given.
+                unsafe { attachment.setStartOfEncoderSampleIndex(at) };
+                // SAFETY: the index is inside the sample buffer the pass was given.
+                unsafe { attachment.setEndOfEncoderSampleIndex(at + 1) };
+                self.state
+                    .command_buffer
+                    .blitCommandEncoderWithDescriptor(&pass)
+            }
+            None => self.state.command_buffer.blitCommandEncoder(),
+        }
+        .expect("failed to open a blit encoder");
+        self.state.open = Open::Blit(encoder.clone());
+        encoder
+    }
+
+    fn begin(&mut self, target: TextureViewId, load: MTLLoadAction) {
+        self.state.close();
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        // SAFETY: attachment 0 of a descriptor is always valid to address.
+        let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        attachment.setTexture(Some(&self.driver.texture(target)));
+        attachment.setLoadAction(load);
+        attachment.setStoreAction(MTLStoreAction::Store);
+        attachment.setClearColor(MTLClearColor {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 0.0,
+        });
+        let encoder = self
+            .state
+            .command_buffer
+            .renderCommandEncoderWithDescriptor(&pass)
+            .expect("failed to open a render encoder");
+        self.state.open = Open::Render(encoder);
+        self.state.pipeline = None;
+    }
+
+    pub fn begin_pass(&mut self, targets: &RenderTargets) {
+        self.state.close();
+        let load = |op: LoadOp| match op {
+            LoadOp::Load => MTLLoadAction::Load,
+            LoadOp::Clear => MTLLoadAction::Clear,
+            LoadOp::DontCare => MTLLoadAction::DontCare,
+        };
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        for (index, color) in targets.colors.iter().enumerate() {
+            // SAFETY: attachments are addressed in order from zero.
+            let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(index) };
+            attachment.setTexture(Some(&self.driver.texture(color.target)));
+            attachment.setLoadAction(load(color.load));
+            attachment.setClearColor(MTLClearColor {
+                red: color.clear[0] as f64,
+                green: color.clear[1] as f64,
+                blue: color.clear[2] as f64,
+                alpha: color.clear[3] as f64,
+            });
+            // A texture the graph found nothing to read back from lives in tile
+            // memory and cannot be stored, however the pass states it.
+            let store = if self.driver.is_memoryless(color.target) {
+                StoreOp::DontCare
+            } else {
+                color.store
+            };
+            attachment.setStoreAction(match (color.resolve, store) {
+                (Some(resolve), store) => {
+                    attachment.setResolveTexture(Some(&self.driver.texture(resolve)));
+                    if store == StoreOp::Store {
+                        MTLStoreAction::StoreAndMultisampleResolve
+                    } else {
+                        MTLStoreAction::MultisampleResolve
+                    }
+                }
+                (None, StoreOp::Store) => MTLStoreAction::Store,
+                (None, StoreOp::DontCare) => MTLStoreAction::DontCare,
+            });
+        }
+        if let Some(depth) = targets.depth {
+            let attachment = pass.depthAttachment();
+            attachment.setTexture(Some(&self.driver.texture(depth.target)));
+            // A depth that need not be kept is cleared, which is what the one
+            // pass that loads `DontCare` (the shadow atlas) relies on to have
+            // every tile it does not light read as far.
+            attachment.setLoadAction(load(match depth.load {
+                LoadOp::DontCare => LoadOp::Clear,
+                other => other,
+            }));
+            attachment.setClearDepth(depth.clear as f64);
+            attachment.setStoreAction(
+                match if self.driver.is_memoryless(depth.target) {
+                    StoreOp::DontCare
+                } else {
+                    depth.store
+                } {
+                    StoreOp::Store => MTLStoreAction::Store,
+                    StoreOp::DontCare => MTLStoreAction::DontCare,
+                },
+            );
+        }
+        if let Some((buffer, at)) = self.state.next_pair() {
+            // SAFETY: attachment 0 of a descriptor is always valid to address.
+            let attachment = unsafe { pass.sampleBufferAttachments().objectAtIndexedSubscript(0) };
+            attachment.setSampleBuffer(Some(&buffer));
+            // SAFETY: the index is inside the sample buffer the pass was given.
+            unsafe { attachment.setStartOfVertexSampleIndex(at) };
+            // SAFETY: the index is inside the sample buffer the pass was given.
+            unsafe { attachment.setEndOfVertexSampleIndex(MTLCounterDontSample) };
+            // SAFETY: the index is inside the sample buffer the pass was given.
+            unsafe { attachment.setStartOfFragmentSampleIndex(MTLCounterDontSample) };
+            // SAFETY: the index is inside the sample buffer the pass was given.
+            unsafe { attachment.setEndOfFragmentSampleIndex(at + 1) };
+        }
+        let encoder = self
+            .state
+            .command_buffer
+            .renderCommandEncoderWithDescriptor(&pass)
+            .expect("failed to open a render encoder");
+        self.state.open = Open::Render(encoder);
+        self.state.pipeline = None;
+    }
+
+    /// Name the passes that follow. While timing, this ends the open encoder so
+    /// the next one starts its own sample pair.
+    pub fn set_pass_name(&mut self, name: &'static str) {
+        if self.state.timing.is_some() {
+            self.state.close();
+            self.state.pass_name = name;
+        }
+    }
+
+    pub fn begin_rendering(&mut self, target: TextureViewId) {
+        self.begin(target, MTLLoadAction::Load);
+    }
+
+    /// The target's contents do not matter, so they are cleared: a tile GPU
+    /// makes that free, and a pass that reads an uncovered texel gets zero, not
+    /// whatever was in the memory.
+    pub fn begin_rendering_fresh(&mut self, target: TextureViewId) {
+        self.begin(target, MTLLoadAction::Clear);
+    }
+
+    pub fn end_rendering(&mut self) {
+        self.state.close();
+    }
+
+    pub fn set_viewport(&mut self, viewport: Viewport) {
+        self.render().setViewport(MTLViewport {
+            originX: viewport.origin[0] as f64,
+            originY: viewport.origin[1] as f64,
+            width: viewport.extent[0] as f64,
+            height: viewport.extent[1] as f64,
+            znear: viewport.depth_range[0] as f64,
+            zfar: viewport.depth_range[1] as f64,
+        });
+    }
+
+    pub fn set_scissor(&mut self, offset: [u32; 2], extent: [u32; 2]) {
+        self.render().setScissorRect(MTLScissorRect {
+            x: offset[0] as usize,
+            y: offset[1] as usize,
+            width: extent[0] as usize,
+            height: extent[1] as usize,
+        });
+    }
+
+    pub fn set_depth_bias(&mut self, constant: f32, clamp: f32, slope: f32) {
+        self.render()
+            .setDepthBias_slopeScale_clamp(constant, slope, clamp);
+    }
+
+    pub fn bind_pipeline(&mut self, pipeline: PipelineId) {
+        let bound = self.driver.with_pipe(pipeline, |pipe| {
+            let kind = match pipe {
+                Pipe::Render(render) => {
+                    let encoder = self.render();
+                    encoder.setRenderPipelineState(&render.state.0);
+                    if let Some(depth) = &render.depth {
+                        encoder.setDepthStencilState(Some(&depth.0));
+                    }
+                    encoder.setCullMode(render.cull);
+                    encoder.setFrontFacingWinding(FRONT_FACING);
+                    BoundKind::Render(render.topology)
+                }
+                Pipe::Compute(compute) => {
+                    let encoder = self.compute();
+                    encoder.setComputePipelineState(&compute.state.0);
+                    BoundKind::Compute(compute.threads)
+                }
+            };
+            Bound {
+                kind,
+                push_constant_bytes: pipe.push_constant_bytes(),
+            }
+        });
+        self.state.pipeline = Some(bound);
+    }
+
+    pub fn bind_vertex_buffer(&mut self, buffer: BufferId) {
+        let buf = self.driver.buffer(buffer);
+        // SAFETY: a live buffer and an offset inside it.
+        unsafe {
+            self.render().setVertexBuffer_offset_atIndex(
+                Some(&buf.buffer.0),
+                buf.offset as usize,
+                crate::gfx::shaders::VERTEX_STREAM_BASE as usize,
+            );
+        }
+    }
+
+    /// Bind the shared geometry: the positions stream, the surface stream unless
+    /// only depth is wanted, and the index buffer.
+    pub fn bind_geometry(&mut self, positions_only: bool) {
+        let geometry = self
+            .driver
+            .geometry
+            .lock()
+            .expect("a pass panicked while using the device");
+        let geometry = &geometry.0;
+        let base = crate::gfx::shaders::VERTEX_STREAM_BASE as usize;
+        let encoder = self.render();
+        // SAFETY: live buffers at offset zero.
+        unsafe {
+            encoder.setVertexBuffer_offset_atIndex(Some(&geometry.positions), 0, base);
+            if !positions_only {
+                encoder.setVertexBuffer_offset_atIndex(Some(&geometry.surfaces), 0, base + 1);
+            }
+        }
+        self.state.index_buffer = Some((geometry.indices.clone(), 0));
+    }
+
+    pub fn bind_index_buffer(&mut self, buffer: BufferId) {
+        let buf = self.driver.buffer(buffer);
+        self.state.index_buffer = Some((buf.buffer.0.clone(), buf.offset));
+    }
+
+    pub fn bind_group(&mut self, set: u32, group: BindGroupId) {
+        let open = &self.state.open;
+        self.driver.with_group(group, |group| {
+            let (buffer, offset) = (&*group.buffer.0, group.offset as usize);
+            match open {
+                Open::Render(encoder) => {
+                    // SAFETY: a live argument buffer at the index its set names.
+                    unsafe {
+                        encoder.setVertexBuffer_offset_atIndex(Some(buffer), offset, set as usize);
+                        encoder.setFragmentBuffer_offset_atIndex(
+                            Some(buffer),
+                            offset,
+                            set as usize,
+                        );
+                    }
+                    for used in &group.uses {
+                        encoder.useResource_usage_stages(
+                            &used.resource.0,
+                            used.usage,
+                            MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+                        );
+                    }
+                }
+                Open::Compute(encoder) => {
+                    // SAFETY: as above.
+                    unsafe { encoder.setBuffer_offset_atIndex(Some(buffer), offset, set as usize) };
+                    for used in &group.uses {
+                        encoder.useResource_usage(&used.resource.0, used.usage);
+                    }
+                }
+                _ => panic!("a bind group was bound outside a pass"),
+            }
+        });
+    }
+
+    pub fn push_constants(&mut self, words: &[u32]) {
+        let given = bytemuck::cast_slice::<u32, u8>(words);
+        // A shader's block is padded to its struct's alignment, and Metal checks
+        // the bound length against the size the shader declares, so a short one
+        // is zero-padded up to it.
+        let declared = self
+            .state
+            .pipeline
+            .map_or(0, |bound| bound.push_constant_bytes)
+            // The struct's size is rounded up to its widest member's alignment.
+            .next_multiple_of(16);
+        let mut padded = [0u8; 512];
+        let bytes: &[u8] = if declared > given.len() {
+            assert!(declared <= padded.len(), "a push block outgrew the pad");
+            padded[..given.len()].copy_from_slice(given);
+            &padded[..declared]
+        } else {
+            given
+        };
+        let pointer =
+            std::ptr::NonNull::new(bytes.as_ptr() as *mut _).expect("a slice is never null");
+        match &self.state.open {
+            // SAFETY: a live slice, copied by Metal before the call returns.
+            Open::Render(encoder) => unsafe {
+                encoder.setVertexBytes_length_atIndex(
+                    pointer,
+                    bytes.len(),
+                    PUSH_CONSTANT_BUFFER as usize,
+                );
+                encoder.setFragmentBytes_length_atIndex(
+                    pointer,
+                    bytes.len(),
+                    PUSH_CONSTANT_BUFFER as usize,
+                );
+            },
+            // SAFETY: as above.
+            Open::Compute(encoder) => unsafe {
+                encoder.setBytes_length_atIndex(
+                    pointer,
+                    bytes.len(),
+                    PUSH_CONSTANT_BUFFER as usize,
+                );
+            },
+            _ => panic!("push constants were recorded outside a pass"),
+        }
+    }
+
+    pub fn dispatch(&mut self, groups: [u32; 3]) {
+        let bound = self
+            .state
+            .pipeline
+            .expect("a dispatch with no pipeline bound");
+        let BoundKind::Compute(threads) = bound.kind else {
+            panic!("a dispatch with a render pipeline bound")
+        };
+        self.compute().dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: groups[0] as usize,
+                height: groups[1] as usize,
+                depth: groups[2] as usize,
+            },
+            threads,
+        );
+    }
+
+    fn topology(&self) -> objc2_metal::MTLPrimitiveType {
+        match self
+            .state
+            .pipeline
+            .expect("a draw with no pipeline bound")
+            .kind
+        {
+            BoundKind::Render(topology) => topology,
+            BoundKind::Compute(_) => panic!("a draw with a compute pipeline bound"),
+        }
+    }
+
+    pub fn draw(&mut self, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+        let topology = self.topology();
+        // SAFETY: plain counts.
+        unsafe {
+            self.render()
+                .drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                    topology,
+                    first_vertex as usize,
+                    vertices as usize,
+                    instances as usize,
+                    first_instance as usize,
+                );
+        }
+    }
+
+    pub fn draw_indexed(
+        &mut self,
+        index_count: u32,
+        instances: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    ) {
+        let topology = self.topology();
+        let (buffer, base) = self
+            .state
+            .index_buffer
+            .clone()
+            .expect("an indexed draw with no index buffer bound");
+        // SAFETY: the range lies inside the bound index buffer, which the pass
+        // recorded the counts against.
+        unsafe {
+            self.render()
+                .drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(
+                    topology,
+                    index_count as usize,
+                    MTLIndexType::UInt32,
+                    &buffer,
+                    base as usize + first_index as usize * 4,
+                    instances as usize,
+                    vertex_offset as isize,
+                    first_instance as usize,
+                );
+        }
+    }
+
+    /// One indirect draw per command: Metal has no multi-draw, and the Vulkan
+    /// layout of a command is the one Metal reads.
+    pub fn draw_indexed_indirect(&mut self, commands: BufferId, range: std::ops::Range<u32>) {
+        let topology = self.topology();
+        let (index, index_base) = self
+            .state
+            .index_buffer
+            .clone()
+            .expect("an indirect draw with no index buffer bound");
+        let buf = self.driver.buffer(commands);
+        for command in range {
+            // SAFETY: each command lies inside the commands buffer.
+            unsafe {
+                self.render()
+                    .drawIndexedPrimitives_indexType_indexBuffer_indexBufferOffset_indirectBuffer_indirectBufferOffset(
+                        topology,
+                        MTLIndexType::UInt32,
+                        &index,
+                        index_base as usize,
+                        &buf.buffer.0,
+                        buf.offset as usize + command as usize * 20,
+                    );
+            }
+        }
+    }
+
+    pub fn copy_buffer(&mut self, src: BufferId, dst: BufferId, regions: &[BufferCopy]) {
+        let (src, dst) = (self.driver.buffer(src), self.driver.buffer(dst));
+        let blit = self.blit();
+        for region in regions {
+            // SAFETY: each region lies inside both buffers.
+            unsafe {
+                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    &src.buffer.0,
+                    (src.offset + region.src_offset) as usize,
+                    &dst.buffer.0,
+                    (dst.offset + region.dst_offset) as usize,
+                    region.size as usize,
+                );
+            }
+        }
+    }
+
+    /// The pass that asks for this opened its depth as `DontCare`, which this
+    /// driver turns into a whole-attachment clear, so there is nothing left to
+    /// clear.
+    pub fn clear_depth(&mut self, _rects: &[DepthRect]) {}
+
+    /// A drawable needs no transition into rendering: hazards are Metal's own.
+    pub fn open_swapchain(&mut self, _target: TextureViewId) {}
+
+    /// Presenting is the command buffer's job, once the frame is finished.
+    pub fn close_swapchain(&mut self, _target: TextureViewId) {}
+
+    /// Reduce what is drawn so far into `half`, then `quarter`. A render pass
+    /// each, because a blit cannot scale.
+    pub fn capture_backdrop(
+        &mut self,
+        target: TextureViewId,
+        half: TextureViewId,
+        quarter: TextureViewId,
+    ) {
+        self.state.close();
+        let (target, half, quarter) = (
+            self.driver.texture(target),
+            self.driver.texture(half),
+            self.driver.texture(quarter),
+        );
+        self.driver
+            .downsample(&self.state.command_buffer, &target, &half);
+        self.driver
+            .downsample(&self.state.command_buffer, &half, &quarter);
+    }
+
+    pub fn generate_cube_mips(&mut self, texture: TextureViewId) {
+        let texture = self.driver.texture(texture);
+        self.blit().generateMipmapsForTexture(&texture);
+    }
+
+    pub fn publish_render_target(&mut self, _texture: TextureViewId) {
+        // Tracked hazards: rendering into a texture and then sampling it needs
+        // nothing said.
+    }
+
+    pub fn write_texture(
+        &mut self,
+        texture: TextureViewId,
+        offset: [u32; 2],
+        extent: [u32; 2],
+        staging: BufferId,
+        _initial: bool,
+    ) {
+        let texture = self.driver.texture(texture);
+        let staging = self.driver.buffer(staging);
+        let row = staging.len as usize / extent[1].max(1) as usize;
+        // SAFETY: the source range is the staged texels and the destination
+        // region lies inside the texture, which the caller sized together.
+        unsafe {
+            self.blit()
+                .copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                    &staging.buffer.0,
+                    staging.offset as usize,
+                    row,
+                    staging.len as usize,
+                    MTLSize {
+                        width: extent[0] as usize,
+                        height: extent[1] as usize,
+                        depth: 1,
+                    },
+                    &texture,
+                    0,
+                    0,
+                    MTLOrigin {
+                        x: offset[0] as usize,
+                        y: offset[1] as usize,
+                        z: 0,
+                    },
+                );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx::format::{Format, SampleCount};
+    use crate::gfx::graph::ImageUsage;
+    use crate::gfx::rhi::{BufferDesc, Device, MemoryLocation, TextureDesc, TextureDimension};
+    use crate::gfx::vulkan::hdr::HdrPass;
+
+    fn metal() -> Device {
+        Device::Metal(MtlDriver::new().expect("this machine runs the Metal backend"))
+    }
+
+    fn target(device: &Device, extent: [u32; 2]) -> TextureViewId {
+        device.create_texture(&TextureDesc {
+            format: Format::Rgba8Unorm,
+            dimension: TextureDimension::D2,
+            extent: [extent[0], extent[1], 1],
+            mip_levels: 1,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED,
+            memoryless: false,
+        })
+    }
+
+    fn floats(values: &[f32]) -> Vec<u8> {
+        bytemuck::cast_slice(values).to_vec()
+    }
+
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn each_named_pass_gets_its_own_ordered_gpu_span() {
+        let device = metal();
+        let Device::Metal(driver) = &device else {
+            unreachable!()
+        };
+        driver.begin_frame(0);
+        let view = target(&device, [64, 64]);
+        let pass = RenderTargets {
+            colors: vec![crate::gfx::rhi::ColorAttachment {
+                target: view,
+                load: LoadOp::Clear,
+                store: StoreOp::Store,
+                clear: [0.0; 4],
+                resolve: None,
+            }],
+            depth: None,
+        };
+        let mut state = State::new(driver);
+        state.time(Timing::new(driver, 7).expect("this device samples timestamps"));
+        {
+            let mut encoder = crate::gfx::rhi::Encoder::Metal(MtlEncoder::new(driver, &mut state));
+            for name in ["first", "second"] {
+                encoder.set_pass_name(name);
+                encoder.begin_pass(&pass);
+                encoder.end_rendering();
+            }
+        }
+        let timing = state.take_timing().unwrap();
+        let _ = state.finish_blocking();
+        let spans = timing.resolve();
+        let names: Vec<_> = spans.iter().map(|span| span.0).collect();
+        assert_eq!(names, ["first", "second"]);
+        assert!(spans[0].2 <= spans[1].2, "{spans:?}");
+    }
+
+    /// The first pass through the whole stack on a real device: a fullscreen
+    /// triangle, a sampled input, a storage buffer and push constants, all
+    /// reached through argument buffers. The expected texels are the ACES curve
+    /// the shader applies, worked by hand.
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn the_tonemap_pass_renders_the_aces_curve() {
+        let device = metal();
+        let Device::Metal(driver) = &device else {
+            unreachable!()
+        };
+        driver.begin_frame(0);
+
+        let hdr = device.create_texture_2d(
+            &floats(&[1.0, 0.5, 0.25, 1.0].repeat(16)),
+            [4, 4],
+            Format::Rgba32Float,
+        );
+        let bloom = device.create_texture_2d(&[0, 0, 0, 255], [1, 1], Format::Rgba8Unorm);
+        let exposure = device.create_buffer_bytes(
+            BufferDesc {
+                size: 12,
+                usage: crate::gfx::graph::BufferUsage::STORAGE_BUFFER,
+                location: MemoryLocation::Upload,
+            },
+            &floats(&[1.0, 1.0, 0.0]),
+        );
+        let output = target(&device, [4, 4]);
+
+        let mut pass = HdrPass::new(&device, Format::Rgba8Unorm);
+        pass.auto_exposure = false;
+        pass.manual_exposure = 1.0;
+        device.record_blocking(|encoder| {
+            encoder.begin_rendering_fresh(output);
+            pass.record_tonemap(&device, encoder, [4, 4], hdr, exposure, bloom);
+            encoder.end_rendering();
+        });
+
+        let pixels = driver.read_texture(output);
+        let expect = [205u8, 157, 95, 255];
+        for texel in pixels.chunks(4) {
+            for (got, want) in texel.iter().zip(expect) {
+                assert!(
+                    got.abs_diff(want) <= 1,
+                    "texel {texel:?}, expected about {expect:?}"
+                );
+            }
+        }
+    }
+
+    /// Drawn through the real gizmo pass: a vertex stream matched to its shader
+    /// by name, a blend, and the Y orientation the translator fixes. The
+    /// triangle covers the top-left half of the target in framebuffer
+    /// coordinates, where row zero is the top.
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_gizmo_triangle_lands_where_vulkan_would_put_it() {
+        use crate::gfx::vulkan::gizmo::{GizmoPass, GizmoVertex};
+        let device = metal();
+        let Device::Metal(driver) = &device else {
+            unreachable!()
+        };
+        driver.begin_frame(0);
+        let output = target(&device, [8, 8]);
+        let pass = GizmoPass::new(&device, Format::Rgba8Unorm);
+        let red = |x: f32, y: f32| GizmoVertex {
+            position: [x, y],
+            edge: [0.0, 100.0],
+            color: [255, 0, 0, 255],
+        };
+        device.record_blocking(|encoder| {
+            encoder.begin_rendering_fresh(output);
+            pass.record(
+                &device,
+                encoder,
+                &[red(0.0, 0.0), red(8.0, 0.0), red(0.0, 8.0)],
+                [8, 8],
+            );
+            encoder.end_rendering();
+        });
+        let pixels = driver.read_texture(output);
+        let texel = |x: usize, y: usize| &pixels[(y * 8 + x) * 4..][..4];
+        assert_eq!(texel(1, 1), [255, 0, 0, 255], "inside, near the top-left");
+        assert_eq!(texel(6, 6), [0, 0, 0, 0], "outside, near the bottom-right");
+        // Inside only if the top row is the top: a flipped triangle covers the
+        // bottom-left half instead, and leaves this texel empty.
+        assert_eq!(texel(6, 0), [255, 0, 0, 255], "the top row, far right");
+        assert_eq!(texel(7, 2), [0, 0, 0, 0], "beyond the diagonal");
+
+        assert_eq!(
+            texel(0, 6),
+            [255, 0, 0, 255],
+            "inside on the left column, low down"
+        );
+    }
+}

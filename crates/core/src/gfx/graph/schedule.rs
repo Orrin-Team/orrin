@@ -35,7 +35,7 @@
 
 use std::ops::Range;
 
-use vulkano::sync::{AccessFlags, PipelineStages};
+use super::sync::{AccessFlags, PipelineStages};
 
 use super::{Barrier, PassDecl, PassId, PassKind};
 

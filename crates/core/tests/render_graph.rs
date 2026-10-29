@@ -22,13 +22,13 @@
 use std::fs;
 use std::path::PathBuf;
 
+use orrin_core::gfx::format::Format;
 use orrin_core::gfx::vulkan::frame::{FrameConfig, declare};
-use vulkano::format::Format;
 
 /// The swapchain format the baseline is written against. Real ones vary by
 /// surface; the plan does not depend on it, and pinning it keeps the file from
 /// depending on whoever regenerated it.
-const COLOR_FORMAT: Format = Format::B8G8R8A8_SRGB;
+const COLOR_FORMAT: Format = Format::Bgra8Srgb;
 
 /// The cascade resolution the baseline is written against. It changes what the
 /// images are sized to, not what the plan says, so pinning it keeps the file
@@ -1832,7 +1832,7 @@ fn every_configuration_leaves_the_swapchain_presentable() {
             .iter()
             .filter(|barrier| {
                 frame.graph.resource_name(barrier.resource) == "swapchain_color"
-                    && barrier.new_layout == vulkano::image::ImageLayout::PresentSrc
+                    && barrier.new_layout == orrin_core::gfx::graph::ImageLayout::PresentSrc
             })
             .collect();
         assert_eq!(

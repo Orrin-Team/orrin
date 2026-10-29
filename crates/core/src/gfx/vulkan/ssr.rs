@@ -17,25 +17,15 @@
 //! TAA resolve. Before TAA, so the accumulation over the jitter sequence is what
 //! denoises the rays; after shading, so what a ray finds is lit.
 
-use std::sync::Arc;
-
 use glam::Vec3;
-use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
-use vulkano::buffer::{BufferContents, BufferUsage};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::format::Format;
-use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
-};
 
+use crate::gfx::rhi::{
+    Binding, BindingResource, BufferId, ComputePipelineDesc, Device, Encoder, PipelineId,
+    SamplerDesc, SamplerId, TextureViewId,
+};
+use crate::gfx::shaders::ShaderId;
 use crate::scene::SsrSettings;
 
-use super::context::VkContext;
-use super::record::{Arena, Recorder};
 use super::taa::FrameView;
 
 /// Side of the compute workgroup for the trace and the composite.
@@ -67,140 +57,80 @@ pub(super) const SOURCE_LEVELS: u32 = 7;
 /// and `R32_SFLOAT` is a storage format every Vulkan implementation supports.
 /// Non-linear NDC depth, not linearised: the march compares against the same
 /// values the depth buffer holds, and the comparison only needs monotonicity.
-pub(super) const HIZ_FORMAT: Format = Format::R32_SFLOAT;
+pub(super) const HIZ_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::R32Float;
 
 /// What one ray leaves behind: the radiance it found, and how much of it to
 /// believe. `SFLOAT` because the radiance is HDR and the confidence is a
 /// fraction — the same target has to carry both.
-pub(super) const RAY_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
+pub(super) const RAY_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::Rgba16Float;
 
 /// Shared by the trace and the composite, because they must agree about the
 /// camera, the environment and the settings to the last bit — the composite
 /// subtracts a term the trace's own weighting assumes.
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct SsrUbo {
-    proj: [[f32; 4]; 4],
-    inv_proj: [[f32; 4]; 4],
-    inv_view: [[f32; 4]; 4],
-    /// x = frame index, y = max roughness, z = thickness, w = intensity.
-    params: [f32; 4],
-    /// x = max steps, y = max distance, z = pyramid levels.
-    trace: [f32; 4],
-    /// xy = full-resolution extent, zw = its reciprocal.
-    extent: [f32; 4],
-    /// x = sin(environment yaw), y = cos, z = specular mip count.
-    env: [f32; 4],
-    env_tint: [f32; 4],
-}
-
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct HizPush {
-    extent: [i32; 2],
-    levels: i32,
-}
+/// The reflection block, as the words of its std140 layout: three matrices
+/// (`proj`, `inv_proj`, `inv_view`), then `params`, `trace`, `extent`, `env` and
+/// `env_tint`, a vec4 each.
+const UBO_WORDS: usize = 3 * 16 + 5 * 4;
 
 pub struct SsrPass {
-    hiz_pipeline: Arc<ComputePipeline>,
-    source_pipeline: Arc<ComputePipeline>,
-    trace_pipeline: Arc<ComputePipeline>,
-    resolve_pipeline: Arc<ComputePipeline>,
+    hiz_pipeline: PipelineId,
+    source_pipeline: PipelineId,
+    trace_pipeline: PipelineId,
+    resolve_pipeline: PipelineId,
     /// Nearest for everything the march reads. The pyramid is sampled at cell
     /// centres and the G-buffer at exact texels; interpolating either invents a
     /// surface between two that are really there, and the march would stop on
     /// it.
-    nearest_clamp: Arc<Sampler>,
+    nearest_clamp: SamplerId,
     /// Linear, for the lit frame a ray lands in and for the environment cube.
-    linear_clamp: Arc<Sampler>,
+    linear_clamp: SamplerId,
     /// Linear across levels as well, because the trace picks a fractional one:
     /// a cone that grows smoothly with distance would otherwise step between
     /// blurs, and the step would be visible as a ring on a curved surface.
-    linear_mip: Arc<Sampler>,
-    uniform_allocator: Arena,
+    linear_mip: SamplerId,
     settings: SsrSettings,
     /// Advanced every frame the pass runs, and what decorrelates the sample
     /// sequence frame to frame. Without it every frame would trace the same ray
     /// per pixel and TAA would average eight copies of one sample.
     frame: u64,
-    uniforms: Option<vulkano::buffer::Subbuffer<SsrUbo>>,
+    uniforms: Option<BufferId>,
 }
 
 impl SsrPass {
-    pub fn new(ctx: &VkContext) -> Self {
-        let device = &ctx.device;
-        let hiz_pipeline = build_pipeline(
-            ctx,
-            hiz_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
-        let source_pipeline = build_pipeline(
-            ctx,
-            source_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
-        let trace_pipeline = build_pipeline(
-            ctx,
-            trace_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
-        let resolve_pipeline = build_pipeline(
-            ctx,
-            resolve_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-        );
+    pub fn new(device: &Device) -> Self {
+        let pipeline = |shader| device.create_compute_pipeline(&ComputePipelineDesc { shader });
+        let hiz_pipeline = pipeline(ShaderId::HizBuildComp);
+        let source_pipeline = pipeline(ShaderId::ColorPyramidComp);
+        let trace_pipeline = pipeline(ShaderId::SsrTraceComp);
+        let resolve_pipeline = pipeline(ShaderId::SsrResolveComp);
 
-        let nearest_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                // Nearest between levels as well: the march picks a level and
-                // means that level's cell, and a value blended with the next
-                // level's is a cell size that exists nowhere.
-                mipmap_mode: vulkano::image::sampler::SamplerMipmapMode::Nearest,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                lod: 0.0..=vulkano::image::sampler::LOD_CLAMP_NONE,
-                ..SamplerCreateInfo::default()
-            },
-        )
-        .unwrap();
-        let linear_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
-            },
-        )
-        .unwrap();
-        let linear_mip = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                mipmap_mode: vulkano::image::sampler::SamplerMipmapMode::Linear,
-                lod: 0.0..=vulkano::image::sampler::LOD_CLAMP_NONE,
-                ..SamplerCreateInfo::simple_repeat_linear()
-            },
-        )
-        .unwrap();
-
-        let uniform_allocator = Arena::new(
-            ctx.memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: vulkano::memory::allocator::MemoryTypeFilter::PREFER_DEVICE
-                    | vulkano::memory::allocator::MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
+        // Nearest between levels as well: the march picks a level and means that
+        // level's cell, and a value blended with the next level's is a cell size
+        // that exists nowhere.
+        let nearest_clamp = device.create_sampler(SamplerDesc {
+            linear: false,
+            mipmap_linear: false,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+            max_lod: None,
+        });
+        let linear_clamp = device.create_sampler(SamplerDesc {
+            linear: true,
+            mipmap_linear: false,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+            max_lod: Some(1.0),
+        });
+        let linear_mip = device.create_sampler(SamplerDesc {
+            linear: true,
+            mipmap_linear: true,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+            max_lod: None,
+        });
 
         Self {
             hiz_pipeline,
@@ -210,7 +140,6 @@ impl SsrPass {
             nearest_clamp,
             linear_clamp,
             linear_mip,
-            uniform_allocator,
             settings: SsrSettings::default(),
             frame: 0,
             uniforms: None,
@@ -226,6 +155,7 @@ impl SsrPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn begin_frame(
         &mut self,
+        device: &Device,
         settings: &SsrSettings,
         view: &FrameView,
         extent: [u32; 2],
@@ -242,92 +172,83 @@ impl SsrPass {
         // put the reconstructed position half a pixel from the depth it came
         // from, and the march would start beside the surface rather than on it.
         let proj = view.proj;
-        let uniforms = self.uniform_allocator.allocate_sized::<SsrUbo>();
-        *uniforms.write().unwrap() = SsrUbo {
-            proj: proj.to_cols_array_2d(),
-            inv_proj: proj.inverse().to_cols_array_2d(),
-            inv_view: view.view.inverse().to_cols_array_2d(),
-            params: [
+        let matrices = [
+            proj.to_cols_array_2d(),
+            proj.inverse().to_cols_array_2d(),
+            view.view.inverse().to_cols_array_2d(),
+        ];
+        let vectors = [
+            [
                 (self.frame % 64) as f32,
                 settings.max_roughness.clamp(0.01, 1.0),
                 settings.thickness.max(1e-3),
                 settings.intensity.max(0.0),
             ],
-            trace: [
+            [
                 settings.max_steps.max(1) as f32,
                 settings.max_distance.max(0.1),
                 levels as f32,
                 0.0,
             ],
-            extent: [
+            [
                 extent[0] as f32,
                 extent[1] as f32,
                 1.0 / extent[0].max(1) as f32,
                 1.0 / extent[1].max(1) as f32,
             ],
-            env: [
+            [
                 environment_yaw.to_radians().sin(),
                 environment_yaw.to_radians().cos(),
                 specular_mips as f32,
                 0.0,
             ],
-            env_tint: [env_tint.x, env_tint.y, env_tint.z, 0.0],
-        };
+            [env_tint.x, env_tint.y, env_tint.z, 0.0],
+        ];
+        let mut words = [0u32; UBO_WORDS];
+        for (word, float) in words.iter_mut().zip(
+            matrices
+                .iter()
+                .flatten()
+                .flatten()
+                .chain(vectors.iter().flatten()),
+        ) {
+            *word = float.to_bits();
+        }
+        let uniforms = device.upload_uniform(&words);
         self.uniforms = Some(uniforms);
     }
 
-    fn uniforms(&self) -> vulkano::buffer::Subbuffer<SsrUbo> {
+    fn uniforms(&self) -> BufferId {
         self.uniforms
-            .clone()
             .expect("the graph scheduled a reflection pass before begin_frame")
     }
 
-    /// Build every level of the depth pyramid in one dispatch. `mips` is one
-    /// view per level, because a storage image descriptor takes exactly one.
     pub(super) fn record_hiz(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        depth: Arc<ImageView>,
-        mips: &[Arc<ImageView>],
+        device: &Device,
+        builder: &mut Encoder,
+        depth: TextureViewId,
+        mips: &[TextureViewId],
         extent: [u32; 2],
     ) {
         let levels = mips.len() as u32;
         // Every slot in the shader's array has to be written even where the
         // pyramid is shorter than the declaration, so the spares point at level
         // zero. `levels` is what stops anything from storing through them.
-        let bound = (0..HIZ_LEVELS as usize).map(|level| mips[level.min(mips.len() - 1)].clone());
+        let mut bindings = vec![self.sampled(0, depth, self.nearest_clamp)];
+        bindings.extend((0..HIZ_LEVELS as usize).map(|level| Binding {
+            binding: 1,
+            resource: BindingResource::StorageTexture(mips[level.min(mips.len() - 1)]),
+        }));
+        let set = device.create_bind_group(self.hiz_pipeline, 0, &bindings);
 
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.hiz_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, depth, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_array(1, 0, bound),
-            ],
-        );
+        builder.bind_pipeline(self.hiz_pipeline);
+        builder.bind_group(0, set);
+        builder.push_constants(&[extent[0], extent[1], levels]);
 
-        builder
-            .bind_pipeline_compute(&self.hiz_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.hiz_pipeline.layout(),
-                0,
-                &[set],
-            )
-            .push_constants(
-                self.hiz_pipeline.layout(),
-                0,
-                &HizPush {
-                    extent: [extent[0] as i32, extent[1] as i32],
-                    levels: levels as i32,
-                },
-            );
-
-        // SAFETY: one workgroup per HIZ_TILE-sized tile covers the frame, and
-        // every store is bounds-checked against the level it writes, so nothing
-        // lands outside an image. The descriptors match the shader's layout, and
-        // the graph declared every resource this pass touches.
+        // One workgroup per HIZ_TILE-sized tile covers the frame, and every store
+        // is bounds-checked against the level it writes, so nothing lands outside
+        // an image.
         builder.dispatch([
             extent[0].div_ceil(HIZ_TILE),
             extent[1].div_ceil(HIZ_TILE),
@@ -335,52 +256,30 @@ impl SsrPass {
         ]);
     }
 
-    /// Reduce the lit frame into the pyramid the trace samples cones out of.
-    /// Same dispatch shape as the depth pyramid, and for the same reason.
     pub(super) fn record_source(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        source: Arc<ImageView>,
-        mips: &[Arc<ImageView>],
+        device: &Device,
+        builder: &mut Encoder,
+        source: TextureViewId,
+        mips: &[TextureViewId],
     ) {
         let levels = mips.len() as u32;
-        let extent = mips[0].image().extent();
-        let bound =
-            (0..SOURCE_LEVELS as usize).map(|level| mips[level.min(mips.len() - 1)].clone());
+        let extent = device.view_extent(mips[0]);
+        // Linear, because level 0 is a 2:1 reduction of the frame and one bilinear
+        // fetch between four texels *is* their average.
+        let mut bindings = vec![self.sampled(0, source, self.linear_clamp)];
+        bindings.extend((0..SOURCE_LEVELS as usize).map(|level| Binding {
+            binding: 1,
+            resource: BindingResource::StorageTexture(mips[level.min(mips.len() - 1)]),
+        }));
+        let set = device.create_bind_group(self.source_pipeline, 0, &bindings);
 
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.source_pipeline.layout().set_layouts()[0],
-            [
-                // Linear, because level 0 is a 2:1 reduction of the frame and
-                // one bilinear fetch between four texels *is* their average.
-                WriteDescriptorSet::image_view_sampler(0, source, self.linear_clamp.clone()),
-                WriteDescriptorSet::image_view_array(1, 0, bound),
-            ],
-        );
+        builder.bind_pipeline(self.source_pipeline);
+        builder.bind_group(0, set);
+        builder.push_constants(&[extent[0], extent[1], levels]);
 
-        builder
-            .bind_pipeline_compute(&self.source_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.source_pipeline.layout(),
-                0,
-                &[set],
-            )
-            .push_constants(
-                self.source_pipeline.layout(),
-                0,
-                &HizPush {
-                    extent: [extent[0] as i32, extent[1] as i32],
-                    levels: levels as i32,
-                },
-            );
-
-        // SAFETY: one workgroup per HIZ_TILE-sized tile covers level 0, and
-        // every store is bounds-checked against the level it writes, so nothing
-        // lands outside an image. The descriptors match the shader's layout, and
-        // the graph declared every resource this pass touches.
+        // One workgroup per HIZ_TILE-sized tile covers level 0, and every store is
+        // bounds-checked against the level it writes.
         builder.dispatch([
             extent[0].div_ceil(HIZ_TILE),
             extent[1].div_ceil(HIZ_TILE),
@@ -391,138 +290,101 @@ impl SsrPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_trace(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        hiz: Arc<ImageView>,
-        depth: Arc<ImageView>,
-        normal: Arc<ImageView>,
-        material: Arc<ImageView>,
-        source: Arc<ImageView>,
-        target: Arc<ImageView>,
+        device: &Device,
+        builder: &mut Encoder,
+        hiz: TextureViewId,
+        depth: TextureViewId,
+        normal: TextureViewId,
+        material: TextureViewId,
+        source: TextureViewId,
+        target: TextureViewId,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.trace_pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::image_view_sampler(0, hiz, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, depth, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(2, normal, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(3, material, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(4, source, self.linear_mip.clone()),
-                WriteDescriptorSet::image_view(5, target.clone()),
-                WriteDescriptorSet::buffer(6, self.uniforms()),
+        let set = device.create_transient_bind_group(
+            self.trace_pipeline,
+            0,
+            &[
+                self.sampled(0, hiz, self.nearest_clamp),
+                self.sampled(1, depth, self.nearest_clamp),
+                self.sampled(2, normal, self.nearest_clamp),
+                self.sampled(3, material, self.nearest_clamp),
+                self.sampled(4, source, self.linear_mip),
+                Binding {
+                    binding: 5,
+                    resource: BindingResource::StorageTexture(target),
+                },
+                Binding {
+                    binding: 6,
+                    resource: BindingResource::UniformBuffer(self.uniforms()),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
-        builder
-            .bind_pipeline_compute(&self.trace_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.trace_pipeline.layout(),
-                0,
-                &[set],
-            );
-        dispatch_over(builder, &target);
+        builder.bind_pipeline(self.trace_pipeline);
+        builder.bind_group(0, set);
+        dispatch_over(device, builder, target);
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_resolve(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        source: Arc<ImageView>,
-        rays: Arc<ImageView>,
-        depth: Arc<ImageView>,
-        normal: Arc<ImageView>,
-        material: Arc<ImageView>,
-        environment: Arc<ImageView>,
-        environment_sampler: Arc<Sampler>,
-        target: Arc<ImageView>,
+        device: &Device,
+        builder: &mut Encoder,
+        source: TextureViewId,
+        rays: TextureViewId,
+        depth: TextureViewId,
+        normal: TextureViewId,
+        material: TextureViewId,
+        environment: TextureViewId,
+        environment_sampler: SamplerId,
+        target: TextureViewId,
     ) {
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.resolve_pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::image_view_sampler(0, source, self.linear_clamp.clone()),
-                // Fetched at exact texels by the bilateral gather, which does
-                // its own interpolation — a linear sampler here would blend
-                // across the silhouettes that gather exists to respect.
-                WriteDescriptorSet::image_view_sampler(1, rays, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(2, depth, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(3, normal, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(4, material, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(5, target.clone()),
-                WriteDescriptorSet::image_view(6, environment),
-                WriteDescriptorSet::sampler(7, environment_sampler),
-                WriteDescriptorSet::buffer(8, self.uniforms()),
+        let set = device.create_transient_bind_group(
+            self.resolve_pipeline,
+            0,
+            &[
+                self.sampled(0, source, self.linear_clamp),
+                // Fetched at exact texels by the bilateral gather, which does its
+                // own interpolation — a linear sampler here would blend across the
+                // silhouettes that gather exists to respect.
+                self.sampled(1, rays, self.nearest_clamp),
+                self.sampled(2, depth, self.nearest_clamp),
+                self.sampled(3, normal, self.nearest_clamp),
+                self.sampled(4, material, self.nearest_clamp),
+                Binding {
+                    binding: 5,
+                    resource: BindingResource::StorageTexture(target),
+                },
+                Binding {
+                    binding: 6,
+                    resource: BindingResource::Texture(environment),
+                },
+                Binding {
+                    binding: 7,
+                    resource: BindingResource::Sampler(environment_sampler),
+                },
+                Binding {
+                    binding: 8,
+                    resource: BindingResource::UniformBuffer(self.uniforms()),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
-        builder
-            .bind_pipeline_compute(&self.resolve_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.resolve_pipeline.layout(),
-                0,
-                &[set],
-            );
-        dispatch_over(builder, &target);
+        builder.bind_pipeline(self.resolve_pipeline);
+        builder.bind_group(0, set);
+        dispatch_over(device, builder, target);
+    }
+
+    fn sampled(&self, binding: u32, view: TextureViewId, sampler: SamplerId) -> Binding {
+        Binding {
+            binding,
+            resource: BindingResource::SampledTexture { view, sampler },
+        }
     }
 }
 
-fn dispatch_over(builder: &mut Recorder, target: &Arc<ImageView>) {
-    let extent = target.image().extent();
-
-    // SAFETY: the dispatch covers exactly `extent`, and each shader discards
-    // invocations past `imageSize`, so nothing writes outside the image. The
-    // descriptors bound above match the shader's layout, and the graph declared
-    // every resource this pass touches, so its barriers precede it.
+fn dispatch_over(device: &Device, builder: &mut Encoder, target: TextureViewId) {
+    let extent = device.view_extent(target);
     builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
-}
-
-fn build_pipeline(
-    ctx: &VkContext,
-    entry_point: vulkano::shader::EntryPoint,
-) -> Arc<ComputePipeline> {
-    let device = &ctx.device;
-    let stage = PipelineShaderStageCreateInfo::new(entry_point);
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    ComputePipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )
-    .unwrap()
-}
-
-mod hiz_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/hiz_build.comp" }
-}
-
-mod source_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/color_pyramid.comp" }
-}
-
-mod trace_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/ssr_trace.comp" }
-}
-
-mod resolve_cs {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        path: "shaders/ssr_resolve.comp",
-        include: ["shaders"],
-    }
 }
 
 #[cfg(test)]

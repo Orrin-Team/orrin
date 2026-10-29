@@ -127,6 +127,13 @@ fn frame_cost() {
     let extent = extent();
     let frames = env_usize("ORRIN_PERF_FRAMES", 200) as u64;
     let instance = headless_instance();
+    #[cfg(target_os = "macos")]
+    let mut renderer = if std::env::var("ORRIN_BACKEND").as_deref() == Ok("metal") {
+        VulkanRenderer::offscreen_metal(extent).expect("no Metal device")
+    } else {
+        VulkanRenderer::offscreen(&instance, extent)
+    };
+    #[cfg(not(target_os = "macos"))]
     let mut renderer = VulkanRenderer::offscreen(&instance, extent);
 
     let mut world = World::new();
@@ -220,6 +227,7 @@ fn frame_cost() {
     let gpu_passes = env_usize("ORRIN_PERF_GPU_PASSES", 1) != 0;
     profile::set_gpu_passes_enabled(gpu_passes);
 
+    let mut gpu_total = 0.0f64;
     let mut entities = 0usize;
     let mut draws = 0usize;
     let mut entries = 0usize;
@@ -343,6 +351,9 @@ fn frame_cost() {
         }
         renderer.drain_gpu_spans(&mut profiler);
         profiler.end_frame();
+        if frame >= WARMUP {
+            gpu_total += renderer.gpu_frame_ms().unwrap_or(0.0) as f64;
+        }
     }
 
     println!(
@@ -355,6 +366,11 @@ fn frame_cost() {
     // The row for an optimisation that costs no frame time. Transient aliasing
     // moves this number and nothing else in this file, so without it there is no
     // table to choose it against — `ORRIN_ALIAS=0` is the other side.
+    println!(
+        "     {:<28} {:>9.3} ms",
+        "gpu frame (renderer)",
+        gpu_total / frames as f64
+    );
     let (used, total) = renderer.gpu_memory();
     match used {
         Some(used) => println!(

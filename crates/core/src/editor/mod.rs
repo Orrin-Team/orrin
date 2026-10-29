@@ -19,8 +19,6 @@ mod widgets;
 
 use std::sync::Arc;
 
-use vulkano::device::Queue;
-use vulkano::swapchain::Surface;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -38,7 +36,7 @@ use crate::gfx::vulkan::{Glass, OverlayFrame, OverlayPhase};
 pub struct Editor {
     ctx: egui::Context,
     input: egui_winit::State,
-    surface: Arc<Surface>,
+    window: Arc<Window>,
     state: EditorState,
     themes: ThemeSet,
     dock: Dock,
@@ -63,21 +61,16 @@ impl Drop for Editor {
 impl Editor {
     pub fn new(
         event_loop: &ActiveEventLoop,
-        surface: Arc<Surface>,
-        queue: Arc<Queue>,
+        window: Arc<Window>,
+        max_texture_side: usize,
         project: Option<&orrin_project::Project>,
     ) -> Self {
         let ctx = egui::Context::default();
-        let max_texture_side = queue
-            .device()
-            .physical_device()
-            .properties()
-            .max_image_dimension2_d as usize;
         let input = egui_winit::State::new(
             ctx.clone(),
             ctx.viewport_id(),
             event_loop,
-            Some(window(&surface).scale_factor() as f32),
+            Some(window.scale_factor() as f32),
             // egui's own default, as the system theme it starts from: the
             // editor's palette is applied over it either way.
             Some(winit::window::Theme::Dark),
@@ -106,7 +99,7 @@ impl Editor {
         Self {
             ctx,
             input,
-            surface,
+            window,
             state,
             themes,
             dock: Dock::from_saved(prefs.layout.take()),
@@ -126,10 +119,7 @@ impl Editor {
     /// wheel; those it would claim across the whole window, for the reason
     /// [`Dock::wants_pointer`] describes.
     pub fn on_window_event(&mut self, event: &WindowEvent) -> bool {
-        let consumed = self
-            .input
-            .on_window_event(window(&self.surface), event)
-            .consumed;
+        let consumed = self.input.on_window_event(&self.window, event).consumed;
         match event {
             WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => {
                 self.dock.wants_pointer(&self.ctx)
@@ -142,7 +132,7 @@ impl Editor {
         let Editor {
             ctx,
             input,
-            surface,
+            window,
             state,
             themes,
             dock,
@@ -152,7 +142,7 @@ impl Editor {
             glass,
             ..
         } = self;
-        ctx.begin_pass(input.take_egui_input(window(surface)));
+        ctx.begin_pass(input.take_egui_input(window));
         panels::draw(ctx, world, state, registry, themes, dock, previews);
         panels::frost(ctx, glass);
         phases::mark(ctx);
@@ -245,7 +235,7 @@ impl Editor {
     pub fn overlay(&mut self) -> &mut OverlayFrame {
         let output = self.ctx.end_pass();
         self.input
-            .handle_platform_output(window(&self.surface), output.platform_output);
+            .handle_platform_output(&self.window, output.platform_output);
 
         let ppp = output.pixels_per_point;
         let frame = &mut self.frame;
@@ -280,11 +270,4 @@ impl Editor {
         }
         &mut self.frame
     }
-}
-
-fn window(surface: &Surface) -> &Window {
-    surface
-        .object()
-        .and_then(|object| object.downcast_ref::<Window>())
-        .expect("the editor's surface is a winit window")
 }

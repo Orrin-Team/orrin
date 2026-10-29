@@ -1,42 +1,21 @@
 use std::ops::Range;
-use std::sync::Arc;
 
 use glam::Mat4;
-use vulkano::buffer::{BufferContents, Subbuffer};
-use vulkano::command_buffer::ClearDepthStencilImageInfo;
-use vulkano::command_buffer::{ClearAttachment, ClearRect, DrawIndexedIndirectCommand};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
-use vulkano::format::ClearDepthStencilValue;
-use vulkano::image::sampler::{
-    BorderColor, Filter, Sampler, SamplerAddressMode, SamplerCreateInfo,
-};
-use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
-use vulkano::image::{Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage};
-use vulkano::memory::allocator::AllocationCreateInfo;
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
-use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::{CullMode, DepthBiasState, RasterizationState};
-use vulkano::pipeline::graphics::vertex_input::{Vertex as _, VertexDefinition};
-use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-    PipelineShaderStageCreateInfo,
-};
 
 use crate::geom::Frustum;
+use crate::gfx::format::SampleCount;
+use crate::gfx::graph::ImageUsage;
 use crate::gfx::punctual::ShadowAtlas;
+use crate::gfx::rhi::{
+    BindGroupId, Binding, BindingResource, Blend, BufferId, CullMode, DepthCompare, DepthRect,
+    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerId, TextureDesc,
+    TextureDimension, TextureViewId, Topology, Viewport,
+};
+use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex};
 
 use super::PassCtx;
-use super::context::VkContext;
 use super::cull::{CullFrame, Draws};
-use super::instances::{GpuObject, InstanceEntry};
-use super::record::{self, Recorder};
-use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
 
 /// Where `shadow.frag` declares the material texture array, in the masked
@@ -44,23 +23,8 @@ use super::swapchain::DEPTH_FORMAT;
 /// it, which is what [`VkContext::mark_texture_array_partial`] assumes.
 const TEXTURE_SET: usize = 2;
 
-/// Per-pass push constants: 64 bytes, comfortably inside the 128-byte guaranteed
-/// `maxPushConstantsSize`. The light's matrix rides here rather than in a
-/// uniform buffer because it changes once per pass, not once per draw.
-///
-/// One struct for both pipeline variants. It was two while the cutout variant
-/// also named a material row to alpha-test against — a member the plain
-/// variant's reflected range did not have, so writing it there would have run
-/// past the end. The material now travels with the instance, which is what
-/// leaves the two ranges the same shape. See [`instances`](super::instances).
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct PushConstants {
-    light_view_proj: [[f32; 4]; 4],
-}
-
 pub struct ShadowPass {
-    pipeline: Arc<GraphicsPipeline>,
+    pipeline: PipelineId,
     /// The caster pipeline for a `Masked` material: two-sided, and running the
     /// fragment shader's alpha test.
     ///
@@ -71,17 +35,17 @@ pub struct ShadowPass {
     /// has no use for, so its layout has three sets where the plain one has one;
     /// set 0 is identical in both, which is what lets the object set stay bound
     /// across a switch.
-    masked_pipeline: Arc<GraphicsPipeline>,
+    masked_pipeline: PipelineId,
     /// 1x1 array depth image cleared to 1.0, bound when shadows are off so the
     /// forward shader samples "fully lit" with no second code path. Not a graph
     /// resource: with shadows off the graph has no cascade image at all, so
     /// there is nothing for the forward pass to declare a read of.
-    lit_view: Arc<ImageView>,
+    lit_view: TextureViewId,
     /// A 1x1 non-array depth texture of 1.0, bound as the punctual atlas when
     /// there is none. The cascades' `lit_view` cannot serve: the forward shader
     /// declares the atlas as a plain `texture2D` and the cascades as a
     /// `texture2DArray`, and a view satisfies one or the other.
-    lit_atlas_view: Arc<ImageView>,
+    lit_atlas_view: TextureViewId,
     pub constant_bias: f32,
     pub slope_bias: f32,
     /// The punctual maps get their own pair. A cascade is orthographic, so one
@@ -94,16 +58,51 @@ pub struct ShadowPass {
 }
 
 impl ShadowPass {
-    pub fn new(ctx: &VkContext) -> Self {
-        let _device = &ctx.device;
-        let pipeline = build_pipeline(ctx, false);
-        let masked_pipeline = build_pipeline(ctx, true);
-
+    pub fn new(device: &Device) -> Self {
+        let pipeline = |vertex, fragment, cull| {
+            device.create_graphics_pipeline(&GraphicsPipelineDesc {
+                vertex,
+                fragment,
+                // No color attachments to blend into.
+                color_formats: &[],
+                depth_format: Some(DEPTH_FORMAT),
+                vertex_streams: &[PositionVertex::STREAM],
+                cull,
+                depth_test: Some(DepthTest {
+                    write: true,
+                    compare: DepthCompare::Less,
+                }),
+                // Only the masked variant samples anything — the plain one
+                // writes depth and nothing else — so on that pipeline this finds
+                // no set to mark and does nothing.
+                partial_texture_set: Some(TEXTURE_SET as u32),
+                dynamic_depth_bias: true,
+                samples: SampleCount::Sample1,
+                alpha_to_coverage: false,
+                immutable_samplers: &[],
+                blend: Blend::None,
+                topology: Topology::Triangles,
+                mask_extra_attachments: false,
+                attachment_blends: &[],
+                layout_from: None,
+                layout_prefix_from: None,
+            })
+        };
+        // Back-face culling matches the forward pass, which is only correct
+        // because `fit_cascade` applies the same Y flip the camera projection
+        // does — otherwise the winding is mirrored here and this would cull front
+        // faces instead.
+        let plain = pipeline(ShaderId::ShadowVert, ShaderId::ShadowFrag, CullMode::Back);
+        let masked_pipeline = pipeline(
+            ShaderId::ShadowVertMasked,
+            ShaderId::ShadowFragMasked,
+            CullMode::None,
+        );
         Self {
-            pipeline,
+            pipeline: plain,
             masked_pipeline,
-            lit_view: build_lit_view(ctx),
-            lit_atlas_view: build_lit_atlas_view(ctx),
+            lit_view: build_lit_depth(device, TextureDimension::D2Array),
+            lit_atlas_view: build_lit_depth(device, TextureDimension::D2),
             constant_bias: 1.25,
             slope_bias: 2.5,
             punctual_constant_bias: 2.0,
@@ -112,14 +111,14 @@ impl ShadowPass {
     }
 
     /// The "everything is lit" atlas, bound when nothing punctual casts.
-    pub(super) fn lit_atlas_view(&self) -> Arc<ImageView> {
-        self.lit_atlas_view.clone()
+    pub(super) fn lit_atlas_view(&self) -> TextureViewId {
+        self.lit_atlas_view
     }
 
     /// The "everything is lit" view, bound when shadows are disabled.
     #[allow(dead_code)]
-    pub(super) fn lit_view(&self) -> Arc<ImageView> {
-        self.lit_view.clone()
+    pub(super) fn lit_view(&self) -> TextureViewId {
+        self.lit_view
     }
 
     /// The per-object descriptor set every cascade binds.
@@ -128,63 +127,49 @@ impl ShadowPass {
     /// cascade: all of them read the same buffer through the same layout.
     pub(super) fn build_object_set(
         &self,
-        ctx: &VkContext,
-        rows: &Subbuffer<[GpuObject]>,
-        indices: &Subbuffer<[InstanceEntry]>,
-    ) -> Arc<DescriptorSet> {
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::buffer(0, rows.clone()),
-                WriteDescriptorSet::buffer(1, indices.clone()),
+        device: &Device,
+        rows: BufferId,
+        indices: BufferId,
+    ) -> BindGroupId {
+        device.create_transient_bind_group(
+            self.pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::StorageBuffer(rows),
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageBuffer(indices),
+                },
             ],
-            [],
         )
-        .unwrap()
     }
 
-    /// The set-1 material table and set-2 texture array the cutout pipeline
-    /// alpha-tests against, over the same buffer and the same views every other
-    /// pass reads. Cached by the renderer beside the prepass's, and rebuilt on
-    /// the same invalidations.
-    pub(super) fn build_material_set(
-        &self,
-        ctx: &VkContext,
-        materials: &Subbuffer<[super::forward::GpuMaterial]>,
-    ) -> Arc<DescriptorSet> {
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.masked_pipeline.layout().set_layouts()[1].clone(),
-            [WriteDescriptorSet::buffer(0, materials.clone())],
-            [],
+    pub(super) fn build_material_set(&self, device: &Device, materials: BufferId) -> BindGroupId {
+        device.create_persistent_bind_group(
+            self.masked_pipeline,
+            1,
+            &[Binding {
+                binding: 0,
+                resource: BindingResource::StorageBuffer(materials),
+            }],
         )
-        .unwrap()
     }
 
     pub(super) fn build_texture_set(
         &self,
-        ctx: &VkContext,
-        textures: &[Arc<ImageView>],
-        sampler: &Arc<Sampler>,
-    ) -> Arc<DescriptorSet> {
-        let default_view = textures[0].clone();
-        let texture_array = (0..ctx.texture_array_len(textures.len())).map(|index| {
-            textures
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| default_view.clone())
-        });
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.masked_pipeline.layout().set_layouts()[TEXTURE_SET].clone(),
-            [
-                WriteDescriptorSet::image_view_array(0, 0, texture_array),
-                WriteDescriptorSet::sampler(1, sampler.clone()),
-            ],
-            [],
+        device: &Device,
+        textures: &[TextureViewId],
+        sampler: SamplerId,
+    ) -> BindGroupId {
+        device.create_texture_array_group(
+            self.masked_pipeline,
+            TEXTURE_SET as u32,
+            textures,
+            sampler,
         )
-        .unwrap()
     }
 
     /// Record one cascade's depth pass.
@@ -195,7 +180,7 @@ impl ShadowPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record(
         &self,
-        builder: &mut Recorder,
+        builder: &mut Encoder,
         renderer: &PassCtx<'_>,
         casters: Draws<'_>,
         view_proj: Mat4,
@@ -206,7 +191,7 @@ impl ShadowPass {
         // Position alone: a depth-only pass reads no surface stream. Bound here
         // rather than in `draw` because vertex bindings are command-buffer
         // state that outlives a draw, and a secondary starts with none.
-        renderer.arena.bind_positions(builder);
+        builder.bind_geometry(true);
         // Dynamic so the editor's bias sliders tune acne live instead of
         // rebuilding the pipeline on every drag. `clamp` stays 0.0: a nonzero
         // one needs the `depth_bias_clamp` device feature. Set before any
@@ -246,12 +231,12 @@ impl ShadowPass {
     )]
     pub(super) fn record_atlas(
         &self,
-        builder: &mut Recorder,
+        builder: &mut Encoder,
         renderer: &PassCtx<'_>,
         atlas: &ShadowAtlas,
         casters: &[DrawList<'_>],
         bases: &[u32],
-        gpu: Option<(&CullFrame, &Subbuffer<[DrawIndexedIndirectCommand]>, u32)>,
+        gpu: Option<(&CullFrame, BufferId, u32)>,
         sets: &CasterSets,
     ) {
         // Every tile this frame assigned, cleared before anything draws — and
@@ -271,23 +256,22 @@ impl ShadowPass {
         // draw: a light whose caster list came back empty still has its tile
         // sampled, and it has to read as far, or the light would be shadowed by
         // whatever the last frame left in that tile.
-        let tiles: Vec<ClearRect> = atlas
+        let tiles: Vec<DepthRect> = atlas
             .casters
             .iter()
             .flat_map(|caster| {
                 &atlas.faces[caster.first_face..caster.first_face + caster.face_count]
             })
-            .map(|face| ClearRect {
+            .map(|face| DepthRect {
                 offset: face.tile.offset,
                 extent: [face.tile.size; 2],
-                array_layers: 0..1,
             })
             .collect();
         if tiles.is_empty() {
             return;
         }
-        builder.clear_attachments([ClearAttachment::Depth(1.0)], tiles);
-        renderer.arena.bind_positions(builder);
+        builder.clear_depth(&tiles);
+        builder.bind_geometry(true);
 
         builder.set_depth_bias(self.punctual_constant_bias, 0.0, self.punctual_slope_bias);
 
@@ -353,44 +337,19 @@ impl ShadowPass {
     /// NDC *lands*, and an implementation is allowed a guard band around the
     /// clip volume — so without a scissor a triangle straddling a tile's edge
     /// may write a fragment into the neighbour, which is another light's depth.
-    fn set_tile(&self, builder: &mut Recorder, offset: [u32; 2], size: u32) {
-        builder
-            .set_viewport(
-                0,
-                &[Viewport {
-                    offset: [offset[0] as f32, offset[1] as f32],
-                    extent: [size as f32, size as f32],
-                    depth_range: 0.0..=1.0,
-                }],
-            )
-            .set_scissor(
-                0,
-                &[Scissor {
-                    offset,
-                    extent: [size, size],
-                }],
-            );
+    fn set_tile(&self, builder: &mut Encoder, offset: [u32; 2], size: u32) {
+        builder.set_viewport(Viewport {
+            origin: [offset[0] as f32, offset[1] as f32],
+            extent: [size as f32, size as f32],
+            depth_range: [0.0, 1.0],
+        });
+        builder.set_scissor(offset, [size, size]);
     }
 
-    /// The draw loop both callers share: one instanced draw per (mesh, material)
-    /// run, with the light's matrix pushed per run.
-    ///
-    /// A run's material decides both the pipeline and the sets bound with it, so
-    /// the loop still switches between them mid-tile when a caster list mixes
-    /// foliage with everything else. What it no longer does is rebind on entry:
-    /// `bound` belongs to the caller and spans the whole render pass instance.
-    ///
-    /// Faces stay the outer loop, drawn one at a time. Inverting that — one run
-    /// drawn into all six faces of a point light — records the same draws off
-    /// one mesh binding instead of six, and was measured and rejected: it
-    /// scatters consecutive draws across nineteen tiles, and the depth
-    /// attachment lost more to the locality than the CPU saved in commands
-    /// (+0.027 ms GPU against -0.028 ms CPU), which is a straight loss on any
-    /// frame that is GPU-bound.
     #[allow(clippy::too_many_arguments)]
     fn draw(
         &self,
-        builder: &mut Recorder,
+        builder: &mut Encoder,
         renderer: &PassCtx<'_>,
         casters: Draws<'_>,
         view_proj: Mat4,
@@ -433,7 +392,7 @@ impl ShadowPass {
         // culled to nothing still records them, with every instance count zero.
         for region in casters.regions() {
             self.bind(builder, sets, bound, region.masked, view_proj);
-            builder.draw_indexed_indirect(region.commands);
+            builder.draw_indexed_indirect(region.commands, region.range);
         }
     }
 
@@ -444,44 +403,45 @@ impl ShadowPass {
     /// and three descriptor sets on each of its nineteen tiles.
     fn bind(
         &self,
-        builder: &mut Recorder,
+        builder: &mut Encoder,
         sets: &CasterSets,
         bound: &mut Bound,
         wants_masked: bool,
         view_proj: Mat4,
     ) {
         let pipeline = if wants_masked {
-            &self.masked_pipeline
+            self.masked_pipeline
         } else {
-            &self.pipeline
+            self.pipeline
         };
         if bound.needs_pipeline(wants_masked) {
-            builder
-                .bind_pipeline_graphics(pipeline)
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    pipeline.layout(),
-                    0,
-                    &sets.for_pipeline(wants_masked),
-                );
+            builder.bind_pipeline(pipeline);
+            for (set, group) in sets.for_pipeline(wants_masked).into_iter().enumerate() {
+                builder.bind_group(set as u32, group);
+            }
         }
-        builder.push_constants(
-            pipeline.layout(),
-            0,
-            &PushConstants {
-                light_view_proj: view_proj.to_cols_array_2d(),
-            },
-        );
+        // Per-pass push constants: 64 bytes, comfortably inside the 128-byte
+        // guaranteed `maxPushConstantsSize`. The light's matrix rides here
+        // rather than in a uniform buffer because it changes once per pass, not
+        // once per draw.
+        //
+        // One block for both pipeline variants. It was two while the cutout
+        // variant also named a material row to alpha-test against — a member the
+        // plain variant's reflected range did not have, so writing it there
+        // would have run past the end. The material now travels with the
+        // instance, which is what leaves the two ranges the same shape. See
+        // [`instances`](super::instances).
+        let mut words = [0u32; 16];
+        for (word, value) in words
+            .iter_mut()
+            .zip(view_proj.to_cols_array_2d().iter().flatten())
+        {
+            *word = value.to_bits();
+        }
+        builder.push_constants(&words);
     }
 }
 
-/// Whether any instance in `run` reaches into `frustum`.
-///
-/// Per item with an early exit, not against the run's union bounds: runs are
-/// grouped by mesh and material and never by position, so a run's union reaches
-/// into faces no instance of it occupies, and the union would keep draws this
-/// keeps out. The scan ends on the first instance that is in, which for a run
-/// being drawn is usually the first one tested.
 fn run_intersects(casters: &DrawList<'_>, run: &Range<usize>, frustum: &Frustum) -> bool {
     run.clone()
         .any(|index| frustum.intersects(&casters.item(index).bounds))
@@ -515,221 +475,41 @@ impl Bound {
 /// here forces the alpha-testing pipeline into existence for a scene with no
 /// foliage in it.
 pub(super) struct CasterSets {
-    pub objects: Arc<DescriptorSet>,
-    pub materials: Arc<DescriptorSet>,
-    pub textures: Arc<DescriptorSet>,
+    pub objects: BindGroupId,
+    pub materials: BindGroupId,
+    pub textures: BindGroupId,
 }
 
 impl CasterSets {
-    fn for_pipeline(&self, masked: bool) -> Vec<Arc<DescriptorSet>> {
+    fn for_pipeline(&self, masked: bool) -> Vec<BindGroupId> {
         if masked {
-            vec![
-                self.objects.clone(),
-                self.materials.clone(),
-                self.textures.clone(),
-            ]
+            vec![self.objects, self.materials, self.textures]
         } else {
-            vec![self.objects.clone()]
+            vec![self.objects]
         }
     }
 }
 
-/// The sampler the forward pass reads the cascades through.
+/// A 1x1 single-layer depth texture cleared to 1.0 — "nothing is nearer than
+/// the far plane", which every comparison reads as lit.
 ///
-/// It must be an *immutable* sampler baked into the descriptor set layout, not
-/// one written into a set: Metal makes a sampler's compare function a
-/// compile-time property, so MoltenVK rejects a written comparison sampler
-/// unless `mutable_comparison_samplers` is available, which on a portability
-/// subset device it is not.
-///
-/// The conventions live here because this module owns the map: `Less` against a
-/// depth map cleared to 1.0, and a white border so a fragment sampling outside a
-/// cascade reads as lit rather than as shadowed.
-pub(super) fn comparison_sampler(device: &Arc<Device>) -> Arc<Sampler> {
-    Sampler::new(
-        device.clone(),
-        SamplerCreateInfo {
-            mag_filter: Filter::Linear,
-            min_filter: Filter::Linear,
-            address_mode: [SamplerAddressMode::ClampToBorder; 3],
-            border_color: BorderColor::FloatOpaqueWhite,
-            // The comparison happens before the bilinear filter, so a single tap
-            // is already a 2x2 percentage-closer result.
-            compare: Some(CompareOp::Less),
-            ..Default::default()
-        },
-    )
-    .unwrap()
-}
-
-fn build_pipeline(ctx: &VkContext, masked: bool) -> Arc<GraphicsPipeline> {
-    let device = &ctx.device;
-    let (vs, fs) = if masked {
-        (
-            vs_masked::load(device.clone()).unwrap(),
-            fs_masked::load(device.clone()).unwrap(),
-        )
-    } else {
-        (
-            vs::load(device.clone()).unwrap(),
-            fs::load(device.clone()).unwrap(),
-        )
-    };
-    let vs = vs.entry_point("main").unwrap();
-    let fs = fs.entry_point("main").unwrap();
-
-    let vertex_input_state = PositionVertex::per_vertex().definition(&vs).unwrap();
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs),
-        PipelineShaderStageCreateInfo::new(fs),
-    ];
-    // Only the masked variant samples anything — the plain one writes depth and
-    // nothing else — so on that pipeline this finds no set to mark and does
-    // nothing, which is why it can be called unconditionally.
-    let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
-    ctx.mark_texture_array_partial(&mut layout_info, TEXTURE_SET);
-    let layout = PipelineLayout::new(
-        device.clone(),
-        layout_info
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    GraphicsPipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState {
-                // Back-face culling matches the forward pass, which is only
-                // correct because `fit_cascade` applies the same Y flip the
-                // camera projection does — otherwise the winding is mirrored
-                // here and this would cull front faces instead.
-                cull_mode: if masked {
-                    CullMode::None
-                } else {
-                    CullMode::Back
-                },
-                // Placeholders; the real values are set dynamically per frame.
-                depth_bias: Some(DepthBiasState::default()),
-                ..Default::default()
-            }),
-            multisample_state: Some(MultisampleState::default()),
-            depth_stencil_state: Some(DepthStencilState {
-                depth: Some(DepthState::simple()),
-                ..Default::default()
-            }),
-            // No color attachments to blend into.
-            color_blend_state: None,
-            // Scissor as well as viewport, because the atlas aims this pipeline
-            // at one tile of a shared attachment and the viewport alone does
-            // not promise a fragment stays inside it.
-            dynamic_state: [
-                DynamicState::Viewport,
-                DynamicState::Scissor,
-                DynamicState::DepthBias,
-            ]
-            .into_iter()
-            .collect(),
-            subpass: Some(rendering::pipeline_info(&[], Some(DEPTH_FORMAT)).into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .unwrap()
-}
-
-/// A 1x1 depth *array* image cleared to 1.0, for the cascades.
-///
-/// The array view type is load-bearing: the forward shader declares the
-/// cascades as `texture2DArray`, and a plain 2D view would not satisfy that
-/// descriptor when shadows are off.
-fn build_lit_view(ctx: &VkContext) -> Arc<ImageView> {
-    build_lit_depth(ctx, ImageViewType::Dim2dArray)
-}
-
-/// The same, viewed as a plain 2D image, for the punctual atlas.
-///
-/// Two views over two allocations rather than one image viewed both ways,
-/// because a view's type is fixed at creation and the two descriptors want
-/// different ones. A pair of one-texel images is not worth avoiding.
-fn build_lit_atlas_view(ctx: &VkContext) -> Arc<ImageView> {
-    build_lit_depth(ctx, ImageViewType::Dim2d)
-}
-
-/// A 1x1 single-layer depth image cleared to 1.0 — "nothing is nearer than the
-/// far plane", which every comparison reads as lit.
-fn build_lit_depth(ctx: &VkContext, view_type: ImageViewType) -> Arc<ImageView> {
-    let image = Image::new(
-        ctx.memory_allocator.clone(),
-        ImageCreateInfo {
-            image_type: ImageType::Dim2d,
-            format: DEPTH_FORMAT,
-            extent: [1, 1, 1],
-            array_layers: 1,
-            usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
-            ..Default::default()
-        },
-        AllocationCreateInfo::default(),
-    )
-    .expect("failed to allocate the shadows-off depth texture");
-
-    let mut builder = Recorder::new(ctx);
-    // Fresh from `Image::new`, so there is nothing to preserve; cleared once and
-    // then only ever sampled, so this is the whole of its synchronisation.
-    builder
-        .image_barrier(record::to_transfer_dst(
-            image.clone(),
-            record::whole_image(&image),
-            ImageLayout::Undefined,
-        ))
-        .clear_depth_stencil_image(ClearDepthStencilImageInfo {
-            clear_value: ClearDepthStencilValue {
-                depth: 1.0,
-                stencil: 0,
-            },
-            ..ClearDepthStencilImageInfo::image(image.clone())
-        })
-        .image_barrier(record::to_shader_read(
-            image.clone(),
-            record::whole_image(&image),
-            ImageLayout::TransferDstOptimal,
-        ));
-    builder.submit_and_wait(ctx);
-
-    ImageView::new(
-        image.clone(),
-        ImageViewCreateInfo {
-            view_type,
-            ..ImageViewCreateInfo::from_image(&image)
-        },
-    )
-    .unwrap()
-}
-
-mod vs {
-    vulkano_shaders::shader! { ty: "vertex", path: "shaders/shadow.vert" }
-}
-mod fs {
-    vulkano_shaders::shader! { ty: "fragment", path: "shaders/shadow.frag" }
-}
-/// The cutout variants of the two above, from the same two files: one define
-/// turns the vertex shader's UV on and the fragment shader's alpha test with it.
-mod vs_masked {
-    vulkano_shaders::shader! {
-        ty: "vertex",
-        path: "shaders/shadow.vert",
-        define: [("ORRIN_MASKED", "1")],
-    }
-}
-mod fs_masked {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "shaders/shadow.frag",
-        define: [("ORRIN_MASKED", "1")],
-    }
+/// Built once per view type rather than one image viewed both ways, because a
+/// view's type is fixed at creation and the cascades' array and the punctual
+/// atlas's plain 2D want different ones. A pair of one-texel images is not worth
+/// avoiding.
+fn build_lit_depth(device: &Device, dimension: TextureDimension) -> TextureViewId {
+    let texture = device.create_texture(&TextureDesc {
+        format: DEPTH_FORMAT,
+        dimension,
+        extent: [1, 1, 1],
+        mip_levels: 1,
+        array_layers: 1,
+        samples: SampleCount::Sample1,
+        usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
+        memoryless: false,
+    });
+    device.fill_depth(texture, 1.0);
+    texture
 }
 
 #[cfg(test)]

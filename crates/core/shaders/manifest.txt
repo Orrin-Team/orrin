@@ -1,0 +1,60 @@
+# name  stage  path  [DEFINE=VALUE ...]
+bloom_downsample_comp compute bloom_downsample.comp
+bloom_prefilter_comp compute bloom_prefilter.comp
+bloom_upsample_comp compute bloom_upsample.comp
+color_pyramid_comp compute color_pyramid.comp
+contact_shadows_frag fragment contact_shadows.frag
+cull_comp compute cull.comp
+cull_reset_comp compute cull_reset.comp
+dof_composite_comp compute dof_composite.comp
+dof_gather_comp compute dof_gather.comp
+dof_prefilter_comp compute dof_prefilter.comp
+dof_tile_max_comp compute dof_tile_max.comp
+equirect_to_cube_frag fragment equirect_to_cube.frag
+fog_integrate_comp compute fog_integrate.comp
+fog_scatter_comp compute fog_scatter.comp
+forward_frag fragment forward.frag
+forward_frag_alpha_test fragment forward.frag ORRIN_ALPHA_TEST=1
+forward_vert vertex forward.vert
+forward_sss_frag fragment forward_sss.frag
+forward_sss_frag_alpha_test fragment forward_sss.frag ORRIN_ALPHA_TEST=1
+frost_frag fragment frost.frag
+fullscreen_vert vertex fullscreen.vert
+gizmo_frag fragment gizmo.frag
+gizmo_vert vertex gizmo.vert
+hiz_build_comp compute hiz_build.comp
+hiz_occlusion_comp compute hiz_occlusion.comp
+line_frag fragment line.frag
+line_vert vertex line.vert
+luminance_average_comp compute luminance_average.comp
+luminance_histogram_comp compute luminance_histogram.comp
+motion_blur_gather_comp compute motion_blur_gather.comp
+motion_blur_neighbour_max_comp compute motion_blur_neighbour_max.comp
+motion_blur_tile_max_comp compute motion_blur_tile_max.comp
+oit_frag fragment oit.frag
+oit_composite_comp compute oit_composite.comp
+outline_frag fragment outline.frag
+outline_mask_frag fragment outline_mask.frag
+outline_mask_vert vertex outline_mask.vert
+overlay_frag fragment overlay.frag
+overlay_vert vertex overlay.vert
+prefilter_cube_frag fragment prefilter_cube.frag
+prepass_frag fragment prepass.frag
+prepass_frag_masked fragment prepass.frag ORRIN_MASKED=1
+prepass_vert vertex prepass.vert
+refraction_frag fragment refraction.frag
+refraction_composite_comp compute refraction_composite.comp
+shadow_frag fragment shadow.frag
+shadow_frag_masked fragment shadow.frag ORRIN_MASKED=1
+shadow_vert vertex shadow.vert
+shadow_vert_masked vertex shadow.vert ORRIN_MASKED=1
+skybox_frag fragment skybox.frag
+skybox_vert vertex skybox.vert
+ssao_frag fragment ssao.frag
+ssao_blur_frag fragment ssao_blur.frag
+ssr_resolve_comp compute ssr_resolve.comp
+ssr_trace_comp compute ssr_trace.comp
+sss_blur_comp compute sss_blur.comp
+sss_composite_comp compute sss_composite.comp
+taa_resolve_comp compute taa_resolve.comp
+tonemap_frag fragment tonemap.frag

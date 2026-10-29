@@ -1,6 +1,4 @@
-use vulkano::buffer::BufferUsage;
-use vulkano::image::{ImageLayout, ImageUsage};
-use vulkano::sync::{AccessFlags, PipelineStages};
+use super::sync::{AccessFlags, BufferUsage, ImageLayout, ImageUsage, PipelineStages};
 
 /// What one pass does with one resource.
 ///

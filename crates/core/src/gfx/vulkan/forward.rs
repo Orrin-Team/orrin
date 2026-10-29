@@ -1,29 +1,4 @@
-use std::sync::Arc;
-
-use glam::{Mat4, Vec3};
-use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
-use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::Device;
-use vulkano::format::Format;
-use vulkano::image::SampleCount;
-use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
-use vulkano::pipeline::graphics::depth_stencil::CompareOp;
-use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
-use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
-use vulkano::pipeline::graphics::vertex_input::{Vertex as _, VertexDefinition};
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-    PipelineShaderStageCreateInfo,
-};
+use glam::Vec3;
 
 use crate::geom::Aabb;
 use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, ShadowAtlas};
@@ -35,18 +10,19 @@ use crate::gfx::{
 };
 use crate::scene::{Camera, EnvironmentSettings};
 
-use super::context::VkContext;
 use super::cull::Draws;
-use super::fog::GpuFog;
-use super::instances::{GpuObject, InstanceEntry};
-use super::mesh::MeshSpan;
-use super::record::{Arena, Recorder};
-use super::rendering;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 use super::{MSAA_SAMPLES, PassCtx, ShadowFrame, VulkanRenderer};
-use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
+use crate::gfx::format::{Format, SampleCount};
+use crate::gfx::rhi::MeshSpan;
+use crate::gfx::rhi::{
+    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferId, CullMode, DepthCompare,
+    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId,
+    TextureViewId, Topology, Viewport,
+};
+use crate::gfx::shaders::ShaderId;
 
 pub struct GpuMesh {
     /// Where this mesh's indices and vertices sit in the shared buffers every
@@ -56,30 +32,6 @@ pub struct GpuMesh {
     /// vertex data exists on the CPU. Culling reads them through
     /// [`RenderBackend::mesh_bounds`](crate::gfx::RenderBackend::mesh_bounds).
     pub bounds: Aabb,
-}
-
-/// The one value a geometry draw still pushes. The fat per-object matrices are
-/// in the set-4 storage buffer, and what used to sit beside `view_proj` here —
-/// the run's material and its first object row — moved into the instance list
-/// and into `firstInstance`, because a multi-draw has no per-draw push. See
-/// [`instances`](super::instances) and [`cull`](super::cull).
-///
-/// `view_proj` replaced a pre-multiplied `mvp` when draws became instanced: a
-/// run covers many models, so the model half has to be applied in the shader.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
-#[repr(C)]
-pub(super) struct PushConstants {
-    view_proj: [[f32; 4]; 4],
-}
-
-impl PushConstants {
-    /// Also what the transparency pass pushes: it draws the same geometry
-    /// through the same pipeline layout, so it pushes the same range.
-    pub(super) fn new(view_proj: Mat4) -> Self {
-        Self {
-            view_proj: view_proj.to_cols_array_2d(),
-        }
-    }
 }
 
 /// Where `forward.frag` declares the cascade comparison sampler. It is bound
@@ -132,7 +84,7 @@ pub(crate) mod material_flags {
 /// iterations in register pressure and get none of them.
 const PARALLAX_STEP_LIMIT: u32 = 64;
 
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(crate) struct GpuMaterial {
     /// `rgb` = albedo, `a` = opacity.
@@ -298,7 +250,7 @@ fn to_gpu_lighting(
 /// std140 gives a struct of a `mat4` array and three `vec4`s exactly the offsets
 /// it gave these fields written out flat, which is why nesting them changed no
 /// layout.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(super) struct GpuCascades {
     /// Per-cascade light view-projection. std140 lays a `mat4` out as four
@@ -357,7 +309,7 @@ impl GpuCascades {
 
 /// GPU mirror of a [`PointLight`](crate::gfx::PointLight), padded to std140
 /// (three `vec4`s).
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuPointLight {
     /// xyz = world position, w = range.
@@ -379,7 +331,7 @@ impl GpuPointLight {
 }
 
 /// GPU mirror of a [`SpotLight`](crate::gfx::SpotLight), padded to std140.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuSpotLight {
     /// xyz = world position, w = range.
@@ -408,7 +360,7 @@ impl GpuSpotLight {
 /// GPU layout of the per-frame lighting uniform buffer (set 0, binding 0).
 /// Every field is a `vec4` so the Rust `#[repr(C)]` layout matches std140 with
 /// no hidden padding.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuLighting {
     /// xyz = camera world position.
@@ -455,7 +407,7 @@ pub(crate) mod decal_flags {
 
 /// One decal as the shader reads it. 160 bytes; std430 packs this exactly like
 /// the `#[repr(C)]` here because every field is 16 bytes or a `mat4`.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(crate) struct GpuDecal {
     world_to_decal: [[f32; 4]; 4],
@@ -500,9 +452,9 @@ impl GpuDecal {
 /// there is one array and one length, in one allocation, bound to both.
 ///
 /// Fixed-length rather than a runtime-sized array, which costs 2.5 KB a frame
-/// whether the scene has decals or not and buys a `Subbuffer<GpuDecals>` that
-/// both passes can bind with no length to agree on either.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+/// whether the scene has decals or not and buys one buffer that both passes
+/// can bind with no length to agree on either.
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(crate) struct GpuDecals {
     /// `x` = how many of `decals` are live. A `uvec4` because std430 aligns the
@@ -520,7 +472,7 @@ pub(crate) struct GpuDecals {
 /// the shader projects with *the same* matrix the tile was rasterised with, so
 /// the two cannot disagree about a near plane, a border, or a handedness — the
 /// only thing left to get right is which face, and that is one comparison.
-#[derive(vulkano::buffer::BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuShadowFace {
     view_proj: [[f32; 4]; 4],
@@ -542,12 +494,12 @@ impl GpuShadowFace {
 /// this pass's own pipeline layout, so it can and must. Bundling them is what
 /// keeps that from being a comment somebody has to keep true.
 pub(super) struct ForwardSets {
-    sets: Vec<Arc<DescriptorSet>>,
+    groups: [BindGroupId; 5],
 }
 
 impl ForwardSets {
-    pub(super) fn as_vec(&self) -> Vec<Arc<DescriptorSet>> {
-        self.sets.clone()
+    pub(super) fn groups(&self) -> [BindGroupId; 5] {
+        self.groups
     }
 
     /// The same five with the object set swapped, for a pass that indexes
@@ -557,10 +509,10 @@ impl ForwardSets {
     /// the blended queues read what the host wrote, and the two are different
     /// allocations. Rebuilding the other four sets to say so would be four
     /// descriptor writes a frame for a difference in one of them.
-    pub(super) fn with_object_set(&self, object_set: Arc<DescriptorSet>) -> ForwardSets {
-        let mut sets = self.sets.clone();
-        *sets.last_mut().expect("the object set is the last of five") = object_set;
-        ForwardSets { sets }
+    pub(super) fn with_object_set(&self, object_set: BindGroupId) -> ForwardSets {
+        let mut groups = self.groups;
+        groups[4] = object_set;
+        ForwardSets { groups }
     }
 }
 
@@ -571,23 +523,23 @@ impl ForwardSets {
 /// attachments a pipeline must declare — while `masked` is a property of a
 /// *run*, so both of those have to exist at once whichever frame it is.
 struct ForwardPipelines {
-    plain: Arc<GraphicsPipeline>,
-    subsurface: Arc<GraphicsPipeline>,
+    plain: PipelineId,
+    subsurface: PipelineId,
     /// Alpha-testing, for the `Masked` runs inside the same render pass. Back
     /// faces are kept, because a cutout sheet has no back to cull, and the cut
     /// itself is taken by whichever mechanism the sample count affords: alpha to
     /// coverage across four samples, a `discard` at one.
-    masked: Arc<GraphicsPipeline>,
-    masked_subsurface: Arc<GraphicsPipeline>,
+    masked: PipelineId,
+    masked_subsurface: PipelineId,
 }
 
 impl ForwardPipelines {
     /// The pair a frame draws with, given whether it diffuses subsurface light.
-    fn for_frame(&self, subsurface: bool) -> (&Arc<GraphicsPipeline>, &Arc<GraphicsPipeline>) {
+    fn for_frame(&self, subsurface: bool) -> (PipelineId, PipelineId) {
         if subsurface {
-            (&self.subsurface, &self.masked_subsurface)
+            (self.subsurface, self.masked_subsurface)
         } else {
-            (&self.plain, &self.masked)
+            (self.plain, self.masked)
         }
     }
 }
@@ -604,7 +556,7 @@ impl ForwardPipelines {
 ///   narrower packed format directly.
 /// - **Diffusing** appends `SUBSURFACE_FORMAT` as a second colour target. The
 ///   skybox and the debug lines rasterise into these same shapes and write
-///   nothing to that attachment, which is what `co_tenant_blend_states` is for.
+///   nothing to that attachment, which is what `GraphicsPipelineDesc::mask_extra_attachments` is for.
 ///
 /// The depth format is the same in all four; what differs is what the pass does
 /// with it, and that is now a record-time decision rather than a property baked
@@ -613,23 +565,30 @@ impl ForwardPipelines {
 /// and tests `EQUAL`. See [`rendering`](super::rendering).
 #[derive(Clone)]
 pub struct ForwardTargets {
-    pub multisampled: PipelineRenderingCreateInfo,
-    pub multisampled_subsurface: PipelineRenderingCreateInfo,
-    pub single: PipelineRenderingCreateInfo,
-    pub single_subsurface: PipelineRenderingCreateInfo,
+    color_format: Format,
+    msaa_color_format: Format,
 }
 
 impl ForwardTargets {
+    /// The colour formats of one of the four shapes, for a pass that builds its
+    /// pipeline through the RHI rather than from the description above.
+    pub fn colors(&self, msaa: bool, subsurface: bool) -> Vec<Format> {
+        let first = if msaa {
+            self.msaa_color_format
+        } else {
+            self.color_format
+        };
+        if subsurface {
+            vec![first, SUBSURFACE_FORMAT]
+        } else {
+            vec![first]
+        }
+    }
+
     fn new(color_format: Format, msaa_color_format: Format) -> Self {
-        let depth = Some(DEPTH_FORMAT);
         Self {
-            multisampled: rendering::pipeline_info(&[msaa_color_format], depth),
-            multisampled_subsurface: rendering::pipeline_info(
-                &[msaa_color_format, SUBSURFACE_FORMAT],
-                depth,
-            ),
-            single: rendering::pipeline_info(&[color_format], depth),
-            single_subsurface: rendering::pipeline_info(&[color_format, SUBSURFACE_FORMAT], depth),
+            color_format,
+            msaa_color_format,
         }
     }
 }
@@ -658,18 +617,12 @@ pub struct ForwardPass {
     /// five descriptor sets bind to any of them.
     multisampled: ForwardPipelines,
     single: ForwardPipelines,
-    uniform_buffer_allocator: Arena,
-    /// Per-frame storage for the atlas face table. A storage buffer rather than
-    /// more of the lighting uniform: forty-eight matrices is three kilobytes,
-    /// and the guaranteed uniform-buffer range is sixteen.
-    shadow_face_allocator: Arena,
     /// Per-frame storage for the decal block. Owned here rather than by a decal
     /// module because there is no decal *pass* to own it — the block is frame
     /// data that two existing passes read, which is exactly what the shadow face
     /// table above is.
-    decal_allocator: Arena,
-    sampler: Arc<Sampler>,
-    ao_sampler: Arc<Sampler>,
+    sampler: SamplerId,
+    ao_sampler: SamplerId,
 }
 
 impl ForwardPass {
@@ -677,150 +630,149 @@ impl ForwardPass {
     /// colour format. `msaa_color_format` is the wider one the multisampled pair
     /// needs: a resolve requires both images to agree, and alpha to coverage
     /// needs an alpha channel to read. See `hdr::HDR_WIDE_FORMAT`.
-    pub fn new(ctx: &VkContext, color_format: Format, msaa_color_format: Format) -> Self {
-        let device = &ctx.device;
-        let memory_allocator = &ctx.memory_allocator;
+    pub fn new(rhi: &Device, color_format: Format, msaa_color_format: Format) -> Self {
         let targets = ForwardTargets::new(color_format, msaa_color_format);
 
-        // One sampler for all eight pipelines. See `build_pipeline`.
-        let shadow_sampler = super::shadow::comparison_sampler(device);
+        // One sampler for all eight pipelines. Vulkan compares immutable samplers
+        // by *identity*, so two calls producing identical samplers would give two
+        // set-3 layouts that are not compatible. The executor binds one set of
+        // five descriptor sets for whichever opaque variant ran, so every
+        // pipeline has to be built around the same sampler object — the same rule
+        // `refraction.rs` obeys by lifting this layout instead of deriving it.
+        let shadow_sampler = rhi.create_sampler(SamplerDesc {
+            linear: true,
+            mipmap_linear: false,
+            repeat: false,
+            compare: true,
+            anisotropy: None,
+            max_lod: None,
+        });
+        let samplers = [(SHADOW_SET as u32, SHADOW_SAMPLER_BINDING, shadow_sampler)];
+        let pipeline = |colors: &[Format],
+                        fragment: ShaderId,
+                        // Inverted from the obvious sense, and named for what it
+                        // selects: back faces are culled for ordinary opaque
+                        // geometry and kept for `BlendMode::Masked`, because a
+                        // cutout sheet has no back to cull.
+                        cull_back: bool,
+                        // How many samples the render pass rasterises at, and —
+                        // because the two are the same decision — where the depth
+                        // being tested came from.
+                        //
+                        // At more than one sample this pass rasterises its own
+                        // depth buffer: the test is `Less` and the pass writes,
+                        // and a masked run spends the extra samples on the
+                        // cutout's edge through alpha to coverage.
+                        //
+                        // At one sample there is no second depth buffer. The
+                        // geometry prepass's is attached read-only and the test
+                        // is `EQUAL` against it, which is the whole point: every
+                        // fragment that is not the front-most surface is killed
+                        // before it shades, so the pass has perfect early-Z and
+                        // zero shading overdraw. It depends on the two vertex
+                        // shaders agreeing on `gl_Position` to the last bit — see
+                        // the `invariant` declaration in each.
+                        samples: SampleCount| {
+            rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
+                vertex: ShaderId::ForwardVert,
+                fragment,
+                color_formats: colors,
+                depth_format: Some(DEPTH_FORMAT),
+                vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
+                cull: if cull_back {
+                    CullMode::Back
+                } else {
+                    CullMode::None
+                },
+                depth_test: Some(if samples == SampleCount::Sample1 {
+                    DepthTest {
+                        write: false,
+                        compare: DepthCompare::Equal,
+                    }
+                } else {
+                    DepthTest {
+                        write: true,
+                        compare: DepthCompare::Less,
+                    }
+                }),
+                // The material textures, of which a scene writes only the ones it
+                // loaded. Set on the layout because it is the *layout* the short
+                // write is legal against — and this layout is also the one the
+                // transparency and refraction pipelines lift, so both inherit it.
+                partial_texture_set: Some(TEXTURE_SET as u32),
+                dynamic_depth_bias: false,
+                samples,
+                // Only where there are samples to spend. At one sample the cutout
+                // is cut by the `discard` in the shader this variant was built
+                // from instead, along the same line.
+                alpha_to_coverage: !cull_back && samples != SampleCount::Sample1,
+                immutable_samplers: &samplers,
+                blend: Blend::None,
+                topology: Topology::Triangles,
+                mask_extra_attachments: false,
+                attachment_blends: &[],
+                layout_from: None,
+                layout_prefix_from: None,
+            })
+        };
+        let msaa = MSAA_SAMPLES;
+        let one = SampleCount::Sample1;
+        let sss = |format: Format| [format, SUBSURFACE_FORMAT];
         let multisampled = ForwardPipelines {
-            plain: build_pipeline(
-                ctx,
-                &targets.multisampled,
-                fs::load(device.clone()).unwrap(),
-                &shadow_sampler,
+            plain: pipeline(&[msaa_color_format], ShaderId::ForwardFrag, true, msaa),
+            subsurface: pipeline(
+                &sss(msaa_color_format),
+                ShaderId::ForwardSssFrag,
                 true,
-                MSAA_SAMPLES,
+                msaa,
             ),
-            subsurface: build_pipeline(
-                ctx,
-                &targets.multisampled_subsurface,
-                fs_sss::load(device.clone()).unwrap(),
-                &shadow_sampler,
-                true,
-                MSAA_SAMPLES,
-            ),
-            masked: build_pipeline(
-                ctx,
-                &targets.multisampled,
-                fs::load(device.clone()).unwrap(),
-                &shadow_sampler,
+            masked: pipeline(&[msaa_color_format], ShaderId::ForwardFrag, false, msaa),
+            masked_subsurface: pipeline(
+                &sss(msaa_color_format),
+                ShaderId::ForwardSssFrag,
                 false,
-                MSAA_SAMPLES,
-            ),
-            masked_subsurface: build_pipeline(
-                ctx,
-                &targets.multisampled_subsurface,
-                fs_sss::load(device.clone()).unwrap(),
-                &shadow_sampler,
-                false,
-                MSAA_SAMPLES,
+                msaa,
             ),
         };
-        // The masked variants take the alpha-testing shader modules rather than
-        // the plain ones: there is no coverage to spend at one sample, so the
-        // cut has to be a `discard`. Everything else about them is unchanged.
+        // The masked variants take the alpha-testing shaders rather than the
+        // plain ones: there is no coverage to spend at one sample, so the cut has
+        // to be a `discard`. Everything else about them is unchanged.
         let single = ForwardPipelines {
-            plain: build_pipeline(
-                ctx,
-                &targets.single,
-                fs::load(device.clone()).unwrap(),
-                &shadow_sampler,
-                true,
-                SampleCount::Sample1,
-            ),
-            subsurface: build_pipeline(
-                ctx,
-                &targets.single_subsurface,
-                fs_sss::load(device.clone()).unwrap(),
-                &shadow_sampler,
-                true,
-                SampleCount::Sample1,
-            ),
-            masked: build_pipeline(
-                ctx,
-                &targets.single,
-                fs_masked::load(device.clone()).unwrap(),
-                &shadow_sampler,
+            plain: pipeline(&[color_format], ShaderId::ForwardFrag, true, one),
+            subsurface: pipeline(&sss(color_format), ShaderId::ForwardSssFrag, true, one),
+            masked: pipeline(&[color_format], ShaderId::ForwardFragAlphaTest, false, one),
+            masked_subsurface: pipeline(
+                &sss(color_format),
+                ShaderId::ForwardSssFragAlphaTest,
                 false,
-                SampleCount::Sample1,
-            ),
-            masked_subsurface: build_pipeline(
-                ctx,
-                &targets.single_subsurface,
-                fs_sss_masked::load(device.clone()).unwrap(),
-                &shadow_sampler,
-                false,
-                SampleCount::Sample1,
+                one,
             ),
         };
-
-        let uniform_buffer_allocator = Arena::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
-
-        let shadow_face_allocator = Arena::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::STORAGE_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
-
-        let decal_allocator = Arena::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::STORAGE_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
 
         // Material textures are the only ones with a mip chain to sample; the
         // AO and tonemap inputs are screen-space targets read at 1:1.
-        let anisotropy = device.enabled_features().sampler_anisotropy.then(|| {
-            device
-                .physical_device()
-                .properties()
-                .max_sampler_anisotropy
-                .min(16.0)
+        let sampler = rhi.create_sampler(SamplerDesc {
+            linear: true,
+            mipmap_linear: true,
+            repeat: true,
+            compare: false,
+            anisotropy: rhi.max_anisotropy(),
+            max_lod: None,
         });
 
-        let sampler = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                anisotropy,
-                ..SamplerCreateInfo::simple_repeat_linear()
-            },
-        )
-        .unwrap();
-
-        let ao_sampler = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
-            },
-        )
-        .unwrap();
+        let ao_sampler = rhi.create_sampler(SamplerDesc {
+            linear: true,
+            mipmap_linear: false,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+            max_lod: Some(1.0),
+        });
 
         Self {
             targets,
             multisampled,
             single,
-            uniform_buffer_allocator,
-            shadow_face_allocator,
-            decal_allocator,
             sampler,
             ao_sampler,
         }
@@ -838,8 +790,10 @@ impl ForwardPass {
     /// The layout the transparency pass builds its own pipeline with. Shared
     /// rather than derived a second time, so the two pipelines cannot disagree
     /// about a binding — see `oit.rs`.
-    pub(super) fn pipeline_layout(&self) -> &Arc<PipelineLayout> {
-        self.single.plain.layout()
+    /// The pipeline whose layout the blended-geometry passes are handed the
+    /// descriptor sets of.
+    pub(super) fn layout_source(&self) -> PipelineId {
+        self.single.plain
     }
 
     /// The set-4 per-object descriptor set for this frame's object buffer.
@@ -849,80 +803,64 @@ impl ForwardPass {
     /// but nothing needs to be rebuilt within one either.
     pub(super) fn build_object_set(
         &self,
-        ctx: &VkContext,
-        rows: &Subbuffer<[GpuObject]>,
-        indices: &Subbuffer<[InstanceEntry]>,
-    ) -> Arc<DescriptorSet> {
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.single.plain.layout().set_layouts()[4].clone(),
-            [
-                WriteDescriptorSet::buffer(0, rows.clone()),
-                WriteDescriptorSet::buffer(1, indices.clone()),
+        device: &Device,
+        rows: BufferId,
+        indices: BufferId,
+    ) -> BindGroupId {
+        device.create_transient_bind_group(
+            self.single.plain,
+            4,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::StorageBuffer(rows),
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageBuffer(indices),
+                },
             ],
-            [],
         )
-        .unwrap()
     }
 
     /// Build the set-1 material descriptor set over the shared table. Cached by
     /// the renderer and only rebuilt when the material table changes.
-    pub fn build_material_set(
-        &self,
-        ctx: &VkContext,
-        buffer: &Subbuffer<[GpuMaterial]>,
-    ) -> Arc<DescriptorSet> {
-        let buffer = buffer.clone();
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.single.plain.layout().set_layouts()[1].clone(),
-            [WriteDescriptorSet::buffer(0, buffer)],
-            [],
+    pub fn build_material_set(&self, device: &Device, materials: BufferId) -> BindGroupId {
+        device.create_persistent_bind_group(
+            self.single.plain,
+            1,
+            &[Binding {
+                binding: 0,
+                resource: BindingResource::StorageBuffer(materials),
+            }],
         )
-        .unwrap()
     }
 
-    /// Build the set-2 texture array + sampler descriptor set. Cached by the
-    /// renderer and only rebuilt when a texture is added.
-    pub fn build_texture_set(
-        &self,
-        ctx: &VkContext,
-        textures: &[Arc<ImageView>],
-    ) -> Arc<DescriptorSet> {
-        let default_view = textures[0].clone();
-        let texture_array = (0..ctx.texture_array_len(textures.len())).map(|i| {
-            textures
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| default_view.clone())
-        });
-        DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.single.plain.layout().set_layouts()[TEXTURE_SET].clone(),
-            [
-                WriteDescriptorSet::image_view_array(0, 0, texture_array),
-                WriteDescriptorSet::sampler(1, self.sampler.clone()),
-            ],
-            [],
+    pub fn build_texture_set(&self, device: &Device, textures: &[TextureViewId]) -> BindGroupId {
+        device.create_texture_array_group(
+            self.single.plain,
+            TEXTURE_SET as u32,
+            textures,
+            self.sampler,
         )
-        .unwrap()
     }
 
     /// Pack this frame's decals into the block both geometry passes bind.
     ///
     /// Uploaded unconditionally, including for a frame with no decals in it —
-    /// 2.5 KB of streaming write against a descriptor that has to be bound
-    /// either way, and a zero count is what the shader's frame-uniform branch
-    /// tests. The alternative is a "no decals" buffer kept alive as a second
-    /// path through both passes, which is more state to get wrong than the
-    /// write costs.
-    pub(super) fn upload_decals(&self, decals: &[DecalInstance]) -> Subbuffer<GpuDecals> {
-        let buffer = self.decal_allocator.allocate_sized::<GpuDecals>();
+    /// 2.5 KB of streaming write against a binding that has to be bound either
+    /// way, and a zero count is what the shader's frame-uniform branch tests.
+    /// The alternative is a "no decals" buffer kept alive as a second path
+    /// through both passes, which is more state to get wrong than the write
+    /// costs.
+    pub(super) fn upload_decals(&self, device: &Device, decals: &[DecalInstance]) -> BufferId {
+        let mut block = GpuDecals {
+            count: [0; 4],
+            decals: [GpuDecal::ZERO; MAX_DECALS],
+        };
         {
-            let mut block = buffer.write().unwrap();
             let count = decals.len().min(MAX_DECALS);
             block.count = [count as u32, 0, 0, 0];
-            block.decals = [GpuDecal::ZERO; MAX_DECALS];
             for (slot, decal) in block.decals.iter_mut().zip(decals.iter().take(count)) {
                 let mut flags = 0u32;
                 if decal.normal.is_some() {
@@ -972,7 +910,7 @@ impl ForwardPass {
                 };
             }
         }
-        buffer
+        device.upload_block(BlockKind::Storage, bytemuck::bytes_of(&block))
     }
 
     /// Build the five descriptor sets both passes into the lit frame bind, and
@@ -986,27 +924,27 @@ impl ForwardPass {
     pub(super) fn begin_frame(
         &self,
         renderer: &VulkanRenderer,
+        device: &Device,
         lighting: &SceneLighting,
         camera: &Camera,
         extent: [u32; 2],
-        ao_view: Arc<ImageView>,
-        contact_shadow_view: Arc<ImageView>,
-        shadow_view: Arc<ImageView>,
-        atlas_view: Arc<ImageView>,
+        ao_view: TextureViewId,
+        contact_shadow_view: TextureViewId,
+        shadow_view: TextureViewId,
+        atlas_view: TextureViewId,
+        env_cube: TextureViewId,
+        env_cube_sampler: SamplerId,
         shadows: Option<ShadowFrame<'_>>,
         atlas: &ShadowAtlas,
-        material_set: Arc<DescriptorSet>,
-        texture_set: Arc<DescriptorSet>,
-        object_set: Arc<DescriptorSet>,
-        decals: Subbuffer<GpuDecals>,
+        material_set: BindGroupId,
+        texture_set: BindGroupId,
+        object_set: BindGroupId,
+        decals: BufferId,
         environment: &EnvironmentSettings,
-        fog: Subbuffer<GpuFog>,
-        fog_volume: Arc<ImageView>,
-        fog_sampler: Arc<Sampler>,
+        fog: BufferId,
+        fog_volume: TextureViewId,
+        fog_sampler: SamplerId,
     ) -> ForwardSets {
-        let lighting_buffer = self
-            .uniform_buffer_allocator
-            .allocate_sized::<GpuLighting>();
         // Both halves fall back to the scene's flat ambient when nothing is
         // loaded — the diffuse as a band-0-only series, the specular as a tint
         // on a white cube. Two descriptions of the same uniform environment,
@@ -1014,7 +952,7 @@ impl ForwardPass {
         let ambient = lighting.ambient_color * lighting.ambient_nits;
         let irradiance = renderer.environment.irradiance(ambient, environment);
         let env_specular = renderer.environment.specular_tint(ambient, environment);
-        *lighting_buffer.write().unwrap() = to_gpu_lighting(
+        let lighting_block = to_gpu_lighting(
             lighting,
             camera.position,
             extent,
@@ -1024,95 +962,109 @@ impl ForwardPass {
             environment.yaw,
             env_specular,
         );
+        let lighting_buffer =
+            device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&lighting_block));
 
-        // Always at least one entry: `allocate_slice` rejects a length of zero,
-        // and a frame where nothing punctual casts still has to bind something
-        // for the descriptor. Every light's face index is -1 in that frame, so
-        // the row is never read.
+        // Always at least one entry: a frame where nothing punctual casts still
+        // has to bind something for the descriptor. Every light's face index is
+        // -1 in that frame, so the row is never read.
         let face_count = atlas.faces.len().clamp(1, MAX_ATLAS_FACES);
-        let shadow_faces = self
-            .shadow_face_allocator
-            .allocate_slice::<GpuShadowFace>(face_count as u64);
-        {
-            let mut rows = shadow_faces.write().unwrap();
-            rows.fill(GpuShadowFace::ZERO);
-            for (row, face) in rows.iter_mut().zip(&atlas.faces) {
-                *row = GpuShadowFace {
-                    view_proj: face.view_proj.to_cols_array_2d(),
-                    rect: face.tile.uv_rect(atlas.resolution),
-                };
-            }
+        let mut shadow_faces = vec![GpuShadowFace::ZERO; face_count];
+        for (row, face) in shadow_faces.iter_mut().zip(&atlas.faces) {
+            *row = GpuShadowFace {
+                view_proj: face.view_proj.to_cols_array_2d(),
+                rect: face.tile.uv_rect(atlas.resolution),
+            };
         }
+        let shadow_faces =
+            device.upload_block(BlockKind::Storage, bytemuck::cast_slice(&shadow_faces));
 
-        let lighting_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.single.plain.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::buffer(0, lighting_buffer),
+        let lighting_set = device.create_transient_bind_group(
+            self.single.plain,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::UniformBuffer(lighting_buffer),
+                },
                 // The same buffer object the prepass binds. Not a copy: what a
                 // decal does to a normal, an `f0` and a roughness has to be the
                 // same in both passes or `ssr_resolve.comp` subtracts an
                 // environment term belonging to the surface as it was before the
                 // stamp landed — the identical argument the parallax march makes
                 // about *where* a map is sampled.
-                WriteDescriptorSet::buffer(1, decals),
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageBuffer(decals),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
-        // Set 3 is the screen-space and shadow inputs. The cascades are kept as
-        // a separate image and comparison sampler rather than a combined one,
-        // for the same reason the texture array is: Metal caps samplers per
-        // stage far lower than sampled images.
-        let ao_set = DescriptorSet::new(
-            renderer.ctx.descriptor_set_allocator.clone(),
-            self.single.plain.layout().set_layouts()[3].clone(),
-            [
-                WriteDescriptorSet::image_view_sampler(0, ao_view, self.ao_sampler.clone()),
-                WriteDescriptorSet::image_view(1, shadow_view),
-                WriteDescriptorSet::image_view(3, renderer.environment.specular_view()),
-                WriteDescriptorSet::sampler(4, renderer.environment.sampler()),
-                WriteDescriptorSet::image_view_sampler(
-                    5,
-                    contact_shadow_view,
-                    self.ao_sampler.clone(),
-                ),
+        // Set 3 is the screen-space and shadow inputs. The cascades are kept as a
+        // separate image and comparison sampler rather than a combined one, for
+        // the same reason the texture array is: Metal caps samplers per stage far
+        // lower than sampled images.
+        let sampled = |binding, view: TextureViewId| Binding {
+            binding,
+            resource: BindingResource::SampledTexture {
+                view,
+                sampler: self.ao_sampler,
+            },
+        };
+        let texture = |binding, view: TextureViewId| Binding {
+            binding,
+            resource: BindingResource::Texture(view),
+        };
+        let ao_set = device.create_transient_bind_group(
+            self.single.plain,
+            3,
+            &[
+                sampled(0, ao_view),
+                texture(1, shadow_view),
+                texture(3, env_cube),
+                Binding {
+                    binding: 4,
+                    resource: BindingResource::Sampler(env_cube_sampler),
+                },
+                sampled(5, contact_shadow_view),
                 // The atlas reads through the cascades' comparison sampler at
                 // binding 2 — same conventions, same `Less` against a map
                 // cleared to 1.0 — so it needs no sampler of its own. Which
                 // matters: Metal caps samplers per stage far below sampled
                 // images, and this shader is already at five.
-                WriteDescriptorSet::image_view(6, atlas_view),
-                WriteDescriptorSet::buffer(7, shadow_faces),
+                texture(6, atlas_view),
+                Binding {
+                    binding: 7,
+                    resource: BindingResource::StorageBuffer(shadow_faces),
+                },
                 // The fog volume and the medium that produced it. Both are bound
                 // in every frame — the volume as a 1x1x1 stand-in when the two
                 // dispatches did not run — because the analytic term past the
                 // froxels reads the same block, so there is one path in the
                 // shader rather than a second pipeline.
-                WriteDescriptorSet::image_view_sampler(8, fog_volume, fog_sampler),
-                WriteDescriptorSet::buffer(9, fog),
+                Binding {
+                    binding: 8,
+                    resource: BindingResource::SampledTexture {
+                        view: fog_volume,
+                        sampler: fog_sampler,
+                    },
+                },
+                Binding {
+                    binding: 9,
+                    resource: BindingResource::UniformBuffer(fog),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
         ForwardSets {
-            sets: vec![lighting_set, material_set, texture_set, ao_set, object_set],
+            groups: [lighting_set, material_set, texture_set, ao_set, object_set],
         }
     }
 
-    /// Draw the opaque geometry. `sets` is what
-    /// [`begin_frame`](Self::begin_frame) built.
-    /// `subsurface` picks the variant that splits the diffusible radiance into a
-    /// second target. It is the graph's answer, not this pass's — the executor
-    /// reads it off the frame's ids, so the pipeline bound here and the
-    /// framebuffer already bound around it cannot disagree about how many
-    /// attachments there are.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw(
         &self,
-        builder: &mut Recorder,
+        builder: &mut Encoder,
         renderer: &PassCtx<'_>,
         draws: Draws<'_>,
         view: &FrameView,
@@ -1129,20 +1081,45 @@ impl ForwardPass {
         // rasterises geometry has to agree on it to a subpixel.
         let view_proj = view.view_proj;
         let (plain, masked) = self.pipelines(msaa).for_frame(subsurface);
+        // The one value a geometry draw still pushes. The fat per-object matrices
+        // are in the set-4 storage buffer, and what used to sit beside
+        // `view_proj` here — the run's material and its first object row — moved
+        // into the instance list and into `firstInstance`, because a multi-draw
+        // has no per-draw push. See [`instances`](super::instances) and
+        // [`cull`](super::cull). `view_proj` replaced a pre-multiplied `mvp` when
+        // draws became instanced: a run covers many models, so the model half has
+        // to be applied in the shader. The transparency and refraction passes push
+        // the same range through the same layout.
+        let mut words = [0u32; 16];
+        for (word, value) in words
+            .iter_mut()
+            .zip(view_proj.to_cols_array_2d().iter().flatten())
+        {
+            *word = value.to_bits();
+        }
+        // The descriptor sets are rebound with the incoming pipeline. All four
+        // layouts are built from the same stages and the same immutable shadow
+        // sampler, so they are set compatible and this is a formality — but it
+        // is the formality that keeps it true if one of them ever stops being.
+        let groups = sets.groups();
+        let bind_all = |builder: &mut Encoder, pipeline: PipelineId| {
+            builder.bind_pipeline(pipeline);
+            for (set, group) in groups.iter().enumerate() {
+                builder.bind_group(set as u32, *group);
+            }
+            builder.push_constants(&words);
+        };
 
-        builder.set_viewport(
-            0,
-            &[Viewport {
-                offset: [0.0, 0.0],
-                extent: [extent[0] as f32, extent[1] as f32],
-                depth_range: 0.0..=1.0,
-            }],
-        );
+        builder.set_viewport(Viewport {
+            origin: [0.0, 0.0],
+            extent: [extent[0] as f32, extent[1] as f32],
+            depth_range: [0.0, 1.0],
+        });
 
         // Every draw below names its geometry through `firstIndex` and
         // `vertexOffset` into the arena, so the three buffers are bound once
         // for the pass rather than once per mesh. See `mesh`.
-        renderer.arena.bind(builder);
+        builder.bind_geometry(false);
 
         // Nothing is bound yet, so the first run always binds. `None` rather
         // than "the plain one" so that a frame of nothing but foliage does not
@@ -1166,22 +1143,8 @@ impl ForwardPass {
                 .materials
                 .get(unit.material as usize)
                 .is_some_and(GpuMaterial::is_masked);
-            let pipeline = if wants_masked { masked } else { plain };
             if bound != Some(wants_masked) {
-                // The descriptor sets are rebound with the incoming pipeline's
-                // layout. All four layouts are built from the same stages and
-                // the same immutable shadow sampler, so they are set compatible
-                // and this is a formality — but it is the formality that keeps
-                // it true if one of them ever stops being.
-                builder
-                    .bind_pipeline_graphics(pipeline)
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        pipeline.layout(),
-                        0,
-                        &sets.as_vec(),
-                    )
-                    .push_constants(pipeline.layout(), 0, &PushConstants::new(view_proj));
+                bind_all(builder, if wants_masked { masked } else { plain });
                 bound = Some(wants_masked);
             }
             builder.draw_indexed(
@@ -1197,44 +1160,10 @@ impl ForwardPass {
         // pipeline variant, over commands a dispatch wrote. Empty on the CPU
         // path.
         for region in draws.regions() {
-            let pipeline = if region.masked { masked } else { plain };
-            builder
-                .bind_pipeline_graphics(pipeline)
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    pipeline.layout(),
-                    0,
-                    &sets.as_vec(),
-                )
-                .push_constants(pipeline.layout(), 0, &PushConstants::new(view_proj))
-                .draw_indexed_indirect(region.commands);
+            bind_all(builder, if region.masked { masked } else { plain });
+            builder.draw_indexed_indirect(region.commands, region.range);
         }
     }
-}
-
-/// The material table both geometry passes read.
-///
-/// One buffer rather than one per pipeline: the prepass writes the `f0` and
-/// roughness the forward pass shades with, and two uploads of the same table are
-/// two ways for one material to be described differently.
-pub(super) fn material_buffer(
-    ctx: &VkContext,
-    materials: &[GpuMaterial],
-) -> Subbuffer<[GpuMaterial]> {
-    Buffer::from_iter(
-        ctx.memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        materials.iter().copied(),
-    )
-    .expect("failed to allocate material buffer")
 }
 
 pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
@@ -1404,216 +1333,6 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
             // texture gives its lobe.
             m.height_texture.map_or(WHITE_TEXTURE, |h| h.0),
         ],
-    }
-}
-
-/// Blend states for a pipeline sharing the forward render pass but writing only
-/// its colour target — the skybox and the debug lines.
-///
-/// The subsurface variant of that render pass has a second colour attachment
-/// those two shaders know nothing about, and Vulkan requires a blend state per
-/// attachment regardless. Leaving the extra one at its default would let them
-/// write whatever their fragment shader happened to leave in an output it never
-/// declared, which is undefined — and the sky covers most of the frame, so the
-/// undefined value would be sitting in the scatter target under every blur tap
-/// near a silhouette. An empty write mask is the whole fix, and unlike disabling
-/// the write it needs no device feature: the attachment keeps its clear, and a
-/// clear of zero is exactly "nothing scattered here".
-pub(super) fn co_tenant_blend_states(target: &PipelineRenderingCreateInfo) -> ColorBlendState {
-    let mut state = ColorBlendState::with_attachment_states(
-        target.color_attachment_formats.len() as u32,
-        ColorBlendAttachmentState::default(),
-    );
-    for attachment in state.attachments.iter_mut().skip(1) {
-        attachment.color_write_mask =
-            vulkano::pipeline::graphics::color_blend::ColorComponents::empty();
-    }
-    state
-}
-
-/// The vertex shader both passes into the lit frame rasterise with. A blended
-/// surface is the same geometry read from the same per-object rows, and
-/// `shading.glsl` reads the same varyings out of it whichever fragment shader
-/// includes it.
-pub(super) fn vertex_shader(device: &Arc<Device>) -> vulkano::shader::EntryPoint {
-    vs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap()
-}
-
-/// Both opaque pipelines, differing only in the fragment shader and the render
-/// pass it targets.
-///
-/// The layout is derived from the stages, so the two come out identical — which is
-/// what has to be true: `oit.rs` and `refraction.rs` build their pipelines from
-/// [`ForwardPass::pipeline_layout`], and the five descriptor sets the executor
-/// binds are bound once for whichever opaque variant ran.
-fn build_pipeline(
-    ctx: &VkContext,
-    target: &PipelineRenderingCreateInfo,
-    fragment: Arc<vulkano::shader::ShaderModule>,
-    // Passed in rather than made here, and that is the whole reason this parameter
-    // exists: Vulkan compares immutable samplers by *identity*, so two calls to
-    // `comparison_sampler` — identical in every field — produce two set-3 layouts
-    // that are not compatible. The executor binds one set of five descriptor sets
-    // for whichever opaque variant ran, so both pipelines have to have been built
-    // around the same sampler object. The same rule `refraction.rs` obeys by
-    // lifting this layout instead of deriving it.
-    shadow_sampler: &Arc<Sampler>,
-    // Inverted from the obvious sense, and named for what it selects rather
-    // than for what it is not: back faces are culled for ordinary opaque
-    // geometry and kept for `BlendMode::Masked`, because a cutout sheet has no
-    // back to cull.
-    cull_back: bool,
-    // How many samples the render pass rasterises at, and — because the two are
-    // the same decision — where the depth being tested came from.
-    //
-    // At more than one sample this pass rasterises its own depth buffer: the
-    // test is `Less` and the pass writes, and a masked run spends the extra
-    // samples on the cutout's edge through alpha to coverage.
-    //
-    // At one sample there is no second depth buffer. The geometry prepass's is
-    // attached read-only and the test is `EQUAL` against it, which is the whole
-    // point of the change: every fragment that is not the front-most surface is
-    // killed before it shades, so the pass has perfect early-Z and zero shading
-    // overdraw instead of rasterising the same geometry a second time for
-    // nothing. It depends on the two vertex shaders agreeing on `gl_Position` to
-    // the last bit -- see the `invariant` declaration in each.
-    samples: SampleCount,
-) -> Arc<GraphicsPipeline> {
-    let device = &ctx.device;
-    let vs = vertex_shader(device);
-    let fs = fragment.entry_point("main").unwrap();
-
-    let vertex_input_state = [PositionVertex::per_vertex(), SurfaceVertex::per_vertex()]
-        .definition(&vs)
-        .unwrap();
-
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs),
-        PipelineShaderStageCreateInfo::new(fs),
-    ];
-
-    // The shadow comparison sampler has to be immutable — part of the layout
-    // rather than something written into a descriptor set — because MoltenVK
-    // cannot accept a written one. Everything else in the layout is still
-    // derived from the shaders' own interface.
-    let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
-    layout_info.set_layouts[SHADOW_SET]
-        .bindings
-        .get_mut(&SHADOW_SAMPLER_BINDING)
-        .expect("forward.frag must declare the shadow comparison sampler")
-        .immutable_samplers = vec![shadow_sampler.clone()];
-    // The material textures, of which a scene writes only the ones it loaded.
-    // Set here rather than beside the write, because it is the *layout* the
-    // short write is legal against — and this layout is also the one the
-    // transparency and refraction pipelines lift, so both inherit it.
-    ctx.mark_texture_array_partial(&mut layout_info, TEXTURE_SET);
-
-    let layout = PipelineLayout::new(
-        device.clone(),
-        layout_info
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-
-    GraphicsPipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState {
-                cull_mode: if cull_back {
-                    CullMode::Back
-                } else {
-                    CullMode::None
-                },
-                ..Default::default()
-            }),
-            multisample_state: Some(MultisampleState {
-                rasterization_samples: samples,
-                // Only where there are samples to spend. At one sample the
-                // cutout is cut by the `discard` in the shader module this
-                // variant was built from instead, along the same line.
-                alpha_to_coverage_enable: !cull_back && samples != SampleCount::Sample1,
-                ..Default::default()
-            }),
-            depth_stencil_state: Some(DepthStencilState {
-                depth: Some(if samples == SampleCount::Sample1 {
-                    DepthState {
-                        write_enable: false,
-                        compare_op: CompareOp::Equal,
-                    }
-                } else {
-                    DepthState::simple()
-                }),
-                ..Default::default()
-            }),
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                target.color_attachment_formats.len() as u32,
-                ColorBlendAttachmentState::default(),
-            )),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(target.clone().into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .unwrap()
-}
-
-mod vs {
-    vulkano_shaders::shader! {
-        ty: "vertex",
-        path: "shaders/forward.vert",
-    }
-}
-
-mod fs {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "shaders/forward.frag",
-        include: ["shaders"],
-    }
-}
-
-mod fs_sss {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "shaders/forward_sss.frag",
-        include: ["shaders"],
-    }
-}
-
-/// The same two shaders with the coverage ramp collapsed to a hard `discard`,
-/// for the one-sample masked pipelines.
-///
-/// A define rather than two more files, as `prepass.rs` does it for the same
-/// cut: the difference really is one branch, and everything about what a surface
-/// looks like stays in the one `shading.glsl` all of them include. Separate
-/// *modules* rather than a uniform the one module tests, because a `discard`
-/// anywhere in a shader costs every draw through it its early depth test — and
-/// early depth is the entire reason this pass tests `EQUAL`. A cutout must not
-/// cost every other opaque material in the scene.
-mod fs_masked {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "shaders/forward.frag",
-        include: ["shaders"],
-        define: [("ORRIN_ALPHA_TEST", "1")],
-    }
-}
-
-mod fs_sss_masked {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "shaders/forward_sss.frag",
-        include: ["shaders"],
-        define: [("ORRIN_ALPHA_TEST", "1")],
     }
 }
 

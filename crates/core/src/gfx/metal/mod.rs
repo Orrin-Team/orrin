@@ -1,0 +1,157 @@
+//! The native Metal driver, beside the Vulkan one behind the same RHI.
+//!
+//! Resources live in pools addressed by the RHI's ids and are freed
+//! `FRAME_SLOTS` frames after they are retired. Per-frame data (uniforms,
+//! staging, transient argument buffers) is suballocated from one arena per kind
+//! per slot, so a frame's slot is reusable only once the GPU has finished the
+//! frame that last wrote it. Every resource is tracked, so Metal orders hazards
+//! itself and nothing here records a barrier.
+
+mod backdrop;
+pub(crate) mod backend;
+mod bind;
+mod convert;
+mod encoder;
+mod geometry;
+mod pipeline;
+mod resources;
+pub(crate) mod window;
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLArgumentBuffersTier, MTLBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLGPUFamily, MTLSamplerState, MTLTexture,
+};
+
+use crate::gfx::rhi::{Encoder, Pool};
+
+pub(crate) use encoder::State;
+use resources::Arena;
+
+/// Frames the CPU may record ahead of the GPU, which is how many sets of
+/// per-frame arenas there are and how late a retired id may be freed.
+pub(crate) const FRAME_SLOTS: u64 = 2;
+
+/// A Metal object, held across threads.
+///
+/// SAFETY: Metal documents devices, queues, buffers, textures and sampler
+/// states as safe to use from any thread; only command encoders are not, and an
+/// encoder is never wrapped in this.
+pub(crate) struct Shared<T>(pub(crate) T);
+
+/// A shared Metal object, by its protocol.
+pub(crate) type Held<P> = Shared<Retained<ProtocolObject<P>>>;
+unsafe impl<T> Send for Shared<T> {}
+unsafe impl<T> Sync for Shared<T> {}
+
+/// A buffer id's target: a whole buffer, or a range of an arena page.
+pub(crate) struct Buf {
+    pub(crate) buffer: Shared<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+}
+
+pub struct MtlDriver {
+    pub(crate) device: Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    frame: AtomicU64,
+    textures: Mutex<Pool<Held<dyn MTLTexture>>>,
+    buffers: Mutex<Pool<Buf>>,
+    samplers: Mutex<Pool<Held<dyn MTLSamplerState>>>,
+    /// Per-frame data, one arena per kind per frame slot: vertices, uniforms,
+    /// storage, indices, staging, argument buffers.
+    arenas: Mutex<[[Arena; FRAME_SLOTS as usize]; 6]>,
+    pipelines: Mutex<Pool<pipeline::Pipe>>,
+    functions: Mutex<pipeline::Functions>,
+    bind_groups: Mutex<Pool<bind::Group>>,
+    encoders: Mutex<bind::EncoderCache>,
+    geometry: Mutex<Shared<geometry::Geometry>>,
+    downsamples: Mutex<backdrop::Downsamples>,
+}
+
+pub struct MtlEncoder<'a> {
+    driver: &'a MtlDriver,
+    state: &'a mut encoder::State,
+}
+
+impl MtlDriver {
+    /// The system's Metal device, or why this machine cannot be the Metal
+    /// backend: it needs Apple GPU family 7 (M1 and later) and tier 2 argument
+    /// buffers, and anything less runs Vulkan through MoltenVK instead.
+    pub fn new() -> Result<Self, String> {
+        let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
+        if !device.supportsFamily(MTLGPUFamily::Apple7) {
+            return Err(format!(
+                "{} is not Apple GPU family 7 or later",
+                device.name()
+            ));
+        }
+        if device.argumentBuffersSupport() != MTLArgumentBuffersTier::Tier2 {
+            return Err(format!("{} lacks tier 2 argument buffers", device.name()));
+        }
+        let queue = device
+            .newCommandQueue()
+            .ok_or("the device gave no command queue")?;
+        let geometry = geometry::Geometry::new(&device);
+        Ok(Self {
+            device,
+            queue,
+            frame: AtomicU64::new(0),
+            textures: Mutex::new(Pool::new(FRAME_SLOTS)),
+            buffers: Mutex::new(Pool::new(FRAME_SLOTS)),
+            samplers: Mutex::new(Pool::new(FRAME_SLOTS)),
+            arenas: Mutex::new(std::array::from_fn(|_| {
+                std::array::from_fn(|_| Arena::new())
+            })),
+            pipelines: Mutex::new(Pool::new(FRAME_SLOTS)),
+            functions: Mutex::new(Default::default()),
+            bind_groups: Mutex::new(Pool::new(FRAME_SLOTS)),
+            encoders: Mutex::new(Default::default()),
+            geometry: Mutex::new(Shared(geometry)),
+            downsamples: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Record with `record` on a fresh encoder and wait for the GPU to finish.
+    pub fn record_blocking(&self, record: impl FnOnce(&mut Encoder)) {
+        let mut state = encoder::State::new(self);
+        {
+            let mut encoder = Encoder::Metal(MtlEncoder::new(self, &mut state));
+            record(&mut encoder);
+        }
+        let _ = state.finish_blocking();
+    }
+
+    /// `(allocated, budget)` in bytes: what this process holds of the GPU's
+    /// working set, and the most the system recommends it use.
+    pub fn memory(&self) -> (Option<u64>, u64) {
+        (
+            Some(self.device.currentAllocatedSize() as u64),
+            self.device.recommendedMaxWorkingSetSize(),
+        )
+    }
+
+    /// The device's name, for the run banner.
+    pub fn name(&self) -> String {
+        self.device.name().to_string()
+    }
+
+    /// Frees whatever `frame - FRAME_SLOTS` retired and reuses the arenas that
+    /// frame wrote.
+    pub fn begin_frame(&self, frame: u64) {
+        self.frame.store(frame, Ordering::Relaxed);
+        self.textures.lock().unwrap().collect(frame);
+        self.buffers.lock().unwrap().collect(frame);
+        self.samplers.lock().unwrap().collect(frame);
+        self.pipelines.lock().unwrap().collect(frame);
+        self.bind_groups.lock().unwrap().collect(frame);
+        let slot = (frame % FRAME_SLOTS) as usize;
+        for kind in self.arenas.lock().unwrap().iter_mut() {
+            kind[slot].reset();
+        }
+    }
+}

@@ -21,31 +21,22 @@
 //! jitter needs to be averaged by. Two allocations, ping-ponged, so the scatter
 //! pass never reads the volume it is writing.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use glam::{Mat4, Vec3};
-use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
-use vulkano::buffer::{BufferContents, BufferUsage, Subbuffer};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::format::Format;
-use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
-use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
-};
 
 use crate::gfx::SceneLighting;
+use crate::gfx::format::SampleCount;
+use crate::gfx::graph::ImageUsage;
+use crate::gfx::rhi::{
+    Binding, BindingResource, BlockKind, BufferId, ComputePipelineDesc, Device, Encoder,
+    PipelineId, SamplerDesc, SamplerId, TextureDesc, TextureDimension, TextureViewId,
+};
+use crate::gfx::shaders::ShaderId;
 use crate::scene::FogSettings;
 
 use super::ShadowFrame;
-use super::context::VkContext;
 use super::forward::GpuCascades;
-use super::record::{Arena, Recorder};
 use super::taa::FrameView;
 
 /// How far the froxel grid is reduced from the frame in each screen axis.
@@ -70,7 +61,7 @@ pub(super) const FROXEL_SLICES: u32 = 64;
 /// radiance, so a sunlit shaft is in the thousands of cd/m² while the shadowed
 /// air beside it is in the ones, and a normalised format would band across
 /// exactly the gradient the effect exists to draw.
-pub(super) const FOG_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
+pub(super) const FOG_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::Rgba16Float;
 
 /// Side of the scatter dispatch's workgroup, matching `fog_scatter.comp`.
 const SCATTER_TILE: u32 = 4;
@@ -98,7 +89,7 @@ const SHADOW_SAMPLER_BINDING: u32 = 2;
 /// that applies the result. That is the decal precedent: a medium described in
 /// two buffers is a medium two passes can disagree about, and the disagreement
 /// would show up as fog that does not match the air it is standing in.
-#[derive(BufferContents, Clone, Copy)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(super) struct GpuFog {
     inv_view_proj: [[f32; 4]; 4],
@@ -122,24 +113,26 @@ pub(super) struct GpuFog {
 }
 
 pub struct FogPass {
-    scatter_pipeline: Arc<ComputePipeline>,
-    integrate_pipeline: Arc<ComputePipeline>,
+    scatter_pipeline: PipelineId,
+    integrate_pipeline: PipelineId,
     /// Linear and clamped: the reprojection lands between froxels in all three
     /// axes, and the clamp is what makes a froxel that has just entered the
     /// frustum fall back to its own measurement rather than a neighbour's.
-    linear_clamp: Arc<Sampler>,
+    linear_clamp: SamplerId,
     /// Nearest, for the integration: it reads exactly the froxel it is
     /// integrating, and a bilinear tap would smear a neighbouring column's
     /// extinction into a transmittance about to be multiplied along a whole ray.
-    nearest_clamp: Arc<Sampler>,
-    uniform_allocator: Arena,
+    nearest_clamp: SamplerId,
+    /// The same linear clamped sampler, as the shading passes bind it beside the
+    /// volume they apply the fog from.
+    shading_sampler: SamplerId,
     /// Ping-ponged: `frame & 1` is this frame's scatter target and the other is
     /// the history. Empty until the first frame the effect is enabled for.
-    history: Option<[Arc<ImageView>; 2]>,
+    history: Option<[TextureViewId; 2]>,
     /// A 1x1x1 volume of "no in-scatter, full transmittance", bound wherever the
     /// real one is absent so every shader has one path rather than two — the
     /// same trick the 1x1 white ambient-occlusion view plays.
-    fallback: Arc<ImageView>,
+    fallback: TextureViewId,
     extent: [u32; 3],
     frame: u64,
     /// Set whenever the history cannot be trusted — first frame, a resize, or
@@ -155,67 +148,62 @@ pub struct FogPass {
     /// This frame's block, resolved once in `begin_frame`. Both dispatches and
     /// every shader that applies the fog bind the same allocation, so the medium
     /// cannot differ between the pass that lit it and the pass that reads it.
-    uniforms: Option<Subbuffer<GpuFog>>,
+    uniforms: Option<BufferId>,
 }
 
 impl FogPass {
-    pub fn new(ctx: &VkContext) -> Self {
-        let device = &ctx.device;
-        let shadow_sampler = super::shadow::comparison_sampler(device);
-        let scatter_pipeline = build_pipeline(
-            ctx,
-            scatter_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-            Some(&shadow_sampler),
+    pub fn new(device: &Device) -> Self {
+        // The comparison sampler has to be *immutable* — part of the layout
+        // rather than something written into a descriptor set — because MoltenVK
+        // is a portability-subset device and rejects a written one outright. The
+        // forward pass patches its own set 3 for exactly this reason; this is the
+        // same constraint reached from a compute pipeline.
+        let shadow_sampler = device.create_sampler(SamplerDesc {
+            linear: true,
+            mipmap_linear: false,
+            repeat: false,
+            compare: true,
+            anisotropy: None,
+            max_lod: None,
+        });
+        let scatter_pipeline = device.create_compute_pipeline_with_samplers(
+            &ComputePipelineDesc {
+                shader: ShaderId::FogScatterComp,
+            },
+            &[(0, SHADOW_SAMPLER_BINDING, shadow_sampler)],
         );
-        let integrate_pipeline = build_pipeline(
-            ctx,
-            integrate_cs::load(device.clone())
-                .unwrap()
-                .entry_point("main")
-                .unwrap(),
-            None,
-        );
+        let integrate_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
+            shader: ShaderId::FogIntegrateComp,
+        });
 
-        let linear_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
-            },
-        )
-        .unwrap();
-        let nearest_clamp = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..SamplerCreateInfo::default()
-            },
-        )
-        .unwrap();
-
-        let uniform_allocator = Arena::new(
-            ctx.memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
+        let sampler = |linear: bool| {
+            device.create_sampler(SamplerDesc {
+                linear,
+                mipmap_linear: false,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(if linear { 1.0 } else { 0.0 }),
+            })
+        };
+        let linear_clamp = sampler(true);
+        let nearest_clamp = sampler(false);
 
         Self {
             scatter_pipeline,
             integrate_pipeline,
             linear_clamp,
             nearest_clamp,
-            uniform_allocator,
+            shading_sampler: device.create_sampler(SamplerDesc {
+                linear: true,
+                mipmap_linear: false,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(0.0),
+            }),
             history: None,
-            fallback: allocate_fallback(ctx),
+            fallback: allocate_fallback(device),
             extent: [0; 3],
             frame: 0,
             reset: AtomicBool::new(true),
@@ -245,7 +233,7 @@ impl FogPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn begin_frame(
         &mut self,
-        ctx: &VkContext,
+        device: &Device,
         settings: &FogSettings,
         lighting: &SceneLighting,
         shadows: Option<ShadowFrame<'_>>,
@@ -259,7 +247,8 @@ impl FogPass {
 
         if live {
             if self.history.is_none() || self.extent != froxels {
-                self.history = Some(allocate_history(ctx, froxels));
+                self.release(device);
+                self.history = Some(allocate_history(device, froxels));
                 self.extent = froxels;
                 self.reset.store(true, Ordering::Relaxed);
             }
@@ -267,7 +256,7 @@ impl FogPass {
         } else {
             // Freed rather than kept: two volumes is real memory, and what they
             // hold is stale the moment a frame renders without them.
-            self.history = None;
+            self.release(device);
             self.reset.store(true, Ordering::Relaxed);
         }
 
@@ -276,8 +265,7 @@ impl FogPass {
         let to_sun = (-lighting.sun.direction).normalize_or_zero();
         let previous_view_proj = self.previous_view_proj.unwrap_or(view.unjittered_view_proj);
 
-        let uniforms = self.uniform_allocator.allocate_sized::<GpuFog>();
-        *uniforms.write().unwrap() = GpuFog {
+        let block = GpuFog {
             // Unjittered, both of them: the volume is reprojected against its own
             // history rather than resolved by TAA, so the raster's subpixel
             // jitter would fight the reprojection for a sixteenth of a froxel.
@@ -326,7 +314,7 @@ impl FogPass {
             // be looking at different matrices.
             cascades: GpuCascades::new(shadows),
         };
-        self.uniforms = Some(uniforms);
+        self.uniforms = Some(device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&block)));
 
         // Tracked whether or not the effect is on, for the reason TAA tracks its
         // own: otherwise the first frame after it is switched back on reprojects
@@ -342,32 +330,37 @@ impl FogPass {
         settings.volumetric && settings.density > 0.0
     }
 
-    pub(super) fn uniforms(&self) -> Subbuffer<GpuFog> {
+    pub(super) fn uniforms(&self) -> BufferId {
         self.uniforms
-            .clone()
             .expect("the frame bound the fog block before begin_frame")
     }
 
     /// What shaders sample to apply the fog: the integrated volume where the
     /// passes ran, and the inert 1x1x1 stand-in where they did not.
-    pub(super) fn volume_or_fallback(&self, volume: Option<Arc<ImageView>>) -> Arc<ImageView> {
-        volume.unwrap_or_else(|| self.fallback.clone())
+    pub(super) fn volume_or_fallback(&self, volume: Option<TextureViewId>) -> TextureViewId {
+        volume.unwrap_or(self.fallback)
     }
 
-    pub(super) fn sampler(&self) -> Arc<Sampler> {
-        self.linear_clamp.clone()
+    fn release(&mut self, device: &Device) {
+        for view in self.history.take().into_iter().flatten() {
+            device.destroy_texture(view);
+        }
+    }
+
+    pub(super) fn sampler(&self) -> SamplerId {
+        self.shading_sampler
     }
 
     /// This frame's scatter target, which is next frame's history.
-    pub(super) fn scatter_view(&self) -> Arc<ImageView> {
-        self.pair()[(self.frame & 1) as usize].clone()
+    pub(super) fn scatter_view(&self) -> TextureViewId {
+        self.pair()[(self.frame & 1) as usize]
     }
 
-    fn history_view(&self) -> Arc<ImageView> {
-        self.pair()[((self.frame + 1) & 1) as usize].clone()
+    fn history_view(&self) -> TextureViewId {
+        self.pair()[((self.frame + 1) & 1) as usize]
     }
 
-    fn pair(&self) -> &[Arc<ImageView>; 2] {
+    fn pair(&self) -> &[TextureViewId; 2] {
         self.history
             .as_ref()
             .expect("the graph scheduled the fog scatter with no history allocated")
@@ -375,46 +368,48 @@ impl FogPass {
 
     pub(super) fn record_scatter(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        shadow_maps: Arc<ImageView>,
+        device: &Device,
+        builder: &mut Encoder,
+        shadow_maps: TextureViewId,
     ) {
         let target = self.scatter_view();
-        let extent = target.image().extent();
+        // The volume's own extent, which the history was allocated at.
+        let extent = self.extent;
 
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.scatter_pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::buffer(0, self.uniforms()),
-                // No write for binding 2: the comparison sampler is immutable
-                // in this layout, which is what a portability-subset device
-                // requires and what writing one would be rejected for.
-                WriteDescriptorSet::image_view(1, shadow_maps),
-                WriteDescriptorSet::image_view_sampler(
-                    3,
-                    self.history_view(),
-                    self.linear_clamp.clone(),
-                ),
-                WriteDescriptorSet::image_view(4, target.clone()),
+        let set = device.create_transient_bind_group(
+            self.scatter_pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::UniformBuffer(self.uniforms()),
+                },
+                // No write for binding 2: the comparison sampler is immutable in
+                // this layout, which is what a portability-subset device requires
+                // and what writing one would be rejected for.
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::Texture(shadow_maps),
+                },
+                Binding {
+                    binding: 3,
+                    resource: BindingResource::SampledTexture {
+                        view: self.history_view(),
+                        sampler: self.linear_clamp,
+                    },
+                },
+                Binding {
+                    binding: 4,
+                    resource: BindingResource::StorageTexture(target),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
-        builder
-            .bind_pipeline_compute(&self.scatter_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.scatter_pipeline.layout(),
-                0,
-                &[set],
-            );
+        builder.bind_pipeline(self.scatter_pipeline);
+        builder.bind_group(0, set);
 
-        // SAFETY: the dispatch covers exactly the volume's extent and the shader
-        // discards invocations past `imageSize`, so nothing writes outside it.
-        // The descriptors bound above match the shader's layout, and the graph
-        // declared every resource this pass touches, so its barriers precede it.
+        // The dispatch covers exactly the volume's extent and the shader discards
+        // invocations past `imageSize`, so nothing writes outside it.
         builder.dispatch([
             extent[0].div_ceil(SCATTER_TILE),
             extent[1].div_ceil(SCATTER_TILE),
@@ -428,41 +423,41 @@ impl FogPass {
 
     pub(super) fn record_integrate(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        target: Arc<ImageView>,
+        device: &Device,
+        builder: &mut Encoder,
+        target: TextureViewId,
     ) {
-        let extent = target.image().extent();
+        let extent = device.view_extent(target);
+        let extent = [extent[0], extent[1]];
 
-        let set = DescriptorSet::new(
-            ctx.descriptor_set_allocator.clone(),
-            self.integrate_pipeline.layout().set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::buffer(0, self.uniforms()),
-                WriteDescriptorSet::image_view_sampler(
-                    1,
-                    self.scatter_view(),
-                    self.nearest_clamp.clone(),
-                ),
-                WriteDescriptorSet::image_view(2, target.clone()),
+        let set = device.create_transient_bind_group(
+            self.integrate_pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::UniformBuffer(self.uniforms()),
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::SampledTexture {
+                        view: self.scatter_view(),
+                        sampler: self.nearest_clamp,
+                    },
+                },
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::StorageTexture(target),
+                },
             ],
-            [],
-        )
-        .unwrap();
+        );
 
-        builder
-            .bind_pipeline_compute(&self.integrate_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.integrate_pipeline.layout(),
-                0,
-                &[set],
-            );
+        builder.bind_pipeline(self.integrate_pipeline);
+        builder.bind_group(0, set);
 
-        // SAFETY: one invocation per froxel *column* — the shader loops the depth
-        // axis itself — so the dispatch covers the volume's `xy` only, and the
-        // shader discards columns past `imageSize`. The descriptors match the
-        // shader's layout and the graph declared what this pass touches.
+        // One invocation per froxel *column* — the shader loops the depth axis
+        // itself — so the dispatch covers the volume's `xy` only, and the shader
+        // discards columns past `imageSize`.
         builder.dispatch([
             extent[0].div_ceil(INTEGRATE_TILE),
             extent[1].div_ceil(INTEGRATE_TILE),
@@ -491,24 +486,21 @@ fn jitter(index: u64) -> f32 {
     result
 }
 
-fn allocate_history(ctx: &VkContext, extent: [u32; 3]) -> [Arc<ImageView>; 2] {
+fn allocate_history(device: &Device, extent: [u32; 3]) -> [TextureViewId; 2] {
     std::array::from_fn(|_| {
-        let image = Image::new(
-            ctx.memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim3d,
-                format: FOG_FORMAT,
-                extent,
-                // Written as a storage image by the scatter pass, read as a
-                // sampled one by the integration this frame and by the scatter
-                // pass's next frame.
-                usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .expect("failed to allocate the fog scattering history");
-        ImageView::new_default(image).unwrap()
+        device.create_texture(&TextureDesc {
+            format: FOG_FORMAT,
+            dimension: TextureDimension::D3,
+            extent,
+            mip_levels: 1,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            // Written as a storage image by the scatter pass, read as a
+            // sampled one by the integration this frame and by the scatter
+            // pass's next frame.
+            usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
+            memoryless: false,
+        })
     })
 }
 
@@ -519,72 +511,17 @@ fn allocate_history(ctx: &VkContext, extent: [u32; 3]) -> [Arc<ImageView>; 2] {
 /// transmittance — zero as well. So the fallback would *hide* the frame rather
 /// than leave it alone, which is why `fog_term` gates the fetch on the block's
 /// own "volume is live" flag and this exists only to satisfy the binding.
-fn allocate_fallback(ctx: &VkContext) -> Arc<ImageView> {
-    let image = Image::new(
-        ctx.memory_allocator.clone(),
-        ImageCreateInfo {
-            image_type: ImageType::Dim3d,
-            format: FOG_FORMAT,
-            extent: [1, 1, 1],
-            usage: ImageUsage::SAMPLED,
-            ..Default::default()
-        },
-        AllocationCreateInfo::default(),
-    )
-    .expect("failed to allocate the fog fallback volume");
-    ImageView::new_default(image).unwrap()
-}
-
-fn build_pipeline(
-    ctx: &VkContext,
-    entry_point: vulkano::shader::EntryPoint,
-    // `Some` for the scatter pass, which reads the cascades. The comparison
-    // sampler has to be *immutable* — part of the layout rather than something
-    // written into a descriptor set — because MoltenVK is a portability-subset
-    // device and rejects a written one outright. The forward pass patches its
-    // own set 3 for exactly this reason; this is the same constraint reached
-    // from a compute pipeline.
-    shadow_sampler: Option<&Arc<Sampler>>,
-) -> Arc<ComputePipeline> {
-    let device = &ctx.device;
-    let stage = PipelineShaderStageCreateInfo::new(entry_point);
-    let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage]);
-    if let Some(sampler) = shadow_sampler {
-        layout_info.set_layouts[0]
-            .bindings
-            .get_mut(&SHADOW_SAMPLER_BINDING)
-            .expect("fog_scatter.comp must declare the shadow comparison sampler")
-            .immutable_samplers = vec![sampler.clone()];
-    }
-    let layout = PipelineLayout::new(
-        device.clone(),
-        layout_info
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    ComputePipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )
-    .unwrap()
-}
-
-mod scatter_cs {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        path: "shaders/fog_scatter.comp",
-        include: ["shaders"],
-    }
-}
-
-mod integrate_cs {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        path: "shaders/fog_integrate.comp",
-        include: ["shaders"],
-    }
+fn allocate_fallback(device: &Device) -> TextureViewId {
+    device.create_texture(&TextureDesc {
+        format: FOG_FORMAT,
+        dimension: TextureDimension::D3,
+        extent: [1, 1, 1],
+        mip_levels: 1,
+        array_layers: 1,
+        samples: SampleCount::Sample1,
+        usage: ImageUsage::SAMPLED,
+        memoryless: false,
+    })
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use vulkano::image::{Image, ImageCreateInfo, ImageUsage};
 use vulkano::memory::allocator::AllocationCreateInfo;
 use vulkano::swapchain::{PresentMode, Surface, Swapchain, SwapchainCreateInfo};
 
-pub const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
+pub const DEPTH_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::D32Float;
 
 /// The one place a [`VsyncMode`] becomes a Vulkan present mode.
 fn present_mode(vsync: VsyncMode) -> PresentMode {

@@ -32,40 +32,17 @@
 //! the first five are identical binding for binding, which is all Vulkan's set
 //! compatibility rule asks.
 
-use std::sync::Arc;
-
-use vulkano::buffer::BufferContents;
-use vulkano::descriptor_set::WriteDescriptorSet;
-use vulkano::format::Format;
-use vulkano::image::sampler::{
-    LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
+use crate::gfx::rhi::{
+    Binding, BindingResource, Blend, ComputePipelineDesc, CullMode, DepthCompare, DepthTest,
+    Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, TextureViewId,
+    Viewport,
 };
-use vulkano::image::view::ImageView;
-use vulkano::pipeline::compute::ComputePipelineCreateInfo;
-use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
-use vulkano::pipeline::graphics::color_blend::{
-    AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
-};
-use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
-use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
-use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
-use vulkano::pipeline::graphics::vertex_input::{Vertex as _, VertexDefinition};
-use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
-use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
-use vulkano::pipeline::{
-    ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-    PipelineShaderStageCreateInfo,
-};
-
+use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 
 use super::PassCtx;
-use super::context::VkContext;
 use super::forward::ForwardSets;
 use super::hdr::HDR_WIDE_FORMAT;
-use super::record::Recorder;
-use super::rendering;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -84,59 +61,100 @@ pub(super) const SCENE_LEVELS: u32 = 7;
 /// it shares with the forward pass.
 const SCENE_SET: usize = 5;
 
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct PyramidPush {
-    extent: [i32; 2],
-    levels: i32,
-}
-
 pub struct RefractionPass {
-    pipeline: Arc<GraphicsPipeline>,
-    pyramid_pipeline: Arc<ComputePipeline>,
-    composite_pipeline: Arc<ComputePipeline>,
-    /// Linear, because level 0 of the pyramid is a copy of the frame and one
-    /// bilinear fetch at a texel centre is exactly that.
-    linear_clamp: Arc<Sampler>,
+    pipeline: PipelineId,
+    /// The same reduction the reflection trace builds its source with, built a
+    /// second time because either pass can run with the other switched off. Two
+    /// pipeline objects, rather than a dependency between two things that are
+    /// structurally independent.
+    pyramid_pipeline: PipelineId,
+    composite_pipeline: PipelineId,
+    /// The pyramid pass's own copy of the clamped linear sampler, on the RHI.
+    pyramid_sampler: SamplerId,
+    composite_sampler: SamplerId,
     /// Linear across levels too, because roughness picks a fractional one: a
     /// curved surface whose roughness varies would otherwise step between blurs,
     /// and the step reads as a ring.
-    linear_mip: Arc<Sampler>,
-    /// Nearest and clamped: the composite reads both inputs at exactly its own
-    /// pixel, so there is nothing to filter.
-    nearest_clamp: Arc<Sampler>,
+    mip_sampler: SamplerId,
 }
 
 impl RefractionPass {
     /// `forward_layout` is the forward pipeline's layout. Not shared outright,
     /// as the transparency pass shares it — this pass needs a sixth set — but its
     /// first five set layouts are lifted from it verbatim; see `build_pipeline`.
-    pub fn new(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Self {
-        let device = &ctx.device;
-        let pipeline = build_pipeline(ctx, forward_layout);
-
-        let clamp = |info: SamplerCreateInfo| {
-            Sampler::new(
-                device.clone(),
-                SamplerCreateInfo {
-                    address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                    ..info
-                },
+    pub fn new(device: &Device, forward: PipelineId) -> Self {
+        let pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            // Front faces only, unlike the transparency accumulation, which draws
+            // both. There the two faces of a glass sphere are two surfaces that
+            // each scatter light; here the material's *thickness* already stands
+            // for the far side, so drawing the back face would refract the same
+            // volume a second time and composite it over the first.
+            cull: CullMode::Back,
+            // Tested against the opaque scene, never written. Two refractive
+            // surfaces are ordered by the back-to-front sort instead, which is
+            // what the premultiplied blend expects — a depth write would let the
+            // nearer of two glass panes reject the farther before it had been
+            // composited under it.
+            depth_test: Some(DepthTest {
+                write: false,
+                compare: DepthCompare::Less,
+            }),
+            depth_format: Some(DEPTH_FORMAT),
+            vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
+            // Premultiplied `over`. The fragment already composited its own
+            // background, so what accumulates here is radiance that has replaced
+            // what was behind it, carrying the coverage that says how much of the
+            // pixel it replaced.
+            blend: Blend::Premultiplied,
+            // Sets 0 through 4 are *the forward pipeline's own objects*, not a
+            // second set derived from the same declarations. Deriving them would
+            // produce layouts that match binding for binding and still fail to
+            // bind: set 3 holds the shadow comparison sampler immutably, and
+            // Vulkan compares immutable samplers by identity. Lifting the objects
+            // is what makes the five sets the executor already built bind to this
+            // pipeline at all.
+            layout_prefix_from: Some((forward, SCENE_SET as u32)),
+            // The forward pass's vertex shader, unchanged: a refractive surface is
+            // the same geometry read from the same per-object rows.
+            ..GraphicsPipelineDesc::fullscreen(
+                ShaderId::ForwardVert,
+                ShaderId::RefractionFrag,
+                &[ACCUM_FORMAT],
             )
-            .unwrap()
-        };
+        });
 
         Self {
             pipeline,
-            pyramid_pipeline: build_compute(ctx, pyramid_cs::load(device.clone()).unwrap()),
-            composite_pipeline: build_compute(ctx, composite_cs::load(device.clone()).unwrap()),
-            linear_clamp: clamp(SamplerCreateInfo::simple_repeat_linear_no_mipmap()),
-            linear_mip: clamp(SamplerCreateInfo {
-                mipmap_mode: SamplerMipmapMode::Linear,
-                lod: 0.0..=LOD_CLAMP_NONE,
-                ..SamplerCreateInfo::simple_repeat_linear()
+            mip_sampler: device.create_sampler(SamplerDesc {
+                linear: true,
+                mipmap_linear: true,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: None,
             }),
-            nearest_clamp: clamp(SamplerCreateInfo::default()),
+            pyramid_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
+                shader: ShaderId::ColorPyramidComp,
+            }),
+            composite_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
+                shader: ShaderId::RefractionCompositeComp,
+            }),
+            pyramid_sampler: device.create_sampler(SamplerDesc {
+                linear: true,
+                mipmap_linear: false,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(1.0),
+            }),
+            composite_sampler: device.create_sampler(SamplerDesc {
+                linear: false,
+                mipmap_linear: false,
+                repeat: false,
+                compare: false,
+                anisotropy: None,
+                max_lod: Some(0.0),
+            }),
         }
     }
 
@@ -144,50 +162,37 @@ impl RefractionPass {
     /// background out of.
     pub(super) fn record_pyramid(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        source: Arc<ImageView>,
-        mips: &[Arc<ImageView>],
+        device: &Device,
+        encoder: &mut Encoder,
+        source: TextureViewId,
+        mips: &[TextureViewId],
     ) {
         let levels = mips.len();
-        let extent = mips[0].image().extent();
+        let extent = device.view_extent(mips[0]);
         // The shader's array is sized at `SCENE_LEVELS` whatever the frame's
         // extent produced, so a short chain repeats its last view into the
         // unused slots rather than leaving a descriptor unwritten; `push.levels`
         // is what stops those slots from being stored to.
-        let bound = (0..SCENE_LEVELS as usize).map(|level| mips[level.min(levels - 1)].clone());
+        let mut bindings = vec![Binding {
+            binding: 0,
+            resource: BindingResource::SampledTexture {
+                view: source,
+                sampler: self.pyramid_sampler,
+            },
+        }];
+        bindings.extend((0..SCENE_LEVELS as usize).map(|level| Binding {
+            binding: 1,
+            resource: BindingResource::StorageTexture(mips[level.min(levels - 1)]),
+        }));
+        let set = device.create_bind_group(self.pyramid_pipeline, 0, &bindings);
 
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.pyramid_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, source, self.linear_clamp.clone()),
-                WriteDescriptorSet::image_view_array(1, 0, bound),
-            ],
-        );
+        encoder.bind_pipeline(self.pyramid_pipeline);
+        encoder.bind_group(0, set);
+        encoder.push_constants(&[extent[0], extent[1], levels as u32]);
 
-        builder
-            .bind_pipeline_compute(&self.pyramid_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.pyramid_pipeline.layout(),
-                0,
-                &[set],
-            )
-            .push_constants(
-                self.pyramid_pipeline.layout(),
-                0,
-                &PyramidPush {
-                    extent: [extent[0] as i32, extent[1] as i32],
-                    levels: levels as i32,
-                },
-            );
-
-        // SAFETY: one workgroup owns a 64x64 tile of level 0, and every store
-        // the shader makes is bounds-checked against `imageSize` and against
-        // `push.levels`. The descriptors bound above match the shader's layout,
-        // and the graph declared every resource this pass touches.
-        builder.dispatch([extent[0].div_ceil(64), extent[1].div_ceil(64), 1]);
+        // One workgroup owns a 64x64 tile of level 0, and every store the shader
+        // makes is bounds-checked against `imageSize` and against `push.levels`.
+        encoder.dispatch([extent[0].div_ceil(64), extent[1].div_ceil(64), 1]);
     }
 
     /// Draw the refractive queue, back to front, into the premultiplied target.
@@ -199,57 +204,64 @@ impl RefractionPass {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record(
         &self,
-        builder: &mut Recorder,
+        device: &Device,
+        builder: &mut Encoder,
         renderer: &PassCtx<'_>,
         draws: DrawList<'_>,
         sets: &ForwardSets,
-        blur: Arc<ImageView>,
-        sharp: Arc<ImageView>,
+        blur: TextureViewId,
+        sharp: TextureViewId,
         view: &FrameView,
         extent: [u32; 2],
         object_base: u32,
     ) {
-        let scene_set = renderer.ctx.descriptor_sets.get(
-            &renderer.ctx.descriptor_set_allocator,
-            &self.pipeline.layout().set_layouts()[SCENE_SET],
-            [
-                WriteDescriptorSet::image_view_sampler(0, blur, self.linear_mip.clone()),
+        let scene_set = device.create_bind_group(
+            self.pipeline,
+            SCENE_SET as u32,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::SampledTexture {
+                        view: blur,
+                        sampler: self.mip_sampler,
+                    },
+                },
                 // The frame itself, for the smooth end of the roughness range —
                 // no mips to step between, so the plain linear sampler.
-                WriteDescriptorSet::image_view_sampler(1, sharp, self.linear_clamp.clone()),
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::SampledTexture {
+                        view: sharp,
+                        sampler: self.pyramid_sampler,
+                    },
+                },
             ],
         );
 
-        let mut bound = sets.as_vec();
-        bound.push(scene_set);
-
-        builder
-            .set_viewport(
-                0,
-                &[Viewport {
-                    offset: [0.0, 0.0],
-                    extent: [extent[0] as f32, extent[1] as f32],
-                    depth_range: 0.0..=1.0,
-                }],
-            )
-            .bind_pipeline_graphics(&self.pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.pipeline.layout(),
-                0,
-                &bound,
-            );
+        builder.set_viewport(Viewport {
+            origin: [0.0, 0.0],
+            extent: [extent[0] as f32, extent[1] as f32],
+            depth_range: [0.0, 1.0],
+        });
+        builder.bind_pipeline(self.pipeline);
+        for (set, group) in sets.groups().into_iter().enumerate() {
+            builder.bind_group(set as u32, group);
+        }
+        builder.bind_group(SCENE_SET as u32, scene_set);
 
         // The arena is bound for the pass, not per draw: a mesh is a span into
         // it. The matrix is pushed once for the same reason — what used to vary
         // per run, the material and the first object row, travels with the
         // instance now.
-        renderer.arena.bind(builder);
-        builder.push_constants(
-            self.pipeline.layout(),
-            0,
-            &super::forward::PushConstants::new(view.view_proj),
-        );
+        builder.bind_geometry(false);
+        let mut words = [0u32; 16];
+        for (word, float) in words
+            .iter_mut()
+            .zip(view.view_proj.to_cols_array_2d().iter().flatten())
+        {
+            *word = float.to_bits();
+        }
+        builder.push_constants(&words);
 
         for run in draws.runs() {
             let item = draws.item(run.start);
@@ -272,160 +284,38 @@ impl RefractionPass {
     /// Put what the draw pass gathered over the lit frame.
     pub(super) fn record_composite(
         &self,
-        builder: &mut Recorder,
-        ctx: &VkContext,
-        scene: Arc<ImageView>,
-        accum: Arc<ImageView>,
-        target: Arc<ImageView>,
+        device: &Device,
+        encoder: &mut Encoder,
+        scene: TextureViewId,
+        accum: TextureViewId,
+        target: TextureViewId,
     ) {
-        let set = ctx.descriptor_sets.get(
-            &ctx.descriptor_set_allocator,
-            &self.composite_pipeline.layout().set_layouts()[0],
-            [
-                WriteDescriptorSet::image_view_sampler(0, scene, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view_sampler(1, accum, self.nearest_clamp.clone()),
-                WriteDescriptorSet::image_view(2, target.clone()),
+        let sampled = |binding, view| Binding {
+            binding,
+            resource: BindingResource::SampledTexture {
+                view,
+                sampler: self.composite_sampler,
+            },
+        };
+        let set = device.create_bind_group(
+            self.composite_pipeline,
+            0,
+            &[
+                sampled(0, scene),
+                sampled(1, accum),
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::StorageTexture(target),
+                },
             ],
         );
 
-        builder
-            .bind_pipeline_compute(&self.composite_pipeline)
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                self.composite_pipeline.layout(),
-                0,
-                &[set],
-            );
+        encoder.bind_pipeline(self.composite_pipeline);
+        encoder.bind_group(0, set);
 
-        let extent = target.image().extent();
-        // SAFETY: the dispatch covers exactly `extent`, and the shader discards
-        // invocations past `imageSize`, so nothing writes outside the image. The
-        // descriptors bound above match the shader's layout, and the graph
-        // declared every resource this pass touches, so its barriers precede it.
-        builder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
+        let extent = device.view_extent(target);
+        encoder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
     }
-}
-
-fn build_pipeline(ctx: &VkContext, forward_layout: &Arc<PipelineLayout>) -> Arc<GraphicsPipeline> {
-    let device = &ctx.device;
-    // The forward pass's vertex shader, unchanged: a refractive surface is the
-    // same geometry read from the same per-object rows, and `shading.glsl` reads
-    // the same varyings from it.
-    let vs = super::forward::vertex_shader(device);
-    let fs = fs::load(device.clone())
-        .unwrap()
-        .entry_point("main")
-        .unwrap();
-
-    let vertex_input_state = [PositionVertex::per_vertex(), SurfaceVertex::per_vertex()]
-        .definition(&vs)
-        .unwrap();
-    let stages = [
-        PipelineShaderStageCreateInfo::new(vs),
-        PipelineShaderStageCreateInfo::new(fs),
-    ];
-
-    // Sets 0 through 4 are *the forward pipeline's own objects*, not a second
-    // set derived from the same declarations. Deriving them would produce
-    // layouts that match binding for binding and still fail to bind: set 3 holds
-    // the shadow comparison sampler immutably — part of the layout rather than
-    // written into a descriptor set, because MoltenVK cannot accept a written
-    // one — and Vulkan compares immutable samplers by identity, so a second
-    // `Sampler::new` of the identical description is a different sampler and
-    // therefore an incompatible set. Lifting the objects is what makes the five
-    // sets the executor already built bind to this pipeline at all.
-    let layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
-    layout_info
-        .set_layouts
-        .get(SCENE_SET)
-        .expect("refraction.frag must declare the scene pyramid in set 5");
-
-    let mut create_info = layout_info
-        .into_pipeline_layout_create_info(device.clone())
-        .unwrap();
-    create_info.set_layouts.splice(
-        ..SCENE_SET,
-        forward_layout.set_layouts()[..SCENE_SET].iter().cloned(),
-    );
-
-    let layout = PipelineLayout::new(device.clone(), create_info).unwrap();
-
-    GraphicsPipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState {
-                // Front faces only, unlike the transparency accumulation, which
-                // draws both. There the two faces of a glass sphere are two
-                // surfaces that each scatter light; here the material's
-                // *thickness* already stands for the far side, so drawing the
-                // back face would refract the same volume a second time and
-                // composite it over the first.
-                cull_mode: CullMode::Back,
-                ..Default::default()
-            }),
-            multisample_state: Some(MultisampleState::default()),
-            depth_stencil_state: Some(DepthStencilState {
-                // Tested against the opaque scene, never written. Two refractive
-                // surfaces are ordered by the back-to-front sort instead, which
-                // is what the premultiplied blend below expects — a depth write
-                // would let the nearer of two glass panes reject the farther
-                // before it had been composited under it.
-                depth: Some(DepthState {
-                    write_enable: false,
-                    compare_op: CompareOp::Less,
-                }),
-                ..Default::default()
-            }),
-            color_blend_state: Some(ColorBlendState {
-                attachments: vec![ColorBlendAttachmentState {
-                    // Premultiplied `over`. The fragment already composited its
-                    // own background, so what accumulates here is radiance that
-                    // has replaced what was behind it, carrying the coverage
-                    // that says how much of the pixel it replaced.
-                    blend: Some(AttachmentBlend {
-                        src_color_blend_factor: BlendFactor::One,
-                        dst_color_blend_factor: BlendFactor::OneMinusSrcAlpha,
-                        color_blend_op: BlendOp::Add,
-                        src_alpha_blend_factor: BlendFactor::One,
-                        dst_alpha_blend_factor: BlendFactor::OneMinusSrcAlpha,
-                        alpha_blend_op: BlendOp::Add,
-                    }),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(rendering::pipeline_info(&[HDR_WIDE_FORMAT], Some(DEPTH_FORMAT)).into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .unwrap()
-}
-
-fn build_compute(
-    ctx: &VkContext,
-    module: Arc<vulkano::shader::ShaderModule>,
-) -> Arc<ComputePipeline> {
-    let device = &ctx.device;
-    let stage = PipelineShaderStageCreateInfo::new(module.entry_point("main").unwrap());
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-            .into_pipeline_layout_create_info(device.clone())
-            .unwrap(),
-    )
-    .unwrap();
-    ComputePipeline::new(
-        device.clone(),
-        ctx.pipeline_cache(),
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )
-    .unwrap()
 }
 
 /// The format the accumulation target is created with. Float and wide because
@@ -434,24 +324,67 @@ fn build_compute(
 /// multiplied by has to survive in alpha for `refraction_composite` to put the
 /// scene back underneath it. That is what keeps this off the packed colour
 /// format the rest of the chain moved to.
-pub(super) const ACCUM_FORMAT: Format = HDR_WIDE_FORMAT;
+pub(super) const ACCUM_FORMAT: crate::gfx::format::Format = HDR_WIDE_FORMAT;
 
-mod fs {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        path: "shaders/refraction.frag",
-        include: ["shaders"],
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::gfx::format::{Format, SampleCount};
+    use crate::gfx::graph::ImageUsage;
+    use crate::gfx::rhi::{TextureDesc, TextureDimension};
+
+    /// The pyramid of a flat frame is a flat pyramid at every level, which is
+    /// what lets glass read the blur at any roughness and see the same colour.
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_flat_frame_builds_a_flat_pyramid_on_metal() {
+        let device = Device::Metal(crate::gfx::metal::MtlDriver::new().expect("a Metal device"));
+        device.begin_frame(0);
+        let forward = super::super::forward::ForwardPass::new(
+            &device,
+            super::super::hdr::HDR_FORMAT,
+            super::super::hdr::HDR_WIDE_FORMAT,
+        );
+        let pass = RefractionPass::new(&device, forward.layout_source());
+        let source = device.create_texture_2d(
+            bytemuck::cast_slice(&[0.5f32, 0.25, 1.0, 1.0].repeat(128 * 128)),
+            [128, 128],
+            Format::Rgba32Float,
+        );
+        let pyramid = device.create_texture(&TextureDesc {
+            format: Format::Rgba16Float,
+            dimension: TextureDimension::D2,
+            extent: [128, 128, 1],
+            mip_levels: SCENE_LEVELS,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::SAMPLED | ImageUsage::STORAGE,
+            memoryless: false,
+        });
+        let mips: Vec<_> = (0..SCENE_LEVELS)
+            .map(|l| device.mip_view(pyramid, l))
+            .collect();
+        device.record_blocking(|encoder| pass.record_pyramid(&device, encoder, source, &mips));
+        let Device::Metal(driver) = &device else {
+            unreachable!()
+        };
+        for level in 0..SCENE_LEVELS as usize {
+            let bytes = driver.read_texture_slice(pyramid, 0, level);
+            let half = |i: usize| {
+                let bits = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+                let exponent = i32::from((bits >> 10) & 0x1f);
+                let fraction = f32::from(bits & 0x3ff);
+                if exponent == 0 {
+                    fraction * 2f32.powi(-24)
+                } else {
+                    (1.0 + fraction / 1024.0) * 2f32.powi(exponent - 15)
+                }
+            };
+            let texel = [half(0), half(2), half(4)];
+            assert!(
+                (texel[0] - 0.5).abs() < 0.02 && (texel[2] - 1.0).abs() < 0.02,
+                "level {level}: {texel:?}"
+            );
+        }
     }
-}
-
-/// The same reduction the reflection trace builds its source with, compiled a
-/// second time because either pass can run with the other switched off. One
-/// module and two pipeline objects, rather than a dependency between two things
-/// that are structurally independent.
-mod pyramid_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/color_pyramid.comp" }
-}
-
-mod composite_cs {
-    vulkano_shaders::shader! { ty: "compute", path: "shaders/refraction_composite.comp" }
 }

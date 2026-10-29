@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn the_busiest_frame_fits_the_query_pool() {
         let config = FrameConfig {
-            color_format: vulkano::format::Format::B8G8R8A8_SRGB,
+            color_format: crate::gfx::format::Format::Bgra8Srgb,
             msaa: false,
             ssao: true,
             ssao_half_res: false,

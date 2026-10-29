@@ -12,7 +12,6 @@ orrin-ecs.workspace = true
 # egui is already below.
 orrin-registry = { workspace = true, features = ["egui"] }
 vulkano.workspace = true
-vulkano-shaders.workspace = true
 winit.workspace = true
 glam.workspace = true
 gltf.workspace = true
@@ -39,6 +38,12 @@ notify = "8"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Raw VK_EXT_memory_budget query for VRAM usage; pinned to vulkano 0.35's ash.
 ash = "0.38"
+# GPU blocks are `#[repr(C)]` plain data; `Pod` is how one becomes bytes for an
+# upload without naming a graphics API. Already in the tree through glam.
+bytemuck = { version = "1", features = ["derive"] }
+# The engine-owned synchronisation vocabulary in `gfx::graph`. Already in the
+# tree through vulkano and winit; naming it here adds no crate.
+bitflags = "2"
 egui_dock = { version = "0.16", features = ["serde"] }
 rayon = { workspace = true }
 tracing.workspace = true
@@ -96,3 +101,26 @@ harness = false
 [[bench]]
 name = "sh"
 harness = false
+
+[build-dependencies]
+# Compile every shader once to SPIR-V and translate it to MSL (see build.rs).
+# shaderc is the compiler vulkano-shaders already builds; spirv-cross2 is the
+# translator MoltenVK runs these shaders through today. Neither is linked into
+# the engine, so neither can move the cold-start gate.
+shaderc = "0.8"
+spirv-cross2 = { version = "0.7", default-features = false, features = ["msl"] }
+
+# Native Metal beside Vulkan, on macOS only: the driver in `gfx/metal`. The
+# bindings are generated per class and default to all of them, which is the
+# compile-time cost of a driver that reaches most of the API.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+# The window half of the Metal backend: a CAMetalLayer on the winit view
+# (`raw-window-metal` makes or reuses one) and the layer's own API. Both are
+# already in the tree through winit's dependencies, so this adds one small crate
+# and a feature of another.
+raw-window-metal = "1.1"
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["CAMetalLayer", "objc2-metal", "objc2-core-foundation", "objc2-core-graphics", "std"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFCGTypes", "std"] }
