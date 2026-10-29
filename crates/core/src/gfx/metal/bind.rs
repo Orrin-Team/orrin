@@ -14,7 +14,7 @@
 //! carries the list of what it holds and the encoder declares it when the group
 //! is bound.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use objc2::rc::Retained;
@@ -55,18 +55,22 @@ pub(super) struct Use {
 /// The `[[id]]`s a shader's translated source declares as real resources in one
 /// descriptor set's struct, not counting the stand-ins that fill the ids it does
 /// not use. Writing a stand-in as a resource would be a type error in Metal's
-/// eyes, and an id the translator proved unused is one of them.
-fn declared_ids(msl: &str, set: u32) -> HashSet<u32> {
+/// eyes, and an id the translator proved unused is one of them. Each id says
+/// whether the stage may write it: a buffer the translator emitted `const` is
+/// only read, and declaring it written makes tracked encoders wait on each
+/// other for nothing.
+fn declared_ids(msl: &str, set: u32) -> HashMap<u32, bool> {
     let marker = format!("struct spvDescriptorSetBuffer{set}\n");
     let Some(body) = msl.split(&marker).nth(1) else {
-        return HashSet::new();
+        return HashMap::new();
     };
     let body = body.split("};").next().unwrap_or("");
     body.lines()
         .filter(|line| !line.contains("_unused"))
         .filter_map(|line| {
             let at = line.find("[[id(")? + 5;
-            line[at..at + line[at..].find(')')?].parse().ok()
+            let id = line[at..at + line[at..].find(')')?].parse().ok()?;
+            Some((id, !line.contains("const device")))
         })
         .collect()
 }
@@ -84,9 +88,14 @@ fn find_in(shader: ShaderId, set: u32, binding: u32) -> Option<Resource> {
 /// One stage's argument encoder over a set's buffer, and the ids it declares.
 struct StageWriter {
     shader: ShaderId,
-    declared: HashSet<u32>,
+    declared: HashMap<u32, bool>,
     encoder: Retained<ProtocolObject<dyn MTLArgumentEncoder>>,
 }
+
+/// What a (shader, set) pair costs to work out: creating an argument encoder is
+/// about 30 microseconds and the set is rebuilt many times a frame.
+pub(super) type EncoderCache =
+    HashMap<(ShaderId, u32), Option<(HashMap<u32, bool>, super::Held<dyn MTLArgumentEncoder>)>>;
 
 impl MtlDriver {
     fn shaders_of(&self, pipeline: PipelineId) -> Vec<ShaderId> {
@@ -107,22 +116,30 @@ impl MtlDriver {
         persistent: bool,
     ) -> BindGroupId {
         let shaders = self.shaders_of(pipeline);
+        // Held for the whole build: an argument encoder is not thread safe and
+        // the cached ones are shared.
+        let mut cache = self.encoders.lock().unwrap();
         let writers: Vec<StageWriter> = shaders
             .iter()
             .copied()
             .filter_map(|shader| {
-                let declared = declared_ids(shader.blob().msl, set);
-                if declared.is_empty() {
-                    return None;
-                }
-                let function = self.function(shader);
-                // SAFETY: `set` is a buffer index this function declares an
-                // argument buffer at, which `declared_ids` just established.
-                let encoder = unsafe { function.newArgumentEncoderWithBufferIndex(set as usize) };
+                let entry = cache.entry((shader, set)).or_insert_with(|| {
+                    let declared = declared_ids(shader.blob().msl, set);
+                    if declared.is_empty() {
+                        return None;
+                    }
+                    let function = self.function(shader);
+                    // SAFETY: `set` is a buffer index this function declares an
+                    // argument buffer at, which `declared_ids` just established.
+                    let encoder =
+                        unsafe { function.newArgumentEncoderWithBufferIndex(set as usize) };
+                    Some((declared, super::Shared(encoder)))
+                });
+                let (declared, encoder) = entry.as_ref()?;
                 Some(StageWriter {
                     shader,
-                    declared,
-                    encoder,
+                    declared: declared.clone(),
+                    encoder: encoder.0.clone(),
                 })
             })
             .collect();
@@ -152,7 +169,11 @@ impl MtlDriver {
         }
         // The stage whose struct declares `id` as a real resource, which is the
         // one whose encoder knows what type to write there.
-        let writer_of = |id: u32| writers.iter().find(|writer| writer.declared.contains(&id));
+        let writer_of = |id: u32| {
+            writers
+                .iter()
+                .find(|writer| writer.declared.contains_key(&id))
+        };
 
         let mut uses = Vec::new();
         // Textures at one binding are an array, filled in the order given.
@@ -229,7 +250,12 @@ impl MtlDriver {
                         continue;
                     };
                     let buf = self.buffer(id);
-                    let usage = if matches!(binding.resource, BindingResource::StorageBuffer(_)) {
+                    let written = writers
+                        .iter()
+                        .any(|writer| writer.declared.get(&resource.index) == Some(&true));
+                    let usage = if written
+                        && matches!(binding.resource, BindingResource::StorageBuffer(_))
+                    {
                         MTLResourceUsage::Read | MTLResourceUsage::Write
                     } else {
                         MTLResourceUsage::Read
@@ -410,5 +436,19 @@ impl MtlDriver {
                 .map(|u| (u.resource.0.clone(), u.usage))
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod declared_tests {
+    use super::declared_ids;
+
+    #[test]
+    fn a_const_buffer_is_declared_read_only_and_a_pad_is_not_declared() {
+        let msl = "struct spvDescriptorSetBuffer0\n{\n    const device A* a [[id(0)]];\n    device B* b [[id(1)]];\n    constant uint* _unused2 [[id(2)]];\n};\n";
+        let ids = declared_ids(msl, 0);
+        assert_eq!(ids.get(&0), Some(&false));
+        assert_eq!(ids.get(&1), Some(&true));
+        assert!(!ids.contains_key(&2));
     }
 }

@@ -66,6 +66,7 @@ pub struct MtlDriver {
     pipelines: Mutex<Pool<pipeline::Pipe>>,
     functions: Mutex<pipeline::Functions>,
     bind_groups: Mutex<Pool<bind::Group>>,
+    encoders: Mutex<bind::EncoderCache>,
     geometry: Mutex<Shared<geometry::Geometry>>,
     downsamples: Mutex<backdrop::Downsamples>,
 }
@@ -107,6 +108,7 @@ impl MtlDriver {
             pipelines: Mutex::new(Pool::new(FRAME_SLOTS)),
             functions: Mutex::new(Default::default()),
             bind_groups: Mutex::new(Pool::new(FRAME_SLOTS)),
+            encoders: Mutex::new(Default::default()),
             geometry: Mutex::new(Shared(geometry)),
             downsamples: Mutex::new(Vec::new()),
         })
