@@ -2603,496 +2603,10 @@ impl FrameRecord<'_> {
         // That is the only thing the kind changes: ordering and barriers are
         // derived for it exactly as for a draw.
         if kind == PassKind::Compute {
-            match body {
-                PassBody::SsrHiz => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .ssr
-                        .expect("reflections without their images");
-                    let prepass = self
-                        .frame
-                        .ids
-                        .prepass
-                        .expect("the graph scheduled reflections with no prepass");
-                    // One self.view per level, because a storage image descriptor
-                    // takes exactly one — the sampled self.view the trace reads
-                    // spans the whole pyramid instead.
-                    let driver = self.device.vulkan();
-                    let depth = self.table.texture(prepass.depth);
-                    let mips = self.table.mip_textures(ids.hiz);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.ssr
-                        .record_hiz(self.device, &mut encoder, depth, mips, self.extent);
-                }
-                PassBody::SsrSource => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .ssr
-                        .expect("reflections without their images");
-                    let driver = self.device.vulkan();
-                    let source = self.texture_of(ids.source);
-                    let mips = self.table.mip_textures(ids.source_pyramid);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.ssr
-                        .record_source(self.device, &mut encoder, source, mips);
-                }
-                PassBody::SsrTrace => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .ssr
-                        .expect("reflections without their images");
-                    let prepass = self
-                        .frame
-                        .ids
-                        .prepass
-                        .expect("the graph scheduled reflections with no prepass");
-                    let driver = self.device.vulkan();
-                    let hiz = self.table.texture(ids.hiz);
-                    let depth = self.table.texture(prepass.depth);
-                    let normal = self.table.texture(prepass.normal);
-                    let material = self.table.texture(prepass.material);
-                    let source = self.table.texture(ids.source_pyramid);
-                    let target = self.table.texture(ids.rays);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.ssr.record_trace(
-                        self.device,
-                        &mut encoder,
-                        hiz,
-                        depth,
-                        normal,
-                        material,
-                        source,
-                        target,
-                    );
-                }
-                PassBody::SsrResolve => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .ssr
-                        .expect("reflections without their images");
-                    let prepass = self
-                        .frame
-                        .ids
-                        .prepass
-                        .expect("the graph scheduled reflections with no prepass");
-                    let driver = self.device.vulkan();
-                    let source = self.texture_of(ids.source);
-                    let rays = self.table.texture(ids.rays);
-                    let depth = self.table.texture(prepass.depth);
-                    let normal = self.table.texture(prepass.normal);
-                    let material = self.table.texture(prepass.material);
-                    let environment = self.environment.specular_view();
-                    let target = self.table.texture(ids.output);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.ssr.record_resolve(
-                        self.device,
-                        &mut encoder,
-                        source,
-                        rays,
-                        depth,
-                        normal,
-                        material,
-                        environment,
-                        self.environment.sampler(),
-                        target,
-                    );
-                }
-                PassBody::FogScatter => {
-                    let driver = self.device.vulkan();
-                    let shadow_maps = self.shadow_view;
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.fog
-                        .record_scatter(self.device, &mut encoder, shadow_maps);
-                }
-                PassBody::FogIntegrate => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .fog
-                        .expect("fog passes without their volumes");
-                    let driver = self.device.vulkan();
-                    let volume = self.table.texture(ids.volume);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.fog.record_integrate(self.device, &mut encoder, volume);
-                }
-                PassBody::SubsurfaceBlurHorizontal | PassBody::SubsurfaceBlurVertical => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .subsurface
-                        .expect("subsurface diffusion without its targets");
-                    let prepass = self
-                        .frame
-                        .ids
-                        .prepass
-                        .expect("the graph scheduled the diffusion with no prepass");
-                    let vertical = matches!(body, PassBody::SubsurfaceBlurVertical);
-                    // Mirrors what `declare` said each axis reads: the target
-                    // the forward pass resolved, then the other axis's output.
-                    let (source, target) = if vertical {
-                        (ids.blurred_x, ids.blurred_y)
-                    } else {
-                        (ids.diffusible, ids.blurred_x)
-                    };
-                    let driver = self.device.vulkan();
-                    let source = self.table.texture(source);
-                    let depth = self.table.texture(prepass.depth);
-                    let target = self.table.texture(target);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.subsurface.record_blur(
-                        self.device,
-                        &mut encoder,
-                        source,
-                        depth,
-                        target,
-                        vertical,
-                    );
-                }
-                PassBody::SubsurfaceComposite => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .subsurface
-                        .expect("subsurface diffusion without its targets");
-                    let driver = self.device.vulkan();
-                    let source = self.texture_of(ids.source);
-                    let diffused = self.table.texture(ids.blurred_y);
-                    let target = self.table.texture(ids.output);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.subsurface.record_composite(
-                        self.device,
-                        &mut encoder,
-                        source,
-                        diffused,
-                        target,
-                    );
-                }
-                PassBody::OitComposite => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .transparency
-                        .expect("transparency without its targets");
-                    let driver = self.device.vulkan();
-                    let scene = self.texture_of(ids.source);
-                    let accum = self.table.texture(ids.accum);
-                    let reveal = self.table.texture(ids.reveal);
-                    let target = self.table.texture(ids.output);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.oit.record_composite(
-                        self.device,
-                        &mut encoder,
-                        scene,
-                        accum,
-                        reveal,
-                        target,
-                    );
-                }
-                PassBody::RefractionScene => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .refraction
-                        .expect("refraction without its images");
-                    let driver = self.device.vulkan();
-                    let source = self.texture_of(ids.source);
-                    let mips = self.table.mip_textures(ids.scene);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.refraction
-                        .record_pyramid(self.device, &mut encoder, source, mips);
-                }
-                PassBody::RefractionComposite => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .refraction
-                        .expect("refraction without its images");
-                    let driver = self.device.vulkan();
-                    let scene = self.texture_of(ids.source);
-                    let accum = self.table.texture(ids.accum);
-                    let target = self.table.texture(ids.output);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.refraction.record_composite(
-                        self.device,
-                        &mut encoder,
-                        scene,
-                        accum,
-                        target,
-                    );
-                }
-                PassBody::TaaResolve => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .prepass
-                        .expect("the graph scheduled TAA with no prepass");
-                    let taa = self.frame.ids.taa.expect("TAA without its images");
-                    let driver = self.device.vulkan();
-                    let color = self.texture_of(taa.source);
-                    let velocity = self.table.texture(ids.velocity);
-                    let depth = self.table.texture(ids.depth);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.taa.record(
-                        self.device,
-                        &mut encoder,
-                        &self.view,
-                        color,
-                        velocity,
-                        depth,
-                    );
-                }
-                PassBody::DofPrefilter => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .dof
-                        .expect("depth of field without its images");
-                    let prepass = self
-                        .frame
-                        .ids
-                        .prepass
-                        .expect("the graph scheduled depth of field with no prepass");
-                    let driver = self.device.vulkan();
-                    let color = self.texture_of(ids.source);
-                    let depth = self.table.texture(prepass.depth);
-                    let target = self.table.texture(ids.prefiltered);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.dof
-                        .record_prefilter(self.device, &mut encoder, color, depth, target);
-                }
-                PassBody::DofTileMax => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .dof
-                        .expect("depth of field without its images");
-                    let driver = self.device.vulkan();
-                    let prefiltered = self.table.texture(ids.prefiltered);
-                    let target = self.table.texture(ids.tile);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.dof
-                        .record_tile_max(self.device, &mut encoder, prefiltered, target);
-                }
-                PassBody::DofGather => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .dof
-                        .expect("depth of field without its images");
-                    let driver = self.device.vulkan();
-                    let prefiltered = self.table.texture(ids.prefiltered);
-                    let tiles = self.table.texture(ids.tile);
-                    let near = self.table.texture(ids.near);
-                    let far = self.table.texture(ids.far);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.dof.record_gather(
-                        self.device,
-                        &mut encoder,
-                        prefiltered,
-                        tiles,
-                        near,
-                        far,
-                    );
-                }
-                PassBody::DofComposite => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .dof
-                        .expect("depth of field without its images");
-                    let prepass = self
-                        .frame
-                        .ids
-                        .prepass
-                        .expect("the graph scheduled depth of field with no prepass");
-                    let driver = self.device.vulkan();
-                    let color = self.texture_of(ids.source);
-                    let depth = self.table.texture(prepass.depth);
-                    let near = self.table.texture(ids.near);
-                    let far = self.table.texture(ids.far);
-                    let target = self.table.texture(ids.output);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.dof.record_composite(
-                        self.device,
-                        &mut encoder,
-                        color,
-                        depth,
-                        near,
-                        far,
-                        target,
-                    );
-                }
-                PassBody::MotionBlurTileMax => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .motion_blur
-                        .expect("motion blur without its images");
-                    let prepass = self
-                        .frame
-                        .ids
-                        .prepass
-                        .expect("the graph scheduled motion blur with no prepass");
-                    let driver = self.device.vulkan();
-                    let velocity = self.table.texture(prepass.velocity);
-                    let depth = self.table.texture(prepass.depth);
-                    let target = self.table.texture(ids.tile);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.motion_blur.record_tile_max(
-                        self.device,
-                        &mut encoder,
-                        &self.view,
-                        velocity,
-                        depth,
-                        target,
-                    );
-                }
-                PassBody::MotionBlurNeighbourMax => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .motion_blur
-                        .expect("motion blur without its images");
-                    let driver = self.device.vulkan();
-                    let tiles = self.table.texture(ids.tile);
-                    let target = self.table.texture(ids.neighbour);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.motion_blur
-                        .record_neighbour_max(self.device, &mut encoder, tiles, target);
-                }
-                PassBody::MotionBlurGather => {
-                    let ids = self
-                        .frame
-                        .ids
-                        .motion_blur
-                        .expect("motion blur without its images");
-                    let prepass = self
-                        .frame
-                        .ids
-                        .prepass
-                        .expect("the graph scheduled motion blur with no prepass");
-                    let driver = self.device.vulkan();
-                    let color = self.texture_of(ids.source);
-                    let velocity = self.table.texture(prepass.velocity);
-                    let depth = self.table.texture(prepass.depth);
-                    let neighbour = self.table.texture(ids.neighbour);
-                    let target = self.table.texture(ids.output);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.motion_blur.record_gather(
-                        self.device,
-                        &mut encoder,
-                        &self.view,
-                        color,
-                        velocity,
-                        depth,
-                        neighbour,
-                        target,
-                    );
-                }
-                PassBody::CullReset => {
-                    let frame = self
-                        .cull_frame
-                        .as_ref()
-                        .expect("the graph scheduled the cull with no batch table");
-                    let driver = self.device.vulkan();
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.cull.record_reset(self.device, &mut encoder, frame);
-                }
-                PassBody::Cull => {
-                    let frame = self
-                        .cull_frame
-                        .as_ref()
-                        .expect("the graph scheduled the cull with no batch table");
-                    let driver = self.device.vulkan();
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.cull.record_cull(
-                        self.device,
-                        &mut encoder,
-                        self.object_rows,
-                        frame,
-                        self.cull_views,
-                        &self.occlusion_test,
-                        self.view.prev_view_proj,
-                    );
-                }
-                PassBody::OcclusionHiz => {
-                    let prepass = self
-                        .frame
-                        .ids
-                        .prepass
-                        .expect("the graph scheduled the occlusion pyramid with no prepass");
-                    let driver = self.device.vulkan();
-                    let depth = self.table.texture(prepass.depth);
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.occlusion
-                        .record(self.device, &mut encoder, depth, self.extent);
-                }
-                PassBody::LuminanceHistogram => {
-                    let driver = self.device.vulkan();
-                    let hdr = self.scene_color;
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.exposure
-                        .record_histogram(self.device, &mut encoder, self.extent, hdr);
-                }
-                PassBody::LuminanceAverage => {
-                    let driver = self.device.vulkan();
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.exposure
-                        .record_average(self.device, &mut encoder, self.extent);
-                }
-                PassBody::BloomPrefilter => {
-                    let ids = self.frame.ids.bloom.expect("bloom pass without levels");
-                    let driver = self.device.vulkan();
-                    let source = self.scene_color;
-                    let target = self.table.texture(ids.down(0));
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.bloom.record_prefilter(
-                        self.device,
-                        &mut encoder,
-                        source,
-                        target,
-                        self.exposure.exposure_buffer(),
-                    );
-                }
-                PassBody::BloomDownsample(level) => {
-                    let ids = self.frame.ids.bloom.expect("bloom pass without levels");
-                    let level = level as usize;
-                    let driver = self.device.vulkan();
-                    let source = self.table.texture(ids.down(level - 1));
-                    let target = self.table.texture(ids.down(level));
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.bloom
-                        .record_downsample(self.device, &mut encoder, source, target);
-                }
-                PassBody::BloomUpsample(level) => {
-                    let ids = self.frame.ids.bloom.expect("bloom pass without levels");
-                    let level = level as usize;
-                    // Mirrors what `declare` said this pass reads: an
-                    // up-chain level where there is one above, and the down
-                    // chain's last level at the top of the climb.
-                    let coarse = if level + 2 < ids.mips as usize {
-                        ids.up(level + 1)
-                    } else {
-                        ids.down(level + 1)
-                    };
-                    let driver = self.device.vulkan();
-                    let coarse = self.table.texture(coarse);
-                    let same_level = self.table.texture(ids.down(level));
-                    let target = self.table.texture(ids.up(level));
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                    self.bloom.record_upsample(
-                        self.device,
-                        &mut encoder,
-                        coarse,
-                        same_level,
-                        target,
-                    );
-                }
-                other => unreachable!("{other:?} is not a compute pass"),
+            {
+                let driver = self.device.vulkan();
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+                self.record_compute(&mut encoder, body);
             }
             if let Some(timestamps) = self.timestamps {
                 timestamps.close(builder, timed);
@@ -3113,16 +2627,448 @@ impl FrameRecord<'_> {
         .expect("the executor reached a graphics pass with nothing to render into");
         Encoder::Vulkan(VkEncoder::new(builder, self.device.vulkan())).begin_pass(&rendering);
 
+        {
+            let driver = self.device.vulkan();
+            let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+            self.record_graphics(&mut encoder, body);
+        }
+
+        builder.end_rendering();
+        if let Some(timestamps) = self.timestamps {
+            timestamps.close(builder, timed);
+        }
+    }
+
+    /// A compute pass's body: dispatches, with no render pass around them.
+    fn record_compute(&self, encoder: &mut Encoder, body: PassBody) {
+        match body {
+            PassBody::SsrHiz => {
+                let ids = self
+                    .frame
+                    .ids
+                    .ssr
+                    .expect("reflections without their images");
+                let prepass = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled reflections with no prepass");
+                // One self.view per level, because a storage image descriptor
+                // takes exactly one — the sampled self.view the trace reads
+                // spans the whole pyramid instead.
+                let depth = self.table.texture(prepass.depth);
+                let mips = self.table.mip_textures(ids.hiz);
+
+                self.ssr
+                    .record_hiz(self.device, encoder, depth, mips, self.extent);
+            }
+            PassBody::SsrSource => {
+                let ids = self
+                    .frame
+                    .ids
+                    .ssr
+                    .expect("reflections without their images");
+                let source = self.texture_of(ids.source);
+                let mips = self.table.mip_textures(ids.source_pyramid);
+
+                self.ssr.record_source(self.device, encoder, source, mips);
+            }
+            PassBody::SsrTrace => {
+                let ids = self
+                    .frame
+                    .ids
+                    .ssr
+                    .expect("reflections without their images");
+                let prepass = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled reflections with no prepass");
+                let hiz = self.table.texture(ids.hiz);
+                let depth = self.table.texture(prepass.depth);
+                let normal = self.table.texture(prepass.normal);
+                let material = self.table.texture(prepass.material);
+                let source = self.table.texture(ids.source_pyramid);
+                let target = self.table.texture(ids.rays);
+
+                self.ssr.record_trace(
+                    self.device,
+                    encoder,
+                    hiz,
+                    depth,
+                    normal,
+                    material,
+                    source,
+                    target,
+                );
+            }
+            PassBody::SsrResolve => {
+                let ids = self
+                    .frame
+                    .ids
+                    .ssr
+                    .expect("reflections without their images");
+                let prepass = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled reflections with no prepass");
+                let source = self.texture_of(ids.source);
+                let rays = self.table.texture(ids.rays);
+                let depth = self.table.texture(prepass.depth);
+                let normal = self.table.texture(prepass.normal);
+                let material = self.table.texture(prepass.material);
+                let environment = self.environment.specular_view();
+                let target = self.table.texture(ids.output);
+
+                self.ssr.record_resolve(
+                    self.device,
+                    encoder,
+                    source,
+                    rays,
+                    depth,
+                    normal,
+                    material,
+                    environment,
+                    self.environment.sampler(),
+                    target,
+                );
+            }
+            PassBody::FogScatter => {
+                let shadow_maps = self.shadow_view;
+
+                self.fog.record_scatter(self.device, encoder, shadow_maps);
+            }
+            PassBody::FogIntegrate => {
+                let ids = self
+                    .frame
+                    .ids
+                    .fog
+                    .expect("fog passes without their volumes");
+                let volume = self.table.texture(ids.volume);
+
+                self.fog.record_integrate(self.device, encoder, volume);
+            }
+            PassBody::SubsurfaceBlurHorizontal | PassBody::SubsurfaceBlurVertical => {
+                let ids = self
+                    .frame
+                    .ids
+                    .subsurface
+                    .expect("subsurface diffusion without its targets");
+                let prepass = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled the diffusion with no prepass");
+                let vertical = matches!(body, PassBody::SubsurfaceBlurVertical);
+                // Mirrors what `declare` said each axis reads: the target
+                // the forward pass resolved, then the other axis's output.
+                let (source, target) = if vertical {
+                    (ids.blurred_x, ids.blurred_y)
+                } else {
+                    (ids.diffusible, ids.blurred_x)
+                };
+                let source = self.table.texture(source);
+                let depth = self.table.texture(prepass.depth);
+                let target = self.table.texture(target);
+
+                self.subsurface
+                    .record_blur(self.device, encoder, source, depth, target, vertical);
+            }
+            PassBody::SubsurfaceComposite => {
+                let ids = self
+                    .frame
+                    .ids
+                    .subsurface
+                    .expect("subsurface diffusion without its targets");
+                let source = self.texture_of(ids.source);
+                let diffused = self.table.texture(ids.blurred_y);
+                let target = self.table.texture(ids.output);
+
+                self.subsurface
+                    .record_composite(self.device, encoder, source, diffused, target);
+            }
+            PassBody::OitComposite => {
+                let ids = self
+                    .frame
+                    .ids
+                    .transparency
+                    .expect("transparency without its targets");
+                let scene = self.texture_of(ids.source);
+                let accum = self.table.texture(ids.accum);
+                let reveal = self.table.texture(ids.reveal);
+                let target = self.table.texture(ids.output);
+
+                self.oit
+                    .record_composite(self.device, encoder, scene, accum, reveal, target);
+            }
+            PassBody::RefractionScene => {
+                let ids = self
+                    .frame
+                    .ids
+                    .refraction
+                    .expect("refraction without its images");
+                let source = self.texture_of(ids.source);
+                let mips = self.table.mip_textures(ids.scene);
+
+                self.refraction
+                    .record_pyramid(self.device, encoder, source, mips);
+            }
+            PassBody::RefractionComposite => {
+                let ids = self
+                    .frame
+                    .ids
+                    .refraction
+                    .expect("refraction without its images");
+                let scene = self.texture_of(ids.source);
+                let accum = self.table.texture(ids.accum);
+                let target = self.table.texture(ids.output);
+
+                self.refraction
+                    .record_composite(self.device, encoder, scene, accum, target);
+            }
+            PassBody::TaaResolve => {
+                let ids = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled TAA with no prepass");
+                let taa = self.frame.ids.taa.expect("TAA without its images");
+                let color = self.texture_of(taa.source);
+                let velocity = self.table.texture(ids.velocity);
+                let depth = self.table.texture(ids.depth);
+
+                self.taa
+                    .record(self.device, encoder, &self.view, color, velocity, depth);
+            }
+            PassBody::DofPrefilter => {
+                let ids = self
+                    .frame
+                    .ids
+                    .dof
+                    .expect("depth of field without its images");
+                let prepass = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled depth of field with no prepass");
+                let color = self.texture_of(ids.source);
+                let depth = self.table.texture(prepass.depth);
+                let target = self.table.texture(ids.prefiltered);
+
+                self.dof
+                    .record_prefilter(self.device, encoder, color, depth, target);
+            }
+            PassBody::DofTileMax => {
+                let ids = self
+                    .frame
+                    .ids
+                    .dof
+                    .expect("depth of field without its images");
+                let prefiltered = self.table.texture(ids.prefiltered);
+                let target = self.table.texture(ids.tile);
+
+                self.dof
+                    .record_tile_max(self.device, encoder, prefiltered, target);
+            }
+            PassBody::DofGather => {
+                let ids = self
+                    .frame
+                    .ids
+                    .dof
+                    .expect("depth of field without its images");
+                let prefiltered = self.table.texture(ids.prefiltered);
+                let tiles = self.table.texture(ids.tile);
+                let near = self.table.texture(ids.near);
+                let far = self.table.texture(ids.far);
+
+                self.dof
+                    .record_gather(self.device, encoder, prefiltered, tiles, near, far);
+            }
+            PassBody::DofComposite => {
+                let ids = self
+                    .frame
+                    .ids
+                    .dof
+                    .expect("depth of field without its images");
+                let prepass = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled depth of field with no prepass");
+                let color = self.texture_of(ids.source);
+                let depth = self.table.texture(prepass.depth);
+                let near = self.table.texture(ids.near);
+                let far = self.table.texture(ids.far);
+                let target = self.table.texture(ids.output);
+
+                self.dof
+                    .record_composite(self.device, encoder, color, depth, near, far, target);
+            }
+            PassBody::MotionBlurTileMax => {
+                let ids = self
+                    .frame
+                    .ids
+                    .motion_blur
+                    .expect("motion blur without its images");
+                let prepass = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled motion blur with no prepass");
+                let velocity = self.table.texture(prepass.velocity);
+                let depth = self.table.texture(prepass.depth);
+                let target = self.table.texture(ids.tile);
+
+                self.motion_blur.record_tile_max(
+                    self.device,
+                    encoder,
+                    &self.view,
+                    velocity,
+                    depth,
+                    target,
+                );
+            }
+            PassBody::MotionBlurNeighbourMax => {
+                let ids = self
+                    .frame
+                    .ids
+                    .motion_blur
+                    .expect("motion blur without its images");
+                let tiles = self.table.texture(ids.tile);
+                let target = self.table.texture(ids.neighbour);
+
+                self.motion_blur
+                    .record_neighbour_max(self.device, encoder, tiles, target);
+            }
+            PassBody::MotionBlurGather => {
+                let ids = self
+                    .frame
+                    .ids
+                    .motion_blur
+                    .expect("motion blur without its images");
+                let prepass = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled motion blur with no prepass");
+                let color = self.texture_of(ids.source);
+                let velocity = self.table.texture(prepass.velocity);
+                let depth = self.table.texture(prepass.depth);
+                let neighbour = self.table.texture(ids.neighbour);
+                let target = self.table.texture(ids.output);
+
+                self.motion_blur.record_gather(
+                    self.device,
+                    encoder,
+                    &self.view,
+                    color,
+                    velocity,
+                    depth,
+                    neighbour,
+                    target,
+                );
+            }
+            PassBody::CullReset => {
+                let frame = self
+                    .cull_frame
+                    .as_ref()
+                    .expect("the graph scheduled the cull with no batch table");
+
+                self.cull.record_reset(self.device, encoder, frame);
+            }
+            PassBody::Cull => {
+                let frame = self
+                    .cull_frame
+                    .as_ref()
+                    .expect("the graph scheduled the cull with no batch table");
+
+                self.cull.record_cull(
+                    self.device,
+                    encoder,
+                    self.object_rows,
+                    frame,
+                    self.cull_views,
+                    &self.occlusion_test,
+                    self.view.prev_view_proj,
+                );
+            }
+            PassBody::OcclusionHiz => {
+                let prepass = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled the occlusion pyramid with no prepass");
+                let depth = self.table.texture(prepass.depth);
+
+                self.occlusion
+                    .record(self.device, encoder, depth, self.extent);
+            }
+            PassBody::LuminanceHistogram => {
+                let hdr = self.scene_color;
+
+                self.exposure
+                    .record_histogram(self.device, encoder, self.extent, hdr);
+            }
+            PassBody::LuminanceAverage => {
+                self.exposure
+                    .record_average(self.device, encoder, self.extent);
+            }
+            PassBody::BloomPrefilter => {
+                let ids = self.frame.ids.bloom.expect("bloom pass without levels");
+                let source = self.scene_color;
+                let target = self.table.texture(ids.down(0));
+
+                self.bloom.record_prefilter(
+                    self.device,
+                    encoder,
+                    source,
+                    target,
+                    self.exposure.exposure_buffer(),
+                );
+            }
+            PassBody::BloomDownsample(level) => {
+                let ids = self.frame.ids.bloom.expect("bloom pass without levels");
+                let level = level as usize;
+                let source = self.table.texture(ids.down(level - 1));
+                let target = self.table.texture(ids.down(level));
+
+                self.bloom
+                    .record_downsample(self.device, encoder, source, target);
+            }
+            PassBody::BloomUpsample(level) => {
+                let ids = self.frame.ids.bloom.expect("bloom pass without levels");
+                let level = level as usize;
+                // Mirrors what `declare` said this pass reads: an
+                // up-chain level where there is one above, and the down
+                // chain's last level at the top of the climb.
+                let coarse = if level + 2 < ids.mips as usize {
+                    ids.up(level + 1)
+                } else {
+                    ids.down(level + 1)
+                };
+                let coarse = self.table.texture(coarse);
+                let same_level = self.table.texture(ids.down(level));
+                let target = self.table.texture(ids.up(level));
+
+                self.bloom
+                    .record_upsample(self.device, encoder, coarse, same_level, target);
+            }
+            other => unreachable!("{other:?} is not a compute pass"),
+        }
+    }
+
+    /// A graphics pass's body, inside the render pass its targets opened.
+    fn record_graphics(&self, encoder: &mut Encoder, body: PassBody) {
         match body {
             PassBody::ShadowCascade(cascade) => {
                 let shadows = self
                     .shadows
                     .expect("the graph scheduled a cascade with no shadows");
                 let cascade_index = cascade as usize;
-                let driver = self.device.vulkan();
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+
                 self.shadow.record(
-                    &mut encoder,
+                    encoder,
                     &self.pass_ctx(),
                     self.opaque_draws(
                         1 + cascade,
@@ -3144,10 +3090,9 @@ impl FrameRecord<'_> {
                     .cull_frame
                     .as_ref()
                     .map(|frame| (frame, self.cull.commands(), self.first_face_view()));
-                let driver = self.device.vulkan();
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+
                 self.shadow.record_atlas(
-                    &mut encoder,
+                    encoder,
                     &self.pass_ctx(),
                     shadows.atlas,
                     shadows.punctual_casters,
@@ -3159,11 +3104,9 @@ impl FrameRecord<'_> {
                 );
             }
             PassBody::GeometryPrepass => {
-                let driver = self.device.vulkan();
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.prepass.record(
                     self.device,
-                    &mut encoder,
+                    encoder,
                     &self.pass_ctx(),
                     self.opaque_draws(0, self.draws, 0),
                     self.extent,
@@ -3183,13 +3126,12 @@ impl FrameRecord<'_> {
             PassBody::SsaoResolve => {
                 let prepass = self.frame.ids.prepass.unwrap();
                 let ids = self.frame.ids.ssao.unwrap();
-                let driver = self.device.vulkan();
                 let depth = self.table.texture(prepass.depth);
                 let normal = self.table.texture(prepass.normal);
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+
                 self.ssao.record_ao(
                     self.device,
-                    &mut encoder,
+                    encoder,
                     self.table.extent(ids.raw_ao),
                     self.ssao_uniforms.as_ref().unwrap(),
                     depth,
@@ -3199,13 +3141,12 @@ impl FrameRecord<'_> {
             PassBody::SsaoBlur => {
                 let ids = self.frame.ids.ssao.unwrap();
                 let prepass = self.frame.ids.prepass.unwrap();
-                let driver = self.device.vulkan();
                 let raw_ao = self.table.texture(ids.raw_ao);
                 let depth = self.table.texture(prepass.depth);
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+
                 self.ssao.record_blur(
                     self.device,
-                    &mut encoder,
+                    encoder,
                     self.table.extent(ids.ao),
                     raw_ao,
                     depth,
@@ -3218,13 +3159,12 @@ impl FrameRecord<'_> {
                     .ids
                     .prepass
                     .expect("the graph scheduled contact shadows with no prepass");
-                let driver = self.device.vulkan();
                 let depth = self.table.texture(ids.depth);
                 let normal = self.table.texture(ids.normal);
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+
                 self.contact_shadows.record(
                     self.device,
-                    &mut encoder,
+                    encoder,
                     self.extent,
                     self.contact_shadow_uniforms
                         .as_ref()
@@ -3239,10 +3179,9 @@ impl FrameRecord<'_> {
                 // binds follows from the same answer.
                 let subsurface = self.frame.ids.subsurface.is_some();
                 let msaa = self.frame.ids.msaa.is_some();
-                let driver = self.device.vulkan();
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+
                 self.forward.draw(
-                    &mut encoder,
+                    encoder,
                     &self.pass_ctx(),
                     self.opaque_draws(0, self.draws, 0),
                     &self.view,
@@ -3256,11 +3195,10 @@ impl FrameRecord<'_> {
                 // wherever something was drawn, and before the lines
                 // because the sky passes its own test at the depth clear
                 // and would otherwise paint over them.
-                let driver = self.device.vulkan();
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+
                 self.environment.record_skybox(
                     self.device,
-                    &mut encoder,
+                    encoder,
                     &self.view,
                     self.extent,
                     self.env,
@@ -3274,11 +3212,10 @@ impl FrameRecord<'_> {
                 );
                 // Debug lines share the forward subpass: depth-tested against
                 // the scene, drawn on top of it, before the pass ends.
-                let driver = self.device.vulkan();
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+
                 self.line.record(
                     self.device,
-                    &mut encoder,
+                    encoder,
                     self.debug_lines,
                     &self.view,
                     self.extent,
@@ -3287,10 +3224,8 @@ impl FrameRecord<'_> {
                 );
             }
             PassBody::OitAccumulate => {
-                let driver = self.device.vulkan();
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.oit.record(
-                    &mut encoder,
+                    encoder,
                     &self.pass_ctx(),
                     self.transparent,
                     &self.blended_sets,
@@ -3305,13 +3240,12 @@ impl FrameRecord<'_> {
                     .ids
                     .refraction
                     .expect("refraction without its images");
-                let driver = self.device.vulkan();
                 let blur = self.table.texture(ids.scene);
                 let sharp = self.texture_of(ids.source);
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+
                 self.refraction.record(
                     self.device,
-                    &mut encoder,
+                    encoder,
                     &self.pass_ctx(),
                     self.refractive,
                     &self.blended_sets,
@@ -3323,7 +3257,6 @@ impl FrameRecord<'_> {
                 );
             }
             PassBody::Tonemap => {
-                let driver = self.device.vulkan();
                 // With bloom off the graph has no chain, so the tonemap
                 // pass samples a 1x1 black self.view at a zero strength: "no
                 // bloom" with no second shader path.
@@ -3333,27 +3266,17 @@ impl FrameRecord<'_> {
                 };
                 let hdr = self.scene_color;
                 let exposure = self.exposure.exposure_buffer();
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
-                self.hdr.record_tonemap(
-                    self.device,
-                    &mut encoder,
-                    self.extent,
-                    hdr,
-                    exposure,
-                    bloom,
-                );
+
+                self.hdr
+                    .record_tonemap(self.device, encoder, self.extent, hdr, exposure, bloom);
             }
             PassBody::Gizmo => {
-                let driver = self.device.vulkan();
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.gizmo
-                    .record(self.device, &mut encoder, self.gizmo_strokes, self.extent);
+                    .record(self.device, encoder, self.gizmo_strokes, self.extent);
             }
             PassBody::OutlineMask => {
-                let driver = self.device.vulkan();
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.outline.record_mask(
-                    &mut encoder,
+                    encoder,
                     self.outline_items,
                     self.meshes,
                     self.view.unjittered_view_proj,
@@ -3366,12 +3289,11 @@ impl FrameRecord<'_> {
                     .ids
                     .outline_mask
                     .expect("an outline pass without its mask");
-                let driver = self.device.vulkan();
                 let mask = self.table.texture(mask);
-                let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
+
                 self.outline.record_outline(
                     self.device,
-                    &mut encoder,
+                    encoder,
                     mask,
                     self.extent,
                     !self.outline_items.is_empty(),
@@ -3406,11 +3328,6 @@ impl FrameRecord<'_> {
             | PassBody::CullReset
             | PassBody::Cull
             | PassBody::OcclusionHiz => unreachable!("handled above"),
-        }
-
-        builder.end_rendering();
-        if let Some(timestamps) = self.timestamps {
-            timestamps.close(builder, timed);
         }
     }
 }

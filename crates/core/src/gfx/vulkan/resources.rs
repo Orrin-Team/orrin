@@ -419,21 +419,6 @@ impl GraphImages {
         self.views_of(id).whole.clone()
     }
 
-    /// The image as a pass binds it.
-    pub fn texture(&self, id: ResourceId) -> TextureViewId {
-        self.views_of(id).whole_id
-    }
-
-    /// One id per level, which is what a storage descriptor takes.
-    pub fn mip_textures(&self, id: ResourceId) -> &[TextureViewId] {
-        let views = self.views_of(id);
-        if views.level_ids.is_empty() {
-            std::slice::from_ref(&views.whole_id)
-        } else {
-            &views.level_ids
-        }
-    }
-
     fn views_of(&self, id: ResourceId) -> &Views {
         self.views[self.slot][id.index()]
             .as_ref()
@@ -463,31 +448,6 @@ impl GraphImages {
                 })
                 .collect(),
         )
-    }
-
-    /// The width and height a graph-owned image was allocated at, which is what
-    /// a pass drawing into one at less than the frame's extent has to set its
-    /// viewport to — the framebuffer's render area follows the attachment, but
-    /// the viewport is dynamic state nothing derives.
-    pub fn extent(&self, id: ResourceId) -> [u32; 2] {
-        let extent = self.view(id).image().extent();
-        [extent[0], extent[1]]
-    }
-
-    /// A single-layer 2D view of one layer of an array image.
-    ///
-    /// A framebuffer attachment has to be one layer, while the same image is
-    /// sampled as a whole array — so the cascades need both kinds of view over
-    /// the same allocation.
-    pub fn layer_texture(&self, id: ResourceId, layer: u32) -> TextureViewId {
-        self.views_of(id).layer_ids[layer as usize]
-    }
-
-    /// How many levels the allocated image actually has, which is what a pass
-    /// writing a pyramid must loop over — the declaration is a request, and a
-    /// small window cannot honour it.
-    pub fn mip_levels(&self, id: ResourceId) -> u32 {
-        self.view(id).image().mip_levels()
     }
 }
 
@@ -662,7 +622,7 @@ mod tests {
 
         let mut images =
             GraphImages::allocate(&ctx.memory_allocator, &ctx, &driver, &graph, [64, 64], 1);
-        let first: Vec<_> = images.mip_textures(pyramid).to_vec();
+        let first: Vec<_> = images.table().mip_textures(pyramid).to_vec();
         assert_eq!(first.len(), 5);
         for (level, id) in first.iter().enumerate() {
             let level = level as u32;
@@ -681,7 +641,8 @@ mod tests {
             [64, 64],
             1,
         );
-        for (before, after) in first.iter().zip(images.mip_textures(pyramid)) {
+        let after = images.table();
+        for (before, after) in first.iter().zip(after.mip_textures(pyramid)) {
             assert_eq!(before, after, "a cache hit rebuilt a mip view");
         }
     }
