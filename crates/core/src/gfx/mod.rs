@@ -1,3 +1,4 @@
+pub mod choice;
 pub mod format;
 pub mod graph;
 pub mod headless;
@@ -13,6 +14,7 @@ mod texel;
 pub mod thumbnail;
 pub mod vulkan;
 
+pub use choice::BackendChoice;
 pub use headless::HeadlessBackend;
 pub use texel::{TexelFormat, TextureLevels};
 
