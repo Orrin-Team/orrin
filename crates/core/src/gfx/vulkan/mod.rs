@@ -472,9 +472,8 @@ impl VulkanRenderer {
     /// them once the frames still reading them are done, so an edit costs a
     /// rebuild on the next frame and nothing once it is let go.
     fn invalidate_material_sets(&mut self) {
-        let driver = self.device.vulkan();
         if let Some(buffer) = self.material_buffer.take() {
-            driver.destroy_buffer(buffer);
+            self.device.destroy_buffer(buffer);
         }
         for group in [
             self.material_set.take(),
@@ -484,14 +483,13 @@ impl VulkanRenderer {
         .into_iter()
         .flatten()
         {
-            driver.destroy_bind_group(group);
+            self.device.destroy_bind_group(group);
         }
     }
 
     /// The same for the texture array, which a frame in flight keeps reading
     /// until it finishes, so it sees the pixels it started with.
     fn invalidate_texture_sets(&mut self) {
-        let driver = self.device.vulkan();
         for group in [
             self.texture_set.take(),
             self.prepass_texture_set.take(),
@@ -500,7 +498,7 @@ impl VulkanRenderer {
         .into_iter()
         .flatten()
         {
-            driver.destroy_bind_group(group);
+            self.device.destroy_bind_group(group);
         }
     }
 
@@ -1104,10 +1102,7 @@ impl RenderBackend for VulkanRenderer {
     }
 
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle {
-        let (span, bounds) = {
-            let driver = self.device.vulkan();
-            driver.upload_mesh(&mesh.vertices, &mesh.indices)
-        };
+        let (span, bounds) = self.device.upload_mesh(&mesh.vertices, &mesh.indices);
         let handle = MeshHandle(self.meshes.len() as u32);
         self.meshes.push(GpuMesh { span, bounds });
         handle
@@ -1124,10 +1119,7 @@ impl RenderBackend for VulkanRenderer {
             tracing::warn!("mesh {} was never loaded; reimport ignored", handle.0);
             return;
         };
-        let (span, bounds) = {
-            let driver = self.device.vulkan();
-            driver.upload_mesh(&mesh.vertices, &mesh.indices)
-        };
+        let (span, bounds) = self.device.upload_mesh(&mesh.vertices, &mesh.indices);
         *slot = GpuMesh { span, bounds };
     }
 
@@ -1664,15 +1656,14 @@ impl VulkanRenderer {
         let occlusion_live = self.occlusion.begin_frame(
             &self.device,
             self.gpu_culling && self.occlusion_culling,
-            self.backend.vk().swapchain.extent,
+            self.backend.extent(),
         );
-        self.dof
-            .begin_frame(dof, camera, self.backend.vk().swapchain.extent);
+        self.dof.begin_frame(dof, camera, self.backend.extent());
         // Resolved against the camera for the reason the lens is: the kernel's
         // width in pixels is a world length divided by a view depth, so both
         // dispatches have to be handed one projection and one depth range.
         self.subsurface
-            .begin_frame(subsurface, camera, self.backend.vk().swapchain.extent);
+            .begin_frame(subsurface, camera, self.backend.extent());
         // Reflections resolve against the camera *and* the environment: the
         // composite subtracts the environment term the forward pass added, so
         // it has to be handed the same rotation and the same tint that pass
@@ -1685,7 +1676,7 @@ impl VulkanRenderer {
                 &self.device,
                 ssr,
                 &view,
-                self.backend.vk().swapchain.extent,
+                self.backend.extent(),
                 self.table.mip_levels(ids.hiz),
                 environment.yaw,
                 environment::SPECULAR_MIPS,
@@ -1707,7 +1698,7 @@ impl VulkanRenderer {
             &view,
             camera.position,
             lighting.ambient_color * lighting.ambient_nits,
-            self.backend.vk().swapchain.extent,
+            self.backend.extent(),
         );
         // Sourced from the compiled frame, not from the setting: a window too
         // small for a chain leaves bloom enabled but unbuilt, and a non-zero
@@ -1993,7 +1984,7 @@ impl VulkanRenderer {
             &self.device,
             lighting,
             camera,
-            self.backend.vk().swapchain.extent,
+            self.backend.extent(),
             ao_view,
             contact_shadow_view,
             shadow_id,
@@ -2885,7 +2876,27 @@ impl FrameRecord<'_> {
                 // Escape-hatch passes own their submission; there is no overlay
                 // to draw over an offscreen capture.
                 PassKind::Raw => {}
-                PassKind::Compute => self.record_compute(encoder, body),
+                PassKind::Compute => {
+                    self.record_compute(encoder, body);
+                    if std::env::var("ORRIN_METAL_DUMP").is_ok()
+                        && matches!(
+                            body,
+                            PassBody::TaaResolve
+                                | PassBody::BloomUpsample(0)
+                                | PassBody::LuminanceAverage
+                        )
+                    {
+                        if let Encoder::Metal(mtl) = encoder {
+                            let target = match body {
+                                PassBody::TaaResolve => {
+                                    self.texture_of(self.frame.ids.taa.unwrap().output)
+                                }
+                                _ => self.scene_color,
+                            };
+                            mtl.debug_mean(target, &format!("after {body:?}"));
+                        }
+                    }
+                }
                 _ => {
                     let targets = rendering::rendering_info(
                         &self.frame.ids,
@@ -2895,9 +2906,23 @@ impl FrameRecord<'_> {
                         self.env.background,
                     )
                     .expect("the executor reached a graphics pass with nothing to render into");
+                    if matches!(body, PassBody::Tonemap)
+                        && std::env::var("ORRIN_METAL_DUMP").is_ok()
+                    {
+                        if let Encoder::Metal(mtl) = encoder {
+                            mtl.debug_mean(self.scene_color, "scene_color before tonemap");
+                        }
+                    }
                     encoder.begin_pass(&targets);
                     self.record_graphics(encoder, body);
                     encoder.end_rendering();
+                    if std::env::var("ORRIN_METAL_DUMP").is_ok() {
+                        if let Some(first) = targets.colors.first() {
+                            if let Encoder::Metal(mtl) = encoder {
+                                mtl.debug_mean(first.target, &format!("{body:?}"));
+                            }
+                        }
+                    }
                 }
             }
         }

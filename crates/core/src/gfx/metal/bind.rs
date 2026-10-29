@@ -16,8 +16,8 @@ use std::sync::atomic::Ordering;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLArgumentEncoder, MTLBuffer, MTLDevice, MTLFunction, MTLResource, MTLResourceOptions,
-    MTLResourceUsage,
+    MTLBuffer, MTLDevice, MTLFunction, MTLResource, MTLResourceID, MTLResourceOptions,
+    MTLResourceUsage, MTLSamplerState, MTLTexture,
 };
 
 use super::pipeline::Pipe;
@@ -26,6 +26,28 @@ use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, PipelineId, SamplerId, TextureViewId,
 };
 use crate::gfx::shaders::{Resource, ResourceKind, ShaderId};
+
+/// An argument buffer being written: eight bytes a slot, at the index the
+/// binding map gave.
+struct Slots(*mut u8);
+
+impl Slots {
+    fn write_id(&self, index: u32, id: MTLResourceID) {
+        // SAFETY: the slot lies inside the buffer this was made over, and a
+        // resource id is eight bytes.
+        unsafe {
+            self.0
+                .add(index as usize * 8)
+                .cast::<MTLResourceID>()
+                .write(id)
+        };
+    }
+
+    fn write_address(&self, index: u32, address: u64) {
+        // SAFETY: as above.
+        unsafe { self.0.add(index as usize * 8).cast::<u64>().write(address) };
+    }
+}
 
 pub(super) struct Group {
     pub buffer: Shared<Retained<ProtocolObject<dyn MTLBuffer>>>,
@@ -91,13 +113,29 @@ impl MtlDriver {
         persistent: bool,
     ) -> BindGroupId {
         let layout = self.layout(pipeline, set);
-        let Some(function) = &layout.function else {
+        if layout.function.is_none() {
             return self.insert_group(self.empty_group(), persistent);
-        };
-        // SAFETY: `set` is a buffer index the function declares an argument
-        // buffer at, which the layout lookup above established.
-        let encoder = unsafe { function.newArgumentEncoderWithBufferIndex(set as usize) };
-        let length = encoder.encodedLength().max(8) as u64;
+        }
+        // Every resource of the set takes eight bytes at its index, whichever
+        // stage reads it: the layout is fixed by `build.rs`, so the buffer is
+        // written directly and one group serves vertex and fragment alike. (An
+        // argument encoder describes only the one function it was made from,
+        // and so cannot write a binding another stage declares.)
+        let length = layout
+            .shaders
+            .iter()
+            .flat_map(|shader| shader.blob().bindings.resources)
+            .filter(|resource| resource.set == set)
+            .map(|resource| {
+                let width = if resource.kind == ResourceKind::CombinedImageSampler {
+                    2
+                } else {
+                    1
+                };
+                (resource.index + resource.count * width) as u64 * 8
+            })
+            .max()
+            .unwrap_or(8);
 
         let (buffer, offset) = if persistent {
             let buffer = self
@@ -108,9 +146,10 @@ impl MtlDriver {
         } else {
             self.frame_arguments(length)
         };
-        // SAFETY: the buffer is at least `encodedLength` bytes from `offset`, at
-        // the alignment the arena and a fresh buffer both give.
-        unsafe { encoder.setArgumentBuffer_offset(Some(&buffer), offset as usize) };
+        // SAFETY: a shared buffer with `length` bytes from `offset`, which is
+        // eight-byte aligned.
+        let base = unsafe { buffer.contents().as_ptr().cast::<u8>().add(offset as usize) };
+        let encoder = Slots(base);
 
         let mut uses = Vec::new();
         // Textures at one binding are an array, filled in the order given.
@@ -172,14 +211,7 @@ impl MtlDriver {
                     } else {
                         MTLResourceUsage::Read
                     };
-                    // SAFETY: a live buffer and an offset inside it.
-                    unsafe {
-                        encoder.setBuffer_offset_atIndex(
-                            Some(&buf.buffer.0),
-                            buf.offset as usize,
-                            resource.index as usize,
-                        );
-                    }
+                    encoder.write_address(resource.index, buf.buffer.0.gpuAddress() + buf.offset);
                     uses.push(Use {
                         resource: Shared(ProtocolObject::from_retained(buf.buffer.0.clone())),
                         usage,
@@ -199,30 +231,23 @@ impl MtlDriver {
 
     fn write_texture(
         &self,
-        encoder: &ProtocolObject<dyn MTLArgumentEncoder>,
+        encoder: &Slots,
         index: u32,
         view: TextureViewId,
         usage: MTLResourceUsage,
         uses: &mut Vec<Use>,
     ) {
         let texture = self.texture(view);
-        // SAFETY: a live texture at an index the shader's map assigned.
-        unsafe { encoder.setTexture_atIndex(Some(&texture), index as usize) };
+        encoder.write_id(index, texture.gpuResourceID());
         uses.push(Use {
             resource: Shared(ProtocolObject::from_retained(texture)),
             usage,
         });
     }
 
-    fn write_sampler(
-        &self,
-        encoder: &ProtocolObject<dyn MTLArgumentEncoder>,
-        index: u32,
-        sampler: SamplerId,
-    ) {
+    fn write_sampler(&self, encoder: &Slots, index: u32, sampler: SamplerId) {
         let sampler = self.sampler(sampler);
-        // SAFETY: a live sampler built for argument buffers.
-        unsafe { encoder.setSamplerState_atIndex(Some(&sampler), index as usize) };
+        encoder.write_id(index, sampler.gpuResourceID());
     }
 
     fn empty_group(&self) -> Group {
@@ -314,6 +339,11 @@ impl MtlDriver {
             .lock()
             .unwrap()
             .remove(group.0, self.frame.load(Ordering::Relaxed));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn group_for_test(&self, group: BindGroupId) -> GroupParts {
+        self.group(group)
     }
 
     pub(super) fn group(&self, group: BindGroupId) -> GroupParts {

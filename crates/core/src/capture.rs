@@ -120,6 +120,25 @@ impl Default for CaptureSettings {
     }
 }
 
+/// The pixels of one of the built-in scenes, as tightly packed RGBA8 with the
+/// extent they were rendered at.
+pub fn scene_pixels(settings: &CaptureSettings) -> (Vec<u8>, [u32; 2]) {
+    let mut renderer = offscreen_renderer(settings.extent);
+    let mut world = World::new();
+    prepare(&mut world, &mut renderer, settings);
+    render(&mut world, &mut renderer, settings)
+}
+
+/// [`scene_pixels`] through native Metal.
+#[cfg(target_os = "macos")]
+pub fn scene_pixels_metal(settings: &CaptureSettings) -> (Vec<u8>, [u32; 2]) {
+    let mut renderer =
+        VulkanRenderer::offscreen_metal(settings.extent).expect("this machine runs Metal");
+    let mut world = World::new();
+    prepare(&mut world, &mut renderer, settings);
+    render(&mut world, &mut renderer, settings)
+}
+
 /// Render one of the built-in scenes and write it to `path` as a PNG.
 ///
 /// Panics rather than returning an error on a device that cannot be reached: it

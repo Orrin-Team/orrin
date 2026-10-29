@@ -231,6 +231,54 @@ fn dispatch_over(device: &Device, encoder: &mut Encoder, target: TextureViewId) 
 mod tests {
     use super::*;
 
+    /// A compute pass that writes a storage texture, on a real device: the
+    /// prefilter of a flat grey frame is a flat grey frame, so anything but
+    /// zeros is the pass having run and stored.
+    #[test]
+    #[ignore = "needs a Metal device"]
+    #[cfg(target_os = "macos")]
+    fn the_prefilter_stores_into_a_storage_texture_on_metal() {
+        use crate::gfx::graph::{BufferUsage, ImageUsage};
+        use crate::gfx::rhi::{BufferDesc, MemoryLocation, TextureDesc, TextureDimension};
+        let device = Device::Metal(crate::gfx::metal::MtlDriver::new().expect("a Metal device"));
+        device.begin_frame(0);
+        let pass = BloomPass::new(&device);
+        let source = device.create_texture_2d(
+            &bytemuck::cast_slice(&[0.5f32, 0.5, 0.5, 1.0].repeat(64)).to_vec(),
+            [8, 8],
+            Format::Rgba32Float,
+        );
+        let target = device.create_texture(&TextureDesc {
+            format: Format::Rgba16Float,
+            dimension: TextureDimension::D2,
+            extent: [4, 4, 1],
+            mip_levels: 1,
+            array_layers: 1,
+            samples: crate::gfx::format::SampleCount::Sample1,
+            usage: ImageUsage::SAMPLED | ImageUsage::STORAGE,
+            memoryless: false,
+        });
+        let exposure = device.create_buffer_bytes(
+            BufferDesc {
+                size: 12,
+                usage: BufferUsage::STORAGE_BUFFER,
+                location: MemoryLocation::Upload,
+            },
+            bytemuck::cast_slice(&[1.0f32, 1.0, 0.0]),
+        );
+        device.record_blocking(|encoder| {
+            pass.record_prefilter(&device, encoder, source, target, exposure);
+        });
+        let Device::Metal(driver) = &device else {
+            unreachable!()
+        };
+        let pixels = driver.read_texture(target);
+        assert!(
+            pixels.iter().any(|&b| b != 0),
+            "nothing was stored: {pixels:?}"
+        );
+    }
+
     /// The chain must stop before a level is too small for a 13-tap filter to
     /// mean anything, and must never exceed the array the ids are carried in.
     #[test]

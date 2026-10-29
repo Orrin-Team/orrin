@@ -9,9 +9,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue, MTLComputeCommandEncoder, MTLIndexType, MTLLoadAction,
-    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderStages, MTLScissorRect, MTLSize,
-    MTLStoreAction, MTLViewport, MTLWinding,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLIndexType, MTLLoadAction, MTLOrigin,
+    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderStages, MTLResource, MTLScissorRect,
+    MTLSize, MTLStoreAction, MTLTexture as _, MTLViewport, MTLWinding,
 };
 
 use super::pipeline::Pipe;
@@ -69,6 +69,13 @@ impl State {
         self.close();
         self.command_buffer.commit();
         self.command_buffer.waitUntilCompleted();
+        // A GPU fault does not fail the call that caused it: the buffer simply
+        // never ran, and every pixel after it is silently wrong.
+        eprintln!("command buffer status {:?}", self.command_buffer.status());
+        if let Some(error) = self.command_buffer.error() {
+            tracing::error!("a Metal command buffer failed: {error}");
+            eprintln!("a Metal command buffer failed: {error}");
+        }
     }
 }
 
@@ -143,6 +150,34 @@ impl<'a> MtlEncoder<'a> {
         self.state.pipeline = None;
     }
 
+    /// Debugging: wait for everything so far and print the mean of a texture.
+    pub fn debug_mean(&mut self, texture: TextureViewId, label: &str) {
+        self.state.close();
+        let old = std::mem::replace(
+            &mut self.state.command_buffer,
+            self.driver.queue_command_buffer(),
+        );
+        old.commit();
+        old.waitUntilCompleted();
+        let tex = self.driver.texture(texture);
+        if tex.storageMode() != objc2_metal::MTLStorageMode::Private {
+            return;
+        }
+        let bytes = self.driver.read_texture(texture);
+        let texel = bytes.len() / (tex.width() * tex.height());
+        let mut sum = [0u64; 4];
+        for chunk in bytes.chunks(texel) {
+            for (i, b) in chunk.iter().take(4).enumerate() {
+                sum[i] += u64::from(*b);
+            }
+        }
+        let n = (tex.width() * tex.height()) as u64;
+        eprintln!(
+            "{label}: texel bytes {texel}, mean bytes {:?}",
+            sum.map(|s| s / n)
+        );
+    }
+
     pub fn begin_pass(&mut self, targets: &RenderTargets) {
         self.state.close();
         let load = |op: LoadOp| match op {
@@ -162,7 +197,14 @@ impl<'a> MtlEncoder<'a> {
                 blue: color.clear[2] as f64,
                 alpha: color.clear[3] as f64,
             });
-            attachment.setStoreAction(match (color.resolve, color.store) {
+            // A texture the graph found nothing to read back from lives in tile
+            // memory and cannot be stored, however the pass states it.
+            let store = if self.driver.is_memoryless(color.target) {
+                StoreOp::DontCare
+            } else {
+                color.store
+            };
+            attachment.setStoreAction(match (color.resolve, store) {
                 (Some(resolve), store) => {
                     attachment.setResolveTexture(Some(&self.driver.texture(resolve)));
                     if store == StoreOp::Store {
@@ -178,12 +220,24 @@ impl<'a> MtlEncoder<'a> {
         if let Some(depth) = targets.depth {
             let attachment = pass.depthAttachment();
             attachment.setTexture(Some(&self.driver.texture(depth.target)));
-            attachment.setLoadAction(load(depth.load));
+            // A depth that need not be kept is cleared, which is what the one
+            // pass that loads `DontCare` (the shadow atlas) relies on to have
+            // every tile it does not light read as far.
+            attachment.setLoadAction(load(match depth.load {
+                LoadOp::DontCare => LoadOp::Clear,
+                other => other,
+            }));
             attachment.setClearDepth(depth.clear as f64);
-            attachment.setStoreAction(match depth.store {
-                StoreOp::Store => MTLStoreAction::Store,
-                StoreOp::DontCare => MTLStoreAction::DontCare,
-            });
+            attachment.setStoreAction(
+                match if self.driver.is_memoryless(depth.target) {
+                    StoreOp::DontCare
+                } else {
+                    depth.store
+                } {
+                    StoreOp::Store => MTLStoreAction::Store,
+                    StoreOp::DontCare => MTLStoreAction::DontCare,
+                },
+            );
         }
         let encoder = self
             .state
@@ -330,7 +384,24 @@ impl<'a> MtlEncoder<'a> {
     }
 
     pub fn push_constants(&mut self, words: &[u32]) {
-        let bytes = bytemuck::cast_slice::<u32, u8>(words);
+        let given = bytemuck::cast_slice::<u32, u8>(words);
+        // A shader's block is padded to its struct's alignment, and Metal checks
+        // the bound length against the size the shader declares, so a short one
+        // is zero-padded up to it.
+        let declared = self
+            .state
+            .pipeline
+            .map_or(0, |pipeline| self.driver.push_constant_bytes(pipeline))
+            // The struct's size is rounded up to its widest member's alignment.
+            .next_multiple_of(16);
+        let mut padded = [0u8; 512];
+        let bytes: &[u8] = if declared > given.len() {
+            assert!(declared <= padded.len(), "a push block outgrew the pad");
+            padded[..given.len()].copy_from_slice(given);
+            &padded[..declared]
+        } else {
+            given
+        };
         let pointer =
             std::ptr::NonNull::new(bytes.as_ptr() as *mut _).expect("a slice is never null");
         match &self.state.open {
@@ -475,9 +546,10 @@ impl<'a> MtlEncoder<'a> {
         }
     }
 
-    pub fn clear_depth(&mut self, _rects: &[DepthRect]) {
-        unimplemented!("metal: clear_depth")
-    }
+    /// The pass that asks for this opened its depth as `DontCare`, which this
+    /// driver turns into a whole-attachment clear, so there is nothing left to
+    /// clear.
+    pub fn clear_depth(&mut self, _rects: &[DepthRect]) {}
 
     pub fn open_swapchain(&mut self, _target: TextureViewId) {
         unimplemented!("metal: open_swapchain")
@@ -496,8 +568,9 @@ impl<'a> MtlEncoder<'a> {
         unimplemented!("metal: capture_backdrop")
     }
 
-    pub fn generate_cube_mips(&mut self, _texture: TextureViewId) {
-        unimplemented!("metal: generate_cube_mips")
+    pub fn generate_cube_mips(&mut self, texture: TextureViewId) {
+        let texture = self.driver.texture(texture);
+        self.blit().generateMipmapsForTexture(&texture);
     }
 
     pub fn publish_render_target(&mut self, _texture: TextureViewId) {
@@ -507,13 +580,39 @@ impl<'a> MtlEncoder<'a> {
 
     pub fn write_texture(
         &mut self,
-        _texture: TextureViewId,
-        _offset: [u32; 2],
-        _extent: [u32; 2],
-        _staging: BufferId,
+        texture: TextureViewId,
+        offset: [u32; 2],
+        extent: [u32; 2],
+        staging: BufferId,
         _initial: bool,
     ) {
-        unimplemented!("metal: write_texture")
+        let texture = self.driver.texture(texture);
+        let staging = self.driver.buffer(staging);
+        let row = staging.len as usize / extent[1].max(1) as usize;
+        // SAFETY: the source range is the staged texels and the destination
+        // region lies inside the texture, which the caller sized together.
+        unsafe {
+            self.blit()
+                .copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                    &staging.buffer.0,
+                    staging.offset as usize,
+                    row,
+                    staging.len as usize,
+                    MTLSize {
+                        width: extent[0] as usize,
+                        height: extent[1] as usize,
+                        depth: 1,
+                    },
+                    &texture,
+                    0,
+                    0,
+                    MTLOrigin {
+                        x: offset[0] as usize,
+                        y: offset[1] as usize,
+                        z: 0,
+                    },
+                );
+        }
     }
 }
 

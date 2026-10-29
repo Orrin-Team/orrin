@@ -11,7 +11,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString, ns_string};
 use objc2_metal::{
-    MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCompareFunction,
+    MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCompareFunction, MTLCompileOptions,
     MTLComputePipelineState, MTLCullMode, MTLDepthStencilDescriptor, MTLDepthStencilState,
     MTLDevice, MTLFunction, MTLLibrary, MTLPrimitiveType, MTLRenderPipelineDescriptor,
     MTLRenderPipelineState, MTLSize, MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
@@ -59,9 +59,15 @@ impl MtlDriver {
         }
         let blob = shader.blob();
         let source = NSString::from_str(blob.msl);
+        // `invariant gl_Position` becomes `[[position, invariant]]`, which Metal
+        // honours only when told to: without it the prepass and the forward pass
+        // can disagree on a depth by a bit, and the forward pass's `Equal` test
+        // then rejects every fragment of the opaque queue.
+        let options = MTLCompileOptions::new();
+        options.setPreserveInvariance(true);
         let library = self
             .device
-            .newLibraryWithSource_options_error(&source, None)
+            .newLibraryWithSource_options_error(&source, Some(&options))
             .unwrap_or_else(|error| panic!("{} does not compile as MSL: {error}", blob.name));
         // The translator's name for a GLSL `main`.
         let function = library
@@ -188,6 +194,19 @@ impl MtlDriver {
         self.create_compute_pipeline(desc)
     }
 
+    /// The most push-constant bytes any stage of a pipeline declares.
+    pub(super) fn push_constant_bytes(&self, id: PipelineId) -> usize {
+        self.with_pipe(id, |pipe| match pipe {
+            Pipe::Render(render) => render
+                .vertex
+                .blob()
+                .bindings
+                .push_constant_bytes
+                .max(render.fragment.blob().bindings.push_constant_bytes),
+            Pipe::Compute(compute) => compute.shader.blob().bindings.push_constant_bytes,
+        }) as usize
+    }
+
     pub(super) fn with_pipe<R>(&self, id: PipelineId, f: impl FnOnce(&Pipe) -> R) -> R {
         let pipelines = self.pipelines.lock().unwrap();
         f(pipelines
@@ -272,16 +291,14 @@ fn vertex_descriptor(shader: ShaderId, streams: &[VertexStream]) -> Retained<MTL
             MTLVertexStepFunction::PerVertex
         });
         for attribute in stream.attributes {
-            let (_, location) = attributes_of
+            // An input the shader never reads is absent from its translated
+            // stage-in, and a stream may carry more than one shader uses.
+            let Some((_, location)) = attributes_of
                 .iter()
                 .find(|(name, _)| *name == attribute.name)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{} has no input named `{}`",
-                        shader.blob().name,
-                        attribute.name
-                    )
-                });
+            else {
+                continue;
+            };
             let described = unsafe {
                 descriptor
                     .attributes()

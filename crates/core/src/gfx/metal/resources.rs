@@ -13,9 +13,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTLBuffer, MTLDevice, MTLOrigin, MTLRegion, MTLResourceOptions, MTLSamplerAddressMode,
-    MTLSamplerBorderColor, MTLSamplerDescriptor, MTLSize, MTLStorageMode, MTLTexture,
-    MTLTextureDescriptor, MTLTextureSwizzle, MTLTextureSwizzleChannels, MTLTextureType,
+    MTLBuffer, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResourceOptions,
+    MTLSamplerAddressMode, MTLSamplerBorderColor, MTLSamplerDescriptor, MTLSize, MTLStorageMode,
+    MTLTexture, MTLTextureDescriptor, MTLTextureSwizzle, MTLTextureSwizzleChannels, MTLTextureType,
+    MTLTextureUsage,
 };
 
 use super::convert::{may_be_memoryless, pixel_format, sampler_state, texture_usage};
@@ -262,7 +263,13 @@ impl MtlDriver {
                 SampleCount::Sample8 => 8,
             });
         }
-        descriptor.setUsage(texture_usage(desc.usage));
+        let mut usage = texture_usage(desc.usage);
+        // A depth texture that is written by a transfer is cleared by a render
+        // pass here, which needs it to be a render target.
+        if desc.format.is_depth() && desc.usage.contains(ImageUsage::TRANSFER_DST) {
+            usage |= objc2_metal::MTLTextureUsage::RenderTarget;
+        }
+        descriptor.setUsage(usage);
         // Only what the graph's usage allows: a memoryless texture that is read
         // back is undefined data (trap T9).
         descriptor.setStorageMode(if desc.memoryless && may_be_memoryless(desc.usage) {
@@ -334,6 +341,152 @@ impl MtlDriver {
             );
         }
         self.insert_texture(texture)
+    }
+
+    /// A 2D colour texture whose whole mip chain is generated from `pixels`.
+    pub fn create_texture_mipped(
+        &self,
+        pixels: &[u8],
+        extent: [u32; 2],
+        format: Format,
+    ) -> TextureViewId {
+        let levels = extent[0].max(extent[1]).max(1).ilog2() + 1;
+        let descriptor = MTLTextureDescriptor::new();
+        descriptor.setTextureType(MTLTextureType::Type2D);
+        descriptor.setPixelFormat(pixel_format(format));
+        // SAFETY: as in `new_texture`.
+        unsafe {
+            descriptor.setWidth(extent[0] as usize);
+            descriptor.setHeight(extent[1] as usize);
+            descriptor.setMipmapLevelCount(levels as usize);
+        }
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        let texture = self
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .expect("failed to allocate a texture");
+        write_level(&texture, 0, extent, pixels, extent[0] as usize * 4);
+        self.generate_mips(&texture);
+        self.insert_texture(texture)
+    }
+
+    /// A texture from levels already authored, which may be block compressed.
+    pub fn create_texture_levels(&self, levels: &crate::gfx::TextureLevels) -> TextureViewId {
+        use crate::gfx::TexelFormat;
+        let (format, block_bytes) = match levels.format {
+            TexelFormat::Rgba8Srgb => (MTLPixelFormat::RGBA8Unorm_sRGB, 0),
+            TexelFormat::Rgba8Unorm => (MTLPixelFormat::RGBA8Unorm, 0),
+            TexelFormat::Bc5Unorm => (MTLPixelFormat::BC5_RGUnorm, 16),
+            TexelFormat::Bc7Unorm => (MTLPixelFormat::BC7_RGBAUnorm, 16),
+            TexelFormat::Bc7Srgb => (MTLPixelFormat::BC7_RGBAUnorm_sRGB, 16),
+        };
+        let descriptor = MTLTextureDescriptor::new();
+        descriptor.setTextureType(MTLTextureType::Type2D);
+        descriptor.setPixelFormat(format);
+        // SAFETY: as in `new_texture`.
+        unsafe {
+            descriptor.setWidth(levels.width as usize);
+            descriptor.setHeight(levels.height as usize);
+            descriptor.setMipmapLevelCount(levels.levels.len().max(1));
+        }
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        let texture = self
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .expect("failed to allocate a texture");
+        for (level, bytes) in levels.levels.iter().enumerate() {
+            let size = [
+                (levels.width >> level).max(1),
+                (levels.height >> level).max(1),
+            ];
+            let row = if block_bytes == 0 {
+                size[0] as usize * 4
+            } else {
+                size[0].div_ceil(4) as usize * block_bytes
+            };
+            write_level(&texture, level, size, bytes, row);
+        }
+        self.insert_texture(texture)
+    }
+
+    /// A cube of `face` texels a side from six tightly packed faces.
+    pub fn create_texture_cube(&self, pixels: &[u8], face: u32, format: Format) -> TextureViewId {
+        let descriptor = MTLTextureDescriptor::new();
+        descriptor.setTextureType(MTLTextureType::TypeCube);
+        descriptor.setPixelFormat(pixel_format(format));
+        // SAFETY: as in `new_texture`.
+        unsafe {
+            descriptor.setWidth(face as usize);
+            descriptor.setHeight(face as usize);
+        }
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        let texture = self
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .expect("failed to allocate a cube texture");
+        let per_face = pixels.len() / 6;
+        let row = per_face / face.max(1) as usize;
+        for slice in 0..6 {
+            let region = MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize {
+                    width: face as usize,
+                    height: face as usize,
+                    depth: 1,
+                },
+            };
+            let bytes = &pixels[slice * per_face..(slice + 1) * per_face];
+            // SAFETY: `bytes` covers one face at `row` bytes a row.
+            unsafe {
+                texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
+                    region,
+                    0,
+                    slice,
+                    NonNull::new(bytes.as_ptr() as *mut c_void).expect("a slice is never null"),
+                    row,
+                    0,
+                );
+            }
+        }
+        self.insert_texture(texture)
+    }
+
+    /// Fill a depth texture with one value, once.
+    pub fn fill_depth(&self, texture: TextureViewId, depth: f32) {
+        use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+        use objc2_metal::{MTLLoadAction, MTLRenderPassDescriptor, MTLStoreAction};
+        let target = self.texture(texture);
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        let attachment = pass.depthAttachment();
+        attachment.setTexture(Some(&target));
+        attachment.setLoadAction(MTLLoadAction::Clear);
+        attachment.setClearDepth(depth as f64);
+        attachment.setStoreAction(MTLStoreAction::Store);
+        let command_buffer = self.queue.commandBuffer().expect("no command buffer");
+        let encoder = command_buffer
+            .renderCommandEncoderWithDescriptor(&pass)
+            .expect("failed to open a render encoder");
+        encoder.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+    }
+
+    /// Chain-generate a texture's mip levels with the blit engine.
+    fn generate_mips(&self, texture: &Retained<ProtocolObject<dyn MTLTexture>>) {
+        use objc2_metal::{
+            MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+        };
+        let command_buffer = self.queue.commandBuffer().expect("no command buffer");
+        let blit = command_buffer
+            .blitCommandEncoder()
+            .expect("failed to open a blit encoder");
+        blit.generateMipmapsForTexture(texture);
+        blit.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
     }
 
     pub fn destroy_texture(&self, view: TextureViewId) {
@@ -428,6 +581,19 @@ impl MtlDriver {
             std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<u8>(), row * height)
                 .to_vec()
         }
+    }
+
+    /// Whether a texture lives in tile memory only.
+    pub(super) fn is_memoryless(&self, view: TextureViewId) -> bool {
+        use objc2_metal::MTLResource;
+        self.texture(view).storageMode() == MTLStorageMode::Memoryless
+    }
+
+    pub(super) fn queue_command_buffer(
+        &self,
+    ) -> Retained<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>> {
+        use objc2_metal::MTLCommandQueue;
+        self.queue.commandBuffer().expect("no command buffer")
     }
 
     pub(super) fn texture(&self, view: TextureViewId) -> Retained<ProtocolObject<dyn MTLTexture>> {
@@ -593,5 +759,35 @@ mod tests {
         let driver = driver();
         let id = driver.create_texture_2d(&[1, 2, 3, 4, 5, 6, 7, 8], [2, 1], Format::Rgba8Unorm);
         assert_eq!(driver.view_extent(id), [2, 1]);
+    }
+}
+
+/// Write one level of a texture from tightly packed bytes.
+fn write_level(
+    texture: &Retained<ProtocolObject<dyn MTLTexture>>,
+    level: usize,
+    size: [u32; 2],
+    bytes: &[u8],
+    row: usize,
+) {
+    let region = MTLRegion {
+        origin: MTLOrigin { x: 0, y: 0, z: 0 },
+        size: MTLSize {
+            width: size[0] as usize,
+            height: size[1] as usize,
+            depth: 1,
+        },
+    };
+    // SAFETY: `bytes` covers the level at `row` bytes a row, and Metal copies it
+    // before returning.
+    unsafe {
+        texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
+            region,
+            level,
+            0,
+            NonNull::new(bytes.as_ptr() as *mut c_void).expect("a slice is never null"),
+            row,
+            0,
+        );
     }
 }

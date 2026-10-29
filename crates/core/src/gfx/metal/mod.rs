@@ -144,28 +144,7 @@ impl MtlDriver {
     unused_variables,
     reason = "operations land one at a time; a stub names itself in its panic"
 )]
-impl MtlDriver {
-    pub fn create_texture_cube(&self, pixels: &[u8], face: u32, format: Format) -> TextureViewId {
-        unimplemented!("metal: create_texture_cube")
-    }
-
-    pub fn create_texture_mipped(
-        &self,
-        pixels: &[u8],
-        extent: [u32; 2],
-        format: Format,
-    ) -> TextureViewId {
-        unimplemented!("metal: create_texture_mipped")
-    }
-
-    pub fn create_texture_levels(&self, levels: &super::TextureLevels) -> TextureViewId {
-        unimplemented!("metal: create_texture_levels")
-    }
-
-    pub fn fill_depth(&self, texture: TextureViewId, depth: f32) {
-        unimplemented!("metal: fill_depth")
-    }
-}
+impl MtlDriver {}
 
 #[allow(
     unused_variables,

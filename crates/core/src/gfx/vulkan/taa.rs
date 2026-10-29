@@ -326,6 +326,107 @@ fn allocate_history(device: &Device, extent: [u32; 2]) -> [TextureViewId; 2] {
 mod tests {
     use super::*;
 
+    /// The first resolve after the history is allocated passes the frame
+    /// through untouched, which is the simplest thing a compute pass can be
+    /// held to on a real device: whatever went in comes out.
+    #[test]
+    #[ignore = "needs a Metal device"]
+    #[cfg(target_os = "macos")]
+    fn the_first_resolve_passes_the_frame_through_on_metal() {
+        use crate::gfx::format::{Format, SampleCount};
+        use crate::gfx::graph::ImageUsage;
+        use crate::gfx::rhi::{TextureDesc, TextureDimension};
+        let device = Device::Metal(crate::gfx::metal::MtlDriver::new().expect("a Metal device"));
+        device.begin_frame(0);
+        let mut pass = TaaPass::new(&device);
+        let settings = TaaSettings {
+            enabled: true,
+            ..TaaSettings::default()
+        };
+        let camera = Camera::default();
+        let view = pass.begin_frame(&device, &settings, &camera, [8, 8]);
+
+        let floats = |values: &[f32]| -> Vec<u8> { bytemuck::cast_slice(values).to_vec() };
+        let color = device.create_texture_2d(
+            &floats(&[0.5, 0.25, 0.125, 1.0].repeat(64)),
+            [8, 8],
+            Format::Rgba32Float,
+        );
+        let velocity = device.create_texture_2d(&vec![0u8; 8 * 8 * 4], [8, 8], Format::Rg16Float);
+        let depth = device.create_texture(&TextureDesc {
+            format: Format::D32Float,
+            dimension: TextureDimension::D2,
+            extent: [8, 8, 1],
+            mip_levels: 1,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
+            memoryless: false,
+        });
+        device.fill_depth(depth, 1.0);
+
+        {
+            let mut words = [0u32; 36];
+            words[35] = 1.0f32.to_bits();
+            let own = device.create_texture(&TextureDesc {
+                format: Format::Rgba16Float,
+                dimension: TextureDimension::D2,
+                extent: [8, 8, 1],
+                mip_levels: 1,
+                array_layers: 1,
+                samples: SampleCount::Sample1,
+                usage: ImageUsage::SAMPLED | ImageUsage::STORAGE,
+                memoryless: false,
+            });
+            let uniforms = device.upload_uniform(&words);
+            let set = device.create_transient_bind_group(
+                pass.pipeline,
+                0,
+                &[
+                    Binding {
+                        binding: 0,
+                        resource: BindingResource::SampledTexture {
+                            view: color,
+                            sampler: pass.nearest_clamp,
+                        },
+                    },
+                    Binding {
+                        binding: 4,
+                        resource: BindingResource::StorageTexture(own),
+                    },
+                    Binding {
+                        binding: 5,
+                        resource: BindingResource::UniformBuffer(uniforms),
+                    },
+                ],
+            );
+            device.record_blocking(|encoder| {
+                encoder.bind_pipeline(pass.pipeline);
+                encoder.bind_group(0, set);
+                encoder.dispatch([1, 1, 1]);
+            });
+            let Device::Metal(driver) = &device else {
+                unreachable!()
+            };
+            eprintln!("minimal set wrote: {:?}", &driver.read_texture(own)[..8]);
+        }
+        device.record_blocking(|encoder| {
+            pass.record(&device, encoder, &view, color, velocity, depth);
+        });
+        let Device::Metal(driver) = &device else {
+            unreachable!()
+        };
+        eprintln!(
+            "input colour bytes: {:?}",
+            &driver.read_texture(color)[..16]
+        );
+        let pixels = driver.read_texture(pass.output_view());
+        assert!(
+            pixels.iter().any(|&byte| byte != 0),
+            "the resolve wrote nothing: {pixels:?}"
+        );
+    }
+
     /// Every offset has to land inside the pixel, or the frame is sampling a
     /// neighbour and the resolve accumulates a blur rather than a reconstruction.
     #[test]
