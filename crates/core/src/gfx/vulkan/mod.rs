@@ -1882,6 +1882,7 @@ impl VulkanRenderer {
             frame: &self.frame,
             images: &self.images,
             swapchain_view: swapchain_view.clone(),
+            swapchain_id: driver.import_view(swapchain_view.clone()),
             shadow_resolution: self.config.shadow_resolution,
             extent,
             timestamps: timestamps.as_ref(),
@@ -2220,6 +2221,8 @@ struct FrameRecord<'a> {
     frame: &'a Frame,
     images: &'a GraphImages,
     swapchain_view: Arc<ImageView>,
+    /// The same image as the device names it, which is what a pass binds.
+    swapchain_id: TextureViewId,
     shadow_resolution: u32,
     extent: [u32; 2],
     /// `None` when the device cannot time passes, or when profiling is off. The
@@ -3099,12 +3102,12 @@ impl FrameRecord<'_> {
         let rendering = rendering::rendering_info(
             &self.frame.ids,
             self.images,
-            &self.swapchain_view,
+            self.swapchain_id,
             body,
             self.env.background,
         )
         .expect("the executor reached a graphics pass with nothing to render into");
-        builder.begin_rendering(rendering);
+        Encoder::Vulkan(VkEncoder::new(builder, self.device.vulkan())).begin_pass(&rendering);
 
         match body {
             PassBody::ShadowCascade(cascade) => {

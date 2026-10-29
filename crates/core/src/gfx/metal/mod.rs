@@ -22,10 +22,8 @@ use objc2_metal::{
     MTLGPUFamily, MTLSamplerState, MTLTexture,
 };
 
-use crate::geom::Aabb;
-use crate::gfx::Vertex;
 use crate::gfx::format::Format;
-use crate::gfx::rhi::{Encoder, MeshSpan, Pool, TextureViewId};
+use crate::gfx::rhi::{Encoder, Pool, TextureViewId};
 
 use resources::Arena;
 

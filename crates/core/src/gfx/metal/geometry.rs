@@ -73,7 +73,7 @@ impl Geometry {
         vertices: u64,
         indices: u64,
     ) {
-        let mut grow = |buffer: &mut Buffer, stride: u64, needed: u64| {
+        let grow = |buffer: &mut Buffer, stride: u64, needed: u64| {
             if let Some(capacity) = grown(buffer.length() as u64 / stride, needed) {
                 let bigger = allocate(device, capacity * stride);
                 // SAFETY: both buffers are shared, the old is no longer than the
@@ -122,7 +122,7 @@ fn write<T: Copy>(buffer: &Buffer, at: usize, items: &[T]) {
         std::ptr::copy_nonoverlapping(
             items.as_ptr().cast::<u8>(),
             buffer.contents().as_ptr().cast::<u8>().add(at * stride),
-            items.len() * stride,
+            std::mem::size_of_val(items),
         );
     }
 }

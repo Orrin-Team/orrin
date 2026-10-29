@@ -17,7 +17,8 @@ use objc2_metal::{
 use super::pipeline::Pipe;
 use super::{MtlDriver, MtlEncoder};
 use crate::gfx::rhi::{
-    BindGroupId, BufferCopy, BufferId, DepthRect, PipelineId, TextureViewId, Viewport,
+    BindGroupId, BufferCopy, BufferId, DepthRect, LoadOp, PipelineId, RenderTargets, StoreOp,
+    TextureViewId, Viewport,
 };
 use crate::gfx::shaders::PUSH_CONSTANT_BUFFER;
 
@@ -133,6 +134,57 @@ impl<'a> MtlEncoder<'a> {
             blue: 0.0,
             alpha: 0.0,
         });
+        let encoder = self
+            .state
+            .command_buffer
+            .renderCommandEncoderWithDescriptor(&pass)
+            .expect("failed to open a render encoder");
+        self.state.open = Open::Render(encoder);
+        self.state.pipeline = None;
+    }
+
+    pub fn begin_pass(&mut self, targets: &RenderTargets) {
+        self.state.close();
+        let load = |op: LoadOp| match op {
+            LoadOp::Load => MTLLoadAction::Load,
+            LoadOp::Clear => MTLLoadAction::Clear,
+            LoadOp::DontCare => MTLLoadAction::DontCare,
+        };
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        for (index, color) in targets.colors.iter().enumerate() {
+            // SAFETY: attachments are addressed in order from zero.
+            let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(index) };
+            attachment.setTexture(Some(&self.driver.texture(color.target)));
+            attachment.setLoadAction(load(color.load));
+            attachment.setClearColor(MTLClearColor {
+                red: color.clear[0] as f64,
+                green: color.clear[1] as f64,
+                blue: color.clear[2] as f64,
+                alpha: color.clear[3] as f64,
+            });
+            attachment.setStoreAction(match (color.resolve, color.store) {
+                (Some(resolve), store) => {
+                    attachment.setResolveTexture(Some(&self.driver.texture(resolve)));
+                    if store == StoreOp::Store {
+                        MTLStoreAction::StoreAndMultisampleResolve
+                    } else {
+                        MTLStoreAction::MultisampleResolve
+                    }
+                }
+                (None, StoreOp::Store) => MTLStoreAction::Store,
+                (None, StoreOp::DontCare) => MTLStoreAction::DontCare,
+            });
+        }
+        if let Some(depth) = targets.depth {
+            let attachment = pass.depthAttachment();
+            attachment.setTexture(Some(&self.driver.texture(depth.target)));
+            attachment.setLoadAction(load(depth.load));
+            attachment.setClearDepth(depth.clear as f64);
+            attachment.setStoreAction(match depth.store {
+                StoreOp::Store => MTLStoreAction::Store,
+                StoreOp::DontCare => MTLStoreAction::DontCare,
+            });
+        }
         let encoder = self
             .state
             .command_buffer

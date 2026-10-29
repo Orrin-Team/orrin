@@ -26,10 +26,11 @@ pub(crate) use geometry::{Placement, grown};
 pub(crate) use pool::Pool;
 
 pub use desc::{
-    Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, ComputePipelineDesc,
-    CullMode, DepthCompare, DepthRect, DepthTest, Feature, GraphicsPipelineDesc, MemoryLocation,
-    SamplerDesc, TextureDesc, TextureDimension, TextureSwizzle, Topology, VertexAttribute,
-    VertexFormat, VertexStream, Viewport,
+    Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, ColorAttachment,
+    ComputePipelineDesc, CullMode, DepthAttachment, DepthCompare, DepthRect, DepthTest, Feature,
+    GraphicsPipelineDesc, LoadOp, MemoryLocation, RenderTargets, SamplerDesc, StoreOp, TextureDesc,
+    TextureDimension, TextureSwizzle, Topology, VertexAttribute, VertexFormat, VertexStream,
+    Viewport,
 };
 
 use super::format::Format;
@@ -382,6 +383,11 @@ impl Encoder<'_> {
     /// Hand a swapchain image back presentable.
     pub fn close_swapchain(&mut self, target: TextureViewId) {
         encoder_dispatch!(self, encoder => encoder.close_swapchain(target))
+    }
+
+    /// Open a render pass over `targets`.
+    pub fn begin_pass(&mut self, targets: &RenderTargets) {
+        encoder_dispatch!(self, encoder => encoder.begin_pass(targets))
     }
 
     /// Open a render pass over `target`, loading what it holds.

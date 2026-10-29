@@ -250,6 +250,51 @@ pub struct DepthRect {
     pub extent: [u32; 2],
 }
 
+/// What a render pass does with an attachment's contents on the way in.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LoadOp {
+    /// Keep what an earlier pass left there.
+    Load,
+    Clear,
+    /// Every texel is about to be written, or nothing will read the rest.
+    DontCare,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoreOp {
+    Store,
+    /// Nothing reads it after the pass, so a tiled GPU need never write it out.
+    DontCare,
+}
+
+/// One colour attachment of a render pass.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ColorAttachment {
+    pub target: TextureViewId,
+    pub load: LoadOp,
+    pub store: StoreOp,
+    pub clear: [f32; 4],
+    /// A single-sample texture the samples are resolved into at the end.
+    pub resolve: Option<TextureViewId>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct DepthAttachment {
+    pub target: TextureViewId,
+    pub load: LoadOp,
+    pub store: StoreOp,
+    pub clear: f32,
+    /// Tested against and never written: a depth another pass wrote, borrowed.
+    pub read_only: bool,
+}
+
+/// What a graphics pass renders into, stated once for every driver.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct RenderTargets {
+    pub colors: Vec<ColorAttachment>,
+    pub depth: Option<DepthAttachment>,
+}
+
 /// Something a device may or may not be able to do, asked before a pass
 /// commits to a path that needs it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

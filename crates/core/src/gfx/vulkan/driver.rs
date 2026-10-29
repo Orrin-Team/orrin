@@ -61,8 +61,9 @@ use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, BufferId,
     ComputePipelineDesc, CullMode, DepthCompare, DepthRect, Encoder, Feature, GraphicsPipelineDesc,
-    MeshSpan, PipelineId, Pool, SamplerDesc, SamplerId, TextureDesc, TextureDimension,
-    TextureSwizzle, TextureViewId, Topology, VertexFormat, VertexStream, Viewport,
+    LoadOp, MeshSpan, PipelineId, Pool, RenderTargets, SamplerDesc, SamplerId, StoreOp,
+    TextureDesc, TextureDimension, TextureSwizzle, TextureViewId, Topology, VertexFormat,
+    VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -1368,6 +1369,57 @@ impl<'a> VkEncoder<'a> {
             .image()
             .clone();
         self.recorder.image_barrier(color_to_present(image));
+    }
+
+    pub fn begin_pass(&mut self, targets: &RenderTargets) {
+        use vulkano::command_buffer::{
+            RenderingAttachmentInfo, RenderingAttachmentResolveInfo, RenderingInfo,
+        };
+        use vulkano::render_pass::{AttachmentLoadOp, AttachmentStoreOp};
+        let load = |op: LoadOp| match op {
+            LoadOp::Load => AttachmentLoadOp::Load,
+            LoadOp::Clear => AttachmentLoadOp::Clear,
+            LoadOp::DontCare => AttachmentLoadOp::DontCare,
+        };
+        let store = |op: StoreOp| match op {
+            StoreOp::Store => AttachmentStoreOp::Store,
+            StoreOp::DontCare => AttachmentStoreOp::DontCare,
+        };
+        let view = |id| lookup(&self.driver.views, id, "texture view");
+        let colors = targets
+            .colors
+            .iter()
+            .map(|color| {
+                Some(RenderingAttachmentInfo {
+                    load_op: load(color.load),
+                    store_op: store(color.store),
+                    clear_value: (color.load == LoadOp::Clear).then(|| color.clear.into()),
+                    resolve_info: color
+                        .resolve
+                        .map(|resolve| RenderingAttachmentResolveInfo::image_view(view(resolve.0))),
+                    ..RenderingAttachmentInfo::image_view(view(color.target.0))
+                })
+            })
+            .collect();
+        let depth = targets.depth.map(|depth| RenderingAttachmentInfo {
+            // `DepthStencilReadOnlyOptimal` is the layout the barrier plan says a
+            // borrowed depth is in, so stating it keeps this attachment from
+            // transitioning an image nobody wrote.
+            image_layout: if depth.read_only {
+                vulkano::image::ImageLayout::DepthStencilReadOnlyOptimal
+            } else {
+                vulkano::image::ImageLayout::DepthStencilAttachmentOptimal
+            },
+            load_op: load(depth.load),
+            store_op: store(depth.store),
+            clear_value: (depth.load == LoadOp::Clear).then(|| depth.clear.into()),
+            ..RenderingAttachmentInfo::image_view(view(depth.target.0))
+        });
+        self.recorder.begin_rendering(RenderingInfo {
+            color_attachments: colors,
+            depth_attachment: depth,
+            ..Default::default()
+        });
     }
 
     pub fn begin_rendering_fresh(&mut self, target: TextureViewId) {

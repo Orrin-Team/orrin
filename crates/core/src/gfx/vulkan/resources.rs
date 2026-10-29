@@ -102,6 +102,10 @@ struct Views {
     /// The same views as the device knows them, which is what a pass binds.
     whole_id: TextureViewId,
     level_ids: Vec<TextureViewId>,
+    /// One single-layer view per layer of an array image, which is what a
+    /// framebuffer attachment takes while the whole array is what a shader
+    /// samples.
+    layer_ids: Vec<TextureViewId>,
 }
 
 /// Graph-owned images, indexed by [`ResourceId`].
@@ -217,7 +221,7 @@ impl GraphImages {
         if self.extent != extent {
             for views in self.cache.values() {
                 driver.destroy_texture(views.whole_id);
-                for &level in &views.level_ids {
+                for &level in views.level_ids.iter().chain(&views.layer_ids) {
                     driver.destroy_texture(level);
                 }
             }
@@ -369,7 +373,11 @@ impl GraphImages {
                 } else {
                     Vec::new()
                 };
+                let layer_ids = (0..image.desc.array_layers.unwrap_or(0))
+                    .map(|layer| driver.adopt_view(layer_view(&allocated, layer)))
+                    .collect();
                 let entry = Views {
+                    layer_ids,
                     whole_id: driver.adopt_view(view.clone()),
                     level_ids: levels
                         .iter()
@@ -445,19 +453,8 @@ impl GraphImages {
     /// A framebuffer attachment has to be one layer, while the same image is
     /// sampled as a whole array — so the cascades need both kinds of view over
     /// the same allocation.
-    pub fn layer_view(&self, id: ResourceId, layer: u32) -> Arc<ImageView> {
-        let image = self.view(id).image().clone();
-
-        let info = ImageViewCreateInfo {
-            view_type: ImageViewType::Dim2d,
-            subresource_range: ImageSubresourceRange {
-                array_layers: layer..layer + 1,
-                ..image.subresource_range()
-            },
-            ..ImageViewCreateInfo::from_image(&image)
-        };
-
-        ImageView::new(image, info).unwrap()
+    pub fn layer_texture(&self, id: ResourceId, layer: u32) -> TextureViewId {
+        self.views_of(id).layer_ids[layer as usize]
     }
 
     /// How many levels the allocated image actually has, which is what a pass
@@ -466,6 +463,22 @@ impl GraphImages {
     pub fn mip_levels(&self, id: ResourceId) -> u32 {
         self.view(id).image().mip_levels()
     }
+}
+
+/// One layer of an array image, as a plain 2D view.
+fn layer_view(image: &Arc<Image>, layer: u32) -> Arc<ImageView> {
+    ImageView::new(
+        image.clone(),
+        ImageViewCreateInfo {
+            view_type: ImageViewType::Dim2d,
+            subresource_range: ImageSubresourceRange {
+                array_layers: layer..layer + 1,
+                ..image.subresource_range()
+            },
+            ..ImageViewCreateInfo::from_image(image)
+        },
+    )
+    .unwrap()
 }
 
 /// Create an image on the block its alias group shares, allocating the block if
