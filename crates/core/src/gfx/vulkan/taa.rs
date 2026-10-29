@@ -365,51 +365,6 @@ mod tests {
         });
         device.fill_depth(depth, 1.0);
 
-        {
-            let mut words = [0u32; 36];
-            words[35] = 1.0f32.to_bits();
-            let own = device.create_texture(&TextureDesc {
-                format: Format::Rgba16Float,
-                dimension: TextureDimension::D2,
-                extent: [8, 8, 1],
-                mip_levels: 1,
-                array_layers: 1,
-                samples: SampleCount::Sample1,
-                usage: ImageUsage::SAMPLED | ImageUsage::STORAGE,
-                memoryless: false,
-            });
-            let uniforms = device.upload_uniform(&words);
-            let set = device.create_transient_bind_group(
-                pass.pipeline,
-                0,
-                &[
-                    Binding {
-                        binding: 0,
-                        resource: BindingResource::SampledTexture {
-                            view: color,
-                            sampler: pass.nearest_clamp,
-                        },
-                    },
-                    Binding {
-                        binding: 4,
-                        resource: BindingResource::StorageTexture(own),
-                    },
-                    Binding {
-                        binding: 5,
-                        resource: BindingResource::UniformBuffer(uniforms),
-                    },
-                ],
-            );
-            device.record_blocking(|encoder| {
-                encoder.bind_pipeline(pass.pipeline);
-                encoder.bind_group(0, set);
-                encoder.dispatch([1, 1, 1]);
-            });
-            let Device::Metal(driver) = &device else {
-                unreachable!()
-            };
-            eprintln!("minimal set wrote: {:?}", &driver.read_texture(own)[..8]);
-        }
         device.record_blocking(|encoder| {
             pass.record(&device, encoder, &view, color, velocity, depth);
         });

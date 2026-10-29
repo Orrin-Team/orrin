@@ -10,8 +10,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
     MTLCommandQueue, MTLComputeCommandEncoder, MTLIndexType, MTLLoadAction, MTLOrigin,
-    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderStages, MTLResource, MTLScissorRect,
-    MTLSize, MTLStoreAction, MTLTexture as _, MTLViewport, MTLWinding,
+    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderStages, MTLScissorRect, MTLSize,
+    MTLStoreAction, MTLViewport, MTLWinding,
 };
 
 use super::pipeline::Pipe;
@@ -20,7 +20,7 @@ use crate::gfx::rhi::{
     BindGroupId, BufferCopy, BufferId, DepthRect, LoadOp, PipelineId, RenderTargets, StoreOp,
     TextureViewId, Viewport,
 };
-use crate::gfx::shaders::PUSH_CONSTANT_BUFFER;
+use crate::gfx::shaders::{PUSH_CONSTANT_BUFFER, Stage};
 
 /// Which way a front face winds, in the window space Metal rasterises in. The
 /// translator flips clip-space Y so the image lands upright, which leaves
@@ -71,7 +71,6 @@ impl State {
         self.command_buffer.waitUntilCompleted();
         // A GPU fault does not fail the call that caused it: the buffer simply
         // never ran, and every pixel after it is silently wrong.
-        eprintln!("command buffer status {:?}", self.command_buffer.status());
         if let Some(error) = self.command_buffer.error() {
             tracing::error!("a Metal command buffer failed: {error}");
             eprintln!("a Metal command buffer failed: {error}");
@@ -148,34 +147,6 @@ impl<'a> MtlEncoder<'a> {
             .expect("failed to open a render encoder");
         self.state.open = Open::Render(encoder);
         self.state.pipeline = None;
-    }
-
-    /// Debugging: wait for everything so far and print the mean of a texture.
-    pub fn debug_mean(&mut self, texture: TextureViewId, label: &str) {
-        self.state.close();
-        let old = std::mem::replace(
-            &mut self.state.command_buffer,
-            self.driver.queue_command_buffer(),
-        );
-        old.commit();
-        old.waitUntilCompleted();
-        let tex = self.driver.texture(texture);
-        if tex.storageMode() != objc2_metal::MTLStorageMode::Private {
-            return;
-        }
-        let bytes = self.driver.read_texture(texture);
-        let texel = bytes.len() / (tex.width() * tex.height());
-        let mut sum = [0u64; 4];
-        for chunk in bytes.chunks(texel) {
-            for (i, b) in chunk.iter().take(4).enumerate() {
-                sum[i] += u64::from(*b);
-            }
-        }
-        let n = (tex.width() * tex.height()) as u64;
-        eprintln!(
-            "{label}: texel bytes {texel}, mean bytes {:?}",
-            sum.map(|s| s / n)
-        );
     }
 
     pub fn begin_pass(&mut self, targets: &RenderTargets) {
@@ -346,40 +317,53 @@ impl<'a> MtlEncoder<'a> {
     }
 
     pub fn bind_group(&mut self, set: u32, group: BindGroupId) {
-        let (buffer, offset, uses) = self.driver.group(group);
-        match &self.state.open {
-            Open::Render(encoder) => {
+        for (stage, buffer, offset, uses) in self.driver.group(group) {
+            match (&self.state.open, stage) {
                 // SAFETY: a live argument buffer at the index its set names.
-                unsafe {
-                    encoder.setVertexBuffer_offset_atIndex(
-                        Some(&buffer),
-                        offset as usize,
-                        set as usize,
-                    );
-                    encoder.setFragmentBuffer_offset_atIndex(
-                        Some(&buffer),
-                        offset as usize,
-                        set as usize,
-                    );
+                (Open::Render(encoder), Stage::Vertex) => {
+                    unsafe {
+                        encoder.setVertexBuffer_offset_atIndex(
+                            Some(&buffer),
+                            offset as usize,
+                            set as usize,
+                        );
+                    }
+                    for (resource, usage) in &uses {
+                        encoder.useResource_usage_stages(resource, *usage, MTLRenderStages::Vertex);
+                    }
                 }
-                for (resource, usage) in &uses {
-                    encoder.useResource_usage_stages(
-                        resource,
-                        *usage,
-                        MTLRenderStages::Vertex | MTLRenderStages::Fragment,
-                    );
-                }
-            }
-            Open::Compute(encoder) => {
                 // SAFETY: as above.
-                unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&buffer), offset as usize, set as usize);
+                (Open::Render(encoder), Stage::Fragment) => {
+                    unsafe {
+                        encoder.setFragmentBuffer_offset_atIndex(
+                            Some(&buffer),
+                            offset as usize,
+                            set as usize,
+                        );
+                    }
+                    for (resource, usage) in &uses {
+                        encoder.useResource_usage_stages(
+                            resource,
+                            *usage,
+                            MTLRenderStages::Fragment,
+                        );
+                    }
                 }
-                for (resource, usage) in &uses {
-                    encoder.useResource_usage(resource, *usage);
+                // SAFETY: as above.
+                (Open::Compute(encoder), Stage::Compute) => {
+                    unsafe {
+                        encoder.setBuffer_offset_atIndex(
+                            Some(&buffer),
+                            offset as usize,
+                            set as usize,
+                        );
+                    }
+                    for (resource, usage) in &uses {
+                        encoder.useResource_usage(resource, *usage);
+                    }
                 }
+                _ => panic!("a bind group was bound outside the pass its stages belong to"),
             }
-            _ => panic!("a bind group was bound outside a pass"),
         }
     }
 

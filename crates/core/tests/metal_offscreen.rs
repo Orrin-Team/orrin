@@ -15,13 +15,19 @@
 
 use std::path::PathBuf;
 
-use orrin_core::capture::{CaptureSettings, scene_pixels, scene_pixels_metal};
+use orrin_core::capture::{scene_pixels, scene_pixels_metal};
+
+mod common;
 
 fn output_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/capture-metal");
     std::fs::create_dir_all(&dir).expect("failed to create the capture directory");
     dir
 }
+
+/// The least PSNR a capture may have against Vulkan. The plan proposes 40 dB as
+/// a start; this is what it is held to until the first full table is read.
+const THRESHOLD_DB: f64 = 30.0;
 
 struct Difference {
     psnr: f64,
@@ -82,7 +88,7 @@ fn metal_renders_the_built_in_scenes_like_vulkan_does() {
     let mut failures = Vec::new();
 
     println!("{:<22} {:>8} {:>6}", "capture", "PSNR dB", "max");
-    for (name, settings) in [("scene", CaptureSettings::default())] {
+    for (name, settings) in common::captures() {
         let (reference, extent) = scene_pixels(&settings);
         let (metal, metal_extent) = scene_pixels_metal(&settings);
         assert_eq!(extent, metal_extent);
@@ -91,7 +97,7 @@ fn metal_renders_the_built_in_scenes_like_vulkan_does() {
         assert_a_picture(name, &metal);
         let difference = compare(&reference, &metal);
         println!("{name:<22} {:>8.2} {:>6}", difference.psnr, difference.max);
-        if difference.psnr < 30.0 {
+        if difference.psnr < THRESHOLD_DB {
             failures.push(format!("{name}: {:.2} dB", difference.psnr));
         }
     }

@@ -415,16 +415,6 @@ impl GraphImages {
             .map(|views| views.whole.clone())
     }
 
-    pub fn view(&self, id: ResourceId) -> Arc<ImageView> {
-        self.views_of(id).whole.clone()
-    }
-
-    fn views_of(&self, id: ResourceId) -> &Views {
-        self.views[self.slot][id.index()]
-            .as_ref()
-            .expect("render graph resource is not a graph-owned image")
-    }
-
     /// The images as the device names them, for everything that records a pass.
     pub fn table(&self) -> ImageTable {
         ImageTable::new(

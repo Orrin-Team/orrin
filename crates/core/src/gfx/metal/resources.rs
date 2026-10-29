@@ -589,13 +589,6 @@ impl MtlDriver {
         self.texture(view).storageMode() == MTLStorageMode::Memoryless
     }
 
-    pub(super) fn queue_command_buffer(
-        &self,
-    ) -> Retained<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>> {
-        use objc2_metal::MTLCommandQueue;
-        self.queue.commandBuffer().expect("no command buffer")
-    }
-
     pub(super) fn texture(&self, view: TextureViewId) -> Retained<ProtocolObject<dyn MTLTexture>> {
         self.textures
             .lock()
@@ -685,6 +678,36 @@ impl Arena {
     }
 }
 
+/// Write one level of a texture from tightly packed bytes.
+fn write_level(
+    texture: &Retained<ProtocolObject<dyn MTLTexture>>,
+    level: usize,
+    size: [u32; 2],
+    bytes: &[u8],
+    row: usize,
+) {
+    let region = MTLRegion {
+        origin: MTLOrigin { x: 0, y: 0, z: 0 },
+        size: MTLSize {
+            width: size[0] as usize,
+            height: size[1] as usize,
+            depth: 1,
+        },
+    };
+    // SAFETY: `bytes` covers the level at `row` bytes a row, and Metal copies it
+    // before returning.
+    unsafe {
+        texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
+            region,
+            level,
+            0,
+            NonNull::new(bytes.as_ptr() as *mut c_void).expect("a slice is never null"),
+            row,
+            0,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,35 +782,5 @@ mod tests {
         let driver = driver();
         let id = driver.create_texture_2d(&[1, 2, 3, 4, 5, 6, 7, 8], [2, 1], Format::Rgba8Unorm);
         assert_eq!(driver.view_extent(id), [2, 1]);
-    }
-}
-
-/// Write one level of a texture from tightly packed bytes.
-fn write_level(
-    texture: &Retained<ProtocolObject<dyn MTLTexture>>,
-    level: usize,
-    size: [u32; 2],
-    bytes: &[u8],
-    row: usize,
-) {
-    let region = MTLRegion {
-        origin: MTLOrigin { x: 0, y: 0, z: 0 },
-        size: MTLSize {
-            width: size[0] as usize,
-            height: size[1] as usize,
-            depth: 1,
-        },
-    };
-    // SAFETY: `bytes` covers the level at `row` bytes a row, and Metal copies it
-    // before returning.
-    unsafe {
-        texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
-            region,
-            level,
-            0,
-            NonNull::new(bytes.as_ptr() as *mut c_void).expect("a slice is never null"),
-            row,
-            0,
-        );
     }
 }

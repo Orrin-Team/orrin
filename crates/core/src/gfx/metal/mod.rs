@@ -23,8 +23,7 @@ use objc2_metal::{
     MTLGPUFamily, MTLSamplerState, MTLTexture,
 };
 
-use crate::gfx::format::Format;
-use crate::gfx::rhi::{Encoder, Pool, TextureViewId};
+use crate::gfx::rhi::{Encoder, Pool};
 
 pub(crate) use encoder::State;
 use resources::Arena;

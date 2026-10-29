@@ -2876,27 +2876,7 @@ impl FrameRecord<'_> {
                 // Escape-hatch passes own their submission; there is no overlay
                 // to draw over an offscreen capture.
                 PassKind::Raw => {}
-                PassKind::Compute => {
-                    self.record_compute(encoder, body);
-                    if std::env::var("ORRIN_METAL_DUMP").is_ok()
-                        && matches!(
-                            body,
-                            PassBody::TaaResolve
-                                | PassBody::BloomUpsample(0)
-                                | PassBody::LuminanceAverage
-                        )
-                    {
-                        if let Encoder::Metal(mtl) = encoder {
-                            let target = match body {
-                                PassBody::TaaResolve => {
-                                    self.texture_of(self.frame.ids.taa.unwrap().output)
-                                }
-                                _ => self.scene_color,
-                            };
-                            mtl.debug_mean(target, &format!("after {body:?}"));
-                        }
-                    }
-                }
+                PassKind::Compute => self.record_compute(encoder, body),
                 _ => {
                     let targets = rendering::rendering_info(
                         &self.frame.ids,
@@ -2906,23 +2886,9 @@ impl FrameRecord<'_> {
                         self.env.background,
                     )
                     .expect("the executor reached a graphics pass with nothing to render into");
-                    if matches!(body, PassBody::Tonemap)
-                        && std::env::var("ORRIN_METAL_DUMP").is_ok()
-                    {
-                        if let Encoder::Metal(mtl) = encoder {
-                            mtl.debug_mean(self.scene_color, "scene_color before tonemap");
-                        }
-                    }
                     encoder.begin_pass(&targets);
                     self.record_graphics(encoder, body);
                     encoder.end_rendering();
-                    if std::env::var("ORRIN_METAL_DUMP").is_ok() {
-                        if let Some(first) = targets.colors.first() {
-                            if let Encoder::Metal(mtl) = encoder {
-                                mtl.debug_mean(first.target, &format!("{body:?}"));
-                            }
-                        }
-                    }
                 }
             }
         }
