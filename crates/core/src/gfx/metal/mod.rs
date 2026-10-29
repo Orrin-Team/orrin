@@ -5,28 +5,114 @@
 //! MSL, then the encoder. A method that is still `unimplemented!` names itself
 //! in the panic, so a pass that reaches one says which operation it needs next.
 
+mod convert;
+mod resources;
+
 use std::marker::PhantomData;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandQueue, MTLDevice};
+use objc2_metal::{
+    MTLArgumentBuffersTier, MTLBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLGPUFamily, MTLSamplerState, MTLTexture,
+};
 
 use crate::geom::Aabb;
 use crate::gfx::Vertex;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BlockKind, BufferCopy, BufferDesc, BufferId, ComputePipelineDesc,
-    DepthRect, Encoder, Feature, GraphicsPipelineDesc, MeshSpan, PipelineId, SamplerDesc,
-    SamplerId, TextureDesc, TextureSwizzle, TextureViewId, Viewport,
+    BindGroupId, Binding, BufferCopy, BufferId, ComputePipelineDesc, DepthRect, Encoder,
+    GraphicsPipelineDesc, MeshSpan, PipelineId, Pool, SamplerId, TextureViewId, Viewport,
 };
+
+use resources::Arena;
+
+/// Frames the CPU may record ahead of the GPU, which is how many sets of
+/// per-frame arenas there are and how late a retired id may be freed.
+pub(crate) const FRAME_SLOTS: u64 = 2;
+
+/// A Metal object, held across threads.
+///
+/// SAFETY: Metal documents devices, queues, buffers, textures and sampler
+/// states as safe to use from any thread; only command encoders are not, and an
+/// encoder is never wrapped in this.
+pub(crate) struct Shared<T>(pub(crate) T);
+unsafe impl<T> Send for Shared<T> {}
+unsafe impl<T> Sync for Shared<T> {}
+
+/// A buffer id's target: a whole buffer, or a range of an arena page.
+pub(crate) struct Buf {
+    pub(crate) buffer: Shared<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+}
 
 pub struct MtlDriver {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    frame: AtomicU64,
+    textures: Mutex<Pool<Shared<Retained<ProtocolObject<dyn MTLTexture>>>>>,
+    buffers: Mutex<Pool<Buf>>,
+    samplers: Mutex<Pool<Shared<Retained<ProtocolObject<dyn MTLSamplerState>>>>>,
+    /// Per-frame data, one arena per kind per frame slot: vertices, uniforms,
+    /// storage, indices, staging.
+    arenas: Mutex<[[Arena; FRAME_SLOTS as usize]; 5]>,
 }
 
 pub struct MtlEncoder<'a> {
     _driver: PhantomData<&'a MtlDriver>,
+}
+
+impl MtlDriver {
+    /// The system's Metal device, or why this machine cannot be the Metal
+    /// backend: it needs Apple GPU family 7 (M1 and later) and tier 2 argument
+    /// buffers, and anything less runs Vulkan through MoltenVK instead.
+    pub fn new() -> Result<Self, String> {
+        let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
+        if !device.supportsFamily(MTLGPUFamily::Apple7) {
+            return Err(format!(
+                "{} is not Apple GPU family 7 or later",
+                device.name()
+            ));
+        }
+        if device.argumentBuffersSupport() != MTLArgumentBuffersTier::Tier2 {
+            return Err(format!("{} lacks tier 2 argument buffers", device.name()));
+        }
+        let queue = device
+            .newCommandQueue()
+            .ok_or("the device gave no command queue")?;
+        Ok(Self {
+            device,
+            queue,
+            frame: AtomicU64::new(0),
+            textures: Mutex::new(Pool::new(FRAME_SLOTS)),
+            buffers: Mutex::new(Pool::new(FRAME_SLOTS)),
+            samplers: Mutex::new(Pool::new(FRAME_SLOTS)),
+            arenas: Mutex::new(std::array::from_fn(|_| {
+                std::array::from_fn(|_| Arena::new())
+            })),
+        })
+    }
+
+    /// The device's name, for the run banner.
+    pub fn name(&self) -> String {
+        self.device.name().to_string()
+    }
+
+    /// Frees whatever `frame - FRAME_SLOTS` retired and reuses the arenas that
+    /// frame wrote.
+    pub fn begin_frame(&self, frame: u64) {
+        self.frame.store(frame, Ordering::Relaxed);
+        self.textures.lock().unwrap().collect(frame);
+        self.buffers.lock().unwrap().collect(frame);
+        self.samplers.lock().unwrap().collect(frame);
+        let slot = (frame % FRAME_SLOTS) as usize;
+        for kind in self.arenas.lock().unwrap().iter_mut() {
+            kind[slot].reset();
+        }
+    }
 }
 
 #[allow(
@@ -34,16 +120,8 @@ pub struct MtlEncoder<'a> {
     reason = "operations land one at a time; a stub names itself in its panic"
 )]
 impl MtlDriver {
-    pub fn begin_frame(&self, frame: u64) {
-        unimplemented!("metal: begin_frame")
-    }
-
     pub fn upload_mesh(&self, vertices: &[Vertex], indices: &[u32]) -> (MeshSpan, Aabb) {
         unimplemented!("metal: upload_mesh")
-    }
-
-    pub fn create_sampler(&self, desc: SamplerDesc) -> SamplerId {
-        unimplemented!("metal: create_sampler")
     }
 
     pub fn create_graphics_pipeline(&self, desc: &GraphicsPipelineDesc) -> PipelineId {
@@ -85,48 +163,12 @@ impl MtlDriver {
         unimplemented!("metal: destroy_bind_group")
     }
 
-    pub fn destroy_buffer(&self, buffer: BufferId) {
-        unimplemented!("metal: destroy_buffer")
-    }
-
-    pub fn create_buffer(&self, desc: BufferDesc) -> BufferId {
-        unimplemented!("metal: create_buffer")
-    }
-
-    pub fn create_buffer_bytes(&self, desc: BufferDesc, bytes: &[u8]) -> BufferId {
-        unimplemented!("metal: create_buffer_bytes")
-    }
-
-    pub fn create_buffer_init(&self, desc: BufferDesc, initial: &[u32]) -> BufferId {
-        unimplemented!("metal: create_buffer_init")
-    }
-
-    pub fn create_texture(&self, desc: &TextureDesc) -> TextureViewId {
-        unimplemented!("metal: create_texture")
-    }
-
-    pub fn create_sampler_wrap_u(&self, desc: SamplerDesc) -> SamplerId {
-        unimplemented!("metal: create_sampler_wrap_u")
-    }
-
     pub fn create_texture_cube(&self, pixels: &[u8], face: u32, format: Format) -> TextureViewId {
         unimplemented!("metal: create_texture_cube")
     }
 
-    pub fn face_view(&self, texture: TextureViewId, face: u32, level: u32) -> TextureViewId {
-        unimplemented!("metal: face_view")
-    }
-
     pub fn record_blocking(&self, record: impl FnOnce(&mut Encoder)) {
         unimplemented!("metal: record_blocking")
-    }
-
-    pub fn mip_view(&self, texture: TextureViewId, level: u32) -> TextureViewId {
-        unimplemented!("metal: mip_view")
-    }
-
-    pub fn max_anisotropy(&self) -> Option<f32> {
-        unimplemented!("metal: max_anisotropy")
     }
 
     pub fn create_texture_mipped(
@@ -142,49 +184,8 @@ impl MtlDriver {
         unimplemented!("metal: create_texture_levels")
     }
 
-    pub fn supports(&self, feature: Feature) -> bool {
-        unimplemented!("metal: supports")
-    }
-
-    pub fn create_texture_swizzled(
-        &self,
-        desc: &TextureDesc,
-        swizzle: TextureSwizzle,
-    ) -> TextureViewId {
-        unimplemented!("metal: create_texture_swizzled")
-    }
-
-    pub fn destroy_texture(&self, view: TextureViewId) {
-        unimplemented!("metal: destroy_texture")
-    }
-
     pub fn fill_depth(&self, texture: TextureViewId, depth: f32) {
         unimplemented!("metal: fill_depth")
-    }
-
-    pub fn create_texture_2d(
-        &self,
-        pixels: &[u8],
-        extent: [u32; 2],
-        format: Format,
-    ) -> TextureViewId {
-        unimplemented!("metal: create_texture_2d")
-    }
-
-    pub fn upload_vertices(&self, bytes: &[u8]) -> BufferId {
-        unimplemented!("metal: upload_vertices")
-    }
-
-    pub fn upload_block(&self, kind: BlockKind, bytes: &[u8]) -> BufferId {
-        unimplemented!("metal: upload_block")
-    }
-
-    pub fn upload_uniform(&self, words: &[u32]) -> BufferId {
-        unimplemented!("metal: upload_uniform")
-    }
-
-    pub fn view_extent(&self, view: TextureViewId) -> [u32; 2] {
-        unimplemented!("metal: view_extent")
     }
 
     pub fn create_transient_bind_group(

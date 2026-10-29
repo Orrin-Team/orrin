@@ -1,0 +1,548 @@
+//! Buffers, textures and samplers: what the passes create and bind by id.
+//!
+//! Unified memory is the premise. On Apple silicon the CPU and GPU share one
+//! pool, so a buffer a pass writes every frame is a shared buffer written in
+//! place, and nothing needs a staging copy to reach the GPU. A buffer only the
+//! GPU touches (a dispatch's output) is private.
+
+use std::ffi::c_void;
+use std::ptr::NonNull;
+use std::sync::atomic::Ordering;
+
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSRange;
+use objc2_metal::{
+    MTLBuffer, MTLDevice, MTLOrigin, MTLRegion, MTLResourceOptions, MTLSamplerAddressMode,
+    MTLSamplerBorderColor, MTLSamplerDescriptor, MTLSize, MTLStorageMode, MTLTexture,
+    MTLTextureDescriptor, MTLTextureSwizzle, MTLTextureSwizzleChannels, MTLTextureType,
+};
+
+use super::convert::{may_be_memoryless, pixel_format, sampler_state, texture_usage};
+use super::{Buf, FRAME_SLOTS, MtlDriver};
+use crate::gfx::format::{Format, SampleCount};
+use crate::gfx::graph::ImageUsage;
+use crate::gfx::rhi::{
+    BlockKind, BufferDesc, BufferId, Feature, MemoryLocation, SamplerDesc, SamplerId, TextureDesc,
+    TextureDimension, TextureSwizzle, TextureViewId,
+};
+
+/// Every offset a buffer is bound at is a multiple of this, which is the
+/// strictest alignment Metal asks of one: a constant buffer's.
+const BIND_ALIGNMENT: u64 = 256;
+
+impl MtlDriver {
+    pub fn max_anisotropy(&self) -> Option<f32> {
+        Some(16.0)
+    }
+
+    pub fn supports(&self, feature: Feature) -> bool {
+        match feature {
+            // Every Apple GPU family 7 device blits and filters every format the
+            // engine renders to.
+            Feature::BackdropCapture(_) => true,
+            Feature::CoverageTexture => true,
+            Feature::BlockCompression => self.device.supportsBCTextureCompression(),
+        }
+    }
+
+    pub fn create_sampler(&self, desc: SamplerDesc) -> SamplerId {
+        self.build_sampler(&desc, MTLSamplerAddressMode::ClampToEdge, None)
+    }
+
+    pub fn create_sampler_wrap_u(&self, desc: SamplerDesc) -> SamplerId {
+        self.build_sampler(
+            &desc,
+            MTLSamplerAddressMode::ClampToEdge,
+            Some(MTLSamplerAddressMode::Repeat),
+        )
+    }
+
+    fn build_sampler(
+        &self,
+        desc: &SamplerDesc,
+        clamp: MTLSamplerAddressMode,
+        s_override: Option<MTLSamplerAddressMode>,
+    ) -> SamplerId {
+        let state = sampler_state(desc);
+        let sampler = MTLSamplerDescriptor::new();
+        sampler.setMinFilter(state.filter);
+        sampler.setMagFilter(state.filter);
+        sampler.setMipFilter(state.mip);
+        let address = if desc.repeat { state.address } else { clamp };
+        sampler.setSAddressMode(s_override.unwrap_or(address));
+        sampler.setTAddressMode(address);
+        sampler.setRAddressMode(address);
+        sampler.setMaxAnisotropy(state.anisotropy);
+        sampler.setLodMaxClamp(state.max_lod);
+        // Reached through an argument buffer, which only takes a sampler built
+        // for it.
+        sampler.setSupportArgumentBuffers(true);
+        if let Some(compare) = state.compare {
+            // `Less` against a depth map cleared to 1.0, and a white border so a
+            // fragment sampling outside a cascade reads as lit. A comparison
+            // sampler is an ordinary one here; Vulkan's immutable-sampler
+            // workaround has no counterpart.
+            sampler.setCompareFunction(compare);
+            sampler.setSAddressMode(MTLSamplerAddressMode::ClampToBorderColor);
+            sampler.setTAddressMode(MTLSamplerAddressMode::ClampToBorderColor);
+            sampler.setBorderColor(MTLSamplerBorderColor::OpaqueWhite);
+        }
+        let sampler = self
+            .device
+            .newSamplerStateWithDescriptor(&sampler)
+            .expect("failed to create a sampler");
+        SamplerId(self.samplers.lock().unwrap().insert(super::Shared(sampler)))
+    }
+
+    pub fn create_buffer(&self, desc: BufferDesc) -> BufferId {
+        let options = match desc.location {
+            MemoryLocation::GpuOnly => MTLResourceOptions::StorageModePrivate,
+            MemoryLocation::Upload | MemoryLocation::Readback => {
+                MTLResourceOptions::StorageModeShared
+            }
+        };
+        let buffer = self
+            .device
+            .newBufferWithLength_options(desc.size.max(1) as usize, options)
+            .expect("failed to allocate a buffer");
+        self.insert_buffer(buffer, 0, desc.size)
+    }
+
+    pub fn create_buffer_bytes(&self, desc: BufferDesc, bytes: &[u8]) -> BufferId {
+        assert_eq!(
+            desc.size,
+            bytes.len() as u64,
+            "a buffer's size is its initial bytes"
+        );
+        // SAFETY: `bytes` is a live slice, so the pointer is valid for its
+        // length, and Metal copies it before returning.
+        let buffer = unsafe {
+            self.device.newBufferWithBytes_length_options(
+                NonNull::new(bytes.as_ptr() as *mut c_void).expect("a slice is never null"),
+                bytes.len().max(1),
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+        .expect("failed to allocate a buffer");
+        self.insert_buffer(buffer, 0, desc.size)
+    }
+
+    pub fn create_buffer_init(&self, desc: BufferDesc, initial: &[u32]) -> BufferId {
+        assert_eq!(
+            desc.size,
+            initial.len() as u64 * 4,
+            "a buffer's size is its initial words"
+        );
+        self.create_buffer_bytes(desc, bytemuck::cast_slice(initial))
+    }
+
+    pub fn destroy_buffer(&self, buffer: BufferId) {
+        self.buffers
+            .lock()
+            .unwrap()
+            .remove(buffer.0, self.frame.load(Ordering::Relaxed));
+    }
+
+    pub(super) fn insert_buffer(
+        &self,
+        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+        offset: u64,
+        len: u64,
+    ) -> BufferId {
+        BufferId(self.buffers.lock().unwrap().insert(Buf {
+            buffer: super::Shared(buffer),
+            offset,
+            len,
+        }))
+    }
+
+    pub fn upload_vertices(&self, bytes: &[u8]) -> BufferId {
+        self.upload_frame(0, bytes)
+    }
+
+    pub fn upload_block(&self, kind: BlockKind, bytes: &[u8]) -> BufferId {
+        let arena = match kind {
+            BlockKind::Uniform => 1,
+            BlockKind::Storage => 2,
+            BlockKind::Index => 3,
+            BlockKind::Staging => 4,
+        };
+        self.upload_frame(arena, bytes)
+    }
+
+    pub fn upload_uniform(&self, words: &[u32]) -> BufferId {
+        self.upload_block(BlockKind::Uniform, bytemuck::cast_slice(words))
+    }
+
+    /// Write `bytes` into this frame's arena `arena` and name where they landed.
+    /// The id retires with the frame, and the arena's slot is reset when the
+    /// frame that used it has retired, so nothing here is ever freed one by one.
+    fn upload_frame(&self, arena: usize, bytes: &[u8]) -> BufferId {
+        let frame = self.frame.load(Ordering::Relaxed);
+        let slot = (frame % FRAME_SLOTS) as usize;
+        let (buffer, offset) = {
+            let mut arenas = self.arenas.lock().unwrap();
+            arenas[arena][slot].allocate(&self.device, bytes.len() as u64)
+        };
+        // SAFETY: the allocation is `bytes.len()` bytes of a shared buffer this
+        // frame's arena slot owns exclusively until it retires.
+        unsafe {
+            let base = buffer.contents().as_ptr().cast::<u8>().add(offset as usize);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), base, bytes.len());
+        }
+        let id = self.insert_buffer(buffer, offset, bytes.len() as u64);
+        self.buffers.lock().unwrap().remove(id.0, frame);
+        id
+    }
+
+    pub fn create_texture(&self, desc: &TextureDesc) -> TextureViewId {
+        self.create_texture_swizzled(desc, TextureSwizzle::Identity)
+    }
+
+    pub fn create_texture_swizzled(
+        &self,
+        desc: &TextureDesc,
+        swizzle: TextureSwizzle,
+    ) -> TextureViewId {
+        let texture = self.new_texture(desc);
+        let texture = match swizzle {
+            TextureSwizzle::Identity => texture,
+            TextureSwizzle::CoverageToWhite => {
+                let channels = MTLTextureSwizzleChannels {
+                    red: MTLTextureSwizzle::Red,
+                    green: MTLTextureSwizzle::Red,
+                    blue: MTLTextureSwizzle::Red,
+                    alpha: MTLTextureSwizzle::Green,
+                };
+                // SAFETY: the whole level and slice ranges of the texture just
+                // made, in a format the swizzle applies to.
+                unsafe {
+                    texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
+                        texture.pixelFormat(),
+                        texture.textureType(),
+                        NSRange::new(0, texture.mipmapLevelCount()),
+                        NSRange::new(0, texture.arrayLength().max(1)),
+                        channels,
+                    )
+                }
+                .expect("failed to create a swizzled view")
+            }
+        };
+        self.insert_texture(texture)
+    }
+
+    fn new_texture(&self, desc: &TextureDesc) -> Retained<ProtocolObject<dyn MTLTexture>> {
+        let descriptor = MTLTextureDescriptor::new();
+        descriptor.setTextureType(match (desc.dimension, desc.samples) {
+            (TextureDimension::D2, SampleCount::Sample1) => MTLTextureType::Type2D,
+            (TextureDimension::D2, _) => MTLTextureType::Type2DMultisample,
+            (TextureDimension::D2Array, _) => MTLTextureType::Type2DArray,
+            (TextureDimension::D3, _) => MTLTextureType::Type3D,
+            (TextureDimension::Cube, _) => MTLTextureType::TypeCube,
+        });
+        descriptor.setPixelFormat(pixel_format(desc.format));
+        // SAFETY: plain extents, counts and lengths of a description the graph
+        // already validated against the format.
+        unsafe {
+            descriptor.setWidth(desc.extent[0] as usize);
+            descriptor.setHeight(desc.extent[1] as usize);
+            descriptor.setDepth(desc.extent[2] as usize);
+            descriptor.setMipmapLevelCount(desc.mip_levels as usize);
+            if !matches!(desc.dimension, TextureDimension::Cube) {
+                descriptor.setArrayLength(match desc.dimension {
+                    TextureDimension::D2Array => desc.array_layers as usize,
+                    _ => 1,
+                });
+            }
+            descriptor.setSampleCount(match desc.samples {
+                SampleCount::Sample1 => 1,
+                SampleCount::Sample2 => 2,
+                SampleCount::Sample4 => 4,
+                SampleCount::Sample8 => 8,
+            });
+        }
+        descriptor.setUsage(texture_usage(desc.usage));
+        // Only what the graph's usage allows: a memoryless texture that is read
+        // back is undefined data (trap T9).
+        descriptor.setStorageMode(if desc.memoryless && may_be_memoryless(desc.usage) {
+            MTLStorageMode::Memoryless
+        } else {
+            MTLStorageMode::Private
+        });
+        self.device
+            .newTextureWithDescriptor(&descriptor)
+            .expect("failed to allocate a texture")
+    }
+
+    fn insert_texture(&self, texture: Retained<ProtocolObject<dyn MTLTexture>>) -> TextureViewId {
+        TextureViewId(self.textures.lock().unwrap().insert(super::Shared(texture)))
+    }
+
+    /// A persistent single-level 2D texture holding `pixels`, tightly packed.
+    pub fn create_texture_2d(
+        &self,
+        pixels: &[u8],
+        extent: [u32; 2],
+        format: Format,
+    ) -> TextureViewId {
+        let desc = TextureDesc {
+            format,
+            dimension: TextureDimension::D2,
+            extent: [extent[0], extent[1], 1],
+            mip_levels: 1,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::SAMPLED,
+            memoryless: false,
+        };
+        let descriptor = MTLTextureDescriptor::new();
+        descriptor.setTextureType(MTLTextureType::Type2D);
+        descriptor.setPixelFormat(pixel_format(format));
+        // SAFETY: as in `new_texture`.
+        unsafe {
+            descriptor.setWidth(extent[0] as usize);
+            descriptor.setHeight(extent[1] as usize);
+        }
+        descriptor.setUsage(texture_usage(desc.usage));
+        // Shared, so the pixels go in directly: this is a load-time upload of
+        // something small, and unified memory makes the copy the whole job.
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        let texture = self
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .expect("failed to allocate a texture");
+        let row = pixels.len() / extent[1].max(1) as usize;
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize {
+                width: extent[0] as usize,
+                height: extent[1] as usize,
+                depth: 1,
+            },
+        };
+        // SAFETY: `pixels` covers `extent` at `row` bytes a row, and Metal
+        // copies it before returning.
+        unsafe {
+            texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
+                region,
+                0,
+                0,
+                NonNull::new(pixels.as_ptr() as *mut c_void).expect("a slice is never null"),
+                row,
+                0,
+            );
+        }
+        self.insert_texture(texture)
+    }
+
+    pub fn destroy_texture(&self, view: TextureViewId) {
+        self.textures
+            .lock()
+            .unwrap()
+            .remove(view.0, self.frame.load(Ordering::Relaxed));
+    }
+
+    pub fn view_extent(&self, view: TextureViewId) -> [u32; 2] {
+        let texture = self.texture(view);
+        [texture.width() as u32, texture.height() as u32]
+    }
+
+    /// One mip level of `texture`, as a texture of its own.
+    pub fn mip_view(&self, texture: TextureViewId, level: u32) -> TextureViewId {
+        let parent = self.texture(texture);
+        // SAFETY: `level` names a level the parent has, which the callers take
+        // from the same description the parent was made with.
+        let view = unsafe {
+            parent.newTextureViewWithPixelFormat_textureType_levels_slices(
+                parent.pixelFormat(),
+                parent.textureType(),
+                NSRange::new(level as usize, 1),
+                NSRange::new(0, parent.arrayLength().max(1)),
+            )
+        }
+        .expect("failed to create a mip view");
+        self.insert_texture(view)
+    }
+
+    /// One face of one level of a cube or array texture, as a 2D texture.
+    pub fn face_view(&self, texture: TextureViewId, face: u32, level: u32) -> TextureViewId {
+        let parent = self.texture(texture);
+        // SAFETY: as in `mip_view`, with `face` a slice the parent has.
+        let view = unsafe {
+            parent.newTextureViewWithPixelFormat_textureType_levels_slices(
+                parent.pixelFormat(),
+                MTLTextureType::Type2D,
+                NSRange::new(level as usize, 1),
+                NSRange::new(face as usize, 1),
+            )
+        }
+        .expect("failed to create a face view");
+        self.insert_texture(view)
+    }
+
+    pub(super) fn texture(&self, view: TextureViewId) -> Retained<ProtocolObject<dyn MTLTexture>> {
+        self.textures
+            .lock()
+            .unwrap()
+            .get(view.0)
+            .unwrap_or_else(|| panic!("texture {} is not live", view.0))
+            .0
+            .clone()
+    }
+
+    pub(super) fn buffer(&self, buffer: BufferId) -> Buf {
+        let pool = self.buffers.lock().unwrap();
+        let found = pool
+            .get(buffer.0)
+            .unwrap_or_else(|| panic!("buffer {} is not live", buffer.0));
+        Buf {
+            buffer: super::Shared(found.buffer.0.clone()),
+            offset: found.offset,
+            len: found.len,
+        }
+    }
+
+    pub(super) fn sampler(
+        &self,
+        sampler: SamplerId,
+    ) -> Retained<ProtocolObject<dyn objc2_metal::MTLSamplerState>> {
+        self.samplers
+            .lock()
+            .unwrap()
+            .get(sampler.0)
+            .unwrap_or_else(|| panic!("sampler {} is not live", sampler.0))
+            .0
+            .clone()
+    }
+}
+
+/// One frame slot's bump allocator over shared buffer pages.
+///
+/// Pages are kept for the life of the driver and the cursor is reset, so a
+/// steady scene allocates nothing after its first few frames; a frame that
+/// outgrows its pages adds one, sized to fit.
+pub(super) struct Arena {
+    pages: Vec<super::Shared<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    page: usize,
+    cursor: u64,
+}
+
+const PAGE_BYTES: u64 = 4 << 20;
+
+impl Arena {
+    pub(super) fn new() -> Self {
+        Self {
+            pages: Vec::new(),
+            page: 0,
+            cursor: 0,
+        }
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.page = 0;
+        self.cursor = 0;
+    }
+
+    fn allocate(
+        &mut self,
+        device: &Retained<ProtocolObject<dyn MTLDevice>>,
+        len: u64,
+    ) -> (Retained<ProtocolObject<dyn MTLBuffer>>, u64) {
+        let len = len.max(1);
+        loop {
+            if let Some(page) = self.pages.get(self.page) {
+                let start = self.cursor.next_multiple_of(BIND_ALIGNMENT);
+                if start + len <= page.0.length() as u64 {
+                    self.cursor = start + len;
+                    return (page.0.clone(), start);
+                }
+                self.page += 1;
+                self.cursor = 0;
+                continue;
+            }
+            let size = PAGE_BYTES.max(len.next_multiple_of(BIND_ALIGNMENT));
+            let page = device
+                .newBufferWithLength_options(size as usize, MTLResourceOptions::StorageModeShared)
+                .expect("failed to allocate an arena page");
+            self.pages.push(super::Shared(page));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn driver() -> MtlDriver {
+        MtlDriver::new().expect("this machine runs the Metal backend")
+    }
+
+    fn read(driver: &MtlDriver, id: BufferId, len: usize) -> Vec<u8> {
+        let buf = driver.buffer(id);
+        // SAFETY: a shared buffer of at least `len` bytes past `offset`.
+        unsafe {
+            let base = buf.buffer.0.contents().as_ptr().cast::<u8>();
+            std::slice::from_raw_parts(base.add(buf.offset as usize), len).to_vec()
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_per_frame_block_holds_what_was_written_at_an_aligned_offset() {
+        let driver = driver();
+        driver.begin_frame(0);
+        let first = driver.upload_block(BlockKind::Uniform, &[1, 2, 3, 4, 5]);
+        let second = driver.upload_block(BlockKind::Uniform, &[9; 300]);
+        assert_eq!(read(&driver, first, 5), [1, 2, 3, 4, 5]);
+        assert_eq!(read(&driver, second, 300), vec![9; 300]);
+        for id in [first, second] {
+            assert_eq!(driver.buffer(id).offset % BIND_ALIGNMENT, 0);
+        }
+        assert_ne!(driver.buffer(first).offset, driver.buffer(second).offset);
+    }
+
+    /// The arena slot a frame used is reused two frames on, not before: an id
+    /// from frame 0 still reads what it was given in frame 1.
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_frames_block_survives_the_next_frame_and_is_reused_after() {
+        let driver = driver();
+        driver.begin_frame(0);
+        let kept = driver.upload_block(BlockKind::Storage, &[7; 16]);
+        let offset = driver.buffer(kept).offset;
+        driver.begin_frame(1);
+        driver.upload_block(BlockKind::Storage, &[8; 16]);
+        assert_eq!(read(&driver, kept, 16), vec![7; 16]);
+        driver.begin_frame(2);
+        let reused = driver.upload_block(BlockKind::Storage, &[6; 16]);
+        assert_eq!(driver.buffer(reused).offset, offset);
+    }
+
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_texture_reports_its_extent_and_a_mip_view_its_level() {
+        let driver = driver();
+        let id = driver.create_texture(&TextureDesc {
+            format: Format::Rgba16Float,
+            dimension: TextureDimension::D2,
+            extent: [64, 32, 1],
+            mip_levels: 4,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::SAMPLED | ImageUsage::STORAGE,
+            memoryless: false,
+        });
+        assert_eq!(driver.view_extent(id), [64, 32]);
+        let level = driver.mip_view(id, 2);
+        assert_eq!(driver.view_extent(level), [16, 8]);
+    }
+
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_two_pixel_texture_uploads_through_shared_storage() {
+        let driver = driver();
+        let id = driver.create_texture_2d(&[1, 2, 3, 4, 5, 6, 7, 8], [2, 1], Format::Rgba8Unorm);
+        assert_eq!(driver.view_extent(id), [2, 1]);
+    }
+}
