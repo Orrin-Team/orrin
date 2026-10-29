@@ -2258,7 +2258,10 @@ impl VulkanRenderer {
                 .map_or(&[], |frame| frame.outline.as_slice()),
         };
 
-        #[cfg_attr(not(target_os = "macos"), allow(clippy::infallible_destructuring_match))]
+        #[cfg_attr(
+            not(target_os = "macos"),
+            allow(clippy::infallible_destructuring_match)
+        )]
         let mut builder = match commands {
             Commands::Vulkan(builder) => builder,
             #[cfg(target_os = "macos")]
