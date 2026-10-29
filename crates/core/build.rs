@@ -110,6 +110,10 @@ struct Resource {
     binding: u32,
     kind: &'static str,
     count: u32,
+    /// Where the resource sits in its set's argument buffer, as the `[[id]]` the
+    /// translated shader declares. A combined image sampler takes `count`
+    /// textures at `index` and then `count` samplers after them.
+    index: u32,
 }
 
 struct Translated {
@@ -119,7 +123,27 @@ struct Translated {
     workgroup_size: Option<[u32; 3]>,
 }
 
-fn translate(entry: &Entry, words: &[u32]) -> Translated {
+/// Where each `(set, binding)` sits in its set's argument buffer, the same for
+/// every shader.
+///
+/// A set is one argument buffer bound to every stage that reads it, so the
+/// index a binding lives at cannot depend on which other bindings a particular
+/// shader happens to use. Each binding is given the widest room any shader asks
+/// of it, and the indices run on from there in binding order.
+type Layout = BTreeMap<(u32, u32), u32>;
+
+fn layout(widths: &BTreeMap<(u32, u32), u32>) -> Layout {
+    let mut next = [0u32; MAX_DESCRIPTOR_SETS as usize];
+    let mut out = BTreeMap::new();
+    for (&(set, binding), &width) in widths {
+        out.insert((set, binding), next[set as usize]);
+        next[set as usize] += width;
+    }
+    out
+}
+
+/// `layout` is `None` on the first pass, which only reflects.
+fn translate(entry: &Entry, words: &[u32], layout: Option<&Layout>) -> Translated {
     let fail = |what: &str, e: &dyn std::fmt::Display| -> ! {
         panic!("{}: SPIRV-Cross {what}: {e}", entry.name)
     };
@@ -184,6 +208,7 @@ fn translate(entry: &Entry, words: &[u32]) -> Translated {
                     binding,
                     kind,
                     count,
+                    index: 0,
                 });
             }
         }
@@ -198,6 +223,20 @@ fn translate(entry: &Entry, words: &[u32]) -> Translated {
         }
     }
     resources.sort_by_key(|r| (r.set, r.binding));
+    let Some(layout) = layout else {
+        return Translated {
+            msl: String::new(),
+            resources,
+            push_constant_bytes,
+            workgroup_size: None,
+        };
+    };
+    // Assigned here rather than left to the translator, whose own order follows
+    // the shader's declarations: a driver finds a binding by the number the
+    // shader declared it at, and has no other way to learn where it landed.
+    for resource in &mut resources {
+        resource.index = layout[&(resource.set, resource.binding)];
+    }
 
     let workgroup_size = (entry.stage == "compute").then(|| {
         match compiler
@@ -225,6 +264,27 @@ fn translate(entry: &Entry, words: &[u32]) -> Translated {
                 },
             )
             .unwrap_or_else(|e| fail("rejected an argument buffer binding", &e));
+    }
+    for resource in &resources {
+        compiler
+            .add_resource_binding(
+                model,
+                ResourceBinding::Qualified {
+                    set: resource.set,
+                    binding: resource.binding,
+                },
+                &BindTarget {
+                    buffer: resource.index,
+                    texture: resource.index,
+                    sampler: if resource.kind == "CombinedImageSampler" {
+                        resource.index + resource.count
+                    } else {
+                        resource.index
+                    },
+                    count: std::num::NonZeroU32::new(resource.count).filter(|&n| n.get() > 1),
+                },
+            )
+            .unwrap_or_else(|e| fail("rejected a resource binding", &e));
     }
     compiler
         .add_resource_binding(
@@ -296,9 +356,27 @@ fn main() {
     let mut table = String::new();
     let mut ids = String::new();
     let mut all = String::new();
-    for entry in &entries {
-        let words = compile_glsl(entry, &shaders);
-        let translated = translate(entry, &words);
+    let compiled: Vec<Vec<u32>> = entries
+        .iter()
+        .map(|entry| compile_glsl(entry, &shaders))
+        .collect();
+    let mut widths: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+    for (entry, words) in entries.iter().zip(&compiled) {
+        for resource in translate(entry, words, None).resources {
+            let width = resource.count
+                * if resource.kind == "CombinedImageSampler" {
+                    2
+                } else {
+                    1
+                };
+            let slot = widths.entry((resource.set, resource.binding)).or_insert(0);
+            *slot = (*slot).max(width);
+        }
+    }
+    let layout = layout(&widths);
+
+    for (entry, words) in entries.iter().zip(&compiled) {
+        let translated = translate(entry, words, Some(&layout));
 
         let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
         fs::write(out_dir.join(format!("{}.spv", entry.name)), bytes).unwrap();
@@ -322,8 +400,8 @@ fn main() {
             .iter()
             .map(|r| {
                 format!(
-                    "Resource {{ set: {}, binding: {}, kind: ResourceKind::{}, count: {} }}, ",
-                    r.set, r.binding, r.kind, r.count
+                    "Resource {{ set: {}, binding: {}, kind: ResourceKind::{}, count: {}, index: {} }}, ",
+                    r.set, r.binding, r.kind, r.count, r.index
                 )
             })
             .collect();

@@ -136,6 +136,48 @@ fn the_buffer_index_assignment_holds() {
     }
 }
 
+/// A driver writes a resource into its set's argument buffer at the index the
+/// binding map gives, so two resources of one set must never share an index and
+/// every `[[id]]` the MSL declares must be one the map assigned. (A resource the
+/// translator proved unused is in the map and not in the MSL, which is fine.)
+#[test]
+fn argument_buffer_indices_are_disjoint_and_declared_in_the_msl() {
+    for shader in SHADERS {
+        let mut taken: BTreeSet<(u32, u32)> = BTreeSet::new();
+        for resource in shader.bindings.resources {
+            let width = if resource.kind == ResourceKind::CombinedImageSampler {
+                2
+            } else {
+                1
+            };
+            for slot in resource.index..resource.index + resource.count * width {
+                assert!(
+                    taken.insert((resource.set, slot)),
+                    "{}: set {} reuses argument buffer index {slot}",
+                    shader.name,
+                    resource.set
+                );
+            }
+        }
+        for set in 0..MAX_DESCRIPTOR_SETS {
+            let marker = format!("struct spvDescriptorSetBuffer{set}\n");
+            let Some(body) = shader.msl.split(&marker).nth(1) else {
+                continue;
+            };
+            let body = body.split("};").next().unwrap_or("");
+            for (at, _) in body.match_indices("[[id(") {
+                let digits = &body[at + 5..];
+                let id: u32 = digits[..digits.find(')').unwrap()].parse().unwrap();
+                assert!(
+                    taken.contains(&(set, id)),
+                    "{}: set {set} declares [[id({id})]], which the binding map never assigned",
+                    shader.name
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn the_material_table_reflects_as_one_array_of_max_textures() {
     for name in ["forward_frag", "prepass_frag"] {

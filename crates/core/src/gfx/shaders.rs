@@ -38,6 +38,9 @@ pub struct Resource {
     pub binding: u32,
     pub kind: ResourceKind,
     pub count: u32,
+    /// The resource's `[[id]]` in its set's argument buffer. A combined image
+    /// sampler's samplers follow its `count` textures.
+    pub index: u32,
 }
 
 #[derive(Debug)]
