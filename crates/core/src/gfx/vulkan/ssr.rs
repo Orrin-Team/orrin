@@ -338,7 +338,6 @@ impl SsrPass {
         environment_sampler: SamplerId,
         target: TextureViewId,
     ) {
-        let _driver = device.vulkan();
         let set = device.create_transient_bind_group(
             self.resolve_pipeline,
             0,

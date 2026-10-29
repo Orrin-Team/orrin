@@ -74,6 +74,17 @@ pub struct CaptureSettings {
     /// between a leaf-shaped shadow and a quad-shaped one is the only place that
     /// pipeline is visible at all.
     pub shadows: bool,
+    /// Screen-space reflections: off by default, because they are the effect
+    /// most easily mistaken for a lighting bug when they are wrong.
+    pub ssr: bool,
+    /// Depth of field, with the scene's default lens.
+    pub dof: bool,
+    /// Motion blur. Nothing moves in a capture, so what this photographs is the
+    /// camera's own shutter reprojected against a static scene.
+    pub motion_blur: bool,
+    /// Rasterise the forward pass at four samples. The alternative to `taa`, which
+    /// the capture turns off when this is on: the two are not companions.
+    pub msaa: bool,
     /// The air, or `None` for whatever the scene asked for.
     ///
     /// Overridden whole rather than by a flag, because the A/B the fog captures
@@ -113,6 +124,10 @@ impl Default for CaptureSettings {
             subsurface: true,
             decals: true,
             shadows: false,
+            ssr: false,
+            dof: false,
+            motion_blur: false,
+            msaa: false,
             fog: None,
             scene: SceneChoice::default(),
             camera: None,
@@ -172,8 +187,14 @@ pub fn prepare(world: &mut World, renderer: &mut VulkanRenderer, settings: &Capt
     // own air, exposure or environment is photographed as itself rather than as
     // the engine's defaults; the explicit fields below then still win, because a
     // capture that is an A/B has to be able to state both halves of it.
-    world.insert_resource(MotionBlurSettings::default());
-    world.insert_resource(DofSettings::default());
+    world.insert_resource(MotionBlurSettings {
+        enabled: settings.motion_blur,
+        ..MotionBlurSettings::default()
+    });
+    world.insert_resource(DofSettings {
+        enabled: settings.dof,
+        ..DofSettings::default()
+    });
     world.insert_resource(BloomSettings::default());
     world.insert_resource(HdrSettings::default());
     world.insert_resource(EnvironmentSettings::default());
@@ -186,7 +207,10 @@ pub fn prepare(world: &mut World, renderer: &mut VulkanRenderer, settings: &Capt
 
     world.insert_resource(SsaoSettings::default());
     world.insert_resource(ContactShadowSettings::default());
-    world.insert_resource(SsrSettings::default());
+    world.insert_resource(SsrSettings {
+        enabled: settings.ssr,
+        ..SsrSettings::default()
+    });
     world.insert_resource(SubsurfaceSettings {
         enabled: settings.subsurface,
         ..SubsurfaceSettings::default()
@@ -201,7 +225,8 @@ pub fn prepare(world: &mut World, renderer: &mut VulkanRenderer, settings: &Capt
         enabled: settings.refraction,
     });
     world.insert_resource(TaaSettings {
-        enabled: settings.taa,
+        enabled: settings.taa && !settings.msaa,
+        msaa: settings.msaa,
         ..TaaSettings::default()
     });
     if let Some(fog) = settings.fog {

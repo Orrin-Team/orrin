@@ -185,6 +185,41 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 ..CaptureSettings::default()
             },
         ),
+        // The optional passes, each switched on alone over the rig scene: the
+        // frame's own A/B is `scene.png`, and what each of these adds to it is
+        // all that differs.
+        (
+            "ssr",
+            CaptureSettings {
+                ssr: true,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "dof",
+            CaptureSettings {
+                dof: true,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "motion-blur",
+            CaptureSettings {
+                motion_blur: true,
+                ..CaptureSettings::default()
+            },
+        ),
+        // Four samples instead of the temporal resolve: the other forward render
+        // pass shape, with a resolve attachment and a depth that is scratch
+        // rather than borrowed.
+        (
+            "msaa",
+            CaptureSettings {
+                taa: false,
+                msaa: true,
+                ..CaptureSettings::default()
+            },
+        ),
         // The courtyard, from the camera it is composed for: low sun through the
         // gateway, everything in frame backlit, and the air marched so the beam
         // has an edge. Shadows are not optional in either showcase capture — the
