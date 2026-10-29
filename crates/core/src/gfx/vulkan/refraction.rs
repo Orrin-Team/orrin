@@ -325,3 +325,66 @@ impl RefractionPass {
 /// scene back underneath it. That is what keeps this off the packed colour
 /// format the rest of the chain moved to.
 pub(super) const ACCUM_FORMAT: crate::gfx::format::Format = HDR_WIDE_FORMAT;
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::gfx::format::{Format, SampleCount};
+    use crate::gfx::graph::ImageUsage;
+    use crate::gfx::rhi::{TextureDesc, TextureDimension};
+
+    /// The pyramid of a flat frame is a flat pyramid at every level, which is
+    /// what lets glass read the blur at any roughness and see the same colour.
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_flat_frame_builds_a_flat_pyramid_on_metal() {
+        let device = Device::Metal(crate::gfx::metal::MtlDriver::new().expect("a Metal device"));
+        device.begin_frame(0);
+        let forward = super::super::forward::ForwardPass::new(
+            &device,
+            super::super::hdr::HDR_FORMAT,
+            super::super::hdr::HDR_WIDE_FORMAT,
+        );
+        let pass = RefractionPass::new(&device, forward.layout_source());
+        let source = device.create_texture_2d(
+            bytemuck::cast_slice(&[0.5f32, 0.25, 1.0, 1.0].repeat(128 * 128)),
+            [128, 128],
+            Format::Rgba32Float,
+        );
+        let pyramid = device.create_texture(&TextureDesc {
+            format: Format::Rgba16Float,
+            dimension: TextureDimension::D2,
+            extent: [128, 128, 1],
+            mip_levels: SCENE_LEVELS,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::SAMPLED | ImageUsage::STORAGE,
+            memoryless: false,
+        });
+        let mips: Vec<_> = (0..SCENE_LEVELS)
+            .map(|l| device.mip_view(pyramid, l))
+            .collect();
+        device.record_blocking(|encoder| pass.record_pyramid(&device, encoder, source, &mips));
+        let Device::Metal(driver) = &device else {
+            unreachable!()
+        };
+        for level in 0..SCENE_LEVELS as usize {
+            let bytes = driver.read_texture_slice(pyramid, 0, level);
+            let half = |i: usize| {
+                let bits = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+                let exponent = i32::from((bits >> 10) & 0x1f);
+                let fraction = f32::from(bits & 0x3ff);
+                if exponent == 0 {
+                    fraction * 2f32.powi(-24)
+                } else {
+                    (1.0 + fraction / 1024.0) * 2f32.powi(exponent - 15)
+                }
+            };
+            let texel = [half(0), half(2), half(4)];
+            assert!(
+                (texel[0] - 0.5).abs() < 0.02 && (texel[2] - 1.0).abs() < 0.02,
+                "level {level}: {texel:?}"
+            );
+        }
+    }
+}

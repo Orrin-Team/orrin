@@ -20,7 +20,7 @@ use crate::gfx::rhi::{
     BindGroupId, BufferCopy, BufferId, DepthRect, LoadOp, PipelineId, RenderTargets, StoreOp,
     TextureViewId, Viewport,
 };
-use crate::gfx::shaders::{PUSH_CONSTANT_BUFFER, Stage};
+use crate::gfx::shaders::PUSH_CONSTANT_BUFFER;
 
 /// Which way a front face winds, in the window space Metal rasterises in. The
 /// translator flips clip-space Y so the image lands upright, which leaves
@@ -317,53 +317,40 @@ impl<'a> MtlEncoder<'a> {
     }
 
     pub fn bind_group(&mut self, set: u32, group: BindGroupId) {
-        for (stage, buffer, offset, uses) in self.driver.group(group) {
-            match (&self.state.open, stage) {
+        let (buffer, offset, uses) = self.driver.group(group);
+        match &self.state.open {
+            Open::Render(encoder) => {
                 // SAFETY: a live argument buffer at the index its set names.
-                (Open::Render(encoder), Stage::Vertex) => {
-                    unsafe {
-                        encoder.setVertexBuffer_offset_atIndex(
-                            Some(&buffer),
-                            offset as usize,
-                            set as usize,
-                        );
-                    }
-                    for (resource, usage) in &uses {
-                        encoder.useResource_usage_stages(resource, *usage, MTLRenderStages::Vertex);
-                    }
+                unsafe {
+                    encoder.setVertexBuffer_offset_atIndex(
+                        Some(&buffer),
+                        offset as usize,
+                        set as usize,
+                    );
+                    encoder.setFragmentBuffer_offset_atIndex(
+                        Some(&buffer),
+                        offset as usize,
+                        set as usize,
+                    );
                 }
-                // SAFETY: as above.
-                (Open::Render(encoder), Stage::Fragment) => {
-                    unsafe {
-                        encoder.setFragmentBuffer_offset_atIndex(
-                            Some(&buffer),
-                            offset as usize,
-                            set as usize,
-                        );
-                    }
-                    for (resource, usage) in &uses {
-                        encoder.useResource_usage_stages(
-                            resource,
-                            *usage,
-                            MTLRenderStages::Fragment,
-                        );
-                    }
+                for (resource, usage) in &uses {
+                    encoder.useResource_usage_stages(
+                        resource,
+                        *usage,
+                        MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+                    );
                 }
-                // SAFETY: as above.
-                (Open::Compute(encoder), Stage::Compute) => {
-                    unsafe {
-                        encoder.setBuffer_offset_atIndex(
-                            Some(&buffer),
-                            offset as usize,
-                            set as usize,
-                        );
-                    }
-                    for (resource, usage) in &uses {
-                        encoder.useResource_usage(resource, *usage);
-                    }
-                }
-                _ => panic!("a bind group was bound outside the pass its stages belong to"),
             }
+            Open::Compute(encoder) => {
+                // SAFETY: as above.
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(&buffer), offset as usize, set as usize);
+                }
+                for (resource, usage) in &uses {
+                    encoder.useResource_usage(resource, *usage);
+                }
+            }
+            _ => panic!("a bind group was bound outside a pass"),
         }
     }
 

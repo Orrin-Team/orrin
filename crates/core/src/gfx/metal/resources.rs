@@ -537,11 +537,24 @@ impl MtlDriver {
     /// The texels of level 0 of a 2D texture, tightly packed, once the GPU has
     /// finished with it. It stalls, which is what a capture wants.
     pub(crate) fn read_texture(&self, view: TextureViewId) -> Vec<u8> {
+        self.read_texture_slice(view, 0, 0)
+    }
+
+    /// One slice and level of a texture, tightly packed.
+    pub(crate) fn read_texture_slice(
+        &self,
+        view: TextureViewId,
+        slice: usize,
+        level: usize,
+    ) -> Vec<u8> {
         use objc2_metal::{
             MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
         };
         let texture = self.texture(view);
-        let (width, height) = (texture.width(), texture.height());
+        let (width, height) = (
+            (texture.width() >> level).max(1),
+            (texture.height() >> level).max(1),
+        );
         let texel = match texture.pixelFormat() {
             f if f == pixel_format(Format::Rgba32Float) => 16,
             f if f == pixel_format(Format::Rgba16Float) => 8,
@@ -562,8 +575,8 @@ impl MtlDriver {
         unsafe {
             blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
                 &texture,
-                0,
-                0,
+                slice,
+                level,
                 MTLOrigin { x: 0, y: 0, z: 0 },
                 MTLSize { width, height, depth: 1 },
                 &buffer,

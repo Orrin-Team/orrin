@@ -244,7 +244,7 @@ mod tests {
         device.begin_frame(0);
         let pass = BloomPass::new(&device);
         let source = device.create_texture_2d(
-            &bytemuck::cast_slice(&[0.5f32, 0.5, 0.5, 1.0].repeat(64)).to_vec(),
+            bytemuck::cast_slice(&[0.5f32, 0.5, 0.5, 1.0].repeat(64)),
             [8, 8],
             Format::Rgba32Float,
         );

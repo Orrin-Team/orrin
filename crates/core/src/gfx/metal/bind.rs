@@ -29,46 +29,44 @@ use super::{MtlDriver, Shared};
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, PipelineId, SamplerId, TextureViewId,
 };
-use crate::gfx::shaders::{Resource, ResourceKind, ShaderId, Stage};
+use crate::gfx::shaders::{Resource, ResourceKind, ShaderId};
 
-/// One stage's argument buffer, and what it holds.
-pub(super) struct StageGroup {
-    pub stage: Stage,
+/// A set's argument buffer, and what it holds. One buffer for every stage: the
+/// translated shaders declare the same slots (see `build.rs`), so the layout is
+/// the set's and not the reading stage's.
+pub(super) struct Group {
     pub buffer: Shared<Retained<ProtocolObject<dyn MTLBuffer>>>,
     pub offset: u64,
     pub uses: Vec<Use>,
 }
 
-pub(super) struct Group {
-    pub stages: Vec<StageGroup>,
-}
-
 /// A group as an encoder binds it.
-pub(super) type GroupParts = Vec<(
-    Stage,
+pub(super) type GroupParts = (
     Retained<ProtocolObject<dyn MTLBuffer>>,
     u64,
     Vec<(Retained<ProtocolObject<dyn MTLResource>>, MTLResourceUsage)>,
-)>;
+);
 
 pub(super) struct Use {
     pub resource: Shared<Retained<ProtocolObject<dyn MTLResource>>>,
     pub usage: MTLResourceUsage,
 }
 
-/// The `[[id]]`s a shader's translated source declares in one descriptor set's
-/// struct. A resource the translator proved unused is in the binding map and not
-/// here, and writing it would be out of the argument buffer's range.
+/// The `[[id]]`s a shader's translated source declares as real resources in one
+/// descriptor set's struct, not counting the stand-ins that fill the ids it does
+/// not use. Writing a stand-in as a resource would be a type error in Metal's
+/// eyes, and an id the translator proved unused is one of them.
 fn declared_ids(msl: &str, set: u32) -> HashSet<u32> {
     let marker = format!("struct spvDescriptorSetBuffer{set}\n");
     let Some(body) = msl.split(&marker).nth(1) else {
         return HashSet::new();
     };
     let body = body.split("};").next().unwrap_or("");
-    body.match_indices("[[id(")
-        .filter_map(|(at, _)| {
-            let digits = &body[at + 5..];
-            digits[..digits.find(')')?].parse().ok()
+    body.lines()
+        .filter(|line| !line.contains("_unused"))
+        .filter_map(|line| {
+            let at = line.find("[[id(")? + 5;
+            line[at..at + line[at..].find(')')?].parse().ok()
         })
         .collect()
 }
@@ -83,14 +81,11 @@ fn find_in(shader: ShaderId, set: u32, binding: u32) -> Option<Resource> {
         .copied()
 }
 
-/// The stages of a pipeline that declare `set`, with the declared ids of each.
-fn stages_of(shaders: &[ShaderId], set: u32) -> Vec<(ShaderId, HashSet<u32>)> {
-    shaders
-        .iter()
-        .copied()
-        .map(|shader| (shader, declared_ids(shader.blob().msl, set)))
-        .filter(|(_, ids)| !ids.is_empty())
-        .collect()
+/// One stage's argument encoder over a set's buffer, and the ids it declares.
+struct StageWriter {
+    shader: ShaderId,
+    declared: HashSet<u32>,
+    encoder: Retained<ProtocolObject<dyn MTLArgumentEncoder>>,
 }
 
 impl MtlDriver {
@@ -112,130 +107,171 @@ impl MtlDriver {
         persistent: bool,
     ) -> BindGroupId {
         let shaders = self.shaders_of(pipeline);
-        let mut stages = Vec::new();
-        for (shader, declared) in stages_of(&shaders, set) {
-            let function = self.function(shader);
-            // SAFETY: `set` is a buffer index this function declares an
-            // argument buffer at, which `declared_ids` just established.
-            let encoder = unsafe { function.newArgumentEncoderWithBufferIndex(set as usize) };
-            let length = encoder.encodedLength().max(8) as u64;
-            let (buffer, offset) = if persistent {
-                let buffer = self
-                    .device
-                    .newBufferWithLength_options(
-                        length as usize,
-                        MTLResourceOptions::StorageModeShared,
-                    )
-                    .expect("failed to allocate an argument buffer");
-                (buffer, 0)
-            } else {
-                self.frame_arguments(length)
-            };
+        let writers: Vec<StageWriter> = shaders
+            .iter()
+            .copied()
+            .filter_map(|shader| {
+                let declared = declared_ids(shader.blob().msl, set);
+                if declared.is_empty() {
+                    return None;
+                }
+                let function = self.function(shader);
+                // SAFETY: `set` is a buffer index this function declares an
+                // argument buffer at, which `declared_ids` just established.
+                let encoder = unsafe { function.newArgumentEncoderWithBufferIndex(set as usize) };
+                Some(StageWriter {
+                    shader,
+                    declared,
+                    encoder,
+                })
+            })
+            .collect();
+        if writers.is_empty() {
+            return self.insert_group(self.empty_group(), persistent);
+        }
+        // Every stage's struct has the same slots, so any encoder's length is
+        // the buffer's.
+        let length = writers[0].encoder.encodedLength().max(8) as u64;
+        let (buffer, offset) = if persistent {
+            let buffer = self
+                .device
+                .newBufferWithLength_options(length as usize, MTLResourceOptions::StorageModeShared)
+                .expect("failed to allocate an argument buffer");
+            (buffer, 0)
+        } else {
+            self.frame_arguments(length)
+        };
+        for writer in &writers {
             // SAFETY: the buffer is at least `encodedLength` bytes from `offset`,
             // at the alignment the arena and a fresh buffer both give.
-            unsafe { encoder.setArgumentBuffer_offset(Some(&buffer), offset as usize) };
+            unsafe {
+                writer
+                    .encoder
+                    .setArgumentBuffer_offset(Some(&buffer), offset as usize)
+            };
+        }
+        // The stage whose struct declares `id` as a real resource, which is the
+        // one whose encoder knows what type to write there.
+        let writer_of = |id: u32| writers.iter().find(|writer| writer.declared.contains(&id));
 
-            let mut uses = Vec::new();
-            // Textures at one binding are an array, filled in the order given.
-            let mut next_in_array: Vec<(u32, u32)> = Vec::new();
-            for binding in bindings {
-                let Some(resource) = find_in(shader, set, binding.binding) else {
-                    continue;
-                };
-                let slot = |counts: &mut Vec<(u32, u32)>| -> u32 {
-                    match counts.iter_mut().find(|(b, _)| *b == binding.binding) {
-                        Some((_, n)) => {
-                            *n += 1;
-                            resource.index + *n
-                        }
-                        None => {
-                            counts.push((binding.binding, 0));
-                            resource.index
-                        }
+        let mut uses = Vec::new();
+        // Textures at one binding are an array, filled in the order given.
+        let mut next_in_array: Vec<(u32, u32)> = Vec::new();
+        for binding in bindings {
+            let Some(resource) = writers
+                .iter()
+                .find_map(|writer| find_in(writer.shader, set, binding.binding))
+            else {
+                continue;
+            };
+            let slot = |counts: &mut Vec<(u32, u32)>| -> u32 {
+                match counts.iter_mut().find(|(b, _)| *b == binding.binding) {
+                    Some((_, n)) => {
+                        *n += 1;
+                        resource.index + *n
                     }
-                };
-                match binding.resource {
-                    BindingResource::SampledTexture { view, sampler } => {
-                        let index = slot(&mut next_in_array);
-                        if declared.contains(&resource.index) {
-                            self.write_texture(
-                                &encoder,
-                                index,
-                                view,
-                                MTLResourceUsage::Read,
-                                &mut uses,
-                            );
-                        }
-                        let at = resource.index + resource.count;
-                        if resource.kind == ResourceKind::CombinedImageSampler
-                            && declared.contains(&at)
-                        {
-                            self.write_sampler(&encoder, at, sampler);
-                        }
-                    }
-                    BindingResource::Texture(view) => {
-                        let index = slot(&mut next_in_array);
-                        if declared.contains(&resource.index) {
-                            self.write_texture(
-                                &encoder,
-                                index,
-                                view,
-                                MTLResourceUsage::Read,
-                                &mut uses,
-                            );
-                        }
-                    }
-                    BindingResource::StorageTexture(view) => {
-                        let index = slot(&mut next_in_array);
-                        if declared.contains(&resource.index) {
-                            self.write_texture(
-                                &encoder,
-                                index,
-                                view,
-                                MTLResourceUsage::Read | MTLResourceUsage::Write,
-                                &mut uses,
-                            );
-                        }
-                    }
-                    BindingResource::Sampler(sampler) => {
-                        if declared.contains(&resource.index) {
-                            self.write_sampler(&encoder, resource.index, sampler);
-                        }
-                    }
-                    BindingResource::StorageBuffer(id) | BindingResource::UniformBuffer(id) => {
-                        if !declared.contains(&resource.index) {
-                            continue;
-                        }
-                        let buf = self.buffer(id);
-                        let usage = if matches!(binding.resource, BindingResource::StorageBuffer(_))
-                        {
-                            MTLResourceUsage::Read | MTLResourceUsage::Write
-                        } else {
-                            MTLResourceUsage::Read
-                        };
-                        // SAFETY: a live buffer and an offset inside it.
-                        unsafe {
-                            encoder.setBuffer_offset_atIndex(
-                                Some(&buf.buffer.0),
-                                buf.offset as usize,
-                                resource.index as usize,
-                            );
-                        }
-                        uses.push(Use {
-                            resource: Shared(ProtocolObject::from_retained(buf.buffer.0.clone())),
-                            usage,
-                        });
+                    None => {
+                        counts.push((binding.binding, 0));
+                        resource.index
                     }
                 }
+            };
+            match binding.resource {
+                BindingResource::SampledTexture { view, sampler } => {
+                    let index = slot(&mut next_in_array);
+                    if let Some(writer) = writer_of(resource.index) {
+                        self.write_texture(
+                            &writer.encoder,
+                            index,
+                            view,
+                            MTLResourceUsage::Read,
+                            &mut uses,
+                        );
+                    }
+                    let at = resource.index + resource.count;
+                    if resource.kind == ResourceKind::CombinedImageSampler
+                        && let Some(writer) = writer_of(at)
+                    {
+                        self.write_sampler(&writer.encoder, at, sampler);
+                    }
+                }
+                BindingResource::Texture(view) => {
+                    let index = slot(&mut next_in_array);
+                    if let Some(writer) = writer_of(resource.index) {
+                        self.write_texture(
+                            &writer.encoder,
+                            index,
+                            view,
+                            MTLResourceUsage::Read,
+                            &mut uses,
+                        );
+                    }
+                }
+                BindingResource::StorageTexture(view) => {
+                    let index = slot(&mut next_in_array);
+                    if let Some(writer) = writer_of(resource.index) {
+                        self.write_texture(
+                            &writer.encoder,
+                            index,
+                            view,
+                            MTLResourceUsage::Read | MTLResourceUsage::Write,
+                            &mut uses,
+                        );
+                    }
+                }
+                BindingResource::Sampler(sampler) => {
+                    if let Some(writer) = writer_of(resource.index) {
+                        self.write_sampler(&writer.encoder, resource.index, sampler);
+                    }
+                }
+                BindingResource::StorageBuffer(id) | BindingResource::UniformBuffer(id) => {
+                    let Some(writer) = writer_of(resource.index) else {
+                        continue;
+                    };
+                    let buf = self.buffer(id);
+                    let usage = if matches!(binding.resource, BindingResource::StorageBuffer(_)) {
+                        MTLResourceUsage::Read | MTLResourceUsage::Write
+                    } else {
+                        MTLResourceUsage::Read
+                    };
+                    // SAFETY: a live buffer and an offset inside it.
+                    unsafe {
+                        writer.encoder.setBuffer_offset_atIndex(
+                            Some(&buf.buffer.0),
+                            buf.offset as usize,
+                            resource.index as usize,
+                        );
+                    }
+                    uses.push(Use {
+                        resource: Shared(ProtocolObject::from_retained(buf.buffer.0.clone())),
+                        usage,
+                    });
+                }
             }
-            stages.push(StageGroup {
-                stage: shader.blob().stage,
+        }
+        // The samplers the layout baked in, which no caller writes.
+        for (immutable_set, binding, sampler) in self.immutable_of(pipeline) {
+            if immutable_set != set {
+                continue;
+            }
+            let Some(resource) = writers
+                .iter()
+                .find_map(|writer| find_in(writer.shader, set, binding))
+            else {
+                continue;
+            };
+            if let Some(writer) = writer_of(resource.index) {
+                self.write_sampler(&writer.encoder, resource.index, sampler);
+            }
+        }
+        self.insert_group(
+            Group {
                 buffer: Shared(buffer),
                 offset,
                 uses,
-            });
-        }
-        self.insert_group(Group { stages }, persistent)
+            },
+            persistent,
+        )
     }
 
     fn write_texture(
@@ -264,6 +300,18 @@ impl MtlDriver {
         let sampler = self.sampler(sampler);
         // SAFETY: a live sampler built for argument buffers.
         unsafe { encoder.setSamplerState_atIndex(Some(&sampler), index as usize) };
+    }
+
+    fn empty_group(&self) -> Group {
+        let buffer = self
+            .device
+            .newBufferWithLength_options(8, MTLResourceOptions::StorageModeShared)
+            .expect("failed to allocate an argument buffer");
+        Group {
+            buffer: Shared(buffer),
+            offset: 0,
+            uses: Vec::new(),
+        }
     }
 
     fn insert_group(&self, group: Group, persistent: bool) -> BindGroupId {
@@ -353,21 +401,14 @@ impl MtlDriver {
         let found = groups
             .get(group.0)
             .unwrap_or_else(|| panic!("bind group {} is not live", group.0));
-        found
-            .stages
-            .iter()
-            .map(|stage| {
-                (
-                    stage.stage,
-                    stage.buffer.0.clone(),
-                    stage.offset,
-                    stage
-                        .uses
-                        .iter()
-                        .map(|u| (u.resource.0.clone(), u.usage))
-                        .collect(),
-                )
-            })
-            .collect()
+        (
+            found.buffer.0.clone(),
+            found.offset,
+            found
+                .uses
+                .iter()
+                .map(|u| (u.resource.0.clone(), u.usage))
+                .collect(),
+        )
     }
 }

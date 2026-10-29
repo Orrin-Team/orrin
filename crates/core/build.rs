@@ -130,14 +130,81 @@ struct Translated {
 /// index a binding lives at cannot depend on which other bindings a particular
 /// shader happens to use. Each binding is given the widest room any shader asks
 /// of it, and the indices run on from there in binding order.
-type Layout = BTreeMap<(u32, u32), u32>;
+struct Layout {
+    index: BTreeMap<(u32, u32), u32>,
+    /// Every argument buffer index of each set that some shader uses.
+    universe: Vec<std::collections::BTreeSet<u32>>,
+}
 
 fn layout(widths: &BTreeMap<(u32, u32), u32>) -> Layout {
     let mut next = [0u32; MAX_DESCRIPTOR_SETS as usize];
-    let mut out = BTreeMap::new();
+    let mut index = BTreeMap::new();
+    let mut universe = vec![std::collections::BTreeSet::new(); MAX_DESCRIPTOR_SETS as usize];
     for (&(set, binding), &width) in widths {
-        out.insert((set, binding), next[set as usize]);
+        let at = next[set as usize];
+        index.insert((set, binding), at);
+        universe[set as usize].extend(at..at + width);
         next[set as usize] += width;
+    }
+    Layout { index, universe }
+}
+
+/// Rewrite each set's argument buffer struct so that every shader declares the
+/// same slots.
+///
+/// Metal packs a struct's members in the order of their `[[id]]`s and gives no
+/// slot to an id nobody declared, so two shaders that use different bindings of
+/// one set would lay the same argument buffer out differently, and a buffer
+/// written for one could not be read by the other. Every id of the set the
+/// shader leaves unused is filled with a pointer-sized stand-in, which makes the
+/// layout a property of the set and not of the shader reading it.
+fn pad_argument_buffers(msl: &str, layout: &Layout) -> String {
+    let mut out = msl.to_string();
+    for set in 0..MAX_DESCRIPTOR_SETS {
+        let marker = format!("struct spvDescriptorSetBuffer{set}\n{{\n");
+        let Some(start) = out.find(&marker) else {
+            continue;
+        };
+        let body_start = start + marker.len();
+        let Some(body_len) = out[body_start..].find("};") else {
+            continue;
+        };
+        let body = &out[body_start..body_start + body_len];
+
+        // (first id, declaration) of each member.
+        let mut members: Vec<(u32, String)> = Vec::new();
+        let mut covered = std::collections::BTreeSet::new();
+        for line in body.lines().filter(|line| line.contains("[[id(")) {
+            let at = line.find("[[id(").unwrap() + 5;
+            let id: u32 = line[at..at + line[at..].find(')').unwrap()]
+                .parse()
+                .unwrap();
+            let width = line
+                .find("array<")
+                .and_then(|a| {
+                    let tail = &line[a..];
+                    let from = tail.rfind(", ")? + 2;
+                    tail[from..from + tail[from..].find('>')?]
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                })
+                .unwrap_or(1);
+            covered.extend(id..id + width);
+            members.push((id, line.to_string()));
+        }
+        for &id in layout.universe[set as usize]
+            .iter()
+            .filter(|id| !covered.contains(id))
+        {
+            members.push((id, format!("    constant uint* _unused{id} [[id({id})]];")));
+        }
+        members.sort_by_key(|(id, _)| *id);
+        let rebuilt: String = members
+            .iter()
+            .map(|(_, line)| format!("{line}\n"))
+            .collect();
+        out.replace_range(body_start..body_start + body_len, &rebuilt);
     }
     out
 }
@@ -235,7 +302,7 @@ fn translate(entry: &Entry, words: &[u32], layout: Option<&Layout>) -> Translate
     // the shader's declarations: a driver finds a binding by the number the
     // shader declared it at, and has no other way to learn where it landed.
     for resource in &mut resources {
-        resource.index = layout[&(resource.set, resource.binding)];
+        resource.index = layout.index[&(resource.set, resource.binding)];
     }
 
     let workgroup_size = (entry.stage == "compute").then(|| {
@@ -309,10 +376,17 @@ fn translate(entry: &Entry, words: &[u32], layout: Option<&Layout>) -> Translate
     // does not have to know.
     options.common.flip_vertex_y = entry.stage == "vertex";
 
-    let msl = compiler
-        .compile(&options)
-        .unwrap_or_else(|e| fail("could not emit MSL", &e))
-        .to_string();
+    #[allow(
+        clippy::unnecessary_to_owned,
+        reason = "the artifact only displays; padding needs the text"
+    )]
+    let msl = pad_argument_buffers(
+        &compiler
+            .compile(&options)
+            .unwrap_or_else(|e| fail("could not emit MSL", &e))
+            .to_string(),
+        layout,
+    );
 
     Translated {
         msl,

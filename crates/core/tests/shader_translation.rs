@@ -165,6 +165,13 @@ fn argument_buffer_indices_are_disjoint_and_declared_in_the_msl() {
                 continue;
             };
             let body = body.split("};").next().unwrap_or("");
+            // Not the stand-ins: those fill the ids a shader does not use, so
+            // that every shader lays the set out alike.
+            let body: String = body
+                .lines()
+                .filter(|line| !line.contains("_unused"))
+                .collect::<Vec<_>>()
+                .join("\n");
             for (at, _) in body.match_indices("[[id(") {
                 let digits = &body[at + 5..];
                 let id: u32 = digits[..digits.find(')').unwrap()].parse().unwrap();

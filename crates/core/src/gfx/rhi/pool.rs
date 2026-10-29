@@ -45,6 +45,10 @@ impl<T> Pool<T> {
         self.slots.get(index as usize)?.as_ref()
     }
 
+    pub(crate) fn get_mut(&mut self, index: u32) -> Option<&mut T> {
+        self.slots.get_mut(index as usize)?.as_mut()
+    }
+
     /// Queue `index` for destruction as of `frame`. Freeing a slot twice is
     /// ignored: recycling it twice would hand one slot to two owners.
     pub(crate) fn remove(&mut self, index: u32, frame: u64) {

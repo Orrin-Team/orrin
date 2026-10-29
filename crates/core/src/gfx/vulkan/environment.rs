@@ -540,6 +540,52 @@ fn bake(
 
 #[cfg(test)]
 mod tests {
+    /// Bake a flat sky and read the prefiltered cube back: whatever level and
+    /// face, every texel is that colour, because there is nothing else in it.
+    #[test]
+    #[ignore = "needs a Metal device"]
+    #[cfg(target_os = "macos")]
+    fn a_flat_sky_bakes_to_a_flat_cube_on_metal() {
+        use super::*;
+        let device = Device::Metal(crate::gfx::metal::MtlDriver::new().expect("a Metal device"));
+        device.begin_frame(0);
+        let forward = super::super::forward::ForwardPass::new(
+            &device,
+            super::super::hdr::HDR_FORMAT,
+            super::super::hdr::HDR_WIDE_FORMAT,
+        );
+        let mut pass = EnvironmentPass::new(&device, &forward.targets);
+        let colour = [0.5f32, 0.25, 1.0, 1.0];
+        pass.set_source(&device, &colour.repeat(8 * 4), [8, 4]);
+        let Device::Metal(driver) = &device else {
+            unreachable!()
+        };
+        let cube = pass.specular_view();
+        for (face, level) in [(0usize, 0usize), (3, 0), (5, 2), (2, 5)] {
+            let bytes = driver.read_texture_slice(cube, face, level);
+            let half = |i: usize| half_to_f32(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+            let texel = [half(0), half(2), half(4)];
+            for (got, want) in texel.iter().zip(colour) {
+                assert!(
+                    (got - want).abs() < 0.02,
+                    "face {face} level {level}: {texel:?}, wanted {colour:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn half_to_f32(bits: u16) -> f32 {
+        let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exponent = i32::from((bits >> 10) & 0x1f);
+        let fraction = f32::from(bits & 0x3ff);
+        match exponent {
+            0 => sign * fraction * 2f32.powi(-24),
+            31 => sign * f32::INFINITY,
+            _ => sign * (1.0 + fraction / 1024.0) * 2f32.powi(exponent - 15),
+        }
+    }
+
     use super::FACES;
 
     /// The cube face selection rules from the Vulkan spec: given a direction,

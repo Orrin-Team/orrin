@@ -39,12 +39,16 @@ pub(super) struct RenderPipe {
     pub topology: MTLPrimitiveType,
     pub vertex: ShaderId,
     pub fragment: ShaderId,
+    /// Samplers Vulkan bakes into the set layout, which a bind group here has to
+    /// write itself because nothing else will: `(set, binding, sampler)`.
+    pub immutable: Vec<(u32, u32, SamplerId)>,
 }
 
 pub(super) struct ComputePipe {
     pub state: Shared<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub shader: ShaderId,
     pub threads: MTLSize,
+    pub immutable: Vec<(u32, u32, SamplerId)>,
 }
 
 /// Compiled functions, one per shader.
@@ -143,6 +147,21 @@ impl MtlDriver {
             )
         });
 
+        // What this pipeline's own description bakes in, then what the pipeline
+        // whose layout it borrows does: a pipeline built to share another's sets
+        // is bound against groups written for them, and reads the same samplers.
+        let mut immutable: Vec<_> = desc.immutable_samplers.to_vec();
+        let inherited = desc
+            .layout_from
+            .map(|source| (source, u32::MAX))
+            .or(desc.layout_prefix_from);
+        if let Some((source, sets)) = inherited {
+            immutable.extend(
+                self.immutable_of(source)
+                    .into_iter()
+                    .filter(|(set, _, _)| *set < sets),
+            );
+        }
         let pipe = Pipe::Render(RenderPipe {
             state: Shared(state),
             depth,
@@ -156,6 +175,7 @@ impl MtlDriver {
             },
             vertex: desc.vertex,
             fragment: desc.fragment,
+            immutable,
         });
         PipelineId(self.pipelines.lock().unwrap().insert(pipe))
     }
@@ -180,6 +200,7 @@ impl MtlDriver {
                 height: y as usize,
                 depth: z as usize,
             },
+            immutable: Vec::new(),
         });
         PipelineId(self.pipelines.lock().unwrap().insert(pipe))
     }
@@ -189,9 +210,27 @@ impl MtlDriver {
     pub fn create_compute_pipeline_with_samplers(
         &self,
         desc: &ComputePipelineDesc,
-        _immutable_samplers: &[(u32, u32, SamplerId)],
+        immutable_samplers: &[(u32, u32, SamplerId)],
     ) -> PipelineId {
-        self.create_compute_pipeline(desc)
+        let id = self.create_compute_pipeline(desc);
+        if let Pipe::Compute(compute) = self
+            .pipelines
+            .lock()
+            .unwrap()
+            .get_mut(id.0)
+            .expect("just created")
+        {
+            compute.immutable = immutable_samplers.to_vec();
+        }
+        id
+    }
+
+    /// The samplers a pipeline has baked into its layout.
+    pub(super) fn immutable_of(&self, id: PipelineId) -> Vec<(u32, u32, SamplerId)> {
+        self.with_pipe(id, |pipe| match pipe {
+            Pipe::Render(render) => render.immutable.clone(),
+            Pipe::Compute(compute) => compute.immutable.clone(),
+        })
     }
 
     /// The most push-constant bytes any stage of a pipeline declares.

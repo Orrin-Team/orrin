@@ -26,8 +26,8 @@ fn output_dir() -> PathBuf {
 }
 
 /// The least PSNR a capture may have against Vulkan. The plan proposes 40 dB as
-/// a start; this is what it is held to until the first full table is read.
-const THRESHOLD_DB: f64 = 30.0;
+/// a start, and the first full table clears it with room: the lowest is 44 dB.
+const THRESHOLD_DB: f64 = 40.0;
 
 struct Difference {
     psnr: f64,
