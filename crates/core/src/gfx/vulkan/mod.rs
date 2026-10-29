@@ -1368,7 +1368,7 @@ impl VulkanRenderer {
         match &self.backend {
             Backend::Vulkan(vk) => vk.timestamps.as_ref().map(GpuTimestamps::last_frame_ms),
             #[cfg(target_os = "macos")]
-            Backend::Metal(mtl) => mtl.windowed.is_some().then_some(mtl.gpu_ms),
+            Backend::Metal(mtl) => Some(mtl.gpu_ms),
         }
     }
 
@@ -2281,7 +2281,12 @@ impl VulkanRenderer {
                         }
                     }
                     // Offscreen, so the frame is waited for rather than presented.
-                    None => state.finish_blocking(),
+                    None => {
+                        let seconds = state.finish_blocking();
+                        if let Backend::Metal(mtl) = &mut self.backend {
+                            mtl.gpu_ms = (seconds * 1.0e3) as f32;
+                        }
+                    }
                 }
                 return;
             }

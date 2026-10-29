@@ -80,7 +80,7 @@ impl State {
     }
 
     /// End recording and wait for the GPU.
-    pub(crate) fn finish_blocking(mut self) {
+    pub(crate) fn finish_blocking(mut self) -> f64 {
         self.close();
         self.command_buffer.commit();
         self.command_buffer.waitUntilCompleted();
@@ -89,6 +89,7 @@ impl State {
         if let Some(error) = self.command_buffer.error() {
             tracing::error!("a Metal command buffer failed: {error}");
         }
+        self.command_buffer.GPUEndTime() - self.command_buffer.GPUStartTime()
     }
 }
 
