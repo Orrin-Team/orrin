@@ -1469,6 +1469,9 @@ impl<'a> VkEncoder<'a> {
         begin(self.recorder, &view);
     }
 
+    /// Vulkan times passes with its own timestamp pairs around each body.
+    pub fn set_pass_name(&mut self, _: &'static str) {}
+
     pub fn end_rendering(&mut self) {
         self.recorder.end_rendering();
     }

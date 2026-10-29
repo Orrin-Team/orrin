@@ -121,7 +121,7 @@ impl MtlDriver {
             let mut encoder = Encoder::Metal(MtlEncoder::new(self, &mut state));
             record(&mut encoder);
         }
-        state.finish_blocking();
+        let _ = state.finish_blocking();
     }
 
     /// `(allocated, budget)` in bytes: what this process holds of the GPU's

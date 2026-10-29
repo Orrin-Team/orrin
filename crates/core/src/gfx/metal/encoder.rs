@@ -8,9 +8,11 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue, MTLComputeCommandEncoder, MTLIndexType, MTLLoadAction, MTLOrigin,
-    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderStages, MTLScissorRect, MTLSize,
+    MTLBlitCommandEncoder, MTLBlitPassDescriptor, MTLBuffer, MTLClearColor, MTLCommandBuffer,
+    MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePassDescriptor,
+    MTLCounterDontSample, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor, MTLCounterSet,
+    MTLDevice, MTLIndexType, MTLLoadAction, MTLOrigin, MTLRenderCommandEncoder,
+    MTLRenderPassDescriptor, MTLRenderStages, MTLScissorRect, MTLSize, MTLStorageMode,
     MTLStoreAction, MTLViewport, MTLWinding,
 };
 
@@ -35,11 +37,61 @@ enum Open {
     Blit(Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>),
 }
 
+/// Two timestamp samples around each Metal encoder, named for the pass that
+/// opened it. Metal samples at encoder boundaries only, so the encoder is ended
+/// at every pass boundary while timing is on.
+pub(crate) struct Timing {
+    buffer: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
+    names: Vec<&'static str>,
+    pub(crate) frame: u64,
+}
+
+/// Encoders timed in one frame; the sample buffer holds two samples each.
+const MAX_TIMED: usize = 128;
+
+/// A finished frame's samples as `(name, start_ns, end_ns)`, relative to the
+/// frame's first sample.
+pub(crate) type Spans = Vec<(&'static str, u64, u64)>;
+
+impl Timing {
+    pub(crate) fn resolve(&self) -> Spans {
+        let count = self.names.len() * 2;
+        if count == 0 {
+            return Vec::new();
+        }
+        // SAFETY: the range is within the samples the frame recorded.
+        let Some(data) = (unsafe {
+            self.buffer
+                .resolveCounterRange(objc2_foundation::NSRange::new(0, count))
+        }) else {
+            return Vec::new();
+        };
+        // SAFETY: the timestamp counter set resolves to one u64 per sample.
+        let ticks: &[u64] =
+            unsafe { std::slice::from_raw_parts(data.as_bytes_unchecked().as_ptr().cast(), count) };
+        let origin = ticks.iter().copied().filter(|t| *t != 0).min().unwrap_or(0);
+        self.names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| {
+                let (start, end) = (ticks[2 * index], ticks[2 * index + 1]);
+                (start >= origin && end > start && start != 0).then_some((
+                    *name,
+                    start - origin,
+                    end - origin,
+                ))
+            })
+            .collect()
+    }
+}
+
 pub(crate) struct State {
     command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     open: Open,
     pipeline: Option<PipelineId>,
     index_buffer: Option<(Retained<ProtocolObject<dyn MTLBuffer>>, u64)>,
+    timing: Option<Timing>,
+    pass_name: &'static str,
 }
 
 impl State {
@@ -52,7 +104,60 @@ impl State {
             open: Open::None,
             pipeline: None,
             index_buffer: None,
+            timing: None,
+            pass_name: "",
         }
+    }
+
+    /// Time every encoder this frame records. A device that cannot sample at
+    /// encoder boundaries just stays untimed.
+    pub(crate) fn time(&mut self, driver: &MtlDriver, frame: u64) {
+        if !driver
+            .device
+            .supportsCounterSampling(objc2_metal::MTLCounterSamplingPoint::AtStageBoundary)
+        {
+            return;
+        }
+        let Some(sets) = driver.device.counterSets() else {
+            return;
+        };
+        let Some(set) = sets
+            .iter()
+            .find(|set| set.name().to_string() == "timestamp")
+        else {
+            return;
+        };
+        let descriptor = MTLCounterSampleBufferDescriptor::new();
+        descriptor.setCounterSet(Some(&set));
+        // SAFETY: a count of at least one sample.
+        unsafe { descriptor.setSampleCount(2 * MAX_TIMED) };
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        if let Ok(buffer) = driver
+            .device
+            .newCounterSampleBufferWithDescriptor_error(&descriptor)
+        {
+            self.timing = Some(Timing {
+                buffer,
+                names: Vec::new(),
+                frame,
+            });
+        }
+    }
+
+    pub(crate) fn take_timing(&mut self) -> Option<Timing> {
+        self.timing.take()
+    }
+
+    /// The sample pair for the encoder about to open, if there is room.
+    fn next_pair(
+        &mut self,
+    ) -> Option<(Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>, usize)> {
+        let timing = self.timing.as_mut()?;
+        if timing.names.len() >= MAX_TIMED {
+            return None;
+        }
+        timing.names.push(self.pass_name);
+        Some((timing.buffer.clone(), 2 * (timing.names.len() - 1)))
     }
 
     fn close(&mut self) {
@@ -80,7 +185,9 @@ impl State {
     }
 
     /// End recording and wait for the GPU.
-    pub(crate) fn finish_blocking(mut self) -> f64 {
+    pub(crate) fn finish_blocking(
+        mut self,
+    ) -> (f64, Retained<ProtocolObject<dyn MTLCommandBuffer>>) {
         self.close();
         self.command_buffer.commit();
         self.command_buffer.waitUntilCompleted();
@@ -89,7 +196,8 @@ impl State {
         if let Some(error) = self.command_buffer.error() {
             tracing::error!("a Metal command buffer failed: {error}");
         }
-        self.command_buffer.GPUEndTime() - self.command_buffer.GPUStartTime()
+        let seconds = self.command_buffer.GPUEndTime() - self.command_buffer.GPUStartTime();
+        (seconds, self.command_buffer)
     }
 }
 
@@ -114,11 +222,24 @@ impl<'a> MtlEncoder<'a> {
             "a dispatch was recorded inside a render pass"
         );
         self.state.close();
-        let encoder = self
-            .state
-            .command_buffer
-            .computeCommandEncoder()
-            .expect("failed to open a compute encoder");
+        let encoder = match self.state.next_pair() {
+            Some((buffer, at)) => {
+                let pass = MTLComputePassDescriptor::computePassDescriptor();
+                // SAFETY: attachment 0 of a descriptor is always valid to address.
+                let attachment =
+                    unsafe { pass.sampleBufferAttachments().objectAtIndexedSubscript(0) };
+                attachment.setSampleBuffer(Some(&buffer));
+                // SAFETY: the index is inside the sample buffer the pass was given.
+                unsafe { attachment.setStartOfEncoderSampleIndex(at) };
+                // SAFETY: the index is inside the sample buffer the pass was given.
+                unsafe { attachment.setEndOfEncoderSampleIndex(at + 1) };
+                self.state
+                    .command_buffer
+                    .computeCommandEncoderWithDescriptor(&pass)
+            }
+            None => self.state.command_buffer.computeCommandEncoder(),
+        }
+        .expect("failed to open a compute encoder");
         self.state.open = Open::Compute(encoder.clone());
         encoder
     }
@@ -132,11 +253,24 @@ impl<'a> MtlEncoder<'a> {
             "a copy was recorded inside a render pass"
         );
         self.state.close();
-        let encoder = self
-            .state
-            .command_buffer
-            .blitCommandEncoder()
-            .expect("failed to open a blit encoder");
+        let encoder = match self.state.next_pair() {
+            Some((buffer, at)) => {
+                let pass = MTLBlitPassDescriptor::blitPassDescriptor();
+                // SAFETY: attachment 0 of a descriptor is always valid to address.
+                let attachment =
+                    unsafe { pass.sampleBufferAttachments().objectAtIndexedSubscript(0) };
+                attachment.setSampleBuffer(Some(&buffer));
+                // SAFETY: the index is inside the sample buffer the pass was given.
+                unsafe { attachment.setStartOfEncoderSampleIndex(at) };
+                // SAFETY: the index is inside the sample buffer the pass was given.
+                unsafe { attachment.setEndOfEncoderSampleIndex(at + 1) };
+                self.state
+                    .command_buffer
+                    .blitCommandEncoderWithDescriptor(&pass)
+            }
+            None => self.state.command_buffer.blitCommandEncoder(),
+        }
+        .expect("failed to open a blit encoder");
         self.state.open = Open::Blit(encoder.clone());
         encoder
     }
@@ -225,6 +359,19 @@ impl<'a> MtlEncoder<'a> {
                 },
             );
         }
+        if let Some((buffer, at)) = self.state.next_pair() {
+            // SAFETY: attachment 0 of a descriptor is always valid to address.
+            let attachment = unsafe { pass.sampleBufferAttachments().objectAtIndexedSubscript(0) };
+            attachment.setSampleBuffer(Some(&buffer));
+            // SAFETY: the index is inside the sample buffer the pass was given.
+            unsafe { attachment.setStartOfVertexSampleIndex(at) };
+            // SAFETY: the index is inside the sample buffer the pass was given.
+            unsafe { attachment.setEndOfVertexSampleIndex(MTLCounterDontSample) };
+            // SAFETY: the index is inside the sample buffer the pass was given.
+            unsafe { attachment.setStartOfFragmentSampleIndex(MTLCounterDontSample) };
+            // SAFETY: the index is inside the sample buffer the pass was given.
+            unsafe { attachment.setEndOfFragmentSampleIndex(at + 1) };
+        }
         let encoder = self
             .state
             .command_buffer
@@ -232,6 +379,15 @@ impl<'a> MtlEncoder<'a> {
             .expect("failed to open a render encoder");
         self.state.open = Open::Render(encoder);
         self.state.pipeline = None;
+    }
+
+    /// Name the passes that follow. While timing, this ends the open encoder so
+    /// the next one starts its own sample pair.
+    pub fn set_pass_name(&mut self, name: &'static str) {
+        if self.state.timing.is_some() {
+            self.state.close();
+            self.state.pass_name = name;
+        }
     }
 
     pub fn begin_rendering(&mut self, target: TextureViewId) {
@@ -638,6 +794,43 @@ mod tests {
 
     fn floats(values: &[f32]) -> Vec<u8> {
         bytemuck::cast_slice(values).to_vec()
+    }
+
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn each_named_pass_gets_its_own_ordered_gpu_span() {
+        let device = metal();
+        let Device::Metal(driver) = &device else {
+            unreachable!()
+        };
+        driver.begin_frame(0);
+        let view = target(&device, [64, 64]);
+        let pass = RenderTargets {
+            colors: vec![crate::gfx::rhi::ColorAttachment {
+                target: view,
+                load: LoadOp::Clear,
+                store: StoreOp::Store,
+                clear: [0.0; 4],
+                resolve: None,
+            }],
+            depth: None,
+        };
+        let mut state = State::new(driver);
+        state.time(driver, 7);
+        {
+            let mut encoder = crate::gfx::rhi::Encoder::Metal(MtlEncoder::new(driver, &mut state));
+            for name in ["first", "second"] {
+                encoder.set_pass_name(name);
+                encoder.begin_pass(&pass);
+                encoder.end_rendering();
+            }
+        }
+        let timing = state.take_timing().expect("this device samples timestamps");
+        let _ = state.finish_blocking();
+        let spans = timing.resolve();
+        let names: Vec<_> = spans.iter().map(|span| span.0).collect();
+        assert_eq!(names, ["first", "second"]);
+        assert!(spans[0].2 <= spans[1].2, "{spans:?}");
     }
 
     /// The first pass through the whole stack on a real device: a fullscreen

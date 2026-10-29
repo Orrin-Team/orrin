@@ -394,6 +394,11 @@ impl Encoder<'_> {
         encoder_dispatch!(self, encoder => encoder.close_swapchain(target))
     }
 
+    /// Name what is recorded next, for the backend's own GPU timing.
+    pub fn set_pass_name(&mut self, name: &'static str) {
+        encoder_dispatch!(self, encoder => encoder.set_pass_name(name))
+    }
+
     /// Open a render pass over `targets`.
     pub fn begin_pass(&mut self, targets: &RenderTargets) {
         encoder_dispatch!(self, encoder => encoder.begin_pass(targets))

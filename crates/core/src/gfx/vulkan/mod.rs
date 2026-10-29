@@ -1413,6 +1413,10 @@ impl VulkanRenderer {
         {
             timestamps.drain_completed(profiler);
         }
+        #[cfg(target_os = "macos")]
+        if let Backend::Metal(mtl) = &mut self.backend {
+            mtl.drain_spans(profiler);
+        }
     }
 
     /// Live device-local VRAM as `(used, total)` bytes; `used` is `None` when the
@@ -1725,7 +1729,16 @@ impl VulkanRenderer {
         let mut commands = match &self.device {
             Device::Vulkan(_) => Commands::Vulkan(self.new_command_buffer()),
             #[cfg(target_os = "macos")]
-            Device::Metal(driver) => Commands::Metal(crate::gfx::metal::State::new(driver)),
+            Device::Metal(driver) => {
+                let mut state = crate::gfx::metal::State::new(driver);
+                if let Some(frame) = profiler_frame
+                    && crate::profile::is_enabled()
+                    && crate::profile::gpu_passes_enabled()
+                {
+                    state.time(driver, frame);
+                }
+                Commands::Metal(state)
+            }
         };
 
         // Resets are illegal inside a render pass, so they and the reserved
@@ -2261,6 +2274,7 @@ impl VulkanRenderer {
                     record.walk(&mut encoder, &target);
                     if raw_passes.contains(&PassBody::Overlay) {
                         profile_scope!("overlay");
+                        encoder.set_pass_name("overlay");
                         let overlay = overlay
                             .take()
                             .expect("the graph scheduled an overlay pass but none was supplied");
@@ -2275,15 +2289,23 @@ impl VulkanRenderer {
                 drop(recording);
                 match self.backend.metal_window() {
                     Some(_) => {
+                        let timing = state.take_timing();
                         let command_buffer = state.finish(drawable);
                         if let Backend::Metal(mtl) = &mut self.backend {
+                            if let Some(timing) = timing {
+                                mtl.timed(timing, command_buffer.clone());
+                            }
                             mtl.submitted(self.frame_index.wrapping_sub(1), command_buffer);
                         }
                     }
                     // Offscreen, so the frame is waited for rather than presented.
                     None => {
-                        let seconds = state.finish_blocking();
+                        let timing = state.take_timing();
+                        let (seconds, command_buffer) = state.finish_blocking();
                         if let Backend::Metal(mtl) = &mut self.backend {
+                            if let Some(timing) = timing {
+                                mtl.timed(timing, command_buffer);
+                            }
                             mtl.gpu_ms = (seconds * 1.0e3) as f32;
                         }
                     }
@@ -3008,6 +3030,7 @@ impl FrameRecord<'_> {
         for slot in 0..self.frame.graph.order().len() {
             let pass = self.frame.graph.order()[slot];
             let body = self.frame.bodies[pass.index()];
+            encoder.set_pass_name(self.frame.graph.pass_name(pass));
             match self.frame.graph.pass_kind(pass) {
                 // Escape-hatch passes own their submission; there is no overlay
                 // to draw over an offscreen capture.

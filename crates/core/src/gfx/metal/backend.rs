@@ -13,6 +13,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandBuffer, MTLPixelFormat};
 
+use super::encoder::Timing;
 use super::window::MtlWindow;
 use super::{FRAME_SLOTS, MtlDriver};
 use crate::gfx::format::{Format, SampleCount};
@@ -67,6 +68,8 @@ pub(crate) struct MtlBackend {
     pub(crate) windowed: Option<Windowed>,
     /// Trails the displayed frame by the pacing depth, as the Vulkan reading does.
     pub(crate) gpu_ms: f32,
+    /// Frames whose samples wait on the GPU to finish.
+    timed: Vec<(Timing, Retained<ProtocolObject<dyn MTLCommandBuffer>>)>,
 }
 
 /// Seconds in, milliseconds out; a buffer that never ran reports zero for both.
@@ -103,6 +106,7 @@ impl MtlBackend {
             cache: HashMap::new(),
             windowed: None,
             gpu_ms: 0.0,
+            timed: Vec::new(),
         };
         let table = backend.rebuild(driver, graph);
         (backend, table)
@@ -206,6 +210,39 @@ impl MtlBackend {
         if let Some(windowed) = &mut self.windowed {
             windowed.ring[(frame % FRAME_SLOTS) as usize] = Some(command_buffer);
         }
+    }
+
+    pub(crate) fn timed(
+        &mut self,
+        timing: Timing,
+        command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    ) {
+        self.timed.push((timing, command_buffer));
+    }
+
+    /// File the samples of every frame the GPU has finished, without waiting.
+    pub(crate) fn drain_spans(&mut self, profiler: &mut crate::profile::Profiler) {
+        let current = profiler.frame_index();
+        self.timed.retain(|(timing, command_buffer)| {
+            if timing.frame >= current {
+                return true;
+            }
+            if command_buffer.status() != objc2_metal::MTLCommandBufferStatus::Completed {
+                return command_buffer.status() < objc2_metal::MTLCommandBufferStatus::Completed;
+            }
+            for (name, start_ns, end_ns) in timing.resolve() {
+                profiler.push_gpu_span(
+                    timing.frame,
+                    crate::profile::Span {
+                        name,
+                        depth: 0,
+                        start_ns,
+                        end_ns,
+                    },
+                );
+            }
+            false
+        });
     }
 
     pub(crate) fn is_stale(&self) -> bool {
