@@ -773,7 +773,7 @@ mod tests {
             ..color_to_present(image)
         });
         {
-            let Device::Vulkan(driver) = &device;
+            let driver = device.vulkan();
             let target = driver.import_view(view.clone());
             let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
             pass.record(&device, &mut encoder, target, &mut frame);
@@ -862,7 +862,7 @@ mod tests {
             ..color_to_present(image.clone())
         });
         {
-            let Device::Vulkan(driver) = &device;
+            let driver = device.vulkan();
             let target = driver.import_view(view.clone());
             let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
             pass.record(&device, &mut encoder, target, &mut frame);
@@ -1009,7 +1009,7 @@ mod tests {
                     first = false;
                 }
                 {
-                    let Device::Vulkan(driver) = &device;
+                    let driver = device.vulkan();
                     let target = driver.import_view(view.clone());
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
                     pass.record(&device, &mut encoder, target, &mut frame);

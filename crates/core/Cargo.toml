@@ -110,7 +110,10 @@ harness = false
 shaderc = "0.8"
 spirv-cross2 = { version = "0.7", default-features = false, features = ["msl"] }
 
-# The ignored test that compiles every MSL translation against a real device.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSError"] }
-objc2-metal = { version = "0.3", default-features = false, features = ["MTLDevice", "MTLLibrary", "std"] }
+# Native Metal beside Vulkan, on macOS only: the driver in `gfx/metal`. The
+# bindings are generated per class and default to all of them, which is the
+# compile-time cost of a driver that reaches most of the API.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
