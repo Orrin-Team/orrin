@@ -321,6 +321,31 @@ pub struct VulkanRenderer {
     backend: Backend,
 }
 
+/// The frame's commands as they are being recorded: a Vulkan command buffer, or
+/// a Metal command buffer with its open encoder.
+enum Commands {
+    Vulkan(Recorder),
+    #[cfg(target_os = "macos")]
+    Metal(crate::gfx::metal::State),
+}
+
+impl Commands {
+    /// An encoder over whatever is being recorded, for the neutral passes.
+    fn encoder<'a>(&'a mut self, device: &'a Device) -> Encoder<'a> {
+        match (self, device) {
+            (Commands::Vulkan(recorder), Device::Vulkan(driver)) => {
+                Encoder::Vulkan(VkEncoder::new(recorder, driver))
+            }
+            #[cfg(target_os = "macos")]
+            (Commands::Metal(state), Device::Metal(driver)) => {
+                Encoder::Metal(crate::gfx::metal::MtlEncoder::new(driver, state))
+            }
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("commands recorded for one driver were handed another"),
+        }
+    }
+}
+
 /// What the renderer is drawing with.
 ///
 /// The passes, the tables and the frame's compiled plan are the renderer's and
@@ -328,18 +353,61 @@ pub struct VulkanRenderer {
 /// does.
 enum Backend {
     Vulkan(Box<VkBackend>),
+    #[cfg(target_os = "macos")]
+    Metal(Box<crate::gfx::metal::backend::MtlBackend>),
 }
 
 impl Backend {
+    /// The Vulkan half, for the code that is only ever Vulkan's: the swapchain,
+    /// submission, the overlay. Reaching it on Metal is a bug in the caller.
     fn vk(&self) -> &VkBackend {
         match self {
             Backend::Vulkan(vk) => vk,
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => unreachable!("a Vulkan-only path ran on the Metal backend"),
         }
     }
 
     fn vk_mut(&mut self) -> &mut VkBackend {
         match self {
             Backend::Vulkan(vk) => vk,
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => unreachable!("a Vulkan-only path ran on the Metal backend"),
+        }
+    }
+
+    fn is_stale(&self) -> bool {
+        match self {
+            Backend::Vulkan(vk) => vk.images.is_stale(vk.swapchain.extent),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(mtl) => mtl.is_stale(),
+        }
+    }
+
+    /// The extent the frame renders at.
+    fn extent(&self) -> [u32; 2] {
+        match self {
+            Backend::Vulkan(vk) => vk.swapchain.extent,
+            #[cfg(target_os = "macos")]
+            Backend::Metal(mtl) => mtl.extent,
+        }
+    }
+
+    fn format(&self) -> EngineFormat {
+        match self {
+            Backend::Vulkan(vk) => engine_format(vk.swapchain.format),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(mtl) => mtl.format,
+        }
+    }
+
+    /// Whether a second queue can take the compute tail. Metal's bring-up uses
+    /// one.
+    fn async_compute(&self) -> bool {
+        match self {
+            Backend::Vulkan(vk) => vk.ctx.compute_queue.is_some(),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => false,
         }
     }
 }
@@ -469,6 +537,35 @@ impl VulkanRenderer {
         )
     }
 
+    /// A renderer drawing into an image of `extent` through native Metal, or why
+    /// this machine cannot be the Metal backend.
+    ///
+    /// The same passes, the same compiled frame and the same per-frame state as
+    /// [`offscreen`](Self::offscreen); only what executes the frame and owns the
+    /// images it renders into differs, which is what makes a capture from here
+    /// comparable to one from there.
+    #[cfg(target_os = "macos")]
+    pub fn offscreen_metal(extent: [u32; 2]) -> Result<Self, String> {
+        let device = Device::Metal(crate::gfx::metal::MtlDriver::new()?);
+        let gpu_culling = gpu_culling_requested(std::env::var("ORRIN_GPU_CULL").ok().as_deref());
+        Ok(Self::assemble(
+            device,
+            OFFSCREEN_FORMAT,
+            extent,
+            gpu_culling,
+            false,
+            |device, frame, _slots| {
+                let (backend, table) = crate::gfx::metal::backend::MtlBackend::new(
+                    device.metal(),
+                    OFFSCREEN_FORMAT,
+                    extent,
+                    &frame.graph,
+                );
+                (Backend::Metal(Box::new(backend)), table)
+            },
+        ))
+    }
+
     /// The half of construction that does not know where the frame ends up.
     fn build(
         ctx: VkContext,
@@ -479,16 +576,69 @@ impl VulkanRenderer {
     ) -> Self {
         let ctx = Arc::new(ctx);
         let device = Device::Vulkan(VkDriver::new(ctx.clone(), FRAMES_IN_FLIGHT as u64));
-        let forward = ForwardPass::new(&ctx, &device, hdr::HDR_FORMAT, hdr::HDR_WIDE_FORMAT);
-        let hdr = HdrPass::new(&device, engine_format(format));
-        let gizmo = GizmoPass::new(&device, engine_format(format));
-        let outline = OutlinePass::new(&device, engine_format(format));
+        let gpu_culling = read_gpu_culling(&ctx);
+        let async_compute = ctx.compute_queue.is_some();
+        Self::assemble(
+            device,
+            engine_format(format),
+            extent,
+            gpu_culling,
+            async_compute,
+            |device, frame, slots| {
+                let swapchain = make_target(&ctx, format, extent);
+                let timestamps = GpuTimestamps::new(&ctx);
+                let images = GraphImages::allocate(
+                    &ctx.memory_allocator,
+                    &ctx,
+                    device.vulkan(),
+                    &frame.graph,
+                    extent,
+                    slots,
+                );
+                let table = images.table();
+                (
+                    Backend::Vulkan(Box::new(VkBackend {
+                        ctx,
+                        swapchain,
+                        in_flight: RunAhead::new(FRAMES_IN_FLIGHT),
+                        frame_chain: None,
+                        pending: None,
+                        head_gate: None,
+                        overlay_present: RunAhead::new(FRAMES_IN_FLIGHT),
+                        overlay: None,
+                        present_waits: Vec::new(),
+                        recreate_swapchain: false,
+                        pending_extent: extent,
+                        present,
+                        timestamps,
+                        images,
+                    })),
+                    table,
+                )
+            },
+        )
+    }
+
+    /// The passes, tables and compiled frame, which are the same whatever draws
+    /// them; `backend` builds the half that is not.
+    fn assemble(
+        device: Device,
+        format: EngineFormat,
+        extent: [u32; 2],
+        gpu_culling: bool,
+        async_compute: bool,
+        backend: impl FnOnce(&Device, &Frame, usize) -> (Backend, ImageTable),
+    ) -> Self {
+        let forward = ForwardPass::new(&device, hdr::HDR_FORMAT, hdr::HDR_WIDE_FORMAT);
+        let hdr = HdrPass::new(&device, format);
+        let gizmo = GizmoPass::new(&device, format);
+        let outline = OutlinePass::new(&device, format);
         let exposure = ExposurePass::new(&device);
         let bloom = BloomPass::new(&device);
-        let prepass = GeometryPrepass::new(&ctx, &device);
+        let prepass = GeometryPrepass::new(&device);
         let ssao = SsaoPass::new(&device);
         let contact_shadows = ContactShadowPass::new(&device);
-        let fog = FogPass::new(&ctx, &device);
+        let fog = FogPass::new(&device);
         let ssr = SsrPass::new(&device);
         let subsurface = SubsurfacePass::new(&device);
         let oit = OitPass::new(&device, forward.layout_source());
@@ -499,9 +649,6 @@ impl VulkanRenderer {
         let shadow = ShadowPass::new(&device);
         let line = LinePass::new(&device, &forward.targets);
         let environment = EnvironmentPass::new(&device, &forward.targets);
-        let swapchain = make_target(&ctx, format, extent);
-        let timestamps = GpuTimestamps::new(&ctx);
-
         // Default textures so every material slot resolves to a valid view:
         // index 0 = white (a no-op multiply), index 1 = flat normal (0,0,1).
         let textures = vec![
@@ -511,10 +658,9 @@ impl VulkanRenderer {
 
         // Compiled for the editor's frame, which is what all but the headless
         // path uses; anything else recompiles on its first render.
-        let gpu_culling = read_gpu_culling(&ctx);
         let occlusion_culling = gpu_culling && read_occlusion_culling();
         let config = FrameConfig {
-            color_format: engine_format(format),
+            color_format: format,
             msaa: false,
             ssao: true,
             ssao_half_res: true,
@@ -533,23 +679,13 @@ impl VulkanRenderer {
             shadow_cascades: 0,
             shadow_resolution: 1,
             shadow_atlas: 0,
-            async_compute: ctx.compute_queue.is_some(),
+            async_compute,
             gpu_culling,
             occlusion_culling,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
-        let images = {
-            let driver = device.vulkan();
-            GraphImages::allocate(
-                &ctx.memory_allocator,
-                &ctx,
-                driver,
-                &frame.graph,
-                extent,
-                slots,
-            )
-        };
+        let (backend, table) = backend(&device, &frame, slots);
 
         Self {
             instances: InstanceStore::new(&device),
@@ -591,23 +727,8 @@ impl VulkanRenderer {
             frame_index: 0,
             config,
             frame,
-            table: images.table(),
-            backend: Backend::Vulkan(Box::new(VkBackend {
-                ctx,
-                swapchain,
-                in_flight: RunAhead::new(FRAMES_IN_FLIGHT),
-                frame_chain: None,
-                pending: None,
-                head_gate: None,
-                overlay_present: RunAhead::new(FRAMES_IN_FLIGHT),
-                overlay: None,
-                present_waits: Vec::new(),
-                recreate_swapchain: false,
-                pending_extent: extent,
-                present,
-                timestamps,
-                images,
-            })),
+            table,
+            backend,
         }
     }
 
@@ -618,12 +739,7 @@ impl VulkanRenderer {
         if self.config != config {
             self.frame = frame::declare(config).expect("the engine's frame must compile");
             self.config = config;
-        } else if !self
-            .backend
-            .vk()
-            .images
-            .is_stale(self.backend.vk().swapchain.extent)
-        {
+        } else if !self.backend.is_stale() {
             return;
         }
         self.reallocate();
@@ -640,6 +756,14 @@ impl VulkanRenderer {
     /// `render_frame` already signalled a fence, and the copy is submitted after
     /// it has been reached, so nothing here can read a half-written image.
     pub fn capture(&mut self) -> Option<(Vec<u8>, [u32; 2])> {
+        #[cfg(target_os = "macos")]
+        if let Backend::Metal(mtl) = &self.backend {
+            let crate::gfx::rhi::Device::Metal(driver) = &self.device else {
+                unreachable!("the Metal backend runs on the Metal device");
+            };
+            // The frame was committed and waited for before `render` returned.
+            return Some((driver.read_texture(mtl.target), mtl.extent));
+        }
         let image = self.backend.vk().swapchain.readback.first()?.clone();
 
         // A split frame holds its last segment back a frame on purpose, so
@@ -950,17 +1074,27 @@ impl VulkanRenderer {
         // Rebuilt rather than replaced, so the image cache survives: a
         // structural toggle re-points `views` at allocations that already exist
         // instead of recreating every image in the frame. See `GraphImages`.
-        let driver = self.device.vulkan();
-        let vk = self.backend.vk_mut();
-        vk.images.rebuild(
-            &vk.ctx.memory_allocator,
-            &vk.ctx,
-            driver,
-            &self.frame.graph,
-            vk.swapchain.extent,
-            image_slots(&self.frame.graph),
-        );
-        self.table = self.backend.vk().images.table();
+        match &mut self.backend {
+            Backend::Vulkan(vk) => {
+                let driver = self.device.vulkan();
+                vk.images.rebuild(
+                    &vk.ctx.memory_allocator,
+                    &vk.ctx,
+                    driver,
+                    &self.frame.graph,
+                    vk.swapchain.extent,
+                    image_slots(&self.frame.graph),
+                );
+                self.table = vk.images.table();
+            }
+            #[cfg(target_os = "macos")]
+            Backend::Metal(mtl) => {
+                let crate::gfx::rhi::Device::Metal(driver) = &self.device else {
+                    unreachable!("the Metal backend runs on the Metal device");
+                };
+                self.table = mtl.rebuild(driver, &self.frame.graph);
+            }
+        }
     }
 }
 
@@ -1082,7 +1216,7 @@ impl RenderBackend for VulkanRenderer {
     }
 
     fn samples_bc(&self) -> bool {
-        self.backend.vk().ctx.samples_bc
+        self.device.supports(Feature::BlockCompression)
     }
 
     fn load_environment(&mut self, pixels: &[f32], width: u32, height: u32) {
@@ -1318,11 +1452,13 @@ impl VulkanRenderer {
         shadows: Option<ShadowFrame<'_>>,
         overlay: Option<Overlay<'_>>,
     ) {
-        if self.backend.vk().pending_extent[0] == 0 || self.backend.vk().pending_extent[1] == 0 {
+        if let Backend::Vulkan(vk) = &self.backend
+            && (vk.pending_extent[0] == 0 || vk.pending_extent[1] == 0)
+        {
             return;
         }
 
-        if self.backend.vk().recreate_swapchain {
+        if matches!(&self.backend, Backend::Vulkan(vk) if vk.recreate_swapchain) {
             // Whatever is held back is held back against the *old* swapchain: it
             // writes an image acquired from it, and the index it was acquired at
             // means nothing in the replacement. Submitted and waited for here so
@@ -1343,7 +1479,7 @@ impl VulkanRenderer {
         // Everything else about this call — how many objects, which camera, what
         // exposure — flows through the same compiled schedule.
         self.ensure_graph(FrameConfig {
-            color_format: engine_format(self.backend.vk().swapchain.format),
+            color_format: self.backend.format(),
             msaa: taa.msaa,
             ssao: ssao.enabled,
             ssao_half_res: ssao.half_resolution,
@@ -1373,7 +1509,7 @@ impl VulkanRenderer {
             // a chain — so a frame dragged to a sliver drops the passes rather
             // than dispatching over one-texel levels.
             bloom_mips: if bloom.enabled {
-                bloom::mip_count(self.backend.vk().swapchain.extent)
+                bloom::mip_count(self.backend.extent())
             } else {
                 0
             },
@@ -1398,7 +1534,7 @@ impl VulkanRenderer {
             // frame is actually split is then the compiler's call — a
             // configuration with no compute tail to move gets the plan it always
             // had, on a device with two queues as much as on one.
-            async_compute: self.backend.vk().ctx.compute_queue.is_some(),
+            async_compute: self.backend.async_compute(),
             gpu_culling: self.gpu_culling,
             occlusion_culling: self.occlusion_culling,
         });
@@ -1406,51 +1542,56 @@ impl VulkanRenderer {
         // Release what the GPU has already finished and block only if the CPU
         // is [`FRAMES_IN_FLIGHT`] frames ahead: recording raw means this crate
         // owns those lifetimes, and the bound is what caps the list.
-        self.backend.vk_mut().in_flight.wait_for_room();
-        self.backend.vk_mut().overlay_present.wait_for_room();
-
-        // Split out because under Fifo this blocks until the presentation engine
-        // hands back an image — a vsync wait, not work. Folded into a single
-        // "render" scope it swamps the numbers and hides real regressions.
         let (image_index, suboptimal, acquire_semaphore) =
-            match self.backend.vk().swapchain.swapchain.clone() {
-                Some(swapchain) => {
-                    profile_scope!("acquire");
-                    // The raw form, because the frame is submitted raw: the
-                    // `SwapchainAcquireFuture` the safe one returns owns its
-                    // semaphore privately, and nothing can read it back out to put
-                    // in a `VkSubmitInfo`.
-                    let semaphore = Arc::new(
-                        Semaphore::from_pool(self.backend.vk().ctx.device.clone())
-                            .expect("failed to create the acquire semaphore"),
-                    );
-                    // SAFETY: the semaphore is unsignalled and has no pending wait
-                    // — it was made a line above, and the frame that ends up waiting
-                    // on it holds it until its own fence signals. The previous frame
-                    // may still be executing, which acquire allows: the presentation
-                    // engine hands back only an image it has finished with.
-                    let acquired = unsafe {
-                        swapchain.acquire_next_image(&AcquireNextImageInfo {
-                            semaphore: Some(semaphore.clone()),
-                            ..Default::default()
-                        })
-                    };
-                    match acquired.map_err(Validated::unwrap) {
-                        Ok(acquired) => (
-                            acquired.image_index,
-                            acquired.is_suboptimal,
-                            Some(semaphore),
-                        ),
-                        Err(VulkanError::OutOfDate) => {
-                            self.backend.vk_mut().recreate_swapchain = true;
-                            return;
+            if matches!(self.backend, Backend::Vulkan(_)) {
+                self.backend.vk_mut().in_flight.wait_for_room();
+                self.backend.vk_mut().overlay_present.wait_for_room();
+
+                // Split out because under Fifo this blocks until the presentation engine
+                // hands back an image — a vsync wait, not work. Folded into a single
+                // "render" scope it swamps the numbers and hides real regressions.
+                match self.backend.vk().swapchain.swapchain.clone() {
+                    Some(swapchain) => {
+                        profile_scope!("acquire");
+                        // The raw form, because the frame is submitted raw: the
+                        // `SwapchainAcquireFuture` the safe one returns owns its
+                        // semaphore privately, and nothing can read it back out to put
+                        // in a `VkSubmitInfo`.
+                        let semaphore = Arc::new(
+                            Semaphore::from_pool(self.backend.vk().ctx.device.clone())
+                                .expect("failed to create the acquire semaphore"),
+                        );
+                        // SAFETY: the semaphore is unsignalled and has no pending wait
+                        // — it was made a line above, and the frame that ends up waiting
+                        // on it holds it until its own fence signals. The previous frame
+                        // may still be executing, which acquire allows: the presentation
+                        // engine hands back only an image it has finished with.
+                        let acquired = unsafe {
+                            swapchain.acquire_next_image(&AcquireNextImageInfo {
+                                semaphore: Some(semaphore.clone()),
+                                ..Default::default()
+                            })
+                        };
+                        match acquired.map_err(Validated::unwrap) {
+                            Ok(acquired) => (
+                                acquired.image_index,
+                                acquired.is_suboptimal,
+                                Some(semaphore),
+                            ),
+                            Err(VulkanError::OutOfDate) => {
+                                self.backend.vk_mut().recreate_swapchain = true;
+                                return;
+                            }
+                            Err(e) => panic!("failed to acquire next image: {e}"),
                         }
-                        Err(e) => panic!("failed to acquire next image: {e}"),
                     }
+                    // Offscreen: one image, always available, and nothing to wait on —
+                    // no presentation engine owns it, so there is no hand-back to time.
+                    None => (0, false, None),
                 }
-                // Offscreen: one image, always available, and nothing to wait on —
-                // no presentation engine owns it, so there is no hand-back to time.
-                None => (0, false, None),
+            } else {
+                // One image, always available, and nothing to wait on.
+                (0, false, None)
             };
         if suboptimal {
             self.backend.vk_mut().recreate_swapchain = true;
@@ -1459,10 +1600,12 @@ impl VulkanRenderer {
         // Which set of the graph's images this frame writes. One set unless the
         // frame was split, in which case the previous frame's compute tail is
         // still reading the other.
-        self.backend.vk_mut().images.set_slot(self.frame_index);
+        if let Backend::Vulkan(vk) = &mut self.backend {
+            vk.images.set_slot(self.frame_index);
+            vk.ctx.descriptor_sets.next_frame();
+        }
         self.table.set_slot(self.frame_index);
         self.frame_index = self.frame_index.wrapping_add(1);
-        self.backend.vk().ctx.descriptor_sets.next_frame();
         self.device.begin_frame(self.frame_index);
 
         // Taken out of `self` for the duration of recording: the pass brackets
@@ -1470,23 +1613,28 @@ impl VulkanRenderer {
         // borrow held across them wouldn't compile. Restored before returning,
         // and only if it was taken — every early return above happens first.
         let mut timestamps = match profiler_frame {
-            Some(frame) => {
+            Some(frame) if matches!(self.backend, Backend::Vulkan(_)) => {
                 let mut taken = self.backend.vk_mut().timestamps.take();
                 if let Some(timestamps) = taken.as_mut() {
                     timestamps.begin_frame(frame);
                 }
                 taken
             }
-            None => None,
+            _ => None,
         };
 
         let recording = crate::profile::scope("record");
-        let mut builder = self.new_command_buffer();
+        let mut commands = match &self.device {
+            Device::Vulkan(_) => Commands::Vulkan(self.new_command_buffer()),
+            #[cfg(target_os = "macos")]
+            Device::Metal(driver) => Commands::Metal(crate::gfx::metal::State::new(driver)),
+        };
 
         // Resets are illegal inside a render pass, so they and the reserved
         // whole-frame pair go here, ahead of every pass below.
-        if let Some(timestamps) = timestamps.as_mut() {
-            timestamps.record_resets(&mut builder);
+        if let (Some(timestamps), Commands::Vulkan(builder)) = (timestamps.as_mut(), &mut commands)
+        {
+            timestamps.record_resets(builder);
         }
 
         // Drive the SSAO tunables from the world resource each frame. When SSAO
@@ -1502,12 +1650,9 @@ impl VulkanRenderer {
         // Before anything records: this is where the frame's subpixel jitter is
         // chosen, and every pass that rasterises geometry has to be drawn with
         // the matrices it returns rather than deriving its own from `camera`.
-        let view = self.taa.begin_frame(
-            &self.device,
-            taa,
-            camera,
-            self.backend.vk().swapchain.extent,
-        );
+        let view = self
+            .taa
+            .begin_frame(&self.device, taa, camera, self.backend.extent());
         // Both resolve their optics against this frame's camera: the lens takes
         // its focal length from the field of view, and the shutter takes the
         // depth range it linearises with.
@@ -1634,7 +1779,6 @@ impl VulkanRenderer {
         let prepass_texture_set = self.prepass_texture_set.unwrap();
         let shadow_material_set = self.shadow_material_set.unwrap();
         let shadow_texture_set = self.shadow_texture_set.unwrap();
-        let driver = self.device.vulkan();
 
         // Every list a frame draws is an ordering over one shared `RenderItem`
         // array, so any non-empty list carries the whole of it. Taking the
@@ -1664,7 +1808,7 @@ impl VulkanRenderer {
         // them is recorded here — at the top of the frame's command buffer,
         // ahead of every pass that reads them.
         {
-            let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut builder, driver));
+            let mut encoder = commands.encoder(&self.device);
             self.instances.sync(&self.device, &mut encoder, items);
         }
 
@@ -1779,9 +1923,8 @@ impl VulkanRenderer {
         // so a half-res target that scaled the pattern by the window would
         // stretch the rotation across two pixels and band the result.
         let ssao_uniforms = self.frame.ids.ssao.map(|ids| {
-            let driver = self.device.vulkan();
             self.ssao.begin_frame(
-                driver,
+                &self.device,
                 self.table.extent(ids.raw_ao),
                 frame_uniforms.expect("SSAO reads the geometry prepass"),
             )
@@ -1790,9 +1933,8 @@ impl VulkanRenderer {
         // rasterising pass takes its matrices from `FrameView`: the depth this
         // marches was written under that projection's jitter.
         let contact_shadow_uniforms = self.frame.ids.contact_shadows.map(|_| {
-            let driver = self.device.vulkan();
             self.contact_shadows.begin_frame(
-                driver,
+                &self.device,
                 contact_shadows,
                 &view,
                 lighting.sun.direction_to_light(),
@@ -1818,17 +1960,10 @@ impl VulkanRenderer {
         // Same trick for shadows: with them off there is no cascade image to
         // read, so the forward pass samples a 1x1 depth texture of 1.0 and every
         // comparison reports "lit".
-        let shadow_view = match self.frame.ids.shadows {
-            Some(id) => self.backend.vk().images.view(id),
-            None => self.vk_view(self.shadow.lit_view()),
+        let shadow_id = match self.frame.ids.shadows {
+            Some(id) => self.table.texture(id),
+            None => self.shadow.lit_view(),
         };
-        debug_assert_eq!(
-            shadow_view.view_type(),
-            vulkano::image::view::ImageViewType::Dim2dArray,
-            "the forward pipeline binds the cascades as texture2DArray",
-        );
-
-        let shadow_id = driver.import_view(shadow_view);
 
         // And the same for the punctual atlas, which is a plain 2D image: with
         // nothing casting there is no atlas to read, so the forward pass samples
@@ -1885,8 +2020,16 @@ impl VulkanRenderer {
         // decides what runs next, what an image's layout is, or what has to
         // finish before what — a pass that needs a different place in the frame
         // gets there by changing its declarations, not by being moved here.
-        let extent = self.backend.vk().swapchain.extent;
-        let swapchain_view = self.backend.vk().swapchain.image_views[image_index as usize].clone();
+        let extent = self.backend.extent();
+        let (swapchain_view, swapchain_id) = match &self.backend {
+            Backend::Vulkan(vk) => {
+                let view = vk.swapchain.image_views[image_index as usize].clone();
+                let id = self.device.vulkan().import_view(view.clone());
+                (Some(view), id)
+            }
+            #[cfg(target_os = "macos")]
+            Backend::Metal(mtl) => (None, mtl.target),
+        };
         // Passes that own their submission, gathered before anything records:
         // they run on the future after this command buffer rather than inside
         // it, and the walk below skips them.
@@ -1929,19 +2072,27 @@ impl VulkanRenderer {
         });
 
         let record = FrameRecord {
-            ctx: &self.backend.vk().ctx,
+            vk: match &self.backend {
+                Backend::Vulkan(vk) => Some(VkFrame {
+                    ctx: &vk.ctx,
+                    images: &vk.images,
+                    swapchain_view: swapchain_view
+                        .clone()
+                        .expect("a Vulkan frame has a swapchain image"),
+                    timestamps: timestamps.as_ref(),
+                    tokens: &tokens,
+                }),
+                #[cfg(target_os = "macos")]
+                Backend::Metal(_) => None,
+            },
             device: &self.device,
             meshes: &self.meshes,
             materials: &self.materials,
             frame: &self.frame,
-            images: &self.backend.vk().images,
             table: &self.table,
-            swapchain_view: swapchain_view.clone(),
-            swapchain_id: driver.import_view(swapchain_view.clone()),
+            swapchain_id,
             shadow_resolution: self.config.shadow_resolution,
             extent,
-            timestamps: timestamps.as_ref(),
-            tokens: &tokens,
             bloom: &self.bloom,
             contact_shadows: &self.contact_shadows,
             dof: &self.dof,
@@ -1995,6 +2146,26 @@ impl VulkanRenderer {
                 .as_deref()
                 .map_or(&[], |frame| frame.outline.as_slice()),
         };
+
+        let mut builder = match commands {
+            Commands::Vulkan(builder) => builder,
+            #[cfg(target_os = "macos")]
+            Commands::Metal(mut state) => {
+                {
+                    let mut encoder = Encoder::Metal(crate::gfx::metal::MtlEncoder::new(
+                        self.device.metal(),
+                        &mut state,
+                    ));
+                    record.walk(&mut encoder);
+                }
+                // Offscreen, so the frame is waited for rather than presented.
+                state.finish_blocking();
+                drop(recording);
+                return;
+            }
+        };
+
+        let swapchain_view = swapchain_view.expect("a Vulkan frame has a swapchain image");
 
         // One command buffer per compiled segment, each bound for the queue the
         // schedule put it on. One segment — the whole frame on the graphics
@@ -2269,25 +2440,32 @@ impl VulkanRenderer {
 /// Not a `&VulkanRenderer` for the reason [`PassCtx`] is not: the renderer owns
 /// the frames in flight and the overlay's futures, neither of which may cross a
 /// thread. What is here is the subset that may.
-struct FrameRecord<'a> {
+/// What only the Vulkan executor reads: the context its command buffers come
+/// from, the images' views for barriers, and the timestamp queries.
+struct VkFrame<'a> {
     ctx: &'a VkContext,
-    device: &'a Device,
-    meshes: &'a [GpuMesh],
-    materials: &'a [GpuMaterial],
-    frame: &'a Frame,
     images: &'a GraphImages,
-    table: &'a ImageTable,
     swapchain_view: Arc<ImageView>,
-    /// The same image as the device names it, which is what a pass binds.
-    swapchain_id: TextureViewId,
-    shadow_resolution: u32,
-    extent: [u32; 2],
     /// `None` when the device cannot time passes, or when profiling is off. The
     /// pairs in `tokens` were reserved before any of this recorded.
     timestamps: Option<&'a GpuTimestamps>,
     /// One entry per slot in the compiled order, `None` for a pass this frame
     /// does not time.
     tokens: &'a [Option<timestamps::PassToken>],
+}
+
+struct FrameRecord<'a> {
+    /// `None` on a backend that is not Vulkan.
+    vk: Option<VkFrame<'a>>,
+    device: &'a Device,
+    meshes: &'a [GpuMesh],
+    materials: &'a [GpuMaterial],
+    frame: &'a Frame,
+    table: &'a ImageTable,
+    /// The same image as the device names it, which is what a pass binds.
+    swapchain_id: TextureViewId,
+    shadow_resolution: u32,
+    extent: [u32; 2],
     bloom: &'a BloomPass,
     contact_shadows: &'a ContactShadowPass,
     dof: &'a DofPass,
@@ -2463,7 +2641,7 @@ impl FrameRecord<'_> {
         let costs: Vec<u32> = segment.clone().map(|slot| self.cost(slot)).collect();
         let runs = parallel::partition(&costs, groups);
         let recorded = threads::map(&runs, |run| {
-            let mut secondary = Recorder::secondary(self.ctx);
+            let mut secondary = Recorder::secondary(self.vk().ctx);
             for offset in run.clone() {
                 self.record_slot(&mut secondary, segment.start + offset);
             }
@@ -2572,7 +2750,9 @@ impl FrameRecord<'_> {
         let ids = &self.frame.ids;
 
         if id == ids.swapchain_color {
-            return Some(record::Target::Image(self.swapchain_view.image().clone()));
+            return Some(record::Target::Image(
+                self.vk().swapchain_view.image().clone(),
+            ));
         }
         // The imported buffers. See `record::Target::Memory` for why these do
         // not need resolving to their `Subbuffer`s.
@@ -2618,7 +2798,8 @@ impl FrameRecord<'_> {
             }
         }
 
-        self.images
+        self.vk()
+            .images
             .try_view(id)
             .map(|view| record::Target::Image(view.image().clone()))
     }
@@ -2646,8 +2827,8 @@ impl FrameRecord<'_> {
             return;
         }
 
-        let timed = self.tokens[slot];
-        if let Some(timestamps) = self.timestamps {
+        let timed = self.vk().tokens[slot];
+        if let Some(timestamps) = self.vk().timestamps {
             timestamps.open(builder, timed);
         }
 
@@ -2661,7 +2842,7 @@ impl FrameRecord<'_> {
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.record_compute(&mut encoder, body);
             }
-            if let Some(timestamps) = self.timestamps {
+            if let Some(timestamps) = self.vk().timestamps {
                 timestamps.close(builder, timed);
             }
             return;
@@ -2687,9 +2868,45 @@ impl FrameRecord<'_> {
         }
 
         builder.end_rendering();
-        if let Some(timestamps) = self.timestamps {
+        if let Some(timestamps) = self.vk().timestamps {
             timestamps.close(builder, timed);
         }
+    }
+
+    /// Run the whole compiled frame into one encoder, for a driver that tracks
+    /// its own hazards: the plan's barriers are not consulted, and nothing is
+    /// timed.
+    #[cfg(target_os = "macos")]
+    fn walk(&self, encoder: &mut Encoder) {
+        for slot in 0..self.frame.graph.order().len() {
+            let pass = self.frame.graph.order()[slot];
+            let body = self.frame.bodies[pass.index()];
+            match self.frame.graph.pass_kind(pass) {
+                // Escape-hatch passes own their submission; there is no overlay
+                // to draw over an offscreen capture.
+                PassKind::Raw => {}
+                PassKind::Compute => self.record_compute(encoder, body),
+                _ => {
+                    let targets = rendering::rendering_info(
+                        &self.frame.ids,
+                        self.table,
+                        self.swapchain_id,
+                        body,
+                        self.env.background,
+                    )
+                    .expect("the executor reached a graphics pass with nothing to render into");
+                    encoder.begin_pass(&targets);
+                    self.record_graphics(encoder, body);
+                    encoder.end_rendering();
+                }
+            }
+        }
+    }
+
+    fn vk(&self) -> &VkFrame<'_> {
+        self.vk
+            .as_ref()
+            .expect("the Vulkan executor ran without its Vulkan parts")
     }
 
     /// A compute pass's body: dispatches, with no render pass around them.

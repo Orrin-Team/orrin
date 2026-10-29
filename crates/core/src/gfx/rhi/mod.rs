@@ -69,6 +69,15 @@ pub enum Device {
 }
 
 impl Device {
+    /// The Metal driver, for the executor that records the Metal frame.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal(&self) -> &super::metal::MtlDriver {
+        match self {
+            Device::Metal(driver) => driver,
+            Device::Vulkan(_) => unreachable!("the Metal executor was handed the Vulkan device"),
+        }
+    }
+
     /// The Vulkan driver, for the executor that records the Vulkan frame. A
     /// pass never asks: it holds a `Device`.
     pub(crate) fn vulkan(&self) -> &VkDriver {

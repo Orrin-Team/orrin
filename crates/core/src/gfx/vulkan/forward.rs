@@ -10,7 +10,6 @@ use crate::gfx::{
 };
 use crate::scene::{Camera, EnvironmentSettings};
 
-use super::context::VkContext;
 use super::cull::Draws;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
@@ -631,13 +630,7 @@ impl ForwardPass {
     /// colour format. `msaa_color_format` is the wider one the multisampled pair
     /// needs: a resolve requires both images to agree, and alpha to coverage
     /// needs an alpha channel to read. See `hdr::HDR_WIDE_FORMAT`.
-    pub fn new(
-        ctx: &VkContext,
-        rhi: &Device,
-        color_format: Format,
-        msaa_color_format: Format,
-    ) -> Self {
-        let _device = &ctx.device;
+    pub fn new(rhi: &Device, color_format: Format, msaa_color_format: Format) -> Self {
         let targets = ForwardTargets::new(color_format, msaa_color_format);
 
         // One sampler for all eight pipelines. Vulkan compares immutable samplers

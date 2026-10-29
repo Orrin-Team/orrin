@@ -36,7 +36,6 @@ use crate::gfx::shaders::ShaderId;
 use crate::scene::FogSettings;
 
 use super::ShadowFrame;
-use super::context::VkContext;
 use super::forward::GpuCascades;
 use super::taa::FrameView;
 
@@ -153,7 +152,7 @@ pub struct FogPass {
 }
 
 impl FogPass {
-    pub fn new(_ctx: &VkContext, device: &Device) -> Self {
+    pub fn new(device: &Device) -> Self {
         // The comparison sampler has to be *immutable* — part of the layout
         // rather than something written into a descriptor set — because MoltenVK
         // is a portability-subset device and rejects a written one outright. The

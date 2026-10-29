@@ -35,7 +35,7 @@ enum Open {
     Blit(Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>),
 }
 
-pub(super) struct State {
+pub(crate) struct State {
     command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     open: Open,
     pipeline: Option<PipelineId>,
@@ -43,7 +43,7 @@ pub(super) struct State {
 }
 
 impl State {
-    pub(super) fn new(driver: &MtlDriver) -> Self {
+    pub(crate) fn new(driver: &MtlDriver) -> Self {
         Self {
             command_buffer: driver
                 .queue
@@ -65,7 +65,7 @@ impl State {
     }
 
     /// End recording and wait for the GPU.
-    pub(super) fn finish_blocking(mut self) {
+    pub(crate) fn finish_blocking(mut self) {
         self.close();
         self.command_buffer.commit();
         self.command_buffer.waitUntilCompleted();
@@ -73,7 +73,7 @@ impl State {
 }
 
 impl<'a> MtlEncoder<'a> {
-    pub(super) fn new(driver: &'a MtlDriver, state: &'a mut State) -> Self {
+    pub(crate) fn new(driver: &'a MtlDriver, state: &'a mut State) -> Self {
         Self { driver, state }
     }
 

@@ -5,6 +5,7 @@
 //! MSL, then the encoder. A method that is still `unimplemented!` names itself
 //! in the panic, so a pass that reaches one says which operation it needs next.
 
+pub(crate) mod backend;
 mod bind;
 mod convert;
 mod encoder;
@@ -25,6 +26,7 @@ use objc2_metal::{
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{Encoder, Pool, TextureViewId};
 
+pub(crate) use encoder::State;
 use resources::Arena;
 
 /// Frames the CPU may record ahead of the GPU, which is how many sets of

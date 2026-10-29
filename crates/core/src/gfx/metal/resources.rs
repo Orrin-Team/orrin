@@ -382,8 +382,7 @@ impl MtlDriver {
     }
 
     /// The texels of level 0 of a 2D texture, tightly packed, once the GPU has
-    /// finished with it. It stalls, which is fine for a test.
-    #[cfg(test)]
+    /// finished with it. It stalls, which is what a capture wants.
     pub(crate) fn read_texture(&self, view: TextureViewId) -> Vec<u8> {
         use objc2_metal::{
             MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,

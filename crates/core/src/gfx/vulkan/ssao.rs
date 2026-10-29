@@ -1,4 +1,3 @@
-use super::driver::VkDriver;
 use super::prepass::NORMAL_FORMAT;
 use crate::gfx::rhi::{
     Binding, BindingResource, BufferId, Device, Encoder, GraphicsPipelineDesc, PipelineId,
@@ -131,7 +130,7 @@ impl SsaoPass {
 
     pub(super) fn begin_frame(
         &self,
-        driver: &VkDriver,
+        device: &Device,
         extent: [u32; 2],
         frame: BufferId,
     ) -> SsaoUniforms {
@@ -149,7 +148,7 @@ impl SsaoPass {
 
         SsaoUniforms {
             frame,
-            params: driver.upload_uniform(&words),
+            params: device.upload_uniform(&words),
         }
     }
 

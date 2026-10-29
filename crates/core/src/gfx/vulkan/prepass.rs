@@ -24,7 +24,6 @@ use crate::gfx::shaders::ShaderId;
 use crate::gfx::{PositionVertex, SurfaceVertex};
 
 use super::PassCtx;
-use super::context::VkContext;
 use super::cull::Draws;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
@@ -101,8 +100,7 @@ pub struct GeometryPrepass {
 }
 
 impl GeometryPrepass {
-    pub fn new(ctx: &VkContext, device_rhi: &Device) -> Self {
-        let _device = &ctx.device;
+    pub fn new(device_rhi: &Device) -> Self {
         let pipeline = |fragment, cull| {
             device_rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
                 vertex: ShaderId::PrepassVert,

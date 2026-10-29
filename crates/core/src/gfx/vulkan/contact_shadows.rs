@@ -25,7 +25,6 @@ use crate::gfx::rhi::{
 use crate::gfx::shaders::ShaderId;
 use crate::scene::ContactShadowSettings;
 
-use super::driver::VkDriver;
 use super::taa::FrameView;
 
 /// One channel, because visibility is one number. The same format the AO target
@@ -102,7 +101,7 @@ impl ContactShadowPass {
     /// takes its matrices from `FrameView`.
     pub(super) fn begin_frame(
         &mut self,
-        driver: &VkDriver,
+        device: &Device,
         settings: &ContactShadowSettings,
         view: &FrameView,
         to_sun: Vec3,
@@ -142,7 +141,7 @@ impl ContactShadowPass {
         {
             *word = value.to_bits();
         }
-        let params = driver.upload_uniform(&words);
+        let params = device.upload_uniform(&words);
         self.frame = self.frame.wrapping_add(1);
 
         ContactShadowUniforms { frame, params }
