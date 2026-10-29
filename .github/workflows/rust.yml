@@ -198,3 +198,27 @@ jobs:
 
       - name: Scene format tests
         run: cargo test -p orrin-registry
+
+  # The Metal driver is cfg(target_os = "macos"), so no other job compiles or
+  # lints it. This is a full engine build on macOS; the GPU tests stay ignored
+  # because the runner has no Metal device to hand.
+  metal-driver:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v2-rust"
+
+      - name: Clippy
+        run: cargo clippy -p orrin-core --all-targets
+
+      - name: Device-free tests
+        run: cargo test -p orrin-core --lib --test render_graph --test shader_translation
