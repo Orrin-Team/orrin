@@ -4,9 +4,9 @@
 built, tested, commented and reviewed. Read it. This file is the operating
 procedure on top of it: how a Claude Code session in this repo should run.
 
-Design questions are answered by [`docs/architecture.md`](docs/architecture.md).
-When a change and the architecture doc disagree, the doc wins or the doc gets
-updated in the same change — never neither.
+Design questions are answered by the `//!` header of the module concerned. When
+a change and that header disagree, the header wins or it gets updated in the
+same change — never neither.
 
 ---
 
