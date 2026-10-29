@@ -1702,6 +1702,7 @@ impl VulkanRenderer {
         // Which set of the graph's images this frame writes. One set unless the
         // frame was split, in which case the previous frame's compute tail is
         // still reading the other.
+        #[cfg_attr(not(target_os = "macos"), allow(irrefutable_let_patterns))]
         if let Backend::Vulkan(vk) = &mut self.backend {
             vk.images.set_slot(self.frame_index);
             vk.ctx.descriptor_sets.next_frame();
@@ -2257,6 +2258,7 @@ impl VulkanRenderer {
                 .map_or(&[], |frame| frame.outline.as_slice()),
         };
 
+        #[cfg_attr(not(target_os = "macos"), allow(clippy::infallible_destructuring_match))]
         let mut builder = match commands {
             Commands::Vulkan(builder) => builder,
             #[cfg(target_os = "macos")]

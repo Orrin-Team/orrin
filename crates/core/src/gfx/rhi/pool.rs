@@ -45,6 +45,7 @@ impl<T> Pool<T> {
         self.slots.get(index as usize)?.as_ref()
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn get_mut(&mut self, index: u32) -> Option<&mut T> {
         self.slots.get_mut(index as usize)?.as_mut()
     }

@@ -204,6 +204,9 @@ jobs:
   # because the runner has no Metal device to hand.
   metal-driver:
     runs-on: macos-14
+    env:
+      # shaderc's bundled CMake files predate CMake 4's removal of policy < 3.5.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
 
