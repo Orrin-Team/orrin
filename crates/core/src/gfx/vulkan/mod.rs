@@ -1368,7 +1368,7 @@ impl VulkanRenderer {
         match &self.backend {
             Backend::Vulkan(vk) => vk.timestamps.as_ref().map(GpuTimestamps::last_frame_ms),
             #[cfg(target_os = "macos")]
-            Backend::Metal(_) => None,
+            Backend::Metal(mtl) => mtl.windowed.is_some().then_some(mtl.gpu_ms),
         }
     }
 

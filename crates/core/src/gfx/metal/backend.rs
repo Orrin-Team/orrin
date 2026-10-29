@@ -65,6 +65,13 @@ pub(crate) struct MtlBackend {
     images: [u32; 2],
     cache: HashMap<Key, ImageEntry>,
     pub(crate) windowed: Option<Windowed>,
+    /// Trails the displayed frame by the pacing depth, as the Vulkan reading does.
+    pub(crate) gpu_ms: f32,
+}
+
+/// Seconds in, milliseconds out; a buffer that never ran reports zero for both.
+fn span_ms(start: f64, end: f64) -> f32 {
+    ((end - start).max(0.0) * 1.0e3) as f32
 }
 
 fn create_target(driver: &MtlDriver, format: Format, extent: [u32; 2]) -> TextureViewId {
@@ -95,6 +102,7 @@ impl MtlBackend {
             images: extent,
             cache: HashMap::new(),
             windowed: None,
+            gpu_ms: 0.0,
         };
         let table = backend.rebuild(driver, graph);
         (backend, table)
@@ -186,6 +194,7 @@ impl MtlBackend {
             && let Some(previous) = windowed.ring[(frame % FRAME_SLOTS) as usize].take()
         {
             previous.waitUntilCompleted();
+            self.gpu_ms = span_ms(previous.GPUStartTime(), previous.GPUEndTime());
         }
     }
 
@@ -275,5 +284,16 @@ impl MtlBackend {
             entries[id.index()] = Some(entry);
         }
         ImageTable::new(vec![entries])
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::span_ms;
+
+    #[test]
+    fn a_span_is_in_milliseconds_and_never_negative() {
+        assert!((span_ms(1.0, 1.0025) - 2.5).abs() < 1e-3);
+        assert_eq!(span_ms(2.0, 0.0), 0.0);
     }
 }
