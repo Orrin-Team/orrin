@@ -905,6 +905,86 @@ mod tests {
         );
     }
 
+    /// The same frame as the Vulkan test above, through the Metal driver: the
+    /// glass has to blur only what is beneath it, which needs the backdrop
+    /// downsample and the target being sampled while it is drawn into.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn metal_glass_blurs_what_is_beneath_it_and_nothing_else() {
+        use crate::gfx::format::{Format, SampleCount};
+        use crate::gfx::graph::ImageUsage;
+        use crate::gfx::metal::MtlDriver;
+        use crate::gfx::rhi::{TextureDesc, TextureDimension};
+
+        const EXTENT: [u32; 2] = [256, 128];
+        let driver = MtlDriver::new().expect("this machine runs the Metal backend");
+        driver.begin_frame(0);
+        let device = Device::Metal(driver);
+        let Device::Metal(driver) = &device else {
+            unreachable!()
+        };
+        let target = device.create_texture(&TextureDesc {
+            format: Format::Rgba8Srgb,
+            dimension: TextureDimension::D2,
+            extent: [EXTENT[0], EXTENT[1], 1],
+            mip_levels: 1,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED | ImageUsage::TRANSFER_SRC,
+            memoryless: false,
+        });
+
+        let egui = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(rect(0.0, 0.0, EXTENT[0] as f32, EXTENT[1] as f32)),
+            ..Default::default()
+        };
+        let output = egui.run(input, |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            painter.rect_filled(rect(0.0, 0.0, 128.0, 128.0), 0.0, egui::Color32::WHITE);
+            painter.rect_filled(rect(128.0, 0.0, 256.0, 128.0), 0.0, egui::Color32::BLACK);
+        });
+        let mut frame = OverlayFrame {
+            gizmo: Vec::new(),
+            outline: Vec::new(),
+            pixels_per_point: 1.0,
+            phases: vec![
+                OverlayPhase {
+                    glass: Vec::new(),
+                    primitives: egui.tessellate(output.shapes, 1.0),
+                },
+                OverlayPhase {
+                    glass: vec![Glass {
+                        rect: rect(64.0, 32.0, 192.0, 96.0),
+                        radius: 8.0,
+                    }],
+                    primitives: Vec::new(),
+                },
+            ],
+            textures: output.textures_delta,
+        };
+
+        let mut pass = OverlayPass::new(&device, Format::Rgba8Srgb, true);
+        assert!(pass.frost.is_some(), "the Metal driver cannot capture");
+        device.record_blocking(|encoder| pass.record(&device, encoder, target, &mut frame));
+
+        let pixels = driver.read_texture(target);
+        let red = |x: u32, y: u32| pixels[((y * EXTENT[0] + x) * 4) as usize];
+        assert_eq!((red(127, 16), red(128, 16)), (255, 0), "above the glass");
+        assert_eq!((red(127, 112), red(128, 112)), (255, 0), "below it");
+        let (left, right) = (red(127, 64), red(128, 64));
+        assert!(
+            (64..=250).contains(&left) && (8..=200).contains(&right) && left > right,
+            "the edge under the glass is {left} | {right}, not blurred"
+        );
+        assert_eq!(
+            red(70, 64),
+            255,
+            "far from the edge, the glass is the colour beneath"
+        );
+    }
+
     /// What the glass costs at 1080p: one editor-sized frame drawn with no
     /// glass, with the viewport's controls' (one capture), and with a menu and
     /// a tooltip open over those (three). Timed per submitted-and-waited
