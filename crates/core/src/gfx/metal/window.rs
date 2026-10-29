@@ -122,13 +122,14 @@ pub(crate) struct Frame<'a> {
     /// window is occluded or the layer is being resized), so the rest of the
     /// frame still has somewhere to write and is simply not shown.
     fallback: TextureViewId,
-    acquired: RefCell<
-        Option<(
-            Option<Retained<ProtocolObject<dyn CAMetalDrawable>>>,
-            TextureViewId,
-        )>,
-    >,
+    acquired: RefCell<Option<Acquired>>,
 }
+
+/// The drawable a frame took, if the layer had one, and the texture to draw into.
+type Acquired = (
+    Option<Retained<ProtocolObject<dyn CAMetalDrawable>>>,
+    TextureViewId,
+);
 
 impl<'a> Frame<'a> {
     pub(crate) fn new(
@@ -163,7 +164,7 @@ impl<'a> Frame<'a> {
         self.acquired
             .into_inner()
             .and_then(|(drawable, _)| drawable)
-            .map(|drawable| ProtocolObject::from_retained(drawable))
+            .map(ProtocolObject::from_retained)
     }
 }
 
