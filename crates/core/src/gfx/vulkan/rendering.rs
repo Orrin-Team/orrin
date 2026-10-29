@@ -19,7 +19,7 @@ use vulkano::format::Format;
 use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
 
 use super::frame::{FrameIds, PassBody};
-use super::resources::GraphImages;
+use crate::gfx::images::ImageTable;
 use crate::gfx::rhi::{
     ColorAttachment, DepthAttachment, LoadOp, RenderTargets, StoreOp, TextureViewId,
 };
@@ -140,7 +140,7 @@ fn depth_borrowed(target: TextureViewId) -> DepthAttachment {
 /// attachments.
 pub(super) fn rendering_info(
     ids: &FrameIds,
-    images: &GraphImages,
+    images: &ImageTable,
     swapchain: TextureViewId,
     body: PassBody,
     background: Vec3,

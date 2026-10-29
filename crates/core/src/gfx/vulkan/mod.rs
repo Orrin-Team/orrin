@@ -130,6 +130,7 @@ use super::{
     DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TextureHandle, TextureLevels,
 };
 use crate::gfx::format::Format as EngineFormat;
+use crate::gfx::images::ImageTable;
 use crate::gfx::rhi::{
     BindGroupId, BufferDesc, BufferId, Device, Encoder, Feature, MemoryLocation, TextureViewId,
 };
@@ -365,6 +366,8 @@ pub struct VulkanRenderer {
     config: FrameConfig,
     frame: Frame,
     images: GraphImages,
+    /// The same images by id, which is how every pass reads them.
+    table: ImageTable,
 }
 
 impl VulkanRenderer {
@@ -572,6 +575,7 @@ impl VulkanRenderer {
             timestamps,
             config,
             frame,
+            table: images.table(),
             images,
         }
     }
@@ -837,7 +841,7 @@ impl VulkanRenderer {
         }
         match self.frame.ids.taa {
             Some(taa) if id == taa.output => self.taa.output_view(),
-            _ => self.images.texture(id),
+            _ => self.table.texture(id),
         }
     }
 
@@ -914,6 +918,7 @@ impl VulkanRenderer {
             self.swapchain.extent,
             image_slots(&self.frame.graph),
         );
+        self.table = self.images.table();
     }
 }
 
@@ -1407,6 +1412,7 @@ impl VulkanRenderer {
         // frame was split, in which case the previous frame's compute tail is
         // still reading the other.
         self.images.set_slot(self.frame_index);
+        self.table.set_slot(self.frame_index);
         self.frame_index = self.frame_index.wrapping_add(1);
         self.ctx.descriptor_sets.next_frame();
         self.device.begin_frame(self.frame_index);
@@ -1483,7 +1489,7 @@ impl VulkanRenderer {
                 ssr,
                 &view,
                 self.swapchain.extent,
-                self.images.mip_levels(ids.hiz),
+                self.table.mip_levels(ids.hiz),
                 environment.yaw,
                 environment::SPECULAR_MIPS,
                 self.environment.specular_tint(ambient, environment),
@@ -1724,7 +1730,7 @@ impl VulkanRenderer {
             let driver = self.device.vulkan();
             self.ssao.begin_frame(
                 driver,
-                self.images.extent(ids.raw_ao),
+                self.table.extent(ids.raw_ao),
                 frame_uniforms.expect("SSAO reads the geometry prepass"),
             )
         });
@@ -1745,7 +1751,7 @@ impl VulkanRenderer {
         // With SSAO off the graph has no AO node, so the forward pass samples a
         // 1x1 white view instead: "no occlusion" with no second shader path.
         let ao_view = match self.frame.ids.ssao {
-            Some(ids) => self.images.texture(ids.ao),
+            Some(ids) => self.table.texture(ids.ao),
             None => self.ssao.white_view(),
         };
 
@@ -1753,7 +1759,7 @@ impl VulkanRenderer {
         // node to read, so the forward pass samples a 1x1 white view and every
         // pixel reports "lit".
         let contact_shadow_view = match self.frame.ids.contact_shadows {
-            Some(id) => self.images.texture(id),
+            Some(id) => self.table.texture(id),
             None => self.contact_shadows.lit_view(),
         };
 
@@ -1776,7 +1782,7 @@ impl VulkanRenderer {
         // nothing casting there is no atlas to read, so the forward pass samples
         // a 1x1 depth texture of 1.0 and every lookup reports "lit".
         let atlas_view = match self.frame.ids.shadow_atlas {
-            Some(id) => self.images.texture(id),
+            Some(id) => self.table.texture(id),
             None => self.shadow.lit_atlas_view(),
         };
         // What the forward pass indexes the face table by. Empty when nothing
@@ -1818,12 +1824,8 @@ impl VulkanRenderer {
             // stand-in volume when they did not run: one description of the
             // medium, three places that read it.
             self.fog.uniforms(),
-            self.fog.volume_or_fallback(
-                self.frame
-                    .ids
-                    .fog
-                    .map(|ids| self.images.texture(ids.volume)),
-            ),
+            self.fog
+                .volume_or_fallback(self.frame.ids.fog.map(|ids| self.table.texture(ids.volume))),
             self.fog.sampler(),
         );
 
@@ -1881,6 +1883,7 @@ impl VulkanRenderer {
             materials: &self.materials,
             frame: &self.frame,
             images: &self.images,
+            table: &self.table,
             swapchain_view: swapchain_view.clone(),
             swapchain_id: driver.import_view(swapchain_view.clone()),
             shadow_resolution: self.config.shadow_resolution,
@@ -2220,6 +2223,7 @@ struct FrameRecord<'a> {
     materials: &'a [GpuMaterial],
     frame: &'a Frame,
     images: &'a GraphImages,
+    table: &'a ImageTable,
     swapchain_view: Arc<ImageView>,
     /// The same image as the device names it, which is what a pass binds.
     swapchain_id: TextureViewId,
@@ -2502,7 +2506,7 @@ impl FrameRecord<'_> {
         }
         match self.frame.ids.taa {
             Some(taa) if id == taa.output => self.taa.output_view(),
-            _ => self.images.texture(id),
+            _ => self.table.texture(id),
         }
     }
 
@@ -2615,8 +2619,8 @@ impl FrameRecord<'_> {
                     // takes exactly one — the sampled self.view the trace reads
                     // spans the whole pyramid instead.
                     let driver = self.device.vulkan();
-                    let depth = self.images.texture(prepass.depth);
-                    let mips = self.images.mip_textures(ids.hiz);
+                    let depth = self.table.texture(prepass.depth);
+                    let mips = self.table.mip_textures(ids.hiz);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.ssr
                         .record_hiz(self.device, &mut encoder, depth, mips, self.extent);
@@ -2629,7 +2633,7 @@ impl FrameRecord<'_> {
                         .expect("reflections without their images");
                     let driver = self.device.vulkan();
                     let source = self.texture_of(ids.source);
-                    let mips = self.images.mip_textures(ids.source_pyramid);
+                    let mips = self.table.mip_textures(ids.source_pyramid);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.ssr
                         .record_source(self.device, &mut encoder, source, mips);
@@ -2646,12 +2650,12 @@ impl FrameRecord<'_> {
                         .prepass
                         .expect("the graph scheduled reflections with no prepass");
                     let driver = self.device.vulkan();
-                    let hiz = self.images.texture(ids.hiz);
-                    let depth = self.images.texture(prepass.depth);
-                    let normal = self.images.texture(prepass.normal);
-                    let material = self.images.texture(prepass.material);
-                    let source = self.images.texture(ids.source_pyramid);
-                    let target = self.images.texture(ids.rays);
+                    let hiz = self.table.texture(ids.hiz);
+                    let depth = self.table.texture(prepass.depth);
+                    let normal = self.table.texture(prepass.normal);
+                    let material = self.table.texture(prepass.material);
+                    let source = self.table.texture(ids.source_pyramid);
+                    let target = self.table.texture(ids.rays);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.ssr.record_trace(
                         self.device,
@@ -2677,12 +2681,12 @@ impl FrameRecord<'_> {
                         .expect("the graph scheduled reflections with no prepass");
                     let driver = self.device.vulkan();
                     let source = self.texture_of(ids.source);
-                    let rays = self.images.texture(ids.rays);
-                    let depth = self.images.texture(prepass.depth);
-                    let normal = self.images.texture(prepass.normal);
-                    let material = self.images.texture(prepass.material);
+                    let rays = self.table.texture(ids.rays);
+                    let depth = self.table.texture(prepass.depth);
+                    let normal = self.table.texture(prepass.normal);
+                    let material = self.table.texture(prepass.material);
                     let environment = self.environment.specular_view();
-                    let target = self.images.texture(ids.output);
+                    let target = self.table.texture(ids.output);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.ssr.record_resolve(
                         self.device,
@@ -2711,7 +2715,7 @@ impl FrameRecord<'_> {
                         .fog
                         .expect("fog passes without their volumes");
                     let driver = self.device.vulkan();
-                    let volume = self.images.texture(ids.volume);
+                    let volume = self.table.texture(ids.volume);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.fog.record_integrate(self.device, &mut encoder, volume);
                 }
@@ -2735,9 +2739,9 @@ impl FrameRecord<'_> {
                         (ids.diffusible, ids.blurred_x)
                     };
                     let driver = self.device.vulkan();
-                    let source = self.images.texture(source);
-                    let depth = self.images.texture(prepass.depth);
-                    let target = self.images.texture(target);
+                    let source = self.table.texture(source);
+                    let depth = self.table.texture(prepass.depth);
+                    let target = self.table.texture(target);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.subsurface.record_blur(
                         self.device,
@@ -2756,8 +2760,8 @@ impl FrameRecord<'_> {
                         .expect("subsurface diffusion without its targets");
                     let driver = self.device.vulkan();
                     let source = self.texture_of(ids.source);
-                    let diffused = self.images.texture(ids.blurred_y);
-                    let target = self.images.texture(ids.output);
+                    let diffused = self.table.texture(ids.blurred_y);
+                    let target = self.table.texture(ids.output);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.subsurface.record_composite(
                         self.device,
@@ -2775,9 +2779,9 @@ impl FrameRecord<'_> {
                         .expect("transparency without its targets");
                     let driver = self.device.vulkan();
                     let scene = self.texture_of(ids.source);
-                    let accum = self.images.texture(ids.accum);
-                    let reveal = self.images.texture(ids.reveal);
-                    let target = self.images.texture(ids.output);
+                    let accum = self.table.texture(ids.accum);
+                    let reveal = self.table.texture(ids.reveal);
+                    let target = self.table.texture(ids.output);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.oit.record_composite(
                         self.device,
@@ -2796,7 +2800,7 @@ impl FrameRecord<'_> {
                         .expect("refraction without its images");
                     let driver = self.device.vulkan();
                     let source = self.texture_of(ids.source);
-                    let mips = self.images.mip_textures(ids.scene);
+                    let mips = self.table.mip_textures(ids.scene);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.refraction
                         .record_pyramid(self.device, &mut encoder, source, mips);
@@ -2809,8 +2813,8 @@ impl FrameRecord<'_> {
                         .expect("refraction without its images");
                     let driver = self.device.vulkan();
                     let scene = self.texture_of(ids.source);
-                    let accum = self.images.texture(ids.accum);
-                    let target = self.images.texture(ids.output);
+                    let accum = self.table.texture(ids.accum);
+                    let target = self.table.texture(ids.output);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.refraction.record_composite(
                         self.device,
@@ -2829,8 +2833,8 @@ impl FrameRecord<'_> {
                     let taa = self.frame.ids.taa.expect("TAA without its images");
                     let driver = self.device.vulkan();
                     let color = self.texture_of(taa.source);
-                    let velocity = self.images.texture(ids.velocity);
-                    let depth = self.images.texture(ids.depth);
+                    let velocity = self.table.texture(ids.velocity);
+                    let depth = self.table.texture(ids.depth);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.taa.record(
                         self.device,
@@ -2854,8 +2858,8 @@ impl FrameRecord<'_> {
                         .expect("the graph scheduled depth of field with no prepass");
                     let driver = self.device.vulkan();
                     let color = self.texture_of(ids.source);
-                    let depth = self.images.texture(prepass.depth);
-                    let target = self.images.texture(ids.prefiltered);
+                    let depth = self.table.texture(prepass.depth);
+                    let target = self.table.texture(ids.prefiltered);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.dof
                         .record_prefilter(self.device, &mut encoder, color, depth, target);
@@ -2867,8 +2871,8 @@ impl FrameRecord<'_> {
                         .dof
                         .expect("depth of field without its images");
                     let driver = self.device.vulkan();
-                    let prefiltered = self.images.texture(ids.prefiltered);
-                    let target = self.images.texture(ids.tile);
+                    let prefiltered = self.table.texture(ids.prefiltered);
+                    let target = self.table.texture(ids.tile);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.dof
                         .record_tile_max(self.device, &mut encoder, prefiltered, target);
@@ -2880,10 +2884,10 @@ impl FrameRecord<'_> {
                         .dof
                         .expect("depth of field without its images");
                     let driver = self.device.vulkan();
-                    let prefiltered = self.images.texture(ids.prefiltered);
-                    let tiles = self.images.texture(ids.tile);
-                    let near = self.images.texture(ids.near);
-                    let far = self.images.texture(ids.far);
+                    let prefiltered = self.table.texture(ids.prefiltered);
+                    let tiles = self.table.texture(ids.tile);
+                    let near = self.table.texture(ids.near);
+                    let far = self.table.texture(ids.far);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.dof.record_gather(
                         self.device,
@@ -2907,10 +2911,10 @@ impl FrameRecord<'_> {
                         .expect("the graph scheduled depth of field with no prepass");
                     let driver = self.device.vulkan();
                     let color = self.texture_of(ids.source);
-                    let depth = self.images.texture(prepass.depth);
-                    let near = self.images.texture(ids.near);
-                    let far = self.images.texture(ids.far);
-                    let target = self.images.texture(ids.output);
+                    let depth = self.table.texture(prepass.depth);
+                    let near = self.table.texture(ids.near);
+                    let far = self.table.texture(ids.far);
+                    let target = self.table.texture(ids.output);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.dof.record_composite(
                         self.device,
@@ -2934,9 +2938,9 @@ impl FrameRecord<'_> {
                         .prepass
                         .expect("the graph scheduled motion blur with no prepass");
                     let driver = self.device.vulkan();
-                    let velocity = self.images.texture(prepass.velocity);
-                    let depth = self.images.texture(prepass.depth);
-                    let target = self.images.texture(ids.tile);
+                    let velocity = self.table.texture(prepass.velocity);
+                    let depth = self.table.texture(prepass.depth);
+                    let target = self.table.texture(ids.tile);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.motion_blur.record_tile_max(
                         self.device,
@@ -2954,8 +2958,8 @@ impl FrameRecord<'_> {
                         .motion_blur
                         .expect("motion blur without its images");
                     let driver = self.device.vulkan();
-                    let tiles = self.images.texture(ids.tile);
-                    let target = self.images.texture(ids.neighbour);
+                    let tiles = self.table.texture(ids.tile);
+                    let target = self.table.texture(ids.neighbour);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.motion_blur
                         .record_neighbour_max(self.device, &mut encoder, tiles, target);
@@ -2973,10 +2977,10 @@ impl FrameRecord<'_> {
                         .expect("the graph scheduled motion blur with no prepass");
                     let driver = self.device.vulkan();
                     let color = self.texture_of(ids.source);
-                    let velocity = self.images.texture(prepass.velocity);
-                    let depth = self.images.texture(prepass.depth);
-                    let neighbour = self.images.texture(ids.neighbour);
-                    let target = self.images.texture(ids.output);
+                    let velocity = self.table.texture(prepass.velocity);
+                    let depth = self.table.texture(prepass.depth);
+                    let neighbour = self.table.texture(ids.neighbour);
+                    let target = self.table.texture(ids.output);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.motion_blur.record_gather(
                         self.device,
@@ -3022,7 +3026,7 @@ impl FrameRecord<'_> {
                         .prepass
                         .expect("the graph scheduled the occlusion pyramid with no prepass");
                     let driver = self.device.vulkan();
-                    let depth = self.images.texture(prepass.depth);
+                    let depth = self.table.texture(prepass.depth);
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.occlusion
                         .record(self.device, &mut encoder, depth, self.extent);
@@ -3044,7 +3048,7 @@ impl FrameRecord<'_> {
                     let ids = self.frame.ids.bloom.expect("bloom pass without levels");
                     let driver = self.device.vulkan();
                     let source = self.scene_color;
-                    let target = self.images.texture(ids.down(0));
+                    let target = self.table.texture(ids.down(0));
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.bloom.record_prefilter(
                         self.device,
@@ -3058,8 +3062,8 @@ impl FrameRecord<'_> {
                     let ids = self.frame.ids.bloom.expect("bloom pass without levels");
                     let level = level as usize;
                     let driver = self.device.vulkan();
-                    let source = self.images.texture(ids.down(level - 1));
-                    let target = self.images.texture(ids.down(level));
+                    let source = self.table.texture(ids.down(level - 1));
+                    let target = self.table.texture(ids.down(level));
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.bloom
                         .record_downsample(self.device, &mut encoder, source, target);
@@ -3076,9 +3080,9 @@ impl FrameRecord<'_> {
                         ids.down(level + 1)
                     };
                     let driver = self.device.vulkan();
-                    let coarse = self.images.texture(coarse);
-                    let same_level = self.images.texture(ids.down(level));
-                    let target = self.images.texture(ids.up(level));
+                    let coarse = self.table.texture(coarse);
+                    let same_level = self.table.texture(ids.down(level));
+                    let target = self.table.texture(ids.up(level));
                     let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                     self.bloom.record_upsample(
                         self.device,
@@ -3101,7 +3105,7 @@ impl FrameRecord<'_> {
         // time and a positional clear list that had to match its order.
         let rendering = rendering::rendering_info(
             &self.frame.ids,
-            self.images,
+            self.table,
             self.swapchain_id,
             body,
             self.env.background,
@@ -3180,13 +3184,13 @@ impl FrameRecord<'_> {
                 let prepass = self.frame.ids.prepass.unwrap();
                 let ids = self.frame.ids.ssao.unwrap();
                 let driver = self.device.vulkan();
-                let depth = self.images.texture(prepass.depth);
-                let normal = self.images.texture(prepass.normal);
+                let depth = self.table.texture(prepass.depth);
+                let normal = self.table.texture(prepass.normal);
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.ssao.record_ao(
                     self.device,
                     &mut encoder,
-                    self.images.extent(ids.raw_ao),
+                    self.table.extent(ids.raw_ao),
                     self.ssao_uniforms.as_ref().unwrap(),
                     depth,
                     normal,
@@ -3196,13 +3200,13 @@ impl FrameRecord<'_> {
                 let ids = self.frame.ids.ssao.unwrap();
                 let prepass = self.frame.ids.prepass.unwrap();
                 let driver = self.device.vulkan();
-                let raw_ao = self.images.texture(ids.raw_ao);
-                let depth = self.images.texture(prepass.depth);
+                let raw_ao = self.table.texture(ids.raw_ao);
+                let depth = self.table.texture(prepass.depth);
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.ssao.record_blur(
                     self.device,
                     &mut encoder,
-                    self.images.extent(ids.ao),
+                    self.table.extent(ids.ao),
                     raw_ao,
                     depth,
                     self.ssao_uniforms.as_ref().unwrap(),
@@ -3215,8 +3219,8 @@ impl FrameRecord<'_> {
                     .prepass
                     .expect("the graph scheduled contact shadows with no prepass");
                 let driver = self.device.vulkan();
-                let depth = self.images.texture(ids.depth);
-                let normal = self.images.texture(ids.normal);
+                let depth = self.table.texture(ids.depth);
+                let normal = self.table.texture(ids.normal);
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.contact_shadows.record(
                     self.device,
@@ -3264,10 +3268,7 @@ impl FrameRecord<'_> {
                     msaa,
                     self.fog.uniforms(),
                     self.fog.volume_or_fallback(
-                        self.frame
-                            .ids
-                            .fog
-                            .map(|ids| self.images.texture(ids.volume)),
+                        self.frame.ids.fog.map(|ids| self.table.texture(ids.volume)),
                     ),
                     self.fog.sampler(),
                 );
@@ -3305,7 +3306,7 @@ impl FrameRecord<'_> {
                     .refraction
                     .expect("refraction without its images");
                 let driver = self.device.vulkan();
-                let blur = self.images.texture(ids.scene);
+                let blur = self.table.texture(ids.scene);
                 let sharp = self.texture_of(ids.source);
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.refraction.record(
@@ -3327,7 +3328,7 @@ impl FrameRecord<'_> {
                 // pass samples a 1x1 black self.view at a zero strength: "no
                 // bloom" with no second shader path.
                 let bloom = match self.frame.ids.bloom {
-                    Some(ids) => self.images.texture(ids.result()),
+                    Some(ids) => self.table.texture(ids.result()),
                     None => self.bloom.black_view(),
                 };
                 let hdr = self.scene_color;
@@ -3366,7 +3367,7 @@ impl FrameRecord<'_> {
                     .outline_mask
                     .expect("an outline pass without its mask");
                 let driver = self.device.vulkan();
-                let mask = self.images.texture(mask);
+                let mask = self.table.texture(mask);
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(builder, driver));
                 self.outline.record_outline(
                     self.device,

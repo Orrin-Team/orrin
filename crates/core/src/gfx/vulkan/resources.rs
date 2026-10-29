@@ -31,6 +31,7 @@ use vulkano::sync::Sharing;
 use super::convert::{vk_format, vk_image_usage, vk_samples};
 use super::driver::VkDriver;
 use crate::gfx::graph::{FrameGraph, ResourceId};
+use crate::gfx::images::{ImageEntry, ImageTable};
 use crate::gfx::rhi::TextureViewId;
 
 /// Everything that distinguishes one allocation from another.
@@ -437,6 +438,31 @@ impl GraphImages {
         self.views[self.slot][id.index()]
             .as_ref()
             .expect("render graph resource is not a graph-owned image")
+    }
+
+    /// The images as the device names them, for everything that records a pass.
+    pub fn table(&self) -> ImageTable {
+        ImageTable::new(
+            self.views
+                .iter()
+                .map(|set| {
+                    set.iter()
+                        .map(|views| {
+                            views.as_ref().map(|views| {
+                                let image = views.whole.image();
+                                ImageEntry {
+                                    whole: views.whole_id,
+                                    levels: views.level_ids.clone(),
+                                    layers: views.layer_ids.clone(),
+                                    extent: [image.extent()[0], image.extent()[1]],
+                                    mip_levels: image.mip_levels(),
+                                }
+                            })
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
     }
 
     /// The width and height a graph-owned image was allocated at, which is what

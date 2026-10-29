@@ -1,6 +1,7 @@
 pub mod format;
 pub mod graph;
 pub mod headless;
+pub mod images;
 #[cfg(target_os = "macos")]
 pub mod metal;
 pub mod punctual;
