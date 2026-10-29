@@ -191,6 +191,12 @@ impl VkDriver {
         self.bind_groups.lock().unwrap().collect(frame);
     }
 
+    /// Take ownership of a view the driver built for a graph-owned image, for as
+    /// long as the image lives: the caller retires it with `destroy_texture`.
+    pub fn adopt_view(&self, view: Arc<ImageView>) -> TextureViewId {
+        TextureViewId(self.views.lock().unwrap().insert(view))
+    }
+
     /// Hand a graph-owned view to the RHI for the frame being recorded. The
     /// handle retires with the frame, so a pass that names it later than
     /// `frames_in_flight` frames on is a bug the pool reports.
