@@ -8,10 +8,10 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLIndexType, MTLLoadAction, MTLRenderCommandEncoder,
-    MTLRenderPassDescriptor, MTLRenderStages, MTLScissorRect, MTLSize, MTLStoreAction, MTLViewport,
-    MTLWinding,
+    MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLIndexType, MTLLoadAction,
+    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderStages, MTLScissorRect, MTLSize,
+    MTLStoreAction, MTLViewport, MTLWinding,
 };
 
 use super::pipeline::Pipe;
@@ -127,6 +127,12 @@ impl<'a> MtlEncoder<'a> {
         attachment.setTexture(Some(&self.driver.texture(target)));
         attachment.setLoadAction(load);
         attachment.setStoreAction(MTLStoreAction::Store);
+        attachment.setClearColor(MTLClearColor {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 0.0,
+        });
         let encoder = self
             .state
             .command_buffer
@@ -140,8 +146,11 @@ impl<'a> MtlEncoder<'a> {
         self.begin(target, MTLLoadAction::Load);
     }
 
+    /// The target's contents do not matter, so they are cleared: a tile GPU
+    /// makes that free, and a pass that reads an uncovered texel gets zero, not
+    /// whatever was in the memory.
     pub fn begin_rendering_fresh(&mut self, target: TextureViewId) {
-        self.begin(target, MTLLoadAction::DontCare);
+        self.begin(target, MTLLoadAction::Clear);
     }
 
     pub fn end_rendering(&mut self) {
@@ -202,6 +211,27 @@ impl<'a> MtlEncoder<'a> {
                 crate::gfx::shaders::VERTEX_STREAM_BASE as usize,
             );
         }
+    }
+
+    /// Bind the shared geometry: the positions stream, the surface stream unless
+    /// only depth is wanted, and the index buffer.
+    pub fn bind_geometry(&mut self, positions_only: bool) {
+        let geometry = self
+            .driver
+            .geometry
+            .lock()
+            .expect("a pass panicked while using the device");
+        let geometry = &geometry.0;
+        let base = crate::gfx::shaders::VERTEX_STREAM_BASE as usize;
+        let encoder = self.render().clone();
+        // SAFETY: live buffers at offset zero.
+        unsafe {
+            encoder.setVertexBuffer_offset_atIndex(Some(&geometry.positions), 0, base);
+            if !positions_only {
+                encoder.setVertexBuffer_offset_atIndex(Some(&geometry.surfaces), 0, base + 1);
+            }
+        }
+        self.state.index_buffer = Some((geometry.indices.clone(), 0));
     }
 
     pub fn bind_index_buffer(&mut self, buffer: BufferId) {
@@ -397,10 +427,6 @@ impl<'a> MtlEncoder<'a> {
         unimplemented!("metal: clear_depth")
     }
 
-    pub fn bind_geometry(&mut self, _positions_only: bool) {
-        unimplemented!("metal: bind_geometry")
-    }
-
     pub fn open_swapchain(&mut self, _target: TextureViewId) {
         unimplemented!("metal: open_swapchain")
     }
@@ -516,5 +542,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Drawn through the real gizmo pass: a vertex stream matched to its shader
+    /// by name, a blend, and the Y orientation the translator fixes. The
+    /// triangle covers the top-left half of the target in framebuffer
+    /// coordinates, where row zero is the top.
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_gizmo_triangle_lands_where_vulkan_would_put_it() {
+        use crate::gfx::vulkan::gizmo::{GizmoPass, GizmoVertex};
+        let device = metal();
+        let Device::Metal(driver) = &device else {
+            unreachable!()
+        };
+        driver.begin_frame(0);
+        let output = target(&device, [8, 8]);
+        let pass = GizmoPass::new(&device, Format::Rgba8Unorm);
+        let red = |x: f32, y: f32| GizmoVertex {
+            position: [x, y],
+            edge: [0.0, 100.0],
+            color: [255, 0, 0, 255],
+        };
+        device.record_blocking(|encoder| {
+            encoder.begin_rendering_fresh(output);
+            pass.record(
+                &device,
+                encoder,
+                &[red(0.0, 0.0), red(8.0, 0.0), red(0.0, 8.0)],
+                [8, 8],
+            );
+            encoder.end_rendering();
+        });
+        let pixels = driver.read_texture(output);
+        let texel = |x: usize, y: usize| &pixels[(y * 8 + x) * 4..][..4];
+        assert_eq!(texel(1, 1), [255, 0, 0, 255], "inside, near the top-left");
+        assert_eq!(texel(6, 6), [0, 0, 0, 0], "outside, near the bottom-right");
+        // Inside only if the top row is the top: a flipped triangle covers the
+        // bottom-left half instead, and leaves this texel empty.
+        assert_eq!(texel(6, 0), [255, 0, 0, 255], "the top row, far right");
+        assert_eq!(texel(7, 2), [0, 0, 0, 0], "beyond the diagonal");
+
+        assert_eq!(
+            texel(0, 6),
+            [255, 0, 0, 255],
+            "inside on the left column, low down"
+        );
     }
 }

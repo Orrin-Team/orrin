@@ -11,7 +11,7 @@ mod exposure;
 mod fog;
 mod forward;
 pub mod frame;
-mod gizmo;
+pub(crate) mod gizmo;
 pub(crate) mod hdr;
 mod instances;
 mod line;

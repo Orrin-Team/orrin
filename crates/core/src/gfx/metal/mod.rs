@@ -8,6 +8,7 @@
 mod bind;
 mod convert;
 mod encoder;
+mod geometry;
 mod pipeline;
 mod resources;
 
@@ -64,6 +65,7 @@ pub struct MtlDriver {
     pipelines: Mutex<Pool<pipeline::Pipe>>,
     functions: Mutex<pipeline::Functions>,
     bind_groups: Mutex<Pool<bind::Group>>,
+    geometry: Mutex<Shared<geometry::Geometry>>,
 }
 
 pub struct MtlEncoder<'a> {
@@ -89,6 +91,7 @@ impl MtlDriver {
         let queue = device
             .newCommandQueue()
             .ok_or("the device gave no command queue")?;
+        let geometry = geometry::Geometry::new(&device);
         Ok(Self {
             device,
             queue,
@@ -102,6 +105,7 @@ impl MtlDriver {
             pipelines: Mutex::new(Pool::new(FRAME_SLOTS)),
             functions: Mutex::new(Default::default()),
             bind_groups: Mutex::new(Pool::new(FRAME_SLOTS)),
+            geometry: Mutex::new(Shared(geometry)),
         })
     }
 
@@ -141,10 +145,6 @@ impl MtlDriver {
     reason = "operations land one at a time; a stub names itself in its panic"
 )]
 impl MtlDriver {
-    pub fn upload_mesh(&self, vertices: &[Vertex], indices: &[u32]) -> (MeshSpan, Aabb) {
-        unimplemented!("metal: upload_mesh")
-    }
-
     pub fn create_texture_cube(&self, pixels: &[u8], face: u32, format: Format) -> TextureViewId {
         unimplemented!("metal: create_texture_cube")
     }
