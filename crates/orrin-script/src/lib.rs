@@ -150,6 +150,7 @@ pub const ASSET_PREFAB: u32 = 1;
 pub const ASSET_MESH: u32 = 2;
 pub const ASSET_TEXTURE: u32 = 3;
 pub const ASSET_MATERIAL: u32 = 4;
+pub const ASSET_SCENE: u32 = 5;
 
 /// What `asset_state` reports. Lock-step with C# `Orrin.AssetState`: append,
 /// never renumber.

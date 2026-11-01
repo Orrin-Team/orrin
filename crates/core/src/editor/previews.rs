@@ -108,7 +108,7 @@ impl Previews {
         let picture = match db.get(id)?.kind {
             AssetKind::Texture | AssetKind::Mesh => Picture::Imported(db.thumbnail(id)?.0),
             AssetKind::Material => Picture::Material(material_surface(db, id)?),
-            AssetKind::Prefab | AssetKind::Folder => return None,
+            AssetKind::Prefab | AssetKind::Scene | AssetKind::Folder => return None,
         };
         if let Some((drawn, texture)) = self.assets.get(&id)
             && *drawn == picture

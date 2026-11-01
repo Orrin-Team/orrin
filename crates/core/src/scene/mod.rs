@@ -15,6 +15,7 @@ mod fog;
 mod hdr;
 mod hierarchy;
 pub mod input;
+pub mod loaded;
 mod material;
 mod mesh;
 pub mod model;
@@ -59,6 +60,7 @@ pub use hierarchy::{
     parent_world_matrix, propagate_transforms, reparent,
 };
 pub use input::{ActionId, Actions, Binding, InputState, MAX_PLAYERS};
+pub use loaded::{InScene, LoadedScenes, SceneHandle};
 pub use material::MaterialBlends;
 pub use mesh::{CpuMesh, MeshBounds};
 pub use motion_blur::MotionBlurSettings;

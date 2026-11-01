@@ -251,6 +251,7 @@ impl App {
         world.insert_resource(PresentSettings::default());
         world.insert_resource(Diagnostics::default());
         world.insert_resource(crate::scene::Play::default());
+        world.insert_resource(crate::scene::LoadedScenes::default());
         world.insert_resource(FrameStats::new());
         world.insert_resource(Profiler::default());
         world.insert_resource(InputState::new());

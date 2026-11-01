@@ -30,8 +30,8 @@ use orrin_registry::Reflect;
 
 use super::{
     AmbientLight, BloomSettings, ContactShadowSettings, DecalSettings, DofSettings,
-    EnvironmentSettings, FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings,
-    ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
+    EnvironmentSettings, FogSettings, HdrSettings, LoadedScenes, MotionBlurSettings,
+    RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
     TransparencySettings,
 };
 
@@ -63,9 +63,19 @@ pub struct RenderSettings {
 #[derive(Default)]
 struct Baseline(Option<Box<RenderSettings>>);
 
-/// The entity whose [`RenderSettings`] the frame is drawn with, if any.
+/// The entity whose [`RenderSettings`] the frame is drawn with, if any: the
+/// active scene's, or failing that another loaded scene's — so a project can
+/// keep its look in the persistent scene and let a level override it.
 pub fn source(world: &World) -> Option<Entity> {
-    world.query::<&RenderSettings>().find(|_, _| true)
+    let active = world
+        .get_resource::<LoadedScenes>()
+        .map(|loaded| loaded.active().handle);
+    let mut any = None;
+    let own = world.query::<&RenderSettings>().find(|entity, _| {
+        any.get_or_insert(entity);
+        active.is_none_or(|active| super::loaded::scene_of(world, entity) == active)
+    });
+    own.or(any)
 }
 
 /// Bring the renderer's resources in line with the scene's settings. Runs once

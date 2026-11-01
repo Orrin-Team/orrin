@@ -38,6 +38,7 @@ struct AssetsSection {
 #[serde(deny_unknown_fields)]
 struct SceneSection {
     start: Option<PathBuf>,
+    persistent: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -182,6 +183,15 @@ impl Project {
             .and_then(|scenes| scenes.start.as_ref())
             .map(|start| self.root.join(start))
     }
+    /// The scene loaded beside every other for as long as the game runs, and
+    /// kept through every scene change.
+    pub fn persistent_scene(&self) -> Option<PathBuf> {
+        self.manifest
+            .scenes
+            .as_ref()
+            .and_then(|scenes| scenes.persistent.as_ref())
+            .map(|persistent| self.root.join(persistent))
+    }
 }
 
 fn validate(manifest: &Manifest) -> Result<(), ProjectError> {
@@ -200,6 +210,13 @@ fn validate(manifest: &Manifest) -> Result<(), ProjectError> {
         (
             "scenes.start",
             manifest.scenes.as_ref().and_then(|s| s.start.as_deref()),
+        ),
+        (
+            "scenes.persistent",
+            manifest
+                .scenes
+                .as_ref()
+                .and_then(|s| s.persistent.as_deref()),
         ),
     ];
 
@@ -432,6 +449,34 @@ entry = "MyGame.Main, MyGame"
 
         assert_eq!(project.assets_dir(), root.join("art"));
         assert_eq!(project.start_scene(), Some(root.join("scenes/main.fscene")));
+    }
+
+    /// The scene a game keeps loaded through every scene change. Resolved like
+    /// the start scene, and validated like it: an absolute path here is a game
+    /// that only runs on one desk.
+    #[test]
+    fn the_persistent_scene_is_resolved_and_validated() {
+        let body = format!("{VALID}\n[scenes]\npersistent = \"assets/scenes/persistent.orrin\"\n");
+        let (_dir, root) = project_dir(&body);
+        let project = Project::locate(&root).unwrap().unwrap();
+        assert_eq!(
+            project.persistent_scene(),
+            Some(root.join("assets/scenes/persistent.orrin"))
+        );
+
+        let body = format!("{VALID}\n[scenes]\npersistent = \"../shared.orrin\"\n");
+        let (_dir, root) = project_dir(&body);
+        let err = Project::locate(&root).expect_err("a path out of the project");
+        assert!(
+            matches!(
+                err,
+                ProjectError::ParentDirInPath {
+                    field: "scenes.persistent",
+                    ..
+                }
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

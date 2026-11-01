@@ -12,8 +12,8 @@ use super::selection::Selection;
 use crate::asset_db::material::MaterialFile;
 use crate::scene::edit::{EditError, History, SceneEditor};
 use crate::scene::{
-    self, Assets, LogBuffer, LogLevel, MaterialHandle, Name, Play, PlayState, Prefabs, Time,
-    Transform, entities,
+    self, Assets, LoadedScenes, LogBuffer, LogLevel, MaterialHandle, Name, Play, PlayState,
+    Prefabs, Time, Transform, entities,
 };
 
 /// Where the editor's Save/Load buttons read and write. Relative to the
@@ -181,6 +181,8 @@ impl SpawnKind {
 pub struct EditorState {
     pub selection: Selection,
     pub scene_path: String,
+    /// The project's persistent scene, loaded beside the scene while it plays.
+    pub persistent_scene: Option<PathBuf>,
     /// What the top bar calls this session. Not the window title and not a
     /// path — just the name, so a run says which project it is inside. `None`
     /// outside a project, where the bar shows the scene file alone rather
@@ -331,6 +333,7 @@ impl Default for EditorState {
         Self {
             selection: Selection::default(),
             scene_path: DEFAULT_SCENE_PATH.to_owned(),
+            persistent_scene: None,
             project_name: None,
             hierarchy_query: String::new(),
             console_levels: LevelFilter::default(),
@@ -387,6 +390,7 @@ impl EditorState {
     pub fn new(project: Option<&orrin_project::Project>) -> Self {
         Self {
             project_name: project.map(|project| project.name().to_owned()),
+            persistent_scene: project.and_then(|project| project.persistent_scene()),
             autosave: Autosave::new(
                 project
                     .map_or_else(|| PathBuf::from(".orrin"), |p| p.editor_dir())
@@ -456,6 +460,12 @@ impl EditorState {
 
     pub fn request_add_render_settings(&mut self) {
         self.render_settings_request = true;
+    }
+
+    /// Make `path` the scene file and load it.
+    pub fn request_open_scene(&mut self, path: impl Into<String>) {
+        self.scene_path = path.into();
+        self.scene_request = Some(SceneRequest::Load);
     }
 
     pub fn request_scene(&mut self, request: SceneRequest) {
@@ -649,6 +659,7 @@ impl EditorState {
                     let loaded = load_scene(world, registry, &path.to_string_lossy());
                     if loaded.0 != LogLevel::Error {
                         self.history.clear_unsaved();
+                        self.opened(world);
                     }
                     loaded
                 }
@@ -657,6 +668,7 @@ impl EditorState {
                     let loaded = load_scene(world, registry, &self.scene_path);
                     if loaded.0 != LogLevel::Error {
                         self.history.clear();
+                        self.opened(world);
                     }
                     loaded
                 }
@@ -941,6 +953,7 @@ impl EditorState {
                     history: std::mem::take(&mut self.history),
                 });
                 world.resource_mut::<Play>().set(PlayState::Playing);
+                self.load_persistent(world, registry);
             }
             Transport::Pause => {
                 let mut play = world.resource_mut::<Play>();
@@ -978,6 +991,7 @@ impl EditorState {
         *world.resource_mut::<scene::Camera>() = fork.camera;
         self.camera_moved = true;
         self.history = fork.history;
+        self.opened(world);
         // Contacts between entities that no longer exist would arrive as exits
         // on the first frame of the next play.
         if world
@@ -996,6 +1010,64 @@ impl EditorState {
             if let Some(&entity) = by_id.get(&id) {
                 self.selection.toggle(entity);
             }
+        }
+    }
+
+    /// The scene file is what is loaded now, and it alone.
+    fn opened(&self, world: &mut World) {
+        let path = std::path::Path::new(&self.scene_path);
+        let asset = scene::loaded::asset_at(world, path);
+        let name = scene::loaded::name_of(&self.scene_path);
+        if world.get_resource::<LoadedScenes>().is_none() {
+            world.insert_resource(LoadedScenes::default());
+        }
+        world.resource_mut::<LoadedScenes>().reset(name, asset);
+    }
+
+    /// Load the project's persistent scene beside the one just forked, as a
+    /// game's start would — unless that is the scene being played.
+    fn load_persistent(&self, world: &mut World, registry: &Registry) {
+        let Some(path) = &self.persistent_scene else {
+            return;
+        };
+        if same_file(path, std::path::Path::new(&self.scene_path)) {
+            return;
+        }
+        let shown = path.display();
+        let document = match std::fs::read_to_string(path) {
+            Ok(text) => match orrin_registry::parse(&text) {
+                Ok(document) => document,
+                Err(error) => {
+                    log(
+                        world,
+                        LogLevel::Error,
+                        format!("persistent scene {shown}: {error}"),
+                    );
+                    return;
+                }
+            },
+            Err(error) => {
+                log(
+                    world,
+                    LogLevel::Error,
+                    format!(
+                        "persistent scene {shown}: could not read it: {error}; check \
+                         `[scenes] persistent` in orrin.toml"
+                    ),
+                );
+                return;
+            }
+        };
+        if world.get_resource::<LoadedScenes>().is_none() {
+            world.insert_resource(LoadedScenes::default());
+        }
+        let asset = scene::loaded::asset_at(world, path);
+        let name = scene::loaded::name_of(&path.to_string_lossy());
+        let handle = world.resource_mut::<LoadedScenes>().reserve();
+        let issues =
+            scene::loaded::load_additive(world, registry, handle, &document, name, asset, true);
+        for issue in issues {
+            log(world, LogLevel::Warning, issue.to_string());
         }
     }
 
@@ -1042,6 +1114,14 @@ impl EditorState {
             }
             Err(error) => log(world, LogLevel::Error, error),
         }
+    }
+}
+
+/// Whether two paths name one file, however each is spelled.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
 }
 

@@ -657,6 +657,7 @@ extern "C" fn find_asset(path: *const c_char, out: *mut u8) -> u32 {
                 AssetKind::Mesh => orrin_script::ASSET_MESH,
                 AssetKind::Texture => orrin_script::ASSET_TEXTURE,
                 AssetKind::Material => orrin_script::ASSET_MATERIAL,
+                AssetKind::Scene => orrin_script::ASSET_SCENE,
                 AssetKind::Folder => return None,
             };
             Some((entry.id, kind))

@@ -637,11 +637,12 @@ const SORTS: [(AssetSort, &str); 4] = [
 
 /// The kinds the browser can be narrowed to. Folders are not among them: a
 /// kind lists the whole project, where a folder has nowhere to be opened.
-const KINDS: [(AssetKind, &str); 4] = [
+const KINDS: [(AssetKind, &str); 5] = [
     (AssetKind::Texture, "Textures"),
     (AssetKind::Mesh, "Meshes"),
     (AssetKind::Material, "Materials"),
     (AssetKind::Prefab, "Prefabs"),
+    (AssetKind::Scene, "Scenes"),
 ];
 
 fn plural(kind: AssetKind) -> String {
@@ -829,6 +830,7 @@ impl Cells<'_> {
                 weak,
                 "Drag onto a mesh renderer's material to draw with it. Edit it in the inspector",
             ),
+            AssetKind::Scene => (icons::globe(), weak, "Double-click to open it"),
             AssetKind::Prefab | AssetKind::Folder => (icons::layers(), weak, PLACE_HINT),
         };
         let (status, detail) = match (&entry.status, self.db.state(entry.id)) {
@@ -869,6 +871,10 @@ impl Cells<'_> {
         }
         if prefab && response.double_clicked() {
             self.state.request_instantiate(entry.id, None);
+        }
+        if entry.kind == AssetKind::Scene && response.double_clicked() {
+            let path = self.db.dir().join(&entry.path);
+            self.state.request_open_scene(path.to_string_lossy());
         }
         self.name_field(ui, &entry.path, response.rect);
         carry(ui, &response, entry.id, name);

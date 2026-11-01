@@ -3895,6 +3895,66 @@ mod tests {
         );
     }
 
+    /// A persistent scene holding one entity called `Music`, written to a file
+    /// of its own.
+    fn persistent_scene(editor: &Harness, tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("orrin-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("persistent.orrin");
+        let mut source = World::new();
+        let music = source.spawn();
+        source.insert(music, Name::new("Music"));
+        std::fs::write(&path, crate::scene::save(&mut source, &editor.registry)).unwrap();
+        path
+    }
+
+    /// Play is the game starting, so the project's persistent scene loads
+    /// beside the scene being played, and goes with the fork on Stop.
+    #[test]
+    fn play_loads_the_persistent_scene_beside_the_scene() {
+        use crate::scene::{InScene, LoadedScenes};
+
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Hub");
+        editor.state.persistent_scene = Some(persistent_scene(&editor, "play-persistent"));
+
+        toggle_play(&mut editor);
+        let music = named(&editor.world, "Music").expect("the persistent scene loaded");
+        assert!(editor.world.get::<InScene>(music).is_some());
+        assert!(named(&editor.world, "Hub").is_some());
+        let persistent: Vec<String> = editor
+            .world
+            .resource::<LoadedScenes>()
+            .iter()
+            .filter(|scene| scene.persistent)
+            .map(|scene| scene.name.clone())
+            .collect();
+        assert_eq!(persistent, ["persistent"]);
+
+        toggle_play(&mut editor);
+        assert!(named(&editor.world, "Music").is_none());
+        assert_eq!(editor.world.resource::<LoadedScenes>().iter().count(), 1);
+    }
+
+    /// Playing the persistent scene itself must not load a second copy of it
+    /// beside the first.
+    #[test]
+    fn playing_the_persistent_scene_loads_it_once() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let path = persistent_scene(&editor, "play-persistent-itself");
+        editor.state.request_open_scene(path.to_string_lossy());
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor.state.persistent_scene = Some(path);
+
+        toggle_play(&mut editor);
+        let copies = editor
+            .world
+            .entities()
+            .filter(|&e| editor.world.get::<Name>(e).is_some_and(|n| n.0 == "Music"))
+            .count();
+        assert_eq!(copies, 1);
+    }
+
     /// Stop respawns the scene into new slots; what was selected is selected
     /// again, by identity.
     #[test]

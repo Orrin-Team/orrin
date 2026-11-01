@@ -1063,7 +1063,7 @@ impl AssetDatabase {
                     self.textures.set_resident(id, failed);
                 }
             }
-            AssetKind::Prefab | AssetKind::Material | AssetKind::Folder => {}
+            AssetKind::Prefab | AssetKind::Material | AssetKind::Scene | AssetKind::Folder => {}
         }
     }
 
