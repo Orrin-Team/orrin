@@ -42,12 +42,16 @@ pub const THUMB: f32 = 36.0;
 pub enum Tool {
     /// Bare until hovered.
     Off,
+    /// A command rather than a mode — Play, not Move. Bare like `Off`, but
+    /// drawn at full strength: it is not one dim choice among several.
+    Command,
     /// A filter or toggle that is on: a neutral raise. Several can be on at
     /// once, so it must not look like a selection.
     On,
     /// The one active mode of a group: the accent tint.
     Selected,
-    /// Not built yet. Legible, never lit, and says so on hover.
+    /// Not built yet, or not now. Legible, never lit, and says which on
+    /// hover.
     Disabled,
 }
 
@@ -109,6 +113,8 @@ pub fn tool_button(
         Tool::On | Tool::Selected => tint.unwrap_or(visuals.strong_text_color()),
         Tool::Off if response.hovered() => visuals.text_color(),
         Tool::Off => visuals.weak_text_color(),
+        Tool::Command if response.hovered() => visuals.strong_text_color(),
+        Tool::Command => visuals.text_color(),
         // Opaque, between the panel and the text: dimmer than a live control,
         // and never egui's half-alpha fade, which reads as missing.
         Tool::Disabled => visuals.panel_fill.lerp_to_gamma(visuals.text_color(), 0.62),

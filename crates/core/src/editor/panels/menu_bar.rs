@@ -21,7 +21,7 @@ use crate::editor::icons;
 use crate::editor::state::{EditorState, SceneRequest, SpawnKind};
 use crate::editor::theme::ThemeSet;
 use crate::editor::widgets::{self, Tool};
-use crate::scene::{ShadowSettings, SsaoSettings, TaaSettings};
+use crate::scene::{Play, PlayState, ShadowSettings, SsaoSettings, TaaSettings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Menu {
@@ -98,21 +98,30 @@ pub fn show(
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(6.0);
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.label(super::figures(&state.scene_path));
+                    if state.scene_dirty() {
+                        ui.label(super::figures(format!("{} •", state.scene_path)))
+                            .on_hover_text("Unsaved changes");
+                    } else {
+                        ui.label(super::figures(&state.scene_path));
+                    }
                     if let Some(project) = &state.project_name {
                         ui.weak("/");
                         ui.weak(project);
                     }
                 });
             });
-            transport(ui, bar);
+            let play = world
+                .get_resource::<Play>()
+                .map_or_else(Default::default, |p| p.state());
+            transport(ui, bar, state, play);
         });
 }
 
 /// Play, pause and step, centred on the window rather than on whatever space
 /// the menus leave, so they stay put as the right-hand label changes length.
-/// Play mode does not exist yet, so they say so rather than doing nothing.
-fn transport(ui: &mut egui::Ui, bar: egui::Rect) {
+/// Play becomes Stop while the game is live, in the accent, so the one button
+/// that ends it is the one that started it.
+fn transport(ui: &mut egui::Ui, bar: egui::Rect, state: &mut EditorState, play: PlayState) {
     let height = ui.spacing().interact_size.y + 2.0;
     let size = egui::vec2(3.0 * height + 2.0 * 2.0 + 6.0, height + 4.0);
     let rect = egui::Rect::from_center_size(bar.center(), size);
@@ -125,13 +134,34 @@ fn transport(ui: &mut egui::Ui, bar: egui::Rect) {
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
         |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            for (icon, name) in [
-                (icons::play(), "Play"),
-                (icons::pause(), "Pause"),
-                (icons::step_forward(), "Step"),
-            ] {
-                let hint = format!("{name} — {NOT_IMPLEMENTED}");
-                widgets::tool_button(ui, icon, None, None, Tool::Disabled, &hint);
+            let live = play != PlayState::Editing;
+            let (icon, tool, hint) = if live {
+                (
+                    icons::stop(),
+                    Tool::Selected,
+                    "Stop (Ctrl+P) — the scene goes back to how it was before Play",
+                )
+            } else {
+                (icons::play(), Tool::Command, "Play (Ctrl+P)")
+            };
+            if widgets::tool_button(ui, icon, None, None, tool, hint).clicked() {
+                state.request_play();
+            }
+            let (tool, hint) = match play {
+                PlayState::Editing => (Tool::Disabled, "Pause — press Play first"),
+                PlayState::Playing => (Tool::Command, "Pause (Ctrl+Shift+P)"),
+                PlayState::Paused => (Tool::Selected, "Resume (Ctrl+Shift+P)"),
+            };
+            if widgets::tool_button(ui, icons::pause(), None, None, tool, hint).clicked() {
+                state.request_pause();
+            }
+            let (tool, hint) = if live {
+                (Tool::Command, "Step one frame (Ctrl+Alt+P)")
+            } else {
+                (Tool::Disabled, "Step — press Play first")
+            };
+            if widgets::tool_button(ui, icons::step_forward(), None, None, tool, hint).clicked() {
+                state.request_step();
             }
         },
     );
@@ -182,12 +212,25 @@ fn command(ui: &mut egui::Ui, label: &str, shortcut: &str) -> bool {
 }
 
 fn file(ui: &mut egui::Ui, state: &mut EditorState) {
-    if command(ui, "Save scene", "Ctrl+S") {
-        state.request_scene(SceneRequest::Save);
-    }
-    if command(ui, "Load scene", "") {
-        state.request_scene(SceneRequest::Load);
-    }
+    let playing = state.playing();
+    let recoverable = state.autosave.path(&state.scene_path).is_file();
+    ui.add_enabled_ui(!playing, |ui| {
+        if command(ui, "Save scene", "Ctrl+S") {
+            state.request_scene(SceneRequest::Save);
+        }
+        if command(ui, "Load scene", "") {
+            state.request_scene(SceneRequest::Load);
+        }
+        ui.add_enabled_ui(recoverable, |ui| {
+            if command(ui, "Recover autosave", "") {
+                state.request_scene(SceneRequest::Recover);
+            }
+        })
+        .response
+        .on_disabled_hover_text("There is no unsaved work to recover for this scene");
+    })
+    .response
+    .on_disabled_hover_text("Stop the game first: the scene is not what is playing");
     unbuilt(ui, "New scene");
     ui.separator();
     // There is no file dialog yet: the path is typed, and both commands above

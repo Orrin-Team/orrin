@@ -1,14 +1,19 @@
+use std::path::PathBuf;
+use std::time::Instant;
+
 use glam::Vec3;
 
 use orrin_ecs::{Entity, World};
-use orrin_registry::{AssetId, Registry};
+use orrin_registry::{AssetId, EntityId, Registry};
 
+use super::autosave::Autosave;
 use super::gizmo::{Drag, Handle};
 use super::selection::Selection;
 use crate::asset_db::material::MaterialFile;
 use crate::scene::edit::{EditError, History, SceneEditor};
 use crate::scene::{
-    self, Assets, LogBuffer, LogLevel, MaterialHandle, Name, Prefabs, Time, Transform, entities,
+    self, Assets, LogBuffer, LogLevel, MaterialHandle, Name, Play, PlayState, Prefabs, Time,
+    Transform, entities,
 };
 
 /// Where the editor's Save/Load buttons read and write. Relative to the
@@ -21,6 +26,8 @@ pub enum SceneRequest {
     Save,
     /// Replaces the current contents: every live entity is despawned first.
     Load,
+    /// Load the scene's autosave in its place, as unsaved work.
+    Recover,
 }
 
 /// What the transform gizmo edits. Select has no handles; the rest do (see
@@ -222,7 +229,9 @@ pub struct EditorState {
     /// rather than copied.
     pub gizmo_strokes: Vec<crate::gfx::vulkan::GizmoVertex>,
     /// Every scene edit the panels make goes through this, by way of the
-    /// requests below; see `scene::edit`.
+    /// requests below; see `scene::edit`. While the game plays it is a
+    /// history of the fork, thrown away with it, and the scene's waits in
+    /// [`Fork`].
     pub history: History,
     /// Component values the panels edited on detached copies this frame,
     /// applied by `apply` as part of the open gesture.
@@ -287,6 +296,32 @@ pub struct EditorState {
     /// app drains it there.
     #[cfg(feature = "scripting")]
     script_reload_request: bool,
+    /// Serviced by `apply`: Stop despawns the fork, for the reason a load is
+    /// deferred.
+    transport_request: Option<Transport>,
+    /// What Stop goes back to. `Some` exactly while the game is live.
+    fork: Option<Fork>,
+    pub autosave: Autosave,
+}
+
+/// A press of one of the transport's buttons.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    PlayStop,
+    Pause,
+    Step,
+}
+
+/// The scene as it was when Play was pressed, and the edit-mode state that
+/// belongs to it rather than to the fork.
+///
+/// The scene is held as its document — what a save would write — because
+/// that is the one form of it the engine already knows how to put back
+/// exactly, scripts and prefab instances included: Stop is a load of it.
+struct Fork {
+    document: orrin_registry::SceneDocument,
+    camera: scene::Camera,
+    history: History,
 }
 
 impl Default for EditorState {
@@ -338,6 +373,9 @@ impl Default for EditorState {
             scene_request: None,
             #[cfg(feature = "scripting")]
             script_reload_request: false,
+            transport_request: None,
+            fork: None,
+            autosave: Autosave::new(PathBuf::from(".orrin/autosave"), Instant::now()),
         }
     }
 }
@@ -346,8 +384,67 @@ impl EditorState {
     pub fn new(project: Option<&orrin_project::Project>) -> Self {
         Self {
             project_name: project.map(|project| project.name().to_owned()),
+            autosave: Autosave::new(
+                project
+                    .map_or_else(|| PathBuf::from(".orrin"), |p| p.editor_dir())
+                    .join("autosave"),
+                Instant::now(),
+            ),
             ..Self::default()
         }
+    }
+
+    /// Play from edit mode; Stop from play.
+    pub fn request_play(&mut self) {
+        self.transport_request = Some(Transport::PlayStop);
+    }
+
+    /// Pause a playing game, or resume a paused one.
+    pub fn request_pause(&mut self) {
+        self.transport_request = Some(Transport::Pause);
+    }
+
+    /// One frame of a live game, leaving it paused.
+    pub fn request_step(&mut self) {
+        self.transport_request = Some(Transport::Step);
+    }
+
+    /// Whether the game is live: the world is the fork.
+    pub fn playing(&self) -> bool {
+        self.fork.is_some()
+    }
+
+    /// Whether the scene has changes its file does not, the fork's aside.
+    pub fn scene_dirty(&self) -> bool {
+        self.fork
+            .as_ref()
+            .map_or(&self.history, |fork| &fork.history)
+            .is_dirty()
+    }
+
+    /// Write a copy of unsaved work if one is owed, and report the last one
+    /// that finished. See `editor::autosave`.
+    pub fn autosave(&mut self, world: &mut World, registry: &Registry, now: Instant) {
+        match self.autosave.finished() {
+            Some(Ok(path)) => log(
+                world,
+                LogLevel::Info,
+                format!("autosaved to {}", path.display()),
+            ),
+            Some(Err(error)) => log(world, LogLevel::Warning, error),
+            None => {}
+        }
+        let version = self.history.version();
+        if self.playing()
+            || self.holding
+            || !self.history.is_dirty()
+            || !self.autosave.due(now, version)
+        {
+            return;
+        }
+        let document = scene::to_document(world, registry);
+        let path = self.autosave.path(&self.scene_path);
+        self.autosave.write(document, path, version, now);
     }
 
     pub fn request_spawn(&mut self, kind: SpawnKind) {
@@ -516,15 +613,37 @@ impl EditorState {
                 log(world, LogLevel::Warning, issue);
             }
         }
+        if let Some(request) = self.transport_request.take() {
+            self.transport(world, registry, request);
+        }
         if let Some(request) = self.scene_request.take() {
             let (level, message) = match request {
+                _ if self.playing() => (
+                    LogLevel::Warning,
+                    format!(
+                        "the game is playing: Stop it first, or the game's state would \
+                         replace {}",
+                        self.scene_path
+                    ),
+                ),
                 SceneRequest::Save => {
                     SceneEditor::new(world, registry, &mut self.history).commit();
                     let saved = save_scene(world, registry, &self.scene_path);
                     if saved.0 != LogLevel::Error {
                         self.history.mark_saved();
+                        self.autosave
+                            .saved(&self.scene_path, self.history.version());
                     }
                     saved
+                }
+                SceneRequest::Recover => {
+                    self.selection.clear();
+                    let path = self.autosave.path(&self.scene_path);
+                    let loaded = load_scene(world, registry, &path.to_string_lossy());
+                    if loaded.0 != LogLevel::Error {
+                        self.history.clear_unsaved();
+                    }
+                    loaded
                 }
                 SceneRequest::Load => {
                     self.selection.clear();
@@ -787,6 +906,80 @@ impl EditorState {
         }
     }
 
+    fn transport(&mut self, world: &mut World, registry: &Registry, request: Transport) {
+        if world.get_resource::<Play>().is_none() {
+            world.insert_resource(Play::default());
+        }
+        match request {
+            Transport::PlayStop if self.playing() => self.stop(world, registry),
+            Transport::PlayStop => {
+                // The gesture is the scene's, so it is closed into the scene's
+                // history rather than carried into the fork's.
+                SceneEditor::new(world, registry, &mut self.history).commit();
+                self.fork = Some(Fork {
+                    document: scene::to_document(world, registry),
+                    camera: *world.resource::<scene::Camera>(),
+                    history: std::mem::take(&mut self.history),
+                });
+                world.resource_mut::<Play>().set(PlayState::Playing);
+            }
+            Transport::Pause => {
+                let mut play = world.resource_mut::<Play>();
+                match play.state() {
+                    PlayState::Playing => play.set(PlayState::Paused),
+                    PlayState::Paused => play.set(PlayState::Playing),
+                    PlayState::Editing => {}
+                }
+            }
+            Transport::Step => world.resource_mut::<Play>().step(),
+        }
+    }
+
+    /// Throw the fork away and put the scene back, selection and camera with
+    /// it. The selection is carried by identity, since every entity comes back
+    /// in a new slot; what the game spawned has none to carry.
+    fn stop(&mut self, world: &mut World, registry: &Registry) {
+        let Some(fork) = self.fork.take() else {
+            return;
+        };
+        let selected: Vec<EntityId> = self
+            .selection
+            .entities()
+            .iter()
+            .filter_map(|&entity| world.get::<EntityId>(entity).map(|id| *id))
+            .collect();
+        self.selection.clear();
+        self.gizmo_drag = None;
+        self.hovered = None;
+        self.marquee = None;
+
+        for issue in replace_scene(world, registry, &fork.document) {
+            log(world, LogLevel::Warning, issue.to_string());
+        }
+        *world.resource_mut::<scene::Camera>() = fork.camera;
+        self.camera_moved = true;
+        self.history = fork.history;
+        // Contacts between entities that no longer exist would arrive as exits
+        // on the first frame of the next play.
+        if world
+            .get_resource::<crate::collision::CollisionState>()
+            .is_some()
+        {
+            world.insert_resource(crate::collision::CollisionState::default());
+        }
+        world.resource_mut::<Play>().set(PlayState::Editing);
+
+        let by_id: std::collections::HashMap<EntityId, Entity> = world
+            .entities()
+            .filter_map(|entity| world.get::<EntityId>(entity).map(|id| (*id, entity)))
+            .collect();
+        for id in selected {
+            if let Some(&entity) = by_id.get(&id) {
+                self.selection.toggle(entity);
+            }
+        }
+    }
+
     /// Save the selection as a prefab in the assets directory, named after the
     /// entity when there is one and `Group` when there are several, and select
     /// the instance it became.
@@ -874,12 +1067,7 @@ fn load_scene(world: &mut World, registry: &Registry, path: &str) -> (LogLevel, 
         Err(e) => return (LogLevel::Error, format!("{path}: {e}")),
     };
 
-    let existing: Vec<Entity> = world.entities().collect();
-    for entity in existing {
-        world.despawn(entity);
-    }
-
-    let issues = scene::instantiate(&document, world, registry);
+    let issues = replace_scene(world, registry, &document);
     let count = document.entities.len();
     for issue in &issues {
         log(world, LogLevel::Warning, issue.to_string());
@@ -894,6 +1082,19 @@ fn load_scene(world: &mut World, registry: &Registry, path: &str) -> (LogLevel, 
             format!("loaded {count} entities from {path}; {n} component(s) kept but not applied"),
         ),
     }
+}
+
+/// Every live entity despawned, and `document`'s spawned in their place.
+fn replace_scene(
+    world: &mut World,
+    registry: &Registry,
+    document: &orrin_registry::SceneDocument,
+) -> Vec<scene::LoadIssue> {
+    let existing: Vec<Entity> = world.entities().collect();
+    for entity in existing {
+        world.despawn(entity);
+    }
+    scene::instantiate(document, world, registry)
 }
 
 fn log(world: &World, level: LogLevel, message: String) {

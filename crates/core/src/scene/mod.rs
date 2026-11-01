@@ -20,6 +20,7 @@ mod mesh;
 pub mod model;
 mod motion_blur;
 pub(crate) mod persist;
+mod play;
 pub mod prefab;
 mod present;
 mod previews;
@@ -61,6 +62,7 @@ pub use material::MaterialBlends;
 pub use mesh::{CpuMesh, MeshBounds};
 pub use motion_blur::MotionBlurSettings;
 pub use persist::{LoadIssue, instantiate, load, save, to_document};
+pub use play::{Play, PlayState};
 pub use prefab::{PrefabInstance, Prefabs};
 pub use present::{PresentSettings, VsyncMode};
 pub use previews::{

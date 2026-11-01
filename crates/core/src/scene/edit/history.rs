@@ -81,6 +81,12 @@ impl History {
         self.saved = self.current();
     }
 
+    /// Which state of the scene this is, an open gesture aside: two equal
+    /// versions are the same scene.
+    pub fn version(&self) -> u64 {
+        self.current()
+    }
+
     /// Forget every step, and count the scene as saved: the one they
     /// described has just been replaced by one read from disk.
     pub fn clear(&mut self) {
@@ -91,6 +97,15 @@ impl History {
         self.batch = None;
         self.floor = self.next;
         self.saved = self.next;
+    }
+
+    /// [`clear`](Self::clear), counting the scene as unsaved: it came from
+    /// somewhere other than its own file.
+    pub fn clear_unsaved(&mut self) {
+        self.clear();
+        // Step ids count up from zero and are never reused, so no state is
+        // ever this one.
+        self.saved = u64::MAX;
     }
 
     /// A new step: what could be redone no longer follows from here.
