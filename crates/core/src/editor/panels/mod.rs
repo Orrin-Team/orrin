@@ -66,12 +66,78 @@ pub fn draw(
         viewport::marquee(ctx, world, state, dock, rect);
         viewport::select_on_click(ctx, world, state, dock, rect);
     }
+    if let Some(rel) = state.pending_delete().map(str::to_owned) {
+        confirm_delete(ctx, world, state, &rel);
+    }
     // A drag ends with the button and a typed edit with the field, so the
     // gesture they make stays open while either is still held. Read after the
     // widgets, which are what let go of the focus.
     let holding = ctx.input(|input| input.pointer.any_down())
         || ctx.memory(|memory| memory.focused().is_some());
     state.hold(holding);
+}
+
+/// The one question every delete asks, whichever tool it came from: what goes,
+/// and that it does not come back.
+///
+/// A modal rather than a line in the tool, because the answer is
+/// irreversible and the tool asking may be scrolled, narrow or floating —
+/// this is the one place in the editor that takes the whole window to ask.
+fn confirm_delete(ctx: &egui::Context, world: &World, state: &mut EditorState, rel: &str) {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let inside = world
+        .get_resource::<crate::asset_db::AssetDatabase>()
+        .filter(|db| db.folders().iter().any(|folder| folder.path == rel))
+        .map(|db| {
+            let prefix = format!("{rel}/");
+            db.iter()
+                .filter(|entry| entry.path.starts_with(&prefix))
+                .count()
+        });
+    let modal = egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
+        ui.set_width(340.0);
+        ui.label(
+            egui::RichText::new(format!("Delete {name}?"))
+                .size(15.0)
+                .strong(),
+        );
+        ui.add_space(6.0);
+        let what = match inside {
+            Some(0) => "The folder is removed from disk.".to_owned(),
+            Some(1) => "The folder and the asset in it are removed from disk.".to_owned(),
+            Some(n) => format!("The folder and the {n} assets in it are removed from disk."),
+            None => format!("{rel} and its id are removed from disk."),
+        };
+        ui.label(what);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Anything that uses it draws a placeholder until it is replaced. \
+                     This cannot be undone.",
+                )
+                .color(ui.visuals().weak_text_color()),
+            )
+            .wrap(),
+        );
+        ui.add_space(10.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let delete = egui::Button::new(
+                egui::RichText::new("Delete")
+                    .color(super::theme::ERROR)
+                    .strong(),
+            );
+            if ui.add(delete).clicked() {
+                state.resolve_delete(true);
+            }
+            if ui.button("Cancel").clicked() {
+                state.resolve_delete(false);
+            }
+        });
+    });
+    // Escape, or a click on the dimmed window around it.
+    if modal.should_close() && state.pending_delete().is_some() {
+        state.resolve_delete(false);
+    }
 }
 
 /// Every surface above the panels — the viewport's floating controls, menus,
@@ -545,6 +611,22 @@ mod tests {
                 self.input.events.push(egui::Event::PointerButton {
                     pos: at,
                     button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            self.frames(1);
+            self.input.events.clear();
+            self
+        }
+
+        /// A secondary press and release at `at`: what opens a context menu.
+        fn right_click(&mut self, at: egui::Pos2) -> &mut Self {
+            self.input.events.push(egui::Event::PointerMoved(at));
+            for pressed in [true, false] {
+                self.input.events.push(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Secondary,
                     pressed,
                     modifiers: Default::default(),
                 });
@@ -4158,6 +4240,189 @@ mod tests {
         assert!(taken.contains("already"), "{taken}");
         let fresh = new_scene_path(&editor.world, "keep").unwrap();
         assert!(fresh.ends_with("scenes/keep.orrin"));
+    }
+
+    /// The header names the file the way the project does — relative, with
+    /// forward slashes — not by the extended-length absolute path Windows
+    /// hands back for a canonicalised directory.
+    #[test]
+    fn the_scene_manager_shows_the_scene_file_short() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-short-path");
+        dir.write("scenes/new_scene.orrin", b"orrin-scene 3 min-reader 3\n");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        let full = std::fs::canonicalize(dir.path().join("scenes/new_scene.orrin")).unwrap();
+        editor.state.scene_path = full.to_string_lossy().into_owned();
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+
+        let body = editor.tab_body(Tab::Scenes);
+        let shown: Vec<String> = editor
+            .painted_text_rects()
+            .into_iter()
+            .filter(|(_, rect)| body.contains(rect.center()))
+            .map(|(text, _)| text)
+            .collect();
+        assert!(
+            shown.iter().any(|text| text == "scenes/new_scene.orrin"),
+            "{shown:?}"
+        );
+        assert!(
+            !shown
+                .iter()
+                .any(|text| text.contains(r"\\?\") || text.contains("Documents")),
+            "{shown:?}"
+        );
+    }
+
+    /// The filter and the new scene's name share one row, each half of it.
+    #[test]
+    fn the_scene_filter_and_the_new_scene_field_share_a_row() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-row");
+        dir.write("levels/castle.orrin", b"");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.bring_forward(Tab::Scenes);
+        editor
+            .dock
+            .apply(crate::editor::state::DockRequest::Float(Tab::Scenes));
+        editor.frames(3);
+
+        let at = |needle: &str| {
+            editor
+                .painted_text_rects()
+                .into_iter()
+                .find(|(text, _)| text == needle)
+                .map(|(_, rect)| rect)
+                .unwrap_or_else(|| panic!("{needle} was not painted"))
+        };
+        let (filter, name, create) = (at("Filter scenes"), at("New scene name"), at("Create"));
+        assert!((filter.center().y - name.center().y).abs() < 4.0);
+        assert!((create.center().y - name.center().y).abs() < 4.0);
+        assert!(filter.left() < name.left() && name.left() < create.left());
+        let body = editor.tab_body(Tab::Scenes);
+        assert!(
+            name.left() > body.center().x - 20.0,
+            "the filter takes no more than half the row"
+        );
+    }
+
+    /// The renderer section says where the settings live; choosing the entity
+    /// is the hierarchy's job, not a button's here.
+    #[test]
+    fn the_renderer_section_has_no_select_button() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.state.request_add_render_settings();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+        let body = editor.tab_body(Tab::Scenes);
+        assert!(
+            !editor
+                .painted_text_rects()
+                .into_iter()
+                .any(|(text, rect)| text == "Select" && body.contains(rect.center()))
+        );
+    }
+
+    /// A scene is deleted only once the user has said yes to a dialog that
+    /// says it cannot be undone.
+    #[test]
+    fn deleting_a_scene_asks_and_then_removes_it() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-delete");
+        dir.write("levels/castle.orrin", b"orrin-scene 3 min-reader 3\n");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+
+        editor
+            .right_click(text_at(&editor, "castle").unwrap())
+            .frames(1);
+        editor
+            .click(text_at(&editor, "Delete…").expect("a delete item"))
+            .frames(1);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(
+            dir.path().join("levels/castle.orrin").is_file(),
+            "not before the answer"
+        );
+        assert!(editor.painted_contains("cannot be undone"));
+
+        editor.click(text_at(&editor, "Delete").expect("the confirming button"));
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(!dir.path().join("levels/castle.orrin").exists());
+        assert!(!dir.path().join("levels/castle.orrin.meta").exists());
+        editor.frames(2);
+        let body = editor.tab_body(Tab::Scenes);
+        assert!(
+            !editor
+                .painted_text_rects()
+                .into_iter()
+                .any(|(text, rect)| text == "castle" && body.contains(rect.center())),
+            "the row is gone from the list"
+        );
+    }
+
+    /// Cancel leaves the file where it was.
+    #[test]
+    fn a_cancelled_delete_keeps_the_file() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-delete-cancel");
+        dir.write("levels/castle.orrin", b"");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.state.request_delete_asset("levels/castle.orrin");
+        editor.frames(2);
+        editor.click(text_at(&editor, "Cancel").unwrap());
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(dir.path().join("levels/castle.orrin").is_file());
+        assert!(editor.state.pending_delete().is_none());
+    }
+
+    /// The open scene is what the editor is showing and would save over; it
+    /// is refused by name rather than deleted out from under the session.
+    #[test]
+    fn the_open_scene_cannot_be_deleted() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-delete-open");
+        dir.write("levels/castle.orrin", b"orrin-scene 3 min-reader 3\n");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor
+            .state
+            .request_open_scene(dir.path().join("levels/castle.orrin").to_string_lossy());
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        editor.state.request_delete_asset("levels/castle.orrin");
+        editor.state.resolve_delete(true);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(dir.path().join("levels/castle.orrin").is_file());
+        assert!(
+            logged(&editor).iter().any(|m| m.contains("open scene")),
+            "{:?}",
+            logged(&editor)
+        );
+    }
+
+    /// The asset browser deletes the same way, from an asset's own menu.
+    #[test]
+    fn the_asset_browser_deletes_an_asset_after_asking() {
+        let dir = crate::asset_db::tests::Dir::new("assets-delete");
+        dir.write("rock.png", b"");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(3);
+
+        let rock = text_at(&editor, "rock.png")
+            .or_else(|| text_at(&editor, "rock"))
+            .expect("the asset is listed");
+        editor.right_click(rock).frames(1);
+        editor
+            .click(text_at(&editor, "Delete…").expect("a delete item"))
+            .frames(1);
+        editor.click(text_at(&editor, "Delete").expect("the confirming button"));
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(!dir.path().join("rock.png").exists());
     }
 
     /// The header says plainly whether the open scene has unsaved work.

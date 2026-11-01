@@ -525,6 +525,46 @@ impl AssetDatabase {
         Ok(rel)
     }
 
+    /// Delete the asset or folder at `path`, and its sidecar, returning how
+    /// many assets went with it.
+    ///
+    /// The sidecar goes too, or the next file given that name would inherit an
+    /// id it never had. A file operation like [`rename`](Self::rename), with no
+    /// undo; the editor asks before calling it. What referred to the asset
+    /// keeps its id and draws the placeholder a missing asset draws.
+    pub fn delete(&mut self, path: &str) -> Result<usize, String> {
+        let folder = self.folders.iter().any(|folder| folder.path == path);
+        if !folder && self.find(path).is_none() {
+            return Err(format!(
+                "there is no asset or folder `{path}` in {}",
+                self.dir.display()
+            ));
+        }
+        let count = if folder {
+            let inside = format!("{path}/");
+            self.iter()
+                .filter(|entry| entry.path.starts_with(&inside))
+                .count()
+        } else {
+            1
+        };
+        let target = self.dir.join(path);
+        let removed = if folder {
+            std::fs::remove_dir_all(&target)
+        } else {
+            std::fs::remove_file(&target)
+        };
+        removed.map_err(|error| format!("could not delete {path}: {error}"))?;
+        let meta = sidecar::path_of(&target);
+        let sidecar = match meta.exists() {
+            true => std::fs::remove_file(&meta),
+            false => Ok(()),
+        };
+        self.rescan();
+        sidecar.map_err(|error| format!("deleted {path}, but not its sidecar: {error}"))?;
+        Ok(count)
+    }
+
     /// Import asset `id` with `settings` from now on, writing them to its
     /// sidecar.
     ///
@@ -1620,6 +1660,31 @@ pub(crate) mod tests {
               kept the original's sidecar. Delete rock.png.meta to give it an id of its own"
             ]
         );
+    }
+
+    /// A delete takes the sidecar too, or the next file given that name would
+    /// inherit an id it never had. A folder goes with everything in it.
+    #[test]
+    fn a_delete_removes_the_file_with_its_sidecar_and_a_folder_with_its_contents() {
+        let dir = Dir::new("db-delete");
+        project(&dir);
+        dir.write("props/crate.png", &png(1, 1, |_, _| [0; 4]));
+        dir.write("props/deep/barrel.png", &png(1, 1, |_, _| [0; 4]));
+        let mut db = open(&dir);
+
+        assert_eq!(db.delete("rocks/rock.png"), Ok(1));
+        assert!(!dir.path().join("rocks/rock.png").exists());
+        assert!(!dir.path().join("rocks/rock.png.meta").exists());
+        assert!(db.find("rocks/rock.png").is_none());
+
+        // The two written here and the fixture's door.
+        assert_eq!(db.delete("props"), Ok(3));
+        assert!(!dir.path().join("props").exists());
+        assert!(db.find("props/deep/barrel.png").is_none());
+        assert!(db.folders().iter().all(|folder| folder.path != "props"));
+
+        let missing = db.delete("nothing.png").unwrap_err();
+        assert!(missing.contains("nothing.png"), "{missing}");
     }
 
     /// A rename takes the sidecar along, so the asset keeps its id and every

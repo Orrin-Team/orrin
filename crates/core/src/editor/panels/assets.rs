@@ -82,6 +82,8 @@ enum Action {
     StartRename(String, String),
     Rename(String, String),
     CancelRename,
+    /// Ask whether to delete this asset or folder; see `confirm_delete`.
+    Delete(String),
     /// Copy these files from outside the project into this folder.
     BringIn(Vec<PathBuf>, String),
     /// Open a file dialog for files to copy into the open folder.
@@ -275,6 +277,7 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
             });
         }
         Some(Action::CancelRename) => place.renaming = None,
+        Some(Action::Delete(path)) => state.request_delete_asset(path),
         Some(Action::BringIn(files, folder)) => bring_in(world, state, &files, &folder),
         Some(Action::PickFiles) => {
             let picked = Arc::new(Mutex::new(None));
@@ -429,6 +432,13 @@ fn file_drop(
 }
 
 /// Rename has no undo: it moves files, as a rename in an explorer does.
+fn delete_item(ui: &mut egui::Ui, path: &str, action: &mut Option<Action>) {
+    if ui.button("Delete…").clicked() {
+        *action = Some(Action::Delete(path.to_owned()));
+        ui.close_menu();
+    }
+}
+
 fn rename_item(ui: &mut egui::Ui, path: &str, name: &str, action: &mut Option<Action>) {
     if ui
         .button("Rename")
@@ -807,6 +817,8 @@ impl Cells<'_> {
                     *action = Some(Action::Tint(folder.path.clone(), None));
                     ui.close_menu();
                 }
+                ui.separator();
+                delete_item(ui, &folder.path, action);
             });
     }
 
@@ -887,6 +899,8 @@ impl Cells<'_> {
                     self.state.request_import_page();
                     ui.close_menu();
                 }
+                ui.separator();
+                delete_item(ui, &entry.path, self.action);
             });
     }
 

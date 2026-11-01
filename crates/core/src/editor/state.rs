@@ -294,6 +294,12 @@ pub struct EditorState {
     /// Save the open scene, then open this one — the save-first answer to
     /// `pending_open`.
     open_after_save: Option<String>,
+    /// An asset or folder, relative to the assets directory, waiting for the
+    /// user to confirm it should be deleted.
+    pending_delete: Option<String>,
+    /// One the user confirmed. Serviced by `apply`, after the panels, since a
+    /// deleted prefab rescans the index the asset browser draws from.
+    delete_request: Option<String>,
     despawn_request: Vec<Entity>,
     /// A registered component to add to an entity, at its default. Deferred
     /// like the rest: the inspector is mid-way through drawing that entity's
@@ -405,6 +411,8 @@ impl Default for EditorState {
             dock_request: None,
             pending_open: None,
             open_after_save: None,
+            pending_delete: None,
+            delete_request: None,
             despawn_request: Vec::new(),
             add_request: None,
             reparent_request: Vec::new(),
@@ -524,6 +532,24 @@ impl EditorState {
         }
     }
 
+    /// Ask to delete the asset or folder at `rel`, relative to the assets
+    /// directory. Nothing happens until [`resolve_delete`](Self::resolve_delete).
+    pub fn request_delete_asset(&mut self, rel: impl Into<String>) {
+        self.pending_delete = Some(rel.into());
+    }
+
+    /// What is waiting to be confirmed for deletion.
+    pub fn pending_delete(&self) -> Option<&str> {
+        self.pending_delete.as_deref()
+    }
+
+    pub fn resolve_delete(&mut self, confirmed: bool) {
+        let pending = self.pending_delete.take();
+        if confirmed {
+            self.delete_request = pending;
+        }
+    }
+
     /// The scene waiting on an answer about the open one's unsaved work.
     pub fn pending_open(&self) -> Option<&str> {
         self.pending_open.as_deref()
@@ -542,7 +568,7 @@ impl EditorState {
 
     /// Make `path` the scene file and load it.
     pub fn request_open_scene(&mut self, path: impl Into<String>) {
-        self.scene_path = path.into();
+        self.scene_path = plain(path.into());
         self.scene_request = Some(SceneRequest::Load);
     }
 
@@ -727,6 +753,9 @@ impl EditorState {
                 self.new_scene(world, registry, &name)
             };
             log(world, level, message);
+        }
+        if let Some(rel) = self.delete_request.take() {
+            self.delete_asset(world, &rel);
         }
         if let Some(request) = self.scene_request.take() {
             let (level, message) = self.scene(world, registry, request);
@@ -1164,7 +1193,7 @@ impl EditorState {
             );
         }
 
-        self.scene_path = path.to_string_lossy().into_owned();
+        self.scene_path = plain(path.to_string_lossy().into_owned());
         self.selection.clear();
         let loaded = load_scene(world, registry, &self.scene_path);
         if loaded.0 != LogLevel::Error {
@@ -1172,6 +1201,56 @@ impl EditorState {
             self.opened(world);
         }
         loaded
+    }
+
+    /// Delete what the user confirmed, unless it is or holds the open scene:
+    /// that is what the editor is showing and would save straight back.
+    fn delete_asset(&mut self, world: &mut World, rel: &str) {
+        let Some(dir) = world
+            .get_resource::<crate::asset_db::AssetDatabase>()
+            .map(|db| db.dir().to_owned())
+        else {
+            let message = format!("could not delete {rel}: there is no asset database");
+            log(world, LogLevel::Error, message);
+            return;
+        };
+        let target = std::fs::canonicalize(dir.join(rel)).ok();
+        let open = std::fs::canonicalize(&self.scene_path).ok();
+        if let (Some(target), Some(open)) = (target, open)
+            && open.starts_with(&target)
+        {
+            let message =
+                format!("could not delete {rel}: it holds the open scene; open another first");
+            log(world, LogLevel::Error, message);
+            return;
+        }
+        let deleted = world
+            .resource_mut::<crate::asset_db::AssetDatabase>()
+            .delete(rel);
+        match deleted {
+            Ok(count) => {
+                // A folder may hold prefabs, and the prefab index is by path.
+                let kind = crate::asset_db::AssetKind::of_path(rel);
+                if kind.is_none_or(|kind| kind == crate::asset_db::AssetKind::Prefab) {
+                    self.rescan_request = true;
+                }
+                let gone = self.revealed_asset.is_some_and(|id| {
+                    world
+                        .resource::<crate::asset_db::AssetDatabase>()
+                        .iter()
+                        .all(|entry| entry.id != id)
+                });
+                if gone {
+                    self.revealed_asset = None;
+                }
+                let what = match count {
+                    1 => String::new(),
+                    n => format!(" and the {n} assets in it"),
+                };
+                log(world, LogLevel::Info, format!("deleted {rel}{what}"));
+            }
+            Err(error) => log(world, LogLevel::Error, error),
+        }
     }
 
     /// The scene file is what is loaded now, and it alone.
@@ -1318,6 +1397,18 @@ fn assets_dir(world: &World) -> PathBuf {
         .get_resource::<Prefabs>()
         .and_then(|prefabs| prefabs.dir().map(std::path::Path::to_owned))
         .unwrap_or_else(|| PathBuf::from("assets"))
+}
+
+/// `path` without the extended-length prefix Windows puts on a canonicalised
+/// path. It is still the same file, but `\\?\` is noise anywhere a person
+/// reads it, and the scene path is shown in the File menu and the Scene
+/// Manager.
+pub fn plain(path: String) -> String {
+    match path.strip_prefix(r"\\?\") {
+        Some(rest) if rest.starts_with("UNC\\") => format!(r"\\{}", &rest[4..]),
+        Some(rest) => rest.to_owned(),
+        None => path,
+    }
 }
 
 /// Whether two paths name one file, however each is spelled.

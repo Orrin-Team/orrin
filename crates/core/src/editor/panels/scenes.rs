@@ -48,7 +48,7 @@ use crate::editor::dock::Tab;
 const ROW: f32 = 26.0;
 
 pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState, floating: bool) {
-    header(ui, state, floating);
+    header(ui, world, state, floating);
     ui.add_space(2.0);
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -63,7 +63,7 @@ pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState, float
 
 /// The open scene's name, file and save state, its commands, and the button
 /// that floats or docks the tool.
-fn header(ui: &mut egui::Ui, state: &mut EditorState, floating: bool) {
+fn header(ui: &mut egui::Ui, world: &World, state: &mut EditorState, floating: bool) {
     let weak = ui.visuals().weak_text_color();
     ui.horizontal(|ui| {
         ui.label(icons::text(icons::globe(), icons::ROW, weak));
@@ -94,8 +94,16 @@ fn header(ui: &mut egui::Ui, state: &mut EditorState, floating: bool) {
             }
         });
     });
-    ui.add(egui::Label::new(egui::RichText::new(&state.scene_path).small().color(weak)).truncate())
-        .on_hover_text(&state.scene_path);
+    let path = crate::editor::state::plain(state.scene_path.clone());
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(short_path(world, &path))
+                .small()
+                .color(weak),
+        )
+        .truncate(),
+    )
+    .on_hover_text(path);
 
     let playing = state.playing();
     let recoverable = state.autosave.path(&state.scene_path).is_file();
@@ -165,20 +173,8 @@ fn renderer(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
         |ui| {
             let source = render_settings::source(world);
             ui.horizontal_wrapped(|ui| match source {
-                Some(entity) => {
+                Some(_) => {
                     pill(ui, theme::OK, "Saved with the scene");
-                    if widgets::tool_button(
-                        ui,
-                        icons::pointer(),
-                        None,
-                        Some(egui::RichText::new("Select")),
-                        Tool::Command,
-                        "Show the Render Settings entity in the inspector",
-                    )
-                    .clicked()
-                    {
-                        state.selection.set(entity);
-                    }
                 }
                 None => {
                     pill(ui, theme::PENDING, "This session only").on_hover_text(
@@ -284,6 +280,7 @@ fn project(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
         "Project scenes",
         None,
         |ui| {
+            tools(ui, world, state);
             let Some(db) = world.get_resource::<AssetDatabase>() else {
                 empty(
                     ui,
@@ -298,17 +295,13 @@ fn project(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
                 .collect();
             scenes.sort_unstable();
             if scenes.is_empty() {
-                empty(ui, "No scenes yet. Name one below to start it.");
+                empty(ui, "No scenes yet. Name one above to start it.");
             } else {
-                widgets::search(ui, &mut state.scenes_query, "Filter scenes");
-                ui.add_space(2.0);
                 list(ui, &db, &scenes, state);
             }
             if let Some(path) = state.pending_open().map(str::to_owned) {
                 confirm(ui, state, &path);
             }
-            ui.add_space(6.0);
-            new_scene(ui, world, state);
         },
     );
 }
@@ -374,6 +367,14 @@ fn list(
                 }
                 if ui.button("Copy path").clicked() {
                     ui.ctx().copy_text(path.clone());
+                    ui.close_menu();
+                }
+                ui.separator();
+                let delete = ui
+                    .add_enabled(!open, egui::Button::new("Delete…"))
+                    .on_disabled_hover_text("This is the open scene; open another first");
+                if delete.clicked() {
+                    state.request_delete_asset(rel);
                     ui.close_menu();
                 }
             });
@@ -492,9 +493,11 @@ fn confirm(ui: &mut egui::Ui, state: &mut EditorState, path: &str) {
         });
 }
 
-/// A field for the new scene's name that says what is wrong with it as it is
-/// typed, by the rule the request is checked by.
-fn new_scene(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
+/// The filter, and beside it a field for a new scene's name that says what is
+/// wrong with the name as it is typed, by the rule the request is checked by.
+/// One row, half each: both are about which scenes there are, and a second
+/// row for a one-word field was a row the list did not get.
+fn tools(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
     let id = ui.id().with("new scene name");
     let mut name = ui.data_mut(|data| data.get_temp::<String>(id).unwrap_or_default());
     let problem = (!name.trim().is_empty())
@@ -502,13 +505,21 @@ fn new_scene(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
         .flatten();
     let playing = state.playing();
     ui.horizontal(|ui| {
+        let gap = ui.spacing().item_spacing.x;
+        let half = ((ui.available_width() - gap) / 2.0).max(60.0);
+        let height = ui.spacing().interact_size.y;
+        ui.allocate_ui(egui::vec2(half, height), |ui| {
+            widgets::search(ui, &mut state.scenes_query, "Filter scenes");
+        });
+
         ui.spacing_mut().item_spacing.x = 4.0;
-        let width = (ui.available_width() - 80.0).max(80.0);
+        let create_width = 74.0;
+        let field_width = (ui.available_width() - create_width - 4.0).max(40.0);
         let field = ui.add_enabled(
             !playing,
             egui::TextEdit::singleline(&mut name)
                 .hint_text("New scene name")
-                .desired_width(width),
+                .desired_width(field_width),
         );
         let ready = !playing && !name.trim().is_empty() && problem.is_none();
         let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
@@ -517,13 +528,12 @@ fn new_scene(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
         } else {
             "Write the scene under scenes/ and open it"
         };
-        let state_of = if ready { Tool::Command } else { Tool::Disabled };
         let create = widgets::tool_button(
             ui,
             icons::file_plus(),
             None,
             Some(egui::RichText::new("Create")),
-            state_of,
+            if ready { Tool::Command } else { Tool::Disabled },
             hint,
         );
         if ready && (create.clicked() || entered) {
@@ -534,6 +544,35 @@ fn new_scene(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
         ui.colored_label(theme::ERROR, problem);
     }
     ui.data_mut(|data| data.insert_temp(id, name));
+    ui.add_space(2.0);
+}
+
+/// `path` as the project spells it: relative to the assets directory when it
+/// is under it, else to the working directory, with forward slashes. Falls
+/// back to the path as given for a file that does not exist yet.
+fn short_path(world: &World, path: &str) -> String {
+    let Ok(full) = std::fs::canonicalize(path) else {
+        return path.replace('\\', "/");
+    };
+    let assets = world
+        .get_resource::<AssetDatabase>()
+        .and_then(|db| std::fs::canonicalize(db.dir()).ok());
+    let here = std::env::current_dir()
+        .ok()
+        .and_then(|dir| std::fs::canonicalize(dir).ok());
+    [assets, here]
+        .into_iter()
+        .flatten()
+        .find_map(|base| full.strip_prefix(base).ok().map(std::path::Path::to_owned))
+        .map_or_else(
+            || path.replace('\\', "/"),
+            |rel| {
+                rel.components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            },
+        )
 }
 
 fn empty(ui: &mut egui::Ui, text: &str) {
