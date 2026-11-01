@@ -44,11 +44,12 @@ const HIERARCHY: f32 = 0.1875;
 const INSPECTOR: f32 = 0.6923;
 const BOTTOM: f32 = 0.7043;
 
-/// A dockable tool. Scene save and load are not one: they live in the File
-/// menu and the status bar, where they are reachable without a tab open.
+/// A dockable tool. Save and load are also in the File menu and the status
+/// bar, where they are reachable without the Scene Manager open.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Tab {
     Hierarchy,
+    Scenes,
     Inspector,
     Environment,
     Performance,
@@ -63,8 +64,9 @@ impl Tab {
     /// even in a build without the feature: the variant stays so a layout file
     /// written by one build still loads in the other, and the tab says why it
     /// is empty instead of vanishing.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Hierarchy,
+        Self::Scenes,
         Self::Inspector,
         Self::Environment,
         Self::Console,
@@ -78,6 +80,7 @@ impl Tab {
         use super::icons;
         match self {
             Self::Hierarchy => icons::list_tree(),
+            Self::Scenes => icons::globe(),
             Self::Inspector => icons::sliders(),
             Self::Environment => icons::mountain_snow(),
             Self::Performance => icons::activity(),
@@ -91,6 +94,7 @@ impl Tab {
     pub fn title(self) -> &'static str {
         match self {
             Self::Hierarchy => "Hierarchy",
+            Self::Scenes => "Scenes",
             Self::Inspector => "Inspector",
             Self::Environment => "Environment",
             Self::Performance => "Profiler",
@@ -130,7 +134,11 @@ pub fn default_layout() -> DockState<Tab> {
     let mut state = DockState::new(Vec::new());
     let surface = state.main_surface_mut();
 
-    let [viewport, _] = surface.split_left(NodeIndex::root(), HIERARCHY, vec![Tab::Hierarchy]);
+    let [viewport, _] = surface.split_left(
+        NodeIndex::root(),
+        HIERARCHY,
+        vec![Tab::Hierarchy, Tab::Scenes],
+    );
     let [viewport, _] = surface.split_right(
         viewport,
         INSPECTOR,
@@ -188,10 +196,15 @@ impl Dock {
     /// Bring the Import tab forward, restoring it first if it was closed — as
     /// it is in every layout saved before it existed.
     pub fn show_import(&mut self) {
-        if !self.is_open(Tab::Import) {
-            self.restore(Tab::Import);
+        self.bring_forward(Tab::Import);
+    }
+
+    /// Bring `tab` forward, restoring it first if it was closed.
+    pub fn bring_forward(&mut self, tab: Tab) {
+        if !self.is_open(tab) {
+            self.restore(tab);
         }
-        self.activate(Tab::Import);
+        self.activate(tab);
     }
 
     pub fn is_open(&self, tab: Tab) -> bool {
@@ -558,6 +571,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
             Tab::Inspector => {
                 panels::inspector::body(ui, self.world, self.state, self.registry, self.previews)
             }
+            Tab::Scenes => panels::scenes::body(ui, self.world, self.state),
             Tab::Environment => panels::environment::body(ui, self.world, self.state),
             Tab::Performance => panels::performance::body(ui, self.world),
             Tab::Console => panels::console::body(ui, self.world, self.state),

@@ -156,6 +156,9 @@ impl Editor {
         if state.take_import_request() {
             dock.show_import();
         }
+        if state.take_environment_request() {
+            dock.bring_forward(dock::Tab::Environment);
+        }
 
         // Kept once the pointer lets go, rather than on every frame a step is
         // dragged through.

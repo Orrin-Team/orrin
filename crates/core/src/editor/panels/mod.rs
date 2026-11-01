@@ -8,6 +8,7 @@ pub(super) mod inspector;
 mod menu_bar;
 pub(super) mod performance;
 #[cfg(feature = "scripting")]
+pub(super) mod scenes;
 pub(super) mod scripts;
 mod status_bar;
 mod viewport;
@@ -3953,6 +3954,117 @@ mod tests {
             .filter(|&e| editor.world.get::<Name>(e).is_some_and(|n| n.0 == "Music"))
             .count();
         assert_eq!(copies, 1);
+    }
+
+    fn with_database(editor: &mut Harness, dir: &crate::asset_db::tests::Dir) {
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        editor.world.insert_resource(db);
+    }
+
+    fn logged(editor: &Harness) -> Vec<String> {
+        editor
+            .world
+            .resource::<crate::scene::LogBuffer>()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect()
+    }
+
+    /// The project's scenes are listed by name, and nothing that is not a
+    /// scene is.
+    #[test]
+    fn the_scene_manager_lists_the_projects_scenes() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-list");
+        dir.write("levels/castle.orrin", b"");
+        dir.write("levels/dungeon.orrin", b"");
+        dir.write("rock.png", b"");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(3);
+
+        assert!(editor.painted_contains("castle"));
+        assert!(editor.painted_contains("dungeon"));
+        assert!(!editor.painted_contains("rock"));
+    }
+
+    /// Where the renderer's settings live is the thing the window has to make
+    /// plain: in the scene, or nowhere that survives a load.
+    #[test]
+    fn the_scene_manager_says_whether_the_renderer_is_saved_with_the_scene() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+        assert!(editor.painted_contains("Save with scene"));
+
+        editor.state.request_add_render_settings();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor.frames(2);
+        assert!(editor.painted_contains("Saved with the scene"));
+        assert!(!editor.painted_contains("Save with scene"));
+    }
+
+    /// While the game plays, what is loaded is more than the scene file.
+    #[test]
+    fn the_scene_manager_lists_what_is_loaded_while_playing() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.state.persistent_scene = Some(persistent_scene(&editor, "manager-loaded"));
+        toggle_play(&mut editor);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+        assert!(editor.painted_contains("Persistent"));
+    }
+
+    /// A new scene is a file at once, holding the settings a scene needs to
+    /// be drawn and a sun to see it by, and it is what the editor has open.
+    #[test]
+    fn a_new_scene_is_written_with_render_settings_and_opened() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-new");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.spawn("Old crate");
+
+        editor.state.request_new_scene("Level 2");
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        let file = dir.path().join("scenes").join("Level 2.orrin");
+        assert!(file.is_file(), "{:?}", logged(&editor));
+        assert!(named(&editor.world, "Old crate").is_none());
+        let settings = named(&editor.world, "Render Settings").expect("settings entity");
+        assert!(
+            editor
+                .world
+                .get::<crate::scene::RenderSettings>(settings)
+                .is_some()
+        );
+        assert!(named(&editor.world, "Sun").is_some());
+        assert!(std::path::Path::new(&editor.state.scene_path).ends_with("scenes/Level 2.orrin"));
+        assert!(!editor.state.scene_dirty());
+    }
+
+    /// The name becomes a file name, so it has to be one, and must not take
+    /// the place of a scene that already exists.
+    #[test]
+    fn a_new_scene_refuses_a_name_that_is_not_a_new_file() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-bad-name");
+        dir.write("scenes/castle.orrin", b"kept");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+
+        for name in ["", "  ", "a/b", "castle"] {
+            editor.state.request_new_scene(name);
+            editor.state.apply(&mut editor.world, &editor.registry);
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("scenes/castle.orrin")).unwrap(),
+            b"kept"
+        );
+        assert!(!dir.path().join("scenes/a").exists());
+        let errors = logged(&editor)
+            .into_iter()
+            .filter(|message| message.starts_with("new scene"))
+            .count();
+        assert_eq!(errors, 4, "{:?}", logged(&editor));
     }
 
     /// Stop respawns the scene into new slots; what was selected is selected

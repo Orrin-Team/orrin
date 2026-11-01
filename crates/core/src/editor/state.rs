@@ -260,6 +260,11 @@ pub struct EditorState {
     spawn_request: Option<SpawnKind>,
     /// Give the scene a Render Settings entity, holding what it is drawn with.
     render_settings_request: bool,
+    /// Write a new scene file under this name and open it. Serviced by
+    /// `apply` with the other scene requests, for the reason they are.
+    new_scene_request: Option<String>,
+    /// Bring the Environment tab forward: the dock's, like `reveal_request`.
+    environment_request: bool,
     despawn_request: Vec<Entity>,
     /// A registered component to add to an entity, at its default. Deferred
     /// like the rest: the inspector is mid-way through drawing that entity's
@@ -366,6 +371,8 @@ impl Default for EditorState {
             revert_request: Vec::new(),
             spawn_request: None,
             render_settings_request: false,
+            new_scene_request: None,
+            environment_request: false,
             despawn_request: Vec::new(),
             add_request: None,
             reparent_request: Vec::new(),
@@ -460,6 +467,19 @@ impl EditorState {
 
     pub fn request_add_render_settings(&mut self) {
         self.render_settings_request = true;
+    }
+
+    /// Write a new scene called `name` beside the project's others, and open it.
+    pub fn request_new_scene(&mut self, name: impl Into<String>) {
+        self.new_scene_request = Some(name.into());
+    }
+
+    pub fn request_environment_tab(&mut self) {
+        self.environment_request = true;
+    }
+
+    pub fn take_environment_request(&mut self) -> bool {
+        std::mem::take(&mut self.environment_request)
     }
 
     /// Make `path` the scene file and load it.
@@ -632,6 +652,17 @@ impl EditorState {
         }
         if let Some(request) = self.transport_request.take() {
             self.transport(world, registry, request);
+        }
+        if let Some(name) = self.new_scene_request.take() {
+            let (level, message) = if self.playing() {
+                (
+                    LogLevel::Warning,
+                    "new scene: the game is playing; Stop it first".to_owned(),
+                )
+            } else {
+                self.new_scene(world, registry, &name)
+            };
+            log(world, level, message);
         }
         if let Some(request) = self.scene_request.take() {
             let (level, message) = match request {
@@ -1013,6 +1044,75 @@ impl EditorState {
         }
     }
 
+    /// Write a scene called `name` under the assets directory's `scenes/`,
+    /// holding render settings and a sun, and open it in place of this one.
+    ///
+    /// Written before it is opened, so the file exists from the moment it is
+    /// listed and a crash before the first save loses nothing but the name.
+    fn new_scene(
+        &mut self,
+        world: &mut World,
+        registry: &Registry,
+        name: &str,
+    ) -> (LogLevel, String) {
+        let name = name.trim();
+        if name.is_empty() {
+            return (LogLevel::Error, "new scene: give it a name".to_owned());
+        }
+        if name.starts_with('.')
+            || name
+                .chars()
+                .any(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        {
+            return (
+                LogLevel::Error,
+                format!(
+                    "new scene: `{name}` is not a file name; leave out slashes and punctuation"
+                ),
+            );
+        }
+        let dir = assets_dir(world).join("scenes");
+        let path = dir.join(format!("{name}.{}", scene::loaded::EXTENSION));
+        if path.exists() {
+            return (
+                LogLevel::Error,
+                format!(
+                    "new scene: {} already exists; open it from the Scene Manager instead",
+                    path.display()
+                ),
+            );
+        }
+
+        let mut fresh = World::new();
+        let settings = fresh.spawn();
+        fresh.insert(settings, Name::new("Render Settings"));
+        fresh.insert(settings, scene::RenderSettings::default());
+        entities::spawn_directional_light(
+            &mut fresh,
+            "Sun",
+            Vec3::new(-0.4, -1.0, -0.6),
+            Vec3::ONE,
+            20_000.0,
+        );
+        let text = scene::save(&mut fresh, registry);
+        if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, text))
+        {
+            return (
+                LogLevel::Error,
+                format!("new scene: could not write {}: {error}", path.display()),
+            );
+        }
+
+        self.scene_path = path.to_string_lossy().into_owned();
+        self.selection.clear();
+        let loaded = load_scene(world, registry, &self.scene_path);
+        if loaded.0 != LogLevel::Error {
+            self.history.clear();
+            self.opened(world);
+        }
+        loaded
+    }
+
     /// The scene file is what is loaded now, and it alone.
     fn opened(&self, world: &mut World) {
         let path = std::path::Path::new(&self.scene_path);
@@ -1115,6 +1215,18 @@ impl EditorState {
             Err(error) => log(world, LogLevel::Error, error),
         }
     }
+}
+
+/// Where the project's assets are: the database's directory, or `assets/`
+/// beside the working directory without one, as prefabs resolve.
+fn assets_dir(world: &World) -> PathBuf {
+    if let Some(db) = world.get_resource::<crate::asset_db::AssetDatabase>() {
+        return db.dir().to_owned();
+    }
+    world
+        .get_resource::<Prefabs>()
+        .and_then(|prefabs| prefabs.dir().map(std::path::Path::to_owned))
+        .unwrap_or_else(|| PathBuf::from("assets"))
 }
 
 /// Whether two paths name one file, however each is spelled.
