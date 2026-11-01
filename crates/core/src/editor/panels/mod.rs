@@ -3216,7 +3216,7 @@ mod tests {
                         ui.allocate_ui(cell, |ui| {
                             inspector::body(ui, world, state, registry, previews)
                         });
-                        ui.allocate_ui(cell, |ui| environment::body(ui, world));
+                        ui.allocate_ui(cell, |ui| environment::body(ui, world, state));
                         ui.allocate_ui(cell, |ui| performance::body(ui, world));
                         ui.allocate_ui(cell, |ui| console::body(ui, world, state));
                         ui.allocate_ui(cell, |ui| assets::body(ui, world, state, previews));

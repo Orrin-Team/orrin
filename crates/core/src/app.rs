@@ -784,6 +784,13 @@ impl ApplicationHandler for App {
                     crate::scene::propagate_transforms(&mut self.world);
                 }
 
+                // After the editor and the script tick, either of which can load
+                // a scene or edit its settings, and before anything reads them.
+                {
+                    profile_scope!("render settings");
+                    crate::scene::render_settings::sync(&mut self.world);
+                }
+
                 // After everything that can issue an asset handle — a scene the
                 // editor loaded, a mesh dropped in the inspector, the script
                 // tick — and before extraction, so no pending handle reaches a

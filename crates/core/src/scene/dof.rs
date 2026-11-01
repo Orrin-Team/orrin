@@ -1,3 +1,5 @@
+use orrin_registry::Reflect;
+
 /// Defocus blur, described the way a lens is.
 ///
 /// The dials here are the ones on a camera — an aperture, a focus distance, a
@@ -9,7 +11,7 @@
 /// deliberately no second field of view to keep in step.
 ///
 /// [`HdrSettings`]: crate::scene::HdrSettings
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct DofSettings {
     /// Off drops the four passes rather than passing a zero radius through
     /// them, which is why it is part of the frame's structure.

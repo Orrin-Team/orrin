@@ -558,7 +558,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
             Tab::Inspector => {
                 panels::inspector::body(ui, self.world, self.state, self.registry, self.previews)
             }
-            Tab::Environment => panels::environment::body(ui, self.world),
+            Tab::Environment => panels::environment::body(ui, self.world, self.state),
             Tab::Performance => panels::performance::body(ui, self.world),
             Tab::Console => panels::console::body(ui, self.world, self.state),
             Tab::Assets => panels::assets::body(ui, self.world, self.state, self.previews),

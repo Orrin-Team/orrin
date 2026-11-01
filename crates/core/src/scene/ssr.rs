@@ -1,3 +1,5 @@
+use orrin_registry::Reflect;
+
 /// Screen-space reflections: what the frame reflects off itself.
 ///
 /// A stopgap, and worth saying so where the settings live. The trace can only
@@ -5,7 +7,7 @@
 /// camera, or hidden behind what it reflects has no radiance to give and falls
 /// back to the environment cube. Every field below except `enabled` is about
 /// making that fallback happen gracefully rather than about accuracy.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct SsrSettings {
     /// Off drops the three passes rather than tracing zero-length rays, which
     /// is why it is part of the frame's structure.

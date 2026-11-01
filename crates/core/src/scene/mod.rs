@@ -25,6 +25,7 @@ pub mod prefab;
 mod present;
 mod previews;
 pub mod registry;
+pub mod render_settings;
 mod shadow;
 mod ssao;
 mod ssr;
@@ -69,6 +70,7 @@ pub use previews::{
     AssetPreviews, MaterialPreview, MeshPreview, apply_material_edits, render_mesh,
 };
 pub use registry::register_components;
+pub use render_settings::RenderSettings;
 pub use shadow::ShadowSettings;
 pub use ssao::SsaoSettings;
 pub use ssr::SsrSettings;

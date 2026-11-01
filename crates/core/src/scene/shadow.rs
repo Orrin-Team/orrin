@@ -1,13 +1,15 @@
+use orrin_registry::Reflect;
+
 use crate::gfx::punctual::AtlasConfig;
 use crate::gfx::shadows::CascadeConfig;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct ShadowSettings {
     /// When false the cascade passes are never declared and the forward shader
     /// samples a 1x1 "fully lit" depth texture instead.
     pub enabled: bool,
     /// Clamped to `MAX_CASCADES` when the cascades are built.
-    pub cascade_count: usize,
+    pub cascade_count: u32,
     /// Edge length of one cascade's depth map, in texels.
     pub resolution: u32,
     /// How far from the camera shadows are cast. Deliberately independent of
@@ -44,7 +46,9 @@ pub struct ShadowSettings {
     /// How dark a fully shadowed fragment gets. 1.0 is physically what the
     /// shadow map says; less is an art dial.
     pub strength: f32,
-    /// Tint each fragment by which cascade it sampled.
+    /// Tint each fragment by which cascade it sampled. A view of the scene
+    /// rather than part of it, so never saved with one.
+    #[reflect(skip)]
     pub debug_cascades: bool,
 }
 
@@ -77,7 +81,7 @@ impl Default for ShadowSettings {
 impl ShadowSettings {
     pub fn cascade_config(&self) -> CascadeConfig {
         CascadeConfig {
-            count: self.cascade_count,
+            count: self.cascade_count as usize,
             max_distance: self.max_distance,
             lambda: self.lambda,
             resolution: self.resolution,

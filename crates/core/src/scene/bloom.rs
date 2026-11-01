@@ -1,3 +1,5 @@
+use orrin_registry::Reflect;
+
 /// Light bleeding from bright areas into their surroundings.
 ///
 /// Thresholdless by design: there is no brightness cutoff feeding the chain, so
@@ -6,7 +8,7 @@
 /// is what makes it scene-invariant — the same [`strength`](Self::strength)
 /// looks the same at noon and at midnight, because metering has already put both
 /// at the same working range.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct BloomSettings {
     /// Off drops the whole chain from the frame rather than running it at zero
     /// strength.

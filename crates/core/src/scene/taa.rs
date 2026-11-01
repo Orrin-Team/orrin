@@ -1,3 +1,5 @@
+use orrin_registry::Reflect;
+
 /// Temporal antialiasing: the frame is jittered by a subpixel offset each frame
 /// and the result accumulated against a reprojected history.
 ///
@@ -5,7 +7,7 @@
 /// the motion vectors exist for it — so turning it off changes the projection
 /// matrix the whole frame is drawn with, not just which nodes the graph
 /// registers.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct TaaSettings {
     /// Off drops the resolve node *and* stops jittering the projection. A frame
     /// that jittered without resolving would simply shake.

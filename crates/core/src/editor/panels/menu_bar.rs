@@ -182,7 +182,7 @@ pub fn menu_body(
         Menu::File => file(ui, state),
         Menu::Edit => edit(ui, world, registry, state),
         Menu::Entity => entity(ui, state),
-        Menu::Render => render(ui, world, dock),
+        Menu::Render => render(ui, world, state, dock),
         Menu::Scripts => scripts(ui, world, state),
         Menu::View => view(ui, state, themes, dock),
     }
@@ -339,18 +339,18 @@ fn entity(ui: &mut egui::Ui, state: &mut EditorState) {
     spawn_entries(ui, state);
 }
 
-fn render(ui: &mut egui::Ui, world: &mut World, dock: &mut Dock) {
-    ui.checkbox(&mut world.resource_mut::<SsaoSettings>().enabled, "SSAO");
-    ui.checkbox(
-        &mut world.resource_mut::<TaaSettings>().enabled,
-        "Temporal AA",
-    );
-    {
+fn render(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState, dock: &mut Dock) {
+    super::environment::edit_settings(world, state, |world| {
+        ui.checkbox(&mut world.resource_mut::<SsaoSettings>().enabled, "SSAO");
+        ui.checkbox(
+            &mut world.resource_mut::<TaaSettings>().enabled,
+            "Temporal AA",
+        );
         let mut shadows = world.resource_mut::<ShadowSettings>();
         ui.checkbox(&mut shadows.enabled, "Shadows");
         ui.checkbox(&mut shadows.debug_cascades, "Tint cascades")
             .on_hover_text("Colour each shadow cascade, to see where the splits fall");
-    }
+    });
     ui.separator();
     if command(ui, "Environment and exposure…", "") {
         dock.activate(Tab::Environment);

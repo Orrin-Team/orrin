@@ -1,3 +1,5 @@
+use orrin_registry::Reflect;
+
 /// How the frame's radiance becomes a displayable image.
 ///
 /// Exposure is expressed the way a camera expresses it — in EV100, the exposure
@@ -7,7 +9,7 @@
 /// [`exposure_compensation`](Self::exposure_compensation) shifts either by a
 /// count of stops. A stop is a doubling, so the dial behaves the same at noon
 /// and at midnight, which a multiplier does not.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct HdrSettings {
     /// Meter the frame and adapt to it. Off makes
     /// [`manual_ev100`](Self::manual_ev100) the whole exposure.

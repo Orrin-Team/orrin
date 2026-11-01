@@ -1,3 +1,5 @@
+use orrin_registry::Reflect;
+
 /// Camera and object motion blur, described the way a shutter is.
 ///
 /// One dial, because a shutter really is one number once the frame rate is
@@ -9,7 +11,7 @@
 /// scene running at 30 fps blurs twice as far as the same scene at 60 fps for
 /// the same angle, which is exactly what a real camera does and what a
 /// frame-rate-independent "strength" would hide.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct MotionBlurSettings {
     /// Off drops the three passes rather than running them with a zero shutter,
     /// which is why it is part of the frame's structure.

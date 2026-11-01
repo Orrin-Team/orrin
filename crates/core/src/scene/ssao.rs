@@ -1,4 +1,6 @@
-#[derive(Clone, Copy, Debug)]
+use orrin_registry::Reflect;
+
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct SsaoSettings {
     /// When false the SSAO passes are skipped and occlusion is 1.0 everywhere.
     pub enabled: bool,

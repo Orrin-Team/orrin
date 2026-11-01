@@ -256,6 +256,8 @@ pub struct EditorState {
         orrin_registry::FieldPath,
     )>,
     spawn_request: Option<SpawnKind>,
+    /// Give the scene a Render Settings entity, holding what it is drawn with.
+    render_settings_request: bool,
     despawn_request: Vec<Entity>,
     /// A registered component to add to an entity, at its default. Deferred
     /// like the rest: the inspector is mid-way through drawing that entity's
@@ -360,6 +362,7 @@ impl Default for EditorState {
             remove_request: None,
             revert_request: Vec::new(),
             spawn_request: None,
+            render_settings_request: false,
             despawn_request: Vec::new(),
             add_request: None,
             reparent_request: Vec::new(),
@@ -449,6 +452,10 @@ impl EditorState {
 
     pub fn request_spawn(&mut self, kind: SpawnKind) {
         self.spawn_request = Some(kind);
+    }
+
+    pub fn request_add_render_settings(&mut self) {
+        self.render_settings_request = true;
     }
 
     pub fn request_scene(&mut self, request: SceneRequest) {
@@ -690,6 +697,18 @@ impl EditorState {
             if let Some(entity) = spawned {
                 self.selection.set(entity);
             }
+        }
+        if std::mem::take(&mut self.render_settings_request)
+            && scene::render_settings::source(editor.world()).is_none()
+        {
+            let settings = scene::render_settings::capture(editor.world());
+            let entity = editor.replace("Add render settings", &[], |world, _| {
+                let entity = world.spawn();
+                world.insert(entity, Name::new("Render Settings"));
+                world.insert(entity, settings);
+                (entity, vec![entity])
+            });
+            self.selection.set(entity);
         }
         if !self.despawn_request.is_empty() {
             let doomed = std::mem::take(&mut self.despawn_request);
