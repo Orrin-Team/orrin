@@ -139,6 +139,26 @@ impl LevelFilter {
     }
 }
 
+/// Where a tool should go. Requested by a tool's own controls, which are drawn
+/// inside the dock and so cannot rearrange it while it is drawing them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockRequest {
+    /// Bring it forward, reopening it if it was closed.
+    Show(super::dock::Tab),
+    /// Into a window of its own.
+    Float(super::dock::Tab),
+    /// Back where the default layout keeps it.
+    Dock(super::dock::Tab),
+}
+
+/// What becomes of unsaved work when another scene is opened over it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenChoice {
+    SaveFirst,
+    Discard,
+    Cancel,
+}
+
 /// What can be done to a prefab instance as a whole, from the tree's menu or
 /// the inspector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +220,8 @@ pub struct EditorState {
     pub inspector_query: String,
     /// The asset browser's filter, kept for the reason the others are.
     pub assets_query: String,
+    /// The Scene Manager's filter over the project's scenes.
+    pub scenes_query: String,
     pub assets_view: AssetView,
     /// The asset the browser marks, and the Import tab shows: the last one
     /// clicked there, or the prefab "Show in Assets" pointed at.
@@ -263,8 +285,15 @@ pub struct EditorState {
     /// Write a new scene file under this name and open it. Serviced by
     /// `apply` with the other scene requests, for the reason they are.
     new_scene_request: Option<String>,
-    /// Bring the Environment tab forward: the dock's, like `reveal_request`.
-    environment_request: bool,
+    /// A change to where a tool sits: the dock's, drained before the next
+    /// frame lays it out.
+    dock_request: Option<DockRequest>,
+    /// A scene the Scene Manager was asked to open over unsaved work, waiting
+    /// for the user to say what happens to that work.
+    pending_open: Option<String>,
+    /// Save the open scene, then open this one — the save-first answer to
+    /// `pending_open`.
+    open_after_save: Option<String>,
     despawn_request: Vec<Entity>,
     /// A registered component to add to an entity, at its default. Deferred
     /// like the rest: the inspector is mid-way through drawing that entity's
@@ -345,6 +374,7 @@ impl Default for EditorState {
             console_query: String::new(),
             inspector_query: String::new(),
             assets_query: String::new(),
+            scenes_query: String::new(),
             assets_view: AssetView::default(),
             revealed_asset: None,
             gizmo_mode: GizmoMode::Select,
@@ -372,7 +402,9 @@ impl Default for EditorState {
             spawn_request: None,
             render_settings_request: false,
             new_scene_request: None,
-            environment_request: false,
+            dock_request: None,
+            pending_open: None,
+            open_after_save: None,
             despawn_request: Vec::new(),
             add_request: None,
             reparent_request: Vec::new(),
@@ -474,12 +506,38 @@ impl EditorState {
         self.new_scene_request = Some(name.into());
     }
 
-    pub fn request_environment_tab(&mut self) {
-        self.environment_request = true;
+    pub fn request_dock(&mut self, request: DockRequest) {
+        self.dock_request = Some(request);
     }
 
-    pub fn take_environment_request(&mut self) -> bool {
-        std::mem::take(&mut self.environment_request)
+    pub fn take_dock_request(&mut self) -> Option<DockRequest> {
+        self.dock_request.take()
+    }
+
+    /// Open `path`, or, over unsaved work, ask first: see
+    /// [`pending_open`](Self::pending_open).
+    pub fn request_open_scene_checked(&mut self, path: impl Into<String>) {
+        if self.scene_dirty() {
+            self.pending_open = Some(path.into());
+        } else {
+            self.request_open_scene(path);
+        }
+    }
+
+    /// The scene waiting on an answer about the open one's unsaved work.
+    pub fn pending_open(&self) -> Option<&str> {
+        self.pending_open.as_deref()
+    }
+
+    pub fn resolve_open(&mut self, choice: OpenChoice) {
+        let Some(path) = self.pending_open.take() else {
+            return;
+        };
+        match choice {
+            OpenChoice::SaveFirst => self.open_after_save = Some(path),
+            OpenChoice::Discard => self.request_open_scene(path),
+            OpenChoice::Cancel => {}
+        }
     }
 
     /// Make `path` the scene file and load it.
@@ -520,6 +578,12 @@ impl EditorState {
 
     pub fn request_prefab_action(&mut self, action: PrefabAction, entity: Entity) {
         self.prefab_request = Some((action, entity));
+    }
+
+    /// Point the asset browser at `id`, and bring it forward.
+    pub fn reveal_asset(&mut self, id: AssetId) {
+        self.revealed_asset = Some(id);
+        self.reveal_request = true;
     }
 
     pub fn take_reveal_request(&mut self) -> bool {
@@ -665,46 +729,65 @@ impl EditorState {
             log(world, level, message);
         }
         if let Some(request) = self.scene_request.take() {
-            let (level, message) = match request {
-                _ if self.playing() => (
-                    LogLevel::Warning,
-                    format!(
-                        "the game is playing: Stop it first, or the game's state would \
-                         replace {}",
-                        self.scene_path
-                    ),
-                ),
-                SceneRequest::Save => {
-                    SceneEditor::new(world, registry, &mut self.history).commit();
-                    let saved = save_scene(world, registry, &self.scene_path);
-                    if saved.0 != LogLevel::Error {
-                        self.history.mark_saved();
-                        self.autosave
-                            .saved(&self.scene_path, self.history.version());
-                    }
-                    saved
-                }
-                SceneRequest::Recover => {
-                    self.selection.clear();
-                    let path = self.autosave.path(&self.scene_path);
-                    let loaded = load_scene(world, registry, &path.to_string_lossy());
-                    if loaded.0 != LogLevel::Error {
-                        self.history.clear_unsaved();
-                        self.opened(world);
-                    }
-                    loaded
-                }
-                SceneRequest::Load => {
-                    self.selection.clear();
-                    let loaded = load_scene(world, registry, &self.scene_path);
-                    if loaded.0 != LogLevel::Error {
-                        self.history.clear();
-                        self.opened(world);
-                    }
-                    loaded
-                }
-            };
+            let (level, message) = self.scene(world, registry, request);
             log(world, level, message);
+        }
+        if let Some(path) = self.open_after_save.take() {
+            let (level, message) = self.scene(world, registry, SceneRequest::Save);
+            let saved = level != LogLevel::Error;
+            log(world, level, message);
+            if saved {
+                self.scene_path = path;
+                let (level, message) = self.scene(world, registry, SceneRequest::Load);
+                log(world, level, message);
+            }
+        }
+    }
+
+    fn scene(
+        &mut self,
+        world: &mut World,
+        registry: &Registry,
+        request: SceneRequest,
+    ) -> (LogLevel, String) {
+        match request {
+            _ if self.playing() => (
+                LogLevel::Warning,
+                format!(
+                    "the game is playing: Stop it first, or the game's state would \
+                         replace {}",
+                    self.scene_path
+                ),
+            ),
+            SceneRequest::Save => {
+                SceneEditor::new(world, registry, &mut self.history).commit();
+                let saved = save_scene(world, registry, &self.scene_path);
+                if saved.0 != LogLevel::Error {
+                    self.history.mark_saved();
+                    self.autosave
+                        .saved(&self.scene_path, self.history.version());
+                }
+                saved
+            }
+            SceneRequest::Recover => {
+                self.selection.clear();
+                let path = self.autosave.path(&self.scene_path);
+                let loaded = load_scene(world, registry, &path.to_string_lossy());
+                if loaded.0 != LogLevel::Error {
+                    self.history.clear_unsaved();
+                    self.opened(world);
+                }
+                loaded
+            }
+            SceneRequest::Load => {
+                self.selection.clear();
+                let loaded = load_scene(world, registry, &self.scene_path);
+                if loaded.0 != LogLevel::Error {
+                    self.history.clear();
+                    self.opened(world);
+                }
+                loaded
+            }
         }
     }
 
@@ -1055,33 +1138,11 @@ impl EditorState {
         registry: &Registry,
         name: &str,
     ) -> (LogLevel, String) {
-        let name = name.trim();
-        if name.is_empty() {
-            return (LogLevel::Error, "new scene: give it a name".to_owned());
-        }
-        if name.starts_with('.')
-            || name
-                .chars()
-                .any(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
-        {
-            return (
-                LogLevel::Error,
-                format!(
-                    "new scene: `{name}` is not a file name; leave out slashes and punctuation"
-                ),
-            );
-        }
-        let dir = assets_dir(world).join("scenes");
-        let path = dir.join(format!("{name}.{}", scene::loaded::EXTENSION));
-        if path.exists() {
-            return (
-                LogLevel::Error,
-                format!(
-                    "new scene: {} already exists; open it from the Scene Manager instead",
-                    path.display()
-                ),
-            );
-        }
+        let path = match new_scene_path(world, name) {
+            Ok(path) => path,
+            Err(problem) => return (LogLevel::Error, format!("new scene: {problem}")),
+        };
+        let dir = path.parent().unwrap_or(&path).to_owned();
 
         let mut fresh = World::new();
         let settings = fresh.spawn();
@@ -1215,6 +1276,36 @@ impl EditorState {
             Err(error) => log(world, LogLevel::Error, error),
         }
     }
+}
+
+/// Where a new scene called `name` would be written, or why it cannot be.
+///
+/// One rule for the Scene Manager's field, which shows the problem as the name
+/// is typed, and for the request, which checks again in case the disk changed
+/// in between.
+pub fn new_scene_path(world: &World, name: &str) -> Result<PathBuf, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("give it a name".to_owned());
+    }
+    if name.starts_with('.')
+        || name
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    {
+        return Err(format!(
+            "`{name}` is not a file name; leave out slashes and punctuation"
+        ));
+    }
+    let path = assets_dir(world)
+        .join("scenes")
+        .join(format!("{name}.{}", scene::loaded::EXTENSION));
+    if path.exists() {
+        return Err(format!(
+            "`{name}` already exists; open it from the list instead"
+        ));
+    }
+    Ok(path)
 }
 
 /// Where the project's assets are: the database's directory, or `assets/`

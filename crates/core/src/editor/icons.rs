@@ -84,9 +84,12 @@ macro_rules! icons {
 // Phosphor's codepoints, from its `style.css` at 2.1.1.
 icons! {
     activity => '\u{e000}',
+    arrow_square_in => '\u{e5dc}',
+    arrow_square_out => '\u{e5de}',
     arrow_up => '\u{e08e}',
     box_ => '\u{e1da}',
     check => '\u{e182}',
+    check_circle => '\u{e184}',
     chevron_down => '\u{e136}',
     chevron_right => '\u{e13a}',
     circle => '\u{e18a}',
@@ -94,6 +97,8 @@ icons! {
     circle_x => '\u{e4f8}',
     ellipsis => '\u{e1fe}',
     file_code => '\u{e914}',
+    file_plus => '\u{e236}',
+    floppy_disk => '\u{e248}',
     folder => '\u{e25a}',
     globe => '\u{e288}',
     grid => '\u{e296}',
@@ -124,6 +129,7 @@ icons! {
     terminal => '\u{eae8}',
     trash => '\u{e4a6}',
     warning => '\u{e4e0}',
+    warning_circle => '\u{e4e2}',
     x => '\u{e4f6}',
 }
 
@@ -162,7 +168,12 @@ pub fn with_label(icon: Icon, color: Option<Color32>, label: &str) -> egui::Widg
 
 /// Paint an icon centred in `rect`, as tall as the rect.
 pub fn paint(ui: &egui::Ui, icon: Icon, rect: egui::Rect, color: Color32) {
-    ui.painter().text(
+    paint_on(ui.painter(), icon, rect, color);
+}
+
+/// [`paint`] onto a painter of the caller's choosing — another layer's.
+pub fn paint_on(painter: &egui::Painter, icon: Icon, rect: egui::Rect, color: Color32) {
+    painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         icon.0,
