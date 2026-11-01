@@ -7,8 +7,8 @@ pub(super) mod import;
 pub(super) mod inspector;
 mod menu_bar;
 pub(super) mod performance;
-#[cfg(feature = "scripting")]
 pub(super) mod scenes;
+#[cfg(feature = "scripting")]
 pub(super) mod scripts;
 mod status_bar;
 mod viewport;
