@@ -18,7 +18,9 @@ use crate::editor::theme::{self, ThemeSet};
 use crate::editor::widgets;
 use crate::editor::{icons, pick};
 use crate::gfx::vulkan::OutlineItem;
-use crate::scene::{Camera, Hierarchy, Light, LocalTransform, MeshHandle, Parent, WorldTransform};
+use crate::scene::{
+    Camera, Hierarchy, Light, LocalTransform, MeshHandle, Parent, Play, PlayState, WorldTransform,
+};
 use crate::stats::FrameStats;
 use orrin_registry::Reflect;
 
@@ -85,6 +87,29 @@ pub fn show(
                     .show(ui, |ui| stats_readout(ui, &stats));
             });
     }
+
+    play_frame(ctx, world, themes, viewport);
+}
+
+/// A border round the scene while the game is live, in the accent while it
+/// runs and amber while it is paused, so a change made to the fork is never
+/// mistaken for one made to the scene: Stop throws it away.
+fn play_frame(ctx: &egui::Context, world: &World, themes: &ThemeSet, viewport: egui::Rect) {
+    let colour = match world.get_resource::<Play>().map(|play| play.state()) {
+        Some(PlayState::Playing) => themes.active().accent(),
+        Some(PlayState::Paused) => theme::PENDING,
+        Some(PlayState::Editing) | None => return,
+    };
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new("play_frame"),
+    ));
+    painter.rect_stroke(
+        viewport,
+        0.0,
+        egui::Stroke::new(2.0_f32, colour),
+        egui::StrokeKind::Inside,
+    );
 }
 
 fn gizmo_modes(ui: &mut egui::Ui, state: &mut EditorState) {

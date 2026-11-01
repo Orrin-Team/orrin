@@ -250,6 +250,7 @@ impl App {
         });
         world.insert_resource(PresentSettings::default());
         world.insert_resource(Diagnostics::default());
+        world.insert_resource(crate::scene::Play::default());
         world.insert_resource(FrameStats::new());
         world.insert_resource(Profiler::default());
         world.insert_resource(InputState::new());
@@ -676,7 +677,11 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                {
+                // Asked once, here: it consumes a paused game's step. Edit mode
+                // runs no game code — see `scene::play`.
+                let simulate = self.world.resource_mut::<crate::scene::Play>().advance();
+
+                if simulate {
                     profile_scope!("spin");
                     systems::spin(&self.world, delta);
                 }
@@ -691,7 +696,7 @@ impl ApplicationHandler for App {
                 // After the transform-mutating systems and before the script
                 // tick, so the events scripts receive match the positions
                 // they'll read this frame.
-                {
+                if simulate {
                     profile_scope!("collision");
                     crate::collision::run(&mut self.world);
                 }
@@ -735,7 +740,7 @@ impl ApplicationHandler for App {
                             }
                         }
                         scripting.attach_pending(&mut self.world, &self.registry);
-                        {
+                        if simulate {
                             profile_scope!("script tick");
                             scripting.tick(&mut self.world, &self.registry, delta);
                         }

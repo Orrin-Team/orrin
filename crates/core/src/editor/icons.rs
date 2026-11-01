@@ -119,6 +119,7 @@ icons! {
     search => '\u{e30c}',
     sliders => '\u{e434}',
     step_forward => '\u{e5a6}',
+    stop => '\u{e46c}',
     sun => '\u{e472}',
     terminal => '\u{eae8}',
     trash => '\u{e4a6}',

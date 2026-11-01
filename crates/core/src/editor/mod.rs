@@ -3,6 +3,7 @@
 //! egui lays the editor out and tessellates it; the renderer draws it, in the
 //! phases `phases` cuts it into (see `gfx/vulkan/overlay.rs`).
 
+mod autosave;
 mod dock;
 mod gizmo;
 mod icons;
@@ -55,6 +56,7 @@ pub struct Editor {
 impl Drop for Editor {
     fn drop(&mut self) {
         self.save_layout();
+        self.state.autosave.wait();
     }
 }
 
@@ -147,6 +149,7 @@ impl Editor {
         panels::frost(ctx, glass);
         phases::mark(ctx);
         state.apply(world, registry);
+        state.autosave(world, registry, std::time::Instant::now());
         if state.take_reveal_request() {
             dock.activate(dock::Tab::Assets);
         }

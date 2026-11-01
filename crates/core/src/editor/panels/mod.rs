@@ -110,6 +110,18 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
     if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
         state.request_scene(SceneRequest::Save);
     }
+    // Most specific first, as with redo below.
+    let (alt, shift) = (
+        egui::Modifiers::COMMAND | egui::Modifiers::ALT,
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+    );
+    if ctx.input_mut(|input| input.consume_key(alt, egui::Key::P)) {
+        state.request_step();
+    } else if ctx.input_mut(|input| input.consume_key(shift, egui::Key::P)) {
+        state.request_pause();
+    } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+        state.request_play();
+    }
     if ctx.wants_keyboard_input() {
         return;
     }
@@ -1962,8 +1974,8 @@ mod tests {
         assert!(slabs.is_empty(), "{slabs:?}");
     }
 
-    /// Play, pause and step are disabled until play mode exists, but they are
-    /// the bar's centrepiece: drawn at egui's faded disabled alpha, in a sunken
+    /// Pause and step are disabled until Play is pressed, but they are the
+    /// bar's centrepiece: drawn at egui's faded disabled alpha, in a sunken
     /// well, they read as an empty field. Opaque, and light enough to read.
     #[test]
     fn the_transport_is_legible_while_disabled() {
@@ -3812,5 +3824,288 @@ mod tests {
         editor.frames(FRAMES);
         let per_frame = start.elapsed() / FRAMES as u32;
         println!("editor layout: {per_frame:?} per frame over {FRAMES} frames, 2 000 entities");
+    }
+
+    fn play_state(editor: &Harness) -> crate::scene::PlayState {
+        editor.world.resource::<crate::scene::Play>().state()
+    }
+
+    /// Ctrl+P, then whatever `apply` does with it, as the editor's frame does.
+    fn toggle_play(editor: &mut Harness) {
+        editor.key_with(egui::Modifiers::COMMAND, egui::Key::P);
+        editor.state.apply(&mut editor.world, &editor.registry);
+    }
+
+    /// Play forks the scene and Stop throws the fork away: whatever the game
+    /// did to the world — moved, despawned, spawned — the scene after Stop is
+    /// the one a save before Play would have written.
+    #[test]
+    fn stop_puts_the_scene_back_as_it_was_before_play() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let crate_ = editor.spawn("Crate");
+        let lamp = editor.spawn("Lamp");
+        let before = crate::scene::save(&mut editor.world, &editor.registry);
+
+        toggle_play(&mut editor);
+        assert_eq!(play_state(&editor), crate::scene::PlayState::Playing);
+        // What a script does: straight at the world, around the pipeline.
+        editor
+            .world
+            .get_mut::<LocalTransform>(crate_)
+            .unwrap()
+            .0
+            .translation
+            .x = 9.0;
+        editor.world.despawn(lamp);
+        editor.spawn("Bullet");
+
+        toggle_play(&mut editor);
+        assert_eq!(play_state(&editor), crate::scene::PlayState::Editing);
+        assert_eq!(
+            crate::scene::save(&mut editor.world, &editor.registry),
+            before
+        );
+        assert!(named(&editor.world, "Bullet").is_none());
+    }
+
+    /// The history is the scene's, and the fork is not the scene: an edit made
+    /// while playing is gone with the fork, and undo after Stop undoes what it
+    /// undid before Play.
+    #[test]
+    fn edits_while_playing_leave_the_history_alone() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Keep");
+        delete_by_key(&mut editor, "Old crate");
+        let label = editor.state.history.undo_label().map(str::to_owned);
+        assert!(label.is_some());
+
+        toggle_play(&mut editor);
+        let keep = named(&editor.world, "Keep").unwrap();
+        editor.state.selection.set(keep);
+        editor.frames(1).key(egui::Key::Delete);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(named(&editor.world, "Keep").is_none());
+        toggle_play(&mut editor);
+
+        assert!(named(&editor.world, "Keep").is_some());
+        assert_eq!(editor.state.history.undo_label().map(str::to_owned), label);
+        assert!(
+            editor.state.history.is_dirty(),
+            "the delete is still unsaved"
+        );
+    }
+
+    /// Stop respawns the scene into new slots; what was selected is selected
+    /// again, by identity.
+    #[test]
+    fn the_selection_survives_stop() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Other");
+        let crate_ = editor.spawn("Crate");
+        editor.state.selection.set(crate_);
+
+        toggle_play(&mut editor);
+        toggle_play(&mut editor);
+
+        let primary = editor.state.selection.primary();
+        assert!(primary.is_some());
+        assert_eq!(primary, named(&editor.world, "Crate"));
+    }
+
+    /// Saving the fork would write the game's state over the scene. Ctrl+S
+    /// while playing says why it did nothing instead.
+    #[test]
+    fn saving_while_playing_writes_nothing_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("orrin-play-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("level.orrin");
+        let _ = std::fs::remove_file(&path);
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Crate");
+        editor.state.scene_path = path.to_string_lossy().into_owned();
+
+        toggle_play(&mut editor);
+        editor.key_with(egui::Modifiers::COMMAND, egui::Key::S);
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        assert!(!path.exists());
+        let warned = editor
+            .world
+            .resource::<crate::scene::LogBuffer>()
+            .iter()
+            .any(|entry| {
+                entry.level == crate::scene::LogLevel::Warning && entry.message.contains("Stop")
+            });
+        assert!(warned);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The transport is live: Play is a button, and while the game runs the
+    /// same button is Stop, lit in the accent.
+    #[test]
+    fn the_play_button_plays_and_becomes_stop() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let play = crate::editor::icons::play().glyph();
+        let stop = crate::editor::icons::stop().glyph();
+        let (_, rect, _) = editor
+            .painted_icons()
+            .into_iter()
+            .find(|(glyph, _, _)| *glyph == play)
+            .expect("a play button");
+
+        editor.click(rect.center());
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(play_state(&editor), crate::scene::PlayState::Playing);
+
+        editor.frames(1);
+        let glyphs: Vec<char> = editor.painted_icons().iter().map(|(g, _, _)| *g).collect();
+        assert!(glyphs.contains(&stop), "{glyphs:?}");
+        assert!(!glyphs.contains(&play), "{glyphs:?}");
+    }
+
+    /// Pause holds the fork where it is; Step lets one frame through and stays
+    /// paused. Both are keys as well as buttons.
+    #[test]
+    fn pause_and_step_hold_the_game() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        toggle_play(&mut editor);
+        let shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+        editor.key_with(shift, egui::Key::P);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(play_state(&editor), crate::scene::PlayState::Paused);
+
+        let alt = egui::Modifiers::COMMAND | egui::Modifiers::ALT;
+        editor.key_with(alt, egui::Key::P);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let mut play = editor.world.resource_mut::<crate::scene::Play>();
+        assert!(play.advance());
+        assert!(!play.advance());
+        assert_eq!(play.state(), crate::scene::PlayState::Paused);
+    }
+
+    /// Unsaved work is marked beside the scene's name, so an autosave or a
+    /// recovered scene is never mistaken for one on disk.
+    #[test]
+    fn the_bar_marks_an_unsaved_scene() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let marked = |editor: &Harness| {
+            editor
+                .painted()
+                .iter()
+                .any(|text| text.contains(&editor.state.scene_path) && text.contains('•'))
+        };
+        assert!(!marked(&editor));
+        delete_by_key(&mut editor, "Crate");
+        editor.frames(1);
+        assert!(marked(&editor));
+    }
+
+    fn autosaving(name: &str) -> (Harness, std::path::PathBuf, std::time::Instant) {
+        use crate::editor::autosave::Autosave;
+        let dir =
+            std::env::temp_dir().join(format!("orrin-autosave-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let start = std::time::Instant::now();
+        editor.state.autosave = Autosave::new(dir.clone(), start);
+        (editor, dir, start)
+    }
+
+    fn autosave_at(editor: &mut Harness, at: std::time::Instant) {
+        let Harness {
+            world,
+            registry,
+            state,
+            ..
+        } = editor;
+        state.autosave(world, registry, at);
+        state.autosave.wait();
+    }
+
+    /// The copy is the scene file a save would have written, byte for byte, so
+    /// recovering it loses nothing a save would have kept.
+    #[test]
+    fn an_autosave_is_what_a_save_would_write() {
+        let (mut editor, dir, start) = autosaving("bytes");
+        editor.spawn("Keep");
+        delete_by_key(&mut editor, "Crate");
+
+        autosave_at(&mut editor, start + crate::editor::autosave::INTERVAL);
+
+        let path = editor.state.autosave.path(&editor.state.scene_path);
+        let copy = std::fs::read_to_string(&path).expect("an autosave");
+        assert_eq!(
+            copy,
+            crate::scene::save(&mut editor.world, &editor.registry)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fork is not the scene, and nothing in edit mode changes while it
+    /// runs, so play mode is never copied.
+    #[test]
+    fn nothing_is_autosaved_while_playing() {
+        let (mut editor, dir, start) = autosaving("playing");
+        delete_by_key(&mut editor, "Crate");
+        toggle_play(&mut editor);
+
+        autosave_at(&mut editor, start + crate::editor::autosave::INTERVAL);
+
+        assert!(
+            !editor
+                .state
+                .autosave
+                .path(&editor.state.scene_path)
+                .exists()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recovered copy is unsaved work, not the scene file: it opens dirty,
+    /// for Save to put back where it belongs.
+    #[test]
+    fn recovering_an_autosave_opens_it_unsaved() {
+        let (mut editor, dir, start) = autosaving("recover");
+        editor.spawn("Keep");
+        delete_by_key(&mut editor, "Crate");
+        autosave_at(&mut editor, start + crate::editor::autosave::INTERVAL);
+        editor.spawn("Later");
+
+        editor
+            .state
+            .request_scene(crate::editor::state::SceneRequest::Recover);
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        assert!(named(&editor.world, "Keep").is_some());
+        assert!(named(&editor.world, "Later").is_none());
+        assert!(editor.state.history.is_dirty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While the game is live the scene is framed in the accent, so a change
+    /// made to the fork is never mistaken for one made to the scene.
+    #[test]
+    fn the_viewport_is_framed_while_playing() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let accent = editor.themes.active().accent();
+        let framed = |editor: &Harness| {
+            let viewport = editor.dock.viewport().expect("a viewport");
+            !editor
+                .painted_rects_of(|shape| {
+                    matches!(shape, egui::Shape::Rect(rect)
+                        if rect.stroke.color == accent && rect.stroke.width >= 2.0)
+                })
+                .into_iter()
+                .filter(|rect| rect.intersects(viewport) && rect.width() >= viewport.width() - 4.0)
+                .collect::<Vec<_>>()
+                .is_empty()
+        };
+        editor.frames(2);
+        assert!(!framed(&editor));
+        toggle_play(&mut editor);
+        editor.frames(1);
+        assert!(framed(&editor));
     }
 }
