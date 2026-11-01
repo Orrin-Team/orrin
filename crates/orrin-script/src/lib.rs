@@ -136,6 +136,19 @@ pub struct OrrinApi {
     // draws is the asset yet, a placeholder while it imports, or a placeholder
     // for good.
     pub asset_state: extern "C" fn(*const u8) -> u32,
+    // Scenes, appended after `asset_state`; never reordered above it.
+    //
+    // A scene is named by its asset id's 16 bytes, a loaded one by a `u32`
+    // handle that is never zero and never reused. All three changes are
+    // deferred structural changes, validated at the call: `load_scene` returns
+    // false and `load_scene_additive` zero for an id that names no scene, and
+    // `unload_scene` false for the active scene or one that is not loaded.
+    // `load_scene_additive` reserves the handle at the call, like
+    // `instantiate_prefab` its root, so the same tick can hold and unload it.
+    pub load_scene: extern "C" fn(*const u8) -> bool,
+    pub load_scene_additive: extern "C" fn(*const u8) -> u32,
+    pub unload_scene: extern "C" fn(u32) -> bool,
+    pub active_scene: extern "C" fn() -> u32,
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -204,7 +217,27 @@ pub fn default_api() -> OrrinApi {
         find_asset: stub_find_asset,
         instantiate_prefab: stub_instantiate_prefab,
         asset_state: stub_asset_state,
+        load_scene: stub_load_scene,
+        load_scene_additive: stub_load_scene_additive,
+        unload_scene: stub_unload_scene,
+        active_scene: stub_active_scene,
     }
+}
+
+extern "C" fn stub_load_scene(_id: *const u8) -> bool {
+    false
+}
+
+extern "C" fn stub_load_scene_additive(_id: *const u8) -> u32 {
+    0
+}
+
+extern "C" fn stub_unload_scene(_handle: u32) -> bool {
+    false
+}
+
+extern "C" fn stub_active_scene() -> u32 {
+    0
 }
 
 extern "C" fn stub_find_asset(_path: *const c_char, _out: *mut u8) -> u32 {

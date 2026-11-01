@@ -71,6 +71,12 @@ public unsafe struct OrrinApi
     // Load state, appended after InstantiatePrefab, matching the Rust struct:
     // an id's sixteen bytes in, an `AssetState` out.
     public delegate* unmanaged<byte*, uint> AssetState;
+    // Scenes, appended after AssetState, matching the Rust struct: a scene by
+    // its id's sixteen bytes, a loaded one by a nonzero handle.
+    public delegate* unmanaged<byte*, byte> LoadScene;
+    public delegate* unmanaged<byte*, uint> LoadSceneAdditive;
+    public delegate* unmanaged<uint, byte> UnloadScene;
+    public delegate* unmanaged<uint> ActiveScene;
 }
 
 public static unsafe class Native
@@ -221,6 +227,26 @@ public static unsafe class Native
         fixed (byte* idPtr = id)
             return _api.InstantiatePrefab(idPtr);
     }
+
+    internal static bool LoadScene(Guid scene)
+    {
+        Span<byte> id = stackalloc byte[16];
+        scene.TryWriteBytes(id, bigEndian: true, out _);
+        fixed (byte* idPtr = id)
+            return _api.LoadScene(idPtr) != 0;
+    }
+
+    internal static uint LoadSceneAdditive(Guid scene)
+    {
+        Span<byte> id = stackalloc byte[16];
+        scene.TryWriteBytes(id, bigEndian: true, out _);
+        fixed (byte* idPtr = id)
+            return _api.LoadSceneAdditive(idPtr);
+    }
+
+    internal static bool UnloadScene(uint handle) => _api.UnloadScene(handle) != 0;
+
+    internal static uint ActiveScene() => _api.ActiveScene();
 
     internal static AssetState GetAssetState(Guid asset)
     {

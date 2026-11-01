@@ -20,9 +20,9 @@ use crate::asset_db::{AssetDatabase, AssetKind, LoadState};
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::prefab::{self, Prefabs};
 use crate::scene::{
-    ActionId, Actions, Assets, Collider, ColliderShape, DebugLines, InputState, LocalTransform,
-    LogLevel, MaterialHandle, MeshHandle, Name, Parent, PendingScripts, ScriptComponent, Tag, Time,
-    Transform, WorldTransform,
+    ActionId, Actions, Assets, Collider, ColliderShape, DebugLines, InputState, LoadedScenes,
+    LocalTransform, LogLevel, MaterialHandle, MeshHandle, Name, Parent, PendingScripts,
+    SceneHandle, ScriptComponent, Tag, Time, Transform, WorldTransform,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -586,6 +586,15 @@ enum Command {
         root: Entity,
         prefab: AssetId,
     },
+    // Despawns the scripts that queued it, which is why scene changes wait
+    // here rather than happening at the call. See `scene::loaded`.
+    LoadScene(AssetId),
+    // `handle` was reserved at the call.
+    LoadSceneAdditive {
+        handle: SceneHandle,
+        scene: AssetId,
+    },
+    UnloadScene(SceneHandle),
 }
 
 thread_local! {
@@ -742,6 +751,135 @@ fn build_prefab(world: &mut World, registry: &Registry, root: Entity, prefab: As
             tracing::warn!("Prefab.Instantiate: {error}");
             world.despawn(root);
         }
+    }
+}
+
+/// Whether `id` names a scene file the project has.
+fn is_scene(world: &World, id: AssetId) -> bool {
+    world
+        .get_resource::<AssetDatabase>()
+        .and_then(|db| db.get(id).map(|entry| entry.kind == AssetKind::Scene))
+        .unwrap_or(false)
+}
+
+fn scene_id(id: *const u8) -> Option<AssetId> {
+    // SAFETY: a non-null `id` is the 16 bytes of an `AssetRef` C# holds.
+    (!id.is_null()).then(|| AssetId::from_bytes(unsafe { *id.cast::<[u8; 16]>() }))
+}
+
+extern "C" fn load_scene(id: *const u8) -> bool {
+    let Some(scene) = scene_id(id) else {
+        return false;
+    };
+    orrin_script::with_world(false, |world| {
+        if !is_scene(world, scene) {
+            tracing::warn!("SceneManager.Load: no scene in the project has the id {scene}");
+            return false;
+        }
+        COMMANDS.with(|commands| commands.borrow_mut().push(Command::LoadScene(scene)));
+        true
+    })
+}
+
+extern "C" fn load_scene_additive(id: *const u8) -> u32 {
+    let Some(scene) = scene_id(id) else {
+        return 0;
+    };
+    orrin_script::with_world(0, |world| {
+        if !is_scene(world, scene) {
+            tracing::warn!("SceneManager.LoadAdditive: no scene in the project has the id {scene}");
+            return 0;
+        }
+        if world.get_resource::<LoadedScenes>().is_none() {
+            world.insert_resource(LoadedScenes::default());
+        }
+        let handle = world.resource_mut::<LoadedScenes>().reserve();
+        COMMANDS.with(|commands| {
+            commands
+                .borrow_mut()
+                .push(Command::LoadSceneAdditive { handle, scene })
+        });
+        handle.get()
+    })
+}
+
+extern "C" fn unload_scene(handle: u32) -> bool {
+    let Some(handle) = SceneHandle::from_raw(handle) else {
+        tracing::warn!("SceneManager.Unload: that handle names no scene");
+        return false;
+    };
+    orrin_script::with_world(false, |world| {
+        let (active, listed) =
+            world
+                .get_resource::<LoadedScenes>()
+                .map_or((false, false), |loaded| {
+                    (
+                        loaded.active().handle == handle,
+                        loaded.get(handle).is_some(),
+                    )
+                });
+        if active {
+            tracing::warn!(
+                "SceneManager.Unload: that is the active scene; Load another in its place"
+            );
+            return false;
+        }
+        let queued = COMMANDS.with(|commands| {
+            commands.borrow().iter().any(|command| {
+                matches!(command, Command::LoadSceneAdditive { handle: h, .. } if *h == handle)
+            })
+        });
+        if !listed && !queued {
+            tracing::warn!(
+                "SceneManager.Unload: scene {} is not loaded; it was unloaded already, or a \
+                 Load replaced it",
+                handle.get()
+            );
+            return false;
+        }
+        COMMANDS.with(|commands| commands.borrow_mut().push(Command::UnloadScene(handle)));
+        true
+    })
+}
+
+extern "C" fn active_scene() -> u32 {
+    orrin_script::with_world(0, |world| {
+        world
+            .get_resource::<LoadedScenes>()
+            .map_or(0, |loaded| loaded.active().handle.get())
+    })
+}
+
+/// Apply a queued scene change. Every other command is `apply_commands`' own.
+fn scene_command(world: &mut World, registry: &Registry, command: Command) {
+    use crate::scene::loaded;
+
+    let (call, issues) = match command {
+        Command::LoadScene(scene) => (
+            "SceneManager.Load",
+            loaded::read(world, scene).map(|(document, name)| {
+                loaded::load(world, registry, &document, name, Some(scene))
+            }),
+        ),
+        Command::LoadSceneAdditive { handle, scene } => (
+            "SceneManager.LoadAdditive",
+            loaded::read(world, scene).map(|(document, name)| {
+                loaded::load_additive(world, registry, handle, &document, name, Some(scene), false)
+            }),
+        ),
+        Command::UnloadScene(handle) => (
+            "SceneManager.Unload",
+            loaded::unload(world, handle).map(|()| Vec::new()),
+        ),
+        _ => unreachable!("not a scene command"),
+    };
+    match issues {
+        Ok(issues) => {
+            for issue in issues {
+                tracing::warn!("{call}: {issue}");
+            }
+        }
+        Err(error) => tracing::warn!("{call}: {error}"),
     }
 }
 
@@ -978,6 +1116,10 @@ fn build_api() -> OrrinApi {
         find_asset,
         instantiate_prefab,
         asset_state,
+        load_scene,
+        load_scene_additive,
+        unload_scene,
+        active_scene,
         ..orrin_script::default_api()
     }
 }
@@ -1696,6 +1838,9 @@ impl Scripting {
                 Command::InstantiatePrefab { root, prefab } => {
                     build_prefab(world, registry, root, prefab);
                 }
+                command @ (Command::LoadScene(_)
+                | Command::LoadSceneAdditive { .. }
+                | Command::UnloadScene(_)) => scene_command(world, registry, command),
                 Command::AttachScript { entity, type_name } => {
                     // Creates the managed instance now; the enable/start pair
                     // dispatches on the next tick, outside any window.
@@ -1851,6 +1996,136 @@ mod tests {
             orrin_script::with_active_world(&mut world, || instantiate_prefab(bytes.as_ptr()));
         assert_eq!((root.index, root.generation), (0, 0));
         assert_eq!(world.entities().count(), 0);
+        assert!(COMMANDS.with(|c| c.borrow().is_empty()));
+    }
+
+    /// A project with two scenes and the active one holding `Hub`, as a script
+    /// running in it sees the world.
+    fn scene_world(
+        tag: &str,
+    ) -> (
+        World,
+        Registry,
+        AssetId,
+        AssetId,
+        crate::asset_db::tests::Dir,
+    ) {
+        let mut registry = Registry::new();
+        crate::scene::register_components(&mut registry);
+        let scene_text = |name: &str| {
+            let mut source = World::new();
+            let entity = source.spawn();
+            source.insert(entity, Name::new(name));
+            crate::scene::save(&mut source, &registry)
+        };
+        let dir = crate::asset_db::tests::Dir::new(tag);
+        dir.write("levels/castle.orrin", scene_text("Gate").as_bytes());
+        dir.write("levels/shop.orrin", scene_text("Shopkeeper").as_bytes());
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let castle = db.find("levels/castle.orrin").unwrap().id;
+        let shop = db.find("levels/shop.orrin").unwrap().id;
+        let mut world = World::new();
+        world.insert_resource(db);
+        world.insert_resource(crate::scene::LoadedScenes::default());
+        let hub = world.spawn();
+        world.insert(hub, Name::new("Hub"));
+        (world, registry, castle, shop, dir)
+    }
+
+    fn names(world: &World) -> Vec<String> {
+        let mut names: Vec<String> = world
+            .entities()
+            .filter_map(|entity| world.get::<Name>(entity).map(|name| name.0.clone()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn drain(world: &mut World, registry: &Registry) {
+        let commands: Vec<Command> = COMMANDS.with(|c| c.borrow_mut().drain(..).collect());
+        for command in commands {
+            scene_command(world, registry, command);
+        }
+    }
+
+    /// A load despawns the scripts that asked for it, so it waits for the
+    /// dispatch to close like every other structural change.
+    #[test]
+    fn a_script_loads_a_scene_after_the_dispatch() {
+        let (mut world, registry, castle, _, _dir) = scene_world("script-scene-load");
+        let bytes = castle.to_bytes();
+        let queued = orrin_script::with_active_world(&mut world, || load_scene(bytes.as_ptr()));
+        assert!(queued);
+        assert_eq!(names(&world), ["Hub"]);
+
+        drain(&mut world, &registry);
+        assert_eq!(names(&world), ["Gate"]);
+        let loaded = world.resource::<crate::scene::LoadedScenes>();
+        assert_eq!(loaded.active().name, "castle");
+        assert_eq!(loaded.active().asset, Some(castle));
+    }
+
+    /// The handle comes back from the call, so the same tick can hold on to it
+    /// — and unload it — before the scene has even loaded.
+    #[test]
+    fn an_additive_load_hands_back_a_handle_the_same_tick_can_unload() {
+        let (mut world, registry, _, shop, _dir) = scene_world("script-scene-additive");
+        let bytes = shop.to_bytes();
+        let handle =
+            orrin_script::with_active_world(&mut world, || load_scene_additive(bytes.as_ptr()));
+        assert_ne!(handle, 0);
+        drain(&mut world, &registry);
+        assert_eq!(names(&world), ["Hub", "Shopkeeper"]);
+
+        let handle = orrin_script::with_active_world(&mut world, || {
+            let again = load_scene_additive(bytes.as_ptr());
+            assert!(unload_scene(again));
+            again
+        });
+        assert_ne!(handle, 0);
+        drain(&mut world, &registry);
+        assert_eq!(names(&world), ["Hub", "Shopkeeper"]);
+    }
+
+    /// A reference to anything but a scene, or to nothing, fails at the call
+    /// and queues nothing — the rule a bad prefab reference follows.
+    #[test]
+    fn a_reference_that_names_no_scene_is_refused_at_the_call() {
+        let (mut world, _, _, _, dir) = scene_world("script-scene-refused");
+        dir.write("rock.png", b"");
+        world.resource_mut::<AssetDatabase>().rescan();
+        let rock = world
+            .resource::<AssetDatabase>()
+            .find("rock.png")
+            .unwrap()
+            .id;
+        for id in [rock, AssetId::new()] {
+            let bytes = id.to_bytes();
+            let (single, additive) = orrin_script::with_active_world(&mut world, || {
+                (
+                    load_scene(bytes.as_ptr()),
+                    load_scene_additive(bytes.as_ptr()),
+                )
+            });
+            assert!(!single);
+            assert_eq!(additive, 0);
+        }
+        assert!(COMMANDS.with(|c| c.borrow().is_empty()));
+    }
+
+    /// There is always an active scene; a script replaces it with a load.
+    #[test]
+    fn a_script_cannot_unload_the_active_scene() {
+        let (mut world, _, _, _, _dir) = scene_world("script-scene-active");
+        let unloaded = orrin_script::with_active_world(&mut world, || {
+            let active = active_scene();
+            assert_ne!(active, 0);
+            unload_scene(active)
+        });
+        assert!(!unloaded);
+        assert!(!orrin_script::with_active_world(&mut world, || {
+            unload_scene(9999)
+        }));
         assert!(COMMANDS.with(|c| c.borrow().is_empty()));
     }
 
