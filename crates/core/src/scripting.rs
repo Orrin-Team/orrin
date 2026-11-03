@@ -850,6 +850,44 @@ extern "C" fn active_scene() -> u32 {
     })
 }
 
+extern "C" fn get_camera(out: *mut CTransform) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    orrin_script::with_world(false, |world| {
+        let Some(camera) = world.get_resource::<crate::scene::Camera>() else {
+            return false;
+        };
+        // SAFETY: `out` is a valid, writable `CTransform` supplied by C#.
+        unsafe {
+            *out = CTransform {
+                position: camera.position.to_array(),
+                rotation: camera.rotation().to_array(),
+                scale: [1.0; 3],
+            };
+        }
+        true
+    })
+}
+
+extern "C" fn set_camera(value: *const CTransform) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    // SAFETY: `value` is a valid `CTransform` supplied by C#.
+    let value = unsafe { *value };
+    orrin_script::with_world(false, |world| {
+        let Some(mut camera) = world.get_resource_mut::<crate::scene::Camera>() else {
+            return false;
+        };
+        camera.place(
+            Vec3::from_array(value.position),
+            Quat::from_array(value.rotation),
+        );
+        true
+    })
+}
+
 /// Apply a queued scene change. Every other command is `apply_commands`' own.
 fn scene_command(world: &mut World, registry: &Registry, command: Command) {
     use crate::scene::loaded;
@@ -1120,6 +1158,8 @@ fn build_api() -> OrrinApi {
         load_scene_additive,
         unload_scene,
         active_scene,
+        get_camera,
+        set_camera,
         ..orrin_script::default_api()
     }
 }

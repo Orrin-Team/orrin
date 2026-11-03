@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use netcorehost::hostfxr::{HostfxrContext, InitializedForRuntimeConfig};
+use netcorehost::pdcstring::PdCString;
 use netcorehost::{nethost, pdcstr};
 use orrin_ecs::World;
 
@@ -149,6 +150,11 @@ pub struct OrrinApi {
     pub load_scene_additive: extern "C" fn(*const u8) -> u32,
     pub unload_scene: extern "C" fn(u32) -> bool,
     pub active_scene: extern "C" fn() -> u32,
+    // The camera the frame is drawn from, as a position and rotation (scale is
+    // ignored and read back as one). Both return false when there is no camera
+    // to read or write.
+    pub get_camera: extern "C" fn(*mut CTransform) -> bool,
+    pub set_camera: extern "C" fn(*const CTransform) -> bool,
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -221,6 +227,8 @@ pub fn default_api() -> OrrinApi {
         load_scene_additive: stub_load_scene_additive,
         unload_scene: stub_unload_scene,
         active_scene: stub_active_scene,
+        get_camera: stub_get_camera,
+        set_camera: stub_set_camera,
     }
 }
 
@@ -238,6 +246,14 @@ extern "C" fn stub_unload_scene(_handle: u32) -> bool {
 
 extern "C" fn stub_active_scene() -> u32 {
     0
+}
+
+extern "C" fn stub_get_camera(_out: *mut CTransform) -> bool {
+    false
+}
+
+extern "C" fn stub_set_camera(_value: *const CTransform) -> bool {
+    false
 }
 
 extern "C" fn stub_find_asset(_path: *const c_char, _out: *mut u8) -> u32 {
@@ -766,24 +782,48 @@ pub struct ScriptHost {
     state_discard_fn: extern "system" fn(),
 }
 
+/// The .NET runtime an exported game carries, beside its `Orrin.dll`: a
+/// `DOTNET_ROOT` holding one `host/fxr` and one `shared/Microsoft.NETCore.App`.
+///
+/// It is a private install rather than a self-contained publish because
+/// hostfxr refuses `initialize_for_runtime_config` for a self-contained app,
+/// and that call is the one component hosting — and so the collectible game
+/// context — is built on. A framework-dependent `Orrin.dll` pointed at its own
+/// root boots exactly the way it does against a machine-wide SDK.
+pub const APP_LOCAL_RUNTIME: &str = "dotnet";
+
 impl ScriptHost {
     /// Boot CoreCLR and load `Orrin.dll` from `assembly_dir`, handing C# the
     /// `api` table. `assembly_dir` must contain `Orrin.dll` and
-    /// `Orrin.runtimeconfig.json`.
+    /// `Orrin.runtimeconfig.json`, and may contain an [`APP_LOCAL_RUNTIME`],
+    /// which is then used instead of any installed .NET.
     pub fn boot(api: &OrrinApi, assembly_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         // hostfxr resolves paths relative to the working directory, and
         // netcorehost's runtime path type isn't public here, so load with the cwd
         // pointed at the assembly dir, then restore it.
         let previous = std::env::current_dir()?;
+        let runtime = assembly_dir.join(APP_LOCAL_RUNTIME);
+        let runtime = runtime
+            .join("host")
+            .is_dir()
+            .then(|| runtime.canonicalize())
+            .transpose()?;
         std::env::set_current_dir(assembly_dir)?;
-        let result = Self::load(api);
+        let result = Self::load(api, runtime.as_deref());
         let _ = std::env::set_current_dir(previous);
         result
     }
 
-    fn load(api: &OrrinApi) -> Result<Self, Box<dyn std::error::Error>> {
-        let hostfxr = nethost::load_hostfxr()?;
-        let context = hostfxr.initialize_for_runtime_config(pdcstr!("Orrin.runtimeconfig.json"))?;
+    fn load(api: &OrrinApi, runtime: Option<&Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = pdcstr!("Orrin.runtimeconfig.json");
+        let context = match runtime {
+            Some(root) => {
+                let root = PdCString::from_os_str(root.as_os_str())?;
+                nethost::load_hostfxr_with_dotnet_root(&root)?
+                    .initialize_for_runtime_config_with_dotnet_root(config, &root)?
+            }
+            None => nethost::load_hostfxr()?.initialize_for_runtime_config(config)?,
+        };
 
         // Deref each `ManagedFunction` to its raw `extern "system"` fn pointer.
         // The loader is scoped so its borrow of `context` ends before the move.

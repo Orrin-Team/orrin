@@ -1,20 +1,22 @@
 //! The bar across the bottom: what the session is doing, readable without
-//! opening a tool — the script build on the left; the frame's cost, the
-//! memory it holds and the device it runs on at the right.
+//! opening a tool — the script build and any export on the left; the frame's
+//! cost, the memory it holds and the device it runs on at the right.
 //!
 //! Nothing here is a control. A status bar that also holds buttons becomes the
 //! place commands go when there is nowhere better, and then it is a toolbar.
 
 use orrin_ecs::World;
 
+use crate::editor::export::{self, Status};
 use crate::editor::icons;
+use crate::editor::state::EditorState;
 use crate::editor::theme::{self, ThemeSet};
 use crate::scene::UnknownComponents;
 use crate::stats::FrameStats;
 
 pub const HEIGHT: f32 = 24.0;
 
-pub fn show(ctx: &egui::Context, world: &World, themes: &ThemeSet) {
+pub fn show(ctx: &egui::Context, world: &World, state: &EditorState, themes: &ThemeSet) {
     let frame = egui::Frame::new()
         .fill(themes.active().bar())
         .inner_margin(egui::Margin::symmetric(10, 0));
@@ -25,6 +27,7 @@ pub fn show(ctx: &egui::Context, world: &World, themes: &ThemeSet) {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 build(ui, world);
+                exporting(ui, state.export.status());
                 carried(ui, world);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -56,6 +59,45 @@ fn device(ui: &mut egui::Ui, stats: &FrameStats) {
     ui.label(super::figures(vram).weak());
     if let Some(device) = stats.device() {
         ui.label(super::figures(device).weak());
+    }
+}
+
+/// The export File → Export game started, while it runs and once it ends.
+fn exporting(ui: &mut egui::Ui, status: &Status) {
+    let (color, text) = match status {
+        Status::Idle => return,
+        Status::Running { platform, step } => (
+            theme::PENDING,
+            match step {
+                Some(step) => format!("Exporting for {} · {step}", export::label(*platform)),
+                None => format!("Exporting for {}", export::label(*platform)),
+            },
+        ),
+        Status::Done { platform, .. } => (
+            theme::OK,
+            format!(
+                "Exported for {} · File → Show the game",
+                export::label(*platform)
+            ),
+        ),
+        Status::Failed { platform, .. } => (
+            theme::ERROR,
+            format!(
+                "Export for {} failed · see the console",
+                export::label(*platform)
+            ),
+        ),
+    };
+    let response = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let (dot, _) = ui.allocate_exact_size(egui::Vec2::splat(8.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot.center(), 3.5, color);
+            ui.label(super::figures(text).weak());
+        })
+        .response;
+    if let Status::Failed { reason, .. } = status {
+        response.on_hover_text(reason);
     }
 }
 

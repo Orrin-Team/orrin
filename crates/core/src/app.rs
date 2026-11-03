@@ -30,7 +30,7 @@ use crate::scene::{
     DebugLines, DecalSettings, Diagnostics, DofSettings, EnvironmentSettings, FogSettings,
     HdrSettings, InputState, LogBuffer, LogLevel, MotionBlurSettings, PresentSettings,
     RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
-    Time, TransparencySettings, load_hdri,
+    Time, TransparencySettings,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -101,6 +101,8 @@ pub struct App {
     project: Option<orrin_project::Project>,
     /// Which built-in scene this run opens, from `ORRIN_SCENE`.
     scene: SceneChoice,
+    /// An exported game rather than the editor: see [`App::shipped_project`].
+    shipped: bool,
     /// Extra profiling load from `ORRIN_STRESS`; `None` for a normal run.
     stress: Option<StressSpec>,
     /// Kept alive for the process: dropping the messenger stops validation
@@ -139,18 +141,36 @@ impl App {
             BackendChoice::Metal => (None, None),
         };
 
-        let cwd = std::env::current_dir().unwrap_or_else(|err| {
-            tracing::error!("cannot read the current directory: {err}");
-            std::process::exit(1);
-        });
-
-        // A manifest that exists but doesn't load is fatal: silently falling
-        // back to the demo scene would hide the user's real project.
-        let project = match orrin_project::Project::locate(&cwd) {
-            Ok(project) => project,
-            Err(err) => {
-                tracing::error!("{err}");
+        let shipped = cfg!(feature = "export");
+        if shipped
+            && !crate::profile::shipped_game_profiles(
+                std::env::var("ORRIN_PROFILE").ok().as_deref(),
+            )
+        {
+            crate::profile::set_enabled(false);
+        }
+        let project = if shipped {
+            match Self::shipped_project() {
+                Ok(project) => Some(project),
+                Err(err) => {
+                    tracing::error!("{err}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            let cwd = std::env::current_dir().unwrap_or_else(|err| {
+                tracing::error!("cannot read the current directory: {err}");
                 std::process::exit(1);
+            });
+
+            // A manifest that exists but doesn't load is fatal: silently falling
+            // back to the demo scene would hide the user's real project.
+            match orrin_project::Project::locate(&cwd) {
+                Ok(project) => project,
+                Err(err) => {
+                    tracing::error!("{err}");
+                    std::process::exit(1);
+                }
             }
         };
         if let Some(project) = &project {
@@ -198,6 +218,7 @@ impl App {
             gamepads,
             project,
             scene: SceneChoice::from_env(),
+            shipped,
             stress: StressSpec::from_env().filter(|spec| !spec.is_empty()),
             _debug_messenger: debug_messenger,
         };
@@ -208,6 +229,27 @@ impl App {
         app.load_prefabs();
 
         event_loop.run_app(&mut app).unwrap();
+    }
+
+    /// The game this executable was exported as, from the `orrin.json` beside
+    /// it. Never the working directory: a player starts a game from a desktop
+    /// shortcut, a launcher or a terminal anywhere, and none of them is the
+    /// game's directory.
+    fn shipped_project() -> Result<orrin_project::Project, String> {
+        let exe = std::env::current_exe()
+            .map_err(|err| format!("cannot find this executable's own location: {err}"))?;
+        let manifest = exe
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(orrin_project::export::FILE_NAME);
+        if !manifest.is_file() {
+            return Err(format!(
+                "{} is missing, so this game does not know what to run. Copy the whole \
+                 exported directory, not only the executable",
+                manifest.display()
+            ));
+        }
+        orrin_project::Project::from_export(&manifest).map_err(|err| err.to_string())
     }
 
     /// Every world resource the engine starts with, before any window or device
@@ -293,7 +335,7 @@ impl App {
         // Watched even when the first read failed: the file is on disk, and
         // fixing it is exactly the save the watcher exists to notice.
         #[cfg(feature = "scripting")]
-        {
+        if !self.shipped {
             self.input_watcher = match crate::scene::input::ConfigWatcher::new(&path) {
                 Ok(watcher) => Some(watcher),
                 Err(error) => {
@@ -324,7 +366,7 @@ impl App {
         }
         self.world.insert_resource(prefabs);
 
-        if dir.is_dir() {
+        if dir.is_dir() && !self.shipped {
             self.prefab_watcher = match crate::scene::prefab::Watcher::new(&dir) {
                 Ok(watcher) => Some(watcher),
                 Err(error) => {
@@ -349,15 +391,20 @@ impl App {
             return;
         };
         let dir = project.assets_dir();
-        let (mut db, issues) = crate::asset_db::AssetDatabase::open_for(
-            &dir,
-            crate::asset_db::cache_dir(Some(project)),
-            target,
-        );
+        let (mut db, issues) = if self.shipped {
+            crate::asset_db::AssetDatabase::open_packed(&dir, target)
+        } else {
+            crate::asset_db::AssetDatabase::open_for(
+                &dir,
+                crate::asset_db::cache_dir(Some(project)),
+                target,
+            )
+        };
         for issue in issues {
             tracing::warn!("{issue}");
         }
         if dir.is_dir()
+            && !self.shipped
             && let Err(error) = db.watch()
         {
             tracing::warn!("{error}; asset changes will need the browser's rescan button");
@@ -367,6 +414,25 @@ impl App {
             tracing::info!("{count} asset(s) under {}", dir.display());
         }
         self.world.insert_resource(db);
+    }
+
+    /// An exported game's opening: its start scene, and its persistent scene
+    /// beside it, in place of the built-in demo.
+    fn open_game(&mut self) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let start = project.start_scene();
+        let persistent = project.persistent_scene();
+        let issues = crate::scene::loaded::open_start(
+            &mut self.world,
+            &self.registry,
+            start.as_deref(),
+            persistent.as_deref(),
+        );
+        for issue in issues {
+            tracing::error!("{issue}");
+        }
     }
 
     /// Boot the script host and attach the project's entry Behaviour.
@@ -421,8 +487,13 @@ impl App {
             .map(|project| project.scripts_dir())
             .unwrap_or_else(|| PathBuf::from(DEMO_SCRIPTS));
 
+        let shipped_dll = self
+            .project
+            .as_ref()
+            .and_then(orrin_project::Project::game_assembly);
         let game_dll = match std::env::var("ORRIN_GAME_DLL") {
             Ok(path) => Some(PathBuf::from(path)),
+            Err(_) if shipped_dll.is_some() => shipped_dll,
             Err(_) => match Scripting::assembly_of(&entry) {
                 Some(assembly) => Scripting::find_game_assembly(&scripts_dir, assembly),
                 None => {
@@ -477,6 +548,7 @@ impl App {
         }
 
         let watcher = match BuildWatcher::for_game_assembly(&game_dll, Some(&bindings_dir)) {
+            _ if self.shipped => None,
             Ok(watcher) => Some(watcher),
             Err(reason) => {
                 tracing::warn!("rebuild-on-save is off: {reason}");
@@ -495,9 +567,13 @@ impl ApplicationHandler for App {
             return;
         }
 
+        let title = match &self.project {
+            Some(project) if self.shipped => project.name().to_owned(),
+            _ => "Orrin".to_owned(),
+        };
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes().with_title("Orrin"))
+                .create_window(Window::default_attributes().with_title(title))
                 .unwrap(),
         );
         let size = window.inner_size();
@@ -513,7 +589,12 @@ impl ApplicationHandler for App {
         let device = renderer.device_label();
         self.world.resource_mut::<FrameStats>().set_device(device);
         self.open_asset_database(crate::asset_db::Target::of(&renderer));
-        self.scene.build(&mut self.world, &mut renderer);
+        if self.shipped {
+            crate::scene::entities::install_library(&mut self.world, &mut renderer);
+            self.open_game();
+        } else {
+            self.scene.build(&mut self.world, &mut renderer);
+        }
         if let Some(spec) = self.stress {
             spawn_stress_scene(&mut self.world, &spec);
         }
@@ -538,6 +619,15 @@ impl ApplicationHandler for App {
             self.project.as_ref(),
         );
 
+        if self.shipped {
+            // A game is played, not edited: there is no transport to press, and
+            // no editor to press it in.
+            self.world
+                .resource_mut::<crate::scene::Play>()
+                .set(crate::scene::PlayState::Playing);
+            self.world.resource_mut::<Diagnostics>().overlay = false;
+        }
+
         print_run_banner(&self.world, &renderer, self.backend, self.scene);
 
         self.active = Some(Active {
@@ -561,7 +651,7 @@ impl ApplicationHandler for App {
         // takes egui out of the frame, so it cannot be a key egui is asked about
         // first. F1 rather than a checkbox for the same reason — a UI that is off
         // cannot offer the control that turns it back on.
-        if pressed_overlay_toggle(&event) {
+        if !self.shipped && pressed_overlay_toggle(&event) {
             let mut diagnostics = self.world.resource_mut::<Diagnostics>();
             diagnostics.overlay = !diagnostics.overlay;
         }
@@ -585,8 +675,11 @@ impl ApplicationHandler for App {
             .resource_mut::<InputState>()
             .on_window_event(&event, egui_wants);
         let was_looking = self.camera_controller.looking();
-        self.camera_controller
-            .process_window_event(&event, egui_wants);
+        // The fly camera is the editor's; in a game the camera is the scripts'.
+        if !self.shipped {
+            self.camera_controller
+                .process_window_event(&event, egui_wants);
+        }
         if self.camera_controller.looking() != was_looking {
             let looking = self.camera_controller.looking();
             active.window.set_cursor_visible(!looking);
@@ -773,8 +866,10 @@ impl ApplicationHandler for App {
 
                 // After the UI, so the editor's own camera edits are the
                 // baseline the controller builds on.
-                self.camera_controller
-                    .update(&mut self.world.resource_mut::<Camera>(), delta);
+                if !self.shipped {
+                    self.camera_controller
+                        .update(&mut self.world.resource_mut::<Camera>(), delta);
+                }
 
                 // A second pass, because collision resolution, the script tick,
                 // and the editor have all written local transforms since the
@@ -984,7 +1079,9 @@ impl ApplicationHandler for App {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
-        self.camera_controller.process_device_event(&event);
+        if !self.shipped {
+            self.camera_controller.process_device_event(&event);
+        }
         self.world
             .resource_mut::<InputState>()
             .on_device_event(&event);
@@ -1127,7 +1224,7 @@ fn print_run_banner(
             "off".to_string()
         },
         on_off(world.resource::<Diagnostics>().overlay),
-        on_off(crate::profile::gpu_passes_enabled()),
+        on_off(crate::profile::is_enabled() && crate::profile::gpu_passes_enabled()),
         scene.label(),
     );
 }
@@ -1216,14 +1313,10 @@ fn load_environment(
     let assets_dir =
         project.map_or_else(|| PathBuf::from("assets"), |project| project.assets_dir());
 
-    match load_hdri(&assets_dir, hdri) {
-        Ok(image) => {
-            renderer.load_environment(&image.pixels, image.width, image.height);
-            tracing::info!(
-                "environment baked from `{hdri}` ({}x{})",
-                image.width,
-                image.height
-            );
+    match crate::scene::sky_pixels(&assets_dir, hdri) {
+        Ok((pixels, width, height)) => {
+            renderer.load_environment(&pixels, width, height);
+            tracing::info!("environment baked from `{hdri}` ({width}x{height})");
         }
         Err(error) => tracing::error!("{error}"),
     }

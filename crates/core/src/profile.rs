@@ -75,6 +75,14 @@ pub fn gpu_passes_enabled() -> bool {
     GPU_PASSES.load(Ordering::Relaxed)
 }
 
+/// Whether a shipped game collects timings, given `ORRIN_PROFILE`. Off unless
+/// asked for: a game has no editor to show them in, and per-pass GPU timing
+/// costs CPU to record and GPU overlap to honour (see [`gpu_passes_enabled`]).
+/// `ORRIN_PROFILE=1` turns it back on, to look at a slow export.
+pub fn shipped_game_profiles(env: Option<&str>) -> bool {
+    env.is_some_and(|value| value.trim() == "1")
+}
+
 pub fn set_gpu_passes_enabled(enabled: bool) {
     GPU_PASSES.store(enabled, Ordering::Relaxed);
 }
@@ -396,6 +404,14 @@ pub struct Row {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_shipped_game_profiles_only_when_asked() {
+        assert!(!super::shipped_game_profiles(None));
+        assert!(!super::shipped_game_profiles(Some("0")));
+        assert!(!super::shipped_game_profiles(Some("")));
+        assert!(super::shipped_game_profiles(Some("1")));
+    }
+
     use super::*;
     use std::sync::Mutex;
 

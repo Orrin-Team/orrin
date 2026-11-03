@@ -225,3 +225,55 @@ jobs:
 
       - name: Device-free tests
         run: cargo test -p orrin-core --lib --test render_graph --test shader_translation
+
+  # `orrin export` end to end, once per platform a game ships for, each on its
+  # own OS: the package a player downloads, made from a clean import. This is
+  # also where a Mac game comes from when nobody exporting has a Mac — Apple's
+  # SDK exists nowhere else — and the artifact is the playable directory.
+  export:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, platform: mac }
+          - { os: ubuntu-latest, platform: linux }
+          - { os: windows-latest, platform: windows }
+    runs-on: ${{ matrix.os }}
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shaderc and gamepad build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3 build-essential git \
+            pkg-config libudev-dev
+
+      - name: Install Ninja
+        if: runner.os == 'Windows'
+        run: choco install ninja --no-progress -y
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v2-rust"
+
+      - name: Export the example project
+        run: >
+          cargo run -p orrin-cli -- export --project examples/hello-orrin
+          --platform ${{ matrix.platform }} --out exports/hello-orrin-${{ matrix.platform }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hello-orrin-${{ matrix.platform }}
+          path: exports/hello-orrin-${{ matrix.platform }}

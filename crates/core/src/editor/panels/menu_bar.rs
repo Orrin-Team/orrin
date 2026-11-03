@@ -245,9 +245,46 @@ fn file(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut Dock) {
     // allowance and drags the menu out with it.
     ui.add(egui::TextEdit::singleline(&mut state.scene_path).desired_width(MENU_WIDTH - 12.0));
     ui.separator();
+    export(ui, state);
+    ui.separator();
     unbuilt(ui, "Import…");
     unbuilt(ui, "Reimport all");
     unbuilt(ui, "Packages");
+}
+
+/// Export game, one entry per platform, with this machine's marked: the rest
+/// cross-compile, which the CLI says is possible or says why not.
+fn export(ui: &mut egui::Ui, state: &mut EditorState) {
+    use crate::editor::export::{self, Status};
+    use orrin_project::export::Platform;
+
+    let open = state.project_root.is_some() && !state.export.is_running();
+    ui.add_enabled_ui(open, |ui| {
+        ui.menu_button("Export game", |ui| {
+            for platform in Platform::ALL {
+                let here = if Platform::host() == Some(platform) {
+                    "this machine"
+                } else {
+                    ""
+                };
+                if command(ui, export::label(platform), here) {
+                    state.request_export(platform);
+                }
+            }
+        });
+    })
+    .response
+    .on_disabled_hover_text(if state.export.is_running() {
+        "An export is running; the status bar shows its progress"
+    } else {
+        "Exporting needs a project: open one with `orrin run` or Orrin Hub"
+    });
+    if let Status::Done { platform, out } = state.export.status() {
+        let label = format!("Show the {} game", export::label(*platform));
+        if command(ui, &label, "") {
+            export::reveal(out);
+        }
+    }
 }
 
 fn edit(ui: &mut egui::Ui, world: &mut World, registry: &Registry, state: &mut EditorState) {

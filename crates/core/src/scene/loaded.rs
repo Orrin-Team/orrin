@@ -238,6 +238,52 @@ pub fn load_additive(
     issues
 }
 
+/// Open a game the way it starts outside the editor: `start` as the active
+/// scene and `persistent` loaded beside it, kept through every later load.
+/// Either may be absent. Returns what went wrong, naming the file; a scene that
+/// cannot be read is skipped rather than ending the game.
+pub fn open_start(
+    world: &mut World,
+    registry: &Registry,
+    start: Option<&std::path::Path>,
+    persistent: Option<&std::path::Path>,
+) -> Vec<String> {
+    ensure(world);
+    let mut issues = Vec::new();
+    let mut open = |path: &std::path::Path, field: &str, persistent: bool| {
+        let shown = path.display();
+        let document = std::fs::read_to_string(path)
+            .map_err(|error| format!("{field} scene {shown}: could not read it: {error}"))
+            .and_then(|text| {
+                orrin_registry::parse(&text)
+                    .map_err(|error| format!("{field} scene {shown}: {error}"))
+            });
+        let document = match document {
+            Ok(document) => document,
+            Err(error) => {
+                issues.push(format!("{error}; check `{field}_scene` in orrin.json"));
+                return;
+            }
+        };
+        let asset = asset_at(world, path);
+        let name = name_of(&path.to_string_lossy());
+        let loaded = if persistent {
+            let handle = world.resource_mut::<LoadedScenes>().reserve();
+            load_additive(world, registry, handle, &document, name, asset, true)
+        } else {
+            load(world, registry, &document, name, asset)
+        };
+        issues.extend(loaded.iter().map(ToString::to_string));
+    };
+    if let Some(path) = start {
+        open(path, "start", false);
+    }
+    if let Some(path) = persistent {
+        open(path, "persistent", true);
+    }
+    issues
+}
+
 /// The scene file asset `id` names, parsed, and the name it is listed under.
 /// Every failure names the scene and why, for the console.
 pub fn read(world: &World, id: AssetId) -> Result<(SceneDocument, String), String> {
@@ -590,5 +636,54 @@ mod tests {
         settings.fog.density = 0.2;
         world.insert(own, settings);
         assert_eq!(render_settings::source(&world), Some(own));
+    }
+
+    fn saved(
+        dir: &std::path::Path,
+        file: &str,
+        registry: &Registry,
+        names: &[&str],
+    ) -> std::path::PathBuf {
+        let mut world = World::new();
+        for name in names {
+            named(&mut world, name);
+        }
+        let path = dir.join(file);
+        std::fs::write(&path, crate::scene::save(&mut world, registry)).unwrap();
+        path
+    }
+
+    /// What an exported game does before its first frame: the start scene
+    /// active, and the persistent scene beside it and marked to survive.
+    #[test]
+    fn a_game_starts_in_its_start_scene_with_the_persistent_one_beside_it() {
+        let (mut world, registry) = session();
+        let dir = std::env::temp_dir().join(format!("orrin-start-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let start = saved(&dir, "level.orrin", &registry, &["Hero"]);
+        let persistent = saved(&dir, "always.orrin", &registry, &["Music"]);
+
+        let issues = open_start(&mut world, &registry, Some(&start), Some(&persistent));
+
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(alive(&world), ["Hero", "Music"]);
+        assert_eq!(listed(&world), ["level", "always"]);
+        let scenes = world.resource::<LoadedScenes>();
+        assert!(!scenes.active().persistent);
+        assert!(scenes.iter().nth(1).is_some_and(|scene| scene.persistent));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_start_scene_is_named_with_the_manifest_field_and_the_game_still_starts() {
+        let (mut world, registry) = session();
+        let missing = std::env::temp_dir().join("orrin-start-missing/level.orrin");
+
+        let issues = open_start(&mut world, &registry, Some(&missing), None);
+
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("level.orrin"), "{}", issues[0]);
+        assert!(issues[0].contains("start"), "{}", issues[0]);
+        assert!(alive(&world).is_empty());
     }
 }

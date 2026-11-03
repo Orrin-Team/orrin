@@ -37,6 +37,7 @@ pub fn scaffold(name: &str, parent: &Path) -> Fallible {
         ("assets/.gitkeep", String::new()),
         ("scenes/.gitkeep", String::new()),
         ("scripts/Main.cs", main_cs(name, &assembly)),
+        ("scripts/FlyCamera.cs", fly_camera_cs(&assembly)),
         (
             &format!("scripts/{assembly}.csproj"),
             csproj(&assembly, checkout.as_deref(), &anchor.join(name)),
@@ -170,6 +171,9 @@ obj/
 
 # Engine-generated cache and asset index
 .orrin/
+
+# Games made by `orrin export`
+exports/
 ";
 
 fn readme(name: &str, assembly: &str) -> String {
@@ -193,6 +197,7 @@ fn readme(name: &str, assembly: &str) -> String {
             "    Main.cs",
             "the entry Behaviour named by `scripts.entry`",
         ),
+        ("    FlyCamera.cs", "WASD and right-drag to move the camera"),
         ("  scenes/", "scene files"),
         ("  .orrin/", "generated, gitignored: cache + asset index"),
     ];
@@ -332,6 +337,7 @@ public class Main : Behaviour
         var spawn = Transform.Identity;
         spawn.Position = new Vector3(0f, Height, 0f);
         _cube = World.SpawnRenderable("cube", "gold", spawn);
+        World.AddScript<FlyCamera>(World.Spawn());
         Debug.Log($"{name} started; cube = {{_cube}}");
     }}
 
@@ -343,6 +349,52 @@ public class Main : Behaviour
         t.Position = new Vector3(0f, Height, 0f);
         t.Rotation = Quaternion.Euler(0f, _spin, 0f);
         Native.SetTransform(_cube, t);
+    }}
+}}
+"#
+    )
+}
+
+fn fly_camera_cs(assembly: &str) -> String {
+    format!(
+        r#"using Orrin;
+using Orrin.Math;
+
+namespace {assembly};
+
+// Walk the scene: WASD to move, hold the right mouse button and move the mouse
+// to look, E and Q to rise and sink, Shift to go faster. Movement reads the
+// axes input.toml defines, so rebinding a key there rebinds it here.
+public class FlyCamera : Behaviour
+{{
+    public float Speed = 4f;
+    public float Boost = 3f;
+    public float LookSpeed = 1f;
+
+    private float _yaw;
+    private float _pitch;
+
+    public override void OnStart()
+    {{
+        Camera.Place(new Vector3(0f, 1.5f, 5f), Quaternion.identity);
+    }}
+
+    public override void OnUpdate(float deltaTime)
+    {{
+        if (Input.GetMouseButton(MouseButton.Right))
+        {{
+            _yaw -= Input.GetAxis("LookX") * LookSpeed;
+            _pitch = System.Math.Clamp(_pitch - Input.GetAxis("LookY") * LookSpeed, -89f, 89f);
+        }}
+        var facing = Quaternion.Euler(_pitch, _yaw, 0f);
+
+        var move = facing * Vector3.forward * Input.GetAxis("Vertical")
+            + facing * Vector3.right * Input.GetAxis("Horizontal");
+        if (Input.GetKey(KeyCode.E)) move += Vector3.up;
+        if (Input.GetKey(KeyCode.Q)) move -= Vector3.up;
+
+        var speed = Speed * (Input.GetKey(KeyCode.LeftShift) ? Boost : 1f);
+        Camera.Place(Camera.position + move * (speed * deltaTime), facing);
     }}
 }}
 "#
@@ -429,6 +481,25 @@ mod tests {
         // A second copy of Orrin.dll in the game's output would mean a second
         // set of types, and every Behaviour cast across the boundary failing.
         assert!(csproj.contains(r#"Private="false""#));
+    }
+
+    /// A new project can be walked around as soon as it runs, in the editor's
+    /// Play and in an export, where the editor's own fly camera is gone.
+    #[test]
+    fn a_scaffolded_project_attaches_a_wasd_camera() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        scaffold("test-game", dir.path()).expect("scaffold");
+        let scripts = dir.path().join("test-game/scripts");
+
+        let camera = std::fs::read_to_string(scripts.join("FlyCamera.cs")).expect("FlyCamera.cs");
+        assert!(camera.contains("namespace TestGame;"), "{camera}");
+        assert!(camera.contains("class FlyCamera : Behaviour"), "{camera}");
+        for axis in ["\"Horizontal\"", "\"Vertical\"", "\"LookX\"", "\"LookY\""] {
+            assert!(camera.contains(axis), "reads {axis} from input.toml");
+            assert!(INPUT.contains(&format!("[axes.{}]", axis.trim_matches('"'))));
+        }
+        let main = std::fs::read_to_string(scripts.join("Main.cs")).expect("Main.cs");
+        assert!(main.contains("World.AddScript<FlyCamera>"), "{main}");
     }
 
     #[test]

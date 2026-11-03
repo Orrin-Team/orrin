@@ -1,0 +1,21 @@
+[package]
+name = "orrin-hub"
+version.workspace = true
+edition.workspace = true
+description = "A window for creating, opening and exporting Orrin projects"
+
+[dependencies]
+orrin-project.workspace = true
+# The hub is its own binary so none of this reaches the engine: eframe's glow
+# backend is the smallest way to put egui in a window, and the engine's cold
+# start never links it.
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui.workspace = true
+# The Orrin mark is an SVG, drawn the way the editor draws it.
+egui_extras = { version = "0.31", features = ["svg"] }
+rfd.workspace = true
+serde.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -25,7 +25,8 @@ Rust edition 2024, resolver 3. Cargo workspace, `members = ["crates/*"]`.
 | `crates/orrin-script` | Boots CoreCLR via netcorehost; the C ABI over the engine |
 | `crates/orrin-build` | `dotnet build` for a project's C# |
 | `crates/orrin-project` | The `orrin.toml` project manifest |
-| `crates/orrin-cli` (binary `orrin`) | `orrin new` / `build` / `run` |
+| `crates/orrin-cli` (binary `orrin`) | `orrin new` / `build` / `run` / `export` / `hub` |
+| `crates/orrin-hub` (binary `orrin-hub`) | Orrin Hub: a window over the CLI for creating, opening and exporting projects. eframe lives here and nowhere else |
 | `scripting/Orrin` | The C# bindings assembly. `scripting/DemoGame` is a game assembly like any project's; `scripting/Orrin.Analyzers` is the Roslyn analyzer holding Behaviour fields to the registry-visible / `[Transient]` split |
 
 Inside `crates/core/src`:

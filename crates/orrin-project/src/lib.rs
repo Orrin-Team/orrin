@@ -1,3 +1,5 @@
+pub mod export;
+
 use crate::ProjectError::ParentDirInPath;
 use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
@@ -106,6 +108,9 @@ impl std::error::Error for ProjectError {
 pub struct Project {
     root: PathBuf,
     manifest: Manifest,
+    /// Set only for an exported game, whose assembly is shipped rather than
+    /// built under `scripts.dir`.
+    game_assembly: Option<PathBuf>,
 }
 
 impl Project {
@@ -140,7 +145,11 @@ impl Project {
             source,
         })?;
 
-        Ok(Project { root, manifest })
+        Ok(Project {
+            root,
+            manifest,
+            game_assembly: None,
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -157,6 +166,11 @@ impl Project {
     }
     pub fn entry_type(&self) -> &str {
         &self.manifest.scripts.entry
+    }
+    /// The game assembly an export ships beside the executable; `None` for a
+    /// project, which builds it under [`scripts_dir`](Self::scripts_dir).
+    pub fn game_assembly(&self) -> Option<PathBuf> {
+        self.game_assembly.clone()
     }
     pub fn assets_dir(&self) -> PathBuf {
         let dir = self

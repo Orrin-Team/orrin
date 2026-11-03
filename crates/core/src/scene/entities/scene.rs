@@ -17,10 +17,7 @@ use glam::Vec3;
 use orrin_ecs::World;
 
 use super::library::{SWEEP, WALL_TILE, load_library};
-use super::textures::sky_equirect;
-use super::{
-    spawn_decal, spawn_directional_light, spawn_mesh, spawn_point_light, spawn_spot_light,
-};
+use super::{spawn_decal, spawn_mesh, spawn_point_light, spawn_spot_light};
 use crate::gfx::RenderBackend;
 use crate::scene::{Assets, Camera, Decal, Spin, Transform};
 
@@ -359,7 +356,6 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
         },
     );
 
-    let sun_dir = Vec3::new(-0.4, -1.0, -0.6).normalize();
     // Deep twilight, and chosen for that rather than inherited. Physical units put
     // the sun, the sky and every fixture on one scale, and under a 100 000 lux
     // noon sun a real lamp lands a fraction of a percent above the ambient — which
@@ -367,12 +363,12 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
     // the emissive material are all invisible. Lighting the scene at the hour when
     // a sun, a lamp and a neon tube are within a few stops of each other is what
     // keeps every feature on screen without any of them lying about its units.
-    spawn_directional_light(world, "Sun", sun_dir, Vec3::new(1.0, 0.97, 0.92), 250.0);
-
-    // Fed the direction *toward* the sun, so the disc in the sky and the
-    // directional light that casts the shadows agree.
-    const SKY: [u32; 2] = [1024, 512];
-    backend.load_environment(&sky_equirect(SKY[0], SKY[1], -sun_dir), SKY[0], SKY[1]);
+    //
+    // The sky and sun are the shared built-in pair, which a new scene in the
+    // editor is lit by too, so the two always look the same.
+    super::spawn_built_in_sun(world);
+    let (sky, width, height) = super::built_in_sky();
+    backend.load_environment(&sky, width, height);
 
     for (i, (pos, color)) in [
         (Vec3::new(-4.0, 3.0, -4.0), Vec3::new(1.0, 0.35, 0.1)),

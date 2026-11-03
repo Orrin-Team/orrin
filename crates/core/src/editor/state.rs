@@ -208,6 +208,11 @@ pub struct EditorState {
     /// outside a project, where the bar shows the scene file alone rather
     /// than a placeholder.
     pub project_name: Option<String>,
+    /// The project's directory, which File → Export game hands the CLI.
+    pub project_root: Option<PathBuf>,
+    /// The export File → Export game started, and how the last one ended.
+    pub export: super::export::Export,
+    export_request: Option<orrin_project::export::Platform>,
     /// The hierarchy's search box. Lives here rather than in the panel so it
     /// survives the frame, and so a filtered tree stays filtered.
     pub hierarchy_query: String,
@@ -375,6 +380,9 @@ impl Default for EditorState {
             scene_path: DEFAULT_SCENE_PATH.to_owned(),
             persistent_scene: None,
             project_name: None,
+            project_root: None,
+            export: super::export::Export::default(),
+            export_request: None,
             hierarchy_query: String::new(),
             console_levels: LevelFilter::default(),
             console_query: String::new(),
@@ -437,6 +445,7 @@ impl EditorState {
     pub fn new(project: Option<&orrin_project::Project>) -> Self {
         Self {
             project_name: project.map(|project| project.name().to_owned()),
+            project_root: project.map(|project| project.root().to_path_buf()),
             persistent_scene: project.and_then(|project| project.persistent_scene()),
             autosave: Autosave::new(
                 project
@@ -446,6 +455,15 @@ impl EditorState {
             ),
             ..Self::default()
         }
+    }
+
+    /// Export the project for `platform`, from File → Export game.
+    pub fn request_export(&mut self, platform: orrin_project::export::Platform) {
+        self.export_request = Some(platform);
+    }
+
+    pub fn take_export_request(&mut self) -> Option<orrin_project::export::Platform> {
+        self.export_request.take()
     }
 
     /// Play from edit mode; Stop from play.
@@ -1157,7 +1175,8 @@ impl EditorState {
     }
 
     /// Write a scene called `name` under the assets directory's `scenes/`,
-    /// holding render settings and a sun, and open it in place of this one.
+    /// holding render settings that name a sky and a sun, and open it in place
+    /// of this one.
     ///
     /// Written before it is opened, so the file exists from the moment it is
     /// listed and a crash before the first save loses nothing but the name.
@@ -1173,17 +1192,13 @@ impl EditorState {
         };
         let dir = path.parent().unwrap_or(&path).to_owned();
 
+        let mut render = scene::RenderSettings::default();
+        render.environment.hdri = entities::BUILT_IN_SKY.to_owned();
         let mut fresh = World::new();
         let settings = fresh.spawn();
         fresh.insert(settings, Name::new("Render Settings"));
-        fresh.insert(settings, scene::RenderSettings::default());
-        entities::spawn_directional_light(
-            &mut fresh,
-            "Sun",
-            Vec3::new(-0.4, -1.0, -0.6),
-            Vec3::ONE,
-            20_000.0,
-        );
+        fresh.insert(settings, render);
+        entities::spawn_built_in_sun(&mut fresh);
         let text = scene::save(&mut fresh, registry);
         if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, text))
         {
