@@ -55,7 +55,7 @@ pub fn draw(
     // Before the dock, so a command that rearranges the layout is reflected in
     // the same frame rather than the next one.
     menu_bar::show(ctx, world, registry, state, themes, dock);
-    status_bar::show(ctx, world, themes);
+    status_bar::show(ctx, world, state, themes);
     dock.show(ctx, world, state, registry, previews);
     if let Some(rect) = dock.viewport() {
         viewport::show(ctx, world, state, themes, rect);
@@ -2040,6 +2040,46 @@ mod tests {
         editor.state.project_name = Some("Courtyard".to_owned());
         editor.frames(2);
         assert!(editor.painted_contains("Courtyard"));
+    }
+
+    /// Opens File, then Export game, and says whether each platform's entry
+    /// was reached and which export the editor was asked for.
+    fn export_from_the_file_menu(editor: &mut Harness, platform: &str) -> bool {
+        editor.frames(2);
+        let file = text_at(editor, "File").expect("the File menu's title");
+        editor.click(file).frames(2);
+        let entry = text_at(editor, "Export game").expect("File lists Export game");
+        editor.click(entry).frames(2);
+        match text_at(editor, platform) {
+            Some(at) => {
+                editor.click(at).frames(1);
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[test]
+    fn file_export_game_asks_for_the_platform_picked() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.state.project_name = Some("Courtyard".to_owned());
+        editor.state.project_root = Some(std::path::PathBuf::from("courtyard"));
+
+        assert!(export_from_the_file_menu(&mut editor, "Windows"));
+        assert_eq!(
+            editor.state.take_export_request(),
+            Some(orrin_project::export::Platform::Windows)
+        );
+    }
+
+    /// Outside a project there is nothing to export: the entry is listed, so it
+    /// can be found, and opens nothing.
+    #[test]
+    fn file_export_game_is_listed_and_closed_outside_a_project() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+
+        assert!(!export_from_the_file_menu(&mut editor, "Windows"));
+        assert_eq!(editor.state.take_export_request(), None);
     }
 
     /// Menu titles are text on the bar until the pointer reaches one. Drawn as
@@ -4715,6 +4755,47 @@ mod tests {
         assert!(named(&editor.world, "Sun").is_some());
         assert!(std::path::Path::new(&editor.state.scene_path).ends_with("scenes/Level 2.orrin"));
         assert!(!editor.state.scene_dirty());
+    }
+
+    /// A new scene looks like the demo a bare `cargo run -p orrin-core` opens
+    /// on: its generated sky, and the sun that sky is drawn around. Nothing is
+    /// copied into the project for it.
+    #[test]
+    fn a_new_scene_is_lit_by_the_demos_sky_and_sun() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-sky");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+
+        editor.state.request_new_scene("Outside");
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        let settings = named(&editor.world, "Render Settings").expect("settings entity");
+        let render = editor
+            .world
+            .get::<crate::scene::RenderSettings>(settings)
+            .expect("render settings")
+            .clone();
+        assert_eq!(
+            render.environment.hdri,
+            crate::scene::entities::BUILT_IN_SKY
+        );
+        let sun = named(&editor.world, "Sun").expect("a sun");
+        let light = editor
+            .world
+            .get::<crate::scene::Light>(sun)
+            .map(|light| *light);
+        assert!(
+            matches!(
+                light,
+                Some(crate::scene::Light::Directional { color, lux })
+                    if color == glam::Vec3::new(1.0, 0.97, 0.92) && lux == 250.0
+            ),
+            "the demo's dusk sun, not a noon one against a dusk sky: {light:?}"
+        );
+        assert!(
+            !dir.path().join("environment").exists(),
+            "nothing copied in"
+        );
     }
 
     /// The name becomes a file name, so it has to be one, and must not take

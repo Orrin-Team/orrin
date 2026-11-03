@@ -83,7 +83,10 @@ default = ["scripting"]
 scripting = ["dep:orrin-script", "dep:orrin-build"]
 # An exported game rather than the editor: trace and debug events are compiled
 # out, and warnings and errors are also written to a log file beside the
-# executable — see `logging::LogConfig::for_this_build`.
+# executable — see `logging::LogConfig::for_this_build`. The game is found from
+# the `orrin.json` beside the executable rather than from the working
+# directory, its assets open from the pack, and it starts playing with the
+# editor out of the frame (`App::shipped_project`).
 export = ["tracing/max_level_info"]
 
 [[bench]]

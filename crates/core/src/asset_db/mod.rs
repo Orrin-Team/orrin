@@ -68,6 +68,7 @@ mod handles;
 pub mod import;
 mod ktx;
 pub mod material;
+pub mod pack;
 pub mod sidecar;
 pub mod texture;
 mod watch;
@@ -182,6 +183,9 @@ pub struct AssetDatabase {
     thumbnails: FxHashMap<AssetId, (CacheKey, crate::gfx::thumbnail::Thumbnail)>,
     /// Assets with an import on its way back for a slot.
     awaiting: HashSet<AssetId, FxBuildHasher>,
+    /// Each imported asset's artifact, when this is an exported game's pack
+    /// rather than a project: nothing is scanned, imported or hashed.
+    pack: Option<FxHashMap<AssetId, CacheKey>>,
 }
 
 impl AssetDatabase {
@@ -204,13 +208,21 @@ impl AssetDatabase {
         cache_dir: impl Into<PathBuf>,
         target: Target,
     ) -> (Self, Vec<String>) {
+        let (mut db, mut issues) = Self::empty(dir.into(), cache_dir.into(), target);
+        issues.extend(db.scan(&[]));
+        (db, issues)
+    }
+
+    /// A database over `dir` with nothing indexed yet, its import thread
+    /// running against `cache_dir`.
+    fn empty(dir: PathBuf, cache_dir: PathBuf, target: Target) -> (Self, Vec<String>) {
         let cache = cache::Cache::new(cache_dir);
         let mut issues = Vec::new();
         let worker = worker::Worker::spawn(cache.clone())
             .map_err(|error| issues.push(error))
             .ok();
-        let mut db = Self {
-            dir: dir.into(),
+        let db = Self {
+            dir,
             cache,
             entries: Vec::new(),
             folders: Vec::new(),
@@ -228,8 +240,8 @@ impl AssetDatabase {
             target,
             thumbnails: FxHashMap::default(),
             awaiting: HashSet::default(),
+            pack: None,
         };
-        issues.extend(db.scan(&[]));
         (db, issues)
     }
 
@@ -767,6 +779,9 @@ impl AssetDatabase {
     /// directory — are queued for import. An asset whose file has gone stays,
     /// off disk; see [`iter`](Self::iter).
     fn scan(&mut self, touched: &[String]) -> Vec<String> {
+        if self.pack.is_some() {
+            return Vec::new();
+        }
         let mut issues = Vec::new();
         let mut files = Vec::new();
         let mut dirs = Vec::new();
@@ -897,6 +912,16 @@ impl AssetDatabase {
             ));
             return;
         };
+        let packed = match &self.pack {
+            // Only what is drawn is read: the editor's reason to import
+            // everything, a browser saying what failed, is not a game's.
+            Some(_) if !payload => return,
+            Some(pack) => match pack.get(&id) {
+                Some(&key) => Some(key),
+                None => return,
+            },
+            None => None,
+        };
         entry.status = Status::Queued;
         if payload {
             self.awaiting.insert(id);
@@ -911,6 +936,7 @@ impl AssetDatabase {
             payload,
             known,
             fresh,
+            packed,
         });
     }
 

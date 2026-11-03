@@ -52,7 +52,7 @@ pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};
 pub use decal::{Decal, DecalSettings};
 pub use diagnostics::Diagnostics;
 pub use dof::DofSettings;
-pub use environment::{EnvironmentSettings, Hdri, HdriError, load_hdri};
+pub use environment::{EnvironmentSettings, Hdri, HdriError, load_hdri, sky_pixels};
 pub use fog::FogSettings;
 pub use hdr::HdrSettings;
 pub use hierarchy::{

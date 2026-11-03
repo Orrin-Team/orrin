@@ -1,5 +1,6 @@
 mod build;
 mod engine;
+mod export;
 mod new;
 mod run;
 
@@ -7,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use orrin_project::Project;
+use orrin_project::export::Platform;
 
 /// Every command returns a message already phrased for the user; `main` is the
 /// only place that decides how a failure is printed and what it exits with.
@@ -41,6 +43,32 @@ enum Command {
     Build {
         #[command(flatten)]
         project: ProjectArgs,
+
+        /// Export a playable game instead; the same as `orrin export`
+        #[arg(long)]
+        export: bool,
+
+        /// With --export: the platform to export for
+        #[arg(long, value_name = "PLATFORM", requires = "export", value_parser = parse_platform)]
+        platform: Option<Platform>,
+    },
+
+    /// Open Orrin Hub: create, open and export projects in a window
+    Hub,
+
+    /// Package the project as a game a player can run, with no SDK needed
+    Export {
+        /// Directory to search upward from for orrin.toml (default: current)
+        #[arg(long, value_name = "DIR")]
+        project: Option<PathBuf>,
+
+        /// mac, linux or windows (default: this machine)
+        #[arg(long, value_name = "PLATFORM", value_parser = parse_platform)]
+        platform: Option<Platform>,
+
+        /// Where to put the game (default: exports/<name>-<platform> in the project)
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
     },
 
     /// Build the project, then launch the engine on it
@@ -51,6 +79,11 @@ enum Command {
         /// Launch whatever is already compiled instead of building first
         #[arg(long)]
         no_build: bool,
+
+        /// From an engine checkout, run the dev build of the engine (faster to
+        /// compile, slower to run) instead of the release one
+        #[arg(long)]
+        dev: bool,
 
         /// Arguments forwarded to the engine, after `--`
         #[arg(last = true, value_name = "ARGS")]
@@ -115,17 +148,50 @@ pub fn display_path(path: &Path) -> String {
     }
 }
 
+fn parse_platform(name: &str) -> Result<Platform, String> {
+    Platform::parse(name)
+        .ok_or_else(|| format!("`{name}` is not a platform; use mac, linux or windows"))
+}
+
+fn export(project: &ProjectArgs, options: export::Options) -> Fallible {
+    export::export(&project.locate()?, &options)
+}
+
 fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
         Command::New { name, path } => new::scaffold(&name, &path),
-        Command::Build { project } => build::build(&project).map(|_| ()),
+        Command::Build {
+            project,
+            export: true,
+            platform,
+        } => export(
+            &project,
+            export::Options {
+                platform,
+                out: None,
+            },
+        ),
+        Command::Build { project, .. } => build::build(&project).map(|_| ()),
+        Command::Hub => engine::launch_hub(),
+        Command::Export {
+            project,
+            platform,
+            out,
+        } => export(
+            &ProjectArgs {
+                project,
+                release: true,
+            },
+            export::Options { platform, out },
+        ),
         Command::Run {
             project,
             no_build,
+            dev,
             engine_args,
-        } => run::run(&project, no_build, &engine_args),
+        } => run::run(&project, no_build, dev, &engine_args),
     };
 
     if let Err(message) = result {

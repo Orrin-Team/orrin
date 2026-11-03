@@ -1,6 +1,7 @@
 # `orrin` — project CLI
 
-Create, build, and run Orrin projects without knowing the engine's internals.
+Create, build, run and export Orrin projects without knowing the engine's
+internals.
 The crate is `orrin-cli`; the binary it installs is **`orrin`**.
 
 ```bash
@@ -81,13 +82,73 @@ interface. Sidecars are recorded as a flag on the asset they describe, dotfiles
 and symlinks are skipped, and entries are sorted so the file is identical
 whichever machine produced it.
 
-### `orrin run [--release] [--no-build] [--project DIR] [-- ARGS…]`
+### `orrin run [--release] [--dev] [--no-build] [--project DIR] [-- ARGS…]`
 
 `orrin build`, then launch the engine with its working directory set to the
 project root — which is how the engine finds the project, since it walks up
 from cwd for `orrin.toml`. `--no-build` launches what is already compiled.
+
+From an engine checkout the engine is built with `--release`, so the editor runs
+at the speed the game will; the first launch compiles it, later ones reuse it.
+`--dev` runs the dev build instead, which compiles faster and runs slower.
+`--release` is about the *scripts*: it builds them in Release, which strips
+`Debug.DrawLine` and friends, so leave it off while editing.
 Arguments after `--` are forwarded to the engine. The engine's exit status
 becomes the CLI's.
+
+### `orrin export [--platform mac|linux|windows] [--out DIR] [--project DIR]`
+
+Packages the project as a directory a player can run on a machine with no
+.NET, no Rust and no Vulkan SDK. `orrin build --export` is the same command.
+
+```
+exports/<name>-<platform>/
+  <name>[.exe]       the engine, release, `export` feature, symbols stripped
+  Orrin.dll          the bindings, with their runtimeconfig
+  <Game>.dll         the game assembly, built Release (no ORRIN_DEBUG)
+  dotnet/            a private .NET runtime the engine boots instead of any install
+  compiled-assets/   cache artifacts, sidecars and text assets; no sources
+  orrin.json         which game this is: entry, assembly, start scene
+```
+
+1. **Publishes the C#** for the target's runtime identifier, and assembles a
+   `DOTNET_ROOT` from the NuGet runtime pack that a self-contained publish
+   restores. A Windows runtime can be built on a Mac this way.
+2. **Builds the engine** for the target, from the checkout so its
+   `rust-toolchain.toml` applies: `cargo` when it is this machine, `cargo xwin`
+   for Windows elsewhere. A Mac game can only be built on a Mac. A Linux game
+   from elsewhere needs `cargo zigbuild` *and* a Linux sysroot with libudev
+   (the gamepad backend links it) named by `PKG_CONFIG_SYSROOT_DIR`; without
+   one the export is refused up front and CI's `linux` package is the way.
+   Missing tools and Rust targets are checked before anything slow starts; a
+   missing Rust target is added for you.
+3. **Packs the assets** with the checkout's own engine on this machine,
+   importing anything the cache lacks. The pack copies artifacts byte for byte,
+   so exporting twice from one import gives the same files.
+4. **Assembles** the directory and writes `orrin.json`.
+
+The engine is built from source, so exporting needs the `orrin` from an engine
+checkout. `--out` defaults to `exports/<name>-<platform>` in the project, which
+`orrin new` gitignores. An earlier export there is replaced; any other non-empty
+directory is refused rather than cleared.
+
+A scene named in `[scenes]` is found in the pack when it sits under the assets
+directory, and is copied to the same relative path when it does not.
+
+Mac exports are Apple Silicon only: that is where the Metal backend is the
+default. An Intel Mac would need MoltenVK shipped beside the engine.
+
+CI's `export` job runs this once per platform, each on its own OS, and uploads
+the playable directory.
+
+### `orrin hub`
+
+Opens Orrin Hub (`crates/orrin-hub`), a window for creating, opening, building
+and exporting projects. Every button runs one of the commands above, and the
+hub shows that command's output, so it can never do something the CLI cannot.
+The hub found beside `orrin` is used; otherwise the checkout `orrin` came from
+builds and runs it. Recent projects are kept in `hub.json` in the platform's
+per-user settings directory.
 
 ## How the engine is found
 
@@ -99,7 +160,8 @@ In order, because a wrong guess here is near-invisible:
    beside the CLI. That pairing is what an exported build lays down.
 3. **An engine checkout** above the project or above the CLI itself (with the
    CLI's path canonicalized first, so a symlink on `$PATH` still points into
-   the checkout) → `cargo run -p orrin-core`.
+   the checkout) → `cargo run --release -p orrin-core` (without `--release`
+   under `orrin run --dev`).
 4. **`orrin-core` alone** beside the CLI.
 
 Step 2 requires the bindings specifically so that a cargo `target/` directory —
@@ -123,4 +185,5 @@ documents — is no longer needed when launching through the CLI.
   yet (issue #6). Generating a `.fscene` the engine cannot load would be worse
   than an empty directory, so the manifest's `[scenes]` section is left
   commented out.
-- Export/packaging is Phase 5; `build` deliberately stops at the index.
+- Exporting from an installed `orrin` with no engine checkout: there are no
+  prebuilt per-platform engines to package yet.

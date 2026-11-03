@@ -16,18 +16,26 @@ pub enum Launcher {
     /// `orrin run` always launches current sources. Scripting comes with the
     /// default features, so there is no flag to pass and no way to get a
     /// scriptless engine by forgetting one.
-    Cargo { root: PathBuf },
+    Cargo {
+        root: PathBuf,
+        /// Built with `--release`: an editor someone makes a game in should
+        /// run at the speed the game will, and the dev profile compiles the
+        /// engine itself at opt-level 1 with debug assertions on.
+        release: bool,
+    },
 }
 
 impl Engine {
     pub fn command(&self) -> Command {
         match &self.launcher {
             Launcher::Exe(exe) => Command::new(exe),
-            Launcher::Cargo { root } => {
+            Launcher::Cargo { root, release } => {
                 let mut cmd = Command::new("cargo");
-                cmd.args(["run", "-p", "orrin-core"])
-                    .arg("--manifest-path")
-                    .arg(root.join("Cargo.toml"));
+                cmd.args(["run", "-p", "orrin-core"]);
+                if *release {
+                    cmd.arg("--release");
+                }
+                cmd.arg("--manifest-path").arg(root.join("Cargo.toml"));
                 cmd
             }
         }
@@ -56,7 +64,7 @@ pub const BINDINGS_ENV: &str = "ORRIN_SCRIPT_DIR";
 /// below would be unreachable for contributors, who would silently get whatever
 /// stale `target/debug/orrin-core` happened to exist rather than a rebuild of
 /// what they are editing.
-pub fn find(start: &Path) -> Result<Engine, String> {
+pub fn find(start: &Path, release: bool) -> Result<Engine, String> {
     if let Some(value) = std::env::var_os(ENGINE_ENV) {
         let exe = PathBuf::from(value);
         if !exe.is_file() {
@@ -83,8 +91,12 @@ pub fn find(start: &Path) -> Result<Engine, String> {
 
     if let Some(root) = find_checkout(start) {
         return Ok(Engine {
-            origin: format!("engine checkout at {}", root.display()),
-            launcher: Launcher::Cargo { root },
+            origin: format!(
+                "the {} engine from the checkout at {}",
+                if release { "release" } else { "dev" },
+                root.display()
+            ),
+            launcher: Launcher::Cargo { root, release },
         });
     }
 
@@ -198,4 +210,67 @@ pub fn built_bindings(checkout: &Path) -> Option<PathBuf> {
     }
 
     best.map(|(_, dir)| dir)
+}
+
+/// Start Orrin Hub and return without waiting for it: the one installed beside
+/// this CLI, else a build of the checkout this CLI came from.
+pub fn launch_hub() -> Result<(), String> {
+    let name = format!("orrin-hub{}", std::env::consts::EXE_SUFFIX);
+    let mut command = match current_exe().and_then(|exe| exe.parent().map(|dir| dir.join(&name))) {
+        Some(hub) if hub.is_file() => Command::new(hub),
+        _ => match current_exe().and_then(|exe| checkout_containing(&exe)) {
+            Some(root) => {
+                println!(
+                    "orrin: building and opening Orrin Hub from {}",
+                    root.display()
+                );
+                let mut cargo = Command::new("cargo");
+                cargo
+                    .args(["run", "--quiet", "-p", "orrin-hub", "--manifest-path"])
+                    .arg(root.join("Cargo.toml"));
+                cargo
+            }
+            None => {
+                return Err(format!(
+                    "Orrin Hub is not installed: there is no `{name}` beside this executable"
+                ));
+            }
+        },
+    };
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("could not open Orrin Hub: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(release: bool) -> Vec<String> {
+        let engine = Engine {
+            launcher: Launcher::Cargo {
+                root: PathBuf::from("/orrin"),
+                release,
+            },
+            origin: String::new(),
+        };
+        engine
+            .command()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The editor `orrin run` opens from a checkout is the optimised engine,
+    /// and the dev build is there when asked for.
+    #[test]
+    fn a_checkout_engine_runs_in_release_unless_asked_for_dev() {
+        let release = args(true);
+        assert!(release.iter().any(|arg| arg == "--release"), "{release:?}");
+        assert_eq!(&release[..3], ["run", "-p", "orrin-core"]);
+
+        let dev = args(false);
+        assert!(!dev.iter().any(|arg| arg == "--release"), "{dev:?}");
+    }
 }

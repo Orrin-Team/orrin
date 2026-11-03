@@ -188,6 +188,18 @@ impl fmt::Display for HdriError {
     }
 }
 
+/// The pixels a scene's [`EnvironmentSettings::hdri`] names: the built-in sky
+/// when it names [`BUILT_IN_SKY`](crate::scene::entities::BUILT_IN_SKY), else
+/// the `.hdr` at that path under `assets_dir`.
+pub fn sky_pixels(assets_dir: &Path, hdri: &str) -> Result<(Vec<f32>, u32, u32), String> {
+    if hdri.trim() == crate::scene::entities::BUILT_IN_SKY {
+        return Ok(crate::scene::entities::built_in_sky());
+    }
+    load_hdri(assets_dir, hdri)
+        .map(|image| (image.pixels, image.width, image.height))
+        .map_err(|error| error.to_string())
+}
+
 /// Resolve `relative` against `assets_dir` and decode it.
 ///
 /// Radiance files carry RGBE, which decodes to unbounded linear float — the sun
@@ -233,6 +245,19 @@ pub fn load_hdri(assets_dir: &Path, relative: &str) -> Result<Hdri, HdriError> {
 
 #[cfg(test)]
 mod tests {
+    /// The demo's sky is generated, so naming it reads nothing from disk —
+    /// which is what lets a scene name it in any project and in an export.
+    #[test]
+    fn the_built_in_sky_needs_no_file() {
+        let (pixels, width, height) = super::sky_pixels(
+            std::path::Path::new("/no/such/assets"),
+            crate::scene::entities::BUILT_IN_SKY,
+        )
+        .expect("the built-in sky");
+        assert_eq!((width, height), (1024, 512));
+        assert_eq!(pixels.len(), (width * height * 4) as usize);
+    }
+
     /// The contract the control rests on: a source measuring anything at all,
     /// calibrated to N cd/m², comes out at N. Without this the number on the
     /// slider is decoration.

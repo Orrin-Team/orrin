@@ -47,6 +47,9 @@ pub struct Job {
     pub known: Option<CacheKey>,
     /// Import even when the cache holds the artifact: a Reimport.
     pub fresh: bool,
+    /// The artifact to read, from an exported game's pack, which has no
+    /// source to read or hash.
+    pub packed: Option<CacheKey>,
 }
 
 /// An artifact on its way to the GPU, with anything derived from it that is
@@ -86,6 +89,9 @@ pub struct Done {
 /// One without its thumbnail — a cache written before there were any — is
 /// imported again to make one.
 pub fn run(job: &Job, cache: &Cache) -> Result<Imported, String> {
+    if let Some(key) = job.packed {
+        return unpack(job, cache, key);
+    }
     let Some(importer) = import::importer(job.kind) else {
         return Err(format!(
             "{} is a {}, which is not imported",
@@ -159,13 +165,7 @@ pub fn run(job: &Job, cache: &Cache) -> Result<Imported, String> {
     };
     let summary = cache.summary(key);
 
-    let payload = wanted.then(|| match artifact {
-        Artifact::Texture(texture) => Payload::Texture(texture),
-        Artifact::Mesh(mesh) => {
-            let preview = render_mesh(&mesh);
-            Payload::Mesh(mesh, preview)
-        }
-    });
+    let payload = wanted.then(|| payload(artifact));
     Ok(Imported {
         key,
         cached,
@@ -174,6 +174,38 @@ pub fn run(job: &Job, cache: &Cache) -> Result<Imported, String> {
         thumbnail,
         summary,
     })
+}
+
+/// [`run`] for a pack: the artifact under `key`, as it is.
+fn unpack(job: &Job, cache: &Cache, key: CacheKey) -> Result<Imported, String> {
+    let artifact = match cache.load(key) {
+        Some(Ok(artifact)) => artifact,
+        Some(Err(error)) => return Err(format!("{}: its packed artifact {error}", job.rel)),
+        None => {
+            return Err(format!(
+                "{}: its artifact {key} is missing from the game's assets; export the game again",
+                job.rel
+            ));
+        }
+    };
+    Ok(Imported {
+        key,
+        cached: true,
+        inputs: Vec::new(),
+        payload: Some(payload(artifact)),
+        thumbnail: None,
+        summary: None,
+    })
+}
+
+fn payload(artifact: Artifact) -> Payload {
+    match artifact {
+        Artifact::Texture(texture) => Payload::Texture(texture),
+        Artifact::Mesh(mesh) => {
+            let preview = render_mesh(&mesh);
+            Payload::Mesh(mesh, preview)
+        }
+    }
 }
 
 #[derive(Default)]

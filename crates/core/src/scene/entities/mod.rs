@@ -6,6 +6,45 @@ mod stress;
 mod textures;
 
 pub use scene::build_default_scene;
+
+/// The sky the built-in demo is lit by, as a scene's render settings name it.
+/// Generated rather than read, so a scene naming it has no file to ship or
+/// lose, in any project and in an export.
+pub const BUILT_IN_SKY: &str = "builtin:dusk";
+
+/// The direction the built-in sky's sun shines, which the sun disc in the sky
+/// is drawn opposite: the light and the picture of it agree.
+pub const BUILT_IN_SUN: Vec3 = Vec3::new(-0.4, -1.0, -0.6);
+
+/// [`BUILT_IN_SKY`]'s pixels: RGBA, linear, and its width and height.
+pub fn built_in_sky() -> (Vec<f32>, u32, u32) {
+    const SIZE: [u32; 2] = [1024, 512];
+    // Fed the direction *toward* the sun, so the disc and the light agree.
+    let pixels = textures::sky_equirect(SIZE[0], SIZE[1], -BUILT_IN_SUN.normalize());
+    (pixels, SIZE[0], SIZE[1])
+}
+
+/// The sun of [`BUILT_IN_SKY`]: a warm directional light at deep twilight,
+/// the hour the demo is lit at (see `build_default_scene` for why).
+pub fn spawn_built_in_sun(world: &mut World) -> Entity {
+    spawn_directional_light(
+        world,
+        "Sun",
+        BUILT_IN_SUN.normalize(),
+        Vec3::new(1.0, 0.97, 0.92),
+        250.0,
+    )
+}
+
+/// The engine's built-in meshes and materials, which a script names by
+/// `Assets` key, with the tables extraction reads beside them — and no scene.
+pub fn install_library(world: &mut World, backend: &mut impl RenderBackend) {
+    let (assets, mesh_bounds, material_blends, asset_previews) = library::load_library(backend);
+    world.insert_resource(assets);
+    world.insert_resource(mesh_bounds);
+    world.insert_resource(material_blends);
+    world.insert_resource(asset_previews);
+}
 pub use showcase::build_showcase_scene;
 pub use sponza::build_sponza_scene;
 pub use stress::{StressSpec, spawn_stress_scene};

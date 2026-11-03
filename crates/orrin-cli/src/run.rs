@@ -1,7 +1,7 @@
 use crate::engine::{self, BINDINGS_ENV};
 use crate::{Fallible, ProjectArgs, build, display_path};
 
-pub fn run(args: &ProjectArgs, no_build: bool, engine_args: &[String]) -> Fallible {
+pub fn run(args: &ProjectArgs, no_build: bool, dev: bool, engine_args: &[String]) -> Fallible {
     let (project, bindings) = if no_build {
         let project = args.locate()?;
         let bindings = engine::find_bindings(project.root());
@@ -11,7 +11,7 @@ pub fn run(args: &ProjectArgs, no_build: bool, engine_args: &[String]) -> Fallib
         (built.project, built.bindings)
     };
 
-    let engine = engine::find(project.root())?;
+    let engine = engine::find(project.root(), !dev)?;
 
     let mut command = engine.command();
 
@@ -26,6 +26,12 @@ pub fn run(args: &ProjectArgs, no_build: bool, engine_args: &[String]) -> Fallib
         && std::env::var_os(BINDINGS_ENV).is_none()
     {
         command.env(BINDINGS_ENV, bindings);
+    }
+
+    // So the editor's File → Export game runs this same CLI rather than
+    // searching for one.
+    if let Ok(cli) = std::env::current_exe() {
+        command.env("ORRIN_CLI", cli);
     }
 
     if !engine_args.is_empty() {

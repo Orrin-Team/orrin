@@ -336,6 +336,17 @@ pub fn text(id: AssetId, settings: &Settings) -> String {
     format!("id = \"{id}\"\n{}", settings.import_table())
 }
 
+/// The sidecar of the source at `source`, which must exist: an exported game's
+/// pack is read and never written to.
+pub fn read_existing(source: &Path, rel: &str, kind: AssetKind) -> Result<Sidecar, String> {
+    match read(&path_of(source), rel)? {
+        Some(text) => parse(&text, rel, kind),
+        None => Err(format!(
+            "{rel} has no sidecar in the game's assets, so its id is unknown; export the game again"
+        )),
+    }
+}
+
 /// A folder's sidecar, which exists only once a tint has been set.
 pub fn read_folder(dir: &Path, rel: &str) -> Result<Option<Sidecar>, String> {
     match read(&path_of(dir), rel)? {

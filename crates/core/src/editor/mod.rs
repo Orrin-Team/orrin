@@ -5,6 +5,7 @@
 
 mod autosave;
 mod dock;
+mod export;
 mod gizmo;
 mod icons;
 mod kind;
@@ -57,6 +58,26 @@ impl Drop for Editor {
     fn drop(&mut self) {
         self.save_layout();
         self.state.autosave.wait();
+    }
+}
+
+/// Run `orrin export` on the open project, from File → Export game.
+fn start_export(state: &mut EditorState, platform: orrin_project::export::Platform) {
+    let (Some(root), Some(name)) = (state.project_root.clone(), state.project_name.clone()) else {
+        return;
+    };
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
+    let started = export::find_cli(
+        std::env::var_os(export::CLI_ENV),
+        beside.as_deref(),
+        std::env::var_os("PATH"),
+    )
+    .and_then(|cli| state.export.start(&cli, &root, &name, platform));
+    match started {
+        Ok(()) => tracing::info!("export: {name} for {}", export::label(platform)),
+        Err(error) => tracing::error!("export: {error}"),
     }
 }
 
@@ -155,6 +176,16 @@ impl Editor {
         }
         if state.take_import_request() {
             dock.show_import();
+        }
+        if let Some(platform) = state.take_export_request() {
+            start_export(state, platform);
+        }
+        for (level, line) in state.export.service() {
+            if level >= crate::scene::LogLevel::Error {
+                tracing::error!("{line}");
+            } else {
+                tracing::info!("{line}");
+            }
         }
 
         // Kept once the pointer lets go, rather than on every frame a step is

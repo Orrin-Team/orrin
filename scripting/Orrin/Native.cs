@@ -77,6 +77,8 @@ public unsafe struct OrrinApi
     public delegate* unmanaged<byte*, uint> LoadSceneAdditive;
     public delegate* unmanaged<uint, byte> UnloadScene;
     public delegate* unmanaged<uint> ActiveScene;
+    public delegate* unmanaged<Transform*, byte> GetCamera;
+    public delegate* unmanaged<Transform*, byte> SetCamera;
 }
 
 public static unsafe class Native
@@ -247,6 +249,15 @@ public static unsafe class Native
     internal static bool UnloadScene(uint handle) => _api.UnloadScene(handle) != 0;
 
     internal static uint ActiveScene() => _api.ActiveScene();
+
+    internal static Transform GetCamera()
+    {
+        Transform transform = Transform.Identity;
+        _api.GetCamera(&transform);
+        return transform;
+    }
+
+    internal static void SetCamera(Transform transform) => _api.SetCamera(&transform);
 
     internal static AssetState GetAssetState(Guid asset)
     {
