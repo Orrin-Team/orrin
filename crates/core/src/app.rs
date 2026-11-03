@@ -251,6 +251,7 @@ impl App {
         world.insert_resource(PresentSettings::default());
         world.insert_resource(Diagnostics::default());
         world.insert_resource(crate::scene::Play::default());
+        world.insert_resource(crate::scene::LoadedScenes::default());
         world.insert_resource(FrameStats::new());
         world.insert_resource(Profiler::default());
         world.insert_resource(InputState::new());
@@ -782,6 +783,13 @@ impl ApplicationHandler for App {
                 {
                     profile_scope!("propagate");
                     crate::scene::propagate_transforms(&mut self.world);
+                }
+
+                // After the editor and the script tick, either of which can load
+                // a scene or edit its settings, and before anything reads them.
+                {
+                    profile_scope!("render settings");
+                    crate::scene::render_settings::sync(&mut self.world);
                 }
 
                 // After everything that can issue an asset handle — a scene the

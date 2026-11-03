@@ -1,4 +1,5 @@
 use glam::Vec3;
+use orrin_registry::Reflect;
 
 use crate::gfx::TextureHandle;
 
@@ -107,7 +108,7 @@ impl Default for Decal {
 /// answer by rendering the scene with this false — and as the cost dial, since
 /// off means the per-fragment loop is skipped on a branch that is uniform across
 /// the whole frame.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct DecalSettings {
     pub enabled: bool,
 }

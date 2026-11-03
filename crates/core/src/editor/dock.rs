@@ -21,6 +21,15 @@
 //! The centre claims no *input* either, and that does not follow from painting
 //! nothing: egui hands the whole `CentralPanel` to the UI regardless. See
 //! [`Dock::wants_pointer`], which is what the editor asks in egui's place.
+//!
+//! **A tab dragged out over the scene floats there.** egui_dock floats a tab
+//! only when it is let go over another tool's body, because a drop needs a
+//! node under the pointer to resolve against — and the centre, being `Empty`,
+//! is not one. So the dock watches the drag itself: a tab that was grabbed,
+//! dragged, and released over no tool at all leaves for a window under the
+//! pointer, and the lone tab of a window carries that window with it. Drops
+//! onto a tool are still egui_dock's, so splitting and re-docking are
+//! unchanged.
 
 use egui_dock::{DockArea, DockState, NodeIndex, Style};
 use serde::{Deserialize, Serialize};
@@ -30,7 +39,7 @@ use orrin_registry::Registry;
 
 use super::panels;
 use super::previews::Previews;
-use super::state::EditorState;
+use super::state::{DockRequest, EditorState};
 
 /// Fractions rather than pixels, because a split is a proportion of its parent
 /// and the window has no fixed size. Measured to land on the widths the design
@@ -44,11 +53,12 @@ const HIERARCHY: f32 = 0.1875;
 const INSPECTOR: f32 = 0.6923;
 const BOTTOM: f32 = 0.7043;
 
-/// A dockable tool. Scene save and load are not one: they live in the File
-/// menu and the status bar, where they are reachable without a tab open.
+/// A dockable tool. Save and load are also in the File menu and the status
+/// bar, where they are reachable without the Scene Manager open.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Tab {
     Hierarchy,
+    Scenes,
     Inspector,
     Environment,
     Performance,
@@ -63,8 +73,9 @@ impl Tab {
     /// even in a build without the feature: the variant stays so a layout file
     /// written by one build still loads in the other, and the tab says why it
     /// is empty instead of vanishing.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Hierarchy,
+        Self::Scenes,
         Self::Inspector,
         Self::Environment,
         Self::Console,
@@ -78,6 +89,7 @@ impl Tab {
         use super::icons;
         match self {
             Self::Hierarchy => icons::list_tree(),
+            Self::Scenes => icons::globe(),
             Self::Inspector => icons::sliders(),
             Self::Environment => icons::mountain_snow(),
             Self::Performance => icons::activity(),
@@ -91,6 +103,7 @@ impl Tab {
     pub fn title(self) -> &'static str {
         match self {
             Self::Hierarchy => "Hierarchy",
+            Self::Scenes => "Scenes",
             Self::Inspector => "Inspector",
             Self::Environment => "Environment",
             Self::Performance => "Profiler",
@@ -110,6 +123,20 @@ pub struct Dock {
     region: egui::Rect,
     tools: Vec<egui::Rect>,
     viewport: Option<egui::Rect>,
+    /// The tab under the primary button since it went down, if it went down
+    /// on one. See the module docs on dragging a tab out.
+    grab: Option<Grab>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Grab {
+    tab: Tab,
+    /// Where the press was, relative to the top-left of the tab's tool, so
+    /// the window it floats into keeps the tab under the pointer.
+    offset: egui::Vec2,
+    /// The tool's size as it was grabbed.
+    size: egui::Vec2,
+    dragged: bool,
 }
 
 impl Default for Dock {
@@ -130,7 +157,11 @@ pub fn default_layout() -> DockState<Tab> {
     let mut state = DockState::new(Vec::new());
     let surface = state.main_surface_mut();
 
-    let [viewport, _] = surface.split_left(NodeIndex::root(), HIERARCHY, vec![Tab::Hierarchy]);
+    let [viewport, _] = surface.split_left(
+        NodeIndex::root(),
+        HIERARCHY,
+        vec![Tab::Hierarchy, Tab::Scenes],
+    );
     let [viewport, _] = surface.split_right(
         viewport,
         INSPECTOR,
@@ -151,12 +182,15 @@ impl Dock {
         Self::with_layout(saved.unwrap_or_else(default_layout))
     }
 
-    fn with_layout(state: DockState<Tab>) -> Self {
+    fn with_layout(mut state: DockState<Tab>) -> Self {
+        // Carried in the saved layout, so set on every load rather than once.
+        state.translations.tab_context_menu.eject_button = "Float in a window".to_owned();
         Self {
             state,
             region: egui::Rect::EVERYTHING,
             tools: Vec::new(),
             viewport: None,
+            grab: None,
         }
     }
 
@@ -188,14 +222,142 @@ impl Dock {
     /// Bring the Import tab forward, restoring it first if it was closed — as
     /// it is in every layout saved before it existed.
     pub fn show_import(&mut self) {
-        if !self.is_open(Tab::Import) {
-            self.restore(Tab::Import);
+        self.bring_forward(Tab::Import);
+    }
+
+    /// Bring `tab` forward, restoring it first if it was closed.
+    pub fn bring_forward(&mut self, tab: Tab) {
+        if !self.is_open(tab) {
+            self.restore(tab);
         }
-        self.activate(Tab::Import);
+        self.activate(tab);
     }
 
     pub fn is_open(&self, tab: Tab) -> bool {
         self.state.find_tab(&tab).is_some()
+    }
+
+    /// Whether `tab` is in a window of its own rather than in the dock.
+    pub fn is_floating(&self, tab: Tab) -> bool {
+        self.state
+            .find_tab(&tab)
+            .is_some_and(|(surface, _, _)| !surface.is_main())
+    }
+
+    /// Do what a tool's own controls asked for last frame.
+    pub fn apply(&mut self, request: DockRequest) {
+        match request {
+            DockRequest::Show(tab) => self.bring_forward(tab),
+            DockRequest::Float(tab) => self.float(tab),
+            DockRequest::Dock(tab) => self.dock_back(tab),
+        }
+    }
+
+    /// Move `tab` into a window of its own, opening it if it was closed. The
+    /// window starts beside the left column, at a tool's width and most of the
+    /// window's height, where it covers the scene's edge rather than its
+    /// middle.
+    fn float(&mut self, tab: Tab) {
+        if !self.is_floating(tab) {
+            if let Some(location) = self.state.find_tab(&tab) {
+                self.state.remove_tab(location);
+            }
+            let surface = self.state.add_window(vec![tab]);
+            let rect = window_rect(self.region);
+            if let Some(window) = self.state.get_window_state_mut(surface) {
+                window.set_position(rect.min).set_size(rect.size());
+            }
+        }
+        self.activate(tab);
+    }
+
+    /// Float `tab` in a window whose top-left is `at`, of `size` unless it is
+    /// already alone in a window, which is moved and keeps its own.
+    fn float_at(&mut self, tab: Tab, at: egui::Pos2, size: egui::Vec2) {
+        let Some(location) = self.state.find_tab(&tab) else {
+            return;
+        };
+        let surface = location.0;
+        if !surface.is_main() && self.state[surface].num_tabs() == 1 {
+            if let Some(window) = self.state.get_window_state_mut(surface) {
+                window.set_position(at);
+            }
+        } else {
+            self.state.remove_tab(location);
+            let surface = self.state.add_window(vec![tab]);
+            if let Some(window) = self.state.get_window_state_mut(surface) {
+                window.set_position(at).set_size(size);
+            }
+        }
+        self.activate(tab);
+    }
+
+    /// Follow a press on a tab through to its release, and float the tab if
+    /// it was let go over no tool. Runs after the area has drawn but against
+    /// the tools of the frame before: those are what egui_dock resolved the
+    /// drop against.
+    fn track_grab(&mut self, ctx: &egui::Context, pressed: Option<Tab>) {
+        let (down, released, dragging, origin, pos) = ctx.input(|input| {
+            let pointer = &input.pointer;
+            (
+                pointer.primary_down(),
+                pointer.primary_released(),
+                pointer.is_decidedly_dragging(),
+                pointer.press_origin(),
+                pointer.interact_pos(),
+            )
+        });
+        if let Some(grab) = &mut self.grab {
+            grab.dragged |= dragging;
+        } else if down
+            && let (Some(tab), Some(origin)) = (pressed, origin)
+            && let Some((surface, node, _)) = self.state.find_tab(&tab)
+            && let Some(rect) = self.state[surface][node].rect()
+        {
+            self.grab = Some(Grab {
+                tab,
+                offset: origin - rect.min,
+                size: rect.size(),
+                dragged: false,
+            });
+        }
+        if !released {
+            if !down {
+                self.grab = None;
+            }
+            return;
+        }
+        let (Some(grab), Some(pos)) = (self.grab.take(), pos) else {
+            return;
+        };
+        if !grab.dragged || self.tools.iter().any(|tool| tool.contains(pos)) {
+            return;
+        }
+        let size = if self.is_floating(grab.tab) {
+            grab.size
+        } else {
+            grab.size
+                .clamp(FLOAT_MIN, WINDOW_SIZE)
+                .min(self.region.size() * 0.9)
+        };
+        // A press far along a wide strip would otherwise leave a narrower
+        // window entirely to the left of the pointer.
+        let offset = egui::vec2(
+            grab.offset.x.clamp(0.0, (size.x - 24.0).max(0.0)),
+            grab.offset.y,
+        );
+        self.float_at(grab.tab, pos - offset, size);
+    }
+
+    /// Put a floating `tab` back where the default layout keeps it.
+    fn dock_back(&mut self, tab: Tab) {
+        if let Some(location) = self.state.find_tab(&tab)
+            && !location.0.is_main()
+        {
+            self.state.remove_tab(location);
+            self.restore(tab);
+        }
+        self.activate(tab);
     }
 
     /// Close an open tool, or bring a closed one back to the layout it belongs
@@ -243,12 +405,15 @@ impl Dock {
         registry: &Registry,
         previews: &mut Previews,
     ) {
+        let floating = Tab::ALL.map(|tab| self.is_floating(tab));
         let mut viewer = Viewer {
             world,
             state,
             registry,
             previews,
+            floating,
             buttons: Vec::new(),
+            pressed: None,
         };
 
         let style = dock_style(&ctx.style());
@@ -288,7 +453,7 @@ impl Dock {
                         _ => None,
                     })
                     .collect();
-                for (tab, rect) in &viewer.buttons {
+                for (tab, rect, layer) in &viewer.buttons {
                     let open = open.contains(tab);
                     let colour = if open { text } else { weak };
                     let glyph = egui::Rect::from_center_size(
@@ -298,15 +463,24 @@ impl Dock {
                         ),
                         egui::Vec2::splat(super::icons::ROW - 2.0),
                     );
-                    super::icons::paint(ui, tab.icon(), glyph, colour);
+                    // A floating tool's strip is in its window's layer, above
+                    // this one: painted here, the window would cover it.
+                    if *layer == ui.layer_id() {
+                        super::icons::paint(ui, tab.icon(), glyph, colour);
+                    } else {
+                        let painter = ui.ctx().layer_painter(*layer);
+                        super::icons::paint_on(&painter, tab.icon(), glyph, colour);
+                    }
                 }
             });
+        self.track_grab(ctx, viewer.pressed);
 
         let Self {
             state,
             tools,
             viewport,
             region,
+            ..
         } = self;
         tools.clear();
         tools.extend(
@@ -354,6 +528,28 @@ impl Dock {
         }
         self.region.contains(pos) && !self.tools.iter().any(|tool| tool.contains(pos))
     }
+}
+
+/// A floated tool's window: a tool's width and most of the window's height.
+/// A tool dragged out keeps its own size between this and [`FLOAT_MIN`], so
+/// the Console does not come away as wide as the strip it was docked in.
+const WINDOW_SIZE: egui::Vec2 = egui::vec2(360.0, 560.0);
+const FLOAT_MIN: egui::Vec2 = egui::vec2(260.0, 220.0);
+
+/// Where a newly floated tool's window goes inside `region`, the area the dock
+/// had last frame — or a fixed spot before the first frame has measured it.
+fn window_rect(region: egui::Rect) -> egui::Rect {
+    const SIZE: egui::Vec2 = WINDOW_SIZE;
+    if !region.is_finite() {
+        return egui::Rect::from_min_size(egui::pos2(80.0, 80.0), SIZE);
+    }
+    let size = SIZE.min(region.size() * 0.9);
+    let left = region.left() + region.width() * HIERARCHY + 16.0;
+    let min = egui::pos2(
+        left.min(region.right() - size.x),
+        region.top() + (region.height() - size.y) / 2.0,
+    );
+    egui::Rect::from_min_size(min, size)
 }
 
 /// Where the largest empty node of `tree` landed.
@@ -507,9 +703,13 @@ struct Viewer<'a> {
     state: &'a mut EditorState,
     registry: &'a Registry,
     previews: &'a mut Previews,
-    /// Where each tab's button landed this frame, and whether it is the open
-    /// one, for the icons painted into them once the area has drawn.
-    buttons: Vec<(Tab, egui::Rect)>,
+    /// Which tools are in windows, by their place in [`Tab::ALL`].
+    floating: [bool; Tab::ALL.len()],
+    /// Where each tab's button landed this frame, and on which layer, for the
+    /// icons painted into them once the area has drawn.
+    buttons: Vec<(Tab, egui::Rect, egui::LayerId)>,
+    /// The tab the primary button is held down on, if any.
+    pressed: Option<Tab>,
 }
 
 /// The gap a tab title leaves at its start for the tool's icon.
@@ -529,7 +729,23 @@ impl egui_dock::TabViewer for Viewer<'_> {
     }
 
     fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
-        self.buttons.push((*tab, response.rect));
+        self.buttons.push((*tab, response.rect, response.layer_id));
+        if response.is_pointer_button_down_on() {
+            self.pressed = Some(*tab);
+        }
+    }
+
+    fn context_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        tab: &mut Tab,
+        surface: egui_dock::SurfaceIndex,
+        _node: NodeIndex,
+    ) {
+        if !surface.is_main() && ui.button("Dock back").clicked() {
+            self.state.request_dock(DockRequest::Dock(*tab));
+            ui.close_menu();
+        }
     }
 
     fn id(&mut self, tab: &mut Tab) -> egui::Id {
@@ -558,7 +774,11 @@ impl egui_dock::TabViewer for Viewer<'_> {
             Tab::Inspector => {
                 panels::inspector::body(ui, self.world, self.state, self.registry, self.previews)
             }
-            Tab::Environment => panels::environment::body(ui, self.world),
+            Tab::Scenes => {
+                let floating = self.floating[Tab::ALL.iter().position(|t| t == tab).unwrap_or(0)];
+                panels::scenes::body(ui, self.world, self.state, floating)
+            }
+            Tab::Environment => panels::environment::body(ui, self.world, self.state),
             Tab::Performance => panels::performance::body(ui, self.world),
             Tab::Console => panels::console::body(ui, self.world, self.state),
             Tab::Assets => panels::assets::body(ui, self.world, self.state, self.previews),

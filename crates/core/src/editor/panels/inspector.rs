@@ -1379,7 +1379,13 @@ mod tests {
             .collect();
         assert_eq!(
             generic,
-            ["orrin.tag", "orrin.collider", "orrin.spin", "orrin.locked"],
+            [
+                "orrin.tag",
+                "orrin.collider",
+                "orrin.spin",
+                "orrin.locked",
+                "orrin.render_settings"
+            ],
             "registration order changed, or a component gained/lost a section"
         );
     }

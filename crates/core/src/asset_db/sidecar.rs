@@ -48,6 +48,7 @@ pub enum AssetKind {
     Mesh,
     Prefab,
     Material,
+    Scene,
     Folder,
 }
 
@@ -65,6 +66,7 @@ impl AssetKind {
             "gltf" | "glb" => Some(Self::Mesh),
             "fprefab" => Some(Self::Prefab),
             super::material::EXTENSION => Some(Self::Material),
+            crate::scene::loaded::EXTENSION => Some(Self::Scene),
             _ => None,
         }
     }
@@ -76,6 +78,7 @@ impl AssetKind {
             Self::Mesh => "mesh",
             Self::Prefab => "prefab",
             Self::Material => "material",
+            Self::Scene => "scene",
             Self::Folder => "folder",
         }
     }
@@ -154,7 +157,9 @@ impl Settings {
                 max_size: 0,
             }),
             AssetKind::Mesh => Self::Mesh(MeshSettings { scale: 1.0 }),
-            AssetKind::Prefab | AssetKind::Material | AssetKind::Folder => Self::None,
+            AssetKind::Prefab | AssetKind::Material | AssetKind::Scene | AssetKind::Folder => {
+                Self::None
+            }
         }
     }
 

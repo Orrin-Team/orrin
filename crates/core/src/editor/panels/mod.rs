@@ -7,6 +7,7 @@ pub(super) mod import;
 pub(super) mod inspector;
 mod menu_bar;
 pub(super) mod performance;
+pub(super) mod scenes;
 #[cfg(feature = "scripting")]
 pub(super) mod scripts;
 mod status_bar;
@@ -46,6 +47,11 @@ pub fn draw(
     previews: &mut Previews,
 ) {
     shortcuts(ctx, world, state);
+    // Asked for by a tool's own controls last frame, while the dock was
+    // drawing them and so could not move.
+    if let Some(request) = state.take_dock_request() {
+        dock.apply(request);
+    }
     // Before the dock, so a command that rearranges the layout is reflected in
     // the same frame rather than the next one.
     menu_bar::show(ctx, world, registry, state, themes, dock);
@@ -60,12 +66,78 @@ pub fn draw(
         viewport::marquee(ctx, world, state, dock, rect);
         viewport::select_on_click(ctx, world, state, dock, rect);
     }
+    if let Some(rel) = state.pending_delete().map(str::to_owned) {
+        confirm_delete(ctx, world, state, &rel);
+    }
     // A drag ends with the button and a typed edit with the field, so the
     // gesture they make stays open while either is still held. Read after the
     // widgets, which are what let go of the focus.
     let holding = ctx.input(|input| input.pointer.any_down())
         || ctx.memory(|memory| memory.focused().is_some());
     state.hold(holding);
+}
+
+/// The one question every delete asks, whichever tool it came from: what goes,
+/// and that it does not come back.
+///
+/// A modal rather than a line in the tool, because the answer is
+/// irreversible and the tool asking may be scrolled, narrow or floating —
+/// this is the one place in the editor that takes the whole window to ask.
+fn confirm_delete(ctx: &egui::Context, world: &World, state: &mut EditorState, rel: &str) {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let inside = world
+        .get_resource::<crate::asset_db::AssetDatabase>()
+        .filter(|db| db.folders().iter().any(|folder| folder.path == rel))
+        .map(|db| {
+            let prefix = format!("{rel}/");
+            db.iter()
+                .filter(|entry| entry.path.starts_with(&prefix))
+                .count()
+        });
+    let modal = egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
+        ui.set_width(340.0);
+        ui.label(
+            egui::RichText::new(format!("Delete {name}?"))
+                .size(15.0)
+                .strong(),
+        );
+        ui.add_space(6.0);
+        let what = match inside {
+            Some(0) => "The folder is removed from disk.".to_owned(),
+            Some(1) => "The folder and the asset in it are removed from disk.".to_owned(),
+            Some(n) => format!("The folder and the {n} assets in it are removed from disk."),
+            None => format!("{rel} and its id are removed from disk."),
+        };
+        ui.label(what);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Anything that uses it draws a placeholder until it is replaced. \
+                     This cannot be undone.",
+                )
+                .color(ui.visuals().weak_text_color()),
+            )
+            .wrap(),
+        );
+        ui.add_space(10.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let delete = egui::Button::new(
+                egui::RichText::new("Delete")
+                    .color(super::theme::ERROR)
+                    .strong(),
+            );
+            if ui.add(delete).clicked() {
+                state.resolve_delete(true);
+            }
+            if ui.button("Cancel").clicked() {
+                state.resolve_delete(false);
+            }
+        });
+    });
+    // Escape, or a click on the dimmed window around it.
+    if modal.should_close() && state.pending_delete().is_some() {
+        state.resolve_delete(false);
+    }
 }
 
 /// Every surface above the panels — the viewport's floating controls, menus,
@@ -539,6 +611,22 @@ mod tests {
                 self.input.events.push(egui::Event::PointerButton {
                     pos: at,
                     button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            self.frames(1);
+            self.input.events.clear();
+            self
+        }
+
+        /// A secondary press and release at `at`: what opens a context menu.
+        fn right_click(&mut self, at: egui::Pos2) -> &mut Self {
+            self.input.events.push(egui::Event::PointerMoved(at));
+            for pressed in [true, false] {
+                self.input.events.push(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Secondary,
                     pressed,
                     modifiers: Default::default(),
                 });
@@ -3216,7 +3304,7 @@ mod tests {
                         ui.allocate_ui(cell, |ui| {
                             inspector::body(ui, world, state, registry, previews)
                         });
-                        ui.allocate_ui(cell, |ui| environment::body(ui, world));
+                        ui.allocate_ui(cell, |ui| environment::body(ui, world, state));
                         ui.allocate_ui(cell, |ui| performance::body(ui, world));
                         ui.allocate_ui(cell, |ui| console::body(ui, world, state));
                         ui.allocate_ui(cell, |ui| assets::body(ui, world, state, previews));
@@ -3893,6 +3981,765 @@ mod tests {
             editor.state.history.is_dirty(),
             "the delete is still unsaved"
         );
+    }
+
+    /// A persistent scene holding one entity called `Music`, written to a file
+    /// of its own.
+    fn persistent_scene(editor: &Harness, tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("orrin-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("persistent.orrin");
+        let mut source = World::new();
+        let music = source.spawn();
+        source.insert(music, Name::new("Music"));
+        std::fs::write(&path, crate::scene::save(&mut source, &editor.registry)).unwrap();
+        path
+    }
+
+    /// Play is the game starting, so the project's persistent scene loads
+    /// beside the scene being played, and goes with the fork on Stop.
+    #[test]
+    fn play_loads_the_persistent_scene_beside_the_scene() {
+        use crate::scene::{InScene, LoadedScenes};
+
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.spawn("Hub");
+        editor.state.persistent_scene = Some(persistent_scene(&editor, "play-persistent"));
+
+        toggle_play(&mut editor);
+        let music = named(&editor.world, "Music").expect("the persistent scene loaded");
+        assert!(editor.world.get::<InScene>(music).is_some());
+        assert!(named(&editor.world, "Hub").is_some());
+        let persistent: Vec<String> = editor
+            .world
+            .resource::<LoadedScenes>()
+            .iter()
+            .filter(|scene| scene.persistent)
+            .map(|scene| scene.name.clone())
+            .collect();
+        assert_eq!(persistent, ["persistent"]);
+
+        toggle_play(&mut editor);
+        assert!(named(&editor.world, "Music").is_none());
+        assert_eq!(editor.world.resource::<LoadedScenes>().iter().count(), 1);
+    }
+
+    /// Playing the persistent scene itself must not load a second copy of it
+    /// beside the first.
+    #[test]
+    fn playing_the_persistent_scene_loads_it_once() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let path = persistent_scene(&editor, "play-persistent-itself");
+        editor.state.request_open_scene(path.to_string_lossy());
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor.state.persistent_scene = Some(path);
+
+        toggle_play(&mut editor);
+        let copies = editor
+            .world
+            .entities()
+            .filter(|&e| editor.world.get::<Name>(e).is_some_and(|n| n.0 == "Music"))
+            .count();
+        assert_eq!(copies, 1);
+    }
+
+    fn with_database(editor: &mut Harness, dir: &crate::asset_db::tests::Dir) {
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        editor.world.insert_resource(db);
+    }
+
+    fn logged(editor: &Harness) -> Vec<String> {
+        editor
+            .world
+            .resource::<crate::scene::LogBuffer>()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect()
+    }
+
+    /// Where the text `needle` was painted, if it was.
+    fn text_at(editor: &Harness, needle: &str) -> Option<egui::Pos2> {
+        editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| text == needle)
+            .map(|(_, rect)| rect.center())
+    }
+
+    /// The Scene Manager can leave the dock for a window of its own, and go
+    /// back to where it came from, from a button on the tool itself.
+    #[test]
+    fn the_scene_manager_pops_out_into_a_window_and_docks_back() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+        let docked = editor.tab(Tab::Scenes);
+        assert_eq!(docked, editor.tab(Tab::Hierarchy));
+
+        let button = icon_in(
+            &editor,
+            crate::editor::icons::arrow_square_out(),
+            editor.tab_body(Tab::Scenes),
+        )
+        .expect("pop-out button");
+        editor.click(button).frames(2);
+        assert!(editor.dock.is_floating(Tab::Scenes));
+        let window = editor.tab(Tab::Scenes);
+        assert_ne!(window, docked);
+        assert!(
+            editor.dock.is_open(Tab::Hierarchy),
+            "the dock keeps its other tools"
+        );
+        assert!(
+            !editor.dock.over_scene(&editor.ctx, window.center()),
+            "a click on the window must not reach the scene behind it"
+        );
+
+        let button = icon_in(&editor, crate::editor::icons::arrow_square_in(), window)
+            .expect("dock-back button");
+        editor.click(button).frames(2);
+        assert!(!editor.dock.is_floating(Tab::Scenes));
+        assert_eq!(editor.tab(Tab::Scenes), editor.tab(Tab::Hierarchy));
+    }
+
+    /// Tab icons are painted by the dock over the strip egui_dock drew. A
+    /// window's strip is above the panels, so its icon must be painted there
+    /// too, or the window covers it.
+    #[test]
+    fn a_floating_tools_tab_icon_is_drawn_over_its_window() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor
+            .dock
+            .apply(crate::editor::state::DockRequest::Float(Tab::Scenes));
+        editor.frames(2);
+        let Harness {
+            world,
+            registry,
+            state,
+            themes,
+            dock,
+            previews,
+            ctx,
+            input,
+            ..
+        } = &mut editor;
+        let output = ctx.run(input.clone(), |ctx| {
+            draw(ctx, world, state, registry, themes, dock, previews);
+            phases::mark(ctx);
+        });
+        let window = {
+            let (surface, node, _) = dock.state().find_tab(&Tab::Scenes).unwrap();
+            dock.state()[surface][node].rect().unwrap()
+        };
+        let [panels, ..] = phases::split(output.shapes);
+        let under = panels.iter().any(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) => {
+                text.galley.text() == Tab::Scenes.icon().glyph().to_string()
+                    && window.contains(text.visual_bounding_rect().center())
+            }
+            _ => false,
+        });
+        assert!(!under, "the Scenes tab icon was painted beneath its window");
+    }
+
+    /// Where `tab`'s title was painted in its strip.
+    fn tab_title(editor: &Harness, tab: Tab) -> egui::Pos2 {
+        let leaf = editor.tab(tab);
+        let strip = egui::Rect::from_min_size(leaf.min, egui::vec2(leaf.width(), TAB_BAR_HEIGHT));
+        editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, rect)| text == tab.title() && strip.contains(rect.center()))
+            .map(|(_, rect)| rect.center())
+            .unwrap_or_else(|| panic!("no {} tab in its strip", tab.title()))
+    }
+
+    /// A press at `from`, a drag to `to` in steps, a pause there and a
+    /// release, one frame each, as a hand delivers it. The pause matters:
+    /// egui_dock holds on to the target a fast drag passed over for a moment.
+    fn drag_tab(editor: &mut Harness, from: egui::Pos2, to: egui::Pos2) {
+        pointer(editor, egui::Event::PointerMoved(from));
+        pointer(editor, button(from, true));
+        for step in 1..=6 {
+            let at = from + (to - from) * (step as f32 / 6.0);
+            pointer(editor, egui::Event::PointerMoved(at));
+        }
+        editor.frames(30);
+        pointer(editor, button(to, false));
+        editor.frames(2);
+    }
+
+    /// A tab dragged out over the scene leaves the dock for a window of its
+    /// own where it was let go, and the tools it shared a strip with stay.
+    #[test]
+    fn a_tab_dragged_onto_the_scene_floats_where_it_is_dropped() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let to = editor.viewport().center();
+        let from = tab_title(&editor, Tab::Console);
+        drag_tab(&mut editor, from, to);
+
+        assert!(editor.dock.is_floating(Tab::Console));
+        let window = editor.tab(Tab::Console);
+        assert!(
+            under_the_strip(window, to),
+            "the window opened at {window:?}, not under the pointer at {to:?}"
+        );
+        assert!(editor.dock.is_open(Tab::Assets));
+        assert!(!editor.dock.is_floating(Tab::Assets));
+    }
+
+    /// Dropped on another tool's strip, a tab joins it: the drop onto the
+    /// scene must not take drops that were egui_dock's to place.
+    #[test]
+    fn a_tab_dragged_onto_another_strip_docks_there() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let strip = editor.tab(Tab::Inspector);
+        let to = egui::pos2(strip.right() - 30.0, strip.top() + TAB_BAR_HEIGHT / 2.0);
+        let from = tab_title(&editor, Tab::Console);
+        drag_tab(&mut editor, from, to);
+
+        assert!(!editor.dock.is_floating(Tab::Console));
+        assert_eq!(editor.tab(Tab::Console), editor.tab(Tab::Inspector));
+    }
+
+    /// A click on a tab only brings it forward.
+    #[test]
+    fn a_click_on_a_tab_does_not_float_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let at = tab_title(&editor, Tab::Assets);
+        drag_tab(&mut editor, at, at + egui::vec2(1.0, 0.0));
+        assert!(!editor.dock.is_floating(Tab::Assets));
+    }
+
+    /// A window's tab is also its handle: dragged over the scene, the window
+    /// follows rather than staying where it was.
+    #[test]
+    fn a_floating_tool_dragged_by_its_tab_moves_its_window() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor
+            .dock
+            .apply(crate::editor::state::DockRequest::Float(Tab::Scenes));
+        editor.frames(2);
+        let before = editor.tab(Tab::Scenes);
+        // High enough that the window still fits below it: egui keeps a
+        // window on screen, so a lower drop lands it higher than the pointer.
+        let to = egui::pos2(before.right() + 200.0, 150.0);
+        assert!(editor.viewport().contains(to));
+        let from = tab_title(&editor, Tab::Scenes);
+        drag_tab(&mut editor, from, to);
+
+        assert!(editor.dock.is_floating(Tab::Scenes));
+        let after = editor.tab(Tab::Scenes);
+        assert!(
+            under_the_strip(after, to),
+            "the window went from {before:?} to {after:?}, not under {to:?}"
+        );
+        assert_eq!(after.size(), before.size());
+    }
+
+    /// Whether `at` is on the tab strip of a window at `window`: where the
+    /// pointer that carried the window there would be.
+    fn under_the_strip(window: egui::Rect, at: egui::Pos2) -> bool {
+        window.x_range().expand(1.0).contains(at.x)
+            && (window.top() - 1.0..=window.top() + TAB_BAR_HEIGHT + 1.0).contains(&at.y)
+    }
+
+    /// Opening another scene over unsaved work asks first, and offers to save
+    /// it, rather than throwing the work away on a click.
+    #[test]
+    fn opening_a_scene_over_unsaved_changes_asks_first() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-guard");
+        let text = {
+            let mut source = World::new();
+            let gate = source.spawn();
+            source.insert(gate, Name::new("Gate"));
+            crate::scene::save(&mut source, &Harness::new(egui::vec2(10.0, 10.0)).registry)
+        };
+        dir.write("levels/castle.orrin", text.as_bytes());
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.state.scene_path = dir.path().join("hub.orrin").to_string_lossy().into_owned();
+        delete_by_key(&mut editor, "Old crate");
+        editor.spawn("Keep");
+        assert!(editor.state.scene_dirty());
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+
+        let row = text_at(&editor, "castle").expect("castle is listed");
+        editor.click(row).frames(1);
+        let open = text_at(&editor, "Open").expect("an Open button on the chosen row");
+        editor.click(open);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor.frames(1);
+        assert!(
+            named(&editor.world, "Keep").is_some(),
+            "nothing was opened yet"
+        );
+        assert!(editor.painted_contains("unsaved changes"));
+
+        let save = text_at(&editor, "Save and open").expect("a save-first choice");
+        editor.click(save);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(
+            named(&editor.world, "Gate").is_some(),
+            "{:?}",
+            logged(&editor)
+        );
+        let saved = std::fs::read_to_string(dir.path().join("hub.orrin")).unwrap();
+        assert!(
+            saved.contains("Keep"),
+            "the work was saved before the switch"
+        );
+        assert!(!editor.state.scene_dirty());
+    }
+
+    /// Without unsaved work there is nothing to ask about.
+    #[test]
+    fn opening_a_saved_scene_does_not_ask() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-clean-open");
+        dir.write("levels/castle.orrin", b"orrin-scene 3 min-reader 3\n");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+        let row = text_at(&editor, "castle").unwrap();
+        editor.click(row).frames(1);
+        editor.click(text_at(&editor, "Open").unwrap());
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(editor.state.scene_path.ends_with("castle.orrin"));
+    }
+
+    /// A long list narrows as a name is typed.
+    #[test]
+    fn the_project_scenes_filter_by_name() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-filter");
+        dir.write("levels/castle.orrin", b"");
+        dir.write("levels/dungeon.orrin", b"");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.state.scenes_query = "cas".to_owned();
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+        assert!(editor.painted_contains("castle"));
+        assert!(!editor.painted_contains("dungeon"));
+    }
+
+    /// A new scene's name is checked before Create is pressed, by the same
+    /// rule the request is checked by.
+    #[test]
+    fn a_new_scene_name_is_checked_before_it_is_used() {
+        use crate::editor::state::new_scene_path;
+
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-check");
+        dir.write("scenes/castle.orrin", b"");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+
+        assert!(new_scene_path(&editor.world, "  ").is_err());
+        let slashed = new_scene_path(&editor.world, "a/b").unwrap_err();
+        assert!(slashed.contains("slashes"), "{slashed}");
+        let taken = new_scene_path(&editor.world, "castle").unwrap_err();
+        assert!(taken.contains("already"), "{taken}");
+        let fresh = new_scene_path(&editor.world, "keep").unwrap();
+        assert!(fresh.ends_with("scenes/keep.orrin"));
+    }
+
+    /// The header names the file the way the project does — relative, with
+    /// forward slashes — not by the extended-length absolute path Windows
+    /// hands back for a canonicalised directory.
+    #[test]
+    fn the_scene_manager_shows_the_scene_file_short() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-short-path");
+        dir.write("scenes/new_scene.orrin", b"orrin-scene 3 min-reader 3\n");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        let full = std::fs::canonicalize(dir.path().join("scenes/new_scene.orrin")).unwrap();
+        editor.state.scene_path = full.to_string_lossy().into_owned();
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+
+        let body = editor.tab_body(Tab::Scenes);
+        let shown: Vec<String> = editor
+            .painted_text_rects()
+            .into_iter()
+            .filter(|(_, rect)| body.contains(rect.center()))
+            .map(|(text, _)| text)
+            .collect();
+        assert!(
+            shown.iter().any(|text| text == "scenes/new_scene.orrin"),
+            "{shown:?}"
+        );
+        assert!(
+            !shown
+                .iter()
+                .any(|text| text.contains(r"\\?\") || text.contains("Documents")),
+            "{shown:?}"
+        );
+    }
+
+    fn painted_rect_of(editor: &Harness, needle: &str) -> Option<egui::Rect> {
+        editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| text == needle)
+            .map(|(_, rect)| rect)
+    }
+
+    /// The filter has the row to itself bar a plus, and the new scene's name
+    /// is asked for below it only once the plus is pressed: two empty wells
+    /// side by side read as one field cut in half.
+    #[test]
+    fn a_new_scene_is_named_below_the_filter_once_asked_for() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-row");
+        dir.write("levels/castle.orrin", b"");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(3);
+
+        let body = editor.tab_body(Tab::Scenes);
+        let filter = painted_rect_of(&editor, "Filter scenes").expect("a filter");
+        assert!(painted_rect_of(&editor, "Scene name").is_none());
+        let row = egui::Rect::from_x_y_ranges(
+            body.x_range(),
+            (filter.center().y - 8.0)..=(filter.center().y + 8.0),
+        );
+        let plus = icon_in(&editor, crate::editor::icons::plus(), row).expect("a plus");
+        assert!(
+            plus.x > body.right() - 40.0,
+            "the plus ends the filter's row"
+        );
+
+        editor.click(plus).frames(1);
+        let name = painted_rect_of(&editor, "Scene name").expect("a name field");
+        assert!(name.top() > filter.bottom(), "the name is asked for below");
+        let create = painted_rect_of(&editor, "Create").expect("a create button");
+        assert!(body.contains(create.center()));
+    }
+
+    /// Named in place, a scene is made with Enter, the way a rename is.
+    #[test]
+    fn a_new_scene_is_made_from_its_field_with_enter() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-enter");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(3);
+        let filter = painted_rect_of(&editor, "Filter scenes").expect("a filter");
+        let row = egui::Rect::from_x_y_ranges(
+            editor.tab_body(Tab::Scenes).x_range(),
+            (filter.center().y - 8.0)..=(filter.center().y + 8.0),
+        );
+        let plus = icon_in(&editor, crate::editor::icons::plus(), row).expect("a plus");
+        editor.click(plus).frames(1);
+
+        editor
+            .input
+            .events
+            .push(egui::Event::Text("Level 3".to_owned()));
+        editor.frames(1);
+        editor.input.events.clear();
+        editor.key(egui::Key::Enter);
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        assert!(
+            dir.path().join("scenes/Level 3.orrin").is_file(),
+            "{:?}",
+            logged(&editor)
+        );
+        assert!(std::path::Path::new(&editor.state.scene_path).ends_with("scenes/Level 3.orrin"));
+    }
+
+    /// The project's scenes are what the tool is opened for; the renderer's
+    /// switches come after them, not between the header and the list.
+    #[test]
+    fn the_scene_list_comes_before_the_renderer() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-order");
+        dir.write("levels/castle.orrin", b"");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(3);
+        let castle = painted_rect_of(&editor, "castle").expect("castle is listed");
+        let renderer = painted_rect_of(&editor, "Renderer").expect("a renderer section");
+        assert!(castle.top() < renderer.top());
+    }
+
+    /// Docked at the hierarchy's width, a switch still says which pass it
+    /// turns off: a property row cut "Ambient …" and "Volumetri…".
+    #[test]
+    fn the_renderer_switches_keep_their_names_when_docked() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(3);
+        fn collect(shape: &egui::Shape, out: &mut Vec<(String, bool)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text.galley.elided))
+                }
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for clipped in &editor.output.as_ref().unwrap().shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        // An elided galley still reports its whole text; the flag is what
+        // says it was cut.
+        for name in ["Ambient occlusion", "Temporal AA", "Volumetric fog"] {
+            let (_, elided) = texts
+                .iter()
+                .find(|(text, _)| text == name)
+                .unwrap_or_else(|| panic!("{name} was not painted"));
+            assert!(!elided, "{name} was cut short");
+        }
+    }
+
+    /// Whether the scene is saved is said beside its name, where the eye
+    /// already is, not at the far edge of a wide window.
+    #[test]
+    fn the_save_state_sits_beside_the_scene_name() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor
+            .dock
+            .apply(crate::editor::state::DockRequest::Float(Tab::Scenes));
+        editor.frames(3);
+        let name = crate::scene::loaded::name_of(&editor.state.scene_path);
+        let title = painted_rect_of(&editor, &name).expect("the scene's name");
+        let pill = painted_rect_of(&editor, "Saved").expect("the save state");
+        assert!((pill.center().y - title.center().y).abs() < 6.0);
+        assert!(pill.left() > title.right() && pill.left() - title.right() < 24.0);
+    }
+
+    /// The renderer section says where the settings live; choosing the entity
+    /// is the hierarchy's job, not a button's here.
+    #[test]
+    fn the_renderer_section_has_no_select_button() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.state.request_add_render_settings();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+        let body = editor.tab_body(Tab::Scenes);
+        assert!(
+            !editor
+                .painted_text_rects()
+                .into_iter()
+                .any(|(text, rect)| text == "Select" && body.contains(rect.center()))
+        );
+    }
+
+    /// A scene is deleted only once the user has said yes to a dialog that
+    /// says it cannot be undone.
+    #[test]
+    fn deleting_a_scene_asks_and_then_removes_it() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-delete");
+        dir.write("levels/castle.orrin", b"orrin-scene 3 min-reader 3\n");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+
+        editor
+            .right_click(text_at(&editor, "castle").unwrap())
+            .frames(1);
+        editor
+            .click(text_at(&editor, "Delete…").expect("a delete item"))
+            .frames(1);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(
+            dir.path().join("levels/castle.orrin").is_file(),
+            "not before the answer"
+        );
+        assert!(editor.painted_contains("cannot be undone"));
+
+        editor.click(text_at(&editor, "Delete").expect("the confirming button"));
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(!dir.path().join("levels/castle.orrin").exists());
+        assert!(!dir.path().join("levels/castle.orrin.meta").exists());
+        editor.frames(2);
+        let body = editor.tab_body(Tab::Scenes);
+        assert!(
+            !editor
+                .painted_text_rects()
+                .into_iter()
+                .any(|(text, rect)| text == "castle" && body.contains(rect.center())),
+            "the row is gone from the list"
+        );
+    }
+
+    /// Cancel leaves the file where it was.
+    #[test]
+    fn a_cancelled_delete_keeps_the_file() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-delete-cancel");
+        dir.write("levels/castle.orrin", b"");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.state.request_delete_asset("levels/castle.orrin");
+        editor.frames(2);
+        editor.click(text_at(&editor, "Cancel").unwrap());
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(dir.path().join("levels/castle.orrin").is_file());
+        assert!(editor.state.pending_delete().is_none());
+    }
+
+    /// The open scene is what the editor is showing and would save over; it
+    /// is refused by name rather than deleted out from under the session.
+    #[test]
+    fn the_open_scene_cannot_be_deleted() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-delete-open");
+        dir.write("levels/castle.orrin", b"orrin-scene 3 min-reader 3\n");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor
+            .state
+            .request_open_scene(dir.path().join("levels/castle.orrin").to_string_lossy());
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        editor.state.request_delete_asset("levels/castle.orrin");
+        editor.state.resolve_delete(true);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(dir.path().join("levels/castle.orrin").is_file());
+        assert!(
+            logged(&editor).iter().any(|m| m.contains("open scene")),
+            "{:?}",
+            logged(&editor)
+        );
+    }
+
+    /// The asset browser deletes the same way, from an asset's own menu.
+    #[test]
+    fn the_asset_browser_deletes_an_asset_after_asking() {
+        let dir = crate::asset_db::tests::Dir::new("assets-delete");
+        dir.write("rock.png", b"");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(3);
+
+        let rock = text_at(&editor, "rock.png")
+            .or_else(|| text_at(&editor, "rock"))
+            .expect("the asset is listed");
+        editor.right_click(rock).frames(1);
+        editor
+            .click(text_at(&editor, "Delete…").expect("a delete item"))
+            .frames(1);
+        editor.click(text_at(&editor, "Delete").expect("the confirming button"));
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(!dir.path().join("rock.png").exists());
+    }
+
+    /// The header says plainly whether the open scene has unsaved work.
+    #[test]
+    fn the_scene_manager_header_says_whether_the_scene_is_saved() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+        assert!(editor.painted_contains("Saved"));
+        delete_by_key(&mut editor, "Old crate");
+        editor.frames(2);
+        assert!(editor.painted_contains("Unsaved"));
+    }
+
+    /// The project's scenes are listed by name, and nothing that is not a
+    /// scene is.
+    #[test]
+    fn the_scene_manager_lists_the_projects_scenes() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-list");
+        dir.write("levels/castle.orrin", b"");
+        dir.write("levels/dungeon.orrin", b"");
+        dir.write("rock.png", b"");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(3);
+
+        assert!(editor.painted_contains("castle"));
+        assert!(editor.painted_contains("dungeon"));
+        assert!(!editor.painted_contains("rock"));
+    }
+
+    /// Where the renderer's settings live is the thing the window has to make
+    /// plain: in the scene, or nowhere that survives a load.
+    #[test]
+    fn the_scene_manager_says_whether_the_renderer_is_saved_with_the_scene() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+        assert!(editor.painted_contains("Save with scene"));
+
+        editor.state.request_add_render_settings();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor.frames(2);
+        assert!(editor.painted_contains("Saved with the scene"));
+        assert!(!editor.painted_contains("Save with scene"));
+    }
+
+    /// While the game plays, what is loaded is more than the scene file.
+    #[test]
+    fn the_scene_manager_lists_what_is_loaded_while_playing() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.state.persistent_scene = Some(persistent_scene(&editor, "manager-loaded"));
+        toggle_play(&mut editor);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(2);
+        assert!(editor.painted_contains("Persistent"));
+    }
+
+    /// A new scene is a file at once, holding the settings a scene needs to
+    /// be drawn and a sun to see it by, and it is what the editor has open.
+    #[test]
+    fn a_new_scene_is_written_with_render_settings_and_opened() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-new");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.spawn("Old crate");
+
+        editor.state.request_new_scene("Level 2");
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        let file = dir.path().join("scenes").join("Level 2.orrin");
+        assert!(file.is_file(), "{:?}", logged(&editor));
+        assert!(named(&editor.world, "Old crate").is_none());
+        let settings = named(&editor.world, "Render Settings").expect("settings entity");
+        assert!(
+            editor
+                .world
+                .get::<crate::scene::RenderSettings>(settings)
+                .is_some()
+        );
+        assert!(named(&editor.world, "Sun").is_some());
+        assert!(std::path::Path::new(&editor.state.scene_path).ends_with("scenes/Level 2.orrin"));
+        assert!(!editor.state.scene_dirty());
+    }
+
+    /// The name becomes a file name, so it has to be one, and must not take
+    /// the place of a scene that already exists.
+    #[test]
+    fn a_new_scene_refuses_a_name_that_is_not_a_new_file() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-bad-name");
+        dir.write("scenes/castle.orrin", b"kept");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+
+        for name in ["", "  ", "a/b", "castle"] {
+            editor.state.request_new_scene(name);
+            editor.state.apply(&mut editor.world, &editor.registry);
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("scenes/castle.orrin")).unwrap(),
+            b"kept"
+        );
+        assert!(!dir.path().join("scenes/a").exists());
+        let errors = logged(&editor)
+            .into_iter()
+            .filter(|message| message.starts_with("new scene"))
+            .count();
+        assert_eq!(errors, 4, "{:?}", logged(&editor));
     }
 
     /// Stop respawns the scene into new slots; what was selected is selected

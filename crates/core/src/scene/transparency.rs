@@ -1,3 +1,5 @@
+use orrin_registry::Reflect;
+
 /// Whether the frame draws blended geometry at all.
 ///
 /// Frame *structure*, like SSAO and reflections: off is a different graph, not a
@@ -9,7 +11,7 @@
 /// screen. Deriving it would recompile the graph and reallocate every image the
 /// moment the last pane of glass left the frustum, and a toggle is also the A/B
 /// for "is this a transparency bug?".
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct TransparencySettings {
     pub enabled: bool,
 }
@@ -29,7 +31,7 @@ impl Default for TransparencySettings {
 /// pyramid of the frame. A scene with glass but no smoke wants the second
 /// without the first, and separating them is also what makes each its own A/B
 /// when a non-opaque surface looks wrong.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct RefractionSettings {
     pub enabled: bool,
 }

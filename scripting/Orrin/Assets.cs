@@ -9,6 +9,7 @@ static class AssetKinds
     public const uint Mesh = 2;
     public const uint Texture = 3;
     public const uint Material = 4;
+    public const uint Scene = 5;
 
     public static uint Of<T>() where T : Asset
     {
@@ -20,6 +21,8 @@ static class AssetKinds
             return Texture;
         if (typeof(T) == typeof(Orrin.Material))
             return Material;
+        if (typeof(T) == typeof(Orrin.Scene))
+            return Scene;
         throw new ArgumentException($"{typeof(T).Name} is not an asset kind the engine knows");
     }
 }

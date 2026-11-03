@@ -1,3 +1,5 @@
+use orrin_registry::Reflect;
+
 /// Contact shadows: a short screen-space march toward the sun, filling the gap
 /// a cascade always leaves under an object.
 ///
@@ -14,7 +16,7 @@
 /// only records what the camera can see, so everything about the settings below
 /// is about failing quietly where it cannot: the ray is short, it fades with
 /// distance, and it fades at the frame's edge.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct ContactShadowSettings {
     /// Off drops the pass rather than marching a zero-length ray, which is why
     /// it is part of the frame's structure.

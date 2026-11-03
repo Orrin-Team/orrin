@@ -1,6 +1,10 @@
 use orrin_ecs::World;
+use orrin_registry::Reflect;
 
+use crate::editor::state::EditorState;
 use crate::gfx::shadows::MAX_CASCADES;
+use crate::scene::registry::RENDER_SETTINGS;
+use crate::scene::render_settings;
 
 use super::{color_row, vec3_row};
 use crate::editor::widgets;
@@ -68,25 +72,77 @@ fn toggle(ui: &mut egui::Ui, label: &str, value: &mut bool) -> egui::Response {
     widgets::property(ui, label, |ui| ui.checkbox(value, ""))
 }
 
-pub fn body(ui: &mut egui::Ui, world: &mut World) {
-    // A docked tab is as wide as its split, which can be nothing at all.
-    let available = ui.available_width();
-    if available > 0.0 {
-        let columns = column_count(available);
-        ui.columns(columns, |cols| {
-            let mut previous = usize::MAX;
-            for (index, column) in COLUMNS.iter().enumerate() {
-                let target = index * columns / COLUMNS.len();
-                if target == previous {
-                    cols[target].add_space(10.0);
-                    cols[target].separator();
-                }
-                column(&mut cols[target], world);
-                previous = target;
-            }
-        });
+pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
+    // Stacked whatever the parent's layout, so the note sits above the columns
+    // rather than taking their width.
+    ui.vertical(|ui| {
+        if render_settings::source(world).is_none() {
+            unsaved_note(ui, state);
+        }
+        // A docked tab is as wide as its split, which can be nothing at all.
+        let available = ui.available_width();
+        if available > 0.0 {
+            let columns = column_count(available);
+            edit_settings(world, state, |world| {
+                ui.columns(columns, |cols| {
+                    let mut previous = usize::MAX;
+                    for (index, column) in COLUMNS.iter().enumerate() {
+                        let target = index * columns / COLUMNS.len();
+                        if target == previous {
+                            cols[target].add_space(10.0);
+                            cols[target].separator();
+                        }
+                        column(&mut cols[target], world);
+                        previous = target;
+                    }
+                });
+            });
+        }
+        ui.add_space(4.0);
+    });
+}
+
+/// Said where the settings are, because without it nothing on screen tells the
+/// user that the evening's tuning will be gone on the next load.
+pub fn unsaved_note(ui: &mut egui::Ui, state: &mut EditorState) {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new("These settings are not part of the scene, and are lost on load.")
+                .weak(),
+        )
+        .wrap(),
+    );
+    if ui
+        .button("Save with scene")
+        .on_hover_text("Add a Render Settings entity holding them, saved with the scene")
+        .clicked()
+    {
+        state.request_add_render_settings();
     }
     ui.add_space(4.0);
+}
+
+/// Run `draw`, which edits the renderer's resources directly, and carry what it
+/// changed into the scene's [`RenderSettings`](render_settings::RenderSettings)
+/// when the scene has one.
+///
+/// The widgets keep writing resources rather than a copy of the component, so
+/// the same controls serve a scene with settings and one without. The
+/// resources are brought in line with the scene first: the editor draws before
+/// the frame syncs, and without it an edit on the frame after a load would
+/// write the previous scene's values into this one.
+pub fn edit_settings(world: &mut World, state: &mut EditorState, draw: impl FnOnce(&mut World)) {
+    let Some(entity) = render_settings::source(world) else {
+        draw(world);
+        return;
+    };
+    render_settings::sync(world);
+    let before = render_settings::capture(world);
+    draw(world);
+    let after = render_settings::capture(world);
+    if after != before {
+        state.edit(entity, RENDER_SETTINGS, after.to_value());
+    }
 }
 
 fn screen_space_column(ui: &mut egui::Ui, world: &World) {
@@ -260,7 +316,7 @@ fn shadow_column(ui: &mut egui::Ui, world: &World) {
     // recompiles the graph and reallocates the maps, so they are steppers
     // rather than sliders — a drag would do that once per frame.
     widgets::property(ui, "Cascades", |ui| {
-        ui.add(egui::DragValue::new(&mut s.cascade_count).range(1..=MAX_CASCADES));
+        ui.add(egui::DragValue::new(&mut s.cascade_count).range(1..=MAX_CASCADES as u32));
     });
     widgets::property(ui, "Resolution", |ui| {
         egui::ComboBox::from_id_salt("shadow_resolution")
@@ -729,5 +785,104 @@ mod tests {
     fn a_sliver_still_yields_a_usable_count() {
         assert_eq!(column_count(20.0), 1);
         assert_eq!(column_count(0.0), 1);
+    }
+
+    use crate::editor::state::EditorState;
+    use crate::scene::render_settings::{self, RenderSettings};
+    use crate::scene::{FogSettings, Name};
+    use orrin_registry::Registry;
+
+    fn session() -> (World, Registry, EditorState) {
+        let mut world = World::new();
+        crate::App::install_default_resources(&mut world);
+        let mut registry = Registry::new();
+        crate::scene::register_components(&mut registry);
+        (world, registry, EditorState::default())
+    }
+
+    fn with_settings(world: &mut World, settings: RenderSettings) -> orrin_ecs::Entity {
+        let entity = world.spawn();
+        world.insert(entity, Name::new("Render Settings"));
+        world.insert(entity, settings);
+        render_settings::sync(world);
+        entity
+    }
+
+    fn density(world: &World, entity: orrin_ecs::Entity) -> f32 {
+        world.get::<RenderSettings>(entity).unwrap().fog.density
+    }
+
+    /// A scene with settings owns them: a slider moved here is a change to
+    /// the scene, which is saved with it, marks it dirty and can be undone.
+    #[test]
+    fn a_change_to_a_scene_with_settings_is_an_undoable_edit() {
+        let (mut world, registry, mut state) = session();
+        let entity = with_settings(&mut world, RenderSettings::default());
+
+        edit_settings(&mut world, &mut state, |world| {
+            world.resource_mut::<FogSettings>().density = 0.4;
+        });
+        state.apply(&mut world, &registry);
+        assert_eq!(density(&world, entity), 0.4);
+        assert!(state.scene_dirty());
+
+        state.request_undo();
+        state.apply(&mut world, &registry);
+        assert_eq!(density(&world, entity), 0.0);
+    }
+
+    /// Without settings in the scene there is nothing to write to: the change
+    /// is this session's, as every change here was before scenes saved them.
+    #[test]
+    fn a_change_to_a_scene_without_settings_is_the_sessions_alone() {
+        let (mut world, registry, mut state) = session();
+        edit_settings(&mut world, &mut state, |world| {
+            world.resource_mut::<FogSettings>().density = 0.4;
+        });
+        state.apply(&mut world, &registry);
+        assert_eq!(world.resource::<FogSettings>().density, 0.4);
+        assert!(!state.scene_dirty());
+    }
+
+    /// The editor draws before the frame syncs, so on the frame after a load
+    /// the resources still hold the last scene. An edit then must not write
+    /// that scene's values into this one.
+    #[test]
+    fn an_edit_starts_from_the_scene_not_from_the_last_frame() {
+        let (mut world, registry, mut state) = session();
+        let mut settings = RenderSettings::default();
+        settings.fog.density = 0.05;
+        let entity = world.spawn();
+        world.insert(entity, settings);
+        world.resource_mut::<FogSettings>().density = 0.3;
+
+        edit_settings(&mut world, &mut state, |world| {
+            world.resource_mut::<crate::scene::BloomSettings>().strength = 0.5;
+        });
+        state.apply(&mut world, &registry);
+        assert_eq!(density(&world, entity), 0.05);
+        let saved = world.get::<RenderSettings>(entity).unwrap().bloom.strength;
+        assert_eq!(saved, 0.5);
+    }
+
+    /// Giving a scene settings keeps what it is being drawn with, so the
+    /// tuning done before the click is what gets saved.
+    #[test]
+    fn adding_settings_keeps_what_the_session_was_drawn_with() {
+        let (mut world, registry, mut state) = session();
+        world.resource_mut::<FogSettings>().density = 0.3;
+        state.request_add_render_settings();
+        state.apply(&mut world, &registry);
+
+        let entity = render_settings::source(&world).expect("the scene has settings");
+        assert_eq!(density(&world, entity), 0.3);
+        assert_eq!(
+            world.get::<Name>(entity).map(|name| name.0.clone()),
+            Some("Render Settings".to_owned())
+        );
+
+        state.request_undo();
+        state.apply(&mut world, &registry);
+        assert!(render_settings::source(&world).is_none());
     }
 }

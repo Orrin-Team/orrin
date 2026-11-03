@@ -1,4 +1,5 @@
 use glam::Vec3;
+use orrin_registry::Reflect;
 
 /// The air, described once for both of the ways the frame draws it.
 ///
@@ -9,7 +10,7 @@ use glam::Vec3;
 /// analytic integral takes over past it, so the same three numbers describe both
 /// segments of every view ray and turning [`volumetric`](Self::volumetric) off
 /// changes how the fog is computed rather than how much of it there is.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct FogSettings {
     /// What fraction of extinction *scatters* rather than absorbs, per channel —
     /// the medium's single-scattering albedo, near 1.0 for water droplets and

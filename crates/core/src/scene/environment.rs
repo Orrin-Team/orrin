@@ -2,13 +2,14 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use glam::Vec3;
+use orrin_registry::Reflect;
 
 /// The environment the scene is drawn against and lit by.
 ///
 /// The cubemap and its irradiance live in the renderer, baked from an
 /// equirectangular source. These are the parameters that can change without a
 /// rebake, plus the name of the source that would cause one.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Reflect)]
 pub struct EnvironmentSettings {
     /// The HDRI to bake from, relative to the assets directory. Empty means
     /// whatever the scene loaded programmatically — for the built-in demo, its
@@ -25,6 +26,7 @@ pub struct EnvironmentSettings {
     /// bake blocks on the GPU and replaces resources the frame in flight may
     /// still be reading, so it happens at the one point in the loop that is
     /// safe rather than wherever a button was clicked.
+    #[reflect(skip)]
     pub reload_requested: bool,
     /// How bright this environment's sky is, in **cd/m²** — a clear zenith
     /// around 8 000, an overcast one 1 000–2 000, dusk in the tens.

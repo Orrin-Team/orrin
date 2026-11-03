@@ -299,6 +299,7 @@ fn glyph_of(kind: AssetKind) -> icons::Icon {
         AssetKind::Mesh => icons::box_(),
         AssetKind::Material => icons::palette(),
         AssetKind::Prefab => icons::layers(),
+        AssetKind::Scene => icons::globe(),
         AssetKind::Folder => icons::folder(),
     }
 }

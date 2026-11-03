@@ -15,6 +15,7 @@ mod fog;
 mod hdr;
 mod hierarchy;
 pub mod input;
+pub mod loaded;
 mod material;
 mod mesh;
 pub mod model;
@@ -25,6 +26,7 @@ pub mod prefab;
 mod present;
 mod previews;
 pub mod registry;
+pub mod render_settings;
 mod shadow;
 mod ssao;
 mod ssr;
@@ -58,6 +60,7 @@ pub use hierarchy::{
     parent_world_matrix, propagate_transforms, reparent,
 };
 pub use input::{ActionId, Actions, Binding, InputState, MAX_PLAYERS};
+pub use loaded::{InScene, LoadedScenes, SceneHandle};
 pub use material::MaterialBlends;
 pub use mesh::{CpuMesh, MeshBounds};
 pub use motion_blur::MotionBlurSettings;
@@ -69,6 +72,7 @@ pub use previews::{
     AssetPreviews, MaterialPreview, MeshPreview, apply_material_edits, render_mesh,
 };
 pub use registry::register_components;
+pub use render_settings::RenderSettings;
 pub use shadow::ShadowSettings;
 pub use ssao::SsaoSettings;
 pub use ssr::SsrSettings;

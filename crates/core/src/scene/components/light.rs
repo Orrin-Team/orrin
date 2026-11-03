@@ -181,7 +181,7 @@ impl Default for Light {
 /// Only in force when no environment is loaded, which is what it stands in for:
 /// the renderer folds it into the irradiance probe's constant band and into the
 /// specular tint, so a scene with a real HDRI ignores it entirely.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct AmbientLight {
     pub color: Vec3,
     /// Luminance of that uniform sky, in cd/m². A clear zenith is a few

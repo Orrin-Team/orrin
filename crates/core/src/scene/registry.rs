@@ -1,6 +1,9 @@
 use orrin_registry::{ComponentId, Registry};
 
-use super::{Collider, Light, LocalTransform, Locked, MaterialHandle, MeshHandle, Name, Spin, Tag};
+use super::{
+    Collider, Light, LocalTransform, Locked, MaterialHandle, MeshHandle, Name, RenderSettings,
+    Spin, Tag,
+};
 
 pub const TRANSFORM: ComponentId = ComponentId::new("orrin.transform");
 pub const NAME: ComponentId = orrin_registry::NAME_COMPONENT;
@@ -9,6 +12,7 @@ pub const LIGHT: ComponentId = ComponentId::new("orrin.light");
 pub const COLLIDER: ComponentId = ComponentId::new("orrin.collider");
 pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
 pub const LOCKED: ComponentId = ComponentId::new("orrin.locked");
+pub const RENDER_SETTINGS: ComponentId = ComponentId::new("orrin.render_settings");
 
 /// `MeshHandle` and `MaterialHandle` are upload indices, so a scene stores the
 /// asset's [`AssetId`](orrin_registry::AssetId) instead — a translation that
@@ -62,6 +66,7 @@ pub fn register_components(registry: &mut Registry) {
     registry.register::<Collider>(COLLIDER, "Collider");
     registry.register::<Spin>(SPIN, "Spin");
     registry.register::<Locked>(LOCKED, "Locked");
+    registry.register::<RenderSettings>(RENDER_SETTINGS, "Render Settings");
     registry.register_resolved::<MeshHandle>(MESH, "Mesh");
     registry.register_resolved::<MaterialHandle>(MATERIAL, "Material");
     registry.end_engine_registration();

@@ -1,4 +1,5 @@
 use glam::Vec3;
+use orrin_registry::Reflect;
 
 /// Subsurface scattering: light that enters a surface, scatters inside it and
 /// leaves somewhere else.
@@ -21,7 +22,7 @@ use glam::Vec3;
 /// the colour target rather than adding it, so the composite has to add all of it
 /// back or the same scene would lose energy by switching a pass on. The dials that
 /// belong to the effect are on the material, where they describe a medium.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct SubsurfaceSettings {
     /// Off drops three passes *and* the second colour target the forward pass
     /// resolves into, which is why it is part of the frame's structure rather than
