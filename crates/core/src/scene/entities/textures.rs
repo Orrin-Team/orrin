@@ -8,6 +8,27 @@ pub fn load_rgba(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
     (img.into_raw(), width, height)
 }
 
+/// `row(y)` for every row in `0..height`, across the pool, in order.
+///
+/// Every generator below is a pure function of a texel's coordinates, so a row
+/// is a task with nothing to share: the split changes how fast a map is drawn
+/// and never what it holds, which is what keeps the captures machine-independent.
+fn by_row<R: Send>(height: u32, row: impl Fn(u32) -> R + Send + Sync) -> Vec<R> {
+    let rows: Vec<u32> = (0..height).collect();
+    crate::threads::map(&rows, |&y| row(y))
+}
+
+/// Rows that each carry a slice of `N` maps, stitched back into the `N` maps.
+fn join_rows<const N: usize>(rows: Vec<[Vec<u8>; N]>) -> [Vec<u8>; N] {
+    std::array::from_fn(|map| {
+        let mut joined = Vec::with_capacity(rows.iter().map(|row| row[map].len()).sum());
+        for row in &rows {
+            joined.extend_from_slice(&row[map]);
+        }
+        joined
+    })
+}
+
 pub fn checkerboard(size: u32, checks: u32, a: [u8; 3], b: [u8; 3]) -> Vec<u8> {
     let cell = (size / checks).max(1);
     let mut data = Vec::with_capacity((size * size * 4) as usize);
@@ -104,22 +125,24 @@ pub fn brick(size: u32, columns: u32, rows: u32, tile: [f32; 2], depth: f32) -> 
         (face, hash01(id))
     };
 
-    let mut height = vec![0.0f32; (size * size) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let (face, jitter) = texel(x, y);
-            // The jitter rides on the face and not on the joint: a block sits
-            // slightly proud of its neighbour, but the mortar between them is
-            // one continuous surface at the back of the wall.
-            height[(y * size + x) as usize] = face * (0.86 + 0.14 * jitter);
-        }
-    }
+    let height = by_row(size, |y| {
+        (0..size)
+            .map(|x| {
+                let (face, jitter) = texel(x, y);
+                // The jitter rides on the face and not on the joint: a block sits
+                // slightly proud of its neighbour, but the mortar between them is
+                // one continuous surface at the back of the wall.
+                face * (0.86 + 0.14 * jitter)
+            })
+            .collect::<Vec<f32>>()
+    })
+    .concat();
 
-    let mut albedo = Vec::with_capacity((size * size * 4) as usize);
-    let mut normal = Vec::with_capacity((size * size * 4) as usize);
-    let mut height_map = Vec::with_capacity((size * size * 4) as usize);
     let at = |x: u32, y: u32| height[((y % size) * size + (x % size)) as usize];
-    for y in 0..size {
+    let rows = by_row(size, |y| {
+        let mut albedo = Vec::with_capacity(size as usize * 4);
+        let mut normal = Vec::with_capacity(size as usize * 4);
+        let mut height_map = Vec::with_capacity(size as usize * 4);
         for x in 0..size {
             let (face, jitter) = texel(x, y);
 
@@ -154,12 +177,14 @@ pub fn brick(size: u32, columns: u32, rows: u32, tile: [f32; 2], depth: f32) -> 
             let h = (at(x, y) * 255.0) as u8;
             height_map.extend_from_slice(&[h, h, h, 255]);
         }
-    }
+        [albedo, normal, height_map]
+    });
 
+    let [albedo, normal, height] = join_rows(rows);
     BrickMaps {
         albedo,
         normal,
-        height: height_map,
+        height,
     }
 }
 
@@ -194,8 +219,8 @@ pub fn sky_equirect(width: u32, height: u32, to_sun: Vec3) -> Vec<f32> {
     let horizon = Vec3::new(0.20, 0.24, 0.30);
     let ground = Vec3::new(0.02, 0.018, 0.016);
 
-    let mut data = Vec::with_capacity((width * height * 4) as usize);
-    for y in 0..height {
+    by_row(height, |y| {
+        let mut row = Vec::with_capacity(width as usize * 4);
         // The inverse of the mapping in equirect_to_cube.frag: v = acos(y)/PI
         // and u = atan2(z, x)/TAU + 0.5. Sampling at texel centres keeps the
         // poles off the exact singularity.
@@ -226,10 +251,11 @@ pub fn sky_equirect(width: u32, height: u32, to_sun: Vec3) -> Vec<f32> {
             color += Vec3::splat(40.0) * ((cosine - 0.9996) / 0.0004).clamp(0.0, 1.0);
             color += Vec3::new(1.0, 0.85, 0.6) * cosine.max(0.0).powf(64.0) * 0.8;
 
-            data.extend_from_slice(&[color.x, color.y, color.z, 1.0]);
+            row.extend_from_slice(&[color.x, color.y, color.z, 1.0]);
         }
-    }
-    data
+        row
+    })
+    .concat()
 }
 
 pub fn metallic_roughness(size: u32) -> Vec<u8> {
@@ -257,10 +283,10 @@ pub fn metallic_roughness(size: u32) -> Vec<u8> {
 /// always been, and the capture would say the pass was doing nothing.
 pub fn foliage(size: u32) -> Vec<u8> {
     let n = size as f32;
-    let mut data = Vec::with_capacity((size * size * 4) as usize);
     // Which way each leaf's tip points, in turns.
     let leaves = [0.07f32, 0.30, 0.55, 0.80];
-    for y in 0..size {
+    by_row(size, |y| {
+        let mut row = Vec::with_capacity(size as usize * 4);
         for x in 0..size {
             let u = (x as f32 + 0.5) / n * 2.0 - 1.0;
             let v = (y as f32 + 0.5) / n * 2.0 - 1.0;
@@ -308,15 +334,16 @@ pub fn foliage(size: u32) -> Vec<u8> {
             // was doing nothing.
             let alpha = (distance + 0.5).clamp(0.0, 1.0);
             let rib = rib.min(1.0);
-            data.extend_from_slice(&[
+            row.extend_from_slice(&[
                 (46.0 + 46.0 * rib) as u8,
                 (86.0 + 74.0 * rib) as u8,
                 (30.0 + 34.0 * rib) as u8,
                 (alpha * 255.0) as u8,
             ]);
         }
-    }
-    data
+        row
+    })
+    .concat()
 }
 
 /// The maps for one decal: an irregular scorch with a crater under it.
@@ -340,9 +367,6 @@ pub struct DecalMaps {
 
 pub fn scorch(size: u32) -> DecalMaps {
     let n = size as f32;
-    let mut albedo = Vec::with_capacity((size * size * 4) as usize);
-    let mut normal = Vec::with_capacity((size * size * 4) as usize);
-    let mut metallic_roughness = Vec::with_capacity((size * size * 4) as usize);
 
     // Depth of the crater as a function of radius, and its derivative, so the
     // normals are the surface's own rather than a filtered guess at it.
@@ -358,7 +382,10 @@ pub fn scorch(size: u32) -> DecalMaps {
         (bowl * 0.5, slope * 0.5)
     };
 
-    for y in 0..size {
+    let rows = by_row(size, |y| {
+        let mut albedo = Vec::with_capacity(size as usize * 4);
+        let mut normal = Vec::with_capacity(size as usize * 4);
+        let mut metallic_roughness = Vec::with_capacity(size as usize * 4);
         for x in 0..size {
             let u = (x as f32 + 0.5) / n * 2.0 - 1.0;
             let v = (y as f32 + 0.5) / n * 2.0 - 1.0;
@@ -403,11 +430,48 @@ pub fn scorch(size: u32) -> DecalMaps {
             let roughness = 0.25 + 0.7 * edge.min(1.0);
             metallic_roughness.extend_from_slice(&[0, (roughness * 255.0) as u8, 0, 255]);
         }
-    }
+        [albedo, normal, metallic_roughness]
+    });
 
+    let [albedo, normal, metallic_roughness] = join_rows(rows);
     DecalMaps {
         albedo,
         normal,
         metallic_roughness,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_threads<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("a pool")
+            .install(f)
+    }
+
+    /// Every generator is drawn a row per task, so the claim the split rests
+    /// on is that a texel depends on its coordinates and nothing else. A map
+    /// that came out different under a parallel pool would make every capture
+    /// of the scene depend on the machine it was taken on.
+    #[test]
+    fn the_generated_maps_do_not_depend_on_the_thread_count() {
+        let draw = || {
+            let bricks = brick(64, 8, 4, [4.0, 2.0], 0.05);
+            let decal = scorch(64);
+            (
+                sky_equirect(64, 32, Vec3::new(0.3, -0.8, 0.5))
+                    .iter()
+                    .map(|f| f.to_bits())
+                    .collect::<Vec<_>>(),
+                foliage(64),
+                [bricks.albedo, bricks.normal, bricks.height],
+                [decal.albedo, decal.normal, decal.metallic_roughness],
+            )
+        };
+        assert!(with_threads(1, draw) == with_threads(4, draw));
     }
 }
