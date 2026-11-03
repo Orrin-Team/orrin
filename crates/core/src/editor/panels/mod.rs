@@ -4142,6 +4142,111 @@ mod tests {
         assert!(!under, "the Scenes tab icon was painted beneath its window");
     }
 
+    /// Where `tab`'s title was painted in its strip.
+    fn tab_title(editor: &Harness, tab: Tab) -> egui::Pos2 {
+        let leaf = editor.tab(tab);
+        let strip = egui::Rect::from_min_size(leaf.min, egui::vec2(leaf.width(), TAB_BAR_HEIGHT));
+        editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, rect)| text == tab.title() && strip.contains(rect.center()))
+            .map(|(_, rect)| rect.center())
+            .unwrap_or_else(|| panic!("no {} tab in its strip", tab.title()))
+    }
+
+    /// A press at `from`, a drag to `to` in steps, a pause there and a
+    /// release, one frame each, as a hand delivers it. The pause matters:
+    /// egui_dock holds on to the target a fast drag passed over for a moment.
+    fn drag_tab(editor: &mut Harness, from: egui::Pos2, to: egui::Pos2) {
+        pointer(editor, egui::Event::PointerMoved(from));
+        pointer(editor, button(from, true));
+        for step in 1..=6 {
+            let at = from + (to - from) * (step as f32 / 6.0);
+            pointer(editor, egui::Event::PointerMoved(at));
+        }
+        editor.frames(30);
+        pointer(editor, button(to, false));
+        editor.frames(2);
+    }
+
+    /// A tab dragged out over the scene leaves the dock for a window of its
+    /// own where it was let go, and the tools it shared a strip with stay.
+    #[test]
+    fn a_tab_dragged_onto_the_scene_floats_where_it_is_dropped() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let to = editor.viewport().center();
+        let from = tab_title(&editor, Tab::Console);
+        drag_tab(&mut editor, from, to);
+
+        assert!(editor.dock.is_floating(Tab::Console));
+        let window = editor.tab(Tab::Console);
+        assert!(
+            under_the_strip(window, to),
+            "the window opened at {window:?}, not under the pointer at {to:?}"
+        );
+        assert!(editor.dock.is_open(Tab::Assets));
+        assert!(!editor.dock.is_floating(Tab::Assets));
+    }
+
+    /// Dropped on another tool's strip, a tab joins it: the drop onto the
+    /// scene must not take drops that were egui_dock's to place.
+    #[test]
+    fn a_tab_dragged_onto_another_strip_docks_there() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let strip = editor.tab(Tab::Inspector);
+        let to = egui::pos2(strip.right() - 30.0, strip.top() + TAB_BAR_HEIGHT / 2.0);
+        let from = tab_title(&editor, Tab::Console);
+        drag_tab(&mut editor, from, to);
+
+        assert!(!editor.dock.is_floating(Tab::Console));
+        assert_eq!(editor.tab(Tab::Console), editor.tab(Tab::Inspector));
+    }
+
+    /// A click on a tab only brings it forward.
+    #[test]
+    fn a_click_on_a_tab_does_not_float_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let at = tab_title(&editor, Tab::Assets);
+        drag_tab(&mut editor, at, at + egui::vec2(1.0, 0.0));
+        assert!(!editor.dock.is_floating(Tab::Assets));
+    }
+
+    /// A window's tab is also its handle: dragged over the scene, the window
+    /// follows rather than staying where it was.
+    #[test]
+    fn a_floating_tool_dragged_by_its_tab_moves_its_window() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor
+            .dock
+            .apply(crate::editor::state::DockRequest::Float(Tab::Scenes));
+        editor.frames(2);
+        let before = editor.tab(Tab::Scenes);
+        // High enough that the window still fits below it: egui keeps a
+        // window on screen, so a lower drop lands it higher than the pointer.
+        let to = egui::pos2(before.right() + 200.0, 150.0);
+        assert!(editor.viewport().contains(to));
+        let from = tab_title(&editor, Tab::Scenes);
+        drag_tab(&mut editor, from, to);
+
+        assert!(editor.dock.is_floating(Tab::Scenes));
+        let after = editor.tab(Tab::Scenes);
+        assert!(
+            under_the_strip(after, to),
+            "the window went from {before:?} to {after:?}, not under {to:?}"
+        );
+        assert_eq!(after.size(), before.size());
+    }
+
+    /// Whether `at` is on the tab strip of a window at `window`: where the
+    /// pointer that carried the window there would be.
+    fn under_the_strip(window: egui::Rect, at: egui::Pos2) -> bool {
+        window.x_range().expand(1.0).contains(at.x)
+            && (window.top() - 1.0..=window.top() + TAB_BAR_HEIGHT + 1.0).contains(&at.y)
+    }
+
     /// Opening another scene over unsaved work asks first, and offers to save
     /// it, rather than throwing the work away on a click.
     #[test]
@@ -4275,36 +4380,139 @@ mod tests {
         );
     }
 
-    /// The filter and the new scene's name share one row, each half of it.
+    fn painted_rect_of(editor: &Harness, needle: &str) -> Option<egui::Rect> {
+        editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| text == needle)
+            .map(|(_, rect)| rect)
+    }
+
+    /// The filter has the row to itself bar a plus, and the new scene's name
+    /// is asked for below it only once the plus is pressed: two empty wells
+    /// side by side read as one field cut in half.
     #[test]
-    fn the_scene_filter_and_the_new_scene_field_share_a_row() {
+    fn a_new_scene_is_named_below_the_filter_once_asked_for() {
         let dir = crate::asset_db::tests::Dir::new("scene-manager-row");
         dir.write("levels/castle.orrin", b"");
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         with_database(&mut editor, &dir);
-        editor.dock.bring_forward(Tab::Scenes);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(3);
+
+        let body = editor.tab_body(Tab::Scenes);
+        let filter = painted_rect_of(&editor, "Filter scenes").expect("a filter");
+        assert!(painted_rect_of(&editor, "Scene name").is_none());
+        let row = egui::Rect::from_x_y_ranges(
+            body.x_range(),
+            (filter.center().y - 8.0)..=(filter.center().y + 8.0),
+        );
+        let plus = icon_in(&editor, crate::editor::icons::plus(), row).expect("a plus");
+        assert!(
+            plus.x > body.right() - 40.0,
+            "the plus ends the filter's row"
+        );
+
+        editor.click(plus).frames(1);
+        let name = painted_rect_of(&editor, "Scene name").expect("a name field");
+        assert!(name.top() > filter.bottom(), "the name is asked for below");
+        let create = painted_rect_of(&editor, "Create").expect("a create button");
+        assert!(body.contains(create.center()));
+    }
+
+    /// Named in place, a scene is made with Enter, the way a rename is.
+    #[test]
+    fn a_new_scene_is_made_from_its_field_with_enter() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-enter");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(3);
+        let filter = painted_rect_of(&editor, "Filter scenes").expect("a filter");
+        let row = egui::Rect::from_x_y_ranges(
+            editor.tab_body(Tab::Scenes).x_range(),
+            (filter.center().y - 8.0)..=(filter.center().y + 8.0),
+        );
+        let plus = icon_in(&editor, crate::editor::icons::plus(), row).expect("a plus");
+        editor.click(plus).frames(1);
+
+        editor
+            .input
+            .events
+            .push(egui::Event::Text("Level 3".to_owned()));
+        editor.frames(1);
+        editor.input.events.clear();
+        editor.key(egui::Key::Enter);
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        assert!(
+            dir.path().join("scenes/Level 3.orrin").is_file(),
+            "{:?}",
+            logged(&editor)
+        );
+        assert!(std::path::Path::new(&editor.state.scene_path).ends_with("scenes/Level 3.orrin"));
+    }
+
+    /// The project's scenes are what the tool is opened for; the renderer's
+    /// switches come after them, not between the header and the list.
+    #[test]
+    fn the_scene_list_comes_before_the_renderer() {
+        let dir = crate::asset_db::tests::Dir::new("scene-manager-order");
+        dir.write("levels/castle.orrin", b"");
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        with_database(&mut editor, &dir);
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(3);
+        let castle = painted_rect_of(&editor, "castle").expect("castle is listed");
+        let renderer = painted_rect_of(&editor, "Renderer").expect("a renderer section");
+        assert!(castle.top() < renderer.top());
+    }
+
+    /// Docked at the hierarchy's width, a switch still says which pass it
+    /// turns off: a property row cut "Ambient …" and "Volumetri…".
+    #[test]
+    fn the_renderer_switches_keep_their_names_when_docked() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.dock.activate(Tab::Scenes);
+        editor.frames(3);
+        fn collect(shape: &egui::Shape, out: &mut Vec<(String, bool)>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text.galley.elided))
+                }
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for clipped in &editor.output.as_ref().unwrap().shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        // An elided galley still reports its whole text; the flag is what
+        // says it was cut.
+        for name in ["Ambient occlusion", "Temporal AA", "Volumetric fog"] {
+            let (_, elided) = texts
+                .iter()
+                .find(|(text, _)| text == name)
+                .unwrap_or_else(|| panic!("{name} was not painted"));
+            assert!(!elided, "{name} was cut short");
+        }
+    }
+
+    /// Whether the scene is saved is said beside its name, where the eye
+    /// already is, not at the far edge of a wide window.
+    #[test]
+    fn the_save_state_sits_beside_the_scene_name() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         editor
             .dock
             .apply(crate::editor::state::DockRequest::Float(Tab::Scenes));
         editor.frames(3);
-
-        let at = |needle: &str| {
-            editor
-                .painted_text_rects()
-                .into_iter()
-                .find(|(text, _)| text == needle)
-                .map(|(_, rect)| rect)
-                .unwrap_or_else(|| panic!("{needle} was not painted"))
-        };
-        let (filter, name, create) = (at("Filter scenes"), at("New scene name"), at("Create"));
-        assert!((filter.center().y - name.center().y).abs() < 4.0);
-        assert!((create.center().y - name.center().y).abs() < 4.0);
-        assert!(filter.left() < name.left() && name.left() < create.left());
-        let body = editor.tab_body(Tab::Scenes);
-        assert!(
-            name.left() > body.center().x - 20.0,
-            "the filter takes no more than half the row"
-        );
+        let name = crate::scene::loaded::name_of(&editor.state.scene_path);
+        let title = painted_rect_of(&editor, &name).expect("the scene's name");
+        let pill = painted_rect_of(&editor, "Saved").expect("the save state");
+        assert!((pill.center().y - title.center().y).abs() < 6.0);
+        assert!(pill.left() > title.right() && pill.left() - title.right() < 24.0);
     }
 
     /// The renderer section says where the settings live; choosing the entity

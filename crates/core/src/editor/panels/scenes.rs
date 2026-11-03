@@ -10,7 +10,13 @@
 //!
 //! The header answers the two questions the window is opened to ask — which
 //! scene, and is it saved — before anything else, and holds the commands on
-//! that scene. Everything below it scrolls.
+//! that scene. Everything below it scrolls, in the order it is reached for:
+//! what the game has loaded (while it plays), the project's scenes, and last
+//! the renderer, which is visited once per scene rather than every time.
+//!
+//! The filter has its row to itself and a new scene is named below it, once
+//! asked for with the plus. Sharing the row put two empty wells side by side
+//! at a docked tool's width, too narrow for either and hard to tell apart.
 //!
 //! It shows the renderer's settings rather than drawing every slider again:
 //! the Environment tab already edits them, into the scene when the scene has
@@ -49,15 +55,15 @@ const ROW: f32 = 26.0;
 
 pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState, floating: bool) {
     header(ui, world, state, floating);
-    ui.add_space(2.0);
+    ui.add_space(4.0);
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            renderer(ui, world, state);
             if state.playing() {
                 loaded(ui, world);
             }
             project(ui, world, state);
+            renderer(ui, world, state);
         });
 }
 
@@ -68,7 +74,18 @@ fn header(ui: &mut egui::Ui, world: &World, state: &mut EditorState, floating: b
     ui.horizontal(|ui| {
         ui.label(icons::text(icons::globe(), icons::ROW, weak));
         let name = name_of(&state.scene_path);
-        ui.add(egui::Label::new(egui::RichText::new(name).size(15.0).strong()).truncate());
+        // Room is kept for the pill and the button, so a long name is the
+        // thing cut rather than the save state.
+        ui.scope(|ui| {
+            ui.set_max_width((ui.available_width() - 96.0).max(40.0));
+            ui.add(egui::Label::new(egui::RichText::new(name).size(15.0).strong()).truncate());
+        });
+        if state.scene_dirty() {
+            pill(ui, theme::PENDING, "Unsaved")
+                .on_hover_text("Changes since the last save; Ctrl+S saves them");
+        } else {
+            pill(ui, theme::OK, "Saved");
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let (icon, hint, request) = if floating {
                 (
@@ -85,12 +102,6 @@ fn header(ui: &mut egui::Ui, world: &World, state: &mut EditorState, floating: b
             };
             if widgets::tool_button(ui, icon, None, None, Tool::Off, hint).clicked() {
                 state.request_dock(request);
-            }
-            if state.scene_dirty() {
-                pill(ui, theme::PENDING, "Unsaved")
-                    .on_hover_text("Changes since the last save; Ctrl+S saves them");
-            } else {
-                pill(ui, theme::OK, "Saved");
             }
         });
     });
@@ -172,40 +183,44 @@ fn renderer(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
         None,
         |ui| {
             let source = render_settings::source(world);
-            ui.horizontal_wrapped(|ui| match source {
-                Some(_) => {
-                    pill(ui, theme::OK, "Saved with the scene");
-                }
-                None => {
-                    pill(ui, theme::PENDING, "This session only").on_hover_text(
+            widgets::padded(ui, |ui| {
+                ui.horizontal_wrapped(|ui| match source {
+                    Some(_) => {
+                        pill(ui, theme::OK, "Saved with the scene");
+                    }
+                    None => {
+                        pill(ui, theme::PENDING, "This session only").on_hover_text(
                         "The renderer's settings are not part of the scene and are lost on load",
                     );
-                    if widgets::tool_button(
-                        ui,
-                        icons::plus(),
-                        None,
-                        Some(egui::RichText::new("Save with scene")),
-                        Tool::Command,
-                        "Add a Render Settings entity holding them, saved with the scene",
-                    )
-                    .clicked()
-                    {
-                        state.request_add_render_settings();
+                        if widgets::tool_button(
+                            ui,
+                            icons::plus(),
+                            None,
+                            Some(egui::RichText::new("Save with scene")),
+                            Tool::Command,
+                            "Add a Render Settings entity holding them, saved with the scene",
+                        )
+                        .clicked()
+                        {
+                            state.request_add_render_settings();
+                        }
                     }
-                }
+                })
             });
-            ui.add_space(2.0);
+            ui.add_space(6.0);
             environment::edit_settings(world, state, |world| switches(ui, world));
-            if widgets::tool_button(
-                ui,
-                icons::sliders(),
-                None,
-                Some(egui::RichText::new("All settings…")),
-                Tool::Command,
-                "Open the Environment tab, which edits every setting",
-            )
-            .clicked()
-            {
+            ui.add_space(4.0);
+            let all = widgets::padded(ui, |ui| {
+                widgets::tool_button(
+                    ui,
+                    icons::sliders(),
+                    None,
+                    Some(egui::RichText::new("All settings…")),
+                    Tool::Command,
+                    "Open the Environment tab, which edits every setting",
+                )
+            });
+            if all.clicked() {
                 state.request_dock(DockRequest::Show(Tab::Environment));
             }
         },
@@ -214,27 +229,58 @@ fn renderer(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
 
 /// The settings that decide which passes the frame runs at all, where the
 /// rest only tune a pass already running.
+///
+/// Checkboxes named by their own label, not property rows: a property's label
+/// column is sized for the inspector, and at a docked tool's width it cut
+/// every name here to its first word. Two columns once both fit.
 fn switches(ui: &mut egui::Ui, world: &World) {
-    let mut row = |label: &str, value: &mut bool| {
-        widgets::property(ui, label, |ui| ui.checkbox(value, ""));
+    const COLUMN: f32 = 150.0;
+    let columns = if ui.available_width() >= COLUMN * 2.0 + widgets::PAD * 2.0 {
+        2
+    } else {
+        1
     };
-    row(
-        "Ambient occlusion",
-        &mut world.resource_mut::<SsaoSettings>().enabled,
-    );
-    row(
-        "Temporal AA",
-        &mut world.resource_mut::<TaaSettings>().enabled,
-    );
-    row("Bloom", &mut world.resource_mut::<BloomSettings>().enabled);
-    row(
-        "Shadows",
-        &mut world.resource_mut::<ShadowSettings>().enabled,
-    );
-    row(
-        "Volumetric fog",
-        &mut world.resource_mut::<FogSettings>().volumetric,
-    );
+    widgets::padded(ui, |ui| {
+        egui::Grid::new(ui.id().with("passes"))
+            .num_columns(columns)
+            .min_col_width(COLUMN)
+            .spacing(egui::vec2(8.0, 4.0))
+            .show(ui, |ui| {
+                let mut cell = 0;
+                let mut check = |ui: &mut egui::Ui, label: &str, value: &mut bool| {
+                    ui.checkbox(value, label);
+                    cell += 1;
+                    if cell % columns == 0 {
+                        ui.end_row();
+                    }
+                };
+                check(
+                    ui,
+                    "Ambient occlusion",
+                    &mut world.resource_mut::<SsaoSettings>().enabled,
+                );
+                check(
+                    ui,
+                    "Temporal AA",
+                    &mut world.resource_mut::<TaaSettings>().enabled,
+                );
+                check(
+                    ui,
+                    "Bloom",
+                    &mut world.resource_mut::<BloomSettings>().enabled,
+                );
+                check(
+                    ui,
+                    "Shadows",
+                    &mut world.resource_mut::<ShadowSettings>().enabled,
+                );
+                check(
+                    ui,
+                    "Volumetric fog",
+                    &mut world.resource_mut::<FogSettings>().volumetric,
+                );
+            });
+    });
 }
 
 fn loaded(ui: &mut egui::Ui, world: &World) {
@@ -281,6 +327,12 @@ fn project(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
         None,
         |ui| {
             tools(ui, world, state);
+            // Above the list rather than after it, which in a long list is
+            // off the bottom of the tool from the row that asked.
+            if let Some(path) = state.pending_open().map(str::to_owned) {
+                confirm(ui, state, &path);
+                ui.add_space(4.0);
+            }
             let Some(db) = world.get_resource::<AssetDatabase>() else {
                 empty(
                     ui,
@@ -295,12 +347,9 @@ fn project(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
                 .collect();
             scenes.sort_unstable();
             if scenes.is_empty() {
-                empty(ui, "No scenes yet. Name one above to start it.");
+                empty(ui, "No scenes yet. Press + to start one.");
             } else {
                 list(ui, &db, &scenes, state);
-            }
-            if let Some(path) = state.pending_open().map(str::to_owned) {
-                confirm(ui, state, &path);
             }
         },
     );
@@ -335,14 +384,15 @@ fn list(
         let marked = chosen.as_deref() == Some(rel);
         let folder = rel.rsplit_once('/').map_or("", |(folder, _)| folder);
 
-        let response = row(ui, &name, folder, open, kept, marked);
+        let openable = !open && !playing;
+        let response = row(ui, &name, folder, open, kept, marked, openable);
         if response.clicked() {
             chosen = Some(rel.to_owned());
         }
         let path = path.to_string_lossy().into_owned();
         // A button only on the row in hand, so the list reads as names and the
         // one command a row has is where the pointer already is.
-        let offer = !open && !playing && (marked || response.hovered());
+        let offer = openable && (marked || response.hovered());
         let button = egui::Rect::from_min_max(
             egui::pos2(response.rect.right() - 58.0, response.rect.top() + 3.0),
             egui::pos2(response.rect.right() - 4.0, response.rect.bottom() - 3.0),
@@ -391,8 +441,9 @@ fn list(
     });
 }
 
-/// One scene: a globe, its name, the folder it is in, and what it is to this
-/// session — open now, or kept through every load.
+/// One scene: a globe, its name, what it is to this session — open now, or
+/// kept through every load — and at the far end the folder it is in, which
+/// gives way to the Open button on a row that has one.
 fn row(
     ui: &mut egui::Ui,
     name: &str,
@@ -400,6 +451,7 @@ fn row(
     open: bool,
     persistent: bool,
     marked: bool,
+    openable: bool,
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW), egui::Sense::click());
@@ -432,25 +484,27 @@ fn row(
         },
     );
     let mut right = label.right() + 8.0;
-    if !folder.is_empty() {
-        right = ui
-            .painter()
-            .text(
-                egui::pos2(right, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                folder,
-                egui::TextStyle::Small.resolve(ui.style()),
-                weak,
-            )
-            .right()
-            + 8.0;
-    }
     for (shown, colour, word) in [
         (open, accent, "Current"),
         (persistent, theme::PREFAB, "Persistent"),
     ] {
         if shown {
             right = paint_pill(ui, egui::pos2(right, rect.center().y), colour, word).right() + 4.0;
+        }
+    }
+    let button = openable && (marked || response.hovered());
+    if !folder.is_empty() && !button {
+        let galley = ui.painter().layout_no_wrap(
+            folder.to_owned(),
+            egui::TextStyle::Small.resolve(ui.style()),
+            weak,
+        );
+        let at = egui::pos2(
+            rect.right() - 8.0 - galley.size().x,
+            rect.center().y - galley.size().y / 2.0,
+        );
+        if at.x > right + 4.0 {
+            ui.painter().galley(at, galley, weak);
         }
     }
     response
@@ -493,58 +547,114 @@ fn confirm(ui: &mut egui::Ui, state: &mut EditorState, path: &str) {
         });
 }
 
-/// The filter, and beside it a field for a new scene's name that says what is
-/// wrong with the name as it is typed, by the rule the request is checked by.
-/// One row, half each: both are about which scenes there are, and a second
-/// row for a one-word field was a row the list did not get.
+/// The filter across the row, and at its end the plus that asks for a new
+/// scene's name below it — or, while it is asked for, the cross that stops.
 fn tools(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
+    let naming_id = ui.id().with("naming a new scene");
+    let mut naming = ui.data(|data| data.get_temp::<bool>(naming_id).unwrap_or(false));
+    let mut opened = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let side = ui.spacing().interact_size.y;
+        let width = (ui.available_width() - side - 4.0).max(40.0);
+        ui.allocate_ui(egui::vec2(width, side), |ui| {
+            widgets::search(ui, &mut state.scenes_query, "Filter scenes");
+        });
+        let (icon, hint) = if naming {
+            (icons::x(), "Stop naming a new scene")
+        } else {
+            (icons::plus(), "New scene")
+        };
+        if widgets::squircle(ui, icon, hint).clicked() {
+            naming = !naming;
+            opened = naming;
+        }
+    });
+    if naming {
+        naming = new_scene(ui, world, state, opened);
+    }
+    ui.data_mut(|data| data.insert_temp(naming_id, naming));
+    ui.add_space(4.0);
+}
+
+/// A field for a new scene's name, saying under it the file the name becomes
+/// or what is wrong with it, by the rule the request is checked by. Enter or
+/// Create makes the scene; Escape puts the field away. Returns whether the
+/// field is still wanted.
+fn new_scene(ui: &mut egui::Ui, world: &World, state: &mut EditorState, focus: bool) -> bool {
     let id = ui.id().with("new scene name");
     let mut name = ui.data_mut(|data| data.get_temp::<String>(id).unwrap_or_default());
-    let problem = (!name.trim().is_empty())
+    let trimmed = name.trim();
+    let problem = (!trimmed.is_empty())
         .then(|| crate::editor::state::new_scene_path(world, &name).err())
         .flatten();
     let playing = state.playing();
-    ui.horizontal(|ui| {
-        let gap = ui.spacing().item_spacing.x;
-        let half = ((ui.available_width() - gap) / 2.0).max(60.0);
-        let height = ui.spacing().interact_size.y;
-        ui.allocate_ui(egui::vec2(half, height), |ui| {
-            widgets::search(ui, &mut state.scenes_query, "Filter scenes");
-        });
+    let ready = !playing && !trimmed.is_empty() && problem.is_none();
+    let weak = ui.visuals().weak_text_color();
+    let (note, colour) = match &problem {
+        _ if playing => ("Stop the game first".to_owned(), weak),
+        Some(problem) => (problem.clone(), theme::ERROR),
+        None if trimmed.is_empty() => ("Saved under scenes/ and opened".to_owned(), weak),
+        None => (
+            format!("scenes/{trimmed}.{}", crate::scene::loaded::EXTENSION),
+            weak,
+        ),
+    };
 
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let create_width = 74.0;
-        let field_width = (ui.available_width() - create_width - 4.0).max(40.0);
-        let field = ui.add_enabled(
-            !playing,
-            egui::TextEdit::singleline(&mut name)
-                .hint_text("New scene name")
-                .desired_width(field_width),
-        );
-        let ready = !playing && !name.trim().is_empty() && problem.is_none();
-        let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        let hint = if playing {
-            "Stop the game first"
-        } else {
-            "Write the scene under scenes/ and open it"
-        };
-        let create = widgets::tool_button(
-            ui,
-            icons::file_plus(),
-            None,
-            Some(egui::RichText::new("Create")),
-            if ready { Tool::Command } else { Tool::Disabled },
-            hint,
-        );
-        if ready && (create.clicked() || entered) {
-            state.request_new_scene(std::mem::take(&mut name));
-        }
-    });
-    if let Some(problem) = problem {
-        ui.colored_label(theme::ERROR, problem);
-    }
+    let mut open = true;
+    ui.add_space(4.0);
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .corner_radius(ui.visuals().widgets.inactive.corner_radius)
+        .inner_margin(6)
+        .show(ui, |ui| {
+            let field = ui.add_enabled(
+                !playing,
+                egui::TextEdit::singleline(&mut name)
+                    .hint_text("Scene name")
+                    .desired_width(f32::INFINITY),
+            );
+            if focus {
+                field.request_focus();
+            }
+            let (entered, escaped) = ui.input(|input| {
+                (
+                    input.key_pressed(egui::Key::Enter),
+                    input.key_pressed(egui::Key::Escape),
+                )
+            });
+            ui.add(egui::Label::new(egui::RichText::new(note).small().color(colour)).wrap());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let create = widgets::tool_button(
+                    ui,
+                    icons::file_plus(),
+                    None,
+                    Some(egui::RichText::new("Create")),
+                    if ready { Tool::Command } else { Tool::Disabled },
+                    "Write the scene and open it",
+                );
+                let cancel = widgets::tool_button(
+                    ui,
+                    icons::x(),
+                    None,
+                    Some(egui::RichText::new("Cancel")),
+                    Tool::Off,
+                    "Put the field away",
+                );
+                let submitted = field.lost_focus() && entered;
+                if ready && (create.clicked() || submitted) {
+                    state.request_new_scene(std::mem::take(&mut name));
+                    open = false;
+                }
+                if cancel.clicked() || (field.lost_focus() && escaped) {
+                    name.clear();
+                    open = false;
+                }
+            });
+        });
     ui.data_mut(|data| data.insert_temp(id, name));
-    ui.add_space(2.0);
+    open
 }
 
 /// `path` as the project spells it: relative to the assets directory when it
