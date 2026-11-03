@@ -42,6 +42,17 @@ float view_depth(vec2 uv) {
 }
 
 void main() {
+    // The resolve already wrote 1.0 across the sky, so the sixteen bilateral
+    // taps below reproduce it everywhere except where geometry within the
+    // tolerance of the far plane leaks into a sky texel's average — which the
+    // forward pass reads only through the bilinear upsample at a silhouette.
+    // The same coherent branch `ssao.frag` takes, for the same reason: an empty
+    // scene is otherwise this pass's worst case.
+    if (texture(u_depth, v_uv).r >= 1.0) {
+        f_ao = 1.0;
+        return;
+    }
+
     vec2 texel = 1.0 / vec2(textureSize(u_ao, 0));
 
     float center = view_depth(v_uv);
