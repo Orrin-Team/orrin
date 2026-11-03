@@ -4,8 +4,8 @@
 // in every `stride` x `stride` block, see `STRIDE` in exposure.rs), one bin per
 // invocation in the workgroup -- which is why the workgroup is 16x16 = 256, the
 // bin count. Each workgroup accumulates privately in shared memory and then
-// contributes one atomic per bin to the global histogram, so global atomic
-// traffic is 256 per workgroup rather than one per pixel.
+// contributes at most one atomic per bin to the global histogram, so global
+// atomic traffic is bounded by 256 per workgroup rather than one per pixel.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -60,5 +60,10 @@ void main() {
     }
     barrier();
 
-    atomicAdd(histogram.bins[gl_LocalInvocationIndex], local_bins[gl_LocalInvocationIndex]);
+    // A tile spans a handful of luminances, so most of its bins are empty, and
+    // adding zero to a global bin is an atomic that changes nothing.
+    uint count = local_bins[gl_LocalInvocationIndex];
+    if (count != 0) {
+        atomicAdd(histogram.bins[gl_LocalInvocationIndex], count);
+    }
 }
