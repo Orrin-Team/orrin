@@ -31,6 +31,7 @@ use super::oit::{ACCUM_FORMAT, REVEAL_FORMAT};
 use super::outline::OUTLINE_MASK_FORMAT;
 use super::prepass::{MATERIAL_FORMAT, NORMAL_FORMAT, VELOCITY_FORMAT};
 use super::refraction::{ACCUM_FORMAT as REFRACTION_ACCUM_FORMAT, SCENE_LEVELS};
+use super::shadow::SHADOW_FORMAT;
 use super::ssao::AO_FORMAT;
 use super::ssr::{HIZ_FORMAT, HIZ_LEVELS, RAY_FORMAT, SOURCE_LEVELS};
 use super::subsurface::SUBSURFACE_FORMAT;
@@ -740,7 +741,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let shadows = (config.shadow_cascades > 0).then(|| {
         builder.create_image(
             "shadow_cascades",
-            ImageDesc::new(DEPTH_FORMAT)
+            ImageDesc::new(SHADOW_FORMAT)
                 .extent(Extent::Fixed([config.shadow_resolution; 2]))
                 .array_layers(config.shadow_cascades as u32),
         )
@@ -800,7 +801,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let shadow_atlas = (config.shadow_atlas > 0).then(|| {
         let atlas = builder.create_image(
             "shadow_atlas",
-            ImageDesc::new(DEPTH_FORMAT).extent(Extent::Fixed([config.shadow_atlas; 2])),
+            ImageDesc::new(SHADOW_FORMAT).extent(Extent::Fixed([config.shadow_atlas; 2])),
         );
 
         let id = indirect(

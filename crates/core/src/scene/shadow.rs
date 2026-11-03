@@ -65,8 +65,8 @@ impl Default for ShadowSettings {
             slope_bias: 2.5,
             punctual_enabled: true,
             // 4096 with 512-texel tiles is 64 faces: ten point lights, or a mix
-            // of points and spots up to the eight-caster budget. One D32 image
-            // of 64 MB, which is the same order as four 2048 cascades.
+            // of points and spots up to the eight-caster budget. One D16 image
+            // of 32 MB, the same as four 2048 cascades.
             atlas_resolution: 4096,
             atlas_tile_size: 512,
             punctual_near: 0.05,

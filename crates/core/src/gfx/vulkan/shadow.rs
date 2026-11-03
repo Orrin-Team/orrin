@@ -16,7 +16,20 @@ use crate::gfx::{DrawList, PositionVertex};
 
 use super::PassCtx;
 use super::cull::{CullFrame, Draws};
-use super::swapchain::DEPTH_FORMAT;
+
+/// The depth format of every shadow map, cascade and punctual alike, and
+/// deliberately not the camera's.
+///
+/// Sixteen bits suffice here and not for the camera: a cascade is orthographic,
+/// so its depth is linear over `2 * radius + pullback` — about 200 m at the
+/// default distance, a 3 mm step — and a punctual face spends its precision near
+/// the light, where its contacts are. The saving is half of every clear, write
+/// and filtered read the shadow passes make, and half their memory.
+///
+/// The bias settings inherit one consequence: a constant depth bias is measured
+/// in the format's smallest step, which for UNORM is a fixed 2^-16 of the map's
+/// range, where for D32 it was relative to the biased depth and nearly nothing.
+pub(super) const SHADOW_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::D16Unorm;
 
 /// Where `shadow.frag` declares the material texture array, in the masked
 /// variant that alpha-tests; the plain one declares no such set. Binding 0 of
@@ -65,7 +78,7 @@ impl ShadowPass {
                 fragment,
                 // No color attachments to blend into.
                 color_formats: &[],
-                depth_format: Some(DEPTH_FORMAT),
+                depth_format: Some(SHADOW_FORMAT),
                 vertex_streams: &[PositionVertex::STREAM],
                 cull,
                 depth_test: Some(DepthTest {
@@ -499,7 +512,7 @@ impl CasterSets {
 /// avoiding.
 fn build_lit_depth(device: &Device, dimension: TextureDimension) -> TextureViewId {
     let texture = device.create_texture(&TextureDesc {
-        format: DEPTH_FORMAT,
+        format: SHADOW_FORMAT,
         dimension,
         extent: [1, 1, 1],
         mip_levels: 1,

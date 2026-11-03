@@ -19,12 +19,13 @@ pub enum Format {
     Rgba16Float,
     R32Float,
     Rgba32Float,
+    D16Unorm,
     D32Float,
     Rg11B10Float,
 }
 
 impl Format {
-    pub const ALL: [Format; 11] = [
+    pub const ALL: [Format; 12] = [
         Format::R8Unorm,
         Format::Rg8Unorm,
         Format::Rgba8Unorm,
@@ -34,12 +35,13 @@ impl Format {
         Format::Rgba16Float,
         Format::R32Float,
         Format::Rgba32Float,
+        Format::D16Unorm,
         Format::D32Float,
         Format::Rg11B10Float,
     ];
 
     pub fn is_depth(self) -> bool {
-        matches!(self, Format::D32Float)
+        matches!(self, Format::D16Unorm | Format::D32Float)
     }
 
     pub fn is_srgb(self) -> bool {

@@ -1053,6 +1053,53 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
     }
 }
 
+/// A cascade's depth is linear over a bounded range and a punctual face spends
+/// its precision near the light, so sixteen bits resolve millimetres where the
+/// shadows are and the other sixteen are pure bandwidth. The camera's depth is a
+/// perspective projection with standard Z, where the float is what keeps distant
+/// geometry from z-fighting, so it must not be narrowed alongside them.
+#[test]
+fn the_shadow_maps_are_sixteen_bit_and_the_camera_depth_is_not() {
+    let frame = declare(FrameConfig {
+        color_format: COLOR_FORMAT,
+        msaa: false,
+        ssao: true,
+        ssao_half_res: false,
+        contact_shadows: false,
+        ssr: false,
+        subsurface: false,
+        transparency: false,
+        refraction: false,
+        taa: true,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        volumetric_fog: false,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        shadow_cascades: 4,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 4096,
+        async_compute: false,
+        gpu_culling: false,
+        occlusion_culling: false,
+    })
+    .unwrap();
+
+    let format_of = |name: &str| {
+        frame
+            .graph
+            .transient_images()
+            .find(|(id, _)| frame.graph.resource_name(*id) == name)
+            .map(|(_, image)| image.desc.format)
+            .unwrap_or_else(|| panic!("the frame declared no {name}"))
+    };
+
+    assert_eq!(format_of("shadow_cascades"), Format::D16Unorm);
+    assert_eq!(format_of("shadow_atlas"), Format::D16Unorm);
+    assert_eq!(format_of("prepass_depth"), Format::D32Float);
+}
+
 /// TAA ping-pongs two allocations, so the image this frame writes as `taa_color`
 /// is the one next frame reads as `taa_history`. That only works if the frame
 /// leaves `taa_color` in exactly the layout `taa_history` is declared to enter

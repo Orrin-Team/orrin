@@ -154,7 +154,7 @@ impl AtlasConfig {
 /// What one frame's punctual shadows resolved to.
 ///
 /// A `faces` of zero means nothing casts, which is what makes the graph drop the
-/// atlas pass entirely rather than clear a 64 MB image for no reader — the same
+/// atlas pass entirely rather than clear a 32 MB image for no reader — the same
 /// way a cascade count of zero drops the cascade passes.
 #[derive(Clone, Debug, Default)]
 pub struct ShadowAtlas {
