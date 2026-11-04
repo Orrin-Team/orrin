@@ -141,9 +141,33 @@ vec3 sample_history(vec2 uv, vec2 size) {
     return max(sum / (k0 + k1 + k2 + k3 + k4), vec3(0.0));
 }
 
+// The 3x3 neighbourhood every invocation of a group reads, loaded once for the
+// group: its 8x8 texels plus a one-texel apron, already through `prepare`, with
+// the depth beside each. Nine fetches of colour and nine of depth per pixel
+// become about one and a half, and `prepare` runs once per texel rather than
+// nine times — measured, the neighbourhood was half of what this pass cost. The
+// statistics below read it in the same order the fetches did, so the result is
+// the same bit for bit.
+const int TILE = 8;
+const int APRON = TILE + 2;
+shared vec3 s_color[APRON * APRON];
+shared float s_depth[APRON * APRON];
+
 void main() {
     ivec2 size = imageSize(u_target);
     ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+
+    // Every invocation loads its share before any of them may leave, the ones
+    // past the image's edge included: a barrier must be reached by the whole
+    // group, so the early-outs below come after it.
+    ivec2 origin = ivec2(gl_WorkGroupID.xy) * TILE - 1;
+    for (int i = int(gl_LocalInvocationIndex); i < APRON * APRON; i += TILE * TILE) {
+        ivec2 at = clamp(origin + ivec2(i % APRON, i / APRON), ivec2(0), size - 1);
+        s_color[i] = prepare(texelFetch(u_color, at, 0).rgb);
+        s_depth[i] = texelFetch(u_depth, at, 0).r;
+    }
+    barrier();
+
     if (any(greaterThanEqual(texel, size))) {
         return;
     }
@@ -164,13 +188,14 @@ void main() {
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
             ivec2 at = clamp(texel + ivec2(x, y), ivec2(0), size - 1);
-            vec3 c = prepare(texelFetch(u_color, at, 0).rgb);
+            int slot = (int(gl_LocalInvocationID.y) + 1 + y) * APRON + int(gl_LocalInvocationID.x) + 1 + x;
+            vec3 c = s_color[slot];
             sum += c;
             sum_squared += c * c;
             lowest = min(lowest, c);
             highest = max(highest, c);
 
-            float depth = texelFetch(u_depth, at, 0).r;
+            float depth = s_depth[slot];
             if (depth_nearer(depth, nearest_depth)) {
                 nearest_depth = depth;
                 nearest = at;
