@@ -40,7 +40,9 @@ use orrin_ecs::Entity;
 use crate::editor::pick::{LightKind, Marker, to_screen};
 use crate::editor::state::{GizmoMode, GizmoSpace};
 use crate::gfx::vulkan::GizmoVertex;
-use crate::scene::{Camera, Light, LocalTransform, MAX_CONE_ANGLE, MIN_CONE_ANGLE};
+use crate::scene::{
+    Camera, CameraComponent, Light, LocalTransform, MAX_CONE_ANGLE, MIN_CONE_ANGLE,
+};
 
 /// How long an axis is on screen, and the radius of a ring, in points.
 pub const LENGTH: f32 = 90.0;
@@ -407,15 +409,13 @@ pub fn marker(
     emphasis: Emphasis,
     pixels_per_point: f32,
 ) {
-    let colour = match (emphasis, kind) {
-        (Emphasis::Selected, _) => HOT.to_array(),
-        (Emphasis::Hovered, _) => {
-            let [red, green, blue, _] = HOT.to_array();
-            [red, green, blue, 150]
-        }
-        (Emphasis::Rest, Marker::Light(_)) => crate::editor::theme::KIND_LIGHT.to_array(),
-        (Emphasis::Rest, Marker::Empty) => CENTRE.to_array(),
-    };
+    let colour = lit(
+        emphasis,
+        match kind {
+            Marker::Light(_) => crate::editor::theme::KIND_LIGHT.to_array(),
+            Marker::Empty => CENTRE.to_array(),
+        },
+    );
     let ring = |radius: f32, centre: egui::Pos2| -> Vec<egui::Pos2> {
         (0..=16)
             .map(|step| {
@@ -524,6 +524,124 @@ pub fn light_lines(light: &Light, world: Mat4, scale: f32, out: &mut Vec<(Vec3, 
                 }
             }
         }
+    }
+}
+
+/// How wide a camera's frame is drawn, in metres, whatever its lens: the
+/// size Blender draws one at by default.
+pub const CAMERA_SIZE: f32 = 1.0;
+
+/// A camera drawn as Blender draws one: a pyramid from the eye onto a frame
+/// in the shape of the picture, with a triangle over the frame's top edge
+/// saying which way is up.
+///
+/// The frame is always [`CAMERA_SIZE`] across its longer side and the lens
+/// decides how far ahead of the eye it stands, so a long lens draws a long
+/// pyramid and a wide one a stubby one — the field of view reads off the
+/// shape. The aspect is the viewport's, which is the picture the game draws.
+/// Everything is carried through the entity's world matrix, scale included.
+pub struct CameraShape {
+    pub eye: Vec3,
+    /// Top left, top right, bottom right, bottom left, as the camera sees it.
+    pub frame: [Vec3; 4],
+    /// The base's two ends, then the tip.
+    pub up: [Vec3; 3],
+}
+
+impl CameraShape {
+    pub fn new(lens: &CameraComponent, world: Mat4, aspect: f32) -> Self {
+        let half = CAMERA_SIZE * 0.5;
+        let aspect = aspect.max(1e-3);
+        let (half_width, half_height) = if aspect >= 1.0 {
+            (half, half / aspect)
+        } else {
+            (half * aspect, half)
+        };
+        let depth = half_height / (lens.fov_degrees.to_radians() * 0.5).tan();
+        let at = |x: f32, y: f32| world.transform_point3(Vec3::new(x, y, -depth));
+        // Blender's proportions: a base 70% of the frame wide, lifted a little
+        // clear of it, and half as tall as it is wide.
+        let base = half_height + 0.1 * half_width;
+        Self {
+            eye: world.transform_point3(Vec3::ZERO),
+            frame: [
+                at(-half_width, half_height),
+                at(half_width, half_height),
+                at(half_width, -half_height),
+                at(-half_width, -half_height),
+            ],
+            up: [
+                at(-0.7 * half_width, base),
+                at(0.7 * half_width, base),
+                at(0.0, base + 0.7 * half_width),
+            ],
+        }
+    }
+
+    /// Every edge: the four from the eye, the frame's four, the triangle's
+    /// three.
+    pub fn edges(&self) -> [(Vec3, Vec3); 11] {
+        let [a, b, c, d] = self.frame;
+        let [left, right, tip] = self.up;
+        [
+            (self.eye, a),
+            (self.eye, b),
+            (self.eye, c),
+            (self.eye, d),
+            (a, b),
+            (b, c),
+            (c, d),
+            (d, a),
+            (left, right),
+            (right, tip),
+            (tip, left),
+        ]
+    }
+}
+
+/// Append a camera's wireframe, lit by `emphasis`, with the up triangle
+/// filled when it is the camera the game draws from. An edge with an end
+/// behind the view is left out rather than clipped.
+pub fn camera(
+    out: &mut Vec<GizmoVertex>,
+    shape: &CameraShape,
+    view: &Camera,
+    screen: egui::Rect,
+    emphasis: Emphasis,
+    active: bool,
+    pixels_per_point: f32,
+) {
+    let colour = lit(emphasis, crate::editor::theme::KIND_CAMERA.to_array());
+    let view_proj = view.view_projection(screen.aspect_ratio());
+    let forward = (view.target - view.position).normalize();
+    let ahead = |point: Vec3| (point - view.position).dot(forward) > view.near;
+    let on_screen = |point: Vec3| to_screen(view_proj, screen, point);
+    for (a, b) in shape.edges() {
+        if ahead(a) && ahead(b) {
+            stroke(
+                out,
+                on_screen(a),
+                on_screen(b),
+                1.0,
+                1.0,
+                colour,
+                pixels_per_point,
+            );
+        }
+    }
+    if active && shape.up.into_iter().all(ahead) {
+        fill_triangle(out, shape.up.map(on_screen), colour, pixels_per_point);
+    }
+}
+
+/// A marker's or a camera's colour: `rest` until the pointer is on it, lit
+/// when selected and half lit under the pointer.
+fn lit(emphasis: Emphasis, rest: [u8; 4]) -> [u8; 4] {
+    let [red, green, blue, _] = HOT.to_array();
+    match emphasis {
+        Emphasis::Selected => HOT.to_array(),
+        Emphasis::Hovered => [red, green, blue, 150],
+        Emphasis::Rest => rest,
     }
 }
 
@@ -960,7 +1078,7 @@ fn plane_hit((start, direction): (Vec3, Vec3), origin: Vec3, normal: Vec3) -> Op
 }
 
 /// How far `point` is from the segment `a`–`b`.
-fn segment_distance(point: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+pub(crate) fn segment_distance(point: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     let along = b - a;
     let t = ((point - a).dot(along) / along.length_sq().max(f32::EPSILON)).clamp(0.0, 1.0);
     (point - (a + along * t)).length()
@@ -1991,5 +2109,146 @@ mod tests {
         let mut none = Vec::new();
         gizmo.strokes(GizmoMode::Select, None, false, 1.0, &mut none);
         assert!(none.is_empty());
+    }
+
+    fn lens(fov_degrees: f32) -> CameraComponent {
+        CameraComponent {
+            fov_degrees,
+            ..CameraComponent::default()
+        }
+    }
+
+    /// Turned to look along -X and set up off the origin, so nothing passes
+    /// for being right by lying on an axis.
+    fn turned() -> (Mat4, Vec3, Vec3, Vec3) {
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        let rotation = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        (
+            Mat4::from_rotation_translation(rotation, at),
+            at,
+            rotation * Vec3::NEG_Z,
+            rotation * Vec3::Y,
+        )
+    }
+
+    #[test]
+    fn a_camera_is_a_pyramid_onto_a_frame_its_lens_sees() {
+        let (world, at, forward, up) = turned();
+        let shape = CameraShape::new(&lens(50.0), world, 16.0 / 9.0);
+        assert!(close(shape.eye, at));
+
+        let [tl, tr, br, bl] = shape.frame;
+        let depth = (tl - at).dot(forward);
+        for corner in shape.frame {
+            assert!(
+                ((corner - at).dot(forward) - depth).abs() < 1e-4,
+                "one plane"
+            );
+        }
+        assert!(depth > 0.0, "ahead of the eye");
+        let top = (tl + tr) * 0.5;
+        let half_angle = (top - at).normalize().dot(forward).acos().to_degrees();
+        assert!((half_angle - 25.0).abs() < 0.01, "{half_angle}°");
+        assert!((top - at).dot(up) > 0.0, "the top is up");
+
+        let (width, height) = (tl.distance(tr), tr.distance(br));
+        assert!((width - CAMERA_SIZE).abs() < 1e-4);
+        assert!((width / height - 16.0 / 9.0).abs() < 1e-3);
+        assert!(close(bl - br, tl - tr), "a rectangle");
+    }
+
+    #[test]
+    fn a_long_lens_draws_a_long_pyramid() {
+        let depth = |fov: f32| {
+            let shape = CameraShape::new(&lens(fov), Mat4::IDENTITY, 16.0 / 9.0);
+            -shape.frame[0].z
+        };
+        assert!(depth(20.0) > 2.0 * depth(60.0));
+        assert!(depth(60.0) > 2.0 * depth(120.0));
+    }
+
+    /// Over the top edge and pointing up, whatever the picture's shape, so the
+    /// camera's roll reads at a glance.
+    #[test]
+    fn the_up_triangle_stands_on_the_frame_and_points_up() {
+        let (world, at, forward, up) = turned();
+        for aspect in [16.0 / 9.0, 1.0, 9.0 / 16.0] {
+            let shape = CameraShape::new(&lens(60.0), world, aspect);
+            let [tl, tr, ..] = shape.frame;
+            let [left, right, tip] = shape.up;
+            let height = |p: Vec3| (p - at).dot(up);
+            assert!(height(left) > height(tl) && height(right) > height(tl));
+            assert!(height(tip) > height(left));
+            assert!((height(left) - height(right)).abs() < 1e-4, "level");
+            let right_axis = forward.cross(up);
+            let across = |p: Vec3| (p - at).dot(right_axis);
+            assert!(across(tip).abs() < 1e-4, "centred");
+            assert!(
+                across(left) > across(tl) && across(right) < across(tr),
+                "inside the edge"
+            );
+            for p in shape.up {
+                assert!(((p - at).dot(forward) - (tl - at).dot(forward)).abs() < 1e-4);
+            }
+        }
+    }
+
+    /// Seen from the default view, from the side.
+    fn drawn(emphasis: Emphasis, active: bool) -> Vec<GizmoVertex> {
+        let world = Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2);
+        let shape = CameraShape::new(&lens(60.0), world, screen().aspect_ratio());
+        let mut out = Vec::new();
+        camera(
+            &mut out,
+            &shape,
+            &Camera::default(),
+            screen(),
+            emphasis,
+            active,
+            1.0,
+        );
+        out
+    }
+
+    /// Filled for the camera the game draws from, as Blender marks its scene
+    /// camera: one solid triangle more, the outline unchanged.
+    #[test]
+    fn the_active_camera_s_triangle_is_filled() {
+        let outline = drawn(Emphasis::Rest, false);
+        let filled = drawn(Emphasis::Rest, true);
+        assert_eq!(outline.len(), 11 * 6, "eleven edges, every one in view");
+        assert_eq!(filled.len(), outline.len() + 3);
+        let key = |v: &GizmoVertex| (v.position, v.color);
+        assert!(
+            outline
+                .iter()
+                .map(key)
+                .eq(filled[..outline.len()].iter().map(key))
+        );
+    }
+
+    #[test]
+    fn a_camera_wears_the_camera_colour_and_is_lit_when_selected() {
+        let colours =
+            |emphasis| -> Vec<[u8; 4]> { drawn(emphasis, false).iter().map(|v| v.color).collect() };
+        let rest = colours(Emphasis::Rest);
+        assert!(!rest.is_empty());
+        let [r, g, b, _] = crate::editor::theme::KIND_CAMERA.to_array();
+        assert!(
+            rest.iter().all(|c| c[..3] == [r, g, b]),
+            "{:?}",
+            rest.first()
+        );
+        assert!(
+            colours(Emphasis::Selected)
+                .iter()
+                .all(|c| *c == HOT.to_array())
+        );
+        let [r, g, b, _] = HOT.to_array();
+        assert!(
+            colours(Emphasis::Hovered)
+                .iter()
+                .all(|c| c[..3] == [r, g, b] && c[3] < 255)
+        );
     }
 }

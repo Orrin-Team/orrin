@@ -14,15 +14,17 @@ use glam::{Mat4, Quat, Vec3};
 
 use orrin_ecs::{Entity, FxHashMap, World};
 use orrin_registry::{AssetId, ComponentId, Registry, ScriptBridge, Value, ValueError};
-use orrin_script::{CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi, ScriptHost};
+use orrin_script::{
+    CCamera, CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi, ScriptHost,
+};
 
 use crate::asset_db::{AssetDatabase, AssetKind, LoadState};
 use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::prefab::{self, Prefabs};
 use crate::scene::{
-    ActionId, Actions, Assets, Collider, ColliderShape, DebugLines, InputState, LoadedScenes,
-    LocalTransform, LogLevel, MaterialHandle, MeshHandle, Name, Parent, PendingScripts,
-    SceneHandle, ScriptComponent, Tag, Time, Transform, WorldTransform,
+    ActionId, Actions, ActiveCamera, Assets, CameraComponent, Collider, ColliderShape, DebugLines,
+    InputState, LoadedScenes, LocalTransform, LogLevel, MaterialHandle, MeshHandle, Name, Parent,
+    PendingScripts, SceneHandle, ScriptComponent, Tag, Time, Transform, WorldTransform,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -378,6 +380,7 @@ extern "C" fn has_component(entity: CEntity, kind: u32) -> bool {
             0 => world.has::<LocalTransform>(entity),
             1 => world.has::<Tag>(entity),
             2 => world.has::<Collider>(entity),
+            3 => world.has::<CameraComponent>(entity),
             _ => false,
         }
     })
@@ -564,6 +567,10 @@ enum Command {
     AddCollider {
         entity: Entity,
         collider: Collider,
+    },
+    AddCamera {
+        entity: Entity,
+        camera: CameraComponent,
     },
     SetMaterial {
         entity: Entity,
@@ -850,19 +857,38 @@ extern "C" fn active_scene() -> u32 {
     })
 }
 
+/// The active camera entity's world position and rotation as of this call:
+/// its own local transform, composed with its parent's last propagated world
+/// one. Not its `WorldTransform`, which predates this tick's script writes,
+/// so a script setting the rotation and then the position keeps both.
+fn camera_entity_pose(world: &World, entity: Entity) -> (Vec3, Quat) {
+    let local = world
+        .get::<LocalTransform>(entity)
+        .map_or(Mat4::IDENTITY, |transform| transform.matrix());
+    let (_, rotation, position) =
+        (crate::scene::parent_world_matrix(world, entity) * local).to_scale_rotation_translation();
+    (position, rotation)
+}
+
 extern "C" fn get_camera(out: *mut CTransform) -> bool {
     if out.is_null() {
         return false;
     }
     orrin_script::with_world(false, |world| {
-        let Some(camera) = world.get_resource::<crate::scene::Camera>() else {
-            return false;
+        let (position, rotation) = match crate::scene::active_camera(world) {
+            Some(entity) => camera_entity_pose(world, entity),
+            None => {
+                let Some(camera) = world.get_resource::<crate::scene::Camera>() else {
+                    return false;
+                };
+                (camera.position, camera.rotation())
+            }
         };
         // SAFETY: `out` is a valid, writable `CTransform` supplied by C#.
         unsafe {
             *out = CTransform {
-                position: camera.position.to_array(),
-                rotation: camera.rotation().to_array(),
+                position: position.to_array(),
+                rotation: rotation.to_array(),
                 scale: [1.0; 3],
             };
         }
@@ -870,20 +896,160 @@ extern "C" fn get_camera(out: *mut CTransform) -> bool {
     })
 }
 
+/// With a camera entity active this moves the entity, keeping its scale, and
+/// the view follows it at the end of the frame; writing the view directly
+/// would be overwritten by that follow before anything drew it.
 extern "C" fn set_camera(value: *const CTransform) -> bool {
     if value.is_null() {
         return false;
     }
     // SAFETY: `value` is a valid `CTransform` supplied by C#.
     let value = unsafe { *value };
+    let position = Vec3::from_array(value.position);
+    let rotation = Quat::from_array(value.rotation).normalize();
     orrin_script::with_world(false, |world| {
+        if let Some(entity) = crate::scene::active_camera(world) {
+            let local = crate::scene::parent_world_matrix(world, entity).inverse()
+                * Mat4::from_rotation_translation(rotation, position);
+            let Some(mut transform) = world.get_mut::<LocalTransform>(entity) else {
+                tracing::warn!(
+                    "Camera.Place: the active camera (entity {}) has no Transform to move",
+                    entity.index
+                );
+                return false;
+            };
+            let (_, rotation, translation) = local.to_scale_rotation_translation();
+            transform.translation = translation;
+            transform.rotation = rotation;
+            return true;
+        }
         let Some(mut camera) = world.get_resource_mut::<crate::scene::Camera>() else {
             return false;
         };
-        camera.place(
-            Vec3::from_array(value.position),
-            Quat::from_array(value.rotation),
-        );
+        camera.place(position, rotation);
+        true
+    })
+}
+
+/// A lens from C#, or `None` with the reason logged against `call`.
+fn checked_lens(value: *const CCamera, call: &str) -> Option<CameraComponent> {
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: `value` is a valid `CCamera` supplied by C#.
+    let value = unsafe { *value };
+    let camera = CameraComponent {
+        fov_degrees: value.fov_degrees,
+        near: value.near,
+        far: value.far,
+        priority: value.priority,
+    };
+    match camera.check() {
+        Ok(()) => Some(camera),
+        Err(error) => {
+            tracing::warn!("{call}: {error}");
+            None
+        }
+    }
+}
+
+extern "C" fn add_camera(entity: CEntity, value: *const CCamera) -> bool {
+    let Some(camera) = checked_lens(value, "World.AddCamera") else {
+        return false;
+    };
+    orrin_script::with_world(false, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        if !world.is_alive(entity) {
+            return false;
+        }
+        COMMANDS.with(|commands| {
+            commands
+                .borrow_mut()
+                .push(Command::AddCamera { entity, camera })
+        });
+        true
+    })
+}
+
+extern "C" fn get_camera_lens(entity: CEntity, out: *mut CCamera) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    orrin_script::with_world(false, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        let Some(camera) = world.get::<CameraComponent>(entity) else {
+            return false;
+        };
+        // SAFETY: `out` is a valid, writable `CCamera` supplied by C#.
+        unsafe {
+            *out = CCamera {
+                fov_degrees: camera.fov_degrees,
+                near: camera.near,
+                far: camera.far,
+                priority: camera.priority,
+            };
+        }
+        true
+    })
+}
+
+extern "C" fn set_camera_lens(entity: CEntity, value: *const CCamera) -> bool {
+    let Some(lens) = checked_lens(value, "World.SetCamera") else {
+        return false;
+    };
+    orrin_script::with_world(false, |world| {
+        let entity = Entity {
+            index: entity.index,
+            generation: entity.generation,
+        };
+        let Some(mut camera) = world.get_mut::<CameraComponent>(entity) else {
+            return false;
+        };
+        *camera = lens;
+        true
+    })
+}
+
+extern "C" fn get_active_camera() -> CEntity {
+    orrin_script::with_world(CEntity::NULL, |world| {
+        crate::scene::active_camera(world).map_or(CEntity::NULL, |entity| CEntity {
+            index: entity.index,
+            generation: entity.generation,
+        })
+    })
+}
+
+extern "C" fn set_active_camera(entity: CEntity) -> bool {
+    orrin_script::with_world(false, |world| {
+        let selected = (entity.index != 0).then_some(Entity {
+            index: entity.index,
+            generation: entity.generation,
+        });
+        if let Some(entity) = selected {
+            let queued = COMMANDS.with(|commands| {
+                commands.borrow().iter().any(
+                    |command| matches!(command, Command::AddCamera { entity: e, .. } if *e == entity),
+                )
+            });
+            if !queued && !world.has::<CameraComponent>(entity) {
+                tracing::warn!(
+                    "Camera.Active: entity {} is not a camera; give it one with \
+                     World.AddCamera first",
+                    entity.index
+                );
+                return false;
+            }
+        }
+        if world.get_resource::<ActiveCamera>().is_none() {
+            world.insert_resource(ActiveCamera::default());
+        }
+        world.resource_mut::<ActiveCamera>().select(selected);
         true
     })
 }
@@ -1160,6 +1326,11 @@ fn build_api() -> OrrinApi {
         active_scene,
         get_camera,
         set_camera,
+        add_camera,
+        get_camera_lens,
+        set_camera_lens,
+        get_active_camera,
+        set_active_camera,
         ..orrin_script::default_api()
     }
 }
@@ -1862,6 +2033,9 @@ impl Scripting {
                 Command::AddCollider { entity, collider } => {
                     world.insert(entity, collider);
                 }
+                Command::AddCamera { entity, camera } => {
+                    world.insert(entity, camera);
+                }
                 Command::SetMaterial { entity, material } => {
                     world.insert(entity, material);
                 }
@@ -2253,5 +2427,199 @@ mod tests {
         assert_eq!(state(&mut world, broken), orrin_script::LOAD_FAILED);
         let gold = AssetId::named("material", "gold");
         assert_eq!(state(&mut world, gold), orrin_script::LOAD_READY);
+    }
+
+    fn c(entity: Entity) -> CEntity {
+        CEntity {
+            index: entity.index,
+            generation: entity.generation,
+        }
+    }
+
+    fn lens(priority: i32) -> CCamera {
+        CCamera {
+            fov_degrees: 70.0,
+            near: 0.2,
+            far: 300.0,
+            priority,
+        }
+    }
+
+    fn camera_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(crate::scene::Camera::default());
+        world.insert_resource(ActiveCamera::default());
+        world
+    }
+
+    /// Structural, so it lands when the dispatch's commands drain; a lens that
+    /// cannot project never reaches the queue.
+    #[test]
+    fn a_script_adds_a_camera_after_the_dispatch_and_never_a_broken_one() {
+        let mut world = camera_world();
+        let entity = world.spawn();
+        let broken = CCamera {
+            near: 0.0,
+            ..lens(0)
+        };
+        let (added, refused) = orrin_script::with_active_world(&mut world, || {
+            (
+                add_camera(c(entity), &lens(4)),
+                add_camera(c(entity), &broken),
+            )
+        });
+        assert!(added);
+        assert!(!refused);
+        assert!(!world.has::<CameraComponent>(entity), "deferred");
+
+        let commands: Vec<Command> = COMMANDS.with(|c| c.borrow_mut().drain(..).collect());
+        let [
+            Command::AddCamera {
+                entity: queued,
+                camera,
+            },
+        ] = commands.as_slice()
+        else {
+            panic!("expected exactly the one valid camera to be queued");
+        };
+        assert_eq!(*queued, entity);
+        assert_eq!(camera.priority, 4);
+    }
+
+    #[test]
+    fn a_script_reads_and_retunes_a_lens_in_place() {
+        let mut world = camera_world();
+        let entity = world.spawn();
+        world.insert(entity, CameraComponent::default());
+
+        let (read, written, refused) = orrin_script::with_active_world(&mut world, || {
+            let mut read = lens(0);
+            get_camera_lens(c(entity), &mut read);
+            let written = set_camera_lens(c(entity), &lens(2));
+            let refused = set_camera_lens(
+                c(entity),
+                &CCamera {
+                    far: 0.1,
+                    ..lens(9)
+                },
+            );
+            (read, written, refused)
+        });
+        let default = CameraComponent::default();
+        assert_eq!(
+            (read.fov_degrees, read.near, read.far, read.priority),
+            (
+                default.fov_degrees,
+                default.near,
+                default.far,
+                default.priority
+            )
+        );
+        assert!(written);
+        assert!(!refused);
+        let camera = *world.get::<CameraComponent>(entity).unwrap();
+        assert_eq!(
+            (camera.fov_degrees, camera.far, camera.priority),
+            (70.0, 300.0, 2)
+        );
+        assert!(orrin_script::with_active_world(&mut world, || {
+            has_component(c(entity), 3)
+        }));
+    }
+
+    #[test]
+    fn a_script_switches_between_cameras_and_back_to_priority() {
+        let mut world = camera_world();
+        let first = world.spawn();
+        world.insert(first, CameraComponent::default());
+        let second = world.spawn();
+        world.insert(second, CameraComponent::default());
+        let not_a_camera = world.spawn();
+
+        orrin_script::with_active_world(&mut world, || {
+            assert_eq!(
+                get_active_camera().index,
+                first.index,
+                "priority tie: lower slot"
+            );
+            assert!(set_active_camera(c(second)));
+            assert_eq!(get_active_camera().index, second.index);
+            assert!(!set_active_camera(c(not_a_camera)));
+            assert_eq!(
+                get_active_camera().index,
+                second.index,
+                "a refusal changes nothing"
+            );
+            assert!(set_active_camera(CEntity::NULL));
+            assert_eq!(get_active_camera().index, first.index);
+        });
+    }
+
+    /// A camera a script adds is one it means to look through, usually at once.
+    #[test]
+    fn a_camera_queued_this_tick_can_be_selected_this_tick() {
+        let mut world = camera_world();
+        let other = world.spawn();
+        world.insert(other, CameraComponent::default());
+        let fresh = world.spawn();
+        let selected = orrin_script::with_active_world(&mut world, || {
+            add_camera(c(fresh), &lens(0)) && set_active_camera(c(fresh))
+        });
+        assert!(selected);
+        COMMANDS.with(|c| c.borrow_mut().clear());
+        assert_eq!(world.resource::<ActiveCamera>().selected(), Some(fresh));
+    }
+
+    /// `Camera.position` and friends move the camera the game draws from, so
+    /// a script written before camera entities keeps working with one active.
+    /// Read back through the local transform, not last frame's world one, so
+    /// setting the rotation and then the position keeps both.
+    #[test]
+    fn the_view_api_moves_the_active_camera_entity_and_reads_this_tick() {
+        let mut world = camera_world();
+        let player = world.spawn();
+        world.insert(
+            player,
+            LocalTransform::new(Transform {
+                translation: Vec3::new(10.0, 0.0, 0.0),
+                ..Transform::default()
+            }),
+        );
+        let camera = world.spawn();
+        world.insert(camera, LocalTransform::default());
+        world.insert(camera, CameraComponent::default());
+        crate::scene::reparent(&mut world, camera, Some(player), false).unwrap();
+        crate::scene::propagate_transforms(&mut world);
+
+        let facing = Quat::from_rotation_y(0.5);
+        let read = orrin_script::with_active_world(&mut world, || {
+            let mut view = CTransform {
+                position: [0.0; 3],
+                rotation: [0.0; 4],
+                scale: [1.0; 3],
+            };
+            assert!(get_camera(&mut view));
+            view.rotation = facing.to_array();
+            assert!(set_camera(&view));
+            assert!(get_camera(&mut view));
+            view.position = [12.0, 1.0, 0.0];
+            assert!(set_camera(&view));
+            assert!(get_camera(&mut view));
+            view
+        });
+        assert!(Vec3::from_array(read.position).distance(Vec3::new(12.0, 1.0, 0.0)) < 1e-4);
+        assert!(Quat::from_array(read.rotation).angle_between(facing) < 1e-4);
+
+        let local = *world.get::<LocalTransform>(camera).unwrap();
+        assert!(
+            local.translation.distance(Vec3::new(2.0, 1.0, 0.0)) < 1e-4,
+            "{local:?}"
+        );
+        assert!(local.rotation.angle_between(facing) < 1e-4);
+        assert_eq!(
+            world.resource::<crate::scene::Camera>().position,
+            crate::scene::Camera::default().position,
+            "the view itself follows the entity at the end of the frame"
+        );
     }
 }

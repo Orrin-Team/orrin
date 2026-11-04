@@ -54,7 +54,9 @@ use glam::{Quat, Vec3};
 use orrin_ecs::{Entity, World};
 
 use crate::gfx::RenderBackend;
-use crate::scene::{Decal, Light, LocalTransform, MaterialHandle, MeshHandle, Name, Transform};
+use crate::scene::{
+    CameraComponent, Decal, Light, LocalTransform, MaterialHandle, MeshHandle, Name, Transform,
+};
 
 /// Which built-in scene a run opens with.
 ///
@@ -225,6 +227,25 @@ pub fn spawn_spot_light(
             ..Default::default()
         }))
         .with(Light::spot(color, lumens, range, inner_angle, outer_angle))
+        .id()
+}
+
+/// A camera with the default lens, looking along `rotation`'s -Z.
+pub fn spawn_camera(
+    world: &mut World,
+    name: impl Into<String>,
+    position: Vec3,
+    rotation: Quat,
+) -> Entity {
+    world
+        .spawn_entity()
+        .with(Name::new(name))
+        .with(LocalTransform::from(Transform {
+            translation: position,
+            rotation,
+            ..Default::default()
+        }))
+        .with(CameraComponent::default())
         .id()
 }
 

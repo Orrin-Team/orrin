@@ -319,19 +319,40 @@ pub fn gizmo(
         let view_proj = camera.view_projection(screen.aspect_ratio());
         let forward = (camera.target - camera.position).normalize();
         let ppp = ctx.pixels_per_point();
+        let (selection, hovered) = (&state.selection, state.hovered);
+        let emphasis = |entity| {
+            if selection.contains(entity) {
+                Emphasis::Selected
+            } else if hovered == Some(entity) {
+                Emphasis::Hovered
+            } else {
+                Emphasis::Rest
+            }
+        };
         pick::each_marker(world, |entity, at, kind| {
             if (at - camera.position).dot(forward) <= camera.near {
                 return;
             }
             let on_screen = pick::to_screen(view_proj, screen, at);
-            let emphasis = if state.selection.contains(entity) {
-                Emphasis::Selected
-            } else if state.hovered == Some(entity) {
-                Emphasis::Hovered
-            } else {
-                Emphasis::Rest
-            };
-            crate::editor::gizmo::marker(&mut state.gizmo_strokes, on_screen, kind, emphasis, ppp);
+            crate::editor::gizmo::marker(
+                &mut state.gizmo_strokes,
+                on_screen,
+                kind,
+                emphasis(entity),
+                ppp,
+            );
+        });
+        pick::each_camera(world, |entity, model, lens, active| {
+            let shape = crate::editor::gizmo::CameraShape::new(lens, model, screen.aspect_ratio());
+            crate::editor::gizmo::camera(
+                &mut state.gizmo_strokes,
+                &shape,
+                &camera,
+                screen,
+                emphasis(entity),
+                active,
+                ppp,
+            );
         });
         // A selected light's reach: its range, its cone, its direction.
         let mut lines = Vec::new();

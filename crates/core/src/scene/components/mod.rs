@@ -1,3 +1,4 @@
+mod camera;
 mod collider;
 mod light;
 mod local_transform;
@@ -14,6 +15,7 @@ mod tag;
 mod unknown;
 mod world_transform;
 
+pub use camera::CameraComponent;
 pub use collider::{Collider, ColliderShape};
 pub use light::{AmbientLight, Light, MAX_CONE_ANGLE, MIN_CONE_ANGLE};
 pub use local_transform::LocalTransform;

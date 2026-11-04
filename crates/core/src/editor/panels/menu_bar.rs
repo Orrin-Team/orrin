@@ -375,6 +375,18 @@ pub fn spawn_entries(ui: &mut egui::Ui, state: &mut EditorState) {
             ui.close_menu();
         }
     }
+    ui.separator();
+    if ui
+        .add(egui::Button::new(icons::with_label(
+            icons::camera(),
+            Some(crate::editor::theme::KIND_CAMERA),
+            "Camera",
+        )))
+        .clicked()
+    {
+        state.request_spawn(SpawnKind::Camera);
+        ui.close_menu();
+    }
 }
 
 fn entity(ui: &mut egui::Ui, state: &mut EditorState) {

@@ -3,8 +3,8 @@
 //!
 //! Decided from the components present, in a fixed order of precedence: a
 //! light is a light even if it also has a mesh (a lamp model with its bulb on
-//! it), and a mesh with a script is still drawn as a mesh, because what it
-//! looks like in the scene is how the user goes looking for it.
+//! it), a camera likewise, and a mesh with a script is still drawn as a mesh,
+//! because what it looks like in the scene is how the user goes looking for it.
 
 use egui::Color32;
 use orrin_ecs::{Entity, World};
@@ -12,7 +12,7 @@ use orrin_ecs::{Entity, World};
 use super::{icons, theme};
 #[cfg(feature = "scripting")]
 use crate::scene::ScriptComponent;
-use crate::scene::{Light, MeshHandle};
+use crate::scene::{CameraComponent, Light, MeshHandle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -21,6 +21,7 @@ pub enum Kind {
     Mesh,
     Light,
     Sun,
+    Camera,
     #[cfg_attr(
         not(feature = "scripting"),
         allow(dead_code, reason = "only a script component makes one")
@@ -35,6 +36,9 @@ impl Kind {
                 Light::Directional { .. } => Self::Sun,
                 _ => Self::Light,
             };
+        }
+        if world.has::<CameraComponent>(entity) {
+            return Self::Camera;
         }
         if world.has::<MeshHandle>(entity) {
             return Self::Mesh;
@@ -52,6 +56,7 @@ impl Kind {
             Self::Mesh => icons::box_(),
             Self::Light => icons::lightbulb(),
             Self::Sun => icons::sun(),
+            Self::Camera => icons::camera(),
             Self::Script => icons::file_code(),
         }
     }
@@ -63,6 +68,7 @@ impl Kind {
             Self::Group => weak,
             Self::Mesh => theme::KIND_MESH,
             Self::Light | Self::Sun => theme::KIND_LIGHT,
+            Self::Camera => theme::KIND_CAMERA,
             Self::Script => theme::KIND_SCRIPT,
         }
     }
@@ -73,6 +79,7 @@ impl Kind {
             Self::Mesh => "Mesh",
             Self::Light => "Light",
             Self::Sun => "Sun",
+            Self::Camera => "Camera",
             Self::Script => "Script",
         }
     }
@@ -127,12 +134,28 @@ mod tests {
         assert_eq!(Kind::of(&world, lamp), Kind::Light);
     }
 
+    /// A camera with a body model on it is still the camera to go looking for.
+    #[test]
+    fn a_camera_wins_over_a_mesh() {
+        let mut world = World::new();
+        let camera = world.spawn();
+        world.insert(camera, MeshHandle(0));
+        world.insert(camera, crate::scene::CameraComponent::default());
+        assert_eq!(Kind::of(&world, camera), Kind::Camera);
+    }
+
     /// Kinds are told apart by their icon's tint; two that share one must
     /// share it on purpose.
     #[test]
     fn only_the_two_lights_share_a_tint() {
         let weak = Color32::GRAY;
-        let kinds = [Kind::Group, Kind::Mesh, Kind::Light, Kind::Script];
+        let kinds = [
+            Kind::Group,
+            Kind::Mesh,
+            Kind::Light,
+            Kind::Camera,
+            Kind::Script,
+        ];
         for (i, a) in kinds.iter().enumerate() {
             for b in &kinds[i + 1..] {
                 assert_ne!(a.tint(weak), b.tint(weak), "{a:?} and {b:?}");

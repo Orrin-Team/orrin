@@ -1048,6 +1048,27 @@ mod tests {
         assert!(editor.state.selection.is_empty());
     }
 
+    /// Where the editor is looking, so it opens on what the author framed.
+    #[test]
+    fn a_new_camera_stands_where_the_editor_view_does() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let view = *editor.world.resource::<crate::scene::Camera>();
+        editor
+            .state
+            .request_spawn(crate::editor::state::SpawnKind::Camera);
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        let camera = named(&editor.world, "Camera").expect("spawned");
+        assert!(editor.world.has::<crate::scene::CameraComponent>(camera));
+        let local = *editor.world.get::<LocalTransform>(camera).unwrap();
+        assert!(local.translation.distance(view.position) < 1e-4);
+        assert!(
+            (local.rotation * glam::Vec3::NEG_Z).distance(view.rotation() * glam::Vec3::NEG_Z)
+                < 1e-4
+        );
+        assert_eq!(editor.state.selection.entities(), [camera]);
+    }
+
     #[test]
     fn a_reparent_in_the_tree_can_be_undone() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));

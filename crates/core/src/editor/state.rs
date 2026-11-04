@@ -180,6 +180,7 @@ pub enum SpawnKind {
     Plane,
     PointLight,
     DirectionalLight,
+    Camera,
 }
 
 impl SpawnKind {
@@ -191,6 +192,7 @@ impl SpawnKind {
             SpawnKind::Plane => "Plane",
             SpawnKind::PointLight => "Point Light",
             SpawnKind::DirectionalLight => "Directional Light",
+            SpawnKind::Camera => "Camera",
         }
     }
 }
@@ -1552,6 +1554,16 @@ fn spawn(world: &mut World, kind: SpawnKind) -> Option<Entity> {
             Vec3::ONE,
             20_000.0,
         )),
+        // Where the editor is looking, so it opens on what the author framed.
+        SpawnKind::Camera => {
+            let view = *world.get_resource::<scene::Camera>()?;
+            Some(entities::spawn_camera(
+                world,
+                kind.name(),
+                view.position,
+                view.rotation(),
+            ))
+        }
     }
 }
 

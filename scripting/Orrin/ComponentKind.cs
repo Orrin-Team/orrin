@@ -7,6 +7,7 @@ public enum ComponentKind : uint
     Transform = 0,
     Tag = 1,
     Collider = 2,
+    Camera = 3,
 }
 
 internal static class ComponentKinds
@@ -18,6 +19,7 @@ internal static class ComponentKinds
     {
         if (typeof(T) == typeof(Transform)) return (uint)ComponentKind.Transform;
         if (typeof(T) == typeof(Tag)) return (uint)ComponentKind.Tag;
+        if (typeof(T) == typeof(CameraComponent)) return (uint)ComponentKind.Camera;
         throw new ArgumentException($"{typeof(T).Name} is not a script-visible engine component");
     }
 }

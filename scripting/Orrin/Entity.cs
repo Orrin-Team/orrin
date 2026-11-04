@@ -38,9 +38,9 @@ public readonly struct Entity : IEquatable<Entity>
 
     /// Typed read of an engine component, or null if the entity lacks it (or
     /// the handle is stale). Components come back by value; write back through
-    /// the corresponding setter (Native.SetTransform, World.SetTag). v1
-    /// supports Transform and Tag — script-defined components arrive with the
-    /// byte-blob milestone.
+    /// the corresponding setter (Native.SetTransform, World.SetTag,
+    /// World.SetCamera). Supports Transform, Tag and CameraComponent —
+    /// script-defined components arrive with the byte-blob milestone.
     public T? GetComponent<T>() where T : struct
     {
         // typeof dispatch per supported component; the (T)(object) round-trip
@@ -49,6 +49,8 @@ public readonly struct Entity : IEquatable<Entity>
             return HasComponent<Transform>() ? (T)(object)Native.GetTransform(this) : null;
         if (typeof(T) == typeof(Tag))
             return Native.GetTag(this) is { } tag ? (T)(object)new Tag(tag) : null;
+        if (typeof(T) == typeof(CameraComponent))
+            return Native.GetCameraLens(this) is { } camera ? (T)(object)camera : null;
         throw new ArgumentException($"{typeof(T).Name} is not a script-visible engine component");
     }
 

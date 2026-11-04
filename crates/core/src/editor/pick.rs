@@ -14,7 +14,9 @@
 use glam::{Mat4, Vec3};
 use orrin_ecs::{Entity, World};
 
-use crate::scene::{Camera, Light, Locked, MeshBounds, MeshHandle, Parent, WorldTransform};
+use crate::scene::{
+    Camera, CameraComponent, Light, Locked, MeshBounds, MeshHandle, Parent, WorldTransform,
+};
 
 /// The ray through `ndc` (−1 to 1, y down, as the scene's projection has it):
 /// its start on the near plane, and a direction reaching the far plane.
@@ -72,7 +74,7 @@ pub fn each_marker(world: &World, mut visit: impl FnMut(Entity, Vec3, Marker)) {
     world
         .query::<&WorldTransform>()
         .for_each(|entity, transform| {
-            if world.has::<MeshHandle>(entity) {
+            if world.has::<MeshHandle>(entity) || world.has::<CameraComponent>(entity) {
                 return;
             }
             let marker = match world.get::<Light>(entity).map(|light| *light) {
@@ -82,6 +84,24 @@ pub fn each_marker(world: &World, mut visit: impl FnMut(Entity, Vec3, Marker)) {
                 None => Marker::Empty,
             };
             visit(entity, transform.translation(), marker);
+        });
+}
+
+/// Every camera entity drawn as its wireframe, with its world matrix, its
+/// lens and whether it is the camera the game draws from.
+pub fn each_camera(world: &World, mut visit: impl FnMut(Entity, Mat4, &CameraComponent, bool)) {
+    let active = crate::scene::active_camera(world);
+    let playing = world
+        .get_resource::<crate::scene::Play>()
+        .is_some_and(|play| play.is_live());
+    // While the game plays the view is the active camera, so it is not drawn.
+    let looked_through = active.filter(|_| playing);
+    world
+        .query::<(&CameraComponent, &WorldTransform)>()
+        .for_each(|entity, (lens, transform)| {
+            if Some(entity) != looked_through {
+                visit(entity, transform.0, lens, Some(entity) == active);
+            }
         });
 }
 
@@ -95,8 +115,9 @@ pub fn to_screen(view_proj: Mat4, screen: egui::Rect, point: Vec3) -> egui::Pos2
         )
 }
 
-/// What is under `pointer`: the nearest of the meshes the ray from it enters
-/// and the markers within [`MARKER_REACH`] of it.
+/// What is under `pointer`: the nearest of the meshes the ray from it enters,
+/// the markers within [`MARKER_REACH`] of it and the cameras whose wireframe
+/// is.
 pub fn pick_at(
     world: &World,
     camera: &Camera,
@@ -113,6 +134,29 @@ pub fn pick_at(
         let reached = (to_screen(view_proj, screen, at) - pointer).length() <= MARKER_REACH;
         if t >= 0.0
             && reached
+            && nearest.is_none_or(|(best, _)| t < best)
+            && !is_locked(world, entity)
+        {
+            nearest = Some((t, entity));
+        }
+    });
+    let forward = (camera.target - camera.position).normalize();
+    let ahead = |point: Vec3| (point - camera.position).dot(forward) > camera.near;
+    each_camera(world, |entity, model, lens, _| {
+        let shape = crate::editor::gizmo::CameraShape::new(lens, model, screen.aspect_ratio());
+        let reached = shape.edges().into_iter().any(|(a, b)| {
+            ahead(a)
+                && ahead(b)
+                && crate::editor::gizmo::segment_distance(
+                    pointer,
+                    to_screen(view_proj, screen, a),
+                    to_screen(view_proj, screen, b),
+                ) <= MARKER_REACH
+        });
+        // Ordered against meshes and markers by where it stands.
+        let t = (shape.eye - origin).dot(direction) / direction.length_squared();
+        if reached
+            && t >= 0.0
             && nearest.is_none_or(|(best, _)| t < best)
             && !is_locked(world, entity)
         {
@@ -375,5 +419,69 @@ mod tests {
         world.insert(unknown, MeshHandle(7));
         world.insert(unknown, WorldTransform(Mat4::IDENTITY));
         assert_eq!(pick(&world, Vec3::new(0.0, 0.0, 3.0), Vec3::NEG_Z), None);
+    }
+
+    fn camera(world: &mut World, model: Mat4) -> Entity {
+        let entity = world.spawn();
+        world.insert(entity, CameraComponent::default());
+        world.insert(entity, WorldTransform(model));
+        entity
+    }
+
+    /// Looking along +X, which the default view sees from the side.
+    fn side_on() -> Mat4 {
+        Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2)
+    }
+
+    /// As Blender picks one: on its lines, and not through the gaps between
+    /// them, where what is behind the camera is what the click meant.
+    #[test]
+    fn a_camera_is_picked_by_its_wireframe_and_not_through_it() {
+        let mut world = world();
+        let entity = camera(&mut world, side_on());
+        let shape = crate::editor::gizmo::CameraShape::new(
+            &CameraComponent::default(),
+            side_on(),
+            screen().aspect_ratio(),
+        );
+        let view = Camera::default();
+        let edge = on_screen((shape.frame[1] + shape.frame[2]) * 0.5);
+        assert_eq!(pick_at(&world, &view, screen(), edge), Some(entity));
+        let gap = on_screen((shape.eye + shape.frame[1] + shape.frame[2]) / 3.0);
+        assert_eq!(pick_at(&world, &view, screen(), gap), None);
+    }
+
+    #[test]
+    fn a_camera_is_drawn_as_its_wireframe_not_a_marker() {
+        let mut world = world();
+        let entity = camera(&mut world, Mat4::IDENTITY);
+        let mut markers = 0;
+        each_marker(&world, |_, _, _| markers += 1);
+        assert_eq!(markers, 0);
+        let mut cameras = Vec::new();
+        each_camera(&world, |camera, _, _, active| {
+            cameras.push((camera, active))
+        });
+        assert_eq!(cameras, [(entity, true)]);
+    }
+
+    /// While the game plays, the view is the active camera: drawn, it would
+    /// be a frame round the edge of the screen and a pick under every click.
+    #[test]
+    fn the_camera_being_looked_through_is_neither_drawn_nor_picked() {
+        let mut world = world();
+        let looking = camera(&mut world, Mat4::IDENTITY);
+        let other = camera(&mut world, side_on());
+        let seen = |world: &World| {
+            let mut seen = Vec::new();
+            each_camera(world, |camera, _, _, active| seen.push((camera, active)));
+            seen
+        };
+        assert_eq!(seen(&world), [(looking, true), (other, false)]);
+
+        let mut play = crate::scene::Play::default();
+        play.set(crate::scene::PlayState::Playing);
+        world.insert_resource(play);
+        assert_eq!(seen(&world), [(other, false)]);
     }
 }

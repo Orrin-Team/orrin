@@ -88,6 +88,7 @@ icons! {
     arrow_square_out => '\u{e5de}',
     arrow_up => '\u{e08e}',
     box_ => '\u{e1da}',
+    camera => '\u{e10e}',
     check => '\u{e182}',
     check_circle => '\u{e184}',
     chevron_down => '\u{e136}',

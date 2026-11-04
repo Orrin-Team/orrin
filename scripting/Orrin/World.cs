@@ -46,6 +46,19 @@ public static class World
         _ => throw new ArgumentException($"unsupported collider type {collider.GetType().Name}"),
     };
 
+    /// Queue making `entity` a camera, looking along its Transform's -Z. It
+    /// can be made <see cref="Camera.Active"/> this tick and draws from next
+    /// frame. Logs and returns false for a lens that cannot project (see
+    /// <see cref="CameraComponent"/>) or a stale handle.
+    public static bool AddCamera(Entity entity, CameraComponent camera) =>
+        Native.AddCamera(entity, camera);
+
+    /// Change a camera's lens in place, from this frame. Logs and returns
+    /// false for a lens that cannot project; returns false if `entity` is not
+    /// a camera.
+    public static bool SetCamera(Entity entity, CameraComponent camera) =>
+        Native.SetCameraLens(entity, camera);
+
     /// Queue a material swap (names come from the same registry as
     /// SpawnRenderable). Logs and returns false if the name is unknown or the
     /// handle was stale.
