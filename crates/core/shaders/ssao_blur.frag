@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // The noise filter over the raw occlusion, and — when the term was resolved at
 // half the frame's extent — the upsample that puts it back.
 //
@@ -48,7 +50,7 @@ void main() {
     // forward pass reads only through the bilinear upsample at a silhouette.
     // The same coherent branch `ssao.frag` takes, for the same reason: an empty
     // scene is otherwise this pass's worst case.
-    if (texture(u_depth, v_uv).r >= 1.0) {
+    if (depth_is_far(texture(u_depth, v_uv).r)) {
         f_ao = 1.0;
         return;
     }

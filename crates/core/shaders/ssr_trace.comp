@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // One reflection ray per half-resolution pixel, marched through the depth
 // pyramid, returning the radiance it found and how much that radiance should be
 // believed.
@@ -18,7 +20,7 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(set = 0, binding = 0) uniform sampler2D u_hiz;      // min-depth pyramid
+layout(set = 0, binding = 0) uniform sampler2D u_hiz;      // nearest-depth pyramid
 layout(set = 0, binding = 1) uniform sampler2D u_depth;    // full-res depth
 layout(set = 0, binding = 2) uniform sampler2D u_normal;   // view-space, encoded
 layout(set = 0, binding = 3) uniform sampler2D u_material; // rgb = f0, a = roughness
@@ -115,7 +117,7 @@ void main() {
     float depth = texture(u_depth, uv).r;
     // The far plane is sky: nothing was rasterised, so there is no surface to
     // reflect off.
-    if (depth >= 1.0 || roughness > ssr.params.y) {
+    if (depth_is_far(depth) || roughness > ssr.params.y) {
         imageStore(u_rays, pixel, vec4(0.0));
         return;
     }
@@ -148,7 +150,7 @@ void main() {
     vec3 target = origin + l * ssr.trace.y;
     // Clip to the near plane: a point behind the camera projects to a position
     // that means nothing, and the segment through it is not the ray.
-    float near_z = -1e-3 + view_pos(vec2(0.5), 0.0).z;
+    float near_z = -1e-3 + view_pos(vec2(0.5), DEPTH_NEAR).z;
     if (target.z > near_z) {
         target = origin + l * ((near_z - origin.z) / max(l.z, 1e-6));
     }
@@ -202,9 +204,9 @@ void main() {
         float z_far = s0.z + dir.z * t_next;
         // The deepest the ray gets inside this cell. If that stays in front of
         // everything the cell contains, the cell is empty for this ray.
-        float z_deep = max(pos.z, z_far);
+        float z_deep = depth_farthest(pos.z, z_far);
 
-        if (z_deep >= cell_z) {
+        if (!depth_nearer(z_deep, cell_z)) {
             if (level == 0) {
                 // Land on the crossing itself rather than the cell edge, so the
                 // hit UV is where the surface is.

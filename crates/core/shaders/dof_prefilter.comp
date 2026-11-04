@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // Depth of field, step one: half the frame, carrying its own circle of
 // confusion.
 //
@@ -30,7 +32,7 @@ layout(push_constant) uniform Push {
 // touches only clip x and y, so this is the same distance whether or not the
 // frame was jittered.
 float linear_depth(float d) {
-    return dof.near * dof.far / max(dof.far - d * (dof.far - dof.near), 1e-6);
+    return depth_linear(d, dof.near, dof.far);
 }
 
 float circle_of_confusion(float d) {

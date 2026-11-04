@@ -24,7 +24,9 @@ layout(location = 0) out vec4 f_accum;
 layout(location = 1) out float f_reveal;
 
 // The paper's weight function (equation 10): near-opaque and near-camera
-// fragments dominate, distant near-transparent ones barely register.
+// fragments dominate, distant near-transparent ones barely register. Written,
+// as the paper writes it, in forward-Z depth, which the reversed buffer gives
+// back as `1 - depth` exactly — so the weights are the paper's own.
 //
 // The bounds matter more than the curve. `accum` is a 16-bit float target, so
 // the weight has to stay inside a range whose products do not saturate — the
@@ -32,7 +34,7 @@ layout(location = 1) out float f_reveal;
 // pixel white.
 float oit_weight(float depth, float alpha) {
     float coverage = min(1.0, alpha * 10.0) + 0.01;
-    float nearness = 1.0 - depth * 0.9;
+    float nearness = 1.0 - (1.0 - depth) * 0.9;
     return clamp(coverage * coverage * coverage * 1e8
                * nearness * nearness * nearness, 1e-2, 3e3);
 }

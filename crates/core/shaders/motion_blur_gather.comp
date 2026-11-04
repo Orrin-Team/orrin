@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // Motion blur, step three: reconstruct what the sensor saw while the shutter
 // was open.
 //
@@ -41,9 +43,7 @@ const int TAPS = 15;
 const float SOFT_DEPTH_EXTENT = 0.1;
 
 float linear_depth(float d) {
-    float near = mb.params.z;
-    float far = mb.params.w;
-    return near * far / max(far - d * (far - near), 1e-6);
+    return depth_linear(d, mb.params.z, mb.params.w);
 }
 
 // Identical to the tile pass's, and it has to be: a pixel whose sky motion this
@@ -53,8 +53,8 @@ vec2 blur_vector(ivec2 at, ivec2 size) {
     vec2 uv = (vec2(at) + 0.5) / vec2(size);
 
     vec2 velocity;
-    if (depth >= 1.0) {
-        vec4 world = mb.inv_view_proj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+    if (depth_is_far(depth)) {
+        vec4 world = mb.inv_view_proj * vec4(uv * 2.0 - 1.0, DEPTH_FAR, 1.0);
         vec4 previous = mb.prev_view_proj * vec4(world.xyz / world.w, 1.0);
         velocity = uv - ((previous.xy / previous.w) * 0.5 + 0.5);
     } else {

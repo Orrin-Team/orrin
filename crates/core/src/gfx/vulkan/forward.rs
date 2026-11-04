@@ -692,7 +692,7 @@ impl ForwardPass {
                 } else {
                     DepthTest {
                         write: true,
-                        compare: DepthCompare::Less,
+                        compare: crate::gfx::depth::NEARER,
                     }
                 }),
                 // The material textures, of which a scene writes only the ones it

@@ -200,7 +200,9 @@ fn face_count(kind: LightKind) -> usize {
     }
 }
 
-/// Vulkan's clip space, matching [`Camera::projection_range`] exactly.
+/// Vulkan's clip space, matching [`Camera::projection_range`]'s Y flip but not
+/// its depth: a shadow map stays forward-Z, for the reason [`crate::gfx::depth`]
+/// gives.
 ///
 /// The Y flip is not cosmetic: it is what makes a triangle's winding come out
 /// the same here as in the forward pass, and therefore what lets the shadow

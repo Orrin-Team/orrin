@@ -18,6 +18,7 @@
 // For the `Cascades` half of the block below: the scatter pass reads the shadow
 // maps, so the same uniform carries what it takes to read them.
 #include "cascades.glsl"
+#include "depth.glsl"
 
 const float FOG_PI = 3.14159265359;
 
@@ -96,7 +97,7 @@ float fog_depth_slice(FogParams f, float view_dist) {
 
 // The view ray through a froxel column, as a unit direction in world space.
 vec3 fog_ray_direction(FogParams f, vec2 uv) {
-    vec4 far = f.inv_view_proj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+    vec4 far = f.inv_view_proj * vec4(uv * 2.0 - 1.0, DEPTH_FAR, 1.0);
     return normalize(far.xyz / far.w - f.camera_pos.xyz);
 }
 

@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // One invocation per (live instance, view): decide whether the instance is
 // wanted by that view, and if it is, append its row to the view's list and count
 // it into its batch's draw command.
@@ -189,17 +191,17 @@ bool occluded(vec3 center, vec3 extents) {
         return false;
     }
 
-    float farthest = 0.0;
+    float farthest = DEPTH_NEAR;
     for (int y = first.y; y <= last.y; ++y) {
         for (int x = first.x; x <= last.x; ++x) {
-            farthest = max(farthest, texelFetch(u_occlusion, ivec2(x, y), level).r);
+            farthest = depth_farthest(farthest, texelFetch(u_occlusion, ivec2(x, y), level).r);
         }
     }
 
     // The cell holds the farthest of the frontmost surfaces under it. A box
     // whose nearest point is behind even that is behind a surface at every
     // texel its rect covers.
-    return ndc_min.z > farthest;
+    return depth_nearer(farthest, depth_nearest(ndc_min.z, ndc_max.z));
 }
 
 void main() {

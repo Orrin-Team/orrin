@@ -33,9 +33,8 @@
 //! compatibility rule asks.
 
 use crate::gfx::rhi::{
-    Binding, BindingResource, Blend, ComputePipelineDesc, CullMode, DepthCompare, DepthTest,
-    Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, TextureViewId,
-    Viewport,
+    Binding, BindingResource, Blend, ComputePipelineDesc, CullMode, DepthTest, Device, Encoder,
+    GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, TextureViewId, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
@@ -97,7 +96,7 @@ impl RefractionPass {
             // composited under it.
             depth_test: Some(DepthTest {
                 write: false,
-                compare: DepthCompare::Less,
+                compare: crate::gfx::depth::NEARER,
             }),
             depth_format: Some(DEPTH_FORMAT),
             vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],

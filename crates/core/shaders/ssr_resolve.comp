@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // Swap the environment's guess at a reflection for the one the trace actually
 // found.
 //
@@ -66,7 +68,7 @@ void main() {
     float depth = texture(u_depth, uv).r;
     vec4 material = texture(u_material, uv);
     float roughness = material.a;
-    if (depth >= 1.0 || roughness > ssr.params.y) {
+    if (depth_is_far(depth) || roughness > ssr.params.y) {
         imageStore(u_output, pixel, vec4(scene, 1.0));
         return;
     }

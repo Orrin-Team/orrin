@@ -18,9 +18,8 @@ use glam::{Mat3, Mat4, Vec3};
 use crate::gfx::format::SampleCount;
 use crate::gfx::graph::ImageUsage;
 use crate::gfx::rhi::{
-    Binding, BindingResource, BufferId, DepthCompare, DepthTest, Device, Encoder,
-    GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, TextureDesc, TextureDimension,
-    TextureViewId, Viewport,
+    Binding, BindingResource, BufferId, DepthTest, Device, Encoder, GraphicsPipelineDesc,
+    PipelineId, SamplerDesc, SamplerId, TextureDesc, TextureDimension, TextureViewId, Viewport,
 };
 use crate::gfx::sh::{self, SH9};
 use crate::gfx::shaders::ShaderId;
@@ -145,7 +144,7 @@ impl EnvironmentPass {
                 // lines drawn after it.
                 depth_test: Some(DepthTest {
                     write: false,
-                    compare: DepthCompare::LessOrEqual,
+                    compare: crate::gfx::depth::NEARER_OR_EQUAL,
                 }),
                 depth_format: Some(super::swapchain::DEPTH_FORMAT),
                 samples: if msaa {

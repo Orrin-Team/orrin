@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out float f_shadow;
 
@@ -58,7 +60,7 @@ float dither(vec2 pixel, float frame_index) {
 void main() {
     float depth = texture(u_depth, v_uv).r;
     // Nothing was rasterised here, so there is no surface for the sun to miss.
-    if (depth >= 1.0) {
+    if (depth_is_far(depth)) {
         f_shadow = 1.0;
         return;
     }
@@ -104,7 +106,7 @@ void main() {
 
         float scene_depth = texture(u_depth, uv).r;
         // Sky: the ray is passing in front of nothing.
-        if (scene_depth >= 1.0) {
+        if (depth_is_far(scene_depth)) {
             continue;
         }
 

@@ -16,9 +16,9 @@
 
 use crate::gfx::format::SampleCount;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferId, CullMode, DepthCompare,
-    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId,
-    TextureViewId, Topology, Viewport,
+    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferId, CullMode, DepthTest, Device,
+    Encoder, GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, TextureViewId, Topology,
+    Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{PositionVertex, SurfaceVertex};
@@ -110,7 +110,7 @@ impl GeometryPrepass {
                 cull,
                 depth_test: Some(DepthTest {
                     write: true,
-                    compare: DepthCompare::Less,
+                    compare: crate::gfx::depth::NEARER,
                 }),
                 partial_texture_set: Some(TEXTURE_SET as u32),
                 dynamic_depth_bias: false,

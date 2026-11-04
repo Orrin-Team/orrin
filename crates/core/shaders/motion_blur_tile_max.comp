@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // Motion blur, step one: the largest motion in each 16x16 tile.
 //
 // The gather cannot simply follow each pixel's own velocity. A fast object's
@@ -44,13 +46,13 @@ vec2 blur_vector(ivec2 at, ivec2 size) {
     vec2 uv = (vec2(at) + 0.5) / vec2(size);
 
     vec2 velocity;
-    if (depth >= 1.0) {
+    if (depth_is_far(depth)) {
         // Nothing was rasterised, so the prepass wrote no motion — but the sky
         // still sweeps when the camera turns. Reproject the far-plane point
         // through both view-projections to recover exactly that. Without this
         // the geometry smears while the sky behind it stays perfectly sharp,
         // which reads as a bug rather than as a camera.
-        vec4 world = mb.inv_view_proj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+        vec4 world = mb.inv_view_proj * vec4(uv * 2.0 - 1.0, DEPTH_FAR, 1.0);
         vec4 previous = mb.prev_view_proj * vec4(world.xyz / world.w, 1.0);
         velocity = uv - ((previous.xy / previous.w) * 0.5 + 0.5);
     } else {

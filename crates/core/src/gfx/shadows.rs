@@ -6,16 +6,19 @@ pub const MAX_CASCADES: usize = 4;
 pub const OVERLAP: f32 = 0.005;
 
 /// Vulkan NDC: x,y in [-1,1], z in [0,1]. First four are the near plane.
-const NDC_CORNERS: [Vec3; 8] = [
-    Vec3::new(-1.0, -1.0, 0.0),
-    Vec3::new(1.0, -1.0, 0.0),
-    Vec3::new(-1.0, 1.0, 0.0),
-    Vec3::new(1.0, 1.0, 0.0),
-    Vec3::new(-1.0, -1.0, 1.0),
-    Vec3::new(1.0, -1.0, 1.0),
-    Vec3::new(-1.0, 1.0, 1.0),
-    Vec3::new(1.0, 1.0, 1.0),
-];
+const NDC_CORNERS: [Vec3; 8] = {
+    use crate::gfx::depth::{FAR, NEAR};
+    [
+        Vec3::new(-1.0, -1.0, NEAR),
+        Vec3::new(1.0, -1.0, NEAR),
+        Vec3::new(-1.0, 1.0, NEAR),
+        Vec3::new(1.0, 1.0, NEAR),
+        Vec3::new(-1.0, -1.0, FAR),
+        Vec3::new(1.0, -1.0, FAR),
+        Vec3::new(-1.0, 1.0, FAR),
+        Vec3::new(1.0, 1.0, FAR),
+    ]
+};
 
 pub struct CascadeConfig {
     pub count: usize,

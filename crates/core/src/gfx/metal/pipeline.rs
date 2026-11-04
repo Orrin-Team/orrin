@@ -153,6 +153,8 @@ impl MtlDriver {
                 DepthCompare::Less => MTLCompareFunction::Less,
                 DepthCompare::Equal => MTLCompareFunction::Equal,
                 DepthCompare::LessOrEqual => MTLCompareFunction::LessEqual,
+                DepthCompare::Greater => MTLCompareFunction::Greater,
+                DepthCompare::GreaterOrEqual => MTLCompareFunction::GreaterEqual,
             });
             stencil.setDepthWriteEnabled(test.write);
             Shared(

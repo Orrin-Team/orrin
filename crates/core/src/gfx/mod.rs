@@ -1,4 +1,5 @@
 pub mod choice;
+pub mod depth;
 pub mod format;
 pub mod graph;
 pub mod headless;

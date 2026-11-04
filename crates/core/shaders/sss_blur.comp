@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // One axis of the subsurface diffusion.
 //
 // The pass runs twice with `direction` swapped, which is what makes an O(n^2)
@@ -43,9 +45,7 @@ const int TAPS = 7;
 // Matches `linear_depth` in the depth-of-field and motion-blur shaders, because
 // it is the same depth buffer read the same way.
 float linear_depth(float d) {
-    float near = push.direction.z;
-    float far = push.direction.w;
-    return near * far / max(far - d * (far - near), 1e-6);
+    return depth_linear(d, push.direction.z, push.direction.w);
 }
 
 void main() {

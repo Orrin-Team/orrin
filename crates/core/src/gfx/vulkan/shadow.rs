@@ -424,7 +424,7 @@ fn build_lit_depth(device: &Device, dimension: TextureDimension) -> TextureViewI
         usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
         memoryless: false,
     });
-    device.fill_depth(texture, 1.0);
+    device.fill_depth(texture, crate::gfx::depth::SHADOW_CLEAR);
     texture
 }
 

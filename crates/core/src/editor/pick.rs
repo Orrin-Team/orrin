@@ -20,8 +20,8 @@ use crate::scene::{Camera, Light, Locked, MeshBounds, MeshHandle, Parent, WorldT
 /// its start on the near plane, and a direction reaching the far plane.
 pub fn ray(camera: &Camera, aspect: f32, ndc: egui::Vec2) -> (Vec3, Vec3) {
     let inverse = camera.view_projection(aspect).inverse();
-    let near = inverse.project_point3(Vec3::new(ndc.x, ndc.y, 0.0));
-    let far = inverse.project_point3(Vec3::new(ndc.x, ndc.y, 1.0));
+    let near = inverse.project_point3(Vec3::new(ndc.x, ndc.y, crate::gfx::depth::NEAR));
+    let far = inverse.project_point3(Vec3::new(ndc.x, ndc.y, crate::gfx::depth::FAR));
     (near, far - near)
 }
 
@@ -180,6 +180,18 @@ mod tests {
         world.insert(entity, MeshHandle(0));
         world.insert(entity, WorldTransform(model));
         entity
+    }
+
+    /// The ray starts at the camera's near plane and points away from it, into
+    /// the scene — whichever end of the depth range the projection puts near.
+    #[test]
+    fn the_ray_through_the_centre_leaves_the_camera_forwards() {
+        let camera = Camera::default();
+        let forward = (camera.target - camera.position).normalize();
+        let (origin, direction) = ray(&camera, 16.0 / 9.0, egui::Vec2::ZERO);
+        assert!((origin - (camera.position + forward * camera.near)).length() < 1e-3);
+        assert!(direction.normalize().dot(forward) > 0.999);
+        assert!((direction.length() - (camera.far - camera.near)).abs() < 1.0);
     }
 
     #[test]

@@ -11,7 +11,7 @@
 
 use crate::gfx::format::SampleCount;
 use crate::gfx::rhi::{
-    CullMode, DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, Topology,
+    CullMode, DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, Topology,
     VertexAttribute, VertexFormat, VertexStream, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
@@ -78,7 +78,7 @@ impl LinePass {
                 // Tested against the scene, never written.
                 depth_test: Some(DepthTest {
                     write: false,
-                    compare: DepthCompare::Less,
+                    compare: crate::gfx::depth::NEARER,
                 }),
                 depth_format: Some(DEPTH_FORMAT),
                 // A description carries formats, not a sample count, and a

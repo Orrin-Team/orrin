@@ -750,6 +750,8 @@ impl VkDriver {
                             DepthCompare::Less => CompareOp::Less,
                             DepthCompare::Equal => CompareOp::Equal,
                             DepthCompare::LessOrEqual => CompareOp::LessOrEqual,
+                            DepthCompare::Greater => CompareOp::Greater,
+                            DepthCompare::GreaterOrEqual => CompareOp::GreaterOrEqual,
                         },
                     }),
                     ..Default::default()
@@ -1231,7 +1233,7 @@ impl<'a> VkEncoder<'a> {
 
     pub fn clear_depth(&mut self, rects: &[DepthRect]) {
         self.recorder.clear_attachments(
-            [ClearAttachment::Depth(1.0)],
+            [ClearAttachment::Depth(crate::gfx::depth::SHADOW_CLEAR)],
             rects.iter().map(|rect| ClearRect {
                 offset: rect.offset,
                 extent: rect.extent,

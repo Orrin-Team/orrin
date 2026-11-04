@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // Temporal antialiasing: accumulate the jittered frame into a reprojected
 // history.
 //
@@ -157,7 +159,7 @@ void main() {
     vec3 lowest = vec3(1e9);
     vec3 highest = vec3(-1e9);
     ivec2 nearest = texel;
-    float nearest_depth = 1.0; // forward-Z, so smaller is nearer
+    float nearest_depth = DEPTH_FAR;
 
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
@@ -169,7 +171,7 @@ void main() {
             highest = max(highest, c);
 
             float depth = texelFetch(u_depth, at, 0).r;
-            if (depth < nearest_depth) {
+            if (depth_nearer(depth, nearest_depth)) {
                 nearest_depth = depth;
                 nearest = at;
             }
@@ -178,12 +180,12 @@ void main() {
 
     vec2 uv = (vec2(texel) + 0.5) * taa.params.xy;
     vec2 previous_uv;
-    if (nearest_depth >= 1.0) {
+    if (depth_is_far(nearest_depth)) {
         // Nothing was rasterised here, so the prepass wrote no motion — but the
         // sky still moves when the camera does. Reproject the far-plane point
         // through both view-projections to recover exactly that motion; skip
         // this and the sky ghosts under any rotation.
-        vec4 world = taa.inv_view_proj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+        vec4 world = taa.inv_view_proj * vec4(uv * 2.0 - 1.0, DEPTH_FAR, 1.0);
         vec4 previous = taa.prev_view_proj * vec4(world.xyz / world.w, 1.0);
         previous_uv = (previous.xy / previous.w) * 0.5 + 0.5;
     } else {

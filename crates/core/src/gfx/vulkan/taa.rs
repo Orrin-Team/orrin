@@ -363,7 +363,7 @@ mod tests {
             usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
             memoryless: false,
         });
-        device.fill_depth(depth, 1.0);
+        device.fill_depth(depth, crate::gfx::depth::CLEAR);
 
         device.record_blocking(|encoder| {
             pass.record(&device, encoder, &view, color, velocity, depth);

@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out float f_ao;
 
@@ -38,7 +40,7 @@ void main() {
     // branch is taken by whole waves across open sky and costs nothing where it
     // is not, since a wave straddling the horizon runs the loop either way.
     float d = texture(u_depth, v_uv).r;
-    if (d >= 1.0) {
+    if (depth_is_far(d)) {
         f_ao = 1.0;
         return;
     }
