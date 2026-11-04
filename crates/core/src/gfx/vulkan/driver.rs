@@ -432,6 +432,18 @@ impl VkDriver {
         builder.submit_and_wait(&self.ctx);
     }
 
+    pub fn initialise_sampled(&self, texture: TextureViewId) {
+        let view = lookup(&self.views, texture.0, "texture view");
+        let image = view.image().clone();
+        let mut builder = Recorder::new(&self.ctx);
+        builder.image_barrier(super::record::to_shader_read(
+            image.clone(),
+            super::record::whole_image(&image),
+            vulkano::image::ImageLayout::Undefined,
+        ));
+        builder.submit_and_wait(&self.ctx);
+    }
+
     /// The vulkano view behind an id, for the Vulkan-side graph executor, which
     /// resolves graph resources to images and hands them to barriers.
     pub fn vk_view(&self, view: TextureViewId) -> Arc<ImageView> {
@@ -620,10 +632,28 @@ impl VkDriver {
             },
         )
         .expect("failed to create a cube texture");
+        // Into the copy's layout and out to the sampler's: a fresh image is
+        // `Undefined`, and a copy into it there, or a sample of it left in the
+        // copy's layout, is undefined behaviour that happens to work on some
+        // drivers.
         let mut recorder = Recorder::new(&self.ctx);
-        recorder.copy_buffer_to_image(
-            vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(staging, image.clone()),
-        );
+        recorder
+            .image_barrier(super::record::to_transfer_dst(
+                image.clone(),
+                super::record::whole_image(&image),
+                vulkano::image::ImageLayout::Undefined,
+            ))
+            .copy_buffer_to_image(
+                vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(
+                    staging,
+                    image.clone(),
+                ),
+            )
+            .image_barrier(super::record::to_shader_read(
+                image.clone(),
+                super::record::whole_image(&image),
+                vulkano::image::ImageLayout::TransferDstOptimal,
+            ));
         recorder.submit_and_wait(&self.ctx);
         let view = ImageView::new(
             image.clone(),
@@ -787,7 +817,14 @@ impl VkDriver {
                     .into_iter()
                     .collect()
                 } else {
-                    [DynamicState::Viewport].into_iter().collect()
+                    // Scissor on every pipeline, not only the atlas's: the
+                    // overlay clips each mesh with one, and a scissor set on a
+                    // pipeline that declares it static is invalid. `set_viewport`
+                    // sets the matching one, so a pass that never asks for a
+                    // narrower scissor gets its whole viewport.
+                    [DynamicState::Viewport, DynamicState::Scissor]
+                        .into_iter()
+                        .collect()
                 },
                 subpass: Some(
                     rendering::pipeline_info(&colors, desc.depth_format.map(vk_format)).into(),
@@ -1212,6 +1249,9 @@ impl<'a> VkEncoder<'a> {
         self.bound.as_ref().expect("no pipeline is bound").layout()
     }
 
+    /// The viewport, and a scissor covering exactly it — every pipeline
+    /// declares scissor dynamic, so a draw needs one set. A pass that wants a
+    /// narrower one sets it after this.
     pub fn set_viewport(&mut self, viewport: Viewport) {
         self.recorder.set_viewport(
             0,
@@ -1221,6 +1261,14 @@ impl<'a> VkEncoder<'a> {
                 depth_range: viewport.depth_range[0]..=viewport.depth_range[1],
             }],
         );
+        let offset = viewport.origin.map(|o| o.max(0.0).floor() as u32);
+        let extent = [0, 1].map(|axis| {
+            (viewport.origin[axis] + viewport.extent[axis])
+                .ceil()
+                .max(0.0) as u32
+                - offset[axis]
+        });
+        self.set_scissor(offset, extent);
     }
 
     pub fn set_scissor(&mut self, offset: [u32; 2], extent: [u32; 2]) {

@@ -400,6 +400,7 @@ mod tests {
             overlay: true,
             outline: true,
             gizmo: true,
+            presents: true,
             shadow_cascades: MAX_CASCADES as u8,
             shadow_resolution: 2048,
             shadow_atlas: 4096,

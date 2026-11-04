@@ -151,6 +151,11 @@ pub struct FrameConfig {
     pub outline: bool,
     /// Whether the transform gizmo draws, for the reason `outline` is separate.
     pub gizmo: bool,
+    /// Whether the frame's target goes to a presentation engine (a window) or is
+    /// copied out (an offscreen capture). It decides the layout the target ends
+    /// in: `PresentSrc` needs the swapchain extension, which an offscreen device
+    /// does not enable, and the readback copies from `TransferSrcOptimal`.
+    pub presents: bool,
     pub shadow_cascades: u8,
     pub shadow_resolution: u32,
     /// Edge of the punctual shadow atlas in texels, zero for a frame where
@@ -656,9 +661,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let occlusion_ids = config.occlusion_culling.then(|| {
         // Entry `ShaderReadOnlyOptimal` states the steady state the ping-pong
         // guarantees: `hiz` leaves every frame in exactly that layout and is
-        // the allocation `history` names next frame. The one frame where it is
-        // not true — the first after an allocation — is the frame the cull is
-        // told to test nothing anyway.
+        // the allocation `history` names next frame. On the first frame after an
+        // allocation the layout is still true — `initialise_sampled` puts it
+        // there — and its contents are what the cull is told to ignore.
         let history = builder.import_image(
             "occlusion_history",
             ImageDesc::new(OCCLUSION_FORMAT)
@@ -722,9 +727,14 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         "swapchain_color",
         ImageDesc::new(config.color_format),
         // An acquired image's contents are not ours to keep, and the
-        // presentation engine wants it back in `PresentSrc`.
+        // presentation engine wants it back in `PresentSrc` — or, offscreen,
+        // the readback wants it in the layout it copies from.
         ImageLayout::Undefined,
-        ImageLayout::PresentSrc,
+        if config.presents {
+            ImageLayout::PresentSrc
+        } else {
+            ImageLayout::TransferSrcOptimal
+        },
     );
 
     // Imported rather than graph-owned, because a far cascade is not redrawn
@@ -971,9 +981,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let fog = config.volumetric_fog.then(|| {
         // Entry `ShaderReadOnlyOptimal` states the steady state, which the
         // ping-pong guarantees: this leaves every frame in exactly that layout
-        // and is the allocation the *history* names next frame. The one frame it
-        // is not true — the first after an allocation — is the frame the scatter
-        // pass is told to ignore its history anyway.
+        // and is the allocation the *history* names next frame. On the first
+        // frame after an allocation the layout is still true — the allocation
+        // put it there — and its contents are what the scatter pass ignores.
         let scatter = builder.import_image(
             "fog_scatter",
             ImageDesc::new(FOG_FORMAT)
@@ -1402,9 +1412,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let prepass = prepass.expect("TAA reads the geometry prepass");
         // Entry `ShaderReadOnlyOptimal` states the steady state, which the
         // ping-pong guarantees: `output` below leaves every frame in exactly
-        // that layout, and it is the allocation `history` names next frame. The
-        // one frame where it is not true — the first after an allocation — is
-        // the frame the pass is told to ignore its history anyway.
+        // that layout, and it is the allocation `history` names next frame. On
+        // the first frame after an allocation the layout is still true — the
+        // allocation put it there — and its contents are what `reset` ignores.
         let history = builder.import_image(
             "taa_history",
             ImageDesc::new(HDR_FORMAT),

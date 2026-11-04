@@ -372,6 +372,16 @@ impl Backend {
         }
     }
 
+    /// Whether the frame's target is handed to a presentation engine rather than
+    /// read back: a window rather than an offscreen capture.
+    fn presents(&self) -> bool {
+        match self {
+            Backend::Vulkan(vk) => vk.swapchain.readback.is_empty(),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(mtl) => mtl.windowed.is_some(),
+        }
+    }
+
     /// The window a Metal frame ends in, if it has one.
     #[cfg(target_os = "macos")]
     fn metal_window(&self) -> Option<&crate::gfx::metal::backend::Windowed> {
@@ -705,6 +715,7 @@ impl VulkanRenderer {
             overlay: true,
             outline: true,
             gizmo: true,
+            presents: true,
             shadow_cascades: 0,
             shadow_resolution: 1,
             shadow_atlas: 0,
@@ -1566,6 +1577,17 @@ impl VulkanRenderer {
             self.flush_pending_tail();
             self.backend.vk_mut().in_flight.drain();
             self.backend.vk_mut().overlay_present.drain();
+            // And the presents, which no fence covers: the old swapchain cannot
+            // be destroyed under a present still pending on it, and the
+            // semaphores those presents wait on go back to the pool the moment
+            // their frames are dropped — still waited on, to be handed out again
+            // as an acquire's. Idling the queue settles both, and it is a resize.
+            self.backend
+                .vk()
+                .ctx
+                .queue
+                .with(|mut queue| queue.wait_idle())
+                .expect("failed to idle the queue before recreating the swapchain");
             let vk = self.backend.vk_mut();
             if vk.swapchain.recreate(vk.pending_extent, vk.present) {
                 vk.recreate_swapchain = false;
@@ -1619,6 +1641,7 @@ impl VulkanRenderer {
             gizmo: overlay
                 .as_ref()
                 .is_some_and(|frame| !frame.gizmo.is_empty()),
+            presents: self.backend.presents(),
             // Sourced from the cascade set rather than the setting, so the
             // number of passes the graph declares cannot disagree with the
             // number of matrices there are to draw them with.

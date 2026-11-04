@@ -260,6 +260,16 @@ impl Device {
         device_dispatch!(self, driver => driver.fill_depth(texture, depth))
     }
 
+    /// Put a freshly created texture into the layout a sampled descriptor
+    /// expects, for an image a pass imports as entering the frame sampled — a
+    /// history — so the declaration is true from its first frame rather than
+    /// only from its second. Its contents stay undefined: every such image is
+    /// one its pass ignores until it has written it. Nothing to do on Metal,
+    /// which has no layouts.
+    pub fn initialise_sampled(&self, texture: TextureViewId) {
+        device_dispatch!(self, driver => driver.initialise_sampled(texture))
+    }
+
     /// A persistent single-level 2D texture holding `pixels`, tightly packed.
     pub fn create_texture_2d(
         &self,
