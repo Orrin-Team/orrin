@@ -217,3 +217,95 @@ impl Drop for Uploads {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use vulkano::VulkanLibrary;
+    use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
+
+    use super::*;
+
+    /// `f` against the real upload staging, failing rather than hanging if it
+    /// never returns — the failure these tests exist for is a spin.
+    fn with_staging(f: impl FnOnce(&VkContext, &Arena) + Send + 'static) {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let instance = Instance::new(
+                VulkanLibrary::new().expect("a Vulkan library"),
+                InstanceCreateInfo {
+                    flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+                    ..Default::default()
+                },
+            )
+            .expect("a headless instance");
+            let ctx = VkContext::new(&instance, None);
+            let uploads = Uploads::new(&ctx);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                f(&ctx, uploads.staging())
+            }));
+            let _ = done.send(outcome);
+        });
+        match finished.recv_timeout(Duration::from_secs(20)) {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!("the staging allocation never returned"),
+        }
+    }
+
+    /// A buffer-to-image copy's source offset is a whole number of texels into
+    /// the *buffer*. An arena buffer need not start at an aligned address in its
+    /// memory, so an offset aligned in memory is not enough; the RGBA32F sky,
+    /// 16 bytes a texel, is the upload that found this.
+    #[test]
+    #[ignore = "needs a Vulkan device"]
+    fn staging_offsets_are_aligned_within_the_buffer() {
+        with_staging(|_, staging| {
+            let mut held = Vec::new();
+            for alignment in [4, 16, 256] {
+                for len in [1, 64, 4096, 65_536, 1 << 20] {
+                    let staging = staging.allocate_bytes(len, alignment);
+                    assert_eq!(
+                        staging.offset() % alignment,
+                        0,
+                        "{len} bytes at alignment {alignment}"
+                    );
+                    assert_eq!(staging.size(), len);
+                    held.push(staging);
+                }
+            }
+        });
+    }
+
+    /// The engine's own cold start: the 4 MiB rock maps size the arenas to
+    /// exactly 8 MiB, and the 8 MiB sky then has to fit one whole — with any
+    /// alignment padding at all, it never did, and the allocator moved to a
+    /// fresh arena of the same size forever. The spacer stands in for the rest
+    /// of a scene's host allocations, which are what leave that fresh arena at
+    /// an address the sky's alignment has to pad.
+    #[test]
+    #[ignore = "needs a Vulkan device"]
+    fn a_request_the_size_of_an_arena_is_allocated() {
+        with_staging(|ctx, staging| {
+            let rock = staging.allocate_bytes(4 << 20, 16);
+            let spacer = vulkano::buffer::Buffer::new_slice::<u8>(
+                ctx.memory_allocator.clone(),
+                vulkano::buffer::BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_SRC,
+                    ..Default::default()
+                },
+                vulkano::memory::allocator::AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                4,
+            )
+            .expect("a spacer buffer");
+            let sky = staging.allocate_bytes(8 << 20, 16);
+            assert_eq!(sky.size(), 8 << 20);
+            drop((rock, spacer));
+        });
+    }
+}

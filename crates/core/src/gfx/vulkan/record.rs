@@ -394,16 +394,33 @@ impl Arena {
     /// `len` bytes starting at a multiple of `alignment`, for a consumer whose
     /// offset rule is not the element type's — a buffer-to-image copy, whose
     /// source offset must be a whole number of texels or blocks.
+    ///
+    /// Aligned here, within the buffer, because `SubbufferAllocator` aligns in
+    /// *memory*, and an arena buffer need not start at an aligned address — on
+    /// an RX 9070 XT every staging arena starts 8 bytes off. Its arenas also grow
+    /// only for a request larger than one, so a request that fits an arena only
+    /// without padding moved to a fresh arena of the same size forever. The
+    /// padding it adds itself is below 256, the spec's ceiling on every
+    /// alignment it applies.
     pub(super) fn allocate_bytes(&self, len: DeviceSize, alignment: DeviceSize) -> Subbuffer<[u8]> {
-        let layout =
-            vulkano::memory::allocator::DeviceLayout::from_size_alignment(len.max(1), alignment)
-                .expect("a staging layout with a power-of-two alignment");
-        self.0
-            .lock()
-            .expect("a pass panicked while recording")
+        const ALLOCATOR_PADDING: DeviceSize = 256;
+        assert!(
+            alignment.is_power_of_two(),
+            "a staging alignment is a power of two"
+        );
+        let len = len.max(1);
+        let padded = len + alignment - 1;
+        let layout = vulkano::memory::allocator::DeviceLayout::from_size_alignment(padded, 1)
+            .expect("a non-empty staging layout");
+        let allocator = self.0.lock().expect("a pass panicked while recording");
+        if allocator.arena_size() < padded + ALLOCATOR_PADDING {
+            allocator.set_arena_size((padded + ALLOCATOR_PADDING) * 2);
+        }
+        let staging = allocator
             .allocate(layout)
-            .expect("failed to suballocate a staging buffer")
-            .slice(..len.max(1))
+            .expect("failed to suballocate a staging buffer");
+        let skip = staging.offset().next_multiple_of(alignment) - staging.offset();
+        staging.slice(skip..skip + len)
     }
 }
 
