@@ -63,6 +63,12 @@ fn rock_maps() -> Vec<(Vec<u8>, u32, u32)> {
 pub fn load_library(
     backend: &mut impl RenderBackend,
 ) -> (Assets, MeshBounds, MaterialBlends, AssetPreviews) {
+    // Started before anything else and collected where the rock maps upload, so
+    // the meshes, their previews and the procedural maps below are built while
+    // it runs. The longest single decode is otherwise the whole cold start's
+    // critical path, with the rest of the pool idle behind it.
+    let rocks = crate::threads::defer(rock_maps);
+
     let mut assets = Assets::new();
     let mut bounds = MeshBounds::default();
     let mut blends = MaterialBlends::default();
@@ -289,7 +295,8 @@ pub fn load_library(
         },
     );
 
-    let [albedo, normal, rough, height]: [_; 4] = rock_maps()
+    let [albedo, normal, rough, height]: [_; 4] = rocks
+        .wait()
         .try_into()
         .expect("one decoded image per rock map");
     let rock_albedo = backend.load_texture(&albedo.0, albedo.1, albedo.2, true);

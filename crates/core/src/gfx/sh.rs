@@ -22,7 +22,7 @@ use std::f32::consts::{FRAC_2_PI, PI, TAU};
 
 use std::ops::{Mul, Sub};
 
-use glam::{Vec3, Vec4};
+use glam::{DVec4, Vec3, Vec4};
 
 /// Coefficient count for bands 0..=2.
 pub const SH9: usize = 9;
@@ -91,6 +91,12 @@ fn row_luminance(pixels: &[f32], width: usize, y: usize) -> impl Iterator<Item =
         .map(|&[r, g, b, _]| Vec3::new(r, g, b).dot(LUMA))
 }
 
+/// Four texels' red, green and blue, one texel per lane.
+fn channels(texels: &[[f32; 4]]) -> [Vec4; 3] {
+    let channel = |c: usize| Vec4::new(texels[0][c], texels[1][c], texels[2][c], texels[3][c]);
+    [channel(0), channel(1), channel(2)]
+}
+
 /// Solid-angle-weighted mean luminance, counting nothing above `ceiling`.
 fn mean_luminance(pixels: &[f32], extent: [u32; 2], ceiling: f32) -> f32 {
     let (width, height) = (extent[0] as usize, extent[1] as usize);
@@ -98,10 +104,27 @@ fn mean_luminance(pixels: &[f32], extent: [u32; 2], ceiling: f32) -> f32 {
     let rows = per_row(0..height, |y| {
         let theta = (y as f32 + 0.5) / height as f32 * PI;
         let weight = theta.sin() as f64;
-        let sum: f64 = row_luminance(pixels, width, y)
-            .map(|luminance| luminance.min(ceiling) as f64)
+        let (row, _) = pixels[y * width * 4..(y + 1) * width * 4].as_chunks::<4>();
+
+        // Four texels a step, each texel's luminance computed exactly as the
+        // one-at-a-time remainder computes it, and summed in f64 lanes so the
+        // row keeps the precision the scalar sum had; only the order of the
+        // additions within a row differs.
+        let lanes = width / 4 * 4;
+        let mut lane_sum = DVec4::ZERO;
+        for texels in row[..lanes].as_chunks::<4>().0 {
+            let [r, g, b] = channels(texels);
+            let luminance = r * LUMA.x + g * LUMA.y + b * LUMA.z;
+            lane_sum += luminance.min(Vec4::splat(ceiling)).as_dvec4();
+        }
+        let tail: f64 = row[lanes..]
+            .iter()
+            .map(|&[r, g, b, _]| Vec3::new(r, g, b).dot(LUMA).min(ceiling) as f64)
             .sum();
-        (sum * weight, weight * width as f64)
+        (
+            (lane_sum.element_sum() + tail) * weight,
+            weight * width as f64,
+        )
     });
     let (mut total, mut measure) = (0.0f64, 0.0f64);
     for (row_total, row_measure) in rows {
@@ -267,10 +290,7 @@ pub fn project_equirect(pixels: &[f32], extent: [u32; 2]) -> [Vec3; SH9] {
         let lanes = width / 4 * 4;
         let mut lane_sums = [[Vec4::ZERO; 3]; SH9];
         for x in (0..lanes).step_by(4) {
-            let texels = &row[x..x + 4];
-            let channel =
-                |c: usize| Vec4::new(texels[0][c], texels[1][c], texels[2][c], texels[3][c]);
-            let mut radiance = [channel(0), channel(1), channel(2)];
+            let mut radiance = channels(&row[x..x + 4]);
 
             let luminance = radiance[0] * LUMA.x + radiance[1] * LUMA.y + radiance[2] * LUMA.z;
             if ceiling > 0.0 {
@@ -627,6 +647,46 @@ mod tests {
                 "coefficient {index}: baked {a}, reference {b}",
             );
         }
+    }
+
+    /// The clamped mean as a single f64 sum over every texel, the definition the
+    /// row-and-lane version has to agree with. The width is odd so both of its
+    /// paths run in every row, and the ceiling sits inside the sun so the clamp
+    /// is exercised rather than skipped.
+    #[test]
+    fn the_mean_matches_a_texel_by_texel_reference() {
+        let extent = [258u32, 129];
+        let pixels = awkward_sky_of(extent);
+        for ceiling in [f32::INFINITY, 5.0] {
+            let (width, height) = (extent[0] as usize, extent[1] as usize);
+            let (mut total, mut measure) = (0.0f64, 0.0f64);
+            for y in 0..height {
+                let weight = ((y as f32 + 0.5) / height as f32 * PI).sin() as f64;
+                for x in 0..width {
+                    let texel = (y * width + x) * 4;
+                    let rgb = Vec3::new(pixels[texel], pixels[texel + 1], pixels[texel + 2]);
+                    total += rgb.dot(LUMA).min(ceiling) as f64 * weight;
+                    measure += weight;
+                }
+            }
+            let reference = (total / measure) as f32;
+            let measured = mean_luminance(&pixels, extent, ceiling);
+            assert!(
+                (measured / reference - 1.0).abs() < 1e-5,
+                "ceiling {ceiling}: measured {measured}, reference {reference}",
+            );
+        }
+    }
+
+    fn awkward_sky_of(extent: [u32; 2]) -> Vec<f32> {
+        let to_sun = Vec3::new(0.3, 0.9, -0.4).normalize();
+        equirect(extent[0], extent[1], |d| {
+            if d.dot(to_sun) > 0.999 {
+                Vec3::new(60_000.0, 55_000.0, 50_000.0)
+            } else {
+                Vec3::new(0.2, 0.3, 0.6) * (0.5 + d.y) + Vec3::splat(d.x * 0.1)
+            }
+        })
     }
 
     /// The projection takes four texels a step and finishes a row's remainder

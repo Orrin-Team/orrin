@@ -133,6 +133,90 @@ where
     items.par_iter().map(f).collect()
 }
 
+/// `f(y, rows)` for every row of `maps`, across the pool, where `rows` holds
+/// row `y` of each map.
+///
+/// Several maps at once because a generator often writes more than one — an
+/// albedo, a normal and a height from the same texel — and each row of all of
+/// them is one task. Every map must be the same whole number of `row_len` rows.
+pub fn rows_mut<T, F, const N: usize>(maps: [&mut [T]; N], row_len: usize, f: F)
+where
+    T: Send,
+    F: Fn(usize, [&mut [T]; N]) + Send + Sync,
+{
+    let rows = maps.first().map_or(0, |map| map.len() / row_len.max(1));
+    assert!(
+        maps.iter().all(|map| map.len() == rows * row_len),
+        "every map must be {rows} rows of {row_len}"
+    );
+    let mut chunks = maps.map(|map| map.chunks_mut(row_len.max(1)));
+    let rows: Vec<[&mut [T]; N]> = (0..rows)
+        .map(|_| {
+            chunks
+                .each_mut()
+                .map(|chunk| chunk.next().expect("counted above"))
+        })
+        .collect();
+    if !is_parallel() {
+        rows.into_iter().enumerate().for_each(|(y, row)| f(y, row));
+        return;
+    }
+    rows.into_par_iter()
+        .enumerate()
+        .for_each(|(y, row)| f(y, row));
+}
+
+/// Work handed to the pool now and collected with [`Deferred::wait`], so the
+/// caller can get on with something that has to stay on its own thread — an
+/// upload into a backend that is not `Send` — while it runs.
+///
+/// Under `ORRIN_THREADS=1` nothing is spawned and nothing runs early: the work
+/// happens inside `wait`, at the point the code read before it was deferred, so
+/// the serial baseline is the program it always was.
+///
+/// `wait` blocks its thread on the result, so it belongs on a thread outside the
+/// pool. A worker that waits holds its slot while the task queues behind it.
+pub fn defer<T, F>(work: F) -> Deferred<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if !is_parallel() {
+        return Deferred(Pending::Serial(Box::new(work)));
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    // A panic in a spawned job aborts the process by default; caught here, it is
+    // re-raised by `wait` on the thread that asked for the result instead.
+    rayon::spawn(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        let _ = sender.send(outcome);
+    });
+    Deferred(Pending::Spawned(receiver))
+}
+
+/// See [`defer`].
+pub struct Deferred<T>(Pending<T>);
+
+enum Pending<T> {
+    Serial(Box<dyn FnOnce() -> T + Send>),
+    Spawned(std::sync::mpsc::Receiver<std::thread::Result<T>>),
+}
+
+impl<T> Deferred<T> {
+    /// The work's result, blocking until it is ready.
+    pub fn wait(self) -> T {
+        match self.0 {
+            Pending::Serial(work) => work(),
+            Pending::Spawned(receiver) => {
+                match receiver.recv().expect("a deferred task always reports") {
+                    Ok(value) => value,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +266,65 @@ mod tests {
             let items: Vec<usize> = (0..64).collect();
             assert_eq!(map(&items, |&value| value + 1)[63], 64);
         });
+    }
+
+    fn pool(threads: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("a pool")
+    }
+
+    /// Every row of every map is handed out exactly once, at its own index, and
+    /// rows of the same index arrive together — on both paths.
+    #[test]
+    fn rows_mut_hands_each_row_its_own_slices() {
+        for threads in [1, 4] {
+            let (mut a, mut b) = (vec![0u32; 12], vec![0u32; 12]);
+            pool(threads).install(|| {
+                rows_mut([&mut a[..], &mut b[..]], 3, |y, [ra, rb]| {
+                    ra.fill(y as u32 + 1);
+                    rb.fill(y as u32 + 101);
+                })
+            });
+            assert_eq!(a, [1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4], "under {threads}");
+            assert_eq!(b[11], 104, "under {threads}");
+        }
+    }
+
+    /// The value comes back whichever path ran.
+    #[test]
+    fn a_deferred_task_returns_its_value_on_either_path() {
+        for threads in [1, 4] {
+            let value = pool(threads).install(|| defer(|| (0..100u32).sum::<u32>()).wait());
+            assert_eq!(value, 4950, "under {threads} threads");
+        }
+    }
+
+    /// The serial path is the baseline every parallel change is judged
+    /// against, so under one thread nothing may run early: the work happens
+    /// where it is waited on, exactly as the code read before it was deferred.
+    #[test]
+    fn under_one_thread_a_deferred_task_runs_where_it_is_waited_on() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        pool(1).install(|| {
+            let ran = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&ran);
+            let deferred = defer(move || flag.store(true, Ordering::SeqCst));
+            assert!(!ran.load(Ordering::SeqCst), "ran before it was waited on");
+            deferred.wait();
+            assert!(ran.load(Ordering::SeqCst));
+        });
+    }
+
+    /// A task on the pool that panics would otherwise abort the process,
+    /// which is rayon's default for a spawned job; the caller is where the
+    /// panic belongs.
+    #[test]
+    #[should_panic(expected = "deferred failure")]
+    fn a_panic_in_a_deferred_task_reaches_the_caller() {
+        pool(4).install(|| defer(|| -> u32 { panic!("deferred failure") }).wait());
     }
 }

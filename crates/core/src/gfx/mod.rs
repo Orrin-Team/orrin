@@ -783,16 +783,6 @@ impl Default for SceneLighting {
 // The seam between the engine and a concrete graphics API: implement for other
 // backends (wgpu, D3D12) without touching scene/app code.
 pub trait RenderBackend {
-    /// Whether this backend decides each opaque view's visible set itself.
-    ///
-    /// Asked by [`extract_geometry`](crate::systems::extract_geometry), which
-    /// otherwise does that work per entity for every view. False for a backend
-    /// that has no compute of its own — the headless one — so the sweep answers
-    /// the question the way it always did.
-    fn gpu_culling(&self) -> bool {
-        false
-    }
-
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle;
     /// Replace what an uploaded mesh's slot draws, for a reimported asset. The
     /// handle keeps its meaning, so nothing naming it changes; the bounds

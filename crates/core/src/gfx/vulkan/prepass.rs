@@ -23,7 +23,6 @@ use crate::gfx::rhi::{
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{PositionVertex, SurfaceVertex};
 
-use super::PassCtx;
 use super::cull::Draws;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
@@ -217,7 +216,6 @@ impl GeometryPrepass {
         &self,
         device: &Device,
         encoder: &mut Encoder,
-        renderer: &PassCtx<'_>,
         draws: Draws<'_>,
         extent: [u32; 2],
         frame: BufferId,
@@ -263,45 +261,8 @@ impl GeometryPrepass {
         // between draws changes them. See `mesh`.
         encoder.bind_geometry(false);
 
-        let mut bound: Option<bool> = None;
-
-        // One instanced draw per (mesh, material) unit, matching the forward
-        // pass. The model and normal matrices come from the shared object
-        // buffer, so this pass no longer recomputes an inverse-transpose per
-        // item.
-        for unit in draws.units() {
-            let Some(mesh) = renderer.meshes.get(unit.mesh as usize) else {
-                continue;
-            };
-            // The same question the forward pass asks of the same flag word, so
-            // the two passes cut a cutout out at the same place. See
-            // `GpuMaterial::is_masked`.
-            let wants_masked = renderer
-                .materials
-                .get(unit.material as usize)
-                .is_some_and(super::forward::GpuMaterial::is_masked);
-            if bound != Some(wants_masked) {
-                bind_all(
-                    encoder,
-                    if wants_masked {
-                        self.masked_pipeline
-                    } else {
-                        self.pipeline
-                    },
-                );
-                bound = Some(wants_masked);
-            }
-            encoder.draw_indexed(
-                mesh.span.index_count,
-                unit.instances,
-                mesh.span.first_index,
-                mesh.span.vertex_offset,
-                unit.object_base,
-            );
-        }
-
-        // The compute path draws the same geometry as two multi-draws, one per
-        // pipeline variant. Empty on the CPU path, and vice versa.
+        // Two multi-draws, one per pipeline variant, over the commands the
+        // dispatch wrote — the same ones the forward pass draws.
         for region in draws.regions() {
             bind_all(
                 encoder,

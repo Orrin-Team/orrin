@@ -74,7 +74,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -106,7 +105,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -133,7 +131,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -166,7 +163,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -198,7 +194,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -228,7 +223,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -260,7 +254,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -291,7 +284,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -326,7 +318,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -358,7 +349,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -390,7 +380,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -422,7 +411,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -452,7 +440,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -484,7 +471,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -514,7 +500,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -545,7 +530,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 4096,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -576,7 +560,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 2048,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -609,7 +592,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -640,7 +622,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -672,7 +653,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -702,7 +682,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -737,7 +716,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -768,7 +746,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -795,7 +772,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -804,12 +780,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
         // changed: the pass order, the barriers and the layouts are the same
         // text, and what is added is the three segment headers and the list of
         // resources that had to stop being exclusive to one queue family.
-        // The compute-culled frame. Its whole reason for being in the baseline
-        // is the pair of buffer barriers a CPU-culled frame has none of: the
+        // The compute-culled frame with cascades and the atlas on, because
+        // those are the views the dispatch exists to cull for. Every frame is
+        // compute-culled now, so what this pins in particular is the pair of
+        // buffer barriers with every shadow view behind them: the
         // write-after-write between the two dispatches, and the storage write
         // that every opaque geometry pass then waits for at the draw-indirect
-        // stage. Cascades and the atlas are on, because those are the views the
-        // dispatch exists to cull for.
+        // stage.
         (
             "editor frame, GPU culling",
             FrameConfig {
@@ -833,7 +810,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 4096,
                 async_compute: false,
-                gpu_culling: true,
                 occlusion_culling: false,
             },
         ),
@@ -867,7 +843,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 4096,
                 async_compute: false,
-                gpu_culling: true,
                 occlusion_culling: true,
             },
         ),
@@ -894,7 +869,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: true,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -926,7 +900,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 2048,
                 async_compute: true,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -1034,7 +1007,6 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
             shadow_resolution: SHADOW_RESOLUTION,
             shadow_atlas: 0,
             async_compute: false,
-            gpu_culling: false,
             occlusion_culling: false,
         })
         .unwrap();
@@ -1081,7 +1053,6 @@ fn the_shadow_maps_are_sixteen_bit_and_the_camera_depth_is_not() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 4096,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1132,7 +1103,6 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1189,7 +1159,6 @@ fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1242,7 +1211,6 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1304,7 +1272,6 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1353,7 +1320,6 @@ fn the_gizmo_draws_between_the_tonemap_and_the_overlay() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute,
-        gpu_culling: false,
         occlusion_culling: false,
     };
     for async_compute in [false, true] {
@@ -1409,7 +1375,6 @@ fn the_selection_outline_is_masked_then_drawn_under_the_gizmo() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     };
     let frame = declare(config(true)).unwrap();
@@ -1478,7 +1443,6 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1539,7 +1503,6 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     };
 
@@ -1638,7 +1601,6 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1700,7 +1662,6 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1753,7 +1714,6 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1831,7 +1791,6 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     };
 
@@ -1927,7 +1886,6 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 4096,
         async_compute: false,
-        gpu_culling: true,
         occlusion_culling: false,
     })
     .unwrap();
@@ -2101,7 +2059,6 @@ fn occlusion_base() -> FrameConfig {
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 4096,
         async_compute: false,
-        gpu_culling: true,
         occlusion_culling: false,
     }
 }

@@ -11,8 +11,8 @@ categories = ["game-development", "data-structures"]
 # Intentionally empty: the ECS is the *mechanism* only. It must not depend on
 # the renderer, math, or windowing crates. Components live in the engine.
 [dependencies]
-# Declared ahead of its first use: the ECS is where parallel query iteration
-# will land, and the pool it will dispatch into is built in `orrin-core`.
+# Parallel read-only queries (`par_for_each`, `par_map`). The pool they dispatch
+# into is built in `orrin-core`; this crate never builds one of its own.
 rayon = { workspace = true }
 
 [dev-dependencies]
@@ -32,11 +32,6 @@ missing_docs = "warn"
 [lints.clippy]
 all = "warn"
 
-# Nightly's cargo reports `rayon` as an unused dependency. It is unused *yet*,
-# deliberately, for the reason written above its declaration — so the lint is
-# what gets turned off, not the dependency.
-[lints.cargo]
-unused_dependencies = "allow"
 [[bench]]
 name = "ecs"
 harness = false

@@ -17,11 +17,11 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 use crate::camera_controller::CameraController;
 use crate::editor::Editor;
 use crate::gfx::BackendChoice;
-use crate::gfx::punctual::{MAX_SHADOW_LIGHTS, ShadowAtlas};
-use crate::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
+use crate::gfx::punctual::ShadowAtlas;
+use crate::gfx::shadows::{CascadeSet, cascades};
 use crate::gfx::vulkan::ShadowFrame;
 use crate::gfx::vulkan::VulkanRenderer;
-use crate::gfx::{DrawList, RenderBackend, SceneLighting};
+use crate::gfx::{RenderBackend, SceneLighting};
 use crate::profile::Profiler;
 use crate::profile_scope;
 use crate::scene::entities::{SceneChoice, StressSpec, spawn_stress_scene};
@@ -593,7 +593,7 @@ impl ApplicationHandler for App {
             crate::scene::entities::install_library(&mut self.world, &mut renderer);
             self.open_game();
         } else {
-            self.scene.build(&mut self.world, &mut renderer);
+            self.scene.begin(&mut self.world, &mut renderer);
         }
         if let Some(spec) = self.stress {
             spawn_stress_scene(&mut self.world, &spec);
@@ -771,6 +771,16 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // A scene still loading on its own thread lands on the first frame
+                // after it is ready; until then the loop keeps presenting.
+                if crate::scene::entities::finish_pending_scene(
+                    &mut self.world,
+                    &mut active.renderer,
+                ) {
+                    self.camera_controller
+                        .sync_from(&self.world.resource::<Camera>());
+                }
+
                 // Asked once, here: it consumes a paused game's step. Edit mode
                 // runs no game code — see `scene::play`.
                 let simulate = self.world.resource_mut::<crate::scene::Play>().advance();
@@ -932,18 +942,7 @@ impl ApplicationHandler for App {
                         ),
                         None => ShadowAtlas::default(),
                     };
-                    // One sweep for every question: the camera's list, every
-                    // cascade's, and every punctual light's are orderings over
-                    // the same derived items, so both fits have to happen before
-                    // it rather than after.
-                    systems::extract_geometry(
-                        &self.world,
-                        aspect,
-                        &self.cascades,
-                        &self.atlas,
-                        active.renderer.gpu_culling(),
-                        &mut self.geometry,
-                    );
+                    systems::extract_geometry(&self.world, aspect, &mut self.geometry);
                     // Copy this frame's debug lines out (they're Copy) so the render
                     // borrow below doesn't overlap the world borrow.
                     self.debug_lines.clear();
@@ -998,12 +997,6 @@ impl ApplicationHandler for App {
                     overlay_on.then(|| editor.overlay());
                 {
                     profile_scope!("render submit");
-                    // Borrowed once here: `ShadowFrame` holds `DrawList`s into
-                    // `geometry`, so the array has to outlive the call.
-                    let caster_lists: [DrawList<'_>; MAX_CASCADES] =
-                        std::array::from_fn(|i| self.geometry.cascade(i));
-                    let punctual_lists: [DrawList<'_>; MAX_SHADOW_LIGHTS] =
-                        std::array::from_fn(|i| self.geometry.punctual(i));
                     renderer.render_with_overlay(
                         self.geometry.visible(),
                         self.geometry.transparent(),
@@ -1034,9 +1027,7 @@ impl ApplicationHandler for App {
                         (self.cascades.count > 0 || !self.atlas.faces.is_empty()).then_some({
                             ShadowFrame {
                                 cascades: &self.cascades,
-                                casters: &caster_lists,
                                 atlas: &self.atlas,
-                                punctual_casters: &punctual_lists,
                                 settings: &shadow_settings,
                             }
                         }),

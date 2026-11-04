@@ -85,8 +85,8 @@ struct Resident {
 /// The material rides here rather than in a push constant because a multi-draw
 /// has no per-draw push — every batch of a pipeline variant is one command, and
 /// the only thing that varies between them that a shader can read is what the
-/// instance points at. The CPU path writes the same pairs so that one vertex
-/// shader serves both. See [`cull`](super::cull).
+/// instance points at. The blended queues' host-written orders use the same
+/// pairs, so that one vertex shader serves every queue. See [`cull`](super::cull).
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(super) struct InstanceEntry {
@@ -106,8 +106,6 @@ pub(super) struct InstanceLists {
     pub transparent_base: u32,
     /// Where the refractive items' indices start.
     pub refractive_base: u32,
-    pub cascade_bases: [u32; crate::gfx::shadows::MAX_CASCADES],
-    pub punctual_bases: [u32; crate::gfx::punctual::MAX_SHADOW_LIGHTS],
 }
 
 /// The persistent row buffer, plus the mirror the dirty test reads.
@@ -233,21 +231,17 @@ impl InstanceStore {
         dirty.len()
     }
 
-    /// Write this frame's draw orders as row numbers.
-    ///
-    /// The opaque `visible` list goes first so the forward and prepass passes
-    /// keep indexing from zero; the blended ones follow, then each cascade's
-    /// casters, then each punctual light's, and the returned bases say where.
-    /// One buffer rather than one per list is what keeps `instance_index` a
-    /// single resource in the graph rather than a convenient fiction.
+    /// Write this frame's blended draw orders as row numbers: the transparent
+    /// list, then the refractive one, and the returned bases say where. The
+    /// opaque orders are not here — the cull dispatch writes those, into a
+    /// buffer of its own. One buffer for both blended lists rather than one each
+    /// is what keeps `blended_instance_index` a single resource in the graph
+    /// rather than a convenient fiction.
     pub(super) fn upload_lists(
         &mut self,
         device: &Device,
-        visible: crate::gfx::DrawList<'_>,
         transparent: crate::gfx::DrawList<'_>,
         refractive: crate::gfx::DrawList<'_>,
-        casters: &[crate::gfx::DrawList<'_>],
-        punctual: &[crate::gfx::DrawList<'_>],
     ) -> InstanceLists {
         let entries = &mut self.entries;
         entries.clear();
@@ -261,21 +255,10 @@ impl InstanceStore {
             }
         };
 
-        push(entries, &visible);
         let transparent_base = entries.len() as u32;
         push(entries, &transparent);
         let refractive_base = entries.len() as u32;
         push(entries, &refractive);
-        let mut cascade_bases = [0u32; crate::gfx::shadows::MAX_CASCADES];
-        for (base, list) in cascade_bases.iter_mut().zip(casters) {
-            *base = entries.len() as u32;
-            push(entries, list);
-        }
-        let mut punctual_bases = [0u32; crate::gfx::punctual::MAX_SHADOW_LIGHTS];
-        for (base, list) in punctual_bases.iter_mut().zip(punctual) {
-            *base = entries.len() as u32;
-            push(entries, list);
-        }
 
         // A zero-length buffer is not one a descriptor can bind, and an empty
         // scene still needs one, so it is padded to a single unread entry.
@@ -286,8 +269,6 @@ impl InstanceStore {
             indices: device.upload_block(BlockKind::Storage, bytemuck::cast_slice(entries)),
             transparent_base,
             refractive_base,
-            cascade_bases,
-            punctual_bases,
         }
     }
 }

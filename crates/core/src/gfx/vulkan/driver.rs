@@ -99,6 +99,8 @@ pub struct VkDriver {
     /// span and never holds the arena.
     arena: RwLock<MeshArena>,
     bind_groups: Mutex<Pool<Arc<DescriptorSet>>>,
+    /// Texture uploads, none of which the CPU waits for. See `upload`.
+    uploads: super::upload::Uploads,
 }
 
 fn lookup<T: Clone>(pool: &Mutex<Pool<T>>, index: u32, what: &str) -> T {
@@ -157,6 +159,7 @@ impl VkDriver {
             },
         );
         let arena = RwLock::new(MeshArena::new(&ctx));
+        let uploads = super::upload::Uploads::new(&ctx);
         Self {
             ctx,
             frame: AtomicU64::new(0),
@@ -171,6 +174,7 @@ impl VkDriver {
             storage,
             vertices,
             bind_groups: Mutex::new(Pool::new(frames_in_flight)),
+            uploads,
         }
     }
 
@@ -229,14 +233,15 @@ impl VkDriver {
         extent: [u32; 2],
         format: Format,
     ) -> TextureViewId {
-        let view = super::texture::upload_texture(
+        let prepared = super::texture::prepare_texture(
             &self.ctx,
+            self.uploads.staging(),
             pixels,
             extent,
             vk_format(format),
             super::texture::MipPolicy::Generate,
         );
-        TextureViewId(self.views.lock().unwrap().insert(view))
+        self.insert_uploaded(prepared, true)
     }
 
     pub fn create_texture_levels(&self, levels: &crate::gfx::TextureLevels) -> TextureViewId {
@@ -249,13 +254,40 @@ impl VkDriver {
             TexelFormat::Bc7Unorm => VkFormat::BC7_UNORM_BLOCK,
             TexelFormat::Bc7Srgb => VkFormat::BC7_SRGB_BLOCK,
         };
-        let view = super::texture::upload_levels(
+        let prepared = super::texture::prepare_levels(
             &self.ctx,
+            self.uploads.staging(),
             format,
             [levels.width, levels.height],
             &levels.levels,
         );
+        self.insert_uploaded(prepared, true)
+    }
+
+    /// Submit an upload without waiting for it and hand back its view, which is
+    /// bindable at once — see `upload` for why that is sound on both paths.
+    fn insert_uploaded(
+        &self,
+        prepared: super::texture::Prepared,
+        may_transfer: bool,
+    ) -> TextureViewId {
+        let image = self.uploads.submit(&self.ctx, prepared, may_transfer);
+        let view = ImageView::new_default(image).expect("failed to create texture image view");
         TextureViewId(self.views.lock().unwrap().insert(view))
+    }
+
+    /// Record, at the top of a frame's command buffer, the ownership acquires
+    /// the transfer queue's finished copies are owed, and return the semaphores
+    /// the frame's first submission waits on for them. Also releases whatever
+    /// uploads have finished since the last frame.
+    pub(super) fn record_upload_acquires(
+        &self,
+        recorder: &mut super::record::Recorder,
+    ) -> Vec<(
+        Arc<vulkano::sync::semaphore::Semaphore>,
+        ash::vk::PipelineStageFlags,
+    )> {
+        self.uploads.record_acquires(&self.ctx, recorder)
     }
 
     pub fn supports(&self, feature: Feature) -> bool {
@@ -412,14 +444,19 @@ impl VkDriver {
         extent: [u32; 2],
         format: Format,
     ) -> TextureViewId {
-        let view = super::texture::upload_texture(
+        // Engine-owned textures, some of them sampled by one-shot graphics work
+        // outside any frame — the environment bake reads its equirect source in
+        // a submission of its own, which would never record an acquire. So
+        // these stay on the graphics queue, still without a wait.
+        let prepared = super::texture::prepare_texture(
             &self.ctx,
+            self.uploads.staging(),
             pixels,
             extent,
             vk_format(format),
             super::texture::MipPolicy::None,
         );
-        TextureViewId(self.views.lock().unwrap().insert(view))
+        self.insert_uploaded(prepared, false)
     }
 
     pub fn upload_vertices(&self, bytes: &[u8]) -> BufferId {

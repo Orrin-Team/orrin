@@ -1,11 +1,12 @@
 //! Deciding what each view draws, on the GPU.
 //!
-//! The CPU sweep in `systems::extract_geometry` answers the same question by
-//! testing every renderable against the camera frustum, then against every
-//! cascade, then against every shadowing light — a per-entity cost that is
-//! invisible at a hundred objects and is most of the frame at ten thousand.
-//! Here the tests are one compute dispatch over (instance, view), and what the
-//! CPU keeps is only the part that is genuinely per entity: which rows the
+//! The CPU sweep in `systems::extract_geometry` used to answer the same
+//! question by testing every renderable against the camera frustum, then
+//! against every cascade, then against every shadowing light — a per-entity
+//! cost that is invisible at a hundred objects and is most of the frame at ten
+//! thousand. That path is gone for opaque geometry: the tests are one compute
+//! dispatch over (instance, view), and what the CPU keeps is only the part that
+//! is genuinely per entity: which rows the
 //! dispatch is offered, and which batch each belongs to. That walk is still
 //! O(entities) — it is a list build and a cached lookup rather than the
 //! frustum, cascade and light tests it replaced, and it is what remains to be
@@ -185,39 +186,13 @@ impl CullFrame {
     }
 }
 
-/// What one geometry pass draws: an ordered list the CPU culled, or the batches
-/// a dispatch culled for one view.
-///
-/// The two are one type so that a pass takes one argument and asks it for both
-/// shapes. Exactly one of [`Draws::units`] and [`Draws::regions`] ever yields
-/// anything, and which it is is the culling path, so a pass writes the loop for
-/// each and neither knows which it is in.
+/// What one opaque geometry pass draws: the batches the dispatch culled for one
+/// view, as commands in `commands` starting at that view's block.
 #[derive(Clone, Copy)]
-pub(super) enum Draws<'a> {
-    Cpu {
-        list: crate::gfx::DrawList<'a>,
-        /// Where this list's block of `instance_index` begins, which the CPU
-        /// path passes through as each run's `firstInstance`.
-        base: u32,
-    },
-    Gpu {
-        frame: &'a CullFrame,
-        view: u32,
-        commands: BufferId,
-    },
-}
-
-/// One CPU-culled draw: which geometry, and how many instances of it.
-pub(super) struct DrawUnit<'a> {
-    pub mesh: u32,
-    pub material: u32,
-    /// The `firstInstance` of the draw. `gl_InstanceIndex` counts from it, and
-    /// the entry found there says which object row and which material.
-    pub object_base: u32,
-    pub instances: u32,
-    /// The items this unit draws, for a caller that wants to narrow it further
-    /// — which the punctual atlas does, per face.
-    pub run: Option<(crate::gfx::DrawList<'a>, std::ops::Range<usize>)>,
+pub(super) struct Draws<'a> {
+    pub frame: &'a CullFrame,
+    pub view: u32,
+    pub commands: BufferId,
 }
 
 /// One multi-draw: every command of one pipeline variant, for one view.
@@ -231,76 +206,19 @@ pub(super) struct DrawRegion {
     pub range: std::ops::Range<u32>,
 }
 
-impl<'a> Draws<'a> {
-    /// The CPU path's runs, one at a time. Empty under GPU culling.
-    ///
-    /// An iterator rather than a collected `Vec` because a pass records this
-    /// once per frame and there are up to four of them: collecting would be an
-    /// allocation per pass per frame in the middle of the frame loop, which is
-    /// the one thing recording is not allowed to do.
-    pub(super) fn units(&self) -> Units<'a> {
-        match *self {
-            Draws::Cpu { list, base } => Units::Cpu {
-                runs: list.runs(),
-                list,
-                base,
-            },
-            Draws::Gpu { .. } => Units::None,
-        }
-    }
-
-    /// The compute path's two multi-draws. Empty under CPU culling.
-    pub(super) fn regions(&self) -> impl Iterator<Item = DrawRegion> + use<'a> {
-        let ranges = match *self {
-            Draws::Cpu { .. } => None,
-            Draws::Gpu {
-                frame,
-                view,
-                commands,
-            } => Some((frame.ranges(view), commands)),
-        };
-        ranges
+impl Draws<'_> {
+    /// The view's multi-draws, one per pipeline variant that has any batches.
+    pub(super) fn regions(&self) -> impl Iterator<Item = DrawRegion> + use<> {
+        let commands = self.commands;
+        self.frame
+            .ranges(self.view)
             .into_iter()
-            .flat_map(|(ranges, commands)| {
-                ranges.map(move |(masked, range)| (masked, range, commands))
-            })
-            .filter(|(_, range, _)| !range.is_empty())
-            .map(|(masked, range, commands)| DrawRegion {
+            .filter(|(_, range)| !range.is_empty())
+            .map(move |(masked, range)| DrawRegion {
                 masked,
                 commands,
                 range: range.start as u32..range.end as u32,
             })
-    }
-}
-
-/// The draws of one CPU-culled pass, one at a time.
-pub(super) enum Units<'a> {
-    Cpu {
-        runs: crate::gfx::Runs<'a>,
-        list: crate::gfx::DrawList<'a>,
-        base: u32,
-    },
-    None,
-}
-
-impl<'a> Iterator for Units<'a> {
-    type Item = DrawUnit<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Units::Cpu { runs, list, base } => {
-                let run = runs.next()?;
-                let item = list.item(run.start);
-                Some(DrawUnit {
-                    mesh: item.mesh.0,
-                    material: item.material.0,
-                    object_base: *base + run.start as u32,
-                    instances: run.len() as u32,
-                    run: Some((*list, run)),
-                })
-            }
-            Units::None => None,
-        }
     }
 }
 
@@ -431,7 +349,7 @@ impl CullPass {
     /// Sort this frame's renderables into batches and size the two persistent
     /// buffers for them.
     ///
-    /// One pass over `items` rather than the sort the CPU path takes, because
+    /// One pass over `items` rather than a sort, because
     /// the batch a renderable belongs to is a property of its mesh and material
     /// and not of any ordering — and because this walk is the last per-entity
     /// cost the frame has left.

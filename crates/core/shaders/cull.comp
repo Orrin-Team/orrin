@@ -221,7 +221,8 @@ void main() {
     vec3 bmin = batch.bounds_min.xyz;
     vec3 bmax = batch.bounds_max.xyz;
     // A mesh with no registered bounds is unmeasurable, so it is drawn rather
-    // than culled -- the same fallback the CPU sweep takes, stated here because
+    // than culled -- the same fallback the blended queue's CPU test takes, stated
+    // here because
     // the inverted box it arrives as would otherwise make a NaN centre and fail
     // every compare instead.
     bool measurable = all(lessThanEqual(bmin, bmax));

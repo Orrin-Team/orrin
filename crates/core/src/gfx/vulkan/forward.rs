@@ -14,7 +14,7 @@ use super::cull::Draws;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
-use super::{MSAA_SAMPLES, PassCtx, ShadowFrame, VulkanRenderer};
+use super::{MSAA_SAMPLES, ShadowFrame, VulkanRenderer};
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::rhi::MeshSpan;
 use crate::gfx::rhi::{
@@ -1065,7 +1065,6 @@ impl ForwardPass {
     pub(super) fn draw(
         &self,
         builder: &mut Encoder,
-        renderer: &PassCtx<'_>,
         draws: Draws<'_>,
         view: &FrameView,
         extent: [u32; 2],
@@ -1121,44 +1120,9 @@ impl ForwardPass {
         // for the pass rather than once per mesh. See `mesh`.
         builder.bind_geometry(false);
 
-        // Nothing is bound yet, so the first run always binds. `None` rather
-        // than "the plain one" so that a frame of nothing but foliage does not
-        // begin by binding a pipeline it never draws with.
-        let mut bound: Option<bool> = None;
-
-        // A unit is one (mesh, material) pair, so each is one instanced draw:
-        // the recording cost stops scaling with entity count and starts scaling
-        // with distinct mesh/material pairs. Empty on the compute path, where
-        // the regions below are what this pass records instead.
-        for unit in draws.units() {
-            let Some(mesh) = renderer.meshes.get(unit.mesh as usize) else {
-                continue;
-            };
-            // A unit is one material, so this is one lookup per draw rather than
-            // per item. The opaque order is grouped by (mesh, material), which
-            // means cutouts are not a contiguous tail and this can flip more
-            // than once — a pipeline bind per draw in the worst case, against a
-            // list whose length is distinct mesh/material pairs.
-            let wants_masked = renderer
-                .materials
-                .get(unit.material as usize)
-                .is_some_and(GpuMaterial::is_masked);
-            if bound != Some(wants_masked) {
-                bind_all(builder, if wants_masked { masked } else { plain });
-                bound = Some(wants_masked);
-            }
-            builder.draw_indexed(
-                mesh.span.index_count,
-                unit.instances,
-                mesh.span.first_index,
-                mesh.span.vertex_offset,
-                unit.object_base,
-            );
-        }
-
-        // The compute path's answer to the same question: one multi-draw per
-        // pipeline variant, over commands a dispatch wrote. Empty on the CPU
-        // path.
+        // One multi-draw per pipeline variant, over the commands the dispatch
+        // wrote: the recording cost scales with neither the entity count nor
+        // the distinct mesh/material pairs, only with the two variants.
         for region in draws.regions() {
             bind_all(builder, if region.masked { masked } else { plain });
             builder.draw_indexed_indirect(region.commands, region.range);

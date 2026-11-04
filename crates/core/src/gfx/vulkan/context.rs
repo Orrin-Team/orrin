@@ -40,6 +40,11 @@ pub struct VkContext {
     /// and buy nothing. Family 1 on RDNA is the asynchronous compute engine,
     /// which is a different one.
     pub compute_queue: Option<Arc<Queue>>,
+    /// Where uploads are copied, off the graphics queue, so a load does not wait
+    /// behind the frame or the frame behind the load. Chosen by capability — see
+    /// [`transfer_slot`] — and `None` where nothing can be spared, in which case
+    /// uploads go on [`queue`](Self::queue) and need no ownership transfer.
+    pub transfer_queue: Option<Arc<Queue>>,
     pub memory_allocator: Arc<StandardMemoryAllocator>,
     pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     pub descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
@@ -83,8 +88,9 @@ pub struct VkContext {
     ///
     /// Both halves are what GPU culling draws through: a view's batches are one
     /// multi-draw, and a batch finds its instances through the `firstInstance`
-    /// the cull dispatch wrote into its command. A device without them keeps the
-    /// CPU sweep whatever `ORRIN_GPU_CULL` asks — see `read_gpu_culling`.
+    /// the cull dispatch wrote into its command. A device without them cannot
+    /// draw the opaque queue, and the renderer refuses it at startup — see
+    /// `require_gpu_culling`.
     pub multi_draw: bool,
 }
 
@@ -145,6 +151,7 @@ impl VkContext {
         let (physical_device, queue_family_index) =
             select_physical_device(instance, surface, &device_extensions);
         let compute_family = select_compute_family(&physical_device);
+        let transfer = select_transfer(&physical_device, queue_family_index, compute_family);
 
         let profile = GpuProfile::detect(&physical_device);
         tracing::info!(
@@ -241,13 +248,25 @@ impl VkContext {
 
         let samples_bc = physical_device.supported_features().texture_compression_bc;
 
-        // The compute-only family second, so `queues` yields the graphics queue
-        // first whether or not there is one.
-        let queue_create_infos = [Some(queue_family_index), compute_family]
-            .into_iter()
-            .flatten()
-            .map(|queue_family_index| QueueCreateInfo {
+        // Graphics first, then the compute-only family, then a transfer family
+        // of its own — so `queues` yields them in that order. A transfer queue
+        // in the compute family is that family's second queue, and comes out
+        // right after the compute queue.
+        let mut families: Vec<(u32, u32)> = vec![(queue_family_index, 1)];
+        if let Some(compute) = compute_family {
+            families.push((compute, 1));
+        }
+        if let Some((family, index)) = transfer {
+            match families.iter_mut().find(|(f, _)| *f == family) {
+                Some((_, count)) => *count = (*count).max(index + 1),
+                None => families.push((family, 1)),
+            }
+        }
+        let queue_create_infos = families
+            .iter()
+            .map(|&(queue_family_index, count)| QueueCreateInfo {
                 queue_family_index,
+                queues: vec![1.0; count as usize],
                 ..Default::default()
             })
             .collect();
@@ -280,6 +299,20 @@ impl VkContext {
                 .next()
                 .expect("a compute queue was requested but not created")
         });
+        let transfer_queue = transfer.map(|_| {
+            queues
+                .next()
+                .expect("a transfer queue was requested but not created")
+        });
+        match &transfer_queue {
+            Some(transfer) => tracing::info!(
+                "uploads: queue family {} queue {}, beside graphics family {}",
+                transfer.queue_family_index(),
+                transfer.queue_index(),
+                queue.queue_family_index(),
+            ),
+            None => tracing::info!("uploads: on the graphics queue, no family to spare"),
+        }
         if let Some(compute) = &compute_queue {
             tracing::info!(
                 "async compute: queue family {} beside graphics family {}",
@@ -310,6 +343,7 @@ impl VkContext {
             device,
             queue,
             compute_queue,
+            transfer_queue,
             memory_allocator,
             command_buffer_allocator,
             descriptor_set_allocator,
@@ -428,6 +462,58 @@ fn select_compute_family(physical_device: &Arc<PhysicalDevice>) -> Option<u32> {
         .map(|index| index as u32)
 }
 
+/// The device's queue families, read for [`transfer_slot`].
+fn select_transfer(
+    physical_device: &Arc<PhysicalDevice>,
+    graphics: u32,
+    compute: Option<u32>,
+) -> Option<(u32, u32)> {
+    // The control the transfer path is measured against, and the way to run
+    // the fallback on a device that has a family to spare — which the fallback
+    // needs, since the machines that only have one family are not the ones most
+    // of this is tested on.
+    if std::env::var("ORRIN_TRANSFER_QUEUE").is_ok_and(|value| value.trim() == "0") {
+        return None;
+    }
+    let families: Vec<(QueueFlags, u32)> = physical_device
+        .queue_family_properties()
+        .iter()
+        .map(|family| (family.queue_flags, family.queue_count))
+        .collect();
+    transfer_slot(&families, graphics, compute)
+}
+
+/// Which family uploads go to, and which queue within it, as `(family, index)`.
+///
+/// By capability and never by index. A transfer-only family is a copy engine of
+/// its own and is preferred. Failing that, a compute-and-transfer family without
+/// graphics, on a queue the async compute tail is not using — the next one when
+/// it shares the family, since one queue for both would put every upload behind
+/// the frame's compute tail. `None` when nothing qualifies, which is the
+/// graphics-queue fallback: one family that does everything, as MoltenVK,
+/// lavapipe and most integrated parts have.
+fn transfer_slot(
+    families: &[(QueueFlags, u32)],
+    graphics: u32,
+    compute: Option<u32>,
+) -> Option<(u32, u32)> {
+    let candidate = |(index, &(flags, count)): (usize, &(QueueFlags, u32))| {
+        let family = index as u32;
+        let copies = flags.intersects(QueueFlags::TRANSFER | QueueFlags::COMPUTE);
+        if family == graphics || !copies || flags.intersects(QueueFlags::GRAPHICS) {
+            return None;
+        }
+        let queue = u32::from(compute == Some(family));
+        (queue < count).then_some((family, queue))
+    };
+    let dedicated = families.iter().enumerate().find(|(_, (flags, _))| {
+        flags.contains(QueueFlags::TRANSFER) && !flags.intersects(QueueFlags::COMPUTE)
+    });
+    dedicated
+        .and_then(candidate)
+        .or_else(|| families.iter().enumerate().find_map(candidate))
+}
+
 fn select_physical_device(
     instance: &Arc<Instance>,
     surface: Option<&Arc<Surface>>,
@@ -497,4 +583,50 @@ fn assert_packed_color_is_storable(device: &Arc<Device>) {
          compute passes against both formats.",
         super::hdr::HDR_FORMAT,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GCT: QueueFlags = QueueFlags::GRAPHICS
+        .union(QueueFlags::COMPUTE)
+        .union(QueueFlags::TRANSFER);
+    const CT: QueueFlags = QueueFlags::COMPUTE.union(QueueFlags::TRANSFER);
+
+    /// RDNA under RADV: one combined family, four compute-and-transfer queues.
+    /// Async compute takes the first of those, so uploads take the second — the
+    /// two must not share a queue, or the upload serialises behind the frame's
+    /// compute tail.
+    #[test]
+    fn beside_async_compute_uploads_take_the_next_queue_of_its_family() {
+        let families = [(GCT, 1), (CT, 4), (QueueFlags::VIDEO_DECODE, 1)];
+        assert_eq!(transfer_slot(&families, 0, Some(1)), Some((1, 1)));
+    }
+
+    /// A transfer-only family is a copy engine of its own, and is preferred over
+    /// a compute family even when one is free.
+    #[test]
+    fn a_dedicated_copy_engine_is_preferred() {
+        let families = [(GCT, 1), (CT, 2), (QueueFlags::TRANSFER, 2)];
+        assert_eq!(transfer_slot(&families, 0, Some(1)), Some((2, 0)));
+        assert_eq!(transfer_slot(&families, 0, None), Some((2, 0)));
+    }
+
+    /// A compute family nobody else uses can carry the uploads on its first
+    /// queue.
+    #[test]
+    fn without_async_compute_a_compute_family_carries_uploads() {
+        let families = [(GCT, 1), (CT, 1)];
+        assert_eq!(transfer_slot(&families, 0, None), Some((1, 0)));
+    }
+
+    /// The fallback: one family that does everything (MoltenVK, lavapipe, an
+    /// iGPU), or a compute family with no queue to spare. Uploads then go on
+    /// the graphics queue, which needs no ownership transfer at all.
+    #[test]
+    fn with_nothing_to_spare_uploads_stay_on_the_graphics_queue() {
+        assert_eq!(transfer_slot(&[(GCT, 4)], 0, None), None);
+        assert_eq!(transfer_slot(&[(GCT, 1), (CT, 1)], 0, Some(1)), None);
+    }
 }

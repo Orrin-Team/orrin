@@ -1,13 +1,12 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
+use vulkano::buffer::Subbuffer;
 use vulkano::command_buffer::{
     BlitImageInfo, BufferImageCopy, CopyBufferToImageInfo, ImageBlit, RecordingCommandBuffer,
 };
 use vulkano::format::{Format, FormatFeatures};
 use vulkano::image::sampler::Filter;
-use vulkano::image::view::ImageView;
 use vulkano::image::{
     Image, ImageAspects, ImageCreateInfo, ImageLayout, ImageSubresourceLayers,
     ImageSubresourceRange, ImageType, ImageUsage, max_mip_levels, mip_level_extent,
@@ -15,7 +14,7 @@ use vulkano::image::{
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
 
 use super::context::VkContext;
-use super::record;
+use super::record::{self, Arena};
 
 pub(super) enum MipPolicy {
     /// One level. For data textures (noise, LUTs) and 1x1 fallbacks.
@@ -41,7 +40,7 @@ fn level_range(image: &Arc<Image>, mip_levels: Range<u32>) -> ImageSubresourceRa
 /// path used to derive: level `n-1` must finish being written before it is read,
 /// and it must be in `TransferSrcOptimal` when it is. The whole image is already
 /// in `TransferDstOptimal` on entry.
-fn generate_mips(recording: &mut RecordingCommandBuffer, image: &Arc<Image>) {
+fn generate_mips_from_base(recording: &mut RecordingCommandBuffer, image: &Arc<Image>) {
     let base = image.extent();
     let source_layers = image.subresource_layers();
     let aspects = source_layers.aspects;
@@ -90,36 +89,119 @@ fn generate_mips(recording: &mut RecordingCommandBuffer, image: &Arc<Image>) {
     }
 }
 
+/// A texture's image and the staging buffer that fills it, before anything is
+/// recorded: the half of an upload that is the same whichever queue the copy
+/// runs on. See [`upload`](super::upload) for where it goes next.
+pub(super) struct Prepared {
+    pub image: Arc<Image>,
+    pub staging: Subbuffer<[u8]>,
+    regions: Vec<BufferImageCopy>,
+    /// Whether levels 1.. are still to be built from level 0 by blits, which
+    /// only a graphics queue can record.
+    pub generate_mips: bool,
+}
+
+impl Prepared {
+    /// Every level into `TransferDstOptimal`, then the copy. Fresh out of
+    /// `Image::new`, so every level is `Undefined` and there is nothing to
+    /// preserve — one barrier covers the whole chain, and the levels the copy
+    /// does not write are the ones the blits will.
+    pub(super) fn record_copy(&self, recording: &mut RecordingCommandBuffer) {
+        record::image_barrier(
+            recording,
+            record::to_transfer_dst(
+                self.image.clone(),
+                record::whole_image(&self.image),
+                ImageLayout::Undefined,
+            ),
+        );
+        let copy = CopyBufferToImageInfo {
+            regions: self.regions.clone().into(),
+            ..CopyBufferToImageInfo::buffer_image(self.staging.clone(), self.image.clone())
+        };
+        // SAFETY: the transition above put every level in the layout the copy
+        // names, and the staging buffer is written before recording and never
+        // touched again until the submission that reads it has completed — the
+        // upload holds it until then.
+        unsafe { recording.copy_buffer_to_image(&copy) }.expect("invalid texture copy");
+    }
+}
+
+/// What follows the copy, on a graphics queue: build the chain if there is one
+/// to build, then hand every level to the shaders. `image` is wholly in
+/// `TransferDstOptimal` on entry, which is where the copy — or the ownership
+/// acquire after it — leaves it.
+pub(super) fn record_finish(
+    recording: &mut RecordingCommandBuffer,
+    image: &Arc<Image>,
+    generate_mips: bool,
+) {
+    let mip_levels = image.mip_levels();
+    if generate_mips && mip_levels > 1 {
+        generate_mips_from_base(recording, image);
+        // What the chain left behind: every level but the last was read as a
+        // blit source, the last was only ever written.
+        record::image_barrier(
+            recording,
+            record::to_shader_read(
+                image.clone(),
+                level_range(image, 0..mip_levels - 1),
+                ImageLayout::TransferSrcOptimal,
+            ),
+        );
+        record::image_barrier(
+            recording,
+            record::to_shader_read(
+                image.clone(),
+                level_range(image, mip_levels - 1..mip_levels),
+                ImageLayout::TransferDstOptimal,
+            ),
+        );
+    } else {
+        record::image_barrier(
+            recording,
+            record::to_shader_read(
+                image.clone(),
+                record::whole_image(image),
+                ImageLayout::TransferDstOptimal,
+            ),
+        );
+    }
+}
+
+/// Where a staging allocation may start: a whole number of 16-byte blocks,
+/// which covers every texel size here and a BC block, or the device's optimal
+/// copy alignment if that is coarser. A suballocated arena hands out offsets
+/// with no such guarantee of its own, where the dedicated buffer each upload
+/// once had always started at zero.
+fn copy_alignment(ctx: &VkContext) -> u64 {
+    let optimal = ctx
+        .device
+        .physical_device()
+        .properties()
+        .optimal_buffer_copy_offset_alignment;
+    // Both are powers of two, so the larger is a multiple of the smaller.
+    optimal.as_devicesize().max(16)
+}
+
 // `format` chooses how the shader interprets the bytes (e.g. `R8G8B8A8_SRGB`
 // for color, `R8G8B8A8_UNORM` for data maps).
-/// Upload a whole mip chain as it is, level 0 first: every level copied from
-/// one staging buffer, none generated.
+/// A whole mip chain as it is, level 0 first: every level copied from one
+/// staging buffer, none generated.
 ///
 /// What an imported texture takes. Its chain was made at import, filtered for
 /// what it holds, and a block-compressed one could not be made here anyway: a
 /// BC image cannot be the target of a blit.
-pub(super) fn upload_levels(
+pub(super) fn prepare_levels(
     ctx: &VkContext,
+    staging: &Arena,
     format: Format,
     extent: [u32; 2],
     levels: &[Vec<u8>],
-) -> Arc<ImageView> {
+) -> Prepared {
     let mip_levels = levels.len() as u32;
     let total: usize = levels.iter().map(Vec::len).sum();
-    let staging = Buffer::new_slice::<u8>(
-        ctx.memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_SRC,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        total as u64,
-    )
-    .expect("failed to allocate texture staging buffer");
+    let staging = staging.allocate_bytes(total as u64, copy_alignment(ctx));
     {
         let mut mapped = staging.write().expect("a new staging buffer is not in use");
         let mut at = 0;
@@ -169,44 +251,25 @@ pub(super) fn upload_levels(
             region
         })
         .collect();
-    let copy = CopyBufferToImageInfo {
+
+    Prepared {
+        image,
+        staging,
         regions,
-        ..CopyBufferToImageInfo::buffer_image(staging, image.clone())
-    };
-
-    record::submit_one_shot(ctx, |recording| {
-        record::image_barrier(
-            recording,
-            record::to_transfer_dst(
-                image.clone(),
-                record::whole_image(&image),
-                ImageLayout::Undefined,
-            ),
-        );
-        // SAFETY: the transition above put every level in the layout the copy
-        // names, and the staging buffer is written and never touched again
-        // before `submit_one_shot` returns.
-        unsafe { recording.copy_buffer_to_image(&copy) }.expect("invalid texture copy");
-        record::image_barrier(
-            recording,
-            record::to_shader_read(
-                image.clone(),
-                record::whole_image(&image),
-                ImageLayout::TransferDstOptimal,
-            ),
-        );
-    });
-
-    ImageView::new_default(image).expect("failed to create texture image view")
+        generate_mips: false,
+    }
 }
 
-pub(super) fn upload_texture(
+/// Level 0 from `pixels`, and with [`MipPolicy::Generate`] — where the format can
+/// be blitted — the rest of the chain to be built from it once it is in.
+pub(super) fn prepare_texture(
     ctx: &VkContext,
+    staging: &Arena,
     pixels: &[u8],
     extent: [u32; 2],
     format: Format,
     mips: MipPolicy,
-) -> Arc<ImageView> {
+) -> Prepared {
     let physical = ctx.device.physical_device();
 
     let blittable = physical
@@ -226,20 +289,11 @@ pub(super) fn upload_texture(
         _ => 1,
     };
 
-    let staging = Buffer::from_iter(
-        ctx.memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_SRC,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        pixels.iter().copied(),
-    )
-    .expect("failed to allocate texture staging buffer");
+    let staging = staging.allocate_bytes(pixels.len() as u64, copy_alignment(ctx));
+    staging
+        .write()
+        .expect("a new staging buffer is not in use")
+        .copy_from_slice(pixels);
 
     let image = Image::new(
         ctx.memory_allocator.clone(),
@@ -258,52 +312,20 @@ pub(super) fn upload_texture(
     )
     .expect("failed to create texture image");
 
-    let copy = CopyBufferToImageInfo::buffer_image(staging, image.clone());
+    let regions = vec![BufferImageCopy {
+        image_subresource: ImageSubresourceLayers {
+            aspects: ImageAspects::COLOR,
+            mip_level: 0,
+            array_layers: 0..1,
+        },
+        image_extent: [extent[0], extent[1], 1],
+        ..Default::default()
+    }];
 
-    record::submit_one_shot(ctx, |recording| {
-        // Fresh out of `Image::new`, so every level is `Undefined` and there is
-        // nothing to preserve — one barrier covers the whole chain, and the
-        // levels the copy does not write are the ones the blits below will.
-        record::image_barrier(
-            recording,
-            record::to_transfer_dst(
-                image.clone(),
-                record::whole_image(&image),
-                ImageLayout::Undefined,
-            ),
-        );
-
-        // SAFETY: the transition above put level 0 in the layout
-        // `CopyBufferToImageInfo::buffer_image` names, and the staging buffer is
-        // written and never touched again before `submit_one_shot` returns.
-        unsafe { recording.copy_buffer_to_image(&copy) }.expect("invalid texture copy");
-
-        if mip_levels > 1 {
-            generate_mips(recording, &image);
-        }
-
-        // What the chain left behind: every level but the last was read as a
-        // blit source, the last was only ever written. With no chain, level 0 is
-        // still the copy's destination.
-        if mip_levels > 1 {
-            record::image_barrier(
-                recording,
-                record::to_shader_read(
-                    image.clone(),
-                    level_range(&image, 0..mip_levels - 1),
-                    ImageLayout::TransferSrcOptimal,
-                ),
-            );
-        }
-        record::image_barrier(
-            recording,
-            record::to_shader_read(
-                image.clone(),
-                level_range(&image, mip_levels - 1..mip_levels),
-                ImageLayout::TransferDstOptimal,
-            ),
-        );
-    });
-
-    ImageView::new_default(image).expect("failed to create texture image view")
+    Prepared {
+        image,
+        staging,
+        regions,
+        generate_mips: mip_levels > 1,
+    }
 }

@@ -41,7 +41,7 @@ use glam::Vec3;
 use crate::gfx::rhi::{MeshSpan, Placement, grown};
 
 use super::context::VkContext;
-use super::record::Recorder;
+use super::record::{self, InFlight, Pending, Recorder};
 
 /// Vertices and indices a fresh arena holds before the first growth. Small
 /// enough that a scene of a few cubes does not reserve megabytes, and a power of
@@ -58,6 +58,10 @@ pub(crate) struct MeshArena {
     /// Whether the arena is memory the CPU can write into. Decided once, by the
     /// same BAR-width probe that used to decide it per mesh.
     host_visible: bool,
+    /// Copies submitted and not yet known to be finished — growth and staged
+    /// uploads, neither of which the CPU waits for. Each holds what it read
+    /// until its fence signals: the outgrown buffer, the staging.
+    pending: Vec<InFlight>,
 }
 
 impl MeshArena {
@@ -84,6 +88,7 @@ impl MeshArena {
             ),
             placement: Placement::default(),
             host_visible,
+            pending: Vec::new(),
         }
     }
 
@@ -151,7 +156,7 @@ impl MeshArena {
                 u64::from(span.first_index),
                 indices,
             );
-            builder.submit_and_wait(ctx);
+            self.submit(ctx, builder);
         }
 
         (span, bounds)
@@ -169,9 +174,11 @@ impl MeshArena {
             return;
         }
 
-        // One command buffer for up to three copies, and one wait: growth is
-        // rare, but it happens while a scene is loading, where a round trip per
-        // buffer would be three.
+        // One command buffer for up to three copies, and no wait: growth is
+        // rare, but it happens while a scene is loading, a few times over. The
+        // copies fill `0..held` of the new buffers while the host goes on
+        // writing the spans placed past `held`, so the two never touch the same
+        // bytes.
         let mut builder = Recorder::new(ctx);
         if let Some(capacity) = positions {
             self.positions = regrow(
@@ -206,7 +213,32 @@ impl MeshArena {
                 self.host_visible,
             );
         }
-        builder.submit_and_wait(ctx);
+        self.submit(ctx, builder);
+    }
+
+    /// Submit an arena copy without waiting for it, ending it with the barrier
+    /// that orders it before anything later on the queue reads the arena.
+    fn submit(&mut self, ctx: &VkContext, mut builder: Recorder) {
+        builder.transfer_to_geometry_reads();
+        let (commands, keep) = builder.end();
+        self.pending.retain(|copy| !copy.is_complete());
+        self.pending.push(record::submit_frame(
+            ctx,
+            &ctx.queue,
+            commands,
+            keep,
+            &[],
+            &[],
+        ));
+    }
+}
+
+impl Drop for MeshArena {
+    /// What a copy reads must outlive it, and the device must outlive that.
+    fn drop(&mut self) {
+        for copy in self.pending.drain(..) {
+            copy.retire();
+        }
     }
 }
 

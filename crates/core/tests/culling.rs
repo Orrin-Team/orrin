@@ -1,5 +1,9 @@
-//! Frustum culling over a scene laid out like the demo's, which is where the
-//! numbers in the editor's Performance panel come from.
+//! Frustum culling on the CPU, over a scene laid out like the demo's.
+//!
+//! Opaque geometry is culled on the GPU, so the CPU frustum test is the blended
+//! queue's alone — it has to be, because that queue is drawn in the order the
+//! sweep leaves it in. The grid is therefore made of a blended material here,
+//! which puts every object through the test the sweep still makes.
 //!
 //! The demo's opening camera frames the whole grid, so it culls nothing — an
 //! easy result to mistake for culling being broken. These lock in both halves:
@@ -7,11 +11,11 @@
 //! isn't.
 
 use glam::Vec3;
-use orrin_core::gfx::punctual::ShadowAtlas;
-use orrin_core::gfx::shadows::CascadeSet;
+use orrin_core::gfx::BlendMode;
 use orrin_core::scene::propagate_transforms;
 use orrin_core::scene::{
-    Camera, CpuMesh, Culling, LocalTransform, MeshBounds, MeshHandle, Transform,
+    Camera, CpuMesh, Culling, LocalTransform, MaterialBlends, MaterialHandle, MeshBounds,
+    MeshHandle, Transform,
 };
 use orrin_core::systems::{FrameGeometry, extract_geometry};
 use orrin_ecs::World;
@@ -29,6 +33,10 @@ fn demo_world() -> World {
     bounds.insert(CUBE, CpuMesh::cube().bounds());
     world.insert_resource(bounds);
     world.insert_resource(Culling::default());
+    // Material 0 is what an entity with no `MaterialHandle` draws with.
+    let mut blends = MaterialBlends::default();
+    blends.insert(MaterialHandle(0), BlendMode::Blend);
+    world.insert_resource(blends);
 
     let half = (GRID - 1) as f32 * SPACING * 0.5;
     for x in 0..GRID {
@@ -71,15 +79,8 @@ fn visible(world: &mut World, camera: Camera) -> usize {
     *world.resource_mut::<Camera>() = camera;
     propagate_transforms(world);
     let mut geometry = FrameGeometry::default();
-    extract_geometry(
-        world,
-        ASPECT,
-        &CascadeSet::default(),
-        &ShadowAtlas::default(),
-        false,
-        &mut geometry,
-    );
-    geometry.visible().len()
+    extract_geometry(world, ASPECT, &mut geometry);
+    geometry.transparent().len()
 }
 
 #[test]

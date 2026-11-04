@@ -163,16 +163,6 @@ pub struct FrameConfig {
     /// The renderer sets it from what the device turned out to have — a device
     /// with no compute-only queue family plans exactly the frame it always did.
     pub async_compute: bool,
-    /// Whether the visible set for each opaque view is decided by a compute
-    /// dispatch rather than by the CPU sweep in `systems::extract_geometry`.
-    ///
-    /// Structural: it registers two passes, it makes `instance_index` something
-    /// the frame *writes* rather than something it is handed, and it changes
-    /// every opaque geometry pass from one draw per run to one indirect draw
-    /// per batch. Kept as a flag rather than taken as the only path so that the
-    /// two can be measured against each other on one binary — the CPU sweep is
-    /// the control, and `ORRIN_GPU_CULL=0` selects it.
-    pub gpu_culling: bool,
     /// Whether the compute cull also drops what the previous frame's depth
     /// already covered.
     ///
@@ -181,10 +171,8 @@ pub struct FrameConfig {
     /// — the pyramid is reduced from the depth that pass writes, and a frame
     /// with no prepass has no depth to reduce.
     ///
-    /// Only meaningful with [`gpu_culling`](Self::gpu_culling), because the
-    /// test lives in `cull.comp`. Kept as a flag of its own rather than folded
-    /// into it for the reason that one is a flag: the visible set it produces
-    /// is *smaller* than the frustum's, so the two have to be comparable on one
+    /// Kept as a flag rather than always on: the visible set it produces is
+    /// *smaller* than the frustum's, so the two have to be comparable on one
     /// binary to say what the difference cost and what it drew.
     pub occlusion_culling: bool,
 }
@@ -600,19 +588,14 @@ pub struct Frame {
     pub bodies: Vec<PassBody>,
 }
 
-/// Declares the draw commands on a pass that issues its draws indirectly, and
-/// nothing at all while the frame still culls on the CPU — which is what
-/// `commands` being `None` means.
+/// Declares the draw commands on a pass that issues its draws indirectly.
 ///
 /// One function rather than the declaration written out at each of the four
-/// sites, so that converting a pass to indirect draws cannot half-land: the
-/// pass either goes through here and is ordered after the cull, or it does not
-/// draw indirectly.
-fn indirect<'a>(pass: PassBuilder<'a>, commands: Option<ResourceId>) -> PassBuilder<'a> {
-    match commands {
-        Some(commands) => pass.access(commands, Access::IndirectRead),
-        None => pass,
-    }
+/// sites, so that an opaque geometry pass cannot draw indirectly without being
+/// ordered after the cull: it goes through here or it does not compile against
+/// the commands at all.
+fn indirect(pass: PassBuilder<'_>, commands: ResourceId) -> PassBuilder<'_> {
+    pass.access(commands, Access::IndirectRead)
 }
 
 pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
@@ -631,10 +614,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // per-object inverse-transpose is too expensive to compute twice, so the
     // passes share one buffer and the graph records that they do.
     let object_transforms = builder.import_buffer("object_transforms");
-    // The draw orders over those rows, which unlike the rows themselves are
-    // written afresh every frame. A second resource rather than a share of the
-    // first because they have different lifetimes, and the graph's whole claim
-    // is to know each resource's exact one. See `vulkan::instances`.
+    // The opaque draw orders over those rows, which the cull writes afresh
+    // every frame. A second resource rather than a share of the first because
+    // they have different lifetimes, and the graph's whole claim is to know each
+    // resource's exact one. See `vulkan::instances`.
     let instance_index = builder.import_buffer("instance_index");
     // Culling is two dispatches because a count can only be atomically
     // incremented from a known value. The reset stamps each command with the
@@ -646,25 +629,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // because a pass may not write its own barrier — the point of the compiler
     // is that the write-after-write between these two is derived rather than
     // remembered.
-    // The blended and refractive queues stay CPU-culled — a refractive surface
+    // The blended and refractive queues are CPU-culled — a refractive surface
     // has to be drawn back to front, which is a correctness requirement no
-    // atomic append can meet — so under GPU culling their orders are still
-    // written by the host, into a buffer of their own. A second resource rather
-    // than a share of the first because it really is a second allocation, and
-    // one name over two buffers is precisely the declaration this compiler
-    // exists to catch.
-    let blended_index = if config.gpu_culling {
-        builder.import_buffer("blended_instance_index")
-    } else {
-        instance_index
-    };
+    // atomic append can meet — so their orders are written by the host, into a
+    // buffer of their own. A second resource rather than a share of the first
+    // because it really is a second allocation, and one name over two buffers
+    // is precisely the declaration this compiler exists to catch.
+    let blended_index = builder.import_buffer("blended_instance_index");
 
-    // Only with the compute cull, because the test is a branch in `cull.comp`
-    // and there is nowhere else to put it: the CPU sweep would have to read
-    // back a pyramid the GPU wrote, a frame late, to answer a question it is
-    // already answering per entity.
-    let occlusion = config.gpu_culling && config.occlusion_culling;
-    let occlusion_ids = occlusion.then(|| {
+    let occlusion_ids = config.occlusion_culling.then(|| {
         // Entry `ShaderReadOnlyOptimal` states the steady state the ping-pong
         // guarantees: `hiz` leaves every frame in exactly that layout and is
         // the allocation `history` names next frame. The one frame where it is
@@ -691,10 +664,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         OcclusionIds { history, hiz }
     });
 
-    let draw_commands = config.gpu_culling.then(|| {
+    let draw_commands = {
         // Which rows the dispatch is offered, and which batch each belongs to.
-        // Written afresh every frame, like the draw orders under CPU culling
-        // and unlike the rows themselves — the batch a row belongs to is
+        // Written afresh every frame, like the blended draw orders and unlike
+        // the rows themselves — the batch a row belongs to is
         // cached, but the list of rows is not. See `vulkan::cull`.
         let instance_table = builder.import_buffer("instance_table");
         // One entry per (mesh, material) batch: the geometry its draw command
@@ -727,7 +700,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         record(id, PassBody::Cull, &mut bodies);
 
         draw_commands
-    });
+    };
 
     let swapchain_color = builder.import_image(
         "swapchain_color",
@@ -846,7 +819,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         || config.ssr
         || config.transparency
         || config.refraction
-        || occlusion)
+        || config.occlusion_culling)
         .then(|| PrepassIds {
             normal: builder.create_image("prepass_normal", ImageDesc::new(NORMAL_FORMAT)),
             velocity: builder.create_image("prepass_velocity", ImageDesc::new(VELOCITY_FORMAT)),

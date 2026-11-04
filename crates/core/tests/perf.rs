@@ -60,10 +60,10 @@ use std::sync::Arc;
 use vulkano::VulkanLibrary;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 
-use orrin_core::gfx::punctual::{MAX_SHADOW_LIGHTS, ShadowAtlas};
-use orrin_core::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
+use orrin_core::gfx::punctual::ShadowAtlas;
+use orrin_core::gfx::shadows::{CascadeSet, cascades};
 use orrin_core::gfx::vulkan::{ShadowFrame, VulkanRenderer};
-use orrin_core::gfx::{DecalInstance, DrawList, RenderBackend, SceneLighting};
+use orrin_core::gfx::{DecalInstance, SceneLighting};
 use orrin_core::profile::{self, Lane, Profiler};
 use orrin_core::scene::entities::{SceneChoice, StressSpec, spawn_stress_scene};
 use orrin_core::scene::model::{self, ImportSettings};
@@ -269,14 +269,7 @@ fn frame_cost() {
             };
             {
                 let _s = profile::scope("geometry");
-                systems::extract_geometry(
-                    &world,
-                    aspect,
-                    &cascade_set,
-                    &atlas,
-                    renderer.gpu_culling(),
-                    &mut geometry,
-                );
+                systems::extract_geometry(&world, aspect, &mut geometry);
             }
             entities = geometry.visible().len();
             // What the CPU actually records: one `draw_indexed` per maximal
@@ -284,38 +277,20 @@ fn frame_cost() {
             // there is to draw; this says how many commands saying so the
             // recording costs, which is the number the per-draw work scales
             // with.
-            // Every entry of every list, which is what the frame used to
-            // upload a 192-byte object row for and now uploads four bytes of
-            // row number for. Larger than the entity count because an object
-            // the camera sees and four cascades also draw appears in five.
+            // Every entry of every list: the opaque set the dispatch is offered,
+            // and the two blended orders the host still writes.
             entries = geometry.visible().len()
                 + geometry.transparent().len()
-                + geometry.refractive().len()
-                + (0..MAX_CASCADES)
-                    .map(|i| geometry.cascade(i).len())
-                    .sum::<usize>()
-                + (0..MAX_SHADOW_LIGHTS)
-                    .map(|i| geometry.punctual(i).len())
-                    .sum::<usize>();
+                + geometry.refractive().len();
             draws = geometry.visible().runs().count()
                 + geometry.transparent().runs().count()
-                + geometry.refractive().runs().count()
-                + (0..MAX_CASCADES)
-                    .map(|i| geometry.cascade(i).runs().count())
-                    .sum::<usize>()
-                + (0..MAX_SHADOW_LIGHTS)
-                    .map(|i| geometry.punctual(i).runs().count())
-                    .sum::<usize>();
+                + geometry.refractive().runs().count();
         }
 
         let camera = *world.resource::<Camera>();
         let shadow_settings = *world.resource::<ShadowSettings>();
         {
             let _phase = profile::scope("render submit");
-            let caster_lists: [DrawList<'_>; MAX_CASCADES] =
-                std::array::from_fn(|i| geometry.cascade(i));
-            let punctual_lists: [DrawList<'_>; MAX_SHADOW_LIGHTS] =
-                std::array::from_fn(|i| geometry.punctual(i));
             renderer.render_with_overlay(
                 geometry.visible(),
                 geometry.transparent(),
@@ -341,9 +316,7 @@ fn frame_cost() {
                 profiler.frame_index(),
                 (cascade_set.count > 0).then_some(ShadowFrame {
                     cascades: &cascade_set,
-                    casters: &caster_lists,
                     atlas: &atlas,
-                    punctual_casters: &punctual_lists,
                     settings: &shadow_settings,
                 }),
                 None,

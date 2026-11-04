@@ -59,7 +59,65 @@ const FETCH_HINT: &str = "run `scripts/fetch-sponza.sh` to download it (Khronos'
                           of Crytek's Sponza, CC BY 3.0), or point ORRIN_SPONZA at a .gltf/.glb \
                           you already have";
 
+/// Build the scene, loading the model on the calling thread. What a capture or
+/// the perf harness wants: there is no frame loop to keep running, and the
+/// first frame has to have the building in it.
 pub fn build_sponza_scene(world: &mut World, backend: &mut impl RenderBackend) {
+    let (path, settings) = source();
+    finish(world, backend, model::load(&path, &settings));
+}
+
+/// [`begin_sponza_scene`] for a model at `path`.
+fn begin_loading(world: &mut World, path: PathBuf, settings: ImportSettings) {
+    let loading = std::thread::Builder::new()
+        .name("orrin-loader".into())
+        .spawn(move || model::load(&path, &settings))
+        .expect("failed to start the model loader thread");
+    world.insert_resource(PendingSponza { loading });
+}
+
+/// A Sponza whose model is being read and decoded on a loader thread.
+///
+/// A plain `std::thread` rather than a task on the pool, because what it mostly
+/// does is block on the filesystem, and a rayon worker parked in `read()` is a
+/// worker the frame cannot have: rayon steals while a worker waits on a *job*,
+/// not on a syscall. The decode inside `model::load` still fans out across the
+/// pool from here, which is CPU work and belongs there.
+pub struct PendingSponza {
+    loading: std::thread::JoinHandle<Result<Model, model::ModelError>>,
+}
+
+/// Start loading the model and return at once; [`finish_pending_scene`] lands
+/// it on the first frame after it is ready. Until then the frame loop runs and
+/// presents an empty world, which is the whole point: a quarter of a million
+/// triangles and seventy images is seconds of file reading and decoding.
+pub fn begin_sponza_scene(world: &mut World) {
+    let (path, settings) = source();
+    begin_loading(world, path, settings);
+}
+
+/// Land a [`begin_sponza_scene`] whose model has finished loading, and say
+/// whether it did. Asked every frame, and free when nothing is pending.
+pub fn finish_pending_scene(world: &mut World, backend: &mut impl RenderBackend) -> bool {
+    let ready = world
+        .get_resource::<PendingSponza>()
+        .is_some_and(|pending| pending.loading.is_finished());
+    if !ready {
+        return false;
+    }
+    let pending = world
+        .remove_resource::<PendingSponza>()
+        .expect("checked present above");
+    let loaded = pending
+        .loading
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    finish(world, backend, loaded);
+    true
+}
+
+/// Where the model is, and how it is to be imported.
+fn source() -> (PathBuf, ImportSettings) {
     let path = std::env::var_os("ORRIN_SPONZA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_PATH));
@@ -79,8 +137,17 @@ pub fn build_sponza_scene(world: &mut World, backend: &mut impl RenderBackend) {
         scale,
         ..ImportSettings::default()
     };
+    (path, settings)
+}
 
-    let model = match model::load(&path, &settings) {
+/// Everything after the model is in memory: spawn it, and measure the scene
+/// around it.
+fn finish(
+    world: &mut World,
+    backend: &mut impl RenderBackend,
+    loaded: Result<Model, model::ModelError>,
+) {
+    let model = match loaded {
         Ok(model) => model,
         Err(error) => {
             // Loud, and then the rig — the same choice `SceneChoice::from_env`
@@ -261,4 +328,50 @@ fn camera(world: &mut World, frame: &Framing) {
         fov_y: 55f32.to_radians(),
         ..Camera::default()
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx::HeadlessBackend;
+
+    /// What the frame loop lands has to be what a capture builds: the same
+    /// entities, and the same uploads in the same order, since a texture handle
+    /// is its upload index. Polled the way the frame loop polls it.
+    #[test]
+    #[ignore = "needs the model on disk — scripts/fetch-sponza.sh"]
+    fn a_pending_sponza_lands_what_a_blocking_one_builds() {
+        // The repository's copy, by absolute path: a test runs in the crate's
+        // directory, where the default relative path finds nothing and both
+        // halves would quietly fall back to the rig and agree.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/sponza/Sponza.gltf");
+        assert!(path.exists(), "no model at {}", path.display());
+
+        let mut blocking = World::new();
+        let mut backend = HeadlessBackend::new();
+        let loaded = model::load(&path, &ImportSettings::default());
+        finish(&mut blocking, &mut backend, loaded);
+        let built = backend.upload_counts();
+        assert!(built.2 > 14, "{built:?} is the rig's library, not Sponza's");
+
+        let mut world = World::new();
+        let mut pending_backend = HeadlessBackend::new();
+        begin_loading(&mut world, path, ImportSettings::default());
+        assert!(world.get_resource::<PendingSponza>().is_some());
+        let mut polls = 0;
+        while !finish_pending_scene(&mut world, &mut pending_backend) {
+            polls += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(world.get_resource::<PendingSponza>().is_none());
+        assert!(
+            !finish_pending_scene(&mut world, &mut pending_backend),
+            "landed twice"
+        );
+
+        assert_eq!(pending_backend.upload_counts(), built);
+        assert_eq!(world.entities().count(), blocking.entities().count());
+        println!("landed after {polls} polls, {built:?} uploads");
+    }
 }

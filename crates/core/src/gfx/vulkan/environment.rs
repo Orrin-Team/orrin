@@ -274,27 +274,53 @@ impl EnvironmentPass {
         // Projected from the source rather than read back from the cube: the
         // pixels are already here, and a readback would be the only GPU-to-CPU
         // transfer anywhere in the engine.
-        self.irradiance = Some(sh::project_equirect(pixels, extent));
+        //
         // Measured here rather than at load: the generated placeholder sky never
         // passes through `load_hdri`, and both sources have to be calibrated the
         // same way or the demo scene is the one scene the mechanism does not
         // cover.
-        self.measured_sky = sh::sky_luminance(pixels, extent);
-
-        let equirect = device.create_texture_2d(
-            bytemuck::cast_slice(pixels),
-            extent,
-            crate::gfx::format::Format::Rgba32Float,
-        );
-        let cube = bake(
-            device,
-            self.bake_pipeline,
-            self.prefilter_pipeline,
-            self.equirect_sampler,
-            self.skybox_sampler,
-            equirect,
-        );
-        device.destroy_texture(equirect);
+        let measure = || {
+            (
+                sh::project_equirect(pixels, extent),
+                sh::sky_luminance(pixels, extent),
+            )
+        };
+        let (bake_pipeline, prefilter_pipeline) = (self.bake_pipeline, self.prefilter_pipeline);
+        let (equirect_sampler, skybox_sampler) = (self.equirect_sampler, self.skybox_sampler);
+        let upload_and_bake = || {
+            let equirect = device.create_texture_2d(
+                bytemuck::cast_slice(pixels),
+                extent,
+                crate::gfx::format::Format::Rgba32Float,
+            );
+            let cube = bake(
+                device,
+                bake_pipeline,
+                prefilter_pipeline,
+                equirect_sampler,
+                skybox_sampler,
+                equirect,
+            );
+            device.destroy_texture(equirect);
+            cube
+        };
+        // The two halves share only the pixels, so a parallel build measures on
+        // the pool while this thread — the one the device belongs to — uploads
+        // and waits on the bake. Serially they run in the order they always did.
+        let ((irradiance, measured_sky), cube) = if crate::threads::is_parallel() {
+            std::thread::scope(|scope| {
+                let measuring = scope.spawn(measure);
+                let cube = upload_and_bake();
+                let measured = measuring
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                (measured, cube)
+            })
+        } else {
+            (measure(), upload_and_bake())
+        };
+        self.irradiance = Some(irradiance);
+        self.measured_sky = measured_sky;
         if let Some(old) = self.cube.replace(cube) {
             device.destroy_texture(old);
         }
