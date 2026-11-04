@@ -375,8 +375,8 @@ impl ShadowPass {
         sets: &CasterSets,
         bound: &mut Bound,
     ) {
-        for region in casters.regions() {
-            self.bind(builder, sets, bound, region.masked, view_proj);
+        for region in casters.regions_by_mask() {
+            self.bind(builder, sets, bound, region.variant.masked, view_proj);
             builder.draw_indexed_indirect(region.commands, region.range);
         }
     }

@@ -263,10 +263,10 @@ impl GeometryPrepass {
 
         // Two multi-draws, one per pipeline variant, over the commands the
         // dispatch wrote — the same ones the forward pass draws.
-        for region in draws.regions() {
+        for region in draws.regions_by_mask() {
             bind_all(
                 encoder,
-                if region.masked {
+                if region.variant.masked {
                     self.masked_pipeline
                 } else {
                     self.pipeline

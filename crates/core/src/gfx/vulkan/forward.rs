@@ -77,6 +77,10 @@ pub(crate) mod material_flags {
     /// can ask the same question about the pixel it is on — the 1-sample passes
     /// need it to know whether to `discard`.
     pub const MASKED: u32 = 1 << 6;
+    /// Every optional lobe: what a material must use none of to draw with the
+    /// flat pipeline, whose shader is compiled without them. See
+    /// `ForwardPipelines`.
+    pub const LOBES: u32 = CLEARCOAT | SHEEN | ANISOTROPY | TRANSMISSION | SUBSURFACE | PARALLAX;
 }
 
 /// Ceiling on a material's parallax step counts. Keep in sync with
@@ -134,6 +138,13 @@ impl GpuMaterial {
     /// it was registered beside could then only cost a queue, never a pipeline.
     pub(super) fn is_masked(&self) -> bool {
         self.tex_flags[1] & material_flags::MASKED != 0
+    }
+
+    /// Whether any optional lobe is on, which is what sends a material to the
+    /// full forward pipeline rather than the flat one. Read off the uploaded
+    /// flag word for the reason `is_masked` is.
+    pub(super) fn is_lobed(&self) -> bool {
+        self.tex_flags[1] & material_flags::LOBES != 0
     }
 }
 
@@ -564,6 +575,17 @@ impl ForwardSets {
 /// *frame* — it decides which render pass is open and therefore how many colour
 /// attachments a pipeline must declare — while `masked` is a property of a
 /// *run*, so both of those have to exist at once whichever frame it is.
+/// Every forward pipeline one sample count needs, in the four variants a batch
+/// can be (see `cull::Variant`), each with and without the subsurface target.
+///
+/// The `flat` ones run `shading.glsl` compiled with `ORRIN_FLAT_SURFACE`, which
+/// takes the optional lobes out — clear coat, sheen, anisotropy, transmission,
+/// subsurface, parallax — for the materials that use none of them, which is
+/// most. Not to save the lobes' work: behind their flag tests that is only a
+/// branch, and measured at ~0.025 ms. It is that their code being there at all
+/// cost every material a quarter of the pass (forward 0.77 -> 0.58 ms on the
+/// demo, M5 Pro, with the lobes compiled out), as register pressure and the
+/// occupancy it costs. One source still, as a define, so the two cannot drift.
 struct ForwardPipelines {
     plain: PipelineId,
     subsurface: PipelineId,
@@ -573,15 +595,25 @@ struct ForwardPipelines {
     /// coverage across four samples, a `discard` at one.
     masked: PipelineId,
     masked_subsurface: PipelineId,
+    flat: PipelineId,
+    flat_subsurface: PipelineId,
+    masked_flat: PipelineId,
+    masked_flat_subsurface: PipelineId,
 }
 
 impl ForwardPipelines {
-    /// The pair a frame draws with, given whether it diffuses subsurface light.
-    fn for_frame(&self, subsurface: bool) -> (PipelineId, PipelineId) {
-        if subsurface {
-            (self.subsurface, self.masked_subsurface)
-        } else {
-            (self.plain, self.masked)
+    /// The pipeline a batch of `variant` draws with in a frame that does or
+    /// does not diffuse subsurface light.
+    fn for_variant(&self, variant: super::cull::Variant, subsurface: bool) -> PipelineId {
+        match (variant.masked, variant.lobed, subsurface) {
+            (false, false, false) => self.flat,
+            (false, false, true) => self.flat_subsurface,
+            (false, true, false) => self.plain,
+            (false, true, true) => self.subsurface,
+            (true, false, false) => self.masked_flat,
+            (true, false, true) => self.masked_flat_subsurface,
+            (true, true, false) => self.masked,
+            (true, true, true) => self.masked_subsurface,
         }
     }
 }
@@ -786,6 +818,20 @@ impl ForwardPass {
                 false,
                 msaa,
             ),
+            flat: pipeline(&[msaa_color_format], ShaderId::ForwardFragFlat, true, msaa),
+            flat_subsurface: pipeline(
+                &sss(msaa_color_format),
+                ShaderId::ForwardSssFragFlat,
+                true,
+                msaa,
+            ),
+            masked_flat: pipeline(&[msaa_color_format], ShaderId::ForwardFragFlat, false, msaa),
+            masked_flat_subsurface: pipeline(
+                &sss(msaa_color_format),
+                ShaderId::ForwardSssFragFlat,
+                false,
+                msaa,
+            ),
         };
         // The masked variants take the alpha-testing shaders rather than the
         // plain ones: there is no coverage to spend at one sample, so the cut has
@@ -797,6 +843,20 @@ impl ForwardPass {
             masked_subsurface: pipeline(
                 &sss(color_format),
                 ShaderId::ForwardSssFragAlphaTest,
+                false,
+                one,
+            ),
+            flat: pipeline(&[color_format], ShaderId::ForwardFragFlat, true, one),
+            flat_subsurface: pipeline(&sss(color_format), ShaderId::ForwardSssFragFlat, true, one),
+            masked_flat: pipeline(
+                &[color_format],
+                ShaderId::ForwardFragAlphaTestFlat,
+                false,
+                one,
+            ),
+            masked_flat_subsurface: pipeline(
+                &sss(color_format),
+                ShaderId::ForwardSssFragAlphaTestFlat,
                 false,
                 one,
             ),
@@ -1162,7 +1222,7 @@ impl ForwardPass {
         // The jittered one, from the frame's shared view: every pass that
         // rasterises geometry has to agree on it to a subpixel.
         let view_proj = view.view_proj;
-        let (plain, masked) = self.pipelines(msaa).for_frame(subsurface);
+        let pipelines = self.pipelines(msaa);
         // The one value a geometry draw still pushes. The fat per-object matrices
         // are in the set-4 storage buffer, and what used to sit beside
         // `view_proj` here — the run's material and its first object row — moved
@@ -1205,9 +1265,9 @@ impl ForwardPass {
 
         // One multi-draw per pipeline variant, over the commands the dispatch
         // wrote: the recording cost scales with neither the entity count nor
-        // the distinct mesh/material pairs, only with the two variants.
+        // the distinct mesh/material pairs, only with the four variants.
         for region in draws.regions() {
-            bind_all(builder, if region.masked { masked } else { plain });
+            bind_all(builder, pipelines.for_variant(region.variant, subsurface));
             builder.draw_indexed_indirect(region.commands, region.range);
         }
     }

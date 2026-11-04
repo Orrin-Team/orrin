@@ -82,22 +82,22 @@ layout(push_constant) uniform Push {
     uint instance_count;
     uint view_count;
     uint batch_count;
-    // Where the masked batches begin, which is what a packed batch number is
-    // resolved against.
-    uint plain_count;
+    uint occlusion;
+    // Where each pipeline variant's batches begin, which is what a packed batch
+    // number is resolved against. See `Variant::class` in cull.rs.
+    uvec4 class_bases;
     // The camera the pyramid was rasterised through, which is the previous
     // frame's. Testing this frame's box against last frame's depth is only
     // meaningful projected the way that depth was.
     mat4 prev_view_proj;
-    uint occlusion;
 } push;
 
-const uint MASKED_BIT = 0x80000000u;
+// Lock-stepped with `CLASS_SHIFT` in cull.rs.
+const uint CLASS_SHIFT = 30u;
 
 // The row of `commands` a packed batch number owns this frame.
 uint slot(uint packed) {
-    uint index = packed & ~MASKED_BIT;
-    return (packed & MASKED_BIT) != 0u ? push.plain_count + index : index;
+    return push.class_bases[packed >> CLASS_SHIFT] + (packed & ((1u << CLASS_SHIFT) - 1u));
 }
 
 // Conservative, exactly as `Frustum::intersects` is: true means "may be

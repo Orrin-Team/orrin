@@ -2023,9 +2023,11 @@ impl VulkanRenderer {
                         .map(|mesh| (mesh.span, mesh.bounds))
                 },
                 |material| {
-                    materials
-                        .get(material as usize)
-                        .is_some_and(GpuMaterial::is_masked)
+                    let material = materials.get(material as usize);
+                    cull::Variant {
+                        masked: material.is_some_and(GpuMaterial::is_masked),
+                        lobed: material.is_some_and(GpuMaterial::is_lobed),
+                    }
                 },
                 cull_views.len() as u32,
             )

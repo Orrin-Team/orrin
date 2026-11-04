@@ -155,12 +155,25 @@ struct GpuMaterial {
 // `v_material` is one value for a whole draw, so every test against these is a
 // coherent branch: a draw either takes a lobe or does not, and a material that
 // never asked for one pays a single comparison rather than the lobe's cost.
+#ifdef ORRIN_FLAT_SURFACE
+// The flat forward pipelines' build: a material drawn with one uses none of the
+// optional lobes, so every test of their bits folds to false and the compiler
+// removes the lobes outright. Their presence alone costs every material a
+// quarter of the forward pass — see `ForwardPipelines` in forward.rs.
+const uint MATERIAL_CLEARCOAT    = 0u;
+const uint MATERIAL_SHEEN        = 0u;
+const uint MATERIAL_ANISOTROPY   = 0u;
+const uint MATERIAL_TRANSMISSION = 0u;
+const uint MATERIAL_SUBSURFACE   = 0u;
+const uint MATERIAL_PARALLAX     = 0u;
+#else
 const uint MATERIAL_CLEARCOAT    = 1u << 0;
 const uint MATERIAL_SHEEN        = 1u << 1;
 const uint MATERIAL_ANISOTROPY   = 1u << 2;
 const uint MATERIAL_TRANSMISSION = 1u << 3;
 const uint MATERIAL_SUBSURFACE   = 1u << 4;
 const uint MATERIAL_PARALLAX     = 1u << 5;
+#endif
 const uint MATERIAL_MASKED       = 1u << 6;
 
 // Material table indexed by the per-draw material_index. A storage

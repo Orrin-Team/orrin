@@ -18,6 +18,10 @@ forward_frag_alpha_test fragment forward.frag ORRIN_ALPHA_TEST=1
 forward_vert vertex forward.vert
 forward_sss_frag fragment forward_sss.frag
 forward_sss_frag_alpha_test fragment forward_sss.frag ORRIN_ALPHA_TEST=1
+forward_frag_flat fragment forward.frag ORRIN_FLAT_SURFACE=1
+forward_frag_alpha_test_flat fragment forward.frag ORRIN_ALPHA_TEST=1 ORRIN_FLAT_SURFACE=1
+forward_sss_frag_flat fragment forward_sss.frag ORRIN_FLAT_SURFACE=1
+forward_sss_frag_alpha_test_flat fragment forward_sss.frag ORRIN_ALPHA_TEST=1 ORRIN_FLAT_SURFACE=1
 frost_frag fragment frost.frag
 fullscreen_vert vertex fullscreen.vert
 gizmo_frag fragment gizmo.frag
