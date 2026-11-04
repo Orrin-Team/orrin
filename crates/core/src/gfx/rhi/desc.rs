@@ -62,6 +62,10 @@ pub enum VertexFormat {
     Float4,
     /// Four bytes, each an unsigned-normalised channel.
     Unorm8x4,
+    /// Two signed-normalised 16-bit channels.
+    Snorm16x2,
+    /// Four signed-normalised 16-bit channels.
+    Snorm16x4,
 }
 
 /// One attribute of a vertex stream. Matched to the shader by name, as the

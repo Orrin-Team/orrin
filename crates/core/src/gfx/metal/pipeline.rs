@@ -350,6 +350,8 @@ fn vertex_descriptor(shader: ShaderId, streams: &[VertexStream]) -> Retained<MTL
                 VertexFormat::Float3 => MTLVertexFormat::Float3,
                 VertexFormat::Float4 => MTLVertexFormat::Float4,
                 VertexFormat::Unorm8x4 => MTLVertexFormat::UChar4Normalized,
+                VertexFormat::Snorm16x2 => MTLVertexFormat::Short2Normalized,
+                VertexFormat::Snorm16x4 => MTLVertexFormat::Short4Normalized,
             });
             unsafe { described.setOffset(attribute.offset as usize) };
             unsafe { described.setBufferIndex(buffer) };

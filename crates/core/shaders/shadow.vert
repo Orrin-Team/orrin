@@ -20,13 +20,9 @@ layout(push_constant) uniform Push {
     mat4 light_view_proj;
 } push;
 
-// The same per-object buffer the forward pass reads, uploaded once per frame.
-// Mirrors GpuObject in forward.rs: both fields stay declared even though only
-// `model` is used here, because dropping one would halve every index.
-struct Object {
-    mat4 model;
-    mat4 prev_model; // read only by the prepass; here to keep the stride in step
-};
+#include "object.glsl"
+
+// The same per-object buffer the forward pass reads.
 layout(set = 0, binding = 0, std430) readonly buffer Objects {
     Object objects[];
 };
@@ -43,7 +39,7 @@ layout(set = 0, binding = 1, std430) readonly buffer Instances {
 
 void main() {
     uvec2 entry = instances[uint(gl_InstanceIndex)];
-    gl_Position = push.light_view_proj * objects[entry.x].model * vec4(position, 1.0);
+    gl_Position = push.light_view_proj * object_model(objects[entry.x]) * vec4(position, 1.0);
 #ifdef ORRIN_MASKED
     v_uv = uv;
     v_material = entry.y;

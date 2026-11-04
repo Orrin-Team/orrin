@@ -44,17 +44,41 @@ use crate::gfx::rhi::{
 
 /// Per-object transforms, indexed through [`InstanceLists`] from a storage
 /// buffer. std430 matches this `#[repr(C)]` layout exactly because every field
-/// is a 64-byte `mat4` (a multiple of 16).
+/// is an array of `vec4`s.
+///
+/// Each matrix is its top three *rows*. A world transform is affine, so the
+/// fourth row is always `(0, 0, 0, 1)` and `affine` in `object.glsl` supplies
+/// it; storing columns instead would leave the translation spread across the
+/// three vectors that were kept and the constant row as the one dropped, which
+/// is the same 48 bytes and a transpose in every vertex shader.
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(super) struct GpuObject {
-    model: [[f32; 4]; 4],
+    model: [[f32; 4]; 3],
     /// Last frame's `model`, for the motion vector the prepass writes. Uploaded
     /// for every pass rather than only the one that reads it: the buffer is
     /// shared, so the row's stride is shared too, and a second layout for the
     /// passes that ignore this field would be two ways for one object row to be
     /// wrong.
-    prev_model: [[f32; 4]; 4],
+    prev_model: [[f32; 4]; 3],
+}
+
+impl GpuObject {
+    pub(super) fn new(model: &Mat4, prev_model: &Mat4) -> Self {
+        Self {
+            model: affine_rows(model),
+            prev_model: affine_rows(prev_model),
+        }
+    }
+}
+
+fn affine_rows(m: &Mat4) -> [[f32; 4]; 3] {
+    debug_assert_eq!(m.row(3), glam::Vec4::W, "an object matrix must be affine");
+    [
+        m.row(0).to_array(),
+        m.row(1).to_array(),
+        m.row(2).to_array(),
+    ]
 }
 
 /// How many rows a fresh store holds before the first growth. Large enough that
@@ -185,13 +209,7 @@ impl InstanceStore {
                 continue;
             }
             self.resident[slot] = Some(current);
-            dirty.push((
-                item.instance,
-                GpuObject {
-                    model: item.model.to_cols_array_2d(),
-                    prev_model: item.prev_model.to_cols_array_2d(),
-                },
-            ));
+            dirty.push((item.instance, GpuObject::new(&item.model, &item.prev_model)));
         }
 
         if dirty.is_empty() {
@@ -392,10 +410,44 @@ mod tests {
         );
     }
 
-    /// Two matrices per row, and std430 lays them out with no padding — the
-    /// stride every `Object` declaration in the shaders has to agree with.
+    /// Two affine matrices per row at three `vec4`s each, and std430 lays them
+    /// out with no padding — the stride every `Object` declaration in the
+    /// shaders has to agree with.
     #[test]
-    fn an_object_row_is_two_matrices() {
-        assert_eq!(std::mem::size_of::<GpuObject>(), 128);
+    fn an_object_row_is_two_affine_matrices() {
+        assert_eq!(std::mem::size_of::<GpuObject>(), 96);
+    }
+
+    /// `affine` in `object.glsl`, here so the packing can be asserted without a
+    /// GPU. The two are a lock-step pair.
+    fn shader_affine(rows: &[[f32; 4]; 3]) -> Mat4 {
+        Mat4::from_cols_array_2d(&[
+            [rows[0][0], rows[1][0], rows[2][0], 0.0],
+            [rows[0][1], rows[1][1], rows[2][1], 0.0],
+            [rows[0][2], rows[1][2], rows[2][2], 0.0],
+            [rows[0][3], rows[1][3], rows[2][3], 1.0],
+        ])
+    }
+
+    /// Bit for bit, not approximately: the prepass and the forward pass test
+    /// depth `EQUAL` against each other, and both rebuild the matrix from this
+    /// row, so the row has to be the matrix rather than a rounding of it.
+    #[test]
+    fn a_row_rebuilds_its_matrices_exactly() {
+        let trs = Transform {
+            translation: Vec3::new(3.0, -2.0, 7.0),
+            rotation: Quat::from_euler(glam::EulerRot::YXZ, 0.6, -1.1, 0.3),
+            scale: Vec3::new(0.5, 4.0, 2.0),
+        }
+        .matrix();
+        let sheared = Mat4::from_cols_array_2d(&[
+            [1.0, 0.0, 0.0, 0.0],
+            [0.7, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [-4.0, 0.5, 9.0, 1.0],
+        ]);
+        let row = GpuObject::new(&trs, &sheared);
+        assert_eq!(shader_affine(&row.model), trs);
+        assert_eq!(shader_affine(&row.prev_model), sheared);
     }
 }

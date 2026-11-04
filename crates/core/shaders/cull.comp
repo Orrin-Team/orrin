@@ -17,10 +17,7 @@ layout(local_size_x = 64, local_size_y = 1) in;
 const uint VIEW_FRUSTUM = 0;
 const uint VIEW_CASCADE = 1;
 
-struct Object {
-    mat4 model;
-    mat4 prev_model;
-};
+#include "object.glsl"
 
 struct Instance {
     uint row;
@@ -229,8 +226,9 @@ void main() {
 
     bool wanted = true;
     if (measurable) {
-        mat3 rotation = mat3(object.model);
-        vec3 center = (object.model * vec4(0.5 * (bmin + bmax), 1.0)).xyz;
+        mat4 model = object_model(object);
+        mat3 rotation = mat3(model);
+        vec3 center = (model * vec4(0.5 * (bmin + bmax), 1.0)).xyz;
         vec3 half_extents = 0.5 * (bmax - bmin);
         vec3 extents = abs(rotation[0]) * half_extents.x
             + abs(rotation[1]) * half_extents.y

@@ -1145,6 +1145,8 @@ fn vertex_buffer(stream: &VertexStream) -> VertexBufferDescription {
                     VertexFormat::Float3 => VkFormat::R32G32B32_SFLOAT,
                     VertexFormat::Float4 => VkFormat::R32G32B32A32_SFLOAT,
                     VertexFormat::Unorm8x4 => VkFormat::R8G8B8A8_UNORM,
+                    VertexFormat::Snorm16x2 => VkFormat::R16G16_SNORM,
+                    VertexFormat::Snorm16x4 => VkFormat::R16G16B16A16_SNORM,
                 };
                 (
                     attribute.name.to_string(),

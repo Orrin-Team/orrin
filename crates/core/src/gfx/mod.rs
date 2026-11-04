@@ -63,9 +63,10 @@ pub struct Vertex {
 /// pipelines beats a third buffer that serves one. The plain variant declares no
 /// `uv` and therefore fetches none — only the stride is shared.
 ///
-/// This costs no memory: the two halves partition [`Vertex`] rather than
-/// duplicating any of it, so a mesh occupies exactly what it did before, in two
-/// buffers instead of one.
+/// The texture coordinate stays 32-bit where [`SurfaceVertex`] narrows
+/// everything it holds. Not half floats, though that is the usual suggestion: a
+/// coordinate is a position on a *tiled* map, and at a value of 8 a half float
+/// steps by 1/128 of a repeat — sixteen texels of a 2048² texture.
 #[derive(BufferContents, VertexTrait, Clone, Copy, Debug)]
 #[repr(C)]
 pub struct PositionVertex {
@@ -80,17 +81,24 @@ pub struct PositionVertex {
 ///
 /// Bound alongside it by the four passes that rasterise a surface rather than
 /// just its depth — the geometry prepass, the forward pass, and the two
-/// non-opaque queues. Between them the two streams still add up to the same 60
-/// bytes the single interleaved vertex was.
+/// non-opaque queues.
+///
+/// Sixteen bytes where the fields it is packed from are forty, because none of
+/// them needs a float's range. The normal is a direction, so it is stored
+/// octahedrally — the unit sphere folded onto a square, two SNORM16 channels,
+/// decoded by `octahedral.glsl` to within a hundredth of a degree. The tangent
+/// keeps its four channels rather than folding too, because its `w` is the
+/// bitangent's sign and an octahedral pair has no room left for it. The colour
+/// is a tint in [0, 1], at the eight bits glTF's own `COLOR_0` usually carries.
 #[derive(BufferContents, VertexTrait, Clone, Copy, Debug)]
 #[repr(C)]
 pub struct SurfaceVertex {
-    #[format(R32G32B32_SFLOAT)]
-    pub normal: [f32; 3],
-    #[format(R32G32B32_SFLOAT)]
-    pub color: [f32; 3],
-    #[format(R32G32B32A32_SFLOAT)]
-    pub tangent: [f32; 4],
+    #[format(R16G16_SNORM)]
+    pub normal: [i16; 2],
+    #[format(R16G16B16A16_SNORM)]
+    pub tangent: [i16; 4],
+    #[format(R8G8B8A8_UNORM)]
+    pub color: [u8; 4],
 }
 
 impl PositionVertex {
@@ -116,23 +124,23 @@ impl PositionVertex {
 
 impl SurfaceVertex {
     pub const STREAM: rhi::VertexStream = rhi::VertexStream {
-        stride: 40,
+        stride: 16,
         per_instance: false,
         attributes: &[
             rhi::VertexAttribute {
                 name: "normal",
-                format: rhi::VertexFormat::Float3,
+                format: rhi::VertexFormat::Snorm16x2,
                 offset: 0,
             },
             rhi::VertexAttribute {
-                name: "color",
-                format: rhi::VertexFormat::Float3,
-                offset: 12,
+                name: "tangent",
+                format: rhi::VertexFormat::Snorm16x4,
+                offset: 4,
             },
             rhi::VertexAttribute {
-                name: "tangent",
-                format: rhi::VertexFormat::Float4,
-                offset: 24,
+                name: "color",
+                format: rhi::VertexFormat::Unorm8x4,
+                offset: 12,
             },
         ],
     };
@@ -151,12 +159,43 @@ impl Vertex {
                 uv: self.uv,
             },
             SurfaceVertex {
-                normal: self.normal,
-                color: self.color,
-                tangent: self.tangent,
+                normal: oct_encode(Vec3::from(self.normal)),
+                tangent: self.tangent.map(snorm16),
+                color: {
+                    let [r, g, b] = self.color.map(unorm8);
+                    [r, g, b, u8::MAX]
+                },
             },
         )
     }
+}
+
+/// `normal` folded onto the octahedron and quantised to SNORM16, the inverse of
+/// `oct_decode` in `octahedral.glsl`. A zero vector packs as +Z rather than as
+/// the NaN its L1 normalisation would give.
+fn oct_encode(normal: Vec3) -> [i16; 2] {
+    let l1 = normal.x.abs() + normal.y.abs() + normal.z.abs();
+    if l1 == 0.0 {
+        return [0, 0];
+    }
+    let n = normal / l1;
+    let (x, y) = if n.z >= 0.0 {
+        (n.x, n.y)
+    } else {
+        (
+            (1.0 - n.y.abs()) * n.x.signum(),
+            (1.0 - n.x.abs()) * n.y.signum(),
+        )
+    };
+    [snorm16(x), snorm16(y)]
+}
+
+fn snorm16(v: f32) -> i16 {
+    (v.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16
+}
+
+fn unorm8(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * u8::MAX as f32).round() as u8
 }
 
 /// One renderable instance, as extraction hands it to the passes. Everything a
@@ -945,5 +984,136 @@ mod draw_list_tests {
             .map(|run| (run.start, run.end))
             .collect();
         assert_eq!(ranges, vec![(0, 2), (2, 3)]);
+    }
+}
+
+#[cfg(test)]
+mod vertex_packing_tests {
+    use super::{SurfaceVertex, Vertex};
+    use glam::{Vec2, Vec3};
+
+    /// `oct_decode` in `octahedral.glsl`, here so the packing can be asserted
+    /// without a GPU. The two are a lock-step pair, as `normal_matrix` is.
+    fn shader_oct_decode(packed: [i16; 2]) -> Vec3 {
+        // SNORM16's own conversion: -32768 and -32767 both read as -1.
+        let e = Vec2::new(packed[0] as f32, packed[1] as f32) / 32767.0;
+        let e = e.max(Vec2::splat(-1.0));
+        let mut n = Vec3::new(e.x, e.y, 1.0 - e.x.abs() - e.y.abs());
+        let t = (-n.z).max(0.0);
+        n.x += if n.x >= 0.0 { -t } else { t };
+        n.y += if n.y >= 0.0 { -t } else { t };
+        n.normalize()
+    }
+
+    fn snorm16(v: i16) -> f32 {
+        (v as f32 / 32767.0).max(-1.0)
+    }
+
+    fn surface(normal: Vec3, tangent: [f32; 4], color: [f32; 3]) -> SurfaceVertex {
+        Vertex {
+            position: [0.0; 3],
+            normal: normal.to_array(),
+            color,
+            uv: [0.0; 2],
+            tangent,
+        }
+        .split()
+        .1
+    }
+
+    /// Directions spread evenly over the whole sphere, plus the ones an
+    /// octahedral map treats specially: the six axes, where the fold meets
+    /// itself, and the eight diagonals of the lower hemisphere, which land on
+    /// the corners of the unfolded square.
+    fn directions() -> Vec<Vec3> {
+        let golden = std::f32::consts::PI * (3.0 - 5f32.sqrt());
+        let count = 20_000;
+        let mut out: Vec<Vec3> = (0..count)
+            .map(|i| {
+                let y = 1.0 - 2.0 * (i as f32 + 0.5) / count as f32;
+                let r = (1.0 - y * y).sqrt();
+                let phi = golden * i as f32;
+                Vec3::new(r * phi.cos(), y, r * phi.sin())
+            })
+            .collect();
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            out.extend([axis, -axis]);
+        }
+        for x in [-1.0, 1.0] {
+            for y in [-1.0, 1.0] {
+                for z in [-1.0, 1.0] {
+                    out.push(Vec3::new(x, y, z).normalize());
+                }
+            }
+        }
+        out
+    }
+
+    /// Sixteen bits a component over the unfolded octahedron is far finer than
+    /// anything a normal map or a lighting term can show; a hundredth of a
+    /// degree is the bound, everywhere on the sphere including the fold.
+    #[test]
+    fn an_octahedral_normal_round_trips_within_a_hundredth_of_a_degree() {
+        let worst = directions()
+            .into_iter()
+            .map(|n| {
+                let decoded = shader_oct_decode(surface(n, [1.0, 0.0, 0.0, 1.0], [1.0; 3]).normal);
+                // Not `acos` of the dot product: in f32 that alone is worth
+                // two hundredths of a degree near zero, more than is measured.
+                n.cross(decoded).length().atan2(n.dot(decoded)).to_degrees()
+            })
+            .fold(0.0f32, f32::max);
+        assert!(worst < 0.01, "worst round-trip error {worst} degrees");
+    }
+
+    /// An authored normal is not always unit length, and the encoding divides
+    /// by its L1 norm — so a degenerate one must still decode to a finite
+    /// direction rather than spreading NaN through every lighting term.
+    #[test]
+    fn a_zero_normal_packs_to_a_finite_direction() {
+        let decoded = shader_oct_decode(surface(Vec3::ZERO, [1.0, 0.0, 0.0, 1.0], [1.0; 3]).normal);
+        assert!(decoded.is_finite(), "decoded {decoded}");
+    }
+
+    /// The scale of an authored normal is not part of what it says.
+    #[test]
+    fn a_normal_packs_by_direction_alone() {
+        let n = Vec3::new(0.3, -0.8, 0.5);
+        assert_eq!(
+            surface(n, [1.0, 0.0, 0.0, 1.0], [1.0; 3]).normal,
+            surface(n * 7.0, [1.0, 0.0, 0.0, 1.0], [1.0; 3]).normal,
+        );
+    }
+
+    /// The bitangent's sign is the one bit of the tangent frame that cannot be
+    /// re-derived — a mirrored UV island lights inside out without it.
+    #[test]
+    fn the_tangent_keeps_its_direction_and_handedness() {
+        for w in [1.0, -1.0] {
+            let t = Vec3::new(0.6, 0.0, -0.8);
+            let packed = surface(Vec3::Y, [t.x, t.y, t.z, w], [1.0; 3]).tangent;
+            let decoded = Vec3::new(snorm16(packed[0]), snorm16(packed[1]), snorm16(packed[2]));
+            assert!((decoded - t).length() < 1e-4, "{decoded} for {t}");
+            assert_eq!(snorm16(packed[3]), w);
+        }
+    }
+
+    /// A vertex colour is a tint in [0, 1]; eight bits a channel is what glTF's
+    /// own UNSIGNED_BYTE COLOR_0 carries, and anything outside the range clamps
+    /// rather than wrapping.
+    #[test]
+    fn the_vertex_colour_packs_to_eight_bits_and_clamps() {
+        let packed = surface(Vec3::Y, [1.0, 0.0, 0.0, 1.0], [1.0, 0.5, 0.0]).color;
+        assert_eq!(packed, [255, 128, 0, 255]);
+        let clamped = surface(Vec3::Y, [1.0, 0.0, 0.0, 1.0], [2.0, -1.0, 0.25]).color;
+        assert_eq!(clamped, [255, 0, 64, 255]);
+    }
+
+    /// The point of the packing, and the stride every surface pipeline is
+    /// built against.
+    #[test]
+    fn the_surface_stream_is_sixteen_bytes() {
+        assert_eq!(std::mem::size_of::<SurfaceVertex>(), 16);
+        assert_eq!(SurfaceVertex::STREAM.stride, 16);
     }
 }
