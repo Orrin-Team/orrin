@@ -115,6 +115,41 @@ fn headless_instance() -> Arc<Instance> {
     .expect("failed to create a headless instance")
 }
 
+/// Counts heap allocations, on every thread, so `frame_cost` can report what a
+/// frame allocates. AGENTS.md asks for none in the frame loop; this is the
+/// number that says whether a frame keeps that.
+struct CountingAllocator;
+
+static ALLOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// SAFETY: every call is forwarded unchanged to the system allocator; the
+// counter is a relaxed atomic increment with no other effect.
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: forwarded with the caller's layout.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: `ptr` came from `alloc` above, which is the system allocator's.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: as above.
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAllocator = CountingAllocator;
+
+fn allocations() -> u64 {
+    ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[test]
 #[ignore = "needs a GPU"]
 fn frame_cost() {
@@ -231,7 +266,9 @@ fn frame_cost() {
     let mut entities = 0usize;
     let mut draws = 0usize;
     let mut entries = 0usize;
+    let (mut extract_allocations, mut render_allocations) = (0u64, 0u64);
     for frame in 0..frames + WARMUP {
+        let before_extract = allocations();
         // The engine throws its numbers away for the first few frames; so does
         // this, by restarting the profiler once the transient is over.
         if frame == WARMUP {
@@ -289,6 +326,7 @@ fn frame_cost() {
 
         let camera = *world.resource::<Camera>();
         let shadow_settings = *world.resource::<ShadowSettings>();
+        let before_render = allocations();
         {
             let _phase = profile::scope("render submit");
             renderer.render_with_overlay(
@@ -322,10 +360,13 @@ fn frame_cost() {
                 None,
             );
         }
+        let after_render = allocations();
         renderer.drain_gpu_spans(&mut profiler);
         profiler.end_frame();
         if frame >= WARMUP {
             gpu_total += renderer.gpu_frame_ms().unwrap_or(0.0) as f64;
+            extract_allocations += before_render - before_extract;
+            render_allocations += after_render - before_render;
         }
     }
 
@@ -339,6 +380,12 @@ fn frame_cost() {
     // The row for an optimisation that costs no frame time. Transient aliasing
     // moves this number and nothing else in this file, so without it there is no
     // table to choose it against — `ORRIN_ALIAS=0` is the other side.
+    println!(
+        "     {:<28} {:>9.1} extract, {:.1} render",
+        "heap allocations / frame",
+        extract_allocations as f64 / frames as f64,
+        render_allocations as f64 / frames as f64,
+    );
     println!(
         "     {:<28} {:>9.3} ms",
         "gpu frame (renderer)",

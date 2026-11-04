@@ -412,19 +412,35 @@ impl Arena {
 /// Dropping this before the frame's fence signals is a use-after-free the
 /// validation layers will not catch. Untyped because the only operation ever
 /// performed on the list is dropping it.
+///
+/// Two lists because almost everything a command names is already an `Arc` —
+/// a pipeline, a layout, a set, a view — and holding one as `Arc<dyn Any>` is a
+/// coercion, where boxing it was a heap allocation per bind: several hundred a
+/// frame, against AGENTS.md's "no allocation in the frame loop". The boxed list
+/// is for the few things that are not reference-counted.
 #[derive(Default)]
-pub(super) struct KeepAlive(Vec<Box<dyn Any + Send + Sync>>);
+pub(super) struct KeepAlive {
+    shared: Vec<Arc<dyn Any + Send + Sync>>,
+    boxed: Vec<Box<dyn Any + Send + Sync>>,
+}
 
 impl KeepAlive {
     /// Hold one resource for the frame's lifetime.
     pub(super) fn hold<T: Any + Send + Sync>(&mut self, resource: T) {
-        self.0.push(Box::new(resource));
+        self.boxed.push(Box::new(resource));
+    }
+
+    /// [`hold`](Self::hold) for a resource that is already reference-counted,
+    /// without allocating.
+    pub(super) fn hold_arc<T: Any + Send + Sync>(&mut self, resource: Arc<T>) {
+        self.shared.push(resource);
     }
 
     /// Take over another recording's obligations, for a secondary buffer whose
     /// commands are now the primary's to keep alive.
     pub(super) fn absorb(&mut self, other: KeepAlive) {
-        self.0.extend(other.0);
+        self.shared.extend(other.shared);
+        self.boxed.extend(other.boxed);
     }
 }
 
@@ -588,7 +604,7 @@ impl Recorder {
     }
 
     pub(super) fn image_barrier(&mut self, barrier: ImageMemoryBarrier) -> &mut Self {
-        self.keep.hold(barrier.image.clone());
+        self.keep.hold_arc(barrier.image.clone());
         image_barrier(&mut self.inner, barrier);
         self
     }
@@ -606,13 +622,13 @@ impl Recorder {
     pub(super) fn begin_rendering(&mut self, mut info: RenderingInfo) -> &mut Self {
         set_auto_extent_layers(&mut info);
         for attachment in info.color_attachments.iter().flatten() {
-            self.keep.hold(attachment.image_view.clone());
+            self.keep.hold_arc(attachment.image_view.clone());
             if let Some(resolve) = &attachment.resolve_info {
-                self.keep.hold(resolve.image_view.clone());
+                self.keep.hold_arc(resolve.image_view.clone());
             }
         }
         for attachment in info.depth_attachment.iter().chain(&info.stencil_attachment) {
-            self.keep.hold(attachment.image_view.clone());
+            self.keep.hold_arc(attachment.image_view.clone());
         }
         unsafe { self.inner.begin_rendering(&info) }.expect("invalid rendering info");
         self
@@ -638,13 +654,13 @@ impl Recorder {
 
     pub(super) fn bind_pipeline_graphics(&mut self, pipeline: &Arc<GraphicsPipeline>) -> &mut Self {
         unsafe { self.inner.bind_pipeline_graphics(pipeline) }.expect("invalid graphics pipeline");
-        self.keep.hold(pipeline.clone());
+        self.keep.hold_arc(pipeline.clone());
         self
     }
 
     pub(super) fn bind_pipeline_compute(&mut self, pipeline: &Arc<ComputePipeline>) -> &mut Self {
         unsafe { self.inner.bind_pipeline_compute(pipeline) }.expect("invalid compute pipeline");
-        self.keep.hold(pipeline.clone());
+        self.keep.hold_arc(pipeline.clone());
         self
     }
 
@@ -658,15 +674,26 @@ impl Recorder {
         // Unannotated on purpose: `bind_descriptor_sets` takes `&[&RawDescriptorSet]`
         // and vulkano 0.35 does not export that type, so the elements can be
         // produced and passed but the vector's type cannot be written down.
-        let raw: Vec<_> = sets.iter().map(|set| set.as_raw()).collect();
-        unsafe {
-            self.inner
-                .bind_descriptor_sets(bind_point, layout, first_set, &raw, &[])
+        //
+        // One set is nearly every call — `bind_group` binds one at a time — so it
+        // takes a stack array rather than collecting a vector per bind.
+        if let [set] = sets {
+            unsafe {
+                self.inner
+                    .bind_descriptor_sets(bind_point, layout, first_set, &[set.as_raw()], &[])
+            }
+            .expect("invalid descriptor set binding");
+        } else {
+            let raw: Vec<_> = sets.iter().map(|set| set.as_raw()).collect();
+            unsafe {
+                self.inner
+                    .bind_descriptor_sets(bind_point, layout, first_set, &raw, &[])
+            }
+            .expect("invalid descriptor set binding");
         }
-        .expect("invalid descriptor set binding");
-        self.keep.hold(layout.clone());
+        self.keep.hold_arc(layout.clone());
         for set in sets {
-            self.keep.hold(set.clone());
+            self.keep.hold_arc(set.clone());
         }
         self
     }
@@ -703,7 +730,7 @@ impl Recorder {
     ) -> &mut Self {
         unsafe { self.inner.push_constants(layout, offset, constants) }
             .expect("invalid push constants");
-        self.keep.hold(layout.clone());
+        self.keep.hold_arc(layout.clone());
         self
     }
 
@@ -831,7 +858,7 @@ impl Recorder {
         // instance, so no query in the range is in flight — `timestamps.rs`
         // documents why that has to happen there.
         unsafe { self.inner.reset_query_pool(&pool, queries) }.expect("invalid query pool reset");
-        self.keep.hold(pool);
+        self.keep.hold_arc(pool);
         self
     }
 
@@ -843,7 +870,7 @@ impl Recorder {
     ) -> &mut Self {
         unsafe { self.inner.write_timestamp(&pool, query, stage) }
             .expect("invalid timestamp write");
-        self.keep.hold(pool);
+        self.keep.hold_arc(pool);
         self
     }
 }
