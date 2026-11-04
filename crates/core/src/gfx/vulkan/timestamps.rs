@@ -60,12 +60,16 @@ const MAX_PASSES: usize = 64;
 /// which `RunAhead` has waited on whenever `SLOTS` is at least
 /// [`FRAMES_IN_FLIGHT`].
 ///
-/// But a slot must also be *read* before it is reused, and `drain_completed`
-/// declines two: the slot being written, and any slot whose frame the profiler
-/// has not closed yet. Frame `N`'s slot is therefore first eligible on frame
-/// `N + 1`, when the write cursor sits at `N + 2` — the same slot when `SLOTS`
-/// is two, which is why two silently files no GPU spans at all rather than
-/// filing wrong ones. One spare slot is what buys the readback its window.
+/// But a slot must also be *read* before it is reused. `drain_completed`
+/// declines any slot whose frame the profiler has not closed yet, so frame `N`
+/// is offered on the drains after frames `N + 1` through `N + SLOTS - 1`, and
+/// only the last of those is sure to find it finished: that is the drain after
+/// the CPU waited for `N` to retire before recording `N + FRAMES_IN_FLIGHT`.
+/// The earlier offers lose whenever a CPU frame is shorter than the queue's
+/// latency. With `SLOTS` equal to the run-ahead there is no such last offer,
+/// which is why two slots silently filed no GPU spans at all rather than filing
+/// wrong ones; one spare slot is what buys the readback its window. By then
+/// frame `N`'s slot is under the write cursor, so the drain must not skip it.
 ///
 /// Derived from the run-ahead rather than written down beside it, because the
 /// two disagreeing costs timings rather than frames, and nothing about a frame
@@ -287,25 +291,12 @@ impl GpuTimestamps {
     /// dropped rather than substituted.
     pub fn drain_completed(&mut self, profiler: &mut Profiler) {
         for index in 0..SLOTS {
-            if index == self.write {
-                continue;
-            }
             let slot = &mut self.slots[index];
-            if slot.state != SlotState::Pending || slot.passes.is_empty() {
+            if !readable(slot.state, slot.frame_index, profiler.frame_index())
+                || slot.passes.is_empty()
+            {
                 continue;
             }
-            // A frame reaches the profiler's ring when `end_frame` closes it, and
-            // `push_gpu_span` files by matching that index — so a slot recorded
-            // in the frame still open has nothing to attach to yet. Leave it
-            // pending and take it on the next drain.
-            //
-            // Never reached while the frame was slower than the readback, which
-            // is why it went unnoticed: this only matters once results are
-            // available in the same frame that recorded them.
-            if slot.frame_index >= profiler.frame_index() {
-                continue;
-            }
-
             let count = slot.next_query as usize;
             let mut results = [0u64; 2 * MAX_PASSES];
             let available = slot
@@ -361,6 +352,23 @@ impl GpuTimestamps {
     }
 }
 
+/// Whether `drain_completed` may read a slot back, with the profiler's frame
+/// `open` not yet closed.
+///
+/// The slot under the write cursor is *not* excluded: it is not reset until the
+/// next frame records, and it holds the one frame the run-ahead has certainly
+/// retired — see [`SLOTS`].
+///
+/// A frame reaches the profiler's ring when `end_frame` closes it, and
+/// `push_gpu_span` files by matching that index — so a slot recorded in the
+/// frame still open has nothing to attach to yet, and waits for the next drain.
+/// That case is never reached while the frame is slower than the readback, which
+/// is why it went unnoticed: it only matters once results are available in the
+/// same frame that recorded them.
+fn readable(state: SlotState, recorded: u64, open: u64) -> bool {
+    state == SlotState::Pending && recorded < open
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +376,42 @@ mod tests {
     use crate::gfx::shadows::MAX_CASCADES;
     use crate::gfx::vulkan::bloom::{MAX_BLOOM_MIPS, mip_count};
     use crate::gfx::vulkan::frame::{FrameConfig, declare};
+
+    /// The latest the GPU may finish frame `g` is when the CPU waits for room to
+    /// record `g + FRAMES_IN_FLIGHT`, so that is when this model finishes it. A
+    /// CPU frame shorter than the queue's latency gets this close in practice:
+    /// the empty scene's 0.66 ms frame lost every whole-frame reading this way.
+    #[test]
+    fn every_frame_is_read_back_when_the_gpu_finishes_as_late_as_it_may() {
+        let in_flight = super::super::FRAMES_IN_FLIGHT as u64;
+        let mut state = [SlotState::Idle; SLOTS];
+        let mut recorded = [0u64; SLOTS];
+        let mut write = 0;
+        let mut read = Vec::new();
+        let frames = 4 * SLOTS as u64;
+
+        for frame in 0..frames {
+            assert!(
+                state[write] != SlotState::Pending,
+                "frame {} was reset by frame {frame} before it was read back",
+                recorded[write],
+            );
+            recorded[write] = frame;
+            state[write] = SlotState::Pending;
+            write = (write + 1) % SLOTS;
+
+            for index in 0..SLOTS {
+                let finished = recorded[index] + in_flight <= frame;
+                if finished && readable(state[index], recorded[index], frame) {
+                    state[index] = SlotState::Idle;
+                    read.push(recorded[index]);
+                }
+            }
+        }
+
+        let expected: Vec<u64> = (0..=frames - 1 - in_flight).collect();
+        assert_eq!(read, expected);
+    }
 
     /// The query pool is sized ahead of knowing what will run, so a frame that
     /// outgrows it drops timings off the end rather than failing to render — the
