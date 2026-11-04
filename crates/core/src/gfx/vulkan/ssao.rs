@@ -7,50 +7,35 @@ use crate::gfx::shaders::ShaderId;
 
 pub(super) const AO_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::R8Unorm;
 const NOISE_SIZE: u32 = 4;
-const KERNEL_SIZE: usize = 32;
-const KERNEL_MAX: usize = 64;
 
-/// The resolve's tunables, as the words of its std140 block: the kernel, then
-/// the noise scale, radius, bias, power and kernel size, padded from 1048 to 1056
-/// bytes (a multiple of 16).
-const PARAMS_WORDS: usize = KERNEL_MAX * 4 + 8;
+/// The resolve's tunables, as the words of its std140 block: the noise scale,
+/// radius, bias and power, padded to a multiple of 16 bytes.
+const PARAMS_WORDS: usize = 8;
 
-fn build_kernel() -> [[f32; 4]; KERNEL_MAX] {
-    let mut seed: u64 = 0x2545F491_4F6CDD1D;
-    let mut next = || {
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (seed >> 33) as f32 / (1u64 << 31) as f32 // [0,1)
-    };
-    let mut kernel = [[0.0f32; 4]; KERNEL_MAX];
-    for (i, k) in kernel.iter_mut().enumerate().take(KERNEL_SIZE) {
-        let v = glam::Vec3::new(next() * 2.0 - 1.0, next() * 2.0 - 1.0, next()).normalize_or_zero()
-            * next();
-        let t = i as f32 / KERNEL_SIZE as f32;
-        let v = v * (0.1 + 0.9 * t * t); // cluster samples near the origin
-        *k = [v.x, v.y, v.z, 0.0];
-    }
-    kernel
+/// A 4x4 ordered-dither matrix: neighbouring cells as far apart in value as
+/// sixteen cells allow, so any 2x2 of the tile already spans the range.
+const BAYER: [u32; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+
+/// The noise tile, row-major: red is the slice rotation, green the step jitter,
+/// each a fraction of a step in [0, 1).
+///
+/// Stratified rather than random. The blur after the resolve is a 4x4
+/// footprint, the same size as this tile, so it averages exactly these sixteen
+/// rotations — and sixteen evenly spaced ones are what make an open surface
+/// average to full visibility at any tilt, where sixteen random draws would
+/// leave it off by whatever they happened to be. The jitter is the same sixteen
+/// values in another order, so a pixel's rotation says nothing about its steps.
+fn noise_texels() -> [[u8; 4]; 16] {
+    let unorm = |k: u32| ((k as f32 + 0.5) / 16.0 * 255.0).round() as u8;
+    std::array::from_fn(|i| {
+        let rotation = BAYER[i];
+        let jitter = (rotation * 5 + 3) % 16;
+        [unorm(rotation), unorm(jitter), 0, 255]
+    })
 }
 
 fn build_noise(device: &Device) -> TextureViewId {
-    let mut seed: u64 = 0x9E3779B9_7F4A7C15;
-    let mut next = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        (seed >> 33) as f32 / (1u64 << 31) as f32
-    };
-    let mut pixels = Vec::with_capacity((NOISE_SIZE * NOISE_SIZE * 4) as usize);
-    for _ in 0..(NOISE_SIZE * NOISE_SIZE) {
-        let x = next() * 2.0 - 1.0;
-        let y = next() * 2.0 - 1.0;
-        pixels.extend_from_slice(&[
-            ((x * 0.5 + 0.5) * 255.0) as u8,
-            ((y * 0.5 + 0.5) * 255.0) as u8,
-            0,
-            255,
-        ]);
-    }
+    let pixels: Vec<u8> = noise_texels().into_iter().flatten().collect();
     device.create_texture_2d(&pixels, [NOISE_SIZE, NOISE_SIZE], NORMAL_FORMAT)
 }
 
@@ -75,7 +60,6 @@ pub struct SsaoPass {
     /// resource: with SSAO off the graph has no AO node at all, so there is
     /// nothing for the forward pass to declare a read of.
     white_view: TextureViewId,
-    kernel: [[f32; 4]; KERNEL_MAX],
     pub radius: f32,
     pub bias: f32,
     pub power: f32,
@@ -116,7 +100,6 @@ impl SsaoPass {
             nearest_repeat,
             noise_view: build_noise(device),
             white_view: device.create_texture_2d(&[255u8], [1, 1], AO_FORMAT),
-            kernel: build_kernel(),
             radius: 1.0,
             bias: 0.025,
             power: 1.0,
@@ -135,16 +118,11 @@ impl SsaoPass {
         frame: BufferId,
     ) -> SsaoUniforms {
         let mut words = [0u32; PARAMS_WORDS];
-        for (word, value) in words.iter_mut().zip(self.kernel.iter().flatten()) {
-            *word = value.to_bits();
-        }
-        let tail = KERNEL_MAX * 4;
-        words[tail] = (extent[0] as f32 / NOISE_SIZE as f32).to_bits();
-        words[tail + 1] = (extent[1] as f32 / NOISE_SIZE as f32).to_bits();
-        words[tail + 2] = self.radius.to_bits();
-        words[tail + 3] = self.bias.to_bits();
-        words[tail + 4] = self.power.to_bits();
-        words[tail + 5] = KERNEL_SIZE as u32;
+        words[0] = (extent[0] as f32 / NOISE_SIZE as f32).to_bits();
+        words[1] = (extent[1] as f32 / NOISE_SIZE as f32).to_bits();
+        words[2] = self.radius.to_bits();
+        words[3] = self.bias.to_bits();
+        words[4] = self.power.to_bits();
 
         SsaoUniforms {
             frame,
@@ -271,4 +249,170 @@ fn set_viewport(encoder: &mut Encoder, extent: [u32; 2]) {
         extent: [extent[0] as f32, extent[1] as f32],
         depth_range: [0.0, 1.0],
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::f32::consts::{FRAC_PI_2, PI};
+
+    use glam::Vec3;
+
+    use super::*;
+
+    /// Slices per pixel. Lock-stepped with `SLICES` in `ssao.frag`, which keeps
+    /// it a constant there so the march unrolls.
+    const SLICES: usize = 2;
+
+    /// `slice_frame` in `ssao.frag`: the normal projected into the slice
+    /// plane, as its angle `n` from the view vector, its cosine, and its length.
+    fn shader_slice_frame(n_view: Vec3, v: Vec3, direction: Vec3) -> (f32, f32, f32) {
+        let ortho = direction - direction.dot(v) * v;
+        let axis = ortho.cross(v).normalize();
+        let projected = n_view - axis * n_view.dot(axis);
+        let len = projected.length();
+        let cos_n = (projected.dot(v) / len.max(1e-6)).clamp(0.0, 1.0);
+        let sign = if ortho.dot(projected) >= 0.0 {
+            1.0
+        } else {
+            -1.0
+        };
+        (sign * cos_n.acos(), cos_n, len)
+    }
+
+    /// `slice_visibility` in `ssao.frag`, the closed-form cosine-weighted
+    /// integral between two horizons. The two are a lock-step pair.
+    fn shader_slice_visibility(frame: (f32, f32, f32), hc0: f32, hc1: f32) -> f32 {
+        let (n, cos_n, len) = frame;
+        let h0 = n + (-hc1.clamp(-1.0, 1.0).acos() - n).clamp(-FRAC_PI_2, FRAC_PI_2);
+        let h1 = n + (hc0.clamp(-1.0, 1.0).acos() - n).clamp(-FRAC_PI_2, FRAC_PI_2);
+        let arc = |h: f32| (cos_n + 2.0 * h * n.sin() - (2.0 * h - n).cos()) * 0.25;
+        len * (arc(h0) + arc(h1))
+    }
+
+    /// The horizons an open surface leaves: none, so each side's is the
+    /// tangent plane, which is where the shader starts its search.
+    fn open(frame: (f32, f32, f32)) -> (f32, f32) {
+        ((frame.0 + FRAC_PI_2).cos(), (frame.0 - FRAC_PI_2).cos())
+    }
+
+    /// The two slices one pixel's noise texel rotates to, as `ssao.frag`
+    /// derives them.
+    fn slices(rotation: f32) -> [Vec3; SLICES] {
+        std::array::from_fn(|s| {
+            let phi = (s as f32 + rotation) * PI / SLICES as f32;
+            Vec3::new(phi.cos(), phi.sin(), 0.0)
+        })
+    }
+
+    /// What the blur's 4x4 footprint averages an open surface to: every
+    /// rotation in the tile, every slice of each.
+    fn tile_visibility(n_view: Vec3) -> f32 {
+        let v = Vec3::Z;
+        let texels = noise_texels();
+        let sum: f32 = texels
+            .iter()
+            .flat_map(|texel| slices(texel[0] as f32 / 255.0))
+            .map(|direction| {
+                let frame = shader_slice_frame(n_view, v, direction);
+                let (hc0, hc1) = open(frame);
+                shader_slice_visibility(frame, hc0, hc1)
+            })
+            .sum();
+        sum / (texels.len() * SLICES) as f32
+    }
+
+    /// The property the closed form exists for: nothing in the way reads as
+    /// fully visible, whichever way the surface faces the camera — so a wall
+    /// seen at a glancing angle is not darkened for being glanced at.
+    #[test]
+    fn an_open_surface_is_fully_visible_at_any_tilt() {
+        for tilt in [0.0f32, 20.0, 45.0, 60.0, 75.0] {
+            for azimuth in [0.0f32, 37.0, 90.0, 200.0] {
+                let (t, a) = (tilt.to_radians(), azimuth.to_radians());
+                let n = Vec3::new(t.sin() * a.cos(), t.sin() * a.sin(), t.cos());
+                let visibility = tile_visibility(n);
+                assert!(
+                    (visibility - 1.0).abs() < 0.01,
+                    "{visibility} at tilt {tilt}, azimuth {azimuth}"
+                );
+            }
+        }
+    }
+
+    /// What one pixel writes for an open surface: its slices' visibility over
+    /// their unoccluded visibility, clamped to the [0, 1] the R8 target holds.
+    fn pixel_visibility(n_view: Vec3, rotation: f32, normalised: bool) -> f32 {
+        let (mut seen, mut open_sum) = (0.0, 0.0);
+        for direction in slices(rotation) {
+            let frame = shader_slice_frame(n_view, Vec3::Z, direction);
+            let (hc0, hc1) = open(frame);
+            seen += shader_slice_visibility(frame, hc0, hc1);
+            open_sum += shader_slice_visibility(
+                frame,
+                (frame.0 + FRAC_PI_2).cos(),
+                (frame.0 - FRAC_PI_2).cos(),
+            );
+        }
+        let raw = if normalised {
+            seen / open_sum
+        } else {
+            seen / SLICES as f32
+        };
+        raw.clamp(0.0, 1.0)
+    }
+
+    /// Two slices of a steeply tilted surface read up to a tenth either side
+    /// of full visibility, and the target clamps at one *before* the blur
+    /// averages — so only the low side survives, and an open surface comes
+    /// out darker the more it is tilted, in a pattern that follows its normal.
+    /// Normalising each pixel by its own slices' unoccluded integral removes
+    /// that before anything is clamped.
+    #[test]
+    fn clamping_before_the_blur_does_not_darken_an_open_surface() {
+        let tilt = 75f32.to_radians();
+        let n = Vec3::new(tilt.sin() * 0.6, tilt.sin() * 0.8, tilt.cos());
+        let mean = |normalised| {
+            let texels = noise_texels();
+            texels
+                .iter()
+                .map(|t| pixel_visibility(n, t[0] as f32 / 255.0, normalised))
+                .sum::<f32>()
+                / texels.len() as f32
+        };
+        assert!(
+            mean(false) < 0.99,
+            "the bias this guards against is gone: {}",
+            mean(false)
+        );
+        assert!((mean(true) - 1.0).abs() < 1e-4, "{}", mean(true));
+    }
+
+    /// A surface facing the camera with an occluder rising straight up along
+    /// its normal on one side of the slice has lost exactly that side's half.
+    #[test]
+    fn a_horizon_at_the_normal_closes_its_half_of_the_slice() {
+        let frame = shader_slice_frame(Vec3::Z, Vec3::Z, Vec3::X);
+        let (_, hc1) = open(frame);
+        let half = shader_slice_visibility(frame, 1.0, hc1);
+        assert!((half - 0.5).abs() < 1e-5, "{half}");
+        let closed = shader_slice_visibility(frame, 1.0, 1.0);
+        assert!(closed.abs() < 1e-5, "{closed}");
+    }
+
+    /// Stratified, not random: the 4x4 blur sees each of sixteen evenly spaced
+    /// rotations exactly once, which is what `an_open_surface_is_fully_visible_
+    /// at_any_tilt` relies on. Random rotations would leave a tilted surface's
+    /// 4x4 average off by whatever the draw happened to be.
+    #[test]
+    fn the_noise_tile_holds_sixteen_evenly_spaced_rotations() {
+        let mut rotations: Vec<f32> = noise_texels().iter().map(|t| t[0] as f32 / 255.0).collect();
+        rotations.sort_by(f32::total_cmp);
+        for (k, rotation) in rotations.iter().enumerate() {
+            let expected = (k as f32 + 0.5) / 16.0;
+            assert!(
+                (rotation - expected).abs() < 1.0 / 255.0,
+                "{rotation} for {expected}"
+            );
+        }
+    }
 }
