@@ -398,6 +398,8 @@ mod tests {
             volumetric_fog: false,
             bloom_mips: MAX_BLOOM_MIPS as u8,
             overlay: true,
+            outline: true,
+            gizmo: true,
             shadow_cascades: MAX_CASCADES as u8,
             shadow_resolution: 2048,
             shadow_atlas: 4096,

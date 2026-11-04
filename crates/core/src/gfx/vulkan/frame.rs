@@ -143,6 +143,14 @@ pub struct FrameConfig {
     /// Whether the editor's egui overlay draws over the frame. Off for headless
     /// and export renders.
     pub overlay: bool,
+    /// Whether the selection outline draws: the overlay is on *and* something is
+    /// selected. Separate from `overlay` because the outline is two full-screen
+    /// passes — a mask, then an edge search over it — and with nothing selected
+    /// both would run every frame to produce nothing. Toggling it recompiles the
+    /// graph, which `GraphImages`' allocation cache makes cheap.
+    pub outline: bool,
+    /// Whether the transform gizmo draws, for the reason `outline` is separate.
+    pub gizmo: bool,
     pub shadow_cascades: u8,
     pub shadow_resolution: u32,
     /// Edge of the punctual shadow atlas in texels, zero for a frame where
@@ -1711,7 +1719,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .build();
     record(id, PassBody::Tonemap, &mut bodies);
 
-    let outline_mask = config.overlay.then(|| {
+    let outline_mask = (config.overlay && config.outline).then(|| {
         // Its own target rather than the depth or stencil of the scene: the
         // outline is the editor's, drawn after the frame is finished, and the
         // frame's targets are resolved and gone by then. See `vulkan::outline`.
@@ -1730,16 +1738,18 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         mask
     });
 
-    if config.overlay {
-        // Its own node, after the tonemap: see `vulkan::gizmo` for why not
-        // lines in the forward pass. Ordered before the overlay by
-        // registration, the two being writers of the same image.
+    // Its own node, after the tonemap: see `vulkan::gizmo` for why not lines in
+    // the forward pass. Ordered before the overlay by registration, the two
+    // being writers of the same image.
+    if config.overlay && config.gizmo {
         let id = builder
             .pass("gizmo", PassKind::Inline)
             .access(swapchain_color, Access::ColorAttachment)
             .build();
         record(id, PassBody::Gizmo, &mut bodies);
+    }
 
+    if config.overlay {
         let id = builder
             .pass("overlay", PassKind::Raw)
             .access(swapchain_color, Access::ColorAttachment)

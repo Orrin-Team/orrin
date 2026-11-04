@@ -703,6 +703,8 @@ impl VulkanRenderer {
             dof: false,
             bloom_mips: bloom::mip_count(extent),
             overlay: true,
+            outline: true,
+            gizmo: true,
             shadow_cascades: 0,
             shadow_resolution: 1,
             shadow_atlas: 0,
@@ -1611,6 +1613,12 @@ impl VulkanRenderer {
                 0
             },
             overlay: overlay.is_some(),
+            outline: overlay
+                .as_ref()
+                .is_some_and(|frame| !frame.outline.is_empty()),
+            gizmo: overlay
+                .as_ref()
+                .is_some_and(|frame| !frame.gizmo.is_empty()),
             // Sourced from the cascade set rather than the setting, so the
             // number of passes the graph declares cannot disagree with the
             // number of matrices there are to draw them with.
