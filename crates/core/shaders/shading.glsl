@@ -700,6 +700,9 @@ Lobes brdf(Surface s, vec3 L, vec3 radiance, float visibility, float back_visibi
     return lobes;
 }
 
+#define ORRIN_CASCADES lighting.cascades
+#include "cascade_lookup.glsl"
+
 // --- Cascaded shadow maps ---
 //
 // The lookup itself is in `cascades.glsl`, shared with the froxel fog. What is
@@ -723,9 +726,7 @@ float sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist) {
         return 1.0;
     }
 
-    return cascade_sun_shadow(
-        lighting.cascades, u_shadow_maps, u_shadow_cmp, world_pos, N, L, view_dist
-    );
+    return cascade_sun_shadow(u_shadow_maps, u_shadow_cmp, world_pos, N, L, view_dist);
 }
 
 // The sun's visibility at the *far* side of a scattering medium — whether light
@@ -756,7 +757,6 @@ float back_sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist, float thi
     // question rather than `sun_shadow` at an offset — and note the missing
     // `dot(N, L)` early-out, deliberately.
     return cascade_sun_shadow(
-        lighting.cascades,
         u_shadow_maps,
         u_shadow_cmp,
         world_pos - N * thickness,
@@ -1395,7 +1395,7 @@ Shaded shade_surface() {
     diffusible *= fog.transmittance;
 
     if (lighting.cascades.params.w > 0.5) {
-        vec3 tint = cascade_debug_tint(select_cascade(lighting.cascades, view_dist));
+        vec3 tint = cascade_debug_tint(select_cascade(view_dist));
         color *= tint;
         diffusible *= tint;
     }

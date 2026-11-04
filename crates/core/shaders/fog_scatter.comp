@@ -30,6 +30,9 @@ layout(set = 0, binding = 2) uniform samplerShadow u_shadow_cmp;
 // reprojection almost never lands on a texel centre, and past the edges the
 // clamp is what makes a froxel that has just entered the frustum fall back to
 // its own measurement rather than to a neighbour's.
+#define ORRIN_CASCADES u.f.cascades
+#include "cascade_lookup.glsl"
+
 layout(set = 0, binding = 3) uniform sampler3D u_history;
 
 layout(set = 0, binding = 4, rgba16f) uniform writeonly image3D u_scatter;
@@ -61,9 +64,7 @@ void main() {
     // surface here — see `cascade_shadow`. The `dot(N, L)` early-out a surface
     // takes has no meaning for a point of air, which is exactly why this calls
     // the shared core rather than `shading.glsl`'s `sun_shadow`.
-    float sun_visibility = cascade_sun_shadow(
-        u.f.cascades, u_shadow_maps, u_shadow_cmp, world_pos, L, L, view_dist
-    );
+    float sun_visibility = cascade_sun_shadow(u_shadow_maps, u_shadow_cmp, world_pos, L, L, view_dist);
 
     // `rgb` is scattered radiance per metre and `a` is extinction per metre, so
     // the pass below can integrate the two together over a slice's own length.
