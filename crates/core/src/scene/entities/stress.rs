@@ -10,6 +10,7 @@
 //! ORRIN_STRESS=2000                                  # meshes only
 //! ORRIN_STRESS=meshes=5000,colliders=800,scripts=200
 //! ORRIN_STRESS=occluded=40000                        # the occlusion rig
+//! ORRIN_STRESS=meshes=4000,lights=256                 # the light-binning rig
 //! ```
 //!
 //! `meshes` and `occluded` are deliberately opposite shapes at the same count,
@@ -24,7 +25,9 @@ use glam::{Mat3, Quat, Vec3};
 use orrin_ecs::World;
 
 use super::spawn_mesh;
-use crate::scene::{Assets, Camera, Collider, ColliderShape, LocalTransform, Name, Transform};
+use crate::scene::{
+    Assets, Camera, Collider, ColliderShape, Light, LocalTransform, Name, Transform,
+};
 
 /// Fixed so the same spec lays out identically everywhere, forever.
 const SEED: u64 = 0x0DDB_A110_C0FF_EE00;
@@ -38,6 +41,11 @@ pub struct StressSpec {
     /// Props for the occlusion rig — small objects packed behind walls that
     /// span the screen. See [`occlusion_rig`].
     pub occluded: usize,
+    /// Small unshadowed point lights scattered just above the floor, a few
+    /// metres of reach each — the shape that separates a per-pixel loop over
+    /// every light from one over the lights that reach the pixel. Unshadowed
+    /// so the atlas budget, not the light loop, is never what is measured.
+    pub lights: usize,
 }
 
 impl StressSpec {
@@ -78,10 +86,11 @@ impl StressSpec {
                 "colliders" => spec.colliders = count,
                 "scripts" => spec.scripts = count,
                 "occluded" => spec.occluded = count,
+                "lights" => spec.lights = count,
                 other => {
                     tracing::warn!(
                         "ORRIN_STRESS: unknown key `{other}` (expected meshes, colliders, \
-                         scripts or occluded); ignoring the whole spec"
+                         scripts, occluded or lights); ignoring the whole spec"
                     );
                     return None;
                 }
@@ -91,7 +100,11 @@ impl StressSpec {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.meshes == 0 && self.colliders == 0 && self.scripts == 0 && self.occluded == 0
+        self.meshes == 0
+            && self.colliders == 0
+            && self.scripts == 0
+            && self.occluded == 0
+            && self.lights == 0
     }
 }
 
@@ -183,11 +196,37 @@ pub fn spawn_stress_scene(world: &mut World, spec: &StressSpec) {
         );
     }
 
+    // Last, so a spec without lights draws the generator exactly as it always
+    // has and every other layout is unchanged.
+    for index in 0..spec.lights {
+        let position = Vec3::new(
+            rng.range(-12.0, 12.0),
+            rng.range(0.3, 2.5),
+            rng.range(-12.0, 12.0),
+        );
+        let color = Vec3::new(
+            rng.range(0.3, 1.0),
+            rng.range(0.3, 1.0),
+            rng.range(0.3, 1.0),
+        );
+        world
+            .spawn_entity()
+            .with(Name::new(format!("Stress Light {index}")))
+            .with(LocalTransform::from(Transform::from_translation(position)))
+            .with(Light::Point {
+                color,
+                lumens: 800.0,
+                range: 3.0,
+                casts_shadows: false,
+            });
+    }
+
     tracing::info!(
-        "stress load added — {} meshes, {} colliders, {} occluded props",
+        "stress load added — {} meshes, {} colliders, {} occluded props, {} lights",
         spec.meshes,
         spec.colliders,
-        spec.occluded
+        spec.occluded,
+        spec.lights
     );
 }
 

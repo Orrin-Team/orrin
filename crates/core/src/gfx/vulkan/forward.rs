@@ -1,6 +1,7 @@
 use glam::Vec3;
 
 use crate::geom::Aabb;
+use crate::gfx::clusters::{CLUSTERS, DepthSlicing, LightClusters};
 use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, ShadowAtlas};
 use crate::gfx::sh::SH9;
 use crate::gfx::shadows::MAX_CASCADES;
@@ -137,68 +138,105 @@ impl GpuMaterial {
 }
 
 /// Pack the engine's [`SceneLighting`] into the std140 layout the shader expects.
-#[allow(clippy::too_many_arguments)]
-fn to_gpu_lighting(
-    lighting: &SceneLighting,
-    camera_pos: Vec3,
-    extent: [u32; 2],
-    shadows: Option<ShadowFrame<'_>>,
-    atlas: &ShadowAtlas,
-    irradiance: [Vec3; SH9],
-    environment_yaw: f32,
-    env_specular: Vec3,
-) -> GpuLighting {
-    let (w, h) = (extent[0] as f32, extent[1] as f32);
-    let count = lighting.point_lights.len().min(MAX_POINT_LIGHTS);
-    let mut point_lights = [GpuPointLight::ZERO; MAX_POINT_LIGHTS];
-    for (index, (slot, light)) in point_lights
-        .iter_mut()
-        .zip(lighting.point_lights.iter().take(count))
+/// The point lights as the shader's storage buffer holds them, into `out`.
+/// Never empty: a buffer binding of zero bytes is invalid, and a frame with no
+/// lights still binds one, whose row no cluster ever names.
+fn gpu_point_lights(lighting: &SceneLighting, atlas: &ShadowAtlas, out: &mut Vec<GpuPointLight>) {
+    out.clear();
+    for (index, light) in lighting
+        .point_lights
+        .iter()
+        .take(MAX_POINT_LIGHTS)
         .enumerate()
     {
-        slot.position = [
-            light.position.x,
-            light.position.y,
-            light.position.z,
-            light.range.max(1e-4),
-        ];
-        slot.color = [light.color.x, light.color.y, light.color.z, light.candela];
-        // A light that asked for tiles and did not get them keeps its -1 and
-        // shades unshadowed, which is the whole behaviour of the budget: too
-        // many casters costs shadows, never correctness.
-        slot.shadow = match atlas.caster(LightKind::Point, index) {
-            Some(caster) => [caster.first_face as f32, caster.near, 0.0, 0.0],
-            None => [-1.0, 0.0, 0.0, 0.0],
-        };
+        out.push(GpuPointLight {
+            position: [
+                light.position.x,
+                light.position.y,
+                light.position.z,
+                light.range.max(1e-4),
+            ],
+            color: [light.color.x, light.color.y, light.color.z, light.candela],
+            // A light that asked for tiles and did not get them keeps its -1 and
+            // shades unshadowed, which is the whole behaviour of the budget: too
+            // many casters costs shadows, never correctness.
+            shadow: match atlas.caster(LightKind::Point, index) {
+                Some(caster) => [caster.first_face as f32, caster.near, 0.0, 0.0],
+                None => [-1.0, 0.0, 0.0, 0.0],
+            },
+        });
     }
+    if out.is_empty() {
+        out.push(GpuPointLight::ZERO);
+    }
+}
 
-    let spot_count = lighting.spot_lights.len().min(MAX_SPOT_LIGHTS);
-    let mut spot_lights = [GpuSpotLight::ZERO; MAX_SPOT_LIGHTS];
-    for (index, (slot, light)) in spot_lights
-        .iter_mut()
-        .zip(lighting.spot_lights.iter().take(spot_count))
+/// [`gpu_point_lights`] for the spots.
+fn gpu_spot_lights(lighting: &SceneLighting, atlas: &ShadowAtlas, out: &mut Vec<GpuSpotLight>) {
+    out.clear();
+    for (index, light) in lighting
+        .spot_lights
+        .iter()
+        .take(MAX_SPOT_LIGHTS)
         .enumerate()
     {
-        slot.position = [
-            light.position.x,
-            light.position.y,
-            light.position.z,
-            light.range.max(1e-4),
-        ];
-        slot.direction = [
-            light.direction.x,
-            light.direction.y,
-            light.direction.z,
-            light.outer_cos,
-        ];
-        slot.color = [light.color.x, light.color.y, light.color.z, light.candela];
         let face = atlas
             .caster(LightKind::Spot, index)
             .map_or([-1.0, 0.0], |caster| {
                 [caster.first_face as f32, caster.near]
             });
-        slot.params = [light.inner_cos, face[0], face[1], 0.0];
+        out.push(GpuSpotLight {
+            position: [
+                light.position.x,
+                light.position.y,
+                light.position.z,
+                light.range.max(1e-4),
+            ],
+            direction: [
+                light.direction.x,
+                light.direction.y,
+                light.direction.z,
+                light.outer_cos,
+            ],
+            color: [light.color.x, light.color.y, light.color.z, light.candela],
+            params: [light.inner_cos, face[0], face[1], 0.0],
+        });
     }
+    if out.is_empty() {
+        out.push(GpuSpotLight::ZERO);
+    }
+}
+
+/// The cluster lists as the shader's `LightClusters` block reads them: the
+/// fixed array of ranges, then the indices — at least one, for the reason the
+/// light buffers are never empty.
+fn gpu_clusters(clusters: &LightClusters, out: &mut Vec<u32>) {
+    out.clear();
+    if clusters.ranges.len() == CLUSTERS {
+        out.extend(clusters.ranges.iter().flatten());
+    } else {
+        out.resize(CLUSTERS * 4, 0);
+    }
+    out.extend(&clusters.indices);
+    out.push(0);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn to_gpu_lighting(
+    lighting: &SceneLighting,
+    camera: &Camera,
+    extent: [u32; 2],
+    shadows: Option<ShadowFrame<'_>>,
+    irradiance: [Vec3; SH9],
+    environment_yaw: f32,
+    env_specular: Vec3,
+) -> GpuLighting {
+    let camera_pos = camera.position;
+    let (w, h) = (extent[0] as f32, extent[1] as f32);
+    let count = lighting.point_lights.len().min(MAX_POINT_LIGHTS);
+    let spot_count = lighting.spot_lights.len().min(MAX_SPOT_LIGHTS);
+    let slicing = DepthSlicing::new(camera.near, camera.far);
+    let forward = (camera.target - camera.position).normalize_or(Vec3::NEG_Z);
 
     // The shader wants the direction *toward* the light, so negate.
     let to_sun = (-lighting.sun.direction).normalize_or_zero();
@@ -226,8 +264,8 @@ fn to_gpu_lighting(
         ],
         viewport: [w, h, 1.0 / w, 1.0 / h],
         cascades: GpuCascades::new(shadows),
-        point_lights,
-        spot_lights,
+        clusters: [slicing.scale, slicing.bias, 0.0, 0.0],
+        view_forward: [forward.x, forward.y, forward.z, 0.0],
         environment: {
             let (sin, cos) = environment_yaw.to_radians().sin_cos();
             [sin, cos, 0.0, 0.0]
@@ -307,8 +345,8 @@ impl GpuCascades {
     }
 }
 
-/// GPU mirror of a [`PointLight`](crate::gfx::PointLight), padded to std140
-/// (three `vec4`s).
+/// GPU mirror of a [`PointLight`](crate::gfx::PointLight): three `vec4`s, so
+/// std430 lays the shader's array out exactly like a slice of these.
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuPointLight {
@@ -330,7 +368,8 @@ impl GpuPointLight {
     };
 }
 
-/// GPU mirror of a [`SpotLight`](crate::gfx::SpotLight), padded to std140.
+/// GPU mirror of a [`SpotLight`](crate::gfx::SpotLight): four `vec4`s, as std430
+/// wants them.
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuSpotLight {
@@ -377,8 +416,11 @@ struct GpuLighting {
     /// x=w, y=h, z=1/w, w=1/h
     viewport: [f32; 4],
     cascades: GpuCascades,
-    point_lights: [GpuPointLight; MAX_POINT_LIGHTS],
-    spot_lights: [GpuSpotLight; MAX_SPOT_LIGHTS],
+    /// x = the depth slicing's scale, y = its bias. See `gfx::clusters`.
+    clusters: [f32; 4],
+    /// xyz = the camera's forward axis, which a fragment's view depth — and so
+    /// its cluster's slice — is measured along.
+    view_forward: [f32; 4],
     /// x = sin(environment yaw), y = cos(environment yaw). The same rotation
     /// the skybox samples through, so the sky and what it lights agree.
     environment: [f32; 4],
@@ -593,6 +635,16 @@ impl ForwardTargets {
     }
 }
 
+/// The light and cluster rows, rebuilt every frame into buffers kept for their
+/// allocations. Behind a lock only because `begin_frame` takes `&self`; it is
+/// taken once a frame, on the thread that records it.
+#[derive(Default)]
+struct LightScratch {
+    points: Vec<GpuPointLight>,
+    spots: Vec<GpuSpotLight>,
+    clusters: Vec<u32>,
+}
+
 pub struct ForwardPass {
     /// The four shapes this pass rasterises into, and the only thing a pipeline
     /// needs to know about any of them.
@@ -623,6 +675,7 @@ pub struct ForwardPass {
     /// table above is.
     sampler: SamplerId,
     ao_sampler: SamplerId,
+    light_scratch: std::sync::Mutex<LightScratch>,
 }
 
 impl ForwardPass {
@@ -775,6 +828,7 @@ impl ForwardPass {
             single,
             sampler,
             ao_sampler,
+            light_scratch: std::sync::Mutex::new(LightScratch::default()),
         }
     }
 
@@ -954,16 +1008,33 @@ impl ForwardPass {
         let env_specular = renderer.environment.specular_tint(ambient, environment);
         let lighting_block = to_gpu_lighting(
             lighting,
-            camera.position,
+            camera,
             extent,
             shadows,
-            atlas,
             irradiance,
             environment.yaw,
             env_specular,
         );
         let lighting_buffer =
             device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&lighting_block));
+        let (point_buffer, spot_buffer, cluster_buffer) = {
+            let mut scratch = self.light_scratch.lock().expect("light scratch poisoned");
+            let LightScratch {
+                points,
+                spots,
+                clusters,
+            } = &mut *scratch;
+            gpu_point_lights(lighting, atlas, points);
+            gpu_spot_lights(lighting, atlas, spots);
+            points.resize(MAX_POINT_LIGHTS, GpuPointLight::ZERO);
+            spots.resize(MAX_SPOT_LIGHTS, GpuSpotLight::ZERO);
+            gpu_clusters(&renderer.light_clusters, clusters);
+            (
+                device.upload_block(BlockKind::Uniform, bytemuck::cast_slice(points)),
+                device.upload_block(BlockKind::Uniform, bytemuck::cast_slice(spots)),
+                device.upload_block(BlockKind::Storage, bytemuck::cast_slice(clusters)),
+            )
+        };
 
         // Always at least one entry: a frame where nothing punctual casts still
         // has to bind something for the descriptor. Every light's face index is
@@ -996,6 +1067,18 @@ impl ForwardPass {
                 Binding {
                     binding: 1,
                     resource: BindingResource::StorageBuffer(decals),
+                },
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::UniformBuffer(point_buffer),
+                },
+                Binding {
+                    binding: 3,
+                    resource: BindingResource::UniformBuffer(spot_buffer),
+                },
+                Binding {
+                    binding: 4,
+                    resource: BindingResource::StorageBuffer(cluster_buffer),
                 },
             ],
         );

@@ -1,4 +1,5 @@
 pub mod choice;
+pub mod clusters;
 pub mod depth;
 pub mod format;
 pub mod graph;
@@ -317,12 +318,15 @@ impl Iterator for Runs<'_> {
     }
 }
 
-pub const MAX_POINT_LIGHTS: usize = 16;
+/// How many point lights a frame extracts. A bound on the per-frame upload, not
+/// on the shader: the lights live in a storage buffer and a fragment loops over
+/// its own cluster's (see `gfx::clusters`), so this is what a scene can ask for
+/// before the rest are dropped, not what any one pixel pays for.
+pub const MAX_POINT_LIGHTS: usize = 256;
 
-/// Half the point-light cap, because a cone is a narrower thing to want a lot
-/// of and every slot costs the same uniform-buffer space whether a scene uses it
-/// or not. Keep in sync with `MAX_SPOT_LIGHTS` in `forward.frag`.
-pub const MAX_SPOT_LIGHTS: usize = 8;
+/// A quarter of the point-light bound, because a cone is a narrower thing to
+/// want a lot of.
+pub const MAX_SPOT_LIGHTS: usize = 64;
 
 /// Size of the shader's bound texture array (set 2). Keep in sync with
 /// `MAX_TEXTURES` in `shading.glsl`, `prepass.frag` and `shadow.frag` — the

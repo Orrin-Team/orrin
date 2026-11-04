@@ -258,6 +258,9 @@ pub struct VulkanRenderer {
     shadow: ShadowPass,
     /// Which cascades this frame redraws. See `shadows::CascadeCache`.
     cascade_cache: CascadeCache,
+    /// Which punctual lights can reach each cluster of this frame's view, binned
+    /// before the forward pass uploads them. See `gfx::clusters`.
+    light_clusters: crate::gfx::clusters::LightClusters,
     /// Debug-line overlay, recorded into the forward pass. Editor-only in
     /// practice: fed lines only through `render_with_overlay`.
     line: LinePass,
@@ -732,6 +735,7 @@ impl VulkanRenderer {
             motion_blur,
             shadow,
             cascade_cache: CascadeCache::default(),
+            light_clusters: Default::default(),
             line,
             gizmo,
             outline,
@@ -2097,6 +2101,22 @@ impl VulkanRenderer {
         // every pass in the chain recorded what it was handed, so nothing here
         // re-derives an order.
         let scene_color = self.texture_of(self.frame.ids.scene_color);
+
+        // Against the unjittered projection: the bins are conservative by far
+        // more than a subpixel, and the lookup reads `gl_FragCoord`, which the
+        // jitter does not move.
+        {
+            profile_scope!("light clusters");
+            let extent = self.backend.extent();
+            let aspect = extent[0] as f32 / extent[1].max(1) as f32;
+            self.light_clusters.bin(
+                lighting,
+                camera.view(),
+                camera.projection(aspect),
+                camera.near,
+                camera.far,
+            );
+        }
 
         // Built before the walk rather than inside the forward pass's body,
         // because two passes bind these five: the forward pass and the
