@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // One invocation per (live instance, view): decide whether the instance is
 // wanted by that view, and if it is, append its row to the view's list and count
 // it into its batch's draw command.
@@ -17,10 +19,7 @@ layout(local_size_x = 64, local_size_y = 1) in;
 const uint VIEW_FRUSTUM = 0;
 const uint VIEW_CASCADE = 1;
 
-struct Object {
-    mat4 model;
-    mat4 prev_model;
-};
+#include "object.glsl"
 
 struct Instance {
     uint row;
@@ -83,22 +82,22 @@ layout(push_constant) uniform Push {
     uint instance_count;
     uint view_count;
     uint batch_count;
-    // Where the masked batches begin, which is what a packed batch number is
-    // resolved against.
-    uint plain_count;
+    uint occlusion;
+    // Where each pipeline variant's batches begin, which is what a packed batch
+    // number is resolved against. See `Variant::class` in cull.rs.
+    uvec4 class_bases;
     // The camera the pyramid was rasterised through, which is the previous
     // frame's. Testing this frame's box against last frame's depth is only
     // meaningful projected the way that depth was.
     mat4 prev_view_proj;
-    uint occlusion;
 } push;
 
-const uint MASKED_BIT = 0x80000000u;
+// Lock-stepped with `CLASS_SHIFT` in cull.rs.
+const uint CLASS_SHIFT = 30u;
 
 // The row of `commands` a packed batch number owns this frame.
 uint slot(uint packed) {
-    uint index = packed & ~MASKED_BIT;
-    return (packed & MASKED_BIT) != 0u ? push.plain_count + index : index;
+    return push.class_bases[packed >> CLASS_SHIFT] + (packed & ((1u << CLASS_SHIFT) - 1u));
 }
 
 // Conservative, exactly as `Frustum::intersects` is: true means "may be
@@ -192,17 +191,17 @@ bool occluded(vec3 center, vec3 extents) {
         return false;
     }
 
-    float farthest = 0.0;
+    float farthest = DEPTH_NEAR;
     for (int y = first.y; y <= last.y; ++y) {
         for (int x = first.x; x <= last.x; ++x) {
-            farthest = max(farthest, texelFetch(u_occlusion, ivec2(x, y), level).r);
+            farthest = depth_farthest(farthest, texelFetch(u_occlusion, ivec2(x, y), level).r);
         }
     }
 
     // The cell holds the farthest of the frontmost surfaces under it. A box
     // whose nearest point is behind even that is behind a surface at every
     // texel its rect covers.
-    return ndc_min.z > farthest;
+    return depth_nearer(farthest, depth_nearest(ndc_min.z, ndc_max.z));
 }
 
 void main() {
@@ -221,15 +220,17 @@ void main() {
     vec3 bmin = batch.bounds_min.xyz;
     vec3 bmax = batch.bounds_max.xyz;
     // A mesh with no registered bounds is unmeasurable, so it is drawn rather
-    // than culled -- the same fallback the CPU sweep takes, stated here because
+    // than culled -- the same fallback the blended queue's CPU test takes, stated
+    // here because
     // the inverted box it arrives as would otherwise make a NaN centre and fail
     // every compare instead.
     bool measurable = all(lessThanEqual(bmin, bmax));
 
     bool wanted = true;
     if (measurable) {
-        mat3 rotation = mat3(object.model);
-        vec3 center = (object.model * vec4(0.5 * (bmin + bmax), 1.0)).xyz;
+        mat4 model = object_model(object);
+        mat3 rotation = mat3(model);
+        vec3 center = (model * vec4(0.5 * (bmin + bmax), 1.0)).xyz;
         vec3 half_extents = 0.5 * (bmax - bmin);
         vec3 extents = abs(rotation[0]) * half_extents.x
             + abs(rotation[1]) * half_extents.y

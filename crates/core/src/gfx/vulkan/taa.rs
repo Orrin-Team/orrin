@@ -306,7 +306,7 @@ fn jittered(mut projection: Mat4, jitter: Vec2) -> Mat4 {
 
 fn allocate_history(device: &Device, extent: [u32; 2]) -> [TextureViewId; 2] {
     std::array::from_fn(|_| {
-        device.create_texture(&TextureDesc {
+        let texture = device.create_texture(&TextureDesc {
             format: HDR_FORMAT,
             dimension: TextureDimension::D2,
             extent: [extent[0], extent[1], 1],
@@ -318,7 +318,11 @@ fn allocate_history(device: &Device, extent: [u32; 2]) -> [TextureViewId; 2] {
             // composites afterwards.
             usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
             memoryless: false,
-        })
+        });
+        // The layout `taa_history` is declared to enter in, from the first
+        // frame on; that frame's contents are still ignored (see `reset`).
+        device.initialise_sampled(texture);
+        texture
     })
 }
 
@@ -363,7 +367,7 @@ mod tests {
             usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
             memoryless: false,
         });
-        device.fill_depth(depth, 1.0);
+        device.fill_depth(depth, crate::gfx::depth::CLEAR);
 
         device.record_blocking(|encoder| {
             pass.record(&device, encoder, &view, color, velocity, depth);

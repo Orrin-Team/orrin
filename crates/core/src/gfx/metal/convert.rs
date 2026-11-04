@@ -23,6 +23,7 @@ pub(super) const fn pixel_format(format: Format) -> MTLPixelFormat {
         Format::Rgba16Float => MTLPixelFormat::RGBA16Float,
         Format::R32Float => MTLPixelFormat::R32Float,
         Format::Rgba32Float => MTLPixelFormat::RGBA32Float,
+        Format::D16Unorm => MTLPixelFormat::Depth16Unorm,
         Format::D32Float => MTLPixelFormat::Depth32Float,
         Format::Rg11B10Float => MTLPixelFormat::RG11B10Float,
     }

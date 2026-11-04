@@ -22,11 +22,10 @@ use orrin_ecs::World;
 use vulkano::VulkanLibrary;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 
-use crate::gfx::RenderBackend;
+use crate::gfx::SceneLighting;
 use crate::gfx::punctual::ShadowAtlas;
-use crate::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
+use crate::gfx::shadows::{CascadeSet, cascades};
 use crate::gfx::vulkan::{ShadowFrame, VulkanRenderer};
-use crate::gfx::{DrawList, SceneLighting};
 use crate::scene::entities::SceneChoice;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, DecalSettings, DofSettings, EnvironmentSettings,
@@ -259,9 +258,8 @@ pub fn render(
         crate::scene::propagate_transforms(world);
         systems::extract_lighting(world, &mut lighting);
         let camera = *world.resource::<Camera>();
-        // Fitted before extraction and after the lighting, exactly as `app.rs`
-        // orders it: the boxes are built around the sun that extraction just
-        // found, and the caster lists are culled against those boxes.
+        // Fitted after the lighting, exactly as `app.rs` orders it: the boxes
+        // are built around the sun that extraction just found.
         let cascade_set = if settings.shadows {
             cascades(
                 &camera,
@@ -272,19 +270,9 @@ pub fn render(
         } else {
             CascadeSet::default()
         };
-        systems::extract_geometry(
-            world,
-            aspect,
-            &cascade_set,
-            &atlas,
-            renderer.gpu_culling(),
-            &mut geometry,
-        );
+        systems::extract_geometry(world, aspect, &mut geometry);
         systems::extract_decals(world, aspect, &mut decals);
 
-        let caster_lists: [DrawList<'_>; MAX_CASCADES] =
-            std::array::from_fn(|i| geometry.cascade(i));
-        let punctual_lists: [DrawList<'_>; 0] = [];
         renderer.render_with_overlay(
             geometry.visible(),
             geometry.transparent(),
@@ -318,9 +306,7 @@ pub fn render(
             0,
             (cascade_set.count > 0).then_some(ShadowFrame {
                 cascades: &cascade_set,
-                casters: &caster_lists,
                 atlas: &atlas,
-                punctual_casters: &punctual_lists,
                 settings: &shadow_settings,
             }),
             None,

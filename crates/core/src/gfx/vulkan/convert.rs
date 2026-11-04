@@ -28,6 +28,7 @@ pub(crate) const fn vk_format(format: Format) -> VkFormat {
         Format::Rgba16Float => VkFormat::R16G16B16A16_SFLOAT,
         Format::R32Float => VkFormat::R32_SFLOAT,
         Format::Rgba32Float => VkFormat::R32G32B32A32_SFLOAT,
+        Format::D16Unorm => VkFormat::D16_UNORM,
         Format::D32Float => VkFormat::D32_SFLOAT,
         Format::Rg11B10Float => VkFormat::B10G11R11_UFLOAT_PACK32,
     }
@@ -212,6 +213,7 @@ mod tests {
             (Format::Rgba16Float, Vk::R16G16B16A16_SFLOAT),
             (Format::R32Float, Vk::R32_SFLOAT),
             (Format::Rgba32Float, Vk::R32G32B32A32_SFLOAT),
+            (Format::D16Unorm, Vk::D16_UNORM),
             (Format::D32Float, Vk::D32_SFLOAT),
             (Format::Rg11B10Float, Vk::B10G11R11_UFLOAT_PACK32),
         ];

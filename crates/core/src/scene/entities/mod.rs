@@ -46,7 +46,7 @@ pub fn install_library(world: &mut World, backend: &mut impl RenderBackend) {
     world.insert_resource(asset_previews);
 }
 pub use showcase::build_showcase_scene;
-pub use sponza::build_sponza_scene;
+pub use sponza::{begin_sponza_scene, build_sponza_scene, finish_pending_scene};
 pub use stress::{StressSpec, spawn_stress_scene};
 
 use glam::{Quat, Vec3};
@@ -104,11 +104,25 @@ impl SceneChoice {
         }
     }
 
+    /// Build the scene in full before returning, for a caller with no frame
+    /// loop to keep running — a capture, a benchmark.
     pub fn build(self, world: &mut World, backend: &mut impl RenderBackend) {
         match self {
             Self::Demo => build_default_scene(world, backend),
             Self::Showcase => build_showcase_scene(world, backend),
             Self::Sponza => build_sponza_scene(world, backend),
+        }
+    }
+
+    /// Build the scene, or start it, for the engine's own frame loop: a scene
+    /// read from disk is loaded on a thread of its own and lands through
+    /// [`finish_pending_scene`], so the window keeps presenting while it loads.
+    /// The other two are built here — they are the engine's own geometry, and
+    /// there is nothing on disk to wait for.
+    pub fn begin(self, world: &mut World, backend: &mut impl RenderBackend) {
+        match self {
+            Self::Sponza => begin_sponza_scene(world),
+            other => other.build(world, backend),
         }
     }
 

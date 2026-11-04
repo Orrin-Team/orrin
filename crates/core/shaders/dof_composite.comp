@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // Depth of field, step three: put the two gathered fields back over the sharp
 // frame, at full resolution.
 //
@@ -32,7 +34,7 @@ layout(push_constant) uniform Push {
 } dof;
 
 float linear_depth(float d) {
-    return dof.near * dof.far / max(dof.far - d * (dof.far - dof.near), 1e-6);
+    return depth_linear(d, dof.near, dof.far);
 }
 
 // Premultiplied by coverage on the way in, so undo that before blending. The

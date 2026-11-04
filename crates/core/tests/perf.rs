@@ -60,10 +60,10 @@ use std::sync::Arc;
 use vulkano::VulkanLibrary;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 
-use orrin_core::gfx::punctual::{MAX_SHADOW_LIGHTS, ShadowAtlas};
-use orrin_core::gfx::shadows::{CascadeSet, MAX_CASCADES, cascades};
+use orrin_core::gfx::punctual::ShadowAtlas;
+use orrin_core::gfx::shadows::{CascadeSet, cascades};
 use orrin_core::gfx::vulkan::{ShadowFrame, VulkanRenderer};
-use orrin_core::gfx::{DecalInstance, DrawList, RenderBackend, SceneLighting};
+use orrin_core::gfx::{DecalInstance, SceneLighting};
 use orrin_core::profile::{self, Lane, Profiler};
 use orrin_core::scene::entities::{SceneChoice, StressSpec, spawn_stress_scene};
 use orrin_core::scene::model::{self, ImportSettings};
@@ -113,6 +113,41 @@ fn headless_instance() -> Arc<Instance> {
         },
     )
     .expect("failed to create a headless instance")
+}
+
+/// Counts heap allocations, on every thread, so `frame_cost` can report what a
+/// frame allocates. AGENTS.md asks for none in the frame loop; this is the
+/// number that says whether a frame keeps that.
+struct CountingAllocator;
+
+static ALLOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// SAFETY: every call is forwarded unchanged to the system allocator; the
+// counter is a relaxed atomic increment with no other effect.
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: forwarded with the caller's layout.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: `ptr` came from `alloc` above, which is the system allocator's.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: as above.
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAllocator = CountingAllocator;
+
+fn allocations() -> u64 {
+    ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[test]
@@ -231,7 +266,9 @@ fn frame_cost() {
     let mut entities = 0usize;
     let mut draws = 0usize;
     let mut entries = 0usize;
+    let (mut extract_allocations, mut render_allocations) = (0u64, 0u64);
     for frame in 0..frames + WARMUP {
+        let before_extract = allocations();
         // The engine throws its numbers away for the first few frames; so does
         // this, by restarting the profiler once the transient is over.
         if frame == WARMUP {
@@ -269,14 +306,7 @@ fn frame_cost() {
             };
             {
                 let _s = profile::scope("geometry");
-                systems::extract_geometry(
-                    &world,
-                    aspect,
-                    &cascade_set,
-                    &atlas,
-                    renderer.gpu_culling(),
-                    &mut geometry,
-                );
+                systems::extract_geometry(&world, aspect, &mut geometry);
             }
             entities = geometry.visible().len();
             // What the CPU actually records: one `draw_indexed` per maximal
@@ -284,38 +314,21 @@ fn frame_cost() {
             // there is to draw; this says how many commands saying so the
             // recording costs, which is the number the per-draw work scales
             // with.
-            // Every entry of every list, which is what the frame used to
-            // upload a 192-byte object row for and now uploads four bytes of
-            // row number for. Larger than the entity count because an object
-            // the camera sees and four cascades also draw appears in five.
+            // Every entry of every list: the opaque set the dispatch is offered,
+            // and the two blended orders the host still writes.
             entries = geometry.visible().len()
                 + geometry.transparent().len()
-                + geometry.refractive().len()
-                + (0..MAX_CASCADES)
-                    .map(|i| geometry.cascade(i).len())
-                    .sum::<usize>()
-                + (0..MAX_SHADOW_LIGHTS)
-                    .map(|i| geometry.punctual(i).len())
-                    .sum::<usize>();
+                + geometry.refractive().len();
             draws = geometry.visible().runs().count()
                 + geometry.transparent().runs().count()
-                + geometry.refractive().runs().count()
-                + (0..MAX_CASCADES)
-                    .map(|i| geometry.cascade(i).runs().count())
-                    .sum::<usize>()
-                + (0..MAX_SHADOW_LIGHTS)
-                    .map(|i| geometry.punctual(i).runs().count())
-                    .sum::<usize>();
+                + geometry.refractive().runs().count();
         }
 
         let camera = *world.resource::<Camera>();
         let shadow_settings = *world.resource::<ShadowSettings>();
+        let before_render = allocations();
         {
             let _phase = profile::scope("render submit");
-            let caster_lists: [DrawList<'_>; MAX_CASCADES] =
-                std::array::from_fn(|i| geometry.cascade(i));
-            let punctual_lists: [DrawList<'_>; MAX_SHADOW_LIGHTS] =
-                std::array::from_fn(|i| geometry.punctual(i));
             renderer.render_with_overlay(
                 geometry.visible(),
                 geometry.transparent(),
@@ -341,18 +354,19 @@ fn frame_cost() {
                 profiler.frame_index(),
                 (cascade_set.count > 0).then_some(ShadowFrame {
                     cascades: &cascade_set,
-                    casters: &caster_lists,
                     atlas: &atlas,
-                    punctual_casters: &punctual_lists,
                     settings: &shadow_settings,
                 }),
                 None,
             );
         }
+        let after_render = allocations();
         renderer.drain_gpu_spans(&mut profiler);
         profiler.end_frame();
         if frame >= WARMUP {
             gpu_total += renderer.gpu_frame_ms().unwrap_or(0.0) as f64;
+            extract_allocations += before_render - before_extract;
+            render_allocations += after_render - before_render;
         }
     }
 
@@ -366,6 +380,12 @@ fn frame_cost() {
     // The row for an optimisation that costs no frame time. Transient aliasing
     // moves this number and nothing else in this file, so without it there is no
     // table to choose it against — `ORRIN_ALIAS=0` is the other side.
+    println!(
+        "     {:<28} {:>9.1} extract, {:.1} render",
+        "heap allocations / frame",
+        extract_allocations as f64 / frames as f64,
+        render_allocations as f64 / frames as f64,
+    );
     println!(
         "     {:<28} {:>9.3} ms",
         "gpu frame (renderer)",

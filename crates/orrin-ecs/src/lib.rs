@@ -728,6 +728,77 @@ impl<T: 'static> QueryParam for &mut T {
     }
 }
 
+/// A [`QueryParam`] that only reads, and so can be read from many threads at
+/// once — what [`QueryRunner::par_for_each`] and [`QueryRunner::par_map`] are
+/// built on.
+///
+/// The `RefCell` guards a fetch holds cannot cross threads, but the storages
+/// they guard can be *shared* across them: a view is the plain `&SparseSet<T>`
+/// behind each guard, taken while the guard stays with the caller, so it is
+/// `Sync` exactly when the components are. That is the whole argument, and it
+/// needs no `unsafe`.
+///
+/// Implemented for `&T`, `Option<&T>` and tuples of them. Deliberately not for
+/// `&mut T` or `Option<&mut T>`: a mutable item handed to several threads would
+/// alias, and the borrow checker is what says so.
+pub trait ReadOnlyQueryParam: QueryParam {
+    /// Shared references into the storages a fetch borrowed.
+    type View<'v>: Copy + Send + Sync;
+
+    /// The view of `fetch`, valid for as long as `fetch` is borrowed.
+    fn view<'v>(fetch: &'v Self::Fetch<'_>) -> Self::View<'v>;
+
+    /// The driving parameter's dense entity list — the same parameter
+    /// [`QueryParam::driver_len`] answers from — or `None` if nothing drives.
+    fn driver_entities<'v>(view: Self::View<'v>) -> Option<&'v [Entity]>;
+
+    /// [`QueryParam::get`], read through a view.
+    fn view_get<'v>(view: Self::View<'v>, entity: Entity) -> Option<Self::Item<'v>>;
+
+    /// [`QueryParam::get_at`], read through a view.
+    fn view_get_at<'v>(view: Self::View<'v>, i: usize, entity: Entity) -> Option<Self::Item<'v>>;
+}
+
+impl<T: Sync + 'static> ReadOnlyQueryParam for &T {
+    type View<'v> = &'v SparseSet<T>;
+
+    fn view<'v>(fetch: &'v Self::Fetch<'_>) -> Self::View<'v> {
+        fetch
+    }
+
+    fn driver_entities<'v>(view: Self::View<'v>) -> Option<&'v [Entity]> {
+        Some(&view.dense_entities)
+    }
+
+    fn view_get<'v>(view: Self::View<'v>, entity: Entity) -> Option<Self::Item<'v>> {
+        view.get(entity)
+    }
+
+    fn view_get_at<'v>(view: Self::View<'v>, i: usize, _entity: Entity) -> Option<Self::Item<'v>> {
+        view.dense_values.get(i)
+    }
+}
+
+impl<T: Sync + 'static> ReadOnlyQueryParam for Option<&T> {
+    type View<'v> = Option<&'v SparseSet<T>>;
+
+    fn view<'v>(fetch: &'v Self::Fetch<'_>) -> Self::View<'v> {
+        fetch.as_deref()
+    }
+
+    fn driver_entities<'v>(_view: Self::View<'v>) -> Option<&'v [Entity]> {
+        None
+    }
+
+    fn view_get<'v>(view: Self::View<'v>, entity: Entity) -> Option<Self::Item<'v>> {
+        Some(view.and_then(|set| set.get(entity)))
+    }
+
+    fn view_get_at<'v>(view: Self::View<'v>, _i: usize, entity: Entity) -> Option<Self::Item<'v>> {
+        Self::view_get(view, entity)
+    }
+}
+
 macro_rules! impl_query_for_tuple {
     ($($name:ident => $idx:tt [$($earlier:ident)*]),+) => {
         impl<$($name: QueryParam),+> QueryParam for ($($name,)+) {
@@ -774,6 +845,39 @@ macro_rules! impl_query_for_tuple {
                         $name::get_at(&mut fetch.$idx, i, entity)?
                     } else {
                         $name::get(&mut fetch.$idx, entity)?
+                    },
+                )+))
+            }
+        }
+
+        impl<$($name: ReadOnlyQueryParam),+> ReadOnlyQueryParam for ($($name,)+) {
+            type View<'v> = ($($name::View<'v>,)+);
+
+            fn view<'v>(fetch: &'v Self::Fetch<'_>) -> Self::View<'v> {
+                ($($name::view(&fetch.$idx),)+)
+            }
+
+            // The same first-that-can order `driver_len` probes in, so the view
+            // is driven by the parameter the serial visit is.
+            fn driver_entities<'v>(view: Self::View<'v>) -> Option<&'v [Entity]> {
+                Option::<&[Entity]>::None
+                    $(.or_else(|| $name::driver_entities(view.$idx)))+
+            }
+
+            fn view_get<'v>(view: Self::View<'v>, entity: Entity) -> Option<Self::Item<'v>> {
+                Some(($($name::view_get(view.$idx, entity)?,)+))
+            }
+
+            fn view_get_at<'v>(
+                view: Self::View<'v>,
+                i: usize,
+                entity: Entity,
+            ) -> Option<Self::Item<'v>> {
+                Some(($(
+                    if const { $name::CAN_DRIVE $(&& !$earlier::CAN_DRIVE)* } {
+                        $name::view_get_at(view.$idx, i, entity)?
+                    } else {
+                        $name::view_get(view.$idx, entity)?
                     },
                 )+))
             }
@@ -840,6 +944,19 @@ impl<'w, Q: QueryParam> QueryRunner<'w, Q> {
         });
     }
 
+    /// How many entities a visit would examine — the driving storage's length,
+    /// or every live entity when nothing drives — without visiting any.
+    ///
+    /// An upper bound on [`count`](Self::count), and constant time for a driven
+    /// query, which is what makes it the right thing to choose a strategy by
+    /// before iterating.
+    pub fn candidates(&self) -> usize {
+        let Some(fetch) = Q::init(self.world) else {
+            return 0;
+        };
+        Q::driver_len(&fetch).unwrap_or_else(|| self.world.entities.iter_alive().count())
+    }
+
     /// Count how many entities match the query, without invoking a callback.
     pub fn count(&self) -> usize {
         let mut matched = 0;
@@ -856,6 +973,95 @@ impl<'w, Q: QueryParam> QueryRunner<'w, Q> {
         F: FnMut(Entity, Q::Item<'_>) -> bool,
     {
         self.visit(&mut pred)
+    }
+}
+
+impl<'w, Q: ReadOnlyQueryParam> QueryRunner<'w, Q> {
+    /// [`for_each`](Self::for_each) across the rayon pool the caller is in.
+    ///
+    /// Serial below `threshold` candidates, and on a pool of one thread, where
+    /// the dispatch would cost more than the work — and where a serial baseline
+    /// has to be genuinely serial to be a baseline. `f` sees every match exactly
+    /// once, in no particular order; [`par_map`](Self::par_map) is the ordered one.
+    ///
+    /// Only read-only queries can run in parallel. A mutable one does not
+    /// compile:
+    ///
+    /// ```compile_fail
+    /// # use orrin_ecs::World;
+    /// struct Position(f32);
+    /// let world = World::new();
+    /// world.query::<&mut Position>().par_for_each(0, |_, p| p.0 += 1.0);
+    /// ```
+    pub fn par_for_each<F>(&self, threshold: usize, f: F)
+    where
+        F: Fn(Entity, Q::Item<'_>) + Send + Sync,
+    {
+        self.par_visit(threshold, |entity, item| f(entity, item), |_| ());
+    }
+
+    /// `f` of every match, in the order [`for_each`](Self::for_each) visits
+    /// them, computed across the pool. Serial under the same conditions as
+    /// [`par_for_each`](Self::par_for_each).
+    ///
+    /// The order is the point: a caller that pairs the results back up with
+    /// anything indexed by match position gets the same pairing on any pool.
+    pub fn par_map<U, F>(&self, threshold: usize, f: F) -> Vec<U>
+    where
+        U: Send,
+        F: Fn(Entity, Q::Item<'_>) -> U + Send + Sync,
+    {
+        let mut out = Vec::new();
+        self.par_visit(threshold, f, |results| out = results);
+        out
+    }
+
+    /// Run `f` over every match and hand `done` the results, in match order.
+    ///
+    /// The guards are taken here, on the calling thread, and outlive every task:
+    /// only the [`ReadOnlyQueryParam::View`] behind them reaches the pool.
+    fn par_visit<U, F>(&self, threshold: usize, f: F, done: impl FnOnce(Vec<U>))
+    where
+        U: Send,
+        F: Fn(Entity, Q::Item<'_>) -> U + Send + Sync,
+    {
+        use rayon::prelude::*;
+
+        let Some(fetch) = Q::init(self.world) else {
+            done(Vec::new());
+            return;
+        };
+        let view = Q::view(&fetch);
+        // No driver means every live entity is a candidate, which is what the
+        // serial visit walks the allocator for.
+        let alive: Vec<Entity>;
+        let (candidates, driven) = match Q::driver_entities(view) {
+            Some(entities) => (entities, true),
+            None => {
+                alive = self.world.entities.iter_alive().collect();
+                (&alive[..], false)
+            }
+        };
+        let item = |i: usize| {
+            let entity = candidates[i];
+            let item = if driven {
+                Q::view_get_at(view, i, entity)
+            } else {
+                Q::view_get(view, entity)
+            };
+            item.map(|item| f(entity, item))
+        };
+
+        if candidates.len() < threshold || rayon::current_num_threads() <= 1 {
+            done((0..candidates.len()).filter_map(item).collect());
+        } else {
+            done(
+                (0..candidates.len())
+                    .into_par_iter()
+                    .filter_map(item)
+                    .collect(),
+            );
+        }
     }
 }
 
@@ -1419,5 +1625,148 @@ mod tests {
         assert!(world.insert(entity, Position { x: 1.0, y: 0.0 }).is_none());
 
         assert_eq!(world.structural_version(), before);
+    }
+
+    fn parallel_world() -> World {
+        let mut world = World::new();
+        for i in 0..2_000 {
+            let entity = world.spawn();
+            world.insert(
+                entity,
+                Position {
+                    x: i as f32,
+                    y: 0.0,
+                },
+            );
+            if i % 3 == 0 {
+                world.insert(
+                    entity,
+                    Velocity {
+                        x: 1.0,
+                        y: i as f32,
+                    },
+                );
+            }
+            if i % 7 == 0 {
+                world.insert(entity, Health(i));
+            }
+        }
+        world
+    }
+
+    /// Run `f` on a pool of `threads`. The world is built inside it: a `World`
+    /// is not `Sync`, so it cannot be captured by a task — which is exactly the
+    /// property the parallel queries are designed around.
+    fn in_pool<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("a pool")
+            .install(f)
+    }
+
+    /// The parallel map is the serial visit, element for element and in the
+    /// same order, for every shape of query: one that drives on its first
+    /// parameter, one whose second parameter filters, and one made only of
+    /// optional parameters, which has no driver and walks the allocator.
+    #[test]
+    fn a_parallel_map_yields_what_for_each_visits_in_the_same_order() {
+        in_pool(4, || {
+            let world = parallel_world();
+
+            let mut serial = Vec::new();
+            world
+                .query::<(&Position, Option<&Velocity>)>()
+                .for_each(|e, (p, v)| serial.push((e, p.x, v.map(|v| v.y))));
+            let parallel = world
+                .query::<(&Position, Option<&Velocity>)>()
+                .par_map(0, |e, (p, v)| (e, p.x, v.map(|v| v.y)));
+            assert_eq!(parallel, serial);
+
+            let mut serial = Vec::new();
+            world
+                .query::<(&Position, &Health)>()
+                .for_each(|e, (p, h)| serial.push((e, p.x, h.0)));
+            let parallel = world
+                .query::<(&Position, &Health)>()
+                .par_map(0, |e, (p, h)| (e, p.x, h.0));
+            assert_eq!(parallel, serial);
+            assert_eq!(parallel.len(), 2_000usize.div_ceil(7));
+
+            let mut serial = Vec::new();
+            world
+                .query::<(Option<&Health>, Option<&Velocity>)>()
+                .for_each(|e, (h, v)| serial.push((e, h.map(|h| h.0), v.is_some())));
+            let parallel = world
+                .query::<(Option<&Health>, Option<&Velocity>)>()
+                .par_map(0, |e, (h, v)| (e, h.map(|h| h.0), v.is_some()));
+            assert_eq!(parallel, serial);
+        });
+    }
+
+    /// Every match is visited exactly once, wherever it runs.
+    #[test]
+    fn par_for_each_visits_every_match_once() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (visits, sum) = in_pool(4, || {
+            let world = parallel_world();
+            let (visits, sum) = (AtomicU64::new(0), AtomicU64::new(0));
+            world.query::<&Velocity>().par_for_each(0, |_, v| {
+                visits.fetch_add(1, Ordering::Relaxed);
+                sum.fetch_add(v.y as u64, Ordering::Relaxed);
+            });
+            (visits.into_inner(), sum.into_inner())
+        });
+        let expected: u64 = (0..2_000u64).filter(|i| i % 3 == 0).sum();
+        assert_eq!(visits, 2_000u64.div_ceil(3));
+        assert_eq!(sum, expected);
+    }
+
+    /// Below the threshold the dispatch would cost more than the work, so
+    /// nothing leaves the calling thread at all.
+    #[test]
+    fn below_the_threshold_nothing_leaves_the_calling_thread() {
+        in_pool(4, || {
+            let world = parallel_world();
+            let caller = std::thread::current().id();
+            let threads = world
+                .query::<&Position>()
+                .par_map(usize::MAX, |_, _| std::thread::current().id());
+            assert_eq!(threads.len(), 2_000);
+            assert!(threads.iter().all(|&thread| thread == caller));
+        });
+    }
+
+    /// A required component nobody has inserted matches nothing, in parallel
+    /// as it does serially.
+    #[test]
+    fn a_parallel_query_over_a_missing_storage_is_empty() {
+        let found = in_pool(4, || {
+            let world = parallel_world();
+            world
+                .query::<(&Position, &Frozen)>()
+                .par_map(0, |e, _| e)
+                .len()
+        });
+        assert_eq!(found, 0);
+    }
+
+    /// How many entities a query would examine: the driver's storage for a
+    /// query with one, every live entity for one made only of optional
+    /// parameters, and none for one whose required storage does not exist.
+    #[test]
+    fn candidates_counts_what_a_visit_would_examine() {
+        let world = parallel_world();
+        assert_eq!(
+            world.query::<(&Velocity, &Position)>().candidates(),
+            2_000usize.div_ceil(3)
+        );
+        assert_eq!(
+            world
+                .query::<(Option<&Health>, Option<&Velocity>)>()
+                .candidates(),
+            2_000
+        );
+        assert_eq!(world.query::<&Frozen>().candidates(), 0);
     }
 }

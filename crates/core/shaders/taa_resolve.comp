@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // Temporal antialiasing: accumulate the jittered frame into a reprojected
 // history.
 //
@@ -52,12 +54,24 @@ float luminance(vec3 c) {
 // Reversible, unlike a real tonemap curve: the blend happens in here and
 // `expand` undoes it exactly, so no dynamic range is lost, only the weighting
 // distorted.
-vec3 compress(vec3 c) {
-    return c / (1.0 + luminance(c));
+//
+// Relative to `k`, the neighbourhood's mean luminance, rather than to 1. The
+// curve exists to stop a sample far brighter than its surroundings dominating
+// the blend, which is a question about *relative* brightness — and this frame
+// is in physical units, where luminance runs to thousands of cd/m2. Measured
+// against 1, nearly every pixel compressed to a luminance just under 1, where
+// `expand`'s `1 / (1 - L)` is singular: the resolve ran its whole image in the
+// regime that magnifies a rounding difference into a different pixel, and a
+// 0.4% change of albedo flipped silhouette pixels by up to 118 levels in the
+// captures. Scaled by `k`, an ordinary pixel compresses to about one half and
+// only a genuine outlier nears the singularity — which is the outlier the curve
+// is for. `compress(c / k)` is `c / (k + L(c))`, written that way.
+vec3 compress(vec3 c, float k) {
+    return c / (k + luminance(c));
 }
 
-vec3 expand(vec3 c) {
-    return c / max(1.0 - luminance(c), 1e-4);
+vec3 expand(vec3 c, float k) {
+    return k * c / max(1.0 - luminance(c), 1e-4);
 }
 
 // YCoCg separates luma from chroma, and the clip below is far tighter in it
@@ -75,12 +89,12 @@ vec3 from_ycocg(vec3 c) {
     return vec3(t + c.y, c.x + c.z, t - c.y);
 }
 
-vec3 prepare(vec3 c) {
-    return to_ycocg(compress(c));
+vec3 prepare(vec3 c, float k) {
+    return to_ycocg(compress(c, k));
 }
 
-vec3 restore(vec3 c) {
-    return max(expand(from_ycocg(c)), vec3(0.0));
+vec3 restore(vec3 c, float k) {
+    return max(expand(from_ycocg(c), k), vec3(0.0));
 }
 
 // Move `history` along the line to the box's centre until it is inside, rather
@@ -139,9 +153,37 @@ vec3 sample_history(vec2 uv, vec2 size) {
     return max(sum / (k0 + k1 + k2 + k3 + k4), vec3(0.0));
 }
 
+// The 3x3 neighbourhood every invocation of a group reads, loaded once for the
+// group: its 8x8 texels plus a one-texel apron, with each texel's luminance and
+// depth beside it. Nine fetches of colour and nine of depth per pixel become
+// about one and a half — measured, the neighbourhood was half of what this pass
+// cost. Stored in YCoCg but not yet through `compress`, because the curve is
+// relative to the pixel's own neighbourhood and so differs between neighbours;
+// YCoCg is linear, so `prepare(c, k)` is that over `k + L(c)`, one division a
+// tap.
+const int TILE = 8;
+const int APRON = TILE + 2;
+shared vec3 s_color[APRON * APRON];
+shared float s_luminance[APRON * APRON];
+shared float s_depth[APRON * APRON];
+
 void main() {
     ivec2 size = imageSize(u_target);
     ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+
+    // Every invocation loads its share before any of them may leave, the ones
+    // past the image's edge included: a barrier must be reached by the whole
+    // group, so the early-outs below come after it.
+    ivec2 origin = ivec2(gl_WorkGroupID.xy) * TILE - 1;
+    for (int i = int(gl_LocalInvocationIndex); i < APRON * APRON; i += TILE * TILE) {
+        ivec2 at = clamp(origin + ivec2(i % APRON, i / APRON), ivec2(0), size - 1);
+        vec3 color = texelFetch(u_color, at, 0).rgb;
+        s_color[i] = to_ycocg(color);
+        s_luminance[i] = luminance(color);
+        s_depth[i] = texelFetch(u_depth, at, 0).r;
+    }
+    barrier();
+
     if (any(greaterThanEqual(texel, size))) {
         return;
     }
@@ -157,19 +199,31 @@ void main() {
     vec3 lowest = vec3(1e9);
     vec3 highest = vec3(-1e9);
     ivec2 nearest = texel;
-    float nearest_depth = 1.0; // forward-Z, so smaller is nearer
+    float nearest_depth = DEPTH_FAR;
+
+    int centre = (int(gl_LocalInvocationID.y) + 1) * APRON + int(gl_LocalInvocationID.x) + 1;
+    float k = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            k += s_luminance[centre + y * APRON + x];
+        }
+    }
+    // A floor rather than zero, for a neighbourhood that is black: there every
+    // compressed value is zero whatever `k` is, and a zero `k` would divide by it.
+    k = max(k / 9.0, 1e-6);
 
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
             ivec2 at = clamp(texel + ivec2(x, y), ivec2(0), size - 1);
-            vec3 c = prepare(texelFetch(u_color, at, 0).rgb);
+            int slot = centre + y * APRON + x;
+            vec3 c = s_color[slot] / (k + s_luminance[slot]);
             sum += c;
             sum_squared += c * c;
             lowest = min(lowest, c);
             highest = max(highest, c);
 
-            float depth = texelFetch(u_depth, at, 0).r;
-            if (depth < nearest_depth) {
+            float depth = s_depth[slot];
+            if (depth_nearer(depth, nearest_depth)) {
                 nearest_depth = depth;
                 nearest = at;
             }
@@ -178,12 +232,12 @@ void main() {
 
     vec2 uv = (vec2(texel) + 0.5) * taa.params.xy;
     vec2 previous_uv;
-    if (nearest_depth >= 1.0) {
+    if (depth_is_far(nearest_depth)) {
         // Nothing was rasterised here, so the prepass wrote no motion — but the
         // sky still moves when the camera does. Reproject the far-plane point
         // through both view-projections to recover exactly that motion; skip
         // this and the sky ghosts under any rotation.
-        vec4 world = taa.inv_view_proj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+        vec4 world = taa.inv_view_proj * vec4(uv * 2.0 - 1.0, DEPTH_FAR, 1.0);
         vec4 previous = taa.prev_view_proj * vec4(world.xyz / world.w, 1.0);
         previous_uv = (previous.xy / previous.w) * 0.5 + 0.5;
     } else {
@@ -202,8 +256,8 @@ void main() {
     vec3 lo = max(mean - VARIANCE_GAMMA * deviation, lowest);
     vec3 hi = min(mean + VARIANCE_GAMMA * deviation, highest);
 
-    vec3 history = clip_to_box(lo, hi, prepare(sample_history(previous_uv, vec2(size))));
-    vec3 resolved = mix(prepare(current), history, taa.params.z);
+    vec3 history = clip_to_box(lo, hi, prepare(sample_history(previous_uv, vec2(size)), k));
+    vec3 resolved = mix(prepare(current, k), history, taa.params.z);
 
-    imageStore(u_target, texel, vec4(restore(resolved), 1.0));
+    imageStore(u_target, texel, vec4(restore(resolved, k), 1.0));
 }

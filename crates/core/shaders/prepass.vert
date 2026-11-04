@@ -1,8 +1,8 @@
 #version 460
 
 layout(location = 0) in vec3 position;
-layout(location = 1) in vec3 normal;
-layout(location = 2) in vec3 color;
+layout(location = 1) in vec2 normal; // octahedral; see octahedral.glsl
+layout(location = 2) in vec4 color;
 layout(location = 3) in vec2 uv;
 layout(location = 4) in vec4 tangent; // xyz = tangent, w = handedness
 
@@ -61,12 +61,10 @@ layout(set = 0, binding = 0) uniform Frame {
 // in floating point.
 invariant gl_Position;
 
-// The same per-object buffer the forward pass reads, uploaded once per frame.
-// Mirrors GpuObject in forward.rs.
-struct Object {
-    mat4 model;
-    mat4 prev_model;
-};
+#include "object.glsl"
+#include "octahedral.glsl"
+
+// The same per-object buffer the forward pass reads.
 layout(set = 1, binding = 0, std430) readonly buffer Objects {
     Object objects[];
 };
@@ -87,11 +85,11 @@ void main() {
     uvec2 entry = instances[uint(gl_InstanceIndex)];
     uint object = entry.x;
     v_material = entry.y;
-    mat4 model = objects[object].model;
+    mat4 model = object_model(objects[object]);
 
     // Same construction as forward.vert, one space along: Gram-Schmidt against
     // the normal, handedness from the tangent's w.
-    vec3 world_n = normal_matrix(model) * normal;
+    vec3 world_n = normal_matrix(model) * oct_decode(normal);
     vec3 world_t = mat3(model) * tangent.xyz;
     vec3 N = normalize(mat3(frame.view) * world_n); // view is rigid → pure rotation
     vec3 T = normalize(mat3(frame.view) * world_t);
@@ -100,7 +98,7 @@ void main() {
     v_view_tangent = T;
     v_view_bitangent = cross(N, T) * tangent.w;
     v_uv = uv;
-    v_color = color;
+    v_color = color.rgb;
 
     // `proj * view` is the same view-projection the forward pass pushes; taking
     // it from the frame UBO keeps the prepass push to the one instance offset.
@@ -118,5 +116,5 @@ void main() {
     // `proj` carries the jitter as a translation of clip.xy by jitter * w, so
     // subtracting exactly that recovers the unjittered position.
     v_clip = vec4(clip.xy - frame.jitter.xy * clip.w, clip.zw);
-    v_previous_clip = frame.prev_view_proj * objects[object].prev_model * vec4(position, 1.0);
+    v_previous_clip = frame.prev_view_proj * object_prev_model(objects[object]) * vec4(position, 1.0);
 }

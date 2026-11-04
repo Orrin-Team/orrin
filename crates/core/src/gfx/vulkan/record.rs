@@ -48,6 +48,7 @@ use vulkano::sync::fence::{Fence, FenceCreateInfo};
 use vulkano::sync::semaphore::Semaphore;
 use vulkano::sync::{
     AccessFlags, DependencyInfo, ImageMemoryBarrier, MemoryBarrier, PipelineStages,
+    QueueFamilyOwnershipTransfer,
 };
 
 use vulkano::DeviceSize;
@@ -59,18 +60,18 @@ use crate::profile_scope;
 
 use super::context::VkContext;
 
-/// Records a one-time command buffer with no auto-synchronisation, submits it,
-/// and blocks until the GPU is done with it.
-///
-/// The wait is what makes this safe to hand a closure that borrows: nothing the
-/// closure named can be dropped before the GPU has finished reading it, because
-/// this does not return until then. That also makes it the wrong primitive for a
-/// frame — see the module docs — and the right one for the load-time uploads,
-/// which block on a fence today regardless.
-pub(super) fn submit_one_shot(ctx: &VkContext, record: impl FnOnce(&mut RecordingCommandBuffer)) {
+/// Record a one-time command buffer for `queue_family_index`, and hand it back
+/// unsubmitted — for work that is submitted and then *not* waited on, which is
+/// what an upload is. Nothing the closure names is kept alive by this; the caller
+/// holds it until the submission's fence says the GPU is done.
+pub(super) fn record_one_shot(
+    ctx: &VkContext,
+    queue_family_index: u32,
+    record: impl FnOnce(&mut RecordingCommandBuffer),
+) -> CommandBuffer {
     let mut recording = RecordingCommandBuffer::new(
         ctx.command_buffer_allocator.clone(),
-        ctx.queue.queue_family_index(),
+        queue_family_index,
         CommandBufferLevel::Primary,
         CommandBufferBeginInfo {
             usage: CommandBufferUsage::OneTimeSubmit,
@@ -84,18 +85,12 @@ pub(super) fn submit_one_shot(ctx: &VkContext, record: impl FnOnce(&mut Recordin
     // SAFETY: the closure has returned, so nothing is still recording, and every
     // command it recorded is one this module's callers have paired with the
     // barriers it needs.
-    let command_buffer = unsafe { recording.end() }.expect("failed to end a raw command buffer");
-
-    let fence = Fence::new(ctx.device.clone(), FenceCreateInfo::default())
-        .expect("failed to create the upload fence");
-
-    submit_and_wait(ctx, &command_buffer, &fence);
+    unsafe { recording.end() }.expect("failed to end a raw command buffer")
 }
 
 /// Submit one finished command buffer and block until it has executed.
 ///
-/// Shared by [`submit_one_shot`] and [`Recorder::submit_and_wait`], which differ
-/// only in how the buffer was recorded.
+/// What [`Recorder::submit_and_wait`] ends in.
 fn submit_and_wait(ctx: &VkContext, command_buffer: &CommandBuffer, fence: &Fence) {
     let handles = [command_buffer.handle()];
     let submit = vk::SubmitInfo::default().command_buffers(&handles);
@@ -200,11 +195,78 @@ pub(super) fn to_shader_read(
     ImageMemoryBarrier {
         src_stages: PipelineStages::ALL_TRANSFER,
         src_access: AccessFlags::TRANSFER_READ | AccessFlags::TRANSFER_WRITE,
-        dst_stages: PipelineStages::FRAGMENT_SHADER,
+        // Every stage that samples, because nothing else orders an upload before
+        // its first reader: uploads are not waited on, so a later submission on
+        // the same queue — a compute pass sampling a bloom fallback as much as a
+        // fragment shader sampling an albedo — is ordered by this barrier alone.
+        dst_stages: PipelineStages::VERTEX_SHADER
+            | PipelineStages::FRAGMENT_SHADER
+            | PipelineStages::COMPUTE_SHADER,
         dst_access: AccessFlags::SHADER_READ,
         old_layout,
         new_layout: ImageLayout::ShaderReadOnlyOptimal,
         subresource_range,
+        ..ImageMemoryBarrier::image(image)
+    }
+}
+
+/// The half of a queue-family ownership transfer the *releasing* queue
+/// records: the transfer queue giving an image it just copied into to the
+/// graphics family.
+///
+/// The layout does not change across the transfer — it stays the copy's
+/// `TransferDstOptimal` — so the acquiring side can carry on from exactly where
+/// the copy stopped: build the mip chain, or move straight to shader-read. The
+/// destination half of a release is ignored by the spec, so it is left empty.
+pub(super) fn release_to(
+    image: Arc<Image>,
+    subresource_range: ImageSubresourceRange,
+    src_family: u32,
+    dst_family: u32,
+) -> ImageMemoryBarrier {
+    ImageMemoryBarrier {
+        src_stages: PipelineStages::ALL_TRANSFER,
+        src_access: AccessFlags::TRANSFER_WRITE,
+        dst_stages: PipelineStages::empty(),
+        dst_access: AccessFlags::empty(),
+        old_layout: ImageLayout::TransferDstOptimal,
+        new_layout: ImageLayout::TransferDstOptimal,
+        subresource_range,
+        queue_family_ownership_transfer: Some(
+            QueueFamilyOwnershipTransfer::ExclusiveBetweenLocal {
+                src_index: src_family,
+                dst_index: dst_family,
+            },
+        ),
+        ..ImageMemoryBarrier::image(image)
+    }
+}
+
+/// The *acquiring* half of [`release_to`], recorded on the graphics queue with
+/// the same families and layouts. Its source half is ignored by the spec — the
+/// semaphore the release signalled is the dependency — and its destination is
+/// the transfer stage, because what follows is either the mip blits or the move
+/// to shader-read, both transfer-stage work.
+pub(super) fn acquire_from(
+    image: Arc<Image>,
+    subresource_range: ImageSubresourceRange,
+    src_family: u32,
+    dst_family: u32,
+) -> ImageMemoryBarrier {
+    ImageMemoryBarrier {
+        src_stages: PipelineStages::empty(),
+        src_access: AccessFlags::empty(),
+        dst_stages: PipelineStages::ALL_TRANSFER,
+        dst_access: AccessFlags::TRANSFER_READ | AccessFlags::TRANSFER_WRITE,
+        old_layout: ImageLayout::TransferDstOptimal,
+        new_layout: ImageLayout::TransferDstOptimal,
+        subresource_range,
+        queue_family_ownership_transfer: Some(
+            QueueFamilyOwnershipTransfer::ExclusiveBetweenLocal {
+                src_index: src_family,
+                dst_index: dst_family,
+            },
+        ),
         ..ImageMemoryBarrier::image(image)
     }
 }
@@ -328,6 +390,38 @@ impl Arena {
             .allocate_slice(len)
             .expect("failed to suballocate a frame buffer")
     }
+
+    /// `len` bytes starting at a multiple of `alignment`, for a consumer whose
+    /// offset rule is not the element type's — a buffer-to-image copy, whose
+    /// source offset must be a whole number of texels or blocks.
+    ///
+    /// Aligned here, within the buffer, because `SubbufferAllocator` aligns in
+    /// *memory*, and an arena buffer need not start at an aligned address — on
+    /// an RX 9070 XT every staging arena starts 8 bytes off. Its arenas also grow
+    /// only for a request larger than one, so a request that fits an arena only
+    /// without padding moved to a fresh arena of the same size forever. The
+    /// padding it adds itself is below 256, the spec's ceiling on every
+    /// alignment it applies.
+    pub(super) fn allocate_bytes(&self, len: DeviceSize, alignment: DeviceSize) -> Subbuffer<[u8]> {
+        const ALLOCATOR_PADDING: DeviceSize = 256;
+        assert!(
+            alignment.is_power_of_two(),
+            "a staging alignment is a power of two"
+        );
+        let len = len.max(1);
+        let padded = len + alignment - 1;
+        let layout = vulkano::memory::allocator::DeviceLayout::from_size_alignment(padded, 1)
+            .expect("a non-empty staging layout");
+        let allocator = self.0.lock().expect("a pass panicked while recording");
+        if allocator.arena_size() < padded + ALLOCATOR_PADDING {
+            allocator.set_arena_size((padded + ALLOCATOR_PADDING) * 2);
+        }
+        let staging = allocator
+            .allocate(layout)
+            .expect("failed to suballocate a staging buffer");
+        let skip = staging.offset().next_multiple_of(alignment) - staging.offset();
+        staging.slice(skip..skip + len)
+    }
 }
 
 /// Everything a recorded command named, held until the GPU is done with it.
@@ -335,19 +429,35 @@ impl Arena {
 /// Dropping this before the frame's fence signals is a use-after-free the
 /// validation layers will not catch. Untyped because the only operation ever
 /// performed on the list is dropping it.
+///
+/// Two lists because almost everything a command names is already an `Arc` —
+/// a pipeline, a layout, a set, a view — and holding one as `Arc<dyn Any>` is a
+/// coercion, where boxing it was a heap allocation per bind: several hundred a
+/// frame, against AGENTS.md's "no allocation in the frame loop". The boxed list
+/// is for the few things that are not reference-counted.
 #[derive(Default)]
-pub(super) struct KeepAlive(Vec<Box<dyn Any + Send + Sync>>);
+pub(super) struct KeepAlive {
+    shared: Vec<Arc<dyn Any + Send + Sync>>,
+    boxed: Vec<Box<dyn Any + Send + Sync>>,
+}
 
 impl KeepAlive {
     /// Hold one resource for the frame's lifetime.
     pub(super) fn hold<T: Any + Send + Sync>(&mut self, resource: T) {
-        self.0.push(Box::new(resource));
+        self.boxed.push(Box::new(resource));
+    }
+
+    /// [`hold`](Self::hold) for a resource that is already reference-counted,
+    /// without allocating.
+    pub(super) fn hold_arc<T: Any + Send + Sync>(&mut self, resource: Arc<T>) {
+        self.shared.push(resource);
     }
 
     /// Take over another recording's obligations, for a secondary buffer whose
     /// commands are now the primary's to keep alive.
     pub(super) fn absorb(&mut self, other: KeepAlive) {
-        self.0.extend(other.0);
+        self.shared.extend(other.shared);
+        self.boxed.extend(other.boxed);
     }
 }
 
@@ -465,8 +575,53 @@ impl Recorder {
     /// Record one image barrier, for the load-time paths that have no compiled
     /// plan to draw on: an upload or a bake is a handful of commands whose
     /// dependencies are written where they happen.
+    /// Record through the raw buffer, for a helper written against it — the
+    /// upload halves in `texture.rs` are, because they are also recorded into
+    /// one-shot buffers that are not a `Recorder`. `keep` is what the commands
+    /// name and must outlive.
+    pub(super) fn record_raw<T: Any + Send + Sync>(
+        &mut self,
+        keep: T,
+        record: impl FnOnce(&mut RecordingCommandBuffer),
+    ) -> &mut Self {
+        record(&mut self.inner);
+        self.keep.hold(keep);
+        self
+    }
+
+    /// Make every transfer write recorded so far visible to whatever later work
+    /// on this queue reads geometry with — another arena copy, a vertex fetch,
+    /// an index fetch. What a mesh upload that is not waited on ends with: with
+    /// no fence wait between it and the next submission, this barrier is the
+    /// only thing that orders the two.
+    pub(super) fn transfer_to_geometry_reads(&mut self) -> &mut Self {
+        let barrier = MemoryBarrier {
+            src_stages: PipelineStages::ALL_TRANSFER,
+            src_access: AccessFlags::TRANSFER_WRITE,
+            dst_stages: PipelineStages::ALL_TRANSFER
+                | PipelineStages::VERTEX_ATTRIBUTE_INPUT
+                | PipelineStages::INDEX_INPUT,
+            dst_access: AccessFlags::TRANSFER_READ
+                | AccessFlags::TRANSFER_WRITE
+                | AccessFlags::VERTEX_ATTRIBUTE_READ
+                | AccessFlags::INDEX_READ,
+            ..Default::default()
+        };
+        // SAFETY: a global memory barrier names no resource, so there is nothing
+        // whose lifetime or layout it could get wrong; vulkano validates the
+        // stage and access pairing.
+        unsafe {
+            self.inner.pipeline_barrier(&DependencyInfo {
+                memory_barriers: [barrier].into_iter().collect(),
+                ..Default::default()
+            })
+        }
+        .expect("invalid memory barrier");
+        self
+    }
+
     pub(super) fn image_barrier(&mut self, barrier: ImageMemoryBarrier) -> &mut Self {
-        self.keep.hold(barrier.image.clone());
+        self.keep.hold_arc(barrier.image.clone());
         image_barrier(&mut self.inner, barrier);
         self
     }
@@ -484,13 +639,13 @@ impl Recorder {
     pub(super) fn begin_rendering(&mut self, mut info: RenderingInfo) -> &mut Self {
         set_auto_extent_layers(&mut info);
         for attachment in info.color_attachments.iter().flatten() {
-            self.keep.hold(attachment.image_view.clone());
+            self.keep.hold_arc(attachment.image_view.clone());
             if let Some(resolve) = &attachment.resolve_info {
-                self.keep.hold(resolve.image_view.clone());
+                self.keep.hold_arc(resolve.image_view.clone());
             }
         }
         for attachment in info.depth_attachment.iter().chain(&info.stencil_attachment) {
-            self.keep.hold(attachment.image_view.clone());
+            self.keep.hold_arc(attachment.image_view.clone());
         }
         unsafe { self.inner.begin_rendering(&info) }.expect("invalid rendering info");
         self
@@ -516,13 +671,13 @@ impl Recorder {
 
     pub(super) fn bind_pipeline_graphics(&mut self, pipeline: &Arc<GraphicsPipeline>) -> &mut Self {
         unsafe { self.inner.bind_pipeline_graphics(pipeline) }.expect("invalid graphics pipeline");
-        self.keep.hold(pipeline.clone());
+        self.keep.hold_arc(pipeline.clone());
         self
     }
 
     pub(super) fn bind_pipeline_compute(&mut self, pipeline: &Arc<ComputePipeline>) -> &mut Self {
         unsafe { self.inner.bind_pipeline_compute(pipeline) }.expect("invalid compute pipeline");
-        self.keep.hold(pipeline.clone());
+        self.keep.hold_arc(pipeline.clone());
         self
     }
 
@@ -536,15 +691,26 @@ impl Recorder {
         // Unannotated on purpose: `bind_descriptor_sets` takes `&[&RawDescriptorSet]`
         // and vulkano 0.35 does not export that type, so the elements can be
         // produced and passed but the vector's type cannot be written down.
-        let raw: Vec<_> = sets.iter().map(|set| set.as_raw()).collect();
-        unsafe {
-            self.inner
-                .bind_descriptor_sets(bind_point, layout, first_set, &raw, &[])
+        //
+        // One set is nearly every call — `bind_group` binds one at a time — so it
+        // takes a stack array rather than collecting a vector per bind.
+        if let [set] = sets {
+            unsafe {
+                self.inner
+                    .bind_descriptor_sets(bind_point, layout, first_set, &[set.as_raw()], &[])
+            }
+            .expect("invalid descriptor set binding");
+        } else {
+            let raw: Vec<_> = sets.iter().map(|set| set.as_raw()).collect();
+            unsafe {
+                self.inner
+                    .bind_descriptor_sets(bind_point, layout, first_set, &raw, &[])
+            }
+            .expect("invalid descriptor set binding");
         }
-        .expect("invalid descriptor set binding");
-        self.keep.hold(layout.clone());
+        self.keep.hold_arc(layout.clone());
         for set in sets {
-            self.keep.hold(set.clone());
+            self.keep.hold_arc(set.clone());
         }
         self
     }
@@ -581,7 +747,7 @@ impl Recorder {
     ) -> &mut Self {
         unsafe { self.inner.push_constants(layout, offset, constants) }
             .expect("invalid push constants");
-        self.keep.hold(layout.clone());
+        self.keep.hold_arc(layout.clone());
         self
     }
 
@@ -709,7 +875,7 @@ impl Recorder {
         // instance, so no query in the range is in flight — `timestamps.rs`
         // documents why that has to happen there.
         unsafe { self.inner.reset_query_pool(&pool, queries) }.expect("invalid query pool reset");
-        self.keep.hold(pool);
+        self.keep.hold_arc(pool);
         self
     }
 
@@ -721,7 +887,7 @@ impl Recorder {
     ) -> &mut Self {
         unsafe { self.inner.write_timestamp(&pool, query, stage) }
             .expect("invalid timestamp write");
-        self.keep.hold(pool);
+        self.keep.hold_arc(pool);
         self
     }
 }

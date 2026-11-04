@@ -44,10 +44,7 @@ layout(location = 5) in vec3 v_color;
 // The material row this instance is drawn with. See `forward.vert`.
 layout(location = 6) flat in uint v_material;
 
-// Keep in sync with MAX_POINT_LIGHTS / MAX_SPOT_LIGHTS / MAX_TEXTURES in
-// forward.rs.
-const int MAX_POINT_LIGHTS = 16;
-const int MAX_SPOT_LIGHTS = 8;
+// Keep in sync with MAX_TEXTURES in forward.rs.
 const int MAX_TEXTURES = 192;
 const float PI = 3.14159265359;
 
@@ -89,12 +86,49 @@ layout(set = 0, binding = 0) uniform Lighting {
     // the struct out at exactly the offsets the flat fields had, so `GpuLighting`
     // is unchanged by the nesting — see `cascades.glsl`.
     Cascades cascades;
-    PointLight point_lights[MAX_POINT_LIGHTS];
-    SpotLight spot_lights[MAX_SPOT_LIGHTS];
+    vec4 clusters;       // x = depth slice scale, y = depth slice bias; see gfx/clusters.rs
+    vec4 view_forward;   // xyz = the camera's forward axis, for view depth
     vec4 environment;    // x = sin(env yaw), y = cos(env yaw)
     vec4 env_specular;   // rgb = multiplier on sampled environment radiance
     vec4 irradiance[9];  // rgb = SH coefficient; see gfx/sh.rs
 } lighting;
+
+// The punctual lights, and which of them can reach each cluster of the view —
+// `gfx/clusters.rs` bins them, and a fragment loops over its own cluster's
+// lists rather than every light in the scene. Storage buffers, so the count is
+// whatever the frame extracted rather than what a uniform block has room for.
+const int MAX_POINT_LIGHTS = 256;
+const int MAX_SPOT_LIGHTS = 64;
+layout(set = 0, binding = 2) uniform PointLights {
+    PointLight point_lights[MAX_POINT_LIGHTS];
+};
+layout(set = 0, binding = 3) uniform SpotLights {
+    SpotLight spot_lights[MAX_SPOT_LIGHTS];
+};
+
+// Lock-stepped with `TILES_X`, `TILES_Y` and `SLICES` in gfx/clusters.rs.
+const uint CLUSTER_TILES_X = 16u;
+const uint CLUSTER_TILES_Y = 9u;
+const uint CLUSTER_SLICES = 24u;
+const uint CLUSTER_COUNT = CLUSTER_TILES_X * CLUSTER_TILES_Y * CLUSTER_SLICES;
+
+// Per cluster: (point offset, point count, spot offset, spot count) into
+// `cluster_lights`.
+layout(set = 0, binding = 4, std430) readonly buffer LightClusters {
+    uvec4 cluster_ranges[CLUSTER_COUNT];
+    uint cluster_lights[];
+};
+
+// The cluster a fragment reads: its screen tile and the exponential depth slice
+// its view depth falls in. Mirrored by `cluster_of` in gfx/clusters.rs, whose
+// tests are what hold the binning conservative against this lookup.
+uint light_cluster(vec2 frag, float view_depth) {
+    vec2 tiles = vec2(CLUSTER_TILES_X, CLUSTER_TILES_Y);
+    uvec2 tile = uvec2(clamp(floor(frag * lighting.viewport.zw * tiles), vec2(0.0), tiles - 1.0));
+    float slice = floor(log(max(view_depth, 1e-6)) * lighting.clusters.x - lighting.clusters.y);
+    uint z = uint(clamp(slice, 0.0, float(CLUSTER_SLICES - 1u)));
+    return (z * CLUSTER_TILES_Y + tile.y) * CLUSTER_TILES_X + tile.x;
+}
 
 // Mirrors GpuMaterial in forward.rs. std430 packs this exactly like
 // the Rust #[repr(C)] struct because every field is 16 bytes.
@@ -121,12 +155,25 @@ struct GpuMaterial {
 // `v_material` is one value for a whole draw, so every test against these is a
 // coherent branch: a draw either takes a lobe or does not, and a material that
 // never asked for one pays a single comparison rather than the lobe's cost.
+#ifdef ORRIN_FLAT_SURFACE
+// The flat forward pipelines' build: a material drawn with one uses none of the
+// optional lobes, so every test of their bits folds to false and the compiler
+// removes the lobes outright. Their presence alone costs every material a
+// quarter of the forward pass — see `ForwardPipelines` in forward.rs.
+const uint MATERIAL_CLEARCOAT    = 0u;
+const uint MATERIAL_SHEEN        = 0u;
+const uint MATERIAL_ANISOTROPY   = 0u;
+const uint MATERIAL_TRANSMISSION = 0u;
+const uint MATERIAL_SUBSURFACE   = 0u;
+const uint MATERIAL_PARALLAX     = 0u;
+#else
 const uint MATERIAL_CLEARCOAT    = 1u << 0;
 const uint MATERIAL_SHEEN        = 1u << 1;
 const uint MATERIAL_ANISOTROPY   = 1u << 2;
 const uint MATERIAL_TRANSMISSION = 1u << 3;
 const uint MATERIAL_SUBSURFACE   = 1u << 4;
 const uint MATERIAL_PARALLAX     = 1u << 5;
+#endif
 const uint MATERIAL_MASKED       = 1u << 6;
 
 // Material table indexed by the per-draw material_index. A storage
@@ -666,6 +713,9 @@ Lobes brdf(Surface s, vec3 L, vec3 radiance, float visibility, float back_visibi
     return lobes;
 }
 
+#define ORRIN_CASCADES lighting.cascades
+#include "cascade_lookup.glsl"
+
 // --- Cascaded shadow maps ---
 //
 // The lookup itself is in `cascades.glsl`, shared with the froxel fog. What is
@@ -689,9 +739,7 @@ float sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist) {
         return 1.0;
     }
 
-    return cascade_sun_shadow(
-        lighting.cascades, u_shadow_maps, u_shadow_cmp, world_pos, N, L, view_dist
-    );
+    return cascade_sun_shadow(u_shadow_maps, u_shadow_cmp, world_pos, N, L, view_dist);
 }
 
 // The sun's visibility at the *far* side of a scattering medium — whether light
@@ -722,7 +770,6 @@ float back_sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist, float thi
     // question rather than `sun_shadow` at an offset — and note the missing
     // `dot(N, L)` early-out, deliberately.
     return cascade_sun_shadow(
-        lighting.cascades,
         u_shadow_maps,
         u_shadow_cmp,
         world_pos - N * thickness,
@@ -1278,10 +1325,15 @@ Shaded shade_surface() {
         diffusible += lobes.diffusible;
     }
 
+    // The lights that can reach this fragment's cluster, rather than every light
+    // in the scene. Each still applies its own range test below: the binning is
+    // conservative, so a list may name a light that just misses this pixel.
+    float view_depth = dot(v_world_pos - lighting.camera_pos.xyz, lighting.view_forward.xyz);
+    uvec4 cluster = cluster_ranges[light_cluster(gl_FragCoord.xy, view_depth)];
+
     // Point lights.
-    int count = int(lighting.params.x);
-    for (int i = 0; i < count; ++i) {
-        PointLight light = lighting.point_lights[i];
+    for (uint k = 0u; k < cluster.y; ++k) {
+        PointLight light = point_lights[cluster_lights[cluster.x + k]];
         vec3 to_light = light.position.xyz - v_world_pos;
         float dist = length(to_light);
         float atten = attenuate(dist, light.position.w);
@@ -1307,9 +1359,8 @@ Shaded shade_surface() {
 
     // Spot lights: a point light with a cone over it, and one atlas face rather
     // than six because a cone is a single frustum.
-    int spot_count = int(lighting.params.w);
-    for (int i = 0; i < spot_count; ++i) {
-        SpotLight light = lighting.spot_lights[i];
+    for (uint k = 0u; k < cluster.w; ++k) {
+        SpotLight light = spot_lights[cluster_lights[cluster.z + k]];
         vec3 to_light = light.position.xyz - v_world_pos;
         float dist = length(to_light);
         float atten = attenuate(dist, light.position.w);
@@ -1357,7 +1408,7 @@ Shaded shade_surface() {
     diffusible *= fog.transmittance;
 
     if (lighting.cascades.params.w > 0.5) {
-        vec3 tint = cascade_debug_tint(select_cascade(lighting.cascades, view_dist));
+        vec3 tint = cascade_debug_tint(select_cascade(view_dist));
         color *= tint;
         diffusible *= tint;
     }

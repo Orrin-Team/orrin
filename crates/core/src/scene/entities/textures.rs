@@ -8,6 +8,45 @@ pub fn load_rgba(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
     (img.into_raw(), width, height)
 }
 
+/// One row of a map being written front to back, so a generator's loop body
+/// reads the same as when it pushed onto a `Vec` of its own.
+///
+/// The generators below are pure functions of a texel's coordinates, so each
+/// row is a task with nothing to share: drawing them across the pool changes how
+/// fast a map is drawn and never what it holds, which is what keeps the
+/// captures machine-independent. Writing into the row's own slice of the final
+/// map is what saves allocating it a second time and copying it back together.
+struct RowWriter<'a, T> {
+    row: &'a mut [T],
+    at: usize,
+}
+
+impl<'a, T: Copy> RowWriter<'a, T> {
+    fn new(row: &'a mut [T]) -> Self {
+        Self { row, at: 0 }
+    }
+
+    fn push(&mut self, value: T) {
+        self.row[self.at] = value;
+        self.at += 1;
+    }
+
+    fn extend_from_slice(&mut self, values: &[T]) {
+        self.row[self.at..self.at + values.len()].copy_from_slice(values);
+        self.at += values.len();
+    }
+}
+
+impl<T> Drop for RowWriter<'_, T> {
+    fn drop(&mut self) {
+        debug_assert_eq!(
+            self.at,
+            self.row.len(),
+            "a generator left part of a row unwritten"
+        );
+    }
+}
+
 pub fn checkerboard(size: u32, checks: u32, a: [u8; 3], b: [u8; 3]) -> Vec<u8> {
     let cell = (size / checks).max(1);
     let mut data = Vec::with_capacity((size * size * 4) as usize);
@@ -105,56 +144,66 @@ pub fn brick(size: u32, columns: u32, rows: u32, tile: [f32; 2], depth: f32) -> 
     };
 
     let mut height = vec![0.0f32; (size * size) as usize];
-    for y in 0..size {
+    crate::threads::rows_mut([&mut height[..]], size as usize, |y, [row]| {
+        let mut row = RowWriter::new(row);
         for x in 0..size {
-            let (face, jitter) = texel(x, y);
+            let (face, jitter) = texel(x, y as u32);
             // The jitter rides on the face and not on the joint: a block sits
             // slightly proud of its neighbour, but the mortar between them is
             // one continuous surface at the back of the wall.
-            height[(y * size + x) as usize] = face * (0.86 + 0.14 * jitter);
+            row.push(face * (0.86 + 0.14 * jitter));
         }
-    }
+    });
 
-    let mut albedo = Vec::with_capacity((size * size * 4) as usize);
-    let mut normal = Vec::with_capacity((size * size * 4) as usize);
-    let mut height_map = Vec::with_capacity((size * size * 4) as usize);
+    let texels = (size * size * 4) as usize;
+    let (mut albedo, mut normal, mut height_map) =
+        (vec![0u8; texels], vec![0u8; texels], vec![0u8; texels]);
     let at = |x: u32, y: u32| height[((y % size) * size + (x % size)) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let (face, jitter) = texel(x, y);
+    let maps = [&mut albedo[..], &mut normal[..], &mut height_map[..]];
+    crate::threads::rows_mut(
+        maps,
+        size as usize * 4,
+        |y, [albedo, normal, height_map]| {
+            let y = y as u32;
+            let mut albedo = RowWriter::new(albedo);
+            let mut normal = RowWriter::new(normal);
+            let mut height_map = RowWriter::new(height_map);
+            for x in 0..size {
+                let (face, jitter) = texel(x, y);
 
-            let block = [
-                0.40 + 0.22 * jitter,
-                0.16 + 0.13 * jitter,
-                0.13 + 0.07 * jitter,
-            ];
-            let mortar = [0.55, 0.53, 0.49];
-            // Per-texel grain, in the colour only. In the height field it would
-            // become a normal map of noise, since the normals below are that
-            // field's derivative and a derivative amplifies exactly the
-            // frequencies a grain is made of.
-            let grain = 0.90 + 0.20 * hash01(y.wrapping_mul(size).wrapping_add(x));
-            for channel in 0..3 {
-                let c = (mortar[channel] + (block[channel] - mortar[channel]) * face) * grain;
-                albedo.push((c.clamp(0.0, 1.0) * 255.0) as u8);
+                let block = [
+                    0.40 + 0.22 * jitter,
+                    0.16 + 0.13 * jitter,
+                    0.13 + 0.07 * jitter,
+                ];
+                let mortar = [0.55, 0.53, 0.49];
+                // Per-texel grain, in the colour only. In the height field it would
+                // become a normal map of noise, since the normals below are that
+                // field's derivative and a derivative amplifies exactly the
+                // frequencies a grain is made of.
+                let grain = 0.90 + 0.20 * hash01(y.wrapping_mul(size).wrapping_add(x));
+                for channel in 0..3 {
+                    let c = (mortar[channel] + (block[channel] - mortar[channel]) * face) * grain;
+                    albedo.push((c.clamp(0.0, 1.0) * 255.0) as u8);
+                }
+                albedo.push(255);
+
+                // Central differences, wrapped, so the tile's normals meet across
+                // the seam as its heights do. Each axis scaled by the depth over the
+                // metres that axis spans, because that is what turns a height in
+                // [0, 1] into a slope — and the two are different numbers on any
+                // wall that is not square.
+                let du = (at(x + 1, y) - at(x + size - 1, y)) * 0.5 * size as f32 * depth / tile[0];
+                let dv = (at(x, y + 1) - at(x, y + size - 1)) * 0.5 * size as f32 * depth / tile[1];
+                let n = Vec3::new(-du, -dv, 1.0).normalize();
+                let e = (n * 0.5 + 0.5) * 255.0;
+                normal.extend_from_slice(&[e.x as u8, e.y as u8, e.z as u8, 255]);
+
+                let h = (at(x, y) * 255.0) as u8;
+                height_map.extend_from_slice(&[h, h, h, 255]);
             }
-            albedo.push(255);
-
-            // Central differences, wrapped, so the tile's normals meet across
-            // the seam as its heights do. Each axis scaled by the depth over the
-            // metres that axis spans, because that is what turns a height in
-            // [0, 1] into a slope — and the two are different numbers on any
-            // wall that is not square.
-            let du = (at(x + 1, y) - at(x + size - 1, y)) * 0.5 * size as f32 * depth / tile[0];
-            let dv = (at(x, y + 1) - at(x, y + size - 1)) * 0.5 * size as f32 * depth / tile[1];
-            let n = Vec3::new(-du, -dv, 1.0).normalize();
-            let e = (n * 0.5 + 0.5) * 255.0;
-            normal.extend_from_slice(&[e.x as u8, e.y as u8, e.z as u8, 255]);
-
-            let h = (at(x, y) * 255.0) as u8;
-            height_map.extend_from_slice(&[h, h, h, 255]);
-        }
-    }
+        },
+    );
 
     BrickMaps {
         albedo,
@@ -194,8 +243,10 @@ pub fn sky_equirect(width: u32, height: u32, to_sun: Vec3) -> Vec<f32> {
     let horizon = Vec3::new(0.20, 0.24, 0.30);
     let ground = Vec3::new(0.02, 0.018, 0.016);
 
-    let mut data = Vec::with_capacity((width * height * 4) as usize);
-    for y in 0..height {
+    let mut data = vec![0.0f32; (width * height * 4) as usize];
+    crate::threads::rows_mut([&mut data[..]], width as usize * 4, |y, [row]| {
+        let y = y as u32;
+        let mut row = RowWriter::new(row);
         // The inverse of the mapping in equirect_to_cube.frag: v = acos(y)/PI
         // and u = atan2(z, x)/TAU + 0.5. Sampling at texel centres keeps the
         // poles off the exact singularity.
@@ -226,9 +277,9 @@ pub fn sky_equirect(width: u32, height: u32, to_sun: Vec3) -> Vec<f32> {
             color += Vec3::splat(40.0) * ((cosine - 0.9996) / 0.0004).clamp(0.0, 1.0);
             color += Vec3::new(1.0, 0.85, 0.6) * cosine.max(0.0).powf(64.0) * 0.8;
 
-            data.extend_from_slice(&[color.x, color.y, color.z, 1.0]);
+            row.extend_from_slice(&[color.x, color.y, color.z, 1.0]);
         }
-    }
+    });
     data
 }
 
@@ -257,10 +308,12 @@ pub fn metallic_roughness(size: u32) -> Vec<u8> {
 /// always been, and the capture would say the pass was doing nothing.
 pub fn foliage(size: u32) -> Vec<u8> {
     let n = size as f32;
-    let mut data = Vec::with_capacity((size * size * 4) as usize);
     // Which way each leaf's tip points, in turns.
     let leaves = [0.07f32, 0.30, 0.55, 0.80];
-    for y in 0..size {
+    let mut data = vec![0u8; (size * size * 4) as usize];
+    crate::threads::rows_mut([&mut data[..]], size as usize * 4, |y, [row]| {
+        let y = y as u32;
+        let mut row = RowWriter::new(row);
         for x in 0..size {
             let u = (x as f32 + 0.5) / n * 2.0 - 1.0;
             let v = (y as f32 + 0.5) / n * 2.0 - 1.0;
@@ -308,14 +361,14 @@ pub fn foliage(size: u32) -> Vec<u8> {
             // was doing nothing.
             let alpha = (distance + 0.5).clamp(0.0, 1.0);
             let rib = rib.min(1.0);
-            data.extend_from_slice(&[
+            row.extend_from_slice(&[
                 (46.0 + 46.0 * rib) as u8,
                 (86.0 + 74.0 * rib) as u8,
                 (30.0 + 34.0 * rib) as u8,
                 (alpha * 255.0) as u8,
             ]);
         }
-    }
+    });
     data
 }
 
@@ -340,9 +393,6 @@ pub struct DecalMaps {
 
 pub fn scorch(size: u32) -> DecalMaps {
     let n = size as f32;
-    let mut albedo = Vec::with_capacity((size * size * 4) as usize);
-    let mut normal = Vec::with_capacity((size * size * 4) as usize);
-    let mut metallic_roughness = Vec::with_capacity((size * size * 4) as usize);
 
     // Depth of the crater as a function of radius, and its derivative, so the
     // normals are the surface's own rather than a filtered guess at it.
@@ -358,56 +408,107 @@ pub fn scorch(size: u32) -> DecalMaps {
         (bowl * 0.5, slope * 0.5)
     };
 
-    for y in 0..size {
-        for x in 0..size {
-            let u = (x as f32 + 0.5) / n * 2.0 - 1.0;
-            let v = (y as f32 + 0.5) / n * 2.0 - 1.0;
-            let r = u.hypot(v);
-            let angle = v.atan2(u);
-            // Ragged, so the stamp does not read as a decal-shaped circle: three
-            // harmonics is enough to break the outline without looking like a
-            // pattern.
-            let wobble = 1.0
-                + 0.10 * (angle * 3.0).sin()
-                + 0.06 * (angle * 7.0 + 1.3).sin()
-                + 0.03 * (angle * 13.0 + 2.1).sin();
-            let edge = r / wobble;
+    let texels = (size * size * 4) as usize;
+    let (mut albedo, mut normal, mut metallic_roughness) =
+        (vec![0u8; texels], vec![0u8; texels], vec![0u8; texels]);
+    let maps = [
+        &mut albedo[..],
+        &mut normal[..],
+        &mut metallic_roughness[..],
+    ];
+    crate::threads::rows_mut(
+        maps,
+        size as usize * 4,
+        |y, [albedo, normal, metallic_roughness]| {
+            let y = y as u32;
+            let mut albedo = RowWriter::new(albedo);
+            let mut normal = RowWriter::new(normal);
+            let mut metallic_roughness = RowWriter::new(metallic_roughness);
+            for x in 0..size {
+                let u = (x as f32 + 0.5) / n * 2.0 - 1.0;
+                let v = (y as f32 + 0.5) / n * 2.0 - 1.0;
+                let r = u.hypot(v);
+                let angle = v.atan2(u);
+                // Ragged, so the stamp does not read as a decal-shaped circle: three
+                // harmonics is enough to break the outline without looking like a
+                // pattern.
+                let wobble = 1.0
+                    + 0.10 * (angle * 3.0).sin()
+                    + 0.06 * (angle * 7.0 + 1.3).sin()
+                    + 0.03 * (angle * 13.0 + 2.1).sin();
+                let edge = r / wobble;
 
-            // Fully covered inside, gone by the outline, and soft across the
-            // last fifth — the edge of a scorch is smoke, not a cut.
-            let coverage = (1.0 - (edge - 0.6) / 0.4).clamp(0.0, 1.0);
-            // Darkest at the centre and browner at the rim.
-            let soot = 1.0 - 0.75 * (1.0 - edge.min(1.0));
-            albedo.extend_from_slice(&[
-                (28.0 * soot + 20.0) as u8,
-                (22.0 * soot + 14.0) as u8,
-                (18.0 * soot + 10.0) as u8,
-                (coverage * 255.0) as u8,
-            ]);
+                // Fully covered inside, gone by the outline, and soft across the
+                // last fifth — the edge of a scorch is smoke, not a cut.
+                let coverage = (1.0 - (edge - 0.6) / 0.4).clamp(0.0, 1.0);
+                // Darkest at the centre and browner at the rim.
+                let soot = 1.0 - 0.75 * (1.0 - edge.min(1.0));
+                albedo.extend_from_slice(&[
+                    (28.0 * soot + 20.0) as u8,
+                    (22.0 * soot + 14.0) as u8,
+                    (18.0 * soot + 10.0) as u8,
+                    (coverage * 255.0) as u8,
+                ]);
 
-            let (_, slope) = profile(edge);
-            // The gradient points outward along the radius, so the tangent-space
-            // normal is that gradient negated in x and y and 1 in z, normalised.
-            let (dir_x, dir_y) = if r > 1e-4 { (u / r, v / r) } else { (0.0, 0.0) };
-            let nx = -dir_x * slope;
-            let ny = -dir_y * slope;
-            let inv = 1.0 / (nx * nx + ny * ny + 1.0).sqrt();
-            normal.extend_from_slice(&[
-                ((nx * inv * 0.5 + 0.5) * 255.0) as u8,
-                ((ny * inv * 0.5 + 0.5) * 255.0) as u8,
-                ((inv * 0.5 + 0.5) * 255.0) as u8,
-                255,
-            ]);
+                let (_, slope) = profile(edge);
+                // The gradient points outward along the radius, so the tangent-space
+                // normal is that gradient negated in x and y and 1 in z, normalised.
+                let (dir_x, dir_y) = if r > 1e-4 { (u / r, v / r) } else { (0.0, 0.0) };
+                let nx = -dir_x * slope;
+                let ny = -dir_y * slope;
+                let inv = 1.0 / (nx * nx + ny * ny + 1.0).sqrt();
+                normal.extend_from_slice(&[
+                    ((nx * inv * 0.5 + 0.5) * 255.0) as u8,
+                    ((ny * inv * 0.5 + 0.5) * 255.0) as u8,
+                    ((inv * 0.5 + 0.5) * 255.0) as u8,
+                    255,
+                ]);
 
-            // Slick in the middle where the crater is glassed, rough at the rim.
-            let roughness = 0.25 + 0.7 * edge.min(1.0);
-            metallic_roughness.extend_from_slice(&[0, (roughness * 255.0) as u8, 0, 255]);
-        }
-    }
+                // Slick in the middle where the crater is glassed, rough at the rim.
+                let roughness = 0.25 + 0.7 * edge.min(1.0);
+                metallic_roughness.extend_from_slice(&[0, (roughness * 255.0) as u8, 0, 255]);
+            }
+        },
+    );
 
     DecalMaps {
         albedo,
         normal,
         metallic_roughness,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_threads<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("a pool")
+            .install(f)
+    }
+
+    /// Every generator is drawn a row per task, so the claim the split rests
+    /// on is that a texel depends on its coordinates and nothing else. A map
+    /// that came out different under a parallel pool would make every capture
+    /// of the scene depend on the machine it was taken on.
+    #[test]
+    fn the_generated_maps_do_not_depend_on_the_thread_count() {
+        let draw = || {
+            let bricks = brick(64, 8, 4, [4.0, 2.0], 0.05);
+            let decal = scorch(64);
+            (
+                sky_equirect(64, 32, Vec3::new(0.3, -0.8, 0.5))
+                    .iter()
+                    .map(|f| f.to_bits())
+                    .collect::<Vec<_>>(),
+                foliage(64),
+                [bricks.albedo, bricks.normal, bricks.height],
+                [decal.albedo, decal.normal, decal.metallic_roughness],
+            )
+        };
+        assert!(with_threads(1, draw) == with_threads(4, draw));
     }
 }

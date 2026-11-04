@@ -281,6 +281,8 @@ fn allocate(device: &Device, extent: [u32; 2], levels: u32) -> (TextureViewId, V
         usage: ImageUsage::SAMPLED | ImageUsage::STORAGE,
         memoryless: false,
     });
+    // The layout `history` is declared to enter in, from the first frame on.
+    device.initialise_sampled(sampled);
     let mips = (0..levels)
         .map(|level| device.mip_view(sampled, level))
         .collect();

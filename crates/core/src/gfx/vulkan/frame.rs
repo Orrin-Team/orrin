@@ -31,6 +31,7 @@ use super::oit::{ACCUM_FORMAT, REVEAL_FORMAT};
 use super::outline::OUTLINE_MASK_FORMAT;
 use super::prepass::{MATERIAL_FORMAT, NORMAL_FORMAT, VELOCITY_FORMAT};
 use super::refraction::{ACCUM_FORMAT as REFRACTION_ACCUM_FORMAT, SCENE_LEVELS};
+use super::shadow::SHADOW_FORMAT;
 use super::ssao::AO_FORMAT;
 use super::ssr::{HIZ_FORMAT, HIZ_LEVELS, RAY_FORMAT, SOURCE_LEVELS};
 use super::subsurface::SUBSURFACE_FORMAT;
@@ -142,6 +143,19 @@ pub struct FrameConfig {
     /// Whether the editor's egui overlay draws over the frame. Off for headless
     /// and export renders.
     pub overlay: bool,
+    /// Whether the selection outline draws: the overlay is on *and* something is
+    /// selected. Separate from `overlay` because the outline is two full-screen
+    /// passes — a mask, then an edge search over it — and with nothing selected
+    /// both would run every frame to produce nothing. Toggling it recompiles the
+    /// graph, which `GraphImages`' allocation cache makes cheap.
+    pub outline: bool,
+    /// Whether the transform gizmo draws, for the reason `outline` is separate.
+    pub gizmo: bool,
+    /// Whether the frame's target goes to a presentation engine (a window) or is
+    /// copied out (an offscreen capture). It decides the layout the target ends
+    /// in: `PresentSrc` needs the swapchain extension, which an offscreen device
+    /// does not enable, and the readback copies from `TransferSrcOptimal`.
+    pub presents: bool,
     pub shadow_cascades: u8,
     pub shadow_resolution: u32,
     /// Edge of the punctual shadow atlas in texels, zero for a frame where
@@ -162,16 +176,6 @@ pub struct FrameConfig {
     /// The renderer sets it from what the device turned out to have — a device
     /// with no compute-only queue family plans exactly the frame it always did.
     pub async_compute: bool,
-    /// Whether the visible set for each opaque view is decided by a compute
-    /// dispatch rather than by the CPU sweep in `systems::extract_geometry`.
-    ///
-    /// Structural: it registers two passes, it makes `instance_index` something
-    /// the frame *writes* rather than something it is handed, and it changes
-    /// every opaque geometry pass from one draw per run to one indirect draw
-    /// per batch. Kept as a flag rather than taken as the only path so that the
-    /// two can be measured against each other on one binary — the CPU sweep is
-    /// the control, and `ORRIN_GPU_CULL=0` selects it.
-    pub gpu_culling: bool,
     /// Whether the compute cull also drops what the previous frame's depth
     /// already covered.
     ///
@@ -180,10 +184,8 @@ pub struct FrameConfig {
     /// — the pyramid is reduced from the depth that pass writes, and a frame
     /// with no prepass has no depth to reduce.
     ///
-    /// Only meaningful with [`gpu_culling`](Self::gpu_culling), because the
-    /// test lives in `cull.comp`. Kept as a flag of its own rather than folded
-    /// into it for the reason that one is a flag: the visible set it produces
-    /// is *smaller* than the frustum's, so the two have to be comparable on one
+    /// Kept as a flag rather than always on: the visible set it produces is
+    /// *smaller* than the frustum's, so the two have to be comparable on one
     /// binary to say what the difference cost and what it drew.
     pub occlusion_culling: bool,
 }
@@ -599,19 +601,22 @@ pub struct Frame {
     pub bodies: Vec<PassBody>,
 }
 
-/// Declares the draw commands on a pass that issues its draws indirectly, and
-/// nothing at all while the frame still culls on the CPU — which is what
-/// `commands` being `None` means.
+/// Declares the draw commands on a pass that issues its draws indirectly.
 ///
 /// One function rather than the declaration written out at each of the four
-/// sites, so that converting a pass to indirect draws cannot half-land: the
-/// pass either goes through here and is ordered after the cull, or it does not
-/// draw indirectly.
-fn indirect<'a>(pass: PassBuilder<'a>, commands: Option<ResourceId>) -> PassBuilder<'a> {
-    match commands {
-        Some(commands) => pass.access(commands, Access::IndirectRead),
-        None => pass,
-    }
+/// sites, so that an opaque geometry pass cannot draw indirectly without being
+/// ordered after the cull: it goes through here or it does not compile against
+/// the commands at all.
+fn indirect(pass: PassBuilder<'_>, commands: ResourceId) -> PassBuilder<'_> {
+    pass.access(commands, Access::IndirectRead)
+}
+
+/// What the cascade map is: one layer per cascade, always an array so a single
+/// cascade is sampled through the same `sampler2DArrayShadow` as four.
+pub fn cascade_map_desc(resolution: u32, cascades: u8) -> ImageDesc {
+    ImageDesc::new(SHADOW_FORMAT)
+        .extent(Extent::Fixed([resolution; 2]))
+        .array_layers(cascades as u32)
 }
 
 pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
@@ -630,10 +635,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // per-object inverse-transpose is too expensive to compute twice, so the
     // passes share one buffer and the graph records that they do.
     let object_transforms = builder.import_buffer("object_transforms");
-    // The draw orders over those rows, which unlike the rows themselves are
-    // written afresh every frame. A second resource rather than a share of the
-    // first because they have different lifetimes, and the graph's whole claim
-    // is to know each resource's exact one. See `vulkan::instances`.
+    // The opaque draw orders over those rows, which the cull writes afresh
+    // every frame. A second resource rather than a share of the first because
+    // they have different lifetimes, and the graph's whole claim is to know each
+    // resource's exact one. See `vulkan::instances`.
     let instance_index = builder.import_buffer("instance_index");
     // Culling is two dispatches because a count can only be atomically
     // incremented from a known value. The reset stamps each command with the
@@ -645,30 +650,20 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // because a pass may not write its own barrier — the point of the compiler
     // is that the write-after-write between these two is derived rather than
     // remembered.
-    // The blended and refractive queues stay CPU-culled — a refractive surface
+    // The blended and refractive queues are CPU-culled — a refractive surface
     // has to be drawn back to front, which is a correctness requirement no
-    // atomic append can meet — so under GPU culling their orders are still
-    // written by the host, into a buffer of their own. A second resource rather
-    // than a share of the first because it really is a second allocation, and
-    // one name over two buffers is precisely the declaration this compiler
-    // exists to catch.
-    let blended_index = if config.gpu_culling {
-        builder.import_buffer("blended_instance_index")
-    } else {
-        instance_index
-    };
+    // atomic append can meet — so their orders are written by the host, into a
+    // buffer of their own. A second resource rather than a share of the first
+    // because it really is a second allocation, and one name over two buffers
+    // is precisely the declaration this compiler exists to catch.
+    let blended_index = builder.import_buffer("blended_instance_index");
 
-    // Only with the compute cull, because the test is a branch in `cull.comp`
-    // and there is nowhere else to put it: the CPU sweep would have to read
-    // back a pyramid the GPU wrote, a frame late, to answer a question it is
-    // already answering per entity.
-    let occlusion = config.gpu_culling && config.occlusion_culling;
-    let occlusion_ids = occlusion.then(|| {
+    let occlusion_ids = config.occlusion_culling.then(|| {
         // Entry `ShaderReadOnlyOptimal` states the steady state the ping-pong
         // guarantees: `hiz` leaves every frame in exactly that layout and is
-        // the allocation `history` names next frame. The one frame where it is
-        // not true — the first after an allocation — is the frame the cull is
-        // told to test nothing anyway.
+        // the allocation `history` names next frame. On the first frame after an
+        // allocation the layout is still true — `initialise_sampled` puts it
+        // there — and its contents are what the cull is told to ignore.
         let history = builder.import_image(
             "occlusion_history",
             ImageDesc::new(OCCLUSION_FORMAT)
@@ -690,10 +685,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         OcclusionIds { history, hiz }
     });
 
-    let draw_commands = config.gpu_culling.then(|| {
+    let draw_commands = {
         // Which rows the dispatch is offered, and which batch each belongs to.
-        // Written afresh every frame, like the draw orders under CPU culling
-        // and unlike the rows themselves — the batch a row belongs to is
+        // Written afresh every frame, like the blended draw orders and unlike
+        // the rows themselves — the batch a row belongs to is
         // cached, but the list of rows is not. See `vulkan::cull`.
         let instance_table = builder.import_buffer("instance_table");
         // One entry per (mesh, material) batch: the geometry its draw command
@@ -726,23 +721,34 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         record(id, PassBody::Cull, &mut bodies);
 
         draw_commands
-    });
+    };
 
     let swapchain_color = builder.import_image(
         "swapchain_color",
         ImageDesc::new(config.color_format),
         // An acquired image's contents are not ours to keep, and the
-        // presentation engine wants it back in `PresentSrc`.
+        // presentation engine wants it back in `PresentSrc` — or, offscreen,
+        // the readback wants it in the layout it copies from.
         ImageLayout::Undefined,
-        ImageLayout::PresentSrc,
+        if config.presents {
+            ImageLayout::PresentSrc
+        } else {
+            ImageLayout::TransferSrcOptimal
+        },
     );
 
+    // Imported rather than graph-owned, because a far cascade is not redrawn
+    // every frame (`shadows::CascadeCache`) and a transient is `Undefined` at the
+    // start of each. Entered and left `ShaderReadOnlyOptimal`, the layout the
+    // frame's samplers leave it in, so a skipped cascade's texels survive the
+    // round trip through the attachment layout. The shadow pass allocates it to
+    // exactly this description.
     let shadows = (config.shadow_cascades > 0).then(|| {
-        builder.create_image(
+        builder.import_image(
             "shadow_cascades",
-            ImageDesc::new(DEPTH_FORMAT)
-                .extent(Extent::Fixed([config.shadow_resolution; 2]))
-                .array_layers(config.shadow_cascades as u32),
+            cascade_map_desc(config.shadow_resolution, config.shadow_cascades),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
         )
     });
 
@@ -800,7 +806,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let shadow_atlas = (config.shadow_atlas > 0).then(|| {
         let atlas = builder.create_image(
             "shadow_atlas",
-            ImageDesc::new(DEPTH_FORMAT).extent(Extent::Fixed([config.shadow_atlas; 2])),
+            ImageDesc::new(SHADOW_FORMAT).extent(Extent::Fixed([config.shadow_atlas; 2])),
         );
 
         let id = indirect(
@@ -845,7 +851,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         || config.ssr
         || config.transparency
         || config.refraction
-        || occlusion)
+        || config.occlusion_culling)
         .then(|| PrepassIds {
             normal: builder.create_image("prepass_normal", ImageDesc::new(NORMAL_FORMAT)),
             velocity: builder.create_image("prepass_velocity", ImageDesc::new(VELOCITY_FORMAT)),
@@ -975,9 +981,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let fog = config.volumetric_fog.then(|| {
         // Entry `ShaderReadOnlyOptimal` states the steady state, which the
         // ping-pong guarantees: this leaves every frame in exactly that layout
-        // and is the allocation the *history* names next frame. The one frame it
-        // is not true — the first after an allocation — is the frame the scatter
-        // pass is told to ignore its history anyway.
+        // and is the allocation the *history* names next frame. On the first
+        // frame after an allocation the layout is still true — the allocation
+        // put it there — and its contents are what the scatter pass ignores.
         let scatter = builder.import_image(
             "fog_scatter",
             ImageDesc::new(FOG_FORMAT)
@@ -1406,9 +1412,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let prepass = prepass.expect("TAA reads the geometry prepass");
         // Entry `ShaderReadOnlyOptimal` states the steady state, which the
         // ping-pong guarantees: `output` below leaves every frame in exactly
-        // that layout, and it is the allocation `history` names next frame. The
-        // one frame where it is not true — the first after an allocation — is
-        // the frame the pass is told to ignore its history anyway.
+        // that layout, and it is the allocation `history` names next frame. On
+        // the first frame after an allocation the layout is still true — the
+        // allocation put it there — and its contents are what `reset` ignores.
         let history = builder.import_image(
             "taa_history",
             ImageDesc::new(HDR_FORMAT),
@@ -1723,7 +1729,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .build();
     record(id, PassBody::Tonemap, &mut bodies);
 
-    let outline_mask = config.overlay.then(|| {
+    let outline_mask = (config.overlay && config.outline).then(|| {
         // Its own target rather than the depth or stencil of the scene: the
         // outline is the editor's, drawn after the frame is finished, and the
         // frame's targets are resolved and gone by then. See `vulkan::outline`.
@@ -1742,16 +1748,18 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         mask
     });
 
-    if config.overlay {
-        // Its own node, after the tonemap: see `vulkan::gizmo` for why not
-        // lines in the forward pass. Ordered before the overlay by
-        // registration, the two being writers of the same image.
+    // Its own node, after the tonemap: see `vulkan::gizmo` for why not lines in
+    // the forward pass. Ordered before the overlay by registration, the two
+    // being writers of the same image.
+    if config.overlay && config.gizmo {
         let id = builder
             .pass("gizmo", PassKind::Inline)
             .access(swapchain_color, Access::ColorAttachment)
             .build();
         record(id, PassBody::Gizmo, &mut bodies);
+    }
 
+    if config.overlay {
         let id = builder
             .pass("overlay", PassKind::Raw)
             .access(swapchain_color, Access::ColorAttachment)

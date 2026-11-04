@@ -1,10 +1,9 @@
-use std::ops::Range;
-
 use glam::Mat4;
 
-use crate::geom::Frustum;
+use crate::gfx::PositionVertex;
 use crate::gfx::format::SampleCount;
 use crate::gfx::graph::ImageUsage;
+use crate::gfx::images::ImageEntry;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BufferId, CullMode, DepthCompare, DepthRect,
@@ -12,11 +11,22 @@ use crate::gfx::rhi::{
     TextureDimension, TextureViewId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
-use crate::gfx::{DrawList, PositionVertex};
 
-use super::PassCtx;
 use super::cull::{CullFrame, Draws};
-use super::swapchain::DEPTH_FORMAT;
+
+/// The depth format of every shadow map, cascade and punctual alike, and
+/// deliberately not the camera's.
+///
+/// Sixteen bits suffice here and not for the camera: a cascade is orthographic,
+/// so its depth is linear over `2 * radius + pullback` — about 200 m at the
+/// default distance, a 3 mm step — and a punctual face spends its precision near
+/// the light, where its contacts are. The saving is half of every clear, write
+/// and filtered read the shadow passes make, and half their memory.
+///
+/// The bias settings inherit one consequence: a constant depth bias is measured
+/// in the format's smallest step, which for UNORM is a fixed 2^-16 of the map's
+/// range, where for D32 it was relative to the biased depth and nearly nothing.
+pub(super) const SHADOW_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::D16Unorm;
 
 /// Where `shadow.frag` declares the material texture array, in the masked
 /// variant that alpha-tests; the plain one declares no such set. Binding 0 of
@@ -46,6 +56,12 @@ pub struct ShadowPass {
     /// declares the atlas as a plain `texture2D` and the cascades as a
     /// `texture2DArray`, and a view satisfies one or the other.
     lit_atlas_view: TextureViewId,
+    /// The cascade map, kept here rather than by the graph because the far
+    /// cascades are not redrawn every frame (`shadows::CascadeCache`) and a
+    /// graph transient starts each frame `Undefined`. Allocated to the
+    /// description `frame::cascade_map_desc` declares, and replaced only when
+    /// that changes.
+    cascade_map: Option<CascadeMap>,
     pub constant_bias: f32,
     pub slope_bias: f32,
     /// The punctual maps get their own pair. A cascade is orthographic, so one
@@ -65,7 +81,7 @@ impl ShadowPass {
                 fragment,
                 // No color attachments to blend into.
                 color_formats: &[],
-                depth_format: Some(DEPTH_FORMAT),
+                depth_format: Some(SHADOW_FORMAT),
                 vertex_streams: &[PositionVertex::STREAM],
                 cull,
                 depth_test: Some(DepthTest {
@@ -103,11 +119,68 @@ impl ShadowPass {
             masked_pipeline,
             lit_view: build_lit_depth(device, TextureDimension::D2Array),
             lit_atlas_view: build_lit_depth(device, TextureDimension::D2),
+            cascade_map: None,
             constant_bias: 1.25,
             slope_bias: 2.5,
             punctual_constant_bias: 2.0,
             punctual_slope_bias: 3.0,
         }
+    }
+
+    /// The cascade map for `resolution` and `layers`, and whether it was just
+    /// (re)allocated — in which case every cascade it held is gone and the
+    /// caller's `CascadeCache` has to forget them.
+    ///
+    /// A new map is cleared to the far plane and left `ShaderReadOnlyOptimal`,
+    /// so the layout the graph declares it entering in is true from its first
+    /// frame rather than only from its second.
+    pub(super) fn cascade_map(
+        &mut self,
+        device: &Device,
+        resolution: u32,
+        layers: u8,
+    ) -> (ImageEntry, bool) {
+        if let Some(map) = &self.cascade_map
+            && map.resolution == resolution
+            && map.layers == layers
+        {
+            return (map.entry.clone(), false);
+        }
+        if let Some(old) = self.cascade_map.take() {
+            for view in old.entry.layers {
+                device.destroy_texture(view);
+            }
+            device.destroy_texture(old.entry.whole);
+        }
+        let desc = super::frame::cascade_map_desc(resolution, layers);
+        let whole = device.create_texture(&TextureDesc {
+            format: desc.format,
+            dimension: TextureDimension::D2Array,
+            extent: [resolution, resolution, 1],
+            mip_levels: 1,
+            array_layers: u32::from(layers),
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT
+                | ImageUsage::SAMPLED
+                | ImageUsage::TRANSFER_DST,
+            memoryless: false,
+        });
+        device.fill_depth(whole, crate::gfx::depth::SHADOW_CLEAR);
+        let entry = ImageEntry {
+            whole,
+            levels: Vec::new(),
+            layers: (0..u32::from(layers))
+                .map(|layer| device.face_view(whole, layer, 0))
+                .collect(),
+            extent: [resolution, resolution],
+            mip_levels: 1,
+        };
+        self.cascade_map = Some(CascadeMap {
+            entry: entry.clone(),
+            resolution,
+            layers,
+        });
+        (entry, true)
     }
 
     /// The "everything is lit" atlas, bound when nothing punctual casts.
@@ -177,11 +250,9 @@ impl ShadowPass {
     /// `resolution` is the shadow map's, not the frame's — every other pass in
     /// the executor takes the swapchain extent, and using it here would render
     /// the cascade into a corner of its own map with nothing reporting an error.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn record(
         &self,
         builder: &mut Encoder,
-        renderer: &PassCtx<'_>,
         casters: Draws<'_>,
         view_proj: Mat4,
         resolution: u32,
@@ -202,41 +273,23 @@ impl ShadowPass {
 
         // A cascade is one view into a map it owns outright, so its guard starts
         // and ends here.
-        self.draw(
-            builder,
-            renderer,
-            casters,
-            view_proj,
-            sets,
-            // Already culled, and against a wider test than this one: a caster
-            // outside the cascade's box can still shadow into it, which is what
-            // `casts_into` extends the box along the sun to catch. Re-testing
-            // here with the plain frustum would undo that and drop shadows.
-            None,
-            &mut Bound::default(),
-        );
+        self.draw(builder, casters, view_proj, sets, &mut Bound::default());
     }
 
     /// Record every face of every punctual caster into one atlas.
     ///
     /// One render pass for all of them, which is the whole reason the atlas
     /// exists: a tile is a viewport, so the sixteen-light worst case is one
-    /// barrier rather than ninety-six. `casters` and `bases` are indexed like
-    /// `atlas.casters` — one culled list per *light*, drawn into each of its
-    /// faces, because a point light's reach is small enough that culling its six
-    /// frustums apart would cost more test than it saved draw.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "a pass records from the frame's bindings; a params struct only renames the list"
-    )]
+    /// barrier rather than ninety-six. Each face is a view of the cull
+    /// dispatch's own, numbered from `first_view`, so what it draws was already
+    /// tested against that face's frustum — which is sound for a punctual face
+    /// in a way it is not for a cascade: the frustum's apex is at the light, so
+    /// anything that can occlude light travelling into a face is inside it.
     pub(super) fn record_atlas(
         &self,
         builder: &mut Encoder,
-        renderer: &PassCtx<'_>,
         atlas: &ShadowAtlas,
-        casters: &[DrawList<'_>],
-        bases: &[u32],
-        gpu: Option<(&CullFrame, BufferId, u32)>,
+        (frame, commands, first_view): (&CullFrame, BufferId, u32),
         sets: &CasterSets,
     ) {
         // Every tile this frame assigned, cleared before anything draws — and
@@ -253,7 +306,7 @@ impl ShadowPass {
         // border — which is why they clear and this does not.
         //
         // Over every assigned face rather than only the ones with something to
-        // draw: a light whose caster list came back empty still has its tile
+        // draw: a face the dispatch culled to nothing still has its tile
         // sampled, and it has to read as far, or the light would be shadowed by
         // whatever the last frame left in that tile.
         let tiles: Vec<DepthRect> = atlas
@@ -277,56 +330,21 @@ impl ShadowPass {
 
         // One guard for every light and every face rather than one per call into
         // `draw`. The two pipelines and the three descriptor sets are the same
-        // for the whole atlas, so past the first run nothing below rebinds
+        // for the whole atlas, so past the first face nothing below rebinds
         // either — where a guard scoped to one face rebound both on every one of
         // the nineteen tiles a demo frame assigns.
         let mut bound = Bound::default();
-        for (index, caster) in atlas.casters.iter().enumerate() {
-            // A light with nothing to draw is skipped on the CPU path only. The
-            // compute path has no per-light list to be empty: its faces are
-            // views, and a view whose every batch culled to zero records the
-            // same draws with a count of zero.
-            let list = casters.get(index).copied();
-            let base = bases.get(index).copied();
-            if gpu.is_none() && list.is_none_or(|list| list.is_empty()) {
-                continue;
-            }
+        for caster in &atlas.casters {
             let faces = caster.first_face..caster.first_face + caster.face_count;
             for (offset, face) in atlas.faces[faces].iter().enumerate() {
                 let face_index = (caster.first_face + offset) as u32;
-                let draws = match gpu {
-                    Some((frame, commands, first_view)) => Draws::Gpu {
-                        frame,
-                        view: first_view + face_index,
-                        commands,
-                    },
-                    None => Draws::Cpu {
-                        list: list.expect("a CPU-culled light with no list is skipped above"),
-                        base: base.expect("a caster list and its base are the same length"),
-                    },
+                let draws = Draws {
+                    frame,
+                    view: first_view + face_index,
+                    commands,
                 };
                 self.set_tile(builder, face.tile.offset, face.tile.size);
-                // Culled per face, where the caster lists were culled per
-                // *light*. A point light's six frustums partition the space its
-                // sphere covers, so most of what the light reaches is behind
-                // five of them: on the demo frame this is what takes the atlas
-                // from 254 draws to 122.
-                //
-                // Sound here in a way it is not for a cascade. These frustums
-                // have their apex at the light, so anything that can occlude
-                // light travelling into a face is inside that face's frustum —
-                // there is no equivalent of the caster standing outside a
-                // cascade's box and shadowing into it.
-                let frustum = Frustum::from_view_projection(face.view_proj);
-                self.draw(
-                    builder,
-                    renderer,
-                    draws,
-                    face.view_proj,
-                    sets,
-                    Some(&frustum),
-                    &mut bound,
-                );
+                self.draw(builder, draws, face.view_proj, sets, &mut bound);
             }
         }
     }
@@ -346,52 +364,19 @@ impl ShadowPass {
         builder.set_scissor(offset, [size, size]);
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// The dispatch's two multi-draws over this view's commands, one per
+    /// pipeline variant. A view culled to nothing still records them, with every
+    /// instance count zero.
     fn draw(
         &self,
         builder: &mut Encoder,
-        renderer: &PassCtx<'_>,
         casters: Draws<'_>,
         view_proj: Mat4,
         sets: &CasterSets,
-        cull: Option<&Frustum>,
         bound: &mut Bound,
     ) {
-        for unit in casters.units() {
-            // Only ever `Some` on the CPU path: the compute path culls each
-            // face as a view of its own, so what reaches here has already been
-            // tested against this very frustum.
-            if let Some(frustum) = cull
-                && let Some((list, run)) = &unit.run
-                && !run_intersects(list, run, frustum)
-            {
-                continue;
-            }
-            let Some(mesh) = renderer.meshes.get(unit.mesh as usize) else {
-                continue;
-            };
-            // The same flag word the forward pass and the prepass read, so all
-            // three cut the cutout out along the same line. A caster list with
-            // no cutout in it never touches `masked_pipeline` and records
-            // exactly what it recorded before this existed.
-            let wants_masked = renderer
-                .materials
-                .get(unit.material as usize)
-                .is_some_and(super::forward::GpuMaterial::is_masked);
-            self.bind(builder, sets, bound, wants_masked, view_proj);
-            builder.draw_indexed(
-                mesh.span.index_count,
-                unit.instances,
-                mesh.span.first_index,
-                mesh.span.vertex_offset,
-                unit.object_base,
-            );
-        }
-
-        // The compute path's two multi-draws over this view's commands. A face
-        // culled to nothing still records them, with every instance count zero.
-        for region in casters.regions() {
-            self.bind(builder, sets, bound, region.masked, view_proj);
+        for region in casters.regions_by_mask() {
+            self.bind(builder, sets, bound, region.variant.masked, view_proj);
             builder.draw_indexed_indirect(region.commands, region.range);
         }
     }
@@ -442,11 +427,6 @@ impl ShadowPass {
     }
 }
 
-fn run_intersects(casters: &DrawList<'_>, run: &Range<usize>, frustum: &Frustum) -> bool {
-    run.clone()
-        .any(|index| frustum.intersects(&casters.item(index).bounds))
-}
-
 /// Which pipeline the rasteriser already has, so the draw loop binds one only
 /// when the run's material actually changes it.
 ///
@@ -490,6 +470,12 @@ impl CasterSets {
     }
 }
 
+struct CascadeMap {
+    entry: ImageEntry,
+    resolution: u32,
+    layers: u8,
+}
+
 /// A 1x1 single-layer depth texture cleared to 1.0 — "nothing is nearer than
 /// the far plane", which every comparison reads as lit.
 ///
@@ -499,7 +485,7 @@ impl CasterSets {
 /// avoiding.
 fn build_lit_depth(device: &Device, dimension: TextureDimension) -> TextureViewId {
     let texture = device.create_texture(&TextureDesc {
-        format: DEPTH_FORMAT,
+        format: SHADOW_FORMAT,
         dimension,
         extent: [1, 1, 1],
         mip_levels: 1,
@@ -508,83 +494,13 @@ fn build_lit_depth(device: &Device, dimension: TextureDimension) -> TextureViewI
         usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
         memoryless: false,
     });
-    device.fill_depth(texture, 1.0);
+    device.fill_depth(texture, crate::gfx::depth::SHADOW_CLEAR);
     texture
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geom::Aabb;
-    use crate::gfx::RenderItem;
-    use crate::scene::{MaterialHandle, MeshHandle};
-    use glam::Vec3A;
-
-    fn item(x: f32) -> RenderItem {
-        RenderItem {
-            model: Mat4::IDENTITY,
-            prev_model: Mat4::IDENTITY,
-            bounds: Aabb {
-                min: Vec3A::new(x - 0.1, -0.1, 0.4),
-                max: Vec3A::new(x + 0.1, 0.1, 0.6),
-            },
-            mesh: MeshHandle(0),
-            material: MaterialHandle(0),
-            instance: 0,
-        }
-    }
-
-    /// Identity clip volume: `x, y` in `[-1, 1]` and `z` in `[0, 1]`, so an item
-    /// at `x = 0` is inside and one at `x = 50` is well outside.
-    fn unit_frustum() -> Frustum {
-        Frustum::from_view_projection(Mat4::IDENTITY)
-    }
-
-    /// A run no instance of which reaches the face is not drawn into it. This is
-    /// the saving: half of a demo frame's atlas draws are a light's caster list
-    /// redrawn into a face that cannot see any of it.
-    #[test]
-    fn a_run_entirely_outside_the_face_is_skipped() {
-        let items = [item(50.0), item(60.0), item(70.0)];
-        let order = [0u32, 1, 2];
-        let list = DrawList::new(&items, &order);
-        assert!(!run_intersects(&list, &(0..3), &unit_frustum()));
-    }
-
-    /// And one instance inside is enough to draw the run — the draw is instanced
-    /// over the whole run, so the question is whether *any* of it is visible.
-    #[test]
-    fn a_run_with_one_instance_inside_is_drawn() {
-        let items = [item(0.0)];
-        let order = [0u32];
-        let list = DrawList::new(&items, &order);
-        assert!(run_intersects(&list, &(0..1), &unit_frustum()));
-    }
-
-    /// The instance inside need not be the first. Testing only the item the run
-    /// starts at is the mistake this guards: runs are grouped by mesh and
-    /// material, never by position, so a run is scattered through the scene.
-    #[test]
-    fn an_instance_inside_is_found_wherever_it_sits_in_the_run() {
-        let items = [item(50.0), item(60.0), item(0.0)];
-        let order = [0u32, 1, 2];
-        let list = DrawList::new(&items, &order);
-        assert!(run_intersects(&list, &(0..3), &unit_frustum()));
-    }
-
-    /// Bounds nothing could measure are drawn rather than culled, which
-    /// [`Frustum::intersects`] promises and this relies on: a caster that
-    /// vanished would be a missing shadow, and a caster drawn needlessly is a
-    /// draw.
-    #[test]
-    fn unmeasurable_bounds_are_drawn_not_culled() {
-        let mut only = item(50.0);
-        only.bounds = Aabb::EMPTY;
-        let items = [only];
-        let order = [0u32];
-        let list = DrawList::new(&items, &order);
-        assert!(run_intersects(&list, &(0..1), &unit_frustum()));
-    }
 
     /// The saving this guard exists for. The atlas enters the draw loop once per
     /// face — nineteen times on a demo frame — and every one of those used to

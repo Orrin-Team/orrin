@@ -905,6 +905,139 @@ mod tests {
         );
     }
 
+    /// What the editor's UI cadence rests on (see `editor::cadence`): a frame
+    /// whose UI was not rebuilt hands the renderer the *same* `OverlayFrame`
+    /// again, after the first draw has already taken its texture deltas. That
+    /// second draw has to produce the same image — the glyphs drawn from the
+    /// font texture the first one uploaded, not a blank or a stale atlas.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_cached_frame_draws_the_same_image_again() {
+        use vulkano::buffer::{Buffer, BufferCreateInfo};
+        use vulkano::command_buffer::CopyImageToBufferInfo;
+
+        const EXTENT: [u32; 2] = [256, 64];
+        let instance = crate::capture::headless_instance();
+        let ctx = Arc::new(VkContext::new(&instance, None));
+        let device = device(&ctx);
+        let format = VkFormat::R8G8B8A8_SRGB;
+        let image = Image::new(
+            ctx.memory_allocator.clone(),
+            ImageCreateInfo {
+                format,
+                extent: [EXTENT[0], EXTENT[1], 1],
+                usage: VkImageUsage::COLOR_ATTACHMENT | VkImageUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap();
+        let view = ImageView::new_default(image.clone()).unwrap();
+
+        let egui = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(rect(0.0, 0.0, EXTENT[0] as f32, EXTENT[1] as f32)),
+            ..Default::default()
+        };
+        // The background covers every pixel, so each draw overwrites the last
+        // and the two readbacks are comparable without a clear between them.
+        let output = egui.run(input, |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            painter.rect_filled(
+                rect(0.0, 0.0, EXTENT[0] as f32, EXTENT[1] as f32),
+                0.0,
+                egui::Color32::DARK_BLUE,
+            );
+            painter.text(
+                egui::pos2(8.0, 8.0),
+                egui::Align2::LEFT_TOP,
+                "Hierarchy",
+                egui::FontId::proportional(24.0),
+                egui::Color32::WHITE,
+            );
+        });
+        let mut frame = OverlayFrame {
+            gizmo: Vec::new(),
+            outline: Vec::new(),
+            pixels_per_point: 1.0,
+            phases: vec![OverlayPhase {
+                glass: Vec::new(),
+                primitives: egui.tessellate(output.shapes, 1.0),
+            }],
+            textures: output.textures_delta,
+        };
+        assert!(
+            !frame.textures.set.is_empty(),
+            "the first frame carries the font atlas"
+        );
+
+        let mut pass = OverlayPass::new(
+            &device,
+            crate::gfx::vulkan::convert::engine_format(format),
+            true,
+        );
+        let readback = Buffer::new_slice::<u8>(
+            ctx.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                ..Default::default()
+            },
+            u64::from(EXTENT[0] * EXTENT[1] * 4),
+        )
+        .unwrap();
+        let mut draw = |frame: &mut OverlayFrame| -> Vec<u8> {
+            let mut recorder = Recorder::new(&ctx);
+            recorder.image_barrier(ImageMemoryBarrier {
+                old_layout: ImageLayout::Undefined,
+                ..color_to_present(image.clone())
+            });
+            {
+                let driver = device.vulkan();
+                let target = driver.import_view(view.clone());
+                let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
+                pass.record(&device, &mut encoder, target, frame);
+            }
+            recorder
+                .image_barrier(ImageMemoryBarrier {
+                    src_stages: PipelineStages::ALL_COMMANDS,
+                    src_access: AccessFlags::MEMORY_WRITE,
+                    dst_stages: PipelineStages::ALL_TRANSFER,
+                    dst_access: AccessFlags::TRANSFER_READ,
+                    old_layout: ImageLayout::PresentSrc,
+                    new_layout: ImageLayout::TransferSrcOptimal,
+                    subresource_range: record::whole_image(&image),
+                    ..ImageMemoryBarrier::image(image.clone())
+                })
+                .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+                    image.clone(),
+                    readback.clone(),
+                ));
+            recorder.submit_and_wait(&ctx);
+            readback.read().unwrap().to_vec()
+        };
+
+        let first = draw(&mut frame);
+        assert!(
+            frame.textures.set.is_empty(),
+            "the first draw takes the deltas"
+        );
+        let second = draw(&mut frame);
+        let lit = first.chunks(4).filter(|texel| texel[0] > 200).count();
+        assert!(
+            lit > 50,
+            "the label drew only {lit} light texels; the test is not looking at text"
+        );
+        assert!(
+            first == second,
+            "a cached frame drew a different image the second time"
+        );
+    }
+
     /// The same frame as the Vulkan test above, through the Metal driver: the
     /// glass has to blur only what is beneath it, which needs the backdrop
     /// downsample and the target being sampled while it is drawn into.

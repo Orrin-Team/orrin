@@ -4,7 +4,7 @@ use orrin_registry::Reflect;
 pub struct SsaoSettings {
     /// When false the SSAO passes are skipped and occlusion is 1.0 everywhere.
     pub enabled: bool,
-    /// Hemisphere sample radius in world units.
+    /// How far the horizon search reaches from each pixel, in world units.
     pub radius: f32,
     /// Depth bias that fights self-occlusion acne on flat surfaces.
     pub bias: f32,
@@ -13,11 +13,10 @@ pub struct SsaoSettings {
     /// Resolve and blur the occlusion at half the frame's width and height,
     /// letting the bilateral blur beside it upsample the result.
     ///
-    /// A quarter of the pixels through the most expensive loop in the frame:
-    /// SSAO is 32 taps, each of them a dependent and effectively random depth
-    /// fetch. On by default, because the term it computes is low-frequency and
-    /// then deliberately blurred — there is nothing at full resolution for the
-    /// extra three quarters of the work to resolve.
+    /// A quarter of the pixels through a loop of twelve dependent depth
+    /// fetches (see `ssao.frag`). On by default, because the term it computes
+    /// is low-frequency and then deliberately blurred — there is nothing at
+    /// full resolution for the extra three quarters of the work to resolve.
     ///
     /// What half resolution costs is edge quality, and that cost is paid by the
     /// blur being bilateral: a box filter here would drag a near surface's

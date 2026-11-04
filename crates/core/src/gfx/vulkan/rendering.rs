@@ -98,19 +98,21 @@ fn depth_scratch(target: TextureViewId) -> DepthAttachment {
         target,
         load: LoadOp::Clear,
         store: StoreOp::DontCare,
-        clear: 1.0,
+        clear: crate::gfx::depth::CLEAR,
         read_only: false,
     }
 }
 
 /// A depth attachment that is cleared, written, and kept for later passes to
-/// sample — the geometry prepass's, and each shadow cascade's.
-fn depth_written(target: TextureViewId) -> DepthAttachment {
+/// sample — the geometry prepass's, and each shadow cascade's. `clear` is the
+/// far plane in that map's own convention, which a camera and a shadow map do
+/// not share; see [`crate::gfx::depth`].
+fn depth_written(target: TextureViewId, clear: f32) -> DepthAttachment {
     DepthAttachment {
         target,
         load: LoadOp::Clear,
         store: StoreOp::Store,
-        clear: 1.0,
+        clear,
         read_only: false,
     }
 }
@@ -167,7 +169,10 @@ pub(super) fn rendering_info(
                     cleared(images.texture(prepass.velocity), [0.0; 4]),
                     cleared(images.texture(prepass.material), [0.0; 4]),
                 ],
-                depth: Some(depth_written(images.texture(prepass.depth))),
+                depth: Some(depth_written(
+                    images.texture(prepass.depth),
+                    crate::gfx::depth::CLEAR,
+                )),
             }
         }
         // 1.0 = fully unoccluded, so an untouched pixel darkens nothing.
@@ -281,10 +286,13 @@ pub(super) fn rendering_info(
         // texel nobody drew into reads as far, and therefore as lit.
         PassBody::ShadowCascade(cascade) => RenderTargets {
             colors: Vec::new(),
-            depth: Some(depth_written(images.layer_texture(
-                ids.shadows.expect("shadow pass without a shadow image"),
-                cascade,
-            ))),
+            depth: Some(depth_written(
+                images.layer_texture(
+                    ids.shadows.expect("shadow pass without a shadow image"),
+                    cascade,
+                ),
+                crate::gfx::depth::SHADOW_CLEAR,
+            )),
         },
         // Not re-rendered whole: it holds up to 64 tiles of which a frame lights
         // a fraction, so it loads `DontCare` and `record_atlas` clears the ones
@@ -299,7 +307,7 @@ pub(super) fn rendering_info(
                 ),
                 load: LoadOp::DontCare,
                 store: StoreOp::Store,
-                clear: 1.0,
+                clear: crate::gfx::depth::SHADOW_CLEAR,
                 read_only: false,
             }),
         },

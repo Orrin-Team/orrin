@@ -20,12 +20,16 @@ pub enum Access {
     ColorAttachment,
     /// The 1-sample destination of an MSAA resolve.
     ///
-    /// Not a color attachment with a different name: vulkano's
-    /// `single_pass_renderpass!` references a resolve target in
-    /// `TransferDstOptimal` and requires `TRANSFER_DST` usage, so that is what
-    /// the frame really does and what the plan has to say. The *write* is still
-    /// a color-attachment write at color-attachment-output — a render-pass
-    /// resolve is not a transfer command, only a transfer-shaped layout.
+    /// In the attachment layout, with attachment usage: under dynamic rendering
+    /// the resolve writes the image as a colour attachment at
+    /// colour-attachment-output, in the layout its `RenderingAttachmentResolveInfo`
+    /// names, which is `ColorAttachmentOptimal`. It used to claim
+    /// `TransferDstOptimal` and `TRANSFER_DST` because vulkano's
+    /// `single_pass_renderpass!` referenced a resolve target that way; with that
+    /// macro gone the claim described nothing the frame did, and the validation
+    /// layer reported every resolve. Kept a variant of its own because a resolve
+    /// is still a different act from drawing — it reads the multisampled
+    /// attachment, not the pipeline's output.
     ResolveAttachment,
     /// Depth tested *and* written.
     DepthAttachment,
@@ -51,7 +55,7 @@ impl Access {
     pub fn layout(self) -> ImageLayout {
         match self {
             Access::ColorAttachment => ImageLayout::ColorAttachmentOptimal,
-            Access::ResolveAttachment => ImageLayout::TransferDstOptimal,
+            Access::ResolveAttachment => ImageLayout::ColorAttachmentOptimal,
             Access::DepthAttachment => ImageLayout::DepthStencilAttachmentOptimal,
             Access::DepthAttachmentRead => ImageLayout::DepthStencilReadOnlyOptimal,
             Access::Sampled => ImageLayout::ShaderReadOnlyOptimal,
@@ -145,7 +149,7 @@ impl Access {
     pub fn image_usage(self) -> ImageUsage {
         match self {
             Access::ColorAttachment => ImageUsage::COLOR_ATTACHMENT,
-            Access::ResolveAttachment => ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_DST,
+            Access::ResolveAttachment => ImageUsage::COLOR_ATTACHMENT,
             Access::DepthAttachment | Access::DepthAttachmentRead => {
                 ImageUsage::DEPTH_STENCIL_ATTACHMENT
             }

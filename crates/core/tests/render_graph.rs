@@ -23,6 +23,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use orrin_core::gfx::format::Format;
+use orrin_core::gfx::graph::ImageDesc;
 use orrin_core::gfx::vulkan::frame::{FrameConfig, declare};
 
 /// The swapchain format the baseline is written against. Real ones vary by
@@ -70,11 +71,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -102,11 +105,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -129,11 +134,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -162,11 +169,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -194,11 +203,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: 0,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -224,11 +235,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -256,11 +269,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -287,11 +302,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: 1,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -322,11 +339,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: true,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -354,11 +373,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -386,11 +407,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -418,11 +441,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -448,11 +473,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -480,11 +507,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -510,11 +539,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: 0,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -541,11 +572,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 4096,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -572,11 +605,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 2048,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -605,11 +640,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -636,11 +673,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: 0,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -668,11 +707,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -698,11 +739,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: 0,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -733,11 +776,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -764,11 +809,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: 0,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -791,11 +838,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: false,
+                outline: false,
+                gizmo: false,
+                presents: true,
                 shadow_cascades: 2,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -804,12 +853,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
         // changed: the pass order, the barriers and the layouts are the same
         // text, and what is added is the three segment headers and the list of
         // resources that had to stop being exclusive to one queue family.
-        // The compute-culled frame. Its whole reason for being in the baseline
-        // is the pair of buffer barriers a CPU-culled frame has none of: the
+        // The compute-culled frame with cascades and the atlas on, because
+        // those are the views the dispatch exists to cull for. Every frame is
+        // compute-culled now, so what this pins in particular is the pair of
+        // buffer barriers with every shadow view behind them: the
         // write-after-write between the two dispatches, and the storage write
         // that every opaque geometry pass then waits for at the draw-indirect
-        // stage. Cascades and the atlas are on, because those are the views the
-        // dispatch exists to cull for.
+        // stage.
         (
             "editor frame, GPU culling",
             FrameConfig {
@@ -829,11 +879,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 4096,
                 async_compute: false,
-                gpu_culling: true,
                 occlusion_culling: false,
             },
         ),
@@ -863,11 +915,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 4096,
                 async_compute: false,
-                gpu_culling: true,
                 occlusion_culling: true,
             },
         ),
@@ -890,11 +944,13 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: false,
                 bloom_mips: BLOOM_MIPS,
                 overlay: true,
+                outline: true,
+                gizmo: true,
+                presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: true,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
@@ -922,15 +978,32 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 volumetric_fog: true,
                 bloom_mips: BLOOM_MIPS,
                 overlay: false,
+                outline: false,
+                gizmo: false,
+                presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 2048,
                 async_compute: true,
-                gpu_culling: false,
                 occlusion_culling: false,
             },
         ),
     ]
+}
+
+/// The declared description of the image `name`, whether the graph owns it or
+/// it is imported from the pass that keeps it across frames.
+fn image_desc(graph: &orrin_core::gfx::graph::FrameGraph, name: &str) -> Option<ImageDesc> {
+    graph
+        .transient_images()
+        .find(|(id, _)| graph.resource_name(*id) == name)
+        .map(|(_, image)| image.desc)
+        .or_else(|| {
+            graph
+                .imported_images()
+                .find(|(id, _)| graph.resource_name(*id) == name)
+                .map(|(_, desc)| *desc)
+        })
 }
 
 fn golden_path() -> PathBuf {
@@ -1030,27 +1103,269 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
             volumetric_fog: false,
             bloom_mips: BLOOM_MIPS,
             overlay: true,
+            outline: true,
+            gizmo: true,
+            presents: true,
             shadow_cascades: count,
             shadow_resolution: SHADOW_RESOLUTION,
             shadow_atlas: 0,
             async_compute: false,
-            gpu_culling: false,
             occlusion_culling: false,
         })
         .unwrap();
 
-        let (_, image) = frame
-            .graph
-            .transient_images()
-            .find(|(id, _)| frame.graph.resource_name(*id) == "shadow_cascades")
+        let desc = image_desc(&frame.graph, "shadow_cascades")
             .unwrap_or_else(|| panic!("{count} cascades declared no shadow map"));
 
         assert_eq!(
-            image.desc.array_layers,
+            desc.array_layers,
             Some(u32::from(count)),
             "{count} cascades must declare a {count}-layer array, not a plain image",
         );
     }
+}
+
+/// A cascade's depth is linear over a bounded range and a punctual face spends
+/// its precision near the light, so sixteen bits resolve millimetres where the
+/// shadows are and the other sixteen are pure bandwidth. The camera's depth is a
+/// reversed perspective projection, which only works *because* it is a float —
+/// the exponent is what spends precision on distance (see `gfx::depth`) — so it
+/// must not be narrowed alongside them.
+#[test]
+fn the_shadow_maps_are_sixteen_bit_and_the_camera_depth_is_not() {
+    let frame = declare(FrameConfig {
+        color_format: COLOR_FORMAT,
+        msaa: false,
+        ssao: true,
+        ssao_half_res: false,
+        contact_shadows: false,
+        ssr: false,
+        subsurface: false,
+        transparency: false,
+        refraction: false,
+        taa: true,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        volumetric_fog: false,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
+        shadow_cascades: 4,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 4096,
+        async_compute: false,
+        occlusion_culling: false,
+    })
+    .unwrap();
+
+    let format_of = |name: &str| {
+        image_desc(&frame.graph, name)
+            .map(|desc| desc.format)
+            .unwrap_or_else(|| panic!("the frame declared no {name}"))
+    };
+
+    assert_eq!(format_of("shadow_cascades"), Format::D16Unorm);
+    assert_eq!(format_of("shadow_atlas"), Format::D16Unorm);
+    assert_eq!(format_of("prepass_depth"), Format::D32Float);
+}
+
+fn reference_config(msaa: bool, presents: bool) -> FrameConfig {
+    FrameConfig {
+        color_format: COLOR_FORMAT,
+        msaa,
+        ssao: true,
+        ssao_half_res: false,
+        contact_shadows: false,
+        ssr: false,
+        subsurface: false,
+        transparency: false,
+        refraction: false,
+        taa: !msaa,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        volumetric_fog: false,
+        bloom_mips: BLOOM_MIPS,
+        overlay: false,
+        outline: false,
+        gizmo: false,
+        presents,
+        shadow_cascades: 0,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+        async_compute: false,
+        occlusion_culling: false,
+    }
+}
+
+/// An offscreen frame has no presentation engine to hand its image to — no
+/// swapchain extension, even — and is copied out instead, so it ends in the
+/// layout the readback copies from. `PresentSrc` there is a layout the device
+/// was never asked to support.
+#[test]
+fn an_offscreen_frame_ends_ready_to_be_read_back() {
+    let frame = declare(reference_config(false, false)).unwrap();
+    let plan = format!("{}", frame.graph);
+    assert!(
+        !plan.contains("PresentSrc"),
+        "an offscreen frame named PresentSrc:\n{plan}"
+    );
+    let closing: Vec<_> = frame
+        .graph
+        .final_barriers()
+        .iter()
+        .filter(|barrier| frame.graph.resource_name(barrier.resource) == "swapchain_color")
+        .map(|barrier| format!("{barrier:?}"))
+        .collect();
+    assert!(
+        closing.iter().any(|b| b.contains("TransferSrcOptimal")),
+        "the target must end ready for the readback copy: {closing:?}"
+    );
+
+    let presenting = format!("{}", declare(reference_config(false, true)).unwrap().graph);
+    assert!(presenting.contains("PresentSrc"));
+}
+
+/// Dynamic rendering resolves into the attachment's own layout: the resolve
+/// target is written as a colour attachment, so that is the layout it must be
+/// in, and it needs no transfer usage at all.
+#[test]
+fn an_msaa_resolve_target_is_written_in_the_attachment_layout() {
+    let frame = declare(reference_config(true, true)).unwrap();
+    let plan = format!("{}", frame.graph);
+    assert!(
+        !plan.contains("hdr_color Undefined->TransferDstOptimal"),
+        "{plan}"
+    );
+    let (_, hdr) = frame
+        .graph
+        .transient_images()
+        .find(|(id, _)| frame.graph.resource_name(*id) == "hdr_color")
+        .expect("an MSAA frame resolves into hdr_color");
+    assert!(
+        !hdr.usage
+            .contains(orrin_core::gfx::graph::ImageUsage::TRANSFER_DST),
+        "a resolve target asked for TRANSFER_DST"
+    );
+}
+
+/// With nothing selected there is nothing to outline and no gizmo to draw, and
+/// the outline is two full-screen passes — a mask cleared and drawn into, then
+/// an edge search over all of it — that would otherwise run every frame to
+/// produce nothing.
+#[test]
+fn an_empty_selection_runs_no_outline_and_no_gizmo() {
+    let config = |outline, gizmo| FrameConfig {
+        color_format: COLOR_FORMAT,
+        msaa: false,
+        ssao: true,
+        ssao_half_res: false,
+        contact_shadows: false,
+        ssr: false,
+        subsurface: false,
+        transparency: false,
+        refraction: false,
+        taa: true,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        volumetric_fog: false,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        outline,
+        gizmo,
+        presents: true,
+        shadow_cascades: 0,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+        async_compute: false,
+        occlusion_culling: false,
+    };
+    let passes = |outline, gizmo| {
+        let frame = declare(config(outline, gizmo)).unwrap();
+        frame
+            .graph
+            .order()
+            .iter()
+            .map(|&pass| frame.graph.pass_name(pass))
+            .collect::<Vec<_>>()
+    };
+
+    let empty = passes(false, false);
+    for name in ["outline_mask", "outline", "gizmo"] {
+        assert!(
+            !empty.contains(&name),
+            "{name} ran with nothing to draw: {empty:?}"
+        );
+    }
+    assert!(empty.contains(&"overlay"), "the UI itself still draws");
+
+    let selected = passes(true, true);
+    for name in ["outline_mask", "outline", "gizmo", "overlay"] {
+        assert!(selected.contains(&name), "{name} missing: {selected:?}");
+    }
+}
+
+/// The far cascades are not re-rendered every frame (`shadows::CascadeCache`),
+/// so the cascade map has to outlive the frame: it is imported from the shadow
+/// pass rather than owned by the graph, whose transients start every frame
+/// `Undefined` and would hand a skipped cascade garbage. It is entered in the
+/// layout the frame's samplers leave it in, so a cascade that is skipped keeps
+/// its texels across the transition into the attachment layout and back.
+#[test]
+fn the_shadow_cascades_leave_the_frame_where_the_next_one_expects_them() {
+    let frame = declare(FrameConfig {
+        color_format: COLOR_FORMAT,
+        msaa: false,
+        ssao: true,
+        ssao_half_res: false,
+        contact_shadows: false,
+        ssr: false,
+        subsurface: false,
+        transparency: false,
+        refraction: false,
+        taa: true,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        volumetric_fog: false,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
+        shadow_cascades: 4,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+        async_compute: false,
+        occlusion_culling: false,
+    })
+    .unwrap();
+
+    let imported = frame
+        .graph
+        .imported_images()
+        .any(|(id, _)| frame.graph.resource_name(id) == "shadow_cascades");
+    assert!(
+        imported,
+        "a transient cascade map loses the cascades a frame skips"
+    );
+
+    let plan = format!("{}", frame.graph);
+    assert!(
+        plan.contains("shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal"),
+        "the map must be entered from the layout it was left in, not Undefined:\n{plan}",
+    );
+    let closing: Vec<_> = frame
+        .graph
+        .final_barriers()
+        .iter()
+        .filter(|barrier| frame.graph.resource_name(barrier.resource) == "shadow_cascades")
+        .collect();
+    assert!(closing.is_empty(), "{closing:?}");
 }
 
 /// TAA ping-pongs two allocations, so the image this frame writes as `taa_color`
@@ -1081,11 +1396,13 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1138,11 +1455,13 @@ fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
         volumetric_fog: true,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
         shadow_cascades: 4,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1191,11 +1510,13 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
         volumetric_fog: true,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
         shadow_cascades: 4,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1253,11 +1574,13 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1302,11 +1625,13 @@ fn the_gizmo_draws_between_the_tonemap_and_the_overlay() {
         volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay,
+        outline: overlay,
+        gizmo: overlay,
+        presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute,
-        gpu_culling: false,
         occlusion_culling: false,
     };
     for async_compute in [false, true] {
@@ -1358,11 +1683,13 @@ fn the_selection_outline_is_masked_then_drawn_under_the_gizmo() {
         volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay,
+        outline: overlay,
+        gizmo: overlay,
+        presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     };
     let frame = declare(config(true)).unwrap();
@@ -1427,11 +1754,13 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         volumetric_fog: false,
         bloom_mips: 0,
         overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1488,11 +1817,13 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
         volumetric_fog: false,
         bloom_mips: 0,
         overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     };
 
@@ -1587,11 +1918,13 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1649,11 +1982,13 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         volumetric_fog: false,
         bloom_mips: 0,
         overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1702,11 +2037,13 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     })
     .unwrap();
@@ -1780,11 +2117,13 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
-        gpu_culling: false,
         occlusion_culling: false,
     };
 
@@ -1876,11 +2215,13 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
         volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
         shadow_cascades: 4,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 4096,
         async_compute: false,
-        gpu_culling: true,
         occlusion_culling: false,
     })
     .unwrap();
@@ -2050,11 +2391,13 @@ fn occlusion_base() -> FrameConfig {
         volumetric_fog: false,
         bloom_mips: BLOOM_MIPS,
         overlay: true,
+        outline: true,
+        gizmo: true,
+        presents: true,
         shadow_cascades: 4,
         shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 4096,
         async_compute: false,
-        gpu_culling: true,
         occlusion_culling: false,
     }
 }

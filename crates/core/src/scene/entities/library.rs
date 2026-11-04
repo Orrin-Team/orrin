@@ -42,9 +42,33 @@ pub const WALL_DEPTH: f32 = 0.05;
 /// a bad level shows up as one sphere that does not belong in the row.
 pub const SWEEP: usize = 5;
 
+/// The rock material's four maps, in the order they are uploaded: albedo,
+/// normal, roughness, displacement.
+const ROCK_MAPS: [&[u8]; 4] = [
+    include_bytes!("../../assets/Rocks016_1K-JPG_Color.jpg"),
+    include_bytes!("../../assets/Rocks016_1K-JPG_NormalDX.jpg"),
+    include_bytes!("../../assets/Rocks016_1K-JPG_Roughness.jpg"),
+    include_bytes!("../../assets/Rocks016_1K-JPG_Displacement.jpg"),
+];
+
+/// [`ROCK_MAPS`] decoded, in the same order.
+///
+/// Side by side across the pool, because the four decodes are most of the
+/// CPU half of a cold start and share nothing. Only the decode: the uploads
+/// stay serial and in this order, since a texture handle is its upload index.
+fn rock_maps() -> Vec<(Vec<u8>, u32, u32)> {
+    crate::threads::map(&ROCK_MAPS, |bytes| load_rgba(bytes))
+}
+
 pub fn load_library(
     backend: &mut impl RenderBackend,
 ) -> (Assets, MeshBounds, MaterialBlends, AssetPreviews) {
+    // Started before anything else and collected where the rock maps upload, so
+    // the meshes, their previews and the procedural maps below are built while
+    // it runs. The longest single decode is otherwise the whole cold start's
+    // critical path, with the rest of the pool idle behind it.
+    let rocks = crate::threads::defer(rock_maps);
+
     let mut assets = Assets::new();
     let mut bounds = MeshBounds::default();
     let mut blends = MaterialBlends::default();
@@ -271,16 +295,14 @@ pub fn load_library(
         },
     );
 
-    let (px, w, h) = load_rgba(include_bytes!("../../assets/Rocks016_1K-JPG_Color.jpg"));
-    let rock_albedo = backend.load_texture(&px, w, h, true);
-    let (px, w, h) = load_rgba(include_bytes!("../../assets/Rocks016_1K-JPG_NormalDX.jpg"));
-    let rock_normal = backend.load_texture(&px, w, h, false);
-    let (px, w, h) = load_rgba(include_bytes!("../../assets/Rocks016_1K-JPG_Roughness.jpg"));
-    let rock_rough = backend.load_texture(&px, w, h, false);
-    let (px, w, h) = load_rgba(include_bytes!(
-        "../../assets/Rocks016_1K-JPG_Displacement.jpg"
-    ));
-    let rock_height = backend.load_texture(&px, w, h, false);
+    let [albedo, normal, rough, height]: [_; 4] = rocks
+        .wait()
+        .try_into()
+        .expect("one decoded image per rock map");
+    let rock_albedo = backend.load_texture(&albedo.0, albedo.1, albedo.2, true);
+    let rock_normal = backend.load_texture(&normal.0, normal.1, normal.2, false);
+    let rock_rough = backend.load_texture(&rough.0, rough.1, rough.2, false);
+    let rock_height = backend.load_texture(&height.0, height.1, height.2, false);
     assets.insert_texture("rock_albedo", rock_albedo);
     assets.insert_texture("rock_normal", rock_normal);
     assets.insert_texture("rock_rough", rock_rough);
@@ -621,5 +643,34 @@ fn load_mesh(
     // box the drawn geometry occupies.
     if let Some(aabb) = backend.mesh_bounds(handle) {
         bounds.insert(handle, aabb);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_threads<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("a pool")
+            .install(f)
+    }
+
+    /// The rock maps are decoded side by side, and their handles are numbered
+    /// in upload order, so what has to survive the parallelism is which image
+    /// lands in which slot. Each slot is checked against its own file decoded
+    /// alone, under a serial pool and a parallel one.
+    #[test]
+    fn the_rock_maps_decode_into_their_own_slots_whatever_the_thread_count() {
+        let alone: Vec<_> = ROCK_MAPS.iter().map(|bytes| load_rgba(bytes)).collect();
+        for threads in [1, 4] {
+            let decoded = with_threads(threads, rock_maps);
+            assert_eq!(decoded.len(), alone.len());
+            for (slot, (got, want)) in decoded.iter().zip(&alone).enumerate() {
+                assert!(got == want, "slot {slot} differs under {threads} threads");
+            }
+        }
     }
 }

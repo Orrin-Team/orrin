@@ -488,7 +488,7 @@ fn jitter(index: u64) -> f32 {
 
 fn allocate_history(device: &Device, extent: [u32; 3]) -> [TextureViewId; 2] {
     std::array::from_fn(|_| {
-        device.create_texture(&TextureDesc {
+        let texture = device.create_texture(&TextureDesc {
             format: FOG_FORMAT,
             dimension: TextureDimension::D3,
             extent,
@@ -500,7 +500,10 @@ fn allocate_history(device: &Device, extent: [u32; 3]) -> [TextureViewId; 2] {
             // pass's next frame.
             usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
             memoryless: false,
-        })
+        });
+        // The layout the scatter pass's history is declared to enter in.
+        device.initialise_sampled(texture);
+        texture
     })
 }
 
@@ -512,7 +515,7 @@ fn allocate_history(device: &Device, extent: [u32; 3]) -> [TextureViewId; 2] {
 /// than leave it alone, which is why `fog_term` gates the fetch on the block's
 /// own "volume is live" flag and this exists only to satisfy the binding.
 fn allocate_fallback(device: &Device) -> TextureViewId {
-    device.create_texture(&TextureDesc {
+    let texture = device.create_texture(&TextureDesc {
         format: FOG_FORMAT,
         dimension: TextureDimension::D3,
         extent: [1, 1, 1],
@@ -521,7 +524,11 @@ fn allocate_fallback(device: &Device) -> TextureViewId {
         samples: SampleCount::Sample1,
         usage: ImageUsage::SAMPLED,
         memoryless: false,
-    })
+    });
+    // Bound every frame the fog is off, and a sampled binding is checked
+    // against its layout whether or not the shader's branch reads it.
+    device.initialise_sampled(texture);
+    texture
 }
 
 #[cfg(test)]

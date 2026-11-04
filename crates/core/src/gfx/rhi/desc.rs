@@ -62,6 +62,10 @@ pub enum VertexFormat {
     Float4,
     /// Four bytes, each an unsigned-normalised channel.
     Unorm8x4,
+    /// Two signed-normalised 16-bit channels.
+    Snorm16x2,
+    /// Four signed-normalised 16-bit channels.
+    Snorm16x4,
 }
 
 /// One attribute of a vertex stream. Matched to the shader by name, as the
@@ -129,7 +133,7 @@ pub enum TextureSwizzle {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DepthCompare {
-    /// The engine's forward-Z convention.
+    /// Forward-Z, which only the shadow maps still use. See [`crate::gfx::depth`].
     Less,
     /// Against a depth another pass already wrote, which is how a one-sample
     /// forward pass gets perfect early-Z from the geometry prepass.
@@ -137,6 +141,10 @@ pub enum DepthCompare {
     /// For geometry that sits exactly on the far plane, which the depth clear
     /// would otherwise reject.
     LessOrEqual,
+    /// The camera's reversed-Z convention, [`crate::gfx::depth::NEARER`].
+    Greater,
+    /// [`crate::gfx::depth::NEARER_OR_EQUAL`].
+    GreaterOrEqual,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

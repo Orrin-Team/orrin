@@ -25,6 +25,25 @@ const BINS: u32 = 256;
 /// Side of the histogram pass's workgroup, so that `TILE * TILE == BINS`.
 const TILE: u32 = 16;
 
+/// The histogram meters one pixel per `STRIDE x STRIDE` block. A geometric mean
+/// over a quarter of the frame is the same exposure to well under a bin, and
+/// it is a quarter of the invocations and shared atomics. Point-sampled rather
+/// than a downsampled image, which would average luminance before the log and
+/// meter a different statistic. Pushed to the shader, so the two cannot drift.
+const STRIDE: u32 = 2;
+
+/// The grid of metered pixels, which is what the histogram pass is dispatched
+/// over and bounds-checks against.
+fn metered_extent(extent: [u32; 2]) -> [u32; 2] {
+    [extent[0].div_ceil(STRIDE), extent[1].div_ceil(STRIDE)]
+}
+
+/// How many pixels the histogram bins, which the averaging pass divides by.
+fn metered_pixel_count(extent: [u32; 2]) -> u32 {
+    let [width, height] = metered_extent(extent);
+    width * height
+}
+
 pub struct ExposurePass {
     histogram_pipeline: PipelineId,
     average_pipeline: PipelineId,
@@ -158,17 +177,19 @@ impl ExposurePass {
 
         encoder.bind_pipeline(self.histogram_pipeline);
         encoder.bind_group(0, set);
+        let metered = metered_extent(extent);
         encoder.push_constants(&[
             self.settings.min_log_luminance.to_bits(),
             (1.0 / self.log_luminance_range()).to_bits(),
-            extent[0],
-            extent[1],
+            metered[0],
+            metered[1],
+            STRIDE,
         ]);
 
-        // The dispatch covers every pixel of `extent` and the shader
-        // bounds-checks the tail invocations of a partial tile against the same
-        // extent, so no invocation reads outside the image.
-        encoder.dispatch([extent[0].div_ceil(TILE), extent[1].div_ceil(TILE), 1]);
+        // The dispatch covers the metered grid and the shader bounds-checks the
+        // tail invocations of a partial tile against the same grid, so no
+        // invocation reads outside the image.
+        encoder.dispatch([metered[0].div_ceil(TILE), metered[1].div_ceil(TILE), 1]);
     }
 
     pub fn record_average(&self, device: &Device, encoder: &mut Encoder, extent: [u32; 2]) {
@@ -196,8 +217,8 @@ impl ExposurePass {
             HdrSettings::adaptation_rate(self.settings.adaptation_darken, self.dt).to_bits(),
             self.settings.exposure_compensation.to_bits(),
             // Exactly what the histogram pass counted: it bins one pixel
-            // per invocation inside the extent and skips the rest.
-            extent[0] * extent[1],
+            // per invocation inside the metered grid and skips the rest.
+            metered_pixel_count(extent),
         ]);
 
         // One workgroup, sized in the shader to the bin count, so every
@@ -271,6 +292,28 @@ mod tests {
         // whether the histogram can represent it. Pulling the floor down widens
         // what can be measured and does not widen what counts as black.
         assert!(0.005f32.log2() > min_log);
+    }
+
+    /// The histogram meters one pixel in every `STRIDE x STRIDE` block. Every
+    /// pixel it fetches must be inside the frame, the blocks must reach the
+    /// frame's far edges (an odd width included), and the averaging pass must
+    /// divide by exactly the number of pixels binned, or every frame meters
+    /// dark by the ratio between the two.
+    #[test]
+    fn the_metered_grid_covers_the_frame_and_counts_what_it_bins() {
+        for extent in [[1, 1], [2, 2], [3, 5], [1920, 1080], [2561, 1441]] {
+            let metered = metered_extent(extent);
+            for axis in 0..2 {
+                let last_fetch = (metered[axis] - 1) * STRIDE;
+                assert!(last_fetch < extent[axis], "{extent:?} fetches outside");
+                assert!(
+                    last_fetch + STRIDE >= extent[axis],
+                    "{extent:?} leaves its far edge unmetered"
+                );
+            }
+            assert_eq!(metered_pixel_count(extent), metered[0] * metered[1]);
+        }
+        assert_eq!(metered_pixel_count([1920, 1080]), 1920 * 1080 / 4);
     }
 
     /// The top bin has to be reachable, or the brightest stop of the metering

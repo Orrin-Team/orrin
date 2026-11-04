@@ -1,6 +1,7 @@
 use glam::Vec3;
 
 use crate::geom::Aabb;
+use crate::gfx::clusters::{CLUSTERS, DepthSlicing, LightClusters};
 use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, ShadowAtlas};
 use crate::gfx::sh::SH9;
 use crate::gfx::shadows::MAX_CASCADES;
@@ -14,7 +15,7 @@ use super::cull::Draws;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
-use super::{MSAA_SAMPLES, PassCtx, ShadowFrame, VulkanRenderer};
+use super::{MSAA_SAMPLES, ShadowFrame, VulkanRenderer};
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::rhi::MeshSpan;
 use crate::gfx::rhi::{
@@ -76,6 +77,10 @@ pub(crate) mod material_flags {
     /// can ask the same question about the pixel it is on — the 1-sample passes
     /// need it to know whether to `discard`.
     pub const MASKED: u32 = 1 << 6;
+    /// Every optional lobe: what a material must use none of to draw with the
+    /// flat pipeline, whose shader is compiled without them. See
+    /// `ForwardPipelines`.
+    pub const LOBES: u32 = CLEARCOAT | SHEEN | ANISOTROPY | TRANSMISSION | SUBSURFACE | PARALLAX;
 }
 
 /// Ceiling on a material's parallax step counts. Keep in sync with
@@ -134,71 +139,115 @@ impl GpuMaterial {
     pub(super) fn is_masked(&self) -> bool {
         self.tex_flags[1] & material_flags::MASKED != 0
     }
+
+    /// Whether any optional lobe is on, which is what sends a material to the
+    /// full forward pipeline rather than the flat one. Read off the uploaded
+    /// flag word for the reason `is_masked` is.
+    pub(super) fn is_lobed(&self) -> bool {
+        self.tex_flags[1] & material_flags::LOBES != 0
+    }
 }
 
 /// Pack the engine's [`SceneLighting`] into the std140 layout the shader expects.
-#[allow(clippy::too_many_arguments)]
-fn to_gpu_lighting(
-    lighting: &SceneLighting,
-    camera_pos: Vec3,
-    extent: [u32; 2],
-    shadows: Option<ShadowFrame<'_>>,
-    atlas: &ShadowAtlas,
-    irradiance: [Vec3; SH9],
-    environment_yaw: f32,
-    env_specular: Vec3,
-) -> GpuLighting {
-    let (w, h) = (extent[0] as f32, extent[1] as f32);
-    let count = lighting.point_lights.len().min(MAX_POINT_LIGHTS);
-    let mut point_lights = [GpuPointLight::ZERO; MAX_POINT_LIGHTS];
-    for (index, (slot, light)) in point_lights
-        .iter_mut()
-        .zip(lighting.point_lights.iter().take(count))
+/// The point lights as the shader's storage buffer holds them, into `out`.
+/// Never empty: a buffer binding of zero bytes is invalid, and a frame with no
+/// lights still binds one, whose row no cluster ever names.
+fn gpu_point_lights(lighting: &SceneLighting, atlas: &ShadowAtlas, out: &mut Vec<GpuPointLight>) {
+    out.clear();
+    for (index, light) in lighting
+        .point_lights
+        .iter()
+        .take(MAX_POINT_LIGHTS)
         .enumerate()
     {
-        slot.position = [
-            light.position.x,
-            light.position.y,
-            light.position.z,
-            light.range.max(1e-4),
-        ];
-        slot.color = [light.color.x, light.color.y, light.color.z, light.candela];
-        // A light that asked for tiles and did not get them keeps its -1 and
-        // shades unshadowed, which is the whole behaviour of the budget: too
-        // many casters costs shadows, never correctness.
-        slot.shadow = match atlas.caster(LightKind::Point, index) {
-            Some(caster) => [caster.first_face as f32, caster.near, 0.0, 0.0],
-            None => [-1.0, 0.0, 0.0, 0.0],
-        };
+        out.push(GpuPointLight {
+            position: [
+                light.position.x,
+                light.position.y,
+                light.position.z,
+                light.range.max(1e-4),
+            ],
+            color: [light.color.x, light.color.y, light.color.z, light.candela],
+            // A light that asked for tiles and did not get them keeps its -1 and
+            // shades unshadowed, which is the whole behaviour of the budget: too
+            // many casters costs shadows, never correctness.
+            shadow: match atlas.caster(LightKind::Point, index) {
+                Some(caster) => [caster.first_face as f32, caster.near, 0.0, 0.0],
+                None => [-1.0, 0.0, 0.0, 0.0],
+            },
+        });
     }
+    if out.is_empty() {
+        out.push(GpuPointLight::ZERO);
+    }
+}
 
-    let spot_count = lighting.spot_lights.len().min(MAX_SPOT_LIGHTS);
-    let mut spot_lights = [GpuSpotLight::ZERO; MAX_SPOT_LIGHTS];
-    for (index, (slot, light)) in spot_lights
-        .iter_mut()
-        .zip(lighting.spot_lights.iter().take(spot_count))
+/// [`gpu_point_lights`] for the spots.
+fn gpu_spot_lights(lighting: &SceneLighting, atlas: &ShadowAtlas, out: &mut Vec<GpuSpotLight>) {
+    out.clear();
+    for (index, light) in lighting
+        .spot_lights
+        .iter()
+        .take(MAX_SPOT_LIGHTS)
         .enumerate()
     {
-        slot.position = [
-            light.position.x,
-            light.position.y,
-            light.position.z,
-            light.range.max(1e-4),
-        ];
-        slot.direction = [
-            light.direction.x,
-            light.direction.y,
-            light.direction.z,
-            light.outer_cos,
-        ];
-        slot.color = [light.color.x, light.color.y, light.color.z, light.candela];
         let face = atlas
             .caster(LightKind::Spot, index)
             .map_or([-1.0, 0.0], |caster| {
                 [caster.first_face as f32, caster.near]
             });
-        slot.params = [light.inner_cos, face[0], face[1], 0.0];
+        out.push(GpuSpotLight {
+            position: [
+                light.position.x,
+                light.position.y,
+                light.position.z,
+                light.range.max(1e-4),
+            ],
+            direction: [
+                light.direction.x,
+                light.direction.y,
+                light.direction.z,
+                light.outer_cos,
+            ],
+            color: [light.color.x, light.color.y, light.color.z, light.candela],
+            params: [light.inner_cos, face[0], face[1], 0.0],
+        });
     }
+    if out.is_empty() {
+        out.push(GpuSpotLight::ZERO);
+    }
+}
+
+/// The cluster lists as the shader's `LightClusters` block reads them: the
+/// fixed array of ranges, then the indices — at least one, for the reason the
+/// light buffers are never empty.
+fn gpu_clusters(clusters: &LightClusters, out: &mut Vec<u32>) {
+    out.clear();
+    if clusters.ranges.len() == CLUSTERS {
+        out.extend(clusters.ranges.iter().flatten());
+    } else {
+        out.resize(CLUSTERS * 4, 0);
+    }
+    out.extend(&clusters.indices);
+    out.push(0);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn to_gpu_lighting(
+    lighting: &SceneLighting,
+    camera: &Camera,
+    extent: [u32; 2],
+    shadows: Option<ShadowFrame<'_>>,
+    irradiance: [Vec3; SH9],
+    environment_yaw: f32,
+    env_specular: Vec3,
+) -> GpuLighting {
+    let camera_pos = camera.position;
+    let (w, h) = (extent[0] as f32, extent[1] as f32);
+    let count = lighting.point_lights.len().min(MAX_POINT_LIGHTS);
+    let spot_count = lighting.spot_lights.len().min(MAX_SPOT_LIGHTS);
+    let slicing = DepthSlicing::new(camera.near, camera.far);
+    let forward = (camera.target - camera.position).normalize_or(Vec3::NEG_Z);
 
     // The shader wants the direction *toward* the light, so negate.
     let to_sun = (-lighting.sun.direction).normalize_or_zero();
@@ -226,8 +275,8 @@ fn to_gpu_lighting(
         ],
         viewport: [w, h, 1.0 / w, 1.0 / h],
         cascades: GpuCascades::new(shadows),
-        point_lights,
-        spot_lights,
+        clusters: [slicing.scale, slicing.bias, 0.0, 0.0],
+        view_forward: [forward.x, forward.y, forward.z, 0.0],
         environment: {
             let (sin, cos) = environment_yaw.to_radians().sin_cos();
             [sin, cos, 0.0, 0.0]
@@ -307,8 +356,8 @@ impl GpuCascades {
     }
 }
 
-/// GPU mirror of a [`PointLight`](crate::gfx::PointLight), padded to std140
-/// (three `vec4`s).
+/// GPU mirror of a [`PointLight`](crate::gfx::PointLight): three `vec4`s, so
+/// std430 lays the shader's array out exactly like a slice of these.
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuPointLight {
@@ -330,7 +379,8 @@ impl GpuPointLight {
     };
 }
 
-/// GPU mirror of a [`SpotLight`](crate::gfx::SpotLight), padded to std140.
+/// GPU mirror of a [`SpotLight`](crate::gfx::SpotLight): four `vec4`s, as std430
+/// wants them.
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 struct GpuSpotLight {
@@ -377,8 +427,11 @@ struct GpuLighting {
     /// x=w, y=h, z=1/w, w=1/h
     viewport: [f32; 4],
     cascades: GpuCascades,
-    point_lights: [GpuPointLight; MAX_POINT_LIGHTS],
-    spot_lights: [GpuSpotLight; MAX_SPOT_LIGHTS],
+    /// x = the depth slicing's scale, y = its bias. See `gfx::clusters`.
+    clusters: [f32; 4],
+    /// xyz = the camera's forward axis, which a fragment's view depth — and so
+    /// its cluster's slice — is measured along.
+    view_forward: [f32; 4],
     /// x = sin(environment yaw), y = cos(environment yaw). The same rotation
     /// the skybox samples through, so the sky and what it lights agree.
     environment: [f32; 4],
@@ -522,6 +575,17 @@ impl ForwardSets {
 /// *frame* — it decides which render pass is open and therefore how many colour
 /// attachments a pipeline must declare — while `masked` is a property of a
 /// *run*, so both of those have to exist at once whichever frame it is.
+/// Every forward pipeline one sample count needs, in the four variants a batch
+/// can be (see `cull::Variant`), each with and without the subsurface target.
+///
+/// The `flat` ones run `shading.glsl` compiled with `ORRIN_FLAT_SURFACE`, which
+/// takes the optional lobes out — clear coat, sheen, anisotropy, transmission,
+/// subsurface, parallax — for the materials that use none of them, which is
+/// most. Not to save the lobes' work: behind their flag tests that is only a
+/// branch, and measured at ~0.025 ms. It is that their code being there at all
+/// cost every material a quarter of the pass (forward 0.77 -> 0.58 ms on the
+/// demo, M5 Pro, with the lobes compiled out), as register pressure and the
+/// occupancy it costs. One source still, as a define, so the two cannot drift.
 struct ForwardPipelines {
     plain: PipelineId,
     subsurface: PipelineId,
@@ -531,15 +595,25 @@ struct ForwardPipelines {
     /// coverage across four samples, a `discard` at one.
     masked: PipelineId,
     masked_subsurface: PipelineId,
+    flat: PipelineId,
+    flat_subsurface: PipelineId,
+    masked_flat: PipelineId,
+    masked_flat_subsurface: PipelineId,
 }
 
 impl ForwardPipelines {
-    /// The pair a frame draws with, given whether it diffuses subsurface light.
-    fn for_frame(&self, subsurface: bool) -> (PipelineId, PipelineId) {
-        if subsurface {
-            (self.subsurface, self.masked_subsurface)
-        } else {
-            (self.plain, self.masked)
+    /// The pipeline a batch of `variant` draws with in a frame that does or
+    /// does not diffuse subsurface light.
+    fn for_variant(&self, variant: super::cull::Variant, subsurface: bool) -> PipelineId {
+        match (variant.masked, variant.lobed, subsurface) {
+            (false, false, false) => self.flat,
+            (false, false, true) => self.flat_subsurface,
+            (false, true, false) => self.plain,
+            (false, true, true) => self.subsurface,
+            (true, false, false) => self.masked_flat,
+            (true, false, true) => self.masked_flat_subsurface,
+            (true, true, false) => self.masked,
+            (true, true, true) => self.masked_subsurface,
         }
     }
 }
@@ -593,6 +667,16 @@ impl ForwardTargets {
     }
 }
 
+/// The light and cluster rows, rebuilt every frame into buffers kept for their
+/// allocations. Behind a lock only because `begin_frame` takes `&self`; it is
+/// taken once a frame, on the thread that records it.
+#[derive(Default)]
+struct LightScratch {
+    points: Vec<GpuPointLight>,
+    spots: Vec<GpuSpotLight>,
+    clusters: Vec<u32>,
+}
+
 pub struct ForwardPass {
     /// The four shapes this pass rasterises into, and the only thing a pipeline
     /// needs to know about any of them.
@@ -623,6 +707,7 @@ pub struct ForwardPass {
     /// table above is.
     sampler: SamplerId,
     ao_sampler: SamplerId,
+    light_scratch: std::sync::Mutex<LightScratch>,
 }
 
 impl ForwardPass {
@@ -692,7 +777,7 @@ impl ForwardPass {
                 } else {
                     DepthTest {
                         write: true,
-                        compare: DepthCompare::Less,
+                        compare: crate::gfx::depth::NEARER,
                     }
                 }),
                 // The material textures, of which a scene writes only the ones it
@@ -733,6 +818,20 @@ impl ForwardPass {
                 false,
                 msaa,
             ),
+            flat: pipeline(&[msaa_color_format], ShaderId::ForwardFragFlat, true, msaa),
+            flat_subsurface: pipeline(
+                &sss(msaa_color_format),
+                ShaderId::ForwardSssFragFlat,
+                true,
+                msaa,
+            ),
+            masked_flat: pipeline(&[msaa_color_format], ShaderId::ForwardFragFlat, false, msaa),
+            masked_flat_subsurface: pipeline(
+                &sss(msaa_color_format),
+                ShaderId::ForwardSssFragFlat,
+                false,
+                msaa,
+            ),
         };
         // The masked variants take the alpha-testing shaders rather than the
         // plain ones: there is no coverage to spend at one sample, so the cut has
@@ -744,6 +843,20 @@ impl ForwardPass {
             masked_subsurface: pipeline(
                 &sss(color_format),
                 ShaderId::ForwardSssFragAlphaTest,
+                false,
+                one,
+            ),
+            flat: pipeline(&[color_format], ShaderId::ForwardFragFlat, true, one),
+            flat_subsurface: pipeline(&sss(color_format), ShaderId::ForwardSssFragFlat, true, one),
+            masked_flat: pipeline(
+                &[color_format],
+                ShaderId::ForwardFragAlphaTestFlat,
+                false,
+                one,
+            ),
+            masked_flat_subsurface: pipeline(
+                &sss(color_format),
+                ShaderId::ForwardSssFragAlphaTestFlat,
                 false,
                 one,
             ),
@@ -775,6 +888,7 @@ impl ForwardPass {
             single,
             sampler,
             ao_sampler,
+            light_scratch: std::sync::Mutex::new(LightScratch::default()),
         }
     }
 
@@ -954,16 +1068,33 @@ impl ForwardPass {
         let env_specular = renderer.environment.specular_tint(ambient, environment);
         let lighting_block = to_gpu_lighting(
             lighting,
-            camera.position,
+            camera,
             extent,
             shadows,
-            atlas,
             irradiance,
             environment.yaw,
             env_specular,
         );
         let lighting_buffer =
             device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&lighting_block));
+        let (point_buffer, spot_buffer, cluster_buffer) = {
+            let mut scratch = self.light_scratch.lock().expect("light scratch poisoned");
+            let LightScratch {
+                points,
+                spots,
+                clusters,
+            } = &mut *scratch;
+            gpu_point_lights(lighting, atlas, points);
+            gpu_spot_lights(lighting, atlas, spots);
+            points.resize(MAX_POINT_LIGHTS, GpuPointLight::ZERO);
+            spots.resize(MAX_SPOT_LIGHTS, GpuSpotLight::ZERO);
+            gpu_clusters(&renderer.light_clusters, clusters);
+            (
+                device.upload_block(BlockKind::Uniform, bytemuck::cast_slice(points)),
+                device.upload_block(BlockKind::Uniform, bytemuck::cast_slice(spots)),
+                device.upload_block(BlockKind::Storage, bytemuck::cast_slice(clusters)),
+            )
+        };
 
         // Always at least one entry: a frame where nothing punctual casts still
         // has to bind something for the descriptor. Every light's face index is
@@ -996,6 +1127,18 @@ impl ForwardPass {
                 Binding {
                     binding: 1,
                     resource: BindingResource::StorageBuffer(decals),
+                },
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::UniformBuffer(point_buffer),
+                },
+                Binding {
+                    binding: 3,
+                    resource: BindingResource::UniformBuffer(spot_buffer),
+                },
+                Binding {
+                    binding: 4,
+                    resource: BindingResource::StorageBuffer(cluster_buffer),
                 },
             ],
         );
@@ -1065,7 +1208,6 @@ impl ForwardPass {
     pub(super) fn draw(
         &self,
         builder: &mut Encoder,
-        renderer: &PassCtx<'_>,
         draws: Draws<'_>,
         view: &FrameView,
         extent: [u32; 2],
@@ -1080,7 +1222,7 @@ impl ForwardPass {
         // The jittered one, from the frame's shared view: every pass that
         // rasterises geometry has to agree on it to a subpixel.
         let view_proj = view.view_proj;
-        let (plain, masked) = self.pipelines(msaa).for_frame(subsurface);
+        let pipelines = self.pipelines(msaa);
         // The one value a geometry draw still pushes. The fat per-object matrices
         // are in the set-4 storage buffer, and what used to sit beside
         // `view_proj` here — the run's material and its first object row — moved
@@ -1121,46 +1263,11 @@ impl ForwardPass {
         // for the pass rather than once per mesh. See `mesh`.
         builder.bind_geometry(false);
 
-        // Nothing is bound yet, so the first run always binds. `None` rather
-        // than "the plain one" so that a frame of nothing but foliage does not
-        // begin by binding a pipeline it never draws with.
-        let mut bound: Option<bool> = None;
-
-        // A unit is one (mesh, material) pair, so each is one instanced draw:
-        // the recording cost stops scaling with entity count and starts scaling
-        // with distinct mesh/material pairs. Empty on the compute path, where
-        // the regions below are what this pass records instead.
-        for unit in draws.units() {
-            let Some(mesh) = renderer.meshes.get(unit.mesh as usize) else {
-                continue;
-            };
-            // A unit is one material, so this is one lookup per draw rather than
-            // per item. The opaque order is grouped by (mesh, material), which
-            // means cutouts are not a contiguous tail and this can flip more
-            // than once — a pipeline bind per draw in the worst case, against a
-            // list whose length is distinct mesh/material pairs.
-            let wants_masked = renderer
-                .materials
-                .get(unit.material as usize)
-                .is_some_and(GpuMaterial::is_masked);
-            if bound != Some(wants_masked) {
-                bind_all(builder, if wants_masked { masked } else { plain });
-                bound = Some(wants_masked);
-            }
-            builder.draw_indexed(
-                mesh.span.index_count,
-                unit.instances,
-                mesh.span.first_index,
-                mesh.span.vertex_offset,
-                unit.object_base,
-            );
-        }
-
-        // The compute path's answer to the same question: one multi-draw per
-        // pipeline variant, over commands a dispatch wrote. Empty on the CPU
-        // path.
+        // One multi-draw per pipeline variant, over the commands the dispatch
+        // wrote: the recording cost scales with neither the entity count nor
+        // the distinct mesh/material pairs, only with the four variants.
         for region in draws.regions() {
-            bind_all(builder, if region.masked { masked } else { plain });
+            bind_all(builder, pipelines.for_variant(region.variant, subsurface));
             builder.draw_indexed_indirect(region.commands, region.range);
         }
     }

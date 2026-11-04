@@ -154,7 +154,7 @@ impl AtlasConfig {
 /// What one frame's punctual shadows resolved to.
 ///
 /// A `faces` of zero means nothing casts, which is what makes the graph drop the
-/// atlas pass entirely rather than clear a 64 MB image for no reader — the same
+/// atlas pass entirely rather than clear a 32 MB image for no reader — the same
 /// way a cascade count of zero drops the cascade passes.
 #[derive(Clone, Debug, Default)]
 pub struct ShadowAtlas {
@@ -200,7 +200,9 @@ fn face_count(kind: LightKind) -> usize {
     }
 }
 
-/// Vulkan's clip space, matching [`Camera::projection_range`] exactly.
+/// Vulkan's clip space, matching [`Camera::projection_range`]'s Y flip but not
+/// its depth: a shadow map stays forward-Z, for the reason [`crate::gfx::depth`]
+/// gives.
 ///
 /// The Y flip is not cosmetic: it is what makes a triangle's winding come out
 /// the same here as in the forward pass, and therefore what lets the shadow

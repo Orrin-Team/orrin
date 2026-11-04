@@ -1,11 +1,12 @@
 //! Deciding what each view draws, on the GPU.
 //!
-//! The CPU sweep in `systems::extract_geometry` answers the same question by
-//! testing every renderable against the camera frustum, then against every
-//! cascade, then against every shadowing light — a per-entity cost that is
-//! invisible at a hundred objects and is most of the frame at ten thousand.
-//! Here the tests are one compute dispatch over (instance, view), and what the
-//! CPU keeps is only the part that is genuinely per entity: which rows the
+//! The CPU sweep in `systems::extract_geometry` used to answer the same
+//! question by testing every renderable against the camera frustum, then
+//! against every cascade, then against every shadowing light — a per-entity
+//! cost that is invisible at a hundred objects and is most of the frame at ten
+//! thousand. That path is gone for opaque geometry: the tests are one compute
+//! dispatch over (instance, view), and what the CPU keeps is only the part that
+//! is genuinely per entity: which rows the
 //! dispatch is offered, and which batch each belongs to. That walk is still
 //! O(entities) — it is a list build and a cached lookup rather than the
 //! frustum, cascade and light tests it replaced, and it is what remains to be
@@ -142,12 +143,12 @@ pub(super) struct Batch {
 
 /// What one frame's `prepare` worked out, and what the passes read back off it.
 pub(super) struct CullFrame {
-    /// Every batch, the ones drawn by the plain pipeline first. That order is
-    /// what makes a pipeline variant a contiguous range of `draw_commands` and
-    /// therefore one multi-draw — see [`CullFrame::regions`].
+    /// Every batch, in [`Variant::class`] order. That order is what makes a
+    /// pipeline variant a contiguous range of `draw_commands` and therefore one
+    /// multi-draw — see [`Draws::regions`].
     pub batches: Vec<Batch>,
-    /// How many of them are plain, which is where the masked ones begin.
-    pub plain: usize,
+    /// Where each variant's batches begin, indexed by [`Variant::class`].
+    pub bases: [usize; CLASSES],
     /// How wide one view's block of `instance_index` is.
     pub stride: u32,
     pub views: u32,
@@ -167,147 +168,123 @@ impl CullFrame {
         view as u64 * self.batches.len() as u64 + batch as u64
     }
 
-    /// The two command ranges one view draws, plain first.
+    /// The four command ranges one view draws, in [`Variant::class`] order.
     ///
     /// A range covers every batch of its variant, including the ones this view
     /// culled to nothing: their commands were reset to zero instances and cost
     /// the command processor a skipped draw rather than the host a decision.
     /// That is the whole trade — the count is known before the dispatch runs,
     /// so recording does not have to wait for it.
-    fn ranges(&self, view: u32) -> [(bool, std::ops::Range<u64>); 2] {
+    fn ranges(&self, view: u32) -> [(Variant, std::ops::Range<u64>); CLASSES] {
         let base = view as u64 * self.batches.len() as u64;
-        let plain = self.plain as u64;
-        let total = self.batches.len() as u64;
-        [
-            (false, base..base + plain),
-            (true, base + plain..base + total),
-        ]
+        let total = self.batches.len();
+        std::array::from_fn(|class| {
+            let start = self.bases[class];
+            let end = self.bases.get(class + 1).copied().unwrap_or(total);
+            (
+                Variant::of_class(class),
+                base + start as u64..base + end as u64,
+            )
+        })
     }
 }
 
-/// What one geometry pass draws: an ordered list the CPU culled, or the batches
-/// a dispatch culled for one view.
-///
-/// The two are one type so that a pass takes one argument and asks it for both
-/// shapes. Exactly one of [`Draws::units`] and [`Draws::regions`] ever yields
-/// anything, and which it is is the culling path, so a pass writes the loop for
-/// each and neither knows which it is in.
-#[derive(Clone, Copy)]
-pub(super) enum Draws<'a> {
-    Cpu {
-        list: crate::gfx::DrawList<'a>,
-        /// Where this list's block of `instance_index` begins, which the CPU
-        /// path passes through as each run's `firstInstance`.
-        base: u32,
-    },
-    Gpu {
-        frame: &'a CullFrame,
-        view: u32,
-        commands: BufferId,
-    },
+/// Which forward pipeline a batch draws with: whether its material cuts holes,
+/// and whether it uses any of the optional lobes (`gfx::vulkan::forward::
+/// material_flags::LOBES`). The lobes are a variant because the shader that can
+/// take them costs a quarter more than one that cannot, for every material, by
+/// their code being there at all — measured, not reasoned (see
+/// `ForwardPipelines`). The depth-only passes care only about `masked`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Variant {
+    pub masked: bool,
+    pub lobed: bool,
 }
 
-/// One CPU-culled draw: which geometry, and how many instances of it.
-pub(super) struct DrawUnit<'a> {
-    pub mesh: u32,
-    pub material: u32,
-    /// The `firstInstance` of the draw. `gl_InstanceIndex` counts from it, and
-    /// the entry found there says which object row and which material.
-    pub object_base: u32,
-    pub instances: u32,
-    /// The items this unit draws, for a caller that wants to narrow it further
-    /// — which the punctual atlas does, per face.
-    pub run: Option<(crate::gfx::DrawList<'a>, std::ops::Range<usize>)>,
+/// How many variants there are, and so how many ranges a view's commands are
+/// cut into.
+pub(super) const CLASSES: usize = 4;
+
+impl Variant {
+    /// The position of this variant's batches: by mask first, then flat before
+    /// lobed, so each mask's two variants are adjacent and a depth-only pass can
+    /// draw them as one range.
+    fn class(self) -> usize {
+        usize::from(self.masked) * 2 + usize::from(self.lobed)
+    }
+
+    fn of_class(class: usize) -> Self {
+        Self {
+            masked: class >= 2,
+            lobed: class % 2 == 1,
+        }
+    }
+}
+
+/// What one opaque geometry pass draws: the batches the dispatch culled for one
+/// view, as commands in `commands` starting at that view's block.
+#[derive(Clone, Copy)]
+pub(super) struct Draws<'a> {
+    pub frame: &'a CullFrame,
+    pub view: u32,
+    pub commands: BufferId,
 }
 
 /// One multi-draw: every command of one pipeline variant, for one view.
 pub(super) struct DrawRegion {
-    /// Which of the two pipeline variants records this range. A variant is a
-    /// contiguous range precisely because batch numbering puts the plain ones
-    /// first — see [`BatchIds`].
-    pub masked: bool,
+    /// Which pipeline variant records this range. A variant is a contiguous
+    /// range precisely because batch numbering orders the variants — see
+    /// [`BatchIds`]. From [`Draws::regions_by_mask`], `lobed` is meaningless.
+    pub variant: Variant,
     pub commands: BufferId,
     /// Which of its commands this region draws.
     pub range: std::ops::Range<u32>,
 }
 
-impl<'a> Draws<'a> {
-    /// The CPU path's runs, one at a time. Empty under GPU culling.
-    ///
-    /// An iterator rather than a collected `Vec` because a pass records this
-    /// once per frame and there are up to four of them: collecting would be an
-    /// allocation per pass per frame in the middle of the frame loop, which is
-    /// the one thing recording is not allowed to do.
-    pub(super) fn units(&self) -> Units<'a> {
-        match *self {
-            Draws::Cpu { list, base } => Units::Cpu {
-                runs: list.runs(),
-                list,
-                base,
-            },
-            Draws::Gpu { .. } => Units::None,
-        }
-    }
-
-    /// The compute path's two multi-draws. Empty under CPU culling.
-    pub(super) fn regions(&self) -> impl Iterator<Item = DrawRegion> + use<'a> {
-        let ranges = match *self {
-            Draws::Cpu { .. } => None,
-            Draws::Gpu {
-                frame,
-                view,
-                commands,
-            } => Some((frame.ranges(view), commands)),
-        };
-        ranges
+impl Draws<'_> {
+    /// The view's multi-draws, one per pipeline variant that has any batches —
+    /// for the forward pass, which has a pipeline for each.
+    pub(super) fn regions(&self) -> impl Iterator<Item = DrawRegion> + use<> {
+        let commands = self.commands;
+        self.frame
+            .ranges(self.view)
             .into_iter()
-            .flat_map(|(ranges, commands)| {
-                ranges.map(move |(masked, range)| (masked, range, commands))
-            })
-            .filter(|(_, range, _)| !range.is_empty())
-            .map(|(masked, range, commands)| DrawRegion {
-                masked,
+            .filter(|(_, range)| !range.is_empty())
+            .map(move |(variant, range)| DrawRegion {
+                variant,
                 commands,
                 range: range.start as u32..range.end as u32,
             })
     }
-}
 
-/// The draws of one CPU-culled pass, one at a time.
-pub(super) enum Units<'a> {
-    Cpu {
-        runs: crate::gfx::Runs<'a>,
-        list: crate::gfx::DrawList<'a>,
-        base: u32,
-    },
-    None,
-}
-
-impl<'a> Iterator for Units<'a> {
-    type Item = DrawUnit<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Units::Cpu { runs, list, base } => {
-                let run = runs.next()?;
-                let item = list.item(run.start);
-                Some(DrawUnit {
-                    mesh: item.mesh.0,
-                    material: item.material.0,
-                    object_base: *base + run.start as u32,
-                    instances: run.len() as u32,
-                    run: Some((*list, run)),
-                })
-            }
-            Units::None => None,
-        }
+    /// The view's multi-draws with flat and lobed merged, one per mask — for a
+    /// depth-only pass, whose shaders take no lobe and whose pipelines differ
+    /// only in whether they cut holes.
+    pub(super) fn regions_by_mask(&self) -> impl Iterator<Item = DrawRegion> + use<> {
+        let commands = self.commands;
+        let [(_, flat), (_, lobed), (_, masked_flat), (_, masked_lobed)] =
+            self.frame.ranges(self.view);
+        [
+            (false, flat.start..lobed.end),
+            (true, masked_flat.start..masked_lobed.end),
+        ]
+        .into_iter()
+        .filter(|(_, range)| !range.is_empty())
+        .map(move |(masked, range)| DrawRegion {
+            variant: Variant {
+                masked,
+                lobed: false,
+            },
+            commands,
+            range: range.start as u32..range.end as u32,
+        })
     }
 }
 
 /// Which batch a (mesh, material) pair is.
 ///
-/// A batch number is *packed*: the top bit says which pipeline variant draws it,
-/// the rest is its index within that variant. The number is what persists — a
+/// A batch number is *packed*: the top two bits say which pipeline variant
+/// draws it ([`Variant::class`]), the rest is its index within that variant. The number is what persists — a
 /// pair asked for twice gets the same one for the life of the renderer, which
 /// is what makes the per-row cache below sound — while the batch's *slot*, the
 /// row of `draw_commands` it owns, is derived per frame by [`slot`] because it
@@ -321,51 +298,56 @@ impl<'a> Iterator for Units<'a> {
 #[derive(Default)]
 struct BatchIds {
     ids: HashMap<(u32, u32), u32>,
-    /// The pairs of each variant in index order, plain first. Indexed by
-    /// [`class`].
-    infos: [Vec<(u32, u32)>; 2],
+    /// The pairs of each variant in index order. Indexed by [`Variant::class`].
+    infos: [Vec<(u32, u32)>; CLASSES],
 }
 
-/// The bit of a packed batch number that says "masked".
-const MASKED_BIT: u32 = 1 << 31;
+/// Where a packed batch number's class sits. Lock-stepped with `CLASS_SHIFT`
+/// in `cull.comp`.
+const CLASS_SHIFT: u32 = 30;
+const INDEX_MASK: u32 = (1 << CLASS_SHIFT) - 1;
 
 fn class(packed: u32) -> usize {
-    usize::from(packed & MASKED_BIT != 0)
+    (packed >> CLASS_SHIFT) as usize
 }
 
 fn index(packed: u32) -> usize {
-    (packed & !MASKED_BIT) as usize
+    (packed & INDEX_MASK) as usize
 }
 
 /// The row of `draw_commands` a packed batch number owns this frame, given
-/// where the masked batches begin. The shaders do this arithmetic themselves;
-/// this is the CPU-side statement of it the tests check against.
+/// where each variant begins. The shaders do this arithmetic themselves; this
+/// is the CPU-side statement of it the tests check against.
 #[cfg(test)]
-fn slot(packed: u32, plain: usize) -> usize {
-    index(packed) + class(packed) * plain
+fn slot(packed: u32, bases: [usize; CLASSES]) -> usize {
+    bases[class(packed)] + index(packed)
 }
 
 impl BatchIds {
     /// The number for this pair, assigning one if it is new.
-    fn id(&mut self, mesh: u32, material: u32, masked: bool) -> u32 {
+    fn id(&mut self, mesh: u32, material: u32, variant: Variant) -> u32 {
         if let Some(&id) = self.ids.get(&(mesh, material)) {
             return id;
         }
-        let class = usize::from(masked);
-        let id = self.infos[class].len() as u32 | (class as u32 * MASKED_BIT);
+        let class = variant.class();
+        let id = self.infos[class].len() as u32 | ((class as u32) << CLASS_SHIFT);
         self.infos[class].push((mesh, material));
         self.ids.insert((mesh, material), id);
         id
     }
 
-    /// How many batches the plain pipeline draws, which is where the masked
-    /// ones begin.
-    fn plain(&self) -> usize {
-        self.infos[0].len()
+    /// Where each variant's batches begin this frame.
+    fn bases(&self) -> [usize; CLASSES] {
+        let mut start = 0;
+        std::array::from_fn(|class| {
+            let base = start;
+            start += self.infos[class].len();
+            base
+        })
     }
 
     fn len(&self) -> usize {
-        self.infos[0].len() + self.infos[1].len()
+        self.infos.iter().map(Vec::len).sum()
     }
 }
 
@@ -396,7 +378,7 @@ pub(super) struct CullPass {
     instances: Vec<GpuInstance>,
     /// How many instances each batch has this frame, per variant, indexed the
     /// way [`BatchIds::infos`] is.
-    counts: [Vec<u32>; 2],
+    counts: [Vec<u32>; CLASSES],
 }
 
 impl CullPass {
@@ -415,7 +397,7 @@ impl CullPass {
             ids: BatchIds::default(),
             cached: Vec::new(),
             instances: Vec::new(),
-            counts: [Vec::new(), Vec::new()],
+            counts: Default::default(),
         }
     }
 
@@ -431,7 +413,7 @@ impl CullPass {
     /// Sort this frame's renderables into batches and size the two persistent
     /// buffers for them.
     ///
-    /// One pass over `items` rather than the sort the CPU path takes, because
+    /// One pass over `items` rather than a sort, because
     /// the batch a renderable belongs to is a property of its mesh and material
     /// and not of any ordering — and because this walk is the last per-entity
     /// cost the frame has left.
@@ -440,12 +422,13 @@ impl CullPass {
         device: &Device,
         items: crate::gfx::DrawList<'_>,
         mesh: impl Fn(u32) -> Option<(MeshSpan, Aabb)>,
-        masked: impl Fn(u32) -> bool,
+        variant: impl Fn(u32) -> Variant,
         views: u32,
     ) -> CullFrame {
         self.instances.clear();
-        self.counts[0].clear();
-        self.counts[1].clear();
+        for counts in &mut self.counts {
+            counts.clear();
+        }
 
         for slot in 0..items.len() {
             let item = items.item(slot);
@@ -457,7 +440,7 @@ impl CullPass {
             let id = match self.cached[row] {
                 Some((mesh, material, id)) if (mesh, material) == key => id,
                 _ => {
-                    let id = self.ids.id(key.0, key.1, masked(key.1));
+                    let id = self.ids.id(key.0, key.1, variant(key.1));
                     self.cached[row] = Some((key.0, key.1, id));
                     id
                 }
@@ -477,7 +460,7 @@ impl CullPass {
         // a scene that stops drawing a mesh leaves a gap. Gaps are kept rather
         // than compacted: renumbering would move every other batch's slice, and
         // an empty batch costs one command whose instance count stays zero.
-        let plain = self.ids.plain();
+        let bases = self.ids.bases();
         let mut batches: Vec<Batch> = Vec::with_capacity(self.ids.len());
         let mut base = 0u32;
         for (infos, counts) in self.ids.infos.iter().zip(&self.counts) {
@@ -514,7 +497,7 @@ impl CullPass {
 
         CullFrame {
             batches,
-            plain,
+            bases,
             stride,
             views,
         }
@@ -598,20 +581,22 @@ impl CullPass {
         // survived to be reduced. `occlusion` is whether the depth test runs at
         // all: a push rather than a second pipeline because the branch is uniform
         // across the dispatch, so what it would buy is a shader compile.
-        let mut words = [0u32; 21];
+        let mut words = [0u32; 24];
         words[0] = self.instances.len() as u32;
         words[1] = frame.views;
         words[2] = frame.batches.len() as u32;
-        // Where the masked batches begin, which is what turns the class and index
-        // an instance carries into the batch's slot. See [`slot`].
-        words[3] = frame.plain as u32;
-        for (word, float) in words[4..20]
+        words[3] = u32::from(occlusion.live);
+        // Where each variant's batches begin, which is what turns the class and
+        // index an instance carries into the batch's slot. See [`slot`].
+        for (word, base) in words[4..8].iter_mut().zip(frame.bases) {
+            *word = base as u32;
+        }
+        for (word, float) in words[8..24]
             .iter_mut()
             .zip(prev_view_proj.to_cols_array_2d().iter().flatten())
         {
             *word = float.to_bits();
         }
-        words[20] = u32::from(occlusion.live);
         builder.push_constants(&words);
         // One invocation per (instance, view). The view axis is the dispatch's
         // `y` so that a workgroup stays within one view — every invocation in it
@@ -712,21 +697,42 @@ fn allocate_indices(device: &Device, len: u64) -> BufferId {
 mod tests {
     use super::*;
 
-    /// A pipeline variant has to be a contiguous range of the command buffer,
-    /// or a multi-draw would cover batches the bound pipeline cannot draw.
-    #[test]
-    fn plain_batches_number_before_masked() {
-        let mut ids = BatchIds::default();
-        let plain = ids.id(0, 0, false);
-        let masked = ids.id(0, 1, true);
-        let second_plain = ids.id(1, 0, false);
+    const PLAIN: Variant = Variant {
+        masked: false,
+        lobed: false,
+    };
+    const LOBED: Variant = Variant {
+        masked: false,
+        lobed: true,
+    };
+    const MASKED: Variant = Variant {
+        masked: true,
+        lobed: false,
+    };
+    const MASKED_LOBED: Variant = Variant {
+        masked: true,
+        lobed: true,
+    };
 
-        let split = ids.plain();
-        assert_eq!(ids.len(), 3);
-        assert_eq!(split, 2);
-        assert!(slot(plain, split) < split);
-        assert!(slot(second_plain, split) < split);
-        assert!(slot(masked, split) >= split);
+    /// A pipeline variant has to be a contiguous range of the command buffer,
+    /// or a multi-draw would cover batches the bound pipeline cannot draw — and
+    /// within each mask the flat batches come first, so the depth-only passes,
+    /// which do not care about lobes, still see one range per mask.
+    #[test]
+    fn batches_number_by_variant_in_draw_order() {
+        let mut ids = BatchIds::default();
+        let masked_lobed = ids.id(0, 4, MASKED_LOBED);
+        let lobed = ids.id(0, 2, LOBED);
+        let plain = ids.id(0, 0, PLAIN);
+        let masked = ids.id(0, 1, MASKED);
+        let second_plain = ids.id(1, 0, PLAIN);
+
+        let bases = ids.bases();
+        assert_eq!(ids.len(), 5);
+        assert_eq!(bases, [0, 2, 3, 4]);
+        let slots = [plain, second_plain, lobed, masked, masked_lobed].map(|id| slot(id, bases));
+        assert!(slots[0] < 2 && slots[1] < 2);
+        assert_eq!(&slots[2..], &[2, 3, 4]);
     }
 
     /// Batch numbers outlive the frame that created them: the per-row cache is
@@ -734,9 +740,9 @@ mod tests {
     #[test]
     fn a_pair_keeps_its_id() {
         let mut ids = BatchIds::default();
-        let first = ids.id(7, 3, false);
-        let other = ids.id(7, 4, false);
-        let again = ids.id(7, 3, false);
+        let first = ids.id(7, 3, PLAIN);
+        let other = ids.id(7, 4, PLAIN);
+        let again = ids.id(7, 3, PLAIN);
 
         assert_eq!(first, again);
         assert_ne!(first, other);
@@ -745,38 +751,67 @@ mod tests {
 
     /// Every batch is drawn exactly once, by the pipeline its material asked
     /// for. A range that overlapped or fell short would draw a cutout through
-    /// the plain pipeline, or draw it twice.
+    /// the plain pipeline, or a coated surface through the flat one.
     #[test]
-    fn the_two_ranges_partition_a_view() {
+    fn the_four_ranges_partition_a_view() {
         let frame = CullFrame {
-            batches: vec![batch(0), batch(1), batch(2)],
-            plain: 2,
+            batches: (0..6).map(batch).collect(),
+            bases: [0, 2, 3, 5],
             stride: 8,
             views: 2,
         };
 
-        let [(plain_masked, plain), (masked_masked, masked)] = frame.ranges(1);
-        assert!(!plain_masked && masked_masked);
-        // View 1's block starts after view 0's three commands.
-        assert_eq!(plain, 3..5);
-        assert_eq!(masked, 5..6);
+        let ranges = frame.ranges(1);
+        assert_eq!(
+            ranges.clone().map(|(variant, _)| variant),
+            [PLAIN, LOBED, MASKED, MASKED_LOBED]
+        );
+        // View 1's block starts after view 0's six commands.
+        assert_eq!(ranges.map(|(_, range)| range), [6..8, 8..9, 9..11, 11..12]);
     }
 
-    /// A frame with nothing masked records one multi-draw, not two: an empty
-    /// range is not a legal `vkCmdDrawIndexedIndirect`.
+    /// The prepass and the shadows draw every opaque batch with one pipeline
+    /// per mask, so they get flat and lobed as one range — one multi-draw each,
+    /// as before there were lobes to split by.
+    #[test]
+    fn a_depth_pass_draws_one_range_per_mask() {
+        let frame = CullFrame {
+            batches: (0..6).map(batch).collect(),
+            bases: [0, 2, 3, 5],
+            stride: 8,
+            views: 1,
+        };
+        let draws = Draws {
+            frame: &frame,
+            view: 0,
+            commands: BufferId(0),
+        };
+        let merged: Vec<_> = draws
+            .regions_by_mask()
+            .map(|r| (r.variant.masked, r.range))
+            .collect();
+        assert_eq!(merged, vec![(false, 0..3), (true, 3..6)]);
+        assert_eq!(draws.regions().count(), 4);
+    }
+
+    /// A frame with nothing masked and nothing lobed records one multi-draw,
+    /// not four: an empty range is not a legal `vkCmdDrawIndexedIndirect`.
     #[test]
     fn an_empty_variant_records_nothing() {
         let frame = CullFrame {
             batches: vec![batch(0)],
-            plain: 1,
+            bases: [0, 1, 1, 1],
             stride: 4,
             views: 1,
         };
-
-        let ranges = frame.ranges(0);
-        let drawn: Vec<_> = ranges.iter().filter(|(_, r)| !r.is_empty()).collect();
-        assert_eq!(drawn.len(), 1);
-        assert_eq!(drawn[0].1, 0..1);
+        let draws = Draws {
+            frame: &frame,
+            view: 0,
+            commands: BufferId(0),
+        };
+        let drawn: Vec<_> = draws.regions().map(|r| r.range).collect();
+        assert_eq!(drawn, vec![0..1]);
+        assert_eq!(draws.regions_by_mask().count(), 1);
     }
 
     fn batch(material: u32) -> Batch {
@@ -788,15 +823,17 @@ mod tests {
         }
     }
 
-    /// A masked batch's slot moves when a plain batch appears after it, which is
-    /// why nothing persistent may hold a slot.
+    /// A batch's slot moves when one of an earlier variant appears after it,
+    /// which is why nothing persistent may hold a slot.
     #[test]
-    fn a_masked_slot_follows_the_split() {
+    fn a_slot_follows_the_variants_before_it() {
         let mut ids = BatchIds::default();
-        let masked = ids.id(0, 1, true);
-        assert_eq!(slot(masked, ids.plain()), 0);
+        let masked = ids.id(0, 1, MASKED);
+        assert_eq!(slot(masked, ids.bases()), 0);
 
-        ids.id(0, 0, false);
-        assert_eq!(slot(masked, ids.plain()), 1);
+        ids.id(0, 0, PLAIN);
+        assert_eq!(slot(masked, ids.bases()), 1);
+        ids.id(0, 2, LOBED);
+        assert_eq!(slot(masked, ids.bases()), 2);
     }
 }

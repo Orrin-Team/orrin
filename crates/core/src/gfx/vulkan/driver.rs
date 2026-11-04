@@ -99,6 +99,8 @@ pub struct VkDriver {
     /// span and never holds the arena.
     arena: RwLock<MeshArena>,
     bind_groups: Mutex<Pool<Arc<DescriptorSet>>>,
+    /// Texture uploads, none of which the CPU waits for. See `upload`.
+    uploads: super::upload::Uploads,
 }
 
 fn lookup<T: Clone>(pool: &Mutex<Pool<T>>, index: u32, what: &str) -> T {
@@ -157,6 +159,7 @@ impl VkDriver {
             },
         );
         let arena = RwLock::new(MeshArena::new(&ctx));
+        let uploads = super::upload::Uploads::new(&ctx);
         Self {
             ctx,
             frame: AtomicU64::new(0),
@@ -171,6 +174,7 @@ impl VkDriver {
             storage,
             vertices,
             bind_groups: Mutex::new(Pool::new(frames_in_flight)),
+            uploads,
         }
     }
 
@@ -229,14 +233,15 @@ impl VkDriver {
         extent: [u32; 2],
         format: Format,
     ) -> TextureViewId {
-        let view = super::texture::upload_texture(
+        let prepared = super::texture::prepare_texture(
             &self.ctx,
+            self.uploads.staging(),
             pixels,
             extent,
             vk_format(format),
             super::texture::MipPolicy::Generate,
         );
-        TextureViewId(self.views.lock().unwrap().insert(view))
+        self.insert_uploaded(prepared, true)
     }
 
     pub fn create_texture_levels(&self, levels: &crate::gfx::TextureLevels) -> TextureViewId {
@@ -249,13 +254,40 @@ impl VkDriver {
             TexelFormat::Bc7Unorm => VkFormat::BC7_UNORM_BLOCK,
             TexelFormat::Bc7Srgb => VkFormat::BC7_SRGB_BLOCK,
         };
-        let view = super::texture::upload_levels(
+        let prepared = super::texture::prepare_levels(
             &self.ctx,
+            self.uploads.staging(),
             format,
             [levels.width, levels.height],
             &levels.levels,
         );
+        self.insert_uploaded(prepared, true)
+    }
+
+    /// Submit an upload without waiting for it and hand back its view, which is
+    /// bindable at once — see `upload` for why that is sound on both paths.
+    fn insert_uploaded(
+        &self,
+        prepared: super::texture::Prepared,
+        may_transfer: bool,
+    ) -> TextureViewId {
+        let image = self.uploads.submit(&self.ctx, prepared, may_transfer);
+        let view = ImageView::new_default(image).expect("failed to create texture image view");
         TextureViewId(self.views.lock().unwrap().insert(view))
+    }
+
+    /// Record, at the top of a frame's command buffer, the ownership acquires
+    /// the transfer queue's finished copies are owed, and return the semaphores
+    /// the frame's first submission waits on for them. Also releases whatever
+    /// uploads have finished since the last frame.
+    pub(super) fn record_upload_acquires(
+        &self,
+        recorder: &mut super::record::Recorder,
+    ) -> Vec<(
+        Arc<vulkano::sync::semaphore::Semaphore>,
+        ash::vk::PipelineStageFlags,
+    )> {
+        self.uploads.record_acquires(&self.ctx, recorder)
     }
 
     pub fn supports(&self, feature: Feature) -> bool {
@@ -400,6 +432,18 @@ impl VkDriver {
         builder.submit_and_wait(&self.ctx);
     }
 
+    pub fn initialise_sampled(&self, texture: TextureViewId) {
+        let view = lookup(&self.views, texture.0, "texture view");
+        let image = view.image().clone();
+        let mut builder = Recorder::new(&self.ctx);
+        builder.image_barrier(super::record::to_shader_read(
+            image.clone(),
+            super::record::whole_image(&image),
+            vulkano::image::ImageLayout::Undefined,
+        ));
+        builder.submit_and_wait(&self.ctx);
+    }
+
     /// The vulkano view behind an id, for the Vulkan-side graph executor, which
     /// resolves graph resources to images and hands them to barriers.
     pub fn vk_view(&self, view: TextureViewId) -> Arc<ImageView> {
@@ -412,14 +456,19 @@ impl VkDriver {
         extent: [u32; 2],
         format: Format,
     ) -> TextureViewId {
-        let view = super::texture::upload_texture(
+        // Engine-owned textures, some of them sampled by one-shot graphics work
+        // outside any frame — the environment bake reads its equirect source in
+        // a submission of its own, which would never record an acquire. So
+        // these stay on the graphics queue, still without a wait.
+        let prepared = super::texture::prepare_texture(
             &self.ctx,
+            self.uploads.staging(),
             pixels,
             extent,
             vk_format(format),
             super::texture::MipPolicy::None,
         );
-        TextureViewId(self.views.lock().unwrap().insert(view))
+        self.insert_uploaded(prepared, false)
     }
 
     pub fn upload_vertices(&self, bytes: &[u8]) -> BufferId {
@@ -583,10 +632,28 @@ impl VkDriver {
             },
         )
         .expect("failed to create a cube texture");
+        // Into the copy's layout and out to the sampler's: a fresh image is
+        // `Undefined`, and a copy into it there, or a sample of it left in the
+        // copy's layout, is undefined behaviour that happens to work on some
+        // drivers.
         let mut recorder = Recorder::new(&self.ctx);
-        recorder.copy_buffer_to_image(
-            vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(staging, image.clone()),
-        );
+        recorder
+            .image_barrier(super::record::to_transfer_dst(
+                image.clone(),
+                super::record::whole_image(&image),
+                vulkano::image::ImageLayout::Undefined,
+            ))
+            .copy_buffer_to_image(
+                vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(
+                    staging,
+                    image.clone(),
+                ),
+            )
+            .image_barrier(super::record::to_shader_read(
+                image.clone(),
+                super::record::whole_image(&image),
+                vulkano::image::ImageLayout::TransferDstOptimal,
+            ));
         recorder.submit_and_wait(&self.ctx);
         let view = ImageView::new(
             image.clone(),
@@ -713,6 +780,8 @@ impl VkDriver {
                             DepthCompare::Less => CompareOp::Less,
                             DepthCompare::Equal => CompareOp::Equal,
                             DepthCompare::LessOrEqual => CompareOp::LessOrEqual,
+                            DepthCompare::Greater => CompareOp::Greater,
+                            DepthCompare::GreaterOrEqual => CompareOp::GreaterOrEqual,
                         },
                     }),
                     ..Default::default()
@@ -748,7 +817,14 @@ impl VkDriver {
                     .into_iter()
                     .collect()
                 } else {
-                    [DynamicState::Viewport].into_iter().collect()
+                    // Scissor on every pipeline, not only the atlas's: the
+                    // overlay clips each mesh with one, and a scissor set on a
+                    // pipeline that declares it static is invalid. `set_viewport`
+                    // sets the matching one, so a pass that never asks for a
+                    // narrower scissor gets its whole viewport.
+                    [DynamicState::Viewport, DynamicState::Scissor]
+                        .into_iter()
+                        .collect()
                 },
                 subpass: Some(
                     rendering::pipeline_info(&colors, desc.depth_format.map(vk_format)).into(),
@@ -1108,6 +1184,8 @@ fn vertex_buffer(stream: &VertexStream) -> VertexBufferDescription {
                     VertexFormat::Float3 => VkFormat::R32G32B32_SFLOAT,
                     VertexFormat::Float4 => VkFormat::R32G32B32A32_SFLOAT,
                     VertexFormat::Unorm8x4 => VkFormat::R8G8B8A8_UNORM,
+                    VertexFormat::Snorm16x2 => VkFormat::R16G16_SNORM,
+                    VertexFormat::Snorm16x4 => VkFormat::R16G16B16A16_SNORM,
                 };
                 (
                     attribute.name.to_string(),
@@ -1171,6 +1249,9 @@ impl<'a> VkEncoder<'a> {
         self.bound.as_ref().expect("no pipeline is bound").layout()
     }
 
+    /// The viewport, and a scissor covering exactly it — every pipeline
+    /// declares scissor dynamic, so a draw needs one set. A pass that wants a
+    /// narrower one sets it after this.
     pub fn set_viewport(&mut self, viewport: Viewport) {
         self.recorder.set_viewport(
             0,
@@ -1180,6 +1261,14 @@ impl<'a> VkEncoder<'a> {
                 depth_range: viewport.depth_range[0]..=viewport.depth_range[1],
             }],
         );
+        let offset = viewport.origin.map(|o| o.max(0.0).floor() as u32);
+        let extent = [0, 1].map(|axis| {
+            (viewport.origin[axis] + viewport.extent[axis])
+                .ceil()
+                .max(0.0) as u32
+                - offset[axis]
+        });
+        self.set_scissor(offset, extent);
     }
 
     pub fn set_scissor(&mut self, offset: [u32; 2], extent: [u32; 2]) {
@@ -1192,7 +1281,7 @@ impl<'a> VkEncoder<'a> {
 
     pub fn clear_depth(&mut self, rects: &[DepthRect]) {
         self.recorder.clear_attachments(
-            [ClearAttachment::Depth(1.0)],
+            [ClearAttachment::Depth(crate::gfx::depth::SHADOW_CLEAR)],
             rects.iter().map(|rect| ClearRect {
                 offset: rect.offset,
                 extent: rect.extent,

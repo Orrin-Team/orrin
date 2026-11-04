@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // The depth pyramid the *next* frame's cull tests against: level `n` holds the
 // **farthest** depth of the 2^(n+1) x 2^(n+1) block of this frame's depth
 // buffer under it, so an object whose nearest point is behind a cell's maximum
@@ -48,7 +50,7 @@ shared float lds[64];
 // the one direction this reduction is not allowed to err in.
 float load(ivec2 p) {
     if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, push.extent))) {
-        return 1.0;
+        return DEPTH_FAR;
     }
     return texelFetch(u_depth, p, 0).r;
 }
@@ -61,8 +63,8 @@ float load(ivec2 p) {
         }                                                         \
     }
 
-float max4(float a, float b, float c, float d) {
-    return max(max(a, b), max(c, d));
+float farthest4(float a, float b, float c, float d) {
+    return depth_farthest(depth_farthest(a, b), depth_farthest(c, d));
 }
 
 void main() {
@@ -82,7 +84,7 @@ void main() {
     for (int j = 0; j < 4; ++j) {
         for (int i = 0; i < 4; ++i) {
             ivec2 p = source + 2 * ivec2(i, j);
-            float v = max4(load(p), load(p + ivec2(1, 0)),
+            float v = farthest4(load(p), load(p + ivec2(1, 0)),
                            load(p + ivec2(0, 1)), load(p + ivec2(1, 1)));
             m0[j * 4 + i] = v;
             STORE(0, base + ivec2(i, j), v)
@@ -94,14 +96,14 @@ void main() {
     float m1[4];
     for (int j = 0; j < 2; ++j) {
         for (int i = 0; i < 2; ++i) {
-            float v = max4(m0[(2 * j) * 4 + 2 * i], m0[(2 * j) * 4 + 2 * i + 1],
+            float v = farthest4(m0[(2 * j) * 4 + 2 * i], m0[(2 * j) * 4 + 2 * i + 1],
                            m0[(2 * j + 1) * 4 + 2 * i], m0[(2 * j + 1) * 4 + 2 * i + 1]);
             m1[j * 2 + i] = v;
             STORE(1, (base >> 1) + ivec2(i, j), v)
         }
     }
 
-    float m2 = max4(m1[0], m1[1], m1[2], m1[3]);
+    float m2 = farthest4(m1[0], m1[1], m1[2], m1[3]);
     STORE(2, (base >> 2) + ivec2(0, 0), m2)
 
     // Past level 2 a texel spans more than one invocation's block, so the
@@ -112,21 +114,21 @@ void main() {
     barrier();
 
     if ((lid.x & 1) == 0 && (lid.y & 1) == 0) {
-        float v = max4(lds[slot], lds[slot + 1], lds[slot + 8], lds[slot + 9]);
+        float v = farthest4(lds[slot], lds[slot + 1], lds[slot + 8], lds[slot + 9]);
         lds[slot] = v;
         STORE(3, ivec2(gl_WorkGroupID.xy) * 4 + (lid >> 1), v)
     }
     barrier();
 
     if ((lid.x & 3) == 0 && (lid.y & 3) == 0) {
-        float v = max4(lds[slot], lds[slot + 2], lds[slot + 16], lds[slot + 18]);
+        float v = farthest4(lds[slot], lds[slot + 2], lds[slot + 16], lds[slot + 18]);
         lds[slot] = v;
         STORE(4, ivec2(gl_WorkGroupID.xy) * 2 + (lid >> 2), v)
     }
     barrier();
 
     if (slot == 0) {
-        float v = max4(lds[0], lds[4], lds[32], lds[36]);
+        float v = farthest4(lds[0], lds[4], lds[32], lds[36]);
         STORE(5, ivec2(gl_WorkGroupID.xy), v)
     }
 }

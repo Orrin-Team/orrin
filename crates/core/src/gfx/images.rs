@@ -44,6 +44,18 @@ impl ImageTable {
             .expect("render graph resource is not a graph-owned image")
     }
 
+    /// Answer for `id` with an image the graph does not own — one imported
+    /// from the pass that keeps it across frames — in every set, since there is
+    /// one of it however many frames are in flight.
+    pub fn import(&mut self, id: ResourceId, entry: ImageEntry) {
+        for set in &mut self.sets {
+            if set.len() <= id.index() {
+                set.resize(id.index() + 1, None);
+            }
+            set[id.index()] = Some(entry.clone());
+        }
+    }
+
     pub fn texture(&self, id: ResourceId) -> TextureViewId {
         self.entry(id).whole
     }

@@ -1,10 +1,11 @@
 #version 460
 
-// Bin the HDR target by log2 luminance. One invocation per pixel, one bin per
+// Bin the HDR target by log2 luminance. One invocation per metered pixel (one
+// in every `stride` x `stride` block, see `STRIDE` in exposure.rs), one bin per
 // invocation in the workgroup -- which is why the workgroup is 16x16 = 256, the
 // bin count. Each workgroup accumulates privately in shared memory and then
-// contributes one atomic per bin to the global histogram, so global atomic
-// traffic is 256 per workgroup rather than one per pixel.
+// contributes at most one atomic per bin to the global histogram, so global
+// atomic traffic is bounded by 256 per workgroup rather than one per pixel.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -14,7 +15,8 @@ layout(set = 0, binding = 1) buffer Histogram { uint bins[]; } histogram;
 layout(push_constant) uniform Push {
     float min_log_luminance;
     float inverse_log_luminance_range;
-    uvec2 extent;
+    uvec2 extent; // the metered grid, not the image
+    uint stride;  // one pixel binned per stride x stride block
 } push;
 
 shared uint local_bins[256];
@@ -53,10 +55,15 @@ void main() {
     if (coord.x < push.extent.x && coord.y < push.extent.y) {
         // texelFetch, not texture: metering wants the pixels that were rendered,
         // and a filtered tap at a half-texel offset is a different set of them.
-        vec3 color = texelFetch(u_hdr, ivec2(coord), 0).rgb;
+        vec3 color = texelFetch(u_hdr, ivec2(coord * push.stride), 0).rgb;
         atomicAdd(local_bins[bin_for(color)], 1);
     }
     barrier();
 
-    atomicAdd(histogram.bins[gl_LocalInvocationIndex], local_bins[gl_LocalInvocationIndex]);
+    // A tile spans a handful of luminances, so most of its bins are empty, and
+    // adding zero to a global bin is an atomic that changes nothing.
+    uint count = local_bins[gl_LocalInvocationIndex];
+    if (count != 0) {
+        atomicAdd(histogram.bins[gl_LocalInvocationIndex], count);
+    }
 }

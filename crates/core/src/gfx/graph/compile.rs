@@ -146,6 +146,19 @@ impl FrameGraph {
     }
 
     /// The images the executor must allocate, in declaration order.
+    /// The images supplied from outside the graph, as they were declared. Their
+    /// owners allocate them, so this is what an owner — or a test — checks a
+    /// declaration against.
+    pub fn imported_images(&self) -> impl Iterator<Item = (ResourceId, &ImageDesc)> + '_ {
+        self.resources
+            .iter()
+            .enumerate()
+            .filter_map(|(index, decl)| match &decl.kind {
+                ResourceKind::Imported(desc, _) => Some((ResourceId(index as u32), desc)),
+                _ => None,
+            })
+    }
+
     pub fn transient_images(&self) -> impl Iterator<Item = (ResourceId, TransientImage)> + '_ {
         self.images
             .iter()

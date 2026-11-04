@@ -1,5 +1,7 @@
 #version 460
 
+#include "depth.glsl"
+
 // The depth pyramid the reflection trace skips empty space with: level `n` holds
 // the *nearest* depth of the 2^n x 2^n block of the frame's depth buffer under
 // it, so a ray that stays in front of a cell's minimum cannot have hit anything
@@ -36,7 +38,7 @@ shared float lds[64];
 // surface nearer than anything really there.
 float load(ivec2 p) {
     if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, push.extent))) {
-        return 1.0;
+        return DEPTH_FAR;
     }
     return texelFetch(u_depth, p, 0).r;
 }
@@ -52,8 +54,8 @@ float load(ivec2 p) {
         }                                                         \
     }
 
-float min4(float a, float b, float c, float d) {
-    return min(min(a, b), min(c, d));
+float nearest4(float a, float b, float c, float d) {
+    return depth_nearest(depth_nearest(a, b), depth_nearest(c, d));
 }
 
 void main() {
@@ -84,7 +86,7 @@ void main() {
     float m1[16];
     for (int j = 0; j < 4; ++j) {
         for (int i = 0; i < 4; ++i) {
-            float v = min4(d[(2 * j) * 8 + 2 * i], d[(2 * j) * 8 + 2 * i + 1],
+            float v = nearest4(d[(2 * j) * 8 + 2 * i], d[(2 * j) * 8 + 2 * i + 1],
                            d[(2 * j + 1) * 8 + 2 * i], d[(2 * j + 1) * 8 + 2 * i + 1]);
             m1[j * 4 + i] = v;
             STORE(1, (base >> 1) + ivec2(i, j), v)
@@ -94,14 +96,14 @@ void main() {
     float m2[4];
     for (int j = 0; j < 2; ++j) {
         for (int i = 0; i < 2; ++i) {
-            float v = min4(m1[(2 * j) * 4 + 2 * i], m1[(2 * j) * 4 + 2 * i + 1],
+            float v = nearest4(m1[(2 * j) * 4 + 2 * i], m1[(2 * j) * 4 + 2 * i + 1],
                            m1[(2 * j + 1) * 4 + 2 * i], m1[(2 * j + 1) * 4 + 2 * i + 1]);
             m2[j * 2 + i] = v;
             STORE(2, (base >> 2) + ivec2(i, j), v)
         }
     }
 
-    float m3 = min4(m2[0], m2[1], m2[2], m2[3]);
+    float m3 = nearest4(m2[0], m2[1], m2[2], m2[3]);
     STORE(3, (base >> 3) + ivec2(0, 0), m3)
 
     // Past level 3 a texel spans more than one invocation's block, so the
@@ -112,21 +114,21 @@ void main() {
     barrier();
 
     if ((lid.x & 1) == 0 && (lid.y & 1) == 0) {
-        float v = min4(lds[slot], lds[slot + 1], lds[slot + 8], lds[slot + 9]);
+        float v = nearest4(lds[slot], lds[slot + 1], lds[slot + 8], lds[slot + 9]);
         lds[slot] = v;
         STORE(4, ivec2(gl_WorkGroupID.xy) * 4 + (lid >> 1), v)
     }
     barrier();
 
     if ((lid.x & 3) == 0 && (lid.y & 3) == 0) {
-        float v = min4(lds[slot], lds[slot + 2], lds[slot + 16], lds[slot + 18]);
+        float v = nearest4(lds[slot], lds[slot + 2], lds[slot + 16], lds[slot + 18]);
         lds[slot] = v;
         STORE(5, ivec2(gl_WorkGroupID.xy) * 2 + (lid >> 2), v)
     }
     barrier();
 
     if (slot == 0) {
-        float v = min4(lds[0], lds[4], lds[32], lds[36]);
+        float v = nearest4(lds[0], lds[4], lds[32], lds[36]);
         STORE(6, ivec2(gl_WorkGroupID.xy), v)
     }
 }

@@ -455,6 +455,9 @@ impl MtlDriver {
     }
 
     /// Fill a depth texture with one value, once.
+    /// Metal has no image layouts, so there is nothing to put in place.
+    pub fn initialise_sampled(&self, _texture: TextureViewId) {}
+
     pub fn fill_depth(&self, texture: TextureViewId, depth: f32) {
         use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
         use objc2_metal::{MTLLoadAction, MTLRenderPassDescriptor, MTLStoreAction};

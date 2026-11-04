@@ -36,6 +36,7 @@ mod swapchain;
 mod taa;
 mod texture;
 mod timestamps;
+mod upload;
 mod vendor;
 
 use std::ops::Range;
@@ -57,7 +58,7 @@ use vulkano::{Validated, VulkanError};
 use crate::geom::{Aabb, Frustum};
 use crate::gfx::DecalInstance;
 use crate::gfx::punctual::ShadowAtlas;
-use crate::gfx::shadows::CascadeSet;
+use crate::gfx::shadows::{CascadeCache, CascadeSet, MAX_CASCADES};
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
     FogSettings, HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, PresentSettings,
@@ -172,22 +173,16 @@ pub type Overlay<'a> = &'a mut OverlayFrame;
 /// Everything the cascade passes need for one frame.
 ///
 /// Bundled because the three travel together and are meaningless apart: the
-/// matrices decide what each pass draws with, the caster lists were culled
-/// against those same matrices, and the settings supply the bias the maps are
-/// rendered with. `None` means shadows are off, which is what makes the graph
-/// drop the passes entirely rather than run them over an empty list.
+/// matrices decide what each pass draws with and what the cull dispatch tests
+/// against, and the settings supply the bias the maps are rendered with. `None`
+/// means shadows are off, which is what makes the graph drop the passes
+/// entirely rather than run them over an empty list.
 #[derive(Clone, Copy)]
 pub struct ShadowFrame<'a> {
     pub cascades: &'a CascadeSet,
-    /// Indexed like `cascades.cascades`. Each is an ordering over the same item
-    /// array the camera's list indexes, so an object both visible and casting
-    /// exists once on the CPU however many cascades want it.
-    pub casters: &'a [DrawList<'a>],
-    /// The punctual lights that got atlas tiles, and one caster list per light —
-    /// indexed like `atlas.casters`, not like the light arrays, because the
-    /// budget means most lights have no list at all.
+    /// The punctual lights that got atlas tiles. What each face draws is the
+    /// cull dispatch's to decide, against the face's own frustum.
     pub atlas: &'a ShadowAtlas,
-    pub punctual_casters: &'a [DrawList<'a>],
     pub settings: &'a ShadowSettings,
 }
 
@@ -200,7 +195,6 @@ pub struct ShadowFrame<'a> {
 /// is `Send`.
 pub(super) struct PassCtx<'a> {
     pub(crate) meshes: &'a [GpuMesh],
-    pub(crate) materials: &'a [GpuMaterial],
 }
 
 pub struct VulkanRenderer {
@@ -212,21 +206,14 @@ pub struct VulkanRenderer {
     /// rows, and no one of them is the owner. See `instances`.
     instances: InstanceStore,
     /// The two dispatches that decide what each opaque view draws, and the
-    /// buffers they write. Built whether or not `FrameConfig::gpu_culling` is
-    /// set — the pipelines cost a compile at startup and nothing per frame, and
-    /// the flag is meant to be switched without a rebuild.
+    /// buffers they write.
     cull: CullPass,
     /// Owns the ping-ponged depth pyramid the graph imports, and records the
-    /// dispatch that fills it. Built whether or not the frame tests, for the
-    /// reason `cull` is built whether or not it culls.
+    /// dispatch that fills it. Built whether or not the frame tests: the
+    /// pipelines cost a compile at startup and nothing per frame.
     occlusion: OcclusionPass,
-    /// Read once. The graph is compiled against it, so a mid-run change would
-    /// leave the passes and the plan disagreeing about who writes
-    /// `instance_index`.
-    gpu_culling: bool,
-    /// Read once, for the reason `gpu_culling` is: the graph is compiled
-    /// against it, and the pass that samples last frame's pyramid has to be the
-    /// pass the plan says samples it.
+    /// Read once. The graph is compiled against it, and the pass that samples
+    /// last frame's pyramid has to be the pass the plan says samples it.
     occlusion_culling: bool,
     hdr: HdrPass,
     /// Owns the histogram and exposure buffers the graph imports, and records
@@ -269,6 +256,11 @@ pub struct VulkanRenderer {
     /// The shutter's reconstruction, and the velocity pyramid it reads.
     motion_blur: MotionBlurPass,
     shadow: ShadowPass,
+    /// Which cascades this frame redraws. See `shadows::CascadeCache`.
+    cascade_cache: CascadeCache,
+    /// Which punctual lights can reach each cluster of this frame's view, binned
+    /// before the forward pass uploads them. See `gfx::clusters`.
+    light_clusters: crate::gfx::clusters::LightClusters,
     /// Debug-line overlay, recorded into the forward pass. Editor-only in
     /// practice: fed lines only through `render_with_overlay`.
     line: LinePass,
@@ -377,6 +369,16 @@ impl Backend {
             Backend::Vulkan(vk) => vk,
             #[cfg(target_os = "macos")]
             Backend::Metal(_) => unreachable!("a Vulkan-only path ran on the Metal backend"),
+        }
+    }
+
+    /// Whether the frame's target is handed to a presentation engine rather than
+    /// read back: a window rather than an offscreen capture.
+    fn presents(&self) -> bool {
+        match self {
+            Backend::Vulkan(vk) => vk.swapchain.readback.is_empty(),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(mtl) => mtl.windowed.is_some(),
         }
     }
 
@@ -558,12 +560,10 @@ impl VulkanRenderer {
     #[cfg(target_os = "macos")]
     pub fn offscreen_metal(extent: [u32; 2]) -> Result<Self, String> {
         let device = Device::Metal(crate::gfx::metal::MtlDriver::new()?);
-        let gpu_culling = gpu_culling_requested(std::env::var("ORRIN_GPU_CULL").ok().as_deref());
         Ok(Self::assemble(
             device,
             OFFSCREEN_FORMAT,
             extent,
-            gpu_culling,
             false,
             |device, frame, _slots| {
                 let (backend, table) = crate::gfx::metal::backend::MtlBackend::new(
@@ -587,12 +587,10 @@ impl VulkanRenderer {
         present: PresentSettings,
     ) -> Result<Self, String> {
         let device = Device::Metal(crate::gfx::metal::MtlDriver::new()?);
-        let gpu_culling = gpu_culling_requested(std::env::var("ORRIN_GPU_CULL").ok().as_deref());
         Ok(Self::assemble(
             device,
             EngineFormat::Bgra8Srgb,
             extent,
-            gpu_culling,
             false,
             |device, frame, _slots| {
                 let (backend, table) = crate::gfx::metal::backend::MtlBackend::windowed(
@@ -617,13 +615,12 @@ impl VulkanRenderer {
     ) -> Self {
         let ctx = Arc::new(ctx);
         let device = Device::Vulkan(VkDriver::new(ctx.clone(), FRAMES_IN_FLIGHT as u64));
-        let gpu_culling = read_gpu_culling(&ctx);
+        require_gpu_culling(&ctx);
         let async_compute = ctx.compute_queue.is_some();
         Self::assemble(
             device,
             engine_format(format),
             extent,
-            gpu_culling,
             async_compute,
             |device, frame, slots| {
                 let swapchain = make_target(&ctx, format, extent);
@@ -666,7 +663,6 @@ impl VulkanRenderer {
         device: Device,
         format: EngineFormat,
         extent: [u32; 2],
-        gpu_culling: bool,
         async_compute: bool,
         backend: impl FnOnce(&Device, &Frame, usize) -> (Backend, ImageTable),
     ) -> Self {
@@ -699,7 +695,7 @@ impl VulkanRenderer {
 
         // Compiled for the editor's frame, which is what all but the headless
         // path uses; anything else recompiles on its first render.
-        let occlusion_culling = gpu_culling && read_occlusion_culling();
+        let occlusion_culling = read_occlusion_culling();
         let config = FrameConfig {
             color_format: format,
             msaa: false,
@@ -717,11 +713,13 @@ impl VulkanRenderer {
             dof: false,
             bloom_mips: bloom::mip_count(extent),
             overlay: true,
+            outline: true,
+            gizmo: true,
+            presents: true,
             shadow_cascades: 0,
             shadow_resolution: 1,
             shadow_atlas: 0,
             async_compute,
-            gpu_culling,
             occlusion_culling,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
@@ -732,7 +730,6 @@ impl VulkanRenderer {
             instances: InstanceStore::new(&device),
             cull: CullPass::new(&device),
             occlusion: OcclusionPass::new(&device),
-            gpu_culling,
             occlusion_culling,
             forward,
             hdr,
@@ -750,6 +747,8 @@ impl VulkanRenderer {
             dof,
             motion_blur,
             shadow,
+            cascade_cache: CascadeCache::default(),
+            light_clusters: Default::default(),
             line,
             gizmo,
             outline,
@@ -1077,6 +1076,15 @@ impl VulkanRenderer {
         // Imported images: a history has to survive a frame boundary, and a
         // transient by contract does not, so the pass that ping-pongs it owns
         // the allocation.
+        //
+        // The cascade map is the one import the table answers for, because it is
+        // also an attachment and `rendering_info` resolves attachments there;
+        // `reallocate` registered it.
+        if Some(id) == ids.shadows {
+            return Some(record::Target::Image(
+                self.vk_view(self.table.texture(id)).image().clone(),
+            ));
+        }
         if let Some(fog) = ids.fog
             && id == fog.scatter
         {
@@ -1141,14 +1149,21 @@ impl VulkanRenderer {
                 self.table = mtl.rebuild(driver, &self.frame.graph);
             }
         }
+        if let Some(id) = self.frame.ids.shadows {
+            let (map, fresh) = self.shadow.cascade_map(
+                &self.device,
+                self.config.shadow_resolution,
+                self.config.shadow_cascades,
+            );
+            if fresh {
+                self.cascade_cache.invalidate();
+            }
+            self.table.import(id, map);
+        }
     }
 }
 
 impl RenderBackend for VulkanRenderer {
-    fn gpu_culling(&self) -> bool {
-        self.gpu_culling
-    }
-
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle {
         let (span, bounds) = self.device.upload_mesh(&mesh.vertices, &mesh.indices);
         let handle = MeshHandle(self.meshes.len() as u32);
@@ -1562,6 +1577,17 @@ impl VulkanRenderer {
             self.flush_pending_tail();
             self.backend.vk_mut().in_flight.drain();
             self.backend.vk_mut().overlay_present.drain();
+            // And the presents, which no fence covers: the old swapchain cannot
+            // be destroyed under a present still pending on it, and the
+            // semaphores those presents wait on go back to the pool the moment
+            // their frames are dropped — still waited on, to be handed out again
+            // as an acquire's. Idling the queue settles both, and it is a resize.
+            self.backend
+                .vk()
+                .ctx
+                .queue
+                .with(|mut queue| queue.wait_idle())
+                .expect("failed to idle the queue before recreating the swapchain");
             let vk = self.backend.vk_mut();
             if vk.swapchain.recreate(vk.pending_extent, vk.present) {
                 vk.recreate_swapchain = false;
@@ -1609,6 +1635,13 @@ impl VulkanRenderer {
                 0
             },
             overlay: overlay.is_some(),
+            outline: overlay
+                .as_ref()
+                .is_some_and(|frame| !frame.outline.is_empty()),
+            gizmo: overlay
+                .as_ref()
+                .is_some_and(|frame| !frame.gizmo.is_empty()),
+            presents: self.backend.presents(),
             // Sourced from the cascade set rather than the setting, so the
             // number of passes the graph declares cannot disagree with the
             // number of matrices there are to draw them with.
@@ -1630,9 +1663,31 @@ impl VulkanRenderer {
             // configuration with no compute tail to move gets the plan it always
             // had, on a device with two queues as much as on one.
             async_compute: self.backend.async_compute(),
-            gpu_culling: self.gpu_culling,
             occlusion_culling: self.occlusion_culling,
         });
+
+        // Each cascade the cache does not redraw this frame is swapped back to
+        // the one its map holds, here and before anything reads the set, so the
+        // cull views, the lighting block and the fog all use the matrices those
+        // texels were rendered with. See `shadows::CascadeCache`.
+        let staggered = shadows.map(|frame| {
+            let extent = self.backend.extent();
+            let aspect = extent[0] as f32 / extent[1].max(1) as f32;
+            self.cascade_cache.resolve(
+                frame.cascades,
+                camera,
+                aspect,
+                lighting.sun.direction,
+                &frame.settings.cascade_config(),
+            )
+        });
+        let cascades_due = staggered.map_or([true; MAX_CASCADES], |(due, _)| due);
+        let shadows = shadows
+            .zip(staggered.as_ref())
+            .map(|(frame, (_, set))| ShadowFrame {
+                cascades: set,
+                ..frame
+            });
 
         // Release what the GPU has already finished and block only if the CPU
         // is [`FRAMES_IN_FLIGHT`] frames ahead: recording raw means this crate
@@ -1749,8 +1804,20 @@ impl VulkanRenderer {
         // whole-frame pair go here, ahead of every pass below.
         if let (Some(timestamps), Commands::Vulkan(builder)) = (timestamps.as_mut(), &mut commands)
         {
-            timestamps.record_resets(builder);
+            timestamps.record_resets(builder, self.frame.graph.segments().len());
         }
+
+        // Textures the transfer queue has copied since the last frame, handed to
+        // the graphics family — and their chains built — ahead of anything in
+        // this frame that can sample them. Their semaphores join the first
+        // submission's waits below. See `upload`.
+        let upload_waits = match (&mut commands, &self.device) {
+            (Commands::Vulkan(recorder), Device::Vulkan(driver)) => {
+                driver.record_upload_acquires(recorder)
+            }
+            #[cfg(target_os = "macos")]
+            _ => Vec::new(),
+        };
 
         // Drive the SSAO tunables from the world resource each frame. When SSAO
         // is disabled we skip the three passes and bind a 1x1 white AO view, so
@@ -1776,11 +1843,9 @@ impl VulkanRenderer {
         // pass that touches either has to agree. It also answers whether the
         // half being read holds anything — a freshly allocated pair does not,
         // and the cull is told to test nothing that frame.
-        let occlusion_live = self.occlusion.begin_frame(
-            &self.device,
-            self.gpu_culling && self.occlusion_culling,
-            self.backend.extent(),
-        );
+        let occlusion_live =
+            self.occlusion
+                .begin_frame(&self.device, self.occlusion_culling, self.backend.extent());
         self.dof.begin_frame(dof, camera, self.backend.extent());
         // Resolved against the camera for the reason the lens is: the kernel's
         // width in pixels is a world length divided by a view depth, so both
@@ -1895,24 +1960,9 @@ impl VulkanRenderer {
         let shadow_texture_set = self.shadow_texture_set.unwrap();
 
         // Every list a frame draws is an ordering over one shared `RenderItem`
-        // array, so any non-empty list carries the whole of it. Taking the
-        // longest rather than the camera's is what keeps a frame that culled
-        // everything on screen — but still casts shadows — from syncing nothing.
-        let no_casters: [DrawList<'_>; 0] = [];
+        // array, so any non-empty list carries the whole of it.
         let items = [draws, transparent, refractive]
             .into_iter()
-            .chain(
-                shadows
-                    .map_or(&no_casters[..], |s| s.casters)
-                    .iter()
-                    .copied(),
-            )
-            .chain(
-                shadows
-                    .map_or(&no_casters[..], |s| s.punctual_casters)
-                    .iter()
-                    .copied(),
-            )
             .map(|list| list.items)
             .max_by_key(|items| items.len())
             .unwrap_or(&[]);
@@ -1926,31 +1976,22 @@ impl VulkanRenderer {
             self.instances.sync(&self.device, &mut encoder, items);
         }
 
-        // The draw orders, as row numbers into those rows. Still per frame,
-        // because the orders are: what the camera can see and what casts into
-        // each cascade is a different answer every frame even when nothing
-        // moved. Four bytes an entry rather than the 192 the matrices took.
-        // The camera-visible items come first, so the two screen-space passes
-        // still index from zero and the cascades index from
-        // `objects.cascade_bases`.
-        let objects = self.instances.upload_lists(
-            &self.device,
-            draws,
-            transparent,
-            refractive,
-            shadows.map_or(&no_casters, |s| s.casters),
-            shadows.map_or(&no_casters, |s| s.punctual_casters),
-        );
+        // The blended queues' draw orders, as row numbers into those rows. Still
+        // per frame, because the orders are: what the camera can see is a
+        // different answer every frame even when nothing moved. The opaque
+        // queue's are the cull dispatch's to write.
+        let objects = self
+            .instances
+            .upload_lists(&self.device, transparent, refractive);
         let object_rows = self.instances.rows();
 
         // The views the compute path culls against, in the numbering `cull.rs`
         // documents: the camera, then each cascade, then each punctual face.
-        // Faces individually rather than one view per light, which is the same
-        // narrowing `ShadowPass::record_atlas` does on the CPU path and for the
-        // same reason — a face frustum has its apex at the light, so nothing
-        // outside one can occlude light entering it.
+        // Faces individually rather than one view per light — a face frustum
+        // has its apex at the light, so nothing outside one can occlude light
+        // entering it. See `ShadowPass::record_atlas`.
         let cull_views: Vec<CullView> =
-            if self.gpu_culling {
+            {
                 let mut views = vec![CullView::Frustum(Frustum::from_view_projection(
                     view.unjittered_view_proj,
                 ))];
@@ -1969,10 +2010,8 @@ impl VulkanRenderer {
                     }));
                 }
                 views
-            } else {
-                Vec::new()
             };
-        let cull_frame = self.gpu_culling.then(|| {
+        let cull_frame = {
             let meshes = &self.meshes;
             let materials = &self.materials;
             self.cull.prepare(
@@ -1984,13 +2023,15 @@ impl VulkanRenderer {
                         .map(|mesh| (mesh.span, mesh.bounds))
                 },
                 |material| {
-                    materials
-                        .get(material as usize)
-                        .is_some_and(GpuMaterial::is_masked)
+                    let material = materials.get(material as usize);
+                    cull::Variant {
+                        masked: material.is_some_and(GpuMaterial::is_masked),
+                        lobed: material.is_some_and(GpuMaterial::is_lobed),
+                    }
                 },
                 cull_views.len() as u32,
             )
-        });
+        };
 
         // One set per pipeline layout per frame, rather than one per pass. The
         // buffer is a fresh subbuffer each frame so none of these can be cached
@@ -1999,14 +2040,11 @@ impl VulkanRenderer {
         // cascade, which is where the duplication actually was. They are kept
         // separate rather than shared because set compatibility is a property of
         // the layout each pipeline declares, not of the buffer written into it.
-        // Which buffer the *opaque* passes index through. Under GPU culling it
-        // is the one the dispatch wrote; the blended and refractive queues are
-        // still CPU-culled and keep the host-written one, which is why the
-        // graph names the two apart. See `blended_index` in `frame::declare`.
-        let opaque_indices = match &cull_frame {
-            Some(_) => self.cull.indices(),
-            None => objects.indices,
-        };
+        // The *opaque* passes index through the buffer the dispatch wrote; the
+        // blended and refractive queues are CPU-culled and keep the host-written
+        // one, which is why the graph names the two apart. See `blended_index`
+        // in `frame::declare`.
+        let opaque_indices = self.cull.indices();
         let forward_object_set =
             self.forward
                 .build_object_set(&self.device, object_rows, opaque_indices);
@@ -2097,6 +2135,22 @@ impl VulkanRenderer {
         // re-derives an order.
         let scene_color = self.texture_of(self.frame.ids.scene_color);
 
+        // Against the unjittered projection: the bins are conservative by far
+        // more than a subpixel, and the lookup reads `gl_FragCoord`, which the
+        // jitter does not move.
+        {
+            profile_scope!("light clusters");
+            let extent = self.backend.extent();
+            let aspect = extent[0] as f32 / extent[1].max(1) as f32;
+            self.light_clusters.bin(
+                lighting,
+                camera.view(),
+                camera.projection(aspect),
+                camera.near,
+                camera.far,
+            );
+        }
+
         // Built before the walk rather than inside the forward pass's body,
         // because two passes bind these five: the forward pass and the
         // transparency accumulation, which draws through the same pipeline
@@ -2173,17 +2227,13 @@ impl VulkanRenderer {
             None => vec![None; self.frame.graph.order().len()],
         };
 
-        // The blended queues index through the host-written list whichever path
-        // the opaque ones took, which is the same buffer on the CPU path and a
-        // different one under GPU culling.
-        let blended_sets = forward_sets.with_object_set(match &cull_frame {
-            Some(_) => {
-                let host_indices = objects.indices;
-                self.forward
-                    .build_object_set(&self.device, object_rows, host_indices)
-            }
-            None => forward_object_set,
-        });
+        // The blended queues index through the host-written list, not the one
+        // the dispatch wrote for the opaque ones.
+        let blended_sets = forward_sets.with_object_set(self.forward.build_object_set(
+            &self.device,
+            object_rows,
+            objects.indices,
+        ));
 
         let record = FrameRecord {
             vk: match &self.backend {
@@ -2201,11 +2251,11 @@ impl VulkanRenderer {
             },
             device: &self.device,
             meshes: &self.meshes,
-            materials: &self.materials,
             frame: &self.frame,
             table: &self.table,
             swapchain_id,
             shadow_resolution: self.config.shadow_resolution,
+            cascades_due,
             extent,
             bloom: &self.bloom,
             contact_shadows: &self.contact_shadows,
@@ -2341,9 +2391,13 @@ impl VulkanRenderer {
             Vec::with_capacity(ranges.len());
         for (index, (queue, range)) in ranges.iter().enumerate() {
             if index > 0 {
-                let (commands, keep) = builder.end();
+                let mut next =
+                    Recorder::for_family(&self.backend.vk().ctx, self.queue_family(*queue));
+                if let Some(timestamps) = timestamps.as_ref() {
+                    timestamps.seam(&mut builder, &mut next, index);
+                }
+                let (commands, keep) = std::mem::replace(&mut builder, next).end();
                 recorded.push((ranges[index - 1].0, commands, keep));
-                builder = Recorder::for_family(&self.backend.vk().ctx, self.queue_family(*queue));
             }
             // Only the graphics head is worth spreading over the pool: the
             // compute tail is a handful of commands per dispatch, and a
@@ -2413,7 +2467,7 @@ impl VulkanRenderer {
             let overlay_ready = overlay_pass.then(&semaphore);
             let chain = semaphore();
 
-            let mut waits = Vec::new();
+            let mut waits = upload_waits;
             if let Some(acquired) = acquire_semaphore {
                 // The acquired image is only written by the passes that render
                 // into it, and the earliest of those is the tonemap's colour
@@ -2479,7 +2533,7 @@ impl VulkanRenderer {
         //    rather than left to the queue's submission order, which Vulkan does
         //    not guarantee is execution order.
         let head_done = semaphore();
-        let mut head_waits = Vec::new();
+        let mut head_waits = upload_waits;
         if let Some(gate) = self.backend.vk_mut().head_gate.take() {
             head_waits.push((gate, ash::vk::PipelineStageFlags::ALL_COMMANDS));
         }
@@ -2616,12 +2670,14 @@ struct FrameRecord<'a> {
     vk: Option<VkFrame<'a>>,
     device: &'a Device,
     meshes: &'a [GpuMesh],
-    materials: &'a [GpuMaterial],
     frame: &'a Frame,
     table: &'a ImageTable,
     /// The same image as the device names it, which is what a pass binds.
     swapchain_id: TextureViewId,
     shadow_resolution: u32,
+    /// Which cascade passes draw; the rest keep last frame's texels and record
+    /// nothing, not even the clear their render pass would open with.
+    cascades_due: [bool; MAX_CASCADES],
     extent: [u32; 2],
     bloom: &'a BloomPass,
     contact_shadows: &'a ContactShadowPass,
@@ -2656,10 +2712,9 @@ struct FrameRecord<'a> {
     /// The persistent object rows, which the cull dispatch reads for the model
     /// matrix that turns a batch's object-space box into a world one.
     object_rows: BufferId,
-    /// The batch table this frame was prepared with, and `None` on the CPU path.
-    /// Every opaque geometry pass reads it to decide whether it draws runs or
-    /// indirect commands, so the two cannot half-switch.
-    cull_frame: Option<cull::CullFrame>,
+    /// The batch table this frame was prepared with, which every opaque
+    /// geometry pass draws its indirect commands through.
+    cull_frame: cull::CullFrame,
     cull_views: &'a [CullView],
     /// The previous frame's pyramid, and whether the cull may conclude anything
     /// from it. Assembled here rather than reached for through `self` because
@@ -2669,8 +2724,7 @@ struct FrameRecord<'a> {
     occlusion: &'a OcclusionPass,
     caster_sets: Option<shadow::CasterSets>,
     forward_sets: forward::ForwardSets,
-    /// The same sets with the blended queues' own instance buffer bound. Equal
-    /// to `forward_sets` on the CPU path, where there is only one such buffer.
+    /// The same sets with the blended queues' own instance buffer bound.
     blended_sets: forward::ForwardSets,
     frame_uniforms: Option<BufferId>,
     ssao_uniforms: Option<ssao::SsaoUniforms>,
@@ -2711,40 +2765,25 @@ struct PendingTail {
     overlay: bool,
 }
 
-/// Whether the frame decides its visible set on the GPU.
+/// Refuse a device that cannot draw what the cull dispatch writes.
 ///
-/// On unless `ORRIN_GPU_CULL=0`, which reads the way `ORRIN_ASYNC_COMPUTE`
-/// does. At 4000 stress entities the dispatch halves extraction against the
-/// CPU sweep, and at demo scale it costs nothing measurable; the sweep stays as
-/// the control the two are measured against on one binary.
-///
-/// A device that cannot multi-draw keeps the sweep whatever the variable says,
-/// and says so rather than drawing one batch per view and calling it the same
-/// thing: a silently different path is not a measurement. See
-/// [`VkContext::multi_draw`].
-fn read_gpu_culling(ctx: &VkContext) -> bool {
-    let asked = gpu_culling_requested(std::env::var("ORRIN_GPU_CULL").ok().as_deref());
-    if asked && !ctx.multi_draw {
-        tracing::warn!(
-            "GPU culling: unavailable — this device has no multi-draw indirect \
-             with a per-draw first instance; keeping the CPU sweep"
-        );
-    }
-    asked && ctx.multi_draw
+/// Opaque geometry is culled on the GPU and nowhere else: every view's batches
+/// are one multi-draw, and a batch finds its instances through the
+/// `firstInstance` the dispatch wrote into its command. A device without both
+/// has no path that draws the opaque queue, so it is told so at startup rather
+/// than drawing nothing. See [`VkContext::multi_draw`].
+fn require_gpu_culling(ctx: &VkContext) {
+    assert!(
+        ctx.multi_draw,
+        "this device has no multi-draw indirect with a per-draw first instance \
+         (`multiDrawIndirect` and `drawIndirectFirstInstance`), which drawing the \
+         GPU-culled opaque queue needs"
+    );
 }
 
-/// `ORRIN_GPU_CULL` read as a request: anything but `0` asks for the dispatch.
-fn gpu_culling_requested(value: Option<&str>) -> bool {
-    value.is_none_or(|value| value.trim() != "0")
-}
-
-/// Whether the cull also drops what the previous frame's depth already covered.
-///
-/// A second variable rather than a level of the first, because the two answer
-/// different questions: `ORRIN_GPU_CULL` asks whether the visible set is decided
-/// on the GPU at all, and this asks whether that decision is allowed to be
-/// *smaller* than the frustum's. It has no effect without the first, which is
-/// where it is anded.
+/// Whether the cull also drops what the previous frame's depth already covered:
+/// whether the visible set it decides is allowed to be *smaller* than the
+/// frustum's.
 fn read_occlusion_culling() -> bool {
     std::env::var("ORRIN_OCCLUSION").is_ok_and(|value| value.trim() == "1")
 }
@@ -2819,20 +2858,8 @@ impl FrameRecord<'_> {
     fn cost(&self, slot: usize) -> u32 {
         let pass_id = self.frame.graph.order()[slot];
         match self.frame.bodies[pass_id.index()] {
-            PassBody::ShadowCascade(cascade) => self
-                .shadows
-                .map_or(0, |shadows| shadows.casters[cascade as usize].len() as u32),
-            // Each caster is drawn once per face of its light, which is what
-            // makes this one pass the frame's most expensive to record.
-            PassBody::PunctualShadows => self.shadows.map_or(0, |shadows| {
-                shadows
-                    .atlas
-                    .casters
-                    .iter()
-                    .zip(shadows.punctual_casters)
-                    .map(|(caster, list)| list.len() as u32 * caster.face_count as u32)
-                    .sum()
-            }),
+            // A shadow view records one multi-draw per pipeline variant, which
+            // the dispatch filled; its cost does not grow with what it casts.
             PassBody::GeometryPrepass | PassBody::Forward => self.draws.len() as u32,
             PassBody::OitAccumulate => self.transparent.len() as u32,
             PassBody::RefractionDraw => self.refractive.len() as u32,
@@ -2842,20 +2869,17 @@ impl FrameRecord<'_> {
 
     /// What a pass body gets of the renderer besides its own state.
     /// What an opaque geometry pass draws for `view`: the batches the dispatch
-    /// culled, or the ordered list the sweep handed it.
+    /// culled for it.
     ///
     /// The view numbering is `cull.rs`'s and is stated once here — the camera,
     /// then each cascade, then each punctual face — because the dispatch wrote
     /// its blocks in that order and a pass reading the wrong one draws another
     /// view's visible set without anything failing.
-    fn opaque_draws<'b>(&'b self, view: u32, list: DrawList<'b>, base: u32) -> Draws<'b> {
-        match &self.cull_frame {
-            Some(frame) => Draws::Gpu {
-                frame,
-                view,
-                commands: self.cull.commands(),
-            },
-            None => Draws::Cpu { list, base },
+    fn opaque_draws(&self, view: u32) -> Draws<'_> {
+        Draws {
+            frame: &self.cull_frame,
+            view,
+            commands: self.cull.commands(),
         }
     }
 
@@ -2869,7 +2893,6 @@ impl FrameRecord<'_> {
     fn pass_ctx(&self) -> PassCtx<'_> {
         PassCtx {
             meshes: self.meshes,
-            materials: self.materials,
         }
     }
 
@@ -2923,6 +2946,15 @@ impl FrameRecord<'_> {
         // Imported images: a history has to survive a frame boundary, and a
         // transient by contract does not, so the pass that ping-pongs it owns
         // the allocation.
+        //
+        // The cascade map is the one import the table answers for, because it is
+        // also an attachment and `rendering_info` resolves attachments there;
+        // `reallocate` registered it.
+        if Some(id) == ids.shadows {
+            return Some(record::Target::Image(
+                self.vk_view(self.table.texture(id)).image().clone(),
+            ));
+        }
         if let Some(fog) = ids.fog
             && id == fog.scatter
         {
@@ -3004,6 +3036,14 @@ impl FrameRecord<'_> {
             }
             return;
         }
+        // The barriers above still ran: they carry the map through the
+        // attachment layout and back, which leaves the texels where they were.
+        if self.skipped(body) {
+            if let Some(timestamps) = self.vk().timestamps {
+                timestamps.close(builder, timed);
+            }
+            return;
+        }
 
         // Attachments, load and store ops and clears together, decided
         // here rather than split between a framebuffer built at allocation
@@ -3044,6 +3084,7 @@ impl FrameRecord<'_> {
                 // to draw over an offscreen capture.
                 PassKind::Raw => {}
                 PassKind::Compute => self.record_compute(encoder, body),
+                _ if self.skipped(body) => {}
                 _ => {
                     // Asked for only by the passes that draw into it, so a window's
                     // drawable is acquired when the first of them records and not
@@ -3070,6 +3111,12 @@ impl FrameRecord<'_> {
                 }
             }
         }
+    }
+
+    /// A cascade the cache kept from an earlier frame: no render pass, so no
+    /// clear, and no draws.
+    fn skipped(&self, body: PassBody) -> bool {
+        matches!(body, PassBody::ShadowCascade(cascade) if !self.cascades_due[cascade as usize])
     }
 
     fn vk(&self) -> &VkFrame<'_> {
@@ -3409,18 +3456,11 @@ impl FrameRecord<'_> {
                 );
             }
             PassBody::CullReset => {
-                let frame = self
-                    .cull_frame
-                    .as_ref()
-                    .expect("the graph scheduled the cull with no batch table");
-
-                self.cull.record_reset(self.device, encoder, frame);
+                self.cull
+                    .record_reset(self.device, encoder, &self.cull_frame);
             }
             PassBody::Cull => {
-                let frame = self
-                    .cull_frame
-                    .as_ref()
-                    .expect("the graph scheduled the cull with no batch table");
+                let frame = &self.cull_frame;
 
                 self.cull.record_cull(
                     self.device,
@@ -3508,12 +3548,7 @@ impl FrameRecord<'_> {
 
                 self.shadow.record(
                     encoder,
-                    &self.pass_ctx(),
-                    self.opaque_draws(
-                        1 + cascade,
-                        shadows.casters[cascade_index],
-                        self.objects.cascade_bases[cascade_index],
-                    ),
+                    self.opaque_draws(1 + cascade),
                     shadows.cascades.cascades[cascade_index].view_proj,
                     self.shadow_resolution,
                     self.caster_sets
@@ -3525,18 +3560,14 @@ impl FrameRecord<'_> {
                 let shadows = self
                     .shadows
                     .expect("the graph scheduled the atlas with no shadow frame");
-                let gpu = self
-                    .cull_frame
-                    .as_ref()
-                    .map(|frame| (frame, self.cull.commands(), self.first_face_view()));
-
                 self.shadow.record_atlas(
                     encoder,
-                    &self.pass_ctx(),
                     shadows.atlas,
-                    shadows.punctual_casters,
-                    &self.objects.punctual_bases,
-                    gpu,
+                    (
+                        &self.cull_frame,
+                        self.cull.commands(),
+                        self.first_face_view(),
+                    ),
                     self.caster_sets
                         .as_ref()
                         .expect("the graph scheduled the atlas with no shadow frame"),
@@ -3546,8 +3577,7 @@ impl FrameRecord<'_> {
                 self.prepass.record(
                     self.device,
                     encoder,
-                    &self.pass_ctx(),
-                    self.opaque_draws(0, self.draws, 0),
+                    self.opaque_draws(0),
                     self.extent,
                     self.frame_uniforms.unwrap(),
                     self.decal_block,
@@ -3621,8 +3651,7 @@ impl FrameRecord<'_> {
 
                 self.forward.draw(
                     encoder,
-                    &self.pass_ctx(),
-                    self.opaque_draws(0, self.draws, 0),
+                    self.opaque_draws(0),
                     &self.view,
                     self.extent,
                     &self.forward_sets,
@@ -3785,19 +3814,4 @@ fn swapchain_color_format(ctx: &VkContext, surface: &Arc<Surface>) -> vulkano::f
         })
         .map(|(f, _)| f)
         .unwrap_or(Format::B8G8R8A8_SRGB)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::gpu_culling_requested;
-
-    /// On unless switched off: the dispatch is the path, and `0` is the
-    /// control every measurement of it is read against.
-    #[test]
-    fn gpu_culling_is_on_unless_switched_off() {
-        assert!(gpu_culling_requested(None));
-        assert!(gpu_culling_requested(Some("1")));
-        assert!(!gpu_culling_requested(Some("0")));
-        assert!(!gpu_culling_requested(Some(" 0 ")));
-    }
 }
