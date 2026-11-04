@@ -1804,7 +1804,7 @@ impl VulkanRenderer {
         // whole-frame pair go here, ahead of every pass below.
         if let (Some(timestamps), Commands::Vulkan(builder)) = (timestamps.as_mut(), &mut commands)
         {
-            timestamps.record_resets(builder);
+            timestamps.record_resets(builder, self.frame.graph.segments().len());
         }
 
         // Textures the transfer queue has copied since the last frame, handed to
@@ -2391,9 +2391,13 @@ impl VulkanRenderer {
             Vec::with_capacity(ranges.len());
         for (index, (queue, range)) in ranges.iter().enumerate() {
             if index > 0 {
-                let (commands, keep) = builder.end();
+                let mut next =
+                    Recorder::for_family(&self.backend.vk().ctx, self.queue_family(*queue));
+                if let Some(timestamps) = timestamps.as_ref() {
+                    timestamps.seam(&mut builder, &mut next, index);
+                }
+                let (commands, keep) = std::mem::replace(&mut builder, next).end();
                 recorded.push((ranges[index - 1].0, commands, keep));
-                builder = Recorder::for_family(&self.backend.vk().ctx, self.queue_family(*queue));
             }
             // Only the graphics head is worth spreading over the pool: the
             // compute tail is a handful of commands per dispatch, and a

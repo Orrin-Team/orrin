@@ -1,8 +1,8 @@
 //! Per-pass GPU timing, feeding [`Profiler::push_gpu_span`].
 //!
-//! One timestamp pair per pass, plus a reserved pair spanning the whole frame so
-//! the HUD's single GPU number keeps its meaning. Three properties shape the
-//! design:
+//! One timestamp pair per pass, plus a reserved pair per submitted segment of
+//! the frame, whose sum is the HUD's single GPU number. Four properties shape
+//! the design:
 //!
 //! - Timestamps are written during recording but readable only once the GPU has
 //!   passed them, so a pass's timing belongs to a frame that closed one or more
@@ -13,6 +13,14 @@
 //!   reset covers `2 * MAX_PASSES` queries rather than the ones actually used.
 //! - A pool must not be reset while the GPU may still be reading it, which is
 //!   what [`SLOTS`] buys.
+//! - A split frame is three submissions, and its trailing graphics segment goes
+//!   to the queue behind the *next* frame's head (see `PendingTail`). One pair
+//!   from its first command to its last would also hold the GPU idling while the
+//!   CPU records that next frame, and the neighbouring frames' segments; measured
+//!   on an RX 9070 XT, that doubled the frame. So each segment carries its own
+//!   pair and the frame is their sum: GPU work across both queues, which can
+//!   exceed the wall-clock interval when compute really overlaps graphics. An
+//!   unsplit frame is one segment, and so the one pair it always was.
 //!
 //! Both stamps of a pair are `BottomOfPipe`. A timestamp latches once all prior
 //! commands have reached the given stage, so a `TopOfPipe` opening stamp can
@@ -32,7 +40,7 @@ use super::context::VkContext;
 use super::record::Recorder;
 use crate::profile::{Profiler, Span};
 
-/// Passes timed per frame, including the reserved whole-frame pair. Costs
+/// Passes timed per frame, including the reserved whole-frame pairs. Costs
 /// `2 * MAX_PASSES` queries per slot whether used or not; passes beyond it are
 /// dropped rather than mis-attributed.
 ///
@@ -41,9 +49,9 @@ use crate::profile::{Profiler, Span};
 /// diffusion passes, four reflection passes, two transparency passes, three
 /// refraction passes, the temporal resolve, four lens passes, three shutter
 /// passes, two metering dispatches, an eleven-pass bloom chain and the tonemap,
-/// plus the whole-frame pair. Bloom is what made the old 16 too small, and it
-/// grows with `MAX_BLOOM_MIPS`: a chain of `n` levels is `2n - 1` passes, so
-/// raising that cap means raising this one.
+/// plus a whole-frame pair per segment. Bloom is what made the old 16 too small,
+/// and it grows with `MAX_BLOOM_MIPS`: a chain of `n` levels is `2n - 1` passes,
+/// so raising that cap means raising this one.
 /// `the_busiest_frame_fits_the_query_pool` is what keeps this number honest —
 /// and it is why 40 was not enough: that test used to switch three features off,
 /// so the frame it called busiest was one nothing runs, while the editor's own
@@ -76,8 +84,9 @@ const MAX_PASSES: usize = 64;
 /// looks wrong while it happens.
 const SLOTS: usize = super::FRAMES_IN_FLIGHT + 1;
 
-/// Name of the reserved pair covering the whole frame. Always query 0/1, which
-/// also makes query 0 a guaranteed-written origin for the anchor below.
+/// Name of the reserved pairs covering the whole frame, one per segment. They
+/// take the first queries in segment order, which makes query 0 a
+/// guaranteed-written origin for the anchor below.
 const WHOLE_FRAME_PASS: &str = "frame";
 
 /// A query pair reserved for one pass. Dropping one without stamping it leaves
@@ -116,6 +125,9 @@ struct FrameSlot {
     passes: Vec<RecordedPass>,
     state: SlotState,
     next_query: u32,
+    /// Whole-frame pairs reserved, one per segment; zero when profiling was off
+    /// as the frame opened.
+    segments: u32,
 }
 
 pub struct GpuTimestamps {
@@ -167,6 +179,7 @@ impl GpuTimestamps {
                 passes: Vec::with_capacity(MAX_PASSES),
                 state: SlotState::Idle,
                 next_query: 0,
+                segments: 0,
             });
         }
 
@@ -188,35 +201,55 @@ impl GpuTimestamps {
         let slot = &mut self.slots[self.write];
         slot.passes.clear();
         slot.next_query = 0;
+        slot.segments = 0;
         slot.frame_index = profiler_frame;
         slot.anchor_ns = crate::profile::now_ns();
         slot.state = SlotState::Idle;
     }
 
-    /// Reset this frame's queries and open the reserved whole-frame pair.
+    /// Reset this frame's queries, reserve a whole-frame pair for each of its
+    /// `segments`, and open the first.
     ///
     /// Must be recorded before the first `begin_rendering`: a reset inside a
     /// render pass instance is invalid, and which passes will run isn't known
     /// yet, so the entire pool is reset in one go.
-    pub fn record_resets(&mut self, builder: &mut Recorder) {
+    pub fn record_resets(&mut self, builder: &mut Recorder, segments: usize) {
         let pool = self.slots[self.write].pool.clone();
         // SAFETY: outside any render pass, and this slot is not in flight —
         // there are more slots than frames the CPU may be ahead by, so the frame
         // that last wrote this one has been waited on by
         // `RunAhead::wait_for_room`.
         builder.reset_query_pool(pool, 0..(2 * MAX_PASSES as u32));
-        // Reserved first, so it is always query 0/1 and query 0 is guaranteed
-        // written — `drain_completed` uses it as the frame's tick origin. Its
-        // closing stamp comes from `end_frame`, which knows that fixed position.
+        // Reserved first, so segment `i` is always queries `2i`/`2i + 1` and
+        // query 0 is guaranteed written — `drain_completed` uses it as the
+        // frame's tick origin. The seams and `end_frame` stamp the rest, from
+        // those fixed positions.
         //
         // Reserved through `stamp` rather than `begin_pass`, because it must not
         // answer to the per-pass switch: the whole-frame pair is the one number
         // that has to survive turning per-pass timing off, since comparing the
         // two is the entire point of being able to.
         if crate::profile::is_enabled() {
-            let whole_frame = self.take_pair(WHOLE_FRAME_PASS);
-            self.open(builder, whole_frame);
+            for _ in 0..segments {
+                self.take_pair(WHOLE_FRAME_PASS);
+            }
+            self.slots[self.write].segments = segments as u32;
+            self.open(builder, self.segment(0));
         }
+    }
+
+    /// Close segment `index - 1`'s whole-frame pair in the buffer it ends, and
+    /// open segment `index`'s in the one that follows.
+    pub fn seam(&self, ending: &mut Recorder, starting: &mut Recorder, index: usize) {
+        self.close(ending, self.segment(index - 1));
+        self.open(starting, self.segment(index));
+    }
+
+    /// The whole-frame pair of segment `index`, if one was reserved.
+    fn segment(&self, index: usize) -> Option<PassToken> {
+        (index < self.slots[self.write].segments as usize).then_some(PassToken {
+            base: 2 * index as u32,
+        })
     }
 
     /// Reserve a query pair for `name`, for the pass to stamp when it records.
@@ -272,12 +305,13 @@ impl GpuTimestamps {
         builder.write_timestamp(pool, token.base + 1, PipelineStage::BottomOfPipe);
     }
 
-    /// Close the reserved whole-frame pair, mark the slot for readback, rotate.
+    /// Close the last segment's whole-frame pair, mark the slot for readback,
+    /// rotate.
     pub fn end_frame(&mut self, builder: &mut Recorder) {
-        // Empty means profiling was off when the frame opened, so nothing was
-        // stamped and there is no pair to close.
-        if !self.slots[self.write].passes.is_empty() {
-            self.close(builder, Some(PassToken { base: 0 }));
+        // No segments means profiling was off when the frame opened, so nothing
+        // was stamped and there is no pair to close.
+        if let Some(last) = (self.slots[self.write].segments as usize).checked_sub(1) {
+            self.close(builder, self.segment(last));
         }
         self.slots[self.write].state = SlotState::Pending;
         self.write = (self.write + 1) % SLOTS;
@@ -312,6 +346,8 @@ impl GpuTimestamps {
             }
 
             let origin = results[0] & self.valid_mask;
+            let mut frame_ms = 0.0f64;
+            let mut frame_pairs = 0u32;
             for pass in &slot.passes {
                 let start = results[pass.base as usize] & self.valid_mask;
                 let end = results[pass.base as usize + 1] & self.valid_mask;
@@ -328,7 +364,8 @@ impl GpuTimestamps {
                         + (tick.saturating_sub(origin) as f64 * self.period_ns as f64) as u64
                 };
                 if pass.name == WHOLE_FRAME_PASS {
-                    self.last_frame_ms = (duration_ns / 1.0e6) as f32;
+                    frame_ms += duration_ns / 1.0e6;
+                    frame_pairs += 1;
                 }
                 profiler.push_gpu_span(
                     slot.frame_index,
@@ -341,12 +378,17 @@ impl GpuTimestamps {
                 );
             }
 
+            // A frame missing a segment would read short, and a short frame
+            // looks like a win.
+            if frame_pairs == slot.segments {
+                self.last_frame_ms = frame_ms as f32;
+            }
             slot.state = SlotState::Idle;
         }
     }
 
-    /// Whole-frame GPU milliseconds, from the reserved pair. Trails the displayed
-    /// frame.
+    /// Whole-frame GPU milliseconds, the sum of the frame's segment pairs.
+    /// Trails the displayed frame.
     pub fn last_frame_ms(&self) -> f32 {
         self.last_frame_ms
     }
@@ -425,6 +467,12 @@ mod tests {
     /// overran the pool.
     #[test]
     fn the_busiest_frame_fits_the_query_pool() {
+        for async_compute in [false, true] {
+            busiest_frame_fits(async_compute);
+        }
+    }
+
+    fn busiest_frame_fits(async_compute: bool) {
         let config = FrameConfig {
             color_format: crate::gfx::format::Format::Bgra8Srgb,
             msaa: false,
@@ -448,23 +496,25 @@ mod tests {
             shadow_cascades: MAX_CASCADES as u8,
             shadow_resolution: 2048,
             shadow_atlas: 4096,
-            async_compute: false,
+            async_compute,
             occlusion_culling: false,
         };
         let frame = declare(config).expect("the busiest frame must compile");
 
         // Raw passes own their submission and are never timed, so they do not
-        // draw from the pool. The whole-frame pair does.
-        let timed = 1 + frame
-            .graph
-            .order()
-            .iter()
-            .filter(|&&id| frame.graph.pass_kind(id) != PassKind::Raw)
-            .count();
+        // draw from the pool. Each segment's whole-frame pair does.
+        let timed = frame.graph.segments().len()
+            + frame
+                .graph
+                .order()
+                .iter()
+                .filter(|&&id| frame.graph.pass_kind(id) != PassKind::Raw)
+                .count();
 
         assert!(
             timed <= MAX_PASSES,
-            "the busiest frame times {timed} passes but the pool holds {MAX_PASSES}",
+            "the busiest frame (async compute {async_compute}) times {timed} passes \
+             but the pool holds {MAX_PASSES}",
         );
     }
 
@@ -489,6 +539,61 @@ mod tests {
             SLOTS >= 3,
             "a slot is only eligible to drain a frame after the \
              one it was written in, and never while the cursor sits on it"
+        );
+    }
+
+    /// A split frame's trailing segment is held back and submitted behind the
+    /// next frame's head, so the GPU can sit idle for a whole CPU frame between
+    /// the frame's first command and its last. The frame's number is its work,
+    /// not that wait: the sleep stands in for the CPU recording the next frame.
+    #[test]
+    #[ignore = "needs a Vulkan device"]
+    fn a_split_frame_is_timed_by_its_work_not_by_the_wait_for_its_tail() {
+        use vulkano::VulkanLibrary;
+        use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
+
+        use super::super::record::Pending;
+
+        const IDLE: std::time::Duration = std::time::Duration::from_millis(20);
+
+        let instance = Instance::new(
+            VulkanLibrary::new().expect("a Vulkan library"),
+            InstanceCreateInfo {
+                flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+                ..Default::default()
+            },
+        )
+        .expect("a headless instance");
+        let ctx = VkContext::new(&instance, None);
+        let mut timestamps = GpuTimestamps::new(&ctx).expect("a queue that writes timestamps");
+        let mut profiler = Profiler::new(4);
+
+        // The renderer's shape: all three segments recorded together, the
+        // middle one on the compute queue where there is one.
+        let compute_queue = ctx.compute_queue.clone().unwrap_or(ctx.queue.clone());
+        timestamps.begin_frame(profiler.frame_index());
+        let mut head = Recorder::new(&ctx);
+        timestamps.record_resets(&mut head, 3);
+        let mut compute = Recorder::for_family(&ctx, compute_queue.queue_family_index());
+        timestamps.seam(&mut head, &mut compute, 1);
+        let mut tail = Recorder::new(&ctx);
+        timestamps.seam(&mut compute, &mut tail, 2);
+        timestamps.end_frame(&mut tail);
+
+        head.submit_and_wait(&ctx);
+        let (commands, keep) = compute.end();
+        super::super::record::submit_frame(&ctx, &compute_queue, commands, keep, &[], &[]).retire();
+        std::thread::sleep(IDLE);
+        tail.submit_and_wait(&ctx);
+
+        profiler.end_frame();
+        timestamps.drain_completed(&mut profiler);
+        let frame_ms = timestamps.last_frame_ms();
+        assert!(frame_ms > 0.0, "the frame was not read back");
+        assert!(
+            frame_ms < IDLE.as_secs_f32() * 1.0e3 / 4.0,
+            "three empty segments read {frame_ms:.3} ms: the {IDLE:?} the GPU sat \
+             idle before the tail was counted as the frame's",
         );
     }
 
