@@ -155,6 +155,22 @@ pub struct OrrinApi {
     // to read or write.
     pub get_camera: extern "C" fn(*mut CTransform) -> bool,
     pub set_camera: extern "C" fn(*const CTransform) -> bool,
+    // Camera entities, appended after `set_camera`; never reordered above it.
+    //
+    // `add_camera` is structural and deferred like `add_box_collider`; the
+    // other two read and write a camera's lens in place. All three refuse a
+    // lens that cannot project (see `CameraComponent::check`). While a camera
+    // entity is active, `get_camera`/`set_camera` above address its world
+    // transform rather than the view, which follows it.
+    pub add_camera: extern "C" fn(CEntity, *const CCamera) -> bool,
+    pub get_camera_lens: extern "C" fn(CEntity, *mut CCamera) -> bool,
+    pub set_camera_lens: extern "C" fn(CEntity, *const CCamera) -> bool,
+    // The camera the game draws from, or `CEntity::NULL` for none. Selecting
+    // `CEntity::NULL` hands the choice back to the cameras' priorities. A
+    // camera `add_camera` queued this tick may be selected; anything else that
+    // is not a camera is refused.
+    pub get_active_camera: extern "C" fn() -> CEntity,
+    pub set_active_camera: extern "C" fn(CEntity) -> bool,
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -229,7 +245,28 @@ pub fn default_api() -> OrrinApi {
         active_scene: stub_active_scene,
         get_camera: stub_get_camera,
         set_camera: stub_set_camera,
+        add_camera: stub_camera_lens,
+        get_camera_lens: stub_get_camera_lens,
+        set_camera_lens: stub_camera_lens,
+        get_active_camera: stub_get_active_camera,
+        set_active_camera: stub_set_active_camera,
     }
+}
+
+extern "C" fn stub_camera_lens(_entity: CEntity, _value: *const CCamera) -> bool {
+    false
+}
+
+extern "C" fn stub_get_camera_lens(_entity: CEntity, _out: *mut CCamera) -> bool {
+    false
+}
+
+extern "C" fn stub_get_active_camera() -> CEntity {
+    CEntity::NULL
+}
+
+extern "C" fn stub_set_active_camera(_entity: CEntity) -> bool {
+    false
 }
 
 extern "C" fn stub_load_scene(_id: *const u8) -> bool {
@@ -681,6 +718,18 @@ pub struct CTransform {
     pub position: [f32; 3],
     pub rotation: [f32; 4],
     pub scale: [f32; 3],
+}
+
+/// C ABI camera lens: vertical field of view in degrees, near and far planes
+/// in metres, and the priority that picks a camera when none is selected.
+/// Matches the C# `Orrin.CameraComponent`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CCamera {
+    pub fov_degrees: f32,
+    pub near: f32,
+    pub far: f32,
+    pub priority: i32,
 }
 
 /// C ABI collision event payload, as seen by one participant: the *other*

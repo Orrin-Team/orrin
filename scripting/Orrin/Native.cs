@@ -79,6 +79,13 @@ public unsafe struct OrrinApi
     public delegate* unmanaged<uint> ActiveScene;
     public delegate* unmanaged<Transform*, byte> GetCamera;
     public delegate* unmanaged<Transform*, byte> SetCamera;
+    // Camera entities, appended after SetCamera, matching the Rust struct;
+    // never reordered above it.
+    public delegate* unmanaged<Entity, CameraComponent*, byte> AddCamera;
+    public delegate* unmanaged<Entity, CameraComponent*, byte> GetCameraLens;
+    public delegate* unmanaged<Entity, CameraComponent*, byte> SetCameraLens;
+    public delegate* unmanaged<Entity> GetActiveCamera;
+    public delegate* unmanaged<Entity, byte> SetActiveCamera;
 }
 
 public static unsafe class Native
@@ -258,6 +265,22 @@ public static unsafe class Native
     }
 
     internal static void SetCamera(Transform transform) => _api.SetCamera(&transform);
+
+    internal static bool AddCamera(Entity entity, CameraComponent camera) =>
+        _api.AddCamera(entity, &camera) != 0;
+
+    internal static CameraComponent? GetCameraLens(Entity entity)
+    {
+        CameraComponent camera = default;
+        return _api.GetCameraLens(entity, &camera) != 0 ? camera : null;
+    }
+
+    internal static bool SetCameraLens(Entity entity, CameraComponent camera) =>
+        _api.SetCameraLens(entity, &camera) != 0;
+
+    internal static Entity GetActiveCamera() => _api.GetActiveCamera();
+
+    internal static bool SetActiveCamera(Entity entity) => _api.SetActiveCamera(entity) != 0;
 
     internal static AssetState GetAssetState(Guid asset)
     {

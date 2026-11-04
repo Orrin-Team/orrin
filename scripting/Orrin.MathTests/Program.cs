@@ -192,6 +192,8 @@ unsafe
     Check(sizeof(Quaternion) == 16, "Quaternion is 16 bytes");
     Check(sizeof(Color) == 16, "Color is 16 bytes");
     Check(sizeof(Orrin.Transform) == 40, "Transform is 10 floats");
+    Check(sizeof(Orrin.CameraComponent) == 16, "CameraComponent is 3 floats and an int");
+    Check(new Orrin.CameraComponent().FieldOfView == 60f, "a new lens is the engine's default");
 }
 
 // --- property bag ABI ----------------------------------------------------------

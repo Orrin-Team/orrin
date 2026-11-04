@@ -3,12 +3,26 @@ using Orrin.Math;
 namespace Orrin;
 
 /// <summary>
-/// The camera the frame is drawn from. There is one, and it is the engine's:
-/// a script moves it by setting <see cref="position"/> and
-/// <see cref="rotation"/>, which take effect in the same frame.
+/// The camera the frame is drawn from. A script moves it by setting
+/// <see cref="position"/> and <see cref="rotation"/>, which take effect in the
+/// same frame. While a camera entity is <see cref="Active"/> these move that
+/// entity, and the view follows it; with none, they move the engine's own view.
 /// </summary>
 public static class Camera
 {
+    /// <summary>
+    /// The camera entity the game draws from, or null when there is none. Set
+    /// it to switch cameras; set null to go back to the highest
+    /// <see cref="CameraComponent.Priority"/>, which is also what draws when
+    /// the selected camera is despawned. Setting an entity that is not a
+    /// camera logs and changes nothing.
+    /// </summary>
+    public static Entity? Active
+    {
+        get => Native.GetActiveCamera() is { IsValid: true } camera ? camera : null;
+        set => Native.SetActiveCamera(value ?? Entity.Null);
+    }
+
     /// <summary>Where the camera stands, in metres.</summary>
     public static Vector3 position
     {
