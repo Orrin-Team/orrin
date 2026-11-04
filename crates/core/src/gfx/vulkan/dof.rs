@@ -168,7 +168,9 @@ impl DofPass {
 
         builder.bind_pipeline(self.tile_max_pipeline);
         builder.bind_group(0, set);
-        dispatch_over(device, builder, target);
+        // One group per tile — see the shader.
+        let tiles = device.view_extent(target);
+        builder.dispatch([tiles[0], tiles[1], 1]);
     }
 
     pub fn record_gather(

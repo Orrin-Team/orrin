@@ -14,7 +14,11 @@
 // easily hold a wide near circle and a tight far one — sizing the far kernel by
 // the near maximum would starve it exactly the way a global maximum does.
 
-layout(local_size_x = 8, local_size_y = 8) in;
+// One workgroup per tile, each invocation folding a 2x2 block of it before a
+// reduction in shared memory. A tile used to be one invocation walking all
+// 1024 of its texels in turn: a few thousand invocations, each a thousand
+// dependent fetches long. A max is order-free, so this is the same answer.
+layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(set = 0, binding = 0) uniform sampler2D u_prefiltered;
 layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_target;
@@ -25,20 +29,19 @@ layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_target;
 // foreground object spill into a tile that never heard about it.
 const int TILE = 32;
 
-void main() {
-    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 size = imageSize(u_target);
-    if (any(greaterThanEqual(texel, size))) {
-        return;
-    }
+shared vec2 s_max[256];
 
+void main() {
+    ivec2 tile = ivec2(gl_WorkGroupID.xy);
+    ivec2 size = imageSize(u_target);
     ivec2 source_size = textureSize(u_prefiltered, 0);
-    ivec2 base = texel * TILE;
+    uint index = gl_LocalInvocationIndex;
+    ivec2 base = tile * TILE + ivec2(gl_LocalInvocationID.xy) * 2;
 
     float far_max = 0.0;
     float near_max = 0.0;
-    for (int y = 0; y < TILE; ++y) {
-        for (int x = 0; x < TILE; ++x) {
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
             ivec2 at = base + ivec2(x, y);
             if (any(greaterThanEqual(at, source_size))) {
                 continue;
@@ -48,6 +51,17 @@ void main() {
             near_max = max(near_max, max(-coc, 0.0));
         }
     }
+    s_max[index] = vec2(far_max, near_max);
+    barrier();
 
-    imageStore(u_target, texel, vec4(far_max, near_max, 0.0, 0.0));
+    for (uint stride = 128u; stride > 0u; stride /= 2u) {
+        if (index < stride) {
+            s_max[index] = max(s_max[index], s_max[index + stride]);
+        }
+        barrier();
+    }
+
+    if (index == 0u && all(lessThan(tile, size))) {
+        imageStore(u_target, tile, vec4(s_max[0], 0.0, 0.0));
+    }
 }

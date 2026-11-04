@@ -17,7 +17,11 @@
 // so every pass below works in final screen-space blur vectors and there is one
 // place where a frame's motion becomes an exposure.
 
-layout(local_size_x = 8, local_size_y = 8) in;
+// One workgroup per tile and one invocation per pixel of it, reduced in shared
+// memory. A tile used to be one invocation walking all 256 of its pixels in
+// turn, which at 1080p is eight thousand invocations each 256 dependent fetches
+// long — too few to fill the GPU and too long to hide their own latency.
+layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(set = 0, binding = 0) uniform sampler2D u_velocity;
 layout(set = 0, binding = 1) uniform sampler2D u_depth;
@@ -65,36 +69,45 @@ vec2 blur_vector(ivec2 at, ivec2 size) {
     return length_pixels > limit ? pixels * (limit / length_pixels) : pixels;
 }
 
+// The longest vector seen so far, its length, and the pixel it came from —
+// the scan-order index, so the reduction can keep the same pixel the serial
+// scan kept: the first of the longest.
+shared vec2 s_vector[TILE * TILE];
+shared float s_length[TILE * TILE];
+shared uint s_index[TILE * TILE];
+
 void main() {
-    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 tile = ivec2(gl_WorkGroupID.xy);
     ivec2 size = imageSize(u_target);
-    if (any(greaterThanEqual(texel, size))) {
-        return;
-    }
-
     ivec2 full_size = textureSize(u_velocity, 0);
-    ivec2 base = texel * TILE;
+    uint index = gl_LocalInvocationIndex;
+    ivec2 at = tile * TILE + ivec2(gl_LocalInvocationID.xy);
 
-    vec2 longest = vec2(0.0);
-    float longest_length = 0.0;
-    for (int y = 0; y < TILE; ++y) {
-        for (int x = 0; x < TILE; ++x) {
-            ivec2 at = base + ivec2(x, y);
-            if (any(greaterThanEqual(at, full_size))) {
-                continue;
-            }
-            vec2 candidate = blur_vector(at, full_size);
-            float candidate_length = length(candidate);
-            if (candidate_length > longest_length) {
-                longest_length = candidate_length;
-                longest = candidate;
+    vec2 candidate = vec2(0.0);
+    if (all(lessThan(at, full_size))) {
+        candidate = blur_vector(at, full_size);
+    }
+    s_vector[index] = candidate;
+    s_length[index] = length(candidate);
+    s_index[index] = index;
+    barrier();
+
+    for (uint stride = uint(TILE * TILE) / 2u; stride > 0u; stride /= 2u) {
+        if (index < stride) {
+            float a = s_length[index];
+            float b = s_length[index + stride];
+            // Strictly longer, or as long and earlier: exactly the pixel the
+            // scan's `>` kept.
+            if (b > a || (b == a && s_index[index + stride] < s_index[index])) {
+                s_length[index] = b;
+                s_vector[index] = s_vector[index + stride];
+                s_index[index] = s_index[index + stride];
             }
         }
+        barrier();
     }
 
-    // An RGBA target for a two-component value, because a storage image is only
-    // guaranteed to support rg16f with an optional device feature while rgba16f
-    // is always available. At one texel per 256 the waste is not worth a feature
-    // flag on the device.
-    imageStore(u_target, texel, vec4(longest, 0.0, 0.0));
+    if (index == 0u && all(lessThan(tile, size))) {
+        imageStore(u_target, tile, vec4(s_vector[0], 0.0, 0.0));
+    }
 }
