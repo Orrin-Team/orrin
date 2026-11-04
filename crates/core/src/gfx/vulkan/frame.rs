@@ -598,6 +598,14 @@ fn indirect(pass: PassBuilder<'_>, commands: ResourceId) -> PassBuilder<'_> {
     pass.access(commands, Access::IndirectRead)
 }
 
+/// What the cascade map is: one layer per cascade, always an array so a single
+/// cascade is sampled through the same `sampler2DArrayShadow` as four.
+pub fn cascade_map_desc(resolution: u32, cascades: u8) -> ImageDesc {
+    ImageDesc::new(SHADOW_FORMAT)
+        .extent(Extent::Fixed([resolution; 2]))
+        .array_layers(cascades as u32)
+}
+
 pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let mut builder = GraphBuilder::new();
     if config.async_compute {
@@ -711,12 +719,18 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         ImageLayout::PresentSrc,
     );
 
+    // Imported rather than graph-owned, because a far cascade is not redrawn
+    // every frame (`shadows::CascadeCache`) and a transient is `Undefined` at the
+    // start of each. Entered and left `ShaderReadOnlyOptimal`, the layout the
+    // frame's samplers leave it in, so a skipped cascade's texels survive the
+    // round trip through the attachment layout. The shadow pass allocates it to
+    // exactly this description.
     let shadows = (config.shadow_cascades > 0).then(|| {
-        builder.create_image(
+        builder.import_image(
             "shadow_cascades",
-            ImageDesc::new(SHADOW_FORMAT)
-                .extent(Extent::Fixed([config.shadow_resolution; 2]))
-                .array_layers(config.shadow_cascades as u32),
+            cascade_map_desc(config.shadow_resolution, config.shadow_cascades),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
         )
     });
 

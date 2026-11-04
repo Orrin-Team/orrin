@@ -3,6 +3,7 @@ use glam::Mat4;
 use crate::gfx::PositionVertex;
 use crate::gfx::format::SampleCount;
 use crate::gfx::graph::ImageUsage;
+use crate::gfx::images::ImageEntry;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BufferId, CullMode, DepthCompare, DepthRect,
@@ -55,6 +56,12 @@ pub struct ShadowPass {
     /// declares the atlas as a plain `texture2D` and the cascades as a
     /// `texture2DArray`, and a view satisfies one or the other.
     lit_atlas_view: TextureViewId,
+    /// The cascade map, kept here rather than by the graph because the far
+    /// cascades are not redrawn every frame (`shadows::CascadeCache`) and a
+    /// graph transient starts each frame `Undefined`. Allocated to the
+    /// description `frame::cascade_map_desc` declares, and replaced only when
+    /// that changes.
+    cascade_map: Option<CascadeMap>,
     pub constant_bias: f32,
     pub slope_bias: f32,
     /// The punctual maps get their own pair. A cascade is orthographic, so one
@@ -112,11 +119,68 @@ impl ShadowPass {
             masked_pipeline,
             lit_view: build_lit_depth(device, TextureDimension::D2Array),
             lit_atlas_view: build_lit_depth(device, TextureDimension::D2),
+            cascade_map: None,
             constant_bias: 1.25,
             slope_bias: 2.5,
             punctual_constant_bias: 2.0,
             punctual_slope_bias: 3.0,
         }
+    }
+
+    /// The cascade map for `resolution` and `layers`, and whether it was just
+    /// (re)allocated — in which case every cascade it held is gone and the
+    /// caller's `CascadeCache` has to forget them.
+    ///
+    /// A new map is cleared to the far plane and left `ShaderReadOnlyOptimal`,
+    /// so the layout the graph declares it entering in is true from its first
+    /// frame rather than only from its second.
+    pub(super) fn cascade_map(
+        &mut self,
+        device: &Device,
+        resolution: u32,
+        layers: u8,
+    ) -> (ImageEntry, bool) {
+        if let Some(map) = &self.cascade_map
+            && map.resolution == resolution
+            && map.layers == layers
+        {
+            return (map.entry.clone(), false);
+        }
+        if let Some(old) = self.cascade_map.take() {
+            for view in old.entry.layers {
+                device.destroy_texture(view);
+            }
+            device.destroy_texture(old.entry.whole);
+        }
+        let desc = super::frame::cascade_map_desc(resolution, layers);
+        let whole = device.create_texture(&TextureDesc {
+            format: desc.format,
+            dimension: TextureDimension::D2Array,
+            extent: [resolution, resolution, 1],
+            mip_levels: 1,
+            array_layers: u32::from(layers),
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT
+                | ImageUsage::SAMPLED
+                | ImageUsage::TRANSFER_DST,
+            memoryless: false,
+        });
+        device.fill_depth(whole, crate::gfx::depth::SHADOW_CLEAR);
+        let entry = ImageEntry {
+            whole,
+            levels: Vec::new(),
+            layers: (0..u32::from(layers))
+                .map(|layer| device.face_view(whole, layer, 0))
+                .collect(),
+            extent: [resolution, resolution],
+            mip_levels: 1,
+        };
+        self.cascade_map = Some(CascadeMap {
+            entry: entry.clone(),
+            resolution,
+            layers,
+        });
+        (entry, true)
     }
 
     /// The "everything is lit" atlas, bound when nothing punctual casts.
@@ -404,6 +468,12 @@ impl CasterSets {
             vec![self.objects]
         }
     }
+}
+
+struct CascadeMap {
+    entry: ImageEntry,
+    resolution: u32,
+    layers: u8,
 }
 
 /// A 1x1 single-layer depth texture cleared to 1.0 — "nothing is nearer than

@@ -58,7 +58,7 @@ use vulkano::{Validated, VulkanError};
 use crate::geom::{Aabb, Frustum};
 use crate::gfx::DecalInstance;
 use crate::gfx::punctual::ShadowAtlas;
-use crate::gfx::shadows::CascadeSet;
+use crate::gfx::shadows::{CascadeCache, CascadeSet, MAX_CASCADES};
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
     FogSettings, HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, PresentSettings,
@@ -256,6 +256,8 @@ pub struct VulkanRenderer {
     /// The shutter's reconstruction, and the velocity pyramid it reads.
     motion_blur: MotionBlurPass,
     shadow: ShadowPass,
+    /// Which cascades this frame redraws. See `shadows::CascadeCache`.
+    cascade_cache: CascadeCache,
     /// Debug-line overlay, recorded into the forward pass. Editor-only in
     /// practice: fed lines only through `render_with_overlay`.
     line: LinePass,
@@ -729,6 +731,7 @@ impl VulkanRenderer {
             dof,
             motion_blur,
             shadow,
+            cascade_cache: CascadeCache::default(),
             line,
             gizmo,
             outline,
@@ -1056,6 +1059,15 @@ impl VulkanRenderer {
         // Imported images: a history has to survive a frame boundary, and a
         // transient by contract does not, so the pass that ping-pongs it owns
         // the allocation.
+        //
+        // The cascade map is the one import the table answers for, because it is
+        // also an attachment and `rendering_info` resolves attachments there;
+        // `reallocate` registered it.
+        if Some(id) == ids.shadows {
+            return Some(record::Target::Image(
+                self.vk_view(self.table.texture(id)).image().clone(),
+            ));
+        }
         if let Some(fog) = ids.fog
             && id == fog.scatter
         {
@@ -1119,6 +1131,17 @@ impl VulkanRenderer {
                 };
                 self.table = mtl.rebuild(driver, &self.frame.graph);
             }
+        }
+        if let Some(id) = self.frame.ids.shadows {
+            let (map, fresh) = self.shadow.cascade_map(
+                &self.device,
+                self.config.shadow_resolution,
+                self.config.shadow_cascades,
+            );
+            if fresh {
+                self.cascade_cache.invalidate();
+            }
+            self.table.import(id, map);
         }
     }
 }
@@ -1607,6 +1630,29 @@ impl VulkanRenderer {
             async_compute: self.backend.async_compute(),
             occlusion_culling: self.occlusion_culling,
         });
+
+        // Each cascade the cache does not redraw this frame is swapped back to
+        // the one its map holds, here and before anything reads the set, so the
+        // cull views, the lighting block and the fog all use the matrices those
+        // texels were rendered with. See `shadows::CascadeCache`.
+        let staggered = shadows.map(|frame| {
+            let extent = self.backend.extent();
+            let aspect = extent[0] as f32 / extent[1].max(1) as f32;
+            self.cascade_cache.resolve(
+                frame.cascades,
+                camera,
+                aspect,
+                lighting.sun.direction,
+                &frame.settings.cascade_config(),
+            )
+        });
+        let cascades_due = staggered.map_or([true; MAX_CASCADES], |(due, _)| due);
+        let shadows = shadows
+            .zip(staggered.as_ref())
+            .map(|(frame, (_, set))| ShadowFrame {
+                cascades: set,
+                ..frame
+            });
 
         // Release what the GPU has already finished and block only if the CPU
         // is [`FRAMES_IN_FLIGHT`] frames ahead: recording raw means this crate
@@ -2156,6 +2202,7 @@ impl VulkanRenderer {
             table: &self.table,
             swapchain_id,
             shadow_resolution: self.config.shadow_resolution,
+            cascades_due,
             extent,
             bloom: &self.bloom,
             contact_shadows: &self.contact_shadows,
@@ -2571,6 +2618,9 @@ struct FrameRecord<'a> {
     /// The same image as the device names it, which is what a pass binds.
     swapchain_id: TextureViewId,
     shadow_resolution: u32,
+    /// Which cascade passes draw; the rest keep last frame's texels and record
+    /// nothing, not even the clear their render pass would open with.
+    cascades_due: [bool; MAX_CASCADES],
     extent: [u32; 2],
     bloom: &'a BloomPass,
     contact_shadows: &'a ContactShadowPass,
@@ -2839,6 +2889,15 @@ impl FrameRecord<'_> {
         // Imported images: a history has to survive a frame boundary, and a
         // transient by contract does not, so the pass that ping-pongs it owns
         // the allocation.
+        //
+        // The cascade map is the one import the table answers for, because it is
+        // also an attachment and `rendering_info` resolves attachments there;
+        // `reallocate` registered it.
+        if Some(id) == ids.shadows {
+            return Some(record::Target::Image(
+                self.vk_view(self.table.texture(id)).image().clone(),
+            ));
+        }
         if let Some(fog) = ids.fog
             && id == fog.scatter
         {
@@ -2920,6 +2979,14 @@ impl FrameRecord<'_> {
             }
             return;
         }
+        // The barriers above still ran: they carry the map through the
+        // attachment layout and back, which leaves the texels where they were.
+        if self.skipped(body) {
+            if let Some(timestamps) = self.vk().timestamps {
+                timestamps.close(builder, timed);
+            }
+            return;
+        }
 
         // Attachments, load and store ops and clears together, decided
         // here rather than split between a framebuffer built at allocation
@@ -2960,6 +3027,7 @@ impl FrameRecord<'_> {
                 // to draw over an offscreen capture.
                 PassKind::Raw => {}
                 PassKind::Compute => self.record_compute(encoder, body),
+                _ if self.skipped(body) => {}
                 _ => {
                     // Asked for only by the passes that draw into it, so a window's
                     // drawable is acquired when the first of them records and not
@@ -2986,6 +3054,12 @@ impl FrameRecord<'_> {
                 }
             }
         }
+    }
+
+    /// A cascade the cache kept from an earlier frame: no render pass, so no
+    /// clear, and no draws.
+    fn skipped(&self, body: PassBody) -> bool {
+        matches!(body, PassBody::ShadowCascade(cascade) if !self.cascades_due[cascade as usize])
     }
 
     fn vk(&self) -> &VkFrame<'_> {

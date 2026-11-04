@@ -490,7 +490,7 @@
 02 pass shadow_cascade_0 [Inline]
   ! instance_index src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! draw_commands src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
-  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      draw_commands IndirectRead
@@ -1076,7 +1076,7 @@
 02 pass shadow_cascade_0 [Inline]
   ! instance_index src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! draw_commands src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
-  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      draw_commands IndirectRead
@@ -1995,7 +1995,7 @@
 02 pass shadow_cascade_0 [Inline]
   ! instance_index src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! draw_commands src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
-  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      draw_commands IndirectRead
@@ -2245,7 +2245,7 @@
 02 pass shadow_cascade_0 [Inline]
   ! instance_index src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! draw_commands src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
-  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      draw_commands IndirectRead
@@ -2572,7 +2572,7 @@
 02 pass shadow_cascade_0 [Inline]
   ! instance_index src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! draw_commands src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
-  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      draw_commands IndirectRead
@@ -2911,7 +2911,7 @@
 02 pass shadow_cascade_0 [Inline]
   ! instance_index src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! draw_commands src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
-  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      draw_commands IndirectRead
@@ -3278,7 +3278,7 @@
 02 pass shadow_cascade_0 [Inline]
   ! instance_index src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! draw_commands src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
-  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      draw_commands IndirectRead
@@ -3591,7 +3591,7 @@
 02 pass shadow_cascade_0 [Inline]
   ! instance_index src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! draw_commands src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
-  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      draw_commands IndirectRead
@@ -3732,7 +3732,7 @@
 02 pass shadow_cascade_0 [Inline]
   ! instance_index src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! draw_commands src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
-  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      draw_commands IndirectRead
@@ -3938,7 +3938,7 @@
 02 pass shadow_cascade_0 [Inline]
   ! instance_index src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! draw_commands src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
-  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      draw_commands IndirectRead
@@ -4149,7 +4149,7 @@
 02 pass shadow_cascade_0 [Inline]
   ! instance_index src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! draw_commands src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
-  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      draw_commands IndirectRead
@@ -4386,7 +4386,7 @@
 02 pass shadow_cascade_0 [Inline]
   ! instance_index src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! draw_commands src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
-  ! shadow_cascades Undefined->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
+  ! shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal src TopOfPipe/- dst EarlyFragmentTests|LateFragmentTests/DepthStencilAttachmentRead|DepthStencilAttachmentWrite
      object_transforms StorageRead
      instance_index StorageRead
      draw_commands IndirectRead

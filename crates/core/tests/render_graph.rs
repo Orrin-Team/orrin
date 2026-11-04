@@ -23,6 +23,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use orrin_core::gfx::format::Format;
+use orrin_core::gfx::graph::ImageDesc;
 use orrin_core::gfx::vulkan::frame::{FrameConfig, declare};
 
 /// The swapchain format the baseline is written against. Real ones vary by
@@ -906,6 +907,21 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
     ]
 }
 
+/// The declared description of the image `name`, whether the graph owns it or
+/// it is imported from the pass that keeps it across frames.
+fn image_desc(graph: &orrin_core::gfx::graph::FrameGraph, name: &str) -> Option<ImageDesc> {
+    graph
+        .transient_images()
+        .find(|(id, _)| graph.resource_name(*id) == name)
+        .map(|(_, image)| image.desc)
+        .or_else(|| {
+            graph
+                .imported_images()
+                .find(|(id, _)| graph.resource_name(*id) == name)
+                .map(|(_, desc)| *desc)
+        })
+}
+
 fn golden_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/frame_graph.txt")
 }
@@ -1011,14 +1027,11 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
         })
         .unwrap();
 
-        let (_, image) = frame
-            .graph
-            .transient_images()
-            .find(|(id, _)| frame.graph.resource_name(*id) == "shadow_cascades")
+        let desc = image_desc(&frame.graph, "shadow_cascades")
             .unwrap_or_else(|| panic!("{count} cascades declared no shadow map"));
 
         assert_eq!(
-            image.desc.array_layers,
+            desc.array_layers,
             Some(u32::from(count)),
             "{count} cascades must declare a {count}-layer array, not a plain image",
         );
@@ -1028,8 +1041,9 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
 /// A cascade's depth is linear over a bounded range and a punctual face spends
 /// its precision near the light, so sixteen bits resolve millimetres where the
 /// shadows are and the other sixteen are pure bandwidth. The camera's depth is a
-/// perspective projection with standard Z, where the float is what keeps distant
-/// geometry from z-fighting, so it must not be narrowed alongside them.
+/// reversed perspective projection, which only works *because* it is a float —
+/// the exponent is what spends precision on distance (see `gfx::depth`) — so it
+/// must not be narrowed alongside them.
 #[test]
 fn the_shadow_maps_are_sixteen_bit_and_the_camera_depth_is_not() {
     let frame = declare(FrameConfig {
@@ -1058,17 +1072,70 @@ fn the_shadow_maps_are_sixteen_bit_and_the_camera_depth_is_not() {
     .unwrap();
 
     let format_of = |name: &str| {
-        frame
-            .graph
-            .transient_images()
-            .find(|(id, _)| frame.graph.resource_name(*id) == name)
-            .map(|(_, image)| image.desc.format)
+        image_desc(&frame.graph, name)
+            .map(|desc| desc.format)
             .unwrap_or_else(|| panic!("the frame declared no {name}"))
     };
 
     assert_eq!(format_of("shadow_cascades"), Format::D16Unorm);
     assert_eq!(format_of("shadow_atlas"), Format::D16Unorm);
     assert_eq!(format_of("prepass_depth"), Format::D32Float);
+}
+
+/// The far cascades are not re-rendered every frame (`shadows::CascadeCache`),
+/// so the cascade map has to outlive the frame: it is imported from the shadow
+/// pass rather than owned by the graph, whose transients start every frame
+/// `Undefined` and would hand a skipped cascade garbage. It is entered in the
+/// layout the frame's samplers leave it in, so a cascade that is skipped keeps
+/// its texels across the transition into the attachment layout and back.
+#[test]
+fn the_shadow_cascades_leave_the_frame_where_the_next_one_expects_them() {
+    let frame = declare(FrameConfig {
+        color_format: COLOR_FORMAT,
+        msaa: false,
+        ssao: true,
+        ssao_half_res: false,
+        contact_shadows: false,
+        ssr: false,
+        subsurface: false,
+        transparency: false,
+        refraction: false,
+        taa: true,
+        auto_exposure: true,
+        motion_blur: false,
+        dof: false,
+        volumetric_fog: false,
+        bloom_mips: BLOOM_MIPS,
+        overlay: true,
+        shadow_cascades: 4,
+        shadow_resolution: SHADOW_RESOLUTION,
+        shadow_atlas: 0,
+        async_compute: false,
+        occlusion_culling: false,
+    })
+    .unwrap();
+
+    let imported = frame
+        .graph
+        .imported_images()
+        .any(|(id, _)| frame.graph.resource_name(id) == "shadow_cascades");
+    assert!(
+        imported,
+        "a transient cascade map loses the cascades a frame skips"
+    );
+
+    let plan = format!("{}", frame.graph);
+    assert!(
+        plan.contains("shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal"),
+        "the map must be entered from the layout it was left in, not Undefined:\n{plan}",
+    );
+    let closing: Vec<_> = frame
+        .graph
+        .final_barriers()
+        .iter()
+        .filter(|barrier| frame.graph.resource_name(barrier.resource) == "shadow_cascades")
+        .collect();
+    assert!(closing.is_empty(), "{closing:?}");
 }
 
 /// TAA ping-pongs two allocations, so the image this frame writes as `taa_color`
