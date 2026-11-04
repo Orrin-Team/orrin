@@ -38,13 +38,13 @@ mod transparency;
 
 pub use assets::Assets;
 pub use bloom::BloomSettings;
-pub use camera::Camera;
+pub use camera::{ActiveCamera, Camera, active_camera, follow_active_camera};
 #[cfg(feature = "scripting")]
 pub use components::ScriptComponent;
 pub use components::{
-    AmbientLight, Collider, ColliderShape, Light, LocalTransform, Locked, MAX_CONE_ANGLE,
-    MIN_CONE_ANGLE, MaterialHandle, MeshHandle, Name, Parent, PendingScripts, Spin, Tag,
-    UnknownComponents, WorldTransform,
+    AmbientLight, CameraComponent, Collider, ColliderShape, Light, LocalTransform, Locked,
+    MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialHandle, MeshHandle, Name, Parent, PendingScripts, Spin,
+    Tag, UnknownComponents, WorldTransform,
 };
 pub use contact_shadows::ContactShadowSettings;
 pub use culling::Culling;

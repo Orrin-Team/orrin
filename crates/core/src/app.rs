@@ -262,6 +262,7 @@ impl App {
     /// creep.
     pub fn install_default_resources(world: &mut World) {
         world.insert_resource(Camera::default());
+        world.insert_resource(crate::scene::ActiveCamera::default());
         world.insert_resource(Time::new());
         world.insert_resource(AmbientLight::default());
         world.insert_resource(SsaoSettings::default());
@@ -902,6 +903,13 @@ impl ApplicationHandler for App {
                 {
                     profile_scope!("propagate");
                     crate::scene::propagate_transforms(&mut self.world);
+                }
+
+                // After the propagation, so the view is where its camera is this
+                // frame. Edit mode keeps the editor's fly camera — see
+                // `scene::camera`.
+                if self.world.resource::<crate::scene::Play>().is_live() {
+                    crate::scene::follow_active_camera(&self.world);
                 }
 
                 // After the editor and the script tick, either of which can load

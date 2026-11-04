@@ -1,6 +1,85 @@
-use glam::{Mat4, Quat, Vec3};
+//! The view a frame is drawn from, and which scene camera supplies it.
+//!
+//! [`Camera`] is a resource, not a component: the renderer, culling, the
+//! shadow cascades and the editor's picking all read one view, and every frame
+//! has exactly one. In edit mode the editor's fly camera owns it. While the
+//! game runs, [`follow_active_camera`] copies the active [`CameraComponent`]
+//! entity into it once a frame, after the last transform propagation, so a
+//! camera parented to a moving player draws from where the player is now.
+//!
+//! Which camera is active is [`ActiveCamera`]'s selection when that names a
+//! live camera, and otherwise the camera with the highest `priority`. The
+//! fallback is what lets a scene author the camera it opens on, and what keeps
+//! a game drawing when the selected camera is despawned or a scene load
+//! replaces it. Ties go to the lower entity slot: stable, but not an order
+//! anyone authored, so a scene that wants a particular camera says so with a
+//! priority.
+//!
+//! A world with no camera entity leaves the resource alone, so a game that
+//! places the view directly through `Camera.Place` keeps working unchanged.
 
+use glam::{Mat4, Quat, Vec3};
+use orrin_ecs::{Entity, World};
+
+use super::{CameraComponent, WorldTransform};
 use crate::geom::Frustum;
+
+/// The scene camera a script chose to draw from, if any. See the module docs
+/// for what happens when it names no live camera.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActiveCamera(Option<Entity>);
+
+impl ActiveCamera {
+    /// `None` hands the choice back to the cameras' priorities.
+    pub fn select(&mut self, camera: Option<Entity>) {
+        self.0 = camera;
+    }
+
+    pub fn selected(&self) -> Option<Entity> {
+        self.0
+    }
+}
+
+/// The camera entity the game draws from this frame, if there is any camera.
+pub fn active_camera(world: &World) -> Option<Entity> {
+    let selected = world.get_resource::<ActiveCamera>().and_then(|a| a.0);
+    if let Some(entity) = selected
+        && world.has::<CameraComponent>(entity)
+    {
+        return Some(entity);
+    }
+    let mut best: Option<(i32, Entity)> = None;
+    world
+        .query::<&CameraComponent>()
+        .for_each(|entity, camera| {
+            let wins = best.is_none_or(|(priority, held)| {
+                (camera.priority, std::cmp::Reverse(entity.index))
+                    > (priority, std::cmp::Reverse(held.index))
+            });
+            if wins {
+                best = Some((camera.priority, entity));
+            }
+        });
+    best.map(|(_, entity)| entity)
+}
+
+/// Copy the active camera's world transform and lens into the [`Camera`]
+/// resource, and say which camera that was. Leaves the resource untouched when
+/// there is no camera entity.
+pub fn follow_active_camera(world: &World) -> Option<Entity> {
+    let entity = active_camera(world)?;
+    let lens = *world.get::<CameraComponent>(entity)?;
+    let placed = world
+        .get::<WorldTransform>(entity)
+        .map_or(Mat4::IDENTITY, |transform| transform.0);
+    let (_, rotation, position) = placed.to_scale_rotation_translation();
+    let mut view = world.get_resource_mut::<Camera>()?;
+    view.place(position, rotation);
+    view.fov_y = lens.fov_degrees.to_radians();
+    view.near = lens.near;
+    view.far = lens.far;
+    Some(entity)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
@@ -88,6 +167,7 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene::{LocalTransform, Transform, propagate_transforms, reparent};
 
     fn close(a: Vec3, b: Vec3) -> bool {
         a.distance(b) < 1e-4
@@ -207,5 +287,130 @@ mod tests {
         ));
         assert!(close(camera.up, rotation * Vec3::Y));
         assert!((camera.target.distance(position) - distance).abs() < 1e-4);
+    }
+
+    fn camera_at(world: &mut World, translation: Vec3, priority: i32) -> Entity {
+        let entity = world.spawn();
+        world.insert(
+            entity,
+            LocalTransform::new(Transform {
+                translation,
+                ..Transform::default()
+            }),
+        );
+        world.insert(
+            entity,
+            CameraComponent {
+                priority,
+                ..CameraComponent::default()
+            },
+        );
+        entity
+    }
+
+    fn game_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(Camera::default());
+        world.insert_resource(ActiveCamera::default());
+        world
+    }
+
+    #[test]
+    fn with_nothing_selected_the_highest_priority_camera_draws() {
+        let mut world = game_world();
+        assert_eq!(active_camera(&world), None);
+        let low = camera_at(&mut world, Vec3::ZERO, 0);
+        let high = camera_at(&mut world, Vec3::ZERO, 5);
+        let _also_low = camera_at(&mut world, Vec3::ZERO, 0);
+        assert_eq!(active_camera(&world), Some(high));
+        world.despawn(high);
+        assert_eq!(
+            active_camera(&world),
+            Some(low),
+            "ties go to the lower slot"
+        );
+    }
+
+    #[test]
+    fn a_selection_outranks_every_priority_until_it_stops_being_a_camera() {
+        let mut world = game_world();
+        let chosen = camera_at(&mut world, Vec3::ZERO, -1);
+        let high = camera_at(&mut world, Vec3::ZERO, 5);
+        world.resource_mut::<ActiveCamera>().select(Some(chosen));
+        assert_eq!(active_camera(&world), Some(chosen));
+
+        world.remove::<CameraComponent>(chosen);
+        assert_eq!(active_camera(&world), Some(high), "no longer a camera");
+
+        world.despawn(chosen);
+        let reused = camera_at(&mut world, Vec3::ZERO, -1);
+        assert_eq!(reused.index, chosen.index, "the slot is reused");
+        assert_eq!(
+            active_camera(&world),
+            Some(high),
+            "a stale handle selects nothing, not the slot's next occupant"
+        );
+    }
+
+    #[test]
+    fn the_view_follows_the_active_camera_lens_and_all() {
+        let mut world = game_world();
+        let entity = camera_at(&mut world, Vec3::new(1.0, 2.0, 3.0), 0);
+        let facing = Quat::from_rotation_y(0.7);
+        {
+            let mut transform = world.get_mut::<LocalTransform>(entity).unwrap();
+            transform.rotation = facing;
+            // A scaled camera still looks along a unit forward.
+            transform.scale = Vec3::splat(3.0);
+        }
+        *world.get_mut::<CameraComponent>(entity).unwrap() = CameraComponent {
+            fov_degrees: 90.0,
+            near: 0.5,
+            far: 40.0,
+            priority: 0,
+        };
+        propagate_transforms(&mut world);
+
+        assert_eq!(follow_active_camera(&world), Some(entity));
+        let view = *world.resource::<Camera>();
+        assert!(close(view.position, Vec3::new(1.0, 2.0, 3.0)));
+        assert!(close(view.rotation() * Vec3::NEG_Z, facing * Vec3::NEG_Z));
+        assert!(close(view.up, Vec3::Y));
+        assert!((view.fov_y - 90f32.to_radians()).abs() < 1e-6);
+        assert_eq!((view.near, view.far), (0.5, 40.0));
+    }
+
+    /// The world transform, not the local one: a camera on a player's
+    /// shoulder is where the player is.
+    #[test]
+    fn a_parented_camera_draws_from_where_its_parent_put_it() {
+        let mut world = game_world();
+        let player = world.spawn();
+        world.insert(
+            player,
+            LocalTransform::new(Transform {
+                translation: Vec3::new(10.0, 0.0, 0.0),
+                ..Transform::default()
+            }),
+        );
+        let camera = camera_at(&mut world, Vec3::new(0.0, 1.5, 2.0), 0);
+        reparent(&mut world, camera, Some(player), false).unwrap();
+        propagate_transforms(&mut world);
+
+        follow_active_camera(&world);
+        assert!(close(
+            world.resource::<Camera>().position,
+            Vec3::new(10.0, 1.5, 2.0)
+        ));
+    }
+
+    /// What keeps `Camera.Place` working for a game with no camera entity.
+    #[test]
+    fn with_no_camera_entity_the_view_is_left_where_it_was() {
+        let world = game_world();
+        let placed = Vec3::new(4.0, 5.0, 6.0);
+        world.resource_mut::<Camera>().position = placed;
+        assert_eq!(follow_active_camera(&world), None);
+        assert_eq!(world.resource::<Camera>().position, placed);
     }
 }

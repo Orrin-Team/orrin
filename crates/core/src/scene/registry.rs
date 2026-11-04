@@ -1,8 +1,8 @@
 use orrin_registry::{ComponentId, Registry};
 
 use super::{
-    Collider, Light, LocalTransform, Locked, MaterialHandle, MeshHandle, Name, RenderSettings,
-    Spin, Tag,
+    CameraComponent, Collider, Light, LocalTransform, Locked, MaterialHandle, MeshHandle, Name,
+    RenderSettings, Spin, Tag,
 };
 
 pub const TRANSFORM: ComponentId = ComponentId::new("orrin.transform");
@@ -13,6 +13,7 @@ pub const COLLIDER: ComponentId = ComponentId::new("orrin.collider");
 pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
 pub const LOCKED: ComponentId = ComponentId::new("orrin.locked");
 pub const RENDER_SETTINGS: ComponentId = ComponentId::new("orrin.render_settings");
+pub const CAMERA: ComponentId = ComponentId::new("orrin.camera");
 
 /// `MeshHandle` and `MaterialHandle` are upload indices, so a scene stores the
 /// asset's [`AssetId`](orrin_registry::AssetId) instead — a translation that
@@ -67,6 +68,7 @@ pub fn register_components(registry: &mut Registry) {
     registry.register::<Spin>(SPIN, "Spin");
     registry.register::<Locked>(LOCKED, "Locked");
     registry.register::<RenderSettings>(RENDER_SETTINGS, "Render Settings");
+    registry.register::<CameraComponent>(CAMERA, "Camera");
     registry.register_resolved::<MeshHandle>(MESH, "Mesh");
     registry.register_resolved::<MaterialHandle>(MATERIAL, "Material");
     registry.end_engine_registration();
@@ -79,7 +81,7 @@ mod tests {
     use orrin_registry::{Reflect, Value};
 
     use super::*;
-    use crate::scene::{ColliderShape, Transform};
+    use crate::scene::{CameraComponent, ColliderShape, Transform};
 
     /// What is locked is how the scene is meant to be worked on, so it is
     /// saved with it.
@@ -97,6 +99,29 @@ mod tests {
         crate::scene::load(&text, &mut loaded, &registry).unwrap();
         let entity = loaded.entities().next().unwrap();
         assert!(loaded.has::<Locked>(entity));
+    }
+
+    /// A scene opens on the camera it was saved with, lens and priority kept.
+    #[test]
+    fn a_camera_survives_a_save_and_a_load() {
+        let mut registry = Registry::new();
+        register_components(&mut registry);
+        let mut world = World::new();
+        let entity = world.spawn();
+        let camera = CameraComponent {
+            fov_degrees: 45.0,
+            near: 0.3,
+            far: 120.0,
+            priority: 3,
+        };
+        world.insert(entity, camera);
+        let text = crate::scene::save(&mut world, &registry);
+        assert!(text.contains("orrin.camera"), "{text}");
+
+        let mut loaded = World::new();
+        crate::scene::load(&text, &mut loaded, &registry).unwrap();
+        let entity = loaded.entities().next().unwrap();
+        assert_eq!(*loaded.get::<CameraComponent>(entity).unwrap(), camera);
     }
 
     fn world() -> (World, orrin_ecs::Entity) {

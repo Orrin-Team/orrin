@@ -1384,7 +1384,8 @@ mod tests {
                 "orrin.collider",
                 "orrin.spin",
                 "orrin.locked",
-                "orrin.render_settings"
+                "orrin.render_settings",
+                "orrin.camera"
             ],
             "registration order changed, or a component gained/lost a section"
         );
