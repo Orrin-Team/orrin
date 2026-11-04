@@ -865,7 +865,12 @@ impl ApplicationHandler for App {
                 // would leave the pass unbalanced — and the UI's own layout and
                 // tessellation are most of what the editor costs, so skipping the
                 // draw alone would answer a question nobody asked.
-                if overlay_on {
+                // And not every frame with it on: the UI is rebuilt at its own
+                // cadence and redrawn as it was in between — see
+                // `editor::cadence`. Decided once, here, because `run` and
+                // `overlay` are one egui pass and have to agree.
+                let ui_due = overlay_on && active.editor.ui_due(std::time::Instant::now());
+                if ui_due {
                     profile_scope!("editor");
                     active.editor.run(&mut self.world, &self.registry);
                     if active.editor.take_camera_moved() {
@@ -877,8 +882,17 @@ impl ApplicationHandler for App {
                 // After the UI, so the editor's own camera edits are the
                 // baseline the controller builds on.
                 if !self.shipped {
+                    let before = *self.world.resource::<Camera>();
                     self.camera_controller
                         .update(&mut self.world.resource_mut::<Camera>(), delta);
+                    let after = *self.world.resource::<Camera>();
+                    if overlay_on
+                        && (before.position != after.position
+                            || before.target != after.target
+                            || before.up != after.up)
+                    {
+                        active.editor.camera_moved();
+                    }
                 }
 
                 // A second pass, because collision resolution, the script tick,
@@ -993,8 +1007,13 @@ impl ApplicationHandler for App {
                 let Active {
                     renderer, editor, ..
                 } = active;
-                let overlay: Option<crate::gfx::vulkan::Overlay<'_>> =
-                    overlay_on.then(|| editor.overlay());
+                let overlay: Option<crate::gfx::vulkan::Overlay<'_>> = overlay_on.then(|| {
+                    if ui_due {
+                        editor.overlay()
+                    } else {
+                        editor.cached_overlay()
+                    }
+                });
                 {
                     profile_scope!("render submit");
                     renderer.render_with_overlay(

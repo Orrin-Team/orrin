@@ -4,6 +4,7 @@
 //! phases `phases` cuts it into (see `gfx/vulkan/overlay.rs`).
 
 mod autosave;
+mod cadence;
 mod dock;
 mod export;
 mod gizmo;
@@ -50,6 +51,9 @@ pub struct Editor {
     /// Kept between frames for its allocations.
     frame: OverlayFrame,
     last_layout_check: std::time::Instant,
+    /// Whether this frame rebuilds the UI or redraws the last one. See
+    /// `cadence`.
+    cadence: cadence::Cadence,
 }
 
 /// The last chance to keep a layout: a drag in the final two seconds of a
@@ -132,6 +136,7 @@ impl Editor {
             glass: Vec::new(),
             frame: OverlayFrame::default(),
             last_layout_check: std::time::Instant::now(),
+            cadence: cadence::Cadence::default(),
         }
     }
 
@@ -142,6 +147,11 @@ impl Editor {
     /// wheel; those it would claim across the whole window, for the reason
     /// [`Dock::wants_pointer`] describes.
     pub fn on_window_event(&mut self, event: &WindowEvent) -> bool {
+        // Every frame brings a redraw request; only what egui can react to
+        // makes the next one rebuild the UI.
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            self.cadence.touch();
+        }
         let consumed = self.input.on_window_event(&self.window, event).consumed;
         match event {
             WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => {
@@ -149,6 +159,26 @@ impl Editor {
             }
             _ => consumed,
         }
+    }
+
+    /// Whether this frame rebuilds the UI. When it does not, neither
+    /// [`run`](Self::run) nor [`overlay`](Self::overlay) is called and the
+    /// renderer is handed [`cached_overlay`](Self::cached_overlay) instead.
+    pub fn ui_due(&self, now: std::time::Instant) -> bool {
+        self.cadence.due(now)
+    }
+
+    /// The scene camera moved, and with it everything the editor projects
+    /// through it: the gizmo and the selection outline.
+    pub fn camera_moved(&mut self) {
+        self.cadence.touch();
+    }
+
+    /// The last frame [`overlay`](Self::overlay) produced, to be drawn again.
+    /// Its texture deltas were drained when it was first drawn, so nothing is
+    /// uploaded twice.
+    pub fn cached_overlay(&mut self) -> &mut OverlayFrame {
+        &mut self.frame
     }
 
     pub fn run(&mut self, world: &mut World, registry: &Registry) {
@@ -270,6 +300,11 @@ impl Editor {
         let output = self.ctx.end_pass();
         self.input
             .handle_platform_output(&self.window, output.platform_output);
+        let repaint = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(std::time::Duration::MAX, |viewport| viewport.repaint_delay);
+        self.cadence.ran(std::time::Instant::now(), repaint);
 
         let ppp = output.pixels_per_point;
         let frame = &mut self.frame;

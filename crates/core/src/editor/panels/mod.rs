@@ -3925,7 +3925,8 @@ mod tests {
 
     /// What the editor's own layout pass costs the CPU each frame — the part of
     /// the frame no `tests/perf.rs` row sees, since that harness has no editor.
-    /// Tessellation and the GPU draw are egui_winit_vulkano's and not measured.
+    /// Tessellation (`Editor::overlay`) and the GPU draw are not measured. It is
+    /// paid only on the frames `editor::cadence` says are due.
     ///
     /// ```text
     /// cargo test --release -p orrin-core --lib editor_frame_cost -- --ignored --nocapture
