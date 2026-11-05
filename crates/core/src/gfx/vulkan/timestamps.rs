@@ -492,6 +492,7 @@ mod tests {
             overlay: true,
             outline: true,
             gizmo: true,
+            ui: false,
             presents: true,
             shadow_cascades: MAX_CASCADES as u8,
             shadow_resolution: 2048,

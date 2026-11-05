@@ -62,3 +62,5 @@ sss_blur_comp compute sss_blur.comp
 sss_composite_comp compute sss_composite.comp
 taa_resolve_comp compute taa_resolve.comp
 tonemap_frag fragment tonemap.frag
+ui_frag fragment ui.frag
+ui_vert vertex ui.vert

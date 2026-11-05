@@ -36,6 +36,7 @@ mod swapchain;
 mod taa;
 mod texture;
 mod timestamps;
+mod ui;
 mod upload;
 mod vendor;
 
@@ -59,6 +60,7 @@ use crate::geom::{Aabb, Frustum};
 use crate::gfx::DecalInstance;
 use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::shadows::{CascadeCache, CascadeSet, MAX_CASCADES};
+use crate::gfx::ui::UiFrame;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
     FogSettings, HdrSettings, MaterialHandle, MeshHandle, MotionBlurSettings, PresentSettings,
@@ -89,6 +91,7 @@ use self::motion_blur::MotionBlurPass;
 use self::outline::OutlinePass;
 use self::prepass::GeometryPrepass;
 use self::record::{InFlight, Recorder, RunAhead};
+use self::ui::UiPass;
 use vulkano::command_buffer::CommandBuffer;
 
 /// How far the CPU may record ahead of the GPU.
@@ -269,6 +272,8 @@ pub struct VulkanRenderer {
     gizmo: GizmoPass,
     /// The selection outline, over the tonemapped frame; fed like the gizmo.
     outline: OutlinePass,
+    /// The game's own UI, over the tonemapped frame, editor or not.
+    ui: UiPass,
     /// The environment cubemap and the skybox that draws it. Also recorded into
     /// the forward pass, for the reason its module documents.
     environment: EnvironmentPass,
@@ -515,6 +520,7 @@ impl VulkanRenderer {
         {
             self.device.destroy_bind_group(group);
         }
+        self.ui.invalidate_textures(&self.device);
     }
 
     pub fn new(
@@ -669,6 +675,7 @@ impl VulkanRenderer {
         let forward = ForwardPass::new(&device, hdr::HDR_FORMAT, hdr::HDR_WIDE_FORMAT);
         let hdr = HdrPass::new(&device, format);
         let gizmo = GizmoPass::new(&device, format);
+        let ui = UiPass::new(&device, format);
         let outline = OutlinePass::new(&device, format);
         let exposure = ExposurePass::new(&device);
         let bloom = BloomPass::new(&device);
@@ -715,6 +722,7 @@ impl VulkanRenderer {
             overlay: true,
             outline: true,
             gizmo: true,
+            ui: false,
             presents: true,
             shadow_cascades: 0,
             shadow_resolution: 1,
@@ -752,6 +760,7 @@ impl VulkanRenderer {
             line,
             gizmo,
             outline,
+            ui,
             environment,
             meshes: Vec::new(),
             materials: vec![forward::to_gpu_material(&Material::default())],
@@ -1340,6 +1349,7 @@ impl RenderBackend for VulkanRenderer {
             None,
             None,
             None,
+            None,
         );
     }
 }
@@ -1495,6 +1505,7 @@ impl VulkanRenderer {
         debug_lines: &[DebugLine],
         profiler_frame: u64,
         shadows: Option<ShadowFrame<'_>>,
+        ui: Option<UiFrame<'_>>,
         overlay: Option<Overlay<'_>>,
     ) {
         self.render_frame(
@@ -1521,6 +1532,7 @@ impl VulkanRenderer {
             debug_lines,
             Some(profiler_frame),
             shadows,
+            ui,
             overlay,
         );
     }
@@ -1553,6 +1565,7 @@ impl VulkanRenderer {
         debug_lines: &[DebugLine],
         profiler_frame: Option<u64>,
         shadows: Option<ShadowFrame<'_>>,
+        ui: Option<UiFrame<'_>>,
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))] mut overlay: Option<Overlay<'_>>,
     ) {
         if let Backend::Vulkan(vk) = &self.backend
@@ -1641,6 +1654,7 @@ impl VulkanRenderer {
             gizmo: overlay
                 .as_ref()
                 .is_some_and(|frame| !frame.gizmo.is_empty()),
+            ui: ui.is_some_and(|frame| !frame.is_empty()),
             presents: self.backend.presents(),
             // Sourced from the cascade set rather than the setting, so the
             // number of passes the graph declares cannot disagree with the
@@ -1974,6 +1988,10 @@ impl VulkanRenderer {
         {
             let mut encoder = commands.encoder(&self.device);
             self.instances.sync(&self.device, &mut encoder, items);
+            if let Some(ui) = ui {
+                self.ui
+                    .prepare(&self.device, &mut encoder, ui, &self.textures);
+            }
         }
 
         // The blended queues' draw orders, as row numbers into those rows. Still
@@ -2268,6 +2286,8 @@ impl VulkanRenderer {
             line: &self.line,
             gizmo: &self.gizmo,
             outline: &self.outline,
+            ui: &self.ui,
+            ui_frame: ui,
             motion_blur: &self.motion_blur,
             oit: &self.oit,
             prepass: &self.prepass,
@@ -2690,6 +2710,8 @@ struct FrameRecord<'a> {
     line: &'a LinePass,
     gizmo: &'a GizmoPass,
     outline: &'a OutlinePass,
+    ui: &'a UiPass,
+    ui_frame: Option<UiFrame<'a>>,
     motion_blur: &'a MotionBlurPass,
     oit: &'a OitPass,
     prepass: &'a GeometryPrepass,
@@ -3091,7 +3113,7 @@ impl FrameRecord<'_> {
                     // while the shadows are still being drawn.
                     let swapchain = if matches!(
                         body,
-                        PassBody::Tonemap | PassBody::Outline | PassBody::Gizmo
+                        PassBody::Tonemap | PassBody::Ui | PassBody::Outline | PassBody::Gizmo
                     ) {
                         swapchain()
                     } else {
@@ -3737,6 +3759,11 @@ impl FrameRecord<'_> {
 
                 self.hdr
                     .record_tonemap(self.device, encoder, self.extent, hdr, exposure, bloom);
+            }
+            PassBody::Ui => {
+                if let Some(frame) = self.ui_frame {
+                    self.ui.record(self.device, encoder, frame, self.extent);
+                }
             }
             PassBody::Gizmo => {
                 self.gizmo

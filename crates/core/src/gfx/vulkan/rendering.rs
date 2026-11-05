@@ -321,8 +321,9 @@ pub(super) fn rendering_info(
             ),
             [0.0; 4],
         )),
-        // The tonemapped frame, which the outline and the handles are drawn over.
-        PassBody::Outline | PassBody::Gizmo => color_only(drawn_over(swapchain)),
+        // The tonemapped frame, which the game's UI, the outline and the
+        // handles are drawn over.
+        PassBody::Ui | PassBody::Outline | PassBody::Gizmo => color_only(drawn_over(swapchain)),
         // Dispatches, and the overlay, which records its own command buffer.
         PassBody::Overlay
         | PassBody::OcclusionHiz

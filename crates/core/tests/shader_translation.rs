@@ -186,7 +186,7 @@ fn argument_buffer_indices_are_disjoint_and_declared_in_the_msl() {
 
 #[test]
 fn the_material_table_reflects_as_one_array_of_max_textures() {
-    for name in ["forward_frag", "prepass_frag"] {
+    for name in ["forward_frag", "prepass_frag", "ui_frag"] {
         let shader = SHADERS
             .iter()
             .find(|shader| shader.name == name)

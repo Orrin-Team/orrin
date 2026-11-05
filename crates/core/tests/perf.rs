@@ -358,6 +358,7 @@ fn frame_cost() {
                     settings: &shadow_settings,
                 }),
                 None,
+                None,
             );
         }
         let after_render = allocations();

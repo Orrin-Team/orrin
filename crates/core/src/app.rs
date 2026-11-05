@@ -30,7 +30,7 @@ use crate::scene::{
     DebugLines, DecalSettings, Diagnostics, DofSettings, EnvironmentSettings, FogSettings,
     HdrSettings, InputState, LogBuffer, LogLevel, MotionBlurSettings, PresentSettings,
     RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
-    Time, TransparencySettings,
+    Time, TransparencySettings, UiCanvas,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -77,6 +77,8 @@ pub struct App {
     /// This frame's debug lines, copied out of the `DebugLines` resource so the
     /// renderer borrow doesn't overlap the world borrow.
     debug_lines: Vec<DebugLine>,
+    /// The game's UI laid out, with the glyph cache it is laid out from.
+    ui: crate::gfx::ui::Painter,
     /// The log stream's end for the console panel, drained once a frame.
     console: crate::logging::ConsoleQueue,
     #[cfg(feature = "scripting")]
@@ -207,6 +209,7 @@ impl App {
             cascades: CascadeSet::default(),
             atlas: ShadowAtlas::default(),
             debug_lines: Vec::new(),
+            ui: crate::gfx::ui::Painter::new(),
             console,
             #[cfg(feature = "scripting")]
             scripting: None,
@@ -302,6 +305,7 @@ impl App {
         world.insert_resource(crate::collision::CollisionState::default());
         world.insert_resource(LogBuffer::default());
         world.insert_resource(DebugLines::default());
+        world.insert_resource(UiCanvas::default());
         world.insert_resource(Culling::default());
         // Empty until `load_prefabs` scans the project: the scan reads the disk,
         // and its cost belongs to the run rather than to the cold-start gate.
@@ -806,6 +810,16 @@ impl ApplicationHandler for App {
                     crate::collision::run(&mut self.world);
                 }
 
+                // The UI is immediate: what this tick draws replaces the last
+                // tick's. A paused game ticks nothing and keeps its UI on
+                // screen; edit mode runs no game code and shows none.
+                if simulate {
+                    let extent = active.renderer.extent();
+                    self.world.resource_mut::<UiCanvas>().begin(extent);
+                } else if !self.world.resource::<crate::scene::Play>().is_live() {
+                    self.world.resource_mut::<UiCanvas>().clear();
+                }
+
                 // A reload requested from the editor last frame lands here:
                 // before the tick, after collision, with no dispatch window
                 // open and no world borrow held — the only point in the frame
@@ -926,6 +940,12 @@ impl ApplicationHandler for App {
                 {
                     profile_scope!("assets");
                     crate::asset_db::service(&self.world, &mut active.renderer);
+                }
+                // After the service, with the backend in hand, for the same
+                // reason: an image the tick drew first gets its slot here.
+                {
+                    profile_scope!("ui");
+                    crate::gfx::ui::paint(&self.world, &mut active.renderer, &mut self.ui);
                 }
 
                 {
@@ -1058,6 +1078,7 @@ impl ApplicationHandler for App {
                                 settings: &shadow_settings,
                             }
                         }),
+                        Some(self.ui.frame()),
                         overlay,
                     );
                 }
