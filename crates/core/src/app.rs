@@ -307,6 +307,8 @@ impl App {
         world.insert_resource(DebugLines::default());
         world.insert_resource(UiCanvas::default());
         world.insert_resource(crate::ui::UiTree::default());
+        world.insert_resource(crate::ui::events::UiPointer::default());
+        world.insert_resource(crate::ui::events::UiEvents::default());
         world.insert_resource(Culling::default());
         // Empty until `load_prefabs` scans the project: the scan reads the disk,
         // and its cost belongs to the run rather than to the cold-start gate.
@@ -819,6 +821,20 @@ impl ApplicationHandler for App {
                     self.world.resource_mut::<UiCanvas>().begin(extent);
                 } else if !self.world.resource::<crate::scene::Play>().is_live() {
                     self.world.resource_mut::<UiCanvas>().clear();
+                }
+                // Against what the last frame drew, which is what the player
+                // pointed at. Edit mode has no pointer state, so a button does
+                // not come back from Stop still lit.
+                if simulate {
+                    profile_scope!("ui events");
+                    crate::ui::events::update(&mut self.world);
+                } else if !self.world.resource::<crate::scene::Play>().is_live() {
+                    self.world
+                        .resource_mut::<crate::ui::events::UiPointer>()
+                        .reset();
+                    self.world
+                        .resource_mut::<crate::ui::events::UiEvents>()
+                        .clear();
                 }
 
                 // A reload requested from the editor last frame lands here:

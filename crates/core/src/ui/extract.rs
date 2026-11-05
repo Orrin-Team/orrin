@@ -2,6 +2,7 @@ use glam::Vec2;
 use orrin_ecs::World;
 use orrin_registry::AssetId;
 
+use super::events::UiPointer;
 use super::{Button, Image, Layout, Text};
 use crate::scene::{Rect, TextStyle, UiCanvas, color_bytes};
 
@@ -14,13 +15,14 @@ pub fn extract(
     extent: impl Fn(AssetId) -> Option<[u32; 2]>,
     out: &mut UiCanvas,
 ) {
-    for element in layout.elements() {
+    let pointer = world.get_resource::<UiPointer>();
+    for (index, element) in layout.elements().iter().enumerate() {
         let entity = element.entity;
         // Screen pixels per unit of the element's own frame.
         let pixels = element.units * element.scale;
         if let Some(image) = world.get::<Image>(entity).map(|image| *image) {
             let tint = match world.get::<Button>(entity) {
-                Some(button) => button_tint(&button),
+                Some(button) => button_tint(&button, pointer.as_deref(), layout, index),
                 None => [1.0; 4],
             };
             let color = color_bytes(std::array::from_fn(|i| image.color[i] * tint[i]));
@@ -45,12 +47,33 @@ pub fn extract(
     }
 }
 
-/// What a button multiplies its image by.
-fn button_tint(button: &Button) -> [f32; 4] {
-    if button.interactable {
-        button.normal
+/// What button element `index` multiplies its image by: pressed while a press
+/// that began on it or under it is held with the pointer still inside, hovered
+/// while the pointer is inside.
+fn button_tint(
+    button: &Button,
+    pointer: Option<&UiPointer>,
+    layout: &Layout,
+    index: usize,
+) -> [f32; 4] {
+    if !button.interactable {
+        return button.disabled;
+    }
+    let Some(pointer) = pointer else {
+        return button.normal;
+    };
+    let entity = layout.elements()[index].entity;
+    if !pointer.is_inside(entity) {
+        return button.normal;
+    }
+    let pressed_here = pointer
+        .pressed()
+        .and_then(|pressed| layout.index_of(pressed))
+        .is_some_and(|pressed| layout.is_at_or_above(entity, pressed));
+    if pressed_here {
+        button.pressed
     } else {
-        button.disabled
+        button.hover
     }
 }
 
@@ -241,6 +264,68 @@ mod tests {
 
         ui.world.get_mut::<Button>(button).unwrap().interactable = false;
         assert_eq!(colour(&ui.commands()), [255, 128, 255, 128]);
+    }
+
+    #[test]
+    fn a_buttons_tint_follows_the_pointer() {
+        use crate::ui::events::{PointerInput, UiEvents, UiPointer, step};
+
+        let mut ui = Ui::new(Canvas::default());
+        let button = ui.element(None, box_at(0.0, 0.0, 100.0, 40.0));
+        ui.world.insert(button, Image::default());
+        ui.world.insert(
+            button,
+            Button {
+                normal: [1.0, 0.0, 0.0, 1.0],
+                hover: [0.0, 1.0, 0.0, 1.0],
+                pressed: [0.0, 0.0, 1.0, 1.0],
+                ..Button::default()
+            },
+        );
+        let label = ui.element(Some(button), box_at(0.0, 0.0, 20.0, 20.0));
+        ui.world.insert(label, Image::default());
+        ui.world.insert_resource(UiPointer::default());
+
+        let frame = |ui: &mut Ui, x: f32, pressed: bool, released: bool| {
+            ensure_current(&mut ui.world);
+            let mut resolved = Layout::default();
+            layout::resolve(
+                &ui.world,
+                &ui.world.resource::<Hierarchy>(),
+                [1920.0, 1080.0],
+                &mut resolved,
+            );
+            let input = PointerInput {
+                position: [x, 10.0],
+                pressed,
+                released,
+            };
+            step(
+                &ui.world,
+                &resolved,
+                &mut ui.world.resource_mut::<UiPointer>(),
+                input,
+                &mut UiEvents::default(),
+            );
+            let canvas = ui.commands();
+            match canvas.commands()[0] {
+                UiCommand::Panel { color, .. } => [color[0], color[1], color[2]],
+                ref other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(frame(&mut ui, 500.0, false, false), [255, 0, 0], "normal");
+        assert_eq!(frame(&mut ui, 50.0, false, false), [0, 255, 0], "hovered");
+        assert_eq!(
+            frame(&mut ui, 10.0, true, false),
+            [0, 0, 255],
+            "pressed through its child"
+        );
+        assert_eq!(
+            frame(&mut ui, 500.0, false, false),
+            [255, 0, 0],
+            "held, but the pointer left"
+        );
+        assert_eq!(frame(&mut ui, 50.0, false, true), [0, 255, 0]);
     }
 
     #[test]

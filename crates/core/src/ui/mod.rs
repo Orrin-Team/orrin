@@ -41,8 +41,22 @@
 //! A sliced image is nine image commands over parts of one texture, measured
 //! in the texture's uploaded pixels, so the painter needs nothing new to draw
 //! one and a frame of them still batches by texture.
+//!
+//! # Pointer events
+//!
+//! [`events::update`] hit-tests the pointer before the script tick against the
+//! layout the last frame drew — what the player is looking at — and queues
+//! uGUI's events: enter and exit to each element the pointer starts or stops
+//! being inside, deepest first and not bubbling, and down, up and click from the
+//! topmost raycast target, each offered up the hierarchy until a behaviour
+//! handles it. Up goes to what was pressed, wherever the pointer is; a click is
+//! a press and a release on the same element. A button that is not interactable
+//! stops the pointer and lets nothing at or under it take part. Only a ticking
+//! game gets events: edit mode and a paused game get none, and edit mode keeps
+//! no pointer state, so a button tints only while the game runs.
 
 pub mod components;
+pub mod events;
 pub mod extract;
 pub mod layout;
 
