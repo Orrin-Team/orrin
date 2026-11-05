@@ -211,6 +211,27 @@ pub fn squircle_menu(
     response
 }
 
+/// A [`squircle`] that opens an egui menu rather than a popup, for a list
+/// whose entries open submenus. A popup closes on the click that would open
+/// one; a menu keeps itself open for it, and each entry closes the menu with
+/// `close_menu`, as the Entity menu's entries do.
+pub fn squircle_command_menu(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    hint: &str,
+    add: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
+    let response = squircle(ui, icon, hint);
+    let id = ui.make_persistent_id(("squircle_command_menu", hint));
+    let mut bar = egui::menu::BarState::load(ui.ctx(), id);
+    bar.bar_menu(&response, |ui| {
+        ui.set_min_width(180.0);
+        add(ui);
+    });
+    bar.store(ui.ctx(), id);
+    response
+}
+
 /// The corner radius of [`toolbar_frame`], which the renderer's blur behind it
 /// has to match.
 pub const TOOLBAR_RADIUS: u8 = 6;

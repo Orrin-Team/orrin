@@ -220,7 +220,7 @@ fn flatten(ctx: &egui::Context, nodes: &[Node], searching: bool) -> Vec<Row> {
 
 fn add_menu(ui: &mut egui::Ui, state: &mut EditorState) {
     // The entries are the Entity menu's own.
-    widgets::squircle_menu(ui, icons::plus(), "Add entity", |ui| {
+    widgets::squircle_command_menu(ui, icons::plus(), "Add entity", |ui| {
         super::menu_bar::spawn_entries(ui, state);
     });
 }

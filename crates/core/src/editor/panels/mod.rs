@@ -2096,6 +2096,48 @@ mod tests {
         }
     }
 
+    /// The hierarchy's add button holds the Entity menu's own entries, so its
+    /// UI entry has to open the submenu there too, rather than close the whole
+    /// list and need opening again.
+    #[test]
+    fn the_hierarchy_add_button_opens_the_ui_submenu_and_builds_from_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.dock.activate(Tab::Hierarchy);
+        editor.frames(2);
+        let tree = editor.tab_body(Tab::Hierarchy);
+        let plus = crate::editor::icons::plus().glyph();
+        let add = editor
+            .painted_icons()
+            .into_iter()
+            .find(|(glyph, rect, _)| *glyph == plus && tree.contains(rect.center()))
+            .expect("the hierarchy has an add button")
+            .1;
+        editor.click(add.center()).frames(1);
+        let text_at = |editor: &Harness, wanted: &str| {
+            editor
+                .painted_text_rects()
+                .into_iter()
+                .find(|(text, _)| without_icons(text) == wanted)
+                .map(|(_, rect)| rect.center())
+        };
+        let ui = text_at(&editor, "UI").expect("the add list is open");
+        editor.click(ui).frames(1);
+        let button = text_at(&editor, "Button").expect("the UI submenu is open");
+        assert!(
+            text_at(&editor, "Cube").is_some(),
+            "and the list behind it still is"
+        );
+
+        editor.click(button).frames(1);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let buttons = editor.world.query::<&crate::ui::Button>().count();
+        assert_eq!(buttons, 1);
+        assert!(
+            text_at(&editor, "Canvas").is_none(),
+            "picking closes the menu"
+        );
+    }
+
     /// One bar across the top and one across the bottom. At the 800x600 the
     /// engine opens at, the frame around the tools has to stay a frame.
     #[test]
