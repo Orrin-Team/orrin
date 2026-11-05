@@ -182,6 +182,23 @@ var threw = false;
 try { Color.FromHex("nope"); } catch (FormatException) { threw = true; }
 Check(threw, "FromHex rejects garbage");
 
+// --- Rect ----------------------------------------------------------------------
+
+var rect = new Rect(10f, 20f, 100f, 50f);
+Check(rect.xMax == 110f && rect.yMax == 70f, "Rect far edges");
+Check(rect.center == new Vector2(60f, 45f), "Rect center");
+Check(rect.Contains(new Vector2(10f, 20f)), "Rect contains its near corner");
+Check(!rect.Contains(new Vector2(110f, 45f)), "Rect excludes its far x edge");
+Check(!rect.Contains(new Vector2(60f, 70f)), "Rect excludes its far y edge");
+Check(!rect.Contains(new Vector2(9.99f, 45f)), "Rect excludes a point before it");
+Check(new Rect(new Vector2(10f, 20f), new Vector2(100f, 50f)) == rect, "Rect from position and size");
+
+// The engine reads the anchor as a row-major index from the upper left
+// (`scene::ui::TextAnchor`): column = value % 3, row = value / 3.
+Check((uint)Orrin.TextAnchor.MiddleCenter == 4, "TextAnchor.MiddleCenter is 4");
+Check((uint)Orrin.TextAnchor.UpperRight == 2, "TextAnchor.UpperRight is 2");
+Check((uint)Orrin.TextAnchor.LowerRight == 8, "TextAnchor.LowerRight is 8");
+
 // --- interop layout ------------------------------------------------------------
 
 unsafe
@@ -191,6 +208,7 @@ unsafe
     Check(sizeof(Vector4) == 16, "Vector4 is 16 bytes");
     Check(sizeof(Quaternion) == 16, "Quaternion is 16 bytes");
     Check(sizeof(Color) == 16, "Color is 16 bytes");
+    Check(sizeof(Rect) == 16, "Rect is 16 bytes");
     Check(sizeof(Orrin.Transform) == 40, "Transform is 10 floats");
     Check(sizeof(Orrin.CameraComponent) == 16, "CameraComponent is 3 floats and an int");
     Check(new Orrin.CameraComponent().FieldOfView == 60f, "a new lens is the engine's default");

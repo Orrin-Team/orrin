@@ -171,6 +171,22 @@ pub struct OrrinApi {
     // is not a camera is refused.
     pub get_active_camera: extern "C" fn() -> CEntity,
     pub set_active_camera: extern "C" fn(CEntity) -> bool,
+    // In-game UI, appended after `set_active_camera`; never reordered above it.
+    //
+    // Immediate mode: each call draws for the frame it is made in. A rect is
+    // four loose floats — x, y, width, height in physical pixels from the
+    // window's top left, the cursor's space — and a colour four more, sRGB with
+    // straight alpha: the blittable-trivial choice `debug_draw_line` made. Text
+    // crosses as a UTF-8 pointer and its byte length, so C# encodes it on the
+    // stack with no terminator. A font or texture is its id's 16 bytes, and a
+    // null font is the engine's own. `ui_text`'s `u32` after the size is C#
+    // `Orrin.TextAnchor`. `ui_screen_size` reports the window the tick began
+    // with.
+    pub ui_panel: extern "C" fn(f32, f32, f32, f32, f32, f32, f32, f32),
+    pub ui_text:
+        extern "C" fn(*const u8, u32, *const u8, f32, u32, f32, f32, f32, f32, f32, f32, f32, f32),
+    pub ui_image: extern "C" fn(*const u8, f32, f32, f32, f32, f32, f32, f32, f32),
+    pub ui_screen_size: extern "C" fn(*mut f32, *mut f32),
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -251,6 +267,10 @@ pub fn default_api() -> OrrinApi {
         set_camera_lens: stub_camera_lens,
         get_active_camera: stub_get_active_camera,
         set_active_camera: stub_set_active_camera,
+        ui_panel: stub_ui_panel,
+        ui_text: stub_ui_text,
+        ui_image: stub_ui_image,
+        ui_screen_size: stub_ui_screen_size,
     }
 }
 
@@ -268,6 +288,49 @@ extern "C" fn stub_get_active_camera() -> CEntity {
 
 extern "C" fn stub_set_active_camera(_entity: CEntity) -> bool {
     false
+}
+
+extern "C" fn stub_ui_panel(_: f32, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn stub_ui_text(
+    _text: *const u8,
+    _len: u32,
+    _font: *const u8,
+    _size: f32,
+    _anchor: u32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+) {
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn stub_ui_image(
+    _texture: *const u8,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+) {
+}
+
+extern "C" fn stub_ui_screen_size(width: *mut f32, height: *mut f32) {
+    for out in [width, height] {
+        if !out.is_null() {
+            // SAFETY: C# passes valid, writable f32 pointers.
+            unsafe { *out = 0.0 };
+        }
+    }
 }
 
 extern "C" fn stub_load_scene(_id: *const u8) -> bool {

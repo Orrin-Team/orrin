@@ -86,6 +86,18 @@ public unsafe struct OrrinApi
     public delegate* unmanaged<Entity, CameraComponent*, byte> SetCameraLens;
     public delegate* unmanaged<Entity> GetActiveCamera;
     public delegate* unmanaged<Entity, byte> SetActiveCamera;
+    // In-game UI, appended after SetActiveCamera, matching the Rust struct;
+    // never reordered above it. A rect is x, y, width, height and a colour
+    // r, g, b, a, as loose floats; text is UTF-8 bytes and their length, with
+    // no terminator; a font or texture is an id's sixteen bytes, and a null
+    // font is the engine's own.
+    public delegate* unmanaged<float, float, float, float, float, float, float, float, void> UiPanel;
+    public delegate* unmanaged<
+        byte*, uint, byte*, float, uint, float, float, float, float, float, float, float, float, void>
+        UiText;
+    public delegate* unmanaged<byte*, float, float, float, float, float, float, float, float, void>
+        UiImage;
+    public delegate* unmanaged<float*, float*, void> UiScreenSize;
 }
 
 public static unsafe class Native
@@ -281,6 +293,43 @@ public static unsafe class Native
     internal static Entity GetActiveCamera() => _api.GetActiveCamera();
 
     internal static bool SetActiveCamera(Entity entity) => _api.SetActiveCamera(entity) != 0;
+
+    internal static void UiPanel(Rect rect, Color color) =>
+        _api.UiPanel(rect.x, rect.y, rect.width, rect.height, color.r, color.g, color.b, color.a);
+
+    internal static void UiText(
+        ReadOnlySpan<byte> utf8, Guid? font, float size, TextAnchor anchor, Rect rect, Color color)
+    {
+        Span<byte> id = stackalloc byte[16];
+        fixed (byte* text = utf8)
+        fixed (byte* idPtr = id)
+        {
+            byte* fontPtr = null;
+            if (font is { } face)
+            {
+                face.TryWriteBytes(id, bigEndian: true, out _);
+                fontPtr = idPtr;
+            }
+            _api.UiText(text, (uint)utf8.Length, fontPtr, size, (uint)anchor,
+                rect.x, rect.y, rect.width, rect.height, color.r, color.g, color.b, color.a);
+        }
+    }
+
+    internal static void UiImage(Guid texture, Rect rect, Color tint)
+    {
+        Span<byte> id = stackalloc byte[16];
+        texture.TryWriteBytes(id, bigEndian: true, out _);
+        fixed (byte* idPtr = id)
+            _api.UiImage(idPtr, rect.x, rect.y, rect.width, rect.height,
+                tint.r, tint.g, tint.b, tint.a);
+    }
+
+    internal static Vector2 UiScreenSize()
+    {
+        float width = 0, height = 0;
+        _api.UiScreenSize(&width, &height);
+        return new Vector2(width, height);
+    }
 
     internal static AssetState GetAssetState(Guid asset)
     {

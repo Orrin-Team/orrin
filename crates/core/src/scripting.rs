@@ -24,7 +24,8 @@ use crate::scene::prefab::{self, Prefabs};
 use crate::scene::{
     ActionId, Actions, ActiveCamera, Assets, CameraComponent, Collider, ColliderShape, DebugLines,
     InputState, LoadedScenes, LocalTransform, LogLevel, MaterialHandle, MeshHandle, Name, Parent,
-    PendingScripts, SceneHandle, ScriptComponent, Tag, Time, Transform, WorldTransform,
+    PendingScripts, Rect, SceneHandle, ScriptComponent, Tag, TextAnchor, TextStyle, Time,
+    Transform, UiCanvas, WorldTransform, color_bytes,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -1055,6 +1056,96 @@ extern "C" fn set_active_camera(entity: CEntity) -> bool {
     })
 }
 
+// The in-game UI's calls record into the `UiCanvas` resource the frame's
+// painter reads; see `scene::ui`. With no canvas (a tool, a test) they do
+// nothing, as a debug line does with no `DebugLines`.
+
+fn with_canvas(draw: impl FnOnce(&mut UiCanvas)) {
+    orrin_script::with_world((), |world| {
+        if let Some(mut canvas) = world.get_resource_mut::<UiCanvas>() {
+            draw(&mut canvas);
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn ui_panel(x: f32, y: f32, width: f32, height: f32, r: f32, g: f32, b: f32, a: f32) {
+    with_canvas(|canvas| canvas.panel(Rect::new(x, y, width, height), color_bytes([r, g, b, a])));
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn ui_text(
+    text: *const u8,
+    len: u32,
+    font: *const u8,
+    size: f32,
+    anchor: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+) {
+    if text.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: C# passes `len` bytes it keeps pinned for the call.
+    let bytes = unsafe { std::slice::from_raw_parts(text, len as usize) };
+    let text = String::from_utf8_lossy(bytes);
+    // SAFETY: a non-null font is the 16 bytes of an `AssetRef` C# holds.
+    let font = (!font.is_null()).then(|| AssetId::from_bytes(unsafe { *font.cast::<[u8; 16]>() }));
+    let style = TextStyle {
+        font,
+        size,
+        anchor: TextAnchor::from_u32(anchor).unwrap_or_default(),
+        color: color_bytes([r, g, b, a]),
+    };
+    with_canvas(|canvas| canvas.text(Rect::new(x, y, width, height), style, &text));
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn ui_image(
+    texture: *const u8,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+) {
+    if texture.is_null() {
+        return;
+    }
+    // SAFETY: `texture` is the 16 bytes of an `AssetRef` C# holds.
+    let texture = AssetId::from_bytes(unsafe { *texture.cast::<[u8; 16]>() });
+    with_canvas(|canvas| {
+        canvas.image(
+            Rect::new(x, y, width, height),
+            texture,
+            color_bytes([r, g, b, a]),
+        );
+    });
+}
+
+extern "C" fn ui_screen_size(width: *mut f32, height: *mut f32) {
+    let screen = orrin_script::with_world([0.0; 2], |world| {
+        world
+            .get_resource::<UiCanvas>()
+            .map_or([0.0; 2], |canvas| canvas.screen())
+    });
+    for (out, side) in [width, height].into_iter().zip(screen) {
+        if !out.is_null() {
+            // SAFETY: C# passes valid, writable f32 pointers.
+            unsafe { *out = side };
+        }
+    }
+}
+
 /// Apply a queued scene change. Every other command is `apply_commands`' own.
 fn scene_command(world: &mut World, registry: &Registry, command: Command) {
     use crate::scene::loaded;
@@ -1332,6 +1423,10 @@ fn build_api() -> OrrinApi {
         set_camera_lens,
         get_active_camera,
         set_active_camera,
+        ui_panel,
+        ui_text,
+        ui_image,
+        ui_screen_size,
         ..orrin_script::default_api()
     }
 }
@@ -2642,5 +2737,158 @@ mod tests {
             crate::scene::Camera::default().position,
             "the view itself follows the entity at the end of the frame"
         );
+    }
+
+    fn ui_world() -> World {
+        let mut world = World::new();
+        let mut canvas = UiCanvas::default();
+        canvas.begin([1920, 1080]);
+        world.insert_resource(canvas);
+        world
+    }
+
+    #[test]
+    fn a_script_draws_into_the_canvas_in_call_order() {
+        use crate::scene::{Rect, TextAnchor, TextStyle, UiCommand};
+
+        let mut world = ui_world();
+        let icon = AssetId::new();
+        let text = "héllo";
+        orrin_script::with_active_world(&mut world, || {
+            ui_panel(10.0, 20.0, 300.0, 40.0, 0.0, 0.0, 0.0, 0.5);
+            ui_text(
+                text.as_ptr(),
+                text.len() as u32,
+                std::ptr::null(),
+                24.0,
+                4,
+                10.0,
+                20.0,
+                300.0,
+                40.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+            );
+            ui_image(
+                icon.to_bytes().as_ptr(),
+                0.0,
+                0.0,
+                64.0,
+                64.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+            );
+        });
+
+        let canvas = world.resource::<UiCanvas>();
+        let rect = Rect::new(10.0, 20.0, 300.0, 40.0);
+        let commands = canvas.commands();
+        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert_eq!(
+            commands[0],
+            UiCommand::Panel {
+                rect,
+                color: [0, 0, 0, 128]
+            }
+        );
+        let UiCommand::Text {
+            rect: text_rect,
+            style,
+            text: range,
+        } = &commands[1]
+        else {
+            panic!("{:?}", commands[1]);
+        };
+        assert_eq!(*text_rect, rect);
+        assert_eq!(
+            *style,
+            TextStyle {
+                font: None,
+                size: 24.0,
+                anchor: TextAnchor::MiddleCenter,
+                color: [255; 4],
+            }
+        );
+        assert_eq!(canvas.str(range), "héllo");
+        assert_eq!(
+            commands[2],
+            UiCommand::Image {
+                rect: Rect::new(0.0, 0.0, 64.0, 64.0),
+                texture: icon,
+                tint: [255; 4],
+            }
+        );
+    }
+
+    /// The anchor crosses as a number C# owns the meaning of; one past the end
+    /// is a version mismatch and sets text as an unanchored label would.
+    #[test]
+    fn a_script_names_its_font_and_an_unknown_anchor_falls_back() {
+        use crate::scene::{TextAnchor, UiCommand};
+
+        let mut world = ui_world();
+        let font = AssetId::new();
+        orrin_script::with_active_world(&mut world, || {
+            ui_text(
+                "a".as_ptr(),
+                1,
+                font.to_bytes().as_ptr(),
+                12.0,
+                99,
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+            );
+        });
+        let canvas = world.resource::<UiCanvas>();
+        let UiCommand::Text { style, .. } = &canvas.commands()[0] else {
+            panic!("{:?}", canvas.commands());
+        };
+        assert_eq!(style.font, Some(font));
+        assert_eq!(style.anchor, TextAnchor::UpperLeft);
+    }
+
+    #[test]
+    fn a_script_reads_the_screen_its_tick_began_with() {
+        let mut world = ui_world();
+        let (mut width, mut height) = (0.0, 0.0);
+        orrin_script::with_active_world(&mut world, || ui_screen_size(&mut width, &mut height));
+        assert_eq!((width, height), (1920.0, 1080.0));
+    }
+
+    /// A tool or a test may tick scripts with no canvas; the calls do nothing.
+    #[test]
+    fn ui_calls_without_a_canvas_are_ignored() {
+        let mut world = World::new();
+        let (mut width, mut height) = (1.0, 1.0);
+        orrin_script::with_active_world(&mut world, || {
+            ui_panel(0.0, 0.0, 10.0, 10.0, 1.0, 1.0, 1.0, 1.0);
+            ui_text(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                12.0,
+                0,
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+            );
+            ui_screen_size(&mut width, &mut height);
+        });
+        assert_eq!((width, height), (0.0, 0.0));
     }
 }
