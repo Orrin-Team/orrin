@@ -109,6 +109,9 @@ pub struct TextStyle {
     pub size: f32,
     pub anchor: TextAnchor,
     pub color: [u8; 4],
+    /// Off, each paragraph sets on one line, running past the rectangle's
+    /// sides rather than breaking; it is still cut at the top and bottom.
+    pub wrap: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,10 +127,13 @@ pub enum UiCommand {
         /// Into [`UiCanvas::text`].
         text: Range<u32>,
     },
-    /// Stretched over the rectangle and multiplied by `tint`.
+    /// `uv`'s part of the texture stretched over the rectangle and multiplied
+    /// by `tint`.
     Image {
         rect: Rect,
         texture: AssetId,
+        /// Left, top, right, bottom, normalised.
+        uv: [f32; 4],
         tint: [u8; 4],
     },
 }
@@ -181,10 +187,16 @@ impl UiCanvas {
     }
 
     pub fn image(&mut self, rect: Rect, texture: AssetId, tint: [u8; 4]) {
+        self.image_region(rect, texture, [0.0, 0.0, 1.0, 1.0], tint);
+    }
+
+    /// The `uv` part of `texture` over `rect`: one piece of a sliced image.
+    pub fn image_region(&mut self, rect: Rect, texture: AssetId, uv: [f32; 4], tint: [u8; 4]) {
         if rect.is_visible() && tint[3] > 0 {
             self.commands.push(UiCommand::Image {
                 rect,
                 texture,
+                uv,
                 tint,
             });
         }
@@ -220,6 +232,7 @@ mod tests {
             size: 16.0,
             anchor: TextAnchor::UpperLeft,
             color: [255; 4],
+            wrap: true,
         }
     }
 

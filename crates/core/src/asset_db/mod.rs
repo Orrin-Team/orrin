@@ -190,6 +190,8 @@ pub struct AssetDatabase {
     font_changes: Vec<AssetId>,
     /// Ids the UI drew as an image that are not textures, each reported once.
     refused_ui: HashSet<AssetId, FxBuildHasher>,
+    /// Each uploaded texture's size, which a sliced UI image is measured in.
+    extents: FxHashMap<AssetId, [u32; 2]>,
 }
 
 impl AssetDatabase {
@@ -247,6 +249,7 @@ impl AssetDatabase {
             pack: None,
             font_changes: Vec::new(),
             refused_ui: HashSet::default(),
+            extents: FxHashMap::default(),
         };
         (db, issues)
     }
@@ -395,6 +398,11 @@ impl AssetDatabase {
         let handle = self.texture_slot(id, false, backend, &mut errors);
         self.reports.extend(errors);
         (self.state(id) != LoadState::Loading).then_some(handle)
+    }
+
+    /// The size texture `id` was uploaded at, once it has been.
+    pub fn texture_extent(&self, id: AssetId) -> Option<[u32; 2]> {
+        self.extents.get(&id).copied()
     }
 
     /// Material `id` as it is drawn: its file's last good read, or an edit in
@@ -1144,6 +1152,7 @@ impl AssetDatabase {
                     return;
                 }
                 backend.replace_texture(TextureHandle(slot), &texture);
+                self.extents.insert(id, [texture.width, texture.height]);
                 self.textures.set_resident(id, ready);
             }
         }
@@ -1186,6 +1195,7 @@ impl AssetDatabase {
                         levels: vec![texel.to_vec()],
                     };
                     backend.replace_texture(TextureHandle(slot), &placeholder);
+                    self.extents.remove(&id);
                     self.textures.set_resident(id, failed);
                 }
             }
@@ -2523,6 +2533,7 @@ pub(crate) mod tests {
         let tree = db.find("models/tree.gltf").unwrap().id;
 
         assert_eq!(db.ui_texture(rock, &mut backend), None, "still importing");
+        assert_eq!(db.texture_extent(rock), None, "nothing measured yet");
         let mut errors = Vec::new();
         for _ in 0..3 {
             assert!(db.wait_idle(WAIT));
@@ -2531,6 +2542,11 @@ pub(crate) mod tests {
         let handle = db.ui_texture(rock, &mut backend);
         assert_eq!(handle, db.texture(rock));
         assert!(handle.is_some());
+        assert_eq!(
+            db.texture_extent(rock),
+            Some([2, 2]),
+            "what a slice is measured in"
+        );
 
         assert_eq!(db.ui_texture(tree, &mut backend), None);
         assert_eq!(db.ui_texture(tree, &mut backend), None);

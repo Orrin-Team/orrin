@@ -1102,6 +1102,7 @@ extern "C" fn ui_text(
         size,
         anchor: TextAnchor::from_u32(anchor).unwrap_or_default(),
         color: color_bytes([r, g, b, a]),
+        wrap: true,
     };
     with_canvas(|canvas| canvas.text(Rect::new(x, y, width, height), style, &text));
 }
@@ -2811,6 +2812,7 @@ mod tests {
                 size: 24.0,
                 anchor: TextAnchor::MiddleCenter,
                 color: [255; 4],
+                wrap: true,
             }
         );
         assert_eq!(canvas.str(range), "héllo");
@@ -2819,6 +2821,7 @@ mod tests {
             UiCommand::Image {
                 rect: Rect::new(0.0, 0.0, 64.0, 64.0),
                 texture: icon,
+                uv: [0.0, 0.0, 1.0, 1.0],
                 tint: [255; 4],
             }
         );

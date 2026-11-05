@@ -26,17 +26,71 @@
 //! below it everything is units, and an element's `scale` multiplies its own
 //! frame and its subtree's about its pivot. There is no rotation: the painter
 //! draws axis-aligned quads, and the rect tool and the hit test lean on that.
+//!
+//! # One command stream, two layers
+//!
+//! [`update`] runs every frame, in edit mode too, and records the trees into a
+//! [`UiCanvas`] of their own — the command record `UI.*` calls write — which
+//! the painter draws first, with the immediate canvas over it. Keeping the two
+//! apart is what leaves the immediate canvas's rules alone: it is still emptied
+//! only by a tick that runs game code, so a paused game keeps its HUD, while
+//! the retained layer is rebuilt from the scene whenever it draws. Canvases
+//! draw by `sort_order`, ties in hierarchy order, and within one an element's
+//! image before its text before its children.
+//!
+//! A sliced image is nine image commands over parts of one texture, measured
+//! in the texture's uploaded pixels, so the painter needs nothing new to draw
+//! one and a frame of them still batches by texture.
 
 pub mod components;
+pub mod extract;
 pub mod layout;
 
 pub use components::{Button, Canvas, Image, RectTransform, ScaleMode, Text};
 pub use layout::{Element, Layout};
 
+use orrin_ecs::World;
+
+use crate::asset_db::AssetDatabase;
+use crate::scene::UiCanvas;
+
+/// The retained UI as last resolved: a world resource, rebuilt by [`update`].
+#[derive(Default)]
+pub struct UiTree {
+    pub layout: Layout,
+    /// What the trees draw, under the immediate canvas.
+    pub canvas: UiCanvas,
+}
+
+/// Resolve every canvas onto a `screen`-sized window and record what it draws.
+/// Runs every frame, after the last thing that can edit the scene.
+pub fn update(world: &mut World, screen: [u32; 2]) {
+    crate::scene::ensure_current(world);
+    if world.get_resource::<UiTree>().is_none() {
+        world.insert_resource(UiTree::default());
+    }
+    let mut tree = world.resource_mut::<UiTree>();
+    let UiTree { layout, canvas } = &mut *tree;
+    let size = screen.map(|side| side as f32);
+    layout::resolve(
+        world,
+        &world.resource::<crate::scene::Hierarchy>(),
+        size,
+        layout,
+    );
+    canvas.begin(screen);
+    if layout.is_empty() {
+        return;
+    }
+    let db = world.get_resource::<AssetDatabase>();
+    let extent = |id| db.as_ref().and_then(|db| db.texture_extent(id));
+    extract::extract(world, layout, extent, canvas);
+}
+
 #[cfg(test)]
 mod tests {
     use glam::Vec2;
-    use orrin_ecs::{Entity, World};
+    use orrin_ecs::Entity;
     use orrin_registry::{AssetId, Registry};
 
     use super::*;
@@ -147,6 +201,32 @@ mod tests {
         let text = world.get::<Text>(text).unwrap();
         assert_eq!(text.text, "Play");
         assert_eq!(text.anchor, TextAnchor::MiddleCenter);
+    }
+
+    /// The retained layer is the scene's, rebuilt whatever the game is doing;
+    /// the immediate one is the tick's, and `update` never touches it.
+    #[test]
+    fn an_update_rebuilds_the_retained_layer_and_leaves_the_immediate_one() {
+        let mut world = World::new();
+        menu(&mut world);
+        let mut immediate = UiCanvas::default();
+        immediate.begin([800, 600]);
+        immediate.panel(crate::scene::Rect::new(0.0, 0.0, 5.0, 5.0), [255; 4]);
+        world.insert_resource(immediate);
+
+        update(&mut world, [1920, 1080]);
+        update(&mut world, [1920, 1080]);
+        let tree = world.resource::<UiTree>();
+        assert_eq!(tree.layout.elements().len(), 3);
+        // The panel's image, the button's, and the label.
+        assert_eq!(
+            tree.canvas.commands().len(),
+            3,
+            "{:?}",
+            tree.canvas.commands()
+        );
+        assert_eq!(tree.canvas.screen(), [1920.0, 1080.0]);
+        assert_eq!(world.resource::<UiCanvas>().commands().len(), 1);
     }
 
     #[test]

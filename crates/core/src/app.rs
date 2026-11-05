@@ -306,6 +306,7 @@ impl App {
         world.insert_resource(LogBuffer::default());
         world.insert_resource(DebugLines::default());
         world.insert_resource(UiCanvas::default());
+        world.insert_resource(crate::ui::UiTree::default());
         world.insert_resource(Culling::default());
         // Empty until `load_prefabs` scans the project: the scan reads the disk,
         // and its cost belongs to the run rather than to the cold-start gate.
@@ -942,9 +943,12 @@ impl ApplicationHandler for App {
                     crate::asset_db::service(&self.world, &mut active.renderer);
                 }
                 // After the service, with the backend in hand, for the same
-                // reason: an image the tick drew first gets its slot here.
+                // reason: an image the tick drew first gets its slot here. The
+                // retained trees are resolved first, every frame and in edit
+                // mode too, against the window the frame is about to fill.
                 {
                     profile_scope!("ui");
+                    crate::ui::update(&mut self.world, active.renderer.extent());
                     crate::gfx::ui::paint(&self.world, &mut active.renderer, &mut self.ui);
                 }
 

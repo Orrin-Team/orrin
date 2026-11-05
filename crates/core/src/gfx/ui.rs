@@ -107,14 +107,14 @@ pub trait UiAssets {
     fn font(&mut self, id: AssetId) -> Result<Vec<u8>, String>;
 }
 
-/// Lay out this frame's [`UiCanvas`] into `painter`. Runs after the asset
+/// Lay out this frame's retained UI and, over it, its [`UiCanvas`] into
+/// `painter`. Runs after the asset
 /// service and before the frame records, with the backend in hand, so an image
 /// seen for the first time gets a texture slot here rather than in the script
 /// tick.
 pub fn paint(world: &World, backend: &mut impl RenderBackend, painter: &mut Painter) {
-    let Some(canvas) = world.get_resource::<UiCanvas>() else {
-        return;
-    };
+    let tree = world.get_resource::<crate::ui::UiTree>();
+    let canvas = world.get_resource::<UiCanvas>();
     let mut db = world.get_resource_mut::<AssetDatabase>();
     if let Some(db) = &mut db {
         for id in db.take_font_changes() {
@@ -125,7 +125,13 @@ pub fn paint(world: &World, backend: &mut impl RenderBackend, painter: &mut Pain
         db: db.as_deref_mut(),
         backend,
     };
-    painter.paint(&canvas, &mut assets);
+    match (tree.as_ref().map(|tree| &tree.canvas), canvas.as_deref()) {
+        (Some(retained), Some(immediate)) => {
+            painter.paint_layers(&[retained, immediate], &mut assets)
+        }
+        (Some(only), None) | (None, Some(only)) => painter.paint_layers(&[only], &mut assets),
+        (None, None) => painter.paint_layers(&[], &mut assets),
+    }
 }
 
 /// The project's assets, as the painter asks for them.
@@ -268,12 +274,23 @@ impl Painter {
 
     /// Lay `canvas` out into this frame's quads.
     pub fn paint(&mut self, canvas: &UiCanvas, assets: &mut impl UiAssets) {
+        self.paint_layers(&[canvas], assets);
+    }
+
+    /// Lay `layers` out into this frame's quads, each over the one before.
+    pub fn paint_layers(&mut self, layers: &[&UiCanvas], assets: &mut impl UiAssets) {
         if std::mem::take(&mut self.full) {
             self.glyphs.clear();
             self.atlas.reset();
         }
         self.quads.clear();
         self.batches.clear();
+        for canvas in layers {
+            self.paint_canvas(canvas, assets);
+        }
+    }
+
+    fn paint_canvas(&mut self, canvas: &UiCanvas, assets: &mut impl UiAssets) {
         for command in canvas.commands() {
             match command {
                 UiCommand::Panel { rect, color } => {
@@ -287,12 +304,13 @@ impl Painter {
                 UiCommand::Image {
                     rect,
                     texture,
+                    uv,
                     tint,
                 } => {
                     if let Some(handle) = assets.texture(*texture) {
                         let quad = UiQuad {
                             rect: corners(rect),
-                            uv: [0.0, 0.0, 1.0, 1.0],
+                            uv: *uv,
                             color: *tint,
                         };
                         self.push(UiSource::Texture(handle), quad);
@@ -361,9 +379,18 @@ impl Painter {
         let mut lines = std::mem::take(&mut self.lines);
         let mut pens = std::mem::take(&mut self.pens);
         let scale = scaled.h_scale_factor();
-        self.wrap(slot, &font, scale, text, rect.width, &mut lines, &mut pens);
+        let width = if style.wrap {
+            rect.width
+        } else {
+            f32::INFINITY
+        };
+        self.wrap(slot, &font, scale, text, width, &mut lines, &mut pens);
         let block = line_height * (lines.len() - 1) as f32 + scaled.height();
-        let clip = corners(rect);
+        let mut clip = corners(rect);
+        if !style.wrap {
+            clip[0] = f32::NEG_INFINITY;
+            clip[2] = f32::INFINITY;
+        }
         let mut baseline =
             rect.y + (rect.height - block) * style.anchor.vertical() + scaled.ascent();
 
@@ -765,6 +792,7 @@ mod tests {
             size: 20.0,
             anchor,
             color: [255, 255, 255, 255],
+            wrap: true,
         }
     }
 
@@ -1009,6 +1037,74 @@ mod tests {
             ]
         );
         assert_eq!(painter.frame().quads[3].uv, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn an_image_region_samples_only_its_part_of_the_texture() {
+        let icon = AssetId::new();
+        let mut canvas = UiCanvas::default();
+        let rect = Rect::new(10.0, 10.0, 32.0, 32.0);
+        canvas.image_region(rect, icon, [0.25, 0.0, 0.75, 0.5], [255; 4]);
+        let mut assets = Fake::default();
+        assets.textures.insert(icon, TextureHandle(3));
+        let mut painter = Painter::new();
+        painter.paint(&canvas, &mut assets);
+        assert_eq!(painter.frame().quads[0].uv, [0.25, 0.0, 0.75, 0.5]);
+        assert_eq!(painter.frame().quads[0].rect, [10.0, 10.0, 42.0, 42.0]);
+    }
+
+    #[test]
+    fn unwrapped_text_runs_on_one_line_past_its_rect() {
+        let rect = Rect::new(0.0, 0.0, 50.0, 300.0);
+        let mut canvas = UiCanvas::default();
+        let unwrapped = TextStyle {
+            wrap: false,
+            ..style(TextAnchor::UpperLeft)
+        };
+        canvas.text(rect, unwrapped, "aaa bbb ccc");
+        let painter = paint(&canvas);
+        let quads = painter.frame().quads;
+        assert_eq!(quads.len(), 9, "nothing is cut at the sides");
+        assert_eq!(rows(quads), 1, "{quads:?}");
+        assert!(bounds(quads)[2] > rect.width, "{quads:?}");
+    }
+
+    /// The retained layer goes under the immediate one, and a panel on each is
+    /// still one draw.
+    #[test]
+    fn layers_paint_in_order_and_share_a_batch_across_the_seam() {
+        let rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let mut under = UiCanvas::default();
+        under.panel(rect, [1, 0, 0, 255]);
+        let mut over = UiCanvas::default();
+        over.panel(rect, [2, 0, 0, 255]);
+        let mut painter = Painter::new();
+        painter.paint_layers(&[&under, &over], &mut Fake::default());
+        let frame = painter.frame();
+        let colours: Vec<u8> = frame.quads.iter().map(|q| q.color[0]).collect();
+        assert_eq!(colours, [1, 2]);
+        assert_eq!(frame.batches.len(), 1);
+    }
+
+    #[test]
+    fn the_retained_tree_draws_under_the_immediate_calls() {
+        let mut world = World::new();
+        let mut tree = crate::ui::UiTree::default();
+        tree.canvas
+            .panel(Rect::new(0.0, 0.0, 10.0, 10.0), [1, 0, 0, 255]);
+        world.insert_resource(tree);
+        let mut immediate = UiCanvas::default();
+        immediate.panel(Rect::new(0.0, 0.0, 10.0, 10.0), [2, 0, 0, 255]);
+        world.insert_resource(immediate);
+
+        let mut painter = Painter::new();
+        super::paint(
+            &world,
+            &mut crate::gfx::HeadlessBackend::new(),
+            &mut painter,
+        );
+        let colours: Vec<u8> = painter.frame().quads.iter().map(|q| q.color[0]).collect();
+        assert_eq!(colours, [1, 2]);
     }
 
     #[test]
