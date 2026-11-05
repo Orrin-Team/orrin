@@ -187,6 +187,30 @@ pub struct OrrinApi {
         extern "C" fn(*const u8, u32, *const u8, f32, u32, f32, f32, f32, f32, f32, f32, f32, f32),
     pub ui_image: extern "C" fn(*const u8, f32, f32, f32, f32, f32, f32, f32, f32),
     pub ui_screen_size: extern "C" fn(*mut f32, *mut f32),
+    // Engine components as blittable structs, appended after `ui_screen_size`;
+    // never reordered above it.
+    //
+    // One generic pair rather than a pair per component: `kind` is C#
+    // `Orrin.ComponentKind`, the numbering `has_component` takes, and the
+    // pointer is that kind's `C…` struct below. `size` is the byte size of the
+    // struct C# built, checked against the engine's on every call — the table's
+    // own size handshake cannot see a struct grow, so a stale bindings build is
+    // refused by name here instead of reading past the end of C#'s buffer.
+    // `get` and `set` act on the component in place; `add` is structural and
+    // deferred like `add_camera`, and a `set` made later in the same tick lands
+    // on the queued one. An asset id inside a struct is its 16 bytes in
+    // canonical UUID order, all zeroes for none; a `bool` is a `u32`, nonzero
+    // for true. Text, which no blittable struct can hold, crosses through
+    // `get_component_text` (the `get_tag` protocol: returns the full UTF-8 byte
+    // length, writes at most `capacity`, -1 for none) and `set_component_text`
+    // (a pointer and a byte length). `ui_pointer_over` is whether the pointer
+    // was over a retained raycast target when the tick began.
+    pub get_component: extern "C" fn(CEntity, u32, *mut u8, u32) -> bool,
+    pub set_component: extern "C" fn(CEntity, u32, *const u8, u32) -> bool,
+    pub add_component: extern "C" fn(CEntity, u32, *const u8, u32) -> bool,
+    pub get_component_text: extern "C" fn(CEntity, u32, *mut u8, i32) -> i32,
+    pub set_component_text: extern "C" fn(CEntity, u32, *const u8, u32) -> bool,
+    pub ui_pointer_over: extern "C" fn() -> bool,
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -271,7 +295,33 @@ pub fn default_api() -> OrrinApi {
         ui_text: stub_ui_text,
         ui_image: stub_ui_image,
         ui_screen_size: stub_ui_screen_size,
+        get_component: stub_get_component,
+        set_component: stub_put_component,
+        add_component: stub_put_component,
+        get_component_text: stub_get_component_text,
+        set_component_text: stub_set_component_text,
+        ui_pointer_over: stub_ui_pointer_over,
     }
+}
+
+extern "C" fn stub_get_component(_: CEntity, _: u32, _: *mut u8, _: u32) -> bool {
+    false
+}
+
+extern "C" fn stub_put_component(_: CEntity, _: u32, _: *const u8, _: u32) -> bool {
+    false
+}
+
+extern "C" fn stub_get_component_text(_: CEntity, _: u32, _: *mut u8, _: i32) -> i32 {
+    -1
+}
+
+extern "C" fn stub_set_component_text(_: CEntity, _: u32, _: *const u8, _: u32) -> bool {
+    false
+}
+
+extern "C" fn stub_ui_pointer_over() -> bool {
+    false
 }
 
 extern "C" fn stub_camera_lens(_entity: CEntity, _value: *const CCamera) -> bool {
@@ -796,6 +846,85 @@ pub struct CCamera {
     pub priority: i32,
 }
 
+/// C ABI `ui::Canvas`; matches C# `Orrin.Canvas`. `scale_mode` is C#
+/// `Orrin.CanvasScaleMode`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CCanvas {
+    pub scale_mode: u32,
+    pub reference_resolution: [f32; 2],
+    pub match_width_or_height: f32,
+    pub sort_order: i32,
+}
+
+/// C ABI `ui::RectTransform`; matches C# `Orrin.RectTransform`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CRectTransform {
+    pub anchor_min: [f32; 2],
+    pub anchor_max: [f32; 2],
+    pub pivot: [f32; 2],
+    pub anchored_position: [f32; 2],
+    pub size_delta: [f32; 2],
+    pub scale: [f32; 2],
+}
+
+/// C ABI `ui::Image`; matches C# `Orrin.Image`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CImage {
+    pub texture: [u8; 16],
+    pub color: [f32; 4],
+    pub slice: [f32; 4],
+    pub raycast_target: u32,
+}
+
+/// C ABI `ui::Text` without its string; matches C# `Orrin.Text`. `anchor` is
+/// C# `Orrin.TextAnchor`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CText {
+    pub font: [u8; 16],
+    pub color: [f32; 4],
+    pub size: f32,
+    pub anchor: u32,
+    pub wrap: u32,
+    pub raycast_target: u32,
+}
+
+/// C ABI `ui::Button`; matches C# `Orrin.Button`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CButton {
+    pub normal: [f32; 4],
+    pub hover: [f32; 4],
+    pub pressed: [f32; 4],
+    pub disabled: [f32; 4],
+    pub interactable: u32,
+}
+
+/// C ABI pointer event payload: where the pointer is, where its button went
+/// down, the element it hit and the button. Matches C# `Orrin.PointerEvent`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CPointerEvent {
+    pub position: [f32; 2],
+    pub press_position: [f32; 2],
+    pub target: CEntity,
+    pub button: u32,
+}
+
+/// What a behaviour did with a pointer event. The bytes are lock-step with C#
+/// `Orrin.Behaviours`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    Handled,
+    /// It threw, which counts as handled: the event does not go on up.
+    Faulted,
+    /// It implements no handler for the event, which goes on to the parent.
+    Unhandled,
+}
+
 /// C ABI collision event payload, as seen by one participant: the *other*
 /// entity, the world-space contact point, and the contact normal pointing from
 /// the receiving entity toward `other`. Matches the C# `Orrin.Collision`.
@@ -882,6 +1011,8 @@ pub struct ScriptHost {
     disable_fn: extern "system" fn(u64) -> u8,
     collision_enter_fn: extern "system" fn(u64, *const CCollision) -> u8,
     collision_exit_fn: extern "system" fn(u64, *const CCollision) -> u8,
+    // Returns 0 handled, 1 faulted, 2 not handled; see `Delivery`.
+    pointer_fn: extern "system" fn(u64, u32, *const CPointerEvent) -> u8,
     // Game-assembly swap. These live in `Orrin.dll`, which is in the default
     // (uncollectible) load context, so the pointers stay valid across every
     // reload of the game assembly — the whole reason the bindings and the game
@@ -943,7 +1074,7 @@ impl ScriptHost {
         #[rustfmt::skip]
         let (
             init, create_fn, start_fn, update_fn, enable_fn, disable_fn,
-            collision_enter_fn, collision_exit_fn, destroy,
+            collision_enter_fn, collision_exit_fn, pointer_fn, destroy,
             game_load_fn, game_commit_fn, game_rollback_fn, game_unload_fn,
             state_capture_fn, state_apply_fn, state_discard_fn,
             bag_read, bag_write, bag_default, bag_components,
@@ -981,6 +1112,10 @@ impl ScriptHost {
                 *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision) -> u8>(
                     pdcstr!("Orrin.Behaviours, Orrin"),
                     pdcstr!("CollisionExit"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, u32, *const CPointerEvent) -> u8>(
+                    pdcstr!("Orrin.Behaviours, Orrin"),
+                    pdcstr!("Pointer"),
                 )?,
                 // Teardown is a process-wide global, not a `ScriptHost` method:
                 // it must stay reachable from `ScriptComponent::drop`, which
@@ -1062,6 +1197,7 @@ impl ScriptHost {
             disable_fn,
             collision_enter_fn,
             collision_exit_fn,
+            pointer_fn,
             game_load_fn,
             game_commit_fn,
             game_rollback_fn,
@@ -1151,5 +1287,33 @@ impl ScriptHost {
 
     pub fn collision_exit(&self, handle: u64, collision: &CCollision) -> bool {
         (self.collision_exit_fn)(handle, collision) != 0
+    }
+
+    /// Offer pointer event `kind` (C# `Orrin.PointerEventKind`) to a behaviour.
+    pub fn pointer(&self, handle: u64, kind: u32, event: &CPointerEvent) -> Delivery {
+        match (self.pointer_fn)(handle, kind, event) {
+            0 => Delivery::Handled,
+            1 => Delivery::Faulted,
+            _ => Delivery::Unhandled,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sizes `Orrin.MathTests` asserts of the C# mirrors. Either side
+    /// changing alone is a layout break the engine's per-call size check would
+    /// then refuse at run time.
+    #[test]
+    fn the_ui_structs_are_the_sizes_the_bindings_check() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<CCanvas>(), 20);
+        assert_eq!(size_of::<CRectTransform>(), 48);
+        assert_eq!(size_of::<CImage>(), 52);
+        assert_eq!(size_of::<CText>(), 48);
+        assert_eq!(size_of::<CButton>(), 68);
+        assert_eq!(size_of::<CPointerEvent>(), 28);
     }
 }

@@ -382,6 +382,11 @@ extern "C" fn has_component(entity: CEntity, kind: u32) -> bool {
             1 => world.has::<Tag>(entity),
             2 => world.has::<Collider>(entity),
             3 => world.has::<CameraComponent>(entity),
+            KIND_CANVAS => world.has::<crate::ui::Canvas>(entity),
+            KIND_RECT_TRANSFORM => world.has::<crate::ui::RectTransform>(entity),
+            KIND_IMAGE => world.has::<crate::ui::Image>(entity),
+            KIND_TEXT => world.has::<crate::ui::Text>(entity),
+            KIND_BUTTON => world.has::<crate::ui::Button>(entity),
             _ => false,
         }
     })
@@ -589,6 +594,10 @@ enum Command {
         parent: Option<Entity>,
         keep_world: bool,
     },
+    AddUi {
+        entity: Entity,
+        component: UiComponent,
+    },
     // `root` was reserved at the call; the instance is built into it here.
     InstantiatePrefab {
         root: Entity,
@@ -603,6 +612,48 @@ enum Command {
         scene: AssetId,
     },
     UnloadScene(SceneHandle),
+}
+
+/// A UI component a script added, waiting for the commands to drain.
+#[derive(Clone)]
+enum UiComponent {
+    Canvas(crate::ui::Canvas),
+    RectTransform(crate::ui::RectTransform),
+    Image(crate::ui::Image),
+    Text(crate::ui::Text),
+    Button(crate::ui::Button),
+}
+
+impl UiComponent {
+    fn kind(&self) -> u32 {
+        match self {
+            Self::Canvas(_) => KIND_CANVAS,
+            Self::RectTransform(_) => KIND_RECT_TRANSFORM,
+            Self::Image(_) => KIND_IMAGE,
+            Self::Text(_) => KIND_TEXT,
+            Self::Button(_) => KIND_BUTTON,
+        }
+    }
+
+    fn insert(self, world: &mut World, entity: Entity) {
+        match self {
+            Self::Canvas(c) => {
+                world.insert(entity, c);
+            }
+            Self::RectTransform(c) => {
+                world.insert(entity, c);
+            }
+            Self::Image(c) => {
+                world.insert(entity, c);
+            }
+            Self::Text(c) => {
+                world.insert(entity, c);
+            }
+            Self::Button(c) => {
+                world.insert(entity, c);
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -1147,6 +1198,400 @@ extern "C" fn ui_screen_size(width: *mut f32, height: *mut f32) {
     }
 }
 
+// Engine components as blittable structs, through one generic pair; see
+// `OrrinApi::get_component`. The `kind`s are C# `Orrin.ComponentKind`, the
+// numbering `has_component` matches on.
+
+const KIND_CANVAS: u32 = 4;
+const KIND_RECT_TRANSFORM: u32 = 5;
+const KIND_IMAGE: u32 = 6;
+const KIND_TEXT: u32 = 7;
+const KIND_BUTTON: u32 = 8;
+
+fn entity_of(entity: CEntity) -> Entity {
+    Entity {
+        index: entity.index,
+        generation: entity.generation,
+    }
+}
+
+/// The C# name of component `kind`, for a message.
+fn kind_name(kind: u32) -> &'static str {
+    match kind {
+        KIND_CANVAS => "Canvas",
+        KIND_RECT_TRANSFORM => "RectTransform",
+        KIND_IMAGE => "Image",
+        KIND_TEXT => "Text",
+        KIND_BUTTON => "Button",
+        _ => "an unknown component",
+    }
+}
+
+/// Whether C# built `T` at the size the engine did, refusing by name if not.
+fn sized<T>(call: &str, kind: u32, size: u32) -> bool {
+    let expected = std::mem::size_of::<T>() as u32;
+    if size != expected {
+        let name = kind_name(kind);
+        tracing::warn!(
+            "World.{call}<{name}>: C# passed {size} bytes and the engine's {name} is \
+             {expected}; rebuild scripting/Orrin so the bindings match the engine"
+        );
+    }
+    size == expected
+}
+
+fn asset_bytes(id: Option<AssetId>) -> [u8; 16] {
+    id.unwrap_or(AssetId::NIL).to_bytes()
+}
+
+fn asset_of(bytes: [u8; 16]) -> Option<AssetId> {
+    Some(AssetId::from_bytes(bytes)).filter(|id| !id.is_nil())
+}
+
+fn canvas_to_c(canvas: &crate::ui::Canvas) -> orrin_script::CCanvas {
+    orrin_script::CCanvas {
+        scale_mode: canvas.scale_mode as u32,
+        reference_resolution: canvas.reference_resolution.to_array(),
+        match_width_or_height: canvas.match_width_or_height,
+        sort_order: canvas.sort_order,
+    }
+}
+
+fn canvas_from_c(c: orrin_script::CCanvas) -> Option<crate::ui::Canvas> {
+    use crate::ui::ScaleMode;
+    let scale_mode = match c.scale_mode {
+        0 => ScaleMode::ConstantPixel,
+        1 => ScaleMode::ScaleWithScreen,
+        other => {
+            tracing::warn!("Canvas: {other} is not a CanvasScaleMode");
+            return None;
+        }
+    };
+    Some(crate::ui::Canvas {
+        scale_mode,
+        reference_resolution: glam::Vec2::from_array(c.reference_resolution),
+        match_width_or_height: c.match_width_or_height,
+        sort_order: c.sort_order,
+    })
+}
+
+fn rect_to_c(rect: &crate::ui::RectTransform) -> orrin_script::CRectTransform {
+    orrin_script::CRectTransform {
+        anchor_min: rect.anchor_min.to_array(),
+        anchor_max: rect.anchor_max.to_array(),
+        pivot: rect.pivot.to_array(),
+        anchored_position: rect.anchored_position.to_array(),
+        size_delta: rect.size_delta.to_array(),
+        scale: rect.scale.to_array(),
+    }
+}
+
+fn rect_from_c(c: orrin_script::CRectTransform) -> crate::ui::RectTransform {
+    use glam::Vec2;
+    crate::ui::RectTransform {
+        anchor_min: Vec2::from_array(c.anchor_min),
+        anchor_max: Vec2::from_array(c.anchor_max),
+        pivot: Vec2::from_array(c.pivot),
+        anchored_position: Vec2::from_array(c.anchored_position),
+        size_delta: Vec2::from_array(c.size_delta),
+        scale: Vec2::from_array(c.scale),
+    }
+}
+
+fn image_to_c(image: &crate::ui::Image) -> orrin_script::CImage {
+    orrin_script::CImage {
+        texture: asset_bytes(image.texture),
+        color: image.color,
+        slice: image.slice,
+        raycast_target: image.raycast_target.into(),
+    }
+}
+
+fn image_from_c(c: orrin_script::CImage) -> crate::ui::Image {
+    crate::ui::Image {
+        texture: asset_of(c.texture),
+        color: c.color,
+        slice: c.slice,
+        raycast_target: c.raycast_target != 0,
+    }
+}
+
+fn text_to_c(text: &crate::ui::Text) -> orrin_script::CText {
+    orrin_script::CText {
+        font: asset_bytes(text.font),
+        color: text.color,
+        size: text.size,
+        anchor: text.anchor as u32,
+        wrap: text.wrap.into(),
+        raycast_target: text.raycast_target.into(),
+    }
+}
+
+/// Everything but the string, which the struct does not carry.
+fn text_from_c(c: orrin_script::CText, text: String) -> Option<crate::ui::Text> {
+    let Some(anchor) = TextAnchor::from_u32(c.anchor) else {
+        tracing::warn!("Text: {} is not a TextAnchor", c.anchor);
+        return None;
+    };
+    Some(crate::ui::Text {
+        text,
+        font: asset_of(c.font),
+        size: c.size,
+        color: c.color,
+        anchor,
+        wrap: c.wrap != 0,
+        raycast_target: c.raycast_target != 0,
+    })
+}
+
+fn button_to_c(button: &crate::ui::Button) -> orrin_script::CButton {
+    orrin_script::CButton {
+        normal: button.normal,
+        hover: button.hover,
+        pressed: button.pressed,
+        disabled: button.disabled,
+        interactable: button.interactable.into(),
+    }
+}
+
+fn button_from_c(c: orrin_script::CButton) -> crate::ui::Button {
+    crate::ui::Button {
+        normal: c.normal,
+        hover: c.hover,
+        pressed: c.pressed,
+        disabled: c.disabled,
+        interactable: c.interactable != 0,
+    }
+}
+
+/// `value` as C# sent it, if it is the size of `T`.
+fn read_c<T: Copy>(call: &str, kind: u32, value: *const u8, size: u32) -> Option<T> {
+    if value.is_null() || !sized::<T>(call, kind, size) {
+        return None;
+    }
+    // SAFETY: C# passes a pointer to `size` readable bytes, just checked to be
+    // a whole `T`; unaligned, since nothing promises the buffer's alignment.
+    Some(unsafe { value.cast::<T>().read_unaligned() })
+}
+
+/// `value` decoded as component `kind`, keeping `text` for a `Text`.
+fn decode(
+    call: &str,
+    kind: u32,
+    value: *const u8,
+    size: u32,
+    text: impl FnOnce() -> String,
+) -> Option<UiComponent> {
+    use orrin_script::{CButton, CCanvas, CImage, CRectTransform, CText};
+    match kind {
+        KIND_CANVAS => {
+            canvas_from_c(read_c::<CCanvas>(call, kind, value, size)?).map(UiComponent::Canvas)
+        }
+        KIND_RECT_TRANSFORM => Some(UiComponent::RectTransform(rect_from_c(read_c::<
+            CRectTransform,
+        >(
+            call, kind, value, size,
+        )?))),
+        KIND_IMAGE => Some(UiComponent::Image(image_from_c(read_c::<CImage>(
+            call, kind, value, size,
+        )?))),
+        KIND_TEXT => {
+            text_from_c(read_c::<CText>(call, kind, value, size)?, text()).map(UiComponent::Text)
+        }
+        KIND_BUTTON => Some(UiComponent::Button(button_from_c(read_c::<CButton>(
+            call, kind, value, size,
+        )?))),
+        _ => {
+            tracing::warn!("World.{call}: component kind {kind} has no blittable form");
+            None
+        }
+    }
+}
+
+/// The add of `kind` to `entity` this tick has queued, if there is one.
+fn with_queued<R>(
+    entity: Entity,
+    kind: u32,
+    change: impl FnOnce(&mut UiComponent) -> R,
+) -> Option<R> {
+    COMMANDS.with(|commands| {
+        commands
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find_map(|command| match command {
+                Command::AddUi {
+                    entity: queued,
+                    component,
+                } if *queued == entity && component.kind() == kind => Some(component),
+                _ => None,
+            })
+            .map(change)
+    })
+}
+
+extern "C" fn get_component(entity: CEntity, kind: u32, out: *mut u8, size: u32) -> bool {
+    fn write<T: Copy>(out: *mut u8, size: u32, kind: u32, value: T) -> bool {
+        if !sized::<T>("GetComponent", kind, size) {
+            return false;
+        }
+        // SAFETY: C# passes `size` writable bytes, just checked to be a whole
+        // `T`; unaligned, as in `read_c`.
+        unsafe { out.cast::<T>().write_unaligned(value) };
+        true
+    }
+    if out.is_null() {
+        return false;
+    }
+    orrin_script::with_world(false, |world| {
+        let entity = entity_of(entity);
+        let value = match kind {
+            KIND_CANVAS => world
+                .get::<crate::ui::Canvas>(entity)
+                .map(|c| canvas_to_c(&c))
+                .map(|c| write(out, size, kind, c)),
+            KIND_RECT_TRANSFORM => world
+                .get::<crate::ui::RectTransform>(entity)
+                .map(|c| write(out, size, kind, rect_to_c(&c))),
+            KIND_IMAGE => world
+                .get::<crate::ui::Image>(entity)
+                .map(|c| write(out, size, kind, image_to_c(&c))),
+            KIND_TEXT => world
+                .get::<crate::ui::Text>(entity)
+                .map(|c| write(out, size, kind, text_to_c(&c))),
+            KIND_BUTTON => world
+                .get::<crate::ui::Button>(entity)
+                .map(|c| write(out, size, kind, button_to_c(&c))),
+            _ => {
+                tracing::warn!("World.GetComponent: component kind {kind} has no blittable form");
+                None
+            }
+        };
+        value.unwrap_or(false)
+    })
+}
+
+extern "C" fn set_component(entity: CEntity, kind: u32, value: *const u8, size: u32) -> bool {
+    orrin_script::with_world(false, |world| {
+        let entity = entity_of(entity);
+        let current_text = || {
+            world
+                .get::<crate::ui::Text>(entity)
+                .map(|text| text.text.clone())
+                .or_else(|| {
+                    with_queued(entity, KIND_TEXT, |queued| match queued {
+                        UiComponent::Text(text) => text.text.clone(),
+                        _ => String::new(),
+                    })
+                })
+                .unwrap_or_default()
+        };
+        let Some(component) = decode("SetComponent", kind, value, size, current_text) else {
+            return false;
+        };
+        let in_place = match &component {
+            UiComponent::Canvas(c) => world
+                .get_mut::<crate::ui::Canvas>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::RectTransform(c) => world
+                .get_mut::<crate::ui::RectTransform>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::Image(c) => world
+                .get_mut::<crate::ui::Image>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::Text(c) => world
+                .get_mut::<crate::ui::Text>(entity)
+                .map(|mut slot| *slot = c.clone()),
+            UiComponent::Button(c) => world
+                .get_mut::<crate::ui::Button>(entity)
+                .map(|mut slot| *slot = *c),
+        };
+        in_place.is_some() || with_queued(entity, kind, |queued| *queued = component).is_some()
+    })
+}
+
+extern "C" fn add_component(entity: CEntity, kind: u32, value: *const u8, size: u32) -> bool {
+    let Some(component) = decode("AddComponent", kind, value, size, String::new) else {
+        return false;
+    };
+    orrin_script::with_world(false, |world| {
+        let entity = entity_of(entity);
+        if !world.is_alive(entity) {
+            return false;
+        }
+        COMMANDS.with(|commands| {
+            commands
+                .borrow_mut()
+                .push(Command::AddUi { entity, component })
+        });
+        true
+    })
+}
+
+// The `get_tag` protocol; see `OrrinApi::get_component_text`.
+extern "C" fn get_component_text(entity: CEntity, kind: u32, out: *mut u8, capacity: i32) -> i32 {
+    if kind != KIND_TEXT || (out.is_null() && capacity > 0) {
+        return -1;
+    }
+    orrin_script::with_world(-1, |world| {
+        let entity = entity_of(entity);
+        let text = world
+            .get::<crate::ui::Text>(entity)
+            .map(|text| text.text.clone())
+            .or_else(|| {
+                with_queued(entity, KIND_TEXT, |queued| match queued {
+                    UiComponent::Text(text) => text.text.clone(),
+                    _ => String::new(),
+                })
+            });
+        let Some(text) = text else {
+            return -1;
+        };
+        let bytes = text.as_bytes();
+        let n = bytes.len().min(capacity.max(0) as usize);
+        if n > 0 {
+            // SAFETY: C# passes `capacity` writable bytes; the source is our own
+            // string, so the ranges cannot overlap.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, n) };
+        }
+        bytes.len() as i32
+    })
+}
+
+extern "C" fn set_component_text(entity: CEntity, kind: u32, text: *const u8, len: u32) -> bool {
+    if kind != KIND_TEXT || (text.is_null() && len > 0) {
+        return false;
+    }
+    let text = if len == 0 {
+        String::new()
+    } else {
+        // SAFETY: C# passes `len` bytes it keeps pinned for the call.
+        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(text, len as usize) })
+            .into_owned()
+    };
+    orrin_script::with_world(false, |world| {
+        let entity = entity_of(entity);
+        if let Some(mut component) = world.get_mut::<crate::ui::Text>(entity) {
+            component.text = text;
+            return true;
+        }
+        with_queued(entity, KIND_TEXT, |queued| {
+            if let UiComponent::Text(queued) = queued {
+                queued.text = text;
+            }
+        })
+        .is_some()
+    })
+}
+
+extern "C" fn ui_pointer_over() -> bool {
+    orrin_script::with_world(false, |world| {
+        world
+            .get_resource::<crate::ui::events::UiPointer>()
+            .is_some_and(|pointer| pointer.is_over_ui())
+    })
+}
+
 /// Apply a queued scene change. Every other command is `apply_commands`' own.
 fn scene_command(world: &mut World, registry: &Registry, command: Command) {
     use crate::scene::loaded;
@@ -1428,6 +1873,12 @@ fn build_api() -> OrrinApi {
         ui_text,
         ui_image,
         ui_screen_size,
+        get_component,
+        set_component,
+        add_component,
+        get_component_text,
+        set_component_text,
+        ui_pointer_over,
         ..orrin_script::default_api()
     }
 }
@@ -1528,6 +1979,9 @@ pub struct Scripting {
     /// hash lookup instead of a scan over every scripted entity. Built only on
     /// ticks that actually have events.
     routing: RefCell<FxHashMap<Entity, usize>>,
+    /// This tick's pointer events, swapped out of the world for the dispatch
+    /// and back, cleared, so neither side reallocates.
+    pointer_events: RefCell<crate::ui::events::UiEvents>,
 }
 
 impl Scripting {
@@ -1639,6 +2093,7 @@ impl Scripting {
             game_dll: game_dll.to_path_buf(),
             pending: RefCell::new(Vec::new()),
             routing: RefCell::new(FxHashMap::default()),
+            pointer_events: RefCell::new(crate::ui::events::UiEvents::default()),
         };
         match scripting.stage() {
             Ok(()) => {}
@@ -1955,7 +2410,7 @@ impl Scripting {
     ///
     /// Dispatch order inside the window mirrors Unity: activation transitions
     /// (OnEnable/OnStart/OnDisable), then this frame's collision callbacks,
-    /// then OnUpdate.
+    /// then its pointer events, then OnUpdate.
     pub fn tick(&self, world: &mut World, registry: &Registry, delta_time: f32) {
         let mut pending = self.pending.take();
         pending.clear();
@@ -1992,9 +2447,14 @@ impl Scripting {
         // Built here and not inside the window, and only when there is
         // something to route: a tick with no collisions should not pay for an
         // index nothing reads.
+        let mut pointer_events = self.pointer_events.take();
+        if let Some(mut queued) = world.get_resource_mut::<crate::ui::events::UiEvents>() {
+            std::mem::swap(&mut *queued, &mut pointer_events);
+        }
+
         let mut routing = self.routing.take();
         routing.clear();
-        if !events.is_empty() {
+        if !events.is_empty() || !pointer_events.is_empty() {
             routing.extend(
                 pending
                     .iter()
@@ -2067,12 +2527,46 @@ impl Scripting {
                 }
             }
 
+            // Offered up each event's chain to the first behaviour that
+            // handles it. One that is inactive, faulted or has no handler
+            // passes it on, as a disabled component does in uGUI.
+            crate::ui::events::deliver(&pointer_events, |entity, event| {
+                let Some(&index) = routing.get(&entity) else {
+                    return false;
+                };
+                let script = &mut pending[index];
+                if !script.active || script.faulted {
+                    return false;
+                }
+                let payload = orrin_script::CPointerEvent {
+                    position: event.position,
+                    press_position: event.press_position,
+                    target: CEntity {
+                        index: event.target.index,
+                        generation: event.target.generation,
+                    },
+                    button: 0,
+                };
+                match self
+                    .host
+                    .pointer(script.handle, event.kind as u32, &payload)
+                {
+                    orrin_script::Delivery::Handled => true,
+                    orrin_script::Delivery::Unhandled => false,
+                    orrin_script::Delivery::Faulted => {
+                        script.faulted = true;
+                        true
+                    }
+                }
+            });
+
             for script in &mut pending {
                 if script.active && !script.faulted && self.host.update(script.handle, delta_time) {
                     script.faulted = true;
                 }
             }
         });
+        pointer_events.clear();
 
         // Structural changes the scripts queued land now, after every script
         // has run — so this frame's extraction already sees new renderables.
@@ -2090,6 +2584,7 @@ impl Scripting {
 
         self.pending.replace(pending);
         self.routing.replace(routing);
+        self.pointer_events.replace(pointer_events);
     }
 
     /// Apply the structural changes scripts queued during a dispatch. Runs
@@ -2133,6 +2628,7 @@ impl Scripting {
                 Command::AddCamera { entity, camera } => {
                     world.insert(entity, camera);
                 }
+                Command::AddUi { entity, component } => component.insert(world, entity),
                 Command::SetMaterial { entity, material } => {
                     world.insert(entity, material);
                 }
@@ -2738,6 +3234,342 @@ mod tests {
             crate::scene::Camera::default().position,
             "the view itself follows the entity at the end of the frame"
         );
+    }
+
+    /// What C# hands across for each kind, with every field away from its
+    /// default so a dropped one shows.
+    fn c_image() -> orrin_script::CImage {
+        orrin_script::CImage {
+            texture: AssetId::new().to_bytes(),
+            color: [0.1, 0.2, 0.3, 0.4],
+            slice: [1.0, 2.0, 3.0, 4.0],
+            raycast_target: 0,
+        }
+    }
+
+    fn bytes_of<T>(value: &T) -> *const u8 {
+        (value as *const T).cast()
+    }
+
+    fn size_of<T>() -> u32 {
+        std::mem::size_of::<T>() as u32
+    }
+
+    /// Every kind reads back what was written to it, and an add is deferred
+    /// like any structural change.
+    #[test]
+    fn each_ui_component_round_trips_through_the_generic_pair() {
+        use orrin_script::{CButton, CCanvas, CRectTransform, CText};
+
+        let mut world = World::new();
+        let entity = world.spawn();
+        let canvas = CCanvas {
+            scale_mode: 1,
+            reference_resolution: [1280.0, 720.0],
+            match_width_or_height: 0.5,
+            sort_order: -2,
+        };
+        let rect = CRectTransform {
+            anchor_min: [0.1, 0.2],
+            anchor_max: [0.3, 0.4],
+            pivot: [0.5, 0.6],
+            anchored_position: [7.0, 8.0],
+            size_delta: [9.0, 10.0],
+            scale: [2.0, 3.0],
+        };
+        let image = c_image();
+        let text = CText {
+            font: AssetId::new().to_bytes(),
+            color: [1.0, 0.0, 0.5, 1.0],
+            size: 40.0,
+            anchor: 4,
+            wrap: 0,
+            raycast_target: 1,
+        };
+        let button = CButton {
+            normal: [0.1; 4],
+            hover: [0.2; 4],
+            pressed: [0.3; 4],
+            disabled: [0.4; 4],
+            interactable: 0,
+        };
+        let added = orrin_script::with_active_world(&mut world, || {
+            [
+                add_component(
+                    c(entity),
+                    KIND_CANVAS,
+                    bytes_of(&canvas),
+                    size_of::<CCanvas>(),
+                ),
+                add_component(
+                    c(entity),
+                    KIND_RECT_TRANSFORM,
+                    bytes_of(&rect),
+                    size_of::<CRectTransform>(),
+                ),
+                add_component(
+                    c(entity),
+                    KIND_IMAGE,
+                    bytes_of(&image),
+                    size_of::<orrin_script::CImage>(),
+                ),
+                add_component(c(entity), KIND_TEXT, bytes_of(&text), size_of::<CText>()),
+                add_component(
+                    c(entity),
+                    KIND_BUTTON,
+                    bytes_of(&button),
+                    size_of::<CButton>(),
+                ),
+            ]
+        });
+        assert_eq!(added, [true; 5]);
+        assert!(!world.has::<crate::ui::Image>(entity), "deferred");
+        let commands: Vec<Command> = COMMANDS.with(|c| c.borrow_mut().drain(..).collect());
+        assert_eq!(commands.len(), 5);
+        for command in commands {
+            let Command::AddUi { entity, component } = command else {
+                panic!("not a UI add");
+            };
+            component.insert(&mut world, entity);
+        }
+
+        fn read<T: Default>(world: &mut World, entity: Entity, kind: u32) -> T {
+            let mut out = T::default();
+            let read = orrin_script::with_active_world(world, || {
+                get_component(c(entity), kind, (&mut out as *mut T).cast(), size_of::<T>())
+            });
+            assert!(read, "kind {kind}");
+            out
+        }
+        assert_eq!(read::<CCanvas>(&mut world, entity, KIND_CANVAS), canvas);
+        assert_eq!(
+            read::<CRectTransform>(&mut world, entity, KIND_RECT_TRANSFORM),
+            rect
+        );
+        assert_eq!(
+            read::<orrin_script::CImage>(&mut world, entity, KIND_IMAGE),
+            image
+        );
+        assert_eq!(read::<CText>(&mut world, entity, KIND_TEXT), text);
+        assert_eq!(read::<CButton>(&mut world, entity, KIND_BUTTON), button);
+
+        let moved = CRectTransform {
+            anchored_position: [-1.0, -2.0],
+            ..rect
+        };
+        assert!(orrin_script::with_active_world(&mut world, || {
+            set_component(
+                c(entity),
+                KIND_RECT_TRANSFORM,
+                bytes_of(&moved),
+                size_of::<CRectTransform>(),
+            )
+        }));
+        assert_eq!(
+            world
+                .get::<crate::ui::RectTransform>(entity)
+                .unwrap()
+                .anchored_position,
+            glam::Vec2::new(-1.0, -2.0)
+        );
+        assert!(orrin_script::with_active_world(&mut world, || {
+            (0..=KIND_BUTTON).all(|kind| kind < KIND_CANVAS || has_component(c(entity), kind))
+        }));
+    }
+
+    /// A bindings build whose struct is not the engine's size is refused by
+    /// name rather than read past the end of.
+    #[test]
+    fn a_struct_of_the_wrong_size_is_refused_by_name() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(entity, crate::ui::Image::default());
+        let image = c_image();
+        let lines = logged(|| {
+            orrin_script::with_active_world(&mut world, || {
+                let mut out = c_image();
+                let short = size_of::<orrin_script::CImage>() - 4;
+                assert!(!get_component(
+                    c(entity),
+                    KIND_IMAGE,
+                    (&mut out as *mut orrin_script::CImage).cast(),
+                    short
+                ));
+                assert!(!set_component(
+                    c(entity),
+                    KIND_IMAGE,
+                    bytes_of(&image),
+                    short
+                ));
+                assert!(!add_component(
+                    c(entity),
+                    KIND_IMAGE,
+                    bytes_of(&image),
+                    short
+                ));
+            });
+        });
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for (level, line) in &lines {
+            assert_eq!(*level, LogLevel::Warning);
+            assert!(
+                line.contains("Image") && line.contains("48") && line.contains("52"),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            *world.get::<crate::ui::Image>(entity).unwrap(),
+            crate::ui::Image::default()
+        );
+        assert!(COMMANDS.with(|c| c.borrow().is_empty()));
+    }
+
+    /// The `get_tag` protocol: the full length comes back whatever the
+    /// buffer, so C# can retry once with one that fits.
+    #[test]
+    fn a_text_is_read_whole_after_a_retry_and_written_by_length() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(
+            entity,
+            crate::ui::Text {
+                text: "Start the game".into(),
+                ..crate::ui::Text::default()
+            },
+        );
+        let bare = world.spawn();
+        orrin_script::with_active_world(&mut world, || {
+            let mut small = [0u8; 4];
+            let total = get_component_text(c(entity), KIND_TEXT, small.as_mut_ptr(), 4);
+            assert_eq!(total, 14);
+            assert_eq!(&small, b"Star");
+            let mut whole = vec![0u8; total as usize];
+            assert_eq!(
+                get_component_text(c(entity), KIND_TEXT, whole.as_mut_ptr(), total),
+                14
+            );
+            assert_eq!(whole, b"Start the game");
+            assert_eq!(
+                get_component_text(c(bare), KIND_TEXT, small.as_mut_ptr(), 4),
+                -1
+            );
+            assert_eq!(
+                get_component_text(c(entity), KIND_IMAGE, small.as_mut_ptr(), 4),
+                -1
+            );
+
+            let text = "Quit — now";
+            assert!(set_component_text(
+                c(entity),
+                KIND_TEXT,
+                text.as_ptr(),
+                text.len() as u32
+            ));
+            assert!(!set_component_text(
+                c(bare),
+                KIND_TEXT,
+                text.as_ptr(),
+                text.len() as u32
+            ));
+        });
+        assert_eq!(
+            world.get::<crate::ui::Text>(entity).unwrap().text,
+            "Quit — now"
+        );
+    }
+
+    /// A set made in the same tick as the add lands on the queued component,
+    /// so `AddComponent` then `SetText` is not a silent no-op.
+    #[test]
+    fn a_set_in_the_tick_of_the_add_lands_on_the_queued_component() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        let text = orrin_script::CText {
+            size: 30.0,
+            wrap: 1,
+            ..Default::default()
+        };
+        orrin_script::with_active_world(&mut world, || {
+            let size = size_of::<orrin_script::CText>();
+            assert!(add_component(c(entity), KIND_TEXT, bytes_of(&text), size));
+            let label = "Ready";
+            assert!(set_component_text(
+                c(entity),
+                KIND_TEXT,
+                label.as_ptr(),
+                label.len() as u32
+            ));
+            let bigger = orrin_script::CText { size: 50.0, ..text };
+            assert!(set_component(c(entity), KIND_TEXT, bytes_of(&bigger), size));
+            let mut back = [0u8; 8];
+            assert_eq!(
+                get_component_text(c(entity), KIND_TEXT, back.as_mut_ptr(), 8),
+                5
+            );
+        });
+        let commands: Vec<Command> = COMMANDS.with(|c| c.borrow_mut().drain(..).collect());
+        let [
+            Command::AddUi {
+                entity: queued,
+                component,
+            },
+        ] = commands.as_slice()
+        else {
+            panic!("expected the one queued add");
+        };
+        let mut placed = World::new();
+        let target = placed.spawn();
+        assert_eq!(*queued, entity);
+        component.clone().insert(&mut placed, target);
+        let added = placed.get::<crate::ui::Text>(target).unwrap();
+        assert_eq!((added.text.as_str(), added.size), ("Ready", 50.0));
+    }
+
+    #[test]
+    fn a_script_asks_whether_the_pointer_is_over_the_ui() {
+        use crate::ui::events::{PointerInput, UiEvents, UiPointer, step};
+
+        let mut world = World::new();
+        assert!(!orrin_script::with_active_world(&mut world, || {
+            ui_pointer_over()
+        }));
+        let canvas = world.spawn();
+        world.insert(canvas, crate::ui::Canvas::default());
+        let panel = world.spawn();
+        world.insert(
+            panel,
+            crate::ui::RectTransform {
+                anchor_min: glam::Vec2::ZERO,
+                anchor_max: glam::Vec2::ZERO,
+                pivot: glam::Vec2::ZERO,
+                ..crate::ui::RectTransform::default()
+            },
+        );
+        world.insert(panel, crate::ui::Image::default());
+        crate::scene::reparent(&mut world, panel, Some(canvas), false).unwrap();
+        crate::ui::update(&mut world, [800, 600]);
+
+        for (x, over) in [(50.0, true), (500.0, false)] {
+            let mut pointer = UiPointer::default();
+            let input = PointerInput {
+                position: [x, 50.0],
+                ..PointerInput::default()
+            };
+            let tree = world.resource::<crate::ui::UiTree>();
+            step(
+                &world,
+                &tree.layout,
+                &mut pointer,
+                input,
+                &mut UiEvents::default(),
+            );
+            drop(tree);
+            world.insert_resource(pointer);
+            assert_eq!(
+                orrin_script::with_active_world(&mut world, || ui_pointer_over()),
+                over
+            );
+        }
     }
 
     fn ui_world() -> World {

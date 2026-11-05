@@ -52,6 +52,14 @@ public static class UI
     /// <summary>The window's size in physical pixels.</summary>
     public static Vector2 ScreenSize => Native.UiScreenSize();
 
+    /// <summary>
+    /// Whether the pointer is over a retained UI element that stops it — an
+    /// <see cref="Orrin.Image"/> or <see cref="Orrin.Text"/> with <c>RaycastTarget</c> on —
+    /// as of the start of this tick. Use it to keep a click on a menu from also
+    /// firing a weapon. The immediate calls on this class are not counted.
+    /// </summary>
+    public static bool IsPointerOverUI => Native.UiPointerOver();
+
     /// <summary>The font text is set in. The null reference is the engine's own.</summary>
     public static AssetRef<Orrin.Font> Font { get; set; }
 

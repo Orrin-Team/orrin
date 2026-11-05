@@ -226,8 +226,51 @@ fn behaviour_lifecycle() {
     );
     orrin_script::destroy_handle(handle);
 
+    pointer_events(&host);
     state_preservation(&host);
     game_assembly_swap(&host);
+}
+
+/// A pointer event reaches a behaviour that handles it with its payload, is
+/// reported unhandled by one that does not — which is what sends it on up the
+/// hierarchy — and a throwing handler is contained and reported as a fault.
+fn pointer_events(host: &ScriptHost) {
+    use orrin_script::{CPointerEvent, Delivery};
+    const DOWN: u32 = 2;
+    const CLICK: u32 = 4;
+    let event = CPointerEvent {
+        position: [12.5, 40.0],
+        press_position: [10.0, 30.0],
+        target: CEntity {
+            index: 9,
+            generation: 2,
+        },
+        button: 0,
+    };
+
+    let handle = create(host, "Orrin.Tests.PointerProbe, Orrin");
+    assert_ne!(handle, 0);
+    take_logs();
+    assert_eq!(host.pointer(handle, CLICK, &event), Delivery::Handled);
+    assert_eq!(take_logs(), ["probe:click 9 12.5 30"]);
+    assert_eq!(host.pointer(handle, DOWN, &event), Delivery::Unhandled);
+    orrin_script::destroy_handle(handle);
+
+    let plain = create(host, "Orrin.Tests.LifecycleProbe, Orrin");
+    assert_eq!(host.pointer(plain, CLICK, &event), Delivery::Unhandled);
+    orrin_script::destroy_handle(plain);
+
+    let throwing = create(host, "Orrin.Tests.ThrowingPointer, Orrin");
+    take_logs();
+    assert_eq!(host.pointer(throwing, DOWN, &event), Delivery::Faulted);
+    let logs = take_logs();
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("ThrowingPointer") && l.contains("OnPointerDown")),
+        "expected a fault naming the script and its handler, got {logs:?}"
+    );
+    orrin_script::destroy_handle(throwing);
+    take_logs();
 }
 
 const STATE_PRESERVATION_IMPLEMENTED: bool = true;

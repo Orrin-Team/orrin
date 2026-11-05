@@ -98,6 +98,16 @@ public unsafe struct OrrinApi
     public delegate* unmanaged<byte*, float, float, float, float, float, float, float, float, void>
         UiImage;
     public delegate* unmanaged<float*, float*, void> UiScreenSize;
+    // Engine components as blittable structs, appended after UiScreenSize,
+    // matching the Rust struct; never reordered above it. A component kind
+    // (ComponentKind), the struct and its byte size, which the engine checks;
+    // text as UTF-8 through the GetTag protocol.
+    public delegate* unmanaged<Entity, uint, byte*, uint, byte> GetComponent;
+    public delegate* unmanaged<Entity, uint, byte*, uint, byte> SetComponent;
+    public delegate* unmanaged<Entity, uint, byte*, uint, byte> AddComponent;
+    public delegate* unmanaged<Entity, uint, byte*, int, int> GetComponentText;
+    public delegate* unmanaged<Entity, uint, byte*, uint, byte> SetComponentText;
+    public delegate* unmanaged<byte> UiPointerOver;
 }
 
 public static unsafe class Native
@@ -330,6 +340,48 @@ public static unsafe class Native
         _api.UiScreenSize(&width, &height);
         return new Vector2(width, height);
     }
+
+    internal static T? GetComponent<T>(Entity entity) where T : unmanaged
+    {
+        T value = default;
+        return _api.GetComponent(entity, ComponentKinds.Blittable<T>(), (byte*)&value, (uint)sizeof(T)) != 0
+            ? value
+            : null;
+    }
+
+    internal static bool SetComponent<T>(Entity entity, T value) where T : unmanaged =>
+        _api.SetComponent(entity, ComponentKinds.Blittable<T>(), (byte*)&value, (uint)sizeof(T)) != 0;
+
+    internal static bool AddComponent<T>(Entity entity, T value) where T : unmanaged =>
+        _api.AddComponent(entity, ComponentKinds.Blittable<T>(), (byte*)&value, (uint)sizeof(T)) != 0;
+
+    internal static string? GetText(Entity entity)
+    {
+        const uint kind = (uint)ComponentKind.Text;
+        Span<byte> buffer = stackalloc byte[256];
+        int length;
+        fixed (byte* p = buffer)
+            length = _api.GetComponentText(entity, kind, p, buffer.Length);
+        if (length < 0)
+            return null;
+        if (length <= buffer.Length)
+            return Encoding.UTF8.GetString(buffer[..length]);
+        // Nothing but a script changes a text inside a tick, so one retry at
+        // the length the first call reported always fits.
+        var bytes = new byte[length];
+        fixed (byte* p = bytes)
+            _api.GetComponentText(entity, kind, p, bytes.Length);
+        return Encoding.UTF8.GetString(bytes);
+    }
+
+    internal static bool SetText(Entity entity, string text)
+    {
+        var bytes = Encoding.UTF8.GetBytes(text);
+        fixed (byte* p = bytes)
+            return _api.SetComponentText(entity, (uint)ComponentKind.Text, p, (uint)bytes.Length) != 0;
+    }
+
+    internal static bool UiPointerOver() => _api.UiPointerOver() != 0;
 
     internal static AssetState GetAssetState(Guid asset)
     {
