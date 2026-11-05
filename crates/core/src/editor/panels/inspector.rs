@@ -1385,7 +1385,12 @@ mod tests {
                 "orrin.spin",
                 "orrin.locked",
                 "orrin.render_settings",
-                "orrin.camera"
+                "orrin.camera",
+                "orrin.ui.canvas",
+                "orrin.ui.rect_transform",
+                "orrin.ui.image",
+                "orrin.ui.text",
+                "orrin.ui.button"
             ],
             "registration order changed, or a component gained/lost a section"
         );

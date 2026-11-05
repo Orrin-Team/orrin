@@ -55,7 +55,7 @@ impl Rect {
 /// Where text sits inside its rectangle. Lock-step with C# `Orrin.TextAnchor`:
 /// row-major from the upper left, so `self as u32 % 3` is the column and
 /// `/ 3` the row.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, orrin_registry::Reflect)]
 #[repr(u32)]
 pub enum TextAnchor {
     #[default]

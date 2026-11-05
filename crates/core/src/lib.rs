@@ -16,5 +16,6 @@ pub mod scripting;
 pub mod stats;
 pub mod systems;
 pub mod threads;
+pub mod ui;
 
 pub use app::App;

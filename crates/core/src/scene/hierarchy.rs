@@ -190,6 +190,12 @@ impl Hierarchy {
         (index != NOT_IN_ORDER).then_some(index as usize)
     }
 
+    /// Where `entity` sits in [`order`](Self::order), for putting a handful of
+    /// entities found some other way into hierarchy order.
+    pub fn position(&self, entity: Entity) -> Option<usize> {
+        self.index_of(entity)
+    }
+
     /// The direct children of `entity`, in a stable order.
     pub fn children_of(&self, entity: Entity) -> &[Entity] {
         match self.index_of(entity) {
