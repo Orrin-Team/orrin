@@ -43,7 +43,11 @@ pub fn importer(kind: AssetKind) -> Option<Importer> {
     match kind {
         AssetKind::Texture => Some(TEXTURE),
         AssetKind::Mesh => Some(MESH),
-        AssetKind::Prefab | AssetKind::Material | AssetKind::Scene | AssetKind::Folder => None,
+        AssetKind::Prefab
+        | AssetKind::Material
+        | AssetKind::Scene
+        | AssetKind::Font
+        | AssetKind::Folder => None,
     }
 }
 

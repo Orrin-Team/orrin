@@ -49,6 +49,8 @@ pub enum AssetKind {
     Prefab,
     Material,
     Scene,
+    /// A TrueType or OpenType file, read as it is by the in-game UI.
+    Font,
     Folder,
 }
 
@@ -67,6 +69,7 @@ impl AssetKind {
             "fprefab" => Some(Self::Prefab),
             super::material::EXTENSION => Some(Self::Material),
             crate::scene::loaded::EXTENSION => Some(Self::Scene),
+            "ttf" | "otf" => Some(Self::Font),
             _ => None,
         }
     }
@@ -79,6 +82,7 @@ impl AssetKind {
             Self::Prefab => "prefab",
             Self::Material => "material",
             Self::Scene => "scene",
+            Self::Font => "font",
             Self::Folder => "folder",
         }
     }
@@ -157,9 +161,11 @@ impl Settings {
                 max_size: 0,
             }),
             AssetKind::Mesh => Self::Mesh(MeshSettings { scale: 1.0 }),
-            AssetKind::Prefab | AssetKind::Material | AssetKind::Scene | AssetKind::Folder => {
-                Self::None
-            }
+            AssetKind::Prefab
+            | AssetKind::Material
+            | AssetKind::Scene
+            | AssetKind::Font
+            | AssetKind::Folder => Self::None,
         }
     }
 
@@ -460,6 +466,8 @@ mod tests {
         assert_eq!(AssetKind::of_path("tree.glb"), Some(AssetKind::Mesh));
         assert_eq!(AssetKind::of_path("door.fprefab"), Some(AssetKind::Prefab));
         assert_eq!(AssetKind::of_path("brick.FMAT"), Some(AssetKind::Material));
+        assert_eq!(AssetKind::of_path("ui/Title.TTF"), Some(AssetKind::Font));
+        assert_eq!(AssetKind::of_path("body.otf"), Some(AssetKind::Font));
         assert_eq!(AssetKind::of_path("tree.bin"), None);
         assert_eq!(AssetKind::of_path("a.png.meta"), None);
         assert_eq!(AssetKind::of_path("png"), None);

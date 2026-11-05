@@ -674,6 +674,7 @@ extern "C" fn find_asset(path: *const c_char, out: *mut u8) -> u32 {
                 AssetKind::Texture => orrin_script::ASSET_TEXTURE,
                 AssetKind::Material => orrin_script::ASSET_MATERIAL,
                 AssetKind::Scene => orrin_script::ASSET_SCENE,
+                AssetKind::Font => orrin_script::ASSET_FONT,
                 AssetKind::Folder => return None,
             };
             Some((entry.id, kind))
@@ -2389,6 +2390,26 @@ mod tests {
             "not a glb"
         );
         assert_eq!(state(&mut world, AssetId::new()), orrin_script::LOAD_FAILED);
+    }
+
+    #[test]
+    fn a_script_finds_a_font_by_path() {
+        let dir = crate::asset_db::tests::Dir::new("script-font");
+        dir.write("fonts/title.ttf", b"glyphs");
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let mut world = World::new();
+        world.insert_resource(db);
+        let mut out = [0u8; 16];
+        let kind = orrin_script::with_active_world(&mut world, || {
+            find_asset(c"fonts/title.ttf".as_ptr(), out.as_mut_ptr())
+        });
+        assert_eq!(kind, orrin_script::ASSET_FONT);
+        let id = world
+            .resource::<crate::asset_db::AssetDatabase>()
+            .find("fonts/title.ttf")
+            .unwrap()
+            .id;
+        assert_eq!(AssetId::from_bytes(out), id);
     }
 
     /// A `.fmat` is found by path as a material, Ready once it reads and

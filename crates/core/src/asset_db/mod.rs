@@ -186,6 +186,10 @@ pub struct AssetDatabase {
     /// Each imported asset's artifact, when this is an exported game's pack
     /// rather than a project: nothing is scanned, imported or hashed.
     pack: Option<FxHashMap<AssetId, CacheKey>>,
+    /// Fonts indexed or changed since [`take_font_changes`](Self::take_font_changes).
+    font_changes: Vec<AssetId>,
+    /// Ids the UI drew as an image that are not textures, each reported once.
+    refused_ui: HashSet<AssetId, FxBuildHasher>,
 }
 
 impl AssetDatabase {
@@ -241,6 +245,8 @@ impl AssetDatabase {
             thumbnails: FxHashMap::default(),
             awaiting: HashSet::default(),
             pack: None,
+            font_changes: Vec::new(),
+            refused_ui: HashSet::default(),
         };
         (db, issues)
     }
@@ -338,6 +344,57 @@ impl AssetDatabase {
     /// for it.
     pub fn texture(&self, id: AssetId) -> Option<TextureHandle> {
         self.textures.handle(id).map(TextureHandle)
+    }
+
+    /// The bytes of font `id`'s file.
+    pub fn font(&self, id: AssetId) -> Result<Vec<u8>, String> {
+        let entry = self
+            .get(id)
+            .ok_or_else(|| format!("font asset {id} is not in the project"))?;
+        if entry.kind != AssetKind::Font {
+            return Err(format!(
+                "`{}` is a {}, not a font",
+                entry.path,
+                entry.kind.label()
+            ));
+        }
+        std::fs::read(self.dir.join(&entry.path))
+            .map_err(|error| format!("{}: {error}", entry.path))
+    }
+
+    /// Fonts indexed or changed since the last call, whose bytes anything
+    /// holding them should read again.
+    pub fn take_font_changes(&mut self) -> Vec<AssetId> {
+        std::mem::take(&mut self.font_changes)
+    }
+
+    /// Texture `id`'s slot for the in-game UI, loading it the first time as a
+    /// material slot does. `None` while it imports — a UI image appears when
+    /// it is ready rather than as a white rectangle first — and for an id that
+    /// names something other than a texture, which is reported once.
+    pub fn ui_texture(
+        &mut self,
+        id: AssetId,
+        backend: &mut impl RenderBackend,
+    ) -> Option<TextureHandle> {
+        if let Some(entry) = self.get(id)
+            && entry.kind != AssetKind::Texture
+        {
+            if !self.refused_ui.contains(&id) {
+                let message = format!(
+                    "`{}` is a {}, not a texture, so the UI draws nothing for it",
+                    entry.path,
+                    entry.kind.label()
+                );
+                self.refused_ui.insert(id);
+                self.reports.push(message);
+            }
+            return None;
+        }
+        let mut errors = Vec::new();
+        let handle = self.texture_slot(id, false, backend, &mut errors);
+        self.reports.extend(errors);
+        (self.state(id) != LoadState::Loading).then_some(handle)
     }
 
     /// Material `id` as it is drawn: its file's last good read, or an edit in
@@ -903,6 +960,9 @@ impl AssetDatabase {
         }
         if import::importer(entry.kind).is_none() {
             entry.status = Status::Indexed;
+            if entry.kind == AssetKind::Font && !self.font_changes.contains(&id) {
+                self.font_changes.push(id);
+            }
             return;
         }
         let Some(worker) = &self.worker else {
@@ -1129,7 +1189,11 @@ impl AssetDatabase {
                     self.textures.set_resident(id, failed);
                 }
             }
-            AssetKind::Prefab | AssetKind::Material | AssetKind::Scene | AssetKind::Folder => {}
+            AssetKind::Prefab
+            | AssetKind::Material
+            | AssetKind::Scene
+            | AssetKind::Font
+            | AssetKind::Folder => {}
         }
     }
 
@@ -2446,6 +2510,76 @@ pub(crate) mod tests {
         );
         let previews = world.resource::<AssetPreviews>();
         assert_eq!(previews.material(bound).unwrap().material.roughness, 0.75);
+    }
+
+    #[test]
+    fn the_ui_draws_a_texture_once_it_has_loaded_and_never_a_mesh() {
+        let dir = Dir::new("db-ui-texture");
+        project(&dir);
+        let mut db = open(&dir);
+        let mut backend = HeadlessBackend::new();
+        let world = World::new();
+        let rock = db.find("rocks/rock.png").unwrap().id;
+        let tree = db.find("models/tree.gltf").unwrap().id;
+
+        assert_eq!(db.ui_texture(rock, &mut backend), None, "still importing");
+        let mut errors = Vec::new();
+        for _ in 0..3 {
+            assert!(db.wait_idle(WAIT));
+            errors.extend(db.update(&world, &mut backend));
+        }
+        let handle = db.ui_texture(rock, &mut backend);
+        assert_eq!(handle, db.texture(rock));
+        assert!(handle.is_some());
+
+        assert_eq!(db.ui_texture(tree, &mut backend), None);
+        assert_eq!(db.ui_texture(tree, &mut backend), None);
+        errors.extend(db.update(&world, &mut backend));
+        let named: Vec<_> = errors.iter().filter(|e| e.contains("tree.gltf")).collect();
+        assert_eq!(
+            named,
+            ["`models/tree.gltf` is a mesh, not a texture, so the UI draws nothing for it"]
+        );
+    }
+
+    /// A font has nothing to import: the UI parses the file itself, so the
+    /// database hands over its bytes, and says when they change.
+    #[test]
+    fn a_font_is_read_as_it_is_and_heard_again_when_saved() {
+        let dir = Dir::new("db-font");
+        dir.write("fonts/title.ttf", b"first");
+        let mut db = open(&dir);
+        let entry = db.find("fonts/title.ttf").unwrap();
+        let id = entry.id;
+        assert_eq!(entry.kind, AssetKind::Font);
+        assert_eq!(entry.status, Status::Indexed);
+        assert_eq!(db.state(id), LoadState::Ready);
+        assert_eq!(db.font(id), Ok(b"first".to_vec()));
+        db.take_font_changes();
+
+        let path = dir.write("fonts/title.ttf", b"saved");
+        db.notice(path);
+        db.apply_changes();
+        assert_eq!(db.take_font_changes(), [id]);
+        assert!(db.take_font_changes().is_empty());
+        assert_eq!(db.font(id), Ok(b"saved".to_vec()));
+    }
+
+    #[test]
+    fn only_a_font_is_read_as_one_and_the_error_names_it() {
+        let dir = Dir::new("db-font-kind");
+        dir.write("rocks/rock.png", &png(2, 2, |_, _| [10, 20, 30, 255]));
+        let db = open(&dir);
+        let rock = db.find("rocks/rock.png").unwrap().id;
+        assert_eq!(
+            db.font(rock),
+            Err("`rocks/rock.png` is a texture, not a font".to_owned())
+        );
+        let missing = AssetId::new();
+        assert_eq!(
+            db.font(missing),
+            Err(format!("font asset {missing} is not in the project"))
+        );
     }
 
     #[test]

@@ -128,6 +128,7 @@ icons! {
     stop => '\u{e46c}',
     sun => '\u{e472}',
     terminal => '\u{eae8}',
+    text_t => '\u{e48a}',
     trash => '\u{e4a6}',
     warning => '\u{e4e0}',
     warning_circle => '\u{e4e2}',

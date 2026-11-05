@@ -416,6 +416,22 @@ mod tests {
         );
     }
 
+    /// A font is read by the UI as it is, so a shipped game finds the file in
+    /// the pack rather than an artifact.
+    #[test]
+    fn a_font_is_packed_as_it_is_and_reads_from_the_pack() {
+        let (dir, assets) = source_project("pack-font");
+        AssetsDir(&assets).write("fonts/title.ttf", b"glyphs");
+        let db = imported(&dir);
+        let id = db.find("fonts/title.ttf").unwrap().id;
+        let out = dir.path().join("pack");
+
+        write(&db, &out).unwrap();
+        let (packed, issues) = AssetDatabase::open_packed(&out, Target::Rgba8);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(packed.font(id), Ok(b"glyphs".to_vec()));
+    }
+
     #[test]
     fn the_same_imported_project_packs_to_the_same_bytes() {
         let (dir, _) = source_project("pack-reproducible");
