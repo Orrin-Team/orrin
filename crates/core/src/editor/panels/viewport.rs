@@ -1,6 +1,12 @@
 //! The controls that float over the scene: gizmo mode, space and snap at the
 //! top left, the frame-stats toggle at the top right.
 //!
+//! While the game is live — playing or paused — the scene is the game's. The
+//! transform tools are hidden, nothing in it is picked, hovered, outlined or
+//! marked, and a click there reaches the game alone, which is what lets an
+//! in-game button sit over a crate without selecting it. The frame stats and
+//! the play border stay: they describe the session, not the scene.
+//!
 //! These are the one deliberate exception to the centre painting nothing (see
 //! `dock`). They are the commands used while looking at the scene, so they sit
 //! on it, where the eye already is — the way every editor the design borrows
@@ -32,25 +38,28 @@ pub fn show(
     state: &mut EditorState,
     themes: &ThemeSet,
     viewport: egui::Rect,
+    live: bool,
 ) {
     let bar = themes.active().bar();
 
-    egui::Area::new(egui::Id::new("viewport_tools"))
-        .fixed_pos(viewport.min + egui::vec2(INSET, INSET))
-        .constrain_to(viewport)
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                widgets::toolbar_frame(ui.visuals(), bar).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    gizmo_modes(ui, state);
-                });
-                widgets::toolbar_frame(ui.visuals(), bar).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    space_and_snap(ui, state);
+    if !live {
+        egui::Area::new(egui::Id::new("viewport_tools"))
+            .fixed_pos(viewport.min + egui::vec2(INSET, INSET))
+            .constrain_to(viewport)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    widgets::toolbar_frame(ui.visuals(), bar).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        gizmo_modes(ui, state);
+                    });
+                    widgets::toolbar_frame(ui.visuals(), bar).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        space_and_snap(ui, state);
+                    });
                 });
             });
-        });
+    }
 
     let toggle = egui::Area::new(egui::Id::new("viewport_view"))
         .fixed_pos(egui::pos2(viewport.right() - INSET, viewport.top() + INSET))

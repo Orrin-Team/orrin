@@ -58,13 +58,21 @@ pub fn draw(
     status_bar::show(ctx, world, state, themes);
     dock.show(ctx, world, state, registry, previews);
     if let Some(rect) = dock.viewport() {
-        viewport::show(ctx, world, state, themes, rect);
-        viewport::accept_prefab(ctx, world, state, dock, rect);
-        viewport::hover(ctx, world, state, dock, rect);
-        // Before the click: a click on a handle is not a click on the scene.
-        viewport::gizmo(ctx, world, state, dock, rect);
-        viewport::marquee(ctx, world, state, dock, rect);
-        viewport::select_on_click(ctx, world, state, dock, rect);
+        let live = world
+            .get_resource::<crate::scene::Play>()
+            .is_some_and(|play| play.is_live());
+        viewport::show(ctx, world, state, themes, rect, live);
+        if !live {
+            viewport::accept_prefab(ctx, world, state, dock, rect);
+            viewport::hover(ctx, world, state, dock, rect);
+            // Before the click: a click on a handle is not a click on the scene.
+            viewport::gizmo(ctx, world, state, dock, rect);
+            viewport::marquee(ctx, world, state, dock, rect);
+            viewport::select_on_click(ctx, world, state, dock, rect);
+        } else {
+            state.gizmo_strokes.clear();
+            state.outline.clear();
+        }
     }
     if let Some(rel) = state.pending_delete().map(str::to_owned) {
         confirm_delete(ctx, world, state, &rel);
@@ -4043,6 +4051,78 @@ mod tests {
             editor.state.history.is_dirty(),
             "the delete is still unsaved"
         );
+    }
+
+    fn area_shown(editor: &Harness, id: &str) -> bool {
+        let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new(id));
+        editor
+            .ctx
+            .memory(|memory| memory.areas().visible_last_frame(&layer))
+    }
+
+    /// While the game is live the scene is the game's: nothing is selected, no
+    /// handle, marker, outline or frustum is drawn over it, and the transform
+    /// tools are gone — the panels around it stay, and so do the frame stats.
+    #[test]
+    fn play_clears_the_selection_and_the_scene_tools() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        light_under_the_viewport_centre(&mut editor);
+        editor.state.selection.set(cube);
+        editor.frames(1);
+        assert!(!editor.state.gizmo_strokes.is_empty());
+        assert!(!editor.state.outline.is_empty());
+        assert!(area_shown(&editor, "viewport_tools"));
+
+        toggle_play(&mut editor);
+        editor.frames(2);
+        assert!(editor.state.selection.entities().is_empty());
+        assert!(
+            editor.state.gizmo_strokes.is_empty(),
+            "no handles or markers"
+        );
+        assert!(editor.state.outline.is_empty());
+        assert!(!area_shown(&editor, "viewport_tools"));
+        assert!(
+            area_shown(&editor, "viewport_view"),
+            "the stats toggle stays"
+        );
+
+        editor
+            .world
+            .resource_mut::<crate::scene::Play>()
+            .set(crate::scene::PlayState::Paused);
+        editor.frames(1);
+        assert!(
+            editor.state.gizmo_strokes.is_empty(),
+            "a paused game is still the game, markers and all"
+        );
+        assert!(!area_shown(&editor, "viewport_tools"));
+    }
+
+    /// A click in a running game is the game's — a HUD button over a crate
+    /// must not select the crate.
+    #[test]
+    fn a_click_on_the_scene_while_playing_selects_nothing() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (_, at) = cube_under_the_viewport_centre(&mut editor);
+        toggle_play(&mut editor);
+        editor.click(at);
+        assert!(editor.state.selection.entities().is_empty());
+        assert!(editor.state.hovered.is_none());
+    }
+
+    /// The selection Play cleared is the editor's, so Stop gives it back.
+    #[test]
+    fn stop_restores_the_selection_play_cleared() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let crate_ = editor.spawn("Crate");
+        editor.state.selection.set(crate_);
+        toggle_play(&mut editor);
+        assert!(editor.state.selection.entities().is_empty());
+        toggle_play(&mut editor);
+        let restored = named(&editor.world, "Crate").unwrap();
+        assert_eq!(editor.state.selection.entities(), [restored]);
     }
 
     /// A persistent scene holding one entity called `Music`, written to a file

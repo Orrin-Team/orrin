@@ -373,6 +373,9 @@ struct Fork {
     document: orrin_registry::SceneDocument,
     camera: scene::Camera,
     history: History,
+    /// What was selected when Play was pressed, by identity: the scene comes
+    /// back in new slots.
+    selection: Vec<EntityId>,
 }
 
 impl Default for EditorState {
@@ -1110,11 +1113,17 @@ impl EditorState {
                 // The gesture is the scene's, so it is closed into the scene's
                 // history rather than carried into the fork's.
                 SceneEditor::new(world, registry, &mut self.history).commit();
+                // After the document, which is what gives an entity its id.
+                let document = scene::to_document(world, registry);
+                let selection = self.selected_ids(world);
                 self.fork = Some(Fork {
-                    document: scene::to_document(world, registry),
+                    document,
                     camera: *world.resource::<scene::Camera>(),
                     history: std::mem::take(&mut self.history),
+                    selection,
                 });
+                // The scene is the game's while it runs: see `panels::viewport`.
+                self.release_scene();
                 world.resource_mut::<Play>().set(PlayState::Playing);
                 self.load_persistent(world, registry);
             }
@@ -1130,23 +1139,33 @@ impl EditorState {
         }
     }
 
-    /// Throw the fork away and put the scene back, selection and camera with
-    /// it. The selection is carried by identity, since every entity comes back
-    /// in a new slot; what the game spawned has none to carry.
+    fn selected_ids(&self, world: &World) -> Vec<EntityId> {
+        self.selection
+            .entities()
+            .iter()
+            .filter_map(|&entity| world.get::<EntityId>(entity).map(|id| *id))
+            .collect()
+    }
+
+    /// Let go of everything the editor holds in the scene: the selection and
+    /// any pointer gesture over it.
+    fn release_scene(&mut self) {
+        self.selection.clear();
+        self.gizmo_drag = None;
+        self.gizmo_hot = None;
+        self.hovered = None;
+        self.marquee = None;
+    }
+
+    /// Throw the fork away and put the scene back, with the camera and the
+    /// selection Play cleared. The selection is carried by identity, since
+    /// every entity comes back in a new slot.
     fn stop(&mut self, world: &mut World, registry: &Registry) {
         let Some(fork) = self.fork.take() else {
             return;
         };
-        let selected: Vec<EntityId> = self
-            .selection
-            .entities()
-            .iter()
-            .filter_map(|&entity| world.get::<EntityId>(entity).map(|id| *id))
-            .collect();
-        self.selection.clear();
-        self.gizmo_drag = None;
-        self.hovered = None;
-        self.marquee = None;
+        let selected = fork.selection;
+        self.release_scene();
 
         for issue in replace_scene(world, registry, &fork.document) {
             log(world, LogLevel::Warning, issue.to_string());
