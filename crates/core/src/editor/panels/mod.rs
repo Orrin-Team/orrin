@@ -20,7 +20,6 @@ use orrin_ecs::World;
 use orrin_registry::Registry;
 
 use super::dock::Dock;
-use super::phases::{self, Glass};
 use super::previews::Previews;
 use super::state::{EditorState, GizmoMode, SceneRequest};
 use super::theme::ThemeSet;
@@ -157,42 +156,6 @@ fn confirm_delete(ctx: &egui::Context, world: &World, state: &mut EditorState, r
     }
 }
 
-/// Every surface above the panels — the viewport's floating controls, menus,
-/// popups, tooltips — has a translucent fill. The renderer blurs what is
-/// beneath each into the rects collected here before drawing it, so the fill
-/// reads as frosted glass, over a panel as over the scene. See
-/// [`phases`](crate::editor::phases) for how "beneath" is drawn first.
-///
-/// Run after [`draw`], once every surface of the frame has been laid out.
-pub fn frost(ctx: &egui::Context, glass: &mut Vec<Glass>) {
-    glass.clear();
-    let toolbars = [
-        egui::Id::new("viewport_tools"),
-        egui::Id::new("viewport_view"),
-        egui::Id::new("viewport_stats"),
-    ];
-    let menu = f32::from(ctx.style().visuals.menu_corner_radius.nw);
-    ctx.memory(|memory| {
-        for layer in memory.layer_ids() {
-            if !memory.areas().is_visible(&layer) {
-                continue;
-            }
-            let radius = match layer.order {
-                egui::Order::Foreground | egui::Order::Tooltip => menu,
-                _ if toolbars.contains(&layer.id) => f32::from(widgets::TOOLBAR_RADIUS),
-                _ => continue,
-            };
-            if let Some(rect) = memory.area_rect(layer.id) {
-                glass.push(Glass {
-                    phase: phases::of(layer.order),
-                    rect,
-                    radius,
-                });
-            }
-        }
-    });
-}
-
 /// The few keys every editor answers the same way. Each one stands aside while
 /// a text field has focus, where the same key edits text.
 fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
@@ -323,8 +286,6 @@ mod tests {
         themes: ThemeSet,
         dock: Dock,
         previews: Previews,
-        /// What the last frame asked the renderer to frost.
-        glass: Vec<Glass>,
         ctx: egui::Context,
         input: egui::RawInput,
         output: Option<egui::FullOutput>,
@@ -363,7 +324,6 @@ mod tests {
                 themes,
                 dock: Dock::default(),
                 previews: Previews::default(),
-                glass: Vec::new(),
                 ctx,
                 input: egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
@@ -391,7 +351,6 @@ mod tests {
                     themes,
                     dock,
                     previews,
-                    glass,
                     ctx,
                     input,
                     output,
@@ -403,7 +362,6 @@ mod tests {
                 crate::ui::update(world, screen);
                 *output = Some(ctx.run(input.clone(), |ctx| {
                     draw(ctx, world, state, registry, themes, dock, previews);
-                    frost(ctx, glass);
                 }));
             }
             self
@@ -3241,9 +3199,8 @@ mod tests {
         );
     }
 
-    /// The edge of anything floating over the scene is a faint light line —
-    /// the rim of a pane of glass — not a drawn border competing with what it
-    /// frames.
+    /// The edge of anything floating over the scene is a faint light line,
+    /// not a drawn border competing with what it frames.
     #[test]
     fn floating_surfaces_have_faint_edges() {
         let ctx = egui::Context::default();
@@ -3256,71 +3213,21 @@ mod tests {
         }
     }
 
-    /// The viewport's floating controls are frosted: each reports the rect the
-    /// renderer is to blur behind it, and the translucent fill over that blur
-    /// is what makes them read as glass rather than as grey boxes.
+    /// Nothing is blurred beneath a floating surface, so each one has to hide
+    /// what it floats over: the viewport's toolbars, menus and popups are
+    /// opaque, over the scene as over a panel.
     #[test]
-    fn the_viewport_controls_are_frosted() {
-        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
-        editor.state.show_stats = true;
-        editor.frames(3);
-
-        for id in ["viewport_tools", "viewport_view", "viewport_stats"] {
-            let area = editor.area(id).expect("drawn");
-            assert!(
-                editor.glass.iter().any(|glass| {
-                    glass.phase == phases::of(egui::Order::Middle)
-                        && glass.rect.contains_rect(area.shrink(1.0))
-                        && glass.radius == f32::from(crate::editor::widgets::TOOLBAR_RADIUS)
-                }),
-                "{id} at {area:?} has no glass in {:?}",
-                editor.glass
-            );
-        }
-        let fill = editor.ctx.style().visuals.window_fill;
-        assert!(fill.a() < 255, "menus are opaque: {fill:?}");
-    }
-
-    /// A menu is frosted whole, over a panel as over the scene: the renderer
-    /// draws the panels before it blurs, so there is something real to blur
-    /// there too.
-    #[test]
-    fn a_menu_is_frosted_over_the_panels_too() {
-        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
-        editor.frames(2);
-        let file = editor
-            .painted_text_rects()
-            .into_iter()
-            .find(|(text, _)| text == "File")
-            .map(|(_, rect)| rect.center())
-            .expect("the File menu's title");
-        editor.click(file).frames(3);
-
-        let viewport = editor.dock.viewport().expect("a viewport");
-        let menu = editor
-            .ctx
-            .memory(|memory| {
-                memory
-                    .layer_ids()
-                    .filter(|layer| {
-                        layer.order == egui::Order::Foreground && memory.areas().is_visible(layer)
-                    })
-                    .find_map(|layer| memory.area_rect(layer.id))
-            })
-            .expect("the File menu is open");
-        assert!(
-            !viewport.contains_rect(menu),
-            "the menu {menu:?} hangs over no panel, so this proves nothing"
-        );
-        let radius = f32::from(editor.ctx.style().visuals.menu_corner_radius.nw);
-        assert!(
-            editor.glass.contains(&Glass {
-                phase: phases::of(egui::Order::Foreground),
-                rect: menu,
-                radius,
-            }),
-            "the menu {menu:?} is not frosted whole: {:?}",
-            editor.glass
+    fn floating_surfaces_are_opaque() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, themes_default());
+        let visuals = ctx.style().visuals.clone();
+        let toolbar = crate::editor::widgets::toolbar_frame(&visuals, themes_default().bar());
+        assert_eq!(toolbar.fill.a(), 255, "toolbar {:?}", toolbar.fill);
+        assert_eq!(
+            visuals.window_fill.a(),
+            255,
+            "menu {:?}",
+            visuals.window_fill
         );
     }
 
@@ -4361,15 +4268,30 @@ mod tests {
             input,
             ..
         } = &mut editor;
+        // A marker painted last on the panels' layer: everything before it in
+        // the output is beneath every window.
+        struct PanelsEnd;
         let output = ctx.run(input.clone(), |ctx| {
             draw(ctx, world, state, registry, themes, dock, previews);
-            phases::mark(ctx);
+            ctx.layer_painter(egui::LayerId::background())
+                .add(egui::Shape::Callback(egui::PaintCallback {
+                    rect: egui::Rect::NOTHING,
+                    callback: std::sync::Arc::new(PanelsEnd),
+                }));
         });
         let window = {
             let (surface, node, _) = dock.state().find_tab(&Tab::Scenes).unwrap();
             dock.state()[surface][node].rect().unwrap()
         };
-        let [panels, ..] = phases::split(output.shapes);
+        let end = output
+            .shapes
+            .iter()
+            .position(|clipped| match &clipped.shape {
+                egui::Shape::Callback(callback) => callback.callback.is::<PanelsEnd>(),
+                _ => false,
+            })
+            .expect("the marker was painted");
+        let panels = &output.shapes[..end];
         let under = panels.iter().any(|clipped| match &clipped.shape {
             egui::Shape::Text(text) => {
                 text.galley.text() == Tab::Scenes.icon().glyph().to_string()

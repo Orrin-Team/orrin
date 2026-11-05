@@ -75,9 +75,6 @@ impl MtlWindow {
         };
         layer.setDevice(Some(&driver.device));
         layer.setPixelFormat(pixel_format);
-        // Not framebuffer-only: the overlay's glass samples what is already in
-        // the drawable, and a framebuffer-only texture cannot be read.
-        layer.setFramebufferOnly(false);
         let window = Self {
             layer,
             _owner: owner,

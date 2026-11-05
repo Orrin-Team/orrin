@@ -117,9 +117,6 @@ pub struct SwapchainState {
     /// onto the same image afterwards.
     pub image_views: Vec<Arc<ImageView>>,
     pub extent: [u32; 2],
-    /// Whether the images may be blitted from, which the editor overlay's
-    /// frosted glass needs. Asked of the surface, which need not offer it.
-    pub capturable: bool,
 }
 
 impl SwapchainState {
@@ -137,13 +134,7 @@ impl SwapchainState {
             .expect("failed to query surface capabilities");
 
         let composite_alpha = caps.supported_composite_alpha.into_iter().next().unwrap();
-        let capturable = caps
-            .supported_usage_flags
-            .contains(ImageUsage::TRANSFER_SRC);
-        let mut image_usage = ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_DST;
-        if capturable {
-            image_usage |= ImageUsage::TRANSFER_SRC;
-        }
+        let image_usage = ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_DST;
         let (present_mode, min_image_count) = resolve(device, surface, present);
 
         let (swapchain, images) = Swapchain::new(
@@ -167,15 +158,13 @@ impl SwapchainState {
             format,
             image_views: build_views(&images),
             extent,
-            capturable,
         }
     }
 
     /// A single image the frame renders into and nobody presents.
     ///
     /// `TRANSFER_SRC` is what lets the finished frame be copied back to host
-    /// memory and written out as a PNG. A window asks for it only for the
-    /// overlay's glass, and only where the surface offers it.
+    /// memory and written out as a PNG; a window's images never are.
     pub fn offscreen(ctx: &VkContext, format: Format, extent: [u32; 2]) -> Self {
         let image = Image::new(
             ctx.memory_allocator.clone(),
@@ -199,7 +188,6 @@ impl SwapchainState {
             readback: images.to_vec(),
             format,
             extent,
-            capturable: true,
         }
     }
 

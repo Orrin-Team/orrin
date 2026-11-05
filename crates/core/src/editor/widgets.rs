@@ -232,17 +232,13 @@ pub fn squircle_command_menu(
     response
 }
 
-/// The corner radius of [`toolbar_frame`], which the renderer's blur behind it
-/// has to match.
-pub const TOOLBAR_RADIUS: u8 = 6;
-
-/// The floating frame a toolbar group sits in over the scene: the bar colour,
-/// translucent over the frosted backdrop the renderer draws behind it.
+/// The floating frame a toolbar group sits in over the scene, in the bar's
+/// colour.
 pub fn toolbar_frame(visuals: &egui::Visuals, bar: egui::Color32) -> egui::Frame {
     egui::Frame::new()
-        .fill(bar.gamma_multiply(super::theme::FLOATING_OPACITY))
+        .fill(bar)
         .stroke(visuals.window_stroke)
-        .corner_radius(TOOLBAR_RADIUS)
+        .corner_radius(6)
         .inner_margin(3)
 }
 

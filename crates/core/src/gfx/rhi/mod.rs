@@ -424,18 +424,6 @@ impl Encoder<'_> {
         encoder_dispatch!(self, encoder => encoder.end_rendering())
     }
 
-    /// Downsample the render target into `half` and then `quarter`, leaving
-    /// `quarter` sampleable and the target ready to render into again. Outside
-    /// a render pass; for a pass that blurs what was drawn under it.
-    pub fn capture_backdrop(
-        &mut self,
-        target: TextureViewId,
-        half: TextureViewId,
-        quarter: TextureViewId,
-    ) {
-        encoder_dispatch!(self, encoder => encoder.capture_backdrop(target, half, quarter))
-    }
-
     /// Open a render pass over `target` whose contents do not matter and need
     /// not be kept from before, for a texture rendered once. A face view's own
     /// level sets the area.

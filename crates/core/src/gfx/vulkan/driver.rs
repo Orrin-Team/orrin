@@ -300,12 +300,6 @@ impl VkDriver {
         };
         match feature {
             Feature::BlockCompression => self.ctx.samples_bc,
-            Feature::BackdropCapture(format) => usable(
-                vk_format(format),
-                FormatFeatures::BLIT_SRC
-                    | FormatFeatures::BLIT_DST
-                    | FormatFeatures::SAMPLED_IMAGE_FILTER_LINEAR,
-            ),
             Feature::CoverageTexture => {
                 let device = &self.ctx.device;
                 let swizzle = !device.enabled_extensions().khr_portability_subset
@@ -1565,24 +1559,6 @@ impl<'a> VkEncoder<'a> {
         self.recorder.end_rendering();
     }
 
-    /// Downsample the render target into `half` and then `quarter`, leaving
-    /// `quarter` sampleable and the target ready to render into again. For a
-    /// pass that blurs what was drawn under it.
-    pub fn capture_backdrop(
-        &mut self,
-        target: TextureViewId,
-        half: TextureViewId,
-        quarter: TextureViewId,
-    ) {
-        let image = |id: TextureViewId| {
-            lookup(&self.driver.views, id.0, "texture view")
-                .image()
-                .clone()
-        };
-        let (target, half, quarter) = (image(target), image(half), image(quarter));
-        capture(self.recorder, &target, &half, &quarter);
-    }
-
     pub fn draw_indexed_indirect(&mut self, commands: BufferId, range: std::ops::Range<u32>) {
         let commands = lookup(&self.driver.buffers, commands.0, "buffer")
             .reinterpret::<[vulkano::command_buffer::DrawIndexedIndirectCommand]>()
@@ -1597,80 +1573,6 @@ impl<'a> VkEncoder<'a> {
     pub fn draw(&mut self, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
         self.recorder
             .draw(vertices, instances, first_vertex, first_instance);
-    }
-}
-
-/// Copy everything drawn so far into `backdrop`'s quarter-resolution image,
-/// through the half one, and hand `target` back to rendering with its
-/// contents.
-fn capture(recorder: &mut Recorder, target: &Arc<Image>, half: &Arc<Image>, quarter: &Arc<Image>) {
-    recorder
-        .image_barrier(record::color_to_transfer_src(
-            target.clone(),
-            record::whole_image(target),
-        ))
-        .image_barrier(reuse_as_transfer_dst(half.clone()))
-        .blit_image(downsample(target, half))
-        .image_barrier(record::transfer_dst_to_src(
-            half.clone(),
-            record::whole_image(half),
-        ))
-        .image_barrier(reuse_as_transfer_dst(quarter.clone()))
-        .blit_image(downsample(half, quarter))
-        .image_barrier(record::to_shader_read(
-            quarter.clone(),
-            record::whole_image(quarter),
-            vulkano::image::ImageLayout::TransferDstOptimal,
-        ))
-        .image_barrier(vulkano::sync::ImageMemoryBarrier {
-            src_stages: vulkano::sync::PipelineStages::ALL_TRANSFER,
-            src_access: vulkano::sync::AccessFlags::empty(),
-            dst_stages: vulkano::sync::PipelineStages::COLOR_ATTACHMENT_OUTPUT,
-            dst_access: vulkano::sync::AccessFlags::COLOR_ATTACHMENT_READ
-                | vulkano::sync::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            old_layout: vulkano::image::ImageLayout::TransferSrcOptimal,
-            new_layout: vulkano::image::ImageLayout::ColorAttachmentOptimal,
-            subresource_range: record::whole_image(target),
-            ..vulkano::sync::ImageMemoryBarrier::image(target.clone())
-        });
-}
-
-/// A capture image about to be rewritten. Its old contents do not matter, but
-/// the previous capture's reads of it — a blit, or the glass sampling it — have
-/// to finish first.
-fn reuse_as_transfer_dst(image: Arc<Image>) -> vulkano::sync::ImageMemoryBarrier {
-    vulkano::sync::ImageMemoryBarrier {
-        src_stages: vulkano::sync::PipelineStages::FRAGMENT_SHADER
-            | vulkano::sync::PipelineStages::ALL_TRANSFER,
-        ..record::to_transfer_dst(
-            image.clone(),
-            record::whole_image(&image),
-            vulkano::image::ImageLayout::Undefined,
-        )
-    }
-}
-
-fn downsample(src: &Arc<Image>, dst: &Arc<Image>) -> vulkano::command_buffer::BlitImageInfo {
-    let corner = |image: &Arc<Image>| [image.extent()[0], image.extent()[1], 1];
-    vulkano::command_buffer::BlitImageInfo {
-        regions: [vulkano::command_buffer::ImageBlit {
-            src_subresource: color_layers(),
-            src_offsets: [[0, 0, 0], corner(src)],
-            dst_subresource: color_layers(),
-            dst_offsets: [[0, 0, 0], corner(dst)],
-            ..Default::default()
-        }]
-        .into(),
-        filter: vulkano::image::sampler::Filter::Linear,
-        ..vulkano::command_buffer::BlitImageInfo::images(src.clone(), dst.clone())
-    }
-}
-
-fn color_layers() -> vulkano::image::ImageSubresourceLayers {
-    vulkano::image::ImageSubresourceLayers {
-        aspects: vulkano::image::ImageAspects::COLOR,
-        mip_level: 0,
-        array_layers: 0..1,
     }
 }
 

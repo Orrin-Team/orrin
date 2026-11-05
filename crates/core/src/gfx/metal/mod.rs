@@ -7,7 +7,6 @@
 //! frame that last wrote it. Every resource is tracked, so Metal orders hazards
 //! itself and nothing here records a barrier.
 
-mod backdrop;
 pub(crate) mod backend;
 mod bind;
 mod convert;
@@ -70,7 +69,6 @@ pub struct MtlDriver {
     bind_groups: Mutex<Pool<bind::Group>>,
     encoders: Mutex<bind::EncoderCache>,
     geometry: Mutex<Shared<geometry::Geometry>>,
-    downsamples: Mutex<backdrop::Downsamples>,
 }
 
 pub struct MtlEncoder<'a> {
@@ -112,7 +110,6 @@ impl MtlDriver {
             bind_groups: Mutex::new(Pool::new(FRAME_SLOTS)),
             encoders: Mutex::new(Default::default()),
             geometry: Mutex::new(Shared(geometry)),
-            downsamples: Mutex::new(Vec::new()),
         })
     }
 

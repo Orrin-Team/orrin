@@ -162,7 +162,7 @@ pub(crate) const OFFSCREEN_FORMAT: crate::gfx::format::Format =
 
 pub use gizmo::GizmoVertex;
 pub use outline::OutlineItem;
-pub use overlay::{Glass, OverlayFrame, OverlayPhase};
+pub use overlay::OverlayFrame;
 
 /// What draws over the final swapchain image between the tonemap pass and
 /// present: the editor UI, already laid out and tessellated. See
@@ -879,11 +879,10 @@ impl VulkanRenderer {
                             );
                             let vk = self.backend.vk_mut();
                             let format = engine_format(vk.swapchain.format);
-                            let capturable = vk.swapchain.capturable;
                             let target_view =
                                 vk.swapchain.image_views[image_index as usize].clone();
                             let pass = vk.overlay.get_or_insert_with(|| {
-                                overlay::OverlayPass::new(&self.device, format, capturable)
+                                overlay::OverlayPass::new(&self.device, format)
                             });
                             let driver = self.device.vulkan();
                             let target = driver.import_view(target_view);
@@ -2357,9 +2356,9 @@ impl VulkanRenderer {
                             .take()
                             .expect("the graph scheduled an overlay pass but none was supplied");
                         let format = self.backend.format();
-                        let pass = self.metal_overlay.get_or_insert_with(|| {
-                            overlay::OverlayPass::new(&self.device, format, true)
-                        });
+                        let pass = self
+                            .metal_overlay
+                            .get_or_insert_with(|| overlay::OverlayPass::new(&self.device, format));
                         pass.record(&self.device, &mut encoder, target(), overlay);
                     }
                     drawable = frame.and_then(|frame| frame.into_drawable());
