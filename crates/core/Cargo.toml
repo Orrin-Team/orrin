@@ -44,6 +44,9 @@ bytemuck = { version = "1", features = ["derive"] }
 # The engine-owned synchronisation vocabulary in `gfx::graph`. Already in the
 # tree through vulkano and winit; naming it here adds no crate.
 bitflags = "2"
+# The in-game UI's TrueType rasteriser (`gfx::ui`). Already in the tree through
+# epaint, with the same features, so naming it here adds no crate.
+ab_glyph = "0.2"
 egui_dock = { version = "0.16", features = ["serde"] }
 rayon = { workspace = true }
 tracing.workspace = true
@@ -103,6 +106,10 @@ harness = false
 
 [[bench]]
 name = "sh"
+harness = false
+
+[[bench]]
+name = "ui"
 harness = false
 
 [build-dependencies]

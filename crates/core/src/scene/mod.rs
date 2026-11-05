@@ -35,6 +35,7 @@ mod taa;
 mod time;
 mod transform;
 mod transparency;
+mod ui;
 
 pub use assets::Assets;
 pub use bloom::BloomSettings;
@@ -81,3 +82,4 @@ pub use taa::TaaSettings;
 pub use time::Time;
 pub use transform::Transform;
 pub use transparency::{RefractionSettings, TransparencySettings};
+pub use ui::{Rect, TextAnchor, TextStyle, UiCanvas, UiCommand, color_bytes};
