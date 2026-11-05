@@ -1,8 +1,12 @@
 //! The controls that float over the scene: gizmo mode, space and snap at the
 //! top left, the frame-stats toggle at the top right.
 //!
+//! In UI mode (the toolbar's toggle, or T) a click picks the topmost UI element
+//! rather than a mesh, and the selected element gets the rect tool (see
+//! `editor::rect_tool`) instead of the transform gizmo.
+//!
 //! While the game is live — playing or paused — the scene is the game's. The
-//! transform tools are hidden, nothing in it is picked, hovered, outlined or
+//! transform tools and the rect tool are hidden, nothing in it is picked, hovered, outlined or
 //! marked, and a click there reaches the game alone, which is what lets an
 //! in-game button sit over a crate without selecting it. The frame stats and
 //! the play border stay: they describe the session, not the scene.
@@ -56,6 +60,12 @@ pub fn show(
                     widgets::toolbar_frame(ui.visuals(), bar).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         space_and_snap(ui, state);
+                    });
+                    widgets::toolbar_frame(ui.visuals(), bar).show(ui, |ui| {
+                        let hint = "UI mode (T): pick and lay out UI elements";
+                        if widgets::toggle_icon(ui, icons::image(), state.ui_mode, hint).clicked() {
+                            state.ui_mode = !state.ui_mode;
+                        }
                     });
                 });
             });
@@ -664,6 +674,147 @@ pub fn select_on_click(
         pick::pick_at(world, &camera, ctx.screen_rect(), pos),
         toggle,
     ) {
+        (Some(entity), true) => state.selection.toggle(entity),
+        (Some(entity), false) => state.selection.set(entity),
+        (None, true) => {}
+        (None, false) => state.selection.clear(),
+    }
+}
+
+/// The topmost UI element under `pos`, a point, that is not locked: what a
+/// click in UI mode selects. Any element counts, raycast target or not — the
+/// editor picks what is drawn, not what the game would hit.
+fn ui_at(world: &World, layout: &crate::ui::Layout, pos: egui::Pos2, ppp: f32) -> Option<usize> {
+    let at = [pos.x * ppp, pos.y * ppp];
+    layout.elements().iter().rposition(|element| {
+        crate::ui::layout::contains(element.rect, at) && !pick::is_locked(world, element.entity)
+    })
+}
+
+/// UI mode's rect tool: an outline round the element under the pointer, the
+/// tool on the selected one, and a drag of it — each frame of which posts the
+/// transform it has reached as an edit, one undo step when the button comes
+/// up. The 3D gizmo, hover and marquee stand down in UI mode.
+pub fn rect_tool(
+    ctx: &egui::Context,
+    world: &World,
+    state: &mut EditorState,
+    dock: &crate::editor::dock::Dock,
+    viewport: egui::Rect,
+) {
+    use crate::editor::rect_tool::{self, Frame, RectDrag, SNAP};
+
+    state.gizmo_strokes.clear();
+    state.outline.clear();
+    state.hovered = None;
+    state.gizmo_drag = None;
+    state.rect_hot = None;
+    let Some(tree) = world.get_resource::<crate::ui::UiTree>() else {
+        state.rect_drag = None;
+        return;
+    };
+    let layout = &tree.layout;
+    let ppp = ctx.pixels_per_point();
+    let (pointer, down, pressed, free) = ctx.input(|input| {
+        (
+            input.pointer.latest_pos(),
+            input.pointer.primary_down(),
+            input.pointer.primary_pressed(),
+            input.modifiers.command,
+        )
+    });
+    let over = pointer.filter(|&pos| viewport.contains(pos) && dock.over_scene(ctx, pos));
+    let selected = state
+        .selection
+        .primary()
+        .and_then(|entity| layout.index_of(entity));
+    if state.rect_drag.is_none()
+        && let Some(index) = over.and_then(|pos| ui_at(world, layout, pos, ppp))
+        && Some(index) != selected
+    {
+        rect_tool::hovered(&mut state.gizmo_strokes, layout.elements()[index].rect, ppp);
+    }
+    let Some(index) = selected else {
+        state.rect_drag = None;
+        return;
+    };
+    let element = layout.elements()[index];
+    let Some(transform) = world
+        .get::<crate::ui::RectTransform>(element.entity)
+        .map(|transform| *transform)
+    else {
+        state.rect_drag = None;
+        return;
+    };
+    let frame = Frame::of(&element, &transform, ppp);
+    let pixels = |pos: egui::Pos2| glam::Vec2::new(pos.x * ppp, pos.y * ppp);
+    match state.rect_drag.take() {
+        Some(drag) if drag.entity == element.entity => {
+            state.rect_hot = Some(drag.grip);
+            if let Some(pos) = pointer.filter(|_| down) {
+                let snap = (!free).then_some(SNAP * ppp);
+                let (moved, guides) = drag.update(pixels(pos), snap);
+                if moved != transform {
+                    state.edit(
+                        element.entity,
+                        crate::scene::registry::RECT_TRANSFORM,
+                        moved.to_value(),
+                    );
+                }
+                let parent = layout.parent_rect(index);
+                rect_tool::guides(&mut state.gizmo_strokes, &guides, parent, ppp);
+                state.rect_drag = Some(drag);
+            }
+        }
+        _ => {
+            if let Some(pos) = over {
+                state.rect_hot = frame.hit(pos);
+                if pressed && let Some(grip) = state.rect_hot {
+                    let parent = layout.parent_rect(index);
+                    state.rect_drag = Some(RectDrag::begin(
+                        grip,
+                        transform,
+                        &element,
+                        parent,
+                        pixels(pos),
+                    ));
+                }
+            }
+        }
+    }
+    frame.strokes(state.rect_hot, &mut state.gizmo_strokes, ppp);
+}
+
+/// [`select_on_click`] for UI mode: the topmost element under the click, or
+/// nothing. A click on one of the rect tool's handles keeps the selection.
+pub fn select_ui_on_click(
+    ctx: &egui::Context,
+    world: &World,
+    state: &mut EditorState,
+    dock: &crate::editor::dock::Dock,
+    viewport: egui::Rect,
+) {
+    use crate::editor::rect_tool::Grip;
+
+    let Some((pos, toggle)) = ctx.input(|input| {
+        let pos = input.pointer.interact_pos()?;
+        let toggle = input.modifiers.command;
+        input.pointer.primary_clicked().then_some((pos, toggle))
+    }) else {
+        return;
+    };
+    if !viewport.contains(pos)
+        || !dock.over_scene(ctx, pos)
+        || matches!(state.rect_hot, Some(Grip::Pivot | Grip::Edge { .. }))
+    {
+        return;
+    }
+    let Some(tree) = world.get_resource::<crate::ui::UiTree>() else {
+        return;
+    };
+    let hit = ui_at(world, &tree.layout, pos, ctx.pixels_per_point())
+        .map(|index| tree.layout.elements()[index].entity);
+    match (hit, toggle) {
         (Some(entity), true) => state.selection.toggle(entity),
         (Some(entity), false) => state.selection.set(entity),
         (None, true) => {}

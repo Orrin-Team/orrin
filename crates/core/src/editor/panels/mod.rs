@@ -11,6 +11,7 @@ pub(super) mod scenes;
 #[cfg(feature = "scripting")]
 pub(super) mod scripts;
 mod status_bar;
+mod ui_sections;
 mod viewport;
 
 use glam::Vec3;
@@ -64,14 +65,22 @@ pub fn draw(
         viewport::show(ctx, world, state, themes, rect, live);
         if !live {
             viewport::accept_prefab(ctx, world, state, dock, rect);
-            viewport::hover(ctx, world, state, dock, rect);
-            // Before the click: a click on a handle is not a click on the scene.
-            viewport::gizmo(ctx, world, state, dock, rect);
-            viewport::marquee(ctx, world, state, dock, rect);
-            viewport::select_on_click(ctx, world, state, dock, rect);
+            if state.ui_mode {
+                // Before the click, for the reason the gizmo is.
+                viewport::rect_tool(ctx, world, state, dock, rect);
+                viewport::select_ui_on_click(ctx, world, state, dock, rect);
+            } else {
+                state.rect_drag = None;
+                viewport::hover(ctx, world, state, dock, rect);
+                // Before the click: a click on a handle is not a click on the scene.
+                viewport::gizmo(ctx, world, state, dock, rect);
+                viewport::marquee(ctx, world, state, dock, rect);
+                viewport::select_on_click(ctx, world, state, dock, rect);
+            }
         } else {
             state.gizmo_strokes.clear();
             state.outline.clear();
+            state.rect_drag = None;
         }
     }
     if let Some(rel) = state.pending_delete().map(str::to_owned) {
@@ -224,6 +233,9 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
             state.gizmo_mode = mode;
         }
+    }
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::T)) {
+        state.ui_mode = !state.ui_mode;
     }
     state.selection.retain_alive(world);
     let selected = !state.selection.is_empty();
@@ -384,6 +396,11 @@ mod tests {
                     input,
                     output,
                 } = self;
+                // As the app does every frame, so UI mode sees what is drawn.
+                let screen = input
+                    .screen_rect
+                    .map_or([0, 0], |rect| [rect.width() as u32, rect.height() as u32]);
+                crate::ui::update(world, screen);
                 *output = Some(ctx.run(input.clone(), |ctx| {
                     draw(ctx, world, state, registry, themes, dock, previews);
                     frost(ctx, glass);
@@ -2038,6 +2055,43 @@ mod tests {
             assert!(
                 painted.iter().any(|text| text == expected),
                 "{menu:?} did not list {expected:?}: {painted:?}"
+            );
+        }
+    }
+
+    /// The entity menu's UI entries sit in a submenu of their own, which lists
+    /// every kind the menu can make.
+    #[test]
+    fn the_entity_menu_offers_ui_in_a_submenu() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let run = |editor: &mut Harness| {
+            let Harness {
+                state, ctx, input, ..
+            } = &mut *editor;
+            let output = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| menu_bar::spawn_entries(ui, state));
+            });
+            editor.output = Some(output);
+        };
+        run(&mut editor);
+        run(&mut editor);
+        let at = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| without_icons(text) == "UI")
+            .map(|(_, rect)| rect.center())
+            .expect("a UI entry");
+        editor.input.events.push(egui::Event::PointerMoved(at));
+        editor.input.events.push(button(at, true));
+        editor.input.events.push(button(at, false));
+        run(&mut editor);
+        editor.input.events.clear();
+        run(&mut editor);
+        let painted = editor.painted();
+        for kind in ["Canvas", "Panel", "Image", "Text", "Button"] {
+            assert!(
+                painted.iter().any(|text| text == kind),
+                "{kind}: {painted:?}"
             );
         }
     }
@@ -5137,5 +5191,315 @@ mod tests {
         toggle_play(&mut editor);
         editor.frames(1);
         assert!(framed(&editor));
+    }
+
+    // --- the retained UI ---------------------------------------------------
+
+    fn ui_spawn(editor: &mut Harness, kind: crate::ui::create::UiKind) {
+        editor
+            .state
+            .request_spawn(crate::editor::state::SpawnKind::Ui(kind));
+        editor.state.apply(&mut editor.world, &editor.registry);
+    }
+
+    fn parent_of(world: &World, entity: orrin_ecs::Entity) -> Option<orrin_ecs::Entity> {
+        world
+            .get::<crate::scene::Parent>(entity)
+            .map(|parent| parent.get())
+    }
+
+    /// A canvas, made the first time, with an element on it placed by its top
+    /// left at `at` and `size` points — one point a pixel in the harness.
+    fn ui_box(
+        editor: &mut Harness,
+        name: &str,
+        at: egui::Pos2,
+        size: egui::Vec2,
+    ) -> orrin_ecs::Entity {
+        let canvas = named(&editor.world, "Canvas").unwrap_or_else(|| {
+            let canvas = editor.world.spawn();
+            editor.world.insert(canvas, Name::new("Canvas"));
+            editor.world.insert(canvas, crate::ui::Canvas::default());
+            canvas
+        });
+        let entity = editor.world.spawn();
+        editor.world.insert(entity, Name::new(name));
+        editor.world.insert(
+            entity,
+            crate::ui::RectTransform {
+                anchor_min: glam::Vec2::ZERO,
+                anchor_max: glam::Vec2::ZERO,
+                pivot: glam::Vec2::ZERO,
+                anchored_position: glam::Vec2::new(at.x, at.y),
+                size_delta: glam::Vec2::new(size.x, size.y),
+                scale: glam::Vec2::ONE,
+            },
+        );
+        editor.world.insert(entity, crate::ui::Image::default());
+        crate::scene::reparent(&mut editor.world, entity, Some(canvas), false).unwrap();
+        entity
+    }
+
+    fn anchored(editor: &Harness, entity: orrin_ecs::Entity) -> crate::ui::RectTransform {
+        *editor
+            .world
+            .get::<crate::ui::RectTransform>(entity)
+            .unwrap()
+    }
+
+    /// uGUI's button: an image that tints, and a label under it, on a canvas
+    /// made for it — and all of it one undo step.
+    #[test]
+    fn creating_a_ui_button_builds_its_tree_under_a_new_canvas() {
+        use crate::ui::create::UiKind;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        ui_spawn(&mut editor, UiKind::Button);
+
+        let world = &editor.world;
+        let canvas = named(world, "Canvas").expect("a canvas to hold it");
+        let button = named(world, "Button").expect("the button");
+        let label = named(world, "Text").expect("its label");
+        assert!(world.has::<crate::ui::Canvas>(canvas));
+        assert_eq!(parent_of(world, canvas), None);
+        assert_eq!(parent_of(world, button), Some(canvas));
+        assert_eq!(parent_of(world, label), Some(button));
+        for component in [
+            world.has::<crate::ui::RectTransform>(button),
+            world.has::<crate::ui::Image>(button),
+            world.has::<crate::ui::Button>(button),
+            world.has::<crate::ui::RectTransform>(label),
+        ] {
+            assert!(component);
+        }
+        assert!(
+            !world.has::<LocalTransform>(button),
+            "UI has no 3D transform"
+        );
+        let text = world.get::<crate::ui::Text>(label).unwrap();
+        assert_eq!(text.text, "Button");
+        assert_eq!(text.anchor, crate::scene::TextAnchor::MiddleCenter);
+        assert_eq!(
+            *world.get::<crate::ui::RectTransform>(label).unwrap(),
+            crate::ui::RectTransform::stretched()
+        );
+        drop(text);
+        assert_eq!(editor.state.selection.entities(), [button]);
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(
+            editor.world.entities().count(),
+            0,
+            "one step took all three"
+        );
+    }
+
+    #[test]
+    fn new_ui_goes_under_the_selection_or_else_the_first_canvas() {
+        use crate::ui::create::UiKind;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        ui_spawn(&mut editor, UiKind::Panel);
+        let panel = named(&editor.world, "Panel").unwrap();
+        let canvas = named(&editor.world, "Canvas").unwrap();
+        ui_spawn(&mut editor, UiKind::Text);
+        let text = named(&editor.world, "Text").unwrap();
+        assert_eq!(parent_of(&editor.world, text), Some(panel));
+
+        let cube = editor.spawn("Cube");
+        editor.state.selection.set(cube);
+        ui_spawn(&mut editor, UiKind::Image);
+        let image = named(&editor.world, "Image").unwrap();
+        assert_eq!(parent_of(&editor.world, image), Some(canvas));
+
+        ui_spawn(&mut editor, UiKind::Canvas);
+        let canvases = editor
+            .world
+            .entities()
+            .filter(|&e| editor.world.has::<crate::ui::Canvas>(e))
+            .count();
+        assert_eq!(canvases, 2, "a canvas is always a new one");
+    }
+
+    #[test]
+    fn t_switches_ui_mode() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(1);
+        editor.key(egui::Key::T);
+        assert!(editor.state.ui_mode);
+        editor.key(egui::Key::T);
+        assert!(!editor.state.ui_mode);
+    }
+
+    #[test]
+    fn in_ui_mode_a_click_selects_the_topmost_element() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let centre = editor.viewport().center();
+        let back = ui_box(
+            &mut editor,
+            "Back",
+            centre - egui::vec2(100.0, 100.0),
+            egui::vec2(200.0, 200.0),
+        );
+        let front = ui_box(
+            &mut editor,
+            "Front",
+            centre - egui::vec2(25.0, 25.0),
+            egui::vec2(50.0, 50.0),
+        );
+        editor.state.ui_mode = true;
+        editor.frames(2);
+
+        editor.click(centre);
+        assert_eq!(editor.state.selection.entities(), [front]);
+        editor.click(centre + egui::vec2(80.0, 80.0));
+        assert_eq!(editor.state.selection.entities(), [back]);
+        editor.click(centre + egui::vec2(150.0, 0.0));
+        assert!(editor.state.selection.is_empty(), "nothing there");
+    }
+
+    /// The rect tool's body is the element: a drag moves it, shows as it
+    /// goes, and undoes in one step. Ctrl places freely, so where the window's
+    /// centre happens to fall cannot snap it.
+    #[test]
+    fn dragging_a_ui_element_moves_it_in_one_undo_step() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let centre = editor.viewport().center();
+        let panel = ui_box(
+            &mut editor,
+            "Panel",
+            centre - egui::vec2(50.0, 50.0),
+            egui::vec2(100.0, 100.0),
+        );
+        let before = anchored(&editor, panel);
+        editor.state.selection.set(panel);
+        editor.state.ui_mode = true;
+        editor.frames(2);
+        assert!(
+            !editor.state.gizmo_strokes.is_empty(),
+            "the rect tool is drawn"
+        );
+
+        editor.input.modifiers = egui::Modifiers::COMMAND;
+        pointer(&mut editor, egui::Event::PointerMoved(centre));
+        pointer(&mut editor, button(centre, true));
+        let mut at = centre;
+        for _ in 0..3 {
+            at += egui::vec2(10.0, 4.0);
+            pointer(&mut editor, egui::Event::PointerMoved(at));
+        }
+        assert_eq!(
+            anchored(&editor, panel).anchored_position,
+            before.anchored_position + glam::Vec2::new(30.0, 12.0),
+            "the drag shows while it is held"
+        );
+        pointer(&mut editor, button(at, false));
+        editor.input.modifiers = egui::Modifiers::NONE;
+        assert_eq!(editor.state.selection.entities(), [panel]);
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(anchored(&editor, panel), before);
+        assert_eq!(editor.state.history.undo_label(), None, "one step");
+    }
+
+    #[test]
+    fn dragging_a_corner_of_the_rect_tool_resizes_from_the_opposite_one() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let centre = editor.viewport().center();
+        let panel = ui_box(
+            &mut editor,
+            "Panel",
+            centre - egui::vec2(50.0, 50.0),
+            egui::vec2(100.0, 100.0),
+        );
+        let before = anchored(&editor, panel);
+        editor.state.selection.set(panel);
+        editor.state.ui_mode = true;
+        editor.frames(2);
+
+        editor.input.modifiers = egui::Modifiers::COMMAND;
+        let corner = centre + egui::vec2(50.0, 50.0);
+        pointer(&mut editor, egui::Event::PointerMoved(corner));
+        pointer(&mut editor, button(corner, true));
+        pointer(
+            &mut editor,
+            egui::Event::PointerMoved(corner + egui::vec2(20.0, 10.0)),
+        );
+        pointer(&mut editor, button(corner + egui::vec2(20.0, 10.0), false));
+        editor.input.modifiers = egui::Modifiers::NONE;
+
+        let after = anchored(&editor, panel);
+        assert_eq!(after.size_delta, glam::Vec2::new(120.0, 110.0));
+        assert_eq!(
+            after.anchored_position, before.anchored_position,
+            "pivoted at its top left, which stays put"
+        );
+        assert_eq!(
+            editor.state.selection.entities(),
+            [panel],
+            "a handle is not a click"
+        );
+    }
+
+    #[test]
+    fn the_rect_tool_and_ui_picking_are_off_while_the_game_is_live() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let centre = editor.viewport().center();
+        let panel = ui_box(
+            &mut editor,
+            "Panel",
+            centre - egui::vec2(50.0, 50.0),
+            egui::vec2(100.0, 100.0),
+        );
+        editor.state.ui_mode = true;
+        editor.state.selection.set(panel);
+        editor.frames(2);
+        assert!(!editor.state.gizmo_strokes.is_empty());
+
+        toggle_play(&mut editor);
+        editor.frames(2);
+        assert!(
+            editor.state.gizmo_strokes.is_empty(),
+            "no rect tool over the game"
+        );
+        editor.click(centre);
+        assert!(editor.state.selection.is_empty(), "a click is the game's");
+    }
+
+    #[test]
+    fn the_inspector_draws_the_ui_sections_once_each() {
+        use crate::ui::create::UiKind;
+        let mut editor = Harness::new(egui::vec2(1280.0, 900.0));
+        ui_spawn(&mut editor, UiKind::Button);
+        editor.frames(3);
+        let painted = editor.painted();
+        let count = |label: &str| {
+            painted
+                .iter()
+                .filter(|text| without_icons(text) == label)
+                .count()
+        };
+        for label in [
+            "Rect Transform",
+            "Anchors",
+            "Pivot",
+            "Normal",
+            "Pressed",
+            "Interactable",
+            "Raycast target",
+        ] {
+            assert_eq!(count(label), 1, "{label}: {painted:?}");
+        }
+        for generic in ["Anchored position", "Size delta"] {
+            assert_eq!(
+                count(generic),
+                0,
+                "drawn by hand, not from the vtable: {painted:?}"
+            );
+        }
     }
 }

@@ -56,6 +56,7 @@
 //! no pointer state, so a button tints only while the game runs.
 
 pub mod components;
+pub mod create;
 pub mod events;
 pub mod extract;
 pub mod layout;

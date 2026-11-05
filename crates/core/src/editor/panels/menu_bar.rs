@@ -387,6 +387,22 @@ pub fn spawn_entries(ui: &mut egui::Ui, state: &mut EditorState) {
         state.request_spawn(SpawnKind::Camera);
         ui.close_menu();
     }
+    ui.separator();
+    ui.menu_button(icons::with_label(icons::image(), None, "UI"), |ui| {
+        use crate::ui::create::UiKind;
+        for kind in [
+            UiKind::Canvas,
+            UiKind::Panel,
+            UiKind::Image,
+            UiKind::Text,
+            UiKind::Button,
+        ] {
+            if ui.button(kind.name()).clicked() {
+                state.request_spawn(SpawnKind::Ui(kind));
+                ui.close_menu();
+            }
+        }
+    });
 }
 
 fn entity(ui: &mut egui::Ui, state: &mut EditorState) {

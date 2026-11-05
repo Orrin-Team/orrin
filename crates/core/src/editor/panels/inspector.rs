@@ -84,6 +84,7 @@ pub fn body(
             mesh_section(ui, world, state, entity, previews, &filter);
             material_section(ui, world, state, entity, previews, &filter);
             light_section(ui, world, state, entity, &filter);
+            super::ui_sections::sections(ui, world, state, entity, &filter);
             #[cfg(feature = "scripting")]
             script_section(ui, world, entity, &filter);
             registered_sections(ui, world, registry, state, entity, &filter, &overridden);
@@ -98,7 +99,7 @@ pub fn body(
 /// otherwise it shows only the rows whose label matches, and disappears when
 /// none do — so typing "rough" leaves one row on screen rather than every
 /// section that happens to contain it somewhere.
-struct Filter {
+pub(super) struct Filter {
     query: String,
 }
 
@@ -118,7 +119,7 @@ impl Filter {
     }
 
     /// `None` when the section should not draw at all.
-    fn section(&self, title: &str, labels: &[&str]) -> Option<Rows<'_>> {
+    pub(super) fn section(&self, title: &str, labels: &[&str]) -> Option<Rows<'_>> {
         if self.is_empty() || self.hits(title) {
             return Some(Rows(None));
         }
@@ -131,7 +132,7 @@ impl Filter {
 
 /// Which rows of a shown section draw.
 #[derive(Clone, Copy)]
-struct Rows<'a>(Option<&'a Filter>);
+pub(super) struct Rows<'a>(Option<&'a Filter>);
 
 impl Rows<'_> {
     fn shows(self, label: &str) -> bool {
@@ -377,12 +378,17 @@ fn prefab_section(
 /// which is what makes a component the engine has never heard of, registered by
 /// a game assembly after a hot reload, inspectable without a panel being written
 /// for it.
-const HAND_DRAWN: [orrin_registry::ComponentId; 5] = [
+const HAND_DRAWN: [orrin_registry::ComponentId; 10] = [
     crate::scene::registry::TRANSFORM,
     crate::scene::registry::NAME,
     crate::scene::registry::LIGHT,
     crate::scene::registry::MESH,
     crate::scene::registry::MATERIAL,
+    crate::scene::registry::CANVAS,
+    crate::scene::registry::RECT_TRANSFORM,
+    crate::scene::registry::IMAGE,
+    crate::scene::registry::TEXT,
+    crate::scene::registry::BUTTON,
 ];
 
 /// Draw every registered component that has no section of its own.
@@ -1108,7 +1114,7 @@ fn material_section(
 /// One texture slot of a material asset: the texture's name, a drop target
 /// for another, and a menu to empty it. Whether a drop is a texture is the
 /// edit's to decide, so a refusal is named in the console like any other.
-fn texture_slot(ui: &mut egui::Ui, world: &World, texture: &mut Option<AssetId>) {
+pub(super) fn texture_slot(ui: &mut egui::Ui, world: &World, texture: &mut Option<AssetId>) {
     let name = match *texture {
         Some(id) => database_name(world, Some(id)).unwrap_or_else(|| format!("missing {id}")),
         None => "—".to_owned(),
@@ -1385,12 +1391,7 @@ mod tests {
                 "orrin.spin",
                 "orrin.locked",
                 "orrin.render_settings",
-                "orrin.camera",
-                "orrin.ui.canvas",
-                "orrin.ui.rect_transform",
-                "orrin.ui.image",
-                "orrin.ui.text",
-                "orrin.ui.button"
+                "orrin.camera"
             ],
             "registration order changed, or a component gained/lost a section"
         );

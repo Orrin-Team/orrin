@@ -93,6 +93,103 @@ impl RectTransform {
     }
 }
 
+/// One axis of an anchor preset: where on the parent the anchors sit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorPreset {
+    /// The left or top edge.
+    Min,
+    Middle,
+    /// The right or bottom edge.
+    Max,
+    /// Both edges, so the element stretches with its parent.
+    Stretch,
+}
+
+impl AnchorPreset {
+    pub const ALL: [Self; 4] = [Self::Min, Self::Middle, Self::Max, Self::Stretch];
+
+    /// The anchors' `(min, max)` along the axis.
+    pub fn anchors(self) -> (f32, f32) {
+        match self {
+            Self::Min => (0.0, 0.0),
+            Self::Middle => (0.5, 0.5),
+            Self::Max => (1.0, 1.0),
+            Self::Stretch => (0.0, 1.0),
+        }
+    }
+
+    /// The pivot that goes with the preset: on the anchored edge, or centred.
+    pub fn pivot(self) -> f32 {
+        match self {
+            Self::Min => 0.0,
+            Self::Max => 1.0,
+            Self::Middle | Self::Stretch => 0.5,
+        }
+    }
+
+    /// The preset `(min, max)` anchors are, if they are one.
+    pub fn of(min: f32, max: f32) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.anchors() == (min, max))
+    }
+}
+
+impl RectTransform {
+    /// Move the anchors to `min` and `max` without moving the element in a
+    /// parent `parent` units across: the size delta and the position absorb
+    /// the change.
+    pub fn set_anchors_keeping_rect(&mut self, parent: Vec2, min: Vec2, max: Vec2) {
+        let (corner, size) = self.rect_in(Vec2::ZERO, parent);
+        self.anchor_min = min;
+        self.anchor_max = max;
+        self.size_delta = size - (max - min) * parent;
+        self.place_pivot(parent, corner + self.pivot * size);
+    }
+
+    /// Move the pivot to `pivot` without moving the element's unscaled
+    /// rectangle.
+    pub fn set_pivot_keeping_rect(&mut self, parent: Vec2, pivot: Vec2) {
+        let (corner, size) = self.rect_in(Vec2::ZERO, parent);
+        self.pivot = pivot;
+        self.place_pivot(parent, corner + pivot * size);
+    }
+
+    /// Set the position that puts the pivot at `point` of the parent.
+    fn place_pivot(&mut self, parent: Vec2, point: Vec2) {
+        let reference =
+            (self.anchor_min + (self.anchor_max - self.anchor_min) * self.pivot) * parent;
+        self.anchored_position = point - reference;
+    }
+
+    /// uGUI's anchor presets: anchor each axis by its preset, keeping the
+    /// element where it is. With `pivot` the pivot moves to the matching edge
+    /// or centre too; with `position` the element moves to its anchors —
+    /// stretched axes filling the parent.
+    pub fn apply_preset(
+        &mut self,
+        parent: Vec2,
+        presets: [AnchorPreset; 2],
+        pivot: bool,
+        position: bool,
+    ) {
+        let [across, down] = presets;
+        let ((x_min, x_max), (y_min, y_max)) = (across.anchors(), down.anchors());
+        self.set_anchors_keeping_rect(parent, Vec2::new(x_min, y_min), Vec2::new(x_max, y_max));
+        if pivot {
+            self.set_pivot_keeping_rect(parent, Vec2::new(across.pivot(), down.pivot()));
+        }
+        if position {
+            self.anchored_position = Vec2::ZERO;
+            for (axis, preset) in presets.into_iter().enumerate() {
+                if preset == AnchorPreset::Stretch {
+                    self.size_delta[axis] = 0.0;
+                }
+            }
+        }
+    }
+}
+
 /// A rectangle filled with `color`, or with `texture` multiplied by it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Image {
@@ -398,6 +495,83 @@ mod tests {
             interactable: false,
             ..Button::default()
         });
+    }
+
+    fn drawn(rect: &RectTransform, parent: Vec2) -> (Vec2, Vec2) {
+        rect.rect_in(Vec2::ZERO, parent)
+    }
+
+    fn near(a: (Vec2, Vec2), b: (Vec2, Vec2)) -> bool {
+        a.0.abs_diff_eq(b.0, 1e-3) && a.1.abs_diff_eq(b.1, 1e-3)
+    }
+
+    #[test]
+    fn moving_the_anchors_or_the_pivot_leaves_the_element_where_it_was() {
+        let parent = Vec2::new(800.0, 600.0);
+        let mut rect = RectTransform {
+            anchored_position: Vec2::new(30.0, -20.0),
+            size_delta: Vec2::new(120.0, 40.0),
+            ..RectTransform::default()
+        };
+        let before = drawn(&rect, parent);
+        rect.set_anchors_keeping_rect(parent, Vec2::new(0.0, 0.25), Vec2::new(1.0, 0.25));
+        assert!(near(drawn(&rect, parent), before), "{rect:?}");
+        assert_eq!(rect.anchor_max, Vec2::new(1.0, 0.25));
+        rect.set_pivot_keeping_rect(parent, Vec2::new(1.0, 0.0));
+        assert!(near(drawn(&rect, parent), before), "{rect:?}");
+        assert_eq!(rect.pivot, Vec2::new(1.0, 0.0));
+    }
+
+    #[test]
+    fn a_preset_anchors_each_axis_and_shift_and_alt_take_the_pivot_and_position() {
+        use AnchorPreset::*;
+        let parent = Vec2::new(800.0, 600.0);
+        let start = RectTransform {
+            anchored_position: Vec2::new(30.0, -20.0),
+            size_delta: Vec2::new(120.0, 40.0),
+            ..RectTransform::default()
+        };
+
+        let mut plain = start;
+        plain.apply_preset(parent, [Max, Min], false, false);
+        assert_eq!(
+            (plain.anchor_min, plain.anchor_max),
+            (Vec2::new(1.0, 0.0), Vec2::new(1.0, 0.0))
+        );
+        assert_eq!(plain.pivot, start.pivot);
+        assert!(
+            near(drawn(&plain, parent), drawn(&start, parent)),
+            "kept in place"
+        );
+
+        let mut pivoted = start;
+        pivoted.apply_preset(parent, [Max, Min], true, false);
+        assert_eq!(pivoted.pivot, Vec2::new(1.0, 0.0));
+        assert!(near(drawn(&pivoted, parent), drawn(&start, parent)));
+
+        let mut placed = start;
+        placed.apply_preset(parent, [Max, Min], true, true);
+        assert_eq!(
+            placed.anchored_position,
+            Vec2::ZERO,
+            "in the top right corner"
+        );
+        assert_eq!(
+            drawn(&placed, parent),
+            (Vec2::new(680.0, 0.0), Vec2::new(120.0, 40.0))
+        );
+
+        let mut filled = start;
+        filled.apply_preset(parent, [Stretch, Stretch], true, true);
+        assert_eq!(
+            filled,
+            RectTransform::stretched(),
+            "Alt on stretch fills the parent"
+        );
+
+        assert_eq!(AnchorPreset::of(1.0, 1.0), Some(Max));
+        assert_eq!(AnchorPreset::of(0.0, 1.0), Some(Stretch));
+        assert_eq!(AnchorPreset::of(0.2, 0.7), None);
     }
 
     /// A scene names only the assets an element uses.

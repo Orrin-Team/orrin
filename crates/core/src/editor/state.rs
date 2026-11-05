@@ -181,6 +181,7 @@ pub enum SpawnKind {
     PointLight,
     DirectionalLight,
     Camera,
+    Ui(crate::ui::create::UiKind),
 }
 
 impl SpawnKind {
@@ -193,6 +194,7 @@ impl SpawnKind {
             SpawnKind::PointLight => "Point Light",
             SpawnKind::DirectionalLight => "Directional Light",
             SpawnKind::Camera => "Camera",
+            SpawnKind::Ui(kind) => kind.name(),
         }
     }
 }
@@ -259,6 +261,13 @@ pub struct EditorState {
     /// This frame's handles, for the renderer. Swapped into the overlay frame
     /// rather than copied.
     pub gizmo_strokes: Vec<crate::gfx::vulkan::GizmoVertex>,
+    /// UI mode: clicks in the scene pick UI elements, and the selected one
+    /// gets the rect tool instead of the transform gizmo.
+    pub ui_mode: bool,
+    /// A drag of the rect tool, while the button is held.
+    pub rect_drag: Option<super::rect_tool::RectDrag>,
+    /// The part of the rect tool under the pointer, or being dragged.
+    pub rect_hot: Option<super::rect_tool::Grip>,
     /// Every scene edit the panels make goes through this, by way of the
     /// requests below; see `scene::edit`. While the game plays it is a
     /// history of the fork, thrown away with it, and the scene's waits in
@@ -407,6 +416,9 @@ impl Default for EditorState {
             hovered: None,
             marquee: None,
             gizmo_strokes: Vec::new(),
+            ui_mode: false,
+            rect_drag: None,
+            rect_hot: None,
             outline: Vec::new(),
             history: History::default(),
             edits: Vec::new(),
@@ -868,9 +880,14 @@ impl EditorState {
 
         if let Some(kind) = self.spawn_request.take() {
             let label = format!("Create {}", kind.name());
+            let selected = self.selection.primary();
             let spawned = editor.replace(label, &[], |world, _| {
-                let entity = spawn(world, kind);
-                (entity, entity.into_iter().collect())
+                let spawned = spawn(world, kind, selected);
+                let root = spawned.map(|(_, root)| root);
+                (
+                    spawned.map(|(entity, _)| entity),
+                    root.into_iter().collect(),
+                )
             });
             if let Some(entity) = spawned {
                 self.selection.set(entity);
@@ -1535,8 +1552,19 @@ fn log(world: &World, level: LogLevel, message: String) {
     }
 }
 
-fn spawn(world: &mut World, kind: SpawnKind) -> Option<Entity> {
+/// Spawn `kind`, returning what to select and the root of what was spawned —
+/// which for UI can be a canvas made to hold it.
+fn spawn(world: &mut World, kind: SpawnKind, selected: Option<Entity>) -> Option<(Entity, Entity)> {
+    if let SpawnKind::Ui(kind) = kind {
+        let created = crate::ui::create::create(world, kind, selected);
+        return Some((created.element, created.root));
+    }
+    spawn_object(world, kind).map(|entity| (entity, entity))
+}
+
+fn spawn_object(world: &mut World, kind: SpawnKind) -> Option<Entity> {
     match kind {
+        SpawnKind::Ui(_) => None,
         SpawnKind::Cube | SpawnKind::Sphere | SpawnKind::Plane => {
             let mesh_name = match kind {
                 SpawnKind::Cube => "cube",

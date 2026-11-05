@@ -1097,7 +1097,7 @@ fn inside(point: egui::Pos2, corners: &[egui::Pos2; 4]) -> bool {
 /// One segment as a quad, `from` points half wide at `a` and `to` at `b`,
 /// written in physical pixels and a pixel wider each side for the antialiasing
 /// the fragment shader fades over.
-fn stroke(
+pub(crate) fn stroke(
     out: &mut Vec<GizmoVertex>,
     a: egui::Pos2,
     b: egui::Pos2,
@@ -1160,7 +1160,7 @@ fn signed_angle(turn: Quat, axis: Vec3) -> f32 {
 
 /// A convex quad, solid: its `edge` puts every fragment well inside, so the
 /// shader covers it fully, and [`stroke`]d edges supply the antialiasing.
-fn fill_quad(
+pub(crate) fn fill_quad(
     out: &mut Vec<GizmoVertex>,
     corners: &[egui::Pos2; 4],
     color: [u8; 4],

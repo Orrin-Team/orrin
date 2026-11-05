@@ -15,6 +15,7 @@ mod phases;
 mod pick;
 mod prefs;
 mod previews;
+mod rect_tool;
 mod selection;
 mod state;
 mod theme;
