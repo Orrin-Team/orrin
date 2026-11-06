@@ -8,13 +8,21 @@
 //! The same HUD built as a retained tree measures what the scene costs before
 //! the painter sees it: resolving every element's rectangle and recording its
 //! commands, which `ui::update` does every frame.
+//!
+//! The styled HUD is that tree with every modifier on every panel — a corner, a
+//! shadow, a stroke and a gradient — an outline on every heading, and the
+//! panels in a scroll frame, so the cost of the styling is read against the
+//! plain HUD's in the same run.
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use orrin_core::gfx::TextureHandle;
 use orrin_core::gfx::ui::{Painter, UiAssets};
 use orrin_core::scene::{Rect, TextAnchor, TextStyle, UiCanvas, reparent};
-use orrin_core::ui::{Canvas, Image, RectTransform, Text};
+use orrin_core::ui::{
+    Canvas, Corner, Gradient, Image, RectTransform, ScrollFrame, Shadow, Stroke, StrokePlacement,
+    Text,
+};
 use orrin_ecs::World;
 use orrin_registry::AssetId;
 
@@ -184,5 +192,87 @@ fn update(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, paint, update);
+/// [`retained_hud`] with every modifier: see the module docs.
+fn styled_hud() -> World {
+    let mut world = retained_hud();
+    let (mut canvas, mut panels, mut headings) = (None, Vec::new(), Vec::new());
+    world
+        .query::<&Canvas>()
+        .for_each(|entity, _| canvas = Some(entity));
+    world
+        .query::<&Image>()
+        .for_each(|entity, _| panels.push(entity));
+    world.query::<&Text>().for_each(|entity, text| {
+        if text.size == 28.0 {
+            headings.push(entity);
+        }
+    });
+    let canvas = canvas.unwrap();
+    let list = world.spawn();
+    world.insert(list, RectTransform::stretched());
+    world.insert(
+        list,
+        ScrollFrame {
+            content_size: glam::Vec2::new(0.0, 1400.0),
+            scroll_position: glam::Vec2::new(0.0, 120.0),
+            ..ScrollFrame::default()
+        },
+    );
+    reparent(&mut world, list, Some(canvas), false).unwrap();
+    for panel in panels {
+        reparent(&mut world, panel, Some(list), false).unwrap();
+        world.insert(
+            panel,
+            Corner {
+                radius: 16.0,
+                ..Corner::default()
+            },
+        );
+        world.insert(panel, Shadow::default());
+        world.insert(
+            panel,
+            Stroke {
+                placement: StrokePlacement::Outside,
+                ..Stroke::default()
+            },
+        );
+        world.insert(panel, Gradient::default());
+    }
+    for heading in headings {
+        world.insert(heading, Stroke::default());
+    }
+    world
+}
+
+fn styled(c: &mut Criterion) {
+    let mut world = styled_hud();
+    orrin_core::ui::update(&mut world, [1920, 1080]);
+    let tree = world.resource::<orrin_core::ui::UiTree>();
+    let mut painter = Painter::new();
+    painter.paint(&tree.canvas, &mut NoAssets);
+    let drawn = (painter.frame().quads.len() + painter.frame().shapes.len()) as u64;
+    assert!(!painter.frame().shapes.is_empty(), "the panels are shapes");
+
+    let mut group = c.benchmark_group("ui");
+    group.throughput(Throughput::Elements(drawn));
+    group.bench_function("paint a cached styled hud", |b| {
+        b.iter(|| painter.paint(black_box(&tree.canvas), &mut NoAssets));
+    });
+    group.finish();
+    drop(tree);
+
+    let elements = world
+        .resource::<orrin_core::ui::UiTree>()
+        .layout
+        .elements()
+        .len() as u64;
+    let mut group = c.benchmark_group("ui");
+    group.throughput(Throughput::Elements(elements));
+    group.bench_function("resolve and record a styled retained hud", |b| {
+        b.iter(|| orrin_core::ui::update(black_box(&mut world), [1920, 1080]));
+    });
+    group.finish();
+}
+
+criterion_group!(benches, paint, update, styled);
 criterion_main!(benches);

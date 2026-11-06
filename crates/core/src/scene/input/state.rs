@@ -18,7 +18,9 @@
 
 use std::collections::HashSet;
 
-use winit::event::{DeviceEvent, ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{
+    DeviceEvent, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::keyboard::PhysicalKey;
 
 use super::MAX_PLAYERS;
@@ -34,6 +36,8 @@ pub struct InputState {
     mouse_released: u8,
     cursor: (f32, f32),
     mouse_delta: (f32, f32),
+    /// Notches of the wheel this frame, x right and y away from the user.
+    wheel: (f32, f32),
     pads: [PadState; MAX_PLAYERS],
     focused: bool,
 }
@@ -93,6 +97,16 @@ impl InputState {
                     self.release_mouse_button(index);
                 }
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if !egui_wants {
+                    self.scroll_wheel(match delta {
+                        MouseScrollDelta::LineDelta(x, y) => (*x, *y),
+                        // A trackpad reports pixels; the editor camera reads
+                        // them at the same rate.
+                        MouseScrollDelta::PixelDelta(p) => (p.x as f32 / 50.0, p.y as f32 / 50.0),
+                    });
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
             }
@@ -119,6 +133,7 @@ impl InputState {
         self.mouse_pressed = 0;
         self.mouse_released = 0;
         self.mouse_delta = (0.0, 0.0);
+        self.wheel = (0.0, 0.0);
     }
 
     pub fn key_down(&self, code: u32) -> bool {
@@ -158,6 +173,16 @@ impl InputState {
 
     pub fn mouse_delta(&self) -> (f32, f32) {
         self.mouse_delta
+    }
+
+    /// Notches the wheel turned this frame: x right, y away from the user.
+    pub fn wheel(&self) -> (f32, f32) {
+        self.wheel
+    }
+
+    pub fn scroll_wheel(&mut self, (x, y): (f32, f32)) {
+        self.wheel.0 += x;
+        self.wheel.1 += y;
     }
 
     /// Whether the window has focus. Keyboard events stop arriving without it,

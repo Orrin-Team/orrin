@@ -82,4 +82,7 @@ pub use taa::TaaSettings;
 pub use time::Time;
 pub use transform::Transform;
 pub use transparency::{RefractionSettings, TransparencySettings};
-pub use ui::{GameScreen, Rect, TextAnchor, TextStyle, UiCanvas, UiCommand, color_bytes};
+pub use ui::{
+    GameScreen, GradientPaint, Rect, ShapePaint, ShapeStyle, TextAnchor, TextStyle, UiCanvas,
+    UiCommand, UiStyle, color_bytes,
+};

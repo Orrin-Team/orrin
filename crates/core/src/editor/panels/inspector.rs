@@ -378,7 +378,7 @@ fn prefab_section(
 /// which is what makes a component the engine has never heard of, registered by
 /// a game assembly after a hot reload, inspectable without a panel being written
 /// for it.
-const HAND_DRAWN: [orrin_registry::ComponentId; 10] = [
+const HAND_DRAWN: [orrin_registry::ComponentId; 15] = [
     crate::scene::registry::TRANSFORM,
     crate::scene::registry::NAME,
     crate::scene::registry::LIGHT,
@@ -389,6 +389,11 @@ const HAND_DRAWN: [orrin_registry::ComponentId; 10] = [
     crate::scene::registry::IMAGE,
     crate::scene::registry::TEXT,
     crate::scene::registry::BUTTON,
+    crate::scene::registry::GRADIENT,
+    crate::scene::registry::CORNER,
+    crate::scene::registry::STROKE,
+    crate::scene::registry::SHADOW,
+    crate::scene::registry::SCROLL_FRAME,
 ];
 
 /// Draw every registered component that has no section of its own.

@@ -2088,6 +2088,40 @@ mod tests {
         }
     }
 
+    /// The submenu offers the scroll frame beside the other kinds.
+    #[test]
+    fn the_ui_submenu_offers_a_scroll_frame() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let run = |editor: &mut Harness| {
+            let Harness {
+                state, ctx, input, ..
+            } = &mut *editor;
+            let output = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| menu_bar::spawn_entries(ui, state));
+            });
+            editor.output = Some(output);
+        };
+        run(&mut editor);
+        run(&mut editor);
+        let at = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| without_icons(text) == "UI")
+            .map(|(_, rect)| rect.center())
+            .expect("a UI entry");
+        editor.input.events.push(egui::Event::PointerMoved(at));
+        editor.input.events.push(button(at, true));
+        editor.input.events.push(button(at, false));
+        run(&mut editor);
+        editor.input.events.clear();
+        run(&mut editor);
+        let painted = editor.painted();
+        assert!(
+            painted.iter().any(|text| text == "Scroll Frame"),
+            "{painted:?}"
+        );
+    }
+
     /// A previewed resolution is the game's screen: the UI is told its size,
     /// it is drawn inside the viewport, and the viewport around it is dimmed.
     #[test]
@@ -5551,6 +5585,76 @@ mod tests {
         );
         editor.click(centre);
         assert!(editor.state.selection.is_empty(), "a click is the game's");
+    }
+
+    /// A scroll frame is made with a backdrop to catch the wheel against and
+    /// content taller than itself, so it scrolls as soon as it has children.
+    #[test]
+    fn creating_a_scroll_frame_makes_one_with_room_to_scroll() {
+        use crate::ui::create::UiKind;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        ui_spawn(&mut editor, UiKind::ScrollFrame);
+        let world = &editor.world;
+        let frame = named(world, "Scroll Frame").expect("the frame");
+        let canvas = named(world, "Canvas").expect("a canvas to hold it");
+        assert_eq!(parent_of(world, frame), Some(canvas));
+        assert!(world.has::<crate::ui::Image>(frame));
+        let rect = *world.get::<crate::ui::RectTransform>(frame).unwrap();
+        let scroll = *world.get::<crate::ui::ScrollFrame>(frame).unwrap();
+        assert!(scroll.vertical);
+        assert!(scroll.content_size.y > rect.size_delta.y, "{scroll:?}");
+        assert_eq!(editor.state.selection.entities(), [frame]);
+    }
+
+    /// Each modifier has a section of its own, drawn once, and none is drawn
+    /// a second time from its vtable.
+    #[test]
+    fn the_inspector_draws_the_modifier_sections_once_each() {
+        use crate::ui::create::UiKind;
+        let mut editor = Harness::new(egui::vec2(1280.0, 2400.0));
+        ui_spawn(&mut editor, UiKind::Button);
+        let button = named(&editor.world, "Button").unwrap();
+        editor.world.insert(button, crate::ui::Gradient::default());
+        editor.world.insert(button, crate::ui::Corner::default());
+        editor.world.insert(button, crate::ui::Stroke::default());
+        editor.world.insert(button, crate::ui::Shadow::default());
+        editor
+            .world
+            .insert(button, crate::ui::ScrollFrame::default());
+        editor.frames(3);
+        let painted = editor.painted();
+        let count = |label: &str| {
+            painted
+                .iter()
+                .filter(|text| without_icons(text) == label)
+                .count()
+        };
+        for label in [
+            "Gradient",
+            "Rotation",
+            "Corner",
+            "Radius",
+            "Squircle",
+            "Stroke",
+            "Thickness",
+            "Placement",
+            "Shadow",
+            "Blur",
+            "Spread",
+            "Scroll Frame",
+            "Content size",
+            "Scroll position",
+            "Scrollbars",
+        ] {
+            assert_eq!(count(label), 1, "{label}: {painted:?}");
+        }
+        for generic in ["radius_fraction", "scroll_position", "scrollbar_color"] {
+            assert_eq!(
+                count(generic),
+                0,
+                "drawn by hand, not from the vtable: {painted:?}"
+            );
+        }
     }
 
     #[test]

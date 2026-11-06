@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use orrin_ecs::{Entity, World};
 
-use super::{Button, Layout, UiTree};
+use super::{Button, Layout, ScrollFrame, UiTree};
 use crate::scene::{InputState, Parent};
 
 /// What happened to the pointer over an element. Lock-step with C#
@@ -89,6 +89,17 @@ pub struct UiPointer {
     press_position: [f32; 2],
     /// Whether a raycast target is under the pointer at all.
     over: bool,
+    /// A scroll bar the left button is holding.
+    drag: Option<BarDrag>,
+}
+
+/// A bar being dragged: whose, which axis, and where along the thumb it was
+/// taken hold of, in pixels from the thumb's start.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BarDrag {
+    frame: Entity,
+    axis: usize,
+    grip: f32,
 }
 
 impl UiPointer {
@@ -110,6 +121,12 @@ impl UiPointer {
         self.inside.clear();
         self.pressed = None;
         self.over = false;
+        self.drag = None;
+    }
+
+    /// Whether a scroll bar is being dragged.
+    pub fn is_dragging_a_bar(&self) -> bool {
+        self.drag.is_some()
     }
 }
 
@@ -119,6 +136,146 @@ pub struct PointerInput {
     pub position: [f32; 2],
     pub pressed: bool,
     pub released: bool,
+}
+
+/// The wheel and the left button, as a scroll frame reads them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScrollInput {
+    pub position: [f32; 2],
+    /// Notches this tick: x right, y away from the user.
+    pub wheel: [f32; 2],
+    pub pressed: bool,
+    /// Whether the left button is down, which a dragged bar follows.
+    pub held: bool,
+}
+
+/// Scroll the frames this tick's wheel and a held bar move. Returns whether a
+/// press landed on a bar: the bar then has it, and nothing under it does.
+pub fn scroll(world: &World, layout: &Layout, pointer: &mut UiPointer, input: ScrollInput) -> bool {
+    if !input.held {
+        pointer.drag = None;
+    }
+    if let Some(drag) = pointer.drag {
+        let view = layout
+            .index_of(drag.frame)
+            .and_then(|index| layout.scroll_of(index));
+        match view {
+            Some(view) => follow(world, layout, view, drag, input.position),
+            None => pointer.drag = None,
+        }
+        return false;
+    }
+    let Some(hit) = layout.hit(input.position, true) else {
+        return false;
+    };
+    if input.pressed
+        && let Some(drag) = grab(layout, hit, input.position)
+    {
+        pointer.drag = Some(drag);
+        if let Some(view) = layout.scroll_of(layout.index_of(drag.frame).unwrap_or(usize::MAX)) {
+            follow(world, layout, view, drag, input.position);
+        }
+        return true;
+    }
+    if input.wheel != [0.0; 2] {
+        wheel(world, layout, hit, input.wheel);
+    }
+    false
+}
+
+/// The bar of a frame at or above element `hit` that `point` is on, taken
+/// hold of where the pointer is — or by its middle, from the track beside it.
+fn grab(layout: &Layout, hit: usize, point: [f32; 2]) -> Option<BarDrag> {
+    let mut cursor = Some(hit as u32);
+    while let Some(index) = cursor {
+        let element = &layout.elements()[index as usize];
+        if let Some(view) = layout.scroll_of(index as usize) {
+            for (axis, bar) in view.bars.iter().enumerate() {
+                let Some(bar) = bar else {
+                    continue;
+                };
+                if !super::layout::contains(bar.track, point) {
+                    continue;
+                }
+                let (start, length) = along(bar.thumb, axis);
+                let grip = if (start..start + length).contains(&point[axis]) {
+                    point[axis] - start
+                } else {
+                    length / 2.0
+                };
+                return Some(BarDrag {
+                    frame: element.entity,
+                    axis,
+                    grip,
+                });
+            }
+        }
+        cursor = element.parent;
+    }
+    None
+}
+
+/// Where `rect` starts on `axis`, and how long it is along it.
+fn along(rect: crate::scene::Rect, axis: usize) -> (f32, f32) {
+    if axis == 0 {
+        (rect.x, rect.width)
+    } else {
+        (rect.y, rect.height)
+    }
+}
+
+/// Scroll `view`'s frame so the thumb `drag` holds is under `point`.
+fn follow(
+    world: &World,
+    layout: &Layout,
+    view: &super::layout::ScrollView,
+    drag: BarDrag,
+    point: [f32; 2],
+) {
+    let Some(bar) = view.bars[drag.axis] else {
+        return;
+    };
+    let (track, track_length) = along(bar.track, drag.axis);
+    let (_, thumb_length) = along(bar.thumb, drag.axis);
+    let travel = track_length - thumb_length;
+    let share = if travel > 0.0 {
+        ((point[drag.axis] - drag.grip - track) / travel).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut scroll = view.scroll;
+    scroll[drag.axis] = share * view.max_scroll[drag.axis];
+    let entity = layout.elements()[view.element as usize].entity;
+    if let Some(mut frame) = world.get_mut::<ScrollFrame>(entity) {
+        frame.scroll_position = scroll;
+    }
+}
+
+/// Scroll the innermost frame at or above element `hit` that the wheel can
+/// still move: one at its end passes the wheel on to the frame around it.
+fn wheel(world: &World, layout: &Layout, hit: usize, notches: [f32; 2]) {
+    let mut cursor = Some(hit as u32);
+    while let Some(index) = cursor {
+        let element = &layout.elements()[index as usize];
+        cursor = element.parent;
+        let Some(view) = layout.scroll_of(index as usize) else {
+            continue;
+        };
+        let Some(mut frame) = world.get_mut::<ScrollFrame>(element.entity) else {
+            continue;
+        };
+        // Wheel notches turn towards the player for content further down, so
+        // the scroll runs against them.
+        let mut delta = glam::Vec2::from(notches) * -frame.scroll_speed;
+        if !frame.vertical && notches[0] == 0.0 {
+            delta = glam::Vec2::new(delta.y, 0.0);
+        }
+        let moved = (view.scroll + delta).clamp(glam::Vec2::ZERO, view.max_scroll);
+        if moved != view.scroll {
+            frame.scroll_position = moved;
+            return;
+        }
+    }
 }
 
 /// Hit-test this tick's pointer against what the last frame drew and queue
@@ -131,6 +288,15 @@ pub fn update(world: &mut World) {
             pressed: input.mouse_button_pressed(0),
             released: input.mouse_button_released(0),
         });
+    let wheel_input =
+        world
+            .get_resource::<InputState>()
+            .map_or_else(ScrollInput::default, |state| ScrollInput {
+                position: input.position,
+                wheel: state.wheel().into(),
+                pressed: input.pressed,
+                held: state.mouse_button_down(0),
+            });
     if world.get_resource::<UiPointer>().is_none() {
         world.insert_resource(UiPointer::default());
     }
@@ -142,6 +308,10 @@ pub fn update(world: &mut World) {
     let mut events = world.resource_mut::<UiEvents>();
     events.clear();
     if let Some(tree) = tree {
+        let mut input = input;
+        if scroll(world, &tree.layout, &mut pointer, wheel_input) {
+            input.pressed = false;
+        }
         step(world, &tree.layout, &mut pointer, input, &mut events);
     }
 }
@@ -518,5 +688,228 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(ui.pointer.pressed(), None);
+    }
+
+    impl Ui {
+        /// A scroll frame of `size` at `(x, y)`, `content` units of content.
+        fn scroller(
+            &mut self,
+            parent: Option<Entity>,
+            rect: RectTransform,
+            frame: ScrollFrame,
+        ) -> Entity {
+            let entity = self.target(parent, rect);
+            self.world.insert(entity, frame);
+            entity
+        }
+
+        fn scroll_with(&mut self, input: ScrollInput) -> bool {
+            ensure_current(&mut self.world);
+            layout::resolve(
+                &self.world,
+                &self.world.resource::<Hierarchy>(),
+                &crate::scene::GameScreen::window([1000, 1000]),
+                &mut self.layout,
+            );
+            scroll(&self.world, &self.layout, &mut self.pointer, input)
+        }
+
+        fn wheel(&mut self, x: f32, y: f32, notches: [f32; 2]) {
+            self.scroll_with(ScrollInput {
+                position: [x, y],
+                wheel: notches,
+                ..ScrollInput::default()
+            });
+        }
+
+        fn scrolled(&self, frame: Entity) -> Vec2 {
+            self.world
+                .get::<ScrollFrame>(frame)
+                .unwrap()
+                .scroll_position
+        }
+    }
+
+    fn list(content: Vec2) -> ScrollFrame {
+        ScrollFrame {
+            content_size: content,
+            scroll_speed: 40.0,
+            ..ScrollFrame::default()
+        }
+    }
+
+    /// A notch towards the player scrolls the content up by the frame's speed,
+    /// and no number of them scrolls it past its end.
+    #[test]
+    fn the_wheel_scrolls_the_frame_under_the_pointer_to_its_end_and_no_further() {
+        let mut ui = Ui::new();
+        let frame = ui.scroller(
+            None,
+            at(0.0, 0.0, 200.0, 100.0),
+            list(Vec2::new(0.0, 400.0)),
+        );
+        let row = ui.target(Some(frame), at(0.0, 0.0, 200.0, 30.0));
+
+        ui.wheel(50.0, 10.0, [0.0, -1.0]);
+        assert_eq!(
+            ui.scrolled(frame),
+            Vec2::new(0.0, 40.0),
+            "over a child, too"
+        );
+        ui.wheel(50.0, 50.0, [0.0, -20.0]);
+        assert_eq!(ui.scrolled(frame), Vec2::new(0.0, 300.0));
+        ui.wheel(50.0, 50.0, [0.0, 2.5]);
+        assert_eq!(ui.scrolled(frame), Vec2::new(0.0, 200.0));
+        ui.wheel(500.0, 500.0, [0.0, 3.0]);
+        assert_eq!(ui.scrolled(frame), Vec2::new(0.0, 200.0), "not over it");
+        let _ = row;
+    }
+
+    /// A frame that scrolls only across takes the ordinary wheel across, and a
+    /// frame at its end passes the wheel to the one around it.
+    #[test]
+    fn the_wheel_goes_across_a_sideways_frame_and_on_from_one_at_its_end() {
+        let mut ui = Ui::new();
+        let outer = ui.scroller(
+            None,
+            at(0.0, 0.0, 400.0, 400.0),
+            list(Vec2::new(0.0, 1000.0)),
+        );
+        let strip = ui.scroller(
+            Some(outer),
+            at(0.0, 0.0, 400.0, 100.0),
+            ScrollFrame {
+                horizontal: true,
+                vertical: false,
+                ..list(Vec2::new(500.0, 0.0))
+            },
+        );
+        ui.wheel(50.0, 50.0, [0.0, -1.0]);
+        assert_eq!(ui.scrolled(strip), Vec2::new(40.0, 0.0));
+        assert_eq!(ui.scrolled(outer), Vec2::ZERO);
+        ui.wheel(50.0, 50.0, [0.0, -5.0]);
+        assert_eq!(ui.scrolled(strip), Vec2::new(100.0, 0.0), "at its end");
+        ui.wheel(50.0, 50.0, [0.0, -1.0]);
+        assert_eq!(
+            ui.scrolled(outer),
+            Vec2::new(0.0, 40.0),
+            "the strip has nowhere left to go"
+        );
+    }
+
+    /// A row scrolled out of the frame is not under the pointer, even where
+    /// its rectangle is: the press goes to the frame.
+    #[test]
+    fn a_child_scrolled_out_of_view_gets_no_press() {
+        let mut ui = Ui::new();
+        let frame = ui.scroller(
+            None,
+            at(0.0, 100.0, 200.0, 100.0),
+            ScrollFrame {
+                scroll_position: Vec2::new(0.0, 60.0),
+                ..list(Vec2::new(0.0, 400.0))
+            },
+        );
+        // Drawn at y 40..90, above the frame.
+        let row = ui.target(Some(frame), at(0.0, 0.0, 200.0, 50.0));
+        let down = |events: Vec<(PointerKind, Entity, Vec<Entity>)>| {
+            events
+                .into_iter()
+                .find(|(kind, ..)| *kind == PointerKind::Down)
+                .map(|(_, target, _)| target)
+        };
+        assert_eq!(down(ui.press(50.0, 60.0)), None);
+        ui.release(50.0, 60.0);
+        assert!(!ui.pointer.is_inside(row));
+        ui.world
+            .get_mut::<ScrollFrame>(frame)
+            .unwrap()
+            .scroll_position = Vec2::ZERO;
+        assert_eq!(down(ui.press(50.0, 120.0)), Some(row), "back in view");
+    }
+
+    /// Taking hold of the thumb scrolls with the pointer for as long as the
+    /// button is held, and the press reaches nothing under the bar.
+    #[test]
+    fn dragging_a_bar_scrolls_and_its_press_is_the_bars() {
+        let mut ui = Ui::new();
+        let frame = ui.scroller(
+            None,
+            at(0.0, 0.0, 200.0, 100.0),
+            ScrollFrame {
+                scrollbar_thickness: 10.0,
+                ..list(Vec2::new(0.0, 400.0))
+            },
+        );
+        let row = ui.target(Some(frame), at(0.0, 0.0, 200.0, 400.0));
+        // The thumb is a quarter of the 100-pixel track: y 0..25 at x 190..200.
+        let input = |y: f32, pressed: bool, held: bool| ScrollInput {
+            position: [195.0, y],
+            wheel: [0.0; 2],
+            pressed,
+            held,
+        };
+        assert!(ui.scroll_with(input(10.0, true, true)), "the bar takes it");
+        assert!(ui.pointer.is_dragging_a_bar());
+        // Down by half the thumb's 75 pixels of travel.
+        assert!(!ui.scroll_with(input(47.5, false, true)));
+        assert_eq!(ui.scrolled(frame), Vec2::new(0.0, 150.0));
+        ui.scroll_with(input(500.0, false, true));
+        assert_eq!(
+            ui.scrolled(frame),
+            Vec2::new(0.0, 300.0),
+            "held past the end"
+        );
+        ui.scroll_with(input(500.0, false, false));
+        assert!(!ui.pointer.is_dragging_a_bar());
+
+        // A press on the track away from the thumb jumps it there.
+        ui.world
+            .get_mut::<ScrollFrame>(frame)
+            .unwrap()
+            .scroll_position = Vec2::ZERO;
+        assert!(ui.scroll_with(input(50.0, true, true)));
+        assert_eq!(
+            ui.scrolled(frame),
+            Vec2::new(0.0, 150.0),
+            "centred on the pointer"
+        );
+        ui.scroll_with(input(50.0, false, false));
+
+        assert!(!ui.scroll_with(input(500.0, true, true)), "nowhere near it");
+        let mid = ScrollInput {
+            position: [50.0, 50.0],
+            ..input(0.0, true, true)
+        };
+        assert!(
+            !ui.scroll_with(mid),
+            "a press on the content is the content's"
+        );
+        let _ = row;
+    }
+
+    /// The whole route: the wheel in `InputState`, the tree the last frame
+    /// drew, and a frame's component scrolled by `update`.
+    #[test]
+    fn the_wheel_reaches_a_frame_through_update() {
+        let mut world = World::new();
+        let canvas = world.spawn();
+        world.insert(canvas, Canvas::default());
+        let frame = world.spawn();
+        world.insert(frame, at(0.0, 0.0, 200.0, 100.0));
+        world.insert(frame, list(Vec2::new(0.0, 400.0)));
+        reparent(&mut world, frame, Some(canvas), false).unwrap();
+        crate::ui::update(&mut world, [1000, 1000]);
+        let mut input = InputState::new();
+        input.place_cursor((20.0, 20.0));
+        input.scroll_wheel((0.0, -2.0));
+        world.insert_resource(input);
+
+        update(&mut world);
+        assert_eq!(
+            world.get::<ScrollFrame>(frame).unwrap().scroll_position,
+            Vec2::new(0.0, 80.0)
+        );
+        assert!(world.resource::<UiPointer>().is_over_ui());
     }
 }

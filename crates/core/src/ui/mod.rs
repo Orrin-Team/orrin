@@ -43,6 +43,35 @@
 //! in the texture's uploaded pixels, so the painter needs nothing new to draw
 //! one and a frame of them still batches by texture.
 //!
+//! # Modifiers
+//!
+//! [`Gradient`], [`Corner`], [`Stroke`] and [`Shadow`] change how an element
+//! draws without being anything it draws: they sit on the element's entity
+//! beside its `Image` or `Text`, so restyling a button is an inspector edit and
+//! a prefab override like any other. [`extract`] resolves them into pixels and
+//! records each piece as its own command — the shadow under the image, the
+//! stroke over it — with a style beside it; the painter's module says how a
+//! style is drawn. A corner rounds the box and everything that follows it; a
+//! gradient colours the image and the text; a stroke rings the box, or each
+//! glyph of an element that is only text. A shadow is the box's alone, because
+//! a glyph's would need a blurred copy of every glyph in the atlas.
+//!
+//! An element with no modifier, in a world that has none, is recorded exactly
+//! as before there were any: the walk checks once a frame which of them the
+//! world holds at all, and it and the recording skip every per-element lookup
+//! for those it does not.
+//!
+//! # Scrolling
+//!
+//! A [`ScrollFrame`]'s children are anchored to a content area at least as
+//! large as the frame and moved by its scroll, clamped as it is laid out, so a
+//! script may write any position and see the nearest one there is. The content
+//! is cut to the frame — and to every frame around it, the clips intersecting
+//! — by the painter's own clipping, and the hit test cuts by the same
+//! rectangle, so a child scrolled out of view is not under the pointer. The
+//! clip is the frame's rectangle, not its `Corner`. Its bars draw over the
+//! content once the frame's subtree is done, as pills.
+//!
 //! # Pointer events
 //!
 //! [`events::update`] hit-tests the pointer before the script tick against the
@@ -55,6 +84,12 @@
 //! stops the pointer and lets nothing at or under it take part. Only a ticking
 //! game gets events: edit mode and a paused game get none, and edit mode keeps
 //! no pointer state, so a button tints only while the game runs.
+//!
+//! The wheel goes the same way, to the nearest scroll frame at or above the
+//! topmost target that can still move — one at its end hands it to the frame
+//! around it — and a frame stops the pointer anywhere in its viewport, so the
+//! gaps between its rows still scroll it. A press on a bar is the bar's: it
+//! drags the thumb until release, and nothing under it hears of the press.
 
 pub mod components;
 pub mod create;
@@ -62,7 +97,10 @@ pub mod events;
 pub mod extract;
 pub mod layout;
 
-pub use components::{Button, Canvas, Image, RectTransform, ScaleMode, Text};
+pub use components::{
+    Button, Canvas, Corner, CornerStyle, Gradient, Image, RectTransform, ScaleMode, ScrollFrame,
+    ScrollbarVisibility, Shadow, Stroke, StrokePlacement, Text,
+};
 pub use layout::{Element, Layout};
 
 use orrin_ecs::World;
@@ -248,6 +286,30 @@ mod tests {
         assert_eq!(world.resource::<UiCanvas>().commands().len(), 1);
     }
 
+    /// What the world has is remembered between frames, and forgotten the
+    /// moment its structure changes: a modifier or a scroll frame added to a
+    /// tree that had none is drawn by the very next update.
+    #[test]
+    fn a_modifier_added_between_frames_is_drawn_the_next() {
+        let mut world = World::new();
+        menu(&mut world);
+        update(&mut world, [1920, 1080]);
+        assert!(world.resource::<UiTree>().canvas.styles().is_empty());
+
+        let button = named(&world, "Button");
+        world.insert(button, Corner::default());
+        update(&mut world, [1920, 1080]);
+        assert_eq!(world.resource::<UiTree>().canvas.styles().len(), 1);
+
+        let panel = named(&world, "Panel");
+        world.insert(panel, ScrollFrame::default());
+        update(&mut world, [1920, 1080]);
+        assert_eq!(world.resource::<UiTree>().layout.scrolls().len(), 1);
+        world.remove::<Corner>(button);
+        update(&mut world, [1920, 1080]);
+        assert!(world.resource::<UiTree>().canvas.styles().is_empty());
+    }
+
     #[test]
     fn a_ui_tree_survives_a_save_and_a_load() {
         let registry = registry();
@@ -268,6 +330,88 @@ mod tests {
         let issues = load(&text, &mut loaded, &registry).unwrap();
         assert!(issues.is_empty(), "{issues:?}");
         assert_menu(&loaded);
+    }
+
+    /// Every modifier is saved under its own id and read back as written.
+    #[test]
+    fn a_styled_tree_survives_a_save_and_a_load() {
+        let registry = registry();
+        let mut world = World::new();
+        menu(&mut world);
+        let button = named(&world, "Button");
+        let panel = named(&world, "Panel");
+        let gradient = Gradient {
+            rotation: 90.0,
+            ..Gradient::default()
+        };
+        let corner = Corner {
+            style: CornerStyle::Squircle,
+            radius_fraction: 0.5,
+            ..Corner::default()
+        };
+        let stroke = Stroke {
+            placement: StrokePlacement::Outside,
+            ..Stroke::default()
+        };
+        let shadow = Shadow {
+            spread: 3.0,
+            ..Shadow::default()
+        };
+        let scroll = ScrollFrame {
+            content_size: Vec2::new(0.0, 2000.0),
+            scroll_position: Vec2::new(0.0, 50.0),
+            ..ScrollFrame::default()
+        };
+        world.insert(button, gradient);
+        world.insert(button, corner);
+        world.insert(button, stroke);
+        world.insert(button, shadow);
+        world.insert(panel, scroll);
+        let text = save(&mut world, &registry);
+        for id in [
+            "orrin.ui.gradient",
+            "orrin.ui.corner",
+            "orrin.ui.stroke",
+            "orrin.ui.shadow",
+            "orrin.ui.scroll_frame",
+        ] {
+            assert!(text.contains(id), "{id} missing from:\n{text}");
+        }
+
+        let mut loaded = World::new();
+        let issues = load(&text, &mut loaded, &registry).unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_menu(&loaded);
+        let (button, panel) = (named(&loaded, "Button"), named(&loaded, "Panel"));
+        assert_eq!(*loaded.get::<Gradient>(button).unwrap(), gradient);
+        assert_eq!(*loaded.get::<Corner>(button).unwrap(), corner);
+        assert_eq!(*loaded.get::<Stroke>(button).unwrap(), stroke);
+        assert_eq!(*loaded.get::<Shadow>(button).unwrap(), shadow);
+        assert_eq!(*loaded.get::<ScrollFrame>(panel).unwrap(), scroll);
+    }
+
+    /// A scene saved before the modifiers existed names none of them, and
+    /// loads as the tree it was, with nothing added.
+    #[test]
+    fn a_scene_saved_without_the_modifiers_still_loads() {
+        let registry = registry();
+        let mut world = World::new();
+        menu(&mut world);
+        let text = save(&mut world, &registry);
+        assert!(!text.contains("orrin.ui.corner"), "{text}");
+
+        let mut loaded = World::new();
+        let issues = load(&text, &mut loaded, &registry).unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_menu(&loaded);
+        let styled = loaded.entities().any(|e| {
+            loaded.has::<Gradient>(e)
+                || loaded.has::<Corner>(e)
+                || loaded.has::<Stroke>(e)
+                || loaded.has::<Shadow>(e)
+                || loaded.has::<ScrollFrame>(e)
+        });
+        assert!(!styled);
     }
 
     #[test]

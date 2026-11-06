@@ -1,7 +1,7 @@
 use glam::Vec2;
 use orrin_ecs::{Entity, World};
 
-use super::{Button, Canvas, Image, RectTransform, Text};
+use super::{Button, Canvas, Image, RectTransform, ScrollFrame, Text};
 use crate::scene::{Name, Parent, TextAnchor, reparent};
 
 /// What the editor's Create ▸ UI menu makes.
@@ -12,6 +12,7 @@ pub enum UiKind {
     Image,
     Text,
     Button,
+    ScrollFrame,
 }
 
 impl UiKind {
@@ -22,6 +23,7 @@ impl UiKind {
             Self::Image => "Image",
             Self::Text => "Text",
             Self::Button => "Button",
+            Self::ScrollFrame => "Scroll Frame",
         }
     }
 }
@@ -113,6 +115,24 @@ pub fn create(world: &mut World, kind: UiKind, under: Option<Entity>) -> Created
                 },
             );
             button
+        }
+        UiKind::ScrollFrame => {
+            element(world, parent, kind, sized(300.0, 200.0), |world, entity| {
+                world.insert(
+                    entity,
+                    Image {
+                        color: [1.0, 1.0, 1.0, 0.39],
+                        ..Image::default()
+                    },
+                );
+                world.insert(
+                    entity,
+                    ScrollFrame {
+                        content_size: Vec2::new(0.0, 600.0),
+                        ..ScrollFrame::default()
+                    },
+                );
+            })
         }
     };
     Created {

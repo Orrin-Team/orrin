@@ -138,6 +138,58 @@ pub enum UiCommand {
     },
 }
 
+/// How one command is drawn beyond a flat rectangle: the retained UI's
+/// modifiers, resolved to pixels. Kept beside the commands rather than in
+/// them, so a plain panel or label is no larger for their existence and the
+/// painter's plain path costs one comparison a command.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum UiStyle {
+    /// Cut to a rounded box and coloured along a gradient.
+    Shape(ShapeStyle),
+    /// A text command's glyphs grown by `width` pixels: the ring a stroke draws
+    /// round them, in the command's colour.
+    Outline { width: f32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapeStyle {
+    /// The box the command is cut to, which may be larger or smaller than what
+    /// the command covers; `None` cuts nothing.
+    pub bounds: Option<Rect>,
+    /// The corners' radius in pixels.
+    pub radius: f32,
+    /// The corners' superellipse exponent: 2 is a circle.
+    pub exponent: f32,
+    pub paint: ShapePaint,
+    pub gradient: Option<GradientPaint>,
+}
+
+/// What of the box a shape covers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShapePaint {
+    Fill,
+    /// A band `width` pixels wide centred on the box's edge.
+    Ring {
+        width: f32,
+    },
+    /// The box blurred by a Gaussian of this standard deviation, in pixels.
+    Blur {
+        sigma: f32,
+    },
+}
+
+/// A linear blend between two colours, multiplied into a command's own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradientPaint {
+    /// sRGB, straight alpha.
+    pub start: [u8; 4],
+    pub end: [u8; 4],
+    /// Where on screen the blend is all `start`, and its rate: a point `p` is
+    /// `dot(p - origin, step)` of the way to `end`.
+    pub origin: [f32; 2],
+    pub step: [f32; 2],
+}
+
 /// This frame's UI, in draw order. A world resource.
 #[derive(Default)]
 pub struct UiCanvas {
@@ -146,6 +198,11 @@ pub struct UiCanvas {
     /// Every text command's bytes, end to end, so a frame of labels is one
     /// allocation that is kept, not one per label.
     text: String,
+    /// The styled commands, by index, in order.
+    styles: Vec<(u32, UiStyle)>,
+    /// From each index on, what the commands are cut to; `None` is nothing
+    /// beyond the layer's own bounds.
+    clips: Vec<(u32, Option<Rect>)>,
 }
 
 impl UiCanvas {
@@ -153,14 +210,43 @@ impl UiCanvas {
     /// `screen` as the size of the window.
     pub fn begin(&mut self, screen: [u32; 2]) {
         self.screen = screen.map(|side| side as f32);
-        self.commands.clear();
-        self.text.clear();
+        self.clear();
     }
 
     /// Drop whatever was drawn, keeping the screen size.
     pub fn clear(&mut self) {
         self.commands.clear();
         self.text.clear();
+        self.styles.clear();
+        self.clips.clear();
+    }
+
+    /// Record what `draw` records, drawn with `style`. A call that records
+    /// nothing — it would draw no pixels — takes no style either.
+    pub fn styled(&mut self, style: UiStyle, draw: impl FnOnce(&mut Self)) {
+        let at = self.commands.len();
+        draw(self);
+        if self.commands.len() > at {
+            self.styles.push((at as u32, style));
+        }
+    }
+
+    /// Cut every command recorded from here on to `rect`, or to nothing beyond
+    /// the layer's bounds.
+    pub fn clip(&mut self, rect: Option<Rect>) {
+        let at = self.commands.len() as u32;
+        match self.clips.last_mut() {
+            Some(last) if last.0 == at => last.1 = rect,
+            _ => self.clips.push((at, rect)),
+        }
+    }
+
+    pub fn styles(&self) -> &[(u32, UiStyle)] {
+        &self.styles
+    }
+
+    pub fn clips(&self) -> &[(u32, Option<Rect>)] {
+        &self.clips
     }
 
     pub fn screen(&self) -> [f32; 2] {
@@ -349,6 +435,31 @@ mod tests {
         );
         canvas.image(Rect::new(0.0, 0.0, 10.0, -1.0), AssetId::new(), [255; 4]);
         assert!(canvas.is_empty(), "{:?}", canvas.commands());
+    }
+
+    /// A style names the command it was recorded with, and a call that drew
+    /// nothing leaves none behind to land on the next command.
+    #[test]
+    fn a_style_and_a_clip_land_on_the_commands_they_were_recorded_with() {
+        let mut canvas = UiCanvas::default();
+        let rect = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let ring = UiStyle::Outline { width: 2.0 };
+        canvas.panel(rect, [255; 4]);
+        canvas.styled(ring, |canvas| canvas.panel(rect, [255, 255, 255, 0]));
+        canvas.clip(Some(rect));
+        canvas.styled(ring, |canvas| canvas.panel(rect, [255; 4]));
+        canvas.clip(None);
+        canvas.clip(Some(Rect::new(1.0, 1.0, 2.0, 2.0)));
+        canvas.panel(rect, [255; 4]);
+        assert_eq!(canvas.commands().len(), 3);
+        assert_eq!(canvas.styles(), [(1, ring)]);
+        assert_eq!(
+            canvas.clips(),
+            [(1, Some(rect)), (2, Some(Rect::new(1.0, 1.0, 2.0, 2.0)))],
+            "a clip replaced before anything drew under it is forgotten"
+        );
+        canvas.begin([10, 10]);
+        assert!(canvas.styles().is_empty() && canvas.clips().is_empty());
     }
 
     #[test]

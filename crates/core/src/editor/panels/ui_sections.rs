@@ -14,9 +14,14 @@ use crate::editor::icons;
 use crate::editor::state::EditorState;
 use crate::editor::widgets;
 use crate::scene::TextAnchor;
-use crate::scene::registry::{BUTTON, CANVAS, IMAGE, RECT_TRANSFORM, TEXT};
+use crate::scene::registry::{
+    BUTTON, CANVAS, CORNER, GRADIENT, IMAGE, RECT_TRANSFORM, SCROLL_FRAME, SHADOW, STROKE, TEXT,
+};
 use crate::ui::components::AnchorPreset;
-use crate::ui::{Button, Canvas, Image, RectTransform, ScaleMode, Text, UiTree};
+use crate::ui::{
+    Button, Canvas, Corner, CornerStyle, Gradient, Image, RectTransform, ScaleMode, ScrollFrame,
+    ScrollbarVisibility, Shadow, Stroke, StrokePlacement, Text, UiTree,
+};
 
 /// Every UI section the entity has a component for.
 pub fn sections(
@@ -31,6 +36,11 @@ pub fn sections(
     image_section(ui, world, state, entity, filter);
     text_section(ui, world, state, entity, filter);
     button_section(ui, world, state, entity, filter);
+    scroll_frame_section(ui, world, state, entity, filter);
+    corner_section(ui, world, state, entity, filter);
+    gradient_section(ui, world, state, entity, filter);
+    stroke_section(ui, world, state, entity, filter);
+    shadow_section(ui, world, state, entity, filter);
 }
 
 /// Post `after` as an edit of `id` if it differs from `before`.
@@ -465,4 +475,232 @@ fn button_section(
         },
     );
     edit(state, entity, BUTTON, &before, &button);
+}
+
+fn length(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
+    widgets::property(ui, label, |ui| {
+        ui.add(egui::DragValue::new(value).speed(0.25).range(range));
+    });
+}
+
+fn gradient_section(
+    ui: &mut egui::Ui,
+    world: &World,
+    state: &mut EditorState,
+    entity: Entity,
+    filter: &Filter,
+) {
+    let Some(before) = world.get::<Gradient>(entity).map(|gradient| *gradient) else {
+        return;
+    };
+    let mut gradient = before;
+    let labels = ["Start", "End", "Rotation", "Offset"];
+    section(
+        ui,
+        state,
+        (entity, GRADIENT),
+        ("Gradient", icons::palette()),
+        &labels,
+        filter,
+        |ui| {
+            colour(ui, "Start", &mut gradient.start);
+            colour(ui, "End", &mut gradient.end);
+            widgets::property(ui, "Rotation", |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut gradient.rotation)
+                        .speed(1.0)
+                        .suffix("°"),
+                )
+                .on_hover_text("Clockwise on screen; 0 runs left to right");
+            });
+            pair(ui, "Offset", &mut gradient.offset, 0.01);
+        },
+    );
+    edit(state, entity, GRADIENT, &before, &gradient);
+}
+
+fn corner_section(
+    ui: &mut egui::Ui,
+    world: &World,
+    state: &mut EditorState,
+    entity: Entity,
+    filter: &Filter,
+) {
+    let Some(before) = world.get::<Corner>(entity).map(|corner| *corner) else {
+        return;
+    };
+    let mut corner = before;
+    let labels = ["Radius", "Fraction", "Style", "Exponent"];
+    section(
+        ui,
+        state,
+        (entity, CORNER),
+        ("Corner", icons::box_()),
+        &labels,
+        filter,
+        |ui| {
+            length(ui, "Radius", &mut corner.radius, 0.0..=f32::MAX);
+            widgets::property(ui, "Fraction", |ui| {
+                ui.add(egui::Slider::new(&mut corner.radius_fraction, 0.0..=0.5))
+                    .on_hover_text("Of the shorter side, added to the radius: 0.5 is a pill");
+            });
+            widgets::property(ui, "Style", |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut corner.style, CornerStyle::Round, "Round");
+                    ui.selectable_value(&mut corner.style, CornerStyle::Squircle, "Squircle")
+                        .on_hover_text("Curvature that eases in from the edge, like iOS's corners");
+                });
+            });
+            if corner.style == CornerStyle::Squircle {
+                widgets::property(ui, "Exponent", |ui| {
+                    ui.add(egui::Slider::new(&mut corner.exponent, Corner::EXPONENTS))
+                        .on_hover_text("2 is a circle; higher squares the corner off");
+                });
+            }
+        },
+    );
+    edit(state, entity, CORNER, &before, &corner);
+}
+
+fn stroke_section(
+    ui: &mut egui::Ui,
+    world: &World,
+    state: &mut EditorState,
+    entity: Entity,
+    filter: &Filter,
+) {
+    let Some(before) = world.get::<Stroke>(entity).map(|stroke| *stroke) else {
+        return;
+    };
+    let mut stroke = before;
+    let labels = ["Colour", "Thickness", "Placement"];
+    section(
+        ui,
+        state,
+        (entity, STROKE),
+        ("Stroke", icons::circle()),
+        &labels,
+        filter,
+        |ui| {
+            colour(ui, "Colour", &mut stroke.color);
+            length(ui, "Thickness", &mut stroke.thickness, 0.0..=f32::MAX);
+            widgets::property(ui, "Placement", |ui| {
+                let name = |placement| match placement {
+                    StrokePlacement::Inside => "Inside",
+                    StrokePlacement::Center => "Centre",
+                    StrokePlacement::Outside => "Outside",
+                };
+                egui::ComboBox::from_id_salt("stroke placement")
+                    .selected_text(name(stroke.placement))
+                    .show_ui(ui, |ui| {
+                        for placement in [
+                            StrokePlacement::Inside,
+                            StrokePlacement::Center,
+                            StrokePlacement::Outside,
+                        ] {
+                            ui.selectable_value(&mut stroke.placement, placement, name(placement));
+                        }
+                    })
+                    .response
+                    .on_hover_text("Against the box's edge; text is always ringed outside");
+            });
+        },
+    );
+    edit(state, entity, STROKE, &before, &stroke);
+}
+
+fn shadow_section(
+    ui: &mut egui::Ui,
+    world: &World,
+    state: &mut EditorState,
+    entity: Entity,
+    filter: &Filter,
+) {
+    let Some(before) = world.get::<Shadow>(entity).map(|shadow| *shadow) else {
+        return;
+    };
+    let mut shadow = before;
+    let labels = ["Colour", "Offset", "Blur", "Spread"];
+    section(
+        ui,
+        state,
+        (entity, SHADOW),
+        ("Shadow", icons::layers()),
+        &labels,
+        filter,
+        |ui| {
+            colour(ui, "Colour", &mut shadow.color);
+            pair(ui, "Offset", &mut shadow.offset, 0.25);
+            length(ui, "Blur", &mut shadow.blur, 0.0..=f32::MAX);
+            length(ui, "Spread", &mut shadow.spread, f32::MIN..=f32::MAX);
+        },
+    );
+    edit(state, entity, SHADOW, &before, &shadow);
+}
+
+fn scroll_frame_section(
+    ui: &mut egui::Ui,
+    world: &World,
+    state: &mut EditorState,
+    entity: Entity,
+    filter: &Filter,
+) {
+    let Some(before) = world.get::<ScrollFrame>(entity).map(|frame| *frame) else {
+        return;
+    };
+    let mut frame = before;
+    let labels = [
+        "Content size",
+        "Scroll position",
+        "Scrolls",
+        "Speed",
+        "Scrollbars",
+        "Bar thickness",
+        "Bar colour",
+    ];
+    section(
+        ui,
+        state,
+        (entity, SCROLL_FRAME),
+        ("Scroll Frame", icons::list_tree()),
+        &labels,
+        filter,
+        |ui| {
+            pair(ui, "Content size", &mut frame.content_size, 1.0);
+            pair(ui, "Scroll position", &mut frame.scroll_position, 1.0);
+            widgets::property(ui, "Scrolls", |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut frame.horizontal, "Across");
+                    ui.checkbox(&mut frame.vertical, "Down");
+                });
+            });
+            length(ui, "Speed", &mut frame.scroll_speed, 0.0..=f32::MAX);
+            widgets::property(ui, "Scrollbars", |ui| {
+                let name = |visibility| match visibility {
+                    ScrollbarVisibility::Auto => "When it scrolls",
+                    ScrollbarVisibility::Always => "Always",
+                    ScrollbarVisibility::Never => "Never",
+                };
+                egui::ComboBox::from_id_salt("scrollbar visibility")
+                    .selected_text(name(frame.scrollbar))
+                    .show_ui(ui, |ui| {
+                        for visibility in [
+                            ScrollbarVisibility::Auto,
+                            ScrollbarVisibility::Always,
+                            ScrollbarVisibility::Never,
+                        ] {
+                            ui.selectable_value(&mut frame.scrollbar, visibility, name(visibility));
+                        }
+                    });
+            });
+            length(
+                ui,
+                "Bar thickness",
+                &mut frame.scrollbar_thickness,
+                0.0..=f32::MAX,
+            );
+            colour(ui, "Bar colour", &mut frame.scrollbar_color);
+        },
+    );
+    edit(state, entity, SCROLL_FRAME, &before, &frame);
 }

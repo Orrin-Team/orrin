@@ -11,6 +11,12 @@
 //! which keeps the table's [`MAX_TEXTURES`](crate::gfx::MAX_TEXTURES) for
 //! materials.
 //!
+//! A styled element's rectangles — rounded, ringed, blurred or graded — are a
+//! second pipeline over the same two sets, fed [`UiShape`](crate::gfx::ui::UiShape)s rather than quads,
+//! so a plain glyph pays nothing for the styling; the frame switches between
+//! the two at the seams the painter's call order leaves, which is the only
+//! cost a styled element puts on the elements around it.
+//!
 //! The atlas is copied at the top of the frame's command buffer, ahead of every
 //! pass, because the draw itself is inside a render pass where nothing may be
 //! copied. Only rows the atlas has ever written are sent, and only in a frame
@@ -55,32 +61,86 @@ const STREAM: VertexStream = VertexStream {
     ],
 };
 
+/// [`UiShape`](crate::gfx::ui::UiShape) as the shape pipeline reads it, one per instance.
+const SHAPE_STREAM: VertexStream = VertexStream {
+    stride: 88,
+    per_instance: true,
+    attributes: &[
+        VertexAttribute {
+            name: "rect",
+            format: VertexFormat::Float4,
+            offset: 0,
+        },
+        VertexAttribute {
+            name: "uv",
+            format: VertexFormat::Float4,
+            offset: 16,
+        },
+        VertexAttribute {
+            name: "shape",
+            format: VertexFormat::Float4,
+            offset: 32,
+        },
+        VertexAttribute {
+            name: "params",
+            format: VertexFormat::Float4,
+            offset: 48,
+        },
+        VertexAttribute {
+            name: "gradient",
+            format: VertexFormat::Float4,
+            offset: 64,
+        },
+        VertexAttribute {
+            name: "color0",
+            format: VertexFormat::Unorm8x4,
+            offset: 80,
+        },
+        VertexAttribute {
+            name: "color1",
+            format: VertexFormat::Unorm8x4,
+            offset: 84,
+        },
+    ],
+};
+
 /// The atlas as last uploaded.
 struct Atlas {
     view: TextureViewId,
-    set: BindGroupId,
+    /// As set 1 of the quad pipeline and of the shape pipeline.
+    sets: [BindGroupId; 2],
     extent: [u32; 2],
     generation: u64,
 }
 
 pub(super) struct UiPass {
-    pipeline: PipelineId,
+    /// The quad pipeline, then the shape pipeline.
+    pipelines: [PipelineId; 2],
     linear_output: bool,
     sampler: SamplerId,
     atlas: Option<Atlas>,
-    /// The material table as set 0 of this pipeline, until a texture changes.
-    textures: Option<BindGroupId>,
+    /// The material table as set 0 of each pipeline, until a texture changes.
+    textures: Option<[BindGroupId; 2]>,
 }
+
+const QUADS: usize = 0;
+const SHAPES: usize = 1;
 
 impl UiPass {
     pub(super) fn new(device: &Device, format: Format) -> Self {
-        Self {
-            pipeline: device.create_graphics_pipeline(&GraphicsPipelineDesc {
-                vertex_streams: &[STREAM],
+        let pipeline = |stream, vertex, fragment| {
+            device.create_graphics_pipeline(&GraphicsPipelineDesc {
+                vertex_streams: &[stream],
                 blend: Blend::Alpha,
                 partial_texture_set: Some(0),
-                ..GraphicsPipelineDesc::fullscreen(ShaderId::UiVert, ShaderId::UiFrag, &[format])
-            }),
+                ..GraphicsPipelineDesc::fullscreen(vertex, fragment, &[format])
+            })
+        };
+        Self {
+            pipelines: [
+                pipeline(STREAM, ShaderId::UiVert, ShaderId::UiFrag),
+                pipeline(SHAPE_STREAM, ShaderId::UiShapeVert, ShaderId::UiShapeFrag),
+            ],
             linear_output: format.is_srgb(),
             // Mipmapped for an icon drawn smaller than its file; clamped so a
             // filtered edge does not wrap round to the opposite one.
@@ -99,7 +159,7 @@ impl UiPass {
 
     /// Forget the material table's set: a texture was loaded or replaced.
     pub(super) fn invalidate_textures(&mut self, device: &Device) {
-        if let Some(set) = self.textures.take() {
+        for set in self.textures.take().into_iter().flatten() {
             device.destroy_bind_group(set);
         }
     }
@@ -117,8 +177,9 @@ impl UiPass {
             return;
         }
         if self.textures.is_none() {
-            self.textures =
-                Some(device.create_texture_array_group(self.pipeline, 0, textures, self.sampler));
+            self.textures = Some(self.pipelines.map(|pipeline| {
+                device.create_texture_array_group(pipeline, 0, textures, self.sampler)
+            }));
         }
 
         let source = frame.atlas;
@@ -136,7 +197,9 @@ impl UiPass {
             .is_none_or(|atlas| atlas.extent != extent);
         if fresh {
             if let Some(old) = self.atlas.take() {
-                device.destroy_bind_group(old.set);
+                for set in old.sets {
+                    device.destroy_bind_group(set);
+                }
                 device.destroy_texture(old.view);
             }
             let view = device.create_texture(&TextureDesc {
@@ -149,20 +212,22 @@ impl UiPass {
                 usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
                 memoryless: false,
             });
-            let set = device.create_persistent_bind_group(
-                self.pipeline,
-                1,
-                &[Binding {
-                    binding: 0,
-                    resource: BindingResource::SampledTexture {
-                        view,
-                        sampler: self.sampler,
-                    },
-                }],
-            );
+            let sets = self.pipelines.map(|pipeline| {
+                device.create_persistent_bind_group(
+                    pipeline,
+                    1,
+                    &[Binding {
+                        binding: 0,
+                        resource: BindingResource::SampledTexture {
+                            view,
+                            sampler: self.sampler,
+                        },
+                    }],
+                )
+            });
             self.atlas = Some(Atlas {
                 view,
-                set,
+                sets,
                 extent,
                 generation: 0,
             });
@@ -189,29 +254,52 @@ impl UiPass {
         if frame.is_empty() {
             return;
         }
-        let quads = device.upload_vertices(bytemuck::cast_slice(frame.quads));
+        let streams = [
+            (!frame.quads.is_empty())
+                .then(|| device.upload_vertices(bytemuck::cast_slice(frame.quads))),
+            (!frame.shapes.is_empty())
+                .then(|| device.upload_vertices(bytemuck::cast_slice(frame.shapes))),
+        ];
         let size = [extent[0] as f32, extent[1] as f32];
         encoder.set_viewport(Viewport {
             origin: [0.0, 0.0],
             extent: size,
             depth_range: [0.0, 1.0],
         });
-        encoder.bind_pipeline(self.pipeline);
-        encoder.bind_group(0, textures);
-        encoder.bind_group(1, atlas.set);
-        encoder.bind_vertex_buffer(quads);
-        for batch in frame.batches {
-            let index = match batch.source {
-                UiSource::Atlas => ATLAS,
-                UiSource::Texture(handle) => handle.0,
+        let mut bound = None;
+        let mut draw =
+            |encoder: &mut Encoder, kind: usize, source: UiSource, range: std::ops::Range<u32>| {
+                if bound != Some(kind) {
+                    let Some(stream) = streams[kind] else {
+                        return;
+                    };
+                    encoder.bind_pipeline(self.pipelines[kind]);
+                    encoder.bind_group(0, textures[kind]);
+                    encoder.bind_group(1, atlas.sets[kind]);
+                    encoder.bind_vertex_buffer(stream);
+                    bound = Some(kind);
+                }
+                let index = match source {
+                    UiSource::Atlas => ATLAS,
+                    UiSource::Texture(handle) => handle.0,
+                };
+                encoder.push_constants(&[
+                    size[0].to_bits(),
+                    size[1].to_bits(),
+                    self.linear_output as u32,
+                    index,
+                ]);
+                encoder.draw(6, range.len() as u32, 0, range.start);
             };
-            encoder.push_constants(&[
-                size[0].to_bits(),
-                size[1].to_bits(),
-                self.linear_output as u32,
-                index,
-            ]);
-            encoder.draw(6, batch.quads.len() as u32, 0, batch.quads.start);
+        let mut shapes = frame.shape_batches.iter().peekable();
+        for (at, batch) in frame.batches.iter().enumerate() {
+            while let Some(run) = shapes.next_if(|run| run.before as usize <= at) {
+                draw(encoder, SHAPES, run.source, run.shapes.clone());
+            }
+            draw(encoder, QUADS, batch.source, batch.quads.clone());
+        }
+        for run in shapes {
+            draw(encoder, SHAPES, run.source, run.shapes.clone());
         }
     }
 }
@@ -221,7 +309,25 @@ mod tests {
     use std::mem::{offset_of, size_of};
 
     use super::*;
-    use crate::gfx::ui::UiQuad;
+    use crate::gfx::ui::{UiQuad, UiShape};
+
+    #[test]
+    fn the_shape_stream_matches_the_shape() {
+        assert_eq!(SHAPE_STREAM.stride as usize, size_of::<UiShape>());
+        let offsets = [
+            ("rect", offset_of!(UiShape, rect)),
+            ("uv", offset_of!(UiShape, uv)),
+            ("shape", offset_of!(UiShape, shape)),
+            ("params", offset_of!(UiShape, params)),
+            ("gradient", offset_of!(UiShape, gradient)),
+            ("color0", offset_of!(UiShape, colors)),
+            ("color1", offset_of!(UiShape, colors) + 4),
+        ];
+        assert_eq!(SHAPE_STREAM.attributes.len(), offsets.len());
+        for (attribute, (name, offset)) in SHAPE_STREAM.attributes.iter().zip(offsets) {
+            assert_eq!((attribute.name, attribute.offset as usize), (name, offset));
+        }
+    }
 
     #[test]
     fn the_instance_stream_matches_the_quad() {

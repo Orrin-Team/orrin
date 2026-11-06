@@ -396,6 +396,7 @@ pub fn spawn_entries(ui: &mut egui::Ui, state: &mut EditorState) {
             UiKind::Image,
             UiKind::Text,
             UiKind::Button,
+            UiKind::ScrollFrame,
         ] {
             if ui.button(kind.name()).clicked() {
                 state.request_spawn(SpawnKind::Ui(kind));

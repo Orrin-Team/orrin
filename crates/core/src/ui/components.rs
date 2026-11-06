@@ -271,6 +271,200 @@ impl Default for Button {
     }
 }
 
+/// Colours what the element fills — its `Image` and its `Text` — with a linear
+/// blend from `start` to `end`, multiplied into the element's own colour.
+///
+/// At `rotation` 0 the blend runs left to right; the angle is in degrees,
+/// clockwise on screen, and the blend always spans the element's whole box
+/// along that axis. `offset` moves it by a fraction of the element's size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gradient {
+    /// sRGB, straight alpha.
+    pub start: [f32; 4],
+    /// sRGB, straight alpha.
+    pub end: [f32; 4],
+    pub rotation: f32,
+    pub offset: Vec2,
+}
+
+impl Default for Gradient {
+    fn default() -> Self {
+        Self {
+            start: [1.0; 4],
+            end: [0.0, 0.0, 0.0, 1.0],
+            rotation: 0.0,
+            offset: Vec2::ZERO,
+        }
+    }
+}
+
+/// The curve a [`Corner`] is cut along.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+pub enum CornerStyle {
+    /// A quarter circle.
+    #[default]
+    Round,
+    /// A quarter superellipse, whose curvature eases in from the straight edge
+    /// rather than starting at once — the continuous corner of Apple's icons.
+    Squircle,
+}
+
+/// Rounds the element's box: its image, and the [`Stroke`] and [`Shadow`] on
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Corner {
+    /// In canvas units.
+    pub radius: f32,
+    /// Added to `radius`, as a fraction of the box's shorter side: 0.5 is a
+    /// pill whatever the size.
+    pub radius_fraction: f32,
+    pub style: CornerStyle,
+    /// The squircle's superellipse exponent: 2 is a circle, and the corner
+    /// squares off as it grows. Ignored by `Round`.
+    pub exponent: f32,
+}
+
+impl Default for Corner {
+    fn default() -> Self {
+        Self {
+            radius: 8.0,
+            radius_fraction: 0.0,
+            style: CornerStyle::Round,
+            exponent: 4.0,
+        }
+    }
+}
+
+impl Corner {
+    /// The exponents a corner may be cut with: below 2 the corner is no longer
+    /// convex, and past 12 it is indistinguishable from a square one.
+    pub const EXPONENTS: std::ops::RangeInclusive<f32> = 2.0..=12.0;
+
+    /// The radius in pixels on a box `size` pixels across, `pixels` to a unit.
+    pub fn radius_px(&self, size: Vec2, pixels: f32) -> f32 {
+        let short = size.x.min(size.y).max(0.0);
+        (self.radius * pixels + self.radius_fraction * short).clamp(0.0, short / 2.0)
+    }
+
+    /// The superellipse exponent the shape is cut with.
+    pub fn exponent(&self) -> f32 {
+        match self.style {
+            CornerStyle::Round => 2.0,
+            CornerStyle::Squircle => self
+                .exponent
+                .clamp(*Self::EXPONENTS.start(), *Self::EXPONENTS.end()),
+        }
+    }
+}
+
+/// Where a [`Stroke`] sits against the edge it follows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+pub enum StrokePlacement {
+    /// Wholly inside the box, so the element covers no more than its rect.
+    #[default]
+    Inside,
+    Center,
+    Outside,
+}
+
+/// An outline. On an element with an `Image`, or with nothing else to draw, it
+/// follows the box — and its [`Corner`]; on one that is only `Text`, it rings
+/// each glyph, always outside it, since a stroke over the ink would thin it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Stroke {
+    /// sRGB, straight alpha.
+    pub color: [f32; 4],
+    /// In canvas units.
+    pub thickness: f32,
+    pub placement: StrokePlacement,
+}
+
+impl Default for Stroke {
+    fn default() -> Self {
+        Self {
+            color: [0.0, 0.0, 0.0, 1.0],
+            thickness: 2.0,
+            placement: StrokePlacement::Inside,
+        }
+    }
+}
+
+/// A drop shadow under the element's box, following its [`Corner`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shadow {
+    /// sRGB, straight alpha.
+    pub color: [f32; 4],
+    /// In canvas units, y down.
+    pub offset: Vec2,
+    /// The blur radius in canvas units, as CSS means it: twice the Gaussian's
+    /// standard deviation.
+    pub blur: f32,
+    /// Grows the shadow's box on every side before it is blurred; negative
+    /// shrinks it.
+    pub spread: f32,
+}
+
+impl Default for Shadow {
+    fn default() -> Self {
+        Self {
+            color: [0.0, 0.0, 0.0, 0.5],
+            offset: Vec2::new(0.0, 4.0),
+            blur: 8.0,
+            spread: 0.0,
+        }
+    }
+}
+
+/// When a [`ScrollFrame`]'s bars are drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+pub enum ScrollbarVisibility {
+    /// On a scrolling axis whose content is larger than the frame.
+    #[default]
+    Auto,
+    /// On every scrolling axis.
+    Always,
+    Never,
+}
+
+/// Lays the element's children out in a content area `content_size` units
+/// across, cut to the element's rect and scrolled by `scroll_position`.
+///
+/// The children's anchors are fractions of the content area, which is never
+/// smaller than the frame itself, so a stretched child fills at least what is
+/// in view. The wheel scrolls it while the game runs, as does dragging a bar.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollFrame {
+    /// In the frame's units; an axis smaller than the frame is the frame's.
+    pub content_size: Vec2,
+    /// How far the content's top left is scrolled past the frame's, in units.
+    /// Laid out clamped to what the content allows.
+    pub scroll_position: Vec2,
+    pub horizontal: bool,
+    pub vertical: bool,
+    /// Units scrolled per notch of the wheel.
+    pub scroll_speed: f32,
+    pub scrollbar: ScrollbarVisibility,
+    /// In canvas units.
+    pub scrollbar_thickness: f32,
+    /// sRGB, straight alpha.
+    pub scrollbar_color: [f32; 4],
+}
+
+impl Default for ScrollFrame {
+    fn default() -> Self {
+        Self {
+            content_size: Vec2::ZERO,
+            scroll_position: Vec2::ZERO,
+            horizontal: false,
+            vertical: true,
+            scroll_speed: 40.0,
+            scrollbar: ScrollbarVisibility::Auto,
+            scrollbar_thickness: 6.0,
+            scrollbar_color: [0.6, 0.6, 0.6, 0.8],
+        }
+    }
+}
+
 /// A `Vec2` as a scene stores it: a struct of `x` and `y`. The registry has no
 /// two-component leaf, and adding one would change the file and wire formats
 /// for a type only this module needs.
@@ -450,12 +644,190 @@ impl Reflect for Button {
     }
 }
 
+impl Reflect for Gradient {
+    fn to_value(&self) -> Value {
+        Value::strukt([
+            ("start", four(self.start, RGBA)),
+            ("end", four(self.end, RGBA)),
+            ("rotation", self.rotation.to_value()),
+            ("offset", V2(self.offset).to_value()),
+        ])
+    }
+
+    fn from_value(value: &Value) -> Result<Self, ValueError> {
+        Ok(Self {
+            start: take_four(value, "start", RGBA)?,
+            end: take_four(value, "end", RGBA)?,
+            rotation: take(value, "rotation")?,
+            offset: vec2(value, "offset")?,
+        })
+    }
+}
+
+impl Reflect for Corner {
+    fn to_value(&self) -> Value {
+        Value::strukt([
+            ("radius", self.radius.to_value()),
+            ("radius_fraction", self.radius_fraction.to_value()),
+            ("style", self.style.to_value()),
+            ("exponent", self.exponent.to_value()),
+        ])
+    }
+
+    fn from_value(value: &Value) -> Result<Self, ValueError> {
+        Ok(Self {
+            radius: take(value, "radius")?,
+            radius_fraction: take(value, "radius_fraction")?,
+            style: take(value, "style")?,
+            exponent: take(value, "exponent")?,
+        })
+    }
+}
+
+impl Reflect for Stroke {
+    fn to_value(&self) -> Value {
+        Value::strukt([
+            ("color", four(self.color, RGBA)),
+            ("thickness", self.thickness.to_value()),
+            ("placement", self.placement.to_value()),
+        ])
+    }
+
+    fn from_value(value: &Value) -> Result<Self, ValueError> {
+        Ok(Self {
+            color: take_four(value, "color", RGBA)?,
+            thickness: take(value, "thickness")?,
+            placement: take(value, "placement")?,
+        })
+    }
+}
+
+impl Reflect for Shadow {
+    fn to_value(&self) -> Value {
+        Value::strukt([
+            ("color", four(self.color, RGBA)),
+            ("offset", V2(self.offset).to_value()),
+            ("blur", self.blur.to_value()),
+            ("spread", self.spread.to_value()),
+        ])
+    }
+
+    fn from_value(value: &Value) -> Result<Self, ValueError> {
+        Ok(Self {
+            color: take_four(value, "color", RGBA)?,
+            offset: vec2(value, "offset")?,
+            blur: take(value, "blur")?,
+            spread: take(value, "spread")?,
+        })
+    }
+}
+
+impl Reflect for ScrollFrame {
+    fn to_value(&self) -> Value {
+        Value::strukt([
+            ("content_size", V2(self.content_size).to_value()),
+            ("scroll_position", V2(self.scroll_position).to_value()),
+            ("horizontal", self.horizontal.to_value()),
+            ("vertical", self.vertical.to_value()),
+            ("scroll_speed", self.scroll_speed.to_value()),
+            ("scrollbar", self.scrollbar.to_value()),
+            ("scrollbar_thickness", self.scrollbar_thickness.to_value()),
+            ("scrollbar_color", four(self.scrollbar_color, RGBA)),
+        ])
+    }
+
+    fn from_value(value: &Value) -> Result<Self, ValueError> {
+        Ok(Self {
+            content_size: vec2(value, "content_size")?,
+            scroll_position: vec2(value, "scroll_position")?,
+            horizontal: take(value, "horizontal")?,
+            vertical: take(value, "vertical")?,
+            scroll_speed: take(value, "scroll_speed")?,
+            scrollbar: take(value, "scrollbar")?,
+            scrollbar_thickness: take(value, "scrollbar_thickness")?,
+            scrollbar_color: take_four(value, "scrollbar_color", RGBA)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn round_trip<T: Reflect + PartialEq + std::fmt::Debug>(value: T) {
         assert_eq!(T::from_value(&value.to_value()).unwrap(), value);
+    }
+
+    #[test]
+    fn every_ui_modifier_reads_back_what_it_wrote() {
+        round_trip(Gradient {
+            start: [0.1, 0.2, 0.3, 0.4],
+            end: [0.5, 0.6, 0.7, 0.8],
+            rotation: 45.0,
+            offset: Vec2::new(0.25, -0.5),
+        });
+        round_trip(Gradient::default());
+        round_trip(Corner {
+            radius: 12.0,
+            radius_fraction: 0.25,
+            style: CornerStyle::Squircle,
+            exponent: 5.0,
+        });
+        round_trip(Corner::default());
+        round_trip(Stroke {
+            color: [1.0, 0.0, 0.5, 1.0],
+            thickness: 3.5,
+            placement: StrokePlacement::Outside,
+        });
+        round_trip(Stroke::default());
+        round_trip(Shadow {
+            color: [0.0, 0.0, 0.0, 0.25],
+            offset: Vec2::new(2.0, 6.0),
+            blur: 16.0,
+            spread: -2.0,
+        });
+        round_trip(Shadow::default());
+        round_trip(ScrollFrame {
+            content_size: Vec2::new(0.0, 900.0),
+            scroll_position: Vec2::new(0.0, 120.0),
+            horizontal: true,
+            vertical: false,
+            scroll_speed: 25.0,
+            scrollbar: ScrollbarVisibility::Always,
+            scrollbar_thickness: 4.0,
+            scrollbar_color: [1.0, 1.0, 1.0, 0.5],
+        });
+        round_trip(ScrollFrame::default());
+    }
+
+    /// A radius is units plus a share of the shorter side, and never more than
+    /// half of it, which is where the two corners on a side meet.
+    #[test]
+    fn a_corner_radius_is_units_plus_a_fraction_clamped_to_half_the_short_side() {
+        let corner = Corner {
+            radius: 10.0,
+            radius_fraction: 0.1,
+            ..Corner::default()
+        };
+        assert_eq!(corner.radius_px(Vec2::new(200.0, 100.0), 2.0), 30.0);
+        let pill = Corner {
+            radius: 0.0,
+            radius_fraction: 0.5,
+            ..Corner::default()
+        };
+        assert_eq!(pill.radius_px(Vec2::new(200.0, 40.0), 1.0), 20.0);
+        let huge = Corner {
+            radius: 1000.0,
+            ..Corner::default()
+        };
+        assert_eq!(huge.radius_px(Vec2::new(60.0, 80.0), 1.0), 30.0);
+        assert_eq!(Corner::default().exponent(), 2.0, "round is a circle");
+        let squircle = Corner {
+            style: CornerStyle::Squircle,
+            exponent: 40.0,
+            ..Corner::default()
+        };
+        assert_eq!(squircle.exponent(), 12.0);
     }
 
     #[test]
