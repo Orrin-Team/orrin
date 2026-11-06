@@ -39,13 +39,7 @@ pub(super) fn texture_usage(usage: ImageUsage) -> MTLTextureUsage {
     if usage.contains(ImageUsage::STORAGE) {
         out |= MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite;
     }
-    // A scaling copy is a render pass here (see `backdrop.rs`), so a transfer
-    // destination is a render target too.
-    if usage.intersects(
-        ImageUsage::COLOR_ATTACHMENT
-            | ImageUsage::DEPTH_STENCIL_ATTACHMENT
-            | ImageUsage::TRANSFER_DST,
-    ) {
+    if usage.intersects(ImageUsage::COLOR_ATTACHMENT | ImageUsage::DEPTH_STENCIL_ATTACHMENT) {
         out |= MTLTextureUsage::RenderTarget;
     }
     out

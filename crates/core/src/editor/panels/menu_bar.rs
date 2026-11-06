@@ -16,11 +16,13 @@
 use orrin_ecs::World;
 use orrin_registry::Registry;
 
+use crate::editor::catalog;
 use crate::editor::dock::{Dock, Tab};
 use crate::editor::icons;
 use crate::editor::state::{EditorState, SceneRequest, SpawnKind};
 use crate::editor::theme::ThemeSet;
 use crate::editor::widgets::{self, Tool};
+use crate::scene::registry as ids;
 use crate::scene::{Play, PlayState, ShadowSettings, SsaoSettings, TaaSettings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,6 +389,25 @@ pub fn spawn_entries(ui: &mut egui::Ui, state: &mut EditorState) {
         state.request_spawn(SpawnKind::Camera);
         ui.close_menu();
     }
+    ui.separator();
+    let ui_icon = catalog::icon(&ids::CANVAS);
+    ui.menu_button(icons::with_label(ui_icon, None, "UI"), |ui| {
+        use crate::ui::create::UiKind;
+        for (kind, icon) in [
+            (UiKind::Canvas, catalog::icon(&ids::CANVAS)),
+            (UiKind::Panel, icons::rectangle()),
+            (UiKind::Image, catalog::icon(&ids::IMAGE)),
+            (UiKind::Text, catalog::icon(&ids::TEXT)),
+            (UiKind::Button, catalog::icon(&ids::BUTTON)),
+            (UiKind::ScrollFrame, catalog::icon(&ids::SCROLL_FRAME)),
+        ] {
+            let label = icons::with_label(icon, None, kind.name());
+            if ui.add(egui::Button::new(label)).clicked() {
+                state.request_spawn(SpawnKind::Ui(kind));
+                ui.close_menu();
+            }
+        }
+    });
 }
 
 fn entity(ui: &mut egui::Ui, state: &mut EditorState) {

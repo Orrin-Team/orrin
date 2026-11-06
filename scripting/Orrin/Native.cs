@@ -86,6 +86,37 @@ public unsafe struct OrrinApi
     public delegate* unmanaged<Entity, CameraComponent*, byte> SetCameraLens;
     public delegate* unmanaged<Entity> GetActiveCamera;
     public delegate* unmanaged<Entity, byte> SetActiveCamera;
+    // In-game UI, appended after SetActiveCamera, matching the Rust struct;
+    // never reordered above it. A rect is x, y, width, height and a colour
+    // r, g, b, a, as loose floats; text is UTF-8 bytes and their length, with
+    // no terminator; a font or texture is an id's sixteen bytes, and a null
+    // font is the engine's own.
+    public delegate* unmanaged<float, float, float, float, float, float, float, float, void> UiPanel;
+    public delegate* unmanaged<
+        byte*, uint, byte*, float, uint, float, float, float, float, float, float, float, float, void>
+        UiText;
+    public delegate* unmanaged<byte*, float, float, float, float, float, float, float, float, void>
+        UiImage;
+    public delegate* unmanaged<float*, float*, void> UiScreenSize;
+    // Engine components as blittable structs, appended after UiScreenSize,
+    // matching the Rust struct; never reordered above it. A component kind
+    // (ComponentKind), the struct and its byte size, which the engine checks;
+    // text as UTF-8 through the GetTag protocol.
+    public delegate* unmanaged<Entity, uint, byte*, uint, byte> GetComponent;
+    public delegate* unmanaged<Entity, uint, byte*, uint, byte> SetComponent;
+    public delegate* unmanaged<Entity, uint, byte*, uint, byte> AddComponent;
+    public delegate* unmanaged<Entity, uint, byte*, int, int> GetComponentText;
+    public delegate* unmanaged<Entity, uint, byte*, uint, byte> SetComponentText;
+    public delegate* unmanaged<byte> UiPointerOver;
+    // Tweens, appended after UiPointerOver; never reordered above it. A
+    // request and its byte size, which the engine checks; an id as bits, zero
+    // for refused.
+    public delegate* unmanaged<Entity, byte*, uint, ulong> TweenPlay;
+    public delegate* unmanaged<ulong, byte> TweenCancel;
+    public delegate* unmanaged<ulong, byte> TweenPlaying;
+    // Story controls: a name as UTF-8 and its byte length, then the default.
+    public delegate* unmanaged<byte*, uint, float, float, float, float> StoryFloat;
+    public delegate* unmanaged<byte*, uint, byte, byte> StoryBool;
 }
 
 public static unsafe class Native
@@ -281,6 +312,109 @@ public static unsafe class Native
     internal static Entity GetActiveCamera() => _api.GetActiveCamera();
 
     internal static bool SetActiveCamera(Entity entity) => _api.SetActiveCamera(entity) != 0;
+
+    internal static void UiPanel(Rect rect, Color color) =>
+        _api.UiPanel(rect.x, rect.y, rect.width, rect.height, color.r, color.g, color.b, color.a);
+
+    internal static void UiText(
+        ReadOnlySpan<byte> utf8, Guid? font, float size, TextAnchor anchor, Rect rect, Color color)
+    {
+        Span<byte> id = stackalloc byte[16];
+        fixed (byte* text = utf8)
+        fixed (byte* idPtr = id)
+        {
+            byte* fontPtr = null;
+            if (font is { } face)
+            {
+                face.TryWriteBytes(id, bigEndian: true, out _);
+                fontPtr = idPtr;
+            }
+            _api.UiText(text, (uint)utf8.Length, fontPtr, size, (uint)anchor,
+                rect.x, rect.y, rect.width, rect.height, color.r, color.g, color.b, color.a);
+        }
+    }
+
+    internal static void UiImage(Guid texture, Rect rect, Color tint)
+    {
+        Span<byte> id = stackalloc byte[16];
+        texture.TryWriteBytes(id, bigEndian: true, out _);
+        fixed (byte* idPtr = id)
+            _api.UiImage(idPtr, rect.x, rect.y, rect.width, rect.height,
+                tint.r, tint.g, tint.b, tint.a);
+    }
+
+    internal static Vector2 UiScreenSize()
+    {
+        float width = 0, height = 0;
+        _api.UiScreenSize(&width, &height);
+        return new Vector2(width, height);
+    }
+
+    internal static T? GetComponent<T>(Entity entity) where T : unmanaged
+    {
+        T value = default;
+        return _api.GetComponent(entity, ComponentKinds.Blittable<T>(), (byte*)&value, (uint)sizeof(T)) != 0
+            ? value
+            : null;
+    }
+
+    internal static bool SetComponent<T>(Entity entity, T value) where T : unmanaged =>
+        _api.SetComponent(entity, ComponentKinds.Blittable<T>(), (byte*)&value, (uint)sizeof(T)) != 0;
+
+    internal static bool AddComponent<T>(Entity entity, T value) where T : unmanaged =>
+        _api.AddComponent(entity, ComponentKinds.Blittable<T>(), (byte*)&value, (uint)sizeof(T)) != 0;
+
+    internal static string? GetText(Entity entity)
+    {
+        const uint kind = (uint)ComponentKind.Text;
+        Span<byte> buffer = stackalloc byte[256];
+        int length;
+        fixed (byte* p = buffer)
+            length = _api.GetComponentText(entity, kind, p, buffer.Length);
+        if (length < 0)
+            return null;
+        if (length <= buffer.Length)
+            return Encoding.UTF8.GetString(buffer[..length]);
+        // Nothing but a script changes a text inside a tick, so one retry at
+        // the length the first call reported always fits.
+        var bytes = new byte[length];
+        fixed (byte* p = bytes)
+            _api.GetComponentText(entity, kind, p, bytes.Length);
+        return Encoding.UTF8.GetString(bytes);
+    }
+
+    internal static bool SetText(Entity entity, string text)
+    {
+        var bytes = Encoding.UTF8.GetBytes(text);
+        fixed (byte* p = bytes)
+            return _api.SetComponentText(entity, (uint)ComponentKind.Text, p, (uint)bytes.Length) != 0;
+    }
+
+    internal static bool UiPointerOver() => _api.UiPointerOver() != 0;
+
+    internal static ulong TweenPlay(Entity entity, in TweenRequest request)
+    {
+        fixed (TweenRequest* p = &request)
+            return _api.TweenPlay(entity, (byte*)p, (uint)sizeof(TweenRequest));
+    }
+
+    internal static bool TweenCancel(ulong id) => _api.TweenCancel(id) != 0;
+
+    internal static bool TweenPlaying(ulong id) => _api.TweenPlaying(id) != 0;
+
+    internal static float StoryFloat(string name, float @default, float min, float max)
+    {
+        var bytes = Encoding.UTF8.GetBytes(name);
+        fixed (byte* p = bytes)
+            return _api.StoryFloat(p, (uint)bytes.Length, @default, min, max);
+    }
+
+    internal static bool StoryBool(string name, bool @default)
+    {
+        var bytes = Encoding.UTF8.GetBytes(name);
+        fixed (byte* p = bytes)
+            return _api.StoryBool(p, (uint)bytes.Length, @default ? (byte)1 : (byte)0) != 0;
+    }
 
     internal static AssetState GetAssetState(Guid asset)
     {

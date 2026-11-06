@@ -260,6 +260,7 @@ fn settings(ui: &mut egui::Ui, entry: &Entry, draft: &mut Draft, action: &mut Op
         Settings::None => {
             ui.weak(match entry.kind {
                 AssetKind::Material => "A material is read as it is. Edit it in the inspector.",
+                AssetKind::Font => "A font is read as it is: it has nothing to import.",
                 _ => "A prefab is read as it is: it has nothing to import.",
             });
             return;
@@ -300,6 +301,7 @@ fn glyph_of(kind: AssetKind) -> icons::Icon {
         AssetKind::Material => icons::palette(),
         AssetKind::Prefab => icons::layers(),
         AssetKind::Scene => icons::globe(),
+        AssetKind::Font => icons::text_t(),
         AssetKind::Folder => icons::folder(),
     }
 }

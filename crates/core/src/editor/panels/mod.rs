@@ -11,6 +11,8 @@ pub(super) mod scenes;
 #[cfg(feature = "scripting")]
 pub(super) mod scripts;
 mod status_bar;
+pub(super) mod storybook;
+mod ui_sections;
 mod viewport;
 
 use glam::Vec3;
@@ -19,7 +21,6 @@ use orrin_ecs::World;
 use orrin_registry::Registry;
 
 use super::dock::Dock;
-use super::phases::{self, Glass};
 use super::previews::Previews;
 use super::state::{EditorState, GizmoMode, SceneRequest};
 use super::theme::ThemeSet;
@@ -57,14 +58,32 @@ pub fn draw(
     menu_bar::show(ctx, world, registry, state, themes, dock);
     status_bar::show(ctx, world, state, themes);
     dock.show(ctx, world, state, registry, previews);
+    // Before the viewport's tools, which show the screen this sets.
+    game_screen(ctx, world, state, dock.viewport());
     if let Some(rect) = dock.viewport() {
-        viewport::show(ctx, world, state, themes, rect);
-        viewport::accept_prefab(ctx, world, state, dock, rect);
-        viewport::hover(ctx, world, state, dock, rect);
-        // Before the click: a click on a handle is not a click on the scene.
-        viewport::gizmo(ctx, world, state, dock, rect);
-        viewport::marquee(ctx, world, state, dock, rect);
-        viewport::select_on_click(ctx, world, state, dock, rect);
+        let live = world
+            .get_resource::<crate::scene::Play>()
+            .is_some_and(|play| play.is_live());
+        viewport::show(ctx, world, state, themes, rect, live);
+        if !live {
+            viewport::accept_prefab(ctx, world, state, dock, rect);
+            if state.ui_mode {
+                // Before the click, for the reason the gizmo is.
+                viewport::rect_tool(ctx, world, state, dock, rect);
+                viewport::select_ui_on_click(ctx, world, state, dock, rect);
+            } else {
+                state.rect_drag = None;
+                viewport::hover(ctx, world, state, dock, rect);
+                // Before the click: a click on a handle is not a click on the scene.
+                viewport::gizmo(ctx, world, state, dock, rect);
+                viewport::marquee(ctx, world, state, dock, rect);
+                viewport::select_on_click(ctx, world, state, dock, rect);
+            }
+        } else {
+            state.gizmo_strokes.clear();
+            state.outline.clear();
+            state.rect_drag = None;
+        }
     }
     if let Some(rel) = state.pending_delete().map(str::to_owned) {
         confirm_delete(ctx, world, state, &rel);
@@ -140,40 +159,36 @@ fn confirm_delete(ctx: &egui::Context, world: &World, state: &mut EditorState, r
     }
 }
 
-/// Every surface above the panels — the viewport's floating controls, menus,
-/// popups, tooltips — has a translucent fill. The renderer blurs what is
-/// beneath each into the rects collected here before drawing it, so the fill
-/// reads as frosted glass, over a panel as over the scene. See
-/// [`phases`](crate::editor::phases) for how "beneath" is drawn first.
-///
-/// Run after [`draw`], once every surface of the frame has been laid out.
-pub fn frost(ctx: &egui::Context, glass: &mut Vec<Glass>) {
-    glass.clear();
-    let toolbars = [
-        egui::Id::new("viewport_tools"),
-        egui::Id::new("viewport_view"),
-        egui::Id::new("viewport_stats"),
-    ];
-    let menu = f32::from(ctx.style().visuals.menu_corner_radius.nw);
-    ctx.memory(|memory| {
-        for layer in memory.layer_ids() {
-            if !memory.areas().is_visible(&layer) {
-                continue;
-            }
-            let radius = match layer.order {
-                egui::Order::Foreground | egui::Order::Tooltip => menu,
-                _ if toolbars.contains(&layer.id) => f32::from(widgets::TOOLBAR_RADIUS),
-                _ => continue,
-            };
-            if let Some(rect) = memory.area_rect(layer.id) {
-                glass.push(Glass {
-                    phase: phases::of(layer.order),
-                    rect,
-                    radius,
-                });
-            }
-        }
-    });
+/// Tell the game how big its screen is and where in the window it is drawn:
+/// the previewed resolution inside the viewport, or the window.
+fn game_screen(
+    ctx: &egui::Context,
+    world: &mut World,
+    state: &EditorState,
+    viewport: Option<egui::Rect>,
+) {
+    use crate::scene::{GameScreen, Rect};
+    let ppp = ctx.pixels_per_point();
+    let window = ctx.screen_rect().size() * ppp;
+    let extent = [window.x.round() as u32, window.y.round() as u32];
+    let screen = match viewport {
+        Some(rect) => crate::editor::preview::screen(
+            &state.preview,
+            Rect::new(
+                rect.min.x * ppp,
+                rect.min.y * ppp,
+                rect.width() * ppp,
+                rect.height() * ppp,
+            ),
+            extent,
+        ),
+        None => GameScreen::window(extent),
+    };
+    if let Some(mut current) = world.get_resource_mut::<GameScreen>() {
+        *current = screen;
+        return;
+    }
+    world.insert_resource(screen);
 }
 
 /// The few keys every editor answers the same way. Each one stands aside while
@@ -216,6 +231,9 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
             state.gizmo_mode = mode;
         }
+    }
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::T)) {
+        state.ui_mode = !state.ui_mode;
     }
     state.selection.retain_alive(world);
     let selected = !state.selection.is_empty();
@@ -303,8 +321,6 @@ mod tests {
         themes: ThemeSet,
         dock: Dock,
         previews: Previews,
-        /// What the last frame asked the renderer to frost.
-        glass: Vec<Glass>,
         ctx: egui::Context,
         input: egui::RawInput,
         output: Option<egui::FullOutput>,
@@ -343,7 +359,6 @@ mod tests {
                 themes,
                 dock: Dock::default(),
                 previews: Previews::default(),
-                glass: Vec::new(),
                 ctx,
                 input: egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
@@ -371,14 +386,17 @@ mod tests {
                     themes,
                     dock,
                     previews,
-                    glass,
                     ctx,
                     input,
                     output,
                 } = self;
+                // As the app does every frame, so UI mode sees what is drawn.
+                let screen = input
+                    .screen_rect
+                    .map_or([0, 0], |rect| [rect.width() as u32, rect.height() as u32]);
+                crate::ui::update(world, screen);
                 *output = Some(ctx.run(input.clone(), |ctx| {
                     draw(ctx, world, state, registry, themes, dock, previews);
-                    frost(ctx, glass);
                 }));
             }
             self
@@ -795,6 +813,126 @@ mod tests {
             "the widest section bar is {widest}px of a {}px panel",
             body.width()
         );
+    }
+
+    fn open_add_component(editor: &mut Harness) {
+        let at = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| without_icons(text) == "Add component")
+            .map(|(_, rect)| rect.center())
+            .expect("the inspector offers to add a component");
+        editor.click(at).frames(1);
+    }
+
+    /// The add menu files what it offers under headings, each row with the
+    /// icon its section wears and its display name alone — never the id.
+    #[test]
+    fn the_add_menu_groups_its_components_under_headings_with_icons() {
+        let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
+        let entity = editor.spawn("Crate");
+        editor.state.selection.set(entity);
+        editor.frames(3);
+        open_add_component(&mut editor);
+
+        let menu = editor.area("add_component").expect("the add menu is open");
+        let texts = editor.painted_text_rects();
+        let row = |wanted: &str| {
+            texts
+                .iter()
+                .find(|(text, rect)| without_icons(text) == wanted && menu.contains(rect.center()))
+                .map(|(_, rect)| *rect)
+        };
+        for heading in ["Rendering", "Physics", "UI"] {
+            assert!(row(heading).is_some(), "no {heading} heading: {texts:?}");
+        }
+        assert!(
+            texts.iter().all(|(text, _)| !text.contains("orrin.")),
+            "an id is shown: {texts:?}"
+        );
+        let ui = row("UI").unwrap();
+        let gradient = row("Gradient").expect("Gradient is offered");
+        let light = row("Light").expect("Light is offered");
+        assert!(gradient.top() > ui.top(), "Gradient is under UI");
+        assert!(light.top() < ui.top(), "Light is under Rendering, above UI");
+
+        let icons = editor.painted_icons();
+        let wears = |glyph: char, beside: egui::Rect| {
+            icons.iter().any(|(painted, rect, _)| {
+                *painted == glyph && (rect.center().y - beside.center().y).abs() < 4.0
+            })
+        };
+        assert!(wears(crate::editor::icons::gradient().glyph(), gradient));
+        assert!(wears(crate::editor::icons::lightbulb().glyph(), light));
+
+        let body = editor.tab_body(Tab::Inspector);
+        assert!(
+            menu.width() <= 240.0 && menu.width() < body.width(),
+            "the add menu is {}px wide in a {}px inspector",
+            menu.width(),
+            body.width()
+        );
+    }
+
+    /// The menu opens where it was asked for, not centred under a button that
+    /// spans the panel.
+    #[test]
+    fn the_add_menu_opens_at_the_click() {
+        let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
+        let entity = editor.spawn("Crate");
+        editor.state.selection.set(entity);
+        editor.frames(3);
+        let label = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| without_icons(text) == "Add component")
+            .map(|(_, rect)| rect)
+            .expect("the inspector offers to add a component");
+        let at = label.center();
+        editor.click(at).frames(1);
+        let menu = editor.area("add_component").expect("the add menu is open");
+        assert!(
+            (menu.left() - at.x).abs() <= 12.0 && menu.top() >= at.y && menu.top() <= at.y + 16.0,
+            "clicked at {at:?}, the menu is at {menu:?}"
+        );
+    }
+
+    /// Typing narrows the menu to what matches, and Enter adds the first.
+    #[test]
+    fn searching_the_add_menu_narrows_it_and_enter_adds_the_match() {
+        let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
+        let entity = editor.spawn("Crate");
+        editor.state.selection.set(entity);
+        editor.frames(3);
+        open_add_component(&mut editor);
+
+        editor.input.events.push(egui::Event::Text("grad".into()));
+        editor.frames(1);
+        editor.input.events.clear();
+        editor.frames(1);
+        let menu = editor.area("add_component").expect("the add menu is open");
+        let shown: Vec<String> = editor
+            .painted_text_rects()
+            .into_iter()
+            .filter(|(_, rect)| menu.contains(rect.center()))
+            .map(|(text, _)| without_icons(&text))
+            .collect();
+        assert!(shown.iter().any(|text| text == "Gradient"), "{shown:?}");
+        for gone in ["Corner", "Light", "Rendering"] {
+            assert!(
+                !shown.iter().any(|text| text == gone),
+                "{gone} still shown: {shown:?}"
+            );
+        }
+
+        editor.key(egui::Key::Enter);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(editor.world.has::<crate::ui::Gradient>(entity));
+        editor.frames(1);
+        let open = editor
+            .ctx
+            .memory(|memory| memory.is_popup_open(egui::Id::new("add_component")));
+        assert!(!open, "adding closes the menu");
     }
 
     /// egui reports two widgets sharing an id by painting "First use" and
@@ -2034,6 +2172,279 @@ mod tests {
         }
     }
 
+    /// The entity menu's UI entries sit in a submenu of their own, which lists
+    /// every kind the menu can make.
+    #[test]
+    fn the_entity_menu_offers_ui_in_a_submenu() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let run = |editor: &mut Harness| {
+            let Harness {
+                state, ctx, input, ..
+            } = &mut *editor;
+            let output = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| menu_bar::spawn_entries(ui, state));
+            });
+            editor.output = Some(output);
+        };
+        run(&mut editor);
+        run(&mut editor);
+        let at = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| without_icons(text) == "UI")
+            .map(|(_, rect)| rect.center())
+            .expect("a UI entry");
+        editor.input.events.push(egui::Event::PointerMoved(at));
+        editor.input.events.push(button(at, true));
+        editor.input.events.push(button(at, false));
+        run(&mut editor);
+        editor.input.events.clear();
+        run(&mut editor);
+        let painted = editor.painted();
+        for kind in ["Canvas", "Panel", "Image", "Text", "Button"] {
+            assert!(
+                painted.iter().any(|text| text == kind),
+                "{kind}: {painted:?}"
+            );
+        }
+    }
+
+    /// The submenu offers the scroll frame beside the other kinds.
+    #[test]
+    fn the_ui_submenu_offers_a_scroll_frame() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let run = |editor: &mut Harness| {
+            let Harness {
+                state, ctx, input, ..
+            } = &mut *editor;
+            let output = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| menu_bar::spawn_entries(ui, state));
+            });
+            editor.output = Some(output);
+        };
+        run(&mut editor);
+        run(&mut editor);
+        let at = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| without_icons(text) == "UI")
+            .map(|(_, rect)| rect.center())
+            .expect("a UI entry");
+        editor.input.events.push(egui::Event::PointerMoved(at));
+        editor.input.events.push(button(at, true));
+        editor.input.events.push(button(at, false));
+        run(&mut editor);
+        editor.input.events.clear();
+        run(&mut editor);
+        let painted = editor.painted();
+        assert!(
+            painted.iter().any(|text| text == "Scroll Frame"),
+            "{painted:?}"
+        );
+    }
+
+    /// A UI element's row wears the icon of what it is, not a group's dot.
+    #[test]
+    fn hierarchy_rows_show_what_a_ui_element_is() {
+        use crate::ui::create::UiKind;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        ui_spawn(&mut editor, UiKind::Button);
+        editor.dock.activate(Tab::Hierarchy);
+        editor.frames(2);
+        let tree = editor.tab_body(Tab::Hierarchy);
+        let painted: Vec<char> = editor
+            .painted_icons()
+            .into_iter()
+            .filter(|(_, rect, _)| tree.contains(rect.center()))
+            .map(|(glyph, ..)| glyph)
+            .collect();
+        for icon in [
+            crate::editor::icons::app_window(),
+            crate::editor::icons::cursor_click(),
+        ] {
+            assert!(painted.contains(&icon.glyph()), "{icon:?} in {painted:?}");
+        }
+    }
+
+    /// Every entry of the UI submenu wears an icon, the one its component's
+    /// inspector section shows where it has one.
+    #[test]
+    fn the_ui_submenu_shows_an_icon_beside_each_entry() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let run = |editor: &mut Harness| {
+            let Harness {
+                state, ctx, input, ..
+            } = &mut *editor;
+            let output = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| menu_bar::spawn_entries(ui, state));
+            });
+            editor.output = Some(output);
+        };
+        run(&mut editor);
+        run(&mut editor);
+        let at = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| without_icons(text) == "UI")
+            .map(|(_, rect)| rect.center())
+            .expect("a UI entry");
+        editor.input.events.push(egui::Event::PointerMoved(at));
+        editor.input.events.push(button(at, true));
+        editor.input.events.push(button(at, false));
+        run(&mut editor);
+        editor.input.events.clear();
+        run(&mut editor);
+        let texts = editor.painted_text_rects();
+        let icons = editor.painted_icons();
+        use crate::editor::icons as glyphs;
+        for (label, icon) in [
+            ("Canvas", glyphs::app_window()),
+            ("Panel", glyphs::rectangle()),
+            ("Image", glyphs::image()),
+            ("Text", glyphs::text_t()),
+            ("Button", glyphs::cursor_click()),
+            ("Scroll Frame", glyphs::mouse_scroll()),
+        ] {
+            let row = texts
+                .iter()
+                .find(|(text, _)| without_icons(text) == label)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("no {label} entry"));
+            assert!(
+                icons.iter().any(|(glyph, rect, _)| *glyph == icon.glyph()
+                    && (rect.center().y - row.center().y).abs() < 4.0),
+                "{label} has no icon"
+            );
+        }
+    }
+
+    /// A previewed resolution is the game's screen: the UI is told its size,
+    /// it is drawn inside the viewport, and the viewport around it is dimmed.
+    #[test]
+    fn previewing_a_resolution_tells_the_game_its_screen_and_dims_the_rest() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let window = *editor.world.resource::<crate::scene::GameScreen>();
+        assert_eq!(
+            window.size,
+            [1280.0, 800.0],
+            "the window until one is picked"
+        );
+
+        editor.state.preview.resolution = Some([1080, 2340]);
+        editor.frames(2);
+        let screen = *editor.world.resource::<crate::scene::GameScreen>();
+        assert_eq!(screen.size, [1080.0, 2340.0]);
+        let viewport = editor.dock.viewport().expect("a viewport");
+        let shown = screen.rect();
+        assert!(
+            viewport
+                .expand(0.5)
+                .contains_rect(egui::Rect::from_min_size(
+                    egui::pos2(shown.x, shown.y),
+                    egui::vec2(shown.width, shown.height),
+                )),
+            "{shown:?} is not inside {viewport:?}"
+        );
+        assert!(
+            (shown.height - viewport.height()).abs() < 1.0,
+            "fitted to the height"
+        );
+        let tree = editor.world.resource::<crate::ui::UiTree>();
+        assert_eq!(tree.canvas.screen(), [1080.0, 2340.0]);
+        drop(tree);
+        let dim = egui::Color32::from_black_alpha(150);
+        assert!(
+            editor.painted_fills().iter().any(|(_, fill)| *fill == dim),
+            "the sides of the viewport are dimmed"
+        );
+    }
+
+    /// In UI mode a button over the viewport opens the templates and the two
+    /// sizes.
+    #[test]
+    fn the_resolution_menu_picks_a_template_and_true_size() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.state.ui_mode = true;
+        editor.frames(2);
+        let text_at = |editor: &Harness, wanted: &str| {
+            editor
+                .painted_text_rects()
+                .into_iter()
+                .find(|(text, _)| without_icons(text).starts_with(wanted))
+                .map(|(_, rect)| rect.center())
+        };
+        let monitor = crate::editor::icons::monitor().glyph();
+        let viewport = editor.dock.viewport().expect("a viewport");
+        let button = editor
+            .painted_icons()
+            .into_iter()
+            .find(|(glyph, rect, _)| *glyph == monitor && viewport.contains(rect.center()))
+            .expect("the resolution button")
+            .1;
+        editor.click(button.center()).frames(1);
+        assert!(
+            text_at(&editor, "Window").is_some(),
+            "the menu offers the window"
+        );
+        let full_hd = text_at(&editor, "Full HD").expect("the templates are listed");
+        editor.click(full_hd).frames(1);
+        assert_eq!(editor.state.preview.resolution, Some([1920, 1080]));
+
+        let true_size = text_at(&editor, "True size").expect("the sizes are listed");
+        editor.click(true_size).frames(2);
+        assert_eq!(
+            editor.state.preview.size,
+            crate::editor::preview::PreviewSize::TrueSize
+        );
+        assert_eq!(
+            editor.world.resource::<crate::scene::GameScreen>().scale,
+            1.0
+        );
+    }
+
+    /// The hierarchy's add button holds the Entity menu's own entries, so its
+    /// UI entry has to open the submenu there too, rather than close the whole
+    /// list and need opening again.
+    #[test]
+    fn the_hierarchy_add_button_opens_the_ui_submenu_and_builds_from_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.dock.activate(Tab::Hierarchy);
+        editor.frames(2);
+        let tree = editor.tab_body(Tab::Hierarchy);
+        let plus = crate::editor::icons::plus().glyph();
+        let add = editor
+            .painted_icons()
+            .into_iter()
+            .find(|(glyph, rect, _)| *glyph == plus && tree.contains(rect.center()))
+            .expect("the hierarchy has an add button")
+            .1;
+        editor.click(add.center()).frames(1);
+        let text_at = |editor: &Harness, wanted: &str| {
+            editor
+                .painted_text_rects()
+                .into_iter()
+                .find(|(text, _)| without_icons(text) == wanted)
+                .map(|(_, rect)| rect.center())
+        };
+        let ui = text_at(&editor, "UI").expect("the add list is open");
+        editor.click(ui).frames(1);
+        let button = text_at(&editor, "Button").expect("the UI submenu is open");
+        assert!(
+            text_at(&editor, "Cube").is_some(),
+            "and the list behind it still is"
+        );
+
+        editor.click(button).frames(1);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let buttons = editor.world.query::<&crate::ui::Button>().count();
+        assert_eq!(buttons, 1);
+        assert!(
+            text_at(&editor, "Canvas").is_none(),
+            "picking closes the menu"
+        );
+    }
+
     /// One bar across the top and one across the bottom. At the 800x600 the
     /// engine opens at, the frame around the tools has to stay a frame.
     #[test]
@@ -3137,9 +3548,8 @@ mod tests {
         );
     }
 
-    /// The edge of anything floating over the scene is a faint light line —
-    /// the rim of a pane of glass — not a drawn border competing with what it
-    /// frames.
+    /// The edge of anything floating over the scene is a faint light line,
+    /// not a drawn border competing with what it frames.
     #[test]
     fn floating_surfaces_have_faint_edges() {
         let ctx = egui::Context::default();
@@ -3152,71 +3562,21 @@ mod tests {
         }
     }
 
-    /// The viewport's floating controls are frosted: each reports the rect the
-    /// renderer is to blur behind it, and the translucent fill over that blur
-    /// is what makes them read as glass rather than as grey boxes.
+    /// Nothing is blurred beneath a floating surface, so each one has to hide
+    /// what it floats over: the viewport's toolbars, menus and popups are
+    /// opaque, over the scene as over a panel.
     #[test]
-    fn the_viewport_controls_are_frosted() {
-        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
-        editor.state.show_stats = true;
-        editor.frames(3);
-
-        for id in ["viewport_tools", "viewport_view", "viewport_stats"] {
-            let area = editor.area(id).expect("drawn");
-            assert!(
-                editor.glass.iter().any(|glass| {
-                    glass.phase == phases::of(egui::Order::Middle)
-                        && glass.rect.contains_rect(area.shrink(1.0))
-                        && glass.radius == f32::from(crate::editor::widgets::TOOLBAR_RADIUS)
-                }),
-                "{id} at {area:?} has no glass in {:?}",
-                editor.glass
-            );
-        }
-        let fill = editor.ctx.style().visuals.window_fill;
-        assert!(fill.a() < 255, "menus are opaque: {fill:?}");
-    }
-
-    /// A menu is frosted whole, over a panel as over the scene: the renderer
-    /// draws the panels before it blurs, so there is something real to blur
-    /// there too.
-    #[test]
-    fn a_menu_is_frosted_over_the_panels_too() {
-        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
-        editor.frames(2);
-        let file = editor
-            .painted_text_rects()
-            .into_iter()
-            .find(|(text, _)| text == "File")
-            .map(|(_, rect)| rect.center())
-            .expect("the File menu's title");
-        editor.click(file).frames(3);
-
-        let viewport = editor.dock.viewport().expect("a viewport");
-        let menu = editor
-            .ctx
-            .memory(|memory| {
-                memory
-                    .layer_ids()
-                    .filter(|layer| {
-                        layer.order == egui::Order::Foreground && memory.areas().is_visible(layer)
-                    })
-                    .find_map(|layer| memory.area_rect(layer.id))
-            })
-            .expect("the File menu is open");
-        assert!(
-            !viewport.contains_rect(menu),
-            "the menu {menu:?} hangs over no panel, so this proves nothing"
-        );
-        let radius = f32::from(editor.ctx.style().visuals.menu_corner_radius.nw);
-        assert!(
-            editor.glass.contains(&Glass {
-                phase: phases::of(egui::Order::Foreground),
-                rect: menu,
-                radius,
-            }),
-            "the menu {menu:?} is not frosted whole: {:?}",
-            editor.glass
+    fn floating_surfaces_are_opaque() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, themes_default());
+        let visuals = ctx.style().visuals.clone();
+        let toolbar = crate::editor::widgets::toolbar_frame(&visuals, themes_default().bar());
+        assert_eq!(toolbar.fill.a(), 255, "toolbar {:?}", toolbar.fill);
+        assert_eq!(
+            visuals.window_fill.a(),
+            255,
+            "menu {:?}",
+            visuals.window_fill
         );
     }
 
@@ -4045,6 +4405,78 @@ mod tests {
         );
     }
 
+    fn area_shown(editor: &Harness, id: &str) -> bool {
+        let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new(id));
+        editor
+            .ctx
+            .memory(|memory| memory.areas().visible_last_frame(&layer))
+    }
+
+    /// While the game is live the scene is the game's: nothing is selected, no
+    /// handle, marker, outline or frustum is drawn over it, and the transform
+    /// tools are gone — the panels around it stay, and so do the frame stats.
+    #[test]
+    fn play_clears_the_selection_and_the_scene_tools() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, _) = cube_under_the_viewport_centre(&mut editor);
+        light_under_the_viewport_centre(&mut editor);
+        editor.state.selection.set(cube);
+        editor.frames(1);
+        assert!(!editor.state.gizmo_strokes.is_empty());
+        assert!(!editor.state.outline.is_empty());
+        assert!(area_shown(&editor, "viewport_tools"));
+
+        toggle_play(&mut editor);
+        editor.frames(2);
+        assert!(editor.state.selection.entities().is_empty());
+        assert!(
+            editor.state.gizmo_strokes.is_empty(),
+            "no handles or markers"
+        );
+        assert!(editor.state.outline.is_empty());
+        assert!(!area_shown(&editor, "viewport_tools"));
+        assert!(
+            area_shown(&editor, "viewport_view"),
+            "the stats toggle stays"
+        );
+
+        editor
+            .world
+            .resource_mut::<crate::scene::Play>()
+            .set(crate::scene::PlayState::Paused);
+        editor.frames(1);
+        assert!(
+            editor.state.gizmo_strokes.is_empty(),
+            "a paused game is still the game, markers and all"
+        );
+        assert!(!area_shown(&editor, "viewport_tools"));
+    }
+
+    /// A click in a running game is the game's — a HUD button over a crate
+    /// must not select the crate.
+    #[test]
+    fn a_click_on_the_scene_while_playing_selects_nothing() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (_, at) = cube_under_the_viewport_centre(&mut editor);
+        toggle_play(&mut editor);
+        editor.click(at);
+        assert!(editor.state.selection.entities().is_empty());
+        assert!(editor.state.hovered.is_none());
+    }
+
+    /// The selection Play cleared is the editor's, so Stop gives it back.
+    #[test]
+    fn stop_restores_the_selection_play_cleared() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let crate_ = editor.spawn("Crate");
+        editor.state.selection.set(crate_);
+        toggle_play(&mut editor);
+        assert!(editor.state.selection.entities().is_empty());
+        toggle_play(&mut editor);
+        let restored = named(&editor.world, "Crate").unwrap();
+        assert_eq!(editor.state.selection.entities(), [restored]);
+    }
+
     /// A persistent scene holding one entity called `Music`, written to a file
     /// of its own.
     fn persistent_scene(editor: &Harness, tag: &str) -> std::path::PathBuf {
@@ -4185,15 +4617,30 @@ mod tests {
             input,
             ..
         } = &mut editor;
+        // A marker painted last on the panels' layer: everything before it in
+        // the output is beneath every window.
+        struct PanelsEnd;
         let output = ctx.run(input.clone(), |ctx| {
             draw(ctx, world, state, registry, themes, dock, previews);
-            phases::mark(ctx);
+            ctx.layer_painter(egui::LayerId::background())
+                .add(egui::Shape::Callback(egui::PaintCallback {
+                    rect: egui::Rect::NOTHING,
+                    callback: std::sync::Arc::new(PanelsEnd),
+                }));
         });
         let window = {
             let (surface, node, _) = dock.state().find_tab(&Tab::Scenes).unwrap();
             dock.state()[surface][node].rect().unwrap()
         };
-        let [panels, ..] = phases::split(output.shapes);
+        let end = output
+            .shapes
+            .iter()
+            .position(|clipped| match &clipped.shape {
+                egui::Shape::Callback(callback) => callback.callback.is::<PanelsEnd>(),
+                _ => false,
+            })
+            .expect("the marker was painted");
+        let panels = &output.shapes[..end];
         let under = panels.iter().any(|clipped| match &clipped.shape {
             egui::Shape::Text(text) => {
                 text.galley.text() == Tab::Scenes.icon().glyph().to_string()
@@ -5057,5 +5504,385 @@ mod tests {
         toggle_play(&mut editor);
         editor.frames(1);
         assert!(framed(&editor));
+    }
+
+    // --- the retained UI ---------------------------------------------------
+
+    fn ui_spawn(editor: &mut Harness, kind: crate::ui::create::UiKind) {
+        editor
+            .state
+            .request_spawn(crate::editor::state::SpawnKind::Ui(kind));
+        editor.state.apply(&mut editor.world, &editor.registry);
+    }
+
+    fn parent_of(world: &World, entity: orrin_ecs::Entity) -> Option<orrin_ecs::Entity> {
+        world
+            .get::<crate::scene::Parent>(entity)
+            .map(|parent| parent.get())
+    }
+
+    /// A canvas, made the first time, with an element on it placed by its top
+    /// left at `at` and `size` points — one point a pixel in the harness.
+    fn ui_box(
+        editor: &mut Harness,
+        name: &str,
+        at: egui::Pos2,
+        size: egui::Vec2,
+    ) -> orrin_ecs::Entity {
+        let canvas = named(&editor.world, "Canvas").unwrap_or_else(|| {
+            let canvas = editor.world.spawn();
+            editor.world.insert(canvas, Name::new("Canvas"));
+            editor.world.insert(canvas, crate::ui::Canvas::default());
+            canvas
+        });
+        let entity = editor.world.spawn();
+        editor.world.insert(entity, Name::new(name));
+        editor.world.insert(
+            entity,
+            crate::ui::RectTransform {
+                anchor_min: glam::Vec2::ZERO,
+                anchor_max: glam::Vec2::ZERO,
+                pivot: glam::Vec2::ZERO,
+                anchored_position: glam::Vec2::new(at.x, at.y),
+                size_delta: glam::Vec2::new(size.x, size.y),
+                scale: glam::Vec2::ONE,
+            },
+        );
+        editor.world.insert(entity, crate::ui::Image::default());
+        crate::scene::reparent(&mut editor.world, entity, Some(canvas), false).unwrap();
+        entity
+    }
+
+    fn anchored(editor: &Harness, entity: orrin_ecs::Entity) -> crate::ui::RectTransform {
+        *editor
+            .world
+            .get::<crate::ui::RectTransform>(entity)
+            .unwrap()
+    }
+
+    /// uGUI's button: an image that tints, and a label under it, on a canvas
+    /// made for it — and all of it one undo step.
+    #[test]
+    fn creating_a_ui_button_builds_its_tree_under_a_new_canvas() {
+        use crate::ui::create::UiKind;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        ui_spawn(&mut editor, UiKind::Button);
+
+        let world = &editor.world;
+        let canvas = named(world, "Canvas").expect("a canvas to hold it");
+        let button = named(world, "Button").expect("the button");
+        let label = named(world, "Text").expect("its label");
+        assert!(world.has::<crate::ui::Canvas>(canvas));
+        assert_eq!(parent_of(world, canvas), None);
+        assert_eq!(parent_of(world, button), Some(canvas));
+        assert_eq!(parent_of(world, label), Some(button));
+        for component in [
+            world.has::<crate::ui::RectTransform>(button),
+            world.has::<crate::ui::Image>(button),
+            world.has::<crate::ui::Button>(button),
+            world.has::<crate::ui::RectTransform>(label),
+        ] {
+            assert!(component);
+        }
+        assert!(
+            !world.has::<LocalTransform>(button),
+            "UI has no 3D transform"
+        );
+        let text = world.get::<crate::ui::Text>(label).unwrap();
+        assert_eq!(text.text, "Button");
+        assert_eq!(text.anchor, crate::scene::TextAnchor::MiddleCenter);
+        assert_eq!(
+            *world.get::<crate::ui::RectTransform>(label).unwrap(),
+            crate::ui::RectTransform::stretched()
+        );
+        drop(text);
+        assert_eq!(editor.state.selection.entities(), [button]);
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(
+            editor.world.entities().count(),
+            0,
+            "one step took all three"
+        );
+    }
+
+    #[test]
+    fn new_ui_goes_under_the_selection_or_else_the_first_canvas() {
+        use crate::ui::create::UiKind;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        ui_spawn(&mut editor, UiKind::Panel);
+        let panel = named(&editor.world, "Panel").unwrap();
+        let canvas = named(&editor.world, "Canvas").unwrap();
+        ui_spawn(&mut editor, UiKind::Text);
+        let text = named(&editor.world, "Text").unwrap();
+        assert_eq!(parent_of(&editor.world, text), Some(panel));
+
+        let cube = editor.spawn("Cube");
+        editor.state.selection.set(cube);
+        ui_spawn(&mut editor, UiKind::Image);
+        let image = named(&editor.world, "Image").unwrap();
+        assert_eq!(parent_of(&editor.world, image), Some(canvas));
+
+        ui_spawn(&mut editor, UiKind::Canvas);
+        let canvases = editor
+            .world
+            .entities()
+            .filter(|&e| editor.world.has::<crate::ui::Canvas>(e))
+            .count();
+        assert_eq!(canvases, 2, "a canvas is always a new one");
+    }
+
+    #[test]
+    fn t_switches_ui_mode() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(1);
+        editor.key(egui::Key::T);
+        assert!(editor.state.ui_mode);
+        editor.key(egui::Key::T);
+        assert!(!editor.state.ui_mode);
+    }
+
+    #[test]
+    fn in_ui_mode_a_click_selects_the_topmost_element() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let centre = editor.viewport().center();
+        let back = ui_box(
+            &mut editor,
+            "Back",
+            centre - egui::vec2(100.0, 100.0),
+            egui::vec2(200.0, 200.0),
+        );
+        let front = ui_box(
+            &mut editor,
+            "Front",
+            centre - egui::vec2(25.0, 25.0),
+            egui::vec2(50.0, 50.0),
+        );
+        editor.state.ui_mode = true;
+        editor.frames(2);
+
+        editor.click(centre);
+        assert_eq!(editor.state.selection.entities(), [front]);
+        editor.click(centre + egui::vec2(80.0, 80.0));
+        assert_eq!(editor.state.selection.entities(), [back]);
+        editor.click(centre + egui::vec2(150.0, 0.0));
+        assert!(editor.state.selection.is_empty(), "nothing there");
+    }
+
+    /// The rect tool's body is the element: a drag moves it, shows as it
+    /// goes, and undoes in one step. Ctrl places freely, so where the window's
+    /// centre happens to fall cannot snap it.
+    #[test]
+    fn dragging_a_ui_element_moves_it_in_one_undo_step() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let centre = editor.viewport().center();
+        let panel = ui_box(
+            &mut editor,
+            "Panel",
+            centre - egui::vec2(50.0, 50.0),
+            egui::vec2(100.0, 100.0),
+        );
+        let before = anchored(&editor, panel);
+        editor.state.selection.set(panel);
+        editor.state.ui_mode = true;
+        editor.frames(2);
+        assert!(
+            !editor.state.gizmo_strokes.is_empty(),
+            "the rect tool is drawn"
+        );
+
+        editor.input.modifiers = egui::Modifiers::COMMAND;
+        pointer(&mut editor, egui::Event::PointerMoved(centre));
+        pointer(&mut editor, button(centre, true));
+        let mut at = centre;
+        for _ in 0..3 {
+            at += egui::vec2(10.0, 4.0);
+            pointer(&mut editor, egui::Event::PointerMoved(at));
+        }
+        assert_eq!(
+            anchored(&editor, panel).anchored_position,
+            before.anchored_position + glam::Vec2::new(30.0, 12.0),
+            "the drag shows while it is held"
+        );
+        pointer(&mut editor, button(at, false));
+        editor.input.modifiers = egui::Modifiers::NONE;
+        assert_eq!(editor.state.selection.entities(), [panel]);
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(anchored(&editor, panel), before);
+        assert_eq!(editor.state.history.undo_label(), None, "one step");
+    }
+
+    #[test]
+    fn dragging_a_corner_of_the_rect_tool_resizes_from_the_opposite_one() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let centre = editor.viewport().center();
+        let panel = ui_box(
+            &mut editor,
+            "Panel",
+            centre - egui::vec2(50.0, 50.0),
+            egui::vec2(100.0, 100.0),
+        );
+        let before = anchored(&editor, panel);
+        editor.state.selection.set(panel);
+        editor.state.ui_mode = true;
+        editor.frames(2);
+
+        editor.input.modifiers = egui::Modifiers::COMMAND;
+        let corner = centre + egui::vec2(50.0, 50.0);
+        pointer(&mut editor, egui::Event::PointerMoved(corner));
+        pointer(&mut editor, button(corner, true));
+        pointer(
+            &mut editor,
+            egui::Event::PointerMoved(corner + egui::vec2(20.0, 10.0)),
+        );
+        pointer(&mut editor, button(corner + egui::vec2(20.0, 10.0), false));
+        editor.input.modifiers = egui::Modifiers::NONE;
+
+        let after = anchored(&editor, panel);
+        assert_eq!(after.size_delta, glam::Vec2::new(120.0, 110.0));
+        assert_eq!(
+            after.anchored_position, before.anchored_position,
+            "pivoted at its top left, which stays put"
+        );
+        assert_eq!(
+            editor.state.selection.entities(),
+            [panel],
+            "a handle is not a click"
+        );
+    }
+
+    #[test]
+    fn the_rect_tool_and_ui_picking_are_off_while_the_game_is_live() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let centre = editor.viewport().center();
+        let panel = ui_box(
+            &mut editor,
+            "Panel",
+            centre - egui::vec2(50.0, 50.0),
+            egui::vec2(100.0, 100.0),
+        );
+        editor.state.ui_mode = true;
+        editor.state.selection.set(panel);
+        editor.frames(2);
+        assert!(!editor.state.gizmo_strokes.is_empty());
+
+        toggle_play(&mut editor);
+        editor.frames(2);
+        assert!(
+            editor.state.gizmo_strokes.is_empty(),
+            "no rect tool over the game"
+        );
+        editor.click(centre);
+        assert!(editor.state.selection.is_empty(), "a click is the game's");
+    }
+
+    /// A scroll frame is made with a backdrop to catch the wheel against and
+    /// content taller than itself, so it scrolls as soon as it has children.
+    #[test]
+    fn creating_a_scroll_frame_makes_one_with_room_to_scroll() {
+        use crate::ui::create::UiKind;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        ui_spawn(&mut editor, UiKind::ScrollFrame);
+        let world = &editor.world;
+        let frame = named(world, "Scroll Frame").expect("the frame");
+        let canvas = named(world, "Canvas").expect("a canvas to hold it");
+        assert_eq!(parent_of(world, frame), Some(canvas));
+        assert!(world.has::<crate::ui::Image>(frame));
+        let rect = *world.get::<crate::ui::RectTransform>(frame).unwrap();
+        let scroll = *world.get::<crate::ui::ScrollFrame>(frame).unwrap();
+        assert!(scroll.vertical);
+        assert!(scroll.content_size.y > rect.size_delta.y, "{scroll:?}");
+        assert_eq!(editor.state.selection.entities(), [frame]);
+    }
+
+    /// Each modifier has a section of its own, drawn once, and none is drawn
+    /// a second time from its vtable.
+    #[test]
+    fn the_inspector_draws_the_modifier_sections_once_each() {
+        use crate::ui::create::UiKind;
+        let mut editor = Harness::new(egui::vec2(1280.0, 2400.0));
+        ui_spawn(&mut editor, UiKind::Button);
+        let button = named(&editor.world, "Button").unwrap();
+        editor.world.insert(button, crate::ui::Gradient::default());
+        editor.world.insert(button, crate::ui::Corner::default());
+        editor.world.insert(button, crate::ui::Stroke::default());
+        editor.world.insert(button, crate::ui::Shadow::default());
+        editor
+            .world
+            .insert(button, crate::ui::ScrollFrame::default());
+        editor.frames(3);
+        let painted = editor.painted();
+        let count = |label: &str| {
+            painted
+                .iter()
+                .filter(|text| without_icons(text) == label)
+                .count()
+        };
+        for label in [
+            "Gradient",
+            "Rotation",
+            "Corner",
+            "Radius",
+            "Squircle",
+            "Stroke",
+            "Thickness",
+            "Placement",
+            "Shadow",
+            "Blur",
+            "Spread",
+            "Scroll Frame",
+            "Content size",
+            "Scroll position",
+            "Scrollbars",
+        ] {
+            assert_eq!(count(label), 1, "{label}: {painted:?}");
+        }
+        for generic in ["radius_fraction", "scroll_position", "scrollbar_color"] {
+            assert_eq!(
+                count(generic),
+                0,
+                "drawn by hand, not from the vtable: {painted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_inspector_draws_the_ui_sections_once_each() {
+        use crate::ui::create::UiKind;
+        let mut editor = Harness::new(egui::vec2(1280.0, 900.0));
+        ui_spawn(&mut editor, UiKind::Button);
+        editor.frames(3);
+        let painted = editor.painted();
+        let count = |label: &str| {
+            painted
+                .iter()
+                .filter(|text| without_icons(text) == label)
+                .count()
+        };
+        for label in [
+            "Rect Transform",
+            "Anchors",
+            "Pivot",
+            "Normal",
+            "Pressed",
+            "Interactable",
+            "Raycast target",
+        ] {
+            assert_eq!(count(label), 1, "{label}: {painted:?}");
+        }
+        for generic in ["Anchored position", "Size delta"] {
+            assert_eq!(
+                count(generic),
+                0,
+                "drawn by hand, not from the vtable: {painted:?}"
+            );
+        }
     }
 }

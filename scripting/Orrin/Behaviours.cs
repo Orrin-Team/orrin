@@ -26,6 +26,9 @@ public static unsafe class Behaviours
     // behaviour, i.e. exactly the engine crash this is preventing.
     const byte Ok = 0;
     const byte Faulted = 1;
+    // Only from `Pointer`: the behaviour has no handler for the event, so the
+    // engine offers it to the parent next. Rust's `orrin_script::Delivery`.
+    const byte Unhandled = 2;
 
     // The handle is a GCHandle passed across the ABI as a fixed-width ulong, to
     // match Rust's `u64` fn-pointer signatures exactly. Using `nint` here would
@@ -179,6 +182,26 @@ public static unsafe class Behaviours
         catch (Exception e)
         {
             return Fault(behaviour, nameof(Behaviour.OnCollisionExit), e);
+        }
+    }
+
+    /// Offer a pointer event, a <see cref="PointerEventKind"/>, to the
+    /// behaviour's handler for it. One with no handler answers Unhandled, and a
+    /// handler that throws is contained and reported as a fault, which also
+    /// stops the event going further up.
+    [UnmanagedCallersOnly]
+    public static byte Pointer(ulong handle, uint kind, PointerEvent* pointer)
+    {
+        if (Resolve(handle) is not { } behaviour)
+            return Unhandled;
+        var which = (PointerEventKind)kind;
+        try
+        {
+            return PointerEvents.Dispatch(behaviour, which, *pointer) ? Ok : Unhandled;
+        }
+        catch (Exception e)
+        {
+            return Fault(behaviour, PointerEvents.MethodName(which), e);
         }
     }
 

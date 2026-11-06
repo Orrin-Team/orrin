@@ -1,0 +1,13 @@
+Cards/Gradient at 1280x720
+
+built
+  0 in -: 0.0 0.0 1280.0x720.0 image(0.10 0.11 0.12 1.00)
+  1 in -: 480.0 260.0 320.0x200.0 image(1.00 1.00 1.00 1.00) gradient(0.0 deg)
+  2 in 1: 480.0 260.0 320.0x200.0 text("Orrin" 40.0)
+  4 commands
+
+after two seconds
+  0 in -: 0.0 0.0 1280.0x720.0 image(0.10 0.11 0.12 1.00)
+  1 in -: 480.0 260.0 320.0x200.0 image(1.00 1.00 1.00 1.00) gradient(180.0 deg)
+  2 in 1: 480.0 260.0 320.0x200.0 text("Orrin" 40.0)
+  4 commands

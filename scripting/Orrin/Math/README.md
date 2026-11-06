@@ -1,7 +1,7 @@
 # Orrin.Math
 
 The engine's public math API for C# scripts: `Vector2`, `Vector3`, `Vector4`,
-`Quaternion`, `Mathf`, `Color`. The shape of the API deliberately follows
+`Quaternion`, `Mathf`, `Color`, `Rect`. The shape of the API deliberately follows
 Unity's (`Mathf.PingPong`, `Quaternion.LookRotation`, lowercase `x`/`y`/`z`
 fields) so it feels familiar, but the *conventions* are Orrin's own — read
 them before assuming Unity behavior.

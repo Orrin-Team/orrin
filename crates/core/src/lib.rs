@@ -14,7 +14,10 @@ pub mod scene;
 #[cfg(feature = "scripting")]
 pub mod scripting;
 pub mod stats;
+#[cfg(feature = "scripting")]
+pub mod storybook;
 pub mod systems;
 pub mod threads;
+pub mod ui;
 
 pub use app::App;

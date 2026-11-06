@@ -182,6 +182,23 @@ var threw = false;
 try { Color.FromHex("nope"); } catch (FormatException) { threw = true; }
 Check(threw, "FromHex rejects garbage");
 
+// --- Rect ----------------------------------------------------------------------
+
+var rect = new Rect(10f, 20f, 100f, 50f);
+Check(rect.xMax == 110f && rect.yMax == 70f, "Rect far edges");
+Check(rect.center == new Vector2(60f, 45f), "Rect center");
+Check(rect.Contains(new Vector2(10f, 20f)), "Rect contains its near corner");
+Check(!rect.Contains(new Vector2(110f, 45f)), "Rect excludes its far x edge");
+Check(!rect.Contains(new Vector2(60f, 70f)), "Rect excludes its far y edge");
+Check(!rect.Contains(new Vector2(9.99f, 45f)), "Rect excludes a point before it");
+Check(new Rect(new Vector2(10f, 20f), new Vector2(100f, 50f)) == rect, "Rect from position and size");
+
+// The engine reads the anchor as a row-major index from the upper left
+// (`scene::ui::TextAnchor`): column = value % 3, row = value / 3.
+Check((uint)Orrin.TextAnchor.MiddleCenter == 4, "TextAnchor.MiddleCenter is 4");
+Check((uint)Orrin.TextAnchor.UpperRight == 2, "TextAnchor.UpperRight is 2");
+Check((uint)Orrin.TextAnchor.LowerRight == 8, "TextAnchor.LowerRight is 8");
+
 // --- interop layout ------------------------------------------------------------
 
 unsafe
@@ -191,10 +208,99 @@ unsafe
     Check(sizeof(Vector4) == 16, "Vector4 is 16 bytes");
     Check(sizeof(Quaternion) == 16, "Quaternion is 16 bytes");
     Check(sizeof(Color) == 16, "Color is 16 bytes");
+    Check(sizeof(Rect) == 16, "Rect is 16 bytes");
     Check(sizeof(Orrin.Transform) == 40, "Transform is 10 floats");
     Check(sizeof(Orrin.CameraComponent) == 16, "CameraComponent is 3 floats and an int");
     Check(new Orrin.CameraComponent().FieldOfView == 60f, "a new lens is the engine's default");
+    // The retained UI's components and pointer payload, lock-step with
+    // orrin-script's CCanvas, CRectTransform, CImage, CText, CButton and
+    // CPointerEvent. The engine also checks each size on every call.
+    Check(sizeof(Orrin.Canvas) == 20, "Canvas is 20 bytes");
+    Check(sizeof(Orrin.RectTransform) == 48, "RectTransform is six Vector2s");
+    Check(sizeof(Orrin.Image) == 52, "Image is an id, two Vector4s and a flag");
+    Check(sizeof(Orrin.Text) == 48, "Text is an id, a colour and four words");
+    Check(sizeof(Orrin.Button) == 68, "Button is four colours and a flag");
+    Check(sizeof(Orrin.PointerEvent) == 28, "PointerEvent is two Vector2s, an Entity and a button");
+    // The modifiers, lock-step with CGradient, CCorner, CStroke, CShadow and
+    // CScrollFrame.
+    Check(sizeof(Orrin.Gradient) == 44, "Gradient is two colours, an angle and a Vector2");
+    Check(sizeof(Orrin.Corner) == 16, "Corner is four words");
+    Check(sizeof(Orrin.Stroke) == 24, "Stroke is a colour and two words");
+    Check(sizeof(Orrin.Shadow) == 32, "Shadow is a colour, a Vector2 and two floats");
+    Check(sizeof(Orrin.ScrollFrame) == 52, "ScrollFrame is two Vector2s, two floats, a colour and three words");
+    Check(sizeof(Orrin.TweenRequest) == 64, "TweenRequest is eight words and two Vector4s");
+    Check((uint)Orrin.CornerStyle.Squircle == 1, "CornerStyle.Squircle is 1");
+    Check((uint)Orrin.StrokePlacement.Outside == 2, "StrokePlacement.Outside is 2");
+    Check((uint)Orrin.ScrollbarVisibility.Never == 2, "ScrollbarVisibility.Never is 2");
+    Check((uint)Orrin.TweenProperty.ScrollPosition == 15 && (uint)Orrin.TweenProperty.ImageColor == 3,
+        "TweenProperty numbers as the engine does");
+    Check((uint)Orrin.EaseStyle.Bounce == 10 && (uint)Orrin.EaseDirection.InOut == 2,
+        "EaseStyle and EaseDirection number as the engine does");
+    Check(Orrin.Tween.Lanes(Orrin.TweenProperty.ShadowOffset) == 2
+        && Orrin.Tween.Lanes(Orrin.TweenProperty.GradientEnd) == 4
+        && Orrin.Tween.Lanes(Orrin.TweenProperty.TextSize) == 1,
+        "a tween property knows how many floats it is");
+    var list = new Orrin.ScrollFrame { Horizontal = true };
+    Check(list.Vertical && list.Horizontal && list.ScrollSpeed == 40f,
+        "a new scroll frame is the engine's default, its flags read back");
+
+    // An asset id crosses inside a struct as its canonical bytes, the order
+    // `AssetId::from_bytes` reads, and the null reference as zeroes.
+    var canonical = Guid.Parse("00112233-4455-6677-8899-aabbccddeeff");
+    var textured = new Orrin.Image { Texture = new AssetRef<Texture>(canonical) };
+    var raw = (byte*)&textured;
+    Check(raw[0] == 0x00 && raw[1] == 0x11 && raw[4] == 0x44 && raw[15] == 0xff,
+        "an image's texture crosses in canonical UUID order");
+    Check(textured.Texture.Id == canonical, "an image's texture reads back");
+    var untextured = new Orrin.Image();
+    var zero = (byte*)&untextured;
+    var allZero = true;
+    for (var i = 0; i < 16; i++)
+        allZero &= zero[i] == 0;
+    Check(allZero && !untextured.Texture.IsValid, "no texture is sixteen zero bytes");
+    var labelled = new Orrin.Text { Font = new AssetRef<Font>(canonical), Wrap = false };
+    Check(labelled.Font.Id == canonical && !labelled.Wrap, "a text's font and flags read back");
 }
+
+// The engine's defaults, so a component made in C# starts where one made in
+// the editor does.
+Check(new Orrin.RectTransform().SizeDelta == new Vector2(100f, 100f)
+    && new Orrin.RectTransform().AnchorMin == new Vector2(0.5f, 0.5f)
+    && new Orrin.RectTransform().Scale == Vector2.one, "a new RectTransform is centred and 100 square");
+Check(new Orrin.Image().RaycastTarget && new Orrin.Image().Color == Color.white, "a new Image is white and stops the pointer");
+Check(new Orrin.Text().Wrap && !new Orrin.Text().RaycastTarget && new Orrin.Text().Size == 24f, "a new Text wraps and lets the pointer through");
+Check(new Orrin.Button().Interactable && new Orrin.Button().Normal == Color.white, "a new Button is interactable");
+Check(new Orrin.Canvas().ReferenceResolution == new Vector2(1920f, 1080f)
+    && new Orrin.Canvas().ScaleMode == CanvasScaleMode.ConstantPixel, "a new Canvas is one unit to a pixel");
+
+// --- component kinds and pointer events ------------------------------------------
+//
+// Numbered with the engine's `has_component` match and `ui::events::PointerKind`.
+
+Check((uint)ComponentKind.Canvas == 4 && (uint)ComponentKind.RectTransform == 5
+    && (uint)ComponentKind.Image == 6 && (uint)ComponentKind.Text == 7
+    && (uint)ComponentKind.Button == 8, "the UI component kinds follow Camera");
+Check(ComponentKinds.Blittable<Orrin.Image>() == 6 && ComponentKinds.Blittable<Orrin.Button>() == 8,
+    "a blittable component's kind is its ComponentKind");
+var refused = false;
+try { ComponentKinds.Blittable<Orrin.CameraComponent>(); } catch (ArgumentException) { refused = true; }
+Check(refused, "a component with no blittable form is refused loudly");
+Check((uint)PointerEventKind.Enter == 0 && (uint)PointerEventKind.Exit == 1
+    && (uint)PointerEventKind.Down == 2 && (uint)PointerEventKind.Up == 3
+    && (uint)PointerEventKind.Click == 4, "pointer event kinds match the engine's");
+
+var clicker = new ClickProbe();
+var press = new PointerEvent(new Vector2(3f, 4f), new Vector2(1f, 2f), new Entity(7, 1), MouseButton.Left);
+Check(PointerEvents.Dispatch(clicker, PointerEventKind.Click, press) && clicker.Clicks == 1
+    && clicker.Last.Target == new Entity(7, 1) && clicker.Last.Position == new Vector2(3f, 4f),
+    "a click handler takes a click, payload and all");
+Check(!PointerEvents.Dispatch(clicker, PointerEventKind.Down, press),
+    "a behaviour with no press handler leaves the press to its parent");
+var hover = new HoverProbe();
+Check(PointerEvents.Dispatch(hover, PointerEventKind.Enter, press)
+    && PointerEvents.Dispatch(hover, PointerEventKind.Exit, press) && hover.Inside == false
+    && hover.Entered == 1, "enter and exit reach their handlers");
+Check(!PointerEvents.Dispatch(hover, (PointerEventKind)99, press), "a kind this build lacks is not handled");
 
 // --- property bag ABI ----------------------------------------------------------
 //
@@ -356,6 +462,32 @@ sealed class BagProbe : Behaviour
     public float Cache = 3f;
     public readonly int Constant = 5;
     public Vector2 Unrepresentable = new(1, 2);
+}
+
+sealed class ClickProbe : Behaviour, IPointerClickHandler
+{
+    [Transient] public int Clicks;
+    [Transient] public PointerEvent Last;
+
+    public void OnPointerClick(PointerEvent pointer)
+    {
+        Clicks++;
+        Last = pointer;
+    }
+}
+
+sealed class HoverProbe : Behaviour, IPointerEnterHandler, IPointerExitHandler
+{
+    [Transient] public bool Inside;
+    [Transient] public int Entered;
+
+    public void OnPointerEnter(PointerEvent pointer)
+    {
+        Inside = true;
+        Entered++;
+    }
+
+    public void OnPointerExit(PointerEvent pointer) => Inside = false;
 }
 
 sealed class AssetProbe : Behaviour

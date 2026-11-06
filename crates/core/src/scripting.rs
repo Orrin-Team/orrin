@@ -24,7 +24,8 @@ use crate::scene::prefab::{self, Prefabs};
 use crate::scene::{
     ActionId, Actions, ActiveCamera, Assets, CameraComponent, Collider, ColliderShape, DebugLines,
     InputState, LoadedScenes, LocalTransform, LogLevel, MaterialHandle, MeshHandle, Name, Parent,
-    PendingScripts, SceneHandle, ScriptComponent, Tag, Time, Transform, WorldTransform,
+    PendingScripts, Rect, SceneHandle, ScriptComponent, Tag, TextAnchor, TextStyle, Time,
+    Transform, UiCanvas, WorldTransform, color_bytes,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -264,11 +265,18 @@ extern "C" fn axis_value(id: u32, player: u32) -> f32 {
     with_actions(|actions| actions.axis(ActionId(id), player as usize))
 }
 
+// In the game's pixels, which are the window's unless the editor is
+// previewing a resolution: a script's own hit tests are against rects in that
+// space.
 extern "C" fn cursor_pos(x: *mut f32, y: *mut f32) {
     let (cx, cy) = orrin_script::with_world((0.0, 0.0), |world| {
-        world
+        let window = world
             .get_resource::<InputState>()
-            .map_or((0.0, 0.0), |input| input.cursor())
+            .map_or((0.0, 0.0), |input| input.cursor());
+        match world.get_resource::<crate::scene::GameScreen>() {
+            Some(screen) => screen.to_game([window.0, window.1]).into(),
+            None => window,
+        }
     });
     if !x.is_null() {
         // SAFETY: C# passes valid, writable f32 pointers.
@@ -381,6 +389,16 @@ extern "C" fn has_component(entity: CEntity, kind: u32) -> bool {
             1 => world.has::<Tag>(entity),
             2 => world.has::<Collider>(entity),
             3 => world.has::<CameraComponent>(entity),
+            KIND_CANVAS => world.has::<crate::ui::Canvas>(entity),
+            KIND_RECT_TRANSFORM => world.has::<crate::ui::RectTransform>(entity),
+            KIND_IMAGE => world.has::<crate::ui::Image>(entity),
+            KIND_TEXT => world.has::<crate::ui::Text>(entity),
+            KIND_BUTTON => world.has::<crate::ui::Button>(entity),
+            KIND_GRADIENT => world.has::<crate::ui::Gradient>(entity),
+            KIND_CORNER => world.has::<crate::ui::Corner>(entity),
+            KIND_STROKE => world.has::<crate::ui::Stroke>(entity),
+            KIND_SHADOW => world.has::<crate::ui::Shadow>(entity),
+            KIND_SCROLL_FRAME => world.has::<crate::ui::ScrollFrame>(entity),
             _ => false,
         }
     })
@@ -588,6 +606,10 @@ enum Command {
         parent: Option<Entity>,
         keep_world: bool,
     },
+    AddUi {
+        entity: Entity,
+        component: UiComponent,
+    },
     // `root` was reserved at the call; the instance is built into it here.
     InstantiatePrefab {
         root: Entity,
@@ -602,6 +624,73 @@ enum Command {
         scene: AssetId,
     },
     UnloadScene(SceneHandle),
+}
+
+/// A UI component a script added, waiting for the commands to drain.
+#[derive(Clone)]
+enum UiComponent {
+    Canvas(crate::ui::Canvas),
+    RectTransform(crate::ui::RectTransform),
+    Image(crate::ui::Image),
+    Text(crate::ui::Text),
+    Button(crate::ui::Button),
+    Gradient(crate::ui::Gradient),
+    Corner(crate::ui::Corner),
+    Stroke(crate::ui::Stroke),
+    Shadow(crate::ui::Shadow),
+    ScrollFrame(crate::ui::ScrollFrame),
+}
+
+impl UiComponent {
+    fn kind(&self) -> u32 {
+        match self {
+            Self::Canvas(_) => KIND_CANVAS,
+            Self::RectTransform(_) => KIND_RECT_TRANSFORM,
+            Self::Image(_) => KIND_IMAGE,
+            Self::Text(_) => KIND_TEXT,
+            Self::Button(_) => KIND_BUTTON,
+            Self::Gradient(_) => KIND_GRADIENT,
+            Self::Corner(_) => KIND_CORNER,
+            Self::Stroke(_) => KIND_STROKE,
+            Self::Shadow(_) => KIND_SHADOW,
+            Self::ScrollFrame(_) => KIND_SCROLL_FRAME,
+        }
+    }
+
+    fn insert(self, world: &mut World, entity: Entity) {
+        match self {
+            Self::Canvas(c) => {
+                world.insert(entity, c);
+            }
+            Self::RectTransform(c) => {
+                world.insert(entity, c);
+            }
+            Self::Image(c) => {
+                world.insert(entity, c);
+            }
+            Self::Text(c) => {
+                world.insert(entity, c);
+            }
+            Self::Button(c) => {
+                world.insert(entity, c);
+            }
+            Self::Gradient(c) => {
+                world.insert(entity, c);
+            }
+            Self::Corner(c) => {
+                world.insert(entity, c);
+            }
+            Self::Stroke(c) => {
+                world.insert(entity, c);
+            }
+            Self::Shadow(c) => {
+                world.insert(entity, c);
+            }
+            Self::ScrollFrame(c) => {
+                world.insert(entity, c);
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -674,6 +763,7 @@ extern "C" fn find_asset(path: *const c_char, out: *mut u8) -> u32 {
                 AssetKind::Texture => orrin_script::ASSET_TEXTURE,
                 AssetKind::Material => orrin_script::ASSET_MATERIAL,
                 AssetKind::Scene => orrin_script::ASSET_SCENE,
+                AssetKind::Font => orrin_script::ASSET_FONT,
                 AssetKind::Folder => return None,
             };
             Some((entry.id, kind))
@@ -1054,6 +1144,785 @@ extern "C" fn set_active_camera(entity: CEntity) -> bool {
     })
 }
 
+// The in-game UI's calls record into the `UiCanvas` resource the frame's
+// painter reads; see `scene::ui`. With no canvas (a tool, a test) they do
+// nothing, as a debug line does with no `DebugLines`.
+
+fn with_canvas(draw: impl FnOnce(&mut UiCanvas)) {
+    orrin_script::with_world((), |world| {
+        if let Some(mut canvas) = world.get_resource_mut::<UiCanvas>() {
+            draw(&mut canvas);
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn ui_panel(x: f32, y: f32, width: f32, height: f32, r: f32, g: f32, b: f32, a: f32) {
+    with_canvas(|canvas| canvas.panel(Rect::new(x, y, width, height), color_bytes([r, g, b, a])));
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn ui_text(
+    text: *const u8,
+    len: u32,
+    font: *const u8,
+    size: f32,
+    anchor: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+) {
+    if text.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: C# passes `len` bytes it keeps pinned for the call.
+    let bytes = unsafe { std::slice::from_raw_parts(text, len as usize) };
+    let text = String::from_utf8_lossy(bytes);
+    // SAFETY: a non-null font is the 16 bytes of an `AssetRef` C# holds.
+    let font = (!font.is_null()).then(|| AssetId::from_bytes(unsafe { *font.cast::<[u8; 16]>() }));
+    let style = TextStyle {
+        font,
+        size,
+        anchor: TextAnchor::from_u32(anchor).unwrap_or_default(),
+        color: color_bytes([r, g, b, a]),
+        wrap: true,
+    };
+    with_canvas(|canvas| canvas.text(Rect::new(x, y, width, height), style, &text));
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn ui_image(
+    texture: *const u8,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+) {
+    if texture.is_null() {
+        return;
+    }
+    // SAFETY: `texture` is the 16 bytes of an `AssetRef` C# holds.
+    let texture = AssetId::from_bytes(unsafe { *texture.cast::<[u8; 16]>() });
+    with_canvas(|canvas| {
+        canvas.image(
+            Rect::new(x, y, width, height),
+            texture,
+            color_bytes([r, g, b, a]),
+        );
+    });
+}
+
+extern "C" fn ui_screen_size(width: *mut f32, height: *mut f32) {
+    let screen = orrin_script::with_world([0.0; 2], |world| {
+        world
+            .get_resource::<UiCanvas>()
+            .map_or([0.0; 2], |canvas| canvas.screen())
+    });
+    for (out, side) in [width, height].into_iter().zip(screen) {
+        if !out.is_null() {
+            // SAFETY: C# passes valid, writable f32 pointers.
+            unsafe { *out = side };
+        }
+    }
+}
+
+// Engine components as blittable structs, through one generic pair; see
+// `OrrinApi::get_component`. The `kind`s are C# `Orrin.ComponentKind`, the
+// numbering `has_component` matches on.
+
+const KIND_CANVAS: u32 = 4;
+const KIND_RECT_TRANSFORM: u32 = 5;
+const KIND_IMAGE: u32 = 6;
+const KIND_TEXT: u32 = 7;
+const KIND_BUTTON: u32 = 8;
+const KIND_GRADIENT: u32 = 9;
+const KIND_CORNER: u32 = 10;
+const KIND_STROKE: u32 = 11;
+const KIND_SHADOW: u32 = 12;
+const KIND_SCROLL_FRAME: u32 = 13;
+
+fn entity_of(entity: CEntity) -> Entity {
+    Entity {
+        index: entity.index,
+        generation: entity.generation,
+    }
+}
+
+/// The C# name of component `kind`, for a message.
+fn kind_name(kind: u32) -> &'static str {
+    match kind {
+        KIND_CANVAS => "Canvas",
+        KIND_RECT_TRANSFORM => "RectTransform",
+        KIND_IMAGE => "Image",
+        KIND_TEXT => "Text",
+        KIND_BUTTON => "Button",
+        KIND_GRADIENT => "Gradient",
+        KIND_CORNER => "Corner",
+        KIND_STROKE => "Stroke",
+        KIND_SHADOW => "Shadow",
+        KIND_SCROLL_FRAME => "ScrollFrame",
+        _ => "an unknown component",
+    }
+}
+
+/// Whether C# built `T` at the size the engine did, refusing by name if not.
+fn sized<T>(call: &str, kind: u32, size: u32) -> bool {
+    let expected = std::mem::size_of::<T>() as u32;
+    if size != expected {
+        let name = kind_name(kind);
+        tracing::warn!(
+            "World.{call}<{name}>: C# passed {size} bytes and the engine's {name} is \
+             {expected}; rebuild scripting/Orrin so the bindings match the engine"
+        );
+    }
+    size == expected
+}
+
+fn asset_bytes(id: Option<AssetId>) -> [u8; 16] {
+    id.unwrap_or(AssetId::NIL).to_bytes()
+}
+
+fn asset_of(bytes: [u8; 16]) -> Option<AssetId> {
+    Some(AssetId::from_bytes(bytes)).filter(|id| !id.is_nil())
+}
+
+fn canvas_to_c(canvas: &crate::ui::Canvas) -> orrin_script::CCanvas {
+    orrin_script::CCanvas {
+        scale_mode: canvas.scale_mode as u32,
+        reference_resolution: canvas.reference_resolution.to_array(),
+        match_width_or_height: canvas.match_width_or_height,
+        sort_order: canvas.sort_order,
+    }
+}
+
+fn canvas_from_c(c: orrin_script::CCanvas) -> Option<crate::ui::Canvas> {
+    use crate::ui::ScaleMode;
+    let scale_mode = match c.scale_mode {
+        0 => ScaleMode::ConstantPixel,
+        1 => ScaleMode::ScaleWithScreen,
+        other => {
+            tracing::warn!("Canvas: {other} is not a CanvasScaleMode");
+            return None;
+        }
+    };
+    Some(crate::ui::Canvas {
+        scale_mode,
+        reference_resolution: glam::Vec2::from_array(c.reference_resolution),
+        match_width_or_height: c.match_width_or_height,
+        sort_order: c.sort_order,
+    })
+}
+
+fn rect_to_c(rect: &crate::ui::RectTransform) -> orrin_script::CRectTransform {
+    orrin_script::CRectTransform {
+        anchor_min: rect.anchor_min.to_array(),
+        anchor_max: rect.anchor_max.to_array(),
+        pivot: rect.pivot.to_array(),
+        anchored_position: rect.anchored_position.to_array(),
+        size_delta: rect.size_delta.to_array(),
+        scale: rect.scale.to_array(),
+    }
+}
+
+fn rect_from_c(c: orrin_script::CRectTransform) -> crate::ui::RectTransform {
+    use glam::Vec2;
+    crate::ui::RectTransform {
+        anchor_min: Vec2::from_array(c.anchor_min),
+        anchor_max: Vec2::from_array(c.anchor_max),
+        pivot: Vec2::from_array(c.pivot),
+        anchored_position: Vec2::from_array(c.anchored_position),
+        size_delta: Vec2::from_array(c.size_delta),
+        scale: Vec2::from_array(c.scale),
+    }
+}
+
+fn image_to_c(image: &crate::ui::Image) -> orrin_script::CImage {
+    orrin_script::CImage {
+        texture: asset_bytes(image.texture),
+        color: image.color,
+        slice: image.slice,
+        raycast_target: image.raycast_target.into(),
+    }
+}
+
+fn image_from_c(c: orrin_script::CImage) -> crate::ui::Image {
+    crate::ui::Image {
+        texture: asset_of(c.texture),
+        color: c.color,
+        slice: c.slice,
+        raycast_target: c.raycast_target != 0,
+    }
+}
+
+fn text_to_c(text: &crate::ui::Text) -> orrin_script::CText {
+    orrin_script::CText {
+        font: asset_bytes(text.font),
+        color: text.color,
+        size: text.size,
+        anchor: text.anchor as u32,
+        wrap: text.wrap.into(),
+        raycast_target: text.raycast_target.into(),
+    }
+}
+
+/// Everything but the string, which the struct does not carry.
+fn text_from_c(c: orrin_script::CText, text: String) -> Option<crate::ui::Text> {
+    let Some(anchor) = TextAnchor::from_u32(c.anchor) else {
+        tracing::warn!("Text: {} is not a TextAnchor", c.anchor);
+        return None;
+    };
+    Some(crate::ui::Text {
+        text,
+        font: asset_of(c.font),
+        size: c.size,
+        color: c.color,
+        anchor,
+        wrap: c.wrap != 0,
+        raycast_target: c.raycast_target != 0,
+    })
+}
+
+fn button_to_c(button: &crate::ui::Button) -> orrin_script::CButton {
+    orrin_script::CButton {
+        normal: button.normal,
+        hover: button.hover,
+        pressed: button.pressed,
+        disabled: button.disabled,
+        interactable: button.interactable.into(),
+    }
+}
+
+fn button_from_c(c: orrin_script::CButton) -> crate::ui::Button {
+    crate::ui::Button {
+        normal: c.normal,
+        hover: c.hover,
+        pressed: c.pressed,
+        disabled: c.disabled,
+        interactable: c.interactable != 0,
+    }
+}
+
+fn gradient_to_c(gradient: &crate::ui::Gradient) -> orrin_script::CGradient {
+    orrin_script::CGradient {
+        start: gradient.start,
+        end: gradient.end,
+        rotation: gradient.rotation,
+        offset: gradient.offset.to_array(),
+    }
+}
+
+fn gradient_from_c(c: orrin_script::CGradient) -> crate::ui::Gradient {
+    crate::ui::Gradient {
+        start: c.start,
+        end: c.end,
+        rotation: c.rotation,
+        offset: glam::Vec2::from_array(c.offset),
+    }
+}
+
+fn corner_to_c(corner: &crate::ui::Corner) -> orrin_script::CCorner {
+    orrin_script::CCorner {
+        radius: corner.radius,
+        radius_fraction: corner.radius_fraction,
+        style: corner.style as u32,
+        exponent: corner.exponent,
+    }
+}
+
+fn corner_from_c(c: orrin_script::CCorner) -> Option<crate::ui::Corner> {
+    use crate::ui::CornerStyle;
+    let style = match c.style {
+        0 => CornerStyle::Round,
+        1 => CornerStyle::Squircle,
+        other => {
+            tracing::warn!("Corner: {other} is not a CornerStyle");
+            return None;
+        }
+    };
+    Some(crate::ui::Corner {
+        radius: c.radius,
+        radius_fraction: c.radius_fraction,
+        style,
+        exponent: c.exponent,
+    })
+}
+
+fn stroke_to_c(stroke: &crate::ui::Stroke) -> orrin_script::CStroke {
+    orrin_script::CStroke {
+        color: stroke.color,
+        thickness: stroke.thickness,
+        placement: stroke.placement as u32,
+    }
+}
+
+fn stroke_from_c(c: orrin_script::CStroke) -> Option<crate::ui::Stroke> {
+    use crate::ui::StrokePlacement;
+    let placement = match c.placement {
+        0 => StrokePlacement::Inside,
+        1 => StrokePlacement::Center,
+        2 => StrokePlacement::Outside,
+        other => {
+            tracing::warn!("Stroke: {other} is not a StrokePlacement");
+            return None;
+        }
+    };
+    Some(crate::ui::Stroke {
+        color: c.color,
+        thickness: c.thickness,
+        placement,
+    })
+}
+
+fn shadow_to_c(shadow: &crate::ui::Shadow) -> orrin_script::CShadow {
+    orrin_script::CShadow {
+        color: shadow.color,
+        offset: shadow.offset.to_array(),
+        blur: shadow.blur,
+        spread: shadow.spread,
+    }
+}
+
+fn shadow_from_c(c: orrin_script::CShadow) -> crate::ui::Shadow {
+    crate::ui::Shadow {
+        color: c.color,
+        offset: glam::Vec2::from_array(c.offset),
+        blur: c.blur,
+        spread: c.spread,
+    }
+}
+
+fn scroll_to_c(frame: &crate::ui::ScrollFrame) -> orrin_script::CScrollFrame {
+    orrin_script::CScrollFrame {
+        content_size: frame.content_size.to_array(),
+        scroll_position: frame.scroll_position.to_array(),
+        scroll_speed: frame.scroll_speed,
+        scrollbar_thickness: frame.scrollbar_thickness,
+        scrollbar_color: frame.scrollbar_color,
+        scrollbar: frame.scrollbar as u32,
+        horizontal: frame.horizontal.into(),
+        vertical: frame.vertical.into(),
+    }
+}
+
+fn scroll_from_c(c: orrin_script::CScrollFrame) -> Option<crate::ui::ScrollFrame> {
+    use crate::ui::ScrollbarVisibility;
+    let scrollbar = match c.scrollbar {
+        0 => ScrollbarVisibility::Auto,
+        1 => ScrollbarVisibility::Always,
+        2 => ScrollbarVisibility::Never,
+        other => {
+            tracing::warn!("ScrollFrame: {other} is not a ScrollbarVisibility");
+            return None;
+        }
+    };
+    Some(crate::ui::ScrollFrame {
+        content_size: glam::Vec2::from_array(c.content_size),
+        scroll_position: glam::Vec2::from_array(c.scroll_position),
+        horizontal: c.horizontal != 0,
+        vertical: c.vertical != 0,
+        scroll_speed: c.scroll_speed,
+        scrollbar,
+        scrollbar_thickness: c.scrollbar_thickness,
+        scrollbar_color: c.scrollbar_color,
+    })
+}
+
+/// `value` as C# sent it, if it is the size of `T`.
+fn read_c<T: Copy>(call: &str, kind: u32, value: *const u8, size: u32) -> Option<T> {
+    if value.is_null() || !sized::<T>(call, kind, size) {
+        return None;
+    }
+    // SAFETY: C# passes a pointer to `size` readable bytes, just checked to be
+    // a whole `T`; unaligned, since nothing promises the buffer's alignment.
+    Some(unsafe { value.cast::<T>().read_unaligned() })
+}
+
+/// `value` decoded as component `kind`, keeping `text` for a `Text`.
+fn decode(
+    call: &str,
+    kind: u32,
+    value: *const u8,
+    size: u32,
+    text: impl FnOnce() -> String,
+) -> Option<UiComponent> {
+    use orrin_script::{
+        CButton, CCanvas, CCorner, CGradient, CImage, CRectTransform, CScrollFrame, CShadow,
+        CStroke, CText,
+    };
+    match kind {
+        KIND_CANVAS => {
+            canvas_from_c(read_c::<CCanvas>(call, kind, value, size)?).map(UiComponent::Canvas)
+        }
+        KIND_RECT_TRANSFORM => Some(UiComponent::RectTransform(rect_from_c(read_c::<
+            CRectTransform,
+        >(
+            call, kind, value, size,
+        )?))),
+        KIND_IMAGE => Some(UiComponent::Image(image_from_c(read_c::<CImage>(
+            call, kind, value, size,
+        )?))),
+        KIND_TEXT => {
+            text_from_c(read_c::<CText>(call, kind, value, size)?, text()).map(UiComponent::Text)
+        }
+        KIND_BUTTON => Some(UiComponent::Button(button_from_c(read_c::<CButton>(
+            call, kind, value, size,
+        )?))),
+        KIND_GRADIENT => Some(UiComponent::Gradient(gradient_from_c(read_c::<CGradient>(
+            call, kind, value, size,
+        )?))),
+        KIND_CORNER => {
+            corner_from_c(read_c::<CCorner>(call, kind, value, size)?).map(UiComponent::Corner)
+        }
+        KIND_STROKE => {
+            stroke_from_c(read_c::<CStroke>(call, kind, value, size)?).map(UiComponent::Stroke)
+        }
+        KIND_SHADOW => Some(UiComponent::Shadow(shadow_from_c(read_c::<CShadow>(
+            call, kind, value, size,
+        )?))),
+        KIND_SCROLL_FRAME => scroll_from_c(read_c::<CScrollFrame>(call, kind, value, size)?)
+            .map(UiComponent::ScrollFrame),
+        _ => {
+            tracing::warn!("World.{call}: component kind {kind} has no blittable form");
+            None
+        }
+    }
+}
+
+/// The add of `kind` to `entity` this tick has queued, if there is one.
+fn with_queued<R>(
+    entity: Entity,
+    kind: u32,
+    change: impl FnOnce(&mut UiComponent) -> R,
+) -> Option<R> {
+    COMMANDS.with(|commands| {
+        commands
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find_map(|command| match command {
+                Command::AddUi {
+                    entity: queued,
+                    component,
+                } if *queued == entity && component.kind() == kind => Some(component),
+                _ => None,
+            })
+            .map(change)
+    })
+}
+
+extern "C" fn get_component(entity: CEntity, kind: u32, out: *mut u8, size: u32) -> bool {
+    fn write<T: Copy>(out: *mut u8, size: u32, kind: u32, value: T) -> bool {
+        if !sized::<T>("GetComponent", kind, size) {
+            return false;
+        }
+        // SAFETY: C# passes `size` writable bytes, just checked to be a whole
+        // `T`; unaligned, as in `read_c`.
+        unsafe { out.cast::<T>().write_unaligned(value) };
+        true
+    }
+    if out.is_null() {
+        return false;
+    }
+    orrin_script::with_world(false, |world| {
+        let entity = entity_of(entity);
+        let value = match kind {
+            KIND_CANVAS => world
+                .get::<crate::ui::Canvas>(entity)
+                .map(|c| canvas_to_c(&c))
+                .map(|c| write(out, size, kind, c)),
+            KIND_RECT_TRANSFORM => world
+                .get::<crate::ui::RectTransform>(entity)
+                .map(|c| write(out, size, kind, rect_to_c(&c))),
+            KIND_IMAGE => world
+                .get::<crate::ui::Image>(entity)
+                .map(|c| write(out, size, kind, image_to_c(&c))),
+            KIND_TEXT => world
+                .get::<crate::ui::Text>(entity)
+                .map(|c| write(out, size, kind, text_to_c(&c))),
+            KIND_BUTTON => world
+                .get::<crate::ui::Button>(entity)
+                .map(|c| write(out, size, kind, button_to_c(&c))),
+            KIND_GRADIENT => world
+                .get::<crate::ui::Gradient>(entity)
+                .map(|c| write(out, size, kind, gradient_to_c(&c))),
+            KIND_CORNER => world
+                .get::<crate::ui::Corner>(entity)
+                .map(|c| write(out, size, kind, corner_to_c(&c))),
+            KIND_STROKE => world
+                .get::<crate::ui::Stroke>(entity)
+                .map(|c| write(out, size, kind, stroke_to_c(&c))),
+            KIND_SHADOW => world
+                .get::<crate::ui::Shadow>(entity)
+                .map(|c| write(out, size, kind, shadow_to_c(&c))),
+            KIND_SCROLL_FRAME => world
+                .get::<crate::ui::ScrollFrame>(entity)
+                .map(|c| write(out, size, kind, scroll_to_c(&c))),
+            _ => {
+                tracing::warn!("World.GetComponent: component kind {kind} has no blittable form");
+                None
+            }
+        };
+        value.unwrap_or(false)
+    })
+}
+
+extern "C" fn set_component(entity: CEntity, kind: u32, value: *const u8, size: u32) -> bool {
+    orrin_script::with_world(false, |world| {
+        let entity = entity_of(entity);
+        let current_text = || {
+            world
+                .get::<crate::ui::Text>(entity)
+                .map(|text| text.text.clone())
+                .or_else(|| {
+                    with_queued(entity, KIND_TEXT, |queued| match queued {
+                        UiComponent::Text(text) => text.text.clone(),
+                        _ => String::new(),
+                    })
+                })
+                .unwrap_or_default()
+        };
+        let Some(component) = decode("SetComponent", kind, value, size, current_text) else {
+            return false;
+        };
+        let in_place = match &component {
+            UiComponent::Canvas(c) => world
+                .get_mut::<crate::ui::Canvas>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::RectTransform(c) => world
+                .get_mut::<crate::ui::RectTransform>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::Image(c) => world
+                .get_mut::<crate::ui::Image>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::Text(c) => world
+                .get_mut::<crate::ui::Text>(entity)
+                .map(|mut slot| *slot = c.clone()),
+            UiComponent::Button(c) => world
+                .get_mut::<crate::ui::Button>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::Gradient(c) => world
+                .get_mut::<crate::ui::Gradient>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::Corner(c) => world
+                .get_mut::<crate::ui::Corner>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::Stroke(c) => world
+                .get_mut::<crate::ui::Stroke>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::Shadow(c) => world
+                .get_mut::<crate::ui::Shadow>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::ScrollFrame(c) => world
+                .get_mut::<crate::ui::ScrollFrame>(entity)
+                .map(|mut slot| *slot = *c),
+        };
+        in_place.is_some() || with_queued(entity, kind, |queued| *queued = component).is_some()
+    })
+}
+
+extern "C" fn add_component(entity: CEntity, kind: u32, value: *const u8, size: u32) -> bool {
+    let Some(component) = decode("AddComponent", kind, value, size, String::new) else {
+        return false;
+    };
+    orrin_script::with_world(false, |world| {
+        let entity = entity_of(entity);
+        if !world.is_alive(entity) {
+            return false;
+        }
+        COMMANDS.with(|commands| {
+            commands
+                .borrow_mut()
+                .push(Command::AddUi { entity, component })
+        });
+        true
+    })
+}
+
+// The `get_tag` protocol; see `OrrinApi::get_component_text`.
+extern "C" fn get_component_text(entity: CEntity, kind: u32, out: *mut u8, capacity: i32) -> i32 {
+    if kind != KIND_TEXT || (out.is_null() && capacity > 0) {
+        return -1;
+    }
+    orrin_script::with_world(-1, |world| {
+        let entity = entity_of(entity);
+        let text = world
+            .get::<crate::ui::Text>(entity)
+            .map(|text| text.text.clone())
+            .or_else(|| {
+                with_queued(entity, KIND_TEXT, |queued| match queued {
+                    UiComponent::Text(text) => text.text.clone(),
+                    _ => String::new(),
+                })
+            });
+        let Some(text) = text else {
+            return -1;
+        };
+        let bytes = text.as_bytes();
+        let n = bytes.len().min(capacity.max(0) as usize);
+        if n > 0 {
+            // SAFETY: C# passes `capacity` writable bytes; the source is our own
+            // string, so the ranges cannot overlap.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, n) };
+        }
+        bytes.len() as i32
+    })
+}
+
+extern "C" fn set_component_text(entity: CEntity, kind: u32, text: *const u8, len: u32) -> bool {
+    if kind != KIND_TEXT || (text.is_null() && len > 0) {
+        return false;
+    }
+    let text = if len == 0 {
+        String::new()
+    } else {
+        // SAFETY: C# passes `len` bytes it keeps pinned for the call.
+        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(text, len as usize) })
+            .into_owned()
+    };
+    orrin_script::with_world(false, |world| {
+        let entity = entity_of(entity);
+        if let Some(mut component) = world.get_mut::<crate::ui::Text>(entity) {
+            component.text = text;
+            return true;
+        }
+        with_queued(entity, KIND_TEXT, |queued| {
+            if let UiComponent::Text(queued) = queued {
+                queued.text = text;
+            }
+        })
+        .is_some()
+    })
+}
+
+extern "C" fn ui_pointer_over() -> bool {
+    orrin_script::with_world(false, |world| {
+        world
+            .get_resource::<crate::ui::events::UiPointer>()
+            .is_some_and(|pointer| pointer.is_over_ui())
+    })
+}
+
+extern "C" fn tween_play(entity: CEntity, request: *const orrin_script::CTween, size: u32) -> u64 {
+    use crate::ui::tween::{Ease, EaseDirection, EaseStyle, Tween, TweenProperty, UiTweens};
+
+    if request.is_null() {
+        return 0;
+    }
+    let expected = std::mem::size_of::<orrin_script::CTween>() as u32;
+    if size != expected {
+        tracing::warn!(
+            "Tween.To: C# passed {size} bytes and the engine's tween is {expected}; rebuild \
+             scripting/Orrin so the bindings match the engine"
+        );
+        return 0;
+    }
+    // SAFETY: C# passes `size` readable bytes, just checked to be a whole
+    // `CTween`; unaligned, as in `read_c`.
+    let c = unsafe { request.cast::<orrin_script::CTween>().read_unaligned() };
+    let (Some(property), Some(style), Some(direction)) = (
+        TweenProperty::from_u32(c.property),
+        EaseStyle::from_u32(c.style),
+        EaseDirection::from_u32(c.direction),
+    ) else {
+        tracing::warn!(
+            "Tween.To: property {}, style {} or direction {} is one this engine cannot name",
+            c.property,
+            c.style,
+            c.direction
+        );
+        return 0;
+    };
+    let finite = |lanes: &[f32]| lanes.iter().all(|lane| lane.is_finite());
+    let timed = |seconds: f32| seconds.is_finite() && seconds >= 0.0;
+    if !timed(c.duration) || !timed(c.delay) || !finite(&c.to) || !finite(&c.from) {
+        tracing::warn!("Tween.To: a duration or delay below zero, or a value that is not finite");
+        return 0;
+    }
+    orrin_script::with_world(0, |world| {
+        let target = entity_of(entity);
+        if !world.is_alive(target) {
+            return 0;
+        }
+        if world.get_resource::<UiTweens>().is_none() {
+            world.insert_resource(UiTweens::default());
+        }
+        let tween = Tween {
+            target,
+            property,
+            to: c.to,
+            from: (c.has_from != 0).then_some(c.from),
+            duration: c.duration,
+            delay: c.delay,
+            ease: Ease::new(style, direction),
+            repeat: c.repeat,
+            reverses: c.reverses != 0,
+        };
+        world.resource_mut::<UiTweens>().play(tween).to_bits()
+    })
+}
+
+fn with_tweens(
+    query: impl FnOnce(&mut crate::ui::tween::UiTweens, crate::ui::tween::TweenId) -> bool,
+    id: u64,
+) -> bool {
+    id != 0
+        && orrin_script::with_world(false, |world| {
+            world
+                .get_resource_mut::<crate::ui::tween::UiTweens>()
+                .is_some_and(|mut tweens| {
+                    query(&mut tweens, crate::ui::tween::TweenId::from_bits(id))
+                })
+        })
+}
+
+extern "C" fn tween_cancel(id: u64) -> bool {
+    with_tweens(|tweens, id| tweens.cancel(id), id)
+}
+
+extern "C" fn tween_playing(id: u64) -> bool {
+    with_tweens(|tweens, id| tweens.is_playing(id), id)
+}
+
+/// A control's name, or `None` for bytes that are not one.
+fn control_name<'a>(name: *const u8, length: u32) -> Option<&'a str> {
+    if name.is_null() {
+        return None;
+    }
+    // SAFETY: C# passes `length` readable bytes of UTF-8.
+    std::str::from_utf8(unsafe { std::slice::from_raw_parts(name, length as usize) }).ok()
+}
+
+extern "C" fn story_float(name: *const u8, length: u32, default: f32, min: f32, max: f32) -> f32 {
+    let Some(name) = control_name(name, length) else {
+        return default;
+    };
+    orrin_script::with_world(default, |world| {
+        world
+            .get_resource_mut::<crate::ui::story::StoryArgs>()
+            .map_or(default, |mut args| args.float(name, default, min, max))
+    })
+}
+
+extern "C" fn story_bool(name: *const u8, length: u32, default: bool) -> bool {
+    let Some(name) = control_name(name, length) else {
+        return default;
+    };
+    orrin_script::with_world(default, |world| {
+        world
+            .get_resource_mut::<crate::ui::story::StoryArgs>()
+            .map_or(default, |mut args| args.bool(name, default))
+    })
+}
+
 /// Apply a queued scene change. Every other command is `apply_commands`' own.
 fn scene_command(world: &mut World, registry: &Registry, command: Command) {
     use crate::scene::loaded;
@@ -1331,6 +2200,21 @@ fn build_api() -> OrrinApi {
         set_camera_lens,
         get_active_camera,
         set_active_camera,
+        ui_panel,
+        ui_text,
+        ui_image,
+        ui_screen_size,
+        get_component,
+        set_component,
+        add_component,
+        get_component_text,
+        set_component_text,
+        ui_pointer_over,
+        tween_play,
+        tween_cancel,
+        tween_playing,
+        story_float,
+        story_bool,
         ..orrin_script::default_api()
     }
 }
@@ -1431,6 +2315,11 @@ pub struct Scripting {
     /// hash lookup instead of a scan over every scripted entity. Built only on
     /// ticks that actually have events.
     routing: RefCell<FxHashMap<Entity, usize>>,
+    /// This tick's pointer events, swapped out of the world for the dispatch
+    /// and back, cleared, so neither side reallocates.
+    pointer_events: RefCell<crate::ui::events::UiEvents>,
+    /// The tweens that finished since the last tick, likewise.
+    finished_tweens: RefCell<Vec<crate::ui::tween::TweenId>>,
 }
 
 impl Scripting {
@@ -1542,6 +2431,8 @@ impl Scripting {
             game_dll: game_dll.to_path_buf(),
             pending: RefCell::new(Vec::new()),
             routing: RefCell::new(FxHashMap::default()),
+            pointer_events: RefCell::new(crate::ui::events::UiEvents::default()),
+            finished_tweens: RefCell::new(Vec::new()),
         };
         match scripting.stage() {
             Ok(()) => {}
@@ -1777,6 +2668,56 @@ impl Scripting {
         &self.host
     }
 
+    /// Every story the live game assembly declares, in name order.
+    pub fn story_names(&self) -> Vec<String> {
+        self.host.story_names()
+    }
+
+    /// Build story `name` onto `canvas` in `world` — a story world from
+    /// `ui::story::world` — with `args` as the controls' held values, and
+    /// apply what it queued. Returns how it went and the controls it asked for.
+    pub fn build_story(
+        &self,
+        world: &mut World,
+        registry: &Registry,
+        name: &str,
+        canvas: Entity,
+        args: crate::ui::story::StoryArgs,
+    ) -> (orrin_script::StoryBuild, crate::ui::story::StoryArgs) {
+        world.insert_resource(args.rebuild());
+        let canvas = CEntity {
+            index: canvas.index,
+            generation: canvas.generation,
+        };
+        let built = orrin_script::with_active_world(world, || self.host.build_story(name, canvas));
+        self.apply_commands(world, registry);
+        let args = world
+            .remove_resource::<crate::ui::story::StoryArgs>()
+            .unwrap_or_default();
+        world.insert_resource(crate::ui::story::StoryArgs::default());
+        (built, args)
+    }
+
+    /// Run the completion callbacks of every tween that finished since the
+    /// last tick, in its own dispatch window. Whether there were any.
+    fn finish_tweens(&self, world: &mut World) -> bool {
+        let mut finished = self.finished_tweens.take();
+        finished.clear();
+        if let Some(mut tweens) = world.get_resource_mut::<crate::ui::tween::UiTweens>() {
+            tweens.take_completed(&mut finished);
+        }
+        let any = !finished.is_empty();
+        if any {
+            orrin_script::with_active_world(world, || {
+                for id in &finished {
+                    self.host.tween_complete(id.to_bits());
+                }
+            });
+        }
+        self.finished_tweens.replace(finished);
+        any
+    }
+
     /// Describe every `[Component]`-attributed Behaviour in the live game
     /// assembly to `registry`, so its fields save, load and inspect exactly as a
     /// Rust component's do.
@@ -1858,8 +2799,11 @@ impl Scripting {
     ///
     /// Dispatch order inside the window mirrors Unity: activation transitions
     /// (OnEnable/OnStart/OnDisable), then this frame's collision callbacks,
-    /// then OnUpdate.
+    /// then its pointer events, then OnUpdate.
     pub fn tick(&self, world: &mut World, registry: &Registry, delta_time: f32) {
+        // First, and whether or not anything else runs: a callback is game
+        // code with no behaviour behind it, and a story may have nothing else.
+        let finished = self.finish_tweens(world);
         let mut pending = self.pending.take();
         pending.clear();
         world
@@ -1881,6 +2825,9 @@ impl Scripting {
             });
         if pending.is_empty() {
             self.pending.replace(pending);
+            if finished {
+                self.apply_commands(world, registry);
+            }
             return;
         }
 
@@ -1895,9 +2842,14 @@ impl Scripting {
         // Built here and not inside the window, and only when there is
         // something to route: a tick with no collisions should not pay for an
         // index nothing reads.
+        let mut pointer_events = self.pointer_events.take();
+        if let Some(mut queued) = world.get_resource_mut::<crate::ui::events::UiEvents>() {
+            std::mem::swap(&mut *queued, &mut pointer_events);
+        }
+
         let mut routing = self.routing.take();
         routing.clear();
-        if !events.is_empty() {
+        if !events.is_empty() || !pointer_events.is_empty() {
             routing.extend(
                 pending
                     .iter()
@@ -1970,12 +2922,46 @@ impl Scripting {
                 }
             }
 
+            // Offered up each event's chain to the first behaviour that
+            // handles it. One that is inactive, faulted or has no handler
+            // passes it on, as a disabled component does in uGUI.
+            crate::ui::events::deliver(&pointer_events, |entity, event| {
+                let Some(&index) = routing.get(&entity) else {
+                    return false;
+                };
+                let script = &mut pending[index];
+                if !script.active || script.faulted {
+                    return false;
+                }
+                let payload = orrin_script::CPointerEvent {
+                    position: event.position,
+                    press_position: event.press_position,
+                    target: CEntity {
+                        index: event.target.index,
+                        generation: event.target.generation,
+                    },
+                    button: 0,
+                };
+                match self
+                    .host
+                    .pointer(script.handle, event.kind as u32, &payload)
+                {
+                    orrin_script::Delivery::Handled => true,
+                    orrin_script::Delivery::Unhandled => false,
+                    orrin_script::Delivery::Faulted => {
+                        script.faulted = true;
+                        true
+                    }
+                }
+            });
+
             for script in &mut pending {
                 if script.active && !script.faulted && self.host.update(script.handle, delta_time) {
                     script.faulted = true;
                 }
             }
         });
+        pointer_events.clear();
 
         // Structural changes the scripts queued land now, after every script
         // has run — so this frame's extraction already sees new renderables.
@@ -1993,6 +2979,7 @@ impl Scripting {
 
         self.pending.replace(pending);
         self.routing.replace(routing);
+        self.pointer_events.replace(pointer_events);
     }
 
     /// Apply the structural changes scripts queued during a dispatch. Runs
@@ -2036,6 +3023,7 @@ impl Scripting {
                 Command::AddCamera { entity, camera } => {
                     world.insert(entity, camera);
                 }
+                Command::AddUi { entity, component } => component.insert(world, entity),
                 Command::SetMaterial { entity, material } => {
                     world.insert(entity, material);
                 }
@@ -2391,6 +3379,26 @@ mod tests {
         assert_eq!(state(&mut world, AssetId::new()), orrin_script::LOAD_FAILED);
     }
 
+    #[test]
+    fn a_script_finds_a_font_by_path() {
+        let dir = crate::asset_db::tests::Dir::new("script-font");
+        dir.write("fonts/title.ttf", b"glyphs");
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let mut world = World::new();
+        world.insert_resource(db);
+        let mut out = [0u8; 16];
+        let kind = orrin_script::with_active_world(&mut world, || {
+            find_asset(c"fonts/title.ttf".as_ptr(), out.as_mut_ptr())
+        });
+        assert_eq!(kind, orrin_script::ASSET_FONT);
+        let id = world
+            .resource::<crate::asset_db::AssetDatabase>()
+            .find("fonts/title.ttf")
+            .unwrap()
+            .id;
+        assert_eq!(AssetId::from_bytes(out), id);
+    }
+
     /// A `.fmat` is found by path as a material, Ready once it reads and
     /// Failed while it does not; an engine-built material is always Ready.
     #[test]
@@ -2621,5 +3629,831 @@ mod tests {
             crate::scene::Camera::default().position,
             "the view itself follows the entity at the end of the frame"
         );
+    }
+
+    /// What C# hands across for each kind, with every field away from its
+    /// default so a dropped one shows.
+    fn c_image() -> orrin_script::CImage {
+        orrin_script::CImage {
+            texture: AssetId::new().to_bytes(),
+            color: [0.1, 0.2, 0.3, 0.4],
+            slice: [1.0, 2.0, 3.0, 4.0],
+            raycast_target: 0,
+        }
+    }
+
+    fn bytes_of<T>(value: &T) -> *const u8 {
+        (value as *const T).cast()
+    }
+
+    fn size_of<T>() -> u32 {
+        std::mem::size_of::<T>() as u32
+    }
+
+    /// Every kind reads back what was written to it, and an add is deferred
+    /// like any structural change.
+    #[test]
+    fn each_ui_component_round_trips_through_the_generic_pair() {
+        use orrin_script::{CButton, CCanvas, CRectTransform, CText};
+
+        let mut world = World::new();
+        let entity = world.spawn();
+        let canvas = CCanvas {
+            scale_mode: 1,
+            reference_resolution: [1280.0, 720.0],
+            match_width_or_height: 0.5,
+            sort_order: -2,
+        };
+        let rect = CRectTransform {
+            anchor_min: [0.1, 0.2],
+            anchor_max: [0.3, 0.4],
+            pivot: [0.5, 0.6],
+            anchored_position: [7.0, 8.0],
+            size_delta: [9.0, 10.0],
+            scale: [2.0, 3.0],
+        };
+        let image = c_image();
+        let text = CText {
+            font: AssetId::new().to_bytes(),
+            color: [1.0, 0.0, 0.5, 1.0],
+            size: 40.0,
+            anchor: 4,
+            wrap: 0,
+            raycast_target: 1,
+        };
+        let button = CButton {
+            normal: [0.1; 4],
+            hover: [0.2; 4],
+            pressed: [0.3; 4],
+            disabled: [0.4; 4],
+            interactable: 0,
+        };
+        let added = orrin_script::with_active_world(&mut world, || {
+            [
+                add_component(
+                    c(entity),
+                    KIND_CANVAS,
+                    bytes_of(&canvas),
+                    size_of::<CCanvas>(),
+                ),
+                add_component(
+                    c(entity),
+                    KIND_RECT_TRANSFORM,
+                    bytes_of(&rect),
+                    size_of::<CRectTransform>(),
+                ),
+                add_component(
+                    c(entity),
+                    KIND_IMAGE,
+                    bytes_of(&image),
+                    size_of::<orrin_script::CImage>(),
+                ),
+                add_component(c(entity), KIND_TEXT, bytes_of(&text), size_of::<CText>()),
+                add_component(
+                    c(entity),
+                    KIND_BUTTON,
+                    bytes_of(&button),
+                    size_of::<CButton>(),
+                ),
+            ]
+        });
+        assert_eq!(added, [true; 5]);
+        assert!(!world.has::<crate::ui::Image>(entity), "deferred");
+        let commands: Vec<Command> = COMMANDS.with(|c| c.borrow_mut().drain(..).collect());
+        assert_eq!(commands.len(), 5);
+        for command in commands {
+            let Command::AddUi { entity, component } = command else {
+                panic!("not a UI add");
+            };
+            component.insert(&mut world, entity);
+        }
+
+        fn read<T: Default>(world: &mut World, entity: Entity, kind: u32) -> T {
+            let mut out = T::default();
+            let read = orrin_script::with_active_world(world, || {
+                get_component(c(entity), kind, (&mut out as *mut T).cast(), size_of::<T>())
+            });
+            assert!(read, "kind {kind}");
+            out
+        }
+        assert_eq!(read::<CCanvas>(&mut world, entity, KIND_CANVAS), canvas);
+        assert_eq!(
+            read::<CRectTransform>(&mut world, entity, KIND_RECT_TRANSFORM),
+            rect
+        );
+        assert_eq!(
+            read::<orrin_script::CImage>(&mut world, entity, KIND_IMAGE),
+            image
+        );
+        assert_eq!(read::<CText>(&mut world, entity, KIND_TEXT), text);
+        assert_eq!(read::<CButton>(&mut world, entity, KIND_BUTTON), button);
+
+        let moved = CRectTransform {
+            anchored_position: [-1.0, -2.0],
+            ..rect
+        };
+        assert!(orrin_script::with_active_world(&mut world, || {
+            set_component(
+                c(entity),
+                KIND_RECT_TRANSFORM,
+                bytes_of(&moved),
+                size_of::<CRectTransform>(),
+            )
+        }));
+        assert_eq!(
+            world
+                .get::<crate::ui::RectTransform>(entity)
+                .unwrap()
+                .anchored_position,
+            glam::Vec2::new(-1.0, -2.0)
+        );
+        assert!(orrin_script::with_active_world(&mut world, || {
+            (0..=KIND_BUTTON).all(|kind| kind < KIND_CANVAS || has_component(c(entity), kind))
+        }));
+    }
+
+    /// The modifiers cross the same generic pair as the rest of the UI: each
+    /// add is deferred, reads back as written, and a set lands in place.
+    #[test]
+    fn each_ui_modifier_round_trips_through_the_generic_pair() {
+        use orrin_script::{CCorner, CGradient, CScrollFrame, CShadow, CStroke};
+
+        let mut world = World::new();
+        let entity = world.spawn();
+        let gradient = CGradient {
+            start: [0.1, 0.2, 0.3, 0.4],
+            end: [0.5, 0.6, 0.7, 0.8],
+            rotation: 30.0,
+            offset: [0.1, -0.2],
+        };
+        let corner = CCorner {
+            radius: 6.0,
+            radius_fraction: 0.25,
+            style: 1,
+            exponent: 5.0,
+        };
+        let stroke = CStroke {
+            color: [1.0, 0.5, 0.0, 1.0],
+            thickness: 3.0,
+            placement: 2,
+        };
+        let shadow = CShadow {
+            color: [0.0, 0.0, 0.0, 0.3],
+            offset: [1.0, 2.0],
+            blur: 12.0,
+            spread: -1.0,
+        };
+        let scroll = CScrollFrame {
+            content_size: [500.0, 900.0],
+            scroll_position: [10.0, 20.0],
+            scroll_speed: 30.0,
+            scrollbar_thickness: 4.0,
+            scrollbar_color: [0.9, 0.9, 0.9, 0.5],
+            scrollbar: 1,
+            horizontal: 1,
+            vertical: 0,
+        };
+        let added = orrin_script::with_active_world(&mut world, || {
+            [
+                add_component(
+                    c(entity),
+                    KIND_GRADIENT,
+                    bytes_of(&gradient),
+                    size_of::<CGradient>(),
+                ),
+                add_component(
+                    c(entity),
+                    KIND_CORNER,
+                    bytes_of(&corner),
+                    size_of::<CCorner>(),
+                ),
+                add_component(
+                    c(entity),
+                    KIND_STROKE,
+                    bytes_of(&stroke),
+                    size_of::<CStroke>(),
+                ),
+                add_component(
+                    c(entity),
+                    KIND_SHADOW,
+                    bytes_of(&shadow),
+                    size_of::<CShadow>(),
+                ),
+                add_component(
+                    c(entity),
+                    KIND_SCROLL_FRAME,
+                    bytes_of(&scroll),
+                    size_of::<CScrollFrame>(),
+                ),
+            ]
+        });
+        assert_eq!(added, [true; 5]);
+        assert!(!world.has::<crate::ui::Corner>(entity), "deferred");
+        let commands: Vec<Command> = COMMANDS.with(|c| c.borrow_mut().drain(..).collect());
+        assert_eq!(commands.len(), 5);
+        for command in commands {
+            let Command::AddUi { entity, component } = command else {
+                panic!("not a UI add");
+            };
+            component.insert(&mut world, entity);
+        }
+        assert_eq!(
+            world.get::<crate::ui::Corner>(entity).unwrap().style,
+            crate::ui::CornerStyle::Squircle
+        );
+        assert_eq!(
+            world.get::<crate::ui::Stroke>(entity).unwrap().placement,
+            crate::ui::StrokePlacement::Outside
+        );
+
+        fn read<T: Default>(world: &mut World, entity: Entity, kind: u32) -> T {
+            let mut out = T::default();
+            let read = orrin_script::with_active_world(world, || {
+                get_component(c(entity), kind, (&mut out as *mut T).cast(), size_of::<T>())
+            });
+            assert!(read, "kind {kind}");
+            out
+        }
+        assert_eq!(
+            read::<CGradient>(&mut world, entity, KIND_GRADIENT),
+            gradient
+        );
+        assert_eq!(read::<CCorner>(&mut world, entity, KIND_CORNER), corner);
+        assert_eq!(read::<CStroke>(&mut world, entity, KIND_STROKE), stroke);
+        assert_eq!(read::<CShadow>(&mut world, entity, KIND_SHADOW), shadow);
+        assert_eq!(
+            read::<CScrollFrame>(&mut world, entity, KIND_SCROLL_FRAME),
+            scroll
+        );
+
+        let scrolled = CScrollFrame {
+            scroll_position: [0.0, 400.0],
+            ..scroll
+        };
+        assert!(orrin_script::with_active_world(&mut world, || {
+            set_component(
+                c(entity),
+                KIND_SCROLL_FRAME,
+                bytes_of(&scrolled),
+                size_of::<CScrollFrame>(),
+            )
+        }));
+        assert_eq!(
+            world
+                .get::<crate::ui::ScrollFrame>(entity)
+                .unwrap()
+                .scroll_position,
+            glam::Vec2::new(0.0, 400.0)
+        );
+        let bad = CCorner { style: 7, ..corner };
+        assert!(!orrin_script::with_active_world(&mut world, || {
+            set_component(c(entity), KIND_CORNER, bytes_of(&bad), size_of::<CCorner>())
+        }));
+        assert!(orrin_script::with_active_world(&mut world, || {
+            (KIND_GRADIENT..=KIND_SCROLL_FRAME).all(|kind| has_component(c(entity), kind))
+        }));
+    }
+
+    /// A bindings build whose struct is not the engine's size is refused by
+    /// name rather than read past the end of.
+    #[test]
+    fn a_struct_of_the_wrong_size_is_refused_by_name() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(entity, crate::ui::Image::default());
+        let image = c_image();
+        let lines = logged(|| {
+            orrin_script::with_active_world(&mut world, || {
+                let mut out = c_image();
+                let short = size_of::<orrin_script::CImage>() - 4;
+                assert!(!get_component(
+                    c(entity),
+                    KIND_IMAGE,
+                    (&mut out as *mut orrin_script::CImage).cast(),
+                    short
+                ));
+                assert!(!set_component(
+                    c(entity),
+                    KIND_IMAGE,
+                    bytes_of(&image),
+                    short
+                ));
+                assert!(!add_component(
+                    c(entity),
+                    KIND_IMAGE,
+                    bytes_of(&image),
+                    short
+                ));
+            });
+        });
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for (level, line) in &lines {
+            assert_eq!(*level, LogLevel::Warning);
+            assert!(
+                line.contains("Image") && line.contains("48") && line.contains("52"),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            *world.get::<crate::ui::Image>(entity).unwrap(),
+            crate::ui::Image::default()
+        );
+        assert!(COMMANDS.with(|c| c.borrow().is_empty()));
+    }
+
+    /// The `get_tag` protocol: the full length comes back whatever the
+    /// buffer, so C# can retry once with one that fits.
+    #[test]
+    fn a_text_is_read_whole_after_a_retry_and_written_by_length() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(
+            entity,
+            crate::ui::Text {
+                text: "Start the game".into(),
+                ..crate::ui::Text::default()
+            },
+        );
+        let bare = world.spawn();
+        orrin_script::with_active_world(&mut world, || {
+            let mut small = [0u8; 4];
+            let total = get_component_text(c(entity), KIND_TEXT, small.as_mut_ptr(), 4);
+            assert_eq!(total, 14);
+            assert_eq!(&small, b"Star");
+            let mut whole = vec![0u8; total as usize];
+            assert_eq!(
+                get_component_text(c(entity), KIND_TEXT, whole.as_mut_ptr(), total),
+                14
+            );
+            assert_eq!(whole, b"Start the game");
+            assert_eq!(
+                get_component_text(c(bare), KIND_TEXT, small.as_mut_ptr(), 4),
+                -1
+            );
+            assert_eq!(
+                get_component_text(c(entity), KIND_IMAGE, small.as_mut_ptr(), 4),
+                -1
+            );
+
+            let text = "Quit — now";
+            assert!(set_component_text(
+                c(entity),
+                KIND_TEXT,
+                text.as_ptr(),
+                text.len() as u32
+            ));
+            assert!(!set_component_text(
+                c(bare),
+                KIND_TEXT,
+                text.as_ptr(),
+                text.len() as u32
+            ));
+        });
+        assert_eq!(
+            world.get::<crate::ui::Text>(entity).unwrap().text,
+            "Quit — now"
+        );
+    }
+
+    /// A set made in the same tick as the add lands on the queued component,
+    /// so `AddComponent` then `SetText` is not a silent no-op.
+    #[test]
+    fn a_set_in_the_tick_of_the_add_lands_on_the_queued_component() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        let text = orrin_script::CText {
+            size: 30.0,
+            wrap: 1,
+            ..Default::default()
+        };
+        orrin_script::with_active_world(&mut world, || {
+            let size = size_of::<orrin_script::CText>();
+            assert!(add_component(c(entity), KIND_TEXT, bytes_of(&text), size));
+            let label = "Ready";
+            assert!(set_component_text(
+                c(entity),
+                KIND_TEXT,
+                label.as_ptr(),
+                label.len() as u32
+            ));
+            let bigger = orrin_script::CText { size: 50.0, ..text };
+            assert!(set_component(c(entity), KIND_TEXT, bytes_of(&bigger), size));
+            let mut back = [0u8; 8];
+            assert_eq!(
+                get_component_text(c(entity), KIND_TEXT, back.as_mut_ptr(), 8),
+                5
+            );
+        });
+        let commands: Vec<Command> = COMMANDS.with(|c| c.borrow_mut().drain(..).collect());
+        let [
+            Command::AddUi {
+                entity: queued,
+                component,
+            },
+        ] = commands.as_slice()
+        else {
+            panic!("expected the one queued add");
+        };
+        let mut placed = World::new();
+        let target = placed.spawn();
+        assert_eq!(*queued, entity);
+        component.clone().insert(&mut placed, target);
+        let added = placed.get::<crate::ui::Text>(target).unwrap();
+        assert_eq!((added.text.as_str(), added.size), ("Ready", 50.0));
+    }
+
+    #[test]
+    fn a_script_asks_whether_the_pointer_is_over_the_ui() {
+        use crate::ui::events::{PointerInput, UiEvents, UiPointer, step};
+
+        let mut world = World::new();
+        assert!(!orrin_script::with_active_world(&mut world, || {
+            ui_pointer_over()
+        }));
+        let canvas = world.spawn();
+        world.insert(canvas, crate::ui::Canvas::default());
+        let panel = world.spawn();
+        world.insert(
+            panel,
+            crate::ui::RectTransform {
+                anchor_min: glam::Vec2::ZERO,
+                anchor_max: glam::Vec2::ZERO,
+                pivot: glam::Vec2::ZERO,
+                ..crate::ui::RectTransform::default()
+            },
+        );
+        world.insert(panel, crate::ui::Image::default());
+        crate::scene::reparent(&mut world, panel, Some(canvas), false).unwrap();
+        crate::ui::update(&mut world, [800, 600]);
+
+        for (x, over) in [(50.0, true), (500.0, false)] {
+            let mut pointer = UiPointer::default();
+            let input = PointerInput {
+                position: [x, 50.0],
+                ..PointerInput::default()
+            };
+            let tree = world.resource::<crate::ui::UiTree>();
+            step(
+                &world,
+                &tree.layout,
+                &mut pointer,
+                input,
+                &mut UiEvents::default(),
+            );
+            drop(tree);
+            world.insert_resource(pointer);
+            assert_eq!(
+                orrin_script::with_active_world(&mut world, || ui_pointer_over()),
+                over
+            );
+        }
+    }
+
+    fn ui_world() -> World {
+        let mut world = World::new();
+        let mut canvas = UiCanvas::default();
+        canvas.begin([1920, 1080]);
+        world.insert_resource(canvas);
+        world
+    }
+
+    #[test]
+    fn a_script_draws_into_the_canvas_in_call_order() {
+        use crate::scene::{Rect, TextAnchor, TextStyle, UiCommand};
+
+        let mut world = ui_world();
+        let icon = AssetId::new();
+        let text = "héllo";
+        orrin_script::with_active_world(&mut world, || {
+            ui_panel(10.0, 20.0, 300.0, 40.0, 0.0, 0.0, 0.0, 0.5);
+            ui_text(
+                text.as_ptr(),
+                text.len() as u32,
+                std::ptr::null(),
+                24.0,
+                4,
+                10.0,
+                20.0,
+                300.0,
+                40.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+            );
+            ui_image(
+                icon.to_bytes().as_ptr(),
+                0.0,
+                0.0,
+                64.0,
+                64.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+            );
+        });
+
+        let canvas = world.resource::<UiCanvas>();
+        let rect = Rect::new(10.0, 20.0, 300.0, 40.0);
+        let commands = canvas.commands();
+        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert_eq!(
+            commands[0],
+            UiCommand::Panel {
+                rect,
+                color: [0, 0, 0, 128]
+            }
+        );
+        let UiCommand::Text {
+            rect: text_rect,
+            style,
+            text: range,
+        } = &commands[1]
+        else {
+            panic!("{:?}", commands[1]);
+        };
+        assert_eq!(*text_rect, rect);
+        assert_eq!(
+            *style,
+            TextStyle {
+                font: None,
+                size: 24.0,
+                anchor: TextAnchor::MiddleCenter,
+                color: [255; 4],
+                wrap: true,
+            }
+        );
+        assert_eq!(canvas.str(range), "héllo");
+        assert_eq!(
+            commands[2],
+            UiCommand::Image {
+                rect: Rect::new(0.0, 0.0, 64.0, 64.0),
+                texture: icon,
+                uv: [0.0, 0.0, 1.0, 1.0],
+                tint: [255; 4],
+            }
+        );
+    }
+
+    /// The anchor crosses as a number C# owns the meaning of; one past the end
+    /// is a version mismatch and sets text as an unanchored label would.
+    #[test]
+    fn a_script_names_its_font_and_an_unknown_anchor_falls_back() {
+        use crate::scene::{TextAnchor, UiCommand};
+
+        let mut world = ui_world();
+        let font = AssetId::new();
+        orrin_script::with_active_world(&mut world, || {
+            ui_text(
+                "a".as_ptr(),
+                1,
+                font.to_bytes().as_ptr(),
+                12.0,
+                99,
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+            );
+        });
+        let canvas = world.resource::<UiCanvas>();
+        let UiCommand::Text { style, .. } = &canvas.commands()[0] else {
+            panic!("{:?}", canvas.commands());
+        };
+        assert_eq!(style.font, Some(font));
+        assert_eq!(style.anchor, TextAnchor::UpperLeft);
+    }
+
+    #[test]
+    fn a_script_reads_the_screen_its_tick_began_with() {
+        let mut world = ui_world();
+        let (mut width, mut height) = (0.0, 0.0);
+        orrin_script::with_active_world(&mut world, || ui_screen_size(&mut width, &mut height));
+        assert_eq!((width, height), (1920.0, 1080.0));
+    }
+
+    /// A tool or a test may tick scripts with no canvas; the calls do nothing.
+    #[test]
+    fn ui_calls_without_a_canvas_are_ignored() {
+        let mut world = World::new();
+        let (mut width, mut height) = (1.0, 1.0);
+        orrin_script::with_active_world(&mut world, || {
+            ui_panel(0.0, 0.0, 10.0, 10.0, 1.0, 1.0, 1.0, 1.0);
+            ui_text(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                12.0,
+                0,
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+            );
+            ui_screen_size(&mut width, &mut height);
+        });
+        assert_eq!((width, height), (0.0, 0.0));
+    }
+
+    /// A script is the game, so it sees the cursor in the pixels of the screen
+    /// it is told it has — the previewed one in the editor.
+    #[test]
+    fn a_script_sees_the_cursor_in_the_game_screens_pixels() {
+        let mut world = World::new();
+        let mut input = InputState::new();
+        input.place_cursor((110.0, 70.0));
+        world.insert_resource(input);
+        world.insert_resource(crate::scene::GameScreen {
+            size: [1920.0, 1080.0],
+            origin: [100.0, 50.0],
+            scale: 0.5,
+            clip: crate::scene::Rect::new(100.0, 50.0, 960.0, 540.0),
+        });
+        let (mut x, mut y) = (0.0, 0.0);
+        orrin_script::with_active_world(&mut world, || cursor_pos(&mut x, &mut y));
+        assert_eq!((x, y), (20.0, 40.0));
+    }
+
+    fn tween_world() -> (World, Entity) {
+        let mut world = World::new();
+        world.insert_resource(crate::ui::tween::UiTweens::default());
+        let entity = world.spawn();
+        world.insert(entity, crate::ui::RectTransform::default());
+        (world, entity)
+    }
+
+    fn slide() -> orrin_script::CTween {
+        orrin_script::CTween {
+            property: 0,
+            style: 3,
+            direction: 1,
+            duration: 1.0,
+            to: [50.0, 0.0, 0.0, 0.0],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_script_starts_watches_and_cancels_a_tween() {
+        let (mut world, entity) = tween_world();
+        let size = size_of::<orrin_script::CTween>();
+        let id =
+            orrin_script::with_active_world(&mut world, || tween_play(c(entity), &slide(), size));
+        assert_ne!(id, 0);
+        {
+            let tweens = world.resource::<crate::ui::tween::UiTweens>();
+            assert!(tweens.is_playing(crate::ui::tween::TweenId::from_bits(id)));
+        }
+        crate::ui::tween::advance(&world, 0.5);
+        assert!(
+            world
+                .get::<crate::ui::RectTransform>(entity)
+                .unwrap()
+                .anchored_position
+                .x
+                > 25.0
+        );
+        orrin_script::with_active_world(&mut world, || {
+            assert!(tween_playing(id));
+            assert!(tween_cancel(id));
+            assert!(!tween_playing(id));
+            assert!(!tween_cancel(id));
+        });
+    }
+
+    /// The named start and every timing field cross intact.
+    #[test]
+    fn a_tween_request_crosses_whole() {
+        let (mut world, entity) = tween_world();
+        let request = orrin_script::CTween {
+            delay: 0.25,
+            repeat: 2,
+            reverses: 1,
+            has_from: 1,
+            from: [-10.0, 0.0, 0.0, 0.0],
+            ..slide()
+        };
+        orrin_script::with_active_world(&mut world, || {
+            tween_play(c(entity), &request, size_of::<orrin_script::CTween>())
+        });
+        crate::ui::tween::advance(&world, 0.1);
+        assert_eq!(
+            world
+                .get::<crate::ui::RectTransform>(entity)
+                .unwrap()
+                .anchored_position
+                .x,
+            -10.0,
+            "the named start is written while the delay runs"
+        );
+    }
+
+    #[test]
+    fn a_tween_that_cannot_run_is_refused() {
+        let (mut world, entity) = tween_world();
+        let stale = world.spawn();
+        world.despawn(stale);
+        let size = size_of::<orrin_script::CTween>();
+        let refused = [
+            (
+                c(entity),
+                orrin_script::CTween {
+                    property: 99,
+                    ..slide()
+                },
+                size,
+            ),
+            (
+                c(entity),
+                orrin_script::CTween {
+                    style: 11,
+                    ..slide()
+                },
+                size,
+            ),
+            (
+                c(entity),
+                orrin_script::CTween {
+                    direction: 3,
+                    ..slide()
+                },
+                size,
+            ),
+            (
+                c(entity),
+                orrin_script::CTween {
+                    duration: -1.0,
+                    ..slide()
+                },
+                size,
+            ),
+            (
+                c(entity),
+                orrin_script::CTween {
+                    delay: f32::NAN,
+                    ..slide()
+                },
+                size,
+            ),
+            (
+                c(entity),
+                orrin_script::CTween {
+                    to: [f32::INFINITY, 0.0, 0.0, 0.0],
+                    ..slide()
+                },
+                size,
+            ),
+            (c(stale), slide(), size),
+            (c(entity), slide(), size - 4),
+        ];
+        orrin_script::with_active_world(&mut world, || {
+            for (target, request, size) in &refused {
+                assert_eq!(tween_play(*target, request, *size), 0, "{request:?}");
+            }
+            assert_eq!(tween_play(c(entity), std::ptr::null(), size), 0);
+            assert!(!tween_playing(0) && !tween_cancel(0));
+        });
+        assert!(world.resource::<crate::ui::tween::UiTweens>().is_empty());
+        assert_eq!(
+            tween_play(c(entity), &slide(), size),
+            0,
+            "outside a dispatch window"
+        );
+    }
+
+    #[test]
+    fn a_story_asks_for_its_controls_by_name() {
+        let mut world = World::new();
+        world.insert_resource(crate::ui::story::StoryArgs::default());
+        let name = "Width";
+        let (width, disabled) = orrin_script::with_active_world(&mut world, || {
+            (
+                story_float(name.as_ptr(), name.len() as u32, 160.0, 80.0, 400.0),
+                story_bool(c"Off".as_ptr().cast(), 3, true),
+            )
+        });
+        assert_eq!((width, disabled), (160.0, true));
+        let args = world.resource::<crate::ui::story::StoryArgs>();
+        assert_eq!(args.controls().len(), 2);
+        assert_eq!(args.controls()[1].name, "Off");
+    }
+
+    #[test]
+    fn a_control_outside_a_story_is_its_default() {
+        let mut world = World::new();
+        let got = orrin_script::with_active_world(&mut world, || {
+            story_float(c"x".as_ptr().cast(), 1, 0.5, 0.0, 1.0)
+        });
+        assert_eq!(got, 0.5);
+        assert!(!story_bool(std::ptr::null(), 0, false));
     }
 }

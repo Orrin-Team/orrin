@@ -1,28 +1,14 @@
-//! The editor's UI, drawn over the finished frame, with liquid glass under its
-//! translucent surfaces: a blur of what is beneath, bent and fringed at the
-//! edge like a lens and lit along its rim.
-//!
-//! A menu's glass blurs what is beneath it, and over a panel what is beneath
-//! it is more UI — which has to have been drawn, to the image, before anything
-//! can sample it. So the editor hands its frame over in phases (see
-//! `editor::phases`): the panels, then the viewport's floating controls, then
-//! menus and popups, then tooltips. Before a phase with glass, the target is
-//! captured — blitted down to half and then quarter resolution — and each
-//! surface's rect gets a blur of that copy, cut to its rounded corners, under
-//! the translucent fill the phase then draws. A frame with no glass captures
-//! nothing, and one with only the viewport's controls captures once.
+//! The editor's UI, drawn over the finished frame.
 //!
 //! Recorded on its own encoder and submitted after the frame, behind the
 //! frame's semaphore. The graph sees the overlay as one `Raw` pass writing the
-//! swapchain image; what happens inside it — the image becoming a blit source
-//! and a render target again between phases — is the encoder's
-//! `capture_backdrop`, `begin_rendering` and `end_rendering`, so this module
-//! names no API object and a driver is free to make those transitions however
-//! it must.
+//! swapchain image; the encoder's `open_swapchain` and `close_swapchain` move
+//! it in and out of the layout the draw needs, so this module names no API
+//! object.
 //!
 //! The vertex layout, blend state, font swizzle and mesh shaders are ported
 //! from egui_winit_vulkano 0.28 (Apache-2.0), which drew the editor before
-//! this did and could not draw it in more than one piece.
+//! this did.
 
 use std::collections::HashMap;
 
@@ -44,28 +30,13 @@ pub struct OverlayFrame {
     pub pixels_per_point: f32,
     /// Every change not yet drawn, oldest first.
     pub textures: egui::TexturesDelta,
-    /// In draw order. Glass in the first phase is ignored: nothing is beneath
-    /// it yet.
-    pub phases: Vec<OverlayPhase>,
+    /// In draw order.
+    pub primitives: Vec<egui::ClippedPrimitive>,
     /// The transform gizmo's triangles, drawn by their own pass before the
     /// editor's UI rather than by this one — see `vulkan::gizmo`.
     pub gizmo: Vec<super::gizmo::GizmoVertex>,
     /// The meshes the selection outline is drawn round — see `vulkan::outline`.
     pub outline: Vec<super::outline::OutlineItem>,
-}
-
-#[derive(Default)]
-pub struct OverlayPhase {
-    /// Blurred into before any of the phase's meshes draw.
-    pub glass: Vec<Glass>,
-    pub primitives: Vec<egui::ClippedPrimitive>,
-}
-
-/// A translucent surface's outline, in points.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Glass {
-    pub rect: egui::Rect,
-    pub radius: f32,
 }
 
 /// egui's vertex, field for field.
@@ -107,30 +78,7 @@ impl OverlayVertex {
     };
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct FrostPush {
-    rect_min: [f32; 2],
-    rect_max: [f32; 2],
-    texel: [f32; 2],
-    radius: f32,
-}
-
-impl FrostPush {
-    fn words(&self) -> [u32; 7] {
-        [
-            self.rect_min[0],
-            self.rect_min[1],
-            self.rect_max[0],
-            self.rect_max[1],
-            self.texel[0],
-            self.texel[1],
-            self.radius,
-        ]
-        .map(f32::to_bits)
-    }
-}
-
-/// Every phase's meshes, uploaded once: a vertex and an index buffer.
+/// The frame's meshes, uploaded once: a vertex and an index buffer.
 type Geometry = (BufferId, BufferId);
 
 struct Texture {
@@ -138,26 +86,14 @@ struct Texture {
     set: BindGroupId,
 }
 
-/// The two downsampled copies of the target a capture writes, sized to it.
-struct Backdrop {
-    extent: [u32; 2],
-    half: TextureViewId,
-    quarter: TextureViewId,
-    set: BindGroupId,
-}
-
 pub(super) struct OverlayPass {
     format: Format,
     pipeline: PipelineId,
-    /// `None` where the target cannot be blitted from, which leaves the glass
-    /// as plain translucency.
-    frost: Option<PipelineId>,
     sampler: SamplerId,
     /// `R8G8_UNORM` swizzled up to premultiplied white where views can swizzle,
     /// at half the size of the `R8G8B8A8_SRGB` it falls back to.
     font_format: Format,
     textures: HashMap<egui::TextureId, Texture>,
-    backdrop: Option<Backdrop>,
     /// Reused each frame so a frame that changes little allocates little.
     vertices: Vec<OverlayVertex>,
     indices: Vec<u32>,
@@ -165,20 +101,7 @@ pub(super) struct OverlayPass {
 }
 
 impl OverlayPass {
-    /// `capturable` is whether the target may be a transfer source — a
-    /// swapchain has to have been created with that usage, and the surface may
-    /// not offer it.
-    pub(super) fn new(device: &Device, format: Format, capturable: bool) -> Self {
-        let frost = (capturable && device.supports(Feature::BackdropCapture(format))).then(|| {
-            device.create_graphics_pipeline(&GraphicsPipelineDesc {
-                blend: Blend::Alpha,
-                ..GraphicsPipelineDesc::fullscreen(
-                    ShaderId::FullscreenVert,
-                    ShaderId::FrostFrag,
-                    &[format],
-                )
-            })
-        });
+    pub(super) fn new(device: &Device, format: Format) -> Self {
         let font_format = if device.supports(Feature::CoverageTexture) {
             Format::Rg8Unorm
         } else {
@@ -198,7 +121,6 @@ impl OverlayPass {
                     &[format],
                 )
             }),
-            frost,
             sampler: device.create_sampler(SamplerDesc {
                 linear: true,
                 mipmap_linear: false,
@@ -209,7 +131,6 @@ impl OverlayPass {
             }),
             font_format,
             textures: HashMap::new(),
-            backdrop: None,
             vertices: Vec::new(),
             indices: Vec::new(),
             pixels: Vec::new(),
@@ -234,51 +155,9 @@ impl OverlayPass {
         let geometry = self.upload_geometry(device, frame);
 
         encoder.open_swapchain(target);
-        let mut rendering = false;
-        let mut cursor = (0, 0);
-        for (index, phase) in frame.phases.iter().enumerate() {
-            let glass: Vec<_> = phase
-                .glass
-                .iter()
-                .filter(|_| index > 0)
-                .filter_map(|glass| frost_draw(glass, ppp, extent))
-                .collect();
-            if let Some(frost) = self.frost
-                && !glass.is_empty()
-            {
-                if rendering {
-                    encoder.end_rendering();
-                }
-                let backdrop = self.backdrop(device, extent);
-                encoder.capture_backdrop(target, backdrop.half, backdrop.quarter);
-                let texel = backdrop_texel(backdrop.extent);
-                let set = backdrop.set;
-                encoder.begin_rendering(target);
-                rendering = true;
-
-                encoder.bind_pipeline(frost);
-                encoder.set_viewport(viewport(extent));
-                encoder.bind_group(0, set);
-                for (scissor, push) in glass {
-                    encoder.set_scissor(scissor.offset, scissor.extent);
-                    encoder.push_constants(&FrostPush { texel, ..push }.words());
-                    encoder.draw(3, 1, 0, 0);
-                }
-            }
-
-            if phase.primitives.is_empty() {
-                continue;
-            }
-            let Some(geometry) = geometry else {
-                continue;
-            };
-            if !rendering {
-                encoder.begin_rendering(target);
-                rendering = true;
-            }
-            cursor = self.draw_meshes(encoder, &phase.primitives, geometry, cursor, ppp, extent);
-        }
-        if rendering {
+        if let Some(geometry) = geometry {
+            encoder.begin_rendering(target);
+            self.draw_meshes(encoder, &frame.primitives, geometry, ppp, extent);
             encoder.end_rendering();
         }
         encoder.close_swapchain(target);
@@ -293,16 +172,15 @@ impl OverlayPass {
         }
     }
 
-    /// Returns the vertex and index cursors past this phase's meshes.
     fn draw_meshes(
         &self,
         encoder: &mut Encoder,
         primitives: &[egui::ClippedPrimitive],
         (vertices, indices): Geometry,
-        (mut vertex, mut index): (u32, u32),
         ppp: f32,
         extent: [u32; 2],
-    ) -> (u32, u32) {
+    ) {
+        let (mut vertex, mut index) = (0, 0);
         encoder.bind_pipeline(self.pipeline);
         encoder.bind_vertex_buffer(vertices);
         encoder.bind_index_buffer(indices);
@@ -355,16 +233,14 @@ impl OverlayPass {
                 0,
             );
         }
-        (vertex, index)
     }
 
-    /// Every phase's meshes in one vertex and one index buffer, in draw order.
+    /// The frame's meshes in one vertex and one index buffer, in draw order.
     fn upload_geometry(&mut self, device: &Device, frame: &OverlayFrame) -> Option<Geometry> {
         let meshes = || {
             frame
-                .phases
+                .primitives
                 .iter()
-                .flat_map(|phase| &phase.primitives)
                 .filter_map(|primitive| match &primitive.primitive {
                     Primitive::Mesh(mesh) => Some(mesh),
                     Primitive::Callback(_) => None,
@@ -474,62 +350,6 @@ impl OverlayPass {
         );
         Texture { view, set }
     }
-
-    /// The capture targets for `extent`, rebuilt when the window resizes.
-    fn backdrop(&mut self, device: &Device, extent: [u32; 2]) -> &Backdrop {
-        if self
-            .backdrop
-            .as_ref()
-            .is_none_or(|backdrop| backdrop.extent != extent)
-        {
-            if let Some(old) = self.backdrop.take() {
-                device.destroy_bind_group(old.set);
-                device.destroy_texture(old.half);
-                device.destroy_texture(old.quarter);
-            }
-            let (half_extent, quarter_extent) = backdrop_extents(extent);
-            let image = |extent: [u32; 2], usage| {
-                device.create_texture(&TextureDesc {
-                    format: self.format,
-                    dimension: TextureDimension::D2,
-                    extent: [extent[0], extent[1], 1],
-                    mip_levels: 1,
-                    array_layers: 1,
-                    samples: SampleCount::Sample1,
-                    usage,
-                    memoryless: false,
-                })
-            };
-            let half = image(
-                half_extent,
-                // SAMPLED only because a texture's view needs a usage a view
-                // can have; nothing samples this level.
-                ImageUsage::TRANSFER_DST | ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
-            );
-            let quarter = image(
-                quarter_extent,
-                ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
-            );
-            let set = device.create_persistent_bind_group(
-                self.frost.expect("only frosted frames capture"),
-                0,
-                &[Binding {
-                    binding: 0,
-                    resource: BindingResource::SampledTexture {
-                        view: quarter,
-                        sampler: self.sampler,
-                    },
-                }],
-            );
-            self.backdrop = Some(Backdrop {
-                extent,
-                half,
-                quarter,
-                set,
-            });
-        }
-        self.backdrop.as_ref().expect("built above")
-    }
 }
 
 fn viewport(extent: [u32; 2]) -> Viewport {
@@ -559,35 +379,6 @@ fn scissor(clip: egui::Rect, ppp: f32, extent: [u32; 2]) -> Option<Clip> {
         offset: [x0 as u32, y0 as u32],
         extent: [(x1 - x0) as u32, (y1 - y0) as u32],
     })
-}
-
-/// The scissor and outline for one surface's glass. Rounded outward so the
-/// blur reaches the surface's antialiased edge; the outline itself stays exact.
-fn frost_draw(glass: &Glass, ppp: f32, extent: [u32; 2]) -> Option<(Clip, FrostPush)> {
-    let rect = egui::Rect::from_min_max(
-        (glass.rect.min.to_vec2() * ppp).floor().to_pos2(),
-        (glass.rect.max.to_vec2() * ppp).ceil().to_pos2(),
-    );
-    let scissor = scissor(rect, 1.0, extent)?;
-    Some((
-        scissor,
-        FrostPush {
-            rect_min: (glass.rect.min.to_vec2() * ppp).into(),
-            rect_max: (glass.rect.max.to_vec2() * ppp).into(),
-            texel: [0.0; 2],
-            radius: glass.radius * ppp,
-        },
-    ))
-}
-
-/// Half and quarter of `extent`, never below one pixel.
-fn backdrop_extents(extent: [u32; 2]) -> ([u32; 2], [u32; 2]) {
-    let half = extent.map(|side| (side / 2).max(1));
-    (half, half.map(|side| (side / 2).max(1)))
-}
-
-fn backdrop_texel(extent: [u32; 2]) -> [f32; 2] {
-    extent.map(|side| 1.0 / side as f32)
 }
 
 /// One texture delta's pixels, packed for `format`.
@@ -686,33 +477,6 @@ mod tests {
         assert_eq!(scissor(egui::Rect::NOTHING, 1.0, [800, 600]), None);
     }
 
-    /// The scissor covers every pixel the surface touches, including the
-    /// partly covered ones on its edge, while the outline the shader cuts to
-    /// stays where the surface really is.
-    #[test]
-    fn glass_rounds_its_scissor_outward_and_keeps_its_outline_exact() {
-        let glass = Glass {
-            rect: rect(10.3, 20.7, 50.2, 60.5),
-            radius: 6.0,
-        };
-        let (scissor, push) = frost_draw(&glass, 2.0, [800, 600]).expect("on screen");
-        assert_eq!(scissor.offset, [20, 41]);
-        assert_eq!(scissor.extent, [81, 80]);
-        assert_eq!(push.rect_min, [20.6, 41.4]);
-        assert_eq!(push.rect_max, [100.4, 121.0]);
-        assert_eq!(push.radius, 12.0);
-    }
-
-    #[test]
-    fn the_backdrop_halves_twice_and_never_vanishes() {
-        assert_eq!(backdrop_extents([1920, 1080]), ([960, 540], [480, 270]));
-        assert_eq!(backdrop_extents([1001, 3]), ([500, 1], [250, 1]));
-        assert_eq!(backdrop_extents([1, 1]), ([1, 1], [1, 1]));
-    }
-
-    /// The whole pass on a real device: a hard white-to-black edge, with glass
-    /// over the middle of it. Inside the glass the edge is blurred; just
-    /// outside it, the same edge is untouched.
     /// Several textures in one frame share the staging buffer, and each copy
     /// must start on a whole texel of its own format. A font patch three
     /// texels wide is six bytes in the swizzled format, which leaves the next
@@ -759,14 +523,11 @@ mod tests {
                 ],
                 free: Vec::new(),
             },
-            phases: Vec::new(),
+            primitives: Vec::new(),
         };
 
-        let mut pass = OverlayPass::new(
-            &device,
-            crate::gfx::vulkan::convert::engine_format(format),
-            false,
-        );
+        let mut pass =
+            OverlayPass::new(&device, crate::gfx::vulkan::convert::engine_format(format));
         let mut recorder = Recorder::new(&ctx);
         recorder.image_barrier(ImageMemoryBarrier {
             old_layout: ImageLayout::Undefined,
@@ -780,129 +541,6 @@ mod tests {
         }
         recorder.submit_and_wait(&ctx);
         assert_eq!(pass.textures.len(), 2);
-    }
-
-    #[test]
-    #[ignore = "needs a GPU"]
-    fn glass_blurs_what_is_beneath_it_and_nothing_else() {
-        use vulkano::buffer::{Buffer, BufferCreateInfo};
-        use vulkano::command_buffer::CopyImageToBufferInfo;
-
-        const EXTENT: [u32; 2] = [256, 128];
-        let instance = crate::capture::headless_instance();
-        let ctx = Arc::new(VkContext::new(&instance, None));
-        let device = device(&ctx);
-        let format = VkFormat::R8G8B8A8_SRGB;
-        let image = Image::new(
-            ctx.memory_allocator.clone(),
-            ImageCreateInfo {
-                format,
-                extent: [EXTENT[0], EXTENT[1], 1],
-                usage: VkImageUsage::COLOR_ATTACHMENT | VkImageUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .unwrap();
-        let view = ImageView::new_default(image.clone()).unwrap();
-
-        let egui = egui::Context::default();
-        let input = egui::RawInput {
-            screen_rect: Some(rect(0.0, 0.0, EXTENT[0] as f32, EXTENT[1] as f32)),
-            ..Default::default()
-        };
-        let output = egui.run(input, |ctx| {
-            let painter = ctx.layer_painter(egui::LayerId::background());
-            painter.rect_filled(rect(0.0, 0.0, 128.0, 128.0), 0.0, egui::Color32::WHITE);
-            painter.rect_filled(rect(128.0, 0.0, 256.0, 128.0), 0.0, egui::Color32::BLACK);
-        });
-        let mut frame = OverlayFrame {
-            gizmo: Vec::new(),
-            outline: Vec::new(),
-            pixels_per_point: 1.0,
-            phases: vec![
-                OverlayPhase {
-                    glass: Vec::new(),
-                    primitives: egui.tessellate(output.shapes, 1.0),
-                },
-                OverlayPhase {
-                    glass: vec![Glass {
-                        rect: rect(64.0, 32.0, 192.0, 96.0),
-                        radius: 8.0,
-                    }],
-                    primitives: Vec::new(),
-                },
-            ],
-            textures: output.textures_delta,
-        };
-
-        let mut pass = OverlayPass::new(
-            &device,
-            crate::gfx::vulkan::convert::engine_format(format),
-            true,
-        );
-        assert!(pass.frost.is_some(), "this device cannot blit {format:?}");
-        let readback = Buffer::new_slice::<u8>(
-            ctx.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
-                ..Default::default()
-            },
-            u64::from(EXTENT[0] * EXTENT[1] * 4),
-        )
-        .unwrap();
-        let mut recorder = Recorder::new(&ctx);
-        recorder.image_barrier(ImageMemoryBarrier {
-            old_layout: ImageLayout::Undefined,
-            ..color_to_present(image.clone())
-        });
-        {
-            let driver = device.vulkan();
-            let target = driver.import_view(view.clone());
-            let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
-            pass.record(&device, &mut encoder, target, &mut frame);
-        }
-        recorder
-            .image_barrier(ImageMemoryBarrier {
-                src_stages: PipelineStages::ALL_COMMANDS,
-                src_access: AccessFlags::MEMORY_WRITE,
-                dst_stages: PipelineStages::ALL_TRANSFER,
-                dst_access: AccessFlags::TRANSFER_READ,
-                old_layout: ImageLayout::PresentSrc,
-                new_layout: ImageLayout::TransferSrcOptimal,
-                subresource_range: record::whole_image(&image),
-                ..ImageMemoryBarrier::image(image.clone())
-            })
-            .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(image, readback.clone()));
-        recorder.submit_and_wait(&ctx);
-
-        let pixels = readback.read().unwrap();
-        let red = |x: u32, y: u32| pixels[((y * EXTENT[0] + x) * 4) as usize];
-        assert_eq!(
-            (red(127, 16), red(128, 16)),
-            (255, 0),
-            "the edge above the glass"
-        );
-        assert_eq!(
-            (red(127, 112), red(128, 112)),
-            (255, 0),
-            "the edge below it"
-        );
-        let (left, right) = (red(127, 64), red(128, 64));
-        assert!(
-            (64..=250).contains(&left) && (8..=200).contains(&right) && left > right,
-            "the edge under the glass is {left} | {right}, not blurred"
-        );
-        assert_eq!(
-            red(70, 64),
-            255,
-            "far from the edge, the glass is the colour beneath"
-        );
     }
 
     /// What the editor's UI cadence rests on (see `editor::cadence`): a frame
@@ -960,10 +598,7 @@ mod tests {
             gizmo: Vec::new(),
             outline: Vec::new(),
             pixels_per_point: 1.0,
-            phases: vec![OverlayPhase {
-                glass: Vec::new(),
-                primitives: egui.tessellate(output.shapes, 1.0),
-            }],
+            primitives: egui.tessellate(output.shapes, 1.0),
             textures: output.textures_delta,
         };
         assert!(
@@ -971,11 +606,8 @@ mod tests {
             "the first frame carries the font atlas"
         );
 
-        let mut pass = OverlayPass::new(
-            &device,
-            crate::gfx::vulkan::convert::engine_format(format),
-            true,
-        );
+        let mut pass =
+            OverlayPass::new(&device, crate::gfx::vulkan::convert::engine_format(format));
         let readback = Buffer::new_slice::<u8>(
             ctx.memory_allocator.clone(),
             BufferCreateInfo {
@@ -1036,205 +668,6 @@ mod tests {
             first == second,
             "a cached frame drew a different image the second time"
         );
-    }
-
-    /// The same frame as the Vulkan test above, through the Metal driver: the
-    /// glass has to blur only what is beneath it, which needs the backdrop
-    /// downsample and the target being sampled while it is drawn into.
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "needs a Metal device"]
-    fn metal_glass_blurs_what_is_beneath_it_and_nothing_else() {
-        use crate::gfx::format::{Format, SampleCount};
-        use crate::gfx::graph::ImageUsage;
-        use crate::gfx::metal::MtlDriver;
-        use crate::gfx::rhi::{TextureDesc, TextureDimension};
-
-        const EXTENT: [u32; 2] = [256, 128];
-        let driver = MtlDriver::new().expect("this machine runs the Metal backend");
-        driver.begin_frame(0);
-        let device = Device::Metal(driver);
-        let Device::Metal(driver) = &device else {
-            unreachable!()
-        };
-        let target = device.create_texture(&TextureDesc {
-            format: Format::Rgba8Srgb,
-            dimension: TextureDimension::D2,
-            extent: [EXTENT[0], EXTENT[1], 1],
-            mip_levels: 1,
-            array_layers: 1,
-            samples: SampleCount::Sample1,
-            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED | ImageUsage::TRANSFER_SRC,
-            memoryless: false,
-        });
-
-        let egui = egui::Context::default();
-        let input = egui::RawInput {
-            screen_rect: Some(rect(0.0, 0.0, EXTENT[0] as f32, EXTENT[1] as f32)),
-            ..Default::default()
-        };
-        let output = egui.run(input, |ctx| {
-            let painter = ctx.layer_painter(egui::LayerId::background());
-            painter.rect_filled(rect(0.0, 0.0, 128.0, 128.0), 0.0, egui::Color32::WHITE);
-            painter.rect_filled(rect(128.0, 0.0, 256.0, 128.0), 0.0, egui::Color32::BLACK);
-        });
-        let mut frame = OverlayFrame {
-            gizmo: Vec::new(),
-            outline: Vec::new(),
-            pixels_per_point: 1.0,
-            phases: vec![
-                OverlayPhase {
-                    glass: Vec::new(),
-                    primitives: egui.tessellate(output.shapes, 1.0),
-                },
-                OverlayPhase {
-                    glass: vec![Glass {
-                        rect: rect(64.0, 32.0, 192.0, 96.0),
-                        radius: 8.0,
-                    }],
-                    primitives: Vec::new(),
-                },
-            ],
-            textures: output.textures_delta,
-        };
-
-        let mut pass = OverlayPass::new(&device, Format::Rgba8Srgb, true);
-        assert!(pass.frost.is_some(), "the Metal driver cannot capture");
-        device.record_blocking(|encoder| pass.record(&device, encoder, target, &mut frame));
-
-        let pixels = driver.read_texture(target);
-        let red = |x: u32, y: u32| pixels[((y * EXTENT[0] + x) * 4) as usize];
-        assert_eq!((red(127, 16), red(128, 16)), (255, 0), "above the glass");
-        assert_eq!((red(127, 112), red(128, 112)), (255, 0), "below it");
-        let (left, right) = (red(127, 64), red(128, 64));
-        assert!(
-            (64..=250).contains(&left) && (8..=200).contains(&right) && left > right,
-            "the edge under the glass is {left} | {right}, not blurred"
-        );
-        assert_eq!(
-            red(70, 64),
-            255,
-            "far from the edge, the glass is the colour beneath"
-        );
-    }
-
-    /// What the glass costs at 1080p: one editor-sized frame drawn with no
-    /// glass, with the viewport's controls' (one capture), and with a menu and
-    /// a tooltip open over those (three). Timed per submitted-and-waited
-    /// frame, so every row carries the same submission overhead and the
-    /// differences between rows are the captures and blurs.
-    ///
-    /// ```text
-    /// cargo test --release -p orrin-core --lib glass_cost -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "needs a GPU"]
-    fn glass_cost() {
-        const EXTENT: [u32; 2] = [1920, 1080];
-        const FRAMES: usize = 300;
-        let instance = crate::capture::headless_instance();
-        let ctx = Arc::new(VkContext::new(&instance, None));
-        let device = device(&ctx);
-        let format = VkFormat::R8G8B8A8_SRGB;
-        let image = Image::new(
-            ctx.memory_allocator.clone(),
-            ImageCreateInfo {
-                format,
-                extent: [EXTENT[0], EXTENT[1], 1],
-                usage: VkImageUsage::COLOR_ATTACHMENT | VkImageUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )
-        .unwrap();
-        let view = ImageView::new_default(image.clone()).unwrap();
-
-        // A panel's worth of rows down each side, so the base phase has the
-        // mesh count of a real editor frame.
-        let egui = egui::Context::default();
-        let input = egui::RawInput {
-            screen_rect: Some(rect(0.0, 0.0, EXTENT[0] as f32, EXTENT[1] as f32)),
-            ..Default::default()
-        };
-        let output = egui.run(input, |ctx| {
-            egui::SidePanel::left("left").show(ctx, |ui| {
-                for row in 0..60 {
-                    ui.label(format!("Cube {row}"));
-                }
-            });
-            egui::SidePanel::right("right").show(ctx, |ui| {
-                for row in 0..60 {
-                    ui.label(format!("Property {row}"));
-                }
-            });
-        });
-        let base = egui.tessellate(output.shapes, 1.0);
-        let mut textures = Some(output.textures_delta);
-
-        let mut pass = OverlayPass::new(
-            &device,
-            crate::gfx::vulkan::convert::engine_format(format),
-            true,
-        );
-        let mut first = true;
-        let toolbar = Glass {
-            rect: rect(400.0, 40.0, 700.0, 72.0),
-            radius: 6.0,
-        };
-        let popup = Glass {
-            rect: rect(60.0, 30.0, 280.0, 260.0),
-            radius: 6.0,
-        };
-        println!(
-            "
-{:<28} {:>10}",
-            "overlay at 1920x1080", "median ms"
-        );
-        for (name, glass) in [
-            ("no glass", vec![]),
-            ("viewport controls", vec![(1, toolbar)]),
-            (
-                "+ a menu and a tooltip",
-                vec![(1, toolbar), (2, popup), (3, popup)],
-            ),
-        ] {
-            let mut times = Vec::with_capacity(FRAMES);
-            for frame_index in 0..FRAMES + 20 {
-                let mut phases: Vec<_> = (0..4).map(|_| OverlayPhase::default()).collect();
-                phases[0].primitives = base.clone();
-                for (phase, glass) in &glass {
-                    phases[*phase].glass.push(*glass);
-                }
-                let mut frame = OverlayFrame {
-                    gizmo: Vec::new(),
-                    outline: Vec::new(),
-                    pixels_per_point: 1.0,
-                    textures: textures.take().unwrap_or_default(),
-                    phases,
-                };
-                let start = std::time::Instant::now();
-                let mut recorder = Recorder::new(&ctx);
-                if first {
-                    recorder.image_barrier(ImageMemoryBarrier {
-                        old_layout: ImageLayout::Undefined,
-                        ..color_to_present(image.clone())
-                    });
-                    first = false;
-                }
-                {
-                    let driver = device.vulkan();
-                    let target = driver.import_view(view.clone());
-                    let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
-                    pass.record(&device, &mut encoder, target, &mut frame);
-                }
-                recorder.submit_and_wait(&ctx);
-                if frame_index >= 20 {
-                    times.push(start.elapsed().as_secs_f64() * 1e3);
-                }
-            }
-            times.sort_by(f64::total_cmp);
-            println!("{name:<28} {:>10.3}", times[FRAMES / 2]);
-        }
     }
 
     /// The swizzled font format carries linear coverage and sRGB alpha; a

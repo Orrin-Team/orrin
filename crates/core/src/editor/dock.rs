@@ -66,6 +66,7 @@ pub enum Tab {
     Scripts,
     Assets,
     Import,
+    Storybook,
 }
 
 impl Tab {
@@ -73,7 +74,7 @@ impl Tab {
     /// even in a build without the feature: the variant stays so a layout file
     /// written by one build still loads in the other, and the tab says why it
     /// is empty instead of vanishing.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Hierarchy,
         Self::Scenes,
         Self::Inspector,
@@ -83,6 +84,7 @@ impl Tab {
         Self::Import,
         Self::Performance,
         Self::Scripts,
+        Self::Storybook,
     ];
 
     pub fn icon(self) -> super::icons::Icon {
@@ -97,6 +99,7 @@ impl Tab {
             Self::Scripts => icons::file_code(),
             Self::Assets => icons::box_(),
             Self::Import => icons::info(),
+            Self::Storybook => icons::palette(),
         }
     }
 
@@ -111,6 +114,7 @@ impl Tab {
             Self::Scripts => "Scripts",
             Self::Assets => "Assets",
             Self::Import => "Import",
+            Self::Storybook => "Storybook",
         }
     }
 }
@@ -170,7 +174,13 @@ pub fn default_layout() -> DockState<Tab> {
     let [viewport, _] = surface.split_below(
         viewport,
         BOTTOM,
-        vec![Tab::Console, Tab::Assets, Tab::Performance, Tab::Scripts],
+        vec![
+            Tab::Console,
+            Tab::Assets,
+            Tab::Performance,
+            Tab::Scripts,
+            Tab::Storybook,
+        ],
     );
 
     surface[viewport] = Node::Empty;
@@ -789,6 +799,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
                 #[cfg(not(feature = "scripting"))]
                 ui.weak("This build was compiled without the `scripting` feature.");
             }
+            Tab::Storybook => panels::storybook::body(ui, self.world),
         }
     }
 }

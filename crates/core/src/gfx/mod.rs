@@ -14,6 +14,7 @@ pub mod shaders;
 pub mod shadows;
 mod texel;
 pub mod thumbnail;
+pub mod ui;
 pub mod vulkan;
 
 pub use choice::BackendChoice;
@@ -329,8 +330,8 @@ pub const MAX_POINT_LIGHTS: usize = 256;
 pub const MAX_SPOT_LIGHTS: usize = 64;
 
 /// Size of the shader's bound texture array (set 2). Keep in sync with
-/// `MAX_TEXTURES` in `shading.glsl`, `prepass.frag` and `shadow.frag` — the
-/// three fragment shaders that bind the array.
+/// `MAX_TEXTURES` in `shading.glsl`, `prepass.frag`, `shadow.frag` and
+/// `ui.frag` — the fragment shaders that bind the array.
 ///
 /// The ceiling is MoltenVK's, not the desktop drivers': an M5 Pro reports
 /// `maxPerStageDescriptorSampledImages` 256 and `maxPerStageResources` 287,

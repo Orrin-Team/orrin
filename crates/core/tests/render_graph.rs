@@ -73,6 +73,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -107,6 +108,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -136,6 +138,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -171,6 +174,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -205,6 +209,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -237,6 +242,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -271,6 +277,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -304,6 +311,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -341,6 +349,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -375,6 +384,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -409,6 +419,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -443,6 +454,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -475,6 +487,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -509,6 +522,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -541,6 +555,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -574,6 +589,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -607,6 +623,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -642,6 +659,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -675,6 +693,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -709,6 +728,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -741,6 +761,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -778,6 +799,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -811,6 +833,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 0,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -840,6 +863,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: false,
                 outline: false,
                 gizmo: false,
+                ui: false,
                 presents: true,
                 shadow_cascades: 2,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -881,6 +905,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -917,6 +942,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -946,6 +972,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: true,
                 outline: true,
                 gizmo: true,
+                ui: false,
                 presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -980,6 +1007,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 overlay: false,
                 outline: false,
                 gizmo: false,
+                ui: false,
                 presents: true,
                 shadow_cascades: 4,
                 shadow_resolution: SHADOW_RESOLUTION,
@@ -1105,6 +1133,7 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
             overlay: true,
             outline: true,
             gizmo: true,
+            ui: false,
             presents: true,
             shadow_cascades: count,
             shadow_resolution: SHADOW_RESOLUTION,
@@ -1152,6 +1181,7 @@ fn the_shadow_maps_are_sixteen_bit_and_the_camera_depth_is_not() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 4,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1192,6 +1222,7 @@ fn reference_config(msaa: bool, presents: bool) -> FrameConfig {
         overlay: false,
         outline: false,
         gizmo: false,
+        ui: false,
         presents,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1277,6 +1308,7 @@ fn an_empty_selection_runs_no_outline_and_no_gizmo() {
         overlay: true,
         outline,
         gizmo,
+        ui: false,
         presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1336,6 +1368,7 @@ fn the_shadow_cascades_leave_the_frame_where_the_next_one_expects_them() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 4,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1398,6 +1431,7 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1457,6 +1491,7 @@ fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 4,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1512,6 +1547,7 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 4,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1576,6 +1612,7 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1627,6 +1664,7 @@ fn the_gizmo_draws_between_the_tonemap_and_the_overlay() {
         overlay,
         outline: overlay,
         gizmo: overlay,
+        ui: false,
         presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1662,6 +1700,50 @@ fn the_gizmo_draws_between_the_tonemap_and_the_overlay() {
     assert!(!names.contains(&"gizmo"), "{names:?}");
 }
 
+/// The game's UI is part of the picture the player sees, so it goes on the
+/// tonemapped frame first — under every one of the editor's marks — and it is
+/// there in a shipped frame, which has no editor at all.
+#[test]
+fn the_game_ui_draws_over_the_tonemap_and_under_the_editor() {
+    let config = |overlay, ui| FrameConfig {
+        overlay,
+        outline: overlay,
+        gizmo: overlay,
+        ui,
+        ..reference_config(false, true)
+    };
+    let order = |config| {
+        let frame = declare(config).unwrap();
+        frame
+            .graph
+            .order()
+            .iter()
+            .map(|&id| frame.graph.pass_name(id).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let at = |order: &[String], name: &str| {
+        order
+            .iter()
+            .position(|pass| pass == name)
+            .unwrap_or_else(|| panic!("{name} is not in the frame: {order:?}"))
+    };
+
+    let editor = order(config(true, true));
+    assert!(at(&editor, "tonemap") < at(&editor, "ui"), "{editor:?}");
+    for mark in ["outline", "gizmo", "overlay"] {
+        assert!(at(&editor, "ui") < at(&editor, mark), "{editor:?}");
+    }
+
+    let shipped = order(config(false, true));
+    assert!(at(&shipped, "tonemap") < at(&shipped, "ui"), "{shipped:?}");
+
+    let nothing_drawn = order(config(true, false));
+    assert!(
+        !nothing_drawn.iter().any(|pass| pass == "ui"),
+        "{nothing_drawn:?}"
+    );
+}
+
 /// The selection outline is drawn from a mask of the outlined meshes, over
 /// the tonemapped frame and under the gizmo, whose handles stay on top.
 #[test]
@@ -1685,6 +1767,7 @@ fn the_selection_outline_is_masked_then_drawn_under_the_gizmo() {
         overlay,
         outline: overlay,
         gizmo: overlay,
+        ui: false,
         presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1756,6 +1839,7 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1819,6 +1903,7 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1920,6 +2005,7 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -1984,6 +2070,7 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -2039,6 +2126,7 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -2119,6 +2207,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 0,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -2217,6 +2306,7 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 4,
         shadow_resolution: SHADOW_RESOLUTION,
@@ -2393,6 +2483,7 @@ fn occlusion_base() -> FrameConfig {
         overlay: true,
         outline: true,
         gizmo: true,
+        ui: false,
         presents: true,
         shadow_cascades: 4,
         shadow_resolution: SHADOW_RESOLUTION,

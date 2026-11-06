@@ -41,7 +41,6 @@ impl MtlDriver {
         match feature {
             // Every Apple GPU family 7 device blits and filters every format the
             // engine renders to.
-            Feature::BackdropCapture(_) => true,
             Feature::CoverageTexture => true,
             Feature::BlockCompression => self.device.supportsBCTextureCompression(),
         }

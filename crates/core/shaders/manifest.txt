@@ -22,7 +22,6 @@ forward_frag_flat fragment forward.frag ORRIN_FLAT_SURFACE=1
 forward_frag_alpha_test_flat fragment forward.frag ORRIN_ALPHA_TEST=1 ORRIN_FLAT_SURFACE=1
 forward_sss_frag_flat fragment forward_sss.frag ORRIN_FLAT_SURFACE=1
 forward_sss_frag_alpha_test_flat fragment forward_sss.frag ORRIN_ALPHA_TEST=1 ORRIN_FLAT_SURFACE=1
-frost_frag fragment frost.frag
 fullscreen_vert vertex fullscreen.vert
 gizmo_frag fragment gizmo.frag
 gizmo_vert vertex gizmo.vert
@@ -62,3 +61,7 @@ sss_blur_comp compute sss_blur.comp
 sss_composite_comp compute sss_composite.comp
 taa_resolve_comp compute taa_resolve.comp
 tonemap_frag fragment tonemap.frag
+ui_frag fragment ui.frag
+ui_vert vertex ui.vert
+ui_shape_frag fragment ui_shape.frag
+ui_shape_vert vertex ui_shape.vert

@@ -732,3 +732,15 @@ fn detaching_a_pad_zeroes_it_rather_than_leaving_a_stick_pushed() {
     assert!(!input.pad_button_down(0, PadButton::South));
     assert_eq!(input.pad_axis(0, PadAxis::LeftStickX), 0.0);
 }
+
+/// The wheel is an edge like a press: what turned this frame, summed, and gone
+/// by the next.
+#[test]
+fn the_wheel_sums_a_frame_and_then_reads_still() {
+    let (mut actions, mut input) = loaded("format_version = 1\n[actions]\n");
+    input.scroll_wheel((0.0, 1.0));
+    input.scroll_wheel((0.5, -3.0));
+    assert_eq!(input.wheel(), (0.5, -2.0));
+    frame(&mut actions, &mut input);
+    assert_eq!(input.wheel(), (0.0, 0.0));
+}

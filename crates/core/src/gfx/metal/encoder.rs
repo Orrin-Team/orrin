@@ -734,26 +734,6 @@ impl<'a> MtlEncoder<'a> {
     /// Presenting is the command buffer's job, once the frame is finished.
     pub fn close_swapchain(&mut self, _target: TextureViewId) {}
 
-    /// Reduce what is drawn so far into `half`, then `quarter`. A render pass
-    /// each, because a blit cannot scale.
-    pub fn capture_backdrop(
-        &mut self,
-        target: TextureViewId,
-        half: TextureViewId,
-        quarter: TextureViewId,
-    ) {
-        self.state.close();
-        let (target, half, quarter) = (
-            self.driver.texture(target),
-            self.driver.texture(half),
-            self.driver.texture(quarter),
-        );
-        self.driver
-            .downsample(&self.state.command_buffer, &target, &half);
-        self.driver
-            .downsample(&self.state.command_buffer, &half, &quarter);
-    }
-
     pub fn generate_cube_mips(&mut self, texture: TextureViewId) {
         let texture = self.driver.texture(texture);
         self.blit().generateMipmapsForTexture(&texture);

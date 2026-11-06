@@ -28,9 +28,9 @@ use crate::scene::entities::{SceneChoice, StressSpec, spawn_stress_scene};
 use crate::scene::{
     Actions, AmbientLight, BloomSettings, Camera, ContactShadowSettings, Culling, DebugLine,
     DebugLines, DecalSettings, Diagnostics, DofSettings, EnvironmentSettings, FogSettings,
-    HdrSettings, InputState, LogBuffer, LogLevel, MotionBlurSettings, PresentSettings,
+    GameScreen, HdrSettings, InputState, LogBuffer, LogLevel, MotionBlurSettings, PresentSettings,
     RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
-    Time, TransparencySettings,
+    Time, TransparencySettings, UiCanvas,
 };
 use crate::stats::FrameStats;
 use crate::systems;
@@ -77,6 +77,8 @@ pub struct App {
     /// This frame's debug lines, copied out of the `DebugLines` resource so the
     /// renderer borrow doesn't overlap the world borrow.
     debug_lines: Vec<DebugLine>,
+    /// The game's UI laid out, with the glyph cache it is laid out from.
+    ui: crate::gfx::ui::Painter,
     /// The log stream's end for the console panel, drained once a frame.
     console: crate::logging::ConsoleQueue,
     #[cfg(feature = "scripting")]
@@ -85,6 +87,16 @@ pub struct App {
     /// — see `BuildWatcher::for_game_assembly`.
     #[cfg(feature = "scripting")]
     build_watcher: Option<crate::build_watcher::BuildWatcher>,
+    /// The open story's world. Beside `scripting` rather than in the editor
+    /// because building one runs game code.
+    #[cfg(feature = "scripting")]
+    stories: crate::storybook::StoryRunner,
+    /// The window the open story is drawn in, and its painter, made the first
+    /// time one opens so a session that never opens one pays nothing for it.
+    #[cfg(feature = "scripting")]
+    story_window: Option<StoryWindow>,
+    #[cfg(feature = "scripting")]
+    story_ui: Option<crate::gfx::ui::Painter>,
     /// Reload-on-save for the project's binding file. `None` without a project,
     /// without the file, or in a build with no `notify`.
     #[cfg(feature = "scripting")]
@@ -207,11 +219,18 @@ impl App {
             cascades: CascadeSet::default(),
             atlas: ShadowAtlas::default(),
             debug_lines: Vec::new(),
+            ui: crate::gfx::ui::Painter::new(),
             console,
             #[cfg(feature = "scripting")]
             scripting: None,
             #[cfg(feature = "scripting")]
             build_watcher: None,
+            #[cfg(feature = "scripting")]
+            stories: crate::storybook::StoryRunner::default(),
+            #[cfg(feature = "scripting")]
+            story_window: None,
+            #[cfg(feature = "scripting")]
+            story_ui: None,
             #[cfg(feature = "scripting")]
             input_watcher: None,
             prefab_watcher: None,
@@ -302,6 +321,12 @@ impl App {
         world.insert_resource(crate::collision::CollisionState::default());
         world.insert_resource(LogBuffer::default());
         world.insert_resource(DebugLines::default());
+        world.insert_resource(UiCanvas::default());
+        world.insert_resource(crate::ui::UiTree::default());
+        world.insert_resource(crate::ui::events::UiPointer::default());
+        world.insert_resource(crate::ui::events::UiEvents::default());
+        world.insert_resource(crate::ui::tween::UiTweens::default());
+        world.insert_resource(crate::ui::story::Storybook::default());
         world.insert_resource(Culling::default());
         // Empty until `load_prefabs` scans the project: the scan reads the disk,
         // and its cost belongs to the run rather than to the cold-start gate.
@@ -609,6 +634,7 @@ impl ApplicationHandler for App {
         // the manifest.
         #[cfg(feature = "scripting")]
         if let Some(scripts) = self.boot_scripting() {
+            self.stories.refresh(&self.world, &scripts.scripting);
             self.scripting = Some(scripts.scripting);
             self.build_watcher = scripts.watcher;
         }
@@ -641,12 +667,35 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        #[cfg_attr(not(feature = "scripting"), allow(unused_variables))] window_id: WindowId,
         event: WindowEvent,
     ) {
         let Some(active) = self.active.as_mut() else {
             return;
         };
+
+        // The storybook's window is the story's alone: none of what follows —
+        // the editor, the fly camera, the game's input — hears of it.
+        #[cfg(feature = "scripting")]
+        if self
+            .story_window
+            .as_ref()
+            .is_some_and(|story| story.window.id() == window_id)
+        {
+            match &event {
+                WindowEvent::CloseRequested => {
+                    self.world
+                        .resource_mut::<crate::ui::story::Storybook>()
+                        .open = None;
+                }
+                WindowEvent::Resized(size) => {
+                    active.renderer.resize_ui_window([size.width, size.height]);
+                }
+                _ => {}
+            }
+            self.stories.on_window_event(&event);
+            return;
+        }
 
         // Ahead of egui, and it has to be: the switch this answers is the one that
         // takes egui out of the frame, so it cannot be a key egui is asked about
@@ -700,7 +749,12 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Its surface before its window, which the renderer cannot
+                // promise once the app is being torn down.
+                active.renderer.close_ui_window();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 active.renderer.resize([size.width, size.height]);
             }
@@ -806,6 +860,40 @@ impl ApplicationHandler for App {
                     crate::collision::run(&mut self.world);
                 }
 
+                // The UI is immediate: what this tick draws replaces the last
+                // tick's. A paused game ticks nothing and keeps its UI on
+                // screen; edit mode runs no game code and shows none.
+                //
+                // The game's screen is the window, unless the editor is drawn
+                // and previewing a resolution — then it is whatever the editor
+                // set last time it drew (see `editor::preview`).
+                let extent = active.renderer.extent();
+                if !overlay_on || self.shipped || self.world.get_resource::<GameScreen>().is_none()
+                {
+                    self.world.insert_resource(GameScreen::window(extent));
+                }
+                if simulate {
+                    let size = self.world.resource::<GameScreen>().size;
+                    let size = size.map(|side| side.round() as u32);
+                    self.world.resource_mut::<UiCanvas>().begin(size);
+                } else if !self.world.resource::<crate::scene::Play>().is_live() {
+                    self.world.resource_mut::<UiCanvas>().clear();
+                }
+                // Against what the last frame drew, which is what the player
+                // pointed at. Edit mode has no pointer state, so a button does
+                // not come back from Stop still lit.
+                if simulate {
+                    profile_scope!("ui events");
+                    crate::ui::events::update(&mut self.world);
+                } else if !self.world.resource::<crate::scene::Play>().is_live() {
+                    self.world
+                        .resource_mut::<crate::ui::events::UiPointer>()
+                        .reset();
+                    self.world
+                        .resource_mut::<crate::ui::events::UiEvents>()
+                        .clear();
+                }
+
                 // A reload requested from the editor last frame lands here:
                 // before the tick, after collision, with no dispatch window
                 // open and no world borrow held — the only point in the frame
@@ -823,6 +911,7 @@ impl ApplicationHandler for App {
                     if let Some(scripting) = &self.scripting {
                         if reload_requested {
                             profile_scope!("script reload");
+                            self.stories.close();
                             let outcome = scripting.reload(&mut self.world);
                             let frame = self.world.resource::<Time>().frame_count();
                             self.world.resource_mut::<LogBuffer>().push(
@@ -843,6 +932,9 @@ impl ApplicationHandler for App {
                                     .resource_mut::<crate::build_watcher::BuildStatus>()
                                     .reloaded();
                             }
+                            // A rejected build rebuilds the story it closed
+                            // from the code still running.
+                            self.stories.refresh(&self.world, scripting);
                         }
                         scripting.attach_pending(&mut self.world, &self.registry);
                         if simulate {
@@ -850,6 +942,19 @@ impl ApplicationHandler for App {
                             scripting.tick(&mut self.world, &self.registry, delta);
                         }
                     }
+                }
+
+                // After the tick, so a tween started in it moves this frame,
+                // and before the layout, which draws where it moved to. A
+                // paused game's tweens hold; a stopped one's are gone with the
+                // scene they were driving.
+                if simulate {
+                    profile_scope!("tweens");
+                    crate::ui::tween::advance(&self.world, delta);
+                } else if !self.world.resource::<crate::scene::Play>().is_live() {
+                    self.world
+                        .resource_mut::<crate::ui::tween::UiTweens>()
+                        .clear();
                 }
 
                 // Everything the stream has heard since the last frame, this
@@ -926,6 +1031,42 @@ impl ApplicationHandler for App {
                 {
                     profile_scope!("assets");
                     crate::asset_db::service(&self.world, &mut active.renderer);
+                }
+                // After the service, with the backend in hand, for the same
+                // reason: an image the tick drew first gets its slot here. The
+                // retained trees are resolved first, every frame and in edit
+                // mode too, against the window the frame is about to fill.
+                {
+                    profile_scope!("ui");
+                    crate::ui::update(&mut self.world, active.renderer.extent());
+                    crate::gfx::ui::paint(&self.world, &mut active.renderer, &mut self.ui);
+                }
+                // The open story, laid out in its own world for its own
+                // window, which is drawn after the frame below.
+                #[cfg(feature = "scripting")]
+                {
+                    sync_story_window(
+                        event_loop,
+                        &self.world,
+                        &mut self.story_window,
+                        &mut self.stories,
+                        self.instance.as_ref(),
+                        &mut active.renderer,
+                    );
+                    if self.story_window.is_some()
+                        && let Some(scripting) = &self.scripting
+                    {
+                        profile_scope!("story");
+                        self.stories
+                            .update(&mut self.world, scripting, &self.registry, delta);
+                        let painter = self
+                            .story_ui
+                            .get_or_insert_with(crate::gfx::ui::Painter::new);
+                        let renderer = &mut active.renderer;
+                        self.stories.paint(&mut self.world, |story| {
+                            crate::gfx::ui::paint(story, renderer, painter)
+                        });
+                    }
                 }
 
                 {
@@ -1058,8 +1199,17 @@ impl ApplicationHandler for App {
                                 settings: &shadow_settings,
                             }
                         }),
+                        Some(self.ui.frame()),
                         overlay,
                     );
+                }
+
+                #[cfg(feature = "scripting")]
+                if renderer.has_ui_window()
+                    && let Some(painter) = &self.story_ui
+                {
+                    profile_scope!("storybook window");
+                    renderer.render_ui_window(painter.frame());
                 }
 
                 // Before `gpu_frame_ms`, which reads the whole-frame pair this
@@ -1081,6 +1231,8 @@ impl ApplicationHandler for App {
                 // Clear the one-frame pressed/released edges now that scripts
                 // have observed them during the tick above.
                 self.world.resource_mut::<InputState>().end_frame();
+                #[cfg(feature = "scripting")]
+                self.stories.end_frame();
 
                 // Last, so every scope guard above has dropped and this frame's
                 // CPU spans are complete. Its GPU spans arrive later and are
@@ -1198,6 +1350,89 @@ fn metal_renderer(window: &Window, extent: [u32; 2], present: PresentSettings) -
 
 #[cfg(not(target_os = "macos"))]
 fn metal_renderer(_: &Window, _: [u32; 2], _: PresentSettings) -> VulkanRenderer {
+    unreachable!("BackendChoice never picks Metal off macOS")
+}
+
+/// The storybook's window, and the story it was opened or retitled for.
+#[cfg(feature = "scripting")]
+struct StoryWindow {
+    window: Arc<Window>,
+    story: String,
+}
+
+/// Open, retitle or close the storybook's window to match the story the
+/// editor has open. A window that cannot be made closes the story rather than
+/// leaving it open with nowhere to draw.
+#[cfg(feature = "scripting")]
+fn sync_story_window(
+    event_loop: &ActiveEventLoop,
+    world: &World,
+    shown: &mut Option<StoryWindow>,
+    runner: &mut crate::storybook::StoryRunner,
+    instance: Option<&Arc<Instance>>,
+    renderer: &mut VulkanRenderer,
+) {
+    use crate::storybook::{WindowChange, window_change};
+    use crate::ui::story::Storybook;
+
+    let wanted = world.resource::<Storybook>().open.clone();
+    let title = |story: &str| format!("Storybook — {story}");
+    match window_change(wanted.as_deref(), shown.as_ref().map(|w| w.story.as_str())) {
+        WindowChange::Keep => {}
+        WindowChange::Retitle => {
+            if let (Some(shown), Some(story)) = (shown.as_mut(), wanted) {
+                shown.window.set_title(&title(&story));
+                shown.story = story;
+            }
+        }
+        WindowChange::Close => {
+            renderer.close_ui_window();
+            *shown = None;
+            runner.close();
+        }
+        WindowChange::Open => {
+            let story = wanted.unwrap_or_default();
+            let attributes = Window::default_attributes()
+                .with_title(title(&story))
+                .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+            let opened = event_loop
+                .create_window(attributes)
+                .map_err(|e| e.to_string())
+                .and_then(|window| {
+                    let window = Arc::new(window);
+                    let size = window.inner_size();
+                    let surface = match instance {
+                        Some(instance) => Surface::from_window(instance.clone(), window.clone())
+                            .map(crate::gfx::vulkan::UiSurface::Vulkan)
+                            .map_err(|e| e.to_string()),
+                        None => metal_surface(&window),
+                    }?;
+                    renderer.open_ui_window(surface, [size.width, size.height])?;
+                    runner.set_extent([size.width, size.height]);
+                    Ok(window)
+                });
+            match opened {
+                Ok(window) => *shown = Some(StoryWindow { window, story }),
+                Err(reason) => {
+                    tracing::warn!("the storybook window could not open: {reason}");
+                    world.resource_mut::<Storybook>().open = None;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "scripting", target_os = "macos"))]
+fn metal_surface(window: &Window) -> Result<crate::gfx::vulkan::UiSurface, String> {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().map_err(|e| e.to_string())?.as_raw() {
+        RawWindowHandle::AppKit(handle) => Ok(crate::gfx::vulkan::UiSurface::Metal(handle.ns_view)),
+        _ => Err("a macOS window is an AppKit one".into()),
+    }
+}
+
+#[cfg(all(feature = "scripting", not(target_os = "macos")))]
+fn metal_surface(_: &Window) -> Result<crate::gfx::vulkan::UiSurface, String> {
     unreachable!("BackendChoice never picks Metal off macOS")
 }
 

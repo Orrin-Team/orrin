@@ -310,6 +310,7 @@ pub fn render(
                 settings: &shadow_settings,
             }),
             None,
+            None,
         );
     }
 

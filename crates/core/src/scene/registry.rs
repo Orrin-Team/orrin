@@ -14,6 +14,16 @@ pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
 pub const LOCKED: ComponentId = ComponentId::new("orrin.locked");
 pub const RENDER_SETTINGS: ComponentId = ComponentId::new("orrin.render_settings");
 pub const CAMERA: ComponentId = ComponentId::new("orrin.camera");
+pub const CANVAS: ComponentId = ComponentId::new("orrin.ui.canvas");
+pub const RECT_TRANSFORM: ComponentId = ComponentId::new("orrin.ui.rect_transform");
+pub const IMAGE: ComponentId = ComponentId::new("orrin.ui.image");
+pub const TEXT: ComponentId = ComponentId::new("orrin.ui.text");
+pub const BUTTON: ComponentId = ComponentId::new("orrin.ui.button");
+pub const GRADIENT: ComponentId = ComponentId::new("orrin.ui.gradient");
+pub const CORNER: ComponentId = ComponentId::new("orrin.ui.corner");
+pub const STROKE: ComponentId = ComponentId::new("orrin.ui.stroke");
+pub const SHADOW: ComponentId = ComponentId::new("orrin.ui.shadow");
+pub const SCROLL_FRAME: ComponentId = ComponentId::new("orrin.ui.scroll_frame");
 
 /// `MeshHandle` and `MaterialHandle` are upload indices, so a scene stores the
 /// asset's [`AssetId`](orrin_registry::AssetId) instead — a translation that
@@ -69,6 +79,16 @@ pub fn register_components(registry: &mut Registry) {
     registry.register::<Locked>(LOCKED, "Locked");
     registry.register::<RenderSettings>(RENDER_SETTINGS, "Render Settings");
     registry.register::<CameraComponent>(CAMERA, "Camera");
+    registry.register::<crate::ui::Canvas>(CANVAS, "Canvas");
+    registry.register::<crate::ui::RectTransform>(RECT_TRANSFORM, "Rect Transform");
+    registry.register::<crate::ui::Image>(IMAGE, "Image");
+    registry.register::<crate::ui::Text>(TEXT, "Text");
+    registry.register::<crate::ui::Button>(BUTTON, "Button");
+    registry.register::<crate::ui::Gradient>(GRADIENT, "Gradient");
+    registry.register::<crate::ui::Corner>(CORNER, "Corner");
+    registry.register::<crate::ui::Stroke>(STROKE, "Stroke");
+    registry.register::<crate::ui::Shadow>(SHADOW, "Shadow");
+    registry.register::<crate::ui::ScrollFrame>(SCROLL_FRAME, "Scroll Frame");
     registry.register_resolved::<MeshHandle>(MESH, "Mesh");
     registry.register_resolved::<MaterialHandle>(MATERIAL, "Material");
     registry.end_engine_registration();

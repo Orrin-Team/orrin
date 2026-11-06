@@ -71,3 +71,17 @@ class StatefulProbe : Behaviour
             + $"scratch={Scratch} fixed={Fixed}");
     }
 }
+
+/// Takes a click and logs its payload; has no handler for anything else, so the
+/// engine offers those to its parent.
+class PointerProbe : Behaviour, IPointerClickHandler
+{
+    public void OnPointerClick(PointerEvent pointer) =>
+        Native.Log($"probe:click {pointer.Target.Index} {pointer.Position.x} {pointer.PressPosition.y}");
+}
+
+/// Exercises the pointer fault channel.
+class ThrowingPointer : Behaviour, IPointerDownHandler
+{
+    public void OnPointerDown(PointerEvent pointer) => throw new InvalidOperationException("down boom");
+}

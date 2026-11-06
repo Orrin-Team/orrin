@@ -70,4 +70,38 @@ public static class World
     /// next tick. Returns false if the handle was stale.
     public static bool AddScript<T>(Entity entity) where T : Behaviour, new() =>
         Native.AddScript(entity, typeof(T).AssemblyQualifiedName!);
+
+    /// <summary>
+    /// <paramref name="entity"/>'s <see cref="Canvas"/>, <see cref="RectTransform"/>,
+    /// <see cref="Image"/>, <see cref="Text"/> or <see cref="Button"/> as it is
+    /// now, or null if it has none.
+    /// </summary>
+    public static T? GetComponent<T>(Entity entity) where T : unmanaged =>
+        Native.GetComponent<T>(entity);
+
+    /// <summary>
+    /// Change <paramref name="entity"/>'s component in place, from this frame — or
+    /// the one queued for it this tick by <see cref="AddComponent{T}"/>. Returns
+    /// false if it has neither.
+    /// </summary>
+    public static bool SetComponent<T>(Entity entity, T value) where T : unmanaged =>
+        Native.SetComponent(entity, value);
+
+    /// <summary>
+    /// Queue giving <paramref name="entity"/> a UI component; it lands when this
+    /// tick's commands apply, replacing one already there. A
+    /// <see cref="SetComponent{T}"/> or <see cref="SetText"/> later in the same
+    /// tick changes the queued one. Returns false for a stale handle.
+    /// </summary>
+    public static bool AddComponent<T>(Entity entity, T value) where T : unmanaged =>
+        Native.AddComponent(entity, value);
+
+    /// <summary>The string <paramref name="entity"/>'s <see cref="Text"/> shows, or null if it has none.</summary>
+    public static string? GetText(Entity entity) => Native.GetText(entity);
+
+    /// <summary>
+    /// Change what <paramref name="entity"/>'s <see cref="Text"/> shows. Returns
+    /// false if it has no Text, nor one queued this tick.
+    /// </summary>
+    public static bool SetText(Entity entity, string text) => Native.SetText(entity, text);
 }

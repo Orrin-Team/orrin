@@ -151,6 +151,10 @@ pub struct FrameConfig {
     pub outline: bool,
     /// Whether the transform gizmo draws, for the reason `outline` is separate.
     pub gizmo: bool,
+    /// Whether the game drew any in-game UI this frame. Independent of
+    /// `overlay`: a shipped game has no editor and still has its HUD, and a
+    /// frame whose game drew nothing registers no pass.
+    pub ui: bool,
     /// Whether the frame's target goes to a presentation engine (a window) or is
     /// copied out (an offscreen capture). It decides the layout the target ends
     /// in: `PresentSrc` needs the swapchain extension, which an offscreen device
@@ -275,6 +279,8 @@ pub enum PassBody {
     /// Writes up-chain level `n`, reading the coarser level and down-chain `n`.
     BloomUpsample(u32),
     Tonemap,
+    /// The game's own UI, over the tonemapped frame.
+    Ui,
     /// The selected and hovered meshes, flat, into the outline's mask.
     OutlineMask,
     /// The outline round the mask's shapes, over the tonemapped frame.
@@ -1728,6 +1734,17 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .access(swapchain_color, Access::ColorAttachment)
         .build();
     record(id, PassBody::Tonemap, &mut bodies);
+
+    // Straight onto the tonemapped image, so the game's colours are the ones it
+    // asked for rather than the scene's exposure of them; first among the
+    // swapchain's writers, so every mark the editor makes stays on top.
+    if config.ui {
+        let id = builder
+            .pass("ui", PassKind::Inline)
+            .access(swapchain_color, Access::ColorAttachment)
+            .build();
+        record(id, PassBody::Ui, &mut bodies);
+    }
 
     let outline_mask = (config.overlay && config.outline).then(|| {
         // Its own target rather than the depth or stencil of the scene: the

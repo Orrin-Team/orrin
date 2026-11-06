@@ -1,20 +1,22 @@
 //! In-window editor UI (egui overlay). New tools are added as `panels` modules.
 //!
-//! egui lays the editor out and tessellates it; the renderer draws it, in the
-//! phases `phases` cuts it into (see `gfx/vulkan/overlay.rs`).
+//! egui lays the editor out and tessellates it; the renderer draws it (see
+//! `gfx/vulkan/overlay.rs`).
 
 mod autosave;
 mod cadence;
+pub(crate) mod catalog;
 mod dock;
 mod export;
 mod gizmo;
 mod icons;
 mod kind;
 mod panels;
-mod phases;
 mod pick;
 mod prefs;
+mod preview;
 mod previews;
+mod rect_tool;
 mod selection;
 mod state;
 mod theme;
@@ -34,7 +36,7 @@ use self::prefs::{Prefs, PrefsFile};
 use self::previews::Previews;
 use self::state::EditorState;
 use self::theme::ThemeSet;
-use crate::gfx::vulkan::{Glass, OverlayFrame, OverlayPhase};
+use crate::gfx::vulkan::OverlayFrame;
 
 pub struct Editor {
     ctx: egui::Context,
@@ -46,8 +48,6 @@ pub struct Editor {
     prefs: Prefs,
     prefs_file: PrefsFile,
     previews: Previews,
-    /// The last frame's translucent surfaces, from `panels::frost`.
-    glass: Vec<phases::Glass>,
     /// Kept between frames for its allocations.
     frame: OverlayFrame,
     last_layout_check: std::time::Instant,
@@ -116,6 +116,9 @@ impl Editor {
         if let Some(steps) = prefs.snap {
             state.snap_steps = steps;
         }
+        if let Some(preview) = prefs.preview {
+            state.preview = preview;
+        }
         if let Some(view) = prefs.assets {
             state.assets_view = view;
         }
@@ -133,7 +136,6 @@ impl Editor {
             prefs,
             prefs_file,
             previews: Previews::default(),
-            glass: Vec::new(),
             frame: OverlayFrame::default(),
             last_layout_check: std::time::Instant::now(),
             cadence: cadence::Cadence::default(),
@@ -192,13 +194,10 @@ impl Editor {
             prefs,
             prefs_file,
             previews,
-            glass,
             ..
         } = self;
         ctx.begin_pass(input.take_egui_input(window));
         panels::draw(ctx, world, state, registry, themes, dock, previews);
-        panels::frost(ctx, glass);
-        phases::mark(ctx);
         state.apply(world, registry);
         state.autosave(world, registry, std::time::Instant::now());
         if state.take_reveal_request() {
@@ -231,6 +230,13 @@ impl Editor {
         };
         if prefs.assets.unwrap_or_default() != view {
             prefs.assets = Some(view);
+            prefs_file.save(prefs);
+        }
+        // Kept once a typed size has stopped being dragged.
+        if prefs.preview.unwrap_or_default() != state.preview
+            && !ctx.input(|input| input.pointer.any_down())
+        {
+            prefs.preview = Some(state.preview);
             prefs_file.save(prefs);
         }
 
@@ -314,29 +320,7 @@ impl Editor {
         self.state.outline.clear();
         frame.pixels_per_point = ppp;
         frame.textures.append(output.textures_delta);
-        frame
-            .phases
-            .resize_with(phases::COUNT, OverlayPhase::default);
-        for (index, (phase, shapes)) in frame
-            .phases
-            .iter_mut()
-            .zip(phases::split(output.shapes))
-            .enumerate()
-        {
-            phase.primitives = self.ctx.tessellate(shapes, ppp);
-            phase.glass.clear();
-            phase
-                .glass
-                .extend(
-                    self.glass
-                        .iter()
-                        .filter(|glass| glass.phase == index)
-                        .map(|glass| Glass {
-                            rect: glass.rect,
-                            radius: glass.radius,
-                        }),
-                );
-        }
+        frame.primitives = self.ctx.tessellate(output.shapes, ppp);
         &mut self.frame
     }
 }

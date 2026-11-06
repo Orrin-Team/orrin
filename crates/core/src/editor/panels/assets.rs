@@ -647,12 +647,13 @@ const SORTS: [(AssetSort, &str); 4] = [
 
 /// The kinds the browser can be narrowed to. Folders are not among them: a
 /// kind lists the whole project, where a folder has nowhere to be opened.
-const KINDS: [(AssetKind, &str); 5] = [
+const KINDS: [(AssetKind, &str); 6] = [
     (AssetKind::Texture, "Textures"),
     (AssetKind::Mesh, "Meshes"),
     (AssetKind::Material, "Materials"),
     (AssetKind::Prefab, "Prefabs"),
     (AssetKind::Scene, "Scenes"),
+    (AssetKind::Font, "Fonts"),
 ];
 
 fn plural(kind: AssetKind) -> String {
@@ -843,6 +844,11 @@ impl Cells<'_> {
                 "Drag onto a mesh renderer's material to draw with it. Edit it in the inspector",
             ),
             AssetKind::Scene => (icons::globe(), weak, "Double-click to open it"),
+            AssetKind::Font => (
+                icons::text_t(),
+                weak,
+                "Drag onto a script's font field to set its UI text in it",
+            ),
             AssetKind::Prefab | AssetKind::Folder => (icons::layers(), weak, PLACE_HINT),
         };
         let (status, detail) = match (&entry.status, self.db.state(entry.id)) {

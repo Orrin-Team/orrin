@@ -307,8 +307,6 @@ pub struct RenderTargets {
 /// commits to a path that needs it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Feature {
-    /// Blitting a render target of this format down and sampling the result.
-    BackdropCapture(Format),
     /// A two-channel texture read as premultiplied white and alpha, which is
     /// what `TextureSwizzle::CoverageToWhite` needs.
     CoverageTexture,

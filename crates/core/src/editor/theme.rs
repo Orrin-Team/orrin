@@ -43,6 +43,7 @@ pub const KIND_MESH: Color32 = Color32::from_rgb(0x7F, 0xA7, 0xE8);
 pub const KIND_LIGHT: Color32 = Color32::from_rgb(0xE2, 0xB6, 0x55);
 pub const KIND_CAMERA: Color32 = Color32::from_rgb(0x6C, 0xC4, 0xB8);
 pub const KIND_SCRIPT: Color32 = Color32::from_rgb(0xB1, 0x93, 0xF0);
+pub const KIND_UI: Color32 = Color32::from_rgb(0xE8, 0x8F, 0x9C);
 /// What belongs to a prefab instance, and what an instance overrides. A text
 /// colour rather than an icon tint, so it reads alongside an entity's kind.
 pub const PREFAB: Color32 = Color32::from_rgb(0x5E, 0xB8, 0xF2);
@@ -152,10 +153,8 @@ impl Theme {
 
         v.override_text_color = Some(rgb(self.text));
         v.panel_fill = rgb(self.panel);
-        // Translucent: every surface above the panels is frosted glass over the
-        // scene (see `panels::frost`), and opaque wherever it covers a panel.
-        v.window_fill = rgb(self.window).gamma_multiply(POPUP_OPACITY);
-        v.window_stroke = Stroke::new(1.0_f32, GLASS_EDGE);
+        v.window_fill = rgb(self.window);
+        v.window_stroke = Stroke::new(1.0_f32, FLOATING_EDGE);
         v.extreme_bg_color = rgb(self.extreme);
         v.faint_bg_color = rgb(self.faint);
         v.hyperlink_color = self.accent();
@@ -293,18 +292,9 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
     });
 }
 
-/// How much of a menu or a dropdown is its own colour; the rest is the blurred
-/// scene behind it. Low enough that the frosting reads as glass — at 0.8 it
-/// read as a slightly odd grey.
-const POPUP_OPACITY: f32 = 0.66;
-
-/// The same for the controls floating over the viewport, which sit on the
-/// scene all the time and so can afford to show more of it.
-pub const FLOATING_OPACITY: f32 = 0.6;
-
-/// The rim of anything floating: a faint light line, the edge of a pane of
-/// glass, rather than a border drawn around it.
-pub const GLASS_EDGE: Color32 = Color32::from_rgba_premultiplied(18, 18, 20, 18);
+/// The rim of anything floating: a faint light line rather than a border drawn
+/// around it.
+pub const FLOATING_EDGE: Color32 = Color32::from_rgba_premultiplied(18, 18, 20, 18);
 
 /// Disclosure triangles, and nothing else — hover, press and selection are
 /// instant fill swaps, because a frame-accurate instrument must not lag the

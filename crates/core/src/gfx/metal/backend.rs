@@ -50,6 +50,10 @@ pub(crate) struct Windowed {
 }
 
 impl Windowed {
+    pub(crate) fn present(&self) -> PresentSettings {
+        self.present
+    }
+
     pub(crate) fn frame<'a>(
         &'a self,
         driver: &'a MtlDriver,
@@ -82,7 +86,7 @@ fn span_ms(start: f64, end: f64) -> f32 {
     ((end - start).max(0.0) * 1.0e3) as f32
 }
 
-fn create_target(driver: &MtlDriver, format: Format, extent: [u32; 2]) -> TextureViewId {
+pub(crate) fn create_target(driver: &MtlDriver, format: Format, extent: [u32; 2]) -> TextureViewId {
     driver.create_texture(&TextureDesc {
         format,
         dimension: TextureDimension::D2,
