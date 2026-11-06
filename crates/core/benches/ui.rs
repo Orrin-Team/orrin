@@ -274,5 +274,40 @@ fn styled(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, paint, update, styled);
+/// A thousand elements each sliding and fading forever: two tweens apiece,
+/// so the cost is read per tween. The empty case is what every frame with no
+/// UI animation pays.
+fn tweens(c: &mut Criterion) {
+    use orrin_core::ui::tween::{Tween, TweenProperty, UiTweens, advance};
+
+    let mut world = World::new();
+    world.insert_resource(UiTweens::default());
+    let mut group = c.benchmark_group("ui");
+    group.bench_function("advance no tweens", |b| {
+        b.iter(|| advance(black_box(&world), 1.0 / 60.0));
+    });
+    for _ in 0..1000 {
+        let element = world.spawn();
+        world.insert(element, RectTransform::default());
+        world.insert(element, Image::default());
+        let mut tweens = world.resource_mut::<UiTweens>();
+        for (property, to) in [
+            (TweenProperty::Position, [100.0, 50.0, 0.0, 0.0]),
+            (TweenProperty::ImageColor, [1.0, 0.5, 0.0, 0.5]),
+        ] {
+            tweens.play(Tween {
+                repeat: -1,
+                reverses: true,
+                ..Tween::new(element, property, to, 0.5)
+            });
+        }
+    }
+    group.throughput(Throughput::Elements(2000));
+    group.bench_function("advance 2000 tweens", |b| {
+        b.iter(|| advance(black_box(&world), 1.0 / 60.0));
+    });
+    group.finish();
+}
+
+criterion_group!(benches, paint, update, styled, tweens);
 criterion_main!(benches);

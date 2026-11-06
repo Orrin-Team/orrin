@@ -157,6 +157,17 @@ impl UiPass {
         }
     }
 
+    /// Free the atlas and the sets, for a window closing.
+    pub(super) fn destroy(mut self, device: &Device) {
+        self.invalidate_textures(device);
+        if let Some(atlas) = self.atlas.take() {
+            for set in atlas.sets {
+                device.destroy_bind_group(set);
+            }
+            device.destroy_texture(atlas.view);
+        }
+    }
+
     /// Forget the material table's set: a texture was loaded or replaced.
     pub(super) fn invalidate_textures(&mut self, device: &Device) {
         for set in self.textures.take().into_iter().flatten() {

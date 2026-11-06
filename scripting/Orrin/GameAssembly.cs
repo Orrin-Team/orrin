@@ -147,6 +147,7 @@ public static unsafe class GameAssembly
         if (_pending is null)
             return NothingStaged;
 
+        Tweens.ForgetGame();
         BeginRetire(ref _current);
         _current = _pending;
         _pending = null;
@@ -175,6 +176,7 @@ public static unsafe class GameAssembly
     {
         if (_current is null)
             return NothingStaged;
+        Tweens.ForgetGame();
         BeginRetire(ref _current);
         return FinishRetire() ? Ok : Leaked;
     }

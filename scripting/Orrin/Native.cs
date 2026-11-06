@@ -108,6 +108,15 @@ public unsafe struct OrrinApi
     public delegate* unmanaged<Entity, uint, byte*, int, int> GetComponentText;
     public delegate* unmanaged<Entity, uint, byte*, uint, byte> SetComponentText;
     public delegate* unmanaged<byte> UiPointerOver;
+    // Tweens, appended after UiPointerOver; never reordered above it. A
+    // request and its byte size, which the engine checks; an id as bits, zero
+    // for refused.
+    public delegate* unmanaged<Entity, byte*, uint, ulong> TweenPlay;
+    public delegate* unmanaged<ulong, byte> TweenCancel;
+    public delegate* unmanaged<ulong, byte> TweenPlaying;
+    // Story controls: a name as UTF-8 and its byte length, then the default.
+    public delegate* unmanaged<byte*, uint, float, float, float, float> StoryFloat;
+    public delegate* unmanaged<byte*, uint, byte, byte> StoryBool;
 }
 
 public static unsafe class Native
@@ -382,6 +391,30 @@ public static unsafe class Native
     }
 
     internal static bool UiPointerOver() => _api.UiPointerOver() != 0;
+
+    internal static ulong TweenPlay(Entity entity, in TweenRequest request)
+    {
+        fixed (TweenRequest* p = &request)
+            return _api.TweenPlay(entity, (byte*)p, (uint)sizeof(TweenRequest));
+    }
+
+    internal static bool TweenCancel(ulong id) => _api.TweenCancel(id) != 0;
+
+    internal static bool TweenPlaying(ulong id) => _api.TweenPlaying(id) != 0;
+
+    internal static float StoryFloat(string name, float @default, float min, float max)
+    {
+        var bytes = Encoding.UTF8.GetBytes(name);
+        fixed (byte* p = bytes)
+            return _api.StoryFloat(p, (uint)bytes.Length, @default, min, max);
+    }
+
+    internal static bool StoryBool(string name, bool @default)
+    {
+        var bytes = Encoding.UTF8.GetBytes(name);
+        fixed (byte* p = bytes)
+            return _api.StoryBool(p, (uint)bytes.Length, @default ? (byte)1 : (byte)0) != 0;
+    }
 
     internal static AssetState GetAssetState(Guid asset)
     {

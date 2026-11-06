@@ -1811,6 +1811,118 @@ extern "C" fn ui_pointer_over() -> bool {
     })
 }
 
+extern "C" fn tween_play(entity: CEntity, request: *const orrin_script::CTween, size: u32) -> u64 {
+    use crate::ui::tween::{Ease, EaseDirection, EaseStyle, Tween, TweenProperty, UiTweens};
+
+    if request.is_null() {
+        return 0;
+    }
+    let expected = std::mem::size_of::<orrin_script::CTween>() as u32;
+    if size != expected {
+        tracing::warn!(
+            "Tween.To: C# passed {size} bytes and the engine's tween is {expected}; rebuild \
+             scripting/Orrin so the bindings match the engine"
+        );
+        return 0;
+    }
+    // SAFETY: C# passes `size` readable bytes, just checked to be a whole
+    // `CTween`; unaligned, as in `read_c`.
+    let c = unsafe { request.cast::<orrin_script::CTween>().read_unaligned() };
+    let (Some(property), Some(style), Some(direction)) = (
+        TweenProperty::from_u32(c.property),
+        EaseStyle::from_u32(c.style),
+        EaseDirection::from_u32(c.direction),
+    ) else {
+        tracing::warn!(
+            "Tween.To: property {}, style {} or direction {} is one this engine cannot name",
+            c.property,
+            c.style,
+            c.direction
+        );
+        return 0;
+    };
+    let finite = |lanes: &[f32]| lanes.iter().all(|lane| lane.is_finite());
+    let timed = |seconds: f32| seconds.is_finite() && seconds >= 0.0;
+    if !timed(c.duration) || !timed(c.delay) || !finite(&c.to) || !finite(&c.from) {
+        tracing::warn!("Tween.To: a duration or delay below zero, or a value that is not finite");
+        return 0;
+    }
+    orrin_script::with_world(0, |world| {
+        let target = entity_of(entity);
+        if !world.is_alive(target) {
+            return 0;
+        }
+        if world.get_resource::<UiTweens>().is_none() {
+            world.insert_resource(UiTweens::default());
+        }
+        let tween = Tween {
+            target,
+            property,
+            to: c.to,
+            from: (c.has_from != 0).then_some(c.from),
+            duration: c.duration,
+            delay: c.delay,
+            ease: Ease::new(style, direction),
+            repeat: c.repeat,
+            reverses: c.reverses != 0,
+        };
+        world.resource_mut::<UiTweens>().play(tween).to_bits()
+    })
+}
+
+fn with_tweens(
+    query: impl FnOnce(&mut crate::ui::tween::UiTweens, crate::ui::tween::TweenId) -> bool,
+    id: u64,
+) -> bool {
+    id != 0
+        && orrin_script::with_world(false, |world| {
+            world
+                .get_resource_mut::<crate::ui::tween::UiTweens>()
+                .is_some_and(|mut tweens| {
+                    query(&mut tweens, crate::ui::tween::TweenId::from_bits(id))
+                })
+        })
+}
+
+extern "C" fn tween_cancel(id: u64) -> bool {
+    with_tweens(|tweens, id| tweens.cancel(id), id)
+}
+
+extern "C" fn tween_playing(id: u64) -> bool {
+    with_tweens(|tweens, id| tweens.is_playing(id), id)
+}
+
+/// A control's name, or `None` for bytes that are not one.
+fn control_name<'a>(name: *const u8, length: u32) -> Option<&'a str> {
+    if name.is_null() {
+        return None;
+    }
+    // SAFETY: C# passes `length` readable bytes of UTF-8.
+    std::str::from_utf8(unsafe { std::slice::from_raw_parts(name, length as usize) }).ok()
+}
+
+extern "C" fn story_float(name: *const u8, length: u32, default: f32, min: f32, max: f32) -> f32 {
+    let Some(name) = control_name(name, length) else {
+        return default;
+    };
+    orrin_script::with_world(default, |world| {
+        world
+            .get_resource_mut::<crate::ui::story::StoryArgs>()
+            .map_or(default, |mut args| args.float(name, default, min, max))
+    })
+}
+
+extern "C" fn story_bool(name: *const u8, length: u32, default: bool) -> bool {
+    let Some(name) = control_name(name, length) else {
+        return default;
+    };
+    orrin_script::with_world(default, |world| {
+        world
+            .get_resource_mut::<crate::ui::story::StoryArgs>()
+            .map_or(default, |mut args| args.bool(name, default))
+    })
+}
+
 /// Apply a queued scene change. Every other command is `apply_commands`' own.
 fn scene_command(world: &mut World, registry: &Registry, command: Command) {
     use crate::scene::loaded;
@@ -2098,6 +2210,11 @@ fn build_api() -> OrrinApi {
         get_component_text,
         set_component_text,
         ui_pointer_over,
+        tween_play,
+        tween_cancel,
+        tween_playing,
+        story_float,
+        story_bool,
         ..orrin_script::default_api()
     }
 }
@@ -2201,6 +2318,8 @@ pub struct Scripting {
     /// This tick's pointer events, swapped out of the world for the dispatch
     /// and back, cleared, so neither side reallocates.
     pointer_events: RefCell<crate::ui::events::UiEvents>,
+    /// The tweens that finished since the last tick, likewise.
+    finished_tweens: RefCell<Vec<crate::ui::tween::TweenId>>,
 }
 
 impl Scripting {
@@ -2313,6 +2432,7 @@ impl Scripting {
             pending: RefCell::new(Vec::new()),
             routing: RefCell::new(FxHashMap::default()),
             pointer_events: RefCell::new(crate::ui::events::UiEvents::default()),
+            finished_tweens: RefCell::new(Vec::new()),
         };
         match scripting.stage() {
             Ok(()) => {}
@@ -2548,6 +2668,56 @@ impl Scripting {
         &self.host
     }
 
+    /// Every story the live game assembly declares, in name order.
+    pub fn story_names(&self) -> Vec<String> {
+        self.host.story_names()
+    }
+
+    /// Build story `name` onto `canvas` in `world` — a story world from
+    /// `ui::story::world` — with `args` as the controls' held values, and
+    /// apply what it queued. Returns how it went and the controls it asked for.
+    pub fn build_story(
+        &self,
+        world: &mut World,
+        registry: &Registry,
+        name: &str,
+        canvas: Entity,
+        args: crate::ui::story::StoryArgs,
+    ) -> (orrin_script::StoryBuild, crate::ui::story::StoryArgs) {
+        world.insert_resource(args.rebuild());
+        let canvas = CEntity {
+            index: canvas.index,
+            generation: canvas.generation,
+        };
+        let built = orrin_script::with_active_world(world, || self.host.build_story(name, canvas));
+        self.apply_commands(world, registry);
+        let args = world
+            .remove_resource::<crate::ui::story::StoryArgs>()
+            .unwrap_or_default();
+        world.insert_resource(crate::ui::story::StoryArgs::default());
+        (built, args)
+    }
+
+    /// Run the completion callbacks of every tween that finished since the
+    /// last tick, in its own dispatch window. Whether there were any.
+    fn finish_tweens(&self, world: &mut World) -> bool {
+        let mut finished = self.finished_tweens.take();
+        finished.clear();
+        if let Some(mut tweens) = world.get_resource_mut::<crate::ui::tween::UiTweens>() {
+            tweens.take_completed(&mut finished);
+        }
+        let any = !finished.is_empty();
+        if any {
+            orrin_script::with_active_world(world, || {
+                for id in &finished {
+                    self.host.tween_complete(id.to_bits());
+                }
+            });
+        }
+        self.finished_tweens.replace(finished);
+        any
+    }
+
     /// Describe every `[Component]`-attributed Behaviour in the live game
     /// assembly to `registry`, so its fields save, load and inspect exactly as a
     /// Rust component's do.
@@ -2631,6 +2801,9 @@ impl Scripting {
     /// (OnEnable/OnStart/OnDisable), then this frame's collision callbacks,
     /// then its pointer events, then OnUpdate.
     pub fn tick(&self, world: &mut World, registry: &Registry, delta_time: f32) {
+        // First, and whether or not anything else runs: a callback is game
+        // code with no behaviour behind it, and a story may have nothing else.
+        let finished = self.finish_tweens(world);
         let mut pending = self.pending.take();
         pending.clear();
         world
@@ -2652,6 +2825,9 @@ impl Scripting {
             });
         if pending.is_empty() {
             self.pending.replace(pending);
+            if finished {
+                self.apply_commands(world, registry);
+            }
             return;
         }
 
@@ -4105,5 +4281,179 @@ mod tests {
         let (mut x, mut y) = (0.0, 0.0);
         orrin_script::with_active_world(&mut world, || cursor_pos(&mut x, &mut y));
         assert_eq!((x, y), (20.0, 40.0));
+    }
+
+    fn tween_world() -> (World, Entity) {
+        let mut world = World::new();
+        world.insert_resource(crate::ui::tween::UiTweens::default());
+        let entity = world.spawn();
+        world.insert(entity, crate::ui::RectTransform::default());
+        (world, entity)
+    }
+
+    fn slide() -> orrin_script::CTween {
+        orrin_script::CTween {
+            property: 0,
+            style: 3,
+            direction: 1,
+            duration: 1.0,
+            to: [50.0, 0.0, 0.0, 0.0],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_script_starts_watches_and_cancels_a_tween() {
+        let (mut world, entity) = tween_world();
+        let size = size_of::<orrin_script::CTween>();
+        let id =
+            orrin_script::with_active_world(&mut world, || tween_play(c(entity), &slide(), size));
+        assert_ne!(id, 0);
+        {
+            let tweens = world.resource::<crate::ui::tween::UiTweens>();
+            assert!(tweens.is_playing(crate::ui::tween::TweenId::from_bits(id)));
+        }
+        crate::ui::tween::advance(&world, 0.5);
+        assert!(
+            world
+                .get::<crate::ui::RectTransform>(entity)
+                .unwrap()
+                .anchored_position
+                .x
+                > 25.0
+        );
+        orrin_script::with_active_world(&mut world, || {
+            assert!(tween_playing(id));
+            assert!(tween_cancel(id));
+            assert!(!tween_playing(id));
+            assert!(!tween_cancel(id));
+        });
+    }
+
+    /// The named start and every timing field cross intact.
+    #[test]
+    fn a_tween_request_crosses_whole() {
+        let (mut world, entity) = tween_world();
+        let request = orrin_script::CTween {
+            delay: 0.25,
+            repeat: 2,
+            reverses: 1,
+            has_from: 1,
+            from: [-10.0, 0.0, 0.0, 0.0],
+            ..slide()
+        };
+        orrin_script::with_active_world(&mut world, || {
+            tween_play(c(entity), &request, size_of::<orrin_script::CTween>())
+        });
+        crate::ui::tween::advance(&world, 0.1);
+        assert_eq!(
+            world
+                .get::<crate::ui::RectTransform>(entity)
+                .unwrap()
+                .anchored_position
+                .x,
+            -10.0,
+            "the named start is written while the delay runs"
+        );
+    }
+
+    #[test]
+    fn a_tween_that_cannot_run_is_refused() {
+        let (mut world, entity) = tween_world();
+        let stale = world.spawn();
+        world.despawn(stale);
+        let size = size_of::<orrin_script::CTween>();
+        let refused = [
+            (
+                c(entity),
+                orrin_script::CTween {
+                    property: 99,
+                    ..slide()
+                },
+                size,
+            ),
+            (
+                c(entity),
+                orrin_script::CTween {
+                    style: 11,
+                    ..slide()
+                },
+                size,
+            ),
+            (
+                c(entity),
+                orrin_script::CTween {
+                    direction: 3,
+                    ..slide()
+                },
+                size,
+            ),
+            (
+                c(entity),
+                orrin_script::CTween {
+                    duration: -1.0,
+                    ..slide()
+                },
+                size,
+            ),
+            (
+                c(entity),
+                orrin_script::CTween {
+                    delay: f32::NAN,
+                    ..slide()
+                },
+                size,
+            ),
+            (
+                c(entity),
+                orrin_script::CTween {
+                    to: [f32::INFINITY, 0.0, 0.0, 0.0],
+                    ..slide()
+                },
+                size,
+            ),
+            (c(stale), slide(), size),
+            (c(entity), slide(), size - 4),
+        ];
+        orrin_script::with_active_world(&mut world, || {
+            for (target, request, size) in &refused {
+                assert_eq!(tween_play(*target, request, *size), 0, "{request:?}");
+            }
+            assert_eq!(tween_play(c(entity), std::ptr::null(), size), 0);
+            assert!(!tween_playing(0) && !tween_cancel(0));
+        });
+        assert!(world.resource::<crate::ui::tween::UiTweens>().is_empty());
+        assert_eq!(
+            tween_play(c(entity), &slide(), size),
+            0,
+            "outside a dispatch window"
+        );
+    }
+
+    #[test]
+    fn a_story_asks_for_its_controls_by_name() {
+        let mut world = World::new();
+        world.insert_resource(crate::ui::story::StoryArgs::default());
+        let name = "Width";
+        let (width, disabled) = orrin_script::with_active_world(&mut world, || {
+            (
+                story_float(name.as_ptr(), name.len() as u32, 160.0, 80.0, 400.0),
+                story_bool(c"Off".as_ptr().cast(), 3, true),
+            )
+        });
+        assert_eq!((width, disabled), (160.0, true));
+        let args = world.resource::<crate::ui::story::StoryArgs>();
+        assert_eq!(args.controls().len(), 2);
+        assert_eq!(args.controls()[1].name, "Off");
+    }
+
+    #[test]
+    fn a_control_outside_a_story_is_its_default() {
+        let mut world = World::new();
+        let got = orrin_script::with_active_world(&mut world, || {
+            story_float(c"x".as_ptr().cast(), 1, 0.5, 0.0, 1.0)
+        });
+        assert_eq!(got, 0.5);
+        assert!(!story_bool(std::ptr::null(), 0, false));
     }
 }

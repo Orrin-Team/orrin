@@ -211,6 +211,25 @@ pub struct OrrinApi {
     pub get_component_text: extern "C" fn(CEntity, u32, *mut u8, i32) -> i32,
     pub set_component_text: extern "C" fn(CEntity, u32, *const u8, u32) -> bool,
     pub ui_pointer_over: extern "C" fn() -> bool,
+    // Tweens, appended after `ui_pointer_over`; never reordered above it.
+    //
+    // `tween_play` takes a `CTween` and its byte size, checked like a
+    // component's, and returns the tween's id as bits — never zero, which is
+    // the refusal: a stale entity, a property, style or direction this build
+    // cannot name, or a duration or delay that is negative or not finite. A
+    // tween is engine data the moment it is started, so unlike `add_component`
+    // nothing about it is deferred; it first moves after the tick. Completion
+    // comes back through the managed `Orrin.Tweens.Complete`, at the start of
+    // the next tick.
+    pub tween_play: extern "C" fn(CEntity, *const CTween, u32) -> u64,
+    pub tween_cancel: extern "C" fn(u64) -> bool,
+    pub tween_playing: extern "C" fn(u64) -> bool,
+    // Story controls, appended after the tweens. A story asks for a control
+    // by name — UTF-8 and a byte length — with its default, and is handed the
+    // value the storybook holds for it, which is the default the first time.
+    // Outside a story build each returns its default.
+    pub story_float: extern "C" fn(*const u8, u32, f32, f32, f32) -> f32,
+    pub story_bool: extern "C" fn(*const u8, u32, bool) -> bool,
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -301,7 +320,28 @@ pub fn default_api() -> OrrinApi {
         get_component_text: stub_get_component_text,
         set_component_text: stub_set_component_text,
         ui_pointer_over: stub_ui_pointer_over,
+        tween_play: stub_tween_play,
+        tween_cancel: stub_tween_query,
+        tween_playing: stub_tween_query,
+        story_float: stub_story_float,
+        story_bool: stub_story_bool,
     }
+}
+
+extern "C" fn stub_tween_play(_: CEntity, _: *const CTween, _: u32) -> u64 {
+    0
+}
+
+extern "C" fn stub_tween_query(_: u64) -> bool {
+    false
+}
+
+extern "C" fn stub_story_float(_: *const u8, _: u32, default: f32, _: f32, _: f32) -> f32 {
+    default
+}
+
+extern "C" fn stub_story_bool(_: *const u8, _: u32, default: bool) -> bool {
+    default
 }
 
 extern "C" fn stub_get_component(_: CEntity, _: u32, _: *mut u8, _: u32) -> bool {
@@ -959,6 +999,26 @@ pub struct CScrollFrame {
     pub vertical: u32,
 }
 
+/// C ABI `ui::tween::Tween` without its target; matches C# `Orrin.TweenRequest`.
+/// `property`, `style` and `direction` are C# `Orrin.TweenProperty`,
+/// `Orrin.EaseStyle` and `Orrin.EaseDirection`. A value uses as many lanes as
+/// its property has, from the first; `from` is read only when `has_from` is
+/// nonzero.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CTween {
+    pub property: u32,
+    pub style: u32,
+    pub direction: u32,
+    pub repeat: i32,
+    pub duration: f32,
+    pub delay: f32,
+    pub reverses: u32,
+    pub has_from: u32,
+    pub from: [f32; 4],
+    pub to: [f32; 4],
+}
+
 /// C ABI pointer event payload: where the pointer is, where its button went
 /// down, the element it hit and the button. Matches C# `Orrin.PointerEvent`.
 #[repr(C)]
@@ -1069,6 +1129,16 @@ pub struct ScriptHost {
     collision_exit_fn: extern "system" fn(u64, *const CCollision) -> u8,
     // Returns 0 handled, 1 faulted, 2 not handled; see `Delivery`.
     pointer_fn: extern "system" fn(u64, u32, *const CPointerEvent) -> u8,
+    // Runs and forgets whatever the game asked to happen when tween `id`
+    // finished. Contains its own exceptions, like the hooks.
+    tween_complete_fn: extern "system" fn(u64),
+    // The game assembly's stories, by the `get_tag` protocol: every name, one
+    // per line, as UTF-8 into a caller-owned buffer, returning the full byte
+    // length.
+    story_names_fn: extern "system" fn(*mut u8, i32) -> i32,
+    // Build the story named by the UTF-8 bytes onto the canvas entity; returns
+    // 0, 1 when it threw, 2 when no story has that name.
+    story_build_fn: extern "system" fn(*const u8, u32, CEntity) -> u8,
     // Game-assembly swap. These live in `Orrin.dll`, which is in the default
     // (uncollectible) load context, so the pointers stay valid across every
     // reload of the game assembly — the whole reason the bindings and the game
@@ -1130,7 +1200,8 @@ impl ScriptHost {
         #[rustfmt::skip]
         let (
             init, create_fn, start_fn, update_fn, enable_fn, disable_fn,
-            collision_enter_fn, collision_exit_fn, pointer_fn, destroy,
+            collision_enter_fn, collision_exit_fn, pointer_fn,
+            tween_complete_fn, story_names_fn, story_build_fn, destroy,
             game_load_fn, game_commit_fn, game_rollback_fn, game_unload_fn,
             state_capture_fn, state_apply_fn, state_discard_fn,
             bag_read, bag_write, bag_default, bag_components,
@@ -1172,6 +1243,18 @@ impl ScriptHost {
                 *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, u32, *const CPointerEvent) -> u8>(
                     pdcstr!("Orrin.Behaviours, Orrin"),
                     pdcstr!("Pointer"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64)>(
+                    pdcstr!("Orrin.Tweens, Orrin"),
+                    pdcstr!("Complete"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*mut u8, i32) -> i32>(
+                    pdcstr!("Orrin.Stories, Orrin"),
+                    pdcstr!("Names"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const u8, u32, CEntity) -> u8>(
+                    pdcstr!("Orrin.Stories, Orrin"),
+                    pdcstr!("Build"),
                 )?,
                 // Teardown is a process-wide global, not a `ScriptHost` method:
                 // it must stay reachable from `ScriptComponent::drop`, which
@@ -1254,6 +1337,9 @@ impl ScriptHost {
             collision_enter_fn,
             collision_exit_fn,
             pointer_fn,
+            tween_complete_fn,
+            story_names_fn,
+            story_build_fn,
             game_load_fn,
             game_commit_fn,
             game_rollback_fn,
@@ -1353,6 +1439,53 @@ impl ScriptHost {
             _ => Delivery::Unhandled,
         }
     }
+
+    /// Tell the game tween `id` finished.
+    pub fn tween_complete(&self, id: u64) {
+        (self.tween_complete_fn)(id);
+    }
+
+    /// Every story the live game assembly declares, in its declared order.
+    pub fn story_names(&self) -> Vec<String> {
+        let mut buffer = vec![0u8; 1024];
+        loop {
+            let length = (self.story_names_fn)(buffer.as_mut_ptr(), buffer.len() as i32);
+            if length < 0 {
+                return Vec::new();
+            }
+            let length = length as usize;
+            if length <= buffer.len() {
+                buffer.truncate(length);
+                break;
+            }
+            buffer.resize(length, 0);
+        }
+        String::from_utf8_lossy(&buffer)
+            .lines()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Run story `name`'s builder onto `canvas`, inside a dispatch window the
+    /// caller has opened.
+    pub fn build_story(&self, name: &str, canvas: CEntity) -> StoryBuild {
+        match (self.story_build_fn)(name.as_ptr(), name.len() as u32, canvas) {
+            0 => StoryBuild::Built,
+            1 => StoryBuild::Faulted,
+            _ => StoryBuild::Missing,
+        }
+    }
+}
+
+/// What a story's builder did. The bytes are lock-step with C# `Orrin.Stories`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoryBuild {
+    Built,
+    /// It threw; the managed side logged why.
+    Faulted,
+    /// The game declares no story by that name.
+    Missing,
 }
 
 #[cfg(test)]
@@ -1376,5 +1509,6 @@ mod tests {
         assert_eq!(size_of::<CStroke>(), 24);
         assert_eq!(size_of::<CShadow>(), 32);
         assert_eq!(size_of::<CScrollFrame>(), 52);
+        assert_eq!(size_of::<CTween>(), 64);
     }
 }

@@ -228,9 +228,18 @@ unsafe
     Check(sizeof(Orrin.Stroke) == 24, "Stroke is a colour and two words");
     Check(sizeof(Orrin.Shadow) == 32, "Shadow is a colour, a Vector2 and two floats");
     Check(sizeof(Orrin.ScrollFrame) == 52, "ScrollFrame is two Vector2s, two floats, a colour and three words");
+    Check(sizeof(Orrin.TweenRequest) == 64, "TweenRequest is eight words and two Vector4s");
     Check((uint)Orrin.CornerStyle.Squircle == 1, "CornerStyle.Squircle is 1");
     Check((uint)Orrin.StrokePlacement.Outside == 2, "StrokePlacement.Outside is 2");
     Check((uint)Orrin.ScrollbarVisibility.Never == 2, "ScrollbarVisibility.Never is 2");
+    Check((uint)Orrin.TweenProperty.ScrollPosition == 15 && (uint)Orrin.TweenProperty.ImageColor == 3,
+        "TweenProperty numbers as the engine does");
+    Check((uint)Orrin.EaseStyle.Bounce == 10 && (uint)Orrin.EaseDirection.InOut == 2,
+        "EaseStyle and EaseDirection number as the engine does");
+    Check(Orrin.Tween.Lanes(Orrin.TweenProperty.ShadowOffset) == 2
+        && Orrin.Tween.Lanes(Orrin.TweenProperty.GradientEnd) == 4
+        && Orrin.Tween.Lanes(Orrin.TweenProperty.TextSize) == 1,
+        "a tween property knows how many floats it is");
     var list = new Orrin.ScrollFrame { Horizontal = true };
     Check(list.Vertical && list.Horizontal && list.ScrollSpeed == 40f,
         "a new scroll frame is the engine's default, its flags read back");

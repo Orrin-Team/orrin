@@ -11,6 +11,7 @@ pub(super) mod scenes;
 #[cfg(feature = "scripting")]
 pub(super) mod scripts;
 mod status_bar;
+pub(super) mod storybook;
 mod ui_sections;
 mod viewport;
 

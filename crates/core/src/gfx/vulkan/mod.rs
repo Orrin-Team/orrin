@@ -37,6 +37,7 @@ mod taa;
 mod texture;
 mod timestamps;
 mod ui;
+mod ui_window;
 mod upload;
 mod vendor;
 
@@ -163,6 +164,7 @@ pub(crate) const OFFSCREEN_FORMAT: crate::gfx::format::Format =
 pub use gizmo::GizmoVertex;
 pub use outline::OutlineItem;
 pub use overlay::OverlayFrame;
+pub use ui_window::UiSurface;
 
 /// What draws over the final swapchain image between the tonemap pass and
 /// present: the editor UI, already laid out and tessellated. See
@@ -320,6 +322,9 @@ pub struct VulkanRenderer {
     /// Everything that is Vulkan's: the context, the swapchain, the images and
     /// the submission state that run ahead of the GPU.
     backend: Backend,
+    /// A second window drawing only a UI frame, while one is open. See
+    /// `ui_window`.
+    ui_window: Option<ui_window::UiWindow>,
 }
 
 /// The frame's commands as they are being recorded: a Vulkan command buffer, or
@@ -521,6 +526,7 @@ impl VulkanRenderer {
             self.device.destroy_bind_group(group);
         }
         self.ui.invalidate_textures(&self.device);
+        self.ui_window_invalidate_textures();
     }
 
     pub fn new(
@@ -779,6 +785,7 @@ impl VulkanRenderer {
             table,
             #[cfg(target_os = "macos")]
             metal_overlay: None,
+            ui_window: None,
             backend,
         }
     }
@@ -1709,6 +1716,7 @@ impl VulkanRenderer {
             if matches!(self.backend, Backend::Vulkan(_)) {
                 self.backend.vk_mut().in_flight.wait_for_room();
                 self.backend.vk_mut().overlay_present.wait_for_room();
+                self.ui_window_wait_for_room();
 
                 // Split out because under Fifo this blocks until the presentation engine
                 // hands back an image — a vsync wait, not work. Folded into a single
@@ -1777,6 +1785,10 @@ impl VulkanRenderer {
         if let Backend::Metal(mtl) = &mut self.backend {
             profile_scope!("wait");
             mtl.wait_for_room(self.frame_index);
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(self.backend, Backend::Metal(_)) {
+            self.ui_window_wait_for_room();
         }
         self.device.begin_frame(self.frame_index);
 

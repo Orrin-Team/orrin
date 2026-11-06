@@ -90,12 +90,23 @@
 //! around it — and a frame stops the pointer anywhere in its viewport, so the
 //! gaps between its rows still scroll it. A press on a bar is the bar's: it
 //! drags the thumb until release, and nothing under it hears of the press.
+//!
+//! # Tweens and stories
+//!
+//! [`tween`] eases an element's fields over time as engine data, advanced
+//! between the script tick and [`update`], so an animated element is laid out
+//! where its tween put it that same frame. [`story`] is the storybook's model:
+//! a piece of UI built by game code into a world of its own and drawn in a
+//! window of its own, which is how a menu is looked at without the game around
+//! it.
 
 pub mod components;
 pub mod create;
 pub mod events;
 pub mod extract;
 pub mod layout;
+pub mod story;
+pub mod tween;
 
 pub use components::{
     Button, Canvas, Corner, CornerStyle, Gradient, Image, RectTransform, ScaleMode, ScrollFrame,
