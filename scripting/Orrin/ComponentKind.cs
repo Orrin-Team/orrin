@@ -13,6 +13,11 @@ public enum ComponentKind : uint
     Image = 6,
     Text = 7,
     Button = 8,
+    Gradient = 9,
+    Corner = 10,
+    Stroke = 11,
+    Shadow = 12,
+    ScrollFrame = 13,
 }
 
 internal static class ComponentKinds
@@ -30,6 +35,11 @@ internal static class ComponentKinds
         if (typeof(T) == typeof(Image)) return (uint)ComponentKind.Image;
         if (typeof(T) == typeof(Text)) return (uint)ComponentKind.Text;
         if (typeof(T) == typeof(Button)) return (uint)ComponentKind.Button;
+        if (typeof(T) == typeof(Gradient)) return (uint)ComponentKind.Gradient;
+        if (typeof(T) == typeof(Corner)) return (uint)ComponentKind.Corner;
+        if (typeof(T) == typeof(Stroke)) return (uint)ComponentKind.Stroke;
+        if (typeof(T) == typeof(Shadow)) return (uint)ComponentKind.Shadow;
+        if (typeof(T) == typeof(ScrollFrame)) return (uint)ComponentKind.ScrollFrame;
         throw new ArgumentException($"{typeof(T).Name} is not a script-visible engine component");
     }
 
@@ -43,6 +53,11 @@ internal static class ComponentKinds
         if (typeof(T) == typeof(Image)) return (uint)ComponentKind.Image;
         if (typeof(T) == typeof(Text)) return (uint)ComponentKind.Text;
         if (typeof(T) == typeof(Button)) return (uint)ComponentKind.Button;
+        if (typeof(T) == typeof(Gradient)) return (uint)ComponentKind.Gradient;
+        if (typeof(T) == typeof(Corner)) return (uint)ComponentKind.Corner;
+        if (typeof(T) == typeof(Stroke)) return (uint)ComponentKind.Stroke;
+        if (typeof(T) == typeof(Shadow)) return (uint)ComponentKind.Shadow;
+        if (typeof(T) == typeof(ScrollFrame)) return (uint)ComponentKind.ScrollFrame;
         throw new ArgumentException(
             $"{typeof(T).Name} is not read or written as a struct; it has calls of its own on World");
     }

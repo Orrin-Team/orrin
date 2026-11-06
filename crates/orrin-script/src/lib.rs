@@ -903,6 +903,62 @@ pub struct CButton {
     pub interactable: u32,
 }
 
+/// C ABI `ui::Gradient`; matches C# `Orrin.Gradient`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CGradient {
+    pub start: [f32; 4],
+    pub end: [f32; 4],
+    pub rotation: f32,
+    pub offset: [f32; 2],
+}
+
+/// C ABI `ui::Corner`; matches C# `Orrin.Corner`. `style` is C#
+/// `Orrin.CornerStyle`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CCorner {
+    pub radius: f32,
+    pub radius_fraction: f32,
+    pub style: u32,
+    pub exponent: f32,
+}
+
+/// C ABI `ui::Stroke`; matches C# `Orrin.Stroke`. `placement` is C#
+/// `Orrin.StrokePlacement`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CStroke {
+    pub color: [f32; 4],
+    pub thickness: f32,
+    pub placement: u32,
+}
+
+/// C ABI `ui::Shadow`; matches C# `Orrin.Shadow`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CShadow {
+    pub color: [f32; 4],
+    pub offset: [f32; 2],
+    pub blur: f32,
+    pub spread: f32,
+}
+
+/// C ABI `ui::ScrollFrame`; matches C# `Orrin.ScrollFrame`. `scrollbar` is C#
+/// `Orrin.ScrollbarVisibility`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CScrollFrame {
+    pub content_size: [f32; 2],
+    pub scroll_position: [f32; 2],
+    pub scroll_speed: f32,
+    pub scrollbar_thickness: f32,
+    pub scrollbar_color: [f32; 4],
+    pub scrollbar: u32,
+    pub horizontal: u32,
+    pub vertical: u32,
+}
+
 /// C ABI pointer event payload: where the pointer is, where its button went
 /// down, the element it hit and the button. Matches C# `Orrin.PointerEvent`.
 #[repr(C)]
@@ -1315,5 +1371,10 @@ mod tests {
         assert_eq!(size_of::<CText>(), 48);
         assert_eq!(size_of::<CButton>(), 68);
         assert_eq!(size_of::<CPointerEvent>(), 28);
+        assert_eq!(size_of::<CGradient>(), 44);
+        assert_eq!(size_of::<CCorner>(), 16);
+        assert_eq!(size_of::<CStroke>(), 24);
+        assert_eq!(size_of::<CShadow>(), 32);
+        assert_eq!(size_of::<CScrollFrame>(), 52);
     }
 }

@@ -221,6 +221,19 @@ unsafe
     Check(sizeof(Orrin.Text) == 48, "Text is an id, a colour and four words");
     Check(sizeof(Orrin.Button) == 68, "Button is four colours and a flag");
     Check(sizeof(Orrin.PointerEvent) == 28, "PointerEvent is two Vector2s, an Entity and a button");
+    // The modifiers, lock-step with CGradient, CCorner, CStroke, CShadow and
+    // CScrollFrame.
+    Check(sizeof(Orrin.Gradient) == 44, "Gradient is two colours, an angle and a Vector2");
+    Check(sizeof(Orrin.Corner) == 16, "Corner is four words");
+    Check(sizeof(Orrin.Stroke) == 24, "Stroke is a colour and two words");
+    Check(sizeof(Orrin.Shadow) == 32, "Shadow is a colour, a Vector2 and two floats");
+    Check(sizeof(Orrin.ScrollFrame) == 52, "ScrollFrame is two Vector2s, two floats, a colour and three words");
+    Check((uint)Orrin.CornerStyle.Squircle == 1, "CornerStyle.Squircle is 1");
+    Check((uint)Orrin.StrokePlacement.Outside == 2, "StrokePlacement.Outside is 2");
+    Check((uint)Orrin.ScrollbarVisibility.Never == 2, "ScrollbarVisibility.Never is 2");
+    var list = new Orrin.ScrollFrame { Horizontal = true };
+    Check(list.Vertical && list.Horizontal && list.ScrollSpeed == 40f,
+        "a new scroll frame is the engine's default, its flags read back");
 
     // An asset id crosses inside a struct as its canonical bytes, the order
     // `AssetId::from_bytes` reads, and the null reference as zeroes.

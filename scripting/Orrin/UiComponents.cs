@@ -233,3 +233,219 @@ public struct Button
         set => _interactable = value ? 1u : 0u;
     }
 }
+
+/// <summary>
+/// Colours what the element fills — its <see cref="Image"/> and its
+/// <see cref="Text"/> — with a blend from <see cref="Start"/> to
+/// <see cref="End"/>, multiplied into the element's own colour.
+/// </summary>
+/// <remarks>
+/// At <see cref="Rotation"/> 0 the blend runs left to right across the whole
+/// box; the angle is in degrees, clockwise on screen. <see cref="Offset"/>
+/// moves it by a fraction of the element's size.
+/// </remarks>
+// Layout must match Rust CGradient.
+[StructLayout(LayoutKind.Sequential)]
+public struct Gradient
+{
+    /// <summary>sRGB, straight alpha.</summary>
+    public Color Start;
+
+    /// <summary>sRGB, straight alpha.</summary>
+    public Color End;
+
+    /// <summary>Degrees, clockwise on screen.</summary>
+    public float Rotation;
+
+    /// <summary>A fraction of the element's size.</summary>
+    public Vector2 Offset;
+
+    public Gradient()
+    {
+        Start = Color.white;
+        End = Color.black;
+        Rotation = 0f;
+        Offset = Vector2.zero;
+    }
+}
+
+/// <summary>The curve a <see cref="Corner"/> is cut along.</summary>
+public enum CornerStyle : uint
+{
+    /// <summary>A quarter circle.</summary>
+    Round,
+
+    /// <summary>
+    /// A quarter superellipse, whose curvature eases in from the straight edge:
+    /// the continuous corner of Apple's icons.
+    /// </summary>
+    Squircle,
+}
+
+/// <summary>
+/// Rounds the element's box: its image, and the <see cref="Stroke"/> and
+/// <see cref="Shadow"/> on it.
+/// </summary>
+// Layout must match Rust CCorner.
+[StructLayout(LayoutKind.Sequential)]
+public struct Corner
+{
+    /// <summary>In canvas units.</summary>
+    public float Radius;
+
+    /// <summary>
+    /// Added to <see cref="Radius"/>, as a fraction of the box's shorter side:
+    /// 0.5 is a pill whatever the size.
+    /// </summary>
+    public float RadiusFraction;
+
+    public CornerStyle Style;
+
+    /// <summary>
+    /// The squircle's superellipse exponent, 2 to 12: 2 is a circle, and the
+    /// corner squares off as it grows. Ignored by <c>Round</c>.
+    /// </summary>
+    public float Exponent;
+
+    public Corner()
+    {
+        Radius = 8f;
+        RadiusFraction = 0f;
+        Style = CornerStyle.Round;
+        Exponent = 4f;
+    }
+}
+
+/// <summary>Where a <see cref="Stroke"/> sits against the edge it follows.</summary>
+public enum StrokePlacement : uint
+{
+    /// <summary>Wholly inside the box.</summary>
+    Inside,
+    Center,
+    Outside,
+}
+
+/// <summary>
+/// An outline. On an element with an <see cref="Image"/>, or with nothing else
+/// to draw, it follows the box and its <see cref="Corner"/>; on one that is only
+/// <see cref="Text"/>, it rings each glyph, always outside it.
+/// </summary>
+// Layout must match Rust CStroke.
+[StructLayout(LayoutKind.Sequential)]
+public struct Stroke
+{
+    /// <summary>sRGB, straight alpha.</summary>
+    public Color Color;
+
+    /// <summary>In canvas units.</summary>
+    public float Thickness;
+
+    public StrokePlacement Placement;
+
+    public Stroke()
+    {
+        Color = Color.black;
+        Thickness = 2f;
+        Placement = StrokePlacement.Inside;
+    }
+}
+
+/// <summary>A drop shadow under the element's box, following its <see cref="Corner"/>.</summary>
+// Layout must match Rust CShadow.
+[StructLayout(LayoutKind.Sequential)]
+public struct Shadow
+{
+    /// <summary>sRGB, straight alpha.</summary>
+    public Color Color;
+
+    /// <summary>In canvas units, y down.</summary>
+    public Vector2 Offset;
+
+    /// <summary>The blur radius in canvas units, as CSS means it: twice the Gaussian's deviation.</summary>
+    public float Blur;
+
+    /// <summary>Grows the shadow's box on every side before it is blurred; negative shrinks it.</summary>
+    public float Spread;
+
+    public Shadow()
+    {
+        Color = new Color(0f, 0f, 0f, 0.5f);
+        Offset = new Vector2(0f, 4f);
+        Blur = 8f;
+        Spread = 0f;
+    }
+}
+
+/// <summary>When a <see cref="ScrollFrame"/>'s bars are drawn.</summary>
+public enum ScrollbarVisibility : uint
+{
+    /// <summary>On a scrolling axis whose content is larger than the frame.</summary>
+    Auto,
+
+    /// <summary>On every scrolling axis.</summary>
+    Always,
+
+    Never,
+}
+
+/// <summary>
+/// Lays the element's children out in a content area <see cref="ContentSize"/>
+/// units across, cut to the element's rect and scrolled by
+/// <see cref="ScrollPosition"/>. The wheel scrolls it while the game runs, as
+/// does dragging a bar; what it hides gets no pointer events.
+/// </summary>
+/// <remarks>
+/// The content area is never smaller than the frame, so a stretched child
+/// fills at least what is in view. A scroll past either end is laid out at the
+/// end.
+/// </remarks>
+// Layout must match Rust CScrollFrame.
+[StructLayout(LayoutKind.Sequential)]
+public struct ScrollFrame
+{
+    /// <summary>In the frame's units; an axis smaller than the frame is the frame's.</summary>
+    public Vector2 ContentSize;
+
+    /// <summary>How far the content's top left is scrolled past the frame's, in units.</summary>
+    public Vector2 ScrollPosition;
+
+    /// <summary>Units scrolled per notch of the wheel.</summary>
+    public float ScrollSpeed;
+
+    /// <summary>In canvas units.</summary>
+    public float ScrollbarThickness;
+
+    /// <summary>sRGB, straight alpha.</summary>
+    public Color ScrollbarColor;
+
+    public ScrollbarVisibility Scrollbar;
+
+    uint _horizontal;
+    uint _vertical;
+
+    public ScrollFrame()
+    {
+        ContentSize = Vector2.zero;
+        ScrollPosition = Vector2.zero;
+        ScrollSpeed = 40f;
+        ScrollbarThickness = 6f;
+        ScrollbarColor = new Color(0.6f, 0.6f, 0.6f, 0.8f);
+        Scrollbar = ScrollbarVisibility.Auto;
+        _horizontal = 0;
+        _vertical = 1;
+    }
+
+    /// <summary>Whether the content scrolls across.</summary>
+    public bool Horizontal
+    {
+        readonly get => _horizontal != 0;
+        set => _horizontal = value ? 1u : 0u;
+    }
+
+    /// <summary>Whether the content scrolls down.</summary>
+    public bool Vertical
+    {
+        readonly get => _vertical != 0;
+        set => _vertical = value ? 1u : 0u;
+    }
+}

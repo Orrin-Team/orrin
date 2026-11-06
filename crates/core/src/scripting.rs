@@ -394,6 +394,11 @@ extern "C" fn has_component(entity: CEntity, kind: u32) -> bool {
             KIND_IMAGE => world.has::<crate::ui::Image>(entity),
             KIND_TEXT => world.has::<crate::ui::Text>(entity),
             KIND_BUTTON => world.has::<crate::ui::Button>(entity),
+            KIND_GRADIENT => world.has::<crate::ui::Gradient>(entity),
+            KIND_CORNER => world.has::<crate::ui::Corner>(entity),
+            KIND_STROKE => world.has::<crate::ui::Stroke>(entity),
+            KIND_SHADOW => world.has::<crate::ui::Shadow>(entity),
+            KIND_SCROLL_FRAME => world.has::<crate::ui::ScrollFrame>(entity),
             _ => false,
         }
     })
@@ -629,6 +634,11 @@ enum UiComponent {
     Image(crate::ui::Image),
     Text(crate::ui::Text),
     Button(crate::ui::Button),
+    Gradient(crate::ui::Gradient),
+    Corner(crate::ui::Corner),
+    Stroke(crate::ui::Stroke),
+    Shadow(crate::ui::Shadow),
+    ScrollFrame(crate::ui::ScrollFrame),
 }
 
 impl UiComponent {
@@ -639,6 +649,11 @@ impl UiComponent {
             Self::Image(_) => KIND_IMAGE,
             Self::Text(_) => KIND_TEXT,
             Self::Button(_) => KIND_BUTTON,
+            Self::Gradient(_) => KIND_GRADIENT,
+            Self::Corner(_) => KIND_CORNER,
+            Self::Stroke(_) => KIND_STROKE,
+            Self::Shadow(_) => KIND_SHADOW,
+            Self::ScrollFrame(_) => KIND_SCROLL_FRAME,
         }
     }
 
@@ -657,6 +672,21 @@ impl UiComponent {
                 world.insert(entity, c);
             }
             Self::Button(c) => {
+                world.insert(entity, c);
+            }
+            Self::Gradient(c) => {
+                world.insert(entity, c);
+            }
+            Self::Corner(c) => {
+                world.insert(entity, c);
+            }
+            Self::Stroke(c) => {
+                world.insert(entity, c);
+            }
+            Self::Shadow(c) => {
+                world.insert(entity, c);
+            }
+            Self::ScrollFrame(c) => {
                 world.insert(entity, c);
             }
         }
@@ -1214,6 +1244,11 @@ const KIND_RECT_TRANSFORM: u32 = 5;
 const KIND_IMAGE: u32 = 6;
 const KIND_TEXT: u32 = 7;
 const KIND_BUTTON: u32 = 8;
+const KIND_GRADIENT: u32 = 9;
+const KIND_CORNER: u32 = 10;
+const KIND_STROKE: u32 = 11;
+const KIND_SHADOW: u32 = 12;
+const KIND_SCROLL_FRAME: u32 = 13;
 
 fn entity_of(entity: CEntity) -> Entity {
     Entity {
@@ -1230,6 +1265,11 @@ fn kind_name(kind: u32) -> &'static str {
         KIND_IMAGE => "Image",
         KIND_TEXT => "Text",
         KIND_BUTTON => "Button",
+        KIND_GRADIENT => "Gradient",
+        KIND_CORNER => "Corner",
+        KIND_STROKE => "Stroke",
+        KIND_SHADOW => "Shadow",
+        KIND_SCROLL_FRAME => "ScrollFrame",
         _ => "an unknown component",
     }
 }
@@ -1371,6 +1411,131 @@ fn button_from_c(c: orrin_script::CButton) -> crate::ui::Button {
     }
 }
 
+fn gradient_to_c(gradient: &crate::ui::Gradient) -> orrin_script::CGradient {
+    orrin_script::CGradient {
+        start: gradient.start,
+        end: gradient.end,
+        rotation: gradient.rotation,
+        offset: gradient.offset.to_array(),
+    }
+}
+
+fn gradient_from_c(c: orrin_script::CGradient) -> crate::ui::Gradient {
+    crate::ui::Gradient {
+        start: c.start,
+        end: c.end,
+        rotation: c.rotation,
+        offset: glam::Vec2::from_array(c.offset),
+    }
+}
+
+fn corner_to_c(corner: &crate::ui::Corner) -> orrin_script::CCorner {
+    orrin_script::CCorner {
+        radius: corner.radius,
+        radius_fraction: corner.radius_fraction,
+        style: corner.style as u32,
+        exponent: corner.exponent,
+    }
+}
+
+fn corner_from_c(c: orrin_script::CCorner) -> Option<crate::ui::Corner> {
+    use crate::ui::CornerStyle;
+    let style = match c.style {
+        0 => CornerStyle::Round,
+        1 => CornerStyle::Squircle,
+        other => {
+            tracing::warn!("Corner: {other} is not a CornerStyle");
+            return None;
+        }
+    };
+    Some(crate::ui::Corner {
+        radius: c.radius,
+        radius_fraction: c.radius_fraction,
+        style,
+        exponent: c.exponent,
+    })
+}
+
+fn stroke_to_c(stroke: &crate::ui::Stroke) -> orrin_script::CStroke {
+    orrin_script::CStroke {
+        color: stroke.color,
+        thickness: stroke.thickness,
+        placement: stroke.placement as u32,
+    }
+}
+
+fn stroke_from_c(c: orrin_script::CStroke) -> Option<crate::ui::Stroke> {
+    use crate::ui::StrokePlacement;
+    let placement = match c.placement {
+        0 => StrokePlacement::Inside,
+        1 => StrokePlacement::Center,
+        2 => StrokePlacement::Outside,
+        other => {
+            tracing::warn!("Stroke: {other} is not a StrokePlacement");
+            return None;
+        }
+    };
+    Some(crate::ui::Stroke {
+        color: c.color,
+        thickness: c.thickness,
+        placement,
+    })
+}
+
+fn shadow_to_c(shadow: &crate::ui::Shadow) -> orrin_script::CShadow {
+    orrin_script::CShadow {
+        color: shadow.color,
+        offset: shadow.offset.to_array(),
+        blur: shadow.blur,
+        spread: shadow.spread,
+    }
+}
+
+fn shadow_from_c(c: orrin_script::CShadow) -> crate::ui::Shadow {
+    crate::ui::Shadow {
+        color: c.color,
+        offset: glam::Vec2::from_array(c.offset),
+        blur: c.blur,
+        spread: c.spread,
+    }
+}
+
+fn scroll_to_c(frame: &crate::ui::ScrollFrame) -> orrin_script::CScrollFrame {
+    orrin_script::CScrollFrame {
+        content_size: frame.content_size.to_array(),
+        scroll_position: frame.scroll_position.to_array(),
+        scroll_speed: frame.scroll_speed,
+        scrollbar_thickness: frame.scrollbar_thickness,
+        scrollbar_color: frame.scrollbar_color,
+        scrollbar: frame.scrollbar as u32,
+        horizontal: frame.horizontal.into(),
+        vertical: frame.vertical.into(),
+    }
+}
+
+fn scroll_from_c(c: orrin_script::CScrollFrame) -> Option<crate::ui::ScrollFrame> {
+    use crate::ui::ScrollbarVisibility;
+    let scrollbar = match c.scrollbar {
+        0 => ScrollbarVisibility::Auto,
+        1 => ScrollbarVisibility::Always,
+        2 => ScrollbarVisibility::Never,
+        other => {
+            tracing::warn!("ScrollFrame: {other} is not a ScrollbarVisibility");
+            return None;
+        }
+    };
+    Some(crate::ui::ScrollFrame {
+        content_size: glam::Vec2::from_array(c.content_size),
+        scroll_position: glam::Vec2::from_array(c.scroll_position),
+        horizontal: c.horizontal != 0,
+        vertical: c.vertical != 0,
+        scroll_speed: c.scroll_speed,
+        scrollbar,
+        scrollbar_thickness: c.scrollbar_thickness,
+        scrollbar_color: c.scrollbar_color,
+    })
+}
+
 /// `value` as C# sent it, if it is the size of `T`.
 fn read_c<T: Copy>(call: &str, kind: u32, value: *const u8, size: u32) -> Option<T> {
     if value.is_null() || !sized::<T>(call, kind, size) {
@@ -1389,7 +1554,10 @@ fn decode(
     size: u32,
     text: impl FnOnce() -> String,
 ) -> Option<UiComponent> {
-    use orrin_script::{CButton, CCanvas, CImage, CRectTransform, CText};
+    use orrin_script::{
+        CButton, CCanvas, CCorner, CGradient, CImage, CRectTransform, CScrollFrame, CShadow,
+        CStroke, CText,
+    };
     match kind {
         KIND_CANVAS => {
             canvas_from_c(read_c::<CCanvas>(call, kind, value, size)?).map(UiComponent::Canvas)
@@ -1408,6 +1576,20 @@ fn decode(
         KIND_BUTTON => Some(UiComponent::Button(button_from_c(read_c::<CButton>(
             call, kind, value, size,
         )?))),
+        KIND_GRADIENT => Some(UiComponent::Gradient(gradient_from_c(read_c::<CGradient>(
+            call, kind, value, size,
+        )?))),
+        KIND_CORNER => {
+            corner_from_c(read_c::<CCorner>(call, kind, value, size)?).map(UiComponent::Corner)
+        }
+        KIND_STROKE => {
+            stroke_from_c(read_c::<CStroke>(call, kind, value, size)?).map(UiComponent::Stroke)
+        }
+        KIND_SHADOW => Some(UiComponent::Shadow(shadow_from_c(read_c::<CShadow>(
+            call, kind, value, size,
+        )?))),
+        KIND_SCROLL_FRAME => scroll_from_c(read_c::<CScrollFrame>(call, kind, value, size)?)
+            .map(UiComponent::ScrollFrame),
         _ => {
             tracing::warn!("World.{call}: component kind {kind} has no blittable form");
             None
@@ -1469,6 +1651,21 @@ extern "C" fn get_component(entity: CEntity, kind: u32, out: *mut u8, size: u32)
             KIND_BUTTON => world
                 .get::<crate::ui::Button>(entity)
                 .map(|c| write(out, size, kind, button_to_c(&c))),
+            KIND_GRADIENT => world
+                .get::<crate::ui::Gradient>(entity)
+                .map(|c| write(out, size, kind, gradient_to_c(&c))),
+            KIND_CORNER => world
+                .get::<crate::ui::Corner>(entity)
+                .map(|c| write(out, size, kind, corner_to_c(&c))),
+            KIND_STROKE => world
+                .get::<crate::ui::Stroke>(entity)
+                .map(|c| write(out, size, kind, stroke_to_c(&c))),
+            KIND_SHADOW => world
+                .get::<crate::ui::Shadow>(entity)
+                .map(|c| write(out, size, kind, shadow_to_c(&c))),
+            KIND_SCROLL_FRAME => world
+                .get::<crate::ui::ScrollFrame>(entity)
+                .map(|c| write(out, size, kind, scroll_to_c(&c))),
             _ => {
                 tracing::warn!("World.GetComponent: component kind {kind} has no blittable form");
                 None
@@ -1511,6 +1708,21 @@ extern "C" fn set_component(entity: CEntity, kind: u32, value: *const u8, size: 
                 .map(|mut slot| *slot = c.clone()),
             UiComponent::Button(c) => world
                 .get_mut::<crate::ui::Button>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::Gradient(c) => world
+                .get_mut::<crate::ui::Gradient>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::Corner(c) => world
+                .get_mut::<crate::ui::Corner>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::Stroke(c) => world
+                .get_mut::<crate::ui::Stroke>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::Shadow(c) => world
+                .get_mut::<crate::ui::Shadow>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::ScrollFrame(c) => world
+                .get_mut::<crate::ui::ScrollFrame>(entity)
                 .map(|mut slot| *slot = *c),
         };
         in_place.is_some() || with_queued(entity, kind, |queued| *queued = component).is_some()
@@ -3381,6 +3593,148 @@ mod tests {
         );
         assert!(orrin_script::with_active_world(&mut world, || {
             (0..=KIND_BUTTON).all(|kind| kind < KIND_CANVAS || has_component(c(entity), kind))
+        }));
+    }
+
+    /// The modifiers cross the same generic pair as the rest of the UI: each
+    /// add is deferred, reads back as written, and a set lands in place.
+    #[test]
+    fn each_ui_modifier_round_trips_through_the_generic_pair() {
+        use orrin_script::{CCorner, CGradient, CScrollFrame, CShadow, CStroke};
+
+        let mut world = World::new();
+        let entity = world.spawn();
+        let gradient = CGradient {
+            start: [0.1, 0.2, 0.3, 0.4],
+            end: [0.5, 0.6, 0.7, 0.8],
+            rotation: 30.0,
+            offset: [0.1, -0.2],
+        };
+        let corner = CCorner {
+            radius: 6.0,
+            radius_fraction: 0.25,
+            style: 1,
+            exponent: 5.0,
+        };
+        let stroke = CStroke {
+            color: [1.0, 0.5, 0.0, 1.0],
+            thickness: 3.0,
+            placement: 2,
+        };
+        let shadow = CShadow {
+            color: [0.0, 0.0, 0.0, 0.3],
+            offset: [1.0, 2.0],
+            blur: 12.0,
+            spread: -1.0,
+        };
+        let scroll = CScrollFrame {
+            content_size: [500.0, 900.0],
+            scroll_position: [10.0, 20.0],
+            scroll_speed: 30.0,
+            scrollbar_thickness: 4.0,
+            scrollbar_color: [0.9, 0.9, 0.9, 0.5],
+            scrollbar: 1,
+            horizontal: 1,
+            vertical: 0,
+        };
+        let added = orrin_script::with_active_world(&mut world, || {
+            [
+                add_component(
+                    c(entity),
+                    KIND_GRADIENT,
+                    bytes_of(&gradient),
+                    size_of::<CGradient>(),
+                ),
+                add_component(
+                    c(entity),
+                    KIND_CORNER,
+                    bytes_of(&corner),
+                    size_of::<CCorner>(),
+                ),
+                add_component(
+                    c(entity),
+                    KIND_STROKE,
+                    bytes_of(&stroke),
+                    size_of::<CStroke>(),
+                ),
+                add_component(
+                    c(entity),
+                    KIND_SHADOW,
+                    bytes_of(&shadow),
+                    size_of::<CShadow>(),
+                ),
+                add_component(
+                    c(entity),
+                    KIND_SCROLL_FRAME,
+                    bytes_of(&scroll),
+                    size_of::<CScrollFrame>(),
+                ),
+            ]
+        });
+        assert_eq!(added, [true; 5]);
+        assert!(!world.has::<crate::ui::Corner>(entity), "deferred");
+        let commands: Vec<Command> = COMMANDS.with(|c| c.borrow_mut().drain(..).collect());
+        assert_eq!(commands.len(), 5);
+        for command in commands {
+            let Command::AddUi { entity, component } = command else {
+                panic!("not a UI add");
+            };
+            component.insert(&mut world, entity);
+        }
+        assert_eq!(
+            world.get::<crate::ui::Corner>(entity).unwrap().style,
+            crate::ui::CornerStyle::Squircle
+        );
+        assert_eq!(
+            world.get::<crate::ui::Stroke>(entity).unwrap().placement,
+            crate::ui::StrokePlacement::Outside
+        );
+
+        fn read<T: Default>(world: &mut World, entity: Entity, kind: u32) -> T {
+            let mut out = T::default();
+            let read = orrin_script::with_active_world(world, || {
+                get_component(c(entity), kind, (&mut out as *mut T).cast(), size_of::<T>())
+            });
+            assert!(read, "kind {kind}");
+            out
+        }
+        assert_eq!(
+            read::<CGradient>(&mut world, entity, KIND_GRADIENT),
+            gradient
+        );
+        assert_eq!(read::<CCorner>(&mut world, entity, KIND_CORNER), corner);
+        assert_eq!(read::<CStroke>(&mut world, entity, KIND_STROKE), stroke);
+        assert_eq!(read::<CShadow>(&mut world, entity, KIND_SHADOW), shadow);
+        assert_eq!(
+            read::<CScrollFrame>(&mut world, entity, KIND_SCROLL_FRAME),
+            scroll
+        );
+
+        let scrolled = CScrollFrame {
+            scroll_position: [0.0, 400.0],
+            ..scroll
+        };
+        assert!(orrin_script::with_active_world(&mut world, || {
+            set_component(
+                c(entity),
+                KIND_SCROLL_FRAME,
+                bytes_of(&scrolled),
+                size_of::<CScrollFrame>(),
+            )
+        }));
+        assert_eq!(
+            world
+                .get::<crate::ui::ScrollFrame>(entity)
+                .unwrap()
+                .scroll_position,
+            glam::Vec2::new(0.0, 400.0)
+        );
+        let bad = CCorner { style: 7, ..corner };
+        assert!(!orrin_script::with_active_world(&mut world, || {
+            set_component(c(entity), KIND_CORNER, bytes_of(&bad), size_of::<CCorner>())
+        }));
+        assert!(orrin_script::with_active_world(&mut world, || {
+            (KIND_GRADIENT..=KIND_SCROLL_FRAME).all(|kind| has_component(c(entity), kind))
         }));
     }
 
