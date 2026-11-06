@@ -14,6 +14,7 @@ use orrin_registry::{AssetId, Reflect, Registry};
 
 use super::{color_row, figures};
 use crate::asset_db::AssetDatabase;
+use crate::editor::catalog;
 use crate::editor::icons;
 use crate::editor::kind::Kind;
 use crate::editor::previews::Previews;
@@ -438,11 +439,7 @@ fn registered_sections(
         } else {
             ui.visuals().weak_text_color()
         };
-        let icon = if vtable.script.is_some() {
-            icons::file_code()
-        } else {
-            icons::layers()
-        };
+        let (_, icon) = catalog::describe(vtable);
         let id = ui.id().with(("component", vtable.id.as_str()));
         let mut remove = false;
         let mut menu = |ui: &mut egui::Ui| {
@@ -473,9 +470,9 @@ fn registered_sections(
     }
 }
 
-/// Every registered component the entity does not have yet, at its default.
-/// Hand-drawn ones are offered too: a bare entity gaining a transform is the
-/// commonest addition of all.
+/// Every registered component the entity does not have yet, at its default,
+/// filed under its group with its icon. Hand-drawn ones are offered too: a bare
+/// entity gaining a transform is the commonest addition of all.
 fn add_component(
     ui: &mut egui::Ui,
     world: &World,
@@ -483,45 +480,127 @@ fn add_component(
     state: &mut EditorState,
     entity: Entity,
 ) {
-    let missing: Vec<(orrin_registry::ComponentId, String)> = registry
+    let mut missing: Vec<Offer> = registry
         .components()
         .filter(|vtable| !vtable.has(world, entity))
-        .map(|vtable| (vtable.id.clone(), vtable.name.to_string()))
+        .map(|vtable| {
+            let (group, icon) = catalog::describe(vtable);
+            Offer {
+                id: vtable.id.clone(),
+                name: vtable.name.to_string(),
+                group,
+                icon,
+            }
+        })
         .collect();
+    // Stable, so a group keeps the registry's order: a canvas before what goes
+    // on one.
+    missing.sort_by_key(|offer| offer.group);
 
     let button = egui::Button::new(icons::with_label(icons::plus(), None, "Add component"))
         .min_size(egui::vec2(ui.available_width(), 28.0));
     let response = ui.add_enabled(!missing.is_empty(), button);
-    let popup = ui.make_persistent_id("add_component");
+    let popup = egui::Id::new("add_component");
+    let query_id = popup.with("query");
     if response.clicked() {
         ui.memory_mut(|memory| memory.toggle_popup(popup));
+        ui.data_mut(|data| data.remove::<String>(query_id));
     }
-    egui::popup_below_widget(
-        ui,
-        popup,
-        &response,
-        egui::PopupCloseBehavior::CloseOnClick,
-        |ui| {
-            ui.set_min_width(response.rect.width() - 12.0);
-            add_component_entries(ui, state, entity, &missing);
-        },
-    );
+    if !ui.memory(|memory| memory.is_popup_open(popup)) {
+        return;
+    }
+    // An area of its own rather than `popup_below_widget`, which holds a popup
+    // to at least the width of the button that opened it — here the panel's.
+    let area = egui::Area::new(popup)
+        .kind(egui::UiKind::Popup)
+        .order(egui::Order::Foreground)
+        .fixed_pos(response.rect.center_bottom() + egui::vec2(0.0, 4.0))
+        .pivot(egui::Align2::CENTER_TOP)
+        .constrain(true)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style())
+                .show(ui, |ui| {
+                    ui.set_width(ADD_MENU_WIDTH);
+                    let mut query: String = ui
+                        .data_mut(|data| data.get_temp(query_id))
+                        .unwrap_or_default();
+                    widgets::search(ui, &mut query, "Search components").request_focus();
+                    let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    ui.data_mut(|data| data.insert_temp(query_id, query.clone()));
+
+                    let needle = query.trim().to_lowercase();
+                    let shown: Vec<&Offer> = missing
+                        .iter()
+                        .filter(|offer| {
+                            needle.is_empty() || offer.name.to_lowercase().contains(&needle)
+                        })
+                        .collect();
+                    if enter {
+                        return shown.first().map(|offer| offer.id.clone());
+                    }
+                    let height = ADD_MENU_HEIGHT.min(ui.ctx().screen_rect().height() - 64.0);
+                    // Floored as well as capped: an area keeps the size its first
+                    // frame measured, and that is egui's 400px default.
+                    egui::ScrollArea::vertical()
+                        .max_height(height)
+                        .min_scrolled_height(height)
+                        .show(ui, |ui| add_component_entries(ui, &shown))
+                        .inner
+                })
+                .inner
+        });
+    let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+    let outside = response.clicked_elsewhere() && area.response.clicked_elsewhere();
+    if let Some(id) = area.inner {
+        state.request_add_component(entity, id);
+        ui.memory_mut(|memory| memory.close_popup());
+    } else if escape || outside {
+        ui.memory_mut(|memory| memory.close_popup());
+    }
 }
 
+const ADD_MENU_WIDTH: f32 = 220.0;
+const ADD_MENU_HEIGHT: f32 = 560.0;
+
+struct Offer {
+    id: orrin_registry::ComponentId,
+    name: String,
+    group: catalog::Group,
+    icon: icons::Icon,
+}
+
+/// The rows under their headings; returns the one clicked.
 fn add_component_entries(
     ui: &mut egui::Ui,
-    state: &mut EditorState,
-    entity: Entity,
-    missing: &[(orrin_registry::ComponentId, String)],
-) {
-    for (id, name) in missing {
-        if ui
-            .add(egui::Button::new(name.as_str()).shortcut_text(id.as_str()))
-            .clicked()
-        {
-            state.request_add_component(entity, id.clone());
+    shown: &[&Offer],
+) -> Option<orrin_registry::ComponentId> {
+    if shown.is_empty() {
+        ui.weak("No component matches");
+        return None;
+    }
+    let weak = ui.visuals().weak_text_color();
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.spacing_mut().button_padding.y = 3.0;
+    // Bare until hovered, the way egui styles a menu's rows.
+    let inactive = &mut ui.visuals_mut().widgets.inactive;
+    inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+    inactive.bg_stroke = egui::Stroke::NONE;
+    let mut chosen = None;
+    let mut group = None;
+    for offer in shown {
+        if group != Some(offer.group) {
+            group = Some(offer.group);
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(offer.group.label()).small().color(weak));
+            ui.add_space(2.0);
+        }
+        let row = egui::Button::new(icons::with_label(offer.icon, Some(weak), &offer.name))
+            .min_size(egui::vec2(ui.available_width(), 0.0));
+        if ui.add(row).clicked() {
+            chosen = Some(offer.id.clone());
         }
     }
+    chosen
 }
 
 /// Print the entity exactly as the registry sees it.

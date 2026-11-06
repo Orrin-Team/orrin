@@ -69,7 +69,7 @@ macro_rules! icons {
     ($($name:ident => $code:literal,)*) => {
         $(
             #[allow(dead_code, reason = "the icon set is a palette, not a use list")]
-            pub fn $name() -> Icon {
+            pub const fn $name() -> Icon {
                 Icon($code)
             }
         )*
@@ -84,9 +84,11 @@ macro_rules! icons {
 // Phosphor's codepoints, from its `style.css` at 2.1.1.
 icons! {
     activity => '\u{e000}',
+    app_window => '\u{e5da}',
     arrow_square_in => '\u{e5dc}',
     arrow_square_out => '\u{e5de}',
     arrow_up => '\u{e08e}',
+    bounding_box => '\u{e6ce}',
     box_ => '\u{e1da}',
     camera => '\u{e10e}',
     check => '\u{e182}',
@@ -96,12 +98,16 @@ icons! {
     circle => '\u{e18a}',
     circle_dot => '\u{ece0}',
     circle_x => '\u{e4f8}',
+    cube_transparent => '\u{ec7c}',
+    cursor_click => '\u{e7c8}',
     ellipsis => '\u{e1fe}',
     file_code => '\u{e914}',
     file_plus => '\u{e236}',
     floppy_disk => '\u{e248}',
     folder => '\u{e25a}',
+    frame_corners => '\u{e626}',
     globe => '\u{e288}',
+    gradient => '\u{eb42}',
     grid => '\u{e296}',
     hourglass => '\u{e2b2}',
     image => '\u{e2ca}',
@@ -113,23 +119,29 @@ icons! {
     lock_open => '\u{e30a}',
     monitor => '\u{e32e}',
     mountain_snow => '\u{e7ae}',
+    mouse_scroll => '\u{e332}',
     move_ => '\u{e0a4}',
     palette => '\u{e6c8}',
     pause => '\u{e39e}',
     play => '\u{e3d0}',
     plus => '\u{e3d4}',
     pointer => '\u{e1dc}',
+    rectangle => '\u{e3f0}',
     refresh => '\u{e094}',
     rotate => '\u{e036}',
     rotate_ccw => '\u{e038}',
     scaling => '\u{e0a2}',
     search => '\u{e30c}',
+    selection_background => '\u{eaf8}',
     sliders => '\u{e434}',
+    square => '\u{e45e}',
     step_forward => '\u{e5a6}',
     stop => '\u{e46c}',
     sun => '\u{e472}',
+    tag => '\u{e478}',
     terminal => '\u{eae8}',
     text_t => '\u{e48a}',
+    textbox => '\u{eb0a}',
     trash => '\u{e4a6}',
     warning => '\u{e4e0}',
     warning_circle => '\u{e4e2}',

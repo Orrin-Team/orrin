@@ -5,6 +5,7 @@
 
 mod autosave;
 mod cadence;
+pub(crate) mod catalog;
 mod dock;
 mod export;
 mod gizmo;

@@ -10,6 +10,7 @@ use orrin_ecs::{Entity, World};
 use orrin_registry::{AssetId, ComponentId, Reflect};
 
 use super::inspector::{Filter, texture_slot};
+use crate::editor::catalog;
 use crate::editor::icons;
 use crate::editor::state::EditorState;
 use crate::editor::widgets;
@@ -143,7 +144,7 @@ fn canvas_section(
         ui,
         state,
         (entity, CANVAS),
-        ("Canvas", icons::image()),
+        ("Canvas", catalog::icon(&CANVAS)),
         &labels,
         filter,
         |ui| {
@@ -218,7 +219,7 @@ fn rect_section(
         ui,
         state,
         (entity, RECT_TRANSFORM),
-        ("Rect Transform", icons::move_()),
+        ("Rect Transform", catalog::icon(&RECT_TRANSFORM)),
         &labels,
         filter,
         |ui| {
@@ -307,7 +308,7 @@ fn image_section(
         ui,
         state,
         (entity, IMAGE),
-        ("Image", icons::image()),
+        ("Image", catalog::icon(&IMAGE)),
         &labels,
         filter,
         |ui| {
@@ -361,7 +362,7 @@ fn text_section(
         ui,
         state,
         (entity, TEXT),
-        ("Text", icons::text_t()),
+        ("Text", catalog::icon(&TEXT)),
         &labels,
         filter,
         |ui| {
@@ -459,7 +460,7 @@ fn button_section(
         ui,
         state,
         (entity, BUTTON),
-        ("Button", icons::pointer()),
+        ("Button", catalog::icon(&BUTTON)),
         &labels,
         filter,
         |ui| {
@@ -499,7 +500,7 @@ fn gradient_section(
         ui,
         state,
         (entity, GRADIENT),
-        ("Gradient", icons::palette()),
+        ("Gradient", catalog::icon(&GRADIENT)),
         &labels,
         filter,
         |ui| {
@@ -535,7 +536,7 @@ fn corner_section(
         ui,
         state,
         (entity, CORNER),
-        ("Corner", icons::box_()),
+        ("Corner", catalog::icon(&CORNER)),
         &labels,
         filter,
         |ui| {
@@ -578,7 +579,7 @@ fn stroke_section(
         ui,
         state,
         (entity, STROKE),
-        ("Stroke", icons::circle()),
+        ("Stroke", catalog::icon(&STROKE)),
         &labels,
         filter,
         |ui| {
@@ -625,7 +626,7 @@ fn shadow_section(
         ui,
         state,
         (entity, SHADOW),
-        ("Shadow", icons::layers()),
+        ("Shadow", catalog::icon(&SHADOW)),
         &labels,
         filter,
         |ui| {
@@ -662,7 +663,7 @@ fn scroll_frame_section(
         ui,
         state,
         (entity, SCROLL_FRAME),
-        ("Scroll Frame", icons::list_tree()),
+        ("Scroll Frame", catalog::icon(&SCROLL_FRAME)),
         &labels,
         filter,
         |ui| {

@@ -814,6 +814,103 @@ mod tests {
         );
     }
 
+    fn open_add_component(editor: &mut Harness) {
+        let at = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| without_icons(text) == "Add component")
+            .map(|(_, rect)| rect.center())
+            .expect("the inspector offers to add a component");
+        editor.click(at).frames(1);
+    }
+
+    /// The add menu files what it offers under headings, each row with the
+    /// icon its section wears and its display name alone — never the id.
+    #[test]
+    fn the_add_menu_groups_its_components_under_headings_with_icons() {
+        let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
+        let entity = editor.spawn("Crate");
+        editor.state.selection.set(entity);
+        editor.frames(3);
+        open_add_component(&mut editor);
+
+        let menu = editor.area("add_component").expect("the add menu is open");
+        let texts = editor.painted_text_rects();
+        let row = |wanted: &str| {
+            texts
+                .iter()
+                .find(|(text, rect)| without_icons(text) == wanted && menu.contains(rect.center()))
+                .map(|(_, rect)| *rect)
+        };
+        for heading in ["Rendering", "Physics", "UI"] {
+            assert!(row(heading).is_some(), "no {heading} heading: {texts:?}");
+        }
+        assert!(
+            texts.iter().all(|(text, _)| !text.contains("orrin.")),
+            "an id is shown: {texts:?}"
+        );
+        let ui = row("UI").unwrap();
+        let gradient = row("Gradient").expect("Gradient is offered");
+        let light = row("Light").expect("Light is offered");
+        assert!(gradient.top() > ui.top(), "Gradient is under UI");
+        assert!(light.top() < ui.top(), "Light is under Rendering, above UI");
+
+        let icons = editor.painted_icons();
+        let wears = |glyph: char, beside: egui::Rect| {
+            icons.iter().any(|(painted, rect, _)| {
+                *painted == glyph && (rect.center().y - beside.center().y).abs() < 4.0
+            })
+        };
+        assert!(wears(crate::editor::icons::gradient().glyph(), gradient));
+        assert!(wears(crate::editor::icons::lightbulb().glyph(), light));
+
+        let body = editor.tab_body(Tab::Inspector);
+        assert!(
+            menu.width() <= 240.0 && menu.width() < body.width(),
+            "the add menu is {}px wide in a {}px inspector",
+            menu.width(),
+            body.width()
+        );
+    }
+
+    /// Typing narrows the menu to what matches, and Enter adds the first.
+    #[test]
+    fn searching_the_add_menu_narrows_it_and_enter_adds_the_match() {
+        let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
+        let entity = editor.spawn("Crate");
+        editor.state.selection.set(entity);
+        editor.frames(3);
+        open_add_component(&mut editor);
+
+        editor.input.events.push(egui::Event::Text("grad".into()));
+        editor.frames(1);
+        editor.input.events.clear();
+        editor.frames(1);
+        let menu = editor.area("add_component").expect("the add menu is open");
+        let shown: Vec<String> = editor
+            .painted_text_rects()
+            .into_iter()
+            .filter(|(_, rect)| menu.contains(rect.center()))
+            .map(|(text, _)| without_icons(&text))
+            .collect();
+        assert!(shown.iter().any(|text| text == "Gradient"), "{shown:?}");
+        for gone in ["Corner", "Light", "Rendering"] {
+            assert!(
+                !shown.iter().any(|text| text == gone),
+                "{gone} still shown: {shown:?}"
+            );
+        }
+
+        editor.key(egui::Key::Enter);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(editor.world.has::<crate::ui::Gradient>(entity));
+        editor.frames(1);
+        let open = editor
+            .ctx
+            .memory(|memory| memory.is_popup_open(egui::Id::new("add_component")));
+        assert!(!open, "adding closes the menu");
+    }
+
     /// egui reports two widgets sharing an id by painting "First use" and
     /// "Second use" over them in red, and the two then fight over one drag
     /// state. Nothing else about that is an error, so the warning text is what
@@ -2120,6 +2217,58 @@ mod tests {
             painted.iter().any(|text| text == "Scroll Frame"),
             "{painted:?}"
         );
+    }
+
+    /// Every entry of the UI submenu wears an icon, the one its component's
+    /// inspector section shows where it has one.
+    #[test]
+    fn the_ui_submenu_shows_an_icon_beside_each_entry() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let run = |editor: &mut Harness| {
+            let Harness {
+                state, ctx, input, ..
+            } = &mut *editor;
+            let output = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| menu_bar::spawn_entries(ui, state));
+            });
+            editor.output = Some(output);
+        };
+        run(&mut editor);
+        run(&mut editor);
+        let at = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| without_icons(text) == "UI")
+            .map(|(_, rect)| rect.center())
+            .expect("a UI entry");
+        editor.input.events.push(egui::Event::PointerMoved(at));
+        editor.input.events.push(button(at, true));
+        editor.input.events.push(button(at, false));
+        run(&mut editor);
+        editor.input.events.clear();
+        run(&mut editor);
+        let texts = editor.painted_text_rects();
+        let icons = editor.painted_icons();
+        use crate::editor::icons as glyphs;
+        for (label, icon) in [
+            ("Canvas", glyphs::app_window()),
+            ("Panel", glyphs::rectangle()),
+            ("Image", glyphs::image()),
+            ("Text", glyphs::text_t()),
+            ("Button", glyphs::cursor_click()),
+            ("Scroll Frame", glyphs::mouse_scroll()),
+        ] {
+            let row = texts
+                .iter()
+                .find(|(text, _)| without_icons(text) == label)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("no {label} entry"));
+            assert!(
+                icons.iter().any(|(glyph, rect, _)| *glyph == icon.glyph()
+                    && (rect.center().y - row.center().y).abs() < 4.0),
+                "{label} has no icon"
+            );
+        }
     }
 
     /// A previewed resolution is the game's screen: the UI is told its size,
