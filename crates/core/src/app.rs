@@ -28,7 +28,7 @@ use crate::scene::entities::{SceneChoice, StressSpec, spawn_stress_scene};
 use crate::scene::{
     Actions, AmbientLight, BloomSettings, Camera, ContactShadowSettings, Culling, DebugLine,
     DebugLines, DecalSettings, Diagnostics, DofSettings, EnvironmentSettings, FogSettings,
-    HdrSettings, InputState, LogBuffer, LogLevel, MotionBlurSettings, PresentSettings,
+    GameScreen, HdrSettings, InputState, LogBuffer, LogLevel, MotionBlurSettings, PresentSettings,
     RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
     Time, TransparencySettings, UiCanvas,
 };
@@ -816,9 +816,19 @@ impl ApplicationHandler for App {
                 // The UI is immediate: what this tick draws replaces the last
                 // tick's. A paused game ticks nothing and keeps its UI on
                 // screen; edit mode runs no game code and shows none.
+                //
+                // The game's screen is the window, unless the editor is drawn
+                // and previewing a resolution — then it is whatever the editor
+                // set last time it drew (see `editor::preview`).
+                let extent = active.renderer.extent();
+                if !overlay_on || self.shipped || self.world.get_resource::<GameScreen>().is_none()
+                {
+                    self.world.insert_resource(GameScreen::window(extent));
+                }
                 if simulate {
-                    let extent = active.renderer.extent();
-                    self.world.resource_mut::<UiCanvas>().begin(extent);
+                    let size = self.world.resource::<GameScreen>().size;
+                    let size = size.map(|side| side.round() as u32);
+                    self.world.resource_mut::<UiCanvas>().begin(size);
                 } else if !self.world.resource::<crate::scene::Play>().is_live() {
                     self.world.resource_mut::<UiCanvas>().clear();
                 }

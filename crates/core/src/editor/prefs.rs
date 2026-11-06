@@ -30,6 +30,9 @@ pub struct Prefs {
     /// How the asset browser lays out and orders a folder; `None` until the
     /// user first changes it.
     pub assets: Option<super::state::AssetView>,
+    /// The resolution the viewport previews; `None` until the user first
+    /// picks one.
+    pub preview: Option<super::preview::Preview>,
     /// Which [`LAYOUT_VERSION`] `layout` was saved under. Absent, and so zero,
     /// in every file written before the field existed.
     layout_version: u32,
@@ -89,6 +92,7 @@ impl PrefsFile {
             layout: prefs.layout.clone(),
             snap: prefs.snap,
             assets: prefs.assets,
+            preview: prefs.preview,
         };
         let text = match ron::ser::to_string_pretty(prefs, ron::ser::PrettyConfig::default()) {
             Ok(text) => text,

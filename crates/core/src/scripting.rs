@@ -265,11 +265,18 @@ extern "C" fn axis_value(id: u32, player: u32) -> f32 {
     with_actions(|actions| actions.axis(ActionId(id), player as usize))
 }
 
+// In the game's pixels, which are the window's unless the editor is
+// previewing a resolution: a script's own hit tests are against rects in that
+// space.
 extern "C" fn cursor_pos(x: *mut f32, y: *mut f32) {
     let (cx, cy) = orrin_script::with_world((0.0, 0.0), |world| {
-        world
+        let window = world
             .get_resource::<InputState>()
-            .map_or((0.0, 0.0), |input| input.cursor())
+            .map_or((0.0, 0.0), |input| input.cursor());
+        match world.get_resource::<crate::scene::GameScreen>() {
+            Some(screen) => screen.to_game([window.0, window.1]).into(),
+            None => window,
+        }
     });
     if !x.is_null() {
         // SAFETY: C# passes valid, writable f32 pointers.
@@ -3725,5 +3732,24 @@ mod tests {
             ui_screen_size(&mut width, &mut height);
         });
         assert_eq!((width, height), (0.0, 0.0));
+    }
+
+    /// A script is the game, so it sees the cursor in the pixels of the screen
+    /// it is told it has — the previewed one in the editor.
+    #[test]
+    fn a_script_sees_the_cursor_in_the_game_screens_pixels() {
+        let mut world = World::new();
+        let mut input = InputState::new();
+        input.place_cursor((110.0, 70.0));
+        world.insert_resource(input);
+        world.insert_resource(crate::scene::GameScreen {
+            size: [1920.0, 1080.0],
+            origin: [100.0, 50.0],
+            scale: 0.5,
+            clip: crate::scene::Rect::new(100.0, 50.0, 960.0, 540.0),
+        });
+        let (mut x, mut y) = (0.0, 0.0);
+        orrin_script::with_active_world(&mut world, || cursor_pos(&mut x, &mut y));
+        assert_eq!((x, y), (20.0, 40.0));
     }
 }

@@ -317,7 +317,7 @@ mod tests {
             layout::resolve(
                 &self.world,
                 &self.world.resource::<Hierarchy>(),
-                [1000.0, 1000.0],
+                &crate::scene::GameScreen::window([1000, 1000]),
                 &mut self.layout,
             );
             self.events.clear();

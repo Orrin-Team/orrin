@@ -57,6 +57,8 @@ pub fn draw(
     menu_bar::show(ctx, world, registry, state, themes, dock);
     status_bar::show(ctx, world, state, themes);
     dock.show(ctx, world, state, registry, previews);
+    // Before the viewport's tools, which show the screen this sets.
+    game_screen(ctx, world, state, dock.viewport());
     if let Some(rect) = dock.viewport() {
         let live = world
             .get_resource::<crate::scene::Play>()
@@ -154,6 +156,38 @@ fn confirm_delete(ctx: &egui::Context, world: &World, state: &mut EditorState, r
     if modal.should_close() && state.pending_delete().is_some() {
         state.resolve_delete(false);
     }
+}
+
+/// Tell the game how big its screen is and where in the window it is drawn:
+/// the previewed resolution inside the viewport, or the window.
+fn game_screen(
+    ctx: &egui::Context,
+    world: &mut World,
+    state: &EditorState,
+    viewport: Option<egui::Rect>,
+) {
+    use crate::scene::{GameScreen, Rect};
+    let ppp = ctx.pixels_per_point();
+    let window = ctx.screen_rect().size() * ppp;
+    let extent = [window.x.round() as u32, window.y.round() as u32];
+    let screen = match viewport {
+        Some(rect) => crate::editor::preview::screen(
+            &state.preview,
+            Rect::new(
+                rect.min.x * ppp,
+                rect.min.y * ppp,
+                rect.width() * ppp,
+                rect.height() * ppp,
+            ),
+            extent,
+        ),
+        None => GameScreen::window(extent),
+    };
+    if let Some(mut current) = world.get_resource_mut::<GameScreen>() {
+        *current = screen;
+        return;
+    }
+    world.insert_resource(screen);
 }
 
 /// The few keys every editor answers the same way. Each one stands aside while
@@ -2052,6 +2086,91 @@ mod tests {
                 "{kind}: {painted:?}"
             );
         }
+    }
+
+    /// A previewed resolution is the game's screen: the UI is told its size,
+    /// it is drawn inside the viewport, and the viewport around it is dimmed.
+    #[test]
+    fn previewing_a_resolution_tells_the_game_its_screen_and_dims_the_rest() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(2);
+        let window = *editor.world.resource::<crate::scene::GameScreen>();
+        assert_eq!(
+            window.size,
+            [1280.0, 800.0],
+            "the window until one is picked"
+        );
+
+        editor.state.preview.resolution = Some([1080, 2340]);
+        editor.frames(2);
+        let screen = *editor.world.resource::<crate::scene::GameScreen>();
+        assert_eq!(screen.size, [1080.0, 2340.0]);
+        let viewport = editor.dock.viewport().expect("a viewport");
+        let shown = screen.rect();
+        assert!(
+            viewport
+                .expand(0.5)
+                .contains_rect(egui::Rect::from_min_size(
+                    egui::pos2(shown.x, shown.y),
+                    egui::vec2(shown.width, shown.height),
+                )),
+            "{shown:?} is not inside {viewport:?}"
+        );
+        assert!(
+            (shown.height - viewport.height()).abs() < 1.0,
+            "fitted to the height"
+        );
+        let tree = editor.world.resource::<crate::ui::UiTree>();
+        assert_eq!(tree.canvas.screen(), [1080.0, 2340.0]);
+        drop(tree);
+        let dim = egui::Color32::from_black_alpha(150);
+        assert!(
+            editor.painted_fills().iter().any(|(_, fill)| *fill == dim),
+            "the sides of the viewport are dimmed"
+        );
+    }
+
+    /// In UI mode a button over the viewport opens the templates and the two
+    /// sizes.
+    #[test]
+    fn the_resolution_menu_picks_a_template_and_true_size() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.state.ui_mode = true;
+        editor.frames(2);
+        let text_at = |editor: &Harness, wanted: &str| {
+            editor
+                .painted_text_rects()
+                .into_iter()
+                .find(|(text, _)| without_icons(text).starts_with(wanted))
+                .map(|(_, rect)| rect.center())
+        };
+        let monitor = crate::editor::icons::monitor().glyph();
+        let viewport = editor.dock.viewport().expect("a viewport");
+        let button = editor
+            .painted_icons()
+            .into_iter()
+            .find(|(glyph, rect, _)| *glyph == monitor && viewport.contains(rect.center()))
+            .expect("the resolution button")
+            .1;
+        editor.click(button.center()).frames(1);
+        assert!(
+            text_at(&editor, "Window").is_some(),
+            "the menu offers the window"
+        );
+        let full_hd = text_at(&editor, "Full HD").expect("the templates are listed");
+        editor.click(full_hd).frames(1);
+        assert_eq!(editor.state.preview.resolution, Some([1920, 1080]));
+
+        let true_size = text_at(&editor, "True size").expect("the sizes are listed");
+        editor.click(true_size).frames(2);
+        assert_eq!(
+            editor.state.preview.size,
+            crate::editor::preview::PreviewSize::TrueSize
+        );
+        assert_eq!(
+            editor.world.resource::<crate::scene::GameScreen>().scale,
+            1.0
+        );
     }
 
     /// The hierarchy's add button holds the Entity menu's own entries, so its

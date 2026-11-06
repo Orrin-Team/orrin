@@ -77,10 +77,19 @@ pub fn show(
         .constrain_to(viewport)
         .show(ctx, |ui| {
             widgets::toolbar_frame(ui.visuals(), bar).show(ui, |ui| {
-                let hint = "Frame stats overlay";
-                if widgets::toggle_icon(ui, icons::activity(), state.show_stats, hint).clicked() {
-                    state.show_stats = !state.show_stats;
-                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    // Offered where it matters — laying out UI — and kept
+                    // while a preview is on, so it can always be turned off.
+                    if state.ui_mode || state.preview.resolution.is_some() {
+                        resolution(ui, world, state);
+                    }
+                    let hint = "Frame stats overlay";
+                    if widgets::toggle_icon(ui, icons::activity(), state.show_stats, hint).clicked()
+                    {
+                        state.show_stats = !state.show_stats;
+                    }
+                });
             });
         })
         .response
@@ -107,7 +116,124 @@ pub fn show(
             });
     }
 
+    preview_frame(ctx, world, state, viewport);
     play_frame(ctx, world, themes, viewport);
+}
+
+/// The resolution the viewport previews: the button says what it is and how
+/// large it is drawn, and opens the choice.
+fn resolution(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
+    use crate::editor::preview::{MAX_SIDE, PreviewSize, TEMPLATES};
+
+    let hint = "Preview the game's UI at a screen size";
+    // Only an icon at rest: the controls over the scene stay a corner's worth.
+    let button = match state.preview.resolution {
+        None => widgets::toggle_icon(ui, icons::monitor(), false, hint),
+        Some([width, height]) => {
+            let percent = world
+                .get_resource::<crate::scene::GameScreen>()
+                .map_or(100.0, |screen| screen.scale * 100.0);
+            let word = format!("{width}×{height} · {percent:.0}%");
+            widgets::icon_label_button(ui, icons::monitor(), &word, true, hint)
+        }
+    };
+    let popup = ui.make_persistent_id("preview_resolution");
+    if button.clicked() {
+        ui.memory_mut(|memory| memory.toggle_popup(popup));
+    }
+    egui::popup_below_widget(
+        ui,
+        popup,
+        &button,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(220.0);
+            let preview = &mut state.preview;
+            ui.selectable_value(&mut preview.resolution, None, "Window");
+            ui.separator();
+            for &(name, size) in TEMPLATES {
+                let label = format!("{name}  {}×{}", size[0], size[1]);
+                ui.selectable_value(&mut preview.resolution, Some(size), label);
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Custom");
+                let mut custom = preview.resolution.unwrap_or([1920, 1080]);
+                let mut changed = false;
+                for side in &mut custom {
+                    changed |= ui
+                        .add(egui::DragValue::new(side).range(1..=MAX_SIDE).speed(4))
+                        .changed();
+                }
+                if icons::button(ui, icons::rotate(), 14.0, ui.visuals().text_color(), false)
+                    .on_hover_text("Swap width and height")
+                    .clicked()
+                {
+                    custom.swap(0, 1);
+                    changed = true;
+                }
+                if changed {
+                    preview.resolution = Some(custom);
+                }
+            });
+            ui.separator();
+            ui.add_enabled_ui(preview.resolution.is_some(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut preview.size, PreviewSize::Fit, "Fit to window")
+                        .on_hover_text("Scale the screen to the viewport");
+                    ui.selectable_value(&mut preview.size, PreviewSize::TrueSize, "True size")
+                        .on_hover_text("One game pixel to one screen pixel, cut to the viewport");
+                });
+            });
+        },
+    );
+}
+
+/// What lies outside the previewed screen, dimmed: there the game has no
+/// pixels. Under the viewport's controls, which are areas over this layer.
+fn preview_frame(ctx: &egui::Context, world: &World, state: &EditorState, viewport: egui::Rect) {
+    if state.preview.resolution.is_none() {
+        return;
+    }
+    let Some(screen) = world.get_resource::<crate::scene::GameScreen>().map(|s| *s) else {
+        return;
+    };
+    let ppp = ctx.pixels_per_point();
+    let shown = screen.rect();
+    let shown = egui::Rect::from_min_size(
+        egui::pos2(shown.x, shown.y) / ppp,
+        egui::vec2(shown.width, shown.height) / ppp,
+    );
+    let painter = ctx
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::new("preview_frame"),
+        ))
+        .with_clip_rect(viewport);
+    let dim = egui::Color32::from_black_alpha(150);
+    let inner = shown.intersect(viewport);
+    for band in [
+        egui::Rect::from_min_max(viewport.min, egui::pos2(viewport.max.x, inner.min.y)),
+        egui::Rect::from_min_max(egui::pos2(viewport.min.x, inner.max.y), viewport.max),
+        egui::Rect::from_min_max(
+            egui::pos2(viewport.min.x, inner.min.y),
+            egui::pos2(inner.min.x, inner.max.y),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(inner.max.x, inner.min.y),
+            egui::pos2(viewport.max.x, inner.max.y),
+        ),
+    ] {
+        if band.is_positive() {
+            painter.rect_filled(band, 0.0, dim);
+        }
+    }
+    painter.rect_stroke(
+        shown,
+        0.0,
+        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(40)),
+        egui::StrokeKind::Outside,
+    );
 }
 
 /// A border round the scene while the game is live, in the accent while it

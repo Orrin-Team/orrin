@@ -20,9 +20,10 @@
 //! [`layout::resolve`] walks each root canvas depth-first and turns every
 //! element into a rectangle in physical pixels, which is what the painter
 //! draws, the pointer hits and the editor's rect tool grabs. A root canvas is
-//! the whole window — the space the 3D camera draws into and the cursor is
-//! reported in — not the editor's viewport, so a HUD sits where it will in the
-//! shipped game. The canvas scaler maps canvas units to pixels once per canvas;
+//! the game's screen, [`GameScreen`]: the whole window — the space the 3D
+//! camera draws into and the cursor is reported in — so a HUD sits where it
+//! will in the shipped game, unless the editor is previewing a resolution, when
+//! the tree is laid out at that size and placed inside the viewport. The canvas scaler maps canvas units to pixels once per canvas;
 //! below it everything is units, and an element's `scale` multiplies its own
 //! frame and its subtree's about its pivot. There is no rotation: the painter
 //! draws axis-aligned quads, and the rect tool and the hit test lean on that.
@@ -67,7 +68,7 @@ pub use layout::{Element, Layout};
 use orrin_ecs::World;
 
 use crate::asset_db::AssetDatabase;
-use crate::scene::UiCanvas;
+use crate::scene::{GameScreen, UiCanvas};
 
 /// The retained UI as last resolved: a world resource, rebuilt by [`update`].
 #[derive(Default)]
@@ -77,23 +78,26 @@ pub struct UiTree {
     pub canvas: UiCanvas,
 }
 
-/// Resolve every canvas onto a `screen`-sized window and record what it draws.
-/// Runs every frame, after the last thing that can edit the scene.
-pub fn update(world: &mut World, screen: [u32; 2]) {
+/// Resolve every canvas onto the game's screen — the [`GameScreen`] resource,
+/// or a window of `extent` without one — and record what it draws. Runs every
+/// frame, after the last thing that can edit the scene.
+pub fn update(world: &mut World, extent: [u32; 2]) {
     crate::scene::ensure_current(world);
     if world.get_resource::<UiTree>().is_none() {
         world.insert_resource(UiTree::default());
     }
     let mut tree = world.resource_mut::<UiTree>();
     let UiTree { layout, canvas } = &mut *tree;
-    let size = screen.map(|side| side as f32);
+    let screen = world
+        .get_resource::<GameScreen>()
+        .map_or_else(|| GameScreen::window(extent), |screen| *screen);
     layout::resolve(
         world,
         &world.resource::<crate::scene::Hierarchy>(),
-        size,
+        &screen,
         layout,
     );
-    canvas.begin(screen);
+    canvas.begin(screen.size.map(|side| side.round() as u32));
     if layout.is_empty() {
         return;
     }

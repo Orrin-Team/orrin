@@ -111,6 +111,7 @@ icons! {
     list_tree => '\u{ee48}',
     lock => '\u{e308}',
     lock_open => '\u{e30a}',
+    monitor => '\u{e32e}',
     mountain_snow => '\u{e7ae}',
     move_ => '\u{e0a4}',
     palette => '\u{e6c8}',

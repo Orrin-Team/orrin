@@ -2,7 +2,7 @@ use glam::Vec2;
 use orrin_ecs::{Entity, World};
 
 use super::{Canvas, Image, RectTransform, ScaleMode, Text};
-use crate::scene::{Hierarchy, Parent, Rect};
+use crate::scene::{GameScreen, Hierarchy, Parent, Rect};
 
 /// One UI element, resolved onto the screen.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,14 +32,15 @@ pub struct Element {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CanvasRoot {
     pub entity: Entity,
-    /// Screen pixels per canvas unit.
+    /// Game pixels per canvas unit: the scaler's answer, before the screen's
+    /// own scale into the window.
     pub scale: f32,
 }
 
 /// Every canvas's tree, resolved for one window size, in draw order.
 #[derive(Default)]
 pub struct Layout {
-    screen: [f32; 2],
+    screen: GameScreen,
     canvases: Vec<CanvasRoot>,
     elements: Vec<Element>,
     /// The depth-first walk's stack, kept for its allocation.
@@ -59,9 +60,15 @@ struct Visit {
     units: Vec2,
 }
 
+impl Default for GameScreen {
+    fn default() -> Self {
+        Self::window([0, 0])
+    }
+}
+
 impl Layout {
-    pub fn screen(&self) -> [f32; 2] {
-        self.screen
+    pub fn screen(&self) -> &GameScreen {
+        &self.screen
     }
 
     pub fn canvases(&self) -> &[CanvasRoot] {
@@ -84,11 +91,11 @@ impl Layout {
     }
 
     /// The rectangle element `index`'s anchors are fractions of, on screen:
-    /// its parent's, or the window for a child of the canvas.
+    /// its parent's, or the game's screen for a child of the canvas.
     pub fn parent_rect(&self, index: usize) -> Rect {
         match self.elements[index].parent {
             Some(parent) => self.elements[parent as usize].rect,
-            None => Rect::new(0.0, 0.0, self.screen[0], self.screen[1]),
+            None => self.screen.rect(),
         }
     }
 
@@ -140,10 +147,11 @@ pub fn scale_factor(canvas: &Canvas, screen: [f32; 2]) -> f32 {
     }
 }
 
-/// Resolve every root canvas's tree onto a `screen`-sized window. `hierarchy`
-/// must be current.
-pub fn resolve(world: &World, hierarchy: &Hierarchy, screen: [f32; 2], out: &mut Layout) {
-    out.screen = screen;
+/// Resolve every root canvas's tree onto the game's `screen`. `hierarchy` must
+/// be current.
+pub fn resolve(world: &World, hierarchy: &Hierarchy, game: &GameScreen, out: &mut Layout) {
+    out.screen = *game;
+    let screen = game.size;
     out.canvases.clear();
     out.elements.clear();
     let mut stack = std::mem::take(&mut out.stack);
@@ -164,14 +172,17 @@ pub fn resolve(world: &World, hierarchy: &Hierarchy, screen: [f32; 2], out: &mut
     out.canvases.sort_by_cached_key(sort_key);
 
     for (index, root) in out.canvases.iter().enumerate() {
-        let units = Vec2::splat(root.scale);
+        // The scaler sees the game's size; the screen's own scale and place
+        // then carry the result into the window.
+        let size = Vec2::from(screen) / root.scale;
+        let units = Vec2::splat(root.scale * game.scale);
         let visit = |entity| Visit {
             entity,
             parent: None,
             canvas: index as u32,
             min: Vec2::ZERO,
-            size: Vec2::from(screen) / units,
-            offset: Vec2::ZERO,
+            size,
+            offset: Vec2::from(game.origin),
             units,
         };
         // Reversed, so popping visits them in hierarchy order.
@@ -277,6 +288,10 @@ mod tests {
         }
 
         fn layout(&mut self, screen: [f32; 2]) -> Layout {
+            self.layout_on(&GameScreen::window(screen.map(|side| side as u32)))
+        }
+
+        fn layout_on(&mut self, screen: &GameScreen) -> Layout {
             ensure_current(&mut self.world);
             let mut layout = Layout::default();
             resolve(
@@ -422,6 +437,47 @@ mod tests {
             "the parent's frame is doubled"
         );
         assert_eq!(child.parent_size, Vec2::new(400.0, 200.0));
+    }
+
+    /// A previewed resolution lays the tree out at its own size and draws it,
+    /// scaled, into its place in the window: a canvas scaled with the screen
+    /// keeps the proportions it will ship with.
+    #[test]
+    fn a_previewed_screen_lays_out_at_its_size_inside_its_rectangle() {
+        let mut tree = Tree::new();
+        let canvas = tree.canvas(Canvas {
+            scale_mode: ScaleMode::ScaleWithScreen,
+            reference_resolution: Vec2::new(1920.0, 1080.0),
+            match_width_or_height: 0.0,
+            sort_order: 0,
+        });
+        let full = tree.element(canvas, RectTransform::stretched());
+        let corner = tree.element(
+            canvas,
+            fixed(
+                Vec2::ZERO,
+                Vec2::ZERO,
+                Vec2::new(10.0, 10.0),
+                Vec2::new(100.0, 50.0),
+            ),
+        );
+        let screen = GameScreen {
+            size: [1920.0, 1080.0],
+            origin: [100.0, 50.0],
+            scale: 0.5,
+            clip: Rect::new(100.0, 50.0, 960.0, 540.0),
+        };
+        let layout = tree.layout_on(&screen);
+        let rect = |entity| layout.elements()[layout.index_of(entity).unwrap()].rect;
+        assert!(close(rect(full), screen.rect()), "{:?}", rect(full));
+        assert!(
+            close(rect(corner), Rect::new(105.0, 55.0, 50.0, 25.0)),
+            "{:?}",
+            rect(corner)
+        );
+        let index = layout.index_of(corner).unwrap();
+        assert_eq!(layout.parent_rect(index), screen.rect());
+        assert_eq!(layout.elements()[index].units, Vec2::splat(0.5));
     }
 
     #[test]

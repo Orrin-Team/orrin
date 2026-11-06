@@ -151,6 +151,11 @@ impl InputState {
         self.cursor
     }
 
+    #[cfg(test)]
+    pub(crate) fn place_cursor(&mut self, at: (f32, f32)) {
+        self.cursor = at;
+    }
+
     pub fn mouse_delta(&self) -> (f32, f32) {
         self.mouse_delta
     }

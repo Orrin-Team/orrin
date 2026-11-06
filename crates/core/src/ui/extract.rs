@@ -154,7 +154,7 @@ mod tests {
             layout::resolve(
                 &self.world,
                 &self.world.resource::<Hierarchy>(),
-                [1920.0, 1080.0],
+                &crate::scene::GameScreen::window([1920, 1080]),
                 &mut resolved,
             );
             let mut out = UiCanvas::default();
@@ -292,7 +292,7 @@ mod tests {
             layout::resolve(
                 &ui.world,
                 &ui.world.resource::<Hierarchy>(),
-                [1920.0, 1080.0],
+                &crate::scene::GameScreen::window([1920, 1080]),
                 &mut resolved,
             );
             let input = PointerInput {

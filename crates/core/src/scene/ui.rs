@@ -216,6 +216,68 @@ impl UiCanvas {
     }
 }
 
+/// Where the game's screen is in the window, and the size the game is told it
+/// has. The whole window, except while the editor previews a resolution (see
+/// `editor::preview`): then the game is laid out at that size and drawn,
+/// scaled, inside the viewport. A world resource; absent means the window.
+///
+/// The UI is the only thing placed by it. The 3D scene still draws across the
+/// window, because its camera's aspect is the swapchain's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GameScreen {
+    /// The screen as the game sees it, in its own pixels.
+    pub size: [f32; 2],
+    /// Its top left, in window pixels.
+    pub origin: [f32; 2],
+    /// Window pixels per game pixel.
+    pub scale: f32,
+    /// What may be drawn on, in window pixels: the screen, less whatever of it
+    /// is out of view.
+    pub clip: Rect,
+}
+
+impl GameScreen {
+    /// The whole window, one to one.
+    pub fn window(extent: [u32; 2]) -> Self {
+        let size = extent.map(|side| side as f32);
+        Self {
+            size,
+            origin: [0.0; 2],
+            scale: 1.0,
+            clip: Rect::new(0.0, 0.0, size[0], size[1]),
+        }
+    }
+
+    /// The screen's rectangle in the window.
+    pub fn rect(&self) -> Rect {
+        let [x, y] = self.origin;
+        Rect::new(x, y, self.size[0] * self.scale, self.size[1] * self.scale)
+    }
+
+    /// A point in the window, in the game's pixels.
+    pub fn to_game(&self, [x, y]: [f32; 2]) -> [f32; 2] {
+        [
+            (x - self.origin[0]) / self.scale,
+            (y - self.origin[1]) / self.scale,
+        ]
+    }
+
+    /// A rectangle in the game's pixels, in the window's.
+    pub fn to_window(&self, rect: Rect) -> Rect {
+        Rect::new(
+            self.origin[0] + rect.x * self.scale,
+            self.origin[1] + rect.y * self.scale,
+            rect.width * self.scale,
+            rect.height * self.scale,
+        )
+    }
+
+    /// Whether this is the window itself, so nothing needs mapping.
+    pub fn is_window(&self, extent: [u32; 2]) -> bool {
+        *self == Self::window(extent)
+    }
+}
+
 /// A C# `Color` as the canvas stores it: each channel clamped and rounded to a
 /// byte. A channel above one means something to a light, not to a pixel.
 pub fn color_bytes(rgba: [f32; 4]) -> [u8; 4] {
@@ -297,6 +359,34 @@ mod tests {
         assert_eq!(TextAnchor::UpperRight.vertical(), 0.0);
         assert_eq!(TextAnchor::LowerCenter.horizontal(), 0.5);
         assert_eq!(TextAnchor::LowerCenter.vertical(), 1.0);
+    }
+
+    #[test]
+    fn the_window_screen_maps_nothing() {
+        let screen = GameScreen::window([1280, 720]);
+        assert_eq!(screen.size, [1280.0, 720.0]);
+        assert_eq!(screen.rect(), Rect::new(0.0, 0.0, 1280.0, 720.0));
+        assert_eq!(screen.clip, screen.rect());
+        assert_eq!(screen.to_game([10.0, 20.0]), [10.0, 20.0]);
+        assert!(screen.is_window([1280, 720]));
+        assert!(!screen.is_window([1920, 1080]));
+    }
+
+    #[test]
+    fn a_placed_screen_maps_between_its_pixels_and_the_windows() {
+        let screen = GameScreen {
+            size: [1920.0, 1080.0],
+            origin: [100.0, 50.0],
+            scale: 0.5,
+            clip: Rect::new(100.0, 50.0, 960.0, 540.0),
+        };
+        assert_eq!(screen.rect(), Rect::new(100.0, 50.0, 960.0, 540.0));
+        assert_eq!(screen.to_game([100.0, 50.0]), [0.0, 0.0]);
+        assert_eq!(screen.to_game([1060.0, 590.0]), [1920.0, 1080.0]);
+        assert_eq!(
+            screen.to_window(Rect::new(20.0, 40.0, 200.0, 100.0)),
+            Rect::new(110.0, 70.0, 100.0, 50.0)
+        );
     }
 
     #[test]

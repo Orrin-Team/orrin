@@ -13,6 +13,7 @@ mod kind;
 mod panels;
 mod pick;
 mod prefs;
+mod preview;
 mod previews;
 mod rect_tool;
 mod selection;
@@ -113,6 +114,9 @@ impl Editor {
         let mut state = EditorState::new(project);
         if let Some(steps) = prefs.snap {
             state.snap_steps = steps;
+        }
+        if let Some(preview) = prefs.preview {
+            state.preview = preview;
         }
         if let Some(view) = prefs.assets {
             state.assets_view = view;
@@ -225,6 +229,13 @@ impl Editor {
         };
         if prefs.assets.unwrap_or_default() != view {
             prefs.assets = Some(view);
+            prefs_file.save(prefs);
+        }
+        // Kept once a typed size has stopped being dragged.
+        if prefs.preview.unwrap_or_default() != state.preview
+            && !ctx.input(|input| input.pointer.any_down())
+        {
+            prefs.preview = Some(state.preview);
             prefs_file.save(prefs);
         }
 

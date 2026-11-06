@@ -99,6 +99,42 @@ impl UiFrame<'_> {
     }
 }
 
+/// Where a layer's commands land in the window, and what of the window they may
+/// cover.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placement {
+    pub origin: [f32; 2],
+    /// Window pixels per command pixel.
+    pub scale: f32,
+    pub clip: Rect,
+}
+
+impl Placement {
+    /// Commands in window pixels, cut to nothing.
+    pub const UNBOUNDED: Self = Self {
+        origin: [0.0; 2],
+        scale: 1.0,
+        clip: Rect::new(-1.0e9, -1.0e9, 2.0e9, 2.0e9),
+    };
+
+    /// Commands already in window pixels, cut to `clip`.
+    pub fn clipped(clip: Rect) -> Self {
+        Self {
+            clip,
+            ..Self::UNBOUNDED
+        }
+    }
+
+    /// Commands in the game's pixels, drawn where `screen` is.
+    pub fn screen(screen: &crate::scene::GameScreen) -> Self {
+        Self {
+            origin: screen.origin,
+            scale: screen.scale,
+            clip: screen.clip,
+        }
+    }
+}
+
 /// What the painter asks of the world: the assets a canvas names.
 pub trait UiAssets {
     /// The texture slot for image `id`, or `None` for one that cannot be drawn.
@@ -125,10 +161,16 @@ pub fn paint(world: &World, backend: &mut impl RenderBackend, painter: &mut Pain
         db: db.as_deref_mut(),
         backend,
     };
-    match (tree.as_ref().map(|tree| &tree.canvas), canvas.as_deref()) {
-        (Some(retained), Some(immediate)) => {
-            painter.paint_layers(&[retained, immediate], &mut assets)
-        }
+    // The retained layer is laid out in window pixels already; the immediate
+    // one is in the game's, and both are cut to the game's screen.
+    let (retained, immediate) = match world.get_resource::<crate::scene::GameScreen>() {
+        Some(screen) => (Placement::clipped(screen.clip), Placement::screen(&screen)),
+        None => (Placement::UNBOUNDED, Placement::UNBOUNDED),
+    };
+    let under = tree.as_ref().map(|tree| (&tree.canvas, retained));
+    let over = canvas.as_deref().map(|canvas| (canvas, immediate));
+    match (under, over) {
+        (Some(under), Some(over)) => painter.paint_layers(&[under, over], &mut assets),
         (Some(only), None) | (None, Some(only)) => painter.paint_layers(&[only], &mut assets),
         (None, None) => painter.paint_layers(&[], &mut assets),
     }
@@ -274,32 +316,45 @@ impl Painter {
 
     /// Lay `canvas` out into this frame's quads.
     pub fn paint(&mut self, canvas: &UiCanvas, assets: &mut impl UiAssets) {
-        self.paint_layers(&[canvas], assets);
+        self.paint_layers(&[(canvas, Placement::UNBOUNDED)], assets);
     }
 
     /// Lay `layers` out into this frame's quads, each over the one before.
-    pub fn paint_layers(&mut self, layers: &[&UiCanvas], assets: &mut impl UiAssets) {
+    pub fn paint_layers(&mut self, layers: &[(&UiCanvas, Placement)], assets: &mut impl UiAssets) {
         if std::mem::take(&mut self.full) {
             self.glyphs.clear();
             self.atlas.reset();
         }
         self.quads.clear();
         self.batches.clear();
-        for canvas in layers {
-            self.paint_canvas(canvas, assets);
+        for (canvas, placement) in layers {
+            self.paint_canvas(canvas, placement, assets);
         }
     }
 
-    fn paint_canvas(&mut self, canvas: &UiCanvas, assets: &mut impl UiAssets) {
+    fn paint_canvas(
+        &mut self,
+        canvas: &UiCanvas,
+        placement: &Placement,
+        assets: &mut impl UiAssets,
+    ) {
+        let bounds = corners(&placement.clip);
+        let place = |rect: &Rect| {
+            Rect::new(
+                placement.origin[0] + rect.x * placement.scale,
+                placement.origin[1] + rect.y * placement.scale,
+                rect.width * placement.scale,
+                rect.height * placement.scale,
+            )
+        };
         for command in canvas.commands() {
             match command {
                 UiCommand::Panel { rect, color } => {
-                    let quad = UiQuad {
-                        rect: corners(rect),
-                        uv: self.atlas.white(),
-                        color: *color,
-                    };
-                    self.push(UiSource::Atlas, quad);
+                    let uv = self.atlas.white();
+                    if let Some((rect, uv)) = clipped(corners(&place(rect)), uv, bounds) {
+                        let color = *color;
+                        self.push(UiSource::Atlas, UiQuad { rect, uv, color });
+                    }
                 }
                 UiCommand::Image {
                     rect,
@@ -307,18 +362,21 @@ impl Painter {
                     uv,
                     tint,
                 } => {
+                    let Some((rect, uv)) = clipped(corners(&place(rect)), *uv, bounds) else {
+                        continue;
+                    };
                     if let Some(handle) = assets.texture(*texture) {
-                        let quad = UiQuad {
-                            rect: corners(rect),
-                            uv: *uv,
-                            color: *tint,
-                        };
-                        self.push(UiSource::Texture(handle), quad);
+                        let color = *tint;
+                        self.push(UiSource::Texture(handle), UiQuad { rect, uv, color });
                     }
                 }
                 UiCommand::Text { rect, style, text } => {
                     let slot = self.font_slot(style.font, assets);
-                    self.set_text(slot, rect, style, canvas.str(text));
+                    let style = TextStyle {
+                        size: style.size * placement.scale,
+                        ..*style
+                    };
+                    self.set_text(slot, &place(rect), &style, bounds, canvas.str(text));
                 }
             }
         }
@@ -369,7 +427,15 @@ impl Painter {
 
     /// Wrap `text` to `rect`'s width, place the block by `style`'s anchor, and
     /// push a quad per inked glyph, clipped to `rect`.
-    fn set_text(&mut self, slot: u32, rect: &Rect, style: &TextStyle, text: &str) {
+    /// Nothing is drawn outside `bounds`, whatever the style allows.
+    fn set_text(
+        &mut self,
+        slot: u32,
+        rect: &Rect,
+        style: &TextStyle,
+        bounds: [f32; 4],
+        text: &str,
+    ) {
         // A cheap handle, cloned so the caches can be borrowed mutably.
         let font = self.fonts[slot as usize].clone();
         let size = style.size.round().clamp(1.0, f32::from(u16::MAX));
@@ -391,6 +457,12 @@ impl Painter {
             clip[0] = f32::NEG_INFINITY;
             clip[2] = f32::INFINITY;
         }
+        let clip = [
+            clip[0].max(bounds[0]),
+            clip[1].max(bounds[1]),
+            clip[2].min(bounds[2]),
+            clip[3].min(bounds[3]),
+        ];
         let mut baseline =
             rect.y + (rect.height - block) * style.anchor.vertical() + scaled.ascent();
 
@@ -760,7 +832,7 @@ impl Atlas {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::TextAnchor;
+    use crate::scene::{GameScreen, TextAnchor};
 
     /// Answers every texture with its slot and every font with the built-in
     /// face's bytes, counting what it was asked.
@@ -1069,6 +1141,42 @@ mod tests {
         assert!(bounds(quads)[2] > rect.width, "{quads:?}");
     }
 
+    /// The immediate canvas is in the game's pixels: a previewed screen draws
+    /// it scaled into its place in the window, and nothing of it outside.
+    #[test]
+    fn a_layer_is_scaled_into_its_screen_and_cut_to_it() {
+        let mut canvas = UiCanvas::default();
+        canvas.panel(Rect::new(0.0, 0.0, 100.0, 100.0), [255; 4]);
+        canvas.panel(Rect::new(-50.0, 0.0, 100.0, 100.0), [255; 4]);
+        let label = Rect::new(0.0, 200.0, 600.0, 100.0);
+        canvas.text(label, style(TextAnchor::UpperLeft), "H");
+        let screen = GameScreen {
+            size: [1920.0, 1080.0],
+            origin: [10.0, 20.0],
+            scale: 0.5,
+            clip: Rect::new(10.0, 20.0, 960.0, 540.0),
+        };
+        let mut painter = Painter::new();
+        painter.paint_layers(
+            &[(&canvas, Placement::screen(&screen))],
+            &mut Fake::default(),
+        );
+        let quads = painter.frame().quads;
+        assert_eq!(quads.len(), 3, "{quads:?}");
+        assert_eq!(quads[0].rect, [10.0, 20.0, 60.0, 70.0]);
+        assert_eq!(
+            quads[1].rect,
+            [10.0, 20.0, 35.0, 70.0],
+            "cut at the screen's edge"
+        );
+
+        let full = paint(&text(label, TextAnchor::UpperLeft, "H"));
+        let height = |quad: &UiQuad| quad.rect[3] - quad.rect[1];
+        let ratio = height(&quads[2]) / height(&full.frame().quads[0]);
+        assert!((ratio - 0.5).abs() < 0.1, "set at half the size: {ratio}");
+        assert!(quads[2].rect[1] >= 120.0, "below its place in the screen");
+    }
+
     /// The retained layer goes under the immediate one, and a panel on each is
     /// still one draw.
     #[test]
@@ -1079,7 +1187,13 @@ mod tests {
         let mut over = UiCanvas::default();
         over.panel(rect, [2, 0, 0, 255]);
         let mut painter = Painter::new();
-        painter.paint_layers(&[&under, &over], &mut Fake::default());
+        painter.paint_layers(
+            &[
+                (&under, Placement::UNBOUNDED),
+                (&over, Placement::UNBOUNDED),
+            ],
+            &mut Fake::default(),
+        );
         let frame = painter.frame();
         let colours: Vec<u8> = frame.quads.iter().map(|q| q.color[0]).collect();
         assert_eq!(colours, [1, 2]);

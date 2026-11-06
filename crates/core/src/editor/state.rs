@@ -264,6 +264,8 @@ pub struct EditorState {
     /// UI mode: clicks in the scene pick UI elements, and the selected one
     /// gets the rect tool instead of the transform gizmo.
     pub ui_mode: bool,
+    /// The resolution the viewport shows the game's UI at.
+    pub preview: super::preview::Preview,
     /// A drag of the rect tool, while the button is held.
     pub rect_drag: Option<super::rect_tool::RectDrag>,
     /// The part of the rect tool under the pointer, or being dragged.
@@ -417,6 +419,7 @@ impl Default for EditorState {
             marquee: None,
             gizmo_strokes: Vec::new(),
             ui_mode: false,
+            preview: Default::default(),
             rect_drag: None,
             rect_hot: None,
             outline: Vec::new(),
