@@ -5,13 +5,16 @@
 //! light is a light even if it also has a mesh (a lamp model with its bulb on
 //! it), a camera likewise, and a mesh with a script is still drawn as a mesh,
 //! because what it looks like in the scene is how the user goes looking for it.
+//! A UI element takes the icon of its most telling component, the one that
+//! component's inspector section wears.
 
 use egui::Color32;
 use orrin_ecs::{Entity, World};
 
-use super::{icons, theme};
+use super::{catalog, icons, theme};
 #[cfg(feature = "scripting")]
 use crate::scene::ScriptComponent;
+use crate::scene::registry as ids;
 use crate::scene::{CameraComponent, Light, MeshHandle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +30,12 @@ pub enum Kind {
         allow(dead_code, reason = "only a script component makes one")
     )]
     Script,
+    Canvas,
+    UiElement,
+    Image,
+    Text,
+    Button,
+    ScrollFrame,
 }
 
 impl Kind {
@@ -43,11 +52,35 @@ impl Kind {
         if world.has::<MeshHandle>(entity) {
             return Self::Mesh;
         }
+        if let Some(ui) = Self::of_ui(world, entity) {
+            return ui;
+        }
         #[cfg(feature = "scripting")]
         if world.has::<ScriptComponent>(entity) {
             return Self::Script;
         }
         Self::Group
+    }
+
+    /// What it does before what it shows: a button carries an image, and a
+    /// scroll frame usually does too.
+    fn of_ui(world: &World, entity: Entity) -> Option<Self> {
+        use crate::ui::{Button, Canvas, Image, RectTransform, ScrollFrame, Text};
+        if world.has::<Canvas>(entity) {
+            Some(Self::Canvas)
+        } else if world.has::<ScrollFrame>(entity) {
+            Some(Self::ScrollFrame)
+        } else if world.has::<Button>(entity) {
+            Some(Self::Button)
+        } else if world.has::<Text>(entity) {
+            Some(Self::Text)
+        } else if world.has::<Image>(entity) {
+            Some(Self::Image)
+        } else if world.has::<RectTransform>(entity) {
+            Some(Self::UiElement)
+        } else {
+            None
+        }
     }
 
     pub fn icon(self) -> icons::Icon {
@@ -58,6 +91,12 @@ impl Kind {
             Self::Sun => icons::sun(),
             Self::Camera => icons::camera(),
             Self::Script => icons::file_code(),
+            Self::Canvas => catalog::icon(&ids::CANVAS),
+            Self::UiElement => catalog::icon(&ids::RECT_TRANSFORM),
+            Self::Image => catalog::icon(&ids::IMAGE),
+            Self::Text => catalog::icon(&ids::TEXT),
+            Self::Button => catalog::icon(&ids::BUTTON),
+            Self::ScrollFrame => catalog::icon(&ids::SCROLL_FRAME),
         }
     }
 
@@ -70,6 +109,12 @@ impl Kind {
             Self::Light | Self::Sun => theme::KIND_LIGHT,
             Self::Camera => theme::KIND_CAMERA,
             Self::Script => theme::KIND_SCRIPT,
+            Self::Canvas
+            | Self::UiElement
+            | Self::Image
+            | Self::Text
+            | Self::Button
+            | Self::ScrollFrame => theme::KIND_UI,
         }
     }
 
@@ -81,6 +126,12 @@ impl Kind {
             Self::Sun => "Sun",
             Self::Camera => "Camera",
             Self::Script => "Script",
+            Self::Canvas => "Canvas",
+            Self::UiElement => "UI Element",
+            Self::Image => "Image",
+            Self::Text => "Text",
+            Self::Button => "Button",
+            Self::ScrollFrame => "Scroll Frame",
         }
     }
 }
@@ -144,10 +195,53 @@ mod tests {
         assert_eq!(Kind::of(&world, camera), Kind::Camera);
     }
 
-    /// Kinds are told apart by their icon's tint; two that share one must
-    /// share it on purpose.
+    /// A UI element is named by what it does before what it shows: a button
+    /// carries an image, and a scroll frame usually does too.
     #[test]
-    fn only_the_two_lights_share_a_tint() {
+    fn each_ui_element_is_read_from_its_most_telling_component() {
+        use crate::ui::{Button, Canvas, Image, RectTransform, ScrollFrame, Text};
+        let mut world = World::new();
+        let spawn = |world: &mut World| {
+            let entity = world.spawn();
+            world.insert(entity, RectTransform::default());
+            entity
+        };
+        let canvas = world.spawn();
+        world.insert(canvas, Canvas::default());
+        let rect = spawn(&mut world);
+        let image = spawn(&mut world);
+        world.insert(image, Image::default());
+        let text = spawn(&mut world);
+        world.insert(text, Text::default());
+        let button = spawn(&mut world);
+        world.insert(button, Image::default());
+        world.insert(button, Button::default());
+        let scroll = spawn(&mut world);
+        world.insert(scroll, Image::default());
+        world.insert(scroll, ScrollFrame::default());
+
+        assert_eq!(Kind::of(&world, canvas), Kind::Canvas);
+        assert_eq!(Kind::of(&world, rect), Kind::UiElement);
+        assert_eq!(Kind::of(&world, image), Kind::Image);
+        assert_eq!(Kind::of(&world, text), Kind::Text);
+        assert_eq!(Kind::of(&world, button), Kind::Button);
+        assert_eq!(Kind::of(&world, scroll), Kind::ScrollFrame);
+    }
+
+    const UI: [Kind; 6] = [
+        Kind::Canvas,
+        Kind::UiElement,
+        Kind::Image,
+        Kind::Text,
+        Kind::Button,
+        Kind::ScrollFrame,
+    ];
+
+    /// Kinds are told apart by their icon's tint; two that share one must
+    /// share it on purpose — the two lights, and the UI elements, which are
+    /// told apart by their icons instead.
+    #[test]
+    fn only_the_two_lights_and_the_ui_share_a_tint() {
         let weak = Color32::GRAY;
         let kinds = [
             Kind::Group,
@@ -155,6 +249,7 @@ mod tests {
             Kind::Light,
             Kind::Camera,
             Kind::Script,
+            Kind::Canvas,
         ];
         for (i, a) in kinds.iter().enumerate() {
             for b in &kinds[i + 1..] {
@@ -162,5 +257,17 @@ mod tests {
             }
         }
         assert_eq!(Kind::Light.tint(weak), Kind::Sun.tint(weak));
+        for kind in UI {
+            assert_eq!(kind.tint(weak), Kind::Canvas.tint(weak), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn no_two_ui_kinds_share_an_icon() {
+        for (i, a) in UI.iter().enumerate() {
+            for b in &UI[i + 1..] {
+                assert_ne!(a.icon(), b.icon(), "{a:?} and {b:?}");
+            }
+        }
     }
 }

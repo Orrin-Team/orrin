@@ -873,6 +873,29 @@ mod tests {
         );
     }
 
+    /// The menu opens where it was asked for, not centred under a button that
+    /// spans the panel.
+    #[test]
+    fn the_add_menu_opens_at_the_click() {
+        let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
+        let entity = editor.spawn("Crate");
+        editor.state.selection.set(entity);
+        editor.frames(3);
+        let label = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| without_icons(text) == "Add component")
+            .map(|(_, rect)| rect)
+            .expect("the inspector offers to add a component");
+        let at = label.center();
+        editor.click(at).frames(1);
+        let menu = editor.area("add_component").expect("the add menu is open");
+        assert!(
+            (menu.left() - at.x).abs() <= 12.0 && menu.top() >= at.y && menu.top() <= at.y + 16.0,
+            "clicked at {at:?}, the menu is at {menu:?}"
+        );
+    }
+
     /// Typing narrows the menu to what matches, and Enter adds the first.
     #[test]
     fn searching_the_add_menu_narrows_it_and_enter_adds_the_match() {
@@ -2217,6 +2240,29 @@ mod tests {
             painted.iter().any(|text| text == "Scroll Frame"),
             "{painted:?}"
         );
+    }
+
+    /// A UI element's row wears the icon of what it is, not a group's dot.
+    #[test]
+    fn hierarchy_rows_show_what_a_ui_element_is() {
+        use crate::ui::create::UiKind;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        ui_spawn(&mut editor, UiKind::Button);
+        editor.dock.activate(Tab::Hierarchy);
+        editor.frames(2);
+        let tree = editor.tab_body(Tab::Hierarchy);
+        let painted: Vec<char> = editor
+            .painted_icons()
+            .into_iter()
+            .filter(|(_, rect, _)| tree.contains(rect.center()))
+            .map(|(glyph, ..)| glyph)
+            .collect();
+        for icon in [
+            crate::editor::icons::app_window(),
+            crate::editor::icons::cursor_click(),
+        ] {
+            assert!(painted.contains(&icon.glyph()), "{icon:?} in {painted:?}");
+        }
     }
 
     /// Every entry of the UI submenu wears an icon, the one its component's

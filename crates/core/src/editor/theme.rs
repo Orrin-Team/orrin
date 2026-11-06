@@ -43,6 +43,7 @@ pub const KIND_MESH: Color32 = Color32::from_rgb(0x7F, 0xA7, 0xE8);
 pub const KIND_LIGHT: Color32 = Color32::from_rgb(0xE2, 0xB6, 0x55);
 pub const KIND_CAMERA: Color32 = Color32::from_rgb(0x6C, 0xC4, 0xB8);
 pub const KIND_SCRIPT: Color32 = Color32::from_rgb(0xB1, 0x93, 0xF0);
+pub const KIND_UI: Color32 = Color32::from_rgb(0xE8, 0x8F, 0x9C);
 /// What belongs to a prefab instance, and what an instance overrides. A text
 /// colour rather than an icon tint, so it reads alongside an entity's kind.
 pub const PREFAB: Color32 = Color32::from_rgb(0x5E, 0xB8, 0xF2);

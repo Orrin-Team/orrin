@@ -502,20 +502,31 @@ fn add_component(
     let response = ui.add_enabled(!missing.is_empty(), button);
     let popup = egui::Id::new("add_component");
     let query_id = popup.with("query");
+    let at_id = popup.with("at");
     if response.clicked() {
         ui.memory_mut(|memory| memory.toggle_popup(popup));
-        ui.data_mut(|data| data.remove::<String>(query_id));
+        let at = response
+            .interact_pointer_pos()
+            .unwrap_or(response.rect.left_bottom());
+        ui.data_mut(|data| {
+            data.remove::<String>(query_id);
+            data.insert_temp(at_id, at);
+        });
     }
     if !ui.memory(|memory| memory.is_popup_open(popup)) {
         return;
     }
     // An area of its own rather than `popup_below_widget`, which holds a popup
-    // to at least the width of the button that opened it — here the panel's.
+    // to at least the width of the button that opened it — here the panel's —
+    // and opens it under the button rather than under the pointer.
+    let at: egui::Pos2 = ui
+        .data(|data| data.get_temp(at_id))
+        .unwrap_or(response.rect.left_bottom());
     let area = egui::Area::new(popup)
         .kind(egui::UiKind::Popup)
         .order(egui::Order::Foreground)
-        .fixed_pos(response.rect.center_bottom() + egui::vec2(0.0, 4.0))
-        .pivot(egui::Align2::CENTER_TOP)
+        .fixed_pos(at + egui::vec2(0.0, 4.0))
+        .pivot(egui::Align2::LEFT_TOP)
         .constrain(true)
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style())
