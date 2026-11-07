@@ -1,0 +1,105 @@
+orrin-scene 3 min-reader 3
+
+entity 3902df69-0d3f-4a44-8bfe-3b9e74dc066b "Render Settings"
+  orrin.render_settings
+    ambient
+      color = (0.6, 0.7, 1.0)
+      nits = 600.0
+    bloom
+      enabled = true
+      radius = 1.0
+      scatter = 0.7
+      strength = 0.06
+    contact_shadows
+      bias = 0.02
+      enabled = true
+      fade_distance = 25.0
+      intensity = 1.0
+      ray_length = 0.25
+      steps = 16
+      thickness = 0.2
+    decals
+      enabled = true
+    dof
+      enabled = false
+      f_number = 2.8
+      focus_distance = 4.0
+      sensor_height = 24.0
+    environment
+      background = (0.0, 0.0, 0.0)
+      exposure_offset = 0.0
+      hdri = "builtin:dusk"
+      show_skybox = true
+      sky_luminance = 30.0
+      yaw = 0.0
+    exposure
+      adaptation_brighten = 0.4
+      adaptation_darken = 1.2
+      auto_exposure = true
+      exposure_compensation = 0.0
+      manual_ev100 = 12.0
+      max_log_luminance = 17.0
+      min_log_luminance = -8.0
+    fog
+      albedo = (0.92, 0.94, 1.0)
+      anisotropy = 0.7
+      density = 0.0
+      distance = 64.0
+      feedback = 0.9
+      height = 0.0
+      height_falloff = 0.1
+      volumetric = true
+    motion_blur
+      enabled = false
+      shutter_angle = 180.0
+    refraction
+      enabled = true
+    shadows
+      atlas_resolution = 4096
+      atlas_tile_size = 512
+      cascade_count = 4
+      constant_bias = 1.25
+      enabled = true
+      lambda = 0.75
+      max_distance = 100.0
+      pullback = 50.0
+      punctual_constant_bias = 2.0
+      punctual_enabled = true
+      punctual_near = 0.05
+      punctual_slope_bias = 3.0
+      resolution = 2048
+      slope_bias = 2.5
+      strength = 1.0
+    ssao
+      bias = 0.025
+      enabled = true
+      half_resolution = true
+      power = 1.0
+      radius = 1.0
+    ssr
+      enabled = false
+      intensity = 1.0
+      max_distance = 50.0
+      max_roughness = 0.6
+      max_steps = 64
+      thickness = 0.5
+    subsurface
+      enabled = false
+      max_radius = 48.0
+      profile = (1.0, 0.354, 0.229)
+    taa
+      enabled = true
+      feedback = 0.92
+      jitter_scale = 1.0
+      msaa = false
+    transparency
+      enabled = true
+
+entity 52d7bee4-afcb-43c8-9ea5-a201695ff975 "Sun"
+  orrin.light = Directional
+    color = (1.0, 0.97, 0.92)
+    lux = 250.0
+  orrin.transform
+    rotation = (-0.4703885, 0.18815541, 0.0, 0.86216706)
+    scale = (1.0, 1.0, 1.0)
+    translation = (0.0, 0.0, 0.0)

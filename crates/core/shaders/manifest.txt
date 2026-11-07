@@ -65,3 +65,5 @@ ui_frag fragment ui.frag
 ui_vert vertex ui.vert
 ui_shape_frag fragment ui_shape.frag
 ui_shape_vert vertex ui_shape.vert
+wireframe_frag fragment wireframe.frag
+wireframe_vert vertex wireframe.vert

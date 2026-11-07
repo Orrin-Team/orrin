@@ -499,6 +499,7 @@ mod tests {
             shadow_atlas: 4096,
             async_compute,
             occlusion_culling: false,
+            wireframe: None,
         };
         let frame = declare(config).expect("the busiest frame must compile");
 

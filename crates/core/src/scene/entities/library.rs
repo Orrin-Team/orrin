@@ -644,6 +644,7 @@ fn load_mesh(
     if let Some(aabb) = backend.mesh_bounds(handle) {
         bounds.insert(handle, aabb);
     }
+    bounds.insert_geometry(handle, mesh);
 }
 
 #[cfg(test)]

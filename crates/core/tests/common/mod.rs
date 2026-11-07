@@ -26,6 +26,24 @@ fn fog_camera() -> Camera {
 pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
     vec![
         ("scene", CaptureSettings::default()),
+        // The editor's two wireframe draw modes over the same frame: edges
+        // hidden by the scene's depth, and every edge alone. Against
+        // `scene.png`, the first shows which surfaces are which triangles and
+        // that an edge sits on its own face rather than behind or in front of it.
+        (
+            "shaded-wireframe",
+            CaptureSettings {
+                wireframe: Some(orrin_core::gfx::vulkan::wireframe::Wireframe::OverShaded),
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "wireframe",
+            CaptureSettings {
+                wireframe: Some(orrin_core::gfx::vulkan::wireframe::Wireframe::Alone),
+                ..CaptureSettings::default()
+            },
+        ),
         (
             "no-refraction",
             CaptureSettings {

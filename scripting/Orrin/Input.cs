@@ -119,6 +119,21 @@ public static class Input
 
     private static uint Slot(int player) => (uint)System.Math.Max(player, 0);
 
+    /// This frame's raw mouse motion, x right and y down, in the device's own
+    /// units rather than pixels — what a first-person camera turns by. Arrives
+    /// whether or not the cursor moves, so it keeps coming at a screen edge
+    /// and while the cursor is locked.
+    public static Vector2 mouseDelta => Native.MouseDelta();
+
+    /// Hide the cursor and hold it in the window, for mouse look. A request:
+    /// the window holds it only while the game runs and has focus, and in the
+    /// editor Escape lets go, so a locked game can always be left.
+    public static bool cursorLocked
+    {
+        get => Native.CursorLocked();
+        set => Native.SetCursorLocked(value);
+    }
+
     /// Cursor position in window coordinates (physical pixels).
     public static Vector2 MousePosition
     {

@@ -1768,6 +1768,47 @@ mod tests {
         assert!(editor.painted_contains("translation"));
     }
 
+    /// The layer matrix is a triangle of checkboxes, each pair once, and a
+    /// tick goes through the edit pipeline into both of the pair's rows.
+    #[test]
+    fn the_layer_matrix_unticks_a_pair_in_the_scenes_physics_settings() {
+        use crate::scene::PhysicsSettings;
+
+        let mut editor = Harness::new(egui::vec2(1280.0, 1400.0));
+        let entity = editor.spawn("Physics");
+        editor.world.insert(entity, PhysicsSettings::default());
+        editor.state.selection.set(entity);
+        editor.frames(2);
+        assert!(editor.painted_contains("Physics Settings"));
+
+        let labels = editor.painted_text_rects();
+        let digit = |text: &str| -> Vec<egui::Rect> {
+            let mut found: Vec<egui::Rect> = labels
+                .iter()
+                .filter(|(t, _)| t == text)
+                .map(|(_, rect)| *rect)
+                .collect();
+            found.sort_by(|a, b| a.top().total_cmp(&b.top()));
+            found
+        };
+        // The column headers sit level with the row's label; a "0" anywhere
+        // else is a transform value. Row "7" is the grid's lowest.
+        let layers = digit("Layers")[0];
+        let column = digit("0")
+            .into_iter()
+            .find(|rect| (rect.center().y - layers.center().y).abs() < 4.0)
+            .expect("the matrix has a column 0")
+            .center()
+            .x;
+        let row = digit("7").last().unwrap().center().y;
+        editor.click(egui::pos2(column, row));
+        editor.state.apply(&mut editor.world, &editor.registry);
+
+        let settings = editor.world.get::<PhysicsSettings>(entity).unwrap().clone();
+        assert!(!settings.collides(7, 0) && !settings.collides(0, 7));
+        assert!(settings.collides(7, 1) && settings.collides(3, 3));
+    }
+
     /// Where the row naming `name` was painted.
     fn row_of(editor: &Harness, name: &str) -> egui::Pos2 {
         editor

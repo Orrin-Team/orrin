@@ -33,6 +33,14 @@ public abstract class Behaviour
     /// frame by definition.
     public virtual void OnCollisionExit(Collision other) { }
 
+    /// The collision callbacks' counterpart for a pair where either side is a
+    /// trigger: something entered this entity's trigger, or this entity
+    /// entered one. A trigger never calls OnCollisionEnter.
+    public virtual void OnTriggerEnter(Collision other) { }
+
+    /// Fired when a trigger pair separates; carries the last known contact.
+    public virtual void OnTriggerExit(Collision other) { }
+
     /// This entity's transform relative to its parent. For an entity with no
     /// parent it is also its world transform.
     ///

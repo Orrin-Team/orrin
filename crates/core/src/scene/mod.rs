@@ -44,8 +44,8 @@ pub use camera::{ActiveCamera, Camera, active_camera, follow_active_camera};
 pub use components::ScriptComponent;
 pub use components::{
     AmbientLight, CameraComponent, Collider, ColliderShape, Light, LocalTransform, Locked,
-    MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialHandle, MeshHandle, Name, Parent, PendingScripts, Spin,
-    Tag, UnknownComponents, WorldTransform,
+    MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialHandle, MeshHandle, Name, PHYSICS_LAYERS, Parent,
+    PendingScripts, PhysicsSettings, RigidBody, Spin, Tag, UnknownComponents, WorldTransform,
 };
 pub use contact_shadows::ContactShadowSettings;
 pub use culling::Culling;
@@ -60,10 +60,10 @@ pub use hierarchy::{
     Hierarchy, HierarchyError, can_reparent, despawn_recursive, ensure_current, is_transform_root,
     parent_world_matrix, propagate_transforms, reparent,
 };
-pub use input::{ActionId, Actions, Binding, InputState, MAX_PLAYERS};
+pub use input::{ActionId, Actions, Binding, CursorLock, InputState, MAX_PLAYERS};
 pub use loaded::{InScene, LoadedScenes, SceneHandle};
 pub use material::MaterialBlends;
-pub use mesh::{CpuMesh, MeshBounds};
+pub use mesh::{CpuMesh, MeshBounds, MeshGeometry};
 pub use motion_blur::MotionBlurSettings;
 pub use persist::{LoadIssue, instantiate, load, save, to_document};
 pub use play::{Play, PlayState};

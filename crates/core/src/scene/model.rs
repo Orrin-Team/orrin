@@ -850,6 +850,7 @@ pub fn instantiate(
             if let Some(aabb) = backend.mesh_bounds(handle) {
                 bounds.insert(handle, aabb);
             }
+            bounds.insert_geometry(handle, &primitive.mesh);
             if let Some(preview) = rendered.next() {
                 previews.insert_rendered_mesh(handle, preview);
             }

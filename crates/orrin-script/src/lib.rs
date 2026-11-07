@@ -230,6 +230,35 @@ pub struct OrrinApi {
     // Outside a story build each returns its default.
     pub story_float: extern "C" fn(*const u8, u32, f32, f32, f32) -> f32,
     pub story_bool: extern "C" fn(*const u8, u32, bool) -> bool,
+    // Physics, appended after the story controls.
+    //
+    // `add_collider` takes a `CCollider` and its byte size, checked like a
+    // component's, and queues the add like `add_box_collider` does; it is what
+    // every collider shape goes through, the two older calls included on the C#
+    // side. The pushes take a vector and a `ForceMode` (C# `Orrin.ForceMode`)
+    // and refuse anything that is not, and will not be, a dynamic body.
+    // Velocities pass `angular` as a flag choosing which of the two; the getter
+    // writes three floats. `physics_raycast` takes an origin, a direction, a
+    // length, a layer mask and whether triggers count, and writes a
+    // `CRaycastHit` of the size given.
+    pub add_collider: extern "C" fn(CEntity, *const CCollider, u32) -> bool,
+    pub physics_add_force: extern "C" fn(CEntity, f32, f32, f32, u32) -> bool,
+    pub physics_add_torque: extern "C" fn(CEntity, f32, f32, f32, u32) -> bool,
+    pub physics_get_velocity: extern "C" fn(CEntity, bool, *mut [f32; 3]) -> bool,
+    pub physics_set_velocity: extern "C" fn(CEntity, bool, f32, f32, f32) -> bool,
+    pub physics_raycast:
+        extern "C" fn(f32, f32, f32, f32, f32, f32, f32, u32, bool, *mut CRaycastHit, u32) -> bool,
+    // Mouse look, appended after physics. `mouse_delta` writes this frame's raw
+    // motion, x right and y down, in the device's own units — what a
+    // first-person camera turns by, and present whether or not the cursor
+    // moves. `set_cursor_locked` is a request; see `scene::input::cursor` for
+    // when the window honours it.
+    pub mouse_delta: extern "C" fn(*mut [f32; 2]),
+    pub set_cursor_locked: extern "C" fn(bool),
+    pub cursor_locked: extern "C" fn() -> bool,
+    // `spawn` with a transform, appended after mouse look: an empty entity
+    // that stands somewhere — a camera, a pivot. Immediate, as `spawn` is.
+    pub spawn_with_transform: extern "C" fn(*const CTransform) -> CEntity,
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -325,7 +354,34 @@ pub fn default_api() -> OrrinApi {
         tween_playing: stub_tween_query,
         story_float: stub_story_float,
         story_bool: stub_story_bool,
+        add_collider: stub_add_collider,
+        physics_add_force: stub_physics_push,
+        physics_add_torque: stub_physics_push,
+        physics_get_velocity: stub_physics_get_velocity,
+        physics_set_velocity: stub_physics_set_velocity,
+        physics_raycast: stub_physics_raycast,
+        mouse_delta: stub_mouse_delta,
+        set_cursor_locked: stub_set_cursor_locked,
+        cursor_locked: stub_cursor_locked,
+        spawn_with_transform: stub_spawn_with_transform,
     }
+}
+
+extern "C" fn stub_spawn_with_transform(_: *const CTransform) -> CEntity {
+    CEntity::NULL
+}
+
+extern "C" fn stub_mouse_delta(out: *mut [f32; 2]) {
+    if !out.is_null() {
+        // SAFETY: C# passes two writable floats.
+        unsafe { out.write_unaligned([0.0; 2]) };
+    }
+}
+
+extern "C" fn stub_set_cursor_locked(_: bool) {}
+
+extern "C" fn stub_cursor_locked() -> bool {
+    false
 }
 
 extern "C" fn stub_tween_play(_: CEntity, _: *const CTween, _: u32) -> u64 {
@@ -342,6 +398,39 @@ extern "C" fn stub_story_float(_: *const u8, _: u32, default: f32, _: f32, _: f3
 
 extern "C" fn stub_story_bool(_: *const u8, _: u32, default: bool) -> bool {
     default
+}
+
+extern "C" fn stub_add_collider(_: CEntity, _: *const CCollider, _: u32) -> bool {
+    false
+}
+
+extern "C" fn stub_physics_push(_: CEntity, _: f32, _: f32, _: f32, _: u32) -> bool {
+    false
+}
+
+extern "C" fn stub_physics_get_velocity(_: CEntity, _: bool, _: *mut [f32; 3]) -> bool {
+    false
+}
+
+extern "C" fn stub_physics_set_velocity(_: CEntity, _: bool, _: f32, _: f32, _: f32) -> bool {
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn stub_physics_raycast(
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: f32,
+    _: u32,
+    _: bool,
+    _: *mut CRaycastHit,
+    _: u32,
+) -> bool {
+    false
 }
 
 extern "C" fn stub_get_component(_: CEntity, _: u32, _: *mut u8, _: u32) -> bool {
@@ -984,6 +1073,46 @@ pub struct CShadow {
     pub spread: f32,
 }
 
+/// C ABI `scene::RigidBody`; matches C# `Orrin.Rigidbody`. Flags are whole
+/// words, as everywhere in this ABI, so neither side pads differently.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CRigidBody {
+    pub kinematic: u32,
+    pub mass: f32,
+    pub gravity_scale: f32,
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+    pub continuous: u32,
+    pub lock_rotation: u32,
+}
+
+/// C ABI `scene::Collider`, for `add_collider`; matches C# `Orrin.ColliderData`.
+/// `shape` is the C# `Orrin.ColliderShape` numbering — box, sphere, capsule,
+/// cylinder, mesh, convex hull — and `size` is read per shape: a box's half
+/// extents; a sphere's radius in `x`; a capsule's or cylinder's radius in `x`
+/// and half height in `y`; nothing for the two read from the entity's mesh.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CCollider {
+    pub shape: u32,
+    pub size: [f32; 3],
+    pub is_trigger: u32,
+    pub friction: f32,
+    pub restitution: f32,
+    pub layer: u32,
+}
+
+/// What `physics_raycast` hit; matches C# `Orrin.RaycastHit`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CRaycastHit {
+    pub entity: CEntity,
+    pub point: [f32; 3],
+    pub normal: [f32; 3],
+    pub distance: f32,
+}
+
 /// C ABI `ui::ScrollFrame`; matches C# `Orrin.ScrollFrame`. `scrollbar` is C#
 /// `Orrin.ScrollbarVisibility`.
 #[repr(C)]
@@ -1127,6 +1256,8 @@ pub struct ScriptHost {
     disable_fn: extern "system" fn(u64) -> u8,
     collision_enter_fn: extern "system" fn(u64, *const CCollision) -> u8,
     collision_exit_fn: extern "system" fn(u64, *const CCollision) -> u8,
+    trigger_enter_fn: extern "system" fn(u64, *const CCollision) -> u8,
+    trigger_exit_fn: extern "system" fn(u64, *const CCollision) -> u8,
     // Returns 0 handled, 1 faulted, 2 not handled; see `Delivery`.
     pointer_fn: extern "system" fn(u64, u32, *const CPointerEvent) -> u8,
     // Runs and forgets whatever the game asked to happen when tween `id`
@@ -1200,7 +1331,7 @@ impl ScriptHost {
         #[rustfmt::skip]
         let (
             init, create_fn, start_fn, update_fn, enable_fn, disable_fn,
-            collision_enter_fn, collision_exit_fn, pointer_fn,
+            collision_enter_fn, collision_exit_fn, trigger_enter_fn, trigger_exit_fn, pointer_fn,
             tween_complete_fn, story_names_fn, story_build_fn, destroy,
             game_load_fn, game_commit_fn, game_rollback_fn, game_unload_fn,
             state_capture_fn, state_apply_fn, state_discard_fn,
@@ -1239,6 +1370,14 @@ impl ScriptHost {
                 *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision) -> u8>(
                     pdcstr!("Orrin.Behaviours, Orrin"),
                     pdcstr!("CollisionExit"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision) -> u8>(
+                    pdcstr!("Orrin.Behaviours, Orrin"),
+                    pdcstr!("TriggerEnter"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision) -> u8>(
+                    pdcstr!("Orrin.Behaviours, Orrin"),
+                    pdcstr!("TriggerExit"),
                 )?,
                 *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, u32, *const CPointerEvent) -> u8>(
                     pdcstr!("Orrin.Behaviours, Orrin"),
@@ -1336,6 +1475,8 @@ impl ScriptHost {
             disable_fn,
             collision_enter_fn,
             collision_exit_fn,
+            trigger_enter_fn,
+            trigger_exit_fn,
             pointer_fn,
             tween_complete_fn,
             story_names_fn,
@@ -1429,6 +1570,16 @@ impl ScriptHost {
 
     pub fn collision_exit(&self, handle: u64, collision: &CCollision) -> bool {
         (self.collision_exit_fn)(handle, collision) != 0
+    }
+
+    /// The trigger half of the same pair: a contact where either side is a
+    /// trigger goes here instead.
+    pub fn trigger_enter(&self, handle: u64, collision: &CCollision) -> bool {
+        (self.trigger_enter_fn)(handle, collision) != 0
+    }
+
+    pub fn trigger_exit(&self, handle: u64, collision: &CCollision) -> bool {
+        (self.trigger_exit_fn)(handle, collision) != 0
     }
 
     /// Offer pointer event `kind` (C# `Orrin.PointerEventKind`) to a behaviour.

@@ -18,6 +18,7 @@ public enum ComponentKind : uint
     Stroke = 11,
     Shadow = 12,
     ScrollFrame = 13,
+    Rigidbody = 14,
 }
 
 internal static class ComponentKinds
@@ -40,6 +41,7 @@ internal static class ComponentKinds
         if (typeof(T) == typeof(Stroke)) return (uint)ComponentKind.Stroke;
         if (typeof(T) == typeof(Shadow)) return (uint)ComponentKind.Shadow;
         if (typeof(T) == typeof(ScrollFrame)) return (uint)ComponentKind.ScrollFrame;
+        if (typeof(T) == typeof(Rigidbody)) return (uint)ComponentKind.Rigidbody;
         throw new ArgumentException($"{typeof(T).Name} is not a script-visible engine component");
     }
 
@@ -58,6 +60,7 @@ internal static class ComponentKinds
         if (typeof(T) == typeof(Stroke)) return (uint)ComponentKind.Stroke;
         if (typeof(T) == typeof(Shadow)) return (uint)ComponentKind.Shadow;
         if (typeof(T) == typeof(ScrollFrame)) return (uint)ComponentKind.ScrollFrame;
+        if (typeof(T) == typeof(Rigidbody)) return (uint)ComponentKind.Rigidbody;
         throw new ArgumentException(
             $"{typeof(T).Name} is not read or written as a struct; it has calls of its own on World");
     }

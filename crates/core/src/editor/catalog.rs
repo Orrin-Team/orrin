@@ -46,6 +46,8 @@ const TABLE: &[(ComponentId, Group, Icon)] = &[
     (id::CAMERA, Group::Rendering, icons::camera()),
     (id::RENDER_SETTINGS, Group::Rendering, icons::sliders()),
     (id::COLLIDER, Group::Physics, icons::cube_transparent()),
+    (id::RIGID_BODY, Group::Physics, icons::circle()),
+    (id::PHYSICS_SETTINGS, Group::Physics, icons::globe()),
     (id::CANVAS, Group::Ui, icons::app_window()),
     (id::RECT_TRANSFORM, Group::Ui, icons::bounding_box()),
     (id::IMAGE, Group::Ui, icons::image()),

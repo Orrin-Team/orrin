@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use glam::Vec3;
 
 use crate::geom::Aabb;
@@ -10,15 +12,46 @@ pub struct CpuMesh {
     pub indices: Vec<u32>,
 }
 
-/// Object-space bounds of every uploaded mesh, indexed by [`MeshHandle`].
+/// Object-space bounds of every uploaded mesh, indexed by [`MeshHandle`], and
+/// the triangles physics builds a mesh collider from.
 ///
 /// The world-side mirror of what the backend derived at upload: culling runs in
 /// extraction, which has a `World` and no renderer. Uploads only ever append, so
 /// a handle's slot never changes meaning — a scene load resolves names against
 /// the meshes already uploaded rather than re-uploading them.
+///
+/// The triangles live here rather than in a table of their own because every
+/// upload already registers its bounds here, so a mesh cannot reach the world
+/// without them. They cost every mesh a CPU copy of its positions and indices,
+/// 24 bytes a triangle for a closed mesh, whether or not anything collides with
+/// it; the renderer keeps no copy to read back from.
 #[derive(Default)]
 pub struct MeshBounds {
     bounds: Vec<Aabb>,
+    geometry: Vec<Option<Arc<MeshGeometry>>>,
+}
+
+/// A mesh as a collider sees it: object-space positions and their triangles.
+/// Shared by reference, because a collider's shape cache is keyed by which
+/// copy it was built from — an asset reimport replaces it, and every body built
+/// from the old one is rebuilt.
+#[derive(Debug, PartialEq)]
+pub struct MeshGeometry {
+    pub positions: Vec<Vec3>,
+    pub triangles: Vec<[u32; 3]>,
+}
+
+impl MeshGeometry {
+    pub fn from_mesh(mesh: &CpuMesh) -> Self {
+        Self {
+            positions: mesh
+                .vertices
+                .iter()
+                .map(|v| Vec3::from(v.position))
+                .collect(),
+            triangles: mesh.indices.as_chunks::<3>().0.to_vec(),
+        }
+    }
 }
 
 impl MeshBounds {
@@ -36,6 +69,18 @@ impl MeshBounds {
     /// rather than cull what it cannot measure.
     pub fn get(&self, handle: MeshHandle) -> Option<Aabb> {
         self.bounds.get(handle.0 as usize).copied()
+    }
+
+    pub fn insert_geometry(&mut self, handle: MeshHandle, mesh: &CpuMesh) {
+        let index = handle.0 as usize;
+        if self.geometry.len() <= index {
+            self.geometry.resize(index + 1, None);
+        }
+        self.geometry[index] = Some(Arc::new(MeshGeometry::from_mesh(mesh)));
+    }
+
+    pub fn geometry(&self, handle: MeshHandle) -> Option<&Arc<MeshGeometry>> {
+        self.geometry.get(handle.0 as usize)?.as_ref()
     }
 }
 

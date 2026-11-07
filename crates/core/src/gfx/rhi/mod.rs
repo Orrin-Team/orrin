@@ -29,9 +29,9 @@ pub(crate) use pool::Pool;
 pub use desc::{
     Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, ColorAttachment,
     ComputePipelineDesc, CullMode, DepthAttachment, DepthCompare, DepthRect, DepthTest, Feature,
-    GraphicsPipelineDesc, LoadOp, MemoryLocation, RenderTargets, SamplerDesc, StoreOp, TextureDesc,
-    TextureDimension, TextureSwizzle, Topology, VertexAttribute, VertexFormat, VertexStream,
-    Viewport,
+    GeometryStream, GraphicsPipelineDesc, LoadOp, MemoryLocation, RenderTargets, SamplerDesc,
+    StoreOp, TextureDesc, TextureDimension, TextureSwizzle, Topology, VertexAttribute,
+    VertexFormat, VertexStream, Viewport,
 };
 
 use super::format::Format;

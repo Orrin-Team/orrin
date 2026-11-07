@@ -85,6 +85,7 @@ pub fn body(
             mesh_section(ui, world, state, entity, previews, &filter);
             material_section(ui, world, state, entity, previews, &filter);
             light_section(ui, world, state, entity, &filter);
+            physics_section(ui, world, state, entity, &filter);
             super::ui_sections::sections(ui, world, state, entity, &filter);
             #[cfg(feature = "scripting")]
             script_section(ui, world, entity, &filter);
@@ -379,7 +380,7 @@ fn prefab_section(
 /// which is what makes a component the engine has never heard of, registered by
 /// a game assembly after a hot reload, inspectable without a panel being written
 /// for it.
-const HAND_DRAWN: [orrin_registry::ComponentId; 15] = [
+const HAND_DRAWN: [orrin_registry::ComponentId; 16] = [
     crate::scene::registry::TRANSFORM,
     crate::scene::registry::NAME,
     crate::scene::registry::LIGHT,
@@ -395,6 +396,7 @@ const HAND_DRAWN: [orrin_registry::ComponentId; 15] = [
     crate::scene::registry::STROKE,
     crate::scene::registry::SHADOW,
     crate::scene::registry::SCROLL_FRAME,
+    crate::scene::registry::PHYSICS_SETTINGS,
 ];
 
 /// Draw every registered component that has no section of its own.
@@ -1440,6 +1442,104 @@ fn light_section(
     }
 }
 
+/// The scene's physics, with its layer matrix as Unity draws one: a triangle
+/// of checkboxes, each pair once, rather than the eight bitmasks it is stored
+/// as.
+fn physics_section(
+    ui: &mut egui::Ui,
+    world: &World,
+    state: &mut EditorState,
+    entity: Entity,
+    filter: &Filter,
+) {
+    use crate::scene::{PHYSICS_LAYERS, PhysicsSettings};
+
+    let Some(before) = world.get::<PhysicsSettings>(entity).map(|s| s.clone()) else {
+        return;
+    };
+    let labels = [
+        "Gravity",
+        "Steps per second",
+        "Max steps per frame",
+        "Layers",
+    ];
+    let Some(rows) = filter.section("Physics Settings", &labels) else {
+        return;
+    };
+    let mut settings = before.clone();
+    let defaults = PhysicsSettings::default();
+    widgets::section(
+        ui,
+        ui.id().with("physics_settings"),
+        icons::globe(),
+        crate::editor::theme::KIND_PHYSICS,
+        "Physics Settings",
+        None,
+        |ui| {
+            if rows.shows("Gravity") {
+                let mut gravity = settings.gravity.to_array();
+                transform_row(
+                    ui,
+                    "Gravity",
+                    &mut gravity,
+                    defaults.gravity.to_array(),
+                    0.1,
+                    " m/s²",
+                );
+                settings.gravity = glam::Vec3::from_array(gravity);
+            }
+            if rows.shows("Steps per second") {
+                widgets::property(ui, "Steps per second", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut settings.steps_per_second, 10..=240).suffix(" Hz"),
+                    )
+                    .on_hover_text(
+                        "Higher stacks stiffer and costs proportionally more; \
+                             the frame interpolates between steps either way",
+                    );
+                });
+            }
+            if rows.shows("Max steps per frame") {
+                widgets::property(ui, "Max steps per frame", |ui| {
+                    ui.add(egui::Slider::new(&mut settings.max_steps_per_frame, 1..=16))
+                        .on_hover_text(
+                            "A slower frame drops the rest of its time rather than \
+                             spend more steps catching up",
+                        );
+                });
+            }
+            if rows.shows("Layers") {
+                widgets::property(ui, "Layers", |ui| {
+                    egui::Grid::new(ui.id().with("layer_matrix"))
+                        .spacing([2.0, 2.0])
+                        .show(ui, |ui| {
+                            ui.label("");
+                            for column in 0..PHYSICS_LAYERS {
+                                ui.weak(column.to_string());
+                            }
+                            ui.end_row();
+                            for row in 0..PHYSICS_LAYERS {
+                                ui.weak(row.to_string());
+                                for column in 0..=row {
+                                    let mut collide = settings.collides(row, column);
+                                    let hint = format!("Layer {row} meets layer {column}");
+                                    if ui.checkbox(&mut collide, "").on_hover_text(hint).changed() {
+                                        settings.set_collides(row, column, collide);
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+            }
+        },
+    );
+    let after = settings.to_value();
+    if !orrin_registry::diff(&before.to_value(), &after).is_empty() {
+        state.edit(entity, crate::scene::registry::PHYSICS_SETTINGS, after);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1483,6 +1583,7 @@ mod tests {
             [
                 "orrin.tag",
                 "orrin.collider",
+                "orrin.rigid_body",
                 "orrin.spin",
                 "orrin.locked",
                 "orrin.render_settings",
@@ -1624,7 +1725,7 @@ mod tests {
             entity,
             Collider {
                 shape: ColliderShape::Sphere { radius: 1.0 },
-                is_trigger: false,
+                ..Collider::default()
             },
         );
 

@@ -167,9 +167,10 @@ pub fn spawn_stress_scene(world: &mut World, spec: &StressSpec) {
                 } else {
                     ColliderShape::Sphere { radius: 0.5 }
                 },
-                // A third are triggers, so the resolver is exercised without
-                // every pair pushing the scene apart.
+                // A third are triggers, so the load reports both kinds of
+                // contact.
                 is_trigger: index % 3 == 0,
+                ..Collider::default()
             })
             .id();
     }

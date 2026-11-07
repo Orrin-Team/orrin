@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Has to agree with the assembly half of `scripts.entry` in orrin.toml. -->
+    <AssemblyName>MovementDemo</AssemblyName>
+    <RootNamespace>DemoGame</RootNamespace>
+    <GenerateRuntimeConfigurationFiles>false</GenerateRuntimeConfigurationFiles>
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
+    <DefineConstants>$(DefineConstants);ORRIN_DEBUG</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The gameplay is the engine demo's own, compiled in by link rather than
+         copied, so the game this exports and the one `tests/movement.rs`
+         holds to its numbers are the same source. -->
+    <Compile Include="../../../scripting/DemoGame/FpsPlayer.cs" Link="FpsPlayer.cs" />
+    <Compile Include="../../../scripting/DemoGame/BallLauncher.cs" Link="BallLauncher.cs" />
+    <Compile Include="../../../scripting/DemoGame/Target.cs" Link="Target.cs" />
+    <Compile Include="../../../scripting/DemoGame/MovementDemo.cs" Link="MovementDemo.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- `Private=false`: one Orrin.dll, the engine's. See examples/hello-orrin. -->
+    <ProjectReference Include="../../../scripting/Orrin/Orrin.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

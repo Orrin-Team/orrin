@@ -8,6 +8,8 @@ mod mesh_handle;
 mod name;
 mod parent;
 mod pending_scripts;
+mod physics_settings;
+mod rigid_body;
 #[cfg(feature = "scripting")]
 mod script;
 mod spin;
@@ -25,6 +27,8 @@ pub use mesh_handle::MeshHandle;
 pub use name::Name;
 pub use parent::Parent;
 pub use pending_scripts::PendingScripts;
+pub use physics_settings::{PHYSICS_LAYERS, PhysicsSettings};
+pub use rigid_body::RigidBody;
 #[cfg(feature = "scripting")]
 pub use script::ScriptComponent;
 pub use spin::Spin;

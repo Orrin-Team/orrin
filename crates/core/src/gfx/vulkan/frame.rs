@@ -192,6 +192,9 @@ pub struct FrameConfig {
     /// *smaller* than the frustum's, so the two have to be comparable on one
     /// binary to say what the difference cost and what it drew.
     pub occlusion_culling: bool,
+    /// The viewport's wireframe draw mode, when it is not plain shaded. The
+    /// editor's, so it needs the overlay too; `None` declares no node.
+    pub wireframe: Option<super::wireframe::Wireframe>,
 }
 
 /// Which piece of engine code a graph node runs.
@@ -285,6 +288,8 @@ pub enum PassBody {
     OutlineMask,
     /// The outline round the mask's shapes, over the tonemapped frame.
     Outline,
+    /// The viewport's wireframe, over the tonemapped frame or alone.
+    Wireframe,
     /// The editor's transform handles, over the tonemapped frame.
     Gizmo,
     Overlay,
@@ -352,6 +357,8 @@ pub struct FrameIds {
     /// Which pixels the selection outline is drawn around: red where a selected
     /// mesh covers, green where the hovered one does. With the editor only.
     pub outline_mask: Option<ResourceId>,
+    /// The wireframe's mode, and the depth it hides edges with when it has one.
+    pub wireframe: Option<(super::wireframe::Wireframe, Option<ResourceId>)>,
 }
 
 /// The two chains bloom needs, each level a separate image.
@@ -857,13 +864,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         || config.ssr
         || config.transparency
         || config.refraction
-        || config.occlusion_culling)
-        .then(|| PrepassIds {
-            normal: builder.create_image("prepass_normal", ImageDesc::new(NORMAL_FORMAT)),
-            velocity: builder.create_image("prepass_velocity", ImageDesc::new(VELOCITY_FORMAT)),
-            material: builder.create_image("prepass_material", ImageDesc::new(MATERIAL_FORMAT)),
-            depth: builder.create_image("prepass_depth", ImageDesc::new(DEPTH_FORMAT)),
-        });
+        || config.occlusion_culling
+        // What the wireframe hides covered edges with.
+        || (config.overlay && config.wireframe == Some(super::wireframe::Wireframe::OverShaded)))
+    .then(|| PrepassIds {
+        normal: builder.create_image("prepass_normal", ImageDesc::new(NORMAL_FORMAT)),
+        velocity: builder.create_image("prepass_velocity", ImageDesc::new(VELOCITY_FORMAT)),
+        material: builder.create_image("prepass_material", ImageDesc::new(MATERIAL_FORMAT)),
+        depth: builder.create_image("prepass_depth", ImageDesc::new(DEPTH_FORMAT)),
+    });
 
     // Both AO images at one extent, whichever it is: the blur samples the
     // resolve's output texel for texel, and the forward pass reads the result by
@@ -1735,9 +1744,34 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .build();
     record(id, PassBody::Tonemap, &mut bodies);
 
+    // First onto the tonemapped image, so the game's UI and every other mark the
+    // editor makes stay on top of it. Over the shaded frame it reads the prepass
+    // depth to hide covered edges — read-only, so the prepass stays its only
+    // writer; alone it clears the frame and draws every edge. See
+    // `vulkan::wireframe`.
+    let wireframe = config
+        .overlay
+        .then_some(config.wireframe)
+        .flatten()
+        .map(|mode| {
+            let depth = match mode {
+                super::wireframe::Wireframe::OverShaded => prepass.as_ref().map(|p| p.depth),
+                super::wireframe::Wireframe::Alone => None,
+            };
+            let mut pass = builder
+                .pass("wireframe", PassKind::Inline)
+                .access(swapchain_color, Access::ColorAttachment);
+            if let Some(depth) = depth {
+                pass = pass.access(depth, Access::DepthAttachmentRead);
+            }
+            record(pass.build(), PassBody::Wireframe, &mut bodies);
+            (mode, depth)
+        });
+
     // Straight onto the tonemapped image, so the game's colours are the ones it
     // asked for rather than the scene's exposure of them; first among the
-    // swapchain's writers, so every mark the editor makes stays on top.
+    // swapchain's writers after the wireframe, so every mark the editor makes
+    // stays on top.
     if config.ui {
         let id = builder
             .pass("ui", PassKind::Inline)
@@ -1776,7 +1810,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         record(id, PassBody::Gizmo, &mut bodies);
     }
 
-    if config.overlay {
+    // Only into a window: offscreen there is no egui to draw and the executor
+    // skips the node, but its barriers would still name `PresentSrc`.
+    if config.overlay && config.presents {
         let id = builder
             .pass("overlay", PassKind::Raw)
             .access(swapchain_color, Access::ColorAttachment)
@@ -1811,6 +1847,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             shadows,
             shadow_atlas,
             outline_mask,
+            wireframe,
         },
         bodies,
     })

@@ -49,6 +49,11 @@ use super::record::{self, InFlight, Pending, Recorder};
 const INITIAL_VERTICES: u64 = 1 << 14;
 const INITIAL_INDICES: u64 = 1 << 15;
 
+/// Positions and indices are also storage buffers, for the wireframe, which
+/// fetches its own vertices so each corner knows which corner it is.
+const POSITION_USAGE: BufferUsage = BufferUsage::VERTEX_BUFFER.union(BufferUsage::STORAGE_BUFFER);
+const INDEX_USAGE: BufferUsage = BufferUsage::INDEX_BUFFER.union(BufferUsage::STORAGE_BUFFER);
+
 /// The shared geometry every opaque and blended pass binds.
 pub(crate) struct MeshArena {
     positions: Subbuffer<[PositionVertex]>,
@@ -68,24 +73,14 @@ impl MeshArena {
     pub(super) fn new(ctx: &VkContext) -> Self {
         let host_visible = ctx.profile.wide_bar();
         Self {
-            positions: allocate(
-                ctx,
-                BufferUsage::VERTEX_BUFFER,
-                INITIAL_VERTICES,
-                host_visible,
-            ),
+            positions: allocate(ctx, POSITION_USAGE, INITIAL_VERTICES, host_visible),
             surfaces: allocate(
                 ctx,
                 BufferUsage::VERTEX_BUFFER,
                 INITIAL_VERTICES,
                 host_visible,
             ),
-            indices: allocate(
-                ctx,
-                BufferUsage::INDEX_BUFFER,
-                INITIAL_INDICES,
-                host_visible,
-            ),
+            indices: allocate(ctx, INDEX_USAGE, INITIAL_INDICES, host_visible),
             placement: Placement::default(),
             host_visible,
             pending: Vec::new(),
@@ -110,6 +105,14 @@ impl MeshArena {
         builder
             .bind_vertex_buffers(0, self.positions.clone())
             .bind_index_buffer(self.indices.clone());
+    }
+
+    /// One of the buffers as bytes, for a shader that reads it as storage.
+    pub(super) fn storage(&self, stream: crate::gfx::rhi::GeometryStream) -> Subbuffer<[u8]> {
+        match stream {
+            crate::gfx::rhi::GeometryStream::Positions => self.positions.clone().into_bytes(),
+            crate::gfx::rhi::GeometryStream::Indices => self.indices.clone().into_bytes(),
+        }
     }
 
     /// Put a mesh into the arena and say where it landed.
@@ -185,7 +188,7 @@ impl MeshArena {
                 ctx,
                 &mut builder,
                 &self.positions,
-                BufferUsage::VERTEX_BUFFER,
+                POSITION_USAGE,
                 capacity,
                 held_vertices,
                 self.host_visible,
@@ -207,7 +210,7 @@ impl MeshArena {
                 ctx,
                 &mut builder,
                 &self.indices,
-                BufferUsage::INDEX_BUFFER,
+                INDEX_USAGE,
                 capacity,
                 held_indices,
                 self.host_visible,

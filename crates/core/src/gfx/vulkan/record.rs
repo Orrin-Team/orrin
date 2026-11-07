@@ -591,20 +591,23 @@ impl Recorder {
 
     /// Make every transfer write recorded so far visible to whatever later work
     /// on this queue reads geometry with — another arena copy, a vertex fetch,
-    /// an index fetch. What a mesh upload that is not waited on ends with: with
-    /// no fence wait between it and the next submission, this barrier is the
-    /// only thing that orders the two.
+    /// an index fetch, or the wireframe's vertex shader reading both as storage.
+    /// What a mesh upload that is not waited on ends with: with no fence wait
+    /// between it and the next submission, this barrier is the only thing that
+    /// orders the two.
     pub(super) fn transfer_to_geometry_reads(&mut self) -> &mut Self {
         let barrier = MemoryBarrier {
             src_stages: PipelineStages::ALL_TRANSFER,
             src_access: AccessFlags::TRANSFER_WRITE,
             dst_stages: PipelineStages::ALL_TRANSFER
                 | PipelineStages::VERTEX_ATTRIBUTE_INPUT
-                | PipelineStages::INDEX_INPUT,
+                | PipelineStages::INDEX_INPUT
+                | PipelineStages::VERTEX_SHADER,
             dst_access: AccessFlags::TRANSFER_READ
                 | AccessFlags::TRANSFER_WRITE
                 | AccessFlags::VERTEX_ATTRIBUTE_READ
-                | AccessFlags::INDEX_READ,
+                | AccessFlags::INDEX_READ
+                | AccessFlags::SHADER_STORAGE_READ,
             ..Default::default()
         };
         // SAFETY: a global memory barrier names no resource, so there is nothing
