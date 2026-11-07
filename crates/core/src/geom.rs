@@ -1,4 +1,5 @@
-//! Bounding volumes and the frustum test, shared by collision and rendering.
+//! Bounding volumes and the frustum test, shared by culling, picking and the
+//! shadow cascades.
 //!
 //! Culling lives above the render backend — extraction runs it before any
 //! renderer type is in reach — so the types it needs are here rather than in
@@ -109,9 +110,8 @@ impl Aabb {
         (far >= near).then_some(near)
     }
 
-    /// The axis-aligned box enclosing this one after `model` — the same
-    /// `abs(M) * half_extents` trick the collision side uses for a rotated box:
-    /// along each world axis the farthest corner picks the sign of every term,
+    /// The axis-aligned box enclosing this one after `model`, by the
+    /// `abs(M) * half_extents` trick: along each world axis the farthest corner picks the sign of every term,
     /// which is the element-wise absolute value.
     ///
     /// Enclosing, not exact: a rotated box grows. Re-deriving it from the source

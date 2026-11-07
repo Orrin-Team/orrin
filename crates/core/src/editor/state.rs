@@ -243,6 +243,11 @@ pub struct EditorState {
     pub scale_linked: bool,
     /// The frame-time readout floating in the viewport's corner.
     pub show_stats: bool,
+    /// Every collider's outline, rather than only the selection's.
+    pub show_colliders: bool,
+    /// How the viewport draws the scene: shaded, or as its edges. `None` is
+    /// shaded, which is what the renderer is handed too.
+    pub wireframe: Option<crate::gfx::vulkan::wireframe::Wireframe>,
     /// The handle being dragged, and the primary selection it was grabbed
     /// under. Dropped when the button is released or the primary changes.
     pub gizmo_drag: Option<(Entity, Drag)>,
@@ -413,6 +418,8 @@ impl Default for EditorState {
             snap_steps: SnapSteps::default(),
             scale_linked: false,
             show_stats: false,
+            show_colliders: false,
+            wireframe: None,
             gizmo_drag: None,
             gizmo_hot: None,
             hovered: None,
@@ -1197,10 +1204,17 @@ impl EditorState {
         // Contacts between entities that no longer exist would arrive as exits
         // on the first frame of the next play.
         if world
-            .get_resource::<crate::collision::CollisionState>()
+            .get_resource::<crate::physics::CollisionState>()
             .is_some()
         {
-            world.insert_resource(crate::collision::CollisionState::default());
+            world.insert_resource(crate::physics::CollisionState::default());
+        }
+        // And bodies whose velocities belong to the session that just ended.
+        if world
+            .get_resource::<crate::physics::PhysicsState>()
+            .is_some()
+        {
+            crate::physics::reset(world);
         }
         world.resource_mut::<Play>().set(PlayState::Editing);
 

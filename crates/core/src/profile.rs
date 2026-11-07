@@ -219,8 +219,8 @@ impl Drop for Scope {
 ///
 /// ```ignore
 /// {
-///     profile_scope!("collision");
-///     collision::run(&mut world);
+///     profile_scope!("physics");
+///     physics::run(&mut world, delta);
 /// }
 /// ```
 ///

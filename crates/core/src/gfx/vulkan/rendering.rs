@@ -324,6 +324,20 @@ pub(super) fn rendering_info(
         // The tonemapped frame, which the game's UI, the outline and the
         // handles are drawn over.
         PassBody::Ui | PassBody::Outline | PassBody::Gizmo => color_only(drawn_over(swapchain)),
+        // Over the frame and behind its depth, or on a cleared one with none.
+        PassBody::Wireframe => {
+            let (mode, depth) = ids.wireframe.expect("a wireframe pass without its mode");
+            let color = match mode {
+                super::wireframe::Wireframe::OverShaded => drawn_over(swapchain),
+                super::wireframe::Wireframe::Alone => {
+                    cleared(swapchain, super::wireframe::BACKGROUND)
+                }
+            };
+            RenderTargets {
+                colors: vec![color],
+                depth: depth.map(|depth| depth_borrowed(images.texture(depth))),
+            }
+        }
         // Dispatches, and the overlay, which records its own command buffer.
         PassBody::Overlay
         | PassBody::OcclusionHiz

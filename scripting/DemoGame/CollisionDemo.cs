@@ -29,7 +29,8 @@ public class CollisionDemo : Behaviour
 }
 
 // Glides toward the world origin until something is hit, then stops and turns
-// neon; separating (e.g. after the MTV push-out) logs the exit.
+// neon. Neither has a rigid body, so nothing pushes them apart: they stop
+// touching only if something moves one away, which would log the exit.
 public class Bumper : Behaviour
 {
     public float Speed = 1.5f;

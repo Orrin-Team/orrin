@@ -1,4 +1,5 @@
 mod library;
+mod physics;
 mod scene;
 mod showcase;
 mod sponza;
@@ -45,6 +46,7 @@ pub fn install_library(world: &mut World, backend: &mut impl RenderBackend) {
     world.insert_resource(material_blends);
     world.insert_resource(asset_previews);
 }
+pub use physics::{build_physics_scene, spawn_from_clicks};
 pub use showcase::build_showcase_scene;
 pub use sponza::{begin_sponza_scene, build_sponza_scene, finish_pending_scene};
 pub use stress::{StressSpec, spawn_stress_scene};
@@ -79,6 +81,10 @@ pub enum SceneChoice {
     /// [`build_sponza_scene`]: Crytek's Sponza atrium, imported from glTF. Needs
     /// the model on disk — see `scripts/fetch-sponza.sh`.
     Sponza,
+    /// [`build_physics_scene`]: a stack to knock over, and the panel that drops
+    /// more. A testbed rather than a fourth thing to look at — nothing is
+    /// captured from it.
+    Physics,
 }
 
 impl SceneChoice {
@@ -95,10 +101,11 @@ impl SceneChoice {
                 "" | "demo" | "rig" | "default" => Self::Demo,
                 "showcase" | "courtyard" => Self::Showcase,
                 "sponza" | "crytek" => Self::Sponza,
+                "physics" | "jolt" => Self::Physics,
                 other => {
                     tracing::warn!(
-                        "ORRIN_SCENE: unknown scene `{other}` (expected demo, showcase or \
-                         sponza); opening the demo scene"
+                        "ORRIN_SCENE: unknown scene `{other}` (expected demo, showcase, \
+                         sponza or physics); opening the demo scene"
                     );
                     Self::Demo
                 }
@@ -113,6 +120,7 @@ impl SceneChoice {
             Self::Demo => build_default_scene(world, backend),
             Self::Showcase => build_showcase_scene(world, backend),
             Self::Sponza => build_sponza_scene(world, backend),
+            Self::Physics => build_physics_scene(world, backend),
         }
     }
 
@@ -136,6 +144,7 @@ impl SceneChoice {
             Self::Demo => "demo",
             Self::Showcase => "showcase",
             Self::Sponza => "sponza",
+            Self::Physics => "physics",
         }
     }
 }

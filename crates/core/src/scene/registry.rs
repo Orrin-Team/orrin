@@ -2,7 +2,7 @@ use orrin_registry::{ComponentId, Registry};
 
 use super::{
     CameraComponent, Collider, Light, LocalTransform, Locked, MaterialHandle, MeshHandle, Name,
-    RenderSettings, Spin, Tag,
+    PhysicsSettings, RenderSettings, RigidBody, Spin, Tag,
 };
 
 pub const TRANSFORM: ComponentId = ComponentId::new("orrin.transform");
@@ -10,6 +10,8 @@ pub const NAME: ComponentId = orrin_registry::NAME_COMPONENT;
 pub const TAG: ComponentId = ComponentId::new("orrin.tag");
 pub const LIGHT: ComponentId = ComponentId::new("orrin.light");
 pub const COLLIDER: ComponentId = ComponentId::new("orrin.collider");
+pub const RIGID_BODY: ComponentId = ComponentId::new("orrin.rigid_body");
+pub const PHYSICS_SETTINGS: ComponentId = ComponentId::new("orrin.physics_settings");
 pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
 pub const LOCKED: ComponentId = ComponentId::new("orrin.locked");
 pub const RENDER_SETTINGS: ComponentId = ComponentId::new("orrin.render_settings");
@@ -75,9 +77,11 @@ pub fn register_components(registry: &mut Registry) {
     registry.register::<Tag>(TAG, "Tag");
     registry.register::<Light>(LIGHT, "Light");
     registry.register::<Collider>(COLLIDER, "Collider");
+    registry.register::<RigidBody>(RIGID_BODY, "Rigid Body");
     registry.register::<Spin>(SPIN, "Spin");
     registry.register::<Locked>(LOCKED, "Locked");
     registry.register::<RenderSettings>(RENDER_SETTINGS, "Render Settings");
+    registry.register::<PhysicsSettings>(PHYSICS_SETTINGS, "Physics Settings");
     registry.register::<CameraComponent>(CAMERA, "Camera");
     registry.register::<crate::ui::Canvas>(CANVAS, "Canvas");
     registry.register::<crate::ui::RectTransform>(RECT_TRANSFORM, "Rect Transform");
@@ -171,7 +175,7 @@ mod tests {
                 shape: ColliderShape::Box {
                     half_extents: Vec3::splat(0.5),
                 },
-                is_trigger: false,
+                ..Collider::default()
             },
         );
         world.insert(entity, Spin::new(Vec3::Y, 1.5));
@@ -184,7 +188,10 @@ mod tests {
             "\
 entity #1 \"Cube\"
   orrin.collider
+    friction = 0.5
     is_trigger = false
+    layer = 0
+    restitution = 0.0
     shape = Box
       half_extents = (0.5, 0.5, 0.5)
   orrin.spin
@@ -330,8 +337,46 @@ entity #1
         round_trips(&Collider {
             shape: ColliderShape::Sphere { radius: 1.5 },
             is_trigger: true,
+            ..Collider::default()
         });
+        round_trips(&Collider {
+            shape: ColliderShape::Capsule {
+                radius: 0.3,
+                half_height: 0.9,
+            },
+            is_trigger: false,
+            friction: 0.8,
+            restitution: 0.25,
+            layer: 3,
+        });
+        round_trips(&Collider {
+            shape: ColliderShape::ConvexHull,
+            ..Collider::default()
+        });
+        round_trips(&crate::scene::RigidBody {
+            continuous: true,
+            lock_rotation: true,
+            ..crate::scene::RigidBody::default()
+        });
+        let mut physics = crate::scene::PhysicsSettings::default();
+        physics.set_collides(1, 4, false);
+        round_trips(&physics);
         round_trips(&Spin::new(Vec3::new(0.0, 1.0, 1.0), 2.0));
+    }
+
+    /// A collider saved before it had a surface or a layer loads as the
+    /// collider it was, with the defaults for what it did not say.
+    #[test]
+    fn a_collider_saved_before_its_surface_existed_loads_with_the_defaults() {
+        let mut value = Collider::default().to_value();
+        let orrin_registry::Value::Struct(fields) = &mut value else {
+            panic!("a collider reflects as a struct");
+        };
+        fields.retain(|(name, _)| name == "shape" || name == "is_trigger");
+
+        let loaded = Collider::from_value(&value).expect("an old collider still loads");
+
+        assert_eq!(loaded, Collider::default());
     }
 
     #[test]

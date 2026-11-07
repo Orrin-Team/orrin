@@ -18,6 +18,11 @@ public static class World
     /// Spawn an empty entity.
     public static Entity Spawn() => Native.Spawn();
 
+    /// An empty entity standing at `transform`, at once: a camera, a pivot,
+    /// anything placed with no mesh. Its Transform can be read and written this
+    /// tick, unlike the components queued by the Add calls.
+    public static Entity Spawn(Transform transform) => Native.SpawnWithTransform(transform);
+
     /// Queue the entity for despawn at the end of this tick. Returns false if
     /// the handle was already stale.
     public static bool Despawn(Entity entity) => Native.Despawn(entity);
@@ -36,15 +41,11 @@ public static class World
     /// tick won't see it yet. Returns false if the handle was stale.
     public static bool SetTag(Entity entity, string tag) => Native.SetTag(entity, tag);
 
-    /// Queue attaching a collision shape to `entity`; it starts participating
-    /// in collision detection next frame. Returns false if the handle was
-    /// stale.
-    public static bool AddCollider(Entity entity, Collider collider) => collider switch
-    {
-        BoxCollider box => Native.AddBoxCollider(entity, box.HalfExtents, box.IsTrigger),
-        SphereCollider sphere => Native.AddSphereCollider(entity, sphere.Radius, sphere.IsTrigger),
-        _ => throw new ArgumentException($"unsupported collider type {collider.GetType().Name}"),
-    };
+    /// Queue attaching a collision shape to `entity`; it becomes a physics
+    /// body next frame — static, unless something moves it or it has a
+    /// <see cref="Rigidbody"/>. Returns false if the handle was stale.
+    public static bool AddCollider(Entity entity, Collider collider) =>
+        Native.AddCollider(entity, collider.ToData());
 
     /// Queue making `entity` a camera, looking along its Transform's -Z. It
     /// can be made <see cref="Camera.Active"/> this tick and draws from next

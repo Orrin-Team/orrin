@@ -19,7 +19,7 @@ use orrin_script::{
 };
 
 use crate::asset_db::{AssetDatabase, AssetKind, LoadState};
-use crate::collision::{CollisionEvent, CollisionEventKind, CollisionState};
+use crate::physics::{CollisionEvent, CollisionEventKind, CollisionState};
 use crate::scene::prefab::{self, Prefabs};
 use crate::scene::{
     ActionId, Actions, ActiveCamera, Assets, CameraComponent, Collider, ColliderShape, DebugLines,
@@ -212,6 +212,59 @@ extern "C" fn key_released(code: u32) -> bool {
     with_input(|input| input.key_released(code))
 }
 
+extern "C" fn mouse_delta(out: *mut [f32; 2]) {
+    if out.is_null() {
+        return;
+    }
+    let delta = orrin_script::with_world((0.0, 0.0), |world| {
+        world
+            .get_resource::<InputState>()
+            .map_or((0.0, 0.0), |input| input.mouse_delta())
+    });
+    // SAFETY: C# passes two writable floats.
+    unsafe { out.write_unaligned([delta.0, delta.1]) };
+}
+
+extern "C" fn spawn_with_transform(value: *const CTransform) -> CEntity {
+    if value.is_null() {
+        return CEntity::NULL;
+    }
+    // SAFETY: `value` is a valid `CTransform` supplied by C#.
+    let value = unsafe { *value };
+    orrin_script::with_world(CEntity::NULL, |world| {
+        let entity = world.spawn();
+        world.insert(
+            entity,
+            LocalTransform::from(crate::scene::Transform {
+                translation: Vec3::from_array(value.position),
+                rotation: Quat::from_array(value.rotation),
+                scale: Vec3::from_array(value.scale),
+            }),
+        );
+        CEntity {
+            index: entity.index,
+            generation: entity.generation,
+        }
+    })
+}
+
+extern "C" fn set_cursor_locked(locked: bool) {
+    orrin_script::with_world((), |world| {
+        if world.get_resource::<crate::scene::CursorLock>().is_none() {
+            world.insert_resource(crate::scene::CursorLock::default());
+        }
+        world.resource_mut::<crate::scene::CursorLock>().requested = locked;
+    });
+}
+
+extern "C" fn cursor_locked() -> bool {
+    orrin_script::with_world(false, |world| {
+        world
+            .get_resource::<crate::scene::CursorLock>()
+            .is_some_and(|lock| lock.requested)
+    })
+}
+
 extern "C" fn mouse_button_down(button: u32) -> bool {
     with_input(|input| input.mouse_button_down(button))
 }
@@ -398,6 +451,7 @@ extern "C" fn has_component(entity: CEntity, kind: u32) -> bool {
             KIND_CORNER => world.has::<crate::ui::Corner>(entity),
             KIND_STROKE => world.has::<crate::ui::Stroke>(entity),
             KIND_SHADOW => world.has::<crate::ui::Shadow>(entity),
+            KIND_RIGID_BODY => world.has::<crate::scene::RigidBody>(entity),
             KIND_SCROLL_FRAME => world.has::<crate::ui::ScrollFrame>(entity),
             _ => false,
         }
@@ -488,6 +542,7 @@ extern "C" fn add_box_collider(
                 half_extents: Vec3::new(hx, hy, hz),
             },
             is_trigger,
+            ..Collider::default()
         },
     )
 }
@@ -498,8 +553,165 @@ extern "C" fn add_sphere_collider(entity: CEntity, radius: f32, is_trigger: bool
         Collider {
             shape: ColliderShape::Sphere { radius },
             is_trigger,
+            ..Collider::default()
         },
     )
+}
+
+// Physics; see `OrrinApi::add_collider` and `physics` for what each means.
+
+extern "C" fn add_collider(
+    entity: CEntity,
+    collider: *const orrin_script::CCollider,
+    size: u32,
+) -> bool {
+    let Some(c) =
+        read_c::<orrin_script::CCollider>("AddCollider", KIND_COLLIDER, collider.cast(), size)
+    else {
+        return false;
+    };
+    let [x, y, z] = c.size;
+    let shape = match c.shape {
+        0 => ColliderShape::Box {
+            half_extents: Vec3::new(x, y, z),
+        },
+        1 => ColliderShape::Sphere { radius: x },
+        2 => ColliderShape::Capsule {
+            radius: x,
+            half_height: y,
+        },
+        3 => ColliderShape::Cylinder {
+            radius: x,
+            half_height: y,
+        },
+        4 => ColliderShape::Mesh,
+        5 => ColliderShape::ConvexHull,
+        other => {
+            tracing::warn!(
+                "World.AddCollider: shape {other} is not one this engine knows; rebuild \
+                 scripting/Orrin so the bindings match the engine"
+            );
+            return false;
+        }
+    };
+    let finite = c
+        .size
+        .iter()
+        .chain([&c.friction, &c.restitution])
+        .all(|v| v.is_finite());
+    if !finite {
+        tracing::warn!("World.AddCollider: every size, friction and restitution must be finite");
+        return false;
+    }
+    queue_add_collider(
+        entity,
+        Collider {
+            shape,
+            is_trigger: c.is_trigger != 0,
+            friction: c.friction,
+            restitution: c.restitution,
+            layer: c.layer,
+        },
+    )
+}
+
+fn physics_push(
+    entity: CEntity,
+    vector: [f32; 3],
+    mode: u32,
+    push: fn(&World, Entity, Vec3, crate::physics::ForceMode) -> bool,
+) -> bool {
+    let Some(mode) = crate::physics::ForceMode::from_u32(mode) else {
+        tracing::warn!("Physics: force mode {mode} is not one this engine knows");
+        return false;
+    };
+    orrin_script::with_world(false, |world| {
+        push(world, entity_of(entity), Vec3::from_array(vector), mode)
+    })
+}
+
+extern "C" fn physics_add_force(entity: CEntity, x: f32, y: f32, z: f32, mode: u32) -> bool {
+    physics_push(entity, [x, y, z], mode, crate::physics::add_force)
+}
+
+extern "C" fn physics_add_torque(entity: CEntity, x: f32, y: f32, z: f32, mode: u32) -> bool {
+    physics_push(entity, [x, y, z], mode, crate::physics::add_torque)
+}
+
+extern "C" fn physics_get_velocity(entity: CEntity, angular: bool, out: *mut [f32; 3]) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    orrin_script::with_world(false, |world| {
+        let Some((linear, spin)) = crate::physics::velocity(world, entity_of(entity)) else {
+            return false;
+        };
+        let value = if angular { spin } else { linear };
+        // SAFETY: C# passes a pointer to three writable floats.
+        unsafe { out.write_unaligned(value.to_array()) };
+        true
+    })
+}
+
+extern "C" fn physics_set_velocity(entity: CEntity, angular: bool, x: f32, y: f32, z: f32) -> bool {
+    let value = Some(Vec3::new(x, y, z));
+    let (linear, spin) = if angular {
+        (None, value)
+    } else {
+        (value, None)
+    };
+    orrin_script::with_world(false, |world| {
+        crate::physics::set_velocity(world, entity_of(entity), linear, spin)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn physics_raycast(
+    ox: f32,
+    oy: f32,
+    oz: f32,
+    dx: f32,
+    dy: f32,
+    dz: f32,
+    max_distance: f32,
+    layers: u32,
+    hit_triggers: bool,
+    out: *mut orrin_script::CRaycastHit,
+    size: u32,
+) -> bool {
+    if out.is_null() || size as usize != std::mem::size_of::<orrin_script::CRaycastHit>() {
+        tracing::warn!(
+            "Physics.Raycast: C# passed a {size}-byte hit and the engine's is {}; rebuild \
+             scripting/Orrin so the bindings match the engine",
+            std::mem::size_of::<orrin_script::CRaycastHit>()
+        );
+        return false;
+    }
+    orrin_script::with_world(false, |world| {
+        let Some(hit) = crate::physics::raycast(
+            world,
+            Vec3::new(ox, oy, oz),
+            Vec3::new(dx, dy, dz),
+            max_distance,
+            layers,
+            hit_triggers,
+        ) else {
+            return false;
+        };
+        let hit = orrin_script::CRaycastHit {
+            entity: CEntity {
+                index: hit.entity.index,
+                generation: hit.entity.generation,
+            },
+            point: hit.point.to_array(),
+            normal: hit.normal.to_array(),
+            distance: hit.distance,
+        };
+        // SAFETY: C# passes a pointer to `size` writable bytes, just checked to
+        // be a whole `CRaycastHit`; unaligned, as in `read_c`.
+        unsafe { out.write_unaligned(hit) };
+        true
+    })
 }
 
 extern "C" fn set_material(entity: CEntity, material: *const c_char) -> bool {
@@ -639,6 +851,7 @@ enum UiComponent {
     Stroke(crate::ui::Stroke),
     Shadow(crate::ui::Shadow),
     ScrollFrame(crate::ui::ScrollFrame),
+    RigidBody(crate::scene::RigidBody),
 }
 
 impl UiComponent {
@@ -654,6 +867,7 @@ impl UiComponent {
             Self::Stroke(_) => KIND_STROKE,
             Self::Shadow(_) => KIND_SHADOW,
             Self::ScrollFrame(_) => KIND_SCROLL_FRAME,
+            Self::RigidBody(_) => KIND_RIGID_BODY,
         }
     }
 
@@ -687,6 +901,9 @@ impl UiComponent {
                 world.insert(entity, c);
             }
             Self::ScrollFrame(c) => {
+                world.insert(entity, c);
+            }
+            Self::RigidBody(c) => {
                 world.insert(entity, c);
             }
         }
@@ -1249,6 +1466,9 @@ const KIND_CORNER: u32 = 10;
 const KIND_STROKE: u32 = 11;
 const KIND_SHADOW: u32 = 12;
 const KIND_SCROLL_FRAME: u32 = 13;
+const KIND_RIGID_BODY: u32 = 14;
+/// Not blittable as a component; named for `add_collider`'s messages.
+const KIND_COLLIDER: u32 = 2;
 
 fn entity_of(entity: CEntity) -> Entity {
     Entity {
@@ -1270,6 +1490,8 @@ fn kind_name(kind: u32) -> &'static str {
         KIND_STROKE => "Stroke",
         KIND_SHADOW => "Shadow",
         KIND_SCROLL_FRAME => "ScrollFrame",
+        KIND_RIGID_BODY => "Rigidbody",
+        KIND_COLLIDER => "Collider",
         _ => "an unknown component",
     }
 }
@@ -1482,6 +1704,43 @@ fn stroke_from_c(c: orrin_script::CStroke) -> Option<crate::ui::Stroke> {
     })
 }
 
+fn rigid_body_to_c(body: &crate::scene::RigidBody) -> orrin_script::CRigidBody {
+    orrin_script::CRigidBody {
+        kinematic: body.kinematic.into(),
+        mass: body.mass,
+        gravity_scale: body.gravity_scale,
+        linear_damping: body.linear_damping,
+        angular_damping: body.angular_damping,
+        continuous: body.continuous.into(),
+        lock_rotation: body.lock_rotation.into(),
+    }
+}
+
+fn rigid_body_from_c(c: orrin_script::CRigidBody) -> Option<crate::scene::RigidBody> {
+    let body = crate::scene::RigidBody {
+        kinematic: c.kinematic != 0,
+        mass: c.mass,
+        gravity_scale: c.gravity_scale,
+        linear_damping: c.linear_damping,
+        angular_damping: c.angular_damping,
+        continuous: c.continuous != 0,
+        lock_rotation: c.lock_rotation != 0,
+    };
+    let finite = [c.mass, c.gravity_scale, c.linear_damping, c.angular_damping]
+        .iter()
+        .all(|v| v.is_finite());
+    if !finite || c.mass <= 0.0 {
+        tracing::warn!(
+            "Rigidbody: a mass of {} and a gravity scale of {} is not a body; mass must be \
+             positive and every field finite",
+            c.mass,
+            c.gravity_scale
+        );
+        return None;
+    }
+    Some(body)
+}
+
 fn shadow_to_c(shadow: &crate::ui::Shadow) -> orrin_script::CShadow {
     orrin_script::CShadow {
         color: shadow.color,
@@ -1590,6 +1849,10 @@ fn decode(
         )?))),
         KIND_SCROLL_FRAME => scroll_from_c(read_c::<CScrollFrame>(call, kind, value, size)?)
             .map(UiComponent::ScrollFrame),
+        KIND_RIGID_BODY => {
+            rigid_body_from_c(read_c::<orrin_script::CRigidBody>(call, kind, value, size)?)
+                .map(UiComponent::RigidBody)
+        }
         _ => {
             tracing::warn!("World.{call}: component kind {kind} has no blittable form");
             None
@@ -1666,6 +1929,9 @@ extern "C" fn get_component(entity: CEntity, kind: u32, out: *mut u8, size: u32)
             KIND_SCROLL_FRAME => world
                 .get::<crate::ui::ScrollFrame>(entity)
                 .map(|c| write(out, size, kind, scroll_to_c(&c))),
+            KIND_RIGID_BODY => world
+                .get::<crate::scene::RigidBody>(entity)
+                .map(|c| write(out, size, kind, rigid_body_to_c(&c))),
             _ => {
                 tracing::warn!("World.GetComponent: component kind {kind} has no blittable form");
                 None
@@ -1723,6 +1989,9 @@ extern "C" fn set_component(entity: CEntity, kind: u32, value: *const u8, size: 
                 .map(|mut slot| *slot = *c),
             UiComponent::ScrollFrame(c) => world
                 .get_mut::<crate::ui::ScrollFrame>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::RigidBody(c) => world
+                .get_mut::<crate::scene::RigidBody>(entity)
                 .map(|mut slot| *slot = *c),
         };
         in_place.is_some() || with_queued(entity, kind, |queued| *queued = component).is_some()
@@ -2215,6 +2484,16 @@ fn build_api() -> OrrinApi {
         tween_playing,
         story_float,
         story_bool,
+        add_collider,
+        physics_add_force,
+        physics_add_torque,
+        physics_get_velocity,
+        physics_set_velocity,
+        physics_raycast,
+        mouse_delta,
+        set_cursor_locked,
+        cursor_locked,
+        spawn_with_transform,
         ..orrin_script::default_api()
     }
 }
@@ -2834,7 +3113,7 @@ impl Scripting {
         // Take this frame's collision events before the dispatch window opens
         // — the resource borrow must not be held while C# can re-enter the
         // world. Leftovers on an early return are cleared by the next
-        // `collision::run`.
+        // `physics::run`.
         let events: Vec<CollisionEvent> = world
             .get_resource_mut::<CollisionState>()
             .map_or_else(Vec::new, |mut state| std::mem::take(&mut state.events));
@@ -2908,12 +3187,18 @@ impl Scripting {
                         point: event.point.to_array(),
                         normal: normal.to_array(),
                     };
-                    let faulted = match event.kind {
-                        CollisionEventKind::Enter => {
+                    let faulted = match (event.kind, event.trigger) {
+                        (CollisionEventKind::Enter, false) => {
                             self.host.collision_enter(script.handle, &collision)
                         }
-                        CollisionEventKind::Exit => {
+                        (CollisionEventKind::Exit, false) => {
                             self.host.collision_exit(script.handle, &collision)
+                        }
+                        (CollisionEventKind::Enter, true) => {
+                            self.host.trigger_enter(script.handle, &collision)
+                        }
+                        (CollisionEventKind::Exit, true) => {
+                            self.host.trigger_exit(script.handle, &collision)
                         }
                     };
                     if faulted {
@@ -4455,5 +4740,275 @@ mod tests {
         });
         assert_eq!(got, 0.5);
         assert!(!story_bool(std::ptr::null(), 0, false));
+    }
+
+    fn taken_commands() -> Vec<Command> {
+        COMMANDS.with(|c| c.borrow_mut().drain(..).collect())
+    }
+
+    fn physics_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(crate::physics::CollisionState::default());
+        world.insert_resource(crate::physics::PhysicsState::default());
+        world.insert_resource(LogBuffer::default());
+        world
+    }
+
+    fn physics_frame(world: &mut World) {
+        crate::scene::propagate_transforms(world);
+        crate::physics::run(world, crate::physics::STEP);
+    }
+
+    fn collider_at(world: &mut World, position: Vec3) -> Entity {
+        world
+            .spawn_entity()
+            .with(LocalTransform::from(
+                crate::scene::Transform::from_translation(position),
+            ))
+            .with(Collider::default())
+            .id()
+    }
+
+    fn c_entity(entity: Entity) -> CEntity {
+        CEntity {
+            index: entity.index,
+            generation: entity.generation,
+        }
+    }
+
+    /// Every shape and the surface come through one call, read per shape.
+    #[test]
+    fn a_script_adds_a_capsule_trigger_with_its_surface() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        let collider = orrin_script::CCollider {
+            shape: 2,
+            size: [0.3, 0.9, 0.0],
+            is_trigger: 1,
+            friction: 0.8,
+            restitution: 0.1,
+            layer: 3,
+        };
+        taken_commands();
+
+        let added = orrin_script::with_active_world(&mut world, || {
+            add_collider(
+                c_entity(entity),
+                &collider,
+                size_of::<orrin_script::CCollider>(),
+            )
+        });
+
+        assert!(added);
+        let queued = taken_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                Command::AddCollider { collider, .. } => Some(collider),
+                _ => None,
+            });
+        assert_eq!(
+            queued,
+            Some(Collider {
+                shape: ColliderShape::Capsule {
+                    radius: 0.3,
+                    half_height: 0.9,
+                },
+                is_trigger: true,
+                friction: 0.8,
+                restitution: 0.1,
+                layer: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn a_collider_of_the_wrong_size_or_an_unknown_shape_is_refused() {
+        let mut world = World::new();
+        let entity = c_entity(world.spawn());
+        let mut collider = orrin_script::CCollider::default();
+        let size = size_of::<orrin_script::CCollider>();
+
+        let (short, unknown) = orrin_script::with_active_world(&mut world, || {
+            let short = add_collider(entity, &collider, size - 4);
+            collider.shape = 9;
+            (short, add_collider(entity, &collider, size))
+        });
+
+        assert!(!short && !unknown);
+        taken_commands();
+    }
+
+    #[test]
+    fn a_script_reads_writes_and_adds_a_rigidbody_as_a_component() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(entity, crate::scene::RigidBody::default());
+        let fresh = world.spawn();
+        let size = size_of::<orrin_script::CRigidBody>();
+        taken_commands();
+
+        let (read, written, refused, added) = orrin_script::with_active_world(&mut world, || {
+            let mut c = orrin_script::CRigidBody::default();
+            let read = get_component(c_entity(entity), KIND_RIGID_BODY, (&raw mut c).cast(), size);
+            c.mass = 3.0;
+            c.continuous = 1;
+            let written = set_component(
+                c_entity(entity),
+                KIND_RIGID_BODY,
+                (&raw const c).cast(),
+                size,
+            );
+            c.mass = 0.0;
+            let refused = !set_component(
+                c_entity(entity),
+                KIND_RIGID_BODY,
+                (&raw const c).cast(),
+                size,
+            );
+            c.mass = 2.0;
+            let added = add_component(
+                c_entity(fresh),
+                KIND_RIGID_BODY,
+                (&raw const c).cast(),
+                size,
+            );
+            (read, written, refused, added)
+        });
+
+        assert!(read && written && refused && added);
+        let body = *world.get::<crate::scene::RigidBody>(entity).unwrap();
+        assert_eq!(body.mass, 3.0);
+        assert!(body.continuous);
+        for command in taken_commands() {
+            if let Command::AddUi { entity, component } = command {
+                component.insert(&mut world, entity);
+            }
+        }
+        assert_eq!(
+            world.get::<crate::scene::RigidBody>(fresh).unwrap().mass,
+            2.0
+        );
+    }
+
+    #[test]
+    fn a_script_pushes_a_body_and_reads_its_velocity_back() {
+        let mut world = physics_world();
+        let body = collider_at(&mut world, Vec3::ZERO);
+        world.insert(
+            body,
+            crate::scene::RigidBody {
+                gravity_scale: 0.0,
+                linear_damping: 0.0,
+                ..crate::scene::RigidBody::default()
+            },
+        );
+        physics_frame(&mut world);
+
+        let (pushed, unknown_mode) = orrin_script::with_active_world(&mut world, || {
+            let pushed = physics_add_force(c_entity(body), 0.0, 0.0, -2.0, 2);
+            (pushed, physics_add_force(c_entity(body), 1.0, 0.0, 0.0, 9))
+        });
+        physics_frame(&mut world);
+        let mut velocity = [0.0; 3];
+        let read = orrin_script::with_active_world(&mut world, || {
+            physics_get_velocity(c_entity(body), false, &mut velocity)
+        });
+
+        assert!(pushed && !unknown_mode && read);
+        assert!((velocity[2] + 2.0).abs() < 1e-3, "{velocity:?}");
+    }
+
+    #[test]
+    fn a_script_raycasts_and_is_told_what_it_hit() {
+        let mut world = physics_world();
+        let wall = collider_at(&mut world, Vec3::new(0.0, 0.0, -5.0));
+        physics_frame(&mut world);
+        let size = size_of::<orrin_script::CRaycastHit>();
+        let mut hit = orrin_script::CRaycastHit {
+            entity: CEntity::NULL,
+            point: [0.0; 3],
+            normal: [0.0; 3],
+            distance: 0.0,
+        };
+
+        let (found, short) = orrin_script::with_active_world(&mut world, || {
+            let found = physics_raycast(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -1.0,
+                100.0,
+                u32::MAX,
+                false,
+                &mut hit,
+                size,
+            );
+            let mut other = hit;
+            let short = physics_raycast(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -1.0,
+                100.0,
+                u32::MAX,
+                false,
+                &mut other,
+                size - 4,
+            );
+            (found, short)
+        });
+
+        assert!(found && !short);
+        assert_eq!(
+            (hit.entity.index, hit.entity.generation),
+            (wall.index, wall.generation)
+        );
+        assert!((hit.distance - 4.5).abs() < 1e-3, "{}", hit.distance);
+    }
+
+    /// Mouse look reads the raw motion the frame accumulated, and asks for the
+    /// cursor through a request the window honours later.
+    #[test]
+    fn a_script_reads_the_mouse_motion_and_asks_for_the_cursor() {
+        let mut world = World::new();
+        let mut input = InputState::new();
+        input.on_device_event(&winit::event::DeviceEvent::MouseMotion { delta: (3.0, -2.0) });
+        input.on_device_event(&winit::event::DeviceEvent::MouseMotion { delta: (1.0, 0.5) });
+        world.insert_resource(input);
+
+        let mut delta = [0.0; 2];
+        let (before, after) = orrin_script::with_active_world(&mut world, || {
+            mouse_delta(&mut delta);
+            let before = cursor_locked();
+            set_cursor_locked(true);
+            (before, cursor_locked())
+        });
+
+        assert_eq!(delta, [4.0, -1.5]);
+        assert!(!before && after);
+        assert!(world.resource::<crate::scene::CursorLock>().requested);
+    }
+
+    /// An empty entity spawned where it stands has its transform at once, so
+    /// the same tick can read and move it.
+    #[test]
+    fn a_script_spawns_an_empty_entity_where_it_stands() {
+        let mut world = World::new();
+        let at = CTransform {
+            position: [1.0, 2.0, 3.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+        };
+
+        let spawned = orrin_script::with_active_world(&mut world, || spawn_with_transform(&at));
+
+        let entity = entity_of(spawned);
+        assert!(world.is_alive(entity));
+        let local = world.get::<LocalTransform>(entity).unwrap();
+        assert_eq!(local.translation, Vec3::new(1.0, 2.0, 3.0));
     }
 }

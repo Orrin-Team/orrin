@@ -110,6 +110,9 @@ pub struct CaptureSettings {
     /// centimetre of relief gets its own vantage point rather than a bigger
     /// image.
     pub camera: Option<Camera>,
+    /// The editor's wireframe draw mode, through the same overlay frame the
+    /// editor hands the renderer, with nothing else in it.
+    pub wireframe: Option<crate::gfx::vulkan::wireframe::Wireframe>,
 }
 
 impl Default for CaptureSettings {
@@ -130,6 +133,7 @@ impl Default for CaptureSettings {
             fog: None,
             scene: SceneChoice::default(),
             camera: None,
+            wireframe: None,
         }
     }
 }
@@ -249,6 +253,12 @@ pub fn render(
     let atlas = ShadowAtlas::default();
     let shadow_settings = ShadowSettings::default();
     let aspect = settings.extent[0] as f32 / settings.extent[1] as f32;
+    let mut overlay = settings
+        .wireframe
+        .map(|wireframe| crate::gfx::vulkan::OverlayFrame {
+            wireframe: Some(wireframe),
+            ..Default::default()
+        });
 
     for _ in 0..settings.frames.max(1) {
         // Extraction reads *world* transforms, and a freshly built scene has
@@ -310,7 +320,7 @@ pub fn render(
                 settings: &shadow_settings,
             }),
             None,
-            None,
+            overlay.as_mut(),
         );
     }
 

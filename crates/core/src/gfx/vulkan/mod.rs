@@ -40,6 +40,7 @@ mod ui;
 mod ui_window;
 mod upload;
 mod vendor;
+pub mod wireframe;
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -274,6 +275,7 @@ pub struct VulkanRenderer {
     gizmo: GizmoPass,
     /// The selection outline, over the tonemapped frame; fed like the gizmo.
     outline: OutlinePass,
+    wireframe: wireframe::WireframePass,
     /// The game's own UI, over the tonemapped frame, editor or not.
     ui: UiPass,
     /// The environment cubemap and the skybox that draws it. Also recorded into
@@ -683,6 +685,7 @@ impl VulkanRenderer {
         let gizmo = GizmoPass::new(&device, format);
         let ui = UiPass::new(&device, format);
         let outline = OutlinePass::new(&device, format);
+        let wireframe = wireframe::WireframePass::new(&device, format);
         let exposure = ExposurePass::new(&device);
         let bloom = BloomPass::new(&device);
         let prepass = GeometryPrepass::new(&device);
@@ -735,6 +738,7 @@ impl VulkanRenderer {
             shadow_atlas: 0,
             async_compute,
             occlusion_culling,
+            wireframe: None,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -766,6 +770,7 @@ impl VulkanRenderer {
             line,
             gizmo,
             outline,
+            wireframe,
             ui,
             environment,
             meshes: Vec::new(),
@@ -1684,6 +1689,7 @@ impl VulkanRenderer {
             // had, on a device with two queues as much as on one.
             async_compute: self.backend.async_compute(),
             occlusion_culling: self.occlusion_culling,
+            wireframe: overlay.as_ref().and_then(|frame| frame.wireframe),
         });
 
         // Each cascade the cache does not redraw this frame is swapped back to
@@ -2297,6 +2303,7 @@ impl VulkanRenderer {
             line: &self.line,
             gizmo: &self.gizmo,
             outline: &self.outline,
+            wireframe: &self.wireframe,
             ui: &self.ui,
             ui_frame: ui,
             motion_blur: &self.motion_blur,
@@ -2721,6 +2728,7 @@ struct FrameRecord<'a> {
     line: &'a LinePass,
     gizmo: &'a GizmoPass,
     outline: &'a OutlinePass,
+    wireframe: &'a wireframe::WireframePass,
     ui: &'a UiPass,
     ui_frame: Option<UiFrame<'a>>,
     motion_blur: &'a MotionBlurPass,
@@ -3124,7 +3132,11 @@ impl FrameRecord<'_> {
                     // while the shadows are still being drawn.
                     let swapchain = if matches!(
                         body,
-                        PassBody::Tonemap | PassBody::Ui | PassBody::Outline | PassBody::Gizmo
+                        PassBody::Tonemap
+                            | PassBody::Ui
+                            | PassBody::Wireframe
+                            | PassBody::Outline
+                            | PassBody::Gizmo
                     ) {
                         swapchain()
                     } else {
@@ -3779,6 +3791,23 @@ impl FrameRecord<'_> {
             PassBody::Gizmo => {
                 self.gizmo
                     .record(self.device, encoder, self.gizmo_strokes, self.extent);
+            }
+            PassBody::Wireframe => {
+                let (mode, depth) = self
+                    .frame
+                    .ids
+                    .wireframe
+                    .expect("a wireframe pass without its mode");
+                self.wireframe.record(
+                    self.device,
+                    encoder,
+                    mode,
+                    depth.is_some(),
+                    &[self.draws, self.transparent, self.refractive],
+                    self.meshes,
+                    self.view.unjittered_view_proj,
+                    self.extent,
+                );
             }
             PassBody::OutlineMask => {
                 self.outline.record_mask(

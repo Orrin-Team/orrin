@@ -240,6 +240,26 @@ unsafe
         && Orrin.Tween.Lanes(Orrin.TweenProperty.GradientEnd) == 4
         && Orrin.Tween.Lanes(Orrin.TweenProperty.TextSize) == 1,
         "a tween property knows how many floats it is");
+    // Physics, lock-step with CRigidBody, CCollider and CRaycastHit, and with
+    // the numbering `ForceMode::from_u32` and `add_collider` read.
+    Check(sizeof(Orrin.Rigidbody) == 28, "Rigidbody is seven words");
+    Check(sizeof(Orrin.ColliderData) == 32, "ColliderData is a shape, a Vector3 and four words");
+    Check(sizeof(Orrin.RaycastHit) == 36, "RaycastHit is an Entity, two Vector3s and a float");
+    Check((uint)Orrin.ComponentKind.Rigidbody == 14, "ComponentKind.Rigidbody is 14");
+    Check((uint)Orrin.ForceMode.Impulse == 1 && (uint)Orrin.ForceMode.Acceleration == 3,
+        "ForceMode numbers as the engine does");
+    Check((uint)Orrin.ColliderShape.Capsule == 2 && (uint)Orrin.ColliderShape.ConvexHull == 5,
+        "ColliderShape numbers as the engine does");
+    var body = new Orrin.Rigidbody { LockRotation = true };
+    Check(body.Mass == 1f && body.GravityScale == 1f && body.LinearDamping == 0.05f
+        && !body.Kinematic && !body.Continuous && body.LockRotation,
+        "a new rigid body is the engine's default, its flags read back");
+    var capsule = new Orrin.CapsuleCollider { Radius = 0.3f, HalfHeight = 0.9f, IsTrigger = true, Layer = 3 }
+        .ToData();
+    Check(capsule.Shape == Orrin.ColliderShape.Capsule && capsule.Size.x == 0.3f && capsule.Size.y == 0.9f
+        && capsule.IsTrigger == 1 && capsule.Layer == 3 && capsule.Friction == 0.5f,
+        "a capsule collider crosses as its radius and half height, with the default surface");
+
     var list = new Orrin.ScrollFrame { Horizontal = true };
     Check(list.Vertical && list.Horizontal && list.ScrollSpeed == 40f,
         "a new scroll frame is the engine's default, its flags read back");

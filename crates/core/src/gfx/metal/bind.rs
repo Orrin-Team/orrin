@@ -258,6 +258,32 @@ impl MtlDriver {
                         self.write_sampler(writer.encoder, resource.index, sampler);
                     }
                 }
+                BindingResource::Geometry(stream) => {
+                    let Some(writer) = writer_of(resource.index) else {
+                        continue;
+                    };
+                    let geometry = self
+                        .geometry
+                        .lock()
+                        .expect("a pass panicked while using the device");
+                    let buffer = match stream {
+                        crate::gfx::rhi::GeometryStream::Positions => &geometry.0.positions,
+                        crate::gfx::rhi::GeometryStream::Indices => &geometry.0.indices,
+                    };
+                    // SAFETY: a live buffer, from its start.
+                    unsafe {
+                        writer.encoder.setBuffer_offset_atIndex(
+                            Some(buffer),
+                            0,
+                            resource.index as usize,
+                        );
+                    }
+                    declare(
+                        &mut uses,
+                        ProtocolObject::from_retained(buffer.clone()),
+                        MTLResourceUsage::Read,
+                    );
+                }
                 BindingResource::StorageBuffer(id) | BindingResource::UniformBuffer(id) => {
                     let Some(writer) = writer_of(resource.index) else {
                         continue;

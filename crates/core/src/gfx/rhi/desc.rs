@@ -243,6 +243,20 @@ pub enum BindingResource {
     Texture(TextureViewId),
     Sampler(SamplerId),
     UniformBuffer(BufferId),
+    /// One of the shared geometry's buffers as a read-only storage buffer, for
+    /// a shader that fetches its own vertices. Named rather than handed over as
+    /// a `BufferId` because the driver owns the arena and replaces its buffers
+    /// when they grow: each group resolves whichever one is current.
+    Geometry(GeometryStream),
+}
+
+/// Which of the shared geometry's buffers a [`BindingResource::Geometry`] is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GeometryStream {
+    /// `PositionVertex`es.
+    Positions,
+    /// `u32`s, relative to a mesh's `vertex_offset`.
+    Indices,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -18,6 +18,7 @@
 pub mod actions;
 pub mod binding;
 pub mod config;
+mod cursor;
 pub mod gamepad;
 pub mod keys;
 mod state;
@@ -27,6 +28,7 @@ pub mod watch;
 pub use actions::{ActionId, Actions, Axis, Definition, Spec};
 pub use binding::Binding;
 pub use config::ConfigError;
+pub use cursor::{CursorLock, wants_grab};
 pub use gamepad::Gamepads;
 pub use state::InputState;
 #[cfg(feature = "scripting")]

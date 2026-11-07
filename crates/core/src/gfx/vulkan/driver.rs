@@ -1082,6 +1082,16 @@ impl VkDriver {
                         lookup(&self.buffers, buffer.0, "buffer"),
                     )
                 }
+                // The arena's current buffer, so a group made after it grew
+                // names the new one — and, being a different buffer, misses
+                // the descriptor cache rather than reusing a set over the old.
+                BindingResource::Geometry(stream) => WriteDescriptorSet::buffer(
+                    binding.binding,
+                    self.arena
+                        .read()
+                        .expect("a pass panicked while using the device")
+                        .storage(stream),
+                ),
             });
             index += 1;
         }

@@ -115,6 +115,8 @@ pub struct App {
     scene: SceneChoice,
     /// An exported game rather than the editor: see [`App::shipped_project`].
     shipped: bool,
+    /// Whether the window holds the cursor now, so a change is applied once.
+    cursor_grabbed: bool,
     /// Extra profiling load from `ORRIN_STRESS`; `None` for a normal run.
     stress: Option<StressSpec>,
     /// Kept alive for the process: dropping the messenger stops validation
@@ -238,6 +240,7 @@ impl App {
             project,
             scene: SceneChoice::from_env(),
             shipped,
+            cursor_grabbed: false,
             stress: StressSpec::from_env().filter(|spec| !spec.is_empty()),
             _debug_messenger: debug_messenger,
         };
@@ -317,8 +320,10 @@ impl App {
         world.insert_resource(FrameStats::new());
         world.insert_resource(Profiler::default());
         world.insert_resource(InputState::new());
+        world.insert_resource(crate::scene::CursorLock::default());
         world.insert_resource(Actions::new());
-        world.insert_resource(crate::collision::CollisionState::default());
+        world.insert_resource(crate::physics::CollisionState::default());
+        world.insert_resource(crate::physics::PhysicsState::default());
         world.insert_resource(LogBuffer::default());
         world.insert_resource(DebugLines::default());
         world.insert_resource(UiCanvas::default());
@@ -724,28 +729,10 @@ impl ApplicationHandler for App {
         self.world
             .resource_mut::<InputState>()
             .on_window_event(&event, egui_wants);
-        let was_looking = self.camera_controller.looking();
         // The fly camera is the editor's; in a game the camera is the scripts'.
         if !self.shipped {
             self.camera_controller
                 .process_window_event(&event, egui_wants);
-        }
-        if self.camera_controller.looking() != was_looking {
-            let looking = self.camera_controller.looking();
-            active.window.set_cursor_visible(!looking);
-            let grab = if looking {
-                CursorGrabMode::Locked
-            } else {
-                CursorGrabMode::None
-            };
-            // Locked is unsupported on some platforms; fall back to Confined.
-            let _ = active.window.set_cursor_grab(grab).or_else(|_| {
-                active.window.set_cursor_grab(if looking {
-                    CursorGrabMode::Confined
-                } else {
-                    CursorGrabMode::None
-                })
-            });
         }
 
         match event {
@@ -839,6 +826,13 @@ impl ApplicationHandler for App {
                 // Asked once, here: it consumes a paused game's step. Edit mode
                 // runs no game code — see `scene::play`.
                 let simulate = self.world.resource_mut::<crate::scene::Play>().advance();
+                apply_cursor_grab(
+                    &self.world,
+                    self.shipped,
+                    self.camera_controller.looking(),
+                    &mut self.cursor_grabbed,
+                    &active.window,
+                );
 
                 if simulate {
                     profile_scope!("spin");
@@ -856,8 +850,8 @@ impl ApplicationHandler for App {
                 // tick, so the events scripts receive match the positions
                 // they'll read this frame.
                 if simulate {
-                    profile_scope!("collision");
-                    crate::collision::run(&mut self.world);
+                    profile_scope!("physics");
+                    crate::physics::run(&mut self.world, delta);
                 }
 
                 // The UI is immediate: what this tick draws replaces the last
@@ -885,6 +879,7 @@ impl ApplicationHandler for App {
                 if simulate {
                     profile_scope!("ui events");
                     crate::ui::events::update(&mut self.world);
+                    crate::scene::entities::spawn_from_clicks(&mut self.world);
                 } else if !self.world.resource::<crate::scene::Play>().is_live() {
                     self.world
                         .resource_mut::<crate::ui::events::UiPointer>()
@@ -895,7 +890,7 @@ impl ApplicationHandler for App {
                 }
 
                 // A reload requested from the editor last frame lands here:
-                // before the tick, after collision, with no dispatch window
+                // before the tick, after physics, with no dispatch window
                 // open and no world borrow held — the only point in the frame
                 // where managed objects may be destroyed and re-created.
                 #[cfg(feature = "scripting")]
@@ -1001,13 +996,18 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // A second pass, because collision resolution, the script tick,
+                // A second pass, because the physics write-back, the script tick,
                 // and the editor have all written local transforms since the
                 // first one. Extraction reads world transforms, so without this
                 // the frame would draw everything one frame behind.
                 {
                     profile_scope!("propagate");
                     crate::scene::propagate_transforms(&mut self.world);
+                }
+                // After the propagation, so an outline is where its body is
+                // drawn this frame.
+                if overlay_on && !self.shipped {
+                    active.editor.outline_colliders(&self.world);
                 }
 
                 // After the propagation, so the view is where its camera is this
@@ -1262,6 +1262,52 @@ impl ApplicationHandler for App {
             active.window.request_redraw();
         }
     }
+}
+
+/// Hold or release the cursor for whichever of the fly camera and the game
+/// wants it — see `scene::input::cursor`. Once a frame, so the two cannot
+/// release each other's grab, and before the scripts tick, so a game that asks
+/// this frame looks from the next.
+fn apply_cursor_grab(
+    world: &World,
+    shipped: bool,
+    fly_camera_looking: bool,
+    grabbed: &mut bool,
+    window: &Window,
+) {
+    /// `Escape` in the engine's key numbering; see `scene::input::keys`.
+    const ESCAPE: u32 = 46;
+    let live = world.resource::<crate::scene::Play>().is_live();
+    let (focused, escaped) = {
+        let input = world.resource::<InputState>();
+        (input.focused(), input.key_pressed(ESCAPE))
+    };
+    let lock = {
+        let mut lock = world.resource_mut::<crate::scene::CursorLock>();
+        if !live || (escaped && !shipped) {
+            lock.requested = false;
+        }
+        *lock
+    };
+    let grab = crate::scene::input::wants_grab(fly_camera_looking, live, focused, lock);
+    if grab == *grabbed {
+        return;
+    }
+    *grabbed = grab;
+    window.set_cursor_visible(!grab);
+    let mode = if grab {
+        CursorGrabMode::Locked
+    } else {
+        CursorGrabMode::None
+    };
+    // Locked is unsupported on some platforms; fall back to Confined.
+    let _ = window.set_cursor_grab(mode).or_else(|_| {
+        window.set_cursor_grab(if grab {
+            CursorGrabMode::Confined
+        } else {
+            CursorGrabMode::None
+        })
+    });
 }
 
 /// Whether this event is the press that toggles the editor overlay.

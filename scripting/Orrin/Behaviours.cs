@@ -185,6 +185,38 @@ public static unsafe class Behaviours
         }
     }
 
+    [UnmanagedCallersOnly]
+    public static byte TriggerEnter(ulong handle, Collision* collision)
+    {
+        if (Resolve(handle) is not { } behaviour)
+            return Ok;
+        try
+        {
+            behaviour.OnTriggerEnter(*collision);
+            return Ok;
+        }
+        catch (Exception e)
+        {
+            return Fault(behaviour, nameof(Behaviour.OnTriggerEnter), e);
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    public static byte TriggerExit(ulong handle, Collision* collision)
+    {
+        if (Resolve(handle) is not { } behaviour)
+            return Ok;
+        try
+        {
+            behaviour.OnTriggerExit(*collision);
+            return Ok;
+        }
+        catch (Exception e)
+        {
+            return Fault(behaviour, nameof(Behaviour.OnTriggerExit), e);
+        }
+    }
+
     /// Offer a pointer event, a <see cref="PointerEventKind"/>, to the
     /// behaviour's handler for it. One with no handler answers Unhandled, and a
     /// handler that throws is contained and reported as a fault, which also

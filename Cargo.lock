@@ -2932,6 +2932,7 @@ dependencies = [
  "objc2-quartz-core 0.3.2",
  "orrin-build",
  "orrin-ecs",
+ "orrin-jolt",
  "orrin-project",
  "orrin-registry",
  "orrin-script",
@@ -2974,6 +2975,24 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "orrin-jolt"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc1f3d41d31df60326c27ba8fce69f7970a492c4a3717b87f78e39fef5b20b63"
+dependencies = [
+ "orrin-jolt-sys",
+]
+
+[[package]]
+name = "orrin-jolt-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa1f0799108d7172aa84d6e1e8133f22e7fd576475f86ea89d0a0b914edba4f7"
+dependencies = [
+ "cmake",
 ]
 
 [[package]]

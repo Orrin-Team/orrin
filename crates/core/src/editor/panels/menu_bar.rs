@@ -468,6 +468,20 @@ fn view(ui: &mut egui::Ui, state: &mut EditorState, themes: &ThemeSet, dock: &mu
     }
     ui.separator();
     ui.checkbox(&mut state.show_stats, "Frame stats overlay");
+    ui.checkbox(&mut state.show_colliders, "Collider outlines");
+    ui.menu_button("Draw mode", |ui| {
+        use crate::gfx::vulkan::wireframe::Wireframe;
+        for (mode, label) in [
+            (None, "Shaded"),
+            (Some(Wireframe::OverShaded), "Shaded wireframe"),
+            (Some(Wireframe::Alone), "Wireframe"),
+        ] {
+            if ui.radio(state.wireframe == mode, label).clicked() {
+                state.wireframe = mode;
+                ui.close_menu();
+            }
+        }
+    });
     ui.menu_button("Theme", |ui| {
         let active = themes.active().name.clone();
         for name in themes.names() {

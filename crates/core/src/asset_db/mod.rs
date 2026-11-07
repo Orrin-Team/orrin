@@ -1138,6 +1138,7 @@ impl AssetDatabase {
                 backend.replace_mesh(handle, &mesh);
                 if let Some(mut bounds) = world.get_resource_mut::<MeshBounds>() {
                     bounds.insert(handle, mesh.bounds());
+                    bounds.insert_geometry(handle, &mesh);
                 }
                 if let Some(mut previews) = world.get_resource_mut::<AssetPreviews>() {
                     previews.insert_rendered_mesh(handle, preview);
@@ -1179,6 +1180,7 @@ impl AssetDatabase {
                 backend.replace_mesh(MeshHandle(slot), &cube);
                 if let Some(mut bounds) = world.get_resource_mut::<MeshBounds>() {
                     bounds.insert(MeshHandle(slot), cube.bounds());
+                    bounds.insert_geometry(MeshHandle(slot), &cube);
                 }
                 self.meshes.set_resident(id, failed);
             }
@@ -1235,6 +1237,7 @@ impl AssetDatabase {
             let handle = backend.load_mesh(&mesh);
             if let Some(mut bounds) = world.get_resource_mut::<MeshBounds>() {
                 bounds.insert(handle, mesh.bounds());
+                bounds.insert_geometry(handle, &mesh);
             }
             self.meshes.bind(id, handle.0, state);
             rebound.insert(promised, handle.0);

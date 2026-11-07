@@ -33,6 +33,9 @@ Inside `crates/core/src`:
 
 - `app.rs` — winit event loop, window, per-frame driver
 - `systems.rs` — world sweep producing `FrameGeometry` (culling, cascades, lights)
+- `physics/` — rigid bodies on Jolt: colliders and `RigidBody` in, poses and
+  enter/exit events out, forces and raycasts for scripts. Read its module docs
+  before changing how a body is built or stepped
 - `gfx/graph/` — the render graph: passes declare `(resource, access)`, the
   compiler derives order, layouts and barriers. Takes no `Device`, so CI with no
   GPU asserts the exact barrier sequence
@@ -80,7 +83,7 @@ Measurement:
 cargo test --release -p orrin-core --test perf -- --ignored --nocapture
 
 # Microbenchmarks
-cargo bench -p orrin-core --bench bvh      # also: collision, startup
+cargo bench -p orrin-core --bench physics  # also: startup, sh, ui
 cargo bench -p orrin-ecs  --bench ecs
 
 # The cold-start gate architecture §6 asks for

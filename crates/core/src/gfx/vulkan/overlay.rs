@@ -37,6 +37,8 @@ pub struct OverlayFrame {
     pub gizmo: Vec<super::gizmo::GizmoVertex>,
     /// The meshes the selection outline is drawn round — see `vulkan::outline`.
     pub outline: Vec<super::outline::OutlineItem>,
+    /// The viewport's draw mode, when it is not plain shaded.
+    pub wireframe: Option<super::wireframe::Wireframe>,
 }
 
 /// egui's vertex, field for field.
@@ -506,6 +508,7 @@ mod tests {
         let mut frame = OverlayFrame {
             gizmo: Vec::new(),
             outline: Vec::new(),
+            wireframe: None,
             pixels_per_point: 1.0,
             textures: egui::TexturesDelta {
                 set: vec![
@@ -597,6 +600,7 @@ mod tests {
         let mut frame = OverlayFrame {
             gizmo: Vec::new(),
             outline: Vec::new(),
+            wireframe: None,
             pixels_per_point: 1.0,
             primitives: egui.tessellate(output.shapes, 1.0),
             textures: output.textures_delta,

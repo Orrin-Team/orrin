@@ -54,6 +54,8 @@ pub struct Editor {
     /// Whether this frame rebuilds the UI or redraws the last one. See
     /// `cadence`.
     cadence: cadence::Cadence,
+    /// Kept between frames for its allocations.
+    outline: Vec<(glam::Vec3, glam::Vec3)>,
 }
 
 /// The last chance to keep a layout: a drag in the final two seconds of a
@@ -139,6 +141,7 @@ impl Editor {
             frame: OverlayFrame::default(),
             last_layout_check: std::time::Instant::now(),
             cadence: cadence::Cadence::default(),
+            outline: Vec::new(),
         }
     }
 
@@ -284,6 +287,52 @@ impl Editor {
         self.prefs_file.save(&self.prefs);
     }
 
+    /// Outline colliders into this frame's debug lines: the selection's
+    /// always, as Unity does, and every one while the viewport toggle is on.
+    /// Every frame rather than with the UI, whose rebuilds are spaced out —
+    /// see `cadence` — because a debug line lasts one frame.
+    pub fn outline_colliders(&mut self, world: &World) {
+        const SOLID: [f32; 4] = [0.45, 0.95, 0.55, 1.0];
+        const TRIGGER: [f32; 4] = [0.95, 0.75, 0.3, 1.0];
+        let all = self.state.show_colliders;
+        let selection = &self.state.selection;
+        if !all && selection.is_empty() {
+            return;
+        }
+        let meshes = world.get_resource::<crate::scene::MeshBounds>();
+        let Some(mut lines) = world.get_resource_mut::<crate::scene::DebugLines>() else {
+            return;
+        };
+        let now = world
+            .get_resource::<crate::scene::Time>()
+            .map_or(0.0, |time| time.elapsed_time());
+        let outline = &mut self.outline;
+        world
+            .query::<(&crate::scene::WorldTransform, &crate::scene::Collider)>()
+            .for_each(|entity, (transform, collider)| {
+                if !all && !selection.contains(entity) {
+                    return;
+                }
+                let geometry = collider
+                    .shape
+                    .uses_mesh()
+                    .then(|| world.get::<crate::scene::MeshHandle>(entity))
+                    .flatten()
+                    .and_then(|handle| meshes.as_ref()?.geometry(*handle).cloned());
+                outline.clear();
+                crate::physics::outline::outline(
+                    collider.shape,
+                    transform.0,
+                    geometry.as_deref(),
+                    outline,
+                );
+                let color = if collider.is_trigger { TRIGGER } else { SOLID };
+                for &(from, to) in outline.iter() {
+                    lines.push(from, to, color, now, 0.0);
+                }
+            });
+    }
+
     /// Whether the editor moved the camera since the last call — see
     /// `EditorState::take_camera_moved`.
     pub fn take_camera_moved(&mut self) -> bool {
@@ -318,6 +367,7 @@ impl Editor {
         self.state.gizmo_strokes.clear();
         std::mem::swap(&mut frame.outline, &mut self.state.outline);
         self.state.outline.clear();
+        frame.wireframe = self.state.wireframe;
         frame.pixels_per_point = ppp;
         frame.textures.append(output.textures_delta);
         frame.primitives = self.ctx.tessellate(output.shapes, ppp);

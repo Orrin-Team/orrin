@@ -117,6 +117,24 @@ public unsafe struct OrrinApi
     // Story controls: a name as UTF-8 and its byte length, then the default.
     public delegate* unmanaged<byte*, uint, float, float, float, float> StoryFloat;
     public delegate* unmanaged<byte*, uint, byte, byte> StoryBool;
+    // Physics, appended after the story controls. A collider as ColliderData
+    // and its byte size; a push as a vector and a ForceMode; velocities with a
+    // flag choosing angular; a ray as origin, direction, length, layer mask
+    // and whether triggers count, written into a RaycastHit of the size given.
+    public delegate* unmanaged<Entity, byte*, uint, byte> AddCollider;
+    public delegate* unmanaged<Entity, float, float, float, uint, byte> PhysicsAddForce;
+    public delegate* unmanaged<Entity, float, float, float, uint, byte> PhysicsAddTorque;
+    public delegate* unmanaged<Entity, byte, float*, byte> PhysicsGetVelocity;
+    public delegate* unmanaged<Entity, byte, float, float, float, byte> PhysicsSetVelocity;
+    public delegate* unmanaged<
+        float, float, float, float, float, float, float, uint, byte, byte*, uint, byte> PhysicsRaycast;
+    // Mouse look, appended after physics: this frame's raw motion as two
+    // floats, and the cursor lock request.
+    public delegate* unmanaged<float*, void> MouseDelta;
+    public delegate* unmanaged<byte, void> SetCursorLocked;
+    public delegate* unmanaged<byte> CursorLocked;
+    // An empty entity standing at a transform, appended after mouse look.
+    public delegate* unmanaged<Transform*, Entity> SpawnWithTransform;
 }
 
 public static unsafe class Native
@@ -399,6 +417,52 @@ public static unsafe class Native
     }
 
     internal static bool TweenCancel(ulong id) => _api.TweenCancel(id) != 0;
+
+    internal static Vector2 MouseDelta()
+    {
+        var xy = stackalloc float[2];
+        _api.MouseDelta(xy);
+        return new Vector2(xy[0], xy[1]);
+    }
+
+    internal static void SetCursorLocked(bool locked) => _api.SetCursorLocked(locked ? (byte)1 : (byte)0);
+
+    internal static bool CursorLocked() => _api.CursorLocked() != 0;
+
+    internal static Entity SpawnWithTransform(Transform transform) => _api.SpawnWithTransform(&transform);
+
+    internal static bool AddCollider(Entity entity, in ColliderData collider)
+    {
+        fixed (ColliderData* p = &collider)
+            return _api.AddCollider(entity, (byte*)p, (uint)sizeof(ColliderData)) != 0;
+    }
+
+    internal static bool PhysicsAddForce(Entity entity, Vector3 force, ForceMode mode) =>
+        _api.PhysicsAddForce(entity, force.x, force.y, force.z, (uint)mode) != 0;
+
+    internal static bool PhysicsAddTorque(Entity entity, Vector3 torque, ForceMode mode) =>
+        _api.PhysicsAddTorque(entity, torque.x, torque.y, torque.z, (uint)mode) != 0;
+
+    internal static bool PhysicsGetVelocity(Entity entity, bool angular, out Vector3 velocity)
+    {
+        var xyz = stackalloc float[3];
+        var found = _api.PhysicsGetVelocity(entity, angular ? (byte)1 : (byte)0, xyz) != 0;
+        velocity = found ? new Vector3(xyz[0], xyz[1], xyz[2]) : Vector3.zero;
+        return found;
+    }
+
+    internal static bool PhysicsSetVelocity(Entity entity, bool angular, Vector3 velocity) =>
+        _api.PhysicsSetVelocity(entity, angular ? (byte)1 : (byte)0, velocity.x, velocity.y, velocity.z) != 0;
+
+    internal static bool PhysicsRaycast(
+        Vector3 origin, Vector3 direction, float maxDistance, uint layers, bool hitTriggers, out RaycastHit hit)
+    {
+        hit = default;
+        fixed (RaycastHit* p = &hit)
+            return _api.PhysicsRaycast(
+                origin.x, origin.y, origin.z, direction.x, direction.y, direction.z,
+                maxDistance, layers, hitTriggers ? (byte)1 : (byte)0, (byte*)p, (uint)sizeof(RaycastHit)) != 0;
+    }
 
     internal static bool TweenPlaying(ulong id) => _api.TweenPlaying(id) != 0;
 
