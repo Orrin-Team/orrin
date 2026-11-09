@@ -11,6 +11,7 @@ static class AssetKinds
     public const uint Material = 4;
     public const uint Scene = 5;
     public const uint Font = 6;
+    public const uint Audio = 7;
 
     public static uint Of<T>() where T : Asset
     {
@@ -26,6 +27,8 @@ static class AssetKinds
             return Scene;
         if (typeof(T) == typeof(Orrin.Font))
             return Font;
+        if (typeof(T) == typeof(AudioClip))
+            return Audio;
         throw new ArgumentException($"{typeof(T).Name} is not an asset kind the engine knows");
     }
 }

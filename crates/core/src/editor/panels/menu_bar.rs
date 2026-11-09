@@ -19,7 +19,7 @@ use orrin_registry::Registry;
 use crate::editor::catalog;
 use crate::editor::dock::{Dock, Tab};
 use crate::editor::icons;
-use crate::editor::state::{EditorState, SceneRequest, SpawnKind};
+use crate::editor::state::{EditorState, IconTints, SceneRequest, SpawnKind};
 use crate::editor::theme::ThemeSet;
 use crate::editor::widgets::{self, Tool};
 use crate::scene::registry as ids;
@@ -459,6 +459,48 @@ fn scripts(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
     }
 }
 
+/// A picker per kind of viewport icon, each drawn inline in a submenu of its
+/// own. egui closes a menu at any press outside its own areas, its submenus
+/// included, and a colour button's popup is an area of its own, so a picker
+/// opened from a button here would close the menu at its first click.
+fn icon_colours(ui: &mut egui::Ui, tints: &mut IconTints) {
+    let IconTints {
+        light,
+        sound,
+        listener,
+        camera,
+        empty,
+    } = tints;
+    for (icon, label, rgb) in [
+        (icons::lightbulb(), "Lights", light),
+        (icons::speaker_high(), "Sounds", sound),
+        (icons::ear(), "Listeners", listener),
+        (icons::camera(), "Cameras", camera),
+        (icons::circle(), "Empties", empty),
+    ] {
+        let [r, g, b] = *rgb;
+        let swatch = egui::Color32::from_rgb(r, g, b);
+        ui.menu_button(icons::with_label(icon, Some(swatch), label), |ui| {
+            let mut colour = swatch;
+            if egui::color_picker::color_picker_color32(
+                ui,
+                &mut colour,
+                egui::color_picker::Alpha::Opaque,
+            ) {
+                *rgb = [colour.r(), colour.g(), colour.b()];
+            }
+        });
+    }
+    ui.separator();
+    let changed = *tints != IconTints::default();
+    if ui
+        .add_enabled(changed, egui::Button::new("Reset colours"))
+        .clicked()
+    {
+        *tints = IconTints::default();
+    }
+}
+
 fn view(ui: &mut egui::Ui, state: &mut EditorState, themes: &ThemeSet, dock: &mut Dock) {
     for tab in Tab::ALL {
         let mut open = dock.is_open(tab);
@@ -482,6 +524,7 @@ fn view(ui: &mut egui::Ui, state: &mut EditorState, themes: &ThemeSet, dock: &mu
             }
         }
     });
+    ui.menu_button("Icon colours", |ui| icon_colours(ui, &mut state.icon_tints));
     ui.menu_button("Theme", |ui| {
         let active = themes.active().name.clone();
         for name in themes.names() {

@@ -452,6 +452,7 @@ extern "C" fn has_component(entity: CEntity, kind: u32) -> bool {
             KIND_STROKE => world.has::<crate::ui::Stroke>(entity),
             KIND_SHADOW => world.has::<crate::ui::Shadow>(entity),
             KIND_RIGID_BODY => world.has::<crate::scene::RigidBody>(entity),
+            KIND_AUDIO_SOURCE => world.has::<crate::scene::AudioSource>(entity),
             KIND_SCROLL_FRAME => world.has::<crate::ui::ScrollFrame>(entity),
             _ => false,
         }
@@ -852,6 +853,7 @@ enum UiComponent {
     Shadow(crate::ui::Shadow),
     ScrollFrame(crate::ui::ScrollFrame),
     RigidBody(crate::scene::RigidBody),
+    AudioSource(crate::scene::AudioSource),
 }
 
 impl UiComponent {
@@ -868,6 +870,7 @@ impl UiComponent {
             Self::Shadow(_) => KIND_SHADOW,
             Self::ScrollFrame(_) => KIND_SCROLL_FRAME,
             Self::RigidBody(_) => KIND_RIGID_BODY,
+            Self::AudioSource(_) => KIND_AUDIO_SOURCE,
         }
     }
 
@@ -904,6 +907,9 @@ impl UiComponent {
                 world.insert(entity, c);
             }
             Self::RigidBody(c) => {
+                world.insert(entity, c);
+            }
+            Self::AudioSource(c) => {
                 world.insert(entity, c);
             }
         }
@@ -981,6 +987,7 @@ extern "C" fn find_asset(path: *const c_char, out: *mut u8) -> u32 {
                 AssetKind::Material => orrin_script::ASSET_MATERIAL,
                 AssetKind::Scene => orrin_script::ASSET_SCENE,
                 AssetKind::Font => orrin_script::ASSET_FONT,
+                AssetKind::Audio => orrin_script::ASSET_AUDIO,
                 AssetKind::Folder => return None,
             };
             Some((entry.id, kind))
@@ -1016,7 +1023,12 @@ extern "C" fn asset_state(id: *const u8) -> u32 {
         if engine_built || indexed {
             return orrin_script::LOAD_READY;
         }
-        match world.get_resource::<AssetDatabase>().map(|db| db.state(id)) {
+        let decoded = world
+            .get_resource::<crate::audio::Audio>()
+            .and_then(|audio| audio.clip_state(id));
+        let state =
+            decoded.or_else(|| world.get_resource::<AssetDatabase>().map(|db| db.state(id)));
+        match state {
             Some(LoadState::Loading) => orrin_script::LOAD_LOADING,
             Some(LoadState::Ready) => orrin_script::LOAD_READY,
             Some(LoadState::Failed) | None => orrin_script::LOAD_FAILED,
@@ -1467,6 +1479,7 @@ const KIND_STROKE: u32 = 11;
 const KIND_SHADOW: u32 = 12;
 const KIND_SCROLL_FRAME: u32 = 13;
 const KIND_RIGID_BODY: u32 = 14;
+const KIND_AUDIO_SOURCE: u32 = 15;
 /// Not blittable as a component; named for `add_collider`'s messages.
 const KIND_COLLIDER: u32 = 2;
 
@@ -1491,6 +1504,7 @@ fn kind_name(kind: u32) -> &'static str {
         KIND_SHADOW => "Shadow",
         KIND_SCROLL_FRAME => "ScrollFrame",
         KIND_RIGID_BODY => "Rigidbody",
+        KIND_AUDIO_SOURCE => "AudioSource",
         KIND_COLLIDER => "Collider",
         _ => "an unknown component",
     }
@@ -1741,6 +1755,51 @@ fn rigid_body_from_c(c: orrin_script::CRigidBody) -> Option<crate::scene::RigidB
     Some(body)
 }
 
+fn audio_source_to_c(source: &crate::scene::AudioSource) -> orrin_script::CAudioSource {
+    orrin_script::CAudioSource {
+        clip: source.clip.to_bytes(),
+        volume: source.volume,
+        looping: source.looping.into(),
+        play_on_start: source.play_on_start.into(),
+        spatial: source.spatial.into(),
+        min_distance: source.min_distance,
+        max_distance: source.max_distance,
+        rolloff: source.rolloff as u32,
+    }
+}
+
+fn audio_source_from_c(c: orrin_script::CAudioSource) -> Option<crate::scene::AudioSource> {
+    let rolloff = rolloff_of("AudioSource", c.rolloff)?;
+    if ![c.volume, c.min_distance, c.max_distance]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        tracing::warn!("AudioSource: a volume or a distance that is not finite");
+        return None;
+    }
+    Some(crate::scene::AudioSource {
+        clip: AssetId::from_bytes(c.clip),
+        volume: c.volume,
+        looping: c.looping != 0,
+        play_on_start: c.play_on_start != 0,
+        spatial: c.spatial != 0,
+        min_distance: c.min_distance,
+        max_distance: c.max_distance,
+        rolloff,
+    })
+}
+
+fn rolloff_of(call: &str, rolloff: u32) -> Option<crate::scene::Rolloff> {
+    match rolloff {
+        0 => Some(crate::scene::Rolloff::Inverse),
+        1 => Some(crate::scene::Rolloff::Linear),
+        other => {
+            tracing::warn!("{call}: {other} is not an AudioRolloff");
+            None
+        }
+    }
+}
+
 fn shadow_to_c(shadow: &crate::ui::Shadow) -> orrin_script::CShadow {
     orrin_script::CShadow {
         color: shadow.color,
@@ -1853,6 +1912,10 @@ fn decode(
             rigid_body_from_c(read_c::<orrin_script::CRigidBody>(call, kind, value, size)?)
                 .map(UiComponent::RigidBody)
         }
+        KIND_AUDIO_SOURCE => audio_source_from_c(read_c::<orrin_script::CAudioSource>(
+            call, kind, value, size,
+        )?)
+        .map(UiComponent::AudioSource),
         _ => {
             tracing::warn!("World.{call}: component kind {kind} has no blittable form");
             None
@@ -1932,6 +1995,9 @@ extern "C" fn get_component(entity: CEntity, kind: u32, out: *mut u8, size: u32)
             KIND_RIGID_BODY => world
                 .get::<crate::scene::RigidBody>(entity)
                 .map(|c| write(out, size, kind, rigid_body_to_c(&c))),
+            KIND_AUDIO_SOURCE => world
+                .get::<crate::scene::AudioSource>(entity)
+                .map(|c| write(out, size, kind, audio_source_to_c(&c))),
             _ => {
                 tracing::warn!("World.GetComponent: component kind {kind} has no blittable form");
                 None
@@ -1992,6 +2058,9 @@ extern "C" fn set_component(entity: CEntity, kind: u32, value: *const u8, size: 
                 .map(|mut slot| *slot = *c),
             UiComponent::RigidBody(c) => world
                 .get_mut::<crate::scene::RigidBody>(entity)
+                .map(|mut slot| *slot = *c),
+            UiComponent::AudioSource(c) => world
+                .get_mut::<crate::scene::AudioSource>(entity)
                 .map(|mut slot| *slot = *c),
         };
         in_place.is_some() || with_queued(entity, kind, |queued| *queued = component).is_some()
@@ -2159,6 +2228,150 @@ extern "C" fn tween_cancel(id: u64) -> bool {
 
 extern "C" fn tween_playing(id: u64) -> bool {
     with_tweens(|tweens, id| tweens.is_playing(id), id)
+}
+
+/// The world's audio, created silent if a test world has none.
+fn audio_of(world: &mut World) -> std::cell::RefMut<'_, crate::audio::Audio> {
+    if world.get_resource::<crate::audio::Audio>().is_none() {
+        world.insert_resource(crate::audio::Audio::default());
+    }
+    world.resource_mut::<crate::audio::Audio>()
+}
+
+/// Whether `clip` is a sound in the project, refusing by name if not.
+fn is_sound(world: &World, call: &str, clip: AssetId) -> bool {
+    let checked = match world.get_resource::<AssetDatabase>() {
+        _ if clip.is_nil() => Err("the clip is the null reference".to_owned()),
+        Some(db) => db.audio_file(clip).map(drop),
+        None => Err("there is no project to find it in".to_owned()),
+    };
+    checked
+        .map_err(|error| tracing::warn!("{call}: {error}"))
+        .is_ok()
+}
+
+extern "C" fn audio_play(request: *const orrin_script::CSound, size: u32) -> u64 {
+    use crate::audio::{Emitter, Falloff, Sound};
+
+    if request.is_null() {
+        return 0;
+    }
+    let expected = std::mem::size_of::<orrin_script::CSound>() as u32;
+    if size != expected {
+        tracing::warn!(
+            "Audio.Play: C# passed {size} bytes and the engine's sound request is {expected}; \
+             rebuild scripting/Orrin so the bindings match the engine"
+        );
+        return 0;
+    }
+    // SAFETY: C# passes `size` readable bytes, just checked to be a whole
+    // `CSound`; unaligned, as in `read_c`.
+    let c = unsafe { request.cast::<orrin_script::CSound>().read_unaligned() };
+    let Some(rolloff) = rolloff_of("Audio.Play", c.rolloff) else {
+        return 0;
+    };
+    let clip = AssetId::from_bytes(c.clip);
+    orrin_script::with_world(0, |world| {
+        let emitter = match c.emitter {
+            0 => Emitter::Flat,
+            1 if c.position.iter().all(|v| v.is_finite()) => {
+                Emitter::At(glam::Vec3::from_array(c.position))
+            }
+            2 if world.is_alive(entity_of(c.entity)) => Emitter::On(entity_of(c.entity)),
+            emitter => {
+                tracing::warn!(
+                    "Audio.Play: emitter {emitter} with that position or entity is nowhere to \
+                     play from: the position must be finite and the entity alive"
+                );
+                return 0;
+            }
+        };
+        if !is_sound(world, "Audio.Play", clip) {
+            return 0;
+        }
+        let sound = Sound {
+            clip,
+            emitter,
+            volume: c.volume,
+            looping: c.looping != 0,
+            falloff: Falloff {
+                min_distance: c.min_distance,
+                max_distance: c.max_distance,
+                rolloff,
+            },
+        };
+        audio_of(world).play(sound).to_bits()
+    })
+}
+
+fn with_audio(
+    query: impl FnOnce(&mut crate::audio::Audio, crate::audio::SoundId) -> bool,
+    id: u64,
+) -> bool {
+    id != 0
+        && orrin_script::with_world(false, |world| {
+            query(&mut audio_of(world), crate::audio::SoundId::from_bits(id))
+        })
+}
+
+extern "C" fn audio_stop(id: u64) -> bool {
+    with_audio(|audio, id| audio.stop(id), id)
+}
+
+extern "C" fn audio_set_volume(id: u64, volume: f32) -> bool {
+    with_audio(|audio, id| audio.set_volume(id, volume), id)
+}
+
+extern "C" fn audio_playing(id: u64) -> bool {
+    with_audio(|audio, id| audio.is_playing(id), id)
+}
+
+extern "C" fn audio_play_source(entity: CEntity) -> u64 {
+    orrin_script::with_world(0, |world| {
+        let entity = entity_of(entity);
+        let Some(source) = world.get::<crate::scene::AudioSource>(entity).map(|s| *s) else {
+            tracing::warn!("Audio.Play: the entity has no AudioSource to play");
+            return 0;
+        };
+        if !is_sound(world, "Audio.Play", source.clip) {
+            return 0;
+        }
+        audio_of(world)
+            .play_source(entity, &source)
+            .map_or(0, |id| id.to_bits())
+    })
+}
+
+extern "C" fn audio_stop_source(entity: CEntity) -> bool {
+    orrin_script::with_world(false, |world| {
+        audio_of(world).stop_source(entity_of(entity))
+    })
+}
+
+extern "C" fn audio_play_music(clip: *const u8, looping: bool) -> u64 {
+    if clip.is_null() {
+        return 0;
+    }
+    // SAFETY: `clip` is the 16 bytes of an `AssetRef` C# holds.
+    let clip = AssetId::from_bytes(unsafe { *clip.cast::<[u8; 16]>() });
+    orrin_script::with_world(0, |world| {
+        if !is_sound(world, "Audio.PlayMusic", clip) {
+            return 0;
+        }
+        audio_of(world).play_music(clip, looping).to_bits()
+    })
+}
+
+extern "C" fn audio_stop_music() {
+    orrin_script::with_world((), |world| audio_of(world).stop_music());
+}
+
+extern "C" fn audio_set_master_volume(volume: f32) {
+    orrin_script::with_world((), |world| audio_of(world).set_master_volume(volume));
+}
+
+extern "C" fn audio_set_music_volume(volume: f32) {
+    orrin_script::with_world((), |world| audio_of(world).set_music_volume(volume));
 }
 
 /// A control's name, or `None` for bytes that are not one.
@@ -2494,6 +2707,16 @@ fn build_api() -> OrrinApi {
         set_cursor_locked,
         cursor_locked,
         spawn_with_transform,
+        audio_play,
+        audio_stop,
+        audio_set_volume,
+        audio_playing,
+        audio_play_source,
+        audio_stop_source,
+        audio_play_music,
+        audio_stop_music,
+        audio_set_master_volume,
+        audio_set_music_volume,
         ..orrin_script::default_api()
     }
 }
@@ -3684,6 +3907,20 @@ mod tests {
         assert_eq!(AssetId::from_bytes(out), id);
     }
 
+    #[test]
+    fn a_script_finds_a_sound_by_path() {
+        let dir = crate::asset_db::tests::Dir::new("script-audio");
+        dir.write("sfx/door.wav", b"riff");
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let mut world = World::new();
+        world.insert_resource(db);
+        let mut out = [0u8; 16];
+        let kind = orrin_script::with_active_world(&mut world, || {
+            find_asset(c"sfx/door.wav".as_ptr(), out.as_mut_ptr())
+        });
+        assert_eq!(kind, orrin_script::ASSET_AUDIO);
+    }
+
     /// A `.fmat` is found by path as a material, Ready once it reads and
     /// Failed while it does not; an engine-built material is always Ready.
     #[test]
@@ -4836,6 +5073,218 @@ mod tests {
 
         assert!(!short && !unknown);
         taken_commands();
+    }
+
+    /// A world with a project holding one sound and one font, and the audio
+    /// resource with no device behind it.
+    fn audio_world(name: &str) -> (World, crate::asset_db::tests::Dir, AssetId, AssetId) {
+        let dir = crate::asset_db::tests::Dir::new(name);
+        dir.write("sfx/door.wav", b"riff");
+        dir.write("fonts/title.ttf", b"glyphs");
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let door = db.find("sfx/door.wav").unwrap().id;
+        let font = db.find("fonts/title.ttf").unwrap().id;
+        let mut world = World::new();
+        world.insert_resource(db);
+        world.insert_resource(crate::audio::Audio::default());
+        (world, dir, door, font)
+    }
+
+    fn sound(clip: AssetId) -> orrin_script::CSound {
+        orrin_script::CSound {
+            clip: clip.to_bytes(),
+            entity: CEntity::NULL,
+            position: [0.0; 3],
+            volume: 1.0,
+            looping: 0,
+            emitter: 0,
+            min_distance: 1.0,
+            max_distance: 50.0,
+            rolloff: 0,
+        }
+    }
+
+    #[test]
+    fn a_script_plays_a_sound_and_holds_it_by_id() {
+        let (mut world, _dir, door, _) = audio_world("script-audio-play");
+        let size = size_of::<orrin_script::CSound>();
+        let at = orrin_script::CSound {
+            emitter: 1,
+            position: [1.0, 2.0, 3.0],
+            ..sound(door)
+        };
+        let (id, placed, playing, louder, stopped, again) =
+            orrin_script::with_active_world(&mut world, || {
+                let id = audio_play(&sound(door), size);
+                let placed = audio_play(&at, size);
+                (
+                    id,
+                    placed,
+                    audio_playing(id),
+                    audio_set_volume(id, 0.5),
+                    audio_stop(id),
+                    audio_stop(id),
+                )
+            });
+        assert!(id != 0 && placed != 0 && id != placed);
+        assert!(playing && louder && stopped && !again);
+        assert!(
+            !world
+                .resource::<crate::audio::Audio>()
+                .is_playing(crate::audio::SoundId::from_bits(id))
+        );
+    }
+
+    #[test]
+    fn audio_play_refuses_what_it_cannot_play() {
+        let (mut world, _dir, door, font) = audio_world("script-audio-refuse");
+        let dead = world.spawn();
+        world.despawn(dead);
+        let size = size_of::<orrin_script::CSound>();
+        let refused = [
+            (sound(door), size - 4),
+            (
+                orrin_script::CSound {
+                    emitter: 3,
+                    ..sound(door)
+                },
+                size,
+            ),
+            (
+                orrin_script::CSound {
+                    rolloff: 9,
+                    ..sound(door)
+                },
+                size,
+            ),
+            (
+                orrin_script::CSound {
+                    emitter: 2,
+                    entity: c_entity(dead),
+                    ..sound(door)
+                },
+                size,
+            ),
+            (
+                orrin_script::CSound {
+                    emitter: 1,
+                    position: [f32::NAN, 0.0, 0.0],
+                    ..sound(door)
+                },
+                size,
+            ),
+            (sound(font), size),
+            (sound(AssetId::NIL), size),
+            (sound(AssetId::new()), size),
+        ];
+        orrin_script::with_active_world(&mut world, || {
+            for (request, size) in &refused {
+                assert_eq!(audio_play(request, *size), 0, "{:?}", request.clip);
+            }
+            assert_eq!(audio_play(std::ptr::null(), size), 0);
+            assert!(!audio_playing(0) && !audio_stop(0) && !audio_set_volume(0, 1.0));
+        });
+    }
+
+    #[test]
+    fn a_script_plays_an_entitys_audio_source_and_the_music_channel() {
+        let (mut world, _dir, door, font) = audio_world("script-audio-source");
+        let speaker = world.spawn();
+        world.insert(
+            speaker,
+            crate::scene::AudioSource {
+                clip: door,
+                ..crate::scene::AudioSource::default()
+            },
+        );
+        let mute = world.spawn();
+        world.insert(mute, crate::scene::AudioSource::default());
+        let bare = world.spawn();
+
+        orrin_script::with_active_world(&mut world, || {
+            let id = audio_play_source(c_entity(speaker));
+            assert_ne!(id, 0);
+            assert!(audio_playing(id));
+            assert_eq!(audio_play_source(c_entity(mute)), 0, "no clip");
+            assert_eq!(audio_play_source(c_entity(bare)), 0, "no source");
+            assert!(audio_stop_source(c_entity(speaker)));
+            assert!(!audio_stop_source(c_entity(speaker)));
+
+            let first = audio_play_music(door.to_bytes().as_ptr(), true);
+            let second = audio_play_music(door.to_bytes().as_ptr(), false);
+            assert!(first != 0 && second != 0);
+            assert!(!audio_playing(first) && audio_playing(second));
+            assert_eq!(audio_play_music(font.to_bytes().as_ptr(), true), 0);
+            audio_stop_music();
+            assert!(!audio_playing(second));
+        });
+    }
+
+    #[test]
+    fn a_script_reads_writes_and_adds_an_audio_source_as_a_component() {
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(entity, crate::scene::AudioSource::default());
+        let fresh = world.spawn();
+        let size = size_of::<orrin_script::CAudioSource>();
+        let clip = AssetId::new();
+        taken_commands();
+
+        let (has, read, written, refused, added) =
+            orrin_script::with_active_world(&mut world, || {
+                let has = has_component(c_entity(entity), KIND_AUDIO_SOURCE);
+                let mut c = orrin_script::CAudioSource::default();
+                let read = get_component(
+                    c_entity(entity),
+                    KIND_AUDIO_SOURCE,
+                    (&raw mut c).cast(),
+                    size,
+                );
+                c.clip = clip.to_bytes();
+                c.rolloff = 1;
+                c.spatial = 0;
+                let written = set_component(
+                    c_entity(entity),
+                    KIND_AUDIO_SOURCE,
+                    (&raw const c).cast(),
+                    size,
+                );
+                c.rolloff = 7;
+                let refused = !set_component(
+                    c_entity(entity),
+                    KIND_AUDIO_SOURCE,
+                    (&raw const c).cast(),
+                    size,
+                );
+                c.rolloff = 0;
+                c.volume = 0.25;
+                let added = add_component(
+                    c_entity(fresh),
+                    KIND_AUDIO_SOURCE,
+                    (&raw const c).cast(),
+                    size,
+                );
+                (has, read, written, refused, added)
+            });
+
+        assert!(has && read && written && refused && added);
+        let source = *world.get::<crate::scene::AudioSource>(entity).unwrap();
+        assert_eq!(source.clip, clip);
+        assert_eq!(source.rolloff, crate::scene::Rolloff::Linear);
+        assert!(!source.spatial);
+        assert_eq!(source.min_distance, 1.0);
+        for command in taken_commands() {
+            if let Command::AddUi { entity, component } = command {
+                component.insert(&mut world, entity);
+            }
+        }
+        assert_eq!(
+            world
+                .get::<crate::scene::AudioSource>(fresh)
+                .unwrap()
+                .volume,
+            0.25
+        );
     }
 
     #[test]

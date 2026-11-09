@@ -135,6 +135,19 @@ public unsafe struct OrrinApi
     public delegate* unmanaged<byte> CursorLocked;
     // An empty entity standing at a transform, appended after mouse look.
     public delegate* unmanaged<Transform*, Entity> SpawnWithTransform;
+    // Audio, appended after SpawnWithTransform; never reordered above it. A
+    // SoundRequest and its byte size, which the engine checks; a sound's id
+    // as bits, zero for refused; a clip as its 16 bytes.
+    public delegate* unmanaged<byte*, uint, ulong> AudioPlay;
+    public delegate* unmanaged<ulong, byte> AudioStop;
+    public delegate* unmanaged<ulong, float, byte> AudioSetVolume;
+    public delegate* unmanaged<ulong, byte> AudioPlaying;
+    public delegate* unmanaged<Entity, ulong> AudioPlaySource;
+    public delegate* unmanaged<Entity, byte> AudioStopSource;
+    public delegate* unmanaged<byte*, byte, ulong> AudioPlayMusic;
+    public delegate* unmanaged<void> AudioStopMusic;
+    public delegate* unmanaged<float, void> AudioSetMasterVolume;
+    public delegate* unmanaged<float, void> AudioSetMusicVolume;
 }
 
 public static unsafe class Native
@@ -430,6 +443,34 @@ public static unsafe class Native
     internal static bool CursorLocked() => _api.CursorLocked() != 0;
 
     internal static Entity SpawnWithTransform(Transform transform) => _api.SpawnWithTransform(&transform);
+
+    internal static ulong AudioPlay(in SoundRequest request)
+    {
+        fixed (SoundRequest* p = &request)
+            return _api.AudioPlay((byte*)p, (uint)sizeof(SoundRequest));
+    }
+
+    internal static bool AudioStop(ulong id) => _api.AudioStop(id) != 0;
+
+    internal static bool AudioSetVolume(ulong id, float volume) => _api.AudioSetVolume(id, volume) != 0;
+
+    internal static bool AudioPlaying(ulong id) => _api.AudioPlaying(id) != 0;
+
+    internal static ulong AudioPlaySource(Entity entity) => _api.AudioPlaySource(entity);
+
+    internal static bool AudioStopSource(Entity entity) => _api.AudioStopSource(entity) != 0;
+
+    internal static ulong AudioPlayMusic(Guid clip, bool loop)
+    {
+        var bytes = AssetBytes.Of(clip);
+        return _api.AudioPlayMusic((byte*)&bytes, loop ? (byte)1 : (byte)0);
+    }
+
+    internal static void AudioStopMusic() => _api.AudioStopMusic();
+
+    internal static void AudioSetMasterVolume(float volume) => _api.AudioSetMasterVolume(volume);
+
+    internal static void AudioSetMusicVolume(float volume) => _api.AudioSetMusicVolume(volume);
 
     internal static bool AddCollider(Entity entity, in ColliderData collider)
     {

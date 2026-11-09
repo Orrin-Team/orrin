@@ -51,6 +51,8 @@ pub enum AssetKind {
     Scene,
     /// A TrueType or OpenType file, read as it is by the in-game UI.
     Font,
+    /// A WAV, Ogg Vorbis or MP3 file, decoded as it is by `audio`.
+    Audio,
     Folder,
 }
 
@@ -70,6 +72,7 @@ impl AssetKind {
             super::material::EXTENSION => Some(Self::Material),
             crate::scene::loaded::EXTENSION => Some(Self::Scene),
             "ttf" | "otf" => Some(Self::Font),
+            "wav" | "ogg" | "mp3" => Some(Self::Audio),
             _ => None,
         }
     }
@@ -83,6 +86,7 @@ impl AssetKind {
             Self::Material => "material",
             Self::Scene => "scene",
             Self::Font => "font",
+            Self::Audio => "sound",
             Self::Folder => "folder",
         }
     }
@@ -165,6 +169,7 @@ impl Settings {
             | AssetKind::Material
             | AssetKind::Scene
             | AssetKind::Font
+            | AssetKind::Audio
             | AssetKind::Folder => Self::None,
         }
     }
@@ -468,6 +473,9 @@ mod tests {
         assert_eq!(AssetKind::of_path("brick.FMAT"), Some(AssetKind::Material));
         assert_eq!(AssetKind::of_path("ui/Title.TTF"), Some(AssetKind::Font));
         assert_eq!(AssetKind::of_path("body.otf"), Some(AssetKind::Font));
+        assert_eq!(AssetKind::of_path("sfx/door.WAV"), Some(AssetKind::Audio));
+        assert_eq!(AssetKind::of_path("theme.ogg"), Some(AssetKind::Audio));
+        assert_eq!(AssetKind::of_path("theme.mp3"), Some(AssetKind::Audio));
         assert_eq!(AssetKind::of_path("tree.bin"), None);
         assert_eq!(AssetKind::of_path("a.png.meta"), None);
         assert_eq!(AssetKind::of_path("png"), None);

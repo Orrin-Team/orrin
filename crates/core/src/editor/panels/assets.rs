@@ -3,7 +3,8 @@
 //! row can be dragged onto whatever takes that kind — a prefab onto the
 //! hierarchy or the scene, a mesh or a material onto a mesh renderer, a
 //! texture onto a material asset's slot. Right-clicking a folder, or the open
-//! folder below its rows, makes a new material there.
+//! folder below its rows, makes a new material there. Double-clicking a sound
+//! plays it through the editor's preview, and again stops it.
 //!
 //! A row hands over the asset's [`AssetId`], never its path: the hierarchy
 //! and the inspector take that payload the way everything else takes a
@@ -88,6 +89,9 @@ enum Action {
     BringIn(Vec<PathBuf>, String),
     /// Open a file dialog for files to copy into the open folder.
     PickFiles,
+    /// Play this sound through the editor's preview, or stop it if it is
+    /// the one playing.
+    TogglePreview(AssetId),
 }
 
 /// The browser's place, kept in egui's memory rather than the editor state:
@@ -125,6 +129,9 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
     let memory = ui.id().with("asset_folder");
     let mut place: Place = ui.data_mut(|data| data.get_temp(memory).unwrap_or_default());
     let in_scene = instance_counts(world);
+    let previewing = world
+        .get_resource::<crate::audio::Audio>()
+        .and_then(|audio| audio.previewing());
     let mut action = None;
     {
         let db = world.resource::<AssetDatabase>();
@@ -184,6 +191,7 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
         let mut cells = Cells {
             db: &db,
             in_scene: &in_scene,
+            previewing,
             layout: view.layout,
             searching,
             state,
@@ -250,6 +258,15 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
     }
 
     match action {
+        Some(Action::TogglePreview(id)) => {
+            if let Some(mut audio) = world.get_resource_mut::<crate::audio::Audio>() {
+                if audio.previewing() == Some(id) {
+                    audio.stop_preview();
+                } else {
+                    audio.preview(id);
+                }
+            }
+        }
         Some(Action::Open(path)) => place.folder = path,
         Some(Action::Tint(path, tint)) => {
             let result = world
@@ -647,13 +664,14 @@ const SORTS: [(AssetSort, &str); 4] = [
 
 /// The kinds the browser can be narrowed to. Folders are not among them: a
 /// kind lists the whole project, where a folder has nowhere to be opened.
-const KINDS: [(AssetKind, &str); 6] = [
+const KINDS: [(AssetKind, &str); 7] = [
     (AssetKind::Texture, "Textures"),
     (AssetKind::Mesh, "Meshes"),
     (AssetKind::Material, "Materials"),
     (AssetKind::Prefab, "Prefabs"),
     (AssetKind::Scene, "Scenes"),
     (AssetKind::Font, "Fonts"),
+    (AssetKind::Audio, "Sounds"),
 ];
 
 fn plural(kind: AssetKind) -> String {
@@ -720,6 +738,8 @@ enum Item<'a> {
 struct Cells<'a> {
     db: &'a AssetDatabase,
     in_scene: &'a FxHashMap<AssetId, usize>,
+    /// The sound the editor's preview is playing.
+    previewing: Option<AssetId>,
     layout: AssetLayout,
     /// Listing the whole project rather than one folder, so each asset says
     /// which folder it is in.
@@ -849,6 +869,16 @@ impl Cells<'_> {
                 weak,
                 "Drag onto a script's font field to set its UI text in it",
             ),
+            AssetKind::Audio if self.previewing == Some(entry.id) => (
+                icons::speaker_high(),
+                theme::KIND_AUDIO,
+                "Playing. Double-click to stop it",
+            ),
+            AssetKind::Audio => (
+                icons::file_audio(),
+                weak,
+                "Double-click to hear it, or drag onto an audio source's clip",
+            ),
             AssetKind::Prefab | AssetKind::Folder => (icons::layers(), weak, PLACE_HINT),
         };
         let (status, detail) = match (&entry.status, self.db.state(entry.id)) {
@@ -889,6 +919,9 @@ impl Cells<'_> {
         }
         if prefab && response.double_clicked() {
             self.state.request_instantiate(entry.id, None);
+        }
+        if entry.kind == AssetKind::Audio && response.double_clicked() {
+            *self.action = Some(Action::TogglePreview(entry.id));
         }
         if entry.kind == AssetKind::Scene && response.double_clicked() {
             let path = self.db.dir().join(&entry.path);

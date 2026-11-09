@@ -36,6 +36,10 @@ use orrin_registry::Reflect;
 
 const INSET: f32 = 8.0;
 
+/// How far above an object its first badge stands, and each badge above the
+/// last, in points: a marker's height and a little.
+const BADGE_RISE: f32 = 21.0;
+
 pub fn show(
     ctx: &egui::Context,
     world: &World,
@@ -474,6 +478,7 @@ pub fn gizmo(
                 Emphasis::Rest
             }
         };
+        let tints = state.icon_tints;
         pick::each_marker(world, |entity, at, kind| {
             if (at - camera.position).dot(forward) <= camera.near {
                 return;
@@ -483,6 +488,24 @@ pub fn gizmo(
                 &mut state.gizmo_strokes,
                 on_screen,
                 kind,
+                tints.of(kind),
+                emphasis(entity),
+                ppp,
+            );
+        });
+        // Stacked above the object's middle, clear of where the transform
+        // gizmo stands.
+        pick::each_badge(world, |entity, at, kind, slot| {
+            if (at - camera.position).dot(forward) <= camera.near {
+                return;
+            }
+            let rise = BADGE_RISE * (slot + 1) as f32;
+            let on_screen = pick::to_screen(view_proj, screen, at) - egui::vec2(0.0, rise);
+            crate::editor::gizmo::marker(
+                &mut state.gizmo_strokes,
+                on_screen,
+                kind,
+                tints.of(kind),
                 emphasis(entity),
                 ppp,
             );
@@ -494,13 +517,36 @@ pub fn gizmo(
                 &shape,
                 &camera,
                 screen,
+                tints.camera(),
                 emphasis(entity),
                 active,
                 ppp,
             );
         });
-        // A selected light's reach: its range, its cone, its direction.
+        // A selected sound's reach: where it is at full volume, half, a
+        // quarter, and where its rolloff stops.
         let mut lines = Vec::new();
+        for &entity in state.selection.entities() {
+            let (Some(source), Some(model)) = (
+                world
+                    .get::<crate::scene::AudioSource>(entity)
+                    .map(|source| *source),
+                world.get::<WorldTransform>(entity).map(|world| world.0),
+            ) else {
+                continue;
+            };
+            lines.clear();
+            crate::editor::gizmo::audio_lines(&source, model, &mut lines);
+            crate::editor::gizmo::world_lines(
+                &mut state.gizmo_strokes,
+                &lines,
+                &camera,
+                screen,
+                tints.of(pick::Marker::Audio { playing: false }),
+                ppp,
+            );
+        }
+        // A selected light's reach: its range, its cone, its direction.
         for &entity in state.selection.entities() {
             let (Some(light), Some(model)) = (
                 world.get::<Light>(entity).map(|light| *light),
@@ -518,7 +564,7 @@ pub fn gizmo(
                 &lines,
                 &camera,
                 screen,
-                crate::editor::theme::KIND_LIGHT,
+                tints.of(pick::Marker::Light(pick::LightKind::Point)),
                 ppp,
             );
         }

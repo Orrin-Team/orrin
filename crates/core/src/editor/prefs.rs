@@ -33,6 +33,8 @@ pub struct Prefs {
     /// The resolution the viewport previews; `None` until the user first
     /// picks one.
     pub preview: Option<super::preview::Preview>,
+    /// The viewport icons' colours; `None` until the user first changes one.
+    pub icons: Option<super::state::IconTints>,
     /// Which [`LAYOUT_VERSION`] `layout` was saved under. Absent, and so zero,
     /// in every file written before the field existed.
     layout_version: u32,
@@ -93,6 +95,7 @@ impl PrefsFile {
             snap: prefs.snap,
             assets: prefs.assets,
             preview: prefs.preview,
+            icons: prefs.icons,
         };
         let text = match ron::ser::to_string_pretty(prefs, ron::ser::PrettyConfig::default()) {
             Ok(text) => text,
@@ -152,6 +155,38 @@ mod tests {
         });
 
         assert_eq!(file.load().snap, Some(steps));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn icon_tints_round_trip() {
+        let dir = scratch("icon-tints");
+        let file = PrefsFile::new(Some(dir.clone()));
+        let tints = super::super::state::IconTints {
+            listener: [10, 200, 90],
+            ..Default::default()
+        };
+        file.save(&Prefs {
+            icons: Some(tints),
+            ..Prefs::default()
+        });
+
+        assert_eq!(file.load().icons, Some(tints));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A file that names only some kinds, as one written before a kind
+    /// existed would, keeps the default for the rest.
+    #[test]
+    fn a_kind_missing_from_the_saved_tints_keeps_its_default() {
+        let dir = scratch("icon-tints-partial");
+        std::fs::write(dir.join(FILE), "(icons: Some((light: (1, 2, 3))))").unwrap();
+        let tints = PrefsFile::new(Some(dir.clone())).load().icons.unwrap();
+        assert_eq!(tints.light, [1, 2, 3]);
+        assert_eq!(
+            tints.listener,
+            super::super::state::IconTints::default().listener
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

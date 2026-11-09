@@ -250,6 +250,17 @@ unsafe
         "ForceMode numbers as the engine does");
     Check((uint)Orrin.ColliderShape.Capsule == 2 && (uint)Orrin.ColliderShape.ConvexHull == 5,
         "ColliderShape numbers as the engine does");
+    // Audio, lock-step with CAudioSource and CSound, and with the numbering
+    // `rolloff_of` and `find_asset` read.
+    Check(sizeof(Orrin.AudioSource) == 44, "AudioSource is a clip's 16 bytes and seven words");
+    Check(sizeof(Orrin.SoundRequest) == 60, "SoundRequest is a clip, an Entity, a Vector3 and six words");
+    Check((uint)Orrin.ComponentKind.AudioSource == 15, "ComponentKind.AudioSource is 15");
+    Check((uint)Orrin.AudioRolloff.Linear == 1, "AudioRolloff numbers as the engine does");
+    Check(Orrin.AssetKinds.Of<Orrin.AudioClip>() == 7, "an AudioClip is asset kind 7");
+    var speaker = new Orrin.AudioSource();
+    Check(speaker.Volume == 1f && speaker.PlayOnStart && speaker.Spatial && !speaker.Loop
+        && speaker.MinDistance == 1f && speaker.MaxDistance == 50f && !speaker.Clip.IsValid,
+        "a new audio source is the engine's default, its flags read back");
     var body = new Orrin.Rigidbody { LockRotation = true };
     Check(body.Mass == 1f && body.GravityScale == 1f && body.LinearDamping == 0.05f
         && !body.Kinematic && !body.Continuous && body.LockRotation,

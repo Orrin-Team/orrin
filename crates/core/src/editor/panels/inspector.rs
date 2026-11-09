@@ -86,6 +86,7 @@ pub fn body(
             material_section(ui, world, state, entity, previews, &filter);
             light_section(ui, world, state, entity, &filter);
             physics_section(ui, world, state, entity, &filter);
+            audio_section(ui, world, state, entity, &filter, &overridden);
             super::ui_sections::sections(ui, world, state, entity, &filter);
             #[cfg(feature = "scripting")]
             script_section(ui, world, entity, &filter);
@@ -380,7 +381,7 @@ fn prefab_section(
 /// which is what makes a component the engine has never heard of, registered by
 /// a game assembly after a hot reload, inspectable without a panel being written
 /// for it.
-const HAND_DRAWN: [orrin_registry::ComponentId; 16] = [
+const HAND_DRAWN: [orrin_registry::ComponentId; 17] = [
     crate::scene::registry::TRANSFORM,
     crate::scene::registry::NAME,
     crate::scene::registry::LIGHT,
@@ -397,6 +398,7 @@ const HAND_DRAWN: [orrin_registry::ComponentId; 16] = [
     crate::scene::registry::SHADOW,
     crate::scene::registry::SCROLL_FRAME,
     crate::scene::registry::PHYSICS_SETTINGS,
+    crate::scene::registry::AUDIO_SOURCE,
 ];
 
 /// Draw every registered component that has no section of its own.
@@ -1540,6 +1542,269 @@ fn physics_section(
     }
 }
 
+/// Drawn by hand for its clip, which the generic row could only show as an id
+/// and could not check: an [`AssetId`] does not say what kind of asset it
+/// names, so only a section that can see the database can refuse a texture.
+fn audio_section(
+    ui: &mut egui::Ui,
+    world: &World,
+    state: &mut EditorState,
+    entity: Entity,
+    filter: &Filter,
+    overridden: &[orrin_registry::ComponentId],
+) {
+    use crate::scene::registry::AUDIO_SOURCE;
+    use crate::scene::{AudioSource, Rolloff};
+
+    let Some(before) = world.get::<AudioSource>(entity).map(|s| *s) else {
+        return;
+    };
+    let labels = [
+        "Clip",
+        "Volume",
+        "Loop",
+        "Play on start",
+        "Spatial",
+        "Min distance",
+        "Max distance",
+        "Rolloff",
+    ];
+    let Some(rows) = filter.section("Audio Source", &labels) else {
+        return;
+    };
+    let mut source = before;
+    let mut remove = false;
+    let mut menu = |ui: &mut egui::Ui| {
+        if ui.button("Remove component").clicked() {
+            remove = true;
+            ui.close_menu();
+        }
+    };
+    let title = overridden
+        .contains(&AUDIO_SOURCE)
+        .then_some(crate::editor::theme::PREFAB);
+    widgets::section_titled(
+        ui,
+        ui.id().with("audio_source"),
+        icons::speaker_high(),
+        crate::editor::theme::KIND_AUDIO,
+        "Audio Source",
+        title,
+        Some(&mut menu),
+        |ui| {
+            if rows.shows("Clip") {
+                clip_row(ui, world, &mut source.clip);
+            }
+            if rows.shows("Volume") {
+                widgets::property(ui, "Volume", |ui| {
+                    let slider = egui::Slider::new(&mut source.volume, 0.0..=1.0)
+                        .clamping(egui::SliderClamping::Never);
+                    ui.add(slider)
+                        .on_hover_text("A linear gain, not decibels: 0.5 is half the amplitude");
+                });
+                source.volume = source.volume.max(0.0);
+            }
+            if rows.shows("Loop") {
+                widgets::property(ui, "Loop", |ui| ui.checkbox(&mut source.looping, ""));
+            }
+            if rows.shows("Play on start") {
+                widgets::property(ui, "Play on start", |ui| {
+                    ui.checkbox(&mut source.play_on_start, "")
+                        .on_hover_text("Starts when the game does, or when it appears in one")
+                });
+            }
+            if rows.shows("Spatial") {
+                widgets::property(ui, "Spatial", |ui| {
+                    ui.checkbox(&mut source.spatial, "")
+                        .on_hover_text("Heard from where it stands, rather than in both ears alike")
+                });
+            }
+            let spatial = source.spatial;
+            for (label, distance) in [
+                ("Min distance", &mut source.min_distance),
+                ("Max distance", &mut source.max_distance),
+            ] {
+                if rows.shows(label) {
+                    widgets::property(ui, label, |ui| {
+                        let field = egui::DragValue::new(distance)
+                            .speed(0.1)
+                            .range(0.0..=f32::MAX)
+                            .suffix(" m");
+                        ui.add_enabled(spatial, field)
+                    });
+                }
+            }
+            if rows.shows("Rolloff") {
+                widgets::property(ui, "Rolloff", |ui| {
+                    ui.add_enabled_ui(spatial, |ui| {
+                        egui::ComboBox::from_id_salt(ui.id().with("rolloff"))
+                            .width(ui.available_width())
+                            .selected_text(format!("{:?}", source.rolloff))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut source.rolloff,
+                                    Rolloff::Inverse,
+                                    "Inverse",
+                                )
+                                .on_hover_text("Halves with every doubling of distance");
+                                ui.selectable_value(&mut source.rolloff, Rolloff::Linear, "Linear")
+                                    .on_hover_text("Falls to silence at the max distance");
+                            });
+                    });
+                });
+            }
+        },
+    );
+    if remove {
+        state.request_remove_component(entity, AUDIO_SOURCE);
+    } else if source != before {
+        state.edit(entity, AUDIO_SOURCE, source.to_value());
+    }
+}
+
+/// Whether `id` is a sound in the project, and if not, why not by name.
+fn is_sound(world: &World, id: AssetId) -> Result<(), String> {
+    match world.get_resource::<AssetDatabase>() {
+        Some(db) => db.audio_file(id).map(drop),
+        None => Err("there is no project to find a sound in".to_owned()),
+    }
+}
+
+/// The clip: a slot naming the sound, which opens a list of the project's
+/// sounds and takes a dropped one, and beside it a button that auditions it.
+/// Anything dropped that is not a sound is refused by name.
+fn clip_row(ui: &mut egui::Ui, world: &World, clip: &mut AssetId) {
+    let current = (!clip.is_nil()).then_some(*clip);
+    let (choices, title, subtitle, about) = {
+        let db = world.get_resource::<AssetDatabase>();
+        let mut choices: Vec<Choice<AssetId>> = db
+            .iter()
+            .flat_map(|db| db.iter())
+            .filter(|entry| entry.kind == crate::asset_db::AssetKind::Audio)
+            .map(|entry| Choice {
+                name: entry.path.clone(),
+                handle: entry.id,
+            })
+            .collect();
+        choices.sort_by(|a, b| a.name.cmp(&b.name));
+        // A missing sound keeps its id on hover: it is the only clue to what
+        // the scene was pointing at.
+        let (title, subtitle, about) = match current {
+            None => ("No sound".to_owned(), String::new(), String::new()),
+            Some(id) => match db.as_ref().and_then(|db| db.get(id)) {
+                Some(entry) => {
+                    let (folder, file) = entry.path.rsplit_once('/').unwrap_or(("", &entry.path));
+                    let about = format!("{}\n", entry.path);
+                    (file.to_owned(), folder.to_owned(), about)
+                }
+                None => (
+                    "Missing sound".to_owned(),
+                    "Not in the project".to_owned(),
+                    format!("{id}\n"),
+                ),
+            },
+        };
+        (choices, title, subtitle, about)
+    };
+    let previewing = world
+        .get_resource::<crate::audio::Audio>()
+        .and_then(|audio| audio.previewing());
+
+    let mut dropped = None;
+    let mut cleared = false;
+    let mut toggled = false;
+    let picked = widgets::property_with(
+        ui,
+        "Clip",
+        |ui| {
+            picker(
+                ui,
+                "clip",
+                choices,
+                current,
+                None,
+                |ui, _| {
+                    let slot =
+                        widgets::asset_slot(ui, None, icons::file_audio(), &title, &subtitle);
+                    if slot.contains_pointer()
+                        && let Some(payload) = egui::DragAndDrop::payload::<AssetId>(ui.ctx())
+                        && is_sound(world, *payload).is_err()
+                    {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::NoDrop);
+                    }
+                    take_drop(&slot, &mut dropped);
+                    let hint = format!("{about}Click to pick a sound, or drop one here");
+                    let slot = slot.on_hover_text(hint);
+                    slot.context_menu(|ui| {
+                        if ui
+                            .add_enabled(current.is_some(), egui::Button::new("Clear"))
+                            .clicked()
+                        {
+                            cleared = true;
+                            ui.close_menu();
+                        }
+                    });
+                    slot
+                },
+                &mut |_, _| None,
+            )
+        },
+        |ui| {
+            let Some(id) = current else {
+                return;
+            };
+            let playing = previewing == Some(id);
+            let (icon, hint) = if playing {
+                (icons::stop(), "Stop the preview")
+            } else {
+                (icons::play(), "Preview the sound")
+            };
+            // Drawn rather than an `egui::Button`, which centres the glyph's
+            // line box: the icon font sits its glyphs low for text, so the
+            // square came out below the middle of its frame.
+            let side = ui.available_width().min(ui.available_height());
+            let (rect, response) =
+                ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::click());
+            let visuals = ui.style().interact(&response);
+            if playing || response.hovered() {
+                ui.painter().rect(
+                    rect,
+                    visuals.corner_radius,
+                    visuals.weak_bg_fill,
+                    visuals.bg_stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
+            let weak = ui.visuals().weak_text_color();
+            icons::paint_ink_centred(ui.painter(), icon, 12.0, rect.center(), weak);
+            toggled = response.on_hover_text(hint).clicked();
+        },
+    );
+
+    if toggled
+        && let Some(id) = current
+        && let Some(mut audio) = world.get_resource_mut::<crate::audio::Audio>()
+    {
+        if previewing == Some(id) {
+            audio.stop_preview();
+        } else {
+            audio.preview(id);
+        }
+    }
+    if let Some(id) = dropped {
+        match is_sound(world, id) {
+            Ok(()) => *clip = id,
+            Err(error) => tracing::warn!("Audio Source clip: {error}"),
+        }
+    }
+    if let Some(id) = picked {
+        *clip = id;
+    }
+    if cleared {
+        *clip = AssetId::NIL;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1584,6 +1849,7 @@ mod tests {
                 "orrin.tag",
                 "orrin.collider",
                 "orrin.rigid_body",
+                "orrin.audio_listener",
                 "orrin.spin",
                 "orrin.locked",
                 "orrin.render_settings",

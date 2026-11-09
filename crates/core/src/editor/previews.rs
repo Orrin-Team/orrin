@@ -108,7 +108,11 @@ impl Previews {
         let picture = match db.get(id)?.kind {
             AssetKind::Texture | AssetKind::Mesh => Picture::Imported(db.thumbnail(id)?.0),
             AssetKind::Material => Picture::Material(material_surface(db, id)?),
-            AssetKind::Prefab | AssetKind::Scene | AssetKind::Font | AssetKind::Folder => {
+            AssetKind::Prefab
+            | AssetKind::Scene
+            | AssetKind::Font
+            | AssetKind::Audio
+            | AssetKind::Folder => {
                 return None;
             }
         };

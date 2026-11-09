@@ -114,6 +114,50 @@ impl Default for SnapSteps {
     }
 }
 
+/// The colour each kind of viewport icon is drawn in: its marker, its badge,
+/// a camera's wireframe and a selected one's reach. The user's to set from
+/// View ▸ Icon colours, and remembered with their other preferences. sRGB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct IconTints {
+    pub light: [u8; 3],
+    pub sound: [u8; 3],
+    pub listener: [u8; 3],
+    pub camera: [u8; 3],
+    pub empty: [u8; 3],
+}
+
+impl Default for IconTints {
+    fn default() -> Self {
+        let rgb = |colour: egui::Color32| [colour.r(), colour.g(), colour.b()];
+        Self {
+            light: rgb(super::theme::KIND_LIGHT),
+            sound: rgb(super::theme::KIND_AUDIO),
+            listener: rgb(super::theme::KIND_LISTENER),
+            camera: rgb(super::theme::KIND_CAMERA),
+            empty: rgb(super::theme::KIND_EMPTY),
+        }
+    }
+}
+
+impl IconTints {
+    pub fn of(&self, marker: super::pick::Marker) -> egui::Color32 {
+        use super::pick::Marker;
+        let [r, g, b] = match marker {
+            Marker::Light(_) => self.light,
+            Marker::Audio { .. } => self.sound,
+            Marker::Listener => self.listener,
+            Marker::Empty => self.empty,
+        };
+        egui::Color32::from_rgb(r, g, b)
+    }
+
+    pub fn camera(&self) -> egui::Color32 {
+        let [r, g, b] = self.camera;
+        egui::Color32::from_rgb(r, g, b)
+    }
+}
+
 /// Which log levels the console shows: one bit per [`LogLevel`], all set to
 /// begin with.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -245,6 +289,7 @@ pub struct EditorState {
     pub show_stats: bool,
     /// Every collider's outline, rather than only the selection's.
     pub show_colliders: bool,
+    pub icon_tints: IconTints,
     /// How the viewport draws the scene: shaded, or as its edges. `None` is
     /// shaded, which is what the renderer is handed too.
     pub wireframe: Option<crate::gfx::vulkan::wireframe::Wireframe>,
@@ -419,6 +464,7 @@ impl Default for EditorState {
             scale_linked: false,
             show_stats: false,
             show_colliders: false,
+            icon_tints: IconTints::default(),
             wireframe: None,
             gizmo_drag: None,
             gizmo_hot: None,

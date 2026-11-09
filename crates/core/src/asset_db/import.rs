@@ -47,6 +47,7 @@ pub fn importer(kind: AssetKind) -> Option<Importer> {
         | AssetKind::Material
         | AssetKind::Scene
         | AssetKind::Font
+        | AssetKind::Audio
         | AssetKind::Folder => None,
     }
 }

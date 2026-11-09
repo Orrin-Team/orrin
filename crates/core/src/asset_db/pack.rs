@@ -432,6 +432,24 @@ mod tests {
         assert_eq!(packed.font(id), Ok(b"glyphs".to_vec()));
     }
 
+    /// Audio is decoded from the file itself, so a shipped game finds it in
+    /// the pack exactly as it was authored.
+    #[test]
+    fn an_audio_clip_is_packed_as_it_is_and_reads_from_the_pack() {
+        let (dir, assets) = source_project("pack-audio");
+        AssetsDir(&assets).write("sfx/door.ogg", b"vorbis");
+        let db = imported(&dir);
+        let id = db.find("sfx/door.ogg").unwrap().id;
+        let out = dir.path().join("pack");
+
+        write(&db, &out).unwrap();
+        let (packed, issues) = AssetDatabase::open_packed(&out, Target::Rgba8);
+        assert!(issues.is_empty(), "{issues:?}");
+        let file = packed.audio_file(id).unwrap();
+        assert!(file.starts_with(&out), "{}", file.display());
+        assert_eq!(std::fs::read(file).unwrap(), b"vorbis");
+    }
+
     #[test]
     fn the_same_imported_project_packs_to_the_same_bytes() {
         let (dir, _) = source_project("pack-reproducible");

@@ -15,7 +15,8 @@ use glam::{Mat4, Vec3};
 use orrin_ecs::{Entity, World};
 
 use crate::scene::{
-    Camera, CameraComponent, Light, Locked, MeshBounds, MeshHandle, Parent, WorldTransform,
+    AudioListener, AudioSource, Camera, CameraComponent, Light, Locked, MeshBounds, MeshHandle,
+    Parent, WorldTransform,
 };
 
 /// The ray through `ndc` (−1 to 1, y down, as the scene's projection has it):
@@ -31,6 +32,13 @@ pub fn ray(camera: &Camera, aspect: f32, ndc: egui::Vec2) -> (Vec3, Vec3) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Marker {
     Light(LightKind),
+    /// An [`AudioSource`](crate::scene::AudioSource), and whether it is
+    /// sounding.
+    Audio {
+        playing: bool,
+    },
+    /// An [`AudioListener`](crate::scene::AudioListener).
+    Listener,
     /// Anything else with no mesh: a group, an anchor, a script's holder.
     Empty,
 }
@@ -61,7 +69,7 @@ pub enum LightKind {
 }
 
 /// How far from a marker's centre a click still picks it, in points.
-pub const MARKER_REACH: f32 = 9.0;
+pub const MARKER_REACH: f32 = 10.0;
 
 /// Every entity shown as a marker, with where it stands: it has a place in
 /// the world and no mesh to see or pick it by.
@@ -74,17 +82,68 @@ pub fn each_marker(world: &World, mut visit: impl FnMut(Entity, Vec3, Marker)) {
     world
         .query::<&WorldTransform>()
         .for_each(|entity, transform| {
-            if world.has::<MeshHandle>(entity) || world.has::<CameraComponent>(entity) {
-                return;
+            if let Some(marker) = marker_of(world, entity) {
+                visit(entity, transform.translation(), marker);
             }
-            let marker = match world.get::<Light>(entity).map(|light| *light) {
-                Some(Light::Point { .. }) => Marker::Light(LightKind::Point),
-                Some(Light::Spot { .. }) => Marker::Light(LightKind::Spot),
-                Some(Light::Directional { .. }) => Marker::Light(LightKind::Sun),
-                None => Marker::Empty,
-            };
-            visit(entity, transform.translation(), marker);
         });
+}
+
+/// What `entity` is shown as, or `None` when its mesh or camera shows it: a
+/// light, then a sound, then a listener, then nothing in particular.
+fn marker_of(world: &World, entity: Entity) -> Option<Marker> {
+    if world.has::<MeshHandle>(entity) || world.has::<CameraComponent>(entity) {
+        return None;
+    }
+    Some(match world.get::<Light>(entity).map(|light| *light) {
+        Some(Light::Point { .. }) => Marker::Light(LightKind::Point),
+        Some(Light::Spot { .. }) => Marker::Light(LightKind::Spot),
+        Some(Light::Directional { .. }) => Marker::Light(LightKind::Sun),
+        None if world.has::<AudioSource>(entity) => Marker::Audio {
+            playing: is_sounding(world, entity),
+        },
+        None if world.has::<AudioListener>(entity) => Marker::Listener,
+        None => Marker::Empty,
+    })
+}
+
+/// Every audio icon an entity wears that its marker does not already show —
+/// a sound or a listener on a mesh or a camera, a listener on a speaker, a
+/// sound on a lamp — with where it stands and its place in the stack above
+/// it, the sound first. Drawn only, never picked: the entity is picked by
+/// what shows it. They are worn so a scene says which of its objects make a
+/// sound and which one hears.
+pub fn each_badge(world: &World, mut visit: impl FnMut(Entity, Vec3, Marker, usize)) {
+    let worn = |entity: Entity, marker: Marker| marker_of(world, entity) != Some(marker);
+    world
+        .query::<(&AudioSource, &WorldTransform)>()
+        .for_each(|entity, (_, transform)| {
+            let sound = Marker::Audio {
+                playing: is_sounding(world, entity),
+            };
+            if worn(entity, sound) {
+                visit(entity, transform.translation(), sound, 0);
+            }
+        });
+    world
+        .query::<(&AudioListener, &WorldTransform)>()
+        .for_each(|entity, (_, transform)| {
+            if worn(entity, Marker::Listener) {
+                let below = world.has::<AudioSource>(entity)
+                    && !matches!(marker_of(world, entity), Some(Marker::Audio { .. }));
+                visit(
+                    entity,
+                    transform.translation(),
+                    Marker::Listener,
+                    below as usize,
+                );
+            }
+        });
+}
+
+fn is_sounding(world: &World, entity: Entity) -> bool {
+    world
+        .get_resource::<crate::audio::Audio>()
+        .is_some_and(|audio| audio.is_source_playing(entity))
 }
 
 /// Every camera entity drawn as its wireframe, with its world matrix, its
@@ -331,6 +390,85 @@ mod tests {
         each_marker(&world, |entity, _, marker| seen.push((entity, marker)));
         seen.sort_by_key(|(entity, _)| entity.index());
         assert_eq!(seen, expected);
+    }
+
+    /// An audio source with nothing else to show it is a speaker, picked
+    /// like a light; one on a mesh is picked by its mesh.
+    #[test]
+    fn an_audio_source_with_no_mesh_is_a_speaker() {
+        let mut world = world();
+        let speaker = world.spawn();
+        world.insert(speaker, WorldTransform(Mat4::IDENTITY));
+        world.insert(speaker, crate::scene::AudioSource::default());
+        let cube = mesh(&mut world, Mat4::IDENTITY);
+        world.insert(cube, crate::scene::AudioSource::default());
+        let mut seen = Vec::new();
+        each_marker(&world, |entity, _, marker| seen.push((entity, marker)));
+        assert_eq!(seen, [(speaker, Marker::Audio { playing: false })]);
+    }
+
+    /// A listener with nothing else to show it is an ear; a sound always
+    /// outranks it, and so does a light.
+    #[test]
+    fn an_audio_listener_with_nothing_else_is_an_ear() {
+        let mut world = world();
+        let ear = world.spawn();
+        world.insert(ear, WorldTransform(Mat4::IDENTITY));
+        world.insert(ear, crate::scene::AudioListener);
+        let both = world.spawn();
+        world.insert(both, WorldTransform(Mat4::IDENTITY));
+        world.insert(both, crate::scene::AudioListener);
+        world.insert(both, crate::scene::AudioSource::default());
+        let mut seen = Vec::new();
+        each_marker(&world, |entity, _, marker| seen.push((entity, marker)));
+        seen.sort_by_key(|(entity, _)| entity.index());
+        assert_eq!(
+            seen,
+            [
+                (ear, Marker::Listener),
+                (both, Marker::Audio { playing: false })
+            ]
+        );
+    }
+
+    /// Every audio icon an entity has that its marker does not already show
+    /// is a badge, stacked in a fixed order: the sound, then the listener.
+    #[test]
+    fn what_a_marker_does_not_show_is_worn_as_a_badge() {
+        let mut world = world();
+        let cube = mesh(&mut world, Mat4::IDENTITY);
+        world.insert(cube, crate::scene::AudioSource::default());
+        world.insert(cube, crate::scene::AudioListener);
+        let camera = world.spawn();
+        world.insert(camera, WorldTransform(Mat4::IDENTITY));
+        world.insert(camera, CameraComponent::default());
+        world.insert(camera, crate::scene::AudioListener);
+        let speaker = world.spawn();
+        world.insert(speaker, WorldTransform(Mat4::IDENTITY));
+        world.insert(speaker, crate::scene::AudioSource::default());
+        world.insert(speaker, crate::scene::AudioListener);
+        let lamp = light(&mut world, Vec3::ZERO);
+        world.insert(lamp, crate::scene::AudioSource::default());
+        let ear = world.spawn();
+        world.insert(ear, WorldTransform(Mat4::IDENTITY));
+        world.insert(ear, crate::scene::AudioListener);
+
+        let mut seen = Vec::new();
+        each_badge(&world, |entity, _, marker, slot| {
+            seen.push((entity, marker, slot))
+        });
+        seen.sort_by_key(|&(entity, _, slot)| (entity.index(), slot));
+        let sound = Marker::Audio { playing: false };
+        assert_eq!(
+            seen,
+            [
+                (cube, sound, 0),
+                (cube, Marker::Listener, 1),
+                (camera, Marker::Listener, 0),
+                (speaker, Marker::Listener, 0),
+                (lamp, sound, 0),
+            ]
+        );
     }
 
     #[test]
