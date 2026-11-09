@@ -188,6 +188,8 @@ pub struct AssetDatabase {
     pack: Option<FxHashMap<AssetId, CacheKey>>,
     /// Fonts indexed or changed since [`take_font_changes`](Self::take_font_changes).
     font_changes: Vec<AssetId>,
+    /// Sounds indexed or changed since [`take_audio_changes`](Self::take_audio_changes).
+    audio_changes: Vec<AssetId>,
     /// Ids the UI drew as an image that are not textures, each reported once.
     refused_ui: HashSet<AssetId, FxBuildHasher>,
     /// Each uploaded texture's size, which a sliced UI image is measured in.
@@ -248,6 +250,7 @@ impl AssetDatabase {
             awaiting: HashSet::default(),
             pack: None,
             font_changes: Vec::new(),
+            audio_changes: Vec::new(),
             refused_ui: HashSet::default(),
             extents: FxHashMap::default(),
         };
@@ -369,6 +372,29 @@ impl AssetDatabase {
     /// holding them should read again.
     pub fn take_font_changes(&mut self) -> Vec<AssetId> {
         std::mem::take(&mut self.font_changes)
+    }
+
+    /// The file sound `id` is decoded from: the source in a project, the
+    /// packed copy in an exported game. A path rather than the bytes, so the
+    /// read happens on the thread that decodes it.
+    pub fn audio_file(&self, id: AssetId) -> Result<PathBuf, String> {
+        let entry = self
+            .get(id)
+            .ok_or_else(|| format!("sound asset {id} is not in the project"))?;
+        if entry.kind != AssetKind::Audio {
+            return Err(format!(
+                "`{}` is a {}, not a sound",
+                entry.path,
+                entry.kind.label()
+            ));
+        }
+        Ok(self.dir.join(&entry.path))
+    }
+
+    /// Sounds indexed or changed since the last call, which anything holding
+    /// them decoded should decode again.
+    pub fn take_audio_changes(&mut self) -> Vec<AssetId> {
+        std::mem::take(&mut self.audio_changes)
     }
 
     /// Texture `id`'s slot for the in-game UI, loading it the first time as a
@@ -968,8 +994,15 @@ impl AssetDatabase {
         }
         if import::importer(entry.kind).is_none() {
             entry.status = Status::Indexed;
-            if entry.kind == AssetKind::Font && !self.font_changes.contains(&id) {
-                self.font_changes.push(id);
+            let changes = match entry.kind {
+                AssetKind::Font => Some(&mut self.font_changes),
+                AssetKind::Audio => Some(&mut self.audio_changes),
+                _ => None,
+            };
+            if let Some(changes) = changes
+                && !changes.contains(&id)
+            {
+                changes.push(id);
             }
             return;
         }
@@ -1205,6 +1238,7 @@ impl AssetDatabase {
             | AssetKind::Material
             | AssetKind::Scene
             | AssetKind::Font
+            | AssetKind::Audio
             | AssetKind::Folder => {}
         }
     }
@@ -2582,6 +2616,39 @@ pub(crate) mod tests {
         assert_eq!(db.take_font_changes(), [id]);
         assert!(db.take_font_changes().is_empty());
         assert_eq!(db.font(id), Ok(b"saved".to_vec()));
+    }
+
+    /// An audio file has nothing to import either: it is decoded off the
+    /// main thread from the file the database names, and a save says so.
+    #[test]
+    fn an_audio_clip_is_read_as_it_is_and_heard_again_when_saved() {
+        let dir = Dir::new("db-audio");
+        dir.write("sfx/door.wav", b"first");
+        let mut db = open(&dir);
+        let entry = db.find("sfx/door.wav").unwrap();
+        let id = entry.id;
+        assert_eq!(entry.kind, AssetKind::Audio);
+        assert_eq!(entry.status, Status::Indexed);
+        assert_eq!(db.state(id), LoadState::Ready);
+        assert_eq!(db.audio_file(id), Ok(dir.path().join("sfx/door.wav")));
+        db.take_audio_changes();
+
+        let path = dir.write("sfx/door.wav", b"saved");
+        db.notice(path);
+        db.apply_changes();
+        assert_eq!(db.take_audio_changes(), [id]);
+        assert!(db.take_audio_changes().is_empty());
+        assert!(db.take_font_changes().is_empty());
+
+        let font = dir.write("fonts/title.ttf", b"glyphs");
+        db.notice(font);
+        db.apply_changes();
+        assert!(db.take_audio_changes().is_empty());
+        let title = db.find("fonts/title.ttf").unwrap().id;
+        assert_eq!(
+            db.audio_file(title),
+            Err("`fonts/title.ttf` is a font, not a sound".to_owned())
+        );
     }
 
     #[test]

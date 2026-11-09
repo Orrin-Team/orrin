@@ -28,7 +28,7 @@ public class Game : Behaviour
     }
 
     public override void OnUpdate(float deltaTime)
-    {
+    {   
         var direction = Vector3.zero;
         if (Input.GetKey(KeyCode.LeftArrow)) direction += Vector3.left;
         if (Input.GetKey(KeyCode.RightArrow)) direction += Vector3.right;

@@ -124,6 +124,9 @@ impl Editor {
         if let Some(view) = prefs.assets {
             state.assets_view = view;
         }
+        if let Some(tints) = prefs.icons {
+            state.icon_tints = tints;
+        }
         icons::install(&ctx);
         theme::install_fonts(&ctx);
         theme::apply(&ctx, themes.active());
@@ -240,6 +243,14 @@ impl Editor {
             && !ctx.input(|input| input.pointer.any_down())
         {
             prefs.preview = Some(state.preview);
+            prefs_file.save(prefs);
+        }
+
+        // Kept once a colour has stopped being dragged in its picker.
+        if prefs.icons.unwrap_or_default() != state.icon_tints
+            && !ctx.input(|input| input.pointer.any_down())
+        {
+            prefs.icons = Some(state.icon_tints);
             prefs_file.save(prefs);
         }
 

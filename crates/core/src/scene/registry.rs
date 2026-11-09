@@ -1,8 +1,8 @@
 use orrin_registry::{ComponentId, Registry};
 
 use super::{
-    CameraComponent, Collider, Light, LocalTransform, Locked, MaterialHandle, MeshHandle, Name,
-    PhysicsSettings, RenderSettings, RigidBody, Spin, Tag,
+    AudioListener, AudioSource, CameraComponent, Collider, Light, LocalTransform, Locked,
+    MaterialHandle, MeshHandle, Name, PhysicsSettings, RenderSettings, RigidBody, Spin, Tag,
 };
 
 pub const TRANSFORM: ComponentId = ComponentId::new("orrin.transform");
@@ -12,6 +12,8 @@ pub const LIGHT: ComponentId = ComponentId::new("orrin.light");
 pub const COLLIDER: ComponentId = ComponentId::new("orrin.collider");
 pub const RIGID_BODY: ComponentId = ComponentId::new("orrin.rigid_body");
 pub const PHYSICS_SETTINGS: ComponentId = ComponentId::new("orrin.physics_settings");
+pub const AUDIO_SOURCE: ComponentId = ComponentId::new("orrin.audio_source");
+pub const AUDIO_LISTENER: ComponentId = ComponentId::new("orrin.audio_listener");
 pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
 pub const LOCKED: ComponentId = ComponentId::new("orrin.locked");
 pub const RENDER_SETTINGS: ComponentId = ComponentId::new("orrin.render_settings");
@@ -78,6 +80,8 @@ pub fn register_components(registry: &mut Registry) {
     registry.register::<Light>(LIGHT, "Light");
     registry.register::<Collider>(COLLIDER, "Collider");
     registry.register::<RigidBody>(RIGID_BODY, "Rigid Body");
+    registry.register::<AudioSource>(AUDIO_SOURCE, "Audio Source");
+    registry.register::<AudioListener>(AUDIO_LISTENER, "Audio Listener");
     registry.register::<Spin>(SPIN, "Spin");
     registry.register::<Locked>(LOCKED, "Locked");
     registry.register::<RenderSettings>(RENDER_SETTINGS, "Render Settings");
@@ -362,6 +366,43 @@ entity #1
         physics.set_collides(1, 4, false);
         round_trips(&physics);
         round_trips(&Spin::new(Vec3::new(0.0, 1.0, 1.0), 2.0));
+        round_trips(&crate::scene::AudioSource {
+            clip: orrin_registry::AssetId::new(),
+            looping: true,
+            rolloff: crate::scene::Rolloff::Linear,
+            ..crate::scene::AudioSource::default()
+        });
+        round_trips(&crate::scene::AudioListener);
+    }
+
+    /// A sound is saved as the asset it names, so a scene reopened after the
+    /// file moved still plays it.
+    #[test]
+    fn an_audio_source_and_its_listener_survive_a_save_and_a_load() {
+        let mut registry = Registry::new();
+        register_components(&mut registry);
+        let mut world = World::new();
+        let entity = world.spawn();
+        let source = crate::scene::AudioSource {
+            clip: orrin_registry::AssetId::new(),
+            volume: 0.4,
+            spatial: false,
+            ..crate::scene::AudioSource::default()
+        };
+        world.insert(entity, source);
+        world.insert(entity, crate::scene::AudioListener);
+        let text = crate::scene::save(&mut world, &registry);
+        assert!(text.contains("orrin.audio_source"), "{text}");
+        assert!(text.contains("orrin.audio_listener"), "{text}");
+
+        let mut loaded = World::new();
+        crate::scene::load(&text, &mut loaded, &registry).unwrap();
+        let entity = loaded.entities().next().unwrap();
+        assert_eq!(
+            *loaded.get::<crate::scene::AudioSource>(entity).unwrap(),
+            source
+        );
+        assert!(loaded.has::<crate::scene::AudioListener>(entity));
     }
 
     /// A collider saved before it had a surface or a layer loads as the

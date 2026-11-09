@@ -638,6 +638,24 @@ mod tests {
             self
         }
 
+        /// Two clicks at `at` inside one frame: a double-click.
+        fn double_click(&mut self, at: egui::Pos2) -> &mut Self {
+            self.input.events.push(egui::Event::PointerMoved(at));
+            for _ in 0..2 {
+                for pressed in [true, false] {
+                    self.input.events.push(egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    });
+                }
+            }
+            self.frames(1);
+            self.input.events.clear();
+            self
+        }
+
         /// A secondary press and release at `at`: what opens a context menu.
         fn right_click(&mut self, at: egui::Pos2) -> &mut Self {
             self.input.events.push(egui::Event::PointerMoved(at));
@@ -2144,6 +2162,238 @@ mod tests {
         editor.input.events.clear();
         editor.state.apply(&mut editor.world, &editor.registry);
         the_door(&editor);
+    }
+
+    /// A project of two sounds and a texture, each in a folder of its own so
+    /// the browser's root lists only folders. The directory is returned so it
+    /// outlives the test.
+    fn sound_project(
+        editor: &mut Harness,
+        name: &str,
+    ) -> (crate::asset_db::tests::Dir, [orrin_registry::AssetId; 3]) {
+        let dir = crate::asset_db::tests::Dir::new(name);
+        let wav = crate::audio::clip::tests::wav(1, 48_000, &[0; 64]);
+        dir.write("sfx/door.wav", &wav);
+        dir.write("music/theme.wav", &wav);
+        dir.write("textures/rock.png", b"");
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let ids = ["sfx/door.wav", "music/theme.wav", "textures/rock.png"]
+            .map(|path| db.find(path).unwrap().id);
+        editor.world.insert_resource(db);
+        (dir, ids)
+    }
+
+    fn select_speaker(editor: &mut Harness) -> orrin_ecs::Entity {
+        let speaker = editor.spawn("Speaker");
+        editor
+            .world
+            .insert(speaker, crate::scene::AudioSource::default());
+        editor.state.selection.set(speaker);
+        editor.frames(2);
+        speaker
+    }
+
+    fn clip_of(editor: &Harness, speaker: orrin_ecs::Entity) -> orrin_registry::AssetId {
+        editor
+            .world
+            .get::<crate::scene::AudioSource>(speaker)
+            .unwrap()
+            .clip
+    }
+
+    fn previewing(editor: &Harness) -> Option<orrin_registry::AssetId> {
+        editor.world.resource::<crate::audio::Audio>().previewing()
+    }
+
+    /// The clip is a slot that names its sound rather than printing its id,
+    /// and takes a sound and nothing else.
+    #[test]
+    fn the_audio_source_clip_is_a_sound_slot_that_names_its_sound() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (_dir, [door, _, rock]) = sound_project(&mut editor, "panel-audio-slot");
+        let speaker = select_speaker(&mut editor);
+        let slot = row_of(&editor, "No sound");
+
+        drop_payload(&mut editor, rock, slot);
+        assert!(clip_of(&editor, speaker).is_nil(), "a texture is no clip");
+
+        drop_payload(&mut editor, door, slot);
+        assert_eq!(clip_of(&editor, speaker), door);
+        editor.frames(1);
+        assert!(editor.painted_contains("door.wav"));
+        assert!(!editor.painted_contains(&door.to_string()));
+    }
+
+    #[test]
+    fn the_clip_picker_offers_the_projects_sounds_and_nothing_else() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (_dir, [_, theme, _]) = sound_project(&mut editor, "panel-audio-picker");
+        let speaker = select_speaker(&mut editor);
+
+        editor.click(row_of(&editor, "No sound"));
+        editor.frames(1);
+        assert!(editor.painted_contains("sfx/door.wav"));
+        assert!(editor.painted_contains("music/theme.wav"));
+        assert!(!editor.painted_contains("rock"));
+
+        editor.click(row_of(&editor, "music/theme.wav"));
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(clip_of(&editor, speaker), theme);
+    }
+
+    /// The clip's row carries a play button that auditions the sound in edit
+    /// mode, and turns into a stop button while it does.
+    #[test]
+    fn the_clip_row_previews_its_sound() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (_dir, [door, _, _]) = sound_project(&mut editor, "panel-audio-row");
+        let speaker = select_speaker(&mut editor);
+        editor
+            .world
+            .get_mut::<crate::scene::AudioSource>(speaker)
+            .unwrap()
+            .clip = door;
+        editor.frames(1);
+        let slot = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| text == "door.wav")
+            .expect("the slot names the sound")
+            .1;
+        let button = |editor: &Harness, glyph: char| {
+            editor
+                .painted_icons()
+                .into_iter()
+                .find(|(g, rect, _)| {
+                    *g == glyph
+                        && rect.left() > slot.right()
+                        && (rect.center().y - slot.center().y).abs() < 24.0
+                })
+                .map(|(_, rect, _)| rect.center())
+        };
+
+        let play = button(&editor, crate::editor::icons::play().glyph()).expect("a play button");
+        editor.click(play);
+        assert_eq!(previewing(&editor), Some(door));
+
+        editor.frames(1);
+        let stop = button(&editor, crate::editor::icons::stop().glyph()).expect("a stop button");
+        editor.click(stop);
+        assert_eq!(previewing(&editor), None);
+    }
+
+    /// The preview button sits in the middle of the clip's slot, and its glyph
+    /// in the middle of the frame it wears while playing.
+    #[test]
+    fn the_preview_button_is_centred_on_the_slot_and_its_glyph_in_its_frame() {
+        // At 2x as well: a Retina display snaps glyphs and frames to a finer
+        // grid, and an offset hidden by rounding at 1x can show there.
+        for scale in [1.0, 2.0] {
+            preview_button_is_centred_at(scale);
+        }
+    }
+
+    fn preview_button_is_centred_at(scale: f32) {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.ctx.set_pixels_per_point(scale);
+        let (_dir, [door, _, _]) = sound_project(&mut editor, "panel-audio-centre");
+        let speaker = select_speaker(&mut editor);
+        editor
+            .world
+            .get_mut::<crate::scene::AudioSource>(speaker)
+            .unwrap()
+            .clip = door;
+        editor
+            .world
+            .resource_mut::<crate::audio::Audio>()
+            .preview(door);
+        editor.frames(2);
+
+        let slot = editor
+            .painted_rects_of(|shape| matches!(shape, egui::Shape::Rect(_)))
+            .into_iter()
+            .filter(|rect| {
+                editor
+                    .painted_text_rects()
+                    .iter()
+                    .any(|(text, at)| text == "door.wav" && rect.contains_rect(*at))
+            })
+            .min_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("the slot's box");
+        let stop = crate::editor::icons::stop().glyph();
+        let glyph = editor
+            .painted_icons()
+            .into_iter()
+            .find(|(g, rect, _)| *g == stop && rect.left() > slot.right())
+            .expect("a stop button")
+            .1;
+        let frame = editor
+            .painted_rects_of(|shape| matches!(shape, egui::Shape::Rect(_)))
+            .into_iter()
+            .filter(|rect| rect.contains(glyph.center()) && rect.width() < 40.0)
+            .min_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("the button's frame");
+
+        // What the eye centres is the glyph's ink, which an icon font places
+        // anywhere in its line box; the line box being centred proves nothing.
+        fn ink(shape: &egui::Shape, glyph: char, out: &mut Option<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    for row in &text.galley.rows {
+                        for g in row.glyphs.iter().filter(|g| g.chr == glyph) {
+                            let min = text.pos + g.pos.to_vec2() + g.uv_rect.offset;
+                            *out = Some(egui::Rect::from_min_size(min, g.uv_rect.size));
+                        }
+                    }
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| ink(s, glyph, out)),
+                _ => {}
+            }
+        }
+        let mut drawn = None;
+        for clipped in &editor.output.as_ref().unwrap().shapes {
+            let mut found = None;
+            ink(&clipped.shape, stop, &mut found);
+            if let Some(rect) = found.filter(|rect| frame.contains_rect(*rect)) {
+                drawn = Some(rect);
+            }
+        }
+        let drawn = drawn.expect("the stop glyph's ink, inside the frame");
+
+        let off = frame.center() - drawn.center();
+        assert!(
+            off.x.abs() <= 0.5 && off.y.abs() <= 0.5,
+            "at {scale}x, ink {drawn:?} sits {off:?} from the middle of its frame {frame:?}"
+        );
+        let off = frame.center().y - slot.center().y;
+        assert!(
+            off.abs() <= 1.0,
+            "at {scale}x, button {frame:?} sits {off} from the middle of the slot {slot:?}"
+        );
+        assert!(
+            frame.width() <= orrin_registry::inspect::TRAIL + 0.5,
+            "button {frame:?} spills out of the row's {} px trailing slot",
+            orrin_registry::inspect::TRAIL
+        );
+    }
+
+    #[test]
+    fn double_clicking_a_sound_in_the_browser_previews_it_and_again_stops_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (_dir, [door, _, _]) = sound_project(&mut editor, "panel-audio-browser");
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+        editor.click(row_of(&editor, "sfx"));
+        editor.frames(1);
+
+        editor.input.time = Some(0.0);
+        editor.double_click(row_of(&editor, "door.wav"));
+        assert_eq!(previewing(&editor), Some(door));
+        // Far enough apart that egui does not count clicks three and four as a
+        // triple-click.
+        editor.input.time = Some(2.0);
+        editor.double_click(row_of(&editor, "door.wav"));
+        assert_eq!(previewing(&editor), None);
     }
 
     /// Let go of a prefab over the scene, and it stands on the ground where the

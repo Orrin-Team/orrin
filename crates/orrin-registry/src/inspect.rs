@@ -115,6 +115,12 @@ pub fn property_with<R>(
         // A child does not grow its parent, so a value taller than one control
         // (an asset slot) claims its height here.
         ui.set_min_height(value.min_rect().height());
+        // Centred on that height rather than left level with its first line, so
+        // a button beside an asset slot sits beside the slot's middle.
+        let drop = ((value.min_rect().height() - height) / 2.0)
+            .max(0.0)
+            .round();
+        let trail_rect = trail_rect.translate(egui::vec2(0.0, drop));
 
         let mut slot = ui.new_child(egui::UiBuilder::new().max_rect(trail_rect).layout(
             egui::Layout::centered_and_justified(egui::Direction::LeftToRight),

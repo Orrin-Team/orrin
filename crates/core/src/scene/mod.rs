@@ -43,9 +43,10 @@ pub use camera::{ActiveCamera, Camera, active_camera, follow_active_camera};
 #[cfg(feature = "scripting")]
 pub use components::ScriptComponent;
 pub use components::{
-    AmbientLight, CameraComponent, Collider, ColliderShape, Light, LocalTransform, Locked,
-    MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialHandle, MeshHandle, Name, PHYSICS_LAYERS, Parent,
-    PendingScripts, PhysicsSettings, RigidBody, Spin, Tag, UnknownComponents, WorldTransform,
+    AmbientLight, AudioListener, AudioSource, CameraComponent, Collider, ColliderShape, Light,
+    LocalTransform, Locked, MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialHandle, MeshHandle, Name,
+    PHYSICS_LAYERS, Parent, PendingScripts, PhysicsSettings, RigidBody, Rolloff, Spin, Tag,
+    UnknownComponents, WorldTransform,
 };
 pub use contact_shadows::ContactShadowSettings;
 pub use culling::Culling;

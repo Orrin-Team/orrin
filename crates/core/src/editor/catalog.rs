@@ -18,6 +18,7 @@ pub enum Group {
     General,
     Rendering,
     Physics,
+    Audio,
     Ui,
     Scripts,
 }
@@ -28,6 +29,7 @@ impl Group {
             Group::General => "General",
             Group::Rendering => "Rendering",
             Group::Physics => "Physics",
+            Group::Audio => "Audio",
             Group::Ui => "UI",
             Group::Scripts => "Scripts",
         }
@@ -48,6 +50,8 @@ const TABLE: &[(ComponentId, Group, Icon)] = &[
     (id::COLLIDER, Group::Physics, icons::cube_transparent()),
     (id::RIGID_BODY, Group::Physics, icons::circle()),
     (id::PHYSICS_SETTINGS, Group::Physics, icons::globe()),
+    (id::AUDIO_SOURCE, Group::Audio, icons::speaker_high()),
+    (id::AUDIO_LISTENER, Group::Audio, icons::ear()),
     (id::CANVAS, Group::Ui, icons::app_window()),
     (id::RECT_TRANSFORM, Group::Ui, icons::bounding_box()),
     (id::IMAGE, Group::Ui, icons::image()),

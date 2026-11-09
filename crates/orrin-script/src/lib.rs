@@ -259,6 +259,28 @@ pub struct OrrinApi {
     // `spawn` with a transform, appended after mouse look: an empty entity
     // that stands somewhere — a camera, a pivot. Immediate, as `spawn` is.
     pub spawn_with_transform: extern "C" fn(*const CTransform) -> CEntity,
+    // Audio, appended after `spawn_with_transform`; never reordered above it.
+    //
+    // `audio_play` takes a `CSound` and its byte size, checked like a
+    // component's, and returns the sound's id as bits — never zero, which is
+    // the refusal: a size the engine does not expect, an emitter or rolloff it
+    // cannot name, an entity that is not alive, or a clip that is not a sound
+    // in the project. A sound is accepted at once and starts once its clip has
+    // decoded; a game with no output device accepts it and ends it the next
+    // frame. `audio_play_source` plays an entity's `AudioSource` from the
+    // start (zero for none, or one with no clip); `audio_play_music` takes a
+    // clip's 16 bytes and replaces what the music channel was playing. The
+    // volumes are linear gains, clamped at zero.
+    pub audio_play: extern "C" fn(*const CSound, u32) -> u64,
+    pub audio_stop: extern "C" fn(u64) -> bool,
+    pub audio_set_volume: extern "C" fn(u64, f32) -> bool,
+    pub audio_playing: extern "C" fn(u64) -> bool,
+    pub audio_play_source: extern "C" fn(CEntity) -> u64,
+    pub audio_stop_source: extern "C" fn(CEntity) -> bool,
+    pub audio_play_music: extern "C" fn(*const u8, bool) -> u64,
+    pub audio_stop_music: extern "C" fn(),
+    pub audio_set_master_volume: extern "C" fn(f32),
+    pub audio_set_music_volume: extern "C" fn(f32),
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -275,6 +297,7 @@ pub const ASSET_TEXTURE: u32 = 3;
 pub const ASSET_MATERIAL: u32 = 4;
 pub const ASSET_SCENE: u32 = 5;
 pub const ASSET_FONT: u32 = 6;
+pub const ASSET_AUDIO: u32 = 7;
 
 /// What `asset_state` reports. Lock-step with C# `Orrin.AssetState`: append,
 /// never renumber.
@@ -364,8 +387,42 @@ pub fn default_api() -> OrrinApi {
         set_cursor_locked: stub_set_cursor_locked,
         cursor_locked: stub_cursor_locked,
         spawn_with_transform: stub_spawn_with_transform,
+        audio_play: stub_audio_play,
+        audio_stop: stub_tween_query,
+        audio_set_volume: stub_audio_set_volume,
+        audio_playing: stub_tween_query,
+        audio_play_source: stub_audio_play_source,
+        audio_stop_source: stub_audio_stop_source,
+        audio_play_music: stub_audio_play_music,
+        audio_stop_music: stub_audio_stop_music,
+        audio_set_master_volume: stub_audio_volume,
+        audio_set_music_volume: stub_audio_volume,
     }
 }
+
+extern "C" fn stub_audio_play(_: *const CSound, _: u32) -> u64 {
+    0
+}
+
+extern "C" fn stub_audio_set_volume(_: u64, _: f32) -> bool {
+    false
+}
+
+extern "C" fn stub_audio_play_source(_: CEntity) -> u64 {
+    0
+}
+
+extern "C" fn stub_audio_stop_source(_: CEntity) -> bool {
+    false
+}
+
+extern "C" fn stub_audio_play_music(_: *const u8, _: bool) -> u64 {
+    0
+}
+
+extern "C" fn stub_audio_stop_music() {}
+
+extern "C" fn stub_audio_volume(_: f32) {}
 
 extern "C" fn stub_spawn_with_transform(_: *const CTransform) -> CEntity {
     CEntity::NULL
@@ -1087,6 +1144,38 @@ pub struct CRigidBody {
     pub lock_rotation: u32,
 }
 
+/// C ABI `scene::AudioSource`; matches C# `Orrin.AudioSource`. `rolloff` is
+/// the C# `Orrin.AudioRolloff` numbering: inverse, linear.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CAudioSource {
+    pub clip: [u8; 16],
+    pub volume: f32,
+    pub looping: u32,
+    pub play_on_start: u32,
+    pub spatial: u32,
+    pub min_distance: f32,
+    pub max_distance: f32,
+    pub rolloff: u32,
+}
+
+/// A request to `audio_play`; matches C# `Orrin.SoundRequest`. `emitter` is
+/// where it is heard from — 0 flat, 1 at `position`, 2 on `entity` — and the
+/// distance fields are read only by the last two, as an `AudioSource`'s are.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CSound {
+    pub clip: [u8; 16],
+    pub entity: CEntity,
+    pub position: [f32; 3],
+    pub volume: f32,
+    pub looping: u32,
+    pub emitter: u32,
+    pub min_distance: f32,
+    pub max_distance: f32,
+    pub rolloff: u32,
+}
+
 /// C ABI `scene::Collider`, for `add_collider`; matches C# `Orrin.ColliderData`.
 /// `shape` is the C# `Orrin.ColliderShape` numbering — box, sphere, capsule,
 /// cylinder, mesh, convex hull — and `size` is read per shape: a box's half
@@ -1661,5 +1750,7 @@ mod tests {
         assert_eq!(size_of::<CShadow>(), 32);
         assert_eq!(size_of::<CScrollFrame>(), 52);
         assert_eq!(size_of::<CTween>(), 64);
+        assert_eq!(size_of::<CAudioSource>(), 44);
+        assert_eq!(size_of::<CSound>(), 60);
     }
 }

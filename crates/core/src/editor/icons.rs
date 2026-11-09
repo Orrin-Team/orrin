@@ -100,7 +100,9 @@ icons! {
     circle_x => '\u{e4f8}',
     cube_transparent => '\u{ec7c}',
     cursor_click => '\u{e7c8}',
+    ear => '\u{e70c}',
     ellipsis => '\u{e1fe}',
+    file_audio => '\u{ea20}',
     file_code => '\u{e914}',
     file_plus => '\u{e236}',
     floppy_disk => '\u{e248}',
@@ -134,6 +136,7 @@ icons! {
     search => '\u{e30c}',
     selection_background => '\u{eaf8}',
     sliders => '\u{e434}',
+    speaker_high => '\u{e44a}',
     square => '\u{e45e}',
     step_forward => '\u{e5a6}',
     stop => '\u{e46c}',
@@ -195,6 +198,30 @@ pub fn paint_on(painter: &egui::Painter, icon: Icon, rect: egui::Rect, color: Co
         FontId::new(rect.height(), family()),
         color,
     );
+}
+
+/// Paint an icon with its drawn shape, not its line box, centred on `centre`.
+/// The font is nudged down to sit level with body text (see [`add_font`]); an
+/// icon alone in a box wants its ink in the middle instead, and the nudge reads
+/// as more than a pixel low at 2x.
+pub fn paint_ink_centred(
+    painter: &egui::Painter,
+    icon: Icon,
+    size: f32,
+    centre: egui::Pos2,
+    color: Color32,
+) {
+    let galley = painter.layout_no_wrap(icon.0.to_string(), FontId::new(size, family()), color);
+    let ink = galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first())
+        .map(|glyph| {
+            egui::Rect::from_min_size(glyph.pos + glyph.uv_rect.offset, glyph.uv_rect.size)
+        })
+        .filter(|ink| ink.is_positive());
+    let middle = ink.map_or(galley.size() / 2.0, |ink| ink.center().to_vec2());
+    painter.galley(centre - middle, galley, color);
 }
 
 /// An icon-only button.

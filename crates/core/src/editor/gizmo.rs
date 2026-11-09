@@ -41,7 +41,7 @@ use crate::editor::pick::{LightKind, Marker, to_screen};
 use crate::editor::state::{GizmoMode, GizmoSpace};
 use crate::gfx::vulkan::GizmoVertex;
 use crate::scene::{
-    Camera, CameraComponent, Light, LocalTransform, MAX_CONE_ANGLE, MIN_CONE_ANGLE,
+    AudioSource, Camera, CameraComponent, Light, LocalTransform, MAX_CONE_ANGLE, MIN_CONE_ANGLE,
 };
 
 /// How long an axis is on screen, and the radius of a ring, in points.
@@ -398,67 +398,244 @@ pub enum Emphasis {
     Selected,
 }
 
-/// Append a marker for an entity standing at `at` on screen: a ring for a
-/// point light, a ring with its beam for a spot, a sun for a directional
-/// light, a diamond for anything else — lit when it is selected and half lit
-/// under the pointer.
+/// Half the width of a marker's line, and how far its dark edge reaches past
+/// it, in points.
+const ICON_LINE: f32 = 1.0;
+const ICON_EDGE: f32 = 1.25;
+
+/// How much of a marker's colour its body takes, the rest being the
+/// outline's: solid, so it reads the same over the sky and a black wall,
+/// and dark, so the line round it stays the brightest thing in it.
+const ICON_BODY: f32 = 0.4;
+
+/// How far out a corner of a line is mitred, as a multiple of its half width;
+/// a sharper corner is cut short there.
+const MITRE_LIMIT: f32 = 2.0;
+
+/// A piece of a marker's glyph, in points from its centre, y down.
+enum Part {
+    Line(Vec<egui::Vec2>),
+    Loop(Vec<egui::Vec2>),
+    /// Filled; convex.
+    Body(Vec<egui::Vec2>),
+}
+
+/// Append a marker for an entity standing at `at` on screen, in `rest` until
+/// it is lit: a bulb for a point light, a lamp with its beam for a spot, a
+/// sun for a directional light, a speaker for a sound — with a second wave
+/// while it plays — an ear for a listener, and a diamond for anything else.
+/// Lit when selected and half lit under the pointer.
+///
+/// Drawn as an icon is: a dark edge, a solid body, and a bright line round
+/// it, the line mitred at its corners so a translucent one has no seams.
 pub fn marker(
     out: &mut Vec<GizmoVertex>,
     at: egui::Pos2,
     kind: Marker,
+    rest: egui::Color32,
     emphasis: Emphasis,
     pixels_per_point: f32,
 ) {
-    let colour = lit(
-        emphasis,
-        match kind {
-            Marker::Light(_) => crate::editor::theme::KIND_LIGHT.to_array(),
-            Marker::Empty => CENTRE.to_array(),
-        },
-    );
-    let ring = |radius: f32, centre: egui::Pos2| -> Vec<egui::Pos2> {
-        (0..=16)
-            .map(|step| {
-                let angle = step as f32 / 16.0 * std::f32::consts::TAU;
-                centre + egui::vec2(angle.cos(), angle.sin()) * radius
-            })
-            .collect()
+    let colour = lit(emphasis, rest.to_array());
+    let alpha = colour[3];
+    let [r, g, b, _] = OUTLINE.to_array();
+    let edge = [r, g, b, (alpha as f32 * 0.6).round() as u8];
+    let body = {
+        let [r, g, b, _] = egui::Color32::from_rgb(r, g, b)
+            .lerp_to_gamma(
+                egui::Color32::from_rgb(colour[0], colour[1], colour[2]),
+                ICON_BODY,
+            )
+            .to_array();
+        [r, g, b, alpha]
     };
-    let spoke = |angle: f32, from: f32, to: f32| {
-        let direction = egui::vec2(angle.cos(), angle.sin());
-        vec![at + direction * from, at + direction * to]
+    let parts = glyph(kind);
+    let placed = |points: &[egui::Vec2]| points.iter().map(|&p| at + p).collect::<Vec<_>>();
+    let lines = || {
+        parts.iter().filter_map(|part| match part {
+            Part::Line(points) => Some((points, false)),
+            Part::Loop(points) => Some((points, true)),
+            Part::Body(_) => None,
+        })
     };
-    // Glyph-like, square to the screen: a bulb, a bulb with its beam, a sun.
-    let lines: Vec<Vec<egui::Pos2>> = match kind {
-        Marker::Light(LightKind::Point) => vec![ring(6.0, at)],
-        Marker::Light(LightKind::Spot) => {
-            let bulb = at - egui::vec2(0.0, 3.0);
+    for (points, closed) in lines() {
+        let half = ICON_LINE + ICON_EDGE;
+        polyline(out, &placed(points), closed, half, edge, pixels_per_point);
+    }
+    for part in &parts {
+        if let Part::Body(points) = part {
+            let points = placed(points);
+            for pair in points[1..].windows(2) {
+                fill_triangle(out, [points[0], pair[0], pair[1]], body, pixels_per_point);
+            }
+        }
+    }
+    for (points, closed) in lines() {
+        polyline(
+            out,
+            &placed(points),
+            closed,
+            ICON_LINE,
+            colour,
+            pixels_per_point,
+        );
+    }
+}
+
+/// Points round an arc about `centre`, from `from` to `to` degrees clockwise
+/// on screen (y down, so 90 is straight down).
+fn arc(centre: (f32, f32), radius: f32, from: f32, to: f32, steps: usize) -> Vec<egui::Vec2> {
+    (0..=steps)
+        .map(|step| {
+            let angle = (from + (to - from) * step as f32 / steps as f32).to_radians();
+            egui::vec2(centre.0, centre.1) + egui::vec2(angle.cos(), angle.sin()) * radius
+        })
+        .collect()
+}
+
+fn points(corners: &[(f32, f32)]) -> Vec<egui::Vec2> {
+    corners.iter().map(|&(x, y)| egui::vec2(x, y)).collect()
+}
+
+/// What `kind` looks like, about 18 points across.
+fn glyph(kind: Marker) -> Vec<Part> {
+    match kind {
+        Marker::Light(LightKind::Point) => {
+            // A bulb opening into its neck, and the cap below it.
+            let mut bulb = arc((0.0, -2.0), 6.0, 125.0, 415.0, 24);
+            bulb.extend(points(&[(2.4, 5.0), (-2.4, 5.0)]));
             vec![
-                ring(5.0, bulb),
-                vec![bulb + egui::vec2(-3.0, 4.0), bulb + egui::vec2(-7.0, 11.0)],
-                vec![bulb + egui::vec2(3.0, 4.0), bulb + egui::vec2(7.0, 11.0)],
+                Part::Body(bulb.clone()),
+                Part::Loop(bulb),
+                Part::Line(points(&[(-1.8, 7.5), (1.8, 7.5)])),
             ]
         }
-        Marker::Light(LightKind::Sun) => std::iter::once(ring(4.0, at))
-            .chain((0..8).map(|ray| spoke(ray as f32 * std::f32::consts::FRAC_PI_4, 6.5, 9.5)))
-            .collect(),
-        Marker::Empty => vec![
-            [
-                (0.0, -6.0),
-                (6.0, 0.0),
-                (0.0, 6.0),
-                (-6.0, 0.0),
-                (0.0, -6.0),
+        Marker::Light(LightKind::Spot) => {
+            let housing = points(&[(-3.0, -8.0), (3.0, -8.0), (5.0, -2.5), (-5.0, -2.5)]);
+            // Its beam spreading down, and the pool it lands in.
+            let mut beam = points(&[(-5.0, -2.5)]);
+            beam.extend((0..=12).map(|step| {
+                let x = -8.5 + 17.0 * step as f32 / 12.0;
+                egui::vec2(x, 7.0 + 1.5 * (1.0 - (x / 8.5).powi(2)))
+            }));
+            beam.push(egui::vec2(5.0, -2.5));
+            vec![
+                Part::Body(housing.clone()),
+                Part::Loop(housing),
+                Part::Line(beam),
             ]
-            .into_iter()
-            .map(|(x, y)| at + egui::vec2(x, y))
-            .collect(),
-        ],
+        }
+        Marker::Light(LightKind::Sun) => {
+            let mut disc = arc((0.0, 0.0), 4.0, 0.0, 360.0, 20);
+            disc.pop();
+            let rays = (0..8).map(|ray| {
+                let direction = egui::Vec2::angled(ray as f32 * std::f32::consts::FRAC_PI_4);
+                Part::Line(vec![direction * 6.5, direction * 9.0])
+            });
+            [Part::Body(disc.clone()), Part::Loop(disc)]
+                .into_iter()
+                .chain(rays)
+                .collect()
+        }
+        Marker::Audio { playing } => {
+            let (box_, cone) = (
+                points(&[(-8.5, -3.5), (-4.0, -3.5), (-4.0, 3.5), (-8.5, 3.5)]),
+                points(&[(-4.0, -3.5), (1.0, -8.0), (1.0, 8.0), (-4.0, 3.5)]),
+            );
+            let outline = points(&[
+                (-8.5, -3.5),
+                (-4.0, -3.5),
+                (1.0, -8.0),
+                (1.0, 8.0),
+                (-4.0, 3.5),
+                (-8.5, 3.5),
+            ]);
+            let mut parts = vec![
+                Part::Body(box_),
+                Part::Body(cone),
+                Part::Loop(outline),
+                Part::Line(arc((1.0, 0.0), 4.0, -50.0, 50.0, 8)),
+            ];
+            if playing {
+                parts.push(Part::Line(arc((1.0, 0.0), 7.5, -50.0, 50.0, 12)));
+            }
+            parts
+        }
+        Marker::Listener => {
+            // An ear: its rim over the top and down to the lobe, and the
+            // curl inside it.
+            let mut rim = arc((0.5, -2.0), 6.0, 160.0, 400.0, 22);
+            rim.extend(points(&[
+                (3.6, 4.2),
+                (2.2, 6.4),
+                (0.2, 8.0),
+                (-2.0, 8.2),
+                (-3.4, 7.0),
+            ]));
+            let mut curl = arc((0.8, -2.0), 2.6, 180.0, 380.0, 12);
+            curl.extend(points(&[(2.4, 1.0), (0.8, 2.0)]));
+            vec![Part::Line(rim), Part::Line(curl)]
+        }
+        Marker::Empty => {
+            let diamond = points(&[(0.0, -6.5), (6.5, 0.0), (0.0, 6.5), (-6.5, 0.0)]);
+            vec![Part::Body(diamond.clone()), Part::Loop(diamond)]
+        }
+    }
+}
+
+/// `points` as one line `half` wide, closed back to the first when
+/// `closed`, with each corner mitred so the segments either side of it meet
+/// edge to edge. [`stroke`]'s square ends would leave a notch on the outside
+/// of a corner and a double coat on its inside, which shows wherever the
+/// line is translucent.
+///
+/// A mitre corner lies on both segments' edge lines, so the distance across
+/// each segment the shader antialiases from is still exact at it.
+pub(crate) fn polyline(
+    out: &mut Vec<GizmoVertex>,
+    points: &[egui::Pos2],
+    closed: bool,
+    half: f32,
+    color: [u8; 4],
+    pixels_per_point: f32,
+) {
+    let count = points.len();
+    if count < 2 {
+        return;
+    }
+    let at = |i: usize| points[i % count].to_vec2() * pixels_per_point;
+    let normal = |i: usize| {
+        let along = at(i + 1) - at(i);
+        egui::vec2(-along.y, along.x) / along.length().max(1e-6)
     };
-    for line in &lines {
-        for pair in line.windows(2) {
-            stroke(out, pair[0], pair[1], 1.25, 1.25, colour, pixels_per_point);
+    // Out to the corner of the edges at point `i`, per unit of half width.
+    let mitre = |i: usize| {
+        let before = (closed || i > 0).then(|| normal(i + count - 1));
+        let after = (closed || i + 1 < count).then(|| normal(i));
+        match (before, after) {
+            (Some(before), Some(after)) => {
+                let between = before + after;
+                if between.length() < 1e-3 {
+                    return after;
+                }
+                let between = between.normalized();
+                between / between.dot(after).max(1.0 / MITRE_LIMIT)
+            }
+            (Some(normal), None) | (None, Some(normal)) => normal,
+            (None, None) => egui::Vec2::ZERO,
         }
+    };
+    let reach = half * pixels_per_point + 1.0;
+    let segments = if closed { count } else { count - 1 };
+    for i in 0..segments {
+        let corner = |point: usize, side: f32| GizmoVertex {
+            position: (at(point) + mitre(point % count) * reach * side).into(),
+            edge: [reach * side, half * pixels_per_point],
+            color,
+        };
+        let (a0, a1) = (corner(i, -1.0), corner(i, 1.0));
+        let (b0, b1) = (corner(i + 1, -1.0), corner(i + 1, 1.0));
+        out.extend([a0, a1, b1, a0, b1, b0]);
     }
 }
 
@@ -523,6 +700,57 @@ pub fn light_lines(light: &Light, world: Mat4, scale: f32, out: &mut Vec<(Vec3, 
                     out.push((end, back + side * scale * 0.08, false));
                 }
             }
+        }
+    }
+}
+
+/// A spatial sound's reach, as lines marked strong or faint: a strong sphere
+/// inside which it plays at full volume, a faint one where its rolloff stops
+/// changing anything, and faint rings between, laid flat, where it has fallen
+/// to half and to a quarter — the levels a scene is laid out by, read across
+/// the floor they are heard over. A flat sound is heard everywhere alike and
+/// has no reach to draw.
+///
+/// Every distance is the mixer's own ([`spatial::distance_at`]), from the
+/// entity's position alone: what is heard does not turn or scale with the
+/// entity, so neither does this.
+///
+/// [`spatial::distance_at`]: crate::audio::spatial::distance_at
+pub fn audio_lines(source: &AudioSource, world: Mat4, out: &mut Vec<(Vec3, Vec3, bool)>) {
+    use crate::audio::spatial::{Falloff, distance_at};
+    const STEPS: usize = 48;
+    const LEVELS: [f32; 2] = [0.5, 0.25];
+    if !source.spatial {
+        return;
+    }
+    let at = world.w_axis.truncate();
+    let falloff = Falloff {
+        min_distance: source.min_distance,
+        max_distance: source.max_distance,
+        rolloff: source.rolloff,
+    };
+    let (min, max) = falloff.reach();
+    let mut circle = |(a, b): (Vec3, Vec3), radius: f32, faint: bool| {
+        let point = |step: usize| {
+            let angle = step as f32 / STEPS as f32 * std::f32::consts::TAU;
+            at + (a * angle.cos() + b * angle.sin()) * radius
+        };
+        out.extend((0..STEPS).map(|step| (point(step), point(step + 1), faint)));
+    };
+    let planes = [(Vec3::X, Vec3::Y), (Vec3::Y, Vec3::Z), (Vec3::Z, Vec3::X)];
+    for plane in planes {
+        circle(plane, min, false);
+    }
+    for radius in LEVELS
+        .into_iter()
+        .filter_map(|gain| distance_at(gain, falloff))
+        .filter(|&radius| radius < max)
+    {
+        circle((Vec3::Z, Vec3::X), radius, true);
+    }
+    if max > min {
+        for plane in planes {
+            circle(plane, max, true);
         }
     }
 }
@@ -599,34 +827,34 @@ impl CameraShape {
     }
 }
 
-/// Append a camera's wireframe, lit by `emphasis`, with the up triangle
-/// filled when it is the camera the game draws from. An edge with an end
-/// behind the view is left out rather than clipped.
+/// Append a camera's wireframe in `rest` until `emphasis` lights it, over a
+/// dark edge as a marker is, with the up triangle filled when it is the
+/// camera the game draws from. An edge with an end behind the view is left
+/// out rather than clipped.
+#[allow(clippy::too_many_arguments)]
 pub fn camera(
     out: &mut Vec<GizmoVertex>,
     shape: &CameraShape,
     view: &Camera,
     screen: egui::Rect,
+    rest: egui::Color32,
     emphasis: Emphasis,
     active: bool,
     pixels_per_point: f32,
 ) {
-    let colour = lit(emphasis, crate::editor::theme::KIND_CAMERA.to_array());
+    let colour = lit(emphasis, rest.to_array());
+    let [r, g, b, _] = OUTLINE.to_array();
+    let edge = [r, g, b, (colour[3] as f32 * 0.5).round() as u8];
     let view_proj = view.view_projection(screen.aspect_ratio());
     let forward = (view.target - view.position).normalize();
     let ahead = |point: Vec3| (point - view.position).dot(forward) > view.near;
     let on_screen = |point: Vec3| to_screen(view_proj, screen, point);
-    for (a, b) in shape.edges() {
-        if ahead(a) && ahead(b) {
-            stroke(
-                out,
-                on_screen(a),
-                on_screen(b),
-                1.0,
-                1.0,
-                colour,
-                pixels_per_point,
-            );
+    for (colour, half) in [(edge, 1.0 + ICON_EDGE), (colour, 1.0)] {
+        for (a, b) in shape.edges() {
+            if ahead(a) && ahead(b) {
+                let (a, b) = (on_screen(a), on_screen(b));
+                stroke(out, a, b, half, half, colour, pixels_per_point);
+            }
         }
     }
     if active && shape.up.into_iter().all(ahead) {
@@ -1178,8 +1406,117 @@ pub(crate) fn fill_quad(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::spatial::{Falloff, attenuation};
     use crate::editor::pick;
-    use crate::scene::Transform;
+    use crate::scene::{AudioSource, Rolloff, Transform};
+
+    /// Every distance from `centre` the lines reach, with how loud a source
+    /// is there, each once.
+    fn reaches(lines: &[(Vec3, Vec3, bool)], centre: Vec3, falloff: Falloff) -> Vec<(f32, f32)> {
+        let mut seen: Vec<(f32, f32)> = Vec::new();
+        for &(a, b, _) in lines {
+            for point in [a, b] {
+                let distance = point.distance(centre);
+                if !seen.iter().any(|(d, _)| (d - distance).abs() < 1e-3) {
+                    seen.push((distance, attenuation(distance, falloff)));
+                }
+            }
+        }
+        seen.sort_by(|a, b| a.0.total_cmp(&b.0));
+        seen
+    }
+
+    fn falloff(source: &AudioSource) -> Falloff {
+        Falloff {
+            min_distance: source.min_distance,
+            max_distance: source.max_distance,
+            rolloff: source.rolloff,
+        }
+    }
+
+    /// The rings are where the mixer puts the sound — full volume, half,
+    /// a quarter, and where the curve stops — whatever the entity's scale or
+    /// turn, since what is heard depends on its position alone.
+    #[test]
+    fn an_audio_source_s_reach_is_drawn_where_it_is_heard() {
+        let centre = Vec3::new(1.0, 2.0, 3.0);
+        let model = Mat4::from_scale_rotation_translation(
+            Vec3::splat(3.0),
+            Quat::from_rotation_y(0.7),
+            centre,
+        );
+        for rolloff in [Rolloff::Inverse, Rolloff::Linear] {
+            let source = AudioSource {
+                min_distance: 2.0,
+                max_distance: 20.0,
+                rolloff,
+                ..AudioSource::default()
+            };
+            let mut lines = Vec::new();
+            audio_lines(&source, model, &mut lines);
+            let gains: Vec<f32> = reaches(&lines, centre, falloff(&source))
+                .iter()
+                .map(|&(_, gain)| (gain * 1000.0).round() / 1000.0)
+                .collect();
+            let at_max = (attenuation(20.0, falloff(&source)) * 1000.0).round() / 1000.0;
+            assert_eq!(gains, [1.0, 0.5, 0.25, at_max], "{rolloff:?}");
+            let strong: Vec<f32> = lines
+                .iter()
+                .filter(|(.., faint)| !faint)
+                .map(|(a, ..)| a.distance(centre))
+                .collect();
+            assert!(
+                !strong.is_empty() && strong.iter().all(|d| (d - 2.0).abs() < 1e-3),
+                "only the full-volume sphere is strong: {strong:?}"
+            );
+        }
+    }
+
+    /// A level the curve only reaches past the maximum distance is never
+    /// reached at all, so it is not drawn; a flat source has no reach.
+    #[test]
+    fn an_audio_source_draws_only_the_levels_it_reaches() {
+        let source = AudioSource {
+            min_distance: 10.0,
+            max_distance: 15.0,
+            ..AudioSource::default()
+        };
+        let mut lines = Vec::new();
+        audio_lines(&source, Mat4::IDENTITY, &mut lines);
+        let distances: Vec<f32> = reaches(&lines, Vec3::ZERO, falloff(&source))
+            .iter()
+            .map(|&(d, _)| d)
+            .collect();
+        assert_eq!(distances.len(), 2, "{distances:?}");
+
+        lines.clear();
+        let flat = AudioSource {
+            spatial: false,
+            ..AudioSource::default()
+        };
+        audio_lines(&flat, Mat4::IDENTITY, &mut lines);
+        assert!(lines.is_empty());
+    }
+
+    /// The speaker reads as one whether or not it is sounding, and gains its
+    /// waves while it is.
+    #[test]
+    fn a_playing_speaker_draws_its_waves() {
+        let strokes = |playing| {
+            let mut out = Vec::new();
+            marker(
+                &mut out,
+                egui::pos2(100.0, 100.0),
+                Marker::Audio { playing },
+                crate::editor::theme::KIND_AUDIO,
+                Emphasis::Rest,
+                1.0,
+            );
+            out.len()
+        };
+        assert!(strokes(false) > 0);
+        assert!(strokes(true) > strokes(false));
+    }
 
     impl Drag {
         /// [`begin`](Drag::begin) on one entity.
@@ -1878,7 +2215,7 @@ mod tests {
     }
 
     /// Under the pointer a marker is lit, but less than when selected, so the
-    /// two can be told apart.
+    /// two can be told apart. Its outline and body are lit as little.
     #[test]
     fn a_hovered_marker_is_half_lit() {
         let mut out = Vec::new();
@@ -1886,15 +2223,106 @@ mod tests {
             &mut out,
             egui::pos2(100.0, 100.0),
             Marker::Light(LightKind::Point),
+            crate::editor::theme::KIND_LIGHT,
             Emphasis::Hovered,
             1.0,
         );
         let [r, g, b, _] = HOT.to_array();
+        assert!(out.iter().any(|v| v.color[..3] == [r, g, b]));
         assert!(
-            out.iter()
-                .all(|v| v.color[..3] == [r, g, b] && v.color[3] > 0 && v.color[3] < 255),
+            out.iter().all(|v| v.color[3] > 0 && v.color[3] < 255),
             "{:?}",
-            out.first().map(|v| v.color)
+            out.iter().map(|v| v.color).max_by_key(|c| c[3])
+        );
+    }
+
+    const EVERY_MARKER: [Marker; 7] = [
+        Marker::Light(LightKind::Point),
+        Marker::Light(LightKind::Spot),
+        Marker::Light(LightKind::Sun),
+        Marker::Audio { playing: false },
+        Marker::Audio { playing: true },
+        Marker::Listener,
+        Marker::Empty,
+    ];
+
+    /// A dark edge under every marker, as under the handles, so a pale one
+    /// still reads over the sky and a gold one over a sunlit wall; and the
+    /// colour it is drawn in is the one it was given.
+    #[test]
+    fn every_marker_is_outlined_in_dark_and_wears_the_tint_it_is_given() {
+        let tint = egui::Color32::from_rgb(10, 200, 90);
+        let [r, g, b, _] = OUTLINE.to_array();
+        for kind in EVERY_MARKER {
+            let mut out = Vec::new();
+            marker(
+                &mut out,
+                egui::pos2(100.0, 100.0),
+                kind,
+                tint,
+                Emphasis::Rest,
+                1.0,
+            );
+            assert!(!out.is_empty() && out.len() % 3 == 0, "{kind:?}");
+            assert!(out.iter().any(|v| v.color[..3] == [r, g, b]), "{kind:?}");
+            assert!(out.iter().any(|v| v.color == tint.to_array()), "{kind:?}");
+        }
+    }
+
+    /// Every kind is a shape of its own, and the listener is not the
+    /// speaker: told apart without selecting anything, or reading a colour.
+    #[test]
+    fn each_kind_of_marker_has_a_shape_of_its_own() {
+        let shapes: Vec<Vec<[f32; 2]>> = EVERY_MARKER
+            .iter()
+            .map(|&kind| {
+                let mut out = Vec::new();
+                marker(
+                    &mut out,
+                    egui::pos2(100.0, 100.0),
+                    kind,
+                    CENTRE,
+                    Emphasis::Rest,
+                    1.0,
+                );
+                out.iter().map(|v| v.position).collect()
+            })
+            .collect();
+        for (i, a) in shapes.iter().enumerate() {
+            for (j, b) in shapes.iter().enumerate().skip(i + 1) {
+                assert_ne!(a, b, "{:?} and {:?}", EVERY_MARKER[i], EVERY_MARKER[j]);
+            }
+        }
+    }
+
+    /// A line's segments share the corners where they meet, so a corner has
+    /// no notch on its outside and no overlap on its inside, where a
+    /// translucent line would show the double coat; the outside corner is
+    /// mitred out to the corner of the line's edges.
+    #[test]
+    fn a_line_is_mitred_so_its_segments_meet_edge_to_edge() {
+        let square =
+            [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)].map(|(x, y)| egui::pos2(x, y));
+        let mut out = Vec::new();
+        polyline(&mut out, &square, true, 2.0, [255; 4], 1.0);
+        assert_eq!(out.len(), 4 * 6);
+        for side in 0..4 {
+            let (this, next) = (&out[side * 6..], &out[(side + 1) % 4 * 6..]);
+            // A quad is a0 a1 b1 a0 b1 b0: this side's b corners are the next one's a.
+            assert_eq!(this[2].position, next[1].position, "side {side}");
+            assert_eq!(this[5].position, next[0].position, "side {side}");
+        }
+        let reach = 2.0 + 1.0;
+        let corners: Vec<f32> = out
+            .iter()
+            .map(|v| (egui::pos2(v.position[0], v.position[1]) - square[0]).length())
+            .filter(|&d| d < 10.0)
+            .collect();
+        assert!(
+            corners
+                .iter()
+                .any(|&d| (d - reach * 2f32.sqrt()).abs() < 1e-4),
+            "{corners:?}"
         );
     }
 
@@ -1907,7 +2335,18 @@ mod tests {
             } else {
                 Emphasis::Rest
             };
-            marker(&mut out, egui::pos2(100.0, 100.0), kind, emphasis, 1.0);
+            let tint = match kind {
+                Marker::Light(_) => crate::editor::theme::KIND_LIGHT,
+                _ => CENTRE,
+            };
+            marker(
+                &mut out,
+                egui::pos2(100.0, 100.0),
+                kind,
+                tint,
+                emphasis,
+                1.0,
+            );
             assert!(!out.is_empty() && out.len() % 3 == 0);
             out.iter().map(|v| v.color).collect()
         };
@@ -1963,6 +2402,7 @@ mod tests {
                 &mut out,
                 egui::pos2(100.0, 100.0),
                 Marker::Light(kind),
+                crate::editor::theme::KIND_LIGHT,
                 Emphasis::Rest,
                 1.0,
             );
@@ -2203,6 +2643,7 @@ mod tests {
             &shape,
             &Camera::default(),
             screen(),
+            crate::editor::theme::KIND_CAMERA,
             emphasis,
             active,
             1.0,
@@ -2216,7 +2657,11 @@ mod tests {
     fn the_active_camera_s_triangle_is_filled() {
         let outline = drawn(Emphasis::Rest, false);
         let filled = drawn(Emphasis::Rest, true);
-        assert_eq!(outline.len(), 11 * 6, "eleven edges, every one in view");
+        assert_eq!(
+            outline.len(),
+            2 * 11 * 6,
+            "eleven edges, every one in view, each over its dark edge"
+        );
         assert_eq!(filled.len(), outline.len() + 3);
         let key = |v: &GizmoVertex| (v.position, v.color);
         assert!(
@@ -2229,8 +2674,17 @@ mod tests {
 
     #[test]
     fn a_camera_wears_the_camera_colour_and_is_lit_when_selected() {
-        let colours =
-            |emphasis| -> Vec<[u8; 4]> { drawn(emphasis, false).iter().map(|v| v.color).collect() };
+        let [r, g, b, _] = OUTLINE.to_array();
+        let edge = [r, g, b];
+        // The wireframe's own colour, apart from the dark edge under it.
+        let colours = |emphasis| -> Vec<[u8; 4]> {
+            let all: Vec<[u8; 4]> = drawn(emphasis, false).iter().map(|v| v.color).collect();
+            assert!(
+                all.iter().any(|c| c[..3] == edge),
+                "{emphasis:?} has no edge"
+            );
+            all.into_iter().filter(|c| c[..3] != edge).collect()
+        };
         let rest = colours(Emphasis::Rest);
         assert!(!rest.is_empty());
         let [r, g, b, _] = crate::editor::theme::KIND_CAMERA.to_array();

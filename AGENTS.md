@@ -36,6 +36,10 @@ Inside `crates/core/src`:
 - `physics/` — rigid bodies on Jolt: colliders and `RigidBody` in, poses and
   enter/exit events out, forces and raycasts for scripts. Read its module docs
   before changing how a body is built or stepped
+- `audio/` — sound on rodio: the `Audio` resource decides on the main thread
+  (voices, spatial gains, play mode), the mixer only sums samples on the
+  device's thread. Read its module docs before adding anything that touches
+  the device's thread
 - `gfx/graph/` — the render graph: passes declare `(resource, access)`, the
   compiler derives order, layouts and barriers. Takes no `Device`, so CI with no
   GPU asserts the exact barrier sequence
@@ -83,7 +87,7 @@ Measurement:
 cargo test --release -p orrin-core --test perf -- --ignored --nocapture
 
 # Microbenchmarks
-cargo bench -p orrin-core --bench physics  # also: startup, sh, ui
+cargo bench -p orrin-core --bench physics  # also: startup, sh, ui, audio
 cargo bench -p orrin-ecs  --bench ecs
 
 # The cold-start gate architecture §6 asks for

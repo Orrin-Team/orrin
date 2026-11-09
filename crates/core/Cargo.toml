@@ -64,6 +64,13 @@ rusty_dds = { version = "0.9", default-features = false, features = ["encode", "
 # `orrin-jolt` because `jolt` was taken; the library is still `jolt`. Without its
 # `glam` feature, which would pull a second glam (0.34) beside the workspace's.
 jolt = { package = "orrin-jolt", version = "0.1" }
+# Audio (`audio`): rodio for the device and for decoding WAV, Ogg Vorbis and
+# MP3 through symphonia; the mixer and the spatialiser are the engine's own.
+# Defaults off, which drops recording, FLAC, MP4/AAC and the dither noise (and
+# with it `rand`). Brings cpal and its platform backend, symphonia's core and
+# three codecs — compile time. The device opens on a thread of its own, so it
+# is not on the cold-start path.
+rodio = { version = "0.23", default-features = false, features = ["playback", "wav", "vorbis", "mp3"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
@@ -112,6 +119,10 @@ harness = false
 
 [[bench]]
 name = "ui"
+harness = false
+
+[[bench]]
+name = "audio"
 harness = false
 
 [build-dependencies]

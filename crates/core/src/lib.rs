@@ -1,5 +1,6 @@
 pub mod app;
 pub mod asset_db;
+pub mod audio;
 #[cfg(feature = "scripting")]
 pub mod build_watcher;
 pub mod camera_controller;

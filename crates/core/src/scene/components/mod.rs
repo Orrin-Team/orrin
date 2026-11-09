@@ -1,3 +1,4 @@
+mod audio;
 mod camera;
 mod collider;
 mod light;
@@ -17,6 +18,7 @@ mod tag;
 mod unknown;
 mod world_transform;
 
+pub use audio::{AudioListener, AudioSource, Rolloff};
 pub use camera::CameraComponent;
 pub use collider::{Collider, ColliderShape};
 pub use light::{AmbientLight, Light, MAX_CONE_ANGLE, MIN_CONE_ANGLE};

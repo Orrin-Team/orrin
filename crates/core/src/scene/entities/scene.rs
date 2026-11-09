@@ -15,11 +15,14 @@
 use glam::Vec3;
 
 use orrin_ecs::World;
+use orrin_registry::AssetId;
 
 use super::library::{SWEEP, WALL_TILE, load_library};
 use super::{spawn_decal, spawn_mesh, spawn_point_light, spawn_spot_light};
+use crate::audio::Audio;
+use crate::audio::clip::Clip;
 use crate::gfx::RenderBackend;
-use crate::scene::{Assets, Camera, Decal, Spin, Transform};
+use crate::scene::{Assets, AudioSource, Camera, Decal, Spin, Transform};
 
 const GRID: i32 = 10;
 const SPACING: f32 = 2.0;
@@ -62,6 +65,7 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
 
     let half = (GRID - 1) as f32 * SPACING * 0.5;
     let mut index = 0;
+    let mut chimer = None;
     for x in 0..GRID {
         for z in 0..GRID {
             let pos = Vec3::new(x as f32 * SPACING - half, 0.0, z as f32 * SPACING - half);
@@ -81,8 +85,34 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
             );
             let speed = 0.5 + ((x + z) % 5) as f32 * 0.4;
             world.insert(entity, Spin::new(Vec3::Y, speed));
+            if x == GRID - 1 && z == GRID - 1 {
+                chimer = Some(entity);
+            }
             index += 1;
         }
+    }
+
+    // The corner cube on the camera's right as the scene opens, so Play is
+    // enough to hear a sound and where it is, and flying round the grid moves
+    // it between the ears. Built rather than read from a file: the demo has no
+    // asset database (see `App::open_asset_database`), so its sound is named
+    // the way the library's meshes are. A sound on an existing cube moves no
+    // pixel of any capture.
+    let chime_id = AssetId::named("sound", "chime");
+    if let Some(mut audio) = world.get_resource_mut::<Audio>() {
+        audio.insert_clip(chime_id, chime());
+    }
+    if let Some(chimer) = chimer {
+        world.insert(
+            chimer,
+            AudioSource {
+                clip: chime_id,
+                looping: true,
+                min_distance: 8.0,
+                max_distance: 60.0,
+                ..AudioSource::default()
+            },
+        );
     }
 
     // A flattened cube gives SSAO real contact surfaces to darken; the floating
@@ -413,4 +443,76 @@ pub fn build_default_scene(world: &mut World, backend: &mut impl RenderBackend) 
         target: Vec3::ZERO,
         ..Camera::default()
     });
+}
+
+/// A struck chime every second and a half: three partials of 660 Hz over a
+/// 200 ms decay, then silence. A sharp onset on every repeat is what lets an
+/// ear place a sound; a steady tone would only get louder and quieter.
+fn chime() -> Clip {
+    let rate = crate::audio::mixer::RATE;
+    let frames = rate as usize * 3 / 2;
+    let samples = (0..frames)
+        .map(|i| {
+            let t = i as f32 / rate as f32;
+            let attack = (t / 0.004).min(1.0);
+            let decay = (-t / 0.2).exp();
+            let tone: f32 = [(1.0, 1.0), (2.0, 0.45), (3.01, 0.2)]
+                .iter()
+                .map(|(partial, level)| level * (std::f32::consts::TAU * 660.0 * partial * t).sin())
+                .sum();
+            0.4 * attack * decay * tone
+        })
+        .collect();
+    Clip::new(1, rate, samples)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::Audio;
+    use crate::scene::{AudioSource, Name};
+
+    fn demo() -> World {
+        let mut world = World::new();
+        world.insert_resource(Audio::default());
+        build_default_scene(
+            &mut world,
+            &mut crate::gfx::headless::HeadlessBackend::new(),
+        );
+        world
+    }
+
+    /// One sound, on a cube the camera opens looking past on its right, so
+    /// pressing Play is enough to hear both the sound and where it is.
+    #[test]
+    fn the_demo_has_one_spatial_sound_on_a_cube_to_the_right() {
+        let world = demo();
+        let mut found = Vec::new();
+        world
+            .query::<(&AudioSource, &Name)>()
+            .for_each(|_, (source, name)| found.push((*source, name.as_str().to_owned())));
+        assert_eq!(found.len(), 1, "{found:?}");
+        let (source, name) = &found[0];
+        assert!(name.starts_with("Cube"), "{name}");
+        assert!(source.spatial && source.looping && source.play_on_start);
+        assert_eq!(
+            world.resource::<Audio>().clip_state(source.clip),
+            Some(crate::asset_db::LoadState::Ready),
+            "the demo has no asset database, so its sound is built, not imported"
+        );
+    }
+
+    /// The chime loops, so it has to end where it starts — at silence — or
+    /// every repeat clicks; and it must not clip.
+    #[test]
+    fn the_chime_loops_without_a_click_and_never_clips() {
+        let clip = chime();
+        let first = clip.frame(0, false)[0];
+        let last = clip.frame(clip.frames() - 1, false)[0];
+        assert!(first.abs() < 1e-3 && last.abs() < 1e-3, "{first} {last}");
+        let peak = (0..clip.frames())
+            .map(|i| clip.frame(i, false)[0].abs())
+            .fold(0.0, f32::max);
+        assert!((0.3..1.0).contains(&peak), "peak {peak}");
+    }
 }

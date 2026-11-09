@@ -247,6 +247,12 @@ impl App {
 
         crate::scene::register_components(&mut app.registry);
         Self::install_default_resources(&mut app.world);
+        // Here rather than in `install_default_resources` for the gamepads'
+        // reason, though it returns at once: the device opens on a thread of
+        // its own, and a test world has no business making a sound.
+        app.world
+            .resource_mut::<crate::audio::Audio>()
+            .open_device();
         app.load_input_config();
         app.load_prefabs();
 
@@ -324,6 +330,7 @@ impl App {
         world.insert_resource(Actions::new());
         world.insert_resource(crate::physics::CollisionState::default());
         world.insert_resource(crate::physics::PhysicsState::default());
+        world.insert_resource(crate::audio::Audio::default());
         world.insert_resource(LogBuffer::default());
         world.insert_resource(DebugLines::default());
         world.insert_resource(UiCanvas::default());
@@ -1015,6 +1022,12 @@ impl ApplicationHandler for App {
                 // `scene::camera`.
                 if self.world.resource::<crate::scene::Play>().is_live() {
                     crate::scene::follow_active_camera(&self.world);
+                }
+                // After the camera follows, so the listener is where the frame
+                // is drawn from, and every emitter where it is drawn.
+                {
+                    profile_scope!("audio");
+                    crate::audio::update(&self.world);
                 }
 
                 // After the editor and the script tick, either of which can load

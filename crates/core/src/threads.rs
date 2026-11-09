@@ -17,7 +17,7 @@
 //! arrive back at one thread. A pool of one would fold that overhead into the
 //! baseline and make every speed-up look better than it is.
 //!
-//! **Imports are the one other place work runs in parallel, and never here.**
+//! **Imports are one other place work runs in parallel, and never here.**
 //! A texture import compresses on threads of its own, a quarter of the machine
 //! and at most four ([`import_threads`]), and stays out of the pool entirely:
 //! rayon workers drain their own queued splits before they take new work, so
@@ -26,6 +26,11 @@
 //! BC7 chain encoding in a loop beside a 4000-object stress frame: through the
 //! pool, frame p95 went from 1.1 to 16.4 ms; on 15 threads of its own, 3.0 ms;
 //! on 4, 1.17 ms, where one thread's 200 ms became 54 ms.
+//!
+//! **Audio is the other, on two threads that are not workers either.** The
+//! device's callback runs on a thread the OS audio server schedules against a
+//! deadline, and sound files decode on one of their own (`audio::load`) for the
+//! import threads' reason. Neither takes frame work.
 //!
 //! Workers are named `orrin-worker-N`, so a `perf` profile or a RenderDoc
 //! capture says which thread a sample came from, and they are taken out of
