@@ -37,10 +37,9 @@ pub fn padded<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 /// down to this, so a high-DPI display still gets a sharp one.
 pub const THUMB: f32 = 36.0;
 
-/// The two greys a material preview is tiled over, fixed rather than themed:
-/// a backdrop that changed with the editor's theme would change how light or
-/// dark every material looks against it.
-const CHECKER: [egui::Color32; 2] = [egui::Color32::from_gray(54), egui::Color32::from_gray(76)];
+/// How many squares a material preview's checkerboard has along each side. Its
+/// two shades are the theme's darkest background and its window fill, so the
+/// square sits in the panel rather than on it while a cutout's holes still read.
 const CHECKER_CELLS: usize = 8;
 
 /// The renderer's sphere of `material` for `viewer`, `points` across at most,
@@ -72,12 +71,13 @@ pub fn material_preview(
     }
 
     let cell = side / CHECKER_CELLS as f32;
+    let shades = [ui.visuals().extreme_bg_color, ui.visuals().window_fill];
     let painter = ui.painter_at(rect);
     for row in 0..CHECKER_CELLS {
         for column in 0..CHECKER_CELLS {
             let min = rect.min + egui::vec2(column as f32, row as f32) * cell;
             let square = egui::Rect::from_min_size(min, egui::Vec2::splat(cell));
-            painter.rect_filled(square, 0.0, CHECKER[(row + column) % 2]);
+            painter.rect_filled(square, 0.0, shades[(row + column) % 2]);
         }
     }
     egui::Image::new(egui::load::SizedTexture::new(viewer.texture(), rect.size()))

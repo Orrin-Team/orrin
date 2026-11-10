@@ -965,7 +965,7 @@ mod tests {
     }
 
     /// A cutout's holes read as holes only against something: the sphere's
-    /// square is tiled in two alternating greys.
+    /// square is tiled in the theme's darkest background and its window fill.
     fn assert_checkerboard_behind(editor: &Harness, sphere: egui::Rect) {
         let cells: Vec<_> = editor
             .painted_fills()
@@ -974,7 +974,14 @@ mod tests {
             .collect();
         assert!(cells.len() >= 16, "{} cells under {sphere:?}", cells.len());
         let shades: std::collections::HashSet<_> = cells.iter().map(|(_, fill)| *fill).collect();
-        assert_eq!(shades.len(), 2, "{shades:?}");
+        let visuals = editor.ctx.style().visuals.clone();
+        let theme: std::collections::HashSet<_> = [visuals.extreme_bg_color, visuals.window_fill]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            shades, theme,
+            "the backdrop is the editor's own backgrounds"
+        );
         let covered: f32 = cells.iter().map(|(rect, _)| rect.area()).sum();
         assert!(
             (covered - sphere.area()).abs() < sphere.area() * 0.02,
