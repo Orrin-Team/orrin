@@ -1,4 +1,4 @@
-//! `.fmat`: a material as a file.
+//! `.omat`: a material as a file.
 //!
 //! The scene grammar under a header of its own (`orrin-material 1 min-reader
 //! 1`), so a material reads, diffs and merges the way a scene does. Every
@@ -23,11 +23,11 @@ use orrin_registry::{AssetId, Reflect, Value, ValueError};
 
 use crate::gfx::{BlendMode, Material, TextureHandle};
 
-/// The word a `.fmat` header starts with.
+/// The word a `.omat` header starts with.
 pub const KIND: &str = "orrin-material";
 /// The version this build writes and the newest it reads.
 pub const VERSION: u32 = 1;
-pub const EXTENSION: &str = "fmat";
+pub const EXTENSION: &str = "omat";
 
 /// A material's texture slots, each naming the texture asset in it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -178,7 +178,7 @@ fn slots(
     ]
 }
 
-/// Read a `.fmat`. `rel` names the file in every error.
+/// Read a `.omat`. `rel` names the file in every error.
 pub fn parse(text: &str, rel: &str) -> Result<MaterialFile, String> {
     let fields = orrin_registry::parse_value_document(text, KIND, VERSION)
         .map_err(|error| format!("{rel}: {error}"))?;
@@ -284,7 +284,7 @@ fn parse_textures(file: &mut MaterialFile, value: &Value, rel: &str) -> Result<(
     Ok(())
 }
 
-/// The text of a `.fmat` holding `file`.
+/// The text of a `.omat` holding `file`.
 pub fn write(file: &MaterialFile) -> String {
     let Material {
         base_color,
@@ -464,7 +464,7 @@ mod tests {
     fn every_parameter_and_slot_survives_a_write_and_a_read() {
         let file = everything();
         let text = write(&file);
-        let back = parse(&text, "brick.fmat").unwrap();
+        let back = parse(&text, "brick.omat").unwrap();
         assert_eq!(format!("{back:?}"), format!("{file:?}"));
         assert_eq!(write(&back), text);
     }
@@ -511,7 +511,7 @@ transmission = 0.0
     fn a_parameter_the_file_lacks_takes_its_default() {
         let file = parse(
             "orrin-material 1 min-reader 1\n\nroughness = 0.2\n",
-            "brick.fmat",
+            "brick.omat",
         )
         .unwrap();
         assert_eq!(file.material.roughness, 0.2);
@@ -523,42 +523,42 @@ transmission = 0.0
     fn an_unknown_or_mistyped_field_is_refused_by_name() {
         let err = parse(
             "orrin-material 1 min-reader 1\n\nrougness = 0.2\n",
-            "brick.fmat",
+            "brick.omat",
         )
         .unwrap_err();
-        assert_eq!(err, "brick.fmat: `rougness` is not a material parameter");
+        assert_eq!(err, "brick.omat: `rougness` is not a material parameter");
 
         let err = parse(
             "orrin-material 1 min-reader 1\n\nroughness = \"low\"\n",
-            "brick.fmat",
+            "brick.omat",
         )
         .unwrap_err();
         assert_eq!(
             err,
-            "brick.fmat: field `roughness`: expected f32, found string"
+            "brick.omat: field `roughness`: expected f32, found string"
         );
 
         let err = parse(
             "orrin-material 1 min-reader 1\n\ntextures\n  albeedo = asset(00000000-0000-4000-8000-000000000001)\n",
-            "brick.fmat",
+            "brick.omat",
         )
         .unwrap_err();
-        assert_eq!(err, "brick.fmat: `albeedo` is not a texture slot");
+        assert_eq!(err, "brick.omat: `albeedo` is not a texture slot");
 
         let err = parse(
             "orrin-material 1 min-reader 1\n\nblend = Glass\n",
-            "brick.fmat",
+            "brick.omat",
         )
         .unwrap_err();
         assert_eq!(
             err,
-            "brick.fmat: `blend` must be Opaque, Masked, Blend or Transmissive, not Glass"
+            "brick.omat: `blend` must be Opaque, Masked, Blend or Transmissive, not Glass"
         );
 
-        let err = parse("orrin-scene 3 min-reader 3\n", "brick.fmat").unwrap_err();
+        let err = parse("orrin-scene 3 min-reader 3\n", "brick.omat").unwrap_err();
         assert_eq!(
             err,
-            "brick.fmat: line 1: expected an `orrin-material 1 min-reader 1` header"
+            "brick.omat: line 1: expected an `orrin-material 1 min-reader 1` header"
         );
     }
 

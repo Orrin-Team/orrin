@@ -20,6 +20,7 @@ use crate::editor::kind::Kind;
 use crate::editor::previews::Previews;
 use crate::editor::state::EditorState;
 use crate::editor::widgets;
+use crate::gfx::vulkan::material_preview;
 #[cfg(feature = "scripting")]
 use crate::scene::ScriptComponent;
 use crate::scene::prefab;
@@ -1082,7 +1083,7 @@ const MAPS: [(&str, &str); 4] = [
 ///
 /// A material is shared by every entity that draws with it, so an edit here
 /// changes all of them — which is what editing a material means. A material
-/// asset is edited through the edit pipeline and saved to its `.fmat` as each
+/// asset is edited through the edit pipeline and saved to its `.omat` as each
 /// gesture ends, so it can be undone with the scene's edits; its texture slots
 /// take texture assets dropped on them. An engine or model material has no
 /// file: its edit goes to the world-side copy and is queued for the renderer
@@ -1115,7 +1116,14 @@ fn material_section(
             kept
         }
     };
-    let mut labels = vec!["Base colour", "Metallic", "Roughness", "Emission", "Blend"];
+    let mut labels = vec![
+        "Preview",
+        "Base colour",
+        "Metallic",
+        "Roughness",
+        "Emission",
+        "Blend",
+    ];
     if asset.is_some() {
         labels.extend(MAPS.map(|(label, _)| label));
     }
@@ -1127,7 +1135,23 @@ fn material_section(
     let mut slots = asset.map(|(_, file)| file);
     let id = ui.id().with("material");
     let weak = ui.visuals().weak_text_color();
+    let mut previewed = None;
     widgets::section(ui, id, icons::palette(), weak, "Material", None, |ui| {
+        if rows.shows("Preview") {
+            // Drawn by the renderer this frame, through the frame's own
+            // shading; see `gfx::vulkan::material_preview`.
+            let side = (ui.available_width() * 0.6).clamp(96.0, 160.0);
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                previewed = Some(widgets::material_preview(
+                    ui,
+                    material_preview::Viewer::Inspector,
+                    handle,
+                    side,
+                ));
+            });
+            ui.add_space(8.0);
+        }
         if rows.shows("Base colour") {
             widgets::property(ui, "Base colour", |ui| {
                 let mut rgb = after.base_color.to_array();
@@ -1190,6 +1214,10 @@ fn material_section(
             }
         }
     });
+
+    if previewed.is_some() {
+        state.material_previews[material_preview::Viewer::Inspector as usize] = previewed;
+    }
 
     let edited = before.base_color != after.base_color
         || before.metallic != after.metallic
@@ -1923,12 +1951,12 @@ mod tests {
         let dir = crate::asset_db::tests::Dir::new("inspector-drop-material");
         dir.write("rock.png", b"");
         dir.write(
-            "brick.fmat",
+            "brick.omat",
             crate::asset_db::material::write(&Default::default()).as_bytes(),
         );
         let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         let rock = db.find("rock.png").unwrap().id;
-        let brick = db.find("brick.fmat").unwrap().id;
+        let brick = db.find("brick.omat").unwrap().id;
 
         let mut world = World::new();
         world.insert_resource(db);

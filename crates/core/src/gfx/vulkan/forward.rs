@@ -17,11 +17,12 @@ use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 use super::{MSAA_SAMPLES, ShadowFrame, VulkanRenderer};
 use crate::gfx::format::{Format, SampleCount};
+use crate::gfx::graph::BufferUsage;
 use crate::gfx::rhi::MeshSpan;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferId, CullMode, DepthCompare,
-    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId,
-    TextureViewId, Topology, Viewport,
+    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferDesc, BufferId, CullMode,
+    DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc, MemoryLocation, PipelineId,
+    SamplerDesc, SamplerId, TextureViewId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -538,6 +539,84 @@ impl GpuShadowFace {
         view_proj: [[0.0; 4]; 4],
         rect: [0.0; 4],
     };
+}
+
+/// What set 0 binds.
+struct LightingSet {
+    lighting: BufferId,
+    decals: BufferId,
+    points: BufferId,
+    spots: BufferId,
+    clusters: BufferId,
+}
+
+/// What set 3 binds.
+struct SurfaceSet {
+    ao: TextureViewId,
+    shadow: TextureViewId,
+    env_cube: TextureViewId,
+    env_sampler: SamplerId,
+    contact_shadow: TextureViewId,
+    atlas: TextureViewId,
+    shadow_faces: BufferId,
+    fog_volume: TextureViewId,
+    fog_sampler: SamplerId,
+    fog: BufferId,
+}
+
+/// The views a frame binds when a term has nothing to say — white occlusion,
+/// lit shadows, still air — and the environment, which the preview does want.
+pub(super) struct NeutralViews {
+    pub ao: TextureViewId,
+    pub contact_shadow: TextureViewId,
+    pub shadow: TextureViewId,
+    pub atlas: TextureViewId,
+    pub env_cube: TextureViewId,
+    pub env_sampler: SamplerId,
+    pub fog_volume: TextureViewId,
+    pub fog_sampler: SamplerId,
+}
+
+/// The blocks a frame binds when there is nothing to light with — no punctual
+/// light, decal, cluster, shadow face or fog — which the material preview
+/// binds on every redraw and therefore holds rather than uploads.
+pub(super) struct NeutralBlocks {
+    decals: BufferId,
+    points: BufferId,
+    spots: BufferId,
+    clusters: BufferId,
+    shadow_faces: BufferId,
+    fog: BufferId,
+}
+
+/// The lighting block the material preview shades with. Kept as the block so
+/// what decides whether the preview is redrawn is exactly what it is drawn
+/// with.
+pub(super) struct PreviewLighting(GpuLighting);
+
+impl PreviewLighting {
+    pub(super) fn new(
+        lighting: &SceneLighting,
+        camera: &Camera,
+        extent: [u32; 2],
+        irradiance: [Vec3; SH9],
+        environment_yaw: f32,
+        env_specular: Vec3,
+    ) -> Self {
+        Self(to_gpu_lighting(
+            lighting,
+            camera,
+            extent,
+            None,
+            irradiance,
+            environment_yaw,
+            env_specular,
+        ))
+    }
+
+    pub(super) fn bytes(&self) -> &[u8] {
+        bytemuck::bytes_of(&self.0)
+    }
 }
 
 /// The five descriptor sets a pass shading into the lit frame binds, in bind
@@ -1110,13 +1189,52 @@ impl ForwardPass {
         let shadow_faces =
             device.upload_block(BlockKind::Storage, bytemuck::cast_slice(&shadow_faces));
 
+        self.assemble(
+            device,
+            LightingSet {
+                lighting: lighting_buffer,
+                decals,
+                points: point_buffer,
+                spots: spot_buffer,
+                clusters: cluster_buffer,
+            },
+            SurfaceSet {
+                ao: ao_view,
+                shadow: shadow_view,
+                env_cube,
+                env_sampler: env_cube_sampler,
+                contact_shadow: contact_shadow_view,
+                atlas: atlas_view,
+                shadow_faces,
+                fog_volume,
+                fog_sampler,
+                fog,
+            },
+            material_set,
+            texture_set,
+            object_set,
+        )
+    }
+
+    /// Sets 0 and 3 over what they bind, with the three shared ones beside
+    /// them. The one place either set's bindings are listed, so the frame's
+    /// sets and the material preview's cannot disagree about a slot.
+    fn assemble(
+        &self,
+        device: &Device,
+        set0: LightingSet,
+        set3: SurfaceSet,
+        material_set: BindGroupId,
+        texture_set: BindGroupId,
+        object_set: BindGroupId,
+    ) -> ForwardSets {
         let lighting_set = device.create_transient_bind_group(
             self.single.plain,
             0,
             &[
                 Binding {
                     binding: 0,
-                    resource: BindingResource::UniformBuffer(lighting_buffer),
+                    resource: BindingResource::UniformBuffer(set0.lighting),
                 },
                 // The same buffer object the prepass binds. Not a copy: what a
                 // decal does to a normal, an `f0` and a roughness has to be the
@@ -1126,19 +1244,19 @@ impl ForwardPass {
                 // about *where* a map is sampled.
                 Binding {
                     binding: 1,
-                    resource: BindingResource::StorageBuffer(decals),
+                    resource: BindingResource::StorageBuffer(set0.decals),
                 },
                 Binding {
                     binding: 2,
-                    resource: BindingResource::UniformBuffer(point_buffer),
+                    resource: BindingResource::UniformBuffer(set0.points),
                 },
                 Binding {
                     binding: 3,
-                    resource: BindingResource::UniformBuffer(spot_buffer),
+                    resource: BindingResource::UniformBuffer(set0.spots),
                 },
                 Binding {
                     binding: 4,
-                    resource: BindingResource::StorageBuffer(cluster_buffer),
+                    resource: BindingResource::StorageBuffer(set0.clusters),
                 },
             ],
         );
@@ -1162,23 +1280,23 @@ impl ForwardPass {
             self.single.plain,
             3,
             &[
-                sampled(0, ao_view),
-                texture(1, shadow_view),
-                texture(3, env_cube),
+                sampled(0, set3.ao),
+                texture(1, set3.shadow),
+                texture(3, set3.env_cube),
                 Binding {
                     binding: 4,
-                    resource: BindingResource::Sampler(env_cube_sampler),
+                    resource: BindingResource::Sampler(set3.env_sampler),
                 },
-                sampled(5, contact_shadow_view),
+                sampled(5, set3.contact_shadow),
                 // The atlas reads through the cascades' comparison sampler at
                 // binding 2 — same conventions, same `Less` against a map
                 // cleared to 1.0 — so it needs no sampler of its own. Which
                 // matters: Metal caps samplers per stage far below sampled
                 // images, and this shader is already at five.
-                texture(6, atlas_view),
+                texture(6, set3.atlas),
                 Binding {
                     binding: 7,
-                    resource: BindingResource::StorageBuffer(shadow_faces),
+                    resource: BindingResource::StorageBuffer(set3.shadow_faces),
                 },
                 // The fog volume and the medium that produced it. Both are bound
                 // in every frame — the volume as a 1x1x1 stand-in when the two
@@ -1188,13 +1306,13 @@ impl ForwardPass {
                 Binding {
                     binding: 8,
                     resource: BindingResource::SampledTexture {
-                        view: fog_volume,
-                        sampler: fog_sampler,
+                        view: set3.fog_volume,
+                        sampler: set3.fog_sampler,
                     },
                 },
                 Binding {
                     binding: 9,
-                    resource: BindingResource::UniformBuffer(fog),
+                    resource: BindingResource::UniformBuffer(set3.fog),
                 },
             ],
         );
@@ -1202,6 +1320,83 @@ impl ForwardPass {
         ForwardSets {
             groups: [lighting_set, material_set, texture_set, ao_set, object_set],
         }
+    }
+
+    /// The five sets the material preview draws its sphere with: the frame's
+    /// material table and textures, and everything else a sphere standing in
+    /// no scene should see — no punctual light, no decal, no shadow, no fog,
+    /// and no screen-space term, since the frame's screen is not its screen.
+    pub(super) fn neutral_blocks(&self, device: &Device) -> NeutralBlocks {
+        let block = |usage, bytes: &[u8]| {
+            device.create_buffer_bytes(
+                BufferDesc {
+                    size: bytes.len() as u64,
+                    usage,
+                    location: MemoryLocation::GpuOnly,
+                },
+                bytes,
+            )
+        };
+        let (uniform, storage) = (BufferUsage::UNIFORM_BUFFER, BufferUsage::STORAGE_BUFFER);
+        let no_decals = GpuDecals {
+            count: [0; 4],
+            decals: [GpuDecal::ZERO; MAX_DECALS],
+        };
+        NeutralBlocks {
+            decals: block(storage, bytemuck::bytes_of(&no_decals)),
+            points: block(
+                uniform,
+                bytemuck::cast_slice(&[GpuPointLight::ZERO; MAX_POINT_LIGHTS]),
+            ),
+            spots: block(
+                uniform,
+                bytemuck::cast_slice(&[GpuSpotLight::ZERO; MAX_SPOT_LIGHTS]),
+            ),
+            clusters: block(storage, bytemuck::cast_slice(&[0u32; CLUSTERS * 4 + 1])),
+            shadow_faces: block(storage, bytemuck::bytes_of(&GpuShadowFace::ZERO)),
+            fog: block(
+                uniform,
+                bytemuck::bytes_of(&<super::fog::GpuFog as bytemuck::Zeroable>::zeroed()),
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn preview_sets(
+        &self,
+        device: &Device,
+        lighting: &PreviewLighting,
+        neutral: NeutralViews,
+        blocks: &NeutralBlocks,
+        material_set: BindGroupId,
+        texture_set: BindGroupId,
+        object_set: BindGroupId,
+    ) -> ForwardSets {
+        self.assemble(
+            device,
+            LightingSet {
+                lighting: device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&lighting.0)),
+                decals: blocks.decals,
+                points: blocks.points,
+                spots: blocks.spots,
+                clusters: blocks.clusters,
+            },
+            SurfaceSet {
+                ao: neutral.ao,
+                shadow: neutral.shadow,
+                env_cube: neutral.env_cube,
+                env_sampler: neutral.env_sampler,
+                contact_shadow: neutral.contact_shadow,
+                atlas: neutral.atlas,
+                shadow_faces: blocks.shadow_faces,
+                fog_volume: neutral.fog_volume,
+                fog_sampler: neutral.fog_sampler,
+                fog: blocks.fog,
+            },
+            material_set,
+            texture_set,
+            object_set,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

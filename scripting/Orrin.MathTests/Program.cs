@@ -250,6 +250,16 @@ unsafe
         "ForceMode numbers as the engine does");
     Check((uint)Orrin.ColliderShape.Capsule == 2 && (uint)Orrin.ColliderShape.ConvexHull == 5,
         "ColliderShape numbers as the engine does");
+    // A mesh renderer, lock-step with CMeshRenderer: two assets' 16 bytes.
+    Check(sizeof(Orrin.MeshRenderer) == 32, "MeshRenderer is two asset ids");
+    Check((uint)Orrin.ComponentKind.MeshRenderer == 16, "ComponentKind.MeshRenderer is 16");
+    Check(Orrin.ComponentKinds.Blittable<Orrin.MeshRenderer>() == 16,
+        "a MeshRenderer is read and written as a struct");
+    var renderer = new Orrin.MeshRenderer();
+    var gold = new Orrin.AssetRef<Orrin.Material>(System.Guid.NewGuid());
+    renderer.Material = gold;
+    Check(renderer.Material.Id == gold.Id && !renderer.Mesh.IsValid,
+        "MeshRenderer.Material round-trips its reference and leaves the mesh alone");
     // Audio, lock-step with CAudioSource and CSound, and with the numbering
     // `rolloff_of` and `find_asset` read.
     Check(sizeof(Orrin.AudioSource) == 44, "AudioSource is a clip's 16 bytes and seven words");

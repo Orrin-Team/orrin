@@ -15,6 +15,7 @@ pub(crate) mod gizmo;
 pub(crate) mod hdr;
 mod instances;
 mod line;
+pub mod material_preview;
 mod mesh;
 mod motion_blur;
 mod occlusion;
@@ -138,7 +139,8 @@ use super::{
 use crate::gfx::format::Format as EngineFormat;
 use crate::gfx::images::ImageTable;
 use crate::gfx::rhi::{
-    BindGroupId, BufferDesc, BufferId, Device, Encoder, Feature, MemoryLocation, TextureViewId,
+    BindGroupId, BlockKind, BufferDesc, BufferId, Device, Encoder, Feature, MemoryLocation,
+    TextureViewId,
 };
 use crate::profile::Profiler;
 use crate::profile_scope;
@@ -249,6 +251,12 @@ pub struct VulkanRenderer {
     /// that puts what it gathered over the lit frame. Draws through the forward
     /// pass's own pipeline layout, so it is constructed after it.
     oit: OitPass,
+    /// The inspector's material sphere. Built on the first frame that asks for
+    /// one, so a game with no editor never compiles its pipelines.
+    material_preview: Option<material_preview::MaterialPreviewPass>,
+    /// Bumped whenever a material, a texture or the environment changes in
+    /// place, which is what the preview's handle and lighting cannot see.
+    preview_inputs: u64,
     /// Screen-space refraction: the scene pyramid, the sorted draw, and the
     /// composite. Built with a layout of its own — the same five descriptor sets
     /// the forward pass binds, plus a sixth for that pyramid.
@@ -499,6 +507,7 @@ impl VulkanRenderer {
     /// them once the frames still reading them are done, so an edit costs a
     /// rebuild on the next frame and nothing once it is let go.
     fn invalidate_material_sets(&mut self) {
+        self.preview_inputs += 1;
         if let Some(buffer) = self.material_buffer.take() {
             self.device.destroy_buffer(buffer);
         }
@@ -517,6 +526,7 @@ impl VulkanRenderer {
     /// The same for the texture array, which a frame in flight keeps reading
     /// until it finishes, so it sees the pixels it started with.
     fn invalidate_texture_sets(&mut self) {
+        self.preview_inputs += 1;
         for group in [
             self.texture_set.take(),
             self.prepass_texture_set.take(),
@@ -739,6 +749,7 @@ impl VulkanRenderer {
             async_compute,
             occlusion_culling,
             wireframe: None,
+            material_preview: false,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -760,6 +771,8 @@ impl VulkanRenderer {
             ssr,
             subsurface,
             oit,
+            material_preview: None,
+            preview_inputs: 0,
             refraction,
             taa,
             dof,
@@ -818,6 +831,65 @@ impl VulkanRenderer {
     /// Waits for the frame first. That is the whole synchronisation story —
     /// `render_frame` already signalled a fence, and the copy is submitted after
     /// it has been reached, so nothing here can read a half-written image.
+    /// The material preview the last frame that redrew `viewer`'s left for
+    /// the overlay, as tightly packed sRGB RGBA8 rows of
+    /// [`material_preview::SIZE`]. `None` before any frame has drawn one.
+    pub fn read_material_preview(&mut self, viewer: material_preview::Viewer) -> Option<Vec<u8>> {
+        let view = self.material_preview.as_ref()?.shown(viewer)?;
+        #[cfg(target_os = "macos")]
+        if let crate::gfx::rhi::Device::Metal(driver) = &self.device {
+            return Some(driver.read_texture(view));
+        }
+        self.flush_pending_tail();
+        self.backend.vk_mut().in_flight.drain();
+        self.backend.vk_mut().overlay_present.drain();
+
+        let image = self.vk_view(view).image().clone();
+        let side = u64::from(material_preview::SIZE);
+        let buffer = Buffer::new_slice::<u8>(
+            self.backend.vk().ctx.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                ..Default::default()
+            },
+            side * side * 4,
+        )
+        .expect("failed to allocate the preview readback buffer");
+        let transition = |old_layout, new_layout| vulkano::sync::ImageMemoryBarrier {
+            src_stages: vulkano::sync::PipelineStages::ALL_COMMANDS,
+            src_access: vulkano::sync::AccessFlags::MEMORY_WRITE,
+            dst_stages: vulkano::sync::PipelineStages::ALL_COMMANDS,
+            dst_access: vulkano::sync::AccessFlags::MEMORY_READ,
+            old_layout,
+            new_layout,
+            subresource_range: record::whole_image(&image),
+            ..vulkano::sync::ImageMemoryBarrier::image(image.clone())
+        };
+        use vulkano::image::ImageLayout as Layout;
+        let mut builder = self.new_command_buffer();
+        builder
+            .image_barrier(transition(
+                Layout::ShaderReadOnlyOptimal,
+                Layout::TransferSrcOptimal,
+            ))
+            .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+                image.clone(),
+                buffer.clone(),
+            ))
+            .image_barrier(transition(
+                Layout::TransferSrcOptimal,
+                Layout::ShaderReadOnlyOptimal,
+            ));
+        builder.submit_and_wait(&self.backend.vk().ctx);
+        let pixels = buffer.read().unwrap().to_vec();
+        Some(pixels)
+    }
+
     pub fn capture(&mut self) -> Option<(Vec<u8>, [u32; 2])> {
         #[cfg(target_os = "macos")]
         if let Backend::Metal(mtl) = &self.backend {
@@ -870,6 +942,9 @@ impl VulkanRenderer {
     /// Shared by both submission paths, which differ only in *when* they reach
     /// it: unsplit, the frame just submitted; split, the frame before it, whose
     /// trailing segment this call has finally sent.
+    /// `preview` is the material preview the frame under the overlay wrote,
+    /// which on the split path is not the one this call's frame did.
+    #[allow(clippy::too_many_arguments)]
     fn finish_frame(
         &mut self,
         overlay_ready: Option<Arc<Semaphore>>,
@@ -877,6 +952,7 @@ impl VulkanRenderer {
         image_index: u32,
         raw_passes: &[PassBody],
         overlay: Option<Overlay<'_>>,
+        preview: material_preview::Lent,
     ) {
         let render_finished = match overlay_ready {
             Some(ready) => {
@@ -900,7 +976,8 @@ impl VulkanRenderer {
                             let target = driver.import_view(target_view);
                             let mut encoder =
                                 Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
-                            pass.record(&self.device, &mut encoder, target, frame);
+                            let user: Vec<_> = preview.iter().flatten().copied().collect();
+                            pass.record(&self.device, &mut encoder, target, frame, &user);
                         }
                         other => unreachable!("{other:?} is not a raw pass"),
                     }
@@ -1100,7 +1177,7 @@ impl VulkanRenderer {
         // The cascade map is the one import the table answers for, because it is
         // also an attachment and `rendering_info` resolves attachments there;
         // `reallocate` registered it.
-        if Some(id) == ids.shadows {
+        if Some(id) == ids.shadows || ids.material_preview.is_some_and(|p| p.output == id) {
             return Some(record::Target::Image(
                 self.vk_view(self.table.texture(id)).image().clone(),
             ));
@@ -1142,6 +1219,63 @@ impl VulkanRenderer {
             .images
             .try_view(id)
             .map(|view| record::Target::Image(view.image().clone()))
+    }
+
+    /// The view whose preview this frame redraws, if any is due, with the
+    /// light it is shown in. Builds the preview's pipelines the first time one
+    /// is asked for.
+    fn preview_request(
+        &mut self,
+        overlay: Option<&OverlayFrame>,
+        lighting: &SceneLighting,
+        environment: &EnvironmentSettings,
+    ) -> Option<(material_preview::Viewer, PreviewRequest)> {
+        let subjects = overlay?.material_previews;
+        let known = |subject: &material_preview::Subject| {
+            (subject.material.0 as usize) < self.materials.len()
+        };
+        if !subjects.iter().flatten().any(known) {
+            return None;
+        }
+        if self.material_preview.is_none() {
+            self.material_preview = Some(material_preview::MaterialPreviewPass::new(
+                &self.device,
+                &self.forward,
+            ));
+        }
+        let mut requests = subjects.map(|subject| {
+            let subject = subject.filter(known)?;
+            let ambient = lighting.ambient_color * lighting.ambient_nits;
+            let irradiance = self.environment.irradiance(ambient, environment);
+            let rig =
+                material_preview::lighting(lighting, &irradiance, environment.yaw, subject.orbit);
+            let side = material_preview::SIZE * material_preview::SUPERSAMPLE;
+            Some(PreviewRequest {
+                subject,
+                exposure: material_preview::exposure(
+                    &rig,
+                    &irradiance,
+                    environment.yaw,
+                    subject.orbit,
+                ),
+                lighting: forward::PreviewLighting::new(
+                    &rig,
+                    &material_preview::camera(subject.orbit),
+                    [side; 2],
+                    irradiance,
+                    environment.yaw,
+                    self.environment.specular_tint(ambient, environment),
+                ),
+            })
+        });
+        let pass = self.material_preview.as_mut().expect("built above");
+        let due = material_preview::Viewer::ALL.map(|viewer| {
+            requests[viewer as usize]
+                .as_ref()
+                .is_some_and(|request| pass.due(viewer, &request.key(self.preview_inputs)))
+        });
+        let viewer = pass.choose(due)?;
+        Some((viewer, requests[viewer as usize].take()?))
     }
 
     fn reallocate(&mut self) {
@@ -1297,6 +1431,7 @@ impl RenderBackend for VulkanRenderer {
     fn load_environment(&mut self, pixels: &[f32], width: u32, height: u32) {
         self.environment
             .set_source(&self.device, pixels, [width, height]);
+        self.preview_inputs += 1;
     }
 
     fn resize(&mut self, extent: [u32; 2]) {
@@ -1620,6 +1755,11 @@ impl VulkanRenderer {
             }
         }
 
+        // Decided before the graph is, because whether the sphere is redrawn is
+        // part of the frame's structure.
+        let preview = self.preview_request(overlay.as_deref(), lighting, environment);
+        let preview_due = preview.is_some();
+
         // The frame's structure, and the only thing that recompiles the graph.
         // Everything else about this call — how many objects, which camera, what
         // exposure — flows through the same compiled schedule.
@@ -1690,6 +1830,7 @@ impl VulkanRenderer {
             async_compute: self.backend.async_compute(),
             occlusion_culling: self.occlusion_culling,
             wireframe: overlay.as_ref().and_then(|frame| frame.wireframe),
+            material_preview: preview_due,
         });
 
         // Each cascade the cache does not redraw this frame is swapped back to
@@ -1989,6 +2130,59 @@ impl VulkanRenderer {
         let prepass_texture_set = self.prepass_texture_set.unwrap();
         let shadow_material_set = self.shadow_material_set.unwrap();
         let shadow_texture_set = self.shadow_texture_set.unwrap();
+
+        // The output this redraw writes is named for the resolve here, and the
+        // redraw counted as done: nothing past this point abandons the frame.
+        let preview_frame = match (self.frame.ids.material_preview, &preview) {
+            (Some(ids), Some((viewer, request))) => {
+                let pass = self
+                    .material_preview
+                    .as_mut()
+                    .expect("a frame that redraws the preview has its pass");
+                let output = pass.advance(&self.device, *viewer, &request.key(self.preview_inputs));
+                self.table.import(ids.output, output);
+                let pass = self.material_preview.as_ref().expect("advanced above");
+                let material = request.subject.material;
+                let (row, entry) = material_preview::object_rows(material);
+                let object_set = self.forward.build_object_set(
+                    &self.device,
+                    self.device
+                        .upload_block(BlockKind::Storage, bytemuck::bytes_of(&row)),
+                    self.device
+                        .upload_block(BlockKind::Storage, bytemuck::cast_slice(&entry)),
+                );
+                let sets = self.forward.preview_sets(
+                    &self.device,
+                    &request.lighting,
+                    forward::NeutralViews {
+                        ao: self.ssao.white_view(),
+                        contact_shadow: self.contact_shadows.lit_view(),
+                        shadow: self.shadow.lit_view(),
+                        atlas: self.shadow.lit_atlas_view(),
+                        env_cube: self.environment.specular_view(),
+                        env_sampler: self.environment.sampler(),
+                        fog_volume: self.fog.volume_or_fallback(None),
+                        fog_sampler: self.fog.sampler(),
+                    },
+                    pass.neutral(),
+                    material_set,
+                    texture_set,
+                    object_set,
+                );
+                let gpu = &self.materials[material.0 as usize];
+                let camera = material_preview::camera(request.subject.orbit);
+                Some(material_preview::PreviewFrame {
+                    sets,
+                    variant: cull::Variant {
+                        masked: gpu.is_masked(),
+                        lobed: gpu.is_lobed(),
+                    },
+                    view_proj: camera.projection(1.0) * camera.view(),
+                    exposure: request.exposure,
+                })
+            }
+            _ => None,
+        };
 
         // Every list a frame draws is an ordering over one shared `RenderItem`
         // array, so any non-empty list carries the whole of it.
@@ -2347,7 +2541,15 @@ impl VulkanRenderer {
             outline_items: overlay
                 .as_deref()
                 .map_or(&[], |frame| frame.outline.as_slice()),
+            material_preview: self.material_preview.as_ref(),
+            preview_frame,
         };
+
+        // What the overlay drawn over this frame samples for each preview.
+        let preview_view = self.material_preview.as_ref().map_or_else(
+            Default::default,
+            material_preview::MaterialPreviewPass::lent,
+        );
 
         #[cfg_attr(
             not(target_os = "macos"),
@@ -2378,7 +2580,8 @@ impl VulkanRenderer {
                         let pass = self
                             .metal_overlay
                             .get_or_insert_with(|| overlay::OverlayPass::new(&self.device, format));
-                        pass.record(&self.device, &mut encoder, target(), overlay);
+                        let user: Vec<_> = preview_view.iter().flatten().copied().collect();
+                        pass.record(&self.device, &mut encoder, target(), overlay, &user);
                     }
                     drawable = frame.and_then(|frame| frame.into_drawable());
                 }
@@ -2549,6 +2752,7 @@ impl VulkanRenderer {
                 image_index,
                 &raw_passes,
                 overlay,
+                preview_view,
             );
             drop(submitting);
             return;
@@ -2631,6 +2835,7 @@ impl VulkanRenderer {
                     pending.image_index,
                     &raw_passes,
                     overlay,
+                    pending.preview,
                 );
                 (Some(done), Some(gate))
             }
@@ -2672,6 +2877,7 @@ impl VulkanRenderer {
             acquire: acquire_semaphore,
             image_index,
             overlay: overlay_pass,
+            preview: preview_view,
         });
 
         drop(submitting);
@@ -2779,6 +2985,26 @@ struct FrameRecord<'a> {
     debug_lines: &'a [DebugLine],
     gizmo_strokes: &'a [GizmoVertex],
     outline_items: &'a [OutlineItem],
+    material_preview: Option<&'a material_preview::MaterialPreviewPass>,
+    preview_frame: Option<material_preview::PreviewFrame>,
+}
+
+/// The material the overlay wants shown, resolved against this frame's light.
+struct PreviewRequest {
+    subject: material_preview::Subject,
+    lighting: forward::PreviewLighting,
+    exposure: f32,
+}
+
+impl PreviewRequest {
+    fn key(&self, generation: u64) -> material_preview::Key<'_> {
+        material_preview::Key {
+            material: self.subject.material,
+            orbit: self.subject.orbit,
+            generation,
+            lighting: self.lighting.bytes(),
+        }
+    }
 }
 
 /// A frame's trailing graphics segment, held back a frame on purpose.
@@ -2804,6 +3030,8 @@ struct PendingTail {
     image_index: u32,
     /// Whether a raw pass draws over the result before it is presented.
     overlay: bool,
+    /// The material previews this frame left for the overlay drawn over it.
+    preview: material_preview::Lent,
 }
 
 /// Refuse a device that cannot draw what the cull dispatch writes.
@@ -2991,7 +3219,7 @@ impl FrameRecord<'_> {
         // The cascade map is the one import the table answers for, because it is
         // also an attachment and `rendering_info` resolves attachments there;
         // `reallocate` registered it.
-        if Some(id) == ids.shadows {
+        if Some(id) == ids.shadows || ids.material_preview.is_some_and(|p| p.output == id) {
             return Some(record::Target::Image(
                 self.vk_view(self.table.texture(id)).image().clone(),
             ));
@@ -3834,6 +4062,24 @@ impl FrameRecord<'_> {
                     !self.outline_items.is_empty(),
                 );
             }
+            PassBody::MaterialPreview => {
+                let (pass, frame) = self.preview();
+                pass.record_sphere(encoder, frame);
+            }
+            PassBody::MaterialPreviewResolve => {
+                let (pass, frame) = self.preview();
+                let ids = self
+                    .frame
+                    .ids
+                    .material_preview
+                    .expect("a preview resolve without its targets");
+                pass.record_resolve(
+                    self.device,
+                    encoder,
+                    self.table.texture(ids.hdr),
+                    frame.exposure,
+                );
+            }
             PassBody::Overlay
             | PassBody::SsrHiz
             | PassBody::SsrSource
@@ -3864,6 +4110,17 @@ impl FrameRecord<'_> {
             | PassBody::Cull
             | PassBody::OcclusionHiz => unreachable!("handled above"),
         }
+    }
+
+    fn preview(
+        &self,
+    ) -> (
+        &material_preview::MaterialPreviewPass,
+        &material_preview::PreviewFrame,
+    ) {
+        self.material_preview
+            .zip(self.preview_frame.as_ref())
+            .expect("the graph scheduled the material preview but none was requested")
     }
 }
 

@@ -1,6 +1,6 @@
 namespace Orrin;
 
-/// An entity tree saved as a `.fprefab` file under the project's assets
+/// An entity tree saved as a `.oprefab` file under the project's assets
 /// directory, instantiated whole.
 public sealed class Prefab : Asset
 {

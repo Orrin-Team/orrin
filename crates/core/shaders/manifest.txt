@@ -31,6 +31,7 @@ line_frag fragment line.frag
 line_vert vertex line.vert
 luminance_average_comp compute luminance_average.comp
 luminance_histogram_comp compute luminance_histogram.comp
+material_preview_frag fragment material_preview.frag
 motion_blur_gather_comp compute motion_blur_gather.comp
 motion_blur_neighbour_max_comp compute motion_blur_neighbour_max.comp
 motion_blur_tile_max_comp compute motion_blur_tile_max.comp

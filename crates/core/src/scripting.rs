@@ -453,6 +453,9 @@ extern "C" fn has_component(entity: CEntity, kind: u32) -> bool {
             KIND_SHADOW => world.has::<crate::ui::Shadow>(entity),
             KIND_RIGID_BODY => world.has::<crate::scene::RigidBody>(entity),
             KIND_AUDIO_SOURCE => world.has::<crate::scene::AudioSource>(entity),
+            KIND_MESH_RENDERER => {
+                world.has::<MeshHandle>(entity) && world.has::<MaterialHandle>(entity)
+            }
             KIND_SCROLL_FRAME => world.has::<crate::ui::ScrollFrame>(entity),
             _ => false,
         }
@@ -854,6 +857,12 @@ enum UiComponent {
     ScrollFrame(crate::ui::ScrollFrame),
     RigidBody(crate::scene::RigidBody),
     AudioSource(crate::scene::AudioSource),
+    /// By asset rather than by slot: an add is decoded before the call has a
+    /// world to resolve ids against, so the slots are found when it applies.
+    MeshRenderer {
+        mesh: AssetId,
+        material: AssetId,
+    },
 }
 
 impl UiComponent {
@@ -871,6 +880,7 @@ impl UiComponent {
             Self::ScrollFrame(_) => KIND_SCROLL_FRAME,
             Self::RigidBody(_) => KIND_RIGID_BODY,
             Self::AudioSource(_) => KIND_AUDIO_SOURCE,
+            Self::MeshRenderer { .. } => KIND_MESH_RENDERER,
         }
     }
 
@@ -911,6 +921,14 @@ impl UiComponent {
             }
             Self::AudioSource(c) => {
                 world.insert(entity, c);
+            }
+            Self::MeshRenderer { mesh, material } => {
+                if let Some((mesh, material)) =
+                    mesh_renderer_handles(world, "World.AddComponent", mesh, material)
+                {
+                    world.insert(entity, mesh);
+                    world.insert(entity, material);
+                }
             }
         }
     }
@@ -1480,6 +1498,7 @@ const KIND_SHADOW: u32 = 12;
 const KIND_SCROLL_FRAME: u32 = 13;
 const KIND_RIGID_BODY: u32 = 14;
 const KIND_AUDIO_SOURCE: u32 = 15;
+const KIND_MESH_RENDERER: u32 = 16;
 /// Not blittable as a component; named for `add_collider`'s messages.
 const KIND_COLLIDER: u32 = 2;
 
@@ -1505,6 +1524,7 @@ fn kind_name(kind: u32) -> &'static str {
         KIND_SCROLL_FRAME => "ScrollFrame",
         KIND_RIGID_BODY => "Rigidbody",
         KIND_AUDIO_SOURCE => "AudioSource",
+        KIND_MESH_RENDERER => "MeshRenderer",
         KIND_COLLIDER => "Collider",
         _ => "an unknown component",
     }
@@ -1768,6 +1788,93 @@ fn audio_source_to_c(source: &crate::scene::AudioSource) -> orrin_script::CAudio
     }
 }
 
+fn mesh_renderer_to_c(world: &World, entity: Entity) -> Option<orrin_script::CMeshRenderer> {
+    use orrin_registry::Resolve;
+    let id = |value: Option<Value>| match value {
+        Some(Value::Asset(id)) => id.to_bytes(),
+        _ => [0; 16],
+    };
+    let mesh = world.get::<MeshHandle>(entity)?.to_value(world);
+    let material = world.get::<MaterialHandle>(entity)?.to_value(world);
+    Some(orrin_script::CMeshRenderer {
+        mesh: id(mesh),
+        material: id(material),
+    })
+}
+
+/// An add's null reference is refused here, where the struct is read, so a
+/// script that assigns nothing hears so by name before anything is queued. A
+/// set's is decided against the entity, in [`mesh_renderer_kept`].
+fn mesh_renderer_from_c(call: &str, c: orrin_script::CMeshRenderer) -> Option<UiComponent> {
+    let (mesh, material) = (AssetId::from_bytes(c.mesh), AssetId::from_bytes(c.material));
+    if call == "AddComponent" && null_field(call, mesh, material) {
+        return None;
+    }
+    Some(UiComponent::MeshRenderer { mesh, material })
+}
+
+fn null_field(call: &str, mesh: AssetId, material: AssetId) -> bool {
+    let null = [("Mesh", mesh), ("Material", material)]
+        .into_iter()
+        .find(|(_, id)| id.is_nil());
+    if let Some((field, _)) = null {
+        tracing::warn!("World.{call}: MeshRenderer.{field} is the null reference");
+    }
+    null.is_some()
+}
+
+/// A set's assets against what the entity draws now. A null field keeps the
+/// handle it has when that handle has no asset either — a glTF's material, or
+/// one made at run time, which is exactly what reading the renderer gave the
+/// script — and is refused where it would replace one that has.
+fn mesh_renderer_kept(
+    world: &World,
+    entity: Entity,
+    mesh: AssetId,
+    material: AssetId,
+) -> Option<(MeshHandle, MaterialHandle)> {
+    use orrin_registry::Resolve;
+    fn field<H: Resolve + Copy>(world: &World, name: &str, current: H, id: AssetId) -> Option<H> {
+        if id.is_nil() {
+            if current.to_value(world).is_none() {
+                return Some(current);
+            }
+            tracing::warn!("World.SetComponent: MeshRenderer.{name} is the null reference");
+            return None;
+        }
+        H::from_value(world, &Value::Asset(id))
+            .map_err(|error| tracing::warn!("World.SetComponent: MeshRenderer.{name}: {error}"))
+            .ok()
+    }
+    let mesh = field(world, "Mesh", *world.get::<MeshHandle>(entity)?, mesh)?;
+    let material = field(
+        world,
+        "Material",
+        *world.get::<MaterialHandle>(entity)?,
+        material,
+    )?;
+    Some((mesh, material))
+}
+
+/// A renderer's assets as the slots that draw them, resolved the way a scene
+/// file's `asset(…)` is — so an asset still importing draws its placeholder,
+/// and an id of the wrong kind is refused by name.
+fn mesh_renderer_handles(
+    world: &World,
+    call: &str,
+    mesh: AssetId,
+    material: AssetId,
+) -> Option<(MeshHandle, MaterialHandle)> {
+    use orrin_registry::Resolve;
+    let mesh = MeshHandle::from_value(world, &Value::Asset(mesh))
+        .map_err(|error| tracing::warn!("{call}: MeshRenderer.Mesh: {error}"))
+        .ok()?;
+    let material = MaterialHandle::from_value(world, &Value::Asset(material))
+        .map_err(|error| tracing::warn!("{call}: MeshRenderer.Material: {error}"))
+        .ok()?;
+    Some((mesh, material))
+}
+
 fn audio_source_from_c(c: orrin_script::CAudioSource) -> Option<crate::scene::AudioSource> {
     let rolloff = rolloff_of("AudioSource", c.rolloff)?;
     if ![c.volume, c.min_distance, c.max_distance]
@@ -1916,6 +2023,10 @@ fn decode(
             call, kind, value, size,
         )?)
         .map(UiComponent::AudioSource),
+        KIND_MESH_RENDERER => mesh_renderer_from_c(
+            call,
+            read_c::<orrin_script::CMeshRenderer>(call, kind, value, size)?,
+        ),
         _ => {
             tracing::warn!("World.{call}: component kind {kind} has no blittable form");
             None
@@ -1998,6 +2109,9 @@ extern "C" fn get_component(entity: CEntity, kind: u32, out: *mut u8, size: u32)
             KIND_AUDIO_SOURCE => world
                 .get::<crate::scene::AudioSource>(entity)
                 .map(|c| write(out, size, kind, audio_source_to_c(&c))),
+            KIND_MESH_RENDERER => {
+                mesh_renderer_to_c(world, entity).map(|c| write(out, size, kind, c))
+            }
             _ => {
                 tracing::warn!("World.GetComponent: component kind {kind} has no blittable form");
                 None
@@ -2025,6 +2139,18 @@ extern "C" fn set_component(entity: CEntity, kind: u32, value: *const u8, size: 
         let Some(component) = decode("SetComponent", kind, value, size, current_text) else {
             return false;
         };
+        if let UiComponent::MeshRenderer { mesh, material } = component {
+            if !(world.has::<MeshHandle>(entity) && world.has::<MaterialHandle>(entity)) {
+                return !null_field("SetComponent", mesh, material)
+                    && with_queued(entity, kind, |queued| *queued = component).is_some();
+            }
+            let Some((mesh, material)) = mesh_renderer_kept(world, entity, mesh, material) else {
+                return false;
+            };
+            *world.get_mut::<MeshHandle>(entity).unwrap() = mesh;
+            *world.get_mut::<MaterialHandle>(entity).unwrap() = material;
+            return true;
+        }
         let in_place = match &component {
             UiComponent::Canvas(c) => world
                 .get_mut::<crate::ui::Canvas>(entity)
@@ -2062,6 +2188,7 @@ extern "C" fn set_component(entity: CEntity, kind: u32, value: *const u8, size: 
             UiComponent::AudioSource(c) => world
                 .get_mut::<crate::scene::AudioSource>(entity)
                 .map(|mut slot| *slot = *c),
+            UiComponent::MeshRenderer { .. } => None,
         };
         in_place.is_some() || with_queued(entity, kind, |queued| *queued = component).is_some()
     })
@@ -3639,7 +3766,7 @@ mod tests {
         prefabs.insert(
             Prefab::parse(
                 id,
-                "props/crate.fprefab",
+                "props/crate.oprefab",
                 "orrin-scene 1\n\nentity 00000000-0000-4000-8000-000000000001\n  orrin.name = \"Crate\"\n",
             )
             .unwrap(),
@@ -3656,13 +3783,13 @@ mod tests {
         let (mut world, _, id) = prefab_world();
         let mut out = [0u8; 16];
         let kind = orrin_script::with_active_world(&mut world, || {
-            find_asset(c"props/crate.fprefab".as_ptr(), out.as_mut_ptr())
+            find_asset(c"props/crate.oprefab".as_ptr(), out.as_mut_ptr())
         });
         assert_eq!(kind, orrin_script::ASSET_PREFAB);
         assert_eq!(AssetId::from_bytes(out), id);
 
         let kind = orrin_script::with_active_world(&mut world, || {
-            find_asset(c"props/barrel.fprefab".as_ptr(), out.as_mut_ptr())
+            find_asset(c"props/barrel.oprefab".as_ptr(), out.as_mut_ptr())
         });
         assert_eq!(kind, orrin_script::ASSET_NONE);
     }
@@ -3921,14 +4048,14 @@ mod tests {
         assert_eq!(kind, orrin_script::ASSET_AUDIO);
     }
 
-    /// A `.fmat` is found by path as a material, Ready once it reads and
+    /// A `.omat` is found by path as a material, Ready once it reads and
     /// Failed while it does not; an engine-built material is always Ready.
     #[test]
     fn a_script_finds_a_material_by_path_and_reads_its_load_state() {
         let dir = crate::asset_db::tests::Dir::new("script-materials");
         let brick = crate::asset_db::material::write(&Default::default());
-        dir.write("props/brick.fmat", brick.as_bytes());
-        dir.write("props/broken.fmat", b"orrin-scene 3 min-reader 3\n");
+        dir.write("props/brick.omat", brick.as_bytes());
+        dir.write("props/broken.omat", b"orrin-scene 3 min-reader 3\n");
         let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         let mut assets = Assets::default();
         assets.insert_material("gold", MaterialHandle(7));
@@ -3948,9 +4075,9 @@ mod tests {
             orrin_script::with_active_world(world, || asset_state(bytes.as_ptr()))
         };
 
-        let (kind, brick) = find(&mut world, c"props/brick.fmat");
+        let (kind, brick) = find(&mut world, c"props/brick.omat");
         assert_eq!(kind, orrin_script::ASSET_MATERIAL);
-        let (kind, broken) = find(&mut world, c"props/broken.fmat");
+        let (kind, broken) = find(&mut world, c"props/broken.omat");
         assert_eq!(kind, orrin_script::ASSET_MATERIAL);
 
         assert_eq!(state(&mut world, brick), orrin_script::LOAD_READY);
@@ -5218,6 +5345,138 @@ mod tests {
             audio_stop_music();
             assert!(!audio_playing(second));
         });
+    }
+
+    /// A mesh renderer crosses as the assets it draws, never as the slots:
+    /// the script reads ids, assigns one it found with `Assets.Find` or
+    /// holds in a field, and the engine resolves it the way a scene file's
+    /// `asset(…)` is resolved. The null reference is refused by name rather
+    /// than drawn as something.
+    #[test]
+    fn a_script_reads_writes_and_adds_a_mesh_renderer_by_its_assets() {
+        let mut world = World::new();
+        let mut assets = crate::scene::Assets::new();
+        assets.insert_mesh("cube", MeshHandle(3));
+        assets.insert_material("clay", MaterialHandle(0));
+        assets.insert_material("gold", MaterialHandle(7));
+        world.insert_resource(assets);
+        let entity = world.spawn();
+        world.insert(entity, MeshHandle(3));
+        world.insert(entity, MaterialHandle(0));
+        let fresh = world.spawn();
+        let bare = world.spawn();
+        let size = size_of::<orrin_script::CMeshRenderer>();
+        let cube = AssetId::named("mesh", "cube");
+        let clay = AssetId::named("material", "clay");
+        let gold = AssetId::named("material", "gold");
+        taken_commands();
+
+        let (has, lacks, read, written, refused, added) =
+            orrin_script::with_active_world(&mut world, || {
+                let has = has_component(c_entity(entity), KIND_MESH_RENDERER);
+                let lacks = !has_component(c_entity(bare), KIND_MESH_RENDERER);
+                let mut c = orrin_script::CMeshRenderer::default();
+                let read = get_component(
+                    c_entity(entity),
+                    KIND_MESH_RENDERER,
+                    (&raw mut c).cast(),
+                    size,
+                ) && c.mesh == cube.to_bytes()
+                    && c.material == clay.to_bytes();
+                c.material = gold.to_bytes();
+                let written = set_component(
+                    c_entity(entity),
+                    KIND_MESH_RENDERER,
+                    (&raw const c).cast(),
+                    size,
+                );
+                let mut null = c;
+                null.material = [0; 16];
+                let refused = !set_component(
+                    c_entity(entity),
+                    KIND_MESH_RENDERER,
+                    (&raw const null).cast(),
+                    size,
+                );
+                let added = add_component(
+                    c_entity(fresh),
+                    KIND_MESH_RENDERER,
+                    (&raw const c).cast(),
+                    size,
+                );
+                (has, lacks, read, written, refused, added)
+            });
+
+        assert!(has && lacks && read, "{has} {lacks} {read}");
+        assert!(written && refused && added, "{written} {refused} {added}");
+        assert_eq!(
+            *world.get::<MaterialHandle>(entity).unwrap(),
+            MaterialHandle(7)
+        );
+        assert_eq!(*world.get::<MeshHandle>(entity).unwrap(), MeshHandle(3));
+        for command in taken_commands() {
+            if let Command::AddUi { entity, component } = command {
+                component.insert(&mut world, entity);
+            }
+        }
+        assert_eq!(*world.get::<MeshHandle>(fresh).unwrap(), MeshHandle(3));
+        assert_eq!(
+            *world.get::<MaterialHandle>(fresh).unwrap(),
+            MaterialHandle(7)
+        );
+    }
+
+    /// A material loaded with no asset behind it — a glTF's, or one made at
+    /// run time — reads as the null reference, and writing that back keeps it:
+    /// otherwise a script could not change such a renderer's mesh at all. The
+    /// null is still refused where it would replace an asset, or be added.
+    #[test]
+    fn a_mesh_renderer_round_trips_a_material_no_asset_names() {
+        let mut world = World::new();
+        let mut assets = crate::scene::Assets::new();
+        assets.insert_mesh("cube", MeshHandle(3));
+        assets.insert_mesh("sphere", MeshHandle(4));
+        world.insert_resource(assets);
+        let entity = world.spawn();
+        world.insert(entity, MeshHandle(3));
+        world.insert(entity, MaterialHandle(9));
+        let fresh = world.spawn();
+        let size = size_of::<orrin_script::CMeshRenderer>();
+        taken_commands();
+
+        let (read, written, added) = orrin_script::with_active_world(&mut world, || {
+            let mut c = orrin_script::CMeshRenderer::default();
+            let read = get_component(
+                c_entity(entity),
+                KIND_MESH_RENDERER,
+                (&raw mut c).cast(),
+                size,
+            ) && c.material == [0; 16];
+            c.mesh = AssetId::named("mesh", "sphere").to_bytes();
+            let written = set_component(
+                c_entity(entity),
+                KIND_MESH_RENDERER,
+                (&raw const c).cast(),
+                size,
+            );
+            let added = add_component(
+                c_entity(fresh),
+                KIND_MESH_RENDERER,
+                (&raw const c).cast(),
+                size,
+            );
+            (read, written, added)
+        });
+
+        assert!(read, "an unnamed material reads as the null reference");
+        assert!(written, "and writing it back is not assigning nothing");
+        assert_eq!(*world.get::<MeshHandle>(entity).unwrap(), MeshHandle(4));
+        assert_eq!(
+            *world.get::<MaterialHandle>(entity).unwrap(),
+            MaterialHandle(9)
+        );
+        assert!(!added, "a new renderer has no material to keep");
+        assert!(taken_commands().is_empty());
     }
 
     #[test]

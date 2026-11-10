@@ -287,11 +287,11 @@ mod tests {
             format!("id = \"{rock}\"\n\n[import]\nusage = \"color\"\n").as_bytes(),
         );
         dir.write(
-            "rock.fmat",
+            "rock.omat",
             format!("orrin-material 1 min-reader 1\n\ntextures\n  albedo = asset({rock})\n")
                 .as_bytes(),
         );
-        dir.write("door.fprefab", b"orrin-scene 1\n");
+        dir.write("door.oprefab", b"orrin-scene 1\n");
         let (mut db, issues) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         assert!(issues.is_empty(), "{issues:?}");
         assert!(db.wait_idle(std::time::Duration::from_secs(30)));
@@ -308,8 +308,8 @@ mod tests {
         let ctx = egui::Context::default();
         let mut previews = Previews::default();
         let rock = db.find("rock.png").unwrap().id;
-        let material = db.find("rock.fmat").unwrap().id;
-        let door = db.find("door.fprefab").unwrap().id;
+        let material = db.find("rock.omat").unwrap().id;
+        let door = db.find("door.oprefab").unwrap().id;
 
         let first = previews
             .asset(&ctx, &db, rock)

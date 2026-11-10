@@ -82,6 +82,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // MSAA with the diffusion on, which is the five-attachment forward pass:
@@ -118,6 +119,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         (
@@ -149,6 +151,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // Four cascades write four layers of one image, which the graph tracks
@@ -186,6 +189,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // SSAO off is a different graph, not a flag read at record time: the
@@ -222,6 +226,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // The shape that proves the prepass belongs to the frame rather than to
@@ -256,6 +261,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // Metering off is the other shape that ships. Worth baselining for one
@@ -292,6 +298,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // A window too small for a real chain still gets one level, and that
@@ -327,6 +334,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // The froxel fog, with the cascades it exists to read. Worth baselining
@@ -366,6 +374,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // The whole optical chain at once: lens, then shutter, then sensor.
@@ -402,6 +411,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // The other shape that proves the prepass belongs to the frame rather
@@ -438,6 +448,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // Reflections are the first thing to sit *between* shading and the
@@ -474,6 +485,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // And the same without a resolve behind it, which is the shape where
@@ -508,6 +520,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // What actually ships in the editor: the march sits between the prepass
@@ -544,6 +557,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // And the march on its own, which is the shape that proves it keeps the
@@ -578,6 +592,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // The punctual atlas: one pass however many lights cast, because a tile
@@ -613,6 +628,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // And the atlas with no cascades, which is an ordinary scene: an indoor
@@ -648,6 +664,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // What ships: transparency accumulates after the reflections and before
@@ -685,6 +702,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // And transparency on its own, which is the shape that proves it keeps
@@ -720,6 +738,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // Both non-opaque queues at once, which is the shape that pins the
@@ -756,6 +775,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // And refraction on its own, which proves it keeps the geometry prepass
@@ -790,6 +810,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // Subsurface scattering is the first thing to change the *forward pass's
@@ -829,6 +850,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // And on its own, which is the shape that proves the diffusion keeps the
@@ -864,6 +886,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         (
@@ -895,6 +918,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // The split, on the frame the editor actually runs. Every configuration
@@ -938,6 +962,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // The same frame with the depth test on, because what it adds is a
@@ -976,6 +1001,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: false,
                 occlusion_culling: true,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         (
@@ -1007,6 +1033,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: true,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
         // And the frame the split is *for*: every optical stage on, which is
@@ -1043,6 +1070,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 async_compute: true,
                 occlusion_culling: false,
                 wireframe: None,
+                material_preview: false,
             },
         ),
     ]
@@ -1170,6 +1198,7 @@ fn a_single_cascade_map_is_still_declared_as_an_array() {
             async_compute: false,
             occlusion_culling: false,
             wireframe: None,
+            material_preview: false,
         })
         .unwrap();
 
@@ -1219,6 +1248,7 @@ fn the_shadow_maps_are_sixteen_bit_and_the_camera_depth_is_not() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     })
     .unwrap();
 
@@ -1261,6 +1291,7 @@ fn reference_config(msaa: bool, presents: bool) -> FrameConfig {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     }
 }
 
@@ -1348,6 +1379,7 @@ fn an_empty_selection_runs_no_outline_and_no_gizmo() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     };
     let passes = |outline, gizmo| {
         let frame = declare(config(outline, gizmo)).unwrap();
@@ -1409,6 +1441,7 @@ fn the_shadow_cascades_leave_the_frame_where_the_next_one_expects_them() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     })
     .unwrap();
 
@@ -1473,6 +1506,7 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     })
     .unwrap();
 
@@ -1534,6 +1568,7 @@ fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     })
     .unwrap();
 
@@ -1591,6 +1626,7 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     })
     .unwrap();
 
@@ -1657,6 +1693,7 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     })
     .unwrap();
 
@@ -1710,6 +1747,7 @@ fn the_gizmo_draws_between_the_tonemap_and_the_overlay() {
         async_compute,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     };
     for async_compute in [false, true] {
         let frame = declare(config(true, async_compute)).unwrap();
@@ -1814,6 +1852,7 @@ fn the_selection_outline_is_masked_then_drawn_under_the_gizmo() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     };
     let frame = declare(config(true)).unwrap();
     let order: Vec<&str> = frame
@@ -1887,6 +1926,7 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     })
     .unwrap();
 
@@ -1952,6 +1992,7 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     };
 
     let plan = format!("{}", declare(base).unwrap().graph);
@@ -2055,6 +2096,7 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     })
     .unwrap();
 
@@ -2121,6 +2163,7 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     })
     .unwrap();
 
@@ -2178,6 +2221,7 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     })
     .unwrap();
 
@@ -2260,6 +2304,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     };
 
     let consumers: [Consumer; 10] = [
@@ -2360,6 +2405,7 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     })
     .unwrap();
 
@@ -2429,6 +2475,7 @@ fn the_occlusion_pyramid_the_cull_reads_is_not_the_one_the_frame_builds() {
     let frame = declare(FrameConfig {
         occlusion_culling: true,
         wireframe: None,
+        material_preview: false,
         ..occlusion_base()
     })
     .unwrap();
@@ -2497,6 +2544,7 @@ fn occlusion_culling_keeps_the_prepass_alive_on_its_own() {
         auto_exposure: false,
         occlusion_culling: true,
         wireframe: None,
+        material_preview: false,
         ..occlusion_base()
     })
     .unwrap();
@@ -2540,6 +2588,7 @@ fn occlusion_base() -> FrameConfig {
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
+        material_preview: false,
     }
 }
 
@@ -2731,4 +2780,92 @@ fn an_offscreen_frame_with_the_editor_overlay_draws_the_wireframe_and_no_egui() 
     assert!(plan.contains(" pass wireframe ["), "{plan}");
     assert!(!plan.contains(" pass overlay ["), "{plan}");
     assert!(!plan.contains("PresentSrc"), "{plan}");
+}
+
+/// The inspector's material sphere is drawn into targets of its own, at a size
+/// of its own, and touches nothing the scene draws with — so switching it on
+/// cannot reorder, re-barrier or resize anything in the frame around it. Its
+/// result is an import the overlay samples after the frame, so the frame has
+/// to leave it sampled; with nothing to redraw it is not in the graph at all.
+#[test]
+fn the_material_preview_is_drawn_apart_from_the_scene_and_left_for_the_overlay() {
+    use orrin_core::gfx::graph::Extent;
+    use orrin_core::gfx::vulkan::material_preview;
+
+    let config = |material_preview| FrameConfig {
+        overlay: true,
+        material_preview,
+        ..reference_config(false, true)
+    };
+
+    let off = declare(config(false)).unwrap();
+    let on = declare(config(true)).unwrap();
+    let names = |frame: &orrin_core::gfx::vulkan::frame::Frame| -> Vec<&'static str> {
+        frame
+            .graph
+            .order()
+            .iter()
+            .map(|&id| frame.graph.pass_name(id))
+            .collect()
+    };
+    let (off_order, on_order) = (names(&off), names(&on));
+    assert!(
+        !off_order
+            .iter()
+            .any(|pass| pass.starts_with("material_preview")),
+        "{off_order:?}"
+    );
+    assert!(on.graph.culled().is_empty(), "{:?}", on.graph.culled());
+    let at = |name: &str| {
+        on_order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| panic!("{name} is not in the frame: {on_order:?}"))
+    };
+    assert!(at("material_preview") < at("material_preview_resolve"));
+
+    let scene: Vec<&str> = on_order
+        .iter()
+        .copied()
+        .filter(|pass| !pass.starts_with("material_preview"))
+        .collect();
+    assert_eq!(scene, off_order, "the preview moved the scene's passes");
+
+    let plan = format!("{}", on.graph);
+    for pass in ["material_preview", "material_preview_resolve"] {
+        let block = pass_block(&plan, pass);
+        for line in block.lines().skip(1) {
+            let resource = line
+                .trim_start()
+                .trim_start_matches("! ")
+                .split_whitespace()
+                .next()
+                .unwrap_or_default();
+            assert!(
+                resource.starts_with("material_preview"),
+                "{pass} touches the scene's {resource}:\n{block}"
+            );
+        }
+    }
+
+    let closing: Vec<String> = on
+        .graph
+        .final_barriers()
+        .iter()
+        .filter(|barrier| on.graph.resource_name(barrier.resource) == "material_preview")
+        .map(|barrier| format!("{barrier:?}"))
+        .collect();
+    assert!(
+        closing.iter().any(|b| b.contains("ShaderReadOnlyOptimal")),
+        "the overlay samples the preview after the frame: {closing:?}"
+    );
+
+    let output = image_desc(&on.graph, "material_preview").expect("the preview is an import");
+    assert_eq!(output.format, material_preview::OUTPUT_FORMAT);
+    assert_eq!(output.extent, Extent::Fixed([material_preview::SIZE; 2]));
+    let shaded = image_desc(&on.graph, "material_preview_hdr").expect("a target of its own");
+    assert_eq!(
+        shaded.extent,
+        Extent::Fixed([material_preview::SIZE * material_preview::SUPERSAMPLE; 2])
+    );
 }

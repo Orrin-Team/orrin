@@ -166,8 +166,8 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
                 format!("The project has no {}.", plural(kind))
             } else if place.folder.is_empty() {
                 format!(
-                    "Nothing to import under {}. PNG and JPEG textures, glTF meshes, .fmat \
-                     materials and .fprefab files are assets.",
+                    "Nothing to import under {}. PNG and JPEG textures, glTF meshes, .omat \
+                     materials and .oprefab files are assets.",
                     db.dir().display()
                 )
             } else {
@@ -387,7 +387,7 @@ fn pick_files() -> Vec<PathBuf> {
         .set_title("Import files into the project")
         .add_filter(
             "Assets",
-            &["png", "jpg", "jpeg", "gltf", "glb", "fmat", "fprefab"],
+            &["png", "jpg", "jpeg", "gltf", "glb", "omat", "oprefab"],
         );
     pollster::block_on(dialog.pick_files())
         .unwrap_or_default()
@@ -537,7 +537,7 @@ fn header(
                 );
             }
             view_controls(ui, view);
-            widgets::search(ui, query, "Filter assets — words, or .png .fmat");
+            widgets::search(ui, query, "Filter assets — words, or .png .omat");
         });
     });
 }
@@ -1206,7 +1206,7 @@ fn prefabs(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
             |dir| dir.display().to_string(),
         );
         ui.weak(format!(
-            "No prefabs under {dir}. A .fprefab is a scene file holding one entity tree."
+            "No prefabs under {dir}. A .oprefab is a scene file holding one entity tree."
         ));
         return;
     }
@@ -1268,7 +1268,7 @@ mod tests {
     #[test]
     fn a_folder_lists_its_own_subfolders_and_assets_only() {
         let dir = Dir::new("browser-listing");
-        dir.write("props/door.fprefab", b"orrin-scene 1\n");
+        dir.write("props/door.oprefab", b"orrin-scene 1\n");
         dir.write("props/wood/plank.png", b"");
         dir.write("props/wood/oak/leaf.png", b"");
         dir.write("rock.png", b"");
@@ -1284,7 +1284,7 @@ mod tests {
         let assets: Vec<&str> = assets.iter().map(|a| a.path.as_str()).collect();
         assert_eq!(
             (folders, assets),
-            (vec!["props/wood"], vec!["props/door.fprefab"])
+            (vec!["props/wood"], vec!["props/door.oprefab"])
         );
     }
 
@@ -1300,9 +1300,9 @@ mod tests {
         );
         assert!(query.matches("textures/Rocks/rock_color.png"));
         assert!(query.matches("rock.JPG"));
-        assert!(!query.matches("rock.fmat"), "not one of the extensions");
+        assert!(!query.matches("rock.omat"), "not one of the extensions");
         assert!(!query.matches("bark.png"), "not the word");
-        assert!(Query::parse(".fmat").matches("materials/brick.fmat"));
+        assert!(Query::parse(".omat").matches("materials/brick.omat"));
         assert!(Query::parse("").is_empty());
     }
 
@@ -1324,7 +1324,7 @@ mod tests {
         let dir = Dir::new("browser-order");
         sized(&dir, "b.png", 30, 3_000);
         sized(&dir, "a.jpg", 10, 1_000);
-        sized(&dir, "c.fprefab", 20, 2_000);
+        sized(&dir, "c.oprefab", 20, 2_000);
         sized(&dir, "deep/d.png", 40, 4_000);
         let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         let names = |query: &str, view: AssetView| -> (Vec<String>, Vec<String>) {
@@ -1342,22 +1342,22 @@ mod tests {
 
         let (folders, assets) = names("", view(AssetSort::Name, false));
         assert_eq!(folders, ["deep"]);
-        assert_eq!(assets, ["a.jpg", "b.png", "c.fprefab"]);
+        assert_eq!(assets, ["a.jpg", "b.png", "c.oprefab"]);
         assert_eq!(
             names("", view(AssetSort::Name, true)).1,
-            ["c.fprefab", "b.png", "a.jpg"]
+            ["c.oprefab", "b.png", "a.jpg"]
         );
         assert_eq!(
             names("", view(AssetSort::Size, false)).1,
-            ["a.jpg", "c.fprefab", "b.png"]
+            ["a.jpg", "c.oprefab", "b.png"]
         );
         assert_eq!(
             names("", view(AssetSort::Modified, true)).1,
-            ["b.png", "c.fprefab", "a.jpg"]
+            ["b.png", "c.oprefab", "a.jpg"]
         );
         assert_eq!(
             names("", view(AssetSort::Type, false)).1,
-            ["c.fprefab", "a.jpg", "b.png"],
+            ["a.jpg", "c.oprefab", "b.png"],
             "by extension, then name"
         );
 

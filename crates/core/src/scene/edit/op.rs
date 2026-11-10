@@ -60,7 +60,7 @@ pub enum Op {
         from: Option<EntityId>,
         to: Option<EntityId>,
     },
-    /// An asset file's whole text, before and after. A `.fmat` is a few
+    /// An asset file's whole text, before and after. A `.omat` is a few
     /// hundred bytes, and keeping the text rather than the values is what lets
     /// an undo leave the file exactly as it was, however it had been written.
     WriteAsset {

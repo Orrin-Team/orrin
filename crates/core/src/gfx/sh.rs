@@ -370,9 +370,9 @@ pub fn from_constant(radiance: Vec3) -> [Vec3; SH9] {
 }
 
 /// Irradiance divided by pi in `direction` — what the shader computes, here so
-/// tests can assert against it without a GPU.
-#[cfg(test)]
-fn evaluate(coefficients: &[Vec3; SH9], direction: Vec3) -> Vec3 {
+/// tests can assert against it without a GPU, and so the material preview can
+/// meter the sky it lights its sphere with.
+pub(crate) fn evaluate(coefficients: &[Vec3; SH9], direction: Vec3) -> Vec3 {
     let basis = basis(direction.normalize());
     let mut total = Vec3::ZERO;
     for (coefficient, harmonic) in coefficients.iter().zip(basis) {

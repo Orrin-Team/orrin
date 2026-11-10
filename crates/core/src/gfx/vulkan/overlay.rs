@@ -39,6 +39,26 @@ pub struct OverlayFrame {
     pub outline: Vec<super::outline::OutlineItem>,
     /// The viewport's draw mode, when it is not plain shaded.
     pub wireframe: Option<super::wireframe::Wireframe>,
+    /// What each view showing a material preview asks for this frame; the
+    /// primitives paint each with its [`Viewer::texture`](super::material_preview::Viewer::texture).
+    pub material_previews: super::material_preview::Subjects,
+}
+
+/// Every egui texture the renderer lends the editor rather than one egui
+/// uploads, so that no two are ever given the same id.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UserTexture {
+    MaterialPreview(super::material_preview::Viewer),
+}
+
+impl UserTexture {
+    pub fn id(self) -> egui::TextureId {
+        use super::material_preview::Viewer;
+        egui::TextureId::User(match self {
+            Self::MaterialPreview(Viewer::Inspector) => 0,
+            Self::MaterialPreview(Viewer::Browser) => 1,
+        })
+    }
 }
 
 /// egui's vertex, field for field.
@@ -96,6 +116,9 @@ pub(super) struct OverlayPass {
     /// at half the size of the `R8G8B8A8_SRGB` it falls back to.
     font_format: Format,
     textures: HashMap<egui::TextureId, Texture>,
+    /// A set for each image the renderer lends egui by a user id, kept for as
+    /// long as the image is.
+    lent: HashMap<TextureViewId, BindGroupId>,
     /// Reused each frame so a frame that changes little allocates little.
     vertices: Vec<OverlayVertex>,
     indices: Vec<u32>,
@@ -133,6 +156,7 @@ impl OverlayPass {
             }),
             font_format,
             textures: HashMap::new(),
+            lent: HashMap::new(),
             vertices: Vec::new(),
             indices: Vec::new(),
             pixels: Vec::new(),
@@ -142,12 +166,14 @@ impl OverlayPass {
     /// Record `frame` over `target`, which arrives and is left in `PresentSrc`
     /// — where the graph leaves the swapchain image, and where presenting
     /// needs it. Takes the frame's texture changes, which are applied once.
+    /// `lent` are images the renderer drew, sampled where egui names their id.
     pub(super) fn record(
         &mut self,
         device: &Device,
         encoder: &mut Encoder,
         target: TextureViewId,
         frame: &mut OverlayFrame,
+        lent: &[(egui::TextureId, TextureViewId)],
     ) {
         let extent = device.view_extent(target);
         let ppp = frame.pixels_per_point;
@@ -155,11 +181,15 @@ impl OverlayPass {
 
         self.upload_textures(device, encoder, &textures.set);
         let geometry = self.upload_geometry(device, frame);
+        let lent: Vec<(egui::TextureId, BindGroupId)> = lent
+            .iter()
+            .map(|&(id, view)| (id, self.lend(device, view)))
+            .collect();
 
         encoder.open_swapchain(target);
         if let Some(geometry) = geometry {
             encoder.begin_rendering(target);
-            self.draw_meshes(encoder, &frame.primitives, geometry, ppp, extent);
+            self.draw_meshes(encoder, &frame.primitives, geometry, ppp, extent, &lent);
             encoder.end_rendering();
         }
         encoder.close_swapchain(target);
@@ -181,6 +211,7 @@ impl OverlayPass {
         (vertices, indices): Geometry,
         ppp: f32,
         extent: [u32; 2],
+        lent: &[(egui::TextureId, BindGroupId)],
     ) {
         let (mut vertex, mut index) = (0, 0);
         encoder.bind_pipeline(self.pipeline);
@@ -213,14 +244,27 @@ impl OverlayPass {
                 continue;
             }
             if bound_texture != Some(mesh.texture_id) {
-                let Some(texture) = self.textures.get(&mesh.texture_id) else {
-                    tracing::warn!(
-                        "egui drew with {:?}, which was never uploaded",
-                        mesh.texture_id
-                    );
+                let set = self
+                    .textures
+                    .get(&mesh.texture_id)
+                    .map(|t| t.set)
+                    .or_else(|| {
+                        lent.iter()
+                            .find(|(id, _)| *id == mesh.texture_id)
+                            .map(|(_, set)| *set)
+                    });
+                // A lent image not drawn yet paints nothing, which is not a
+                // mistake: the view behind it shows through until it is.
+                let Some(set) = set else {
+                    if matches!(mesh.texture_id, egui::TextureId::Managed(_)) {
+                        tracing::warn!(
+                            "egui drew with {:?}, which was never uploaded",
+                            mesh.texture_id
+                        );
+                    }
                     continue;
                 };
-                encoder.bind_group(0, texture.set);
+                encoder.bind_group(0, set);
                 bound_texture = Some(mesh.texture_id);
             }
             if bound_clip != Some(scissor) {
@@ -321,6 +365,20 @@ impl OverlayPass {
         }
     }
 
+    fn lend(&mut self, device: &Device, view: TextureViewId) -> BindGroupId {
+        let (pipeline, sampler) = (self.pipeline, self.sampler);
+        *self.lent.entry(view).or_insert_with(|| {
+            device.create_persistent_bind_group(
+                pipeline,
+                0,
+                &[Binding {
+                    binding: 0,
+                    resource: BindingResource::SampledTexture { view, sampler },
+                }],
+            )
+        })
+    }
+
     fn create_texture(&self, device: &Device, format: Format, extent: [u32; 2]) -> Texture {
         let view = device.create_texture_swizzled(
             &TextureDesc {
@@ -418,6 +476,18 @@ fn pack(image: &egui::ImageData, format: Format, into: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+    /// Two lent textures given one id would paint one in the other's place.
+    #[test]
+    fn every_lent_texture_has_its_own_id() {
+        use super::super::material_preview::Viewer;
+        let ids: Vec<_> = Viewer::ALL
+            .map(|viewer| UserTexture::MaterialPreview(viewer).id())
+            .into();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        assert!(ids.iter().all(|id| matches!(id, egui::TextureId::User(_))));
+    }
+
     use super::*;
     use crate::gfx::vulkan::context::VkContext;
     use crate::gfx::vulkan::driver::color_to_present;
@@ -509,6 +579,7 @@ mod tests {
             gizmo: Vec::new(),
             outline: Vec::new(),
             wireframe: None,
+            material_previews: Default::default(),
             pixels_per_point: 1.0,
             textures: egui::TexturesDelta {
                 set: vec![
@@ -540,7 +611,7 @@ mod tests {
             let driver = device.vulkan();
             let target = driver.import_view(view.clone());
             let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
-            pass.record(&device, &mut encoder, target, &mut frame);
+            pass.record(&device, &mut encoder, target, &mut frame, &[]);
         }
         recorder.submit_and_wait(&ctx);
         assert_eq!(pass.textures.len(), 2);
@@ -601,6 +672,7 @@ mod tests {
             gizmo: Vec::new(),
             outline: Vec::new(),
             wireframe: None,
+            material_previews: Default::default(),
             pixels_per_point: 1.0,
             primitives: egui.tessellate(output.shapes, 1.0),
             textures: output.textures_delta,
@@ -636,7 +708,7 @@ mod tests {
                 let driver = device.vulkan();
                 let target = driver.import_view(view.clone());
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
-                pass.record(&device, &mut encoder, target, frame);
+                pass.record(&device, &mut encoder, target, frame, &[]);
             }
             recorder
                 .image_barrier(ImageMemoryBarrier {

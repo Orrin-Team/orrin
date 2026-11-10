@@ -1159,6 +1159,17 @@ pub struct CAudioSource {
     pub rolloff: u32,
 }
 
+/// C ABI of an entity's `MeshHandle` and `MaterialHandle` together; matches C#
+/// `Orrin.MeshRenderer`. Each is the [`AssetId`](orrin_registry::AssetId)
+/// bytes of what the slot draws rather than the slot, which means nothing
+/// outside this session.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CMeshRenderer {
+    pub mesh: [u8; 16],
+    pub material: [u8; 16],
+}
+
 /// A request to `audio_play`; matches C# `Orrin.SoundRequest`. `emitter` is
 /// where it is heard from — 0 flat, 1 at `position`, 2 on `entity` — and the
 /// distance fields are read only by the last two, as an `AudioSource`'s are.
@@ -1752,5 +1763,6 @@ mod tests {
         assert_eq!(size_of::<CTween>(), 64);
         assert_eq!(size_of::<CAudioSource>(), 44);
         assert_eq!(size_of::<CSound>(), 60);
+        assert_eq!(size_of::<CMeshRenderer>(), 32);
     }
 }

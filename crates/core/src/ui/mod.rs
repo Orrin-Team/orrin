@@ -436,7 +436,7 @@ mod tests {
         let canvas = menu(&mut world);
 
         let (_, id) =
-            crate::scene::prefab::create(&mut world, &registry, &[canvas], "menu.fprefab").unwrap();
+            crate::scene::prefab::create(&mut world, &registry, &[canvas], "menu.oprefab").unwrap();
         let mut placed = World::new();
         let (prefabs, issues) = Prefabs::scan(dir.path());
         assert!(issues.is_empty(), "{issues:?}");

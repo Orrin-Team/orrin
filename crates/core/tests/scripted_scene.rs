@@ -73,7 +73,7 @@ fn a_saved_behaviour_comes_back_attached_with_its_fields() {
          orrin.name = \"Windmill\"\n",
         EntityId::new()
     );
-    prefabs.insert(Prefab::parse(windmill, "windmill.fprefab", &source).unwrap());
+    prefabs.insert(Prefab::parse(windmill, "windmill.oprefab", &source).unwrap());
     world.insert_resource(prefabs);
     let (root, issues) = prefab::instantiate(&mut world, &registry, windmill).unwrap();
     assert!(issues.is_empty(), "{issues:?}");

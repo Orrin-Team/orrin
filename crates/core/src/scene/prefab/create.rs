@@ -136,7 +136,7 @@ pub(super) fn document_of(
 }
 
 /// A path for a new prefab called `name` that no file under `dir` has yet:
-/// `name.fprefab`, else `name 2.fprefab`, and so on.
+/// `name.oprefab`, else `name 2.oprefab`, and so on.
 pub fn unused_path(dir: &Path, name: &str) -> String {
     let name: String = name
         .chars()
@@ -297,9 +297,9 @@ mod tests {
                 std::env::temp_dir().join(format!("orrin-create-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join("props")).unwrap();
-            std::fs::write(dir.join("props/door.fprefab"), door_text("handle", 1.0)).unwrap();
+            std::fs::write(dir.join("props/door.oprefab"), door_text("handle", 1.0)).unwrap();
             std::fs::write(
-                dir.join("props/door.fprefab.meta"),
+                dir.join("props/door.oprefab.meta"),
                 format!("id = \"{DOOR_ID}\"\n"),
             )
             .unwrap();
@@ -375,10 +375,10 @@ mod tests {
         world.insert(lamp, Tag::new("light"));
         reparent(&mut world, lamp, Some(room), false).unwrap();
 
-        let (root, id) = create(&mut world, &registry(), &[room], "rooms/room.fprefab").unwrap();
+        let (root, id) = create(&mut world, &registry(), &[room], "rooms/room.oprefab").unwrap();
         assert_eq!(root, room, "a single tree keeps its own root");
-        assert!(dir.0.join("rooms/room.fprefab").is_file());
-        let sidecar = std::fs::read_to_string(dir.0.join("rooms/room.fprefab.meta")).unwrap();
+        assert!(dir.0.join("rooms/room.oprefab").is_file());
+        let sidecar = std::fs::read_to_string(dir.0.join("rooms/room.oprefab.meta")).unwrap();
         assert_eq!(sidecar, format!("id = \"{id}\"\n"));
 
         let text = save(&mut world, &registry());
@@ -402,7 +402,7 @@ mod tests {
         let b = spawn(&mut world, "B", Vec3::new(-1.0, 2.0, 0.0));
         propagate_transforms(&mut world);
 
-        let (root, _) = create(&mut world, &registry(), &[a, b], "pair.fprefab").unwrap();
+        let (root, _) = create(&mut world, &registry(), &[a, b], "pair.oprefab").unwrap();
         assert_eq!(world.get::<Name>(root).unwrap().0, "pair");
         assert_eq!(parent_of(&world, a), Some(root));
         assert_eq!(parent_of(&world, b), Some(root));
@@ -420,8 +420,8 @@ mod tests {
         let (door, _) = super::super::instantiate(&mut world, &registry(), door_id()).unwrap();
         reparent(&mut world, door, Some(room), false).unwrap();
 
-        create(&mut world, &registry(), &[room], "room.fprefab").unwrap();
-        let file = std::fs::read_to_string(dir.0.join("room.fprefab")).unwrap();
+        create(&mut world, &registry(), &[room], "room.oprefab").unwrap();
+        let file = std::fs::read_to_string(dir.0.join("room.oprefab")).unwrap();
         assert!(
             file.contains(&format!("source = asset({DOOR_ID})")),
             "{file}"
@@ -444,7 +444,7 @@ mod tests {
         let mut world = world_in(&dir);
         let (door, _) = super::super::instantiate(&mut world, &registry(), door_id()).unwrap();
 
-        let (root, _) = create(&mut world, &registry(), &[door], "doorway.fprefab").unwrap();
+        let (root, _) = create(&mut world, &registry(), &[door], "doorway.oprefab").unwrap();
         assert_ne!(root, door);
         assert_eq!(parent_of(&world, door), Some(root));
         assert_eq!(world.get::<PrefabInstance>(door).unwrap().prefab, door_id());
@@ -457,9 +457,9 @@ mod tests {
         super::super::instantiate(&mut world, &registry(), door_id()).unwrap();
         let panel = named(&world, "Panel");
 
-        let err = create(&mut world, &registry(), &[panel], "panel.fprefab").unwrap_err();
+        let err = create(&mut world, &registry(), &[panel], "panel.oprefab").unwrap_err();
         assert!(err.contains("part of an instance"), "{err}");
-        assert!(!dir.0.join("panel.fprefab").exists());
+        assert!(!dir.0.join("panel.oprefab").exists());
     }
 
     #[test]
@@ -468,9 +468,9 @@ mod tests {
         let mut world = world_in(&dir);
         let crate_ = spawn(&mut world, "Crate", Vec3::ZERO);
 
-        let err = create(&mut world, &registry(), &[crate_], "props/door.fprefab").unwrap_err();
+        let err = create(&mut world, &registry(), &[crate_], "props/door.oprefab").unwrap_err();
         assert!(err.contains("already exists"), "{err}");
-        assert_eq!(unused_path(&dir.0.join("props"), "door"), "door 2.fprefab");
-        assert_eq!(unused_path(&dir.0, "a/b"), "a_b.fprefab");
+        assert_eq!(unused_path(&dir.0.join("props"), "door"), "door 2.oprefab");
+        assert_eq!(unused_path(&dir.0, "a/b"), "a_b.oprefab");
     }
 }

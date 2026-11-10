@@ -1,4 +1,4 @@
-//! Which `.fprefab` files the project has, under which ids.
+//! Which `.oprefab` files the project has, under which ids.
 //!
 //! The slice of the asset database (issue #22) that prefabs need, in the shape
 //! that database takes: identity lives in a `<file>.meta` sidecar beside the
@@ -17,7 +17,7 @@ use orrin_registry::{AssetId, EntityId, SceneDocument, SceneEntity, Value};
 use crate::scene::registry::{PARENT, PREFAB};
 
 /// The extension a prefab file is recognised by.
-pub const EXTENSION: &str = "fprefab";
+pub const EXTENSION: &str = "oprefab";
 
 /// One prefab file, parsed and checked to be a single tree.
 #[derive(Clone)]
@@ -165,7 +165,7 @@ pub struct Prefabs {
 }
 
 impl Prefabs {
-    /// Index every `.fprefab` under `dir`, giving any without a sidecar an id.
+    /// Index every `.oprefab` under `dir`, giving any without a sidecar an id.
     ///
     /// A file that cannot be indexed is left out and named in the returned
     /// issues, and the rest still load. Files are read in path order, so which
@@ -284,7 +284,7 @@ pub struct Rescan {
     pub replaced: Vec<Prefab>,
 }
 
-/// Every `.fprefab` below `dir`, as `(relative path, path)`. Dotfiles and
+/// Every `.oprefab` below `dir`, as `(relative path, path)`. Dotfiles and
 /// symlinks are skipped, as the CLI's asset index skips them.
 fn collect(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, issues: &mut Vec<String>) {
     let entries = match std::fs::read_dir(dir) {
@@ -399,12 +399,12 @@ entity {HANDLE}
         let two_roots = format!(
             "orrin-scene 1\n\nentity {ROOT}\n  orrin.name = \"A\"\n\nentity {PANEL}\n  orrin.name = \"B\"\n"
         );
-        let err = Prefab::parse(door_id(), "props/pair.fprefab", &two_roots)
+        let err = Prefab::parse(door_id(), "props/pair.oprefab", &two_roots)
             .err()
             .expect("two roots must be refused");
         assert_eq!(
             err,
-            "props/pair.fprefab: a prefab is one entity tree, and this one has 2 roots; \
+            "props/pair.oprefab: a prefab is one entity tree, and this one has 2 roots; \
              parent them under one entity"
         );
     }
@@ -421,7 +421,7 @@ entity {ROOT}
     source = asset({DOOR_ID})
 "
         );
-        let err = Prefab::parse(AssetId::new(), "props/variant.fprefab", &text)
+        let err = Prefab::parse(AssetId::new(), "props/variant.oprefab", &text)
             .err()
             .unwrap();
         assert!(
@@ -434,12 +434,12 @@ entity {ROOT}
     fn a_prefab_that_does_not_parse_names_its_file_and_line() {
         let err = Prefab::parse(
             door_id(),
-            "props/door.fprefab",
+            "props/door.oprefab",
             "orrin-scene 1\n\nentity nope\n",
         )
         .err()
         .unwrap();
-        assert!(err.starts_with("props/door.fprefab: line 3:"), "{err}");
+        assert!(err.starts_with("props/door.oprefab: line 3:"), "{err}");
     }
 
     struct Dir(PathBuf);
@@ -473,34 +473,34 @@ entity {ROOT}
     #[test]
     fn a_prefab_without_a_sidecar_is_given_an_id_that_sticks() {
         let dir = Dir::new("sticks");
-        dir.write("props/door.fprefab", &door_text("handle", 1.0));
+        dir.write("props/door.oprefab", &door_text("handle", 1.0));
 
         let (first, issues) = Prefabs::scan(dir.path());
         assert!(issues.is_empty(), "{issues:?}");
         let id = first
-            .find("props/door.fprefab")
+            .find("props/door.oprefab")
             .expect("indexed by its relative path");
-        let sidecar = std::fs::read_to_string(dir.path().join("props/door.fprefab.meta")).unwrap();
+        let sidecar = std::fs::read_to_string(dir.path().join("props/door.oprefab.meta")).unwrap();
         assert_eq!(sidecar, format!("id = \"{id}\"\n"));
 
         let (second, _) = Prefabs::scan(dir.path());
-        assert_eq!(second.find("props/door.fprefab"), Some(id));
+        assert_eq!(second.find("props/door.oprefab"), Some(id));
     }
 
     #[test]
     fn a_sidecar_id_is_used_as_written() {
         let dir = Dir::new("sidecar");
-        dir.write("props/door.fprefab", &door_text("handle", 1.0));
+        dir.write("props/door.oprefab", &door_text("handle", 1.0));
         dir.write(
-            "props/door.fprefab.meta",
+            "props/door.oprefab.meta",
             &format!("# import settings live here too\nid = \"{DOOR_ID}\"\n"),
         );
 
         let (prefabs, issues) = Prefabs::scan(dir.path());
         assert!(issues.is_empty(), "{issues:?}");
-        assert_eq!(prefabs.find("props/door.fprefab"), Some(door_id()));
+        assert_eq!(prefabs.find("props/door.oprefab"), Some(door_id()));
         let prefab = prefabs.get(door_id()).unwrap();
-        assert_eq!(prefab.path, "props/door.fprefab");
+        assert_eq!(prefab.path, "props/door.oprefab");
         assert_eq!(prefab.name(), "door");
     }
 
@@ -511,10 +511,10 @@ entity {ROOT}
     #[test]
     fn a_prefab_sidecar_follows_the_asset_databases_rules() {
         let dir = Dir::new("shared-sidecar");
-        dir.write("props/door.fprefab", &door_text("handle", 1.0));
-        dir.write("props/gate.fprefab", &door_text("handle", 1.0));
+        dir.write("props/door.oprefab", &door_text("handle", 1.0));
+        dir.write("props/gate.oprefab", &door_text("handle", 1.0));
         dir.write(
-            "props/door.fprefab.meta",
+            "props/door.oprefab.meta",
             &format!("id = \"{DOOR_ID}\"\n\n[import]\nscale = 2.0\n"),
         );
 
@@ -522,11 +522,11 @@ entity {ROOT}
         let (prefabs, issues) = Prefabs::scan(dir.path());
         assert_eq!(
             issues,
-            ["props/door.fprefab.meta: `scale` is not a prefab import setting; a prefab has none"]
+            ["props/door.oprefab.meta: `scale` is not a prefab import setting; a prefab has none"]
         );
         assert_eq!(
-            prefabs.find("props/gate.fprefab"),
-            db.find("props/gate.fprefab").map(|entry| entry.id)
+            prefabs.find("props/gate.oprefab"),
+            db.find("props/gate.oprefab").map(|entry| entry.id)
         );
     }
 
@@ -537,7 +537,7 @@ entity {ROOT}
     fn a_copy_that_kept_the_original_sidecar_is_refused_by_name() {
         let dir = Dir::new("copy");
         let sidecar = format!("id = \"{DOOR_ID}\"\n");
-        for rel in ["props/door.fprefab", "props/door copy.fprefab"] {
+        for rel in ["props/door.oprefab", "props/door copy.oprefab"] {
             dir.write(rel, &door_text("handle", 1.0));
             dir.write(&format!("{rel}.meta"), &sidecar);
         }
@@ -546,8 +546,8 @@ entity {ROOT}
         assert_eq!(prefabs.iter().count(), 1);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(
-            issues[0].contains("props/door copy.fprefab")
-                && issues[0].contains("props/door.fprefab"),
+            issues[0].contains("props/door copy.oprefab")
+                && issues[0].contains("props/door.oprefab"),
             "{}",
             issues[0]
         );
@@ -556,15 +556,15 @@ entity {ROOT}
     #[test]
     fn a_broken_prefab_is_reported_and_the_rest_still_load() {
         let dir = Dir::new("broken");
-        dir.write("props/door.fprefab", &door_text("handle", 1.0));
-        dir.write("props/bad.fprefab", "not a scene\n");
+        dir.write("props/door.oprefab", &door_text("handle", 1.0));
+        dir.write("props/bad.oprefab", "not a scene\n");
         dir.write("props/notes.txt", "not a prefab, and never read\n");
 
         let (prefabs, issues) = Prefabs::scan(dir.path());
         assert_eq!(prefabs.iter().count(), 1);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(
-            issues[0].starts_with("props/bad.fprefab: line 1:"),
+            issues[0].starts_with("props/bad.oprefab: line 1:"),
             "{}",
             issues[0]
         );
@@ -575,13 +575,13 @@ entity {ROOT}
     #[test]
     fn a_rescan_keeps_a_deleted_prefab_for_the_instances_already_made() {
         let dir = Dir::new("rescan");
-        dir.write("props/door.fprefab", &door_text("handle", 1.0));
-        dir.write("props/door.fprefab.meta", &format!("id = \"{DOOR_ID}\"\n"));
+        dir.write("props/door.oprefab", &door_text("handle", 1.0));
+        dir.write("props/door.oprefab.meta", &format!("id = \"{DOOR_ID}\"\n"));
         let (mut prefabs, _) = Prefabs::scan(dir.path());
 
-        std::fs::remove_file(dir.path().join("props/door.fprefab")).unwrap();
+        std::fs::remove_file(dir.path().join("props/door.oprefab")).unwrap();
         assert!(prefabs.rescan().issues.is_empty());
-        assert_eq!(prefabs.find("props/door.fprefab"), None);
+        assert_eq!(prefabs.find("props/door.oprefab"), None);
         assert_eq!(prefabs.iter().count(), 0);
         assert!(prefabs.get(door_id()).is_some());
     }

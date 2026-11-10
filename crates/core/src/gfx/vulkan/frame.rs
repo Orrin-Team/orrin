@@ -195,6 +195,10 @@ pub struct FrameConfig {
     /// The viewport's wireframe draw mode, when it is not plain shaded. The
     /// editor's, so it needs the overlay too; `None` declares no node.
     pub wireframe: Option<super::wireframe::Wireframe>,
+    /// Whether the inspector's material sphere is redrawn this frame: the
+    /// editor is showing one *and* something it shows changed. See
+    /// [`material_preview`](super::material_preview).
+    pub material_preview: bool,
 }
 
 /// Which piece of engine code a graph node runs.
@@ -292,6 +296,10 @@ pub enum PassBody {
     Wireframe,
     /// The editor's transform handles, over the tonemapped frame.
     Gizmo,
+    /// The inspector's material on a sphere, into targets of its own.
+    MaterialPreview,
+    /// That sphere supersampled down and tonemapped, for the overlay to sample.
+    MaterialPreviewResolve,
     Overlay,
     ShadowCascade(u32),
     /// Every point and spot light's faces, in one pass over one atlas. A tile is
@@ -359,6 +367,17 @@ pub struct FrameIds {
     pub outline_mask: Option<ResourceId>,
     /// The wireframe's mode, and the depth it hides edges with when it has one.
     pub wireframe: Option<(super::wireframe::Wireframe, Option<ResourceId>)>,
+    pub material_preview: Option<MaterialPreviewIds>,
+}
+
+/// The inspector's material sphere: shaded into `hdr` against `depth`, then
+/// resolved into `output`, which the preview module owns and the overlay
+/// samples after the frame.
+#[derive(Clone, Copy, Debug)]
+pub struct MaterialPreviewIds {
+    pub hdr: ResourceId,
+    pub depth: ResourceId,
+    pub output: ResourceId,
 }
 
 /// The two chains bloom needs, each level a separate image.
@@ -1810,6 +1829,44 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         record(id, PassBody::Gizmo, &mut bodies);
     }
 
+    // Apart from everything above: its own targets at its own size, sharing no
+    // resource with the scene, so the scene's plan is the same with it or
+    // without it. The output is imported because the overlay samples it after
+    // the frame, and on later frames that leave it alone — so it leaves
+    // sampled, and is entered `Undefined` because the resolve covers it.
+    let material_preview = config.material_preview.then(|| {
+        use super::material_preview::{OUTPUT_FORMAT, SIZE, SUPERSAMPLE};
+        let shaded = Extent::Fixed([SIZE * SUPERSAMPLE; 2]);
+        let hdr = builder.create_image(
+            "material_preview_hdr",
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(shaded),
+        );
+        let depth = builder.create_image(
+            "material_preview_depth",
+            ImageDesc::new(DEPTH_FORMAT).extent(shaded),
+        );
+        let id = builder
+            .pass("material_preview", PassKind::Inline)
+            .access(hdr, Access::ColorAttachment)
+            .access(depth, Access::DepthAttachment)
+            .build();
+        record(id, PassBody::MaterialPreview, &mut bodies);
+
+        let output = builder.import_image(
+            "material_preview",
+            ImageDesc::new(OUTPUT_FORMAT).extent(Extent::Fixed([SIZE; 2])),
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let id = builder
+            .pass("material_preview_resolve", PassKind::Inline)
+            .access(hdr, Access::Sampled)
+            .access(output, Access::ColorAttachment)
+            .build();
+        record(id, PassBody::MaterialPreviewResolve, &mut bodies);
+        MaterialPreviewIds { hdr, depth, output }
+    });
+
     // Only into a window: offscreen there is no egui to draw and the executor
     // skips the node, but its barriers would still name `PresentSrc`.
     if config.overlay && config.presents {
@@ -1848,6 +1905,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             shadow_atlas,
             outline_mask,
             wireframe,
+            material_preview,
         },
         bodies,
     })

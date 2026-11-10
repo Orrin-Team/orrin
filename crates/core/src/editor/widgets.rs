@@ -37,6 +37,54 @@ pub fn padded<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 /// down to this, so a high-DPI display still gets a sharp one.
 pub const THUMB: f32 = 36.0;
 
+/// How many squares a material preview's checkerboard has along each side. Its
+/// two shades are the theme's darkest background and its window fill, so the
+/// square sits in the panel rather than on it while a cutout's holes still read.
+const CHECKER_CELLS: usize = 8;
+
+/// The renderer's sphere of `material` for `viewer`, `points` across at most,
+/// over a checkerboard so a cutout's holes read as holes. Dragging it orbits
+/// the camera; a double-click puts the camera back. Returns what to ask the
+/// renderer for, which the caller hands to the editor state.
+pub fn material_preview(
+    ui: &mut egui::Ui,
+    viewer: crate::gfx::vulkan::material_preview::Viewer,
+    material: crate::scene::MaterialHandle,
+    points: f32,
+) -> crate::gfx::vulkan::material_preview::Subject {
+    use crate::gfx::vulkan::material_preview::{Orbit, Subject, display_side};
+    let side = display_side(points, ui.pixels_per_point());
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(side), Sense::click_and_drag());
+    let memory = egui::Id::new(("material_preview_orbit", viewer));
+    let mut orbit: Orbit = ui.data(|data| data.get_temp(memory)).unwrap_or_default();
+    if response.double_clicked() {
+        orbit = Orbit::default();
+    } else if response.dragged() {
+        let delta = response.drag_delta();
+        orbit = orbit.dragged([delta.x, delta.y]);
+    }
+    ui.data_mut(|data| data.insert_temp(memory, orbit));
+    if response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    } else if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+
+    let cell = side / CHECKER_CELLS as f32;
+    let shades = [ui.visuals().extreme_bg_color, ui.visuals().window_fill];
+    let painter = ui.painter_at(rect);
+    for row in 0..CHECKER_CELLS {
+        for column in 0..CHECKER_CELLS {
+            let min = rect.min + egui::vec2(column as f32, row as f32) * cell;
+            let square = egui::Rect::from_min_size(min, egui::Vec2::splat(cell));
+            painter.rect_filled(square, 0.0, shades[(row + column) % 2]);
+        }
+    }
+    egui::Image::new(egui::load::SizedTexture::new(viewer.texture(), rect.size()))
+        .paint_at(ui, rect);
+    Subject { material, orbit }
+}
+
 /// What a toolbar button is showing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {

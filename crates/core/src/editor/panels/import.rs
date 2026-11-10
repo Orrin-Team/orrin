@@ -1,6 +1,7 @@
 //! The Import tab: the asset the browser marks, as the database sees it — what
 //! it is, how its last import went and what that made — and its import
-//! settings.
+//! settings. A material is pictured by the renderer's own sphere rather than a
+//! thumbnail, since it has no import to make one from.
 //!
 //! The settings are a draft until Apply writes them to the asset's sidecar,
 //! because every change to a texture's settings is a full reimport, and a
@@ -16,7 +17,9 @@ use crate::asset_db::cache::Summary;
 use crate::asset_db::{AssetDatabase, AssetKind, Entry, Settings, Status, Usage};
 use crate::editor::previews::Previews;
 use crate::editor::state::EditorState;
-use crate::editor::{icons, theme};
+use crate::editor::{icons, theme, widgets};
+use crate::gfx::vulkan::material_preview::{Subject, Viewer};
+use crate::scene::MaterialHandle;
 
 /// The picture's side: twice a browser tile's, which is as far as a 64 px
 /// thumbnail stretches before it reads as blurred rather than large.
@@ -47,6 +50,13 @@ enum Action {
 }
 
 pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: &mut Previews) {
+    // Asked for before the database is borrowed to draw: a material nothing in
+    // the scene uses is given its slot here, which the next service binds.
+    let material = state.revealed_asset.and_then(|id| {
+        let mut db = world.get_resource_mut::<AssetDatabase>()?;
+        let is_material = db.get(id)?.kind == AssetKind::Material;
+        is_material.then(|| db.material(id).ok()).flatten()
+    });
     let Some(db) = world.get_resource::<AssetDatabase>() else {
         ui.weak("Import settings belong to a project's assets. Open a project to see them.");
         return;
@@ -70,15 +80,19 @@ pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews:
             settings: entry.settings,
         });
     let mut action = None;
+    let mut previewed = None;
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
-            overview(ui, &db, entry, previews);
+            previewed = overview(ui, &db, entry, previews, material);
             ui.add_space(10.0);
             settings(ui, entry, &mut draft, &mut action);
         });
     ui.data_mut(|data| data.insert_temp(memory, draft));
     drop(db);
+    if previewed.is_some() {
+        state.material_previews[Viewer::Browser as usize] = previewed;
+    }
 
     let mut db = world.resource_mut::<AssetDatabase>();
     let done = match action {
@@ -92,23 +106,28 @@ pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews:
     }
 }
 
-/// The picture, the name and where it is, then a line for each fact.
-fn overview(ui: &mut egui::Ui, db: &AssetDatabase, entry: &Entry, previews: &mut Previews) {
+/// The picture, the name and where it is, then a line for each fact. Returns
+/// what the material's sphere asks of the renderer, for a material.
+fn overview(
+    ui: &mut egui::Ui,
+    db: &AssetDatabase,
+    entry: &Entry,
+    previews: &mut Previews,
+    material: Option<MaterialHandle>,
+) -> Option<Subject> {
     let side = PICTURE.min(ui.available_width());
-    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
-    let visuals = ui.visuals();
-    ui.painter().rect_filled(
-        rect,
-        visuals.widgets.inactive.corner_radius,
-        visuals.extreme_bg_color,
-    );
-    match previews.asset(ui.ctx(), db, entry.id) {
-        Some(picture) => egui::Image::new((picture.id(), rect.size())).paint_at(ui, rect),
+    let subject = match material {
+        Some(material) => Some(widgets::material_preview(
+            ui,
+            Viewer::Browser,
+            material,
+            side,
+        )),
         None => {
-            let glyph = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(48.0));
-            icons::paint(ui, glyph_of(entry.kind), glyph, visuals.weak_text_color());
+            picture(ui, db, entry, previews, side);
+            None
         }
-    }
+    };
     ui.add_space(6.0);
 
     let (folder, file) = entry.path.rsplit_once('/').unwrap_or(("", &entry.path));
@@ -189,6 +208,30 @@ fn overview(ui: &mut egui::Ui, db: &AssetDatabase, entry: &Entry, previews: &mut
                 ui.end_row();
             }
         });
+    subject
+}
+
+fn picture(
+    ui: &mut egui::Ui,
+    db: &AssetDatabase,
+    entry: &Entry,
+    previews: &mut Previews,
+    side: f32,
+) {
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
+    let visuals = ui.visuals();
+    ui.painter().rect_filled(
+        rect,
+        visuals.widgets.inactive.corner_radius,
+        visuals.extreme_bg_color,
+    );
+    match previews.asset(ui.ctx(), db, entry.id) {
+        Some(picture) => egui::Image::new((picture.id(), rect.size())).paint_at(ui, rect),
+        None => {
+            let glyph = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(48.0));
+            icons::paint(ui, glyph_of(entry.kind), glyph, visuals.weak_text_color());
+        }
+    }
 }
 
 fn fact(ui: &mut egui::Ui, name: &str) {

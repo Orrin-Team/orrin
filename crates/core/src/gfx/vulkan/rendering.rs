@@ -338,6 +338,25 @@ pub(super) fn rendering_info(
                 depth: depth.map(|depth| depth_borrowed(images.texture(depth))),
             }
         }
+        // Cleared to nothing drawn, which the resolve reads as no coverage, and
+        // a depth of its own that nothing samples.
+        PassBody::MaterialPreview => {
+            let ids = ids
+                .material_preview
+                .expect("a material preview pass without its targets");
+            RenderTargets {
+                colors: vec![cleared(images.texture(ids.hdr), [0.0; 4])],
+                depth: Some(depth_scratch(images.texture(ids.depth))),
+            }
+        }
+        // Every pixel written by the full-screen resolve.
+        PassBody::MaterialPreviewResolve => color_only(overwritten(
+            images.texture(
+                ids.material_preview
+                    .expect("a material preview resolve without its output")
+                    .output,
+            ),
+        )),
         // Dispatches, and the overlay, which records its own command buffer.
         PassBody::Overlay
         | PassBody::OcclusionHiz
