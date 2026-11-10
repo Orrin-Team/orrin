@@ -1245,9 +1245,10 @@ impl VulkanRenderer {
         }
         let mut requests = subjects.map(|subject| {
             let subject = subject.filter(known)?;
-            let rig = material_preview::lighting(lighting, subject.orbit);
-            let ambient = rig.ambient_color * rig.ambient_nits;
+            let ambient = lighting.ambient_color * lighting.ambient_nits;
             let irradiance = self.environment.irradiance(ambient, environment);
+            let rig =
+                material_preview::lighting(lighting, &irradiance, environment.yaw, subject.orbit);
             let side = material_preview::SIZE * material_preview::SUPERSAMPLE;
             Some(PreviewRequest {
                 subject,

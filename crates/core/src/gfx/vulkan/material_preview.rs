@@ -10,7 +10,9 @@
 //!
 //! **What it is lit by.** The scene's sky, ambient and environment yaw, so a
 //! metal reflects the world it will be seen in, and a studio key light of its
-//! own, so a material in a night scene is still visible. Everything else a
+//! own at a fixed ratio above that sky ([`KEY_TO_SKY`]), so the sphere always
+//! has a lit and a shadowed side and an emitter is judged against the scene's
+//! level of light rather than a midday sun's. Everything else a
 //! frame binds is bound neutral — no punctual light, decal, shadow, fog or
 //! screen-space term — because the sphere stands in no scene and the frame's
 //! screen-space targets describe a different screen. Exposure is metered at the
@@ -137,9 +139,15 @@ pub fn display_side(points: f32, pixels_per_point: f32) -> f32 {
     points.min(SIZE as f32 / pixels_per_point)
 }
 
-/// The studio key's illuminance, about a clear midday sun's: the same order as
-/// a calibrated sky's irradiance, so neither swamps the other on the sphere.
-pub(super) const KEY_LUX: f32 = 20_000.0;
+/// The studio key's illuminance over the sky's, on a surface facing the key:
+/// a lit side four times the shadowed one, the classic studio ratio, so the
+/// sphere always reads as a sphere. Tied to the sky rather than fixed, so the
+/// rig sits at the scene's level of light and an emitter is seen against what
+/// it will be seen against there: a fixed midday key made a 600-nit panel look
+/// dimmer than paper under a dusk sky it outshines.
+const KEY_TO_SKY: f32 = 3.0;
+/// What the key keeps under a black sky, where the ratio would leave nothing.
+const MIN_KEY_LUX: f32 = 1.0;
 
 /// The engine's built-in sphere: unit diameter, like every primitive.
 const RADIUS: f32 = 0.5;
@@ -195,12 +203,32 @@ pub(super) fn camera(orbit: Orbit) -> Camera {
     }
 }
 
-pub(super) fn lighting(scene: &SceneLighting, orbit: Orbit) -> SceneLighting {
+/// The sky's illuminance on a surface facing `direction`, read the way
+/// `sh_irradiance` reads it — through the environment's yaw — so the rig and
+/// the shader agree about which way the bright half of a sky faces.
+fn sky_illuminance(irradiance: &[Vec3; SH9], yaw: f32, direction: Vec3) -> f32 {
+    let (s, c) = yaw.to_radians().sin_cos();
+    let in_environment = Vec3::new(
+        c * direction.x - s * direction.z,
+        direction.y,
+        s * direction.x + c * direction.z,
+    );
+    PI * sh::evaluate(irradiance, in_environment).dot(REC709_LUMINANCE)
+}
+
+pub(super) fn lighting(
+    scene: &SceneLighting,
+    irradiance: &[Vec3; SH9],
+    yaw: f32,
+    orbit: Orbit,
+) -> SceneLighting {
+    let to_key = toward_key(orbit);
+    let key = KEY_TO_SKY * sky_illuminance(irradiance, yaw, to_key);
     SceneLighting {
         sun: DirectionalLight {
-            direction: -toward_key(orbit),
+            direction: -to_key,
             color: Vec3::ONE,
-            illuminance: KEY_LUX,
+            illuminance: key.max(MIN_KEY_LUX),
         },
         point_lights: Vec::new(),
         spot_lights: Vec::new(),
@@ -209,9 +237,7 @@ pub(super) fn lighting(scene: &SceneLighting, orbit: Orbit) -> SceneLighting {
 }
 
 /// The exposure an incident-light meter at the sphere, facing the camera,
-/// would set. The sky is read the way `sh_irradiance` reads it, through the
-/// environment's yaw, so the meter and the sphere agree about which way the
-/// bright half of a sky faces.
+/// would set.
 pub(super) fn exposure(
     lighting: &SceneLighting,
     irradiance: &[Vec3; SH9],
@@ -220,13 +246,7 @@ pub(super) fn exposure(
 ) -> f32 {
     let to_camera = toward_camera(orbit);
     let key = lighting.sun.illuminance * (-lighting.sun.direction).dot(to_camera).max(0.0);
-    let (s, c) = yaw.to_radians().sin_cos();
-    let in_environment = Vec3::new(
-        c * to_camera.x - s * to_camera.z,
-        to_camera.y,
-        s * to_camera.x + c * to_camera.z,
-    );
-    let sky = PI * sh::evaluate(irradiance, in_environment).dot(REC709_LUMINANCE);
+    let sky = sky_illuminance(irradiance, yaw, to_camera);
     let incident = (key + sky).max(f32::MIN_POSITIVE);
     HdrSettings::exposure_from_ev100((incident * 100.0 / METER_CALIBRATION).log2())
 }
@@ -539,7 +559,8 @@ mod tests {
             }],
             ..SceneLighting::default()
         };
-        let rig = lighting(&scene, Orbit::default());
+        let sky = sh::from_constant(Vec3::splat(50.0));
+        let rig = lighting(&scene, &sky, 0.0, Orbit::default());
         assert_eq!(rig.ambient_color, scene.ambient_color);
         assert_eq!(rig.ambient_nits, scene.ambient_nits);
         assert!(rig.point_lights.is_empty() && rig.spot_lights.is_empty());
@@ -549,7 +570,45 @@ mod tests {
         assert!(to_light.dot(to_camera) > 0.5, "{to_light}");
         assert!(to_light.y > 0.3, "{to_light}");
         assert_eq!(rig.sun.color, Vec3::ONE);
-        assert_eq!(rig.sun.illuminance, KEY_LUX);
+    }
+
+    /// The key is a fixed ratio above the sky it shares the sphere with, so
+    /// the sphere always has a lit side and a shadowed one, and the whole rig
+    /// sits at the scene's level of light. A black sky still gets a key.
+    #[test]
+    fn the_key_stands_a_fixed_ratio_above_the_sky() {
+        for nits in [1.0, 30.0, 6_000.0] {
+            let sky = sh::from_constant(Vec3::splat(nits));
+            let rig = lighting(&SceneLighting::default(), &sky, 0.0, Orbit::default());
+            let ratio = rig.sun.illuminance / (PI * nits);
+            assert!((ratio - KEY_TO_SKY).abs() < 1e-3, "{nits} nits: {ratio}");
+        }
+        let black = sh::from_constant(Vec3::ZERO);
+        let rig = lighting(&SceneLighting::default(), &black, 0.0, Orbit::default());
+        assert_eq!(rig.sun.illuminance, MIN_KEY_LUX);
+    }
+
+    /// What an emitter looks like depends on the light around it. Under the
+    /// default dusk sky a 600-nit panel outshines a lit white surface, as it
+    /// does in such a scene; under a daylight sky it does not.
+    #[test]
+    fn an_emitter_glows_against_a_dim_sky_and_not_against_a_bright_one() {
+        let exposed = |sky_nits: f32, nits: f32| {
+            let sky = sh::from_constant(Vec3::splat(sky_nits));
+            let rig = lighting(&SceneLighting::default(), &sky, 0.0, Orbit::default());
+            nits * exposure(&rig, &sky, 0.0, Orbit::default())
+        };
+        let white = 250.0 / (1.2 * 100.0 * PI);
+        assert!(
+            exposed(30.0, 600.0) > 2.0 * white,
+            "{}",
+            exposed(30.0, 600.0)
+        );
+        assert!(
+            exposed(6_000.0, 600.0) < white,
+            "{}",
+            exposed(6_000.0, 600.0)
+        );
     }
 
     /// An incident-light meter: whatever the sky, a white diffuse surface
@@ -560,8 +619,13 @@ mod tests {
     fn a_white_diffuse_surface_facing_the_camera_is_exposed_alike_under_any_sky() {
         let to_camera = camera(Orbit::default()).position.normalize();
         for sky in [0.0, 1.0, 600.0, 8_000.0] {
-            let rig = lighting(&SceneLighting::default(), Orbit::default());
             let irradiance = sh::from_constant(Vec3::splat(sky));
+            let rig = lighting(
+                &SceneLighting::default(),
+                &irradiance,
+                37.0,
+                Orbit::default(),
+            );
             let incident = rig.sun.illuminance * (-rig.sun.direction).dot(to_camera).max(0.0)
                 + std::f32::consts::PI * sky;
             let white = incident / std::f32::consts::PI;
@@ -579,7 +643,12 @@ mod tests {
     /// way it changes what lights the sphere.
     #[test]
     fn the_meter_reads_the_sky_through_the_environments_yaw() {
-        let rig = lighting(&SceneLighting::default(), Orbit::default());
+        let rig = lighting(
+            &SceneLighting::default(),
+            &sh::from_constant(Vec3::splat(400.0)),
+            0.0,
+            Orbit::default(),
+        );
         let mut lopsided = [Vec3::ZERO; SH9];
         lopsided[0] = Vec3::splat(400.0);
         lopsided[2] = Vec3::splat(300.0);
@@ -631,7 +700,12 @@ mod tests {
     #[test]
     fn orbiting_moves_the_camera_round_the_sphere_and_the_key_with_it() {
         let rest = Orbit::default();
-        let to_light = |orbit| -lighting(&SceneLighting::default(), orbit).sun.direction;
+        let sky = sh::from_constant(Vec3::splat(30.0));
+        let to_light = |orbit| {
+            -lighting(&SceneLighting::default(), &sky, 0.0, orbit)
+                .sun
+                .direction
+        };
         for orbit in [
             Orbit {
                 yaw: 90.0,
