@@ -91,7 +91,7 @@ public class QueryTest : Behaviour
         Check(_victim.GetComponent<Tag>() is null, "stale handle reads no tag");
         Check(!World.SetTag(_victim, "qt-zombie"), "SetTag on stale handle returns false");
 
-        Native.Log(_failed == 0
+        Debug.Log(_failed == 0
             ? $"[QueryTest] ALL PASS ({_checked} checks)"
             : $"[QueryTest] {_failed}/{_checked} CHECKS FAILED");
     }
@@ -100,6 +100,6 @@ public class QueryTest : Behaviour
     {
         _checked++;
         if (!condition) _failed++;
-        Native.Log($"[QueryTest] {(condition ? "PASS" : "FAIL")}: {name}");
+        Debug.Log($"[QueryTest] {(condition ? "PASS" : "FAIL")}: {name}");
     }
 }

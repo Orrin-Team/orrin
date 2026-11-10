@@ -13,7 +13,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use orrin_script::{CEntity, GameAssemblyStatus, ScriptHost};
+use orrin_script::{CEntity, CMeshRenderer, CTransform, GameAssemblyStatus, ScriptHost};
 
 static LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -53,6 +53,167 @@ fn take_attributed_logs() -> Vec<(u32, String, u32, String)> {
         .zip(logs)
         .map(|((level, source, line), text)| (level, source, line, text))
         .collect()
+}
+
+/// The engine calls the surface probes made, in order, as the recording stubs
+/// below describe them.
+static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn record(call: String) {
+    CALLS.lock().unwrap().push(call);
+}
+
+fn take_calls() -> Vec<String> {
+    std::mem::take(&mut *CALLS.lock().unwrap())
+}
+
+fn named(entity: CEntity) -> String {
+    format!("{}v{}", entity.index, entity.generation)
+}
+
+fn placed(transform: *const CTransform) -> String {
+    // SAFETY: C# passes a valid transform for the duration of the call.
+    let [x, y, z] = unsafe { (*transform).position };
+    format!("{x} {y} {z}")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Every transform read answers at x = 7 locally and x = 4 in the world.
+fn answer(out: *mut CTransform, x: f32) -> bool {
+    // SAFETY: C# passes a writable transform for the duration of the call.
+    unsafe {
+        *out = CTransform {
+            position: [x, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+        }
+    };
+    true
+}
+
+extern "C" fn local_read(_: CEntity, out: *mut CTransform) -> bool {
+    answer(out, 7.0)
+}
+
+extern "C" fn world_read(_: CEntity, out: *mut CTransform) -> bool {
+    answer(out, 4.0)
+}
+
+extern "C" fn local_write(entity: CEntity, value: *const CTransform) -> bool {
+    record(format!("set_transform {} {}", named(entity), placed(value)));
+    true
+}
+
+extern "C" fn world_write(entity: CEntity, value: *const CTransform) -> bool {
+    record(format!(
+        "set_world_transform {} {}",
+        named(entity),
+        placed(value)
+    ));
+    true
+}
+
+extern "C" fn parent_of(_: CEntity) -> CEntity {
+    CEntity {
+        index: 6,
+        generation: 2,
+    }
+}
+
+extern "C" fn reparent(child: CEntity, parent: CEntity, keep_world: bool) -> bool {
+    record(format!(
+        "set_parent {} {} {keep_world}",
+        named(child),
+        named(parent)
+    ));
+    true
+}
+
+extern "C" fn tag_of(_: CEntity, out: *mut c_char, capacity: i32) -> i32 {
+    let tag = b"tagged";
+    if capacity >= tag.len() as i32 {
+        // SAFETY: C# passes `capacity` writable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(tag.as_ptr(), out.cast(), tag.len()) };
+    }
+    tag.len() as i32
+}
+
+fn text(value: *const c_char) -> String {
+    // SAFETY: C# passes a valid, null-terminated UTF-8 buffer.
+    unsafe { CStr::from_ptr(value) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+extern "C" fn retag(entity: CEntity, tag: *const c_char) -> bool {
+    record(format!("set_tag {} {}", named(entity), text(tag)));
+    true
+}
+
+extern "C" fn attach_script(entity: CEntity, type_name: *const c_char) -> bool {
+    record(format!("add_script {} {}", named(entity), text(type_name)));
+    true
+}
+
+extern "C" fn despawn(entity: CEntity) -> bool {
+    record(format!("despawn {}", named(entity)));
+    true
+}
+
+const MESH_RENDERER: u32 = 16;
+const SPAWNED: CEntity = CEntity {
+    index: 9,
+    generation: 1,
+};
+
+extern "C" fn spawn_at(_: *const CTransform) -> CEntity {
+    record("spawn_with_transform".into());
+    SPAWNED
+}
+
+fn renderer(value: *const u8, size: u32) -> String {
+    assert_eq!(size as usize, size_of::<CMeshRenderer>());
+    // SAFETY: C# passes `size` readable bytes, just checked to be a renderer.
+    let renderer = unsafe { value.cast::<CMeshRenderer>().read_unaligned() };
+    format!("{} {}", hex(&renderer.mesh), hex(&renderer.material))
+}
+
+extern "C" fn add_component(entity: CEntity, kind: u32, value: *const u8, size: u32) -> bool {
+    record(format!(
+        "add_component {} {kind} {}",
+        named(entity),
+        renderer(value, size)
+    ));
+    true
+}
+
+extern "C" fn set_component(entity: CEntity, kind: u32, value: *const u8, size: u32) -> bool {
+    record(format!(
+        "set_component {} {kind} {}",
+        named(entity),
+        renderer(value, size)
+    ));
+    true
+}
+
+/// Only the spawned entity draws anything: the probe's mesh and its first
+/// material.
+extern "C" fn get_component(entity: CEntity, kind: u32, out: *mut u8, size: u32) -> bool {
+    record(format!("get_component {} {kind}", named(entity)));
+    if kind != MESH_RENDERER || named(entity) != named(SPAWNED) {
+        return false;
+    }
+    assert_eq!(size as usize, size_of::<CMeshRenderer>());
+    let drawn = CMeshRenderer {
+        mesh: 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff_u128.to_be_bytes(),
+        material: 0x1000_0000_0000_0000_0000_0000_0000_0001_u128.to_be_bytes(),
+    };
+    // SAFETY: C# passes `size` writable bytes, just checked to be a renderer.
+    unsafe { out.cast::<CMeshRenderer>().write_unaligned(drawn) };
+    true
 }
 
 /// `ORRIN_SCRIPT_DIR` override, else probe the C# build output relative to
@@ -98,14 +259,12 @@ fn game_assembly() -> Option<PathBuf> {
 }
 
 fn create(host: &ScriptHost, type_name: &str) -> u64 {
+    create_at(host, type_name, 1, 0)
+}
+
+fn create_at(host: &ScriptHost, type_name: &str, index: u32, generation: u32) -> u64 {
     let name = CString::new(type_name).unwrap();
-    host.create(
-        CEntity {
-            index: 1,
-            generation: 0,
-        },
-        &name,
-    )
+    host.create(CEntity { index, generation }, &name)
 }
 
 #[test]
@@ -116,6 +275,20 @@ fn behaviour_lifecycle() {
     };
     let api = orrin_script::OrrinApi {
         log_event: capture_log,
+        get_transform: local_read,
+        set_transform: local_write,
+        get_world_transform: world_read,
+        set_world_transform: world_write,
+        get_parent: parent_of,
+        set_parent: reparent,
+        get_tag: tag_of,
+        set_tag: retag,
+        add_script: attach_script,
+        despawn,
+        spawn_with_transform: spawn_at,
+        get_component,
+        set_component,
+        add_component,
         ..orrin_script::default_api()
     };
     let host = ScriptHost::boot(&api, &dir).expect("CoreCLR failed to boot");
@@ -226,9 +399,189 @@ fn behaviour_lifecycle() {
     );
     orrin_script::destroy_handle(handle);
 
+    behaviour_index(&host);
+    entity_members(&host);
+    asset_references(&host);
+    timers(&host);
     pointer_events(&host);
     state_preservation(&host);
     game_assembly_swap(&host);
+}
+
+/// One Behaviour reaches another by entity or by type, through an index that
+/// holds handles rather than objects: an entry appears at create and is gone
+/// at destroy, so nothing resolves a freed handle — including one the runtime
+/// has since handed to a different Behaviour.
+fn behaviour_index(host: &ScriptHost) {
+    let probe = create_at(host, "Orrin.Tests.IndexProbe, Orrin", 1, 0);
+    let marker = create_at(host, "Orrin.Tests.IndexMarker, Orrin", 2, 0);
+    assert_ne!(probe, 0, "IndexProbe not found in Orrin.dll");
+    assert_ne!(marker, 0, "IndexMarker not found in Orrin.dll");
+    take_logs();
+
+    assert!(!host.update(probe, 0.016), "the index probe faulted");
+    assert_eq!(
+        take_logs(),
+        ["probe:index get=2 try=True:2 respawned=none all=2 first=2 self=True wrongType=none"],
+        "a live Behaviour is found by its entity and by its type, and only at its own generation"
+    );
+
+    orrin_script::destroy_handle(marker);
+    take_logs();
+    assert!(!host.update(probe, 0.016), "the index probe faulted");
+    assert_eq!(
+        take_logs(),
+        [
+            "probe:index get=none try=False:none respawned=none all= first=none self=True wrongType=none"
+        ],
+        "a destroyed Behaviour must leave the index with its handle"
+    );
+
+    let elsewhere = create_at(host, "Orrin.Tests.IndexMarker, Orrin", 3, 0);
+    take_logs();
+    assert!(!host.update(probe, 0.016), "the index probe faulted");
+    assert_eq!(
+        take_logs(),
+        [
+            "probe:index get=none try=False:none respawned=none all=3 first=3 self=True wrongType=none"
+        ],
+        "a new Behaviour is found where it is, never through a stale entry for entity 2"
+    );
+
+    orrin_script::destroy_handle(elsewhere);
+    orrin_script::destroy_handle(probe);
+    take_logs();
+}
+
+/// An entity's own members reach the same engine calls the Behaviour's
+/// protected ones and `World` do, on whichever entity they are asked of.
+fn entity_members(host: &ScriptHost) {
+    let handle = create_at(host, "Orrin.Tests.EntityProbe, Orrin", 5, 1);
+    assert_ne!(handle, 0, "EntityProbe not found in Orrin.dll");
+    take_logs();
+    take_calls();
+
+    assert!(!host.update(handle, 0.016), "the entity probe faulted");
+    assert_eq!(
+        take_logs(),
+        [
+            "probe:entity local=7 world=4 parent=Entity(6v2) tag=tagged",
+            "probe:entity reparent=True tag=True script=True despawn=True",
+        ]
+    );
+    let calls = take_calls();
+    assert_eq!(
+        calls[..4],
+        [
+            "set_transform 6v2 1 2 3",
+            "set_world_transform 6v2 1 2 3",
+            "set_parent 5v1 6v2 false",
+            "set_tag 5v1 hero",
+        ]
+    );
+    assert!(
+        calls[4].starts_with("add_script 5v1 Orrin.Tests.LifecycleProbe, Orrin,"),
+        "AddScript<T> names T assembly-qualified: {}",
+        calls[4]
+    );
+    assert_eq!(calls[5..], ["despawn 5v1"]);
+
+    orrin_script::destroy_handle(handle);
+    take_logs();
+}
+
+/// The asset-reference spawn and material swap ride on the MeshRenderer
+/// component calls: a spawn at a transform plus a queued renderer, and a read
+/// of the renderer written back with only its material changed. A null
+/// reference spawns nothing at all.
+fn asset_references(host: &ScriptHost) {
+    let handle = create(host, "Orrin.Tests.AssetProbe, Orrin");
+    assert_ne!(handle, 0, "AssetProbe not found in Orrin.dll");
+    take_logs();
+    take_calls();
+
+    assert!(!host.update(handle, 0.016), "the asset probe faulted");
+    assert_eq!(
+        take_logs(),
+        [
+            "World.SpawnRenderable: MeshRenderer.Material is the null reference, so nothing was spawned",
+            "probe:asset spawned=Entity(9v1) refused=Entity(0v0) swapped=True bare=False",
+        ]
+    );
+    let mesh = "00112233445566778899aabbccddeeff";
+    let first = "10000000000000000000000000000001";
+    let second = "20000000000000000000000000000002";
+    assert_eq!(
+        take_calls(),
+        [
+            "spawn_with_transform".to_owned(),
+            format!("add_component 9v1 16 {mesh} {first}"),
+            "get_component 9v1 16".to_owned(),
+            format!("set_component 9v1 16 {mesh} {second}"),
+            "get_component 4v0 16".to_owned(),
+        ]
+    );
+
+    orrin_script::destroy_handle(handle);
+    take_logs();
+}
+
+/// `After` fires once, `Every` repeats — at most once a tick, however long the
+/// tick — a cancelled timer never fires, and all of it runs before OnUpdate on
+/// the delta the engine passed in. A throwing callback is contained and
+/// reported as the script's fault, exactly as a throwing OnUpdate is.
+fn timers(host: &ScriptHost) {
+    let handle = create(host, "Orrin.Tests.TimerProbe, Orrin");
+    assert_ne!(handle, 0, "TimerProbe not found in Orrin.dll");
+    host.enable(handle);
+    host.start(handle);
+    take_logs();
+    for delta in [0.25, 0.25, 0.25, 0.25, 1.25] {
+        assert!(!host.update(handle, delta), "the timer probe faulted");
+    }
+    assert_eq!(
+        take_logs(),
+        [
+            "probe:update 1",
+            "probe:timer once",
+            "probe:timer every",
+            "probe:update 2",
+            "probe:cancel True False pending=False",
+            "probe:update 3",
+            "probe:timer every",
+            "probe:update 4",
+            "probe:timer every",
+            "probe:update 5",
+        ]
+    );
+    orrin_script::destroy_handle(handle);
+    take_logs();
+
+    let throwing = create(host, "Orrin.Tests.ThrowingTimer, Orrin");
+    assert_ne!(throwing, 0, "ThrowingTimer not found in Orrin.dll");
+    host.enable(throwing);
+    host.start(throwing);
+    take_logs();
+    assert!(
+        host.update(throwing, 0.016),
+        "a throwing timer callback must report a fault"
+    );
+    let logs = take_attributed_logs();
+    assert!(
+        logs.iter().any(|(level, source, _, text)| *level == 4
+            && source == "ThrowingTimer"
+            && text.contains("ThrowingTimer.After")
+            && text.contains("timer boom")),
+        "expected the fault as an error naming the script and its timer, got {logs:?}"
+    );
+    assert!(
+        !logs
+            .iter()
+            .any(|(_, _, _, text)| text == "probe:throwing-timer update"),
+        "OnUpdate ran after its timer faulted the script: {logs:?}"
+    );
+    orrin_script::destroy_handle(throwing);
+    take_logs();
 }
 
 /// A pointer event reaches a behaviour that handles it with its payload, is

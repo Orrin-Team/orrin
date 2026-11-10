@@ -15,7 +15,7 @@ public static class DemoStories
     {
         var entity = World.Spawn();
         World.AddComponent(entity, rect);
-        Native.SetParent(entity, parent, keepWorld: false);
+        entity.SetParent(parent, keepWorld: false);
         return entity;
     }
 

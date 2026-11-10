@@ -15,6 +15,33 @@ public static class World
     public static Entity SpawnRenderable(string mesh, string material, Transform transform) =>
         Native.SpawnRenderable(mesh, material, transform);
 
+    /// <summary>
+    /// Spawn an entity at <paramref name="transform"/> drawing
+    /// <paramref name="mesh"/> with <paramref name="material"/>. Its Transform
+    /// can be read this tick and its renderer lands when the tick's commands
+    /// apply. A null reference spawns nothing and returns
+    /// <see cref="Entity.Null"/>; one naming an asset of the wrong kind is
+    /// logged by name when it applies, and leaves the entity undrawn.
+    /// </summary>
+    public static Entity SpawnRenderable(AssetRef<Mesh> mesh, AssetRef<Material> material, Transform transform)
+    {
+        if (!mesh.IsValid || !material.IsValid)
+        {
+            Native.LogEvent(
+                LogLevel.Warning,
+                $"World.SpawnRenderable: MeshRenderer.{(mesh.IsValid ? "Material" : "Mesh")} is the null "
+                + "reference, so nothing was spawned",
+                "",
+                0);
+            return Entity.Null;
+        }
+        var entity = Native.SpawnWithTransform(transform);
+        if (Native.AddComponent(entity, new MeshRenderer { Mesh = mesh, Material = material }))
+            return entity;
+        Native.Despawn(entity);
+        return Entity.Null;
+    }
+
     /// Spawn an empty entity.
     public static Entity Spawn() => Native.Spawn();
 
@@ -66,11 +93,40 @@ public static class World
     public static bool SetMaterial(Entity entity, string material) =>
         Native.SetMaterial(entity, material);
 
+    /// <summary>
+    /// Draw <paramref name="entity"/>'s mesh with <paramref name="material"/>,
+    /// from this frame. Returns false if it has no renderer yet — one spawned
+    /// this tick gets it when the tick's commands apply — or if the engine
+    /// refuses the material, which it logs by name.
+    /// </summary>
+    public static bool SetMaterial(Entity entity, AssetRef<Material> material)
+    {
+        if (Native.GetComponent<MeshRenderer>(entity) is not { } renderer)
+            return false;
+        renderer.Material = material;
+        return Native.SetComponent(entity, renderer);
+    }
+
     /// Queue attaching a Behaviour of type T to `entity`. The instance is
     /// created when this tick's commands apply; OnEnable/OnStart fire on the
     /// next tick. Returns false if the handle was stale.
     public static bool AddScript<T>(Entity entity) where T : Behaviour, new() =>
         Native.AddScript(entity, typeof(T).AssemblyQualifiedName!);
+
+    /// <summary>
+    /// Every live Behaviour of type <typeparamref name="T"/> (or derived from
+    /// it), in no particular order; empty if there is none. Live means created
+    /// and not yet destroyed, so a disabled one is included. The search covers
+    /// every world the engine runs scripts in, a storybook story's included.
+    /// </summary>
+    public static T[] FindAll<T>() where T : Behaviour => Behaviours.FindAll<T>();
+
+    /// <summary>
+    /// One live Behaviour of type <typeparamref name="T"/>, or null if there is
+    /// none. Which one is arbitrary when several exist; use
+    /// <see cref="FindAll{T}"/> for those.
+    /// </summary>
+    public static T? FindFirst<T>() where T : Behaviour => Behaviours.FindFirst<T>();
 
     /// <summary>
     /// <paramref name="entity"/>'s <see cref="Canvas"/>, <see cref="RectTransform"/>,

@@ -15,7 +15,7 @@ public class CollisionDemo : Behaviour
     {
         Spawn("cube", new BoxCollider(), new Vector3(-4f, 2f, 0f));
         Spawn("sphere", new SphereCollider(), new Vector3(4f, 2f, 0f));
-        Native.Log("collision demo: two bodies closing in");
+        Debug.Log("collision demo: two bodies closing in");
     }
 
     private static void Spawn(string mesh, Collider collider, Vector3 position)
@@ -54,12 +54,12 @@ public class Bumper : Behaviour
     public override void OnCollisionEnter(Collision collision)
     {
         _stopped = true;
-        Native.Log($"{Entity} hit {collision.Other} at {collision.ContactPoint} (normal {collision.Normal})");
+        Debug.Log($"{Entity} hit {collision.Other} at {collision.ContactPoint} (normal {collision.Normal})");
         World.SetMaterial(Entity, "neon");
     }
 
     public override void OnCollisionExit(Collision collision)
     {
-        Native.Log($"{Entity} separated from {collision.Other}");
+        Debug.Log($"{Entity} separated from {collision.Other}");
     }
 }

@@ -203,7 +203,47 @@ fn the_demo_controller_moves_like_it_is_tuned_to() {
     the_mouse_turns_where_it_walks(&scripting, &registry);
     stands_still_on_a_ramp(&scripting, &registry);
     a_ball_fired_at_a_target_scores(&scripting, &registry);
+    a_ball_carries_the_velocity_of_its_player(&scripting, &registry);
     the_course_builds_and_nothing_falls_through_it(&scripting, &registry);
+}
+
+/// The launcher rides on the camera, a different entity from the body, so the
+/// velocity a ball inherits depends on finding the player a camera belongs to.
+/// One ball fired standing and one running differ by the player's speed.
+fn a_ball_carries_the_velocity_of_its_player(scripting: &Scripting, registry: &Registry) {
+    let mut game = Game::new(scripting, registry);
+    let player = game.player(Vec3::new(0.0, 1.0, 0.0));
+    game.seconds(0.3);
+
+    let fire = |game: &mut Game| {
+        let before = game.tagged("ball");
+        game.click();
+        game.frame();
+        let fired: Vec<_> = game
+            .tagged("ball")
+            .into_iter()
+            .filter(|ball| !before.contains(ball))
+            .collect();
+        assert_eq!(fired.len(), 1, "the click fired {} balls", fired.len());
+        -game.velocity(fired[0]).z
+    };
+
+    // The first click locks the cursor, the second fires.
+    game.click();
+    let standing = fire(&mut game);
+    game.hold(W);
+    game.seconds(1.0);
+    let running = -game.velocity(player).z;
+    let moving = fire(&mut game);
+    eprintln!(
+        "carry: a ball flew at {standing:.2} m/s fired standing, {moving:.2} fired running at {running:.2}"
+    );
+    assert!(running > 5.0, "the player was not running: {running} m/s");
+    assert!(
+        moving - standing > running * 0.8,
+        "fired running at {running} m/s, a ball gained only {} over one fired standing",
+        moving - standing
+    );
 }
 
 fn walks_to_its_top_speed_and_stops_when_let_go(scripting: &Scripting, registry: &Registry) {

@@ -23,7 +23,7 @@ public class Hover : Behaviour
         var t = LocalTransform;
         _basePosition = t.Position;
         _baseScale = t.Scale;
-        Native.Log($"Hover attached to {Entity}");
+        Debug.Log($"Hover attached to {Entity}");
     }
 
     public override void OnUpdate(float deltaTime)

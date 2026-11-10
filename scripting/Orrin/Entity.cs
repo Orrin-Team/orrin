@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 
 namespace Orrin;
@@ -38,9 +39,9 @@ public readonly struct Entity : IEquatable<Entity>
 
     /// Typed read of an engine component, or null if the entity lacks it (or
     /// the handle is stale). Components come back by value; write back through
-    /// the corresponding setter (Native.SetTransform, World.SetTag,
-    /// World.SetCamera). Supports Transform, Tag and CameraComponent —
-    /// script-defined components arrive with the byte-blob milestone.
+    /// the corresponding setter (`LocalTransform`, `SetTag`, World.SetCamera).
+    /// Supports Transform, Tag and CameraComponent — script-defined components
+    /// arrive with the byte-blob milestone.
     public T? GetComponent<T>() where T : struct
     {
         // typeof dispatch per supported component; the (T)(object) round-trip
@@ -52,6 +53,80 @@ public readonly struct Entity : IEquatable<Entity>
         if (typeof(T) == typeof(CameraComponent))
             return Native.GetCameraLens(this) is { } camera ? (T)(object)camera : null;
         throw new ArgumentException($"{typeof(T).Name} is not a script-visible engine component");
+    }
+
+    /// <summary>
+    /// This entity's transform relative to its parent; for a root, also its
+    /// world transform. Setting it moves the entity from this frame.
+    /// </summary>
+    public Transform LocalTransform
+    {
+        get => Native.GetTransform(this);
+        set => Native.SetTransform(this, value);
+    }
+
+    /// <summary>
+    /// This entity's transform in world space, whatever it is parented to.
+    /// Setting it composes with the inverse of the parent's transform; the
+    /// scale read back is a best fit once a non-uniformly scaled ancestor
+    /// introduces shear.
+    /// </summary>
+    public Transform WorldTransform
+    {
+        get => Native.GetWorldTransform(this);
+        set => Native.SetWorldTransform(this, value);
+    }
+
+    /// <summary>This entity's parent, or <see cref="Null"/> for a root.</summary>
+    public Entity Parent => Native.GetParent(this);
+
+    /// <summary>
+    /// Attach this entity to <paramref name="parent"/>, or pass
+    /// <see cref="Null"/> to detach it. With <paramref name="keepWorld"/> it
+    /// stays where it is in the world; without it, it keeps its local
+    /// transform and moves into the parent's frame. Returns false, changing
+    /// nothing, for a cycle or a stale handle. Applied after this tick, so
+    /// <see cref="Parent"/> reads the old value until the next one.
+    /// </summary>
+    public bool SetParent(Entity parent, bool keepWorld = true) =>
+        Native.SetParent(this, parent, keepWorld);
+
+    /// <summary>This entity's tag, or null if it has none.</summary>
+    public string? Tag => Native.GetTag(this);
+
+    /// <summary>
+    /// Set or replace this entity's tag. Applied after this tick, so
+    /// <see cref="World.FindByTag"/> and <see cref="Tag"/> see it from the next
+    /// one. Returns false for a stale handle.
+    /// </summary>
+    public bool SetTag(string tag) => Native.SetTag(this, tag);
+
+    /// <summary>
+    /// Despawn this entity, and everything parented to it, at the end of this
+    /// tick. Returns false if the handle was already stale.
+    /// </summary>
+    public bool Despawn() => Native.Despawn(this);
+
+    /// <summary>
+    /// Attach a Behaviour of type <typeparamref name="T"/> to this entity. It is
+    /// created when this tick's commands apply, and its OnEnable and OnStart run
+    /// on the next tick. Returns false for a stale handle.
+    /// </summary>
+    public bool AddScript<T>() where T : Behaviour, new() => World.AddScript<T>(this);
+
+    /// <summary>
+    /// This entity's Behaviour of type <typeparamref name="T"/> (or derived from
+    /// it), or null if it has none. A Behaviour attached this tick is found from
+    /// the next, once it has been created; one being destroyed is found until
+    /// its OnDestroy has run.
+    /// </summary>
+    public T? GetBehaviour<T>() where T : Behaviour => Behaviours.Find<T>(this);
+
+    /// <summary><see cref="GetBehaviour{T}"/>, as a test.</summary>
+    public bool TryGetBehaviour<T>([MaybeNullWhen(false)] out T behaviour) where T : Behaviour
+    {
+        behaviour = Behaviours.Find<T>(this);
+        return behaviour is not null;
     }
 
     /// Handle equality: same index and generation. Two handles being equal means

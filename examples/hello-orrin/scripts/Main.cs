@@ -34,6 +34,6 @@ public class Main : Behaviour
         var t = Transform.Identity;
         t.Position = new Vector3(0f, Height, 0f);
         t.Rotation = Quaternion.Euler(0f, _spin, 0f);
-        Native.SetTransform(_cube, t);
+        _cube.LocalTransform = t;
     }
 }

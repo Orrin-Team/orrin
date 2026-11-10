@@ -74,4 +74,70 @@ public abstract class Behaviour
     /// still reads the old value until the next frame.
     protected bool SetParent(Entity parent, bool keepWorld = true) =>
         Native.SetParent(Entity, parent, keepWorld);
+
+    /// Owned by the instance, so timers die with it and a hot reload, which
+    /// builds a fresh instance, starts with none.
+    List<TimerHandle>? _timers;
+
+    /// <summary>
+    /// Run <paramref name="callback"/> once, <paramref name="seconds"/> from
+    /// now. Timers run just before <see cref="OnUpdate"/>, on the same delta,
+    /// so one started earlier in the tick — in OnStart or a collision callback
+    /// — counts this tick's delta too. They pause while the behaviour is
+    /// disabled and are dropped when it is destroyed or its scripts are
+    /// reloaded. A callback that throws faults the script exactly as a
+    /// throwing OnUpdate does.
+    /// </summary>
+    protected TimerHandle After(float seconds, Action callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        if (float.IsNaN(seconds))
+            throw new ArgumentOutOfRangeException(nameof(seconds), seconds, "a delay must be a number");
+        return Schedule(new TimerHandle(seconds, callback, 0f));
+    }
+
+    /// <summary>
+    /// Run <paramref name="callback"/> every <paramref name="seconds"/> until
+    /// it is cancelled, first <paramref name="seconds"/> from now. It runs at
+    /// most once a tick: a tick longer than the interval runs it once rather
+    /// than once per interval missed. Otherwise as <see cref="After"/>.
+    /// </summary>
+    protected TimerHandle Every(float seconds, Action callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        if (!(seconds > 0f))
+            throw new ArgumentOutOfRangeException(nameof(seconds), seconds, "an interval must be positive");
+        return Schedule(new TimerHandle(seconds, callback, seconds));
+    }
+
+    TimerHandle Schedule(TimerHandle timer)
+    {
+        (_timers ??= []).Add(timer);
+        return timer;
+    }
+
+    /// Run the timers due this tick, stopping at the first that throws and
+    /// handing back which kind it was and what it threw. A timer started by a
+    /// callback waits for the next tick.
+    internal (string Hook, Exception Error)? TickTimers(float deltaTime)
+    {
+        if (_timers is not { Count: > 0 } timers)
+            return null;
+        (string, Exception)? failure = null;
+        var due = timers.Count;
+        for (var i = 0; i < due && failure is null; i++)
+        {
+            var timer = timers[i];
+            try
+            {
+                timer.Tick(deltaTime);
+            }
+            catch (Exception e)
+            {
+                failure = (timer.Repeats ? nameof(Every) : nameof(After), e);
+            }
+        }
+        timers.RemoveAll(static timer => !timer.IsPending);
+        return failure;
+    }
 }

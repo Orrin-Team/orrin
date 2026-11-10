@@ -150,7 +150,7 @@ public unsafe struct OrrinApi
     public delegate* unmanaged<float, void> AudioSetMusicVolume;
 }
 
-public static unsafe class Native
+internal static unsafe class Native
 {
     private static OrrinApi _api;
 

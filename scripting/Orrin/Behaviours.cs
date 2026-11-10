@@ -38,6 +38,67 @@ public static unsafe class Behaviours
     internal static Behaviour? Resolve(ulong handle) =>
         handle != 0 && GCHandle.FromIntPtr((nint)handle).Target is Behaviour behaviour ? behaviour : null;
 
+    /// Every live Behaviour's handle, by the entity it is on.
+    ///
+    /// Handles rather than objects: this assembly is never unloaded, so a
+    /// `Behaviour` held here would pin the game's load context through every
+    /// reload, while a handle is only a number that `Destroy` takes out of here
+    /// before it frees it. A list per entity rather than one handle, so that an
+    /// entity carrying several Behaviours needs no new shape.
+    static readonly Dictionary<Entity, List<ulong>> ByEntity = [];
+
+    static void Index(Entity entity, ulong handle)
+    {
+        if (!ByEntity.TryGetValue(entity, out var handles))
+            ByEntity[entity] = handles = [];
+        handles.Add(handle);
+    }
+
+    static void Unindex(Entity entity, ulong handle)
+    {
+        if (ByEntity.TryGetValue(entity, out var handles) && handles.Remove(handle) && handles.Count == 0)
+            ByEntity.Remove(entity);
+    }
+
+    internal static T? Find<T>(Entity entity) where T : Behaviour
+    {
+        if (!ByEntity.TryGetValue(entity, out var handles))
+            return null;
+        foreach (var handle in handles)
+        {
+            if (Resolve(handle) is T found)
+                return found;
+        }
+        return null;
+    }
+
+    internal static T? FindFirst<T>() where T : Behaviour
+    {
+        foreach (var handles in ByEntity.Values)
+        {
+            foreach (var handle in handles)
+            {
+                if (Resolve(handle) is T found)
+                    return found;
+            }
+        }
+        return null;
+    }
+
+    internal static T[] FindAll<T>() where T : Behaviour
+    {
+        var found = new List<T>();
+        foreach (var handles in ByEntity.Values)
+        {
+            foreach (var handle in handles)
+            {
+                if (Resolve(handle) is T behaviour)
+                    found.Add(behaviour);
+            }
+        }
+        return [.. found];
+    }
+
     /// Log a contained script exception with the script's type, the hook that
     /// threw, and the exception (type + message + stack trace), then report the
     /// fault so the caller stops dispatching to this behaviour.
@@ -70,7 +131,9 @@ public static unsafe class Behaviours
                 return 0;
 
             behaviour.Entity = entity;
-            return (ulong)GCHandle.ToIntPtr(GCHandle.Alloc(behaviour));
+            var handle = (ulong)GCHandle.ToIntPtr(GCHandle.Alloc(behaviour));
+            Index(entity, handle);
+            return handle;
         }
         catch (Exception e)
         {
@@ -102,6 +165,8 @@ public static unsafe class Behaviours
     {
         if (Resolve(handle) is not { } behaviour)
             return Ok;
+        if (behaviour.TickTimers(deltaTime) is { } timer)
+            return Fault(behaviour, timer.Hook, timer.Error);
         try
         {
             behaviour.OnUpdate(deltaTime);
@@ -263,6 +328,7 @@ public static unsafe class Behaviours
             }
             finally
             {
+                Unindex(behaviour.Entity, handle);
                 GCHandle.FromIntPtr((nint)handle).Free();
             }
         }

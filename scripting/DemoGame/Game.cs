@@ -24,7 +24,7 @@ public class Game : Behaviour
         _playerTransform = Transform.Identity;
         _playerTransform.Position = new Vector3(0f, 2.5f, 0f);
         _player = World.SpawnRenderable("cube", "gold", _playerTransform);
-        Native.Log($"Game started; player = {_player} (arrow keys move, Space spawns)");
+        Debug.Log($"Game started; player = {_player} (arrow keys move, Space spawns)");
     }
 
     public override void OnUpdate(float deltaTime)
@@ -38,7 +38,7 @@ public class Game : Behaviour
         if (direction != Vector3.zero)
         {
             _playerTransform.Position += direction.normalized * MoveSpeed * deltaTime;
-            Native.SetTransform(_player, _playerTransform);
+            _player.LocalTransform = _playerTransform;
         }
 
         if (Input.GetKeyDown(KeyCode.Space))
@@ -48,7 +48,7 @@ public class Game : Behaviour
             drop.Scale = Vector3.one * 0.5f;
             var material = Palette[_spawned++ % Palette.Length];
             var entity = World.SpawnRenderable("cube", material, drop);
-            Native.Log($"spawned {entity} ({material})");
+            Debug.Log($"spawned {entity} ({material})");
         }
     }
 }
