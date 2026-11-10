@@ -57,7 +57,7 @@ public sealed class Texture : Asset
     Texture() { }
 }
 
-/// A `.fmat` file under the project's assets directory, or a material the
+/// A `.omat` file under the project's assets directory, or a material the
 /// engine builds, which is always ready.
 public sealed class Material : Asset
 {
@@ -74,7 +74,7 @@ public sealed class Font : Asset
 public static class Assets
 {
     /// The asset at `path`, relative to the project's assets directory with `/`
-    /// separators, e.g. `"props/door.fprefab"`.
+    /// separators, e.g. `"props/door.oprefab"`.
     ///
     /// The one place a path becomes a reference, for tools. Game code should
     /// hold an `AssetRef<T>` field instead: a path in code breaks the day the

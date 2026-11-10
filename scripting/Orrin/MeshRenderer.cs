@@ -26,7 +26,7 @@ public struct MeshRenderer
     }
 
     /// <summary>
-    /// The material the mesh is shaded with: a <c>.fmat</c> asset, or one the
+    /// The material the mesh is shaded with: a <c>.omat</c> asset, or one the
     /// engine builds. A material is shared, so editing the asset changes every
     /// renderer that draws with it; assigning another changes only this one.
     /// </summary>

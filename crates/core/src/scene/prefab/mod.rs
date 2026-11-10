@@ -1,7 +1,7 @@
 //! Prefabs: an entity tree authored once, in a file of its own, and
 //! instantiated any number of times.
 //!
-//! A `.fprefab` is a scene file holding one tree — the same grammar, parser,
+//! A `.oprefab` is a scene file holding one tree — the same grammar, parser,
 //! writer and determinism rules, no second format. Each is an asset with an
 //! [`AssetId`] in a sidecar beside it (see [`index`]), and nothing refers to a
 //! prefab by its path.
@@ -928,8 +928,8 @@ mod tests {
     /// The door, and a house holding one.
     fn library(door: &str) -> Prefabs {
         let mut prefabs = Prefabs::default();
-        prefabs.insert(Prefab::parse(door_id(), "props/door.fprefab", door).unwrap());
-        prefabs.insert(Prefab::parse(house_id(), "props/house.fprefab", &house_text()).unwrap());
+        prefabs.insert(Prefab::parse(door_id(), "props/door.oprefab", door).unwrap());
+        prefabs.insert(Prefab::parse(house_id(), "props/house.oprefab", &house_text()).unwrap());
         prefabs
     }
 
@@ -1429,7 +1429,7 @@ entity {HOUSE_DOOR}
     fn edit_door(world: &mut World, door: &str) -> Vec<String> {
         let old = {
             let mut prefabs = world.resource_mut::<Prefabs>();
-            let new = Prefab::parse(door_id(), "props/door.fprefab", door).unwrap();
+            let new = Prefab::parse(door_id(), "props/door.oprefab", door).unwrap();
             prefabs.replace(new).expect("the door was indexed")
         };
         apply_edits(world, &registry(), vec![old])
@@ -1524,9 +1524,9 @@ entity {HOUSE_DOOR}
         let dir = std::env::temp_dir().join(format!("orrin-refresh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("door.fprefab"), door_text("handle", 1.0)).unwrap();
+        std::fs::write(dir.join("door.oprefab"), door_text("handle", 1.0)).unwrap();
         std::fs::write(
-            dir.join("door.fprefab.meta"),
+            dir.join("door.oprefab.meta"),
             format!("id = \"{DOOR_ID}\"\n"),
         )
         .unwrap();
@@ -1534,7 +1534,7 @@ entity {HOUSE_DOOR}
         let mut world = world();
         world.insert_resource(Prefabs::scan(&dir).0);
         instantiate(&mut world, &registry(), door_id()).unwrap();
-        std::fs::write(dir.join("door.fprefab"), door_text("knob", 1.0)).unwrap();
+        std::fs::write(dir.join("door.oprefab"), door_text("knob", 1.0)).unwrap();
 
         let issues = rescan(&mut world, &registry());
         let _ = std::fs::remove_dir_all(&dir);

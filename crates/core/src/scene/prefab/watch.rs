@@ -103,7 +103,7 @@ mod tests {
         std::fs::write(dir.join("props/notes.txt"), "not a prefab").unwrap();
         assert!(!due_within(&mut watcher, Duration::from_millis(600)));
 
-        std::fs::write(dir.join("props/door.fprefab"), "orrin-scene 1\n").unwrap();
+        std::fs::write(dir.join("props/door.oprefab"), "orrin-scene 1\n").unwrap();
         let due = due_within(&mut watcher, Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(due, "a saved prefab was not heard");
@@ -111,9 +111,9 @@ mod tests {
 
     #[test]
     fn a_sidecar_counts_and_a_lookalike_does_not() {
-        assert!(is_prefab_file(Path::new("a/door.fprefab")));
-        assert!(is_prefab_file(Path::new("a/door.fprefab.meta")));
+        assert!(is_prefab_file(Path::new("a/door.oprefab")));
+        assert!(is_prefab_file(Path::new("a/door.oprefab.meta")));
         assert!(!is_prefab_file(Path::new("a/door.png.meta")));
-        assert!(!is_prefab_file(Path::new("a/notfprefab")));
+        assert!(!is_prefab_file(Path::new("a/notoprefab")));
     }
 }

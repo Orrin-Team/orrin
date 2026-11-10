@@ -1083,7 +1083,7 @@ const MAPS: [(&str, &str); 4] = [
 ///
 /// A material is shared by every entity that draws with it, so an edit here
 /// changes all of them — which is what editing a material means. A material
-/// asset is edited through the edit pipeline and saved to its `.fmat` as each
+/// asset is edited through the edit pipeline and saved to its `.omat` as each
 /// gesture ends, so it can be undone with the scene's edits; its texture slots
 /// take texture assets dropped on them. An engine or model material has no
 /// file: its edit goes to the world-side copy and is queued for the renderer
@@ -1950,12 +1950,12 @@ mod tests {
         let dir = crate::asset_db::tests::Dir::new("inspector-drop-material");
         dir.write("rock.png", b"");
         dir.write(
-            "brick.fmat",
+            "brick.omat",
             crate::asset_db::material::write(&Default::default()).as_bytes(),
         );
         let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         let rock = db.find("rock.png").unwrap().id;
-        let brick = db.find("brick.fmat").unwrap().id;
+        let brick = db.find("brick.omat").unwrap().id;
 
         let mut world = World::new();
         world.insert_resource(db);

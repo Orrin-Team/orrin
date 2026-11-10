@@ -68,7 +68,7 @@ impl AssetKind {
         match extension.to_ascii_lowercase().as_str() {
             "png" | "jpg" | "jpeg" => Some(Self::Texture),
             "gltf" | "glb" => Some(Self::Mesh),
-            "fprefab" => Some(Self::Prefab),
+            "oprefab" => Some(Self::Prefab),
             super::material::EXTENSION => Some(Self::Material),
             crate::scene::loaded::EXTENSION => Some(Self::Scene),
             "ttf" | "otf" => Some(Self::Font),
@@ -469,8 +469,8 @@ mod tests {
         assert_eq!(AssetKind::of_path("a.jpg"), Some(AssetKind::Texture));
         assert_eq!(AssetKind::of_path("m/tree.gltf"), Some(AssetKind::Mesh));
         assert_eq!(AssetKind::of_path("tree.glb"), Some(AssetKind::Mesh));
-        assert_eq!(AssetKind::of_path("door.fprefab"), Some(AssetKind::Prefab));
-        assert_eq!(AssetKind::of_path("brick.FMAT"), Some(AssetKind::Material));
+        assert_eq!(AssetKind::of_path("door.oprefab"), Some(AssetKind::Prefab));
+        assert_eq!(AssetKind::of_path("brick.OMAT"), Some(AssetKind::Material));
         assert_eq!(AssetKind::of_path("ui/Title.TTF"), Some(AssetKind::Font));
         assert_eq!(AssetKind::of_path("body.otf"), Some(AssetKind::Font));
         assert_eq!(AssetKind::of_path("sfx/door.WAV"), Some(AssetKind::Audio));

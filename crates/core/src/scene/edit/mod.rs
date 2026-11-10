@@ -975,7 +975,7 @@ mod tests {
                     orrin.name = \"Handle\"\n  \
                     orrin.parent = entity(00000000-0000-4000-8000-000000000001)\n";
         let mut prefabs = Prefabs::default();
-        prefabs.insert(crate::scene::prefab::Prefab::parse(id, "door.fprefab", text).unwrap());
+        prefabs.insert(crate::scene::prefab::Prefab::parse(id, "door.oprefab", text).unwrap());
         world.insert_resource(prefabs);
         let (root, issues) = crate::scene::prefab::instantiate(&mut world, &registry, id).unwrap();
         assert!(issues.is_empty(), "{issues:?}");
@@ -1044,16 +1044,16 @@ mod tests {
     /// rewrote the values instead of the text would show.
     const HAND_WRITTEN: &str = "orrin-material 1 min-reader 1\n\nroughness = 0.25\n";
 
-    /// `brick.fmat` beside a texture and a mesh, in a world holding their
+    /// `brick.omat` beside a texture and a mesh, in a world holding their
     /// database. Neither file needs to import: a slot is checked by kind.
     fn material_world(name: &str) -> (Dir, World, AssetId) {
         let dir = Dir::new(name);
-        dir.write("brick.fmat", HAND_WRITTEN.as_bytes());
+        dir.write("brick.omat", HAND_WRITTEN.as_bytes());
         dir.write("rock.png", b"");
         dir.write("tree.glb", b"");
         let (db, issues) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         assert!(issues.is_empty(), "{issues:?}");
-        let id = db.find("brick.fmat").unwrap().id;
+        let id = db.find("brick.omat").unwrap().id;
         let mut world = world();
         world.insert_resource(db);
         (dir, world, id)
@@ -1070,7 +1070,7 @@ mod tests {
     }
 
     fn on_disk(dir: &Dir) -> String {
-        std::fs::read_to_string(dir.path().join("brick.fmat")).unwrap()
+        std::fs::read_to_string(dir.path().join("brick.omat")).unwrap()
     }
 
     fn drawn(world: &World, id: AssetId) -> MaterialFile {
@@ -1080,7 +1080,7 @@ mod tests {
     #[test]
     fn an_undone_material_edit_leaves_its_file_as_it_was_byte_for_byte() {
         let registry = registry();
-        let (dir, mut world, id) = material_world("edit-fmat-undo");
+        let (dir, mut world, id) = material_world("edit-omat-undo");
         let mut history = History::default();
         let rough = brick_with(&world, id, |file| file.material.roughness = 0.75);
 
@@ -1102,7 +1102,7 @@ mod tests {
     #[test]
     fn a_material_drag_is_one_step_and_one_write() {
         let registry = registry();
-        let (dir, mut world, id) = material_world("edit-fmat-drag");
+        let (dir, mut world, id) = material_world("edit-omat-drag");
         let mut history = History::default();
 
         let mut editor = SceneEditor::new(&mut world, &registry, &mut history);
@@ -1115,7 +1115,7 @@ mod tests {
             assert_eq!(on_disk(&dir), HAND_WRITTEN, "nothing is written mid-drag");
         }
         editor.try_commit().unwrap();
-        let saved = material::parse(&on_disk(&dir), "brick.fmat").unwrap();
+        let saved = material::parse(&on_disk(&dir), "brick.omat").unwrap();
         assert_eq!(saved.material.roughness, 0.6);
 
         assert_eq!(editor.undo().unwrap().as_deref(), Some("Edit brick"));
@@ -1126,7 +1126,7 @@ mod tests {
     #[test]
     fn a_dropped_texture_fills_a_slot_and_anything_else_is_refused_by_path() {
         let registry = registry();
-        let (dir, mut world, id) = material_world("edit-fmat-slot");
+        let (dir, mut world, id) = material_world("edit-omat-slot");
         let mut history = History::default();
         let (rock, tree) = {
             let db = world.resource::<AssetDatabase>();
@@ -1140,14 +1140,14 @@ mod tests {
         let textured = brick_with(editor.world(), id, |file| file.textures.albedo = Some(rock));
         editor.set_material(id, textured).unwrap();
         editor.try_commit().unwrap();
-        let saved = material::parse(&on_disk(&dir), "brick.fmat").unwrap();
+        let saved = material::parse(&on_disk(&dir), "brick.omat").unwrap();
         assert_eq!(saved.textures.albedo, Some(rock));
 
         let meshed = brick_with(editor.world(), id, |file| file.textures.normal = Some(tree));
         let error = editor.set_material(id, meshed).unwrap_err();
         assert_eq!(
             error.0,
-            "brick.fmat: the `normal` slot takes a texture, not `tree.glb`, which is a mesh"
+            "brick.omat: the `normal` slot takes a texture, not `tree.glb`, which is a mesh"
         );
         editor.try_commit().unwrap();
         assert_eq!(drawn(editor.world(), id).textures.normal, None);
@@ -1161,19 +1161,19 @@ mod tests {
     #[test]
     fn a_material_that_cannot_be_written_is_named_and_drawn_as_before() {
         let registry = registry();
-        let (dir, mut world, id) = material_world("edit-fmat-fail");
+        let (dir, mut world, id) = material_world("edit-omat-fail");
         let mut history = History::default();
         let rough = brick_with(&world, id, |file| file.material.roughness = 0.75);
 
         let mut editor = SceneEditor::new(&mut world, &registry, &mut history);
         editor.set_material(id, rough).unwrap();
         // A directory where the file was: a rename onto it fails everywhere.
-        std::fs::remove_file(dir.path().join("brick.fmat")).unwrap();
-        std::fs::create_dir(dir.path().join("brick.fmat")).unwrap();
+        std::fs::remove_file(dir.path().join("brick.omat")).unwrap();
+        std::fs::create_dir(dir.path().join("brick.omat")).unwrap();
         let error = editor.try_commit().unwrap_err();
 
         assert!(
-            error.0.starts_with("could not write brick.fmat: "),
+            error.0.starts_with("could not write brick.omat: "),
             "{error}"
         );
         assert_eq!(drawn(editor.world(), id).material.roughness, 0.25);

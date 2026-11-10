@@ -1315,7 +1315,7 @@ mod tests {
         let text = "orrin-scene 1\n\nentity 00000000-0000-4000-8000-000000000001\n  \
                     orrin.name = \"Door\"\n  orrin.transform\n    rotation = (0.0, 0.0, 0.0, 1.0)\n    \
                     scale = (1.0, 1.0, 1.0)\n    translation = (0.0, 0.0, 0.0)\n";
-        let prefab = crate::scene::prefab::Prefab::parse(id, "props/door.fprefab", text).unwrap();
+        let prefab = crate::scene::prefab::Prefab::parse(id, "props/door.oprefab", text).unwrap();
         editor
             .world
             .resource_mut::<crate::scene::Prefabs>()
@@ -1365,7 +1365,7 @@ mod tests {
     fn the_assets_tool_browses_the_projects_folders_and_counts_failures() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let dir = crate::asset_db::tests::Dir::new("panel-browser");
-        dir.write("props/door.fprefab", b"orrin-scene 1\n");
+        dir.write("props/door.oprefab", b"orrin-scene 1\n");
         dir.write("rocks/bad.png", b"not a png");
         let (mut db, _) =
             crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
@@ -1390,8 +1390,8 @@ mod tests {
     fn the_browser_lays_a_folder_out_as_a_list_or_a_grid() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let dir = crate::asset_db::tests::Dir::new("panel-browser-layout");
-        dir.write("alpha.fprefab", b"orrin-scene 1\n");
-        dir.write("bravo.fprefab", b"orrin-scene 1\n");
+        dir.write("alpha.oprefab", b"orrin-scene 1\n");
+        dir.write("bravo.oprefab", b"orrin-scene 1\n");
         let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         editor.world.insert_resource(db);
         editor.dock.activate(Tab::Assets);
@@ -1406,8 +1406,8 @@ mod tests {
         };
 
         let (a, b) = (
-            label(&editor, "alpha.fprefab"),
-            label(&editor, "bravo.fprefab"),
+            label(&editor, "alpha.oprefab"),
+            label(&editor, "bravo.oprefab"),
         );
         assert!(
             (a.left() - b.left()).abs() < 2.0,
@@ -1421,8 +1421,8 @@ mod tests {
         editor.state.assets_view.layout = crate::editor::state::AssetLayout::Grid;
         editor.frames(2);
         let (a, b) = (
-            label(&editor, "alpha.fprefab"),
-            label(&editor, "bravo.fprefab"),
+            label(&editor, "alpha.oprefab"),
+            label(&editor, "bravo.oprefab"),
         );
         assert!(
             (a.center().y - b.center().y).abs() < 1.0,
@@ -1437,7 +1437,7 @@ mod tests {
     fn the_browsers_controls_are_one_row() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let dir = crate::asset_db::tests::Dir::new("panel-browser-bar");
-        dir.write("alpha.fprefab", b"orrin-scene 1\n");
+        dir.write("alpha.oprefab", b"orrin-scene 1\n");
         let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         editor.world.insert_resource(db);
         editor.dock.activate(Tab::Assets);
@@ -1468,10 +1468,10 @@ mod tests {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let dir = crate::asset_db::tests::Dir::new("panel-browser-mark");
         dir.write("rock.png", b"");
-        dir.write("brick.fmat", b"orrin-material 1 min-reader 1\n");
+        dir.write("brick.omat", b"orrin-material 1 min-reader 1\n");
         let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         let rock = db.find("rock.png").unwrap().id;
-        let brick = db.find("brick.fmat").unwrap().id;
+        let brick = db.find("brick.omat").unwrap().id;
         editor.world.insert_resource(db);
         editor.dock.activate(Tab::Assets);
         editor.frames(2);
@@ -1480,7 +1480,7 @@ mod tests {
         assert_eq!(editor.state.revealed_asset, Some(rock));
         editor.state.assets_view.layout = crate::editor::state::AssetLayout::Grid;
         editor.frames(2);
-        editor.click(row_of(&editor, "brick.fmat"));
+        editor.click(row_of(&editor, "brick.omat"));
         assert_eq!(editor.state.revealed_asset, Some(brick));
     }
 
@@ -1493,7 +1493,7 @@ mod tests {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let dir = crate::asset_db::tests::Dir::new("panel-rename");
         dir.write("rock.png", b"");
-        dir.write("props/door.fprefab", b"orrin-scene 1\n");
+        dir.write("props/door.oprefab", b"orrin-scene 1\n");
         let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         let rock = db.find("rock.png").unwrap().id;
         editor.world.insert_resource(db);
@@ -1630,9 +1630,9 @@ mod tests {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let outside = crate::asset_db::tests::Dir::new("panel-drop-source");
         let rock = outside.write("rock.png", b"");
-        let door = outside.write("door.fprefab", b"orrin-scene 1\n");
+        let door = outside.write("door.oprefab", b"orrin-scene 1\n");
         let dir = crate::asset_db::tests::Dir::new("panel-drop");
-        dir.write("props/chair.fprefab", b"orrin-scene 1\n");
+        dir.write("props/chair.oprefab", b"orrin-scene 1\n");
         let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         editor.world.insert_resource(db);
         editor.dock.activate(Tab::Assets);
@@ -1658,7 +1658,7 @@ mod tests {
         drop_file(&mut editor, &door);
         let db = editor.world.resource::<AssetDatabase>();
         let copied = db
-            .find("props/door.fprefab")
+            .find("props/door.oprefab")
             .expect("copied into the folder")
             .id;
         assert_eq!(editor.state.revealed_asset, Some(copied));
@@ -1674,7 +1674,7 @@ mod tests {
         let outside = crate::asset_db::tests::Dir::new("panel-pick-source");
         let rock = outside.write("rock.png", b"");
         let dir = crate::asset_db::tests::Dir::new("panel-pick");
-        dir.write("props/chair.fprefab", b"orrin-scene 1\n");
+        dir.write("props/chair.oprefab", b"orrin-scene 1\n");
         let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         editor.world.insert_resource(db);
         editor.dock.activate(Tab::Assets);
@@ -1738,14 +1738,14 @@ mod tests {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let dir = crate::asset_db::tests::Dir::new("panel-browser-prefabs");
         dir.write(
-            "props/door.fprefab",
+            "props/door.oprefab",
             b"orrin-scene 3 min-reader 3\n\nentity 00000000-0000-4000-8000-000000000001 \"Door\"\n",
         );
         dir.write("rocks/rock.png", b"");
         let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         let (prefabs, issues) = crate::scene::Prefabs::scan(dir.path());
         assert!(issues.is_empty(), "{issues:?}");
-        let door = db.find("props/door.fprefab").unwrap().id;
+        let door = db.find("props/door.oprefab").unwrap().id;
         editor.world.insert_resource(db);
         editor.world.insert_resource(prefabs);
         crate::scene::prefab::instantiate(&mut editor.world, &editor.registry, door).unwrap();
@@ -1989,7 +1989,7 @@ mod tests {
 
         editor.state.request_save_prefab();
         editor.state.apply(&mut editor.world, &editor.registry);
-        let saved = dir.join("Group.fprefab").is_file();
+        let saved = dir.join("Group.oprefab").is_file();
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(saved, "the selection was saved under its new root's name");
@@ -2163,7 +2163,7 @@ mod tests {
         crate::scene::prefab::instantiate(&mut editor.world, &editor.registry, id).unwrap();
         let crate_ = crate::scene::prefab::Prefab::parse(
             orrin_registry::AssetId::new(),
-            "props/crate.fprefab",
+            "props/crate.oprefab",
             "orrin-scene 1\n\nentity 00000000-0000-4000-8000-000000000002\n  orrin.name = \"Crate\"\n",
         )
         .unwrap();
@@ -4476,7 +4476,7 @@ mod tests {
         Harness::new(egui::vec2(120.0, 400.0)).frames(4);
     }
 
-    /// An editor drawing `brick.fmat` on a selected crate, beside a texture and
+    /// An editor drawing `brick.omat` on a selected crate, beside a texture and
     /// a mesh, with the material bound as a frame's service would bind it.
     fn material_editor(
         name: &str,
@@ -4490,13 +4490,13 @@ mod tests {
         let mut editor = Harness::new(egui::vec2(1280.0, 1400.0));
         let dir = crate::asset_db::tests::Dir::new(name);
         dir.write(
-            "brick.fmat",
+            "brick.omat",
             material::write(&Default::default()).as_bytes(),
         );
         dir.write("rock.png", b"");
         dir.write("tree.glb", b"");
         let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
-        let brick = db.find("brick.fmat").unwrap().id;
+        let brick = db.find("brick.omat").unwrap().id;
         let world = &mut editor.world;
         world.insert_resource(db);
         world.insert_resource(crate::scene::Assets::new());
@@ -4532,7 +4532,7 @@ mod tests {
     #[test]
     fn a_texture_dropped_on_a_material_assets_slot_is_saved_and_undoable() {
         use crate::asset_db::{AssetDatabase, material};
-        let (mut editor, dir, _, brick) = material_editor("panel-fmat-slot");
+        let (mut editor, dir, _, brick) = material_editor("panel-omat-slot");
         let (rock, tree) = {
             let db = editor.world.resource::<AssetDatabase>();
             (
@@ -4541,8 +4541,8 @@ mod tests {
             )
         };
         let saved = || {
-            let text = std::fs::read_to_string(dir.path().join("brick.fmat")).unwrap();
-            material::parse(&text, "brick.fmat").unwrap().textures
+            let text = std::fs::read_to_string(dir.path().join("brick.omat")).unwrap();
+            material::parse(&text, "brick.omat").unwrap().textures
         };
 
         let slot = value_of(&editor, "Albedo map");
@@ -4564,7 +4564,7 @@ mod tests {
             .collect();
         assert_eq!(
             logged,
-            ["brick.fmat: the `normal` slot takes a texture, not `tree.glb`, which is a mesh"]
+            ["brick.omat: the `normal` slot takes a texture, not `tree.glb`, which is a mesh"]
         );
 
         editor.state.request_undo();
@@ -4578,16 +4578,16 @@ mod tests {
     #[test]
     fn a_material_asset_dropped_on_the_mesh_renderer_draws_with_it() {
         use crate::asset_db::{AssetDatabase, material};
-        let (mut editor, dir, entity, _) = material_editor("panel-fmat-renderer");
+        let (mut editor, dir, entity, _) = material_editor("panel-omat-renderer");
         dir.write(
-            "glass.fmat",
+            "glass.omat",
             material::write(&Default::default()).as_bytes(),
         );
         editor.world.resource_mut::<AssetDatabase>().rescan();
         let glass = editor
             .world
             .resource::<AssetDatabase>()
-            .find("glass.fmat")
+            .find("glass.omat")
             .unwrap()
             .id;
         editor.frames(1);
@@ -4613,7 +4613,7 @@ mod tests {
         use crate::asset_db::{AssetDatabase, AssetKind};
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
         let dir = crate::asset_db::tests::Dir::new("panel-new-material");
-        dir.write("props/door.fprefab", b"orrin-scene 1\n");
+        dir.write("props/door.oprefab", b"orrin-scene 1\n");
         let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         editor.world.insert_resource(db);
         editor.dock.activate(Tab::Assets);
@@ -4625,19 +4625,19 @@ mod tests {
         let item = row_of(&editor, "New material");
         editor.click(item);
         let db = editor.world.resource::<AssetDatabase>();
-        let created = db.find("New Material.fmat").expect("written and indexed");
+        let created = db.find("New Material.omat").expect("written and indexed");
         assert_eq!(created.kind, AssetKind::Material);
         assert_eq!(editor.state.revealed_asset, Some(created.id));
         drop(db);
         editor.frames(1);
-        assert!(editor.painted_contains("New Material.fmat"));
+        assert!(editor.painted_contains("New Material.omat"));
 
         secondary_click(&mut editor, props);
         let item = row_of(&editor, "New material");
         editor.click(item);
         let db = editor.world.resource::<AssetDatabase>();
         let inside = db
-            .find("props/New Material.fmat")
+            .find("props/New Material.omat")
             .expect("made in the folder");
         assert_eq!(editor.state.revealed_asset, Some(inside.id));
     }

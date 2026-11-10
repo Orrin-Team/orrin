@@ -166,9 +166,9 @@ mod tests {
                 std::env::temp_dir().join(format!("orrin-actions-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("door.fprefab"), door_text("handle", 1.0)).unwrap();
+            std::fs::write(dir.join("door.oprefab"), door_text("handle", 1.0)).unwrap();
             std::fs::write(
-                dir.join("door.fprefab.meta"),
+                dir.join("door.oprefab.meta"),
                 format!("id = \"{DOOR_ID}\"\n"),
             )
             .unwrap();
@@ -176,7 +176,7 @@ mod tests {
         }
 
         fn door(&self) -> String {
-            std::fs::read_to_string(self.0.join("door.fprefab")).unwrap()
+            std::fs::read_to_string(self.0.join("door.oprefab")).unwrap()
         }
     }
 

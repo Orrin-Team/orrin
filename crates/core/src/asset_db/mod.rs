@@ -42,7 +42,7 @@
 //!
 //! # Materials
 //!
-//! A `.fmat` ([`material`]) has nothing to import: it is a few hundred bytes of
+//! A `.omat` ([`material`]) has nothing to import: it is a few hundred bytes of
 //! text, read on this thread when it is queued, as a prefab is. Its last good
 //! read is kept, so a save that does not parse goes on drawing the version
 //! before it while the error says what to fix. A reread updates the material
@@ -167,7 +167,7 @@ pub struct AssetDatabase {
     meshes: handles::Slots,
     materials: handles::Slots,
     textures: handles::Slots,
-    /// Each material's last `.fmat` that read, or the edit drawn in its place.
+    /// Each material's last `.omat` that read, or the edit drawn in its place.
     material_files: FxHashMap<AssetId, material::MaterialFile>,
     /// Each material file's text as this database last read or wrote it.
     material_texts: FxHashMap<AssetId, String>,
@@ -326,7 +326,7 @@ impl AssetDatabase {
     }
 
     /// The handle for material `id`, pending until the next [`service`] binds
-    /// it to its `.fmat`. An id with no file draws pink and keeps the id, as
+    /// it to its `.omat`. An id with no file draws pink and keeps the id, as
     /// [`mesh`](Self::mesh) does.
     pub fn material(&mut self, id: AssetId) -> Result<MaterialHandle, String> {
         self.expect_kind(id, AssetKind::Material)?;
@@ -1744,7 +1744,7 @@ pub(crate) mod tests {
         dir.write("rocks/rock.png", &png(2, 2, |_, _| [10, 20, 30, 255]));
         dir.write("models/tree.gltf", triangle_gltf("").as_bytes());
         dir.write("models/tri angle.bin", &triangle_bin());
-        dir.write("props/door.fprefab", b"orrin-scene 1\n");
+        dir.write("props/door.oprefab", b"orrin-scene 1\n");
         dir.write("notes.txt", b"not an asset");
         dir.write(".hidden/secret.png", b"never read");
     }
@@ -1763,7 +1763,7 @@ pub(crate) mod tests {
             listed,
             [
                 ("models/tree.gltf", AssetKind::Mesh),
-                ("props/door.fprefab", AssetKind::Prefab),
+                ("props/door.oprefab", AssetKind::Prefab),
                 ("rocks/rock.png", AssetKind::Texture),
             ]
         );
@@ -1937,7 +1937,7 @@ pub(crate) mod tests {
             assert_eq!(db.state(entry.id), LoadState::Ready);
         }
         assert_eq!(
-            db.find("props/door.fprefab").unwrap().status,
+            db.find("props/door.oprefab").unwrap().status,
             Status::Indexed
         );
 
@@ -2252,13 +2252,13 @@ pub(crate) mod tests {
         assert_eq!((entry.id, entry.settings), (rock, settings));
 
         let tree = db.find("models/tree.gltf").unwrap().id;
-        let door = db.find("props/door.fprefab").unwrap().id;
+        let door = db.find("props/door.oprefab").unwrap().id;
         let mesh = |scale| Settings::Mesh(MeshSettings { scale });
         for (id, settings, named) in [
             (rock, mesh(2.0), "rocks/rock.png"),
             (tree, mesh(-1.0), "models/tree.gltf"),
             (tree, mesh(f32::NAN), "models/tree.gltf"),
-            (door, mesh(1.0), "props/door.fprefab"),
+            (door, mesh(1.0), "props/door.oprefab"),
         ] {
             let error = db.set_settings(id, settings).unwrap_err();
             assert!(error.contains(named), "{error}");
@@ -2287,11 +2287,11 @@ pub(crate) mod tests {
         assert!(db.wait_idle(WAIT));
         db.update(&World::new(), &mut HeadlessBackend::new());
         assert_eq!(imported_key(&db, "rocks/rock.png"), (key, false));
-        let door = db.find("props/door.fprefab").unwrap().id;
+        let door = db.find("props/door.oprefab").unwrap().id;
         assert!(
             db.reimport(door)
                 .unwrap_err()
-                .contains("props/door.fprefab")
+                .contains("props/door.oprefab")
         );
     }
 
@@ -2353,7 +2353,7 @@ pub(crate) mod tests {
                 assert_eq!(rgba, layout == "rgba", "{run}: {path}");
                 assert!(entry.summary.is_some(), "{run}: {path}");
             }
-            let door = db.find("props/door.fprefab").unwrap().id;
+            let door = db.find("props/door.oprefab").unwrap().id;
             assert!(db.thumbnail(door).is_none(), "a prefab has no artifact");
         }
     }
@@ -2374,7 +2374,7 @@ pub(crate) mod tests {
                 Target::of(&backend),
             );
             assert!(issues.is_empty(), "{issues:?}");
-            let id = db.find("brick.fmat").unwrap().id;
+            let id = db.find("brick.omat").unwrap().id;
             let (world, _) = drawing_material(db, id);
             let mut backend = backend;
 
@@ -2409,7 +2409,7 @@ pub(crate) mod tests {
         ROCK.parse().unwrap()
     }
 
-    /// `brick.fmat` at `roughness` and `blend`, with the rock as its albedo.
+    /// `brick.omat` at `roughness` and `blend`, with the rock as its albedo.
     fn brick(roughness: f32, blend: crate::gfx::BlendMode) -> material::MaterialFile {
         material::MaterialFile {
             material: crate::gfx::Material {
@@ -2425,14 +2425,14 @@ pub(crate) mod tests {
     }
 
     /// [`project`] with the rock under a known id, so a material can name it,
-    /// and `brick.fmat` holding `file`.
+    /// and `brick.omat` holding `file`.
     fn material_project(dir: &Dir, file: &material::MaterialFile) {
         project(dir);
         dir.write(
             "rocks/rock.png.meta",
             format!("id = \"{ROCK}\"\n").as_bytes(),
         );
-        dir.write("brick.fmat", material::write(file).as_bytes());
+        dir.write("brick.omat", material::write(file).as_bytes());
     }
 
     /// A world that draws material `id` on one entity, holding the pending
@@ -2459,7 +2459,7 @@ pub(crate) mod tests {
         use crate::gfx::BlendMode;
         material_project(dir, &brick(0.25, BlendMode::Masked));
         let db = open(dir);
-        let id = db.find("brick.fmat").unwrap().id;
+        let id = db.find("brick.omat").unwrap().id;
         let (world, entity) = drawing_material(db, id);
         let mut backend = HeadlessBackend::new();
         assert_eq!(update(&world, &mut backend), Vec::<String>::new());
@@ -2469,25 +2469,25 @@ pub(crate) mod tests {
 
     #[test]
     fn a_material_file_is_indexed_as_a_material_and_a_broken_one_fails_by_name() {
-        let dir = Dir::new("db-fmat-index");
+        let dir = Dir::new("db-omat-index");
         dir.write(
-            "brick.fmat",
+            "brick.omat",
             material::write(&Default::default()).as_bytes(),
         );
         dir.write(
-            "bad.fmat",
+            "bad.omat",
             b"orrin-material 1 min-reader 1\n\nrougness = 0.5\n",
         );
         let mut db = open(&dir);
 
-        let brick = db.find("brick.fmat").unwrap();
+        let brick = db.find("brick.omat").unwrap();
         assert_eq!(brick.kind, AssetKind::Material);
         assert_eq!(brick.status, Status::Indexed);
         assert_eq!(db.state(brick.id), LoadState::Ready);
-        assert!(dir.path().join("brick.fmat.meta").is_file());
+        assert!(dir.path().join("brick.omat.meta").is_file());
 
-        let message = "bad.fmat: `rougness` is not a material parameter";
-        let bad = db.find("bad.fmat").unwrap();
+        let message = "bad.omat: `rougness` is not a material parameter";
+        let bad = db.find("bad.omat").unwrap();
         assert_eq!(bad.status, Status::Failed(message.to_owned()));
         assert_eq!(db.state(bad.id), LoadState::Failed);
         assert_eq!(
@@ -2498,12 +2498,12 @@ pub(crate) mod tests {
 
     #[test]
     fn a_material_binds_to_its_file_with_its_textures_in_their_slots() {
-        let dir = Dir::new("db-fmat-bind");
+        let dir = Dir::new("db-omat-bind");
         let (world, bound, mut backend) = loaded_brick(&dir);
         assert_eq!(bound.0 & PENDING, 0, "rewritten to a real slot");
 
         let db = world.resource::<AssetDatabase>();
-        let id = db.find("brick.fmat").unwrap().id;
+        let id = db.find("brick.omat").unwrap().id;
         assert_eq!(db.material_id(bound), Some(id));
         assert_eq!(db.state(id), LoadState::Ready);
         let albedo = db.texture(rock()).expect("the albedo is loaded with it");
@@ -2534,12 +2534,12 @@ pub(crate) mod tests {
     #[test]
     fn a_saved_material_is_reread_into_the_same_slot() {
         use crate::gfx::BlendMode;
-        let dir = Dir::new("db-fmat-reload");
+        let dir = Dir::new("db-omat-reload");
         let (world, bound, mut backend) = loaded_brick(&dir);
         let uploads = backend.upload_counts();
 
         let saved = material::write(&brick(0.75, BlendMode::Blend));
-        change(&world, &dir, "brick.fmat", saved.as_bytes(), &mut backend);
+        change(&world, &dir, "brick.omat", saved.as_bytes(), &mut backend);
 
         let reread = backend.material(bound).unwrap();
         assert_eq!(reread.roughness, 0.75);
@@ -2670,11 +2670,11 @@ pub(crate) mod tests {
 
     #[test]
     fn a_broken_material_save_keeps_drawing_the_last_good_version() {
-        let dir = Dir::new("db-fmat-broken");
+        let dir = Dir::new("db-omat-broken");
         let (world, bound, mut backend) = loaded_brick(&dir);
 
         let path = dir.write(
-            "brick.fmat",
+            "brick.omat",
             b"orrin-material 1 min-reader 1\n\nroughness = \"low\"\n",
         );
         let mut db = world.resource_mut::<AssetDatabase>();
@@ -2684,7 +2684,7 @@ pub(crate) mod tests {
         assert_eq!(
             update(&world, &mut backend),
             [
-                "brick.fmat: field `roughness`: expected f32, found string. Still drawing the \
+                "brick.omat: field `roughness`: expected f32, found string. Still drawing the \
                  last good version"
             ]
         );
@@ -2696,13 +2696,13 @@ pub(crate) mod tests {
         );
 
         let fixed = material::write(&brick(0.5, crate::gfx::BlendMode::Masked));
-        change(&world, &dir, "brick.fmat", fixed.as_bytes(), &mut backend);
+        change(&world, &dir, "brick.omat", fixed.as_bytes(), &mut backend);
         assert_eq!(backend.material(bound).unwrap().roughness, 0.5);
     }
 
     #[test]
     fn a_texture_given_as_a_material_is_refused_by_path() {
-        let dir = Dir::new("db-fmat-kind");
+        let dir = Dir::new("db-omat-kind");
         project(&dir);
         let mut db = open(&dir);
         let rock = db.find("rocks/rock.png").unwrap().id;
@@ -2714,7 +2714,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_slot_naming_something_other_than_a_texture_is_named() {
-        let dir = Dir::new("db-fmat-slot");
+        let dir = Dir::new("db-omat-slot");
         project(&dir);
         let tree: AssetId = "5f0c3a4e-0000-4000-8000-0000000000a3".parse().unwrap();
         dir.write(
@@ -2728,14 +2728,14 @@ pub(crate) mod tests {
             },
             ..Default::default()
         };
-        dir.write("brick.fmat", material::write(&file).as_bytes());
+        dir.write("brick.omat", material::write(&file).as_bytes());
         let db = open(&dir);
-        let id = db.find("brick.fmat").unwrap().id;
+        let id = db.find("brick.omat").unwrap().id;
         let (world, _) = drawing_material(db, id);
         assert_eq!(
             update(&world, &mut HeadlessBackend::new()),
             [
-                "brick.fmat: the `emissive` slot names `models/tree.gltf`, which is a mesh, \
+                "brick.omat: the `emissive` slot names `models/tree.gltf`, which is a mesh, \
                  so it draws pink. Assign a texture"
             ]
         );
@@ -2745,7 +2745,7 @@ pub(crate) mod tests {
     /// normal map that has not arrived yet must leave the surface flat.
     #[test]
     fn a_normal_map_loads_flat_while_it_imports() {
-        let dir = Dir::new("db-fmat-normal");
+        let dir = Dir::new("db-omat-normal");
         project(&dir);
         dir.write(
             "rocks/rock.png.meta",
@@ -2770,9 +2770,9 @@ pub(crate) mod tests {
             },
             ..Default::default()
         };
-        dir.write("brick.fmat", material::write(&file).as_bytes());
+        dir.write("brick.omat", material::write(&file).as_bytes());
         let db = open(&dir);
-        let id = db.find("brick.fmat").unwrap().id;
+        let id = db.find("brick.omat").unwrap().id;
         let (world, _) = drawing_material(db, id);
         let mut backend = HeadlessBackend::new();
         assert_eq!(
@@ -2792,7 +2792,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_normal_map_that_fails_to_import_stays_flat() {
-        let dir = Dir::new("db-fmat-normal-bad");
+        let dir = Dir::new("db-omat-normal-bad");
         project(&dir);
         dir.write("rocks/bad_normal.png", b"not a png");
         dir.write(
@@ -2811,9 +2811,9 @@ pub(crate) mod tests {
             },
             ..Default::default()
         };
-        dir.write("brick.fmat", material::write(&file).as_bytes());
+        dir.write("brick.omat", material::write(&file).as_bytes());
         let db = open(&dir);
-        let id = db.find("brick.fmat").unwrap().id;
+        let id = db.find("brick.omat").unwrap().id;
         let (world, _) = drawing_material(db, id);
         let mut backend = HeadlessBackend::new();
         update(&world, &mut backend);
@@ -2834,11 +2834,11 @@ pub(crate) mod tests {
     #[test]
     fn the_editors_own_save_is_not_read_back_as_a_change() {
         use crate::gfx::BlendMode;
-        let dir = Dir::new("db-fmat-echo");
+        let dir = Dir::new("db-omat-echo");
         let (world, bound, mut backend) = loaded_brick(&dir);
         let id = world
             .resource::<AssetDatabase>()
-            .find("brick.fmat")
+            .find("brick.omat")
             .unwrap()
             .id;
 
@@ -2851,11 +2851,11 @@ pub(crate) mod tests {
         assert_eq!(backend.material(bound).unwrap().roughness, 0.75);
         assert_eq!(backend.material_updates(), 1);
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("brick.fmat")).unwrap(),
+            std::fs::read_to_string(dir.path().join("brick.omat")).unwrap(),
             saved
         );
 
-        let echo = dir.path().join("brick.fmat");
+        let echo = dir.path().join("brick.omat");
         let mut db = world.resource_mut::<AssetDatabase>();
         db.notice(echo);
         db.apply_changes();
@@ -2867,7 +2867,7 @@ pub(crate) mod tests {
         change(
             &world,
             &dir,
-            "brick.fmat",
+            "brick.omat",
             elsewhere.as_bytes(),
             &mut backend,
         );
@@ -2879,10 +2879,10 @@ pub(crate) mod tests {
     /// before it reaches the file.
     #[test]
     fn a_material_slot_refuses_what_is_not_a_texture_by_path() {
-        let dir = Dir::new("db-fmat-check");
+        let dir = Dir::new("db-omat-check");
         let (world, _, _) = loaded_brick(&dir);
         let db = world.resource::<AssetDatabase>();
-        let id = db.find("brick.fmat").unwrap().id;
+        let id = db.find("brick.omat").unwrap().id;
         let tree = db.find("models/tree.gltf").unwrap().id;
         let mut file = *db.material_file(id).unwrap();
 
@@ -2892,7 +2892,7 @@ pub(crate) mod tests {
         assert_eq!(
             db.check_material(id, &file),
             Err(
-                "brick.fmat: the `emissive` slot takes a texture, not `models/tree.gltf`, which \
+                "brick.omat: the `emissive` slot takes a texture, not `models/tree.gltf`, which \
                  is a mesh"
                     .to_owned()
             )
@@ -2901,24 +2901,24 @@ pub(crate) mod tests {
 
     #[test]
     fn a_text_that_does_not_read_is_never_written() {
-        let dir = Dir::new("db-fmat-unwritable");
+        let dir = Dir::new("db-omat-unwritable");
         let (world, _, _) = loaded_brick(&dir);
         let id = world
             .resource::<AssetDatabase>()
-            .find("brick.fmat")
+            .find("brick.omat")
             .unwrap()
             .id;
-        let before = std::fs::read_to_string(dir.path().join("brick.fmat")).unwrap();
+        let before = std::fs::read_to_string(dir.path().join("brick.omat")).unwrap();
 
         let refused = world
             .resource_mut::<AssetDatabase>()
             .write_asset(id, "orrin-material 1 min-reader 1\n\nrougness = 0.5\n");
         assert_eq!(
             refused,
-            Err("brick.fmat: `rougness` is not a material parameter".to_owned())
+            Err("brick.omat: `rougness` is not a material parameter".to_owned())
         );
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("brick.fmat")).unwrap(),
+            std::fs::read_to_string(dir.path().join("brick.omat")).unwrap(),
             before
         );
     }
@@ -2927,24 +2927,24 @@ pub(crate) mod tests {
     /// sidecar, indexed at once, and drawn once something asks for it.
     #[test]
     fn a_new_material_is_written_at_the_defaults_and_binds() {
-        let dir = Dir::new("db-fmat-new");
+        let dir = Dir::new("db-omat-new");
         project(&dir);
         let mut db = open(&dir);
 
         let id = db.create_material("rocks").unwrap();
-        let entry = db.find("rocks/New Material.fmat").expect("indexed at once");
+        let entry = db.find("rocks/New Material.omat").expect("indexed at once");
         assert_eq!((entry.id, entry.kind), (id, AssetKind::Material));
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("rocks/New Material.fmat")).unwrap(),
+            std::fs::read_to_string(dir.path().join("rocks/New Material.omat")).unwrap(),
             material::write(&Default::default())
         );
-        assert!(dir.path().join("rocks/New Material.fmat.meta").is_file());
+        assert!(dir.path().join("rocks/New Material.omat.meta").is_file());
         let again = db.create_material("rocks").unwrap();
-        assert_eq!(db.get(again).unwrap().path, "rocks/New Material 2.fmat");
+        assert_eq!(db.get(again).unwrap().path, "rocks/New Material 2.omat");
         assert_eq!(
             db.create_material("")
                 .map(|id| db.get(id).unwrap().path.clone()),
-            Ok("New Material.fmat".to_owned())
+            Ok("New Material.omat".to_owned())
         );
 
         let (world, entity) = drawing_material(db, id);

@@ -306,7 +306,7 @@ mod tests {
         dir.write("rocks/rock.png", &png(2, 2, |_, _| [10, 20, 30, 255]));
         dir.write("models/tree.gltf", triangle_gltf("").as_bytes());
         dir.write("models/tri angle.bin", &triangle_bin());
-        dir.write("props/door.fprefab", b"orrin-scene 1\n");
+        dir.write("props/door.oprefab", b"orrin-scene 1\n");
         dir.write("scenes/level.orrin", b"orrin-scene 1\n");
     }
 
@@ -379,10 +379,10 @@ mod tests {
         for source in ["rocks/rock.png", "models/tree.gltf", "models/tri angle.bin"] {
             assert!(!packed.contains_key(source), "{source} is a source");
         }
-        for kept in ["props/door.fprefab", "scenes/level.orrin"] {
+        for kept in ["props/door.oprefab", "scenes/level.orrin"] {
             assert!(packed.contains_key(kept), "{kept} is read as it is");
         }
-        for asset in ["rocks/rock.png", "models/tree.gltf", "props/door.fprefab"] {
+        for asset in ["rocks/rock.png", "models/tree.gltf", "props/door.oprefab"] {
             assert!(
                 packed.contains_key(&format!("{asset}.meta")),
                 "{asset}'s id"

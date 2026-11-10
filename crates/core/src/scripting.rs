@@ -3726,7 +3726,7 @@ mod tests {
         prefabs.insert(
             Prefab::parse(
                 id,
-                "props/crate.fprefab",
+                "props/crate.oprefab",
                 "orrin-scene 1\n\nentity 00000000-0000-4000-8000-000000000001\n  orrin.name = \"Crate\"\n",
             )
             .unwrap(),
@@ -3743,13 +3743,13 @@ mod tests {
         let (mut world, _, id) = prefab_world();
         let mut out = [0u8; 16];
         let kind = orrin_script::with_active_world(&mut world, || {
-            find_asset(c"props/crate.fprefab".as_ptr(), out.as_mut_ptr())
+            find_asset(c"props/crate.oprefab".as_ptr(), out.as_mut_ptr())
         });
         assert_eq!(kind, orrin_script::ASSET_PREFAB);
         assert_eq!(AssetId::from_bytes(out), id);
 
         let kind = orrin_script::with_active_world(&mut world, || {
-            find_asset(c"props/barrel.fprefab".as_ptr(), out.as_mut_ptr())
+            find_asset(c"props/barrel.oprefab".as_ptr(), out.as_mut_ptr())
         });
         assert_eq!(kind, orrin_script::ASSET_NONE);
     }
@@ -4008,14 +4008,14 @@ mod tests {
         assert_eq!(kind, orrin_script::ASSET_AUDIO);
     }
 
-    /// A `.fmat` is found by path as a material, Ready once it reads and
+    /// A `.omat` is found by path as a material, Ready once it reads and
     /// Failed while it does not; an engine-built material is always Ready.
     #[test]
     fn a_script_finds_a_material_by_path_and_reads_its_load_state() {
         let dir = crate::asset_db::tests::Dir::new("script-materials");
         let brick = crate::asset_db::material::write(&Default::default());
-        dir.write("props/brick.fmat", brick.as_bytes());
-        dir.write("props/broken.fmat", b"orrin-scene 3 min-reader 3\n");
+        dir.write("props/brick.omat", brick.as_bytes());
+        dir.write("props/broken.omat", b"orrin-scene 3 min-reader 3\n");
         let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         let mut assets = Assets::default();
         assets.insert_material("gold", MaterialHandle(7));
@@ -4035,9 +4035,9 @@ mod tests {
             orrin_script::with_active_world(world, || asset_state(bytes.as_ptr()))
         };
 
-        let (kind, brick) = find(&mut world, c"props/brick.fmat");
+        let (kind, brick) = find(&mut world, c"props/brick.omat");
         assert_eq!(kind, orrin_script::ASSET_MATERIAL);
-        let (kind, broken) = find(&mut world, c"props/broken.fmat");
+        let (kind, broken) = find(&mut world, c"props/broken.omat");
         assert_eq!(kind, orrin_script::ASSET_MATERIAL);
 
         assert_eq!(state(&mut world, brick), orrin_script::LOAD_READY);

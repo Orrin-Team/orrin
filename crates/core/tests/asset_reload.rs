@@ -197,13 +197,13 @@ fn an_edited_texture_and_mesh_reach_the_next_frame() {
             ..Default::default()
         },
     };
-    dir.write("painted.fmat", material::write(&painted).as_bytes());
+    dir.write("painted.omat", material::write(&painted).as_bytes());
     let target = Target::of(&renderer);
     println!("the device samples BC: {}", renderer.samples_bc());
     let (db, issues) = AssetDatabase::open_for(dir.path(), dir.path().join(".cache"), target);
     assert!(issues.is_empty(), "{issues:?}");
     let quad = db.find("quad.gltf").unwrap().id;
-    let painted = db.find("painted.fmat").unwrap().id;
+    let painted = db.find("painted.omat").unwrap().id;
     world.insert_resource(db);
 
     let mesh = world.resource_mut::<AssetDatabase>().mesh(quad).unwrap();
@@ -396,7 +396,7 @@ fn a_compressed_normal_map_shades_as_its_normals() {
     );
 }
 
-/// `brick.fmat`: a rough dielectric of `base_color`.
+/// `brick.omat`: a rough dielectric of `base_color`.
 fn brick(base_color: Vec3) -> String {
     material::write(&material::MaterialFile {
         material: Material {
@@ -409,7 +409,7 @@ fn brick(base_color: Vec3) -> String {
     })
 }
 
-/// The quad drawn with `brick.fmat` at `base_color`, bound, under exposure
+/// The quad drawn with `brick.omat` at `base_color`, bound, under exposure
 /// held still for the reason it is in the normal-map test above.
 struct MaterialRig {
     renderer: VulkanRenderer,
@@ -451,12 +451,12 @@ fn material_rig(name: &str, base_color: Vec3) -> MaterialRig {
     let dir = Dir::new(name);
     dir.write("quad.gltf", quad_gltf(0.0).as_bytes());
     dir.write("quad.bin", &quad_bin());
-    dir.write("brick.fmat", brick(base_color).as_bytes());
+    dir.write("brick.omat", brick(base_color).as_bytes());
     let target = Target::of(&renderer);
     let (db, issues) = AssetDatabase::open_for(dir.path(), dir.path().join(".cache"), target);
     assert!(issues.is_empty(), "{issues:?}");
     let quad = db.find("quad.gltf").unwrap().id;
-    let brick = db.find("brick.fmat").unwrap().id;
+    let brick = db.find("brick.omat").unwrap().id;
     world.insert_resource(db);
     let mesh = world.resource_mut::<AssetDatabase>().mesh(quad).unwrap();
     let pending = world
@@ -489,7 +489,7 @@ fn is_green([r, g, b]: [u8; 3]) -> bool {
     g > r + 40 && g > b + 40
 }
 
-/// A saved `.fmat` reaches the material's slot in the renderer, so the next
+/// A saved `.omat` reaches the material's slot in the renderer, so the next
 /// frame shades with it, and the handle the entity holds stays the one it was
 /// given.
 #[test]
@@ -512,7 +512,7 @@ fn an_edited_material_file_reaches_the_next_frame() {
         &mut world,
         &mut renderer,
         &dir,
-        "brick.fmat",
+        "brick.omat",
         brick(Vec3::new(0.0, 1.0, 0.0)).as_bytes(),
     );
     let drawn = centre(&capture::render(&mut world, &mut renderer, &settings));
@@ -554,7 +554,7 @@ fn an_inspector_edit_of_a_material_reaches_the_next_frame_and_its_file() {
     between_frames(&mut world, &mut renderer);
     let drawn = centre(&capture::render(&mut world, &mut renderer, &settings));
     assert!(is_green(drawn), "edited green: {drawn:?}");
-    let on_disk = || std::fs::read_to_string(dir.path().join("brick.fmat")).unwrap();
+    let on_disk = || std::fs::read_to_string(dir.path().join("brick.omat")).unwrap();
     assert_eq!(on_disk(), brick(Vec3::new(0.0, 1.0, 0.0)));
 
     SceneEditor::new(&mut world, &registry, &mut history)
