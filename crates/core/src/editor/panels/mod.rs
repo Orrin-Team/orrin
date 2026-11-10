@@ -816,7 +816,7 @@ mod tests {
     /// keeps the preview's passes out of every other frame.
     #[test]
     fn the_material_section_shows_its_material_on_the_renderers_sphere() {
-        use crate::gfx::vulkan::material_preview;
+        use crate::gfx::vulkan::material_preview::{SIZE, Viewer};
         use crate::scene::{AssetPreviews, MaterialHandle, MeshHandle};
 
         let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
@@ -829,30 +829,156 @@ mod tests {
         editor.world.insert_resource(crate::scene::Assets::new());
 
         editor.frames(2);
-        assert_eq!(editor.state.material_preview, None);
+        assert_eq!(editor.state.material_previews, [None, None]);
 
         editor.state.selection.set(entity);
         editor.frames(2);
-        assert_eq!(editor.state.material_preview, Some(MaterialHandle(3)));
-
-        let inspector = editor.tab_body(Tab::Inspector);
-        let sphere = editor.painted_rects_of(|shape| match shape {
-            egui::Shape::Rect(rect) => rect
-                .brush
-                .as_ref()
-                .is_some_and(|brush| brush.fill_texture_id == material_preview::TEXTURE),
-            egui::Shape::Mesh(mesh) => mesh.texture_id == material_preview::TEXTURE,
-            _ => false,
-        });
-        assert_eq!(sphere.len(), 1, "{sphere:?}");
-        let sphere = sphere[0];
-        assert!(
-            inspector.contains_rect(sphere),
-            "{sphere:?} in {inspector:?}"
+        let asked = editor.state.material_previews[Viewer::Inspector as usize];
+        assert_eq!(
+            asked.map(|subject| subject.material),
+            Some(MaterialHandle(3))
         );
+        assert_eq!(
+            editor.state.material_previews[Viewer::Browser as usize],
+            None
+        );
+
+        let sphere = sphere_in(&editor, Tab::Inspector, Viewer::Inspector);
         assert!(
             (sphere.width() - sphere.height()).abs() < 0.5 && sphere.width() >= 96.0,
             "{sphere:?}"
+        );
+        assert_checkerboard_behind(&editor, sphere);
+
+        // Denser than 2x, the picture shrinks rather than stretch past its pixels.
+        editor.ctx.set_pixels_per_point(3.0);
+        editor.frames(2);
+        let sphere = sphere_in(&editor, Tab::Inspector, Viewer::Inspector);
+        assert!(sphere.width() * 3.0 <= SIZE as f32 + 0.5, "{sphere:?}");
+    }
+
+    /// Dragging the sphere orbits it, and a double-click puts it back.
+    #[test]
+    fn dragging_the_material_sphere_orbits_it() {
+        use crate::gfx::vulkan::material_preview::{Orbit, Viewer};
+        use crate::scene::{AssetPreviews, MaterialHandle, MeshHandle};
+
+        let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
+        let entity = editor.spawn("Crate");
+        editor.world.insert(entity, MeshHandle(0));
+        editor.world.insert(entity, MaterialHandle(3));
+        let mut kept = AssetPreviews::default();
+        kept.insert_material(MaterialHandle(3), &crate::gfx::Material::default(), None);
+        editor.world.insert_resource(kept);
+        editor.world.insert_resource(crate::scene::Assets::new());
+        editor.state.selection.set(entity);
+        editor.frames(2);
+        let orbit = |editor: &Harness| {
+            editor.state.material_previews[Viewer::Inspector as usize]
+                .expect("the inspector shows a sphere")
+                .orbit
+        };
+        assert_eq!(orbit(&editor), Orbit::default());
+
+        let centre = sphere_in(&editor, Tab::Inspector, Viewer::Inspector).center();
+        let frame = |editor: &mut Harness, event: egui::Event| {
+            editor.input.events.push(event);
+            editor.frames(1);
+            editor.input.events.clear();
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut editor, egui::Event::PointerMoved(centre));
+        frame(&mut editor, button(centre, true));
+        let mut at = centre;
+        for _ in 0..3 {
+            at += egui::vec2(10.0, 4.0);
+            frame(&mut editor, egui::Event::PointerMoved(at));
+        }
+        frame(&mut editor, button(at, false));
+        let turned = orbit(&editor);
+        assert_ne!(turned.yaw, 0.0, "{turned:?}");
+        assert_ne!(turned.pitch, 0.0, "{turned:?}");
+        editor.frames(2);
+        assert_eq!(orbit(&editor), turned, "the orbit is kept between frames");
+
+        editor.double_click(centre);
+        editor.frames(1);
+        assert_eq!(orbit(&editor), Orbit::default());
+    }
+
+    /// A material marked in the browser is drawn on the renderer's sphere in
+    /// the Import tab, beside, not instead of, the inspector's.
+    #[test]
+    fn a_material_marked_in_the_browser_is_previewed_on_the_sphere() {
+        use crate::gfx::vulkan::material_preview::Viewer;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let dir = crate::asset_db::tests::Dir::new("panel-browser-material-preview");
+        dir.write("brick.omat", b"orrin-material 1 min-reader 1\n");
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let brick = db.find("brick.omat").unwrap().id;
+        editor.world.insert_resource(db);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+        editor.click(row_of(&editor, "brick.omat"));
+        editor.dock.activate(Tab::Import);
+        editor.frames(2);
+
+        let handle = editor
+            .world
+            .resource_mut::<crate::asset_db::AssetDatabase>()
+            .material(brick)
+            .unwrap();
+        let asked = editor.state.material_previews[Viewer::Browser as usize];
+        assert_eq!(asked.map(|subject| subject.material), Some(handle));
+        let sphere = sphere_in(&editor, Tab::Import, Viewer::Browser);
+        assert_checkerboard_behind(&editor, sphere);
+    }
+
+    /// Where the sphere `viewer` asked for was painted, inside `tab`.
+    fn sphere_in(
+        editor: &Harness,
+        tab: Tab,
+        viewer: crate::gfx::vulkan::material_preview::Viewer,
+    ) -> egui::Rect {
+        let texture = viewer.texture();
+        let spheres = editor.painted_rects_of(|shape| match shape {
+            egui::Shape::Rect(rect) => rect
+                .brush
+                .as_ref()
+                .is_some_and(|brush| brush.fill_texture_id == texture),
+            egui::Shape::Mesh(mesh) => mesh.texture_id == texture,
+            _ => false,
+        });
+        assert_eq!(spheres.len(), 1, "{spheres:?}");
+        let body = editor.tab_body(tab);
+        assert!(
+            body.contains_rect(spheres[0]),
+            "{:?} in {body:?}",
+            spheres[0]
+        );
+        spheres[0]
+    }
+
+    /// A cutout's holes read as holes only against something: the sphere's
+    /// square is tiled in two alternating greys.
+    fn assert_checkerboard_behind(editor: &Harness, sphere: egui::Rect) {
+        let cells: Vec<_> = editor
+            .painted_fills()
+            .into_iter()
+            .filter(|(rect, _)| sphere.expand(0.5).contains_rect(*rect) && rect.area() > 1.0)
+            .collect();
+        assert!(cells.len() >= 16, "{} cells under {sphere:?}", cells.len());
+        let shades: std::collections::HashSet<_> = cells.iter().map(|(_, fill)| *fill).collect();
+        assert_eq!(shades.len(), 2, "{shades:?}");
+        let covered: f32 = cells.iter().map(|(rect, _)| rect.area()).sum();
+        assert!(
+            (covered - sphere.area()).abs() < sphere.area() * 0.02,
+            "{covered}"
         );
     }
 

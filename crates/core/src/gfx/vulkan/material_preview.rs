@@ -22,7 +22,19 @@
 //! They are in the graph only on frames where something the sphere shows has
 //! changed — the material, a texture under it, the environment, the light
 //! ([`Schedule`]) — so a preview left open costs the frame nothing, and
-//! dragging a slider costs one 512² draw and one 256² resolve a frame.
+//! dragging a slider or the sphere costs one 640² draw and one 320² resolve a
+//! frame.
+//!
+//! **Who it is for.** Each editor view that shows one — the inspector's
+//! Material section, the Import tab's material — is a [`Viewer`] with images
+//! and a schedule of its own, so two views can show two materials at once. A
+//! frame redraws at most one of them, taking turns when both are due, which
+//! keeps the passes in the graph to one pair however many views there are.
+//!
+//! **Orbiting.** Dragging a view moves the camera round the sphere, and the key
+//! light with it, as a studio light on the camera would: what changes is the
+//! sky the surface reflects and the side of its textures in view, never which
+//! way the terminator falls.
 //!
 //! **Why three output images.** The overlay samples the result in a submission
 //! of its own after the frame, which the next frame does not wait for; on the
@@ -39,8 +51,9 @@ use std::f32::consts::PI;
 use glam::{Mat4, Vec3};
 
 use super::cull::Variant;
-use super::forward::{ForwardPass, ForwardSets};
+use super::forward::{ForwardPass, ForwardSets, NeutralBlocks};
 use super::hdr::HDR_WIDE_FORMAT;
+use super::overlay::UserTexture;
 use super::swapchain::DEPTH_FORMAT;
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::graph::ImageUsage;
@@ -55,16 +68,74 @@ use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DirectionalLight, PositionVertex, SceneLighting, SurfaceVertex};
 use crate::scene::{Camera, CpuMesh, HdrSettings, MaterialHandle};
 
-/// The edge of the image the inspector shows, in pixels.
-pub const SIZE: u32 = 256;
+/// The edge of the image a view shows, in pixels: the inspector's largest,
+/// 160 points, on a 2x display. A view sizes itself with [`display_side`], so
+/// the picture is never shown larger than it was drawn.
+pub const SIZE: u32 = 320;
 /// Samples per output pixel along each axis: the sphere is shaded at
 /// `SIZE * SUPERSAMPLE` and averaged after tonemapping, which is what gives a
 /// one-sample render an antialiased silhouette. `SUPERSAMPLE` in
 /// `material_preview.frag`.
 pub const SUPERSAMPLE: u32 = 2;
 pub const OUTPUT_FORMAT: Format = Format::Rgba8Srgb;
-/// The egui texture the inspector paints the sphere with.
-pub const TEXTURE: egui::TextureId = egui::TextureId::User(0);
+
+/// An editor view with a preview of its own.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Viewer {
+    Inspector,
+    Browser,
+}
+
+impl Viewer {
+    pub const ALL: [Self; VIEWERS] = [Self::Inspector, Self::Browser];
+
+    /// The egui texture the view paints its sphere with.
+    pub fn texture(self) -> egui::TextureId {
+        UserTexture::MaterialPreview(self).id()
+    }
+}
+
+const VIEWERS: usize = 2;
+
+/// Where the camera stands round the sphere, in degrees: `yaw` about the
+/// vertical and `pitch` above the view it starts from.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Orbit {
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+impl Orbit {
+    /// Turned by a drag of `delta` points: the surface follows the pointer.
+    pub fn dragged(self, delta: [f32; 2]) -> Self {
+        const DEGREES_PER_POINT: f32 = 0.6;
+        let lowest = -MAX_ELEVATION_DEGREES - ELEVATION_DEGREES;
+        let highest = MAX_ELEVATION_DEGREES - ELEVATION_DEGREES;
+        Self {
+            yaw: (self.yaw - delta[0] * DEGREES_PER_POINT).rem_euclid(360.0),
+            pitch: (self.pitch + delta[1] * DEGREES_PER_POINT).clamp(lowest, highest),
+        }
+    }
+}
+
+/// What a view asks to be shown this frame.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Subject {
+    pub material: MaterialHandle,
+    pub orbit: Orbit,
+}
+
+/// One request per [`Viewer`], indexed by it.
+pub type Subjects = [Option<Subject>; VIEWERS];
+
+/// Each view's picture as the overlay samples it.
+pub(super) type Lent = [Option<(egui::TextureId, TextureViewId)>; VIEWERS];
+
+/// The side, in points, to show a preview wanted at `points`: no larger than
+/// [`SIZE`] pixels at this display's density.
+pub fn display_side(points: f32, pixels_per_point: f32) -> f32 {
+    points.min(SIZE as f32 / pixels_per_point)
+}
 
 /// The studio key's illuminance, about a clear midday sun's: the same order as
 /// a calibrated sky's irradiance, so neither swamps the other on the sphere.
@@ -73,25 +144,49 @@ pub(super) const KEY_LUX: f32 = 20_000.0;
 /// The engine's built-in sphere: unit diameter, like every primitive.
 const RADIUS: f32 = 0.5;
 const FOV_Y_DEGREES: f32 = 30.0;
+/// How far above the sphere's equator the camera starts, and how far an orbit
+/// may take it: short of the poles, where "up" stops meaning anything.
+const ELEVATION_DEGREES: f32 = 14.0;
+const MAX_ELEVATION_DEGREES: f32 = 75.0;
 /// How much of the view's half-height the silhouette takes.
 const FILL: f32 = 0.84;
-/// Toward the key light, before normalising: above the camera and to its left.
+/// Toward the key light in the camera's frame — right, up, back toward the
+/// camera — before normalising: above the camera and to its left.
 const TO_KEY: Vec3 = Vec3::new(-0.55, 0.65, 0.75);
 /// What an incident-light meter is calibrated to (ISO 2720's C for a flat
 /// receptor). It puts a white diffuse surface at `C / (1.2 * 100 * pi)`, about
 /// two thirds, after exposure.
 const METER_CALIBRATION: f32 = 250.0;
 const REC709_LUMINANCE: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
-/// Enough segments that the silhouette is round at 512 pixels.
+/// Enough segments that the silhouette is round at 640 pixels.
 const SECTORS: u32 = 96;
 const STACKS: u32 = 48;
 const OUTPUTS: usize = 3;
 
-pub(super) fn camera() -> Camera {
+fn toward_camera(orbit: Orbit) -> Vec3 {
+    let elevation = (ELEVATION_DEGREES + orbit.pitch)
+        .clamp(-MAX_ELEVATION_DEGREES, MAX_ELEVATION_DEGREES)
+        .to_radians();
+    let (sin_yaw, cos_yaw) = orbit.yaw.to_radians().sin_cos();
+    Vec3::new(
+        sin_yaw * elevation.cos(),
+        elevation.sin(),
+        cos_yaw * elevation.cos(),
+    )
+}
+
+fn toward_key(orbit: Orbit) -> Vec3 {
+    let back = toward_camera(orbit);
+    let right = Vec3::Y.cross(back).normalize();
+    let up = back.cross(right);
+    (right * TO_KEY.x + up * TO_KEY.y + back * TO_KEY.z).normalize()
+}
+
+pub(super) fn camera(orbit: Orbit) -> Camera {
     let fov_y = FOV_Y_DEGREES.to_radians();
     let distance = RADIUS / (FILL * fov_y / 2.0).sin();
     Camera {
-        position: Vec3::new(0.0, 0.25, 1.0).normalize() * distance,
+        position: toward_camera(orbit) * distance,
         target: Vec3::ZERO,
         up: Vec3::Y,
         fov_y,
@@ -100,10 +195,10 @@ pub(super) fn camera() -> Camera {
     }
 }
 
-pub(super) fn lighting(scene: &SceneLighting) -> SceneLighting {
+pub(super) fn lighting(scene: &SceneLighting, orbit: Orbit) -> SceneLighting {
     SceneLighting {
         sun: DirectionalLight {
-            direction: -TO_KEY.normalize(),
+            direction: -toward_key(orbit),
             color: Vec3::ONE,
             illuminance: KEY_LUX,
         },
@@ -117,8 +212,13 @@ pub(super) fn lighting(scene: &SceneLighting) -> SceneLighting {
 /// would set. The sky is read the way `sh_irradiance` reads it, through the
 /// environment's yaw, so the meter and the sphere agree about which way the
 /// bright half of a sky faces.
-pub(super) fn exposure(lighting: &SceneLighting, irradiance: &[Vec3; SH9], yaw: f32) -> f32 {
-    let to_camera = camera().position.normalize();
+pub(super) fn exposure(
+    lighting: &SceneLighting,
+    irradiance: &[Vec3; SH9],
+    yaw: f32,
+    orbit: Orbit,
+) -> f32 {
+    let to_camera = toward_camera(orbit);
     let key = lighting.sun.illuminance * (-lighting.sun.direction).dot(to_camera).max(0.0);
     let (s, c) = yaw.to_radians().sin_cos();
     let in_environment = Vec3::new(
@@ -137,6 +237,7 @@ pub(super) fn exposure(lighting: &SceneLighting, irradiance: &[Vec3; SH9], yaw: 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Key<'a> {
     pub material: MaterialHandle,
+    pub orbit: Orbit,
     pub generation: u64,
     pub lighting: &'a [u8],
 }
@@ -144,29 +245,51 @@ pub(super) struct Key<'a> {
 /// What the preview last drew, kept as owned bytes so asking costs nothing.
 #[derive(Default)]
 pub(super) struct Schedule {
-    drawn: Option<(MaterialHandle, u64)>,
+    drawn: Option<(MaterialHandle, Orbit, u64)>,
     lighting: Vec<u8>,
 }
 
 impl Schedule {
     pub(super) fn due(&self, key: Option<&Key<'_>>) -> bool {
         key.is_some_and(|key| {
-            self.drawn != Some((key.material, key.generation)) || self.lighting != key.lighting
+            self.drawn != Some((key.material, key.orbit, key.generation))
+                || self.lighting != key.lighting
         })
     }
 
     pub(super) fn drawn(&mut self, key: &Key<'_>) {
-        self.drawn = Some((key.material, key.generation));
+        self.drawn = Some((key.material, key.orbit, key.generation));
         self.lighting.clear();
         self.lighting.extend_from_slice(key.lighting);
     }
 }
 
-/// One redraw: the sets the sphere binds, and how it is tonemapped.
+/// The view to redraw this frame among those `due`, starting from `turn` so
+/// that two views both due take turns rather than one starving the other.
+pub(super) fn next_due(due: [bool; VIEWERS], turn: usize) -> Option<Viewer> {
+    (0..VIEWERS)
+        .map(|step| (turn + step) % VIEWERS)
+        .find(|&index| due[index])
+        .map(|index| Viewer::ALL[index])
+}
+
+/// One redraw: the sets the sphere binds, where it is seen from, and how it
+/// is tonemapped.
 pub(super) struct PreviewFrame {
     pub sets: ForwardSets,
     pub variant: Variant,
+    pub view_proj: Mat4,
     pub exposure: f32,
+}
+
+/// A view's images, created the first time it is drawn, and what it last drew.
+#[derive(Default)]
+struct Slot {
+    outputs: Option<[TextureViewId; OUTPUTS]>,
+    /// The output the overlay samples, and the one written before it.
+    shown: usize,
+    previous: usize,
+    schedule: Schedule,
 }
 
 pub(super) struct MaterialPreviewPass {
@@ -175,11 +298,10 @@ pub(super) struct MaterialPreviewPass {
     resolve: PipelineId,
     nearest: SamplerId,
     sphere: MeshSpan,
-    outputs: [TextureViewId; OUTPUTS],
-    /// The output the overlay samples, and the one written before it.
-    shown: usize,
-    previous: usize,
-    pub(super) schedule: Schedule,
+    neutral: NeutralBlocks,
+    slots: [Slot; VIEWERS],
+    /// The view first in line when more than one is due.
+    turn: usize,
 }
 
 impl MaterialPreviewPass {
@@ -225,45 +347,64 @@ impl MaterialPreviewPass {
         });
         let mesh = CpuMesh::sphere(SECTORS, STACKS);
         let (sphere, _) = device.upload_mesh(&mesh.vertices, &mesh.indices);
-        let outputs = std::array::from_fn(|_| {
-            let view = device.create_texture(&TextureDesc {
-                format: OUTPUT_FORMAT,
-                dimension: TextureDimension::D2,
-                extent: [SIZE, SIZE, 1],
-                mip_levels: 1,
-                array_layers: 1,
-                samples: SampleCount::Sample1,
-                // Transfer as well, for `VulkanRenderer::read_material_preview`.
-                usage: ImageUsage::COLOR_ATTACHMENT
-                    | ImageUsage::SAMPLED
-                    | ImageUsage::TRANSFER_SRC,
-                memoryless: false,
-            });
-            device.initialise_sampled(view);
-            view
-        });
         Self {
             pipelines,
             resolve,
             nearest,
             sphere,
-            outputs,
-            shown: 0,
-            previous: OUTPUTS - 1,
-            schedule: Schedule::default(),
+            neutral: forward.neutral_blocks(device),
+            slots: Default::default(),
+            turn: 0,
         }
     }
 
-    /// Move on to the output neither of the last two redraws wrote, and name
-    /// it for the frame's resolve to write. See the module docs.
-    pub(super) fn advance(&mut self) -> ImageEntry {
+    pub(super) fn neutral(&self) -> &NeutralBlocks {
+        &self.neutral
+    }
+
+    pub(super) fn due(&self, viewer: Viewer, key: &Key<'_>) -> bool {
+        self.slots[viewer as usize].schedule.due(Some(key))
+    }
+
+    /// Which of the views `due` this frame redraws, passing the turn on.
+    pub(super) fn choose(&mut self, due: [bool; VIEWERS]) -> Option<Viewer> {
+        let viewer = next_due(due, self.turn)?;
+        self.turn = viewer as usize + 1;
+        Some(viewer)
+    }
+
+    /// Count `key` as drawn for `viewer`, move on to the output neither of its
+    /// last two redraws wrote, and name that for the frame's resolve. See the
+    /// module docs.
+    pub(super) fn advance(&mut self, device: &Device, viewer: Viewer, key: &Key<'_>) -> ImageEntry {
+        let slot = &mut self.slots[viewer as usize];
+        slot.schedule.drawn(key);
+        let outputs = *slot.outputs.get_or_insert_with(|| {
+            std::array::from_fn(|_| {
+                let view = device.create_texture(&TextureDesc {
+                    format: OUTPUT_FORMAT,
+                    dimension: TextureDimension::D2,
+                    extent: [SIZE, SIZE, 1],
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: SampleCount::Sample1,
+                    // Transfer as well, for `VulkanRenderer::read_material_preview`.
+                    usage: ImageUsage::COLOR_ATTACHMENT
+                        | ImageUsage::SAMPLED
+                        | ImageUsage::TRANSFER_SRC,
+                    memoryless: false,
+                });
+                device.initialise_sampled(view);
+                view
+            })
+        });
         let next = (0..OUTPUTS)
-            .find(|slot| *slot != self.shown && *slot != self.previous)
+            .find(|index| *index != slot.shown && *index != slot.previous)
             .expect("three outputs leave one free");
-        self.previous = self.shown;
-        self.shown = next;
+        slot.previous = slot.shown;
+        slot.shown = next;
         ImageEntry {
-            whole: self.outputs[next],
+            whole: outputs[next],
             levels: Vec::new(),
             layers: Vec::new(),
             extent: [SIZE; 2],
@@ -271,14 +412,20 @@ impl MaterialPreviewPass {
         }
     }
 
-    /// What the overlay samples: the last output a frame wrote.
-    pub(super) fn shown(&self) -> TextureViewId {
-        self.outputs[self.shown]
+    /// What the overlay samples for `viewer`: the last output a frame wrote,
+    /// or nothing before its first redraw.
+    pub(super) fn shown(&self, viewer: Viewer) -> Option<TextureViewId> {
+        let slot = &self.slots[viewer as usize];
+        Some(slot.outputs?[slot.shown])
+    }
+
+    /// Every view's picture, as the overlay is lent them.
+    pub(super) fn lent(&self) -> Lent {
+        Viewer::ALL.map(|viewer| Some((viewer.texture(), self.shown(viewer)?)))
     }
 
     pub(super) fn record_sphere(&self, encoder: &mut Encoder, frame: &PreviewFrame) {
-        let camera = camera();
-        let view_proj = camera.projection(1.0) * camera.view();
+        let view_proj = frame.view_proj;
         let mut words = [0u32; 16];
         for (word, value) in words
             .iter_mut()
@@ -358,7 +505,7 @@ mod tests {
     /// Fresnel and the rim live is never cut off.
     #[test]
     fn the_sphere_fills_most_of_the_preview_and_none_of_it_is_cut_off() {
-        let camera = camera();
+        let camera = camera(Orbit::default());
         assert_eq!(camera.target, Vec3::ZERO);
         let distance = camera.position.length();
         let silhouette = (SPHERE_RADIUS / distance).asin();
@@ -392,13 +539,13 @@ mod tests {
             }],
             ..SceneLighting::default()
         };
-        let rig = lighting(&scene);
+        let rig = lighting(&scene, Orbit::default());
         assert_eq!(rig.ambient_color, scene.ambient_color);
         assert_eq!(rig.ambient_nits, scene.ambient_nits);
         assert!(rig.point_lights.is_empty() && rig.spot_lights.is_empty());
 
         let to_light = -rig.sun.direction;
-        let to_camera = camera().position.normalize();
+        let to_camera = camera(Orbit::default()).position.normalize();
         assert!(to_light.dot(to_camera) > 0.5, "{to_light}");
         assert!(to_light.y > 0.3, "{to_light}");
         assert_eq!(rig.sun.color, Vec3::ONE);
@@ -411,14 +558,14 @@ mod tests {
     /// calibrated at C = 250 puts it at — 250 / (1.2 * 100 * pi).
     #[test]
     fn a_white_diffuse_surface_facing_the_camera_is_exposed_alike_under_any_sky() {
-        let to_camera = camera().position.normalize();
+        let to_camera = camera(Orbit::default()).position.normalize();
         for sky in [0.0, 1.0, 600.0, 8_000.0] {
-            let rig = lighting(&SceneLighting::default());
+            let rig = lighting(&SceneLighting::default(), Orbit::default());
             let irradiance = sh::from_constant(Vec3::splat(sky));
             let incident = rig.sun.illuminance * (-rig.sun.direction).dot(to_camera).max(0.0)
                 + std::f32::consts::PI * sky;
             let white = incident / std::f32::consts::PI;
-            let exposed = white * exposure(&rig, &irradiance, 37.0);
+            let exposed = white * exposure(&rig, &irradiance, 37.0, Orbit::default());
             let expected = 250.0 / (1.2 * 100.0 * std::f32::consts::PI);
             assert!(
                 (exposed - expected).abs() < 1e-3,
@@ -432,12 +579,12 @@ mod tests {
     /// way it changes what lights the sphere.
     #[test]
     fn the_meter_reads_the_sky_through_the_environments_yaw() {
-        let rig = lighting(&SceneLighting::default());
+        let rig = lighting(&SceneLighting::default(), Orbit::default());
         let mut lopsided = [Vec3::ZERO; SH9];
         lopsided[0] = Vec3::splat(400.0);
         lopsided[2] = Vec3::splat(300.0);
-        let facing = exposure(&rig, &lopsided, 0.0);
-        let turned = exposure(&rig, &lopsided, 180.0);
+        let facing = exposure(&rig, &lopsided, 0.0, Orbit::default());
+        let turned = exposure(&rig, &lopsided, 180.0, Orbit::default());
         assert!(
             (facing - turned).abs() > 1e-9,
             "{facing} and {turned} read one sky"
@@ -447,6 +594,7 @@ mod tests {
     fn key(material: u32, generation: u64, lighting: &[u8]) -> Key<'_> {
         Key {
             material: MaterialHandle(material),
+            orbit: Orbit::default(),
             generation,
             lighting,
         }
@@ -467,5 +615,89 @@ mod tests {
         assert!(schedule.due(Some(&key(2, 0, &lit))));
         assert!(schedule.due(Some(&key(1, 1, &lit))));
         assert!(schedule.due(Some(&key(1, 0, &relit))));
+        let turned = Key {
+            orbit: Orbit {
+                yaw: 30.0,
+                pitch: 0.0,
+            },
+            ..key(1, 0, &lit)
+        };
+        assert!(schedule.due(Some(&turned)));
+    }
+
+    /// The camera orbits at the distance that frames the sphere, so a turn
+    /// never crops it, and the key turns with the camera: the terminator falls
+    /// where it did, and what moves is the sky in the reflection.
+    #[test]
+    fn orbiting_moves_the_camera_round_the_sphere_and_the_key_with_it() {
+        let rest = Orbit::default();
+        let to_light = |orbit| -lighting(&SceneLighting::default(), orbit).sun.direction;
+        for orbit in [
+            Orbit {
+                yaw: 90.0,
+                pitch: 0.0,
+            },
+            Orbit {
+                yaw: 210.0,
+                pitch: 40.0,
+            },
+            Orbit {
+                yaw: 0.0,
+                pitch: -50.0,
+            },
+        ] {
+            let (from, turned) = (camera(rest), camera(orbit));
+            assert!((from.position.length() - turned.position.length()).abs() < 1e-5);
+            assert!(turned.position.distance(from.position) > 0.1, "{orbit:?}");
+            let lit = |orbit, camera: &Camera| to_light(orbit).dot(camera.position.normalize());
+            assert!(
+                (lit(rest, &from) - lit(orbit, &turned)).abs() < 1e-5,
+                "{orbit:?}: the key keeps its angle to the camera"
+            );
+        }
+    }
+
+    /// A drag turns the surface the way the pointer moves, and stops short of
+    /// the poles however far it goes.
+    #[test]
+    fn a_drag_orbits_and_never_reaches_a_pole() {
+        let right = Orbit::default().dragged([10.0, 0.0]);
+        assert!(
+            toward_camera(right).x < 0.0,
+            "dragging right swings the camera left"
+        );
+        let over = Orbit::default().dragged([0.0, 10_000.0]);
+        let elevation = toward_camera(over).y.asin().to_degrees();
+        assert!(
+            (elevation - MAX_ELEVATION_DEGREES).abs() < 1e-3,
+            "{elevation}"
+        );
+        let back = over.dragged([0.0, -1.0]);
+        assert!(
+            toward_camera(back).y < toward_camera(over).y,
+            "no slack to unwind past the pole"
+        );
+        assert!((0.0..360.0).contains(&Orbit::default().dragged([1e4, 0.0]).yaw));
+    }
+
+    /// Two views due in the same frames take turns; one alone has every frame.
+    #[test]
+    fn views_due_together_take_turns() {
+        assert_eq!(next_due([false, false], 0), None);
+        assert_eq!(next_due([false, true], 0), Some(Viewer::Browser));
+        assert_eq!(next_due([true, false], 1), Some(Viewer::Inspector));
+        assert_eq!(next_due([true, true], 0), Some(Viewer::Inspector));
+        assert_eq!(next_due([true, true], 1), Some(Viewer::Browser));
+        assert_eq!(next_due([true, true], 2), Some(Viewer::Inspector));
+    }
+
+    /// A view is never shown larger than the picture was drawn, at any
+    /// display density.
+    #[test]
+    fn a_view_is_sized_to_the_pixels_drawn() {
+        assert_eq!(display_side(160.0, 2.0), 160.0);
+        assert_eq!(display_side(160.0, 1.0), 160.0);
+        assert_eq!(display_side(160.0, 3.0), SIZE as f32 / 3.0);
+        assert_eq!(display_side(96.0, 3.0), 96.0);
     }
 }

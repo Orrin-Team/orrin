@@ -1135,19 +1135,20 @@ fn material_section(
     let mut slots = asset.map(|(_, file)| file);
     let id = ui.id().with("material");
     let weak = ui.visuals().weak_text_color();
-    let mut previewed = false;
+    let mut previewed = None;
     widgets::section(ui, id, icons::palette(), weak, "Material", None, |ui| {
         if rows.shows("Preview") {
             // Drawn by the renderer this frame, through the frame's own
             // shading; see `gfx::vulkan::material_preview`.
-            previewed = true;
             let side = (ui.available_width() * 0.6).clamp(96.0, 160.0);
             ui.add_space(8.0);
             ui.vertical_centered(|ui| {
-                ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                    material_preview::TEXTURE,
-                    [side, side],
-                )));
+                previewed = Some(widgets::material_preview(
+                    ui,
+                    material_preview::Viewer::Inspector,
+                    handle,
+                    side,
+                ));
             });
             ui.add_space(8.0);
         }
@@ -1214,8 +1215,8 @@ fn material_section(
         }
     });
 
-    if previewed {
-        state.material_preview = Some(handle);
+    if previewed.is_some() {
+        state.material_previews[material_preview::Viewer::Inspector as usize] = previewed;
     }
 
     let edited = before.base_color != after.base_color

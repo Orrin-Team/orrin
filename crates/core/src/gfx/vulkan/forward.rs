@@ -17,11 +17,12 @@ use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 use super::{MSAA_SAMPLES, ShadowFrame, VulkanRenderer};
 use crate::gfx::format::{Format, SampleCount};
+use crate::gfx::graph::BufferUsage;
 use crate::gfx::rhi::MeshSpan;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferId, CullMode, DepthCompare,
-    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId,
-    TextureViewId, Topology, Viewport,
+    BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferDesc, BufferId, CullMode,
+    DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc, MemoryLocation, PipelineId,
+    SamplerDesc, SamplerId, TextureViewId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -574,6 +575,18 @@ pub(super) struct NeutralViews {
     pub env_sampler: SamplerId,
     pub fog_volume: TextureViewId,
     pub fog_sampler: SamplerId,
+}
+
+/// The blocks a frame binds when there is nothing to light with — no punctual
+/// light, decal, cluster, shadow face or fog — which the material preview
+/// binds on every redraw and therefore holds rather than uploads.
+pub(super) struct NeutralBlocks {
+    decals: BufferId,
+    points: BufferId,
+    spots: BufferId,
+    clusters: BufferId,
+    shadow_faces: BufferId,
+    fog: BufferId,
 }
 
 /// The lighting block the material preview shades with. Kept as the block so
@@ -1313,27 +1326,60 @@ impl ForwardPass {
     /// material table and textures, and everything else a sphere standing in
     /// no scene should see — no punctual light, no decal, no shadow, no fog,
     /// and no screen-space term, since the frame's screen is not its screen.
+    pub(super) fn neutral_blocks(&self, device: &Device) -> NeutralBlocks {
+        let block = |usage, bytes: &[u8]| {
+            device.create_buffer_bytes(
+                BufferDesc {
+                    size: bytes.len() as u64,
+                    usage,
+                    location: MemoryLocation::GpuOnly,
+                },
+                bytes,
+            )
+        };
+        let (uniform, storage) = (BufferUsage::UNIFORM_BUFFER, BufferUsage::STORAGE_BUFFER);
+        let no_decals = GpuDecals {
+            count: [0; 4],
+            decals: [GpuDecal::ZERO; MAX_DECALS],
+        };
+        NeutralBlocks {
+            decals: block(storage, bytemuck::bytes_of(&no_decals)),
+            points: block(
+                uniform,
+                bytemuck::cast_slice(&[GpuPointLight::ZERO; MAX_POINT_LIGHTS]),
+            ),
+            spots: block(
+                uniform,
+                bytemuck::cast_slice(&[GpuSpotLight::ZERO; MAX_SPOT_LIGHTS]),
+            ),
+            clusters: block(storage, bytemuck::cast_slice(&[0u32; CLUSTERS * 4 + 1])),
+            shadow_faces: block(storage, bytemuck::bytes_of(&GpuShadowFace::ZERO)),
+            fog: block(
+                uniform,
+                bytemuck::bytes_of(&<super::fog::GpuFog as bytemuck::Zeroable>::zeroed()),
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn preview_sets(
         &self,
         device: &Device,
         lighting: &PreviewLighting,
         neutral: NeutralViews,
+        blocks: &NeutralBlocks,
         material_set: BindGroupId,
         texture_set: BindGroupId,
         object_set: BindGroupId,
     ) -> ForwardSets {
-        let uniform = |bytes: &[u8]| device.upload_block(BlockKind::Uniform, bytes);
-        let storage = |bytes: &[u8]| device.upload_block(BlockKind::Storage, bytes);
         self.assemble(
             device,
             LightingSet {
-                lighting: uniform(bytemuck::bytes_of(&lighting.0)),
-                decals: self.upload_decals(device, &[]),
-                points: uniform(bytemuck::cast_slice(
-                    &[GpuPointLight::ZERO; MAX_POINT_LIGHTS],
-                )),
-                spots: uniform(bytemuck::cast_slice(&[GpuSpotLight::ZERO; MAX_SPOT_LIGHTS])),
-                clusters: storage(bytemuck::cast_slice(&[0u32; CLUSTERS * 4 + 1])),
+                lighting: device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&lighting.0)),
+                decals: blocks.decals,
+                points: blocks.points,
+                spots: blocks.spots,
+                clusters: blocks.clusters,
             },
             SurfaceSet {
                 ao: neutral.ao,
@@ -1342,12 +1388,10 @@ impl ForwardPass {
                 env_sampler: neutral.env_sampler,
                 contact_shadow: neutral.contact_shadow,
                 atlas: neutral.atlas,
-                shadow_faces: storage(bytemuck::bytes_of(&GpuShadowFace::ZERO)),
+                shadow_faces: blocks.shadow_faces,
                 fog_volume: neutral.fog_volume,
                 fog_sampler: neutral.fog_sampler,
-                fog: uniform(bytemuck::bytes_of(
-                    &<super::fog::GpuFog as bytemuck::Zeroable>::zeroed(),
-                )),
+                fog: blocks.fog,
             },
             material_set,
             texture_set,

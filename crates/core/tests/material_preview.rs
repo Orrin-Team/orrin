@@ -6,7 +6,7 @@
 //! the unit tests in `gfx::vulkan::material_preview` and by `render_graph.rs`;
 //! this is the half that only pixels can answer: that the sphere is there, is
 //! the material, is lit from the key's side, has a soft edge over a clear
-//! background, and follows an edit.
+//! background, follows an edit, and that two views each keep their own.
 //!
 //! ```text
 //! cargo test -p orrin-core --test material_preview -- --ignored --nocapture
@@ -18,7 +18,8 @@ use std::path::PathBuf;
 
 use glam::Vec3;
 use orrin_core::capture::offscreen_renderer;
-use orrin_core::gfx::vulkan::{OverlayFrame, VulkanRenderer, material_preview};
+use orrin_core::gfx::vulkan::material_preview::{self, Orbit, Subject, Subjects, Viewer};
+use orrin_core::gfx::vulkan::{OverlayFrame, VulkanRenderer};
 use orrin_core::gfx::{DrawList, Material, RenderBackend, SceneLighting};
 use orrin_core::scene::{
     BloomSettings, Camera, ContactShadowSettings, DofSettings, EnvironmentSettings, FogSettings,
@@ -29,8 +30,19 @@ use orrin_core::scene::{
 const SIDE: u32 = material_preview::SIZE;
 
 fn draw(renderer: &mut VulkanRenderer, material: MaterialHandle) -> Vec<u8> {
+    let subject = Subject {
+        material,
+        orbit: Orbit::default(),
+    };
+    frame(renderer, [Some(subject), None]);
+    renderer
+        .read_material_preview(Viewer::Inspector)
+        .expect("a frame that asked for the preview leaves one to read")
+}
+
+fn frame(renderer: &mut VulkanRenderer, subjects: Subjects) {
     let mut overlay = OverlayFrame {
-        material_preview: Some(material),
+        material_previews: subjects,
         ..Default::default()
     };
     let nothing = DrawList::new(&[], &[]);
@@ -61,9 +73,6 @@ fn draw(renderer: &mut VulkanRenderer, material: MaterialHandle) -> Vec<u8> {
         None,
         Some(&mut overlay),
     );
-    renderer
-        .read_material_preview()
-        .expect("a frame that asked for the preview leaves one to read")
 }
 
 fn pixel(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
@@ -147,6 +156,35 @@ fn check(mut renderer: VulkanRenderer, backend: &str) {
     assert_eq!(
         again, blue,
         "{backend}: nothing changed, so neither did the sphere"
+    );
+
+    // Two views at once: a frame redraws one, so both are due for two frames,
+    // and each is left holding its own material.
+    let moss = renderer.load_material(&Material {
+        base_color: Vec3::new(0.06, 0.7, 0.08),
+        metallic: 0.0,
+        roughness: 0.6,
+        ..Material::default()
+    });
+    let at = |material| {
+        Some(Subject {
+            material,
+            orbit: Orbit::default(),
+        })
+    };
+    for _ in 0..2 {
+        frame(&mut renderer, [at(clay), at(moss)]);
+    }
+    let inspector = renderer.read_material_preview(Viewer::Inspector).unwrap();
+    let browser = renderer.read_material_preview(Viewer::Browser).unwrap();
+    save(&browser, &format!("{backend}-browser"));
+    let [_, g, b, _] = pixel(&inspector, SIDE / 2, SIDE / 2);
+    assert!(b > 2 * g, "{backend}: the inspector kept its material");
+    let [r, g, b, _] = pixel(&browser, SIDE / 2, SIDE / 2);
+    assert!(
+        g > 2 * r.max(b),
+        "{backend}: the browser has its own: {:?}",
+        [r, g, b]
     );
 }
 

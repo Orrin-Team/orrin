@@ -39,9 +39,26 @@ pub struct OverlayFrame {
     pub outline: Vec<super::outline::OutlineItem>,
     /// The viewport's draw mode, when it is not plain shaded.
     pub wireframe: Option<super::wireframe::Wireframe>,
-    /// The material the inspector shows on the renderer's sphere, which the
-    /// primitives paint with [`material_preview::TEXTURE`](super::material_preview::TEXTURE).
-    pub material_preview: Option<crate::scene::MaterialHandle>,
+    /// What each view showing a material preview asks for this frame; the
+    /// primitives paint each with its [`Viewer::texture`](super::material_preview::Viewer::texture).
+    pub material_previews: super::material_preview::Subjects,
+}
+
+/// Every egui texture the renderer lends the editor rather than one egui
+/// uploads, so that no two are ever given the same id.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UserTexture {
+    MaterialPreview(super::material_preview::Viewer),
+}
+
+impl UserTexture {
+    pub fn id(self) -> egui::TextureId {
+        use super::material_preview::Viewer;
+        egui::TextureId::User(match self {
+            Self::MaterialPreview(Viewer::Inspector) => 0,
+            Self::MaterialPreview(Viewer::Browser) => 1,
+        })
+    }
 }
 
 /// egui's vertex, field for field.
@@ -236,11 +253,15 @@ impl OverlayPass {
                             .find(|(id, _)| *id == mesh.texture_id)
                             .map(|(_, set)| *set)
                     });
+                // A lent image not drawn yet paints nothing, which is not a
+                // mistake: the view behind it shows through until it is.
                 let Some(set) = set else {
-                    tracing::warn!(
-                        "egui drew with {:?}, which was never uploaded",
-                        mesh.texture_id
-                    );
+                    if matches!(mesh.texture_id, egui::TextureId::Managed(_)) {
+                        tracing::warn!(
+                            "egui drew with {:?}, which was never uploaded",
+                            mesh.texture_id
+                        );
+                    }
                     continue;
                 };
                 encoder.bind_group(0, set);
@@ -455,6 +476,18 @@ fn pack(image: &egui::ImageData, format: Format, into: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+    /// Two lent textures given one id would paint one in the other's place.
+    #[test]
+    fn every_lent_texture_has_its_own_id() {
+        use super::super::material_preview::Viewer;
+        let ids: Vec<_> = Viewer::ALL
+            .map(|viewer| UserTexture::MaterialPreview(viewer).id())
+            .into();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        assert!(ids.iter().all(|id| matches!(id, egui::TextureId::User(_))));
+    }
+
     use super::*;
     use crate::gfx::vulkan::context::VkContext;
     use crate::gfx::vulkan::driver::color_to_present;
@@ -546,7 +579,7 @@ mod tests {
             gizmo: Vec::new(),
             outline: Vec::new(),
             wireframe: None,
-            material_preview: None,
+            material_previews: Default::default(),
             pixels_per_point: 1.0,
             textures: egui::TexturesDelta {
                 set: vec![
@@ -639,7 +672,7 @@ mod tests {
             gizmo: Vec::new(),
             outline: Vec::new(),
             wireframe: None,
-            material_preview: None,
+            material_previews: Default::default(),
             pixels_per_point: 1.0,
             primitives: egui.tessellate(output.shapes, 1.0),
             textures: output.textures_delta,
