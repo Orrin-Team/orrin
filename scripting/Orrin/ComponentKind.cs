@@ -20,6 +20,7 @@ public enum ComponentKind : uint
     ScrollFrame = 13,
     Rigidbody = 14,
     AudioSource = 15,
+    MeshRenderer = 16,
 }
 
 internal static class ComponentKinds
@@ -44,6 +45,7 @@ internal static class ComponentKinds
         if (typeof(T) == typeof(ScrollFrame)) return (uint)ComponentKind.ScrollFrame;
         if (typeof(T) == typeof(Rigidbody)) return (uint)ComponentKind.Rigidbody;
         if (typeof(T) == typeof(AudioSource)) return (uint)ComponentKind.AudioSource;
+        if (typeof(T) == typeof(MeshRenderer)) return (uint)ComponentKind.MeshRenderer;
         throw new ArgumentException($"{typeof(T).Name} is not a script-visible engine component");
     }
 
@@ -64,6 +66,7 @@ internal static class ComponentKinds
         if (typeof(T) == typeof(ScrollFrame)) return (uint)ComponentKind.ScrollFrame;
         if (typeof(T) == typeof(Rigidbody)) return (uint)ComponentKind.Rigidbody;
         if (typeof(T) == typeof(AudioSource)) return (uint)ComponentKind.AudioSource;
+        if (typeof(T) == typeof(MeshRenderer)) return (uint)ComponentKind.MeshRenderer;
         throw new ArgumentException(
             $"{typeof(T).Name} is not read or written as a struct; it has calls of its own on World");
     }
