@@ -39,6 +39,9 @@ pub struct OverlayFrame {
     pub outline: Vec<super::outline::OutlineItem>,
     /// The viewport's draw mode, when it is not plain shaded.
     pub wireframe: Option<super::wireframe::Wireframe>,
+    /// The material the inspector shows on the renderer's sphere, which the
+    /// primitives paint with [`material_preview::TEXTURE`](super::material_preview::TEXTURE).
+    pub material_preview: Option<crate::scene::MaterialHandle>,
 }
 
 /// egui's vertex, field for field.
@@ -96,6 +99,9 @@ pub(super) struct OverlayPass {
     /// at half the size of the `R8G8B8A8_SRGB` it falls back to.
     font_format: Format,
     textures: HashMap<egui::TextureId, Texture>,
+    /// A set for each image the renderer lends egui by a user id, kept for as
+    /// long as the image is.
+    lent: HashMap<TextureViewId, BindGroupId>,
     /// Reused each frame so a frame that changes little allocates little.
     vertices: Vec<OverlayVertex>,
     indices: Vec<u32>,
@@ -133,6 +139,7 @@ impl OverlayPass {
             }),
             font_format,
             textures: HashMap::new(),
+            lent: HashMap::new(),
             vertices: Vec::new(),
             indices: Vec::new(),
             pixels: Vec::new(),
@@ -142,12 +149,14 @@ impl OverlayPass {
     /// Record `frame` over `target`, which arrives and is left in `PresentSrc`
     /// — where the graph leaves the swapchain image, and where presenting
     /// needs it. Takes the frame's texture changes, which are applied once.
+    /// `lent` are images the renderer drew, sampled where egui names their id.
     pub(super) fn record(
         &mut self,
         device: &Device,
         encoder: &mut Encoder,
         target: TextureViewId,
         frame: &mut OverlayFrame,
+        lent: &[(egui::TextureId, TextureViewId)],
     ) {
         let extent = device.view_extent(target);
         let ppp = frame.pixels_per_point;
@@ -155,11 +164,15 @@ impl OverlayPass {
 
         self.upload_textures(device, encoder, &textures.set);
         let geometry = self.upload_geometry(device, frame);
+        let lent: Vec<(egui::TextureId, BindGroupId)> = lent
+            .iter()
+            .map(|&(id, view)| (id, self.lend(device, view)))
+            .collect();
 
         encoder.open_swapchain(target);
         if let Some(geometry) = geometry {
             encoder.begin_rendering(target);
-            self.draw_meshes(encoder, &frame.primitives, geometry, ppp, extent);
+            self.draw_meshes(encoder, &frame.primitives, geometry, ppp, extent, &lent);
             encoder.end_rendering();
         }
         encoder.close_swapchain(target);
@@ -181,6 +194,7 @@ impl OverlayPass {
         (vertices, indices): Geometry,
         ppp: f32,
         extent: [u32; 2],
+        lent: &[(egui::TextureId, BindGroupId)],
     ) {
         let (mut vertex, mut index) = (0, 0);
         encoder.bind_pipeline(self.pipeline);
@@ -213,14 +227,23 @@ impl OverlayPass {
                 continue;
             }
             if bound_texture != Some(mesh.texture_id) {
-                let Some(texture) = self.textures.get(&mesh.texture_id) else {
+                let set = self
+                    .textures
+                    .get(&mesh.texture_id)
+                    .map(|t| t.set)
+                    .or_else(|| {
+                        lent.iter()
+                            .find(|(id, _)| *id == mesh.texture_id)
+                            .map(|(_, set)| *set)
+                    });
+                let Some(set) = set else {
                     tracing::warn!(
                         "egui drew with {:?}, which was never uploaded",
                         mesh.texture_id
                     );
                     continue;
                 };
-                encoder.bind_group(0, texture.set);
+                encoder.bind_group(0, set);
                 bound_texture = Some(mesh.texture_id);
             }
             if bound_clip != Some(scissor) {
@@ -319,6 +342,20 @@ impl OverlayPass {
             };
             encoder.write_texture(view, offset, [width, height], staging, initial);
         }
+    }
+
+    fn lend(&mut self, device: &Device, view: TextureViewId) -> BindGroupId {
+        let (pipeline, sampler) = (self.pipeline, self.sampler);
+        *self.lent.entry(view).or_insert_with(|| {
+            device.create_persistent_bind_group(
+                pipeline,
+                0,
+                &[Binding {
+                    binding: 0,
+                    resource: BindingResource::SampledTexture { view, sampler },
+                }],
+            )
+        })
     }
 
     fn create_texture(&self, device: &Device, format: Format, extent: [u32; 2]) -> Texture {
@@ -509,6 +546,7 @@ mod tests {
             gizmo: Vec::new(),
             outline: Vec::new(),
             wireframe: None,
+            material_preview: None,
             pixels_per_point: 1.0,
             textures: egui::TexturesDelta {
                 set: vec![
@@ -540,7 +578,7 @@ mod tests {
             let driver = device.vulkan();
             let target = driver.import_view(view.clone());
             let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
-            pass.record(&device, &mut encoder, target, &mut frame);
+            pass.record(&device, &mut encoder, target, &mut frame, &[]);
         }
         recorder.submit_and_wait(&ctx);
         assert_eq!(pass.textures.len(), 2);
@@ -601,6 +639,7 @@ mod tests {
             gizmo: Vec::new(),
             outline: Vec::new(),
             wireframe: None,
+            material_preview: None,
             pixels_per_point: 1.0,
             primitives: egui.tessellate(output.shapes, 1.0),
             textures: output.textures_delta,
@@ -636,7 +675,7 @@ mod tests {
                 let driver = device.vulkan();
                 let target = driver.import_view(view.clone());
                 let mut encoder = Encoder::Vulkan(VkEncoder::new(&mut recorder, driver));
-                pass.record(&device, &mut encoder, target, frame);
+                pass.record(&device, &mut encoder, target, frame, &[]);
             }
             recorder
                 .image_barrier(ImageMemoryBarrier {

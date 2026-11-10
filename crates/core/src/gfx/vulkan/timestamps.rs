@@ -500,6 +500,7 @@ mod tests {
             async_compute,
             occlusion_culling: false,
             wireframe: None,
+            material_preview: false,
         };
         let frame = declare(config).expect("the busiest frame must compile");
 
