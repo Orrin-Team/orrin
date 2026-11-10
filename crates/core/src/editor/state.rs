@@ -293,6 +293,8 @@ pub struct EditorState {
     /// How the viewport draws the scene: shaded, or as its edges. `None` is
     /// shaded, which is what the renderer is handed too.
     pub wireframe: Option<crate::gfx::vulkan::wireframe::Wireframe>,
+    /// The material the inspector shows on the renderer's sphere this frame.
+    pub material_preview: Option<crate::scene::MaterialHandle>,
     /// The handle being dragged, and the primary selection it was grabbed
     /// under. Dropped when the button is released or the primary changes.
     pub gizmo_drag: Option<(Entity, Drag)>,
@@ -466,6 +468,7 @@ impl Default for EditorState {
             show_colliders: false,
             icon_tints: IconTints::default(),
             wireframe: None,
+            material_preview: None,
             gizmo_drag: None,
             gizmo_hot: None,
             hovered: None,

@@ -379,6 +379,7 @@ impl Editor {
         std::mem::swap(&mut frame.outline, &mut self.state.outline);
         self.state.outline.clear();
         frame.wireframe = self.state.wireframe;
+        frame.material_preview = self.state.material_preview.take();
         frame.pixels_per_point = ppp;
         frame.textures.append(output.textures_delta);
         frame.primitives = self.ctx.tessellate(output.shapes, ppp);

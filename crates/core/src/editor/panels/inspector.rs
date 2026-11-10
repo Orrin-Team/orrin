@@ -20,6 +20,7 @@ use crate::editor::kind::Kind;
 use crate::editor::previews::Previews;
 use crate::editor::state::EditorState;
 use crate::editor::widgets;
+use crate::gfx::vulkan::material_preview;
 #[cfg(feature = "scripting")]
 use crate::scene::ScriptComponent;
 use crate::scene::prefab;
@@ -1115,7 +1116,14 @@ fn material_section(
             kept
         }
     };
-    let mut labels = vec!["Base colour", "Metallic", "Roughness", "Emission", "Blend"];
+    let mut labels = vec![
+        "Preview",
+        "Base colour",
+        "Metallic",
+        "Roughness",
+        "Emission",
+        "Blend",
+    ];
     if asset.is_some() {
         labels.extend(MAPS.map(|(label, _)| label));
     }
@@ -1127,7 +1135,22 @@ fn material_section(
     let mut slots = asset.map(|(_, file)| file);
     let id = ui.id().with("material");
     let weak = ui.visuals().weak_text_color();
+    let mut previewed = false;
     widgets::section(ui, id, icons::palette(), weak, "Material", None, |ui| {
+        if rows.shows("Preview") {
+            // Drawn by the renderer this frame, through the frame's own
+            // shading; see `gfx::vulkan::material_preview`.
+            previewed = true;
+            let side = (ui.available_width() * 0.6).clamp(96.0, 160.0);
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                    material_preview::TEXTURE,
+                    [side, side],
+                )));
+            });
+            ui.add_space(8.0);
+        }
         if rows.shows("Base colour") {
             widgets::property(ui, "Base colour", |ui| {
                 let mut rgb = after.base_color.to_array();
@@ -1190,6 +1213,10 @@ fn material_section(
             }
         }
     });
+
+    if previewed {
+        state.material_preview = Some(handle);
+    }
 
     let edited = before.base_color != after.base_color
         || before.metallic != after.metallic

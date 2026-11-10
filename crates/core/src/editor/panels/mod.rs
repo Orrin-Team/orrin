@@ -809,6 +809,53 @@ mod tests {
         }
     }
 
+    /// The selected entity's material is shown on a sphere the renderer draws,
+    /// at the top of its section: the inspector asks for that material and
+    /// paints the image the renderer will have drawn it into by the time the
+    /// overlay samples it. Nothing selected asks for nothing, which is what
+    /// keeps the preview's passes out of every other frame.
+    #[test]
+    fn the_material_section_shows_its_material_on_the_renderers_sphere() {
+        use crate::gfx::vulkan::material_preview;
+        use crate::scene::{AssetPreviews, MaterialHandle, MeshHandle};
+
+        let mut editor = Harness::new(egui::vec2(1440.0, 900.0));
+        let entity = editor.spawn("Crate");
+        editor.world.insert(entity, MeshHandle(0));
+        editor.world.insert(entity, MaterialHandle(3));
+        let mut kept = AssetPreviews::default();
+        kept.insert_material(MaterialHandle(3), &crate::gfx::Material::default(), None);
+        editor.world.insert_resource(kept);
+        editor.world.insert_resource(crate::scene::Assets::new());
+
+        editor.frames(2);
+        assert_eq!(editor.state.material_preview, None);
+
+        editor.state.selection.set(entity);
+        editor.frames(2);
+        assert_eq!(editor.state.material_preview, Some(MaterialHandle(3)));
+
+        let inspector = editor.tab_body(Tab::Inspector);
+        let sphere = editor.painted_rects_of(|shape| match shape {
+            egui::Shape::Rect(rect) => rect
+                .brush
+                .as_ref()
+                .is_some_and(|brush| brush.fill_texture_id == material_preview::TEXTURE),
+            egui::Shape::Mesh(mesh) => mesh.texture_id == material_preview::TEXTURE,
+            _ => false,
+        });
+        assert_eq!(sphere.len(), 1, "{sphere:?}");
+        let sphere = sphere[0];
+        assert!(
+            inspector.contains_rect(sphere),
+            "{sphere:?} in {inspector:?}"
+        );
+        assert!(
+            (sphere.width() - sphere.height()).abs() < 0.5 && sphere.width() >= 96.0,
+            "{sphere:?}"
+        );
+    }
+
     /// A section bar runs edge to edge across the inspector, so the sections
     /// divide the panel rather than sitting as boxes inside it.
     #[test]
