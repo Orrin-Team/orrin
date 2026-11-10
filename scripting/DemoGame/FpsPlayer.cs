@@ -26,7 +26,7 @@ namespace DemoGame;
 // The body is never rotated: its Transform is the physics step's, and writing
 // a rotation every frame would teleport it each time. The view turns a camera
 // of its own instead, placed at the eye every frame — and the BallLauncher, when
-// there is one, rides on that camera, because an entity holds one behaviour.
+// there is one, rides on that camera, since it fires along the view.
 [Component("demo.fps_player")]
 public class FpsPlayer : Behaviour
 {

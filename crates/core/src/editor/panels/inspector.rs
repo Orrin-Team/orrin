@@ -22,7 +22,7 @@ use crate::editor::state::EditorState;
 use crate::editor::widgets;
 use crate::gfx::vulkan::material_preview;
 #[cfg(feature = "scripting")]
-use crate::scene::ScriptComponent;
+use crate::scene::Scripts;
 use crate::scene::prefab;
 use crate::scene::{
     AssetPreviews, Assets, Light, LocalTransform, LogBuffer, LogLevel, MaterialHandle, MeshHandle,
@@ -90,7 +90,7 @@ pub fn body(
             audio_section(ui, world, state, entity, &filter, &overridden);
             super::ui_sections::sections(ui, world, state, entity, &filter);
             #[cfg(feature = "scripting")]
-            script_section(ui, world, entity, &filter);
+            script_sections(ui, world, registry, state, entity, &filter, &overridden);
             registered_sections(ui, world, registry, state, entity, &filter, &overridden);
             if filter.is_empty() {
                 ui.add_space(8.0);
@@ -422,7 +422,8 @@ fn registered_sections(
     overridden: &[orrin_registry::ComponentId],
 ) {
     for vtable in registry.components() {
-        if HAND_DRAWN.contains(&vtable.id) {
+        // A Behaviour's fields are drawn in its own script section.
+        if HAND_DRAWN.contains(&vtable.id) || vtable.script.is_some() {
             continue;
         }
         let Some(before) = vtable.read(world, entity) else {
@@ -439,11 +440,7 @@ fn registered_sections(
         }
 
         let mut after = before.clone();
-        let tint = if vtable.script.is_some() {
-            crate::editor::theme::KIND_SCRIPT
-        } else {
-            ui.visuals().weak_text_color()
-        };
+        let tint = ui.visuals().weak_text_color();
         let (_, icon) = catalog::describe(vtable);
         let id = ui.id().with(("component", vtable.id.as_str()));
         let mut remove = false;
@@ -1265,59 +1262,163 @@ pub(super) fn texture_slot(ui: &mut egui::Ui, world: &World, texture: &mut Optio
         });
 }
 
+/// One section per Behaviour on the entity, in attach order: its lifecycle
+/// rows, and, when its type is a registered component, its fields and a way to
+/// remove it alone.
+///
+/// A Behaviour with no `[Component]` has no id for the edit pipeline to name,
+/// so it cannot be removed here: a removal that skipped the pipeline would be
+/// the one edit undo never saw.
 #[cfg(feature = "scripting")]
-fn script_section(ui: &mut egui::Ui, world: &World, entity: Entity, filter: &Filter) {
-    let Some(mut script) = world.get_mut::<ScriptComponent>(entity) else {
-        return;
-    };
-    let Some(rows) = filter.section("Script", &["Behaviour", "Enabled", "State"]) else {
-        return;
-    };
-    let id = ui.id().with("script");
-    widgets::section(
-        ui,
-        id,
-        icons::file_code(),
-        crate::editor::theme::KIND_SCRIPT,
-        "Script",
-        None,
-        |ui| {
-            if rows.shows("Behaviour") {
-                let type_name = script.type_name.clone();
-                widgets::property(ui, "Behaviour", |ui| ui.label(figures(type_name)));
+fn script_sections(
+    ui: &mut egui::Ui,
+    world: &World,
+    registry: &Registry,
+    state: &mut EditorState,
+    entity: Entity,
+    filter: &Filter,
+    overridden: &[orrin_registry::ComponentId],
+) {
+    struct Shown {
+        type_name: String,
+        enabled: bool,
+        faulted: bool,
+        active: bool,
+        started: bool,
+    }
+    // Copied out, because reading a Behaviour's fields through the registry
+    // borrows the same storage.
+    let shown: Vec<Shown> = world
+        .get::<Scripts>(entity)
+        .map(|scripts| {
+            scripts
+                .iter()
+                .map(|script| Shown {
+                    type_name: script.type_name.clone(),
+                    enabled: script.enabled,
+                    faulted: script.faulted,
+                    active: script.active,
+                    started: script.started,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for script in shown {
+        let vtable = registry.components().find(|vtable| {
+            vtable
+                .script
+                .as_ref()
+                .is_some_and(|binding| binding.type_name == script.type_name)
+        });
+        let title = vtable.map_or_else(
+            || {
+                let qualified = script.type_name.split(',').next().unwrap_or_default();
+                qualified
+                    .rsplit(['.', '+'])
+                    .next()
+                    .unwrap_or(qualified)
+                    .to_owned()
+            },
+            |vtable| vtable.name.to_string(),
+        );
+        let before = vtable.and_then(|vtable| vtable.read(world, entity));
+        let mut labels = vec!["Behaviour", "Enabled", "State"];
+        if let Some(
+            orrin_registry::Value::Struct(fields) | orrin_registry::Value::Enum { fields, .. },
+        ) = &before
+        {
+            labels.extend(fields.iter().map(|(name, _)| name.as_str()));
+        }
+        let Some(rows) = filter.section(&title, &labels) else {
+            continue;
+        };
+
+        let mut enabled = script.enabled;
+        let mut clear_fault = false;
+        let mut after = before.clone();
+        let mut remove = false;
+        let mut menu = |ui: &mut egui::Ui| {
+            if ui.button("Remove component").clicked() {
+                remove = true;
+                ui.close_menu();
             }
-            if rows.shows("Enabled") {
-                // Only the desired state is written here; the script tick sees
-                // the change next frame and dispatches OnEnable/OnDisable itself.
-                widgets::property(ui, "Enabled", |ui| ui.checkbox(&mut script.enabled, ""));
-            }
-            if rows.shows("State") {
-                widgets::property(ui, "State", |ui| {
-                    if script.faulted {
-                        // A hook threw and the engine disabled the script (see
-                        // the log for the exception). Clearing re-arms it from
-                        // next tick — the manual counterpart to "re-enable on
-                        // hot reload".
-                        icons::labelled(
-                            ui,
-                            icons::warning(),
-                            crate::editor::theme::ERROR,
-                            "faulted",
-                        );
-                        if ui.small_button("Clear fault").clicked() {
-                            script.faulted = false;
+        };
+        let id = ui.id().with(("script", script.type_name.as_str()));
+        let title_colour = vtable
+            .is_some_and(|vtable| overridden.contains(&vtable.id))
+            .then_some(crate::editor::theme::PREFAB);
+        let touched = widgets::section_titled(
+            ui,
+            id,
+            icons::file_code(),
+            crate::editor::theme::KIND_SCRIPT,
+            &title,
+            title_colour,
+            vtable.map(|_| &mut menu as &mut dyn FnMut(&mut egui::Ui)),
+            |ui| {
+                if rows.shows("Behaviour") {
+                    widgets::property(ui, "Behaviour", |ui| {
+                        ui.label(figures(script.type_name.clone()))
+                    });
+                }
+                if rows.shows("Enabled") {
+                    // Only the desired state is written here; the script tick
+                    // sees the change next frame and dispatches
+                    // OnEnable/OnDisable itself.
+                    widgets::property(ui, "Enabled", |ui| ui.checkbox(&mut enabled, ""));
+                }
+                if rows.shows("State") {
+                    widgets::property(ui, "State", |ui| {
+                        if script.faulted {
+                            // A hook threw and the engine disabled the script
+                            // (see the log for the exception). Clearing re-arms
+                            // it from next tick — the manual counterpart to
+                            // "re-enable on hot reload".
+                            icons::labelled(
+                                ui,
+                                icons::warning(),
+                                crate::editor::theme::ERROR,
+                                "faulted",
+                            );
+                            if ui.small_button("Clear fault").clicked() {
+                                clear_fault = true;
+                            }
+                        } else {
+                            ui.weak(match (script.active, script.started) {
+                                (true, _) => "active",
+                                (false, true) => "inactive",
+                                (false, false) => "not started",
+                            });
                         }
-                    } else {
-                        ui.weak(match (script.active, script.started) {
-                            (true, _) => "active",
-                            (false, true) => "inactive",
-                            (false, false) => "not started",
-                        });
-                    }
-                });
+                    });
+                }
+                match (vtable, after.as_mut()) {
+                    (Some(vtable), Some(after)) => (vtable.inspect)(ui, after),
+                    _ => false,
+                }
+            },
+        )
+        .unwrap_or(false);
+        drop(menu);
+
+        if (enabled != script.enabled || clear_fault)
+            && let Some(mut scripts) = world.get_mut::<Scripts>(entity)
+            && let Some(live) = scripts.get_mut(&script.type_name)
+        {
+            live.enabled = enabled;
+            if clear_fault {
+                live.faulted = false;
             }
-        },
-    );
+        }
+        if let Some(vtable) = vtable {
+            if remove {
+                state.request_remove_component(entity, vtable.id.clone());
+            } else if touched && let Some(after) = after {
+                state.edit(entity, vtable.id.clone(), after);
+            }
+        }
+    }
 }
 
 /// Range is where the light is cut off, not how far it carries — inverse-square

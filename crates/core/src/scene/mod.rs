@@ -40,14 +40,14 @@ mod ui;
 pub use assets::Assets;
 pub use bloom::BloomSettings;
 pub use camera::{ActiveCamera, Camera, active_camera, follow_active_camera};
-#[cfg(feature = "scripting")]
-pub use components::ScriptComponent;
 pub use components::{
     AmbientLight, AudioListener, AudioSource, CameraComponent, Collider, ColliderShape, Light,
     LocalTransform, Locked, MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialHandle, MeshHandle, Name,
     PHYSICS_LAYERS, Parent, PendingScripts, PhysicsSettings, RigidBody, Rolloff, Spin, Tag,
     UnknownComponents, WorldTransform,
 };
+#[cfg(feature = "scripting")]
+pub use components::{ScriptComponent, Scripts, canonical_type_name};
 pub use contact_shadows::ContactShadowSettings;
 pub use culling::Culling;
 pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};

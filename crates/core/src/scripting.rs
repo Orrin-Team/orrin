@@ -24,8 +24,8 @@ use crate::scene::prefab::{self, Prefabs};
 use crate::scene::{
     ActionId, Actions, ActiveCamera, Assets, CameraComponent, Collider, ColliderShape, DebugLines,
     InputState, LoadedScenes, LocalTransform, LogLevel, MaterialHandle, MeshHandle, Name, Parent,
-    PendingScripts, Rect, SceneHandle, ScriptComponent, Tag, TextAnchor, TextStyle, Time,
-    Transform, UiCanvas, WorldTransform, color_bytes,
+    PendingScripts, Rect, SceneHandle, ScriptComponent, Scripts, Tag, TextAnchor, TextStyle, Time,
+    Transform, UiCanvas, WorldTransform, canonical_type_name, color_bytes,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -2672,13 +2672,15 @@ extern "C" fn debug_draw_line(
 struct PropertyBags;
 
 impl PropertyBags {
-    /// The GCHandle for `entity`'s behaviour, if it is the type this vtable
-    /// entry belongs to. An entity carries at most one `ScriptComponent`, so
-    /// two script components on one entity is simply not a state that exists.
+    /// The GCHandle for `entity`'s behaviour of the type this vtable entry
+    /// belongs to. An entity carries at most one Behaviour of each type, so the
+    /// type name picks out exactly one of its [`Scripts`]; both sides hold it in
+    /// [`canonical_type_name`]'s form, which is what lets an exact comparison
+    /// find a Behaviour that `World.AddScript<T>` attached.
     fn handle(world: &World, entity: Entity, type_name: &str) -> Option<u64> {
         world
-            .get::<ScriptComponent>(entity)
-            .filter(|script| script.type_name == type_name)
+            .get::<Scripts>(entity)?
+            .get(type_name)
             .map(|script| script.handle)
     }
 }
@@ -2727,11 +2729,7 @@ impl ScriptBridge for PropertyBags {
     }
 
     fn remove(&self, world: &mut World, entity: Entity, type_name: &str) {
-        if Self::handle(world, entity, type_name).is_some() {
-            // Dropping the component is what tears the managed object down; see
-            // `ScriptComponent`'s `Drop`.
-            let _ = world.remove::<ScriptComponent>(entity);
-        }
+        Scripts::remove(world, entity, type_name);
     }
 
     /// An empty struct rather than a panic when the managed side cannot answer:
@@ -2940,10 +2938,12 @@ pub struct Scripting {
     /// future re-entry into a `RefCell` panic instead of a compile error, and
     /// the whole point of the window is that C# may call back in.
     pending: RefCell<Vec<Pending>>,
-    /// `entity -> index into pending`, so routing a collision event costs a
-    /// hash lookup instead of a scan over every scripted entity. Built only on
-    /// ticks that actually have events.
-    routing: RefCell<FxHashMap<Entity, usize>>,
+    /// `entity -> start..end in pending`, so routing a collision event costs a
+    /// hash lookup instead of a scan over every scripted entity. An entity's
+    /// Behaviours are contiguous in `pending`, in attach order, because they are
+    /// collected from one [`Scripts`]. Built only on ticks that actually have
+    /// events.
+    routing: RefCell<FxHashMap<Entity, (u32, u32)>>,
     /// This tick's pointer events, swapped out of the world for the dispatch
     /// and back, cleared, so neither side reallocates.
     pointer_events: RefCell<crate::ui::events::UiEvents>,
@@ -3107,7 +3107,9 @@ impl Scripting {
     ///   `RefCell` borrow of the storage the teardown loop needs mutably — a
     ///   runtime panic, not a compile error.
     /// - **Capture precedes destroy, and commit follows both.** Dropping the
-    ///   component frees its `GCHandle`, leaving nothing to snapshot; and
+    ///   component frees its `GCHandle`, leaving nothing to snapshot — and an
+    ///   entity's [`Scripts`] go all at once, so every instance is captured
+    ///   before any entity's are destroyed; and
     ///   `commit_game` retires the old load context only once *every* handle
     ///   into it is gone. Faulted scripts are included for that second reason:
     ///   skipping them strands a handle and leaks a context per reload after.
@@ -3128,27 +3130,30 @@ impl Scripting {
             snapshot: u64,
         }
 
+        // In attach order within each entity, which re-creating them in this
+        // order below preserves.
         let mut pending: Vec<Reloading> = Vec::new();
-        world
-            .query::<&ScriptComponent>()
-            .for_each(|entity, script| {
-                pending.push(Reloading {
-                    entity,
-                    handle: script.handle,
-                    type_name: script.type_name.clone(),
-                    enabled: script.enabled,
-                    started: script.started,
-                    snapshot: 0,
-                })
-            });
+        world.query::<&Scripts>().for_each(|entity, scripts| {
+            pending.extend(scripts.iter().map(|script| Reloading {
+                entity,
+                handle: script.handle,
+                type_name: script.type_name.clone(),
+                enabled: script.enabled,
+                started: script.started,
+                snapshot: 0,
+            }))
+        });
 
         for script in pending.iter_mut() {
             script.snapshot = self.host.capture_state(script.handle);
+        }
+        for script in &pending {
             // Dropped here and not bound to anything: the `Drop` impl is what
             // fires OnDisable/OnDestroy (against the old code, correctly) and
             // frees the handle. A binding that outlived the commit below would
-            // pin the retired assembly.
-            let _ = world.remove::<ScriptComponent>(script.entity);
+            // pin the retired assembly. An entity's later entries find nothing
+            // left to remove.
+            let _ = world.remove::<Scripts>(script.entity);
         }
 
         let status = self.host.commit_game();
@@ -3199,8 +3204,8 @@ impl Scripting {
     /// Run outside any dispatch window, since it creates managed objects, and
     /// before the tick, so they get their OnEnable and OnStart on it. One that
     /// cannot be created is kept as data, never dropped: a type renamed since
-    /// the save, a game assembly that is not loaded, or a second Behaviour on an
-    /// entity that can carry only one.
+    /// the save, a game assembly that is not loaded, or a second Behaviour of a
+    /// type the entity already carries.
     pub fn attach_pending(&self, world: &mut World, registry: &Registry) {
         let mut waiting = Vec::new();
         world
@@ -3218,15 +3223,6 @@ impl Scripting {
                     crate::scene::persist::keep_unapplied(world, entity, (id, value));
                     continue;
                 };
-                if world.has::<ScriptComponent>(entity) {
-                    tracing::warn!(
-                        "entity {} already has a Behaviour, and carries one at most; `{id}` was \
-                         kept but not attached",
-                        entity.index()
-                    );
-                    crate::scene::persist::keep_unapplied(world, entity, (id, value));
-                    continue;
-                }
                 if self.attach_with(world, entity, &binding.type_name, false, true) == 0 {
                     crate::scene::persist::keep_unapplied(world, entity, (id, value));
                     continue;
@@ -3238,14 +3234,19 @@ impl Scripting {
         }
     }
 
-    /// Attach a C# `Behaviour` (by assembly-qualified type name) to `entity`.
-    /// A no-op when the type isn't in the loaded game assembly.
+    /// Attach a C# `Behaviour` (by assembly-qualified type name) to `entity`,
+    /// after any it already carries. A no-op when the type isn't in the loaded
+    /// game assembly, or when the entity already carries one of that type.
     pub fn attach(&self, world: &mut World, entity: Entity, type_name: &str) {
         self.attach_with(world, entity, type_name, false, true);
     }
 
     /// `attach`, with the lifecycle position a hot reload has to carry over.
-    /// Returns the new managed handle, or `0` if the type could not be created.
+    /// Returns the new managed handle, or `0` if the type could not be created
+    /// or the entity already carries one.
+    ///
+    /// The duplicate is refused before anything managed runs, so a refused
+    /// attach constructs nothing and destroys nothing.
     pub fn attach_with(
         &self,
         world: &mut World,
@@ -3254,7 +3255,19 @@ impl Scripting {
         started: bool,
         enabled: bool,
     ) -> u64 {
-        let Ok(name) = CString::new(type_name) else {
+        let type_name = canonical_type_name(type_name);
+        if world
+            .get::<Scripts>(entity)
+            .is_some_and(|scripts| scripts.get(&type_name).is_some())
+        {
+            tracing::warn!(
+                "entity {} already has a `{type_name}`, and carries one Behaviour of each type \
+                 at most; the second was not attached",
+                entity.index()
+            );
+            return 0;
+        }
+        let Ok(name) = CString::new(type_name.as_str()) else {
             return 0;
         };
         let handle = self.host.create(
@@ -3274,19 +3287,24 @@ impl Scripting {
             );
         }
         if handle != 0 {
-            world.insert(
-                entity,
-                ScriptComponent {
-                    handle,
-                    type_name: type_name.to_owned(),
-                    started,
-                    // Desired-on from birth; `active` stays false until the
-                    // first tick actually dispatches OnEnable.
-                    enabled,
-                    active: false,
-                    faulted: false,
-                },
-            );
+            let script = ScriptComponent {
+                handle,
+                type_name,
+                started,
+                // Desired-on from birth; `active` stays false until the
+                // first tick actually dispatches OnEnable.
+                enabled,
+                active: false,
+                faulted: false,
+            };
+            if !world.has::<Scripts>(entity) {
+                world.insert(entity, Scripts::default());
+            }
+            // A stale entity has no `Scripts`, and `script` is dropped, which
+            // destroys it. `push` refuses only a duplicate, ruled out above.
+            if let Some(mut scripts) = world.get_mut::<Scripts>(entity) {
+                let _ = scripts.push(script);
+            }
         }
         handle
     }
@@ -3409,16 +3427,25 @@ impl Scripting {
                 );
                 continue;
             }
-            registry.register_script(component_id, name, type_name, Arc::clone(&bridge));
+            registry.register_script(
+                component_id,
+                name,
+                canonical_type_name(&type_name),
+                Arc::clone(&bridge),
+            );
             registered += 1;
         }
         registered
     }
 
-    /// Request an activation change; the transition (OnEnable/OnDisable) is
-    /// dispatched by the next `tick`, not here.
-    pub fn set_enabled(&self, world: &mut World, entity: Entity, enabled: bool) {
-        if let Some(mut script) = world.get_mut::<ScriptComponent>(entity) {
+    /// Request an activation change for `entity`'s Behaviour of `type_name`;
+    /// the transition (OnEnable/OnDisable) is dispatched by the next `tick`,
+    /// not here. The others on the entity are untouched.
+    pub fn set_enabled(&self, world: &mut World, entity: Entity, type_name: &str, enabled: bool) {
+        let type_name = canonical_type_name(type_name);
+        if let Some(mut scripts) = world.get_mut::<Scripts>(entity)
+            && let Some(script) = scripts.get_mut(&type_name)
+        {
             script.enabled = enabled;
         }
     }
@@ -3428,30 +3455,31 @@ impl Scripting {
     ///
     /// Dispatch order inside the window mirrors Unity: activation transitions
     /// (OnEnable/OnStart/OnDisable), then this frame's collision callbacks,
-    /// then its pointer events, then OnUpdate.
+    /// then its pointer events, then OnUpdate. Within each phase an entity's
+    /// Behaviours run in attach order.
     pub fn tick(&self, world: &mut World, registry: &Registry, delta_time: f32) {
         // First, and whether or not anything else runs: a callback is game
         // code with no behaviour behind it, and a story may have nothing else.
         let finished = self.finish_tweens(world);
         let mut pending = self.pending.take();
         pending.clear();
-        world
-            .query::<&ScriptComponent>()
-            .for_each(|entity, script| {
-                // Already-faulted scripts are inert: never collected, never
-                // dispatched to, until something clears the flag.
-                if script.faulted {
-                    return;
-                }
-                pending.push(Pending {
-                    entity,
-                    handle: script.handle,
-                    started: script.started,
-                    enabled: script.enabled,
-                    active: script.active,
-                    faulted: false,
-                })
-            });
+        world.query::<&Scripts>().for_each(|entity, scripts| {
+            // Already-faulted scripts are inert: never collected, never
+            // dispatched to, until something clears the flag.
+            pending.extend(
+                scripts
+                    .iter()
+                    .filter(|script| !script.faulted)
+                    .map(|script| Pending {
+                        entity,
+                        handle: script.handle,
+                        started: script.started,
+                        enabled: script.enabled,
+                        active: script.active,
+                        faulted: false,
+                    }),
+            )
+        });
         if pending.is_empty() {
             self.pending.replace(pending);
             if finished {
@@ -3479,12 +3507,12 @@ impl Scripting {
         let mut routing = self.routing.take();
         routing.clear();
         if !events.is_empty() || !pointer_events.is_empty() {
-            routing.extend(
-                pending
-                    .iter()
-                    .enumerate()
-                    .map(|(i, script)| (script.entity, i)),
-            );
+            let mut start = 0;
+            for run in pending.chunk_by(|a, b| a.entity == b.entity) {
+                let end = start + run.len();
+                routing.insert(run[0].entity, (start as u32, end as u32));
+                start = end;
+            }
         }
 
         orrin_script::with_active_world(world, || {
@@ -3512,22 +3540,14 @@ impl Scripting {
                 }
             }
 
-            // Route each event to both participants' scripts (if any). The
-            // stored normal points a → b, so b's callback sees it negated —
+            // Route each event to every script on both participants. The
+            // stored normal points a → b, so b's callbacks see it negated —
             // "from me toward the other", both sides.
             for event in &events {
                 for (target, other, flip) in [(event.a, event.b, false), (event.b, event.a, true)] {
-                    // An entity holds at most one `ScriptComponent`, so the
-                    // index names the same entry the linear scan used to find.
-                    // The activation flags are still re-read per event, since a
-                    // fault raised by an earlier one must stop delivery here.
-                    let Some(&index) = routing.get(&target) else {
+                    let Some(&(start, end)) = routing.get(&target) else {
                         continue;
                     };
-                    let script = &mut pending[index];
-                    if !script.active || script.faulted {
-                        continue;
-                    }
                     let normal = if flip { -event.normal } else { event.normal };
                     let collision = CCollision {
                         other: CEntity {
@@ -3537,37 +3557,41 @@ impl Scripting {
                         point: event.point.to_array(),
                         normal: normal.to_array(),
                     };
-                    let faulted = match (event.kind, event.trigger) {
-                        (CollisionEventKind::Enter, false) => {
-                            self.host.collision_enter(script.handle, &collision)
+                    // The activation flags are re-read per event, since a fault
+                    // raised by an earlier one must stop delivery here.
+                    for script in &mut pending[start as usize..end as usize] {
+                        if !script.active || script.faulted {
+                            continue;
                         }
-                        (CollisionEventKind::Exit, false) => {
-                            self.host.collision_exit(script.handle, &collision)
+                        let faulted = match (event.kind, event.trigger) {
+                            (CollisionEventKind::Enter, false) => {
+                                self.host.collision_enter(script.handle, &collision)
+                            }
+                            (CollisionEventKind::Exit, false) => {
+                                self.host.collision_exit(script.handle, &collision)
+                            }
+                            (CollisionEventKind::Enter, true) => {
+                                self.host.trigger_enter(script.handle, &collision)
+                            }
+                            (CollisionEventKind::Exit, true) => {
+                                self.host.trigger_exit(script.handle, &collision)
+                            }
+                        };
+                        if faulted {
+                            script.faulted = true;
                         }
-                        (CollisionEventKind::Enter, true) => {
-                            self.host.trigger_enter(script.handle, &collision)
-                        }
-                        (CollisionEventKind::Exit, true) => {
-                            self.host.trigger_exit(script.handle, &collision)
-                        }
-                    };
-                    if faulted {
-                        script.faulted = true;
                     }
                 }
             }
 
-            // Offered up each event's chain to the first behaviour that
-            // handles it. One that is inactive, faulted or has no handler
-            // passes it on, as a disabled component does in uGUI.
+            // Offered up each event's chain, and within an entity in attach
+            // order, to the first behaviour that handles it. One that is
+            // inactive, faulted or has no handler passes it on, as a disabled
+            // component does in uGUI.
             crate::ui::events::deliver(&pointer_events, |entity, event| {
-                let Some(&index) = routing.get(&entity) else {
+                let Some(&(start, end)) = routing.get(&entity) else {
                     return false;
                 };
-                let script = &mut pending[index];
-                if !script.active || script.faulted {
-                    return false;
-                }
                 let payload = orrin_script::CPointerEvent {
                     position: event.position,
                     press_position: event.press_position,
@@ -3577,17 +3601,23 @@ impl Scripting {
                     },
                     button: 0,
                 };
-                match self
-                    .host
-                    .pointer(script.handle, event.kind as u32, &payload)
-                {
-                    orrin_script::Delivery::Handled => true,
-                    orrin_script::Delivery::Unhandled => false,
-                    orrin_script::Delivery::Faulted => {
-                        script.faulted = true;
-                        true
+                for script in &mut pending[start as usize..end as usize] {
+                    if !script.active || script.faulted {
+                        continue;
+                    }
+                    match self
+                        .host
+                        .pointer(script.handle, event.kind as u32, &payload)
+                    {
+                        orrin_script::Delivery::Handled => return true,
+                        orrin_script::Delivery::Unhandled => {}
+                        orrin_script::Delivery::Faulted => {
+                            script.faulted = true;
+                            return true;
+                        }
                     }
                 }
+                false
             });
 
             for script in &mut pending {
@@ -3602,13 +3632,21 @@ impl Scripting {
         // has run — so this frame's extraction already sees new renderables.
         self.apply_commands(world, registry);
 
-        for script in &pending {
-            if let Some(mut component) = world.get_mut::<ScriptComponent>(script.entity) {
-                component.active = script.active;
-                component.started = script.started;
-                // Persist a fault raised this tick so every future tick skips
-                // it; a script that threw during OnUpdate does not run again.
-                component.faulted = script.faulted;
+        // Matched by handle rather than by position: the commands above may
+        // have attached more to an entity, or despawned it.
+        for run in pending.chunk_by(|a, b| a.entity == b.entity) {
+            let Some(mut scripts) = world.get_mut::<Scripts>(run[0].entity) else {
+                continue;
+            };
+            for script in run {
+                if let Some(component) = scripts.iter_mut().find(|c| c.handle == script.handle) {
+                    component.active = script.active;
+                    component.started = script.started;
+                    // Persist a fault raised this tick so every future tick
+                    // skips it; a script that threw during OnUpdate does not
+                    // run again.
+                    component.faulted = script.faulted;
+                }
             }
         }
 

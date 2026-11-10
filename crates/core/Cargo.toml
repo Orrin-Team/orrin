@@ -125,6 +125,11 @@ harness = false
 name = "audio"
 harness = false
 
+[[bench]]
+name = "scripts"
+harness = false
+required-features = ["scripting"]
+
 [build-dependencies]
 # Compile every shader once to SPIR-V and translate it to MSL (see build.rs).
 # shaderc is the compiler vulkano-shaders already builds; spirv-cross2 is the

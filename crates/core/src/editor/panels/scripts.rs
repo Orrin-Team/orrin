@@ -13,16 +13,14 @@ use crate::build_watcher::{BuildState, BuildStatus};
 use crate::editor::icons;
 use crate::editor::state::EditorState;
 use crate::editor::theme::{ERROR, OK, PENDING};
-use crate::scene::ScriptComponent;
+use crate::scene::Scripts;
 
 pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
     let mut live = 0usize;
     let mut faulted = 0usize;
-    world.query::<&ScriptComponent>().for_each(|_, script| {
-        live += 1;
-        if script.faulted {
-            faulted += 1;
-        }
+    world.query::<&Scripts>().for_each(|_, scripts| {
+        live += scripts.len();
+        faulted += scripts.iter().filter(|script| script.faulted).count();
     });
 
     if ui.button("Reload scripts").clicked() {

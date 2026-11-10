@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use glam::{Quat, Vec3};
 use orrin_core::physics::{self, CollisionState, PhysicsState};
 use orrin_core::scene::{
-    Collider, ColliderShape, InputState, LocalTransform, LogBuffer, Name, Tag, Transform,
-    propagate_transforms, register_components,
+    CameraComponent, Collider, ColliderShape, InputState, LocalTransform, LogBuffer, Name, Tag,
+    Transform, propagate_transforms, register_components,
 };
 use orrin_core::scripting::Scripting;
 use orrin_ecs::{Entity, World};
@@ -97,9 +97,9 @@ impl<'a> Game<'a> {
             .spawn_entity()
             .with(LocalTransform::from(Transform::from_translation(at)))
             .id();
-        // It attaches its own launcher, to its camera: an entity holds one
-        // behaviour. Its first tick builds its body and its camera, a second
-        // lets the physics run create the body and the launcher start.
+        // It attaches its own launcher, to its camera. Its first tick builds
+        // its body and its camera, a second lets the physics run create the
+        // body and the launcher start.
         self.scripting.attach(&mut self.world, player, PLAYER);
         self.frames(3);
         player
@@ -204,6 +204,7 @@ fn the_demo_controller_moves_like_it_is_tuned_to() {
     stands_still_on_a_ramp(&scripting, &registry);
     a_ball_fired_at_a_target_scores(&scripting, &registry);
     a_ball_carries_the_velocity_of_its_player(&scripting, &registry);
+    a_launcher_added_by_a_script_reads_through_the_registry(&scripting, &registry);
     the_course_builds_and_nothing_falls_through_it(&scripting, &registry);
 }
 
@@ -244,6 +245,24 @@ fn a_ball_carries_the_velocity_of_its_player(scripting: &Scripting, registry: &R
         "fired running at {running} m/s, a ball gained only {} over one fired standing",
         moving - standing
     );
+}
+
+/// The player adds its launcher with `World.AddScript<T>`, which names the type
+/// by its full assembly-qualified name, so the launcher is only visible to the
+/// inspector and to a save if that name finds its registry entry.
+fn a_launcher_added_by_a_script_reads_through_the_registry(
+    scripting: &Scripting,
+    registry: &Registry,
+) {
+    let mut game = Game::new(scripting, registry);
+    game.player(Vec3::new(0.0, 1.0, 0.0));
+    let camera = game
+        .world
+        .entities()
+        .find(|&e| game.world.has::<CameraComponent>(e))
+        .expect("the player built no camera");
+    let speed = game.field(camera, "demo.ball_launcher", "Speed");
+    assert_eq!(speed, 40.0, "the launcher's Speed read as {speed}");
 }
 
 fn walks_to_its_top_speed_and_stops_when_let_go(scripting: &Scripting, registry: &Registry) {
