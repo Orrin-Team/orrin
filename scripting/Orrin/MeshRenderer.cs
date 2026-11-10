@@ -8,8 +8,12 @@ namespace Orrin;
 /// <see cref="World.SetComponent{T}"/> and <see cref="World.AddComponent{T}"/>.
 /// Both are asset references, so a field holding one survives the file being
 /// moved; assign them from such a field, from <see cref="Assets.Find{T}"/>, or
-/// by dropping an asset on the inspector's slot. Setting either to the null
-/// reference is refused, and the engine logs why.
+/// by dropping an asset on the inspector's slot.
+/// A mesh or material loaded with no asset behind it — a model's own, or one
+/// made at run time — reads as the null reference, and setting that null back
+/// keeps it, so such a renderer can still be read, changed and written. Any
+/// other null is refused, as is adding a renderer with one, and the engine
+/// logs why.
 /// </summary>
 // Layout must match Rust CMeshRenderer: two asset ids' 16 bytes.
 [StructLayout(LayoutKind.Sequential)]

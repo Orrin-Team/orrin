@@ -1802,17 +1802,58 @@ fn mesh_renderer_to_c(world: &World, entity: Entity) -> Option<orrin_script::CMe
     })
 }
 
-/// The null reference is refused here, where the struct is read, so a script
-/// that assigns nothing hears so by name before anything is queued.
+/// An add's null reference is refused here, where the struct is read, so a
+/// script that assigns nothing hears so by name before anything is queued. A
+/// set's is decided against the entity, in [`mesh_renderer_kept`].
 fn mesh_renderer_from_c(call: &str, c: orrin_script::CMeshRenderer) -> Option<UiComponent> {
     let (mesh, material) = (AssetId::from_bytes(c.mesh), AssetId::from_bytes(c.material));
-    for (field, id) in [("Mesh", mesh), ("Material", material)] {
-        if id.is_nil() {
-            tracing::warn!("World.{call}: MeshRenderer.{field} is the null reference");
-            return None;
-        }
+    if call == "AddComponent" && null_field(call, mesh, material) {
+        return None;
     }
     Some(UiComponent::MeshRenderer { mesh, material })
+}
+
+fn null_field(call: &str, mesh: AssetId, material: AssetId) -> bool {
+    let null = [("Mesh", mesh), ("Material", material)]
+        .into_iter()
+        .find(|(_, id)| id.is_nil());
+    if let Some((field, _)) = null {
+        tracing::warn!("World.{call}: MeshRenderer.{field} is the null reference");
+    }
+    null.is_some()
+}
+
+/// A set's assets against what the entity draws now. A null field keeps the
+/// handle it has when that handle has no asset either — a glTF's material, or
+/// one made at run time, which is exactly what reading the renderer gave the
+/// script — and is refused where it would replace one that has.
+fn mesh_renderer_kept(
+    world: &World,
+    entity: Entity,
+    mesh: AssetId,
+    material: AssetId,
+) -> Option<(MeshHandle, MaterialHandle)> {
+    use orrin_registry::Resolve;
+    fn field<H: Resolve + Copy>(world: &World, name: &str, current: H, id: AssetId) -> Option<H> {
+        if id.is_nil() {
+            if current.to_value(world).is_none() {
+                return Some(current);
+            }
+            tracing::warn!("World.SetComponent: MeshRenderer.{name} is the null reference");
+            return None;
+        }
+        H::from_value(world, &Value::Asset(id))
+            .map_err(|error| tracing::warn!("World.SetComponent: MeshRenderer.{name}: {error}"))
+            .ok()
+    }
+    let mesh = field(world, "Mesh", *world.get::<MeshHandle>(entity)?, mesh)?;
+    let material = field(
+        world,
+        "Material",
+        *world.get::<MaterialHandle>(entity)?,
+        material,
+    )?;
+    Some((mesh, material))
 }
 
 /// A renderer's assets as the slots that draw them, resolved the way a scene
@@ -2098,13 +2139,12 @@ extern "C" fn set_component(entity: CEntity, kind: u32, value: *const u8, size: 
         let Some(component) = decode("SetComponent", kind, value, size, current_text) else {
             return false;
         };
-        if let UiComponent::MeshRenderer { mesh, material } = component
-            && world.has::<MeshHandle>(entity)
-            && world.has::<MaterialHandle>(entity)
-        {
-            let Some((mesh, material)) =
-                mesh_renderer_handles(world, "World.SetComponent", mesh, material)
-            else {
+        if let UiComponent::MeshRenderer { mesh, material } = component {
+            if !(world.has::<MeshHandle>(entity) && world.has::<MaterialHandle>(entity)) {
+                return !null_field("SetComponent", mesh, material)
+                    && with_queued(entity, kind, |queued| *queued = component).is_some();
+            }
+            let Some((mesh, material)) = mesh_renderer_kept(world, entity, mesh, material) else {
                 return false;
             };
             *world.get_mut::<MeshHandle>(entity).unwrap() = mesh;
@@ -5384,6 +5424,59 @@ mod tests {
             *world.get::<MaterialHandle>(fresh).unwrap(),
             MaterialHandle(7)
         );
+    }
+
+    /// A material loaded with no asset behind it — a glTF's, or one made at
+    /// run time — reads as the null reference, and writing that back keeps it:
+    /// otherwise a script could not change such a renderer's mesh at all. The
+    /// null is still refused where it would replace an asset, or be added.
+    #[test]
+    fn a_mesh_renderer_round_trips_a_material_no_asset_names() {
+        let mut world = World::new();
+        let mut assets = crate::scene::Assets::new();
+        assets.insert_mesh("cube", MeshHandle(3));
+        assets.insert_mesh("sphere", MeshHandle(4));
+        world.insert_resource(assets);
+        let entity = world.spawn();
+        world.insert(entity, MeshHandle(3));
+        world.insert(entity, MaterialHandle(9));
+        let fresh = world.spawn();
+        let size = size_of::<orrin_script::CMeshRenderer>();
+        taken_commands();
+
+        let (read, written, added) = orrin_script::with_active_world(&mut world, || {
+            let mut c = orrin_script::CMeshRenderer::default();
+            let read = get_component(
+                c_entity(entity),
+                KIND_MESH_RENDERER,
+                (&raw mut c).cast(),
+                size,
+            ) && c.material == [0; 16];
+            c.mesh = AssetId::named("mesh", "sphere").to_bytes();
+            let written = set_component(
+                c_entity(entity),
+                KIND_MESH_RENDERER,
+                (&raw const c).cast(),
+                size,
+            );
+            let added = add_component(
+                c_entity(fresh),
+                KIND_MESH_RENDERER,
+                (&raw const c).cast(),
+                size,
+            );
+            (read, written, added)
+        });
+
+        assert!(read, "an unnamed material reads as the null reference");
+        assert!(written, "and writing it back is not assigning nothing");
+        assert_eq!(*world.get::<MeshHandle>(entity).unwrap(), MeshHandle(4));
+        assert_eq!(
+            *world.get::<MaterialHandle>(entity).unwrap(),
+            MaterialHandle(9)
+        );
+        assert!(!added, "a new renderer has no material to keep");
+        assert!(taken_commands().is_empty());
     }
 
     #[test]
