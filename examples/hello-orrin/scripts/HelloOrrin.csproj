@@ -29,6 +29,11 @@
          with the engine instead; the ProjectReference here is only because the
          example lives in the engine's own tree. -->
     <ProjectReference Include="../../../scripting/Orrin/Orrin.csproj" Private="false" />
+    <!-- ORRIN001, a Behaviour field the registry cannot save. Loaded by the
+         compiler, never referenced by the game assembly; outside this
+         repository it is found beside the shipped Orrin.dll instead. -->
+    <ProjectReference Include="../../../scripting/Orrin.Analyzers/Orrin.Analyzers.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

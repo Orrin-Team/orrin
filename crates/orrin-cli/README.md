@@ -42,6 +42,7 @@ Scaffolds a project directory, matching the canonical layout in
   README.md
   assets/               .gitkeep
   scenes/               .gitkeep
+  .vscode/launch.json   attach a C# debugger to the running engine
   scripts/
     <Name>.csproj       AssemblyName matches the entry type's assembly half
     Main.cs             the entry Behaviour — a spinning cube
@@ -65,12 +66,21 @@ reference gets committed:
 
 Both use `Private="false"`, so no second `Orrin.dll` lands in the game's output.
 
+The Behaviour-field analyzer (ORRIN001) is referenced the same two ways: as an
+analyzer `ProjectReference` to `scripting/Orrin.Analyzers` in a checkout, and
+as `$(OrrinBindings)/Orrin.Analyzers.dll` elsewhere, conditional on the file
+existing so bindings without it still build. Neither is ever copied into the
+game's output.
+
 ### `orrin build [--release] [--project DIR]`
 
 1. Locates the project by walking up from the current directory for
    `orrin.toml`.
 2. Builds the engine bindings if this is a checkout that has never built them —
-   a game assembly cannot compile without `Orrin.dll`.
+   a game assembly cannot compile without `Orrin.dll`. When the bindings are a
+   checkout's build output, the analyzer built in the same configuration is
+   copied beside them; it is not part of the bindings' publish, so an export
+   never carries it.
 3. Runs `dotnet build` on `scripts.dir`, passing the resolved bindings path.
 4. Writes `.orrin/assets.toml`: every file under `assets.dir` with its size,
    mtime, and whether a `.meta` sidecar sits beside it.

@@ -22,6 +22,9 @@ pub fn build(args: &ProjectArgs) -> Result<Built, String> {
     );
 
     let bindings = ensure_bindings(project.root(), args.configuration())?;
+    if let Some(bindings) = &bindings {
+        engine::place_analyzer(bindings)?;
+    }
     build_scripts(&project, args.configuration(), bindings.as_deref())?;
     index_assets(&project)?;
 

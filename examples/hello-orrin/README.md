@@ -12,6 +12,7 @@ hello-orrin/
     HelloOrrin.csproj   builds HelloOrrin.dll, this project's game assembly
     Main.cs              the entry Behaviour named by `scripts.entry`
   scenes/                .fscene files
+  .vscode/launch.json   attaches VS Code's C# debugger to the engine
   .orrin/               engine-generated, gitignored: cache + asset index
 ```
 
@@ -70,6 +71,30 @@ picks up where it left off rather than snapping back to zero.
 A build that fails, or leaves a DLL the runtime rejects, is refused: the reload
 is staged before anything is torn down, so the session keeps running the code it
 already had and says so in the console.
+
+## Debugging
+
+`HelloOrrin.dll` runs inside the engine's process, so a debugger attaches to the
+running engine rather than launching the game. Start it with `orrin run` (or by
+hand, as above) on a Debug build of the scripts — a Release build optimises
+locals away — then:
+
+- **VS Code**, with the C# extension, opened on this directory: Run and Debug,
+  **Attach to Orrin**. It finds the engine by its process name, `orrin-core`;
+  **Pick a process to attach to** asks instead.
+- **Rider**: Run ▸ Attach to Process…, and pick `orrin-core`.
+
+The engine loads `HelloOrrin.pdb` together with the DLL, which is what lets a
+breakpoint in `scripts/` bind to the code that is running.
+
+## Warnings about Behaviour fields
+
+The build reports ORRIN001 for a Behaviour field the component registry cannot
+save and that is not marked `[Transient]`: such a field silently fails to
+survive a save, and may not survive a hot reload. The analyzer behind it is a
+project reference here; a project outside this repository finds
+`Orrin.Analyzers.dll` beside the engine's `Orrin.dll`, where `orrin build` puts
+it, and builds without the warning if it is missing.
 
 ## Why `ORRIN_SCRIPT_DIR` is still needed
 
