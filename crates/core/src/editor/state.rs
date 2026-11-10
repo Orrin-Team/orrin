@@ -267,6 +267,8 @@ pub struct EditorState {
     /// The console's level toggles. Here for the reason the search box is.
     pub console_levels: LevelFilter,
     pub console_query: String,
+    /// Where the console's script attributions lead.
+    pub script_files: super::source::ScriptFiles,
     /// The inspector's property filter. Kept across selections, the way a
     /// search in a property panel usually is: looking for one field on several
     /// entities is the case it exists for.
@@ -411,6 +413,9 @@ pub struct EditorState {
     /// app drains it there.
     #[cfg(feature = "scripting")]
     script_reload_request: bool,
+    /// A script and line to show in the user's editor. Drained after the UI
+    /// pass like `theme_request`, so a panel only ever asks.
+    open_source_request: Option<(PathBuf, u32)>,
     /// Serviced by `apply`: Stop despawns the fork, for the reason a load is
     /// deferred.
     transport_request: Option<Transport>,
@@ -455,6 +460,7 @@ impl Default for EditorState {
             hierarchy_query: String::new(),
             console_levels: LevelFilter::default(),
             console_query: String::new(),
+            script_files: Default::default(),
             inspector_query: String::new(),
             assets_query: String::new(),
             scenes_query: String::new(),
@@ -511,6 +517,7 @@ impl Default for EditorState {
             scene_request: None,
             #[cfg(feature = "scripting")]
             script_reload_request: false,
+            open_source_request: None,
             transport_request: None,
             fork: None,
             autosave: Autosave::new(PathBuf::from(".orrin/autosave"), Instant::now()),
@@ -811,6 +818,14 @@ impl EditorState {
     #[cfg(feature = "scripting")]
     pub fn take_script_reload_request(&mut self) -> bool {
         std::mem::take(&mut self.script_reload_request)
+    }
+
+    pub fn request_open_source(&mut self, file: PathBuf, line: u32) {
+        self.open_source_request = Some((file, line));
+    }
+
+    pub fn take_open_source_request(&mut self) -> Option<(PathBuf, u32)> {
+        self.open_source_request.take()
     }
 
     pub fn apply(&mut self, world: &mut World, registry: &Registry) {

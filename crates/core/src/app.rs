@@ -131,6 +131,8 @@ pub struct App {
 struct Scripts {
     scripting: crate::scripting::Scripting,
     watcher: Option<crate::build_watcher::BuildWatcher>,
+    /// The scripts' source, which the console's script attributions open.
+    dir: std::path::PathBuf,
 }
 
 impl App {
@@ -595,7 +597,11 @@ impl App {
             }
         };
 
-        Some(Scripts { scripting, watcher })
+        Some(Scripts {
+            scripting,
+            watcher,
+            dir: scripts_dir,
+        })
     }
 }
 
@@ -645,17 +651,21 @@ impl ApplicationHandler for App {
         // developer can always point a run at something else without editing
         // the manifest.
         #[cfg(feature = "scripting")]
-        if let Some(scripts) = self.boot_scripting() {
+        let scripts_dir = self.boot_scripting().map(|scripts| {
             self.stories.refresh(&self.world, &scripts.scripting);
             self.scripting = Some(scripts.scripting);
             self.build_watcher = scripts.watcher;
-        }
+            scripts.dir
+        });
+        #[cfg(not(feature = "scripting"))]
+        let scripts_dir = None;
 
         let editor = Editor::new(
             event_loop,
             window.clone(),
             renderer.max_texture_side(),
             self.project.as_ref(),
+            scripts_dir,
         );
 
         if self.shipped {

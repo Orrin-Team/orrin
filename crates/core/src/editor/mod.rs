@@ -18,6 +18,7 @@ mod preview;
 mod previews;
 mod rect_tool;
 mod selection;
+pub(crate) mod source;
 mod state;
 mod theme;
 mod widgets;
@@ -93,6 +94,7 @@ impl Editor {
         window: Arc<Window>,
         max_texture_side: usize,
         project: Option<&orrin_project::Project>,
+        scripts_dir: Option<std::path::PathBuf>,
     ) -> Self {
         let ctx = egui::Context::default();
         let input = egui_winit::State::new(
@@ -115,6 +117,7 @@ impl Editor {
             themes.select(name);
         }
         let mut state = EditorState::new(project);
+        state.script_files = source::ScriptFiles::new(scripts_dir);
         if let Some(steps) = prefs.snap {
             state.snap_steps = steps;
         }
@@ -214,6 +217,9 @@ impl Editor {
         }
         if let Some(platform) = state.take_export_request() {
             start_export(state, platform);
+        }
+        if let Some((file, line)) = state.take_open_source_request() {
+            source::open(&file, line);
         }
         for (level, line) in state.export.service() {
             if level >= crate::scene::LogLevel::Error {
