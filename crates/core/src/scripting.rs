@@ -1190,7 +1190,7 @@ extern "C" fn find_asset(path: *const c_char, out: *mut u8) -> u32 {
                 AssetKind::Scene => orrin_script::ASSET_SCENE,
                 AssetKind::Font => orrin_script::ASSET_FONT,
                 AssetKind::Audio => orrin_script::ASSET_AUDIO,
-                AssetKind::Folder => return None,
+                AssetKind::Folder | AssetKind::Shader => return None,
             };
             Some((entry.id, kind))
         });

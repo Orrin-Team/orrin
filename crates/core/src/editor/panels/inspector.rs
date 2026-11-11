@@ -1099,10 +1099,10 @@ fn material_section(
     };
     let asset = world.get_resource::<AssetDatabase>().and_then(|db| {
         let id = db.material_id(handle)?;
-        Some((id, *db.material_file(id)?))
+        Some((id, db.material_file(id)?.clone()))
     });
     let (before, textured) = match asset {
-        Some((_, file)) => (file.material, file.textures.albedo.is_some()),
+        Some((_, ref file)) => (file.material, file.textures.albedo.is_some()),
         None => {
             let Some(kept) = world
                 .get_resource::<AssetPreviews>()
@@ -1129,7 +1129,7 @@ fn material_section(
     };
 
     let mut after = before;
-    let mut slots = asset.map(|(_, file)| file);
+    let mut slots = asset.as_ref().map(|(_, file)| file.clone());
     let id = ui.id().with("material");
     let weak = ui.visuals().weak_text_color();
     let mut previewed = None;

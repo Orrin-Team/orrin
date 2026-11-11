@@ -75,6 +75,12 @@ impl CompiledVariant {
 }
 
 impl SurfaceArtifact {
+    /// What an encoded artifact starts with.
+    pub const MAGIC: [u8; 4] = MAGIC;
+    /// The encoding's version: an artifact of any other is refused, so it is
+    /// part of what a cached artifact is keyed by.
+    pub const FORMAT_VERSION: u32 = VERSION;
+
     /// Whether it was compiled against this engine's shader sources. One that
     /// was not binds against a layout this build may not have.
     pub fn matches_this_build(&self) -> bool {

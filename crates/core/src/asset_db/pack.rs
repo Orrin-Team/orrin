@@ -14,6 +14,14 @@
 //! ([`AssetDatabase::open_packed`]) never reads a source, never writes a
 //! sidecar, never watches, and never reimports: a missing artifact is a named
 //! error and a pink object, as a broken import is in the editor.
+//!
+//! A surface shader is packed as its compiled artifact, like a texture, and
+//! loaded with no compiler, which a game is built without. An artifact compiled
+//! by another build of the engine, or one that fails its integrity check, is a
+//! named error, and the materials drawn through it draw as standard ones. The
+//! packing engine is the editor's build, so a shader the cache has no artifact
+//! for is compiled while packing; one that does not compile stops the pack by
+//! name, as a texture that does not import does.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -292,6 +300,8 @@ mod tests {
     use std::time::Duration;
 
     use orrin_ecs::World;
+    #[cfg(feature = "shader-compiler")]
+    use orrin_registry::AssetId;
 
     use super::super::import::tests::{png, triangle_bin, triangle_gltf};
     use super::super::tests::Dir;
@@ -521,6 +531,121 @@ mod tests {
             "the triangle, not the loading stand-in"
         );
         assert_eq!(files(&out), before, "nothing written into the pack");
+    }
+
+    /// A project whose `brick.omat` is drawn through `fx/glow.oshader`, packed
+    /// and then stripped of its sources and cache, as a shipped game is.
+    #[cfg(feature = "shader-compiler")]
+    fn packed_shader(name: &str) -> (Dir, PathBuf, AssetId, CacheKey) {
+        use super::super::material::{self, MaterialFile, ShaderValue};
+        let (dir, assets) = source_project(name);
+        let glow = "param color tint = (1, 1, 1, 1);\n\
+                    void surface(in SurfaceIn i, inout SurfaceOut o) {\n    o.albedo = tint.rgb;\n}\n";
+        AssetsDir(&assets).write("fx/glow.oshader", glow.as_bytes());
+        let id: AssetId = "5f0c3a4e-0000-4000-8000-0000000000d1".parse().unwrap();
+        AssetsDir(&assets).write(
+            "fx/glow.oshader.meta",
+            format!("id = \"{id}\"\n").as_bytes(),
+        );
+        let mut brick = MaterialFile {
+            shader: Some(id),
+            ..MaterialFile::default()
+        };
+        brick.set_shader_value("tint", Some(ShaderValue::Vec4([1.0, 0.0, 0.0, 1.0])));
+        AssetsDir(&assets).write("brick.omat", material::write(&brick).as_bytes());
+        let db = imported(&dir);
+        let key = key_of(&db, "fx/glow.oshader");
+        let out = dir.path().join("pack");
+        write(&db, &out).unwrap();
+        assert_eq!(
+            std::fs::read(out.join(ARTIFACTS).join(key.to_string())).unwrap(),
+            std::fs::read(db.cache_dir().join(key.to_string())).unwrap(),
+            "the artifact, byte for byte"
+        );
+        assert!(!out.join("fx/glow.oshader").exists(), "never the source");
+        assert!(out.join("fx/glow.oshader.meta").is_file());
+        drop(db);
+        std::fs::remove_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::remove_dir_all(dir.path().join("cache")).unwrap();
+        (dir, out, id, key)
+    }
+
+    /// The pack opened and `brick.omat` drawn until nothing is left to do:
+    /// what was logged, and whether the material reads through a shader.
+    #[cfg(feature = "shader-compiler")]
+    fn draw_packed_brick(
+        out: &Path,
+    ) -> (
+        Vec<String>,
+        Option<crate::gfx::surface::SurfaceShaderHandle>,
+    ) {
+        let (packed, issues) = AssetDatabase::open_packed(out, Target::Rgba8);
+        assert!(issues.is_empty(), "{issues:?}");
+        let brick = packed.find("brick.omat").unwrap().id;
+        let (world, entity) = super::super::tests::drawing_material(packed, brick);
+        let mut backend = HeadlessBackend::new();
+        let mut errors = Vec::new();
+        for _ in 0..4 {
+            errors.extend(super::super::tests::update(&world, &mut backend));
+            assert!(world.resource::<AssetDatabase>().wait_idle(WAIT));
+        }
+        let bound = super::super::tests::material_handle(&world, entity);
+        (errors, backend.surface_buffer().shader_of(bound))
+    }
+
+    /// The source and the cache are gone, so nothing could have been compiled:
+    /// the shader drawn is the packed artifact.
+    #[cfg(feature = "shader-compiler")]
+    #[test]
+    fn a_packed_shader_is_its_artifact_and_draws_with_no_source_to_compile() {
+        let (_dir, out, _, _) = packed_shader("pack-shader");
+        let (errors, shader) = draw_packed_brick(&out);
+        assert_eq!(errors, Vec::<String>::new());
+        assert!(shader.is_some(), "the material reads through the shader");
+    }
+
+    /// An artifact from another build would bind against layouts this one may
+    /// not have, and a damaged one could crash a driver: each is refused by
+    /// name, and the material draws as a standard one.
+    #[cfg(feature = "shader-compiler")]
+    #[test]
+    fn a_packed_shader_from_another_build_or_damaged_is_named_and_draws_standard() {
+        use crate::gfx::surface::SurfaceArtifact;
+        let foreign = |bytes: Vec<u8>| {
+            let mut artifact = SurfaceArtifact::decode(&bytes).unwrap();
+            artifact.sources_hash ^= 1;
+            artifact.encode()
+        };
+        let damaged = |mut bytes: Vec<u8>| {
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xff;
+            bytes
+        };
+        type Spoil<'a> = &'a dyn Fn(Vec<u8>) -> Vec<u8>;
+        let cases: [(&str, Spoil, &str); 2] = [
+            (
+                "pack-shader-foreign",
+                &foreign,
+                "fx/glow.oshader: its packed artifact was compiled by another build of the \
+                 engine than this one, so its materials draw without it; export the game again",
+            ),
+            (
+                "pack-shader-damaged",
+                &damaged,
+                "fx/glow.oshader: its packed artifact cannot be read, so its materials draw \
+                 without it: the surface shader artifact is corrupt: its contents do not match \
+                 its integrity hash. Export the game again",
+            ),
+        ];
+        for (name, spoil, expected) in cases {
+            let (_dir, out, _, key) = packed_shader(name);
+            let artifact = out.join(ARTIFACTS).join(key.to_string());
+            std::fs::write(&artifact, spoil(std::fs::read(&artifact).unwrap())).unwrap();
+
+            let (errors, shader) = draw_packed_brick(&out);
+            assert_eq!(errors, [expected], "{name}");
+            assert_eq!(shader, None, "{name}: standard");
+        }
     }
 
     #[test]

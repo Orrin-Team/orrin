@@ -1,4 +1,6 @@
-//! Source bytes to artifacts: PNG and JPEG textures, glTF 2.0 meshes.
+//! Source bytes to artifacts: PNG and JPEG textures, glTF 2.0 meshes. A
+//! surface shader's import is `asset_db::shader`'s; this module only names its
+//! importer and what its key hashes.
 //!
 //! A texture is decoded, scaled to its `max_size`, given its mip chain and
 //! stored in the format its usage takes on the device's [`Target`] — the work
@@ -43,6 +45,7 @@ pub fn importer(kind: AssetKind) -> Option<Importer> {
     match kind {
         AssetKind::Texture => Some(TEXTURE),
         AssetKind::Mesh => Some(MESH),
+        AssetKind::Shader => Some(super::shader::IMPORTER),
         AssetKind::Prefab
         | AssetKind::Material
         | AssetKind::Scene
@@ -53,10 +56,15 @@ pub fn importer(kind: AssetKind) -> Option<Importer> {
 }
 
 /// The settings as the cache key hashes them: a texture's artifact also
-/// depends on what the device samples, a mesh's does not.
+/// depends on what the device samples, a mesh's does not, and a surface
+/// shader's depends on the engine it was compiled against.
 pub fn key_settings(kind: AssetKind, settings: &Settings, target: Target) -> String {
     match kind {
         AssetKind::Texture => format!("{};target={}", settings.canonical(), target.name()),
+        AssetKind::Shader => super::shader::key_settings(
+            crate::gfx::shaders::SOURCES_HASH,
+            crate::gfx::surface::SurfaceArtifact::FORMAT_VERSION,
+        ),
         _ => settings.canonical(),
     }
 }
@@ -315,7 +323,7 @@ pub(super) mod tests {
             &inputs,
         )? {
             Artifact::Texture(texture) => Ok(texture),
-            Artifact::Mesh(_) => panic!("a texture imports as a texture"),
+            other => panic!("a texture imports as a texture, not {other:?}"),
         }
     }
 
@@ -541,7 +549,7 @@ pub(super) mod tests {
             &inputs,
         )? {
             Artifact::Mesh(mesh) => Ok(mesh),
-            Artifact::Texture(_) => panic!("a mesh imports as a mesh"),
+            other => panic!("a mesh imports as a mesh, not {other:?}"),
         }
     }
 

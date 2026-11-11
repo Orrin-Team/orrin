@@ -664,7 +664,7 @@ const SORTS: [(AssetSort, &str); 4] = [
 
 /// The kinds the browser can be narrowed to. Folders are not among them: a
 /// kind lists the whole project, where a folder has nowhere to be opened.
-const KINDS: [(AssetKind, &str); 7] = [
+const KINDS: [(AssetKind, &str); 8] = [
     (AssetKind::Texture, "Textures"),
     (AssetKind::Mesh, "Meshes"),
     (AssetKind::Material, "Materials"),
@@ -672,6 +672,7 @@ const KINDS: [(AssetKind, &str); 7] = [
     (AssetKind::Scene, "Scenes"),
     (AssetKind::Font, "Fonts"),
     (AssetKind::Audio, "Sounds"),
+    (AssetKind::Shader, "Surface shaders"),
 ];
 
 fn plural(kind: AssetKind) -> String {
@@ -878,6 +879,11 @@ impl Cells<'_> {
                 icons::file_audio(),
                 weak,
                 "Double-click to hear it, or drag onto an audio source's clip",
+            ),
+            AssetKind::Shader => (
+                icons::file_code(),
+                weak,
+                "Assign to a material asset to draw it through this shader",
             ),
             AssetKind::Prefab | AssetKind::Folder => (icons::layers(), weak, PLACE_HINT),
         };

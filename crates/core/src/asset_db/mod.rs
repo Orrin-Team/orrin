@@ -55,6 +55,31 @@
 //! is nothing new — which is what the watcher hearing the editor's own save
 //! amounts to, so that save is not read back and uploaded a second time.
 //!
+//! # Shaders
+//!
+//! A `.oshader` ([`shader`]) imports by compiling, on the import thread, into
+//! a cached artifact keyed by its source *and* the engine's own shader sources,
+//! so an engine update recompiles every shader instead of loading one built
+//! against code it no longer has. An exported game has no compiler and loads
+//! only the artifacts its pack carries.
+//!
+//! A shader is not a slot with a placeholder in it: there is nothing to draw
+//! "while it compiles" except the material without it. So a shader takes a
+//! backend handle only once it has compiled *and* a drawn material names it,
+//! keeps that handle for the session — a backend cannot unload one — and a
+//! reimport replaces what the handle holds. A save that does not compile keeps
+//! the last version that did drawing, as a material's bad save does, while its
+//! errors — each at its line — are kept for the shader editor
+//! ([`shader_errors`](AssetDatabase::shader_errors)) and logged as
+//! `path:line: message`, the path relative to the assets directory as every
+//! asset's is. A material whose shader has never compiled draws as a standard
+//! material.
+//!
+//! A material's shader values reach the backend whenever the material is
+//! uploaded or reread and whenever its shader first loads; a value the shader
+//! ignores is a warning ([`take_warnings`](AssetDatabase::take_warnings)), once
+//! per change and never per frame.
+//!
 //! # What is not here
 //!
 //! Engine-built assets — the demo library's cube and gold, a model the demo
@@ -69,6 +94,7 @@ pub mod import;
 mod ktx;
 pub mod material;
 pub mod pack;
+pub mod shader;
 pub mod sidecar;
 pub mod texture;
 mod watch;
@@ -89,6 +115,7 @@ use crate::gfx::{RenderBackend, TextureHandle};
 use crate::scene::{
     AssetPreviews, CpuMesh, MaterialBlends, MaterialHandle, MeshBounds, MeshHandle,
 };
+use worker::ImportError;
 
 /// Set on a handle the database has promised and not yet bound to a slot.
 pub const PENDING: u32 = 1 << 31;
@@ -194,6 +221,12 @@ pub struct AssetDatabase {
     refused_ui: HashSet<AssetId, FxBuildHasher>,
     /// Each uploaded texture's size, which a sliced UI image is measured in.
     extents: FxHashMap<AssetId, [u32; 2]>,
+    /// Every surface shader asset imported or asked for.
+    shaders: FxHashMap<AssetId, shader::Shader>,
+    /// What each drawn material reading through a shader was last given.
+    attached_surfaces: FxHashMap<AssetId, shader::Attached>,
+    /// Warnings found between frames, for [`take_warnings`](Self::take_warnings).
+    warnings: Vec<String>,
 }
 
 impl AssetDatabase {
@@ -253,6 +286,9 @@ impl AssetDatabase {
             audio_changes: Vec::new(),
             refused_ui: HashSet::default(),
             extents: FxHashMap::default(),
+            shaders: FxHashMap::default(),
+            attached_surfaces: FxHashMap::default(),
+            warnings: Vec::new(),
         };
         (db, issues)
     }
@@ -301,6 +337,9 @@ impl AssetDatabase {
     /// it has imported; one being drawn is ready once its slot holds it. An id
     /// the project has no file for is [`Failed`](LoadState::Failed).
     pub fn state(&self, id: AssetId) -> LoadState {
+        if self.shaders.get(&id).is_some_and(shader::Shader::is_loaded) {
+            return LoadState::Ready;
+        }
         if let Some(resident) = self.resident(id) {
             return resident.state;
         }
@@ -443,21 +482,39 @@ impl AssetDatabase {
         self.material_texts.get(&id).map(String::as_str)
     }
 
-    /// Refuse `file` as material `id` when a texture slot it fills differently
-    /// names something other than a texture. A slot the file already had is
-    /// left to [`update`](Self::update) to name, as one read from disk is.
+    /// Refuse `file` as material `id` when a texture slot or a shader texture
+    /// value it fills differently names something other than a texture, or
+    /// its shader is something other than a surface shader. What the file
+    /// already had is left to [`update`](Self::update) to name, as one read
+    /// from disk is.
     pub fn check_material(&self, id: AssetId, file: &material::MaterialFile) -> Result<(), String> {
-        let current = self.material_files.get(&id).map(|kept| kept.textures);
-        let current = current.unwrap_or_default().slots();
-        for ((slot, texture), (_, was)) in file.textures.slots().into_iter().zip(current) {
-            let Some(texture) = texture.filter(|&texture| Some(texture) != was) else {
+        let kept = self.material_files.get(&id);
+        let current = kept.map(|kept| kept.textures).unwrap_or_default().slots();
+        let slots = file.textures.slots().into_iter().zip(current);
+        let slots = slots.map(|((slot, texture), (_, was))| {
+            (
+                format!("the `{slot}` slot"),
+                texture.filter(|&t| Some(t) != was),
+            )
+        });
+        let values = file.shader_values.iter().map(|(name, value)| {
+            let texture = match *value {
+                material::ShaderValue::Texture(texture) => Some(texture),
+                _ => None,
+            };
+            let was = kept.and_then(|kept| kept.shader_value(name));
+            let changed = texture.filter(|&t| was != Some(material::ShaderValue::Texture(t)));
+            (format!("shader parameter `{name}`"), changed)
+        });
+        for (what, texture) in slots.chain(values) {
+            let Some(texture) = texture else {
                 continue;
             };
             match self.get(texture) {
                 Some(entry) if entry.kind == AssetKind::Texture => {}
                 Some(entry) => {
                     return Err(format!(
-                        "{}: the `{slot}` slot takes a texture, not `{}`, which is a {}",
+                        "{}: {what} takes a texture, not `{}`, which is a {}",
                         self.path_of(id),
                         entry.path,
                         entry.kind.label()
@@ -465,14 +522,31 @@ impl AssetDatabase {
                 }
                 None => {
                     return Err(format!(
-                        "{}: the `{slot}` slot names texture asset {texture}, which is not in \
-                         the project",
+                        "{}: {what} names texture asset {texture}, which is not in the project",
                         self.path_of(id)
                     ));
                 }
             }
         }
-        Ok(())
+        let changed = file
+            .shader
+            .filter(|&shader| kept.is_none_or(|kept| kept.shader != Some(shader)));
+        let Some(shader) = changed else {
+            return Ok(());
+        };
+        match self.get(shader) {
+            Some(entry) if entry.kind == AssetKind::Shader => Ok(()),
+            Some(entry) => Err(format!(
+                "{}: `shader` takes a surface shader, not `{}`, which is a {}",
+                self.path_of(id),
+                entry.path,
+                entry.kind.label()
+            )),
+            None => Err(format!(
+                "{}: `shader` names surface shader asset {shader}, which is not in the project",
+                self.path_of(id)
+            )),
+        }
     }
 
     /// Draw material `id` as `file` from the next [`update`](Self::update),
@@ -536,11 +610,31 @@ impl AssetDatabase {
     /// Material` and numbered past any already there, with its sidecar, and
     /// index it.
     pub fn create_material(&mut self, folder: &str) -> Result<AssetId, String> {
+        let text = material::write(&Default::default());
+        self.create_file(
+            folder,
+            "New Material",
+            material::EXTENSION,
+            &text,
+            AssetKind::Material,
+        )
+    }
+
+    /// Write `text` into `folder` as `stem.extension`, numbered past any file
+    /// already there, with its sidecar, and index it.
+    fn create_file(
+        &mut self,
+        folder: &str,
+        stem: &str,
+        extension: &str,
+        text: &str,
+        kind: AssetKind,
+    ) -> Result<AssetId, String> {
         let rel = (1..)
             .map(|n| {
                 let name = match n {
-                    1 => format!("New Material.{}", material::EXTENSION),
-                    n => format!("New Material {n}.{}", material::EXTENSION),
+                    1 => format!("{stem}.{extension}"),
+                    n => format!("{stem} {n}.{extension}"),
                 };
                 match folder {
                     "" => name,
@@ -550,9 +644,12 @@ impl AssetDatabase {
             .find(|rel| !self.dir.join(rel).exists())
             .expect("an unbounded range finds one");
         let path = self.dir.join(&rel);
-        write_atomically(&path, &material::write(&Default::default()))
-            .map_err(|error| format!("could not write {rel}: {error}"))?;
-        let id = sidecar::read_or_create(&path, &rel, AssetKind::Material)?.id;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("could not write {rel}: {error}"))?;
+        }
+        write_atomically(&path, text).map_err(|error| format!("could not write {rel}: {error}"))?;
+        let id = sidecar::read_or_create(&path, &rel, kind)?.id;
         self.rescan();
         Ok(id)
     }
@@ -839,6 +936,12 @@ impl AssetDatabase {
             .is_none_or(|worker| worker.wait_idle(timeout))
     }
 
+    /// Warnings found since the last call: values a material's shader
+    /// ignores, each reported once per change.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
+    }
+
     /// Everything [`service`] does, returning the errors it would log.
     pub fn update(&mut self, world: &World, backend: &mut impl RenderBackend) -> Vec<String> {
         if let Some(watcher) = &mut self.watcher {
@@ -983,8 +1086,12 @@ impl AssetDatabase {
 
     /// [`queue`](Self::queue), past the cache when `fresh`.
     fn enqueue(&mut self, id: AssetId, fresh: bool) {
-        let payload = self.resident(id).is_some();
-        let known = self.resident(id).and_then(|resident| resident.key);
+        let shader = self.shaders.get(&id);
+        let payload = self.resident(id).is_some() || shader.is_some_and(shader::Shader::wanted);
+        let known = match shader {
+            Some(shader) => shader.key(),
+            None => self.resident(id).and_then(|resident| resident.key),
+        };
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
             return;
         };
@@ -1090,6 +1197,9 @@ impl AssetDatabase {
         backend: &mut impl RenderBackend,
         errors: &mut Vec<String>,
     ) {
+        if done.job.kind == AssetKind::Shader {
+            return self.finish_shader(done, backend, errors);
+        }
         let id = done.job.id;
         if done.job.payload {
             self.awaiting.remove(&id);
@@ -1127,7 +1237,7 @@ impl AssetDatabase {
                     }
                 }
             }
-            Err(message) => {
+            Err(ImportError { message, .. }) => {
                 entry.status = Status::Failed(message.clone());
                 let kind = entry.kind;
                 match resident {
@@ -1178,6 +1288,8 @@ impl AssetDatabase {
                 }
                 self.meshes.set_resident(id, ready);
             }
+            // Taken by `finish_shader`, which `finish` hands every shader to.
+            worker::Payload::Shader(_) => {}
             worker::Payload::Texture(texture) => {
                 let Some(slot) = self.textures.handle(id) else {
                     return;
@@ -1239,7 +1351,8 @@ impl AssetDatabase {
             | AssetKind::Scene
             | AssetKind::Font
             | AssetKind::Audio
-            | AssetKind::Folder => {}
+            | AssetKind::Folder
+            | AssetKind::Shader => {}
         }
     }
 
@@ -1315,6 +1428,7 @@ impl AssetDatabase {
             register_material(world, handle, &material);
             self.materials.bind(id, handle.0, state);
             rebound.insert(promised, handle.0);
+            self.attach_surface(id, backend, errors);
         }
         world.query::<&mut MaterialHandle>().for_each(|_, handle| {
             if let Some(&slot) = rebound.get(&handle.0) {
@@ -1346,6 +1460,7 @@ impl AssetDatabase {
                 key: None,
             };
             self.materials.set_resident(id, ready);
+            self.attach_surface(id, backend, errors);
         }
     }
 
@@ -1357,7 +1472,7 @@ impl AssetDatabase {
         backend: &mut impl RenderBackend,
         errors: &mut Vec<String>,
     ) -> Option<crate::gfx::Material> {
-        let file = *self.material_files.get(&id)?;
+        let file = self.material_files.get(&id)?.clone();
         let rel = self
             .get(id)
             .map_or_else(|| id.to_string(), |entry| entry.path.clone());
@@ -1685,6 +1800,9 @@ pub fn service(world: &World, backend: &mut impl RenderBackend) {
     for error in db.update(world, backend) {
         tracing::error!("{error}");
     }
+    for warning in db.take_warnings() {
+        tracing::warn!("{warning}");
+    }
 }
 
 /// The directory a project's artifacts are cached in.
@@ -1734,7 +1852,7 @@ pub(crate) mod tests {
 
     const WAIT: Duration = Duration::from_secs(20);
 
-    fn open(dir: &Dir) -> AssetDatabase {
+    pub(crate) fn open(dir: &Dir) -> AssetDatabase {
         let (db, issues) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
         assert!(issues.is_empty(), "{issues:?}");
         db
@@ -1995,7 +2113,7 @@ pub(crate) mod tests {
         (world, entity)
     }
 
-    fn update(world: &World, backend: &mut HeadlessBackend) -> Vec<String> {
+    pub(crate) fn update(world: &World, backend: &mut HeadlessBackend) -> Vec<String> {
         world.resource_mut::<AssetDatabase>().update(world, backend)
     }
 
@@ -2421,6 +2539,7 @@ pub(crate) mod tests {
                 albedo: Some(rock()),
                 ..Default::default()
             },
+            ..Default::default()
         }
     }
 
@@ -2437,7 +2556,7 @@ pub(crate) mod tests {
 
     /// A world that draws material `id` on one entity, holding the pending
     /// handle a scene load would leave.
-    fn drawing_material(db: AssetDatabase, id: AssetId) -> (World, orrin_ecs::Entity) {
+    pub(crate) fn drawing_material(db: AssetDatabase, id: AssetId) -> (World, orrin_ecs::Entity) {
         let mut world = World::new();
         world.insert_resource(MeshBounds::default());
         world.insert_resource(AssetPreviews::default());
@@ -2450,7 +2569,7 @@ pub(crate) mod tests {
         (world, entity)
     }
 
-    fn material_handle(world: &World, entity: orrin_ecs::Entity) -> MaterialHandle {
+    pub(crate) fn material_handle(world: &World, entity: orrin_ecs::Entity) -> MaterialHandle {
         *world.get::<MaterialHandle>(entity).unwrap()
     }
 
@@ -2884,7 +3003,7 @@ pub(crate) mod tests {
         let db = world.resource::<AssetDatabase>();
         let id = db.find("brick.omat").unwrap().id;
         let tree = db.find("models/tree.gltf").unwrap().id;
-        let mut file = *db.material_file(id).unwrap();
+        let mut file = db.material_file(id).unwrap().clone();
 
         file.textures.normal = Some(rock());
         assert_eq!(db.check_material(id, &file), Ok(()));
