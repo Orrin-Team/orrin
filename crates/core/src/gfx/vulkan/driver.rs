@@ -764,6 +764,25 @@ impl VkDriver {
         Ok((entry, view.name.to_string()))
     }
 
+    /// The persistent pipeline cache, unless a stage was loaded at run time.
+    /// A loaded shader is a surface shader's variant, a new module with every
+    /// save, while the cache is machine-wide and never pruned — and MoltenVK
+    /// compiles everything it holds when it is created, so caching these made
+    /// the editor's startup grow with every edit.
+    fn cache_for(
+        &self,
+        stages: &[ShaderRef],
+    ) -> Option<Arc<vulkano::pipeline::cache::PipelineCache>> {
+        if stages
+            .iter()
+            .any(|stage| matches!(stage, ShaderRef::Loaded(_)))
+        {
+            None
+        } else {
+            self.ctx.pipeline_cache()
+        }
+    }
+
     pub fn try_create_graphics_pipeline(
         &self,
         desc: &GraphicsPipelineDesc,
@@ -829,7 +848,7 @@ impl VkDriver {
         let colors: Vec<_> = desc.color_formats.iter().map(|&f| vk_format(f)).collect();
         let pipeline = GraphicsPipeline::new(
             device.clone(),
-            self.ctx.pipeline_cache(),
+            self.cache_for(&[desc.vertex, desc.fragment]),
             GraphicsPipelineCreateInfo {
                 stages: stages.into_iter().collect(),
                 vertex_input_state: Some(vertex_input),
@@ -954,7 +973,7 @@ impl VkDriver {
         let layout = PipelineLayout::new(device.clone(), info).map_err(|e| named(&reason(e)))?;
         let pipeline = ComputePipeline::new(
             device.clone(),
-            self.ctx.pipeline_cache(),
+            self.cache_for(&[desc.shader]),
             ComputePipelineCreateInfo::stage_layout(stage, layout),
         )
         .map_err(|e| named(&reason(e)))?;
@@ -2256,6 +2275,45 @@ pub(crate) mod tests {
         broken.spirv[at..at + 4].copy_from_slice(&0x0001_ffff_u32.to_le_bytes());
         spirv_words(&broken.spirv).expect("the framing is intact");
         a_broken_loaded_shader_is_an_error(&vulkan(), &broken);
+    }
+
+    /// A pipeline with a stage loaded at run time — a surface shader's twin —
+    /// adds nothing to the persistent pipeline cache. Every save of a shader is
+    /// a new module, the cache is machine-wide and never pruned, and MoltenVK
+    /// compiles every shader the file holds when the cache is created: before
+    /// this, a cache grown by sessions of shader edits held the editor's window
+    /// for over a minute at startup.
+    #[cfg(feature = "shader-compiler")]
+    #[test]
+    #[ignore = "needs a Vulkan device"]
+    fn a_loaded_shader_leaves_the_persistent_pipeline_cache_alone_on_vulkan() {
+        let device = vulkan();
+        let cache = device
+            .vulkan()
+            .ctx
+            .pipeline_cache()
+            .expect("a pipeline cache");
+        // A constant no earlier run wrote, so no earlier run cached this shader.
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let source = format!(
+            "#version 450\nlayout(location = 0) out vec4 colour;\n\
+             void main() {{ colour = vec4(float({salt}u) * 1e-9); }}\n"
+        );
+        let compiled = crate::gfx::shaders::compile(
+            &source,
+            crate::gfx::shaders::Stage::Fragment,
+            "salted.frag",
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fragment = device.load_shader(&compiled);
+        let before = cache.get_data().unwrap().len();
+        fullscreen(&device, ShaderId::FullscreenVert, fragment).expect("a pipeline");
+        assert_eq!(cache.get_data().unwrap().len(), before);
     }
 
     #[test]
