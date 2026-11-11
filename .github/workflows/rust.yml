@@ -92,6 +92,15 @@ jobs:
       - name: Check the build without scripting
         run: cargo check -p orrin-core --no-default-features --all-targets --verbose
 
+      # The shape `orrin export` builds a game's engine in: scripting on, the
+      # shader compiler off. A game loads its surface shaders as the compiled
+      # artifacts its pack carries, so that load path has to build with no
+      # compiler behind it. The export job below builds this shape too, but
+      # only the binary; most of the `cfg(feature = "shader-compiler")` seams
+      # are in the tests, which only `--all-targets` reaches.
+      - name: Check the exported game's build
+        run: cargo check -p orrin-core --no-default-features --features scripting,export --all-targets --verbose
+
       # The managed half, which no Rust target reaches. The bindings assembly
       # is the engine's own and boots CoreCLR; DemoGame is a game assembly like
       # any project's, and building it here is what keeps the one loading path
