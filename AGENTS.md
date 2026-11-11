@@ -25,6 +25,7 @@ Rust edition 2024, resolver 3. Cargo workspace, `members = ["crates/*"]`.
 | `crates/orrin-script` | Boots CoreCLR via netcorehost; the C ABI over the engine |
 | `crates/orrin-build` | `dotnet build` for a project's C# |
 | `crates/orrin-project` | The `orrin.toml` project manifest |
+| `crates/orrin-shaderc` | Compiling a shader: GLSL to SPIR-V, that SPIR-V to MSL, and the binding layout both agree on. The one way `build.rs` and the editor's runtime compiler compile a shader |
 | `crates/orrin-cli` (binary `orrin`) | `orrin new` / `build` / `run` / `export` / `hub` |
 | `crates/orrin-hub` (binary `orrin-hub`) | Orrin Hub: a window over the CLI for creating, opening and exporting projects. eframe lives here and nowhere else |
 | `scripting/Orrin` | The C# bindings assembly. `scripting/DemoGame` is a game assembly like any project's; `scripting/Orrin.Analyzers` is the Roslyn analyzer holding Behaviour fields to the registry-visible / `[Transient]` split |
@@ -44,7 +45,11 @@ Inside `crates/core/src`:
   compiler derives order, layouts and barriers. Takes no `Device`, so CI with no
   GPU asserts the exact barrier sequence
 - `gfx/vulkan/` — one file per pass (forward, prepass, ssao, ssr, taa, bloom,
-  dof, fog, oit, shadow, …) plus `frame.rs`, `record.rs`, `rendering.rs`
+  dof, fog, oit, shadow, …) plus `frame.rs`, `record.rs`, `rendering.rs`, and
+  `surface.rs`, the pipelines and parameter buffer a surface shader draws with
+- `gfx/surface/` — surface shaders: the `.oshader` language, its parameters,
+  the compile of every variant and the checked artifact a game ships. Read its
+  module docs before changing what a surface function may see or do
 - `gfx/headless.rs` — `HeadlessBackend`, the CPU-only path CI tests through
 - `scene/` — components, resources, model import, persistence, entity builders
 - `editor/` — egui panels, dock, theme
@@ -71,6 +76,10 @@ cargo run -p orrin-core
 # The no-.NET build shape. CI checks it; so should you if you touch a
 # `#[cfg(feature = "scripting")]` seam.
 cargo check -p orrin-core --no-default-features --all-targets
+
+# The exported game's shape: scripting, no shader compiler. CI checks it; so
+# should you if you touch a `#[cfg(feature = "shader-compiler")]` seam.
+cargo check -p orrin-core --no-default-features --features scripting,export --all-targets
 
 # A project through the CLI
 cargo build -p orrin-cli && ./target/debug/orrin new my-game && ./target/debug/orrin run
@@ -99,7 +108,7 @@ Useful environment variables (full list in each harness's module docs):
 `ORRIN_PERF_*`, `ORRIN_UPDATE_GOLDEN`, `ORRIN_COLD_START_BUDGET_MS`.
 
 CI (`.github/workflows/rust.yml`) runs: workspace build, workspace test, the
-`--no-default-features` check, both C# builds, the C# math/ABI tests, and the
+`--no-default-features` check, the exported-game check, both C# builds, the C# math/ABI tests, and the
 cold-start benchmark. A change is not done until all of those would pass.
 
 ---
@@ -165,7 +174,12 @@ Where tests live:
 - **`crates/core/tests/`** for cross-module behaviour: `render_graph.rs` (barrier
   sequences, no GPU needed), `cold_start.rs` (the §6 startup gate),
   `culling.rs`, `hierarchy_probe.rs`, `offscreen.rs`, `perf.rs` and
-  `asset_reload.rs` (the last three `#[ignore]`d — they need a GPU).
+  `asset_reload.rs` (the last three `#[ignore]`d — they need a GPU). Surface
+  shaders have four: `shader_compiler.rs` and `surface_shader.rs` (the runtime
+  compiler and the language through it), `surface_params.rs` (the parameter
+  bookkeeping on the headless backend), and `surface_render.rs` (`#[ignore]`d,
+  the GPU proof). A test that compiles a shader is gated on the default
+  `shader-compiler` feature.
 - **Golden files** in `crates/core/tests/golden/`, refreshed with
   `ORRIN_UPDATE_GOLDEN=1`. Read the diff before you accept a new golden.
 - **`benches/`** with criterion, for anything on the frame's critical path.

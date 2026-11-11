@@ -679,8 +679,9 @@ impl ForwardSets {
 /// *frame* — it decides which render pass is open and therefore how many colour
 /// attachments a pipeline must declare — while `masked` is a property of a
 /// *run*, so both of those have to exist at once whichever frame it is.
-/// Every forward pipeline one sample count needs, in the four variants a batch
-/// can be (see `cull::Variant`), each with and without the subsurface target.
+/// Every forward pipeline one sample count needs, in the four built-in variants
+/// a batch can be (see `cull::Variant`), each with and without the subsurface
+/// target.
 ///
 /// The `flat` ones run `shading.glsl` compiled with `ORRIN_FLAT_SURFACE`, which
 /// takes the optional lobes out — clear coat, sheen, anisotropy, transmission,

@@ -141,11 +141,12 @@ Packages the project as a directory a player can run on a machine with no
 
 ```
 exports/<name>-<platform>/
-  <name>[.exe]       the engine, release, `export` feature, symbols stripped
+  <name>[.exe]       the engine, release, `scripting,export` and no shader compiler, symbols stripped
   Orrin.dll          the bindings, with their runtimeconfig
   <Game>.dll         the game assembly, built Release (no ORRIN_DEBUG)
   dotnet/            a private .NET runtime the engine boots instead of any install
-  compiled-assets/   cache artifacts, sidecars and text assets; no sources
+  compiled-assets/   cache artifacts, sidecars and text assets; no sources, so a
+                     surface shader ships as its compiled artifact
   orrin.json         which game this is: entry, assembly, start scene
 ```
 
@@ -161,8 +162,12 @@ exports/<name>-<platform>/
    Missing tools and Rust targets are checked before anything slow starts; a
    missing Rust target is added for you.
 3. **Packs the assets** with the checkout's own engine on this machine,
-   importing anything the cache lacks. The pack copies artifacts byte for byte,
-   so exporting twice from one import gives the same files.
+   importing anything the cache lacks — compiling a surface shader whose
+   artifact it does not have, and stopping the export by name at one that does
+   not compile. The pack copies artifacts byte for byte, so exporting twice from
+   one import gives the same files. The game's engine is built without the
+   shader compiler and loads those artifacts, checked against the engine
+   sources they were compiled with.
 4. **Assembles** the directory and writes `orrin.json`.
 
 The engine is built from source, so exporting needs the `orrin` from an engine

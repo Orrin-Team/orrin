@@ -106,8 +106,9 @@ scripting = ["dep:orrin-script", "dep:orrin-build"]
 # `orrin export` builds without it. What it costs the editor (macOS arm64):
 # shaderc and spirv-cross2 are already built for build.rs, and a dev build
 # shares that build, but a release build makes a second, optimised one. Once
-# something calls `compile` they are linked in, ~3.6 MB of release binary
-# (26.8 -> 30.4 MB); until then the linker drops them.
+# something calls `compile` they are linked in, shaderc statically, ~10.7 MB of
+# release binary (26.8 -> 37.5 MB; 8.4 MB stripped); until then the linker
+# drops them.
 shader-compiler = ["dep:orrin-shaderc"]
 # An exported game rather than the editor: trace and debug events are compiled
 # out, and warnings and errors are also written to a log file beside the

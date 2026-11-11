@@ -14,9 +14,10 @@
 //!
 //! **A shader's artifact always comes back from the worker**, unlike a texture
 //! nothing draws, because its parameter table is what the material inspector
-//! and the shader editor show whether or not anything draws it. A shader is a
-//! few hundred kilobytes and a project has few of them; the artifact itself is
-//! dropped once the table is read, unless something draws the shader.
+//! and the shader editor show whether or not anything draws it. An artifact is
+//! about a megabyte — eight variants, each as SPIR-V and as MSL — and a project
+//! has few of them; the artifact itself is dropped once the table is read,
+//! unless something draws the shader.
 //!
 //! **One handle for the session.** A backend cannot unload a surface shader,
 //! and holds at most `MAX_SURFACE_SHADERS`, so a shader is loaded the first

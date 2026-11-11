@@ -44,6 +44,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets
 cargo test --workspace
 cargo check -p orrin-core --no-default-features --all-targets   # if you touched a scripting cfg seam
+cargo check -p orrin-core --no-default-features --features scripting,export --all-targets   # if you touched a shader-compiler cfg seam
 ```
 
 Paste the real output of the tests you added. "Tests pass" summarised is not
@@ -83,6 +84,16 @@ session are not a baseline.
   (right-handed, -Z forward, degrees, YXZ euler, Hamilton products) are a frozen
   ABI checked only by `dotnet run --project scripting/Orrin.MathTests`. Touching
   a blittable struct means running it.
+- **Surface shaders.** A `.oshader` changes what a surface *is*, never how it
+  is lit, and it is one function every surface-reading pass runs — so
+  `SurfaceIn` holds nothing pass-specific and the normal leaves in tangent
+  space. A custom draw binds exactly what its built-in twin binds plus one
+  parameter buffer that changes only when a value does; a binding of a
+  shader's own, or a per-frame value in that buffer (the time is not there, on
+  purpose), is a design change. An artifact read from disk is trusted only by
+  its integrity and sources hashes, and a test never hands a driver SPIR-V it
+  built or edited: MoltenVK crashes on well-framed invalid SPIR-V.
+  `gfx/surface/mod.rs` is the design.
 - **`unsafe`.** Confined to FFI (`scripting.rs`, `orrin-script`) and raw ash
   recording (`record.rs`); forbidden in `orrin-ecs`. New `unsafe` anywhere else
   is a conversation before it is a diff.
