@@ -150,6 +150,19 @@ impl GpuMaterial {
     pub(super) fn is_lobed(&self) -> bool {
         self.tex_flags[1] & material_flags::LOBES != 0
     }
+
+    /// The class a batch of this material draws in when no surface shader
+    /// reads it.
+    pub(super) fn built_in_variant(&self) -> super::cull::Variant {
+        super::cull::Variant {
+            masked: self.is_masked(),
+            surface: if self.is_lobed() {
+                super::cull::Surface::Lobed
+            } else {
+                super::cull::Surface::Flat
+            },
+        }
+    }
 }
 
 /// Pack the engine's [`SceneLighting`] into the std140 layout the shader expects.
@@ -685,9 +698,12 @@ struct ForwardPipelines {
 
 impl ForwardPipelines {
     /// The pipeline a batch of `variant` draws with in a frame that does or
-    /// does not diffuse subsurface light.
+    /// does not diffuse subsurface light. A surface shader's batches draw with
+    /// the lobed one when it has no twin to draw them, which is the standard
+    /// material it was compiled against.
     fn for_variant(&self, variant: super::cull::Variant, subsurface: bool) -> PipelineId {
-        match (variant.masked, variant.lobed, subsurface) {
+        let lobed = variant.surface != super::cull::Surface::Flat;
+        match (variant.masked, lobed, subsurface) {
             (false, false, false) => self.flat,
             (false, false, true) => self.flat_subsurface,
             (false, true, false) => self.plain,

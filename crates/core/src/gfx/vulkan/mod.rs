@@ -164,6 +164,7 @@ pub(crate) const MSAA_SAMPLES: crate::gfx::format::SampleCount =
 pub(crate) const OFFSCREEN_FORMAT: crate::gfx::format::Format =
     crate::gfx::format::Format::Rgba8Srgb;
 
+pub use cull::MAX_SURFACE_SHADERS;
 pub use gizmo::GizmoVertex;
 pub use outline::OutlineItem;
 pub use overlay::OverlayFrame;
@@ -1356,7 +1357,13 @@ impl RenderBackend for VulkanRenderer {
             tracing::warn!("material {} was never loaded; edit ignored", handle.0);
             return;
         };
+        let before = slot.built_in_variant();
         *slot = forward::to_gpu_material(material);
+        // Masking a material or giving it a lobe moves its batches to another
+        // pipeline's class, which the cull's per-row cache cannot see.
+        if slot.built_in_variant() != before {
+            self.cull.forget_classes();
+        }
         // The same invalidation an upload does: the buffer and the sets that
         // bind it are rebuilt on the next frame. An edit costs a rebuild per
         // frame while a slider is dragged, and nothing once it is let go.
@@ -2173,10 +2180,7 @@ impl VulkanRenderer {
                 let camera = material_preview::camera(request.subject.orbit);
                 Some(material_preview::PreviewFrame {
                     sets,
-                    variant: cull::Variant {
-                        masked: gpu.is_masked(),
-                        lobed: gpu.is_lobed(),
-                    },
+                    variant: gpu.built_in_variant(),
                     view_proj: camera.projection(1.0) * camera.view(),
                     exposure: request.exposure,
                 })
@@ -2252,11 +2256,9 @@ impl VulkanRenderer {
                         .map(|mesh| (mesh.span, mesh.bounds))
                 },
                 |material| {
-                    let material = materials.get(material as usize);
-                    cull::Variant {
-                        masked: material.is_some_and(GpuMaterial::is_masked),
-                        lobed: material.is_some_and(GpuMaterial::is_lobed),
-                    }
+                    materials
+                        .get(material as usize)
+                        .map_or(cull::Variant::STANDARD, GpuMaterial::built_in_variant)
                 },
                 cull_views.len() as u32,
             )

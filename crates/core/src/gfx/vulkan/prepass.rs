@@ -261,9 +261,9 @@ impl GeometryPrepass {
         // between draws changes them. See `mesh`.
         encoder.bind_geometry(false);
 
-        // Two multi-draws, one per pipeline variant, over the commands the
-        // dispatch wrote — the same ones the forward pass draws.
-        for region in draws.regions_by_mask() {
+        // One multi-draw per mask, over the commands the dispatch wrote — the
+        // same ones the forward pass draws.
+        for region in draws.regions_by_surface_shader() {
             bind_all(
                 encoder,
                 if region.variant.masked {

@@ -460,7 +460,8 @@ impl MaterialPreviewPass {
             depth_range: [0.0, 1.0],
         });
         let variant = frame.variant;
-        encoder.bind_pipeline(self.pipelines[variant.masked as usize * 2 + variant.lobed as usize]);
+        let lobed = variant.surface != super::cull::Surface::Flat;
+        encoder.bind_pipeline(self.pipelines[variant.masked as usize * 2 + lobed as usize]);
         for (set, group) in frame.sets.groups().iter().enumerate() {
             encoder.bind_group(set as u32, *group);
         }

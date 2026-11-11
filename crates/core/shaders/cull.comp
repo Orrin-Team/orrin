@@ -23,8 +23,8 @@ const uint VIEW_CASCADE = 1;
 
 struct Instance {
     uint row;
-    // The batch's number, not its slot: the top bit says which pipeline variant
-    // draws it and the rest is its index within that variant. `slot` below is
+    // The batch's number, not its slot: the top `32 - CLASS_SHIFT` bits say
+    // which pipeline class draws it and the rest is its index within that class. `slot` below is
     // what turns the pair into a row of `commands`, and it cannot be resolved
     // on the host because the split moves whenever a new plain batch appears.
     // See `BatchIds` in `gfx/vulkan/cull.rs`.
@@ -77,15 +77,17 @@ layout(set = 0, binding = 5) writeonly buffer Indices { uvec2 indices[]; };
 // it does not -- because a descriptor set with a hole in it is not one Vulkan
 // accepts, and the branch below is uniform across the whole dispatch.
 layout(set = 0, binding = 6) uniform sampler2D u_occlusion;
+// Where each pipeline class's batches begin, which is what a packed batch number
+// is resolved against: one word per class the frame has. A buffer rather than
+// push constants because the classes grow with the loaded surface shaders. See
+// `Variant::class` in cull.rs.
+layout(set = 0, binding = 7) readonly buffer ClassBases { uint class_bases[]; };
 
 layout(push_constant) uniform Push {
     uint instance_count;
     uint view_count;
     uint batch_count;
     uint occlusion;
-    // Where each pipeline variant's batches begin, which is what a packed batch
-    // number is resolved against. See `Variant::class` in cull.rs.
-    uvec4 class_bases;
     // The camera the pyramid was rasterised through, which is the previous
     // frame's. Testing this frame's box against last frame's depth is only
     // meaningful projected the way that depth was.
@@ -93,11 +95,11 @@ layout(push_constant) uniform Push {
 } push;
 
 // Lock-stepped with `CLASS_SHIFT` in cull.rs.
-const uint CLASS_SHIFT = 30u;
+const uint CLASS_SHIFT = 24u;
 
 // The row of `commands` a packed batch number owns this frame.
 uint slot(uint packed) {
-    return push.class_bases[packed >> CLASS_SHIFT] + (packed & ((1u << CLASS_SHIFT) - 1u));
+    return class_bases[packed >> CLASS_SHIFT] + (packed & ((1u << CLASS_SHIFT) - 1u));
 }
 
 // Conservative, exactly as `Frustum::intersects` is: true means "may be
