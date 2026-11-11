@@ -11,7 +11,7 @@ public class Spinner : Behaviour
 {
     public float DegreesPerSecond = 90f;
 
-    public override void OnStart() => Native.Log($"Spinner attached to {Entity}");
+    public override void OnStart() => Debug.Log($"Spinner attached to {Entity}");
 
     public override void OnUpdate(float deltaTime)
     {

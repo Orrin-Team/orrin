@@ -36,8 +36,10 @@ pub fn scaffold(name: &str, parent: &Path) -> Fallible {
         ("README.md", readme(name, &assembly)),
         ("assets/.gitkeep", String::new()),
         ("scenes/.gitkeep", String::new()),
+        (".vscode/launch.json", LAUNCH.to_string()),
         ("scripts/Main.cs", main_cs(name, &assembly)),
         ("scripts/FlyCamera.cs", fly_camera_cs(&assembly)),
+        ("scripts/Tests.cs", tests_cs(&assembly)),
         (
             &format!("scripts/{assembly}.csproj"),
             csproj(&assembly, checkout.as_deref(), &anchor.join(name)),
@@ -176,6 +178,28 @@ obj/
 exports/
 ";
 
+/// The game assembly is loaded into the engine's own process, so there is no
+/// game executable to launch under a debugger; both configurations attach.
+/// `orrin-core` is the engine's name both from a checkout and installed.
+const LAUNCH: &str = r#"{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Attach to Orrin",
+      "type": "coreclr",
+      "request": "attach",
+      "processName": "orrin-core"
+    },
+    {
+      "name": "Pick a process to attach to",
+      "type": "coreclr",
+      "request": "attach",
+      "processId": "${command:pickProcess}"
+    }
+  ]
+}
+"#;
+
 fn readme(name: &str, assembly: &str) -> String {
     let csproj = format!("{assembly}.csproj");
     let tree = [
@@ -198,7 +222,12 @@ fn readme(name: &str, assembly: &str) -> String {
             "the entry Behaviour named by `scripts.entry`",
         ),
         ("    FlyCamera.cs", "WASD and right-drag to move the camera"),
+        ("    Tests.cs", "tests `orrin test` runs, with no window"),
         ("  scenes/", "scene files"),
+        (
+            "  .vscode/launch.json",
+            "attaches VS Code's C# debugger to the engine",
+        ),
         ("  .orrin/", "generated, gitignored: cache + asset index"),
     ];
 
@@ -241,6 +270,33 @@ orrin build
 and press **Reload scripts** in the editor's Scripts panel. Fields keep their
 current values across the swap, so the scene picks up where it left off. A
 build that fails leaves the running session untouched.
+
+## Debugging
+
+Your scripts run inside the engine's process, so a debugger attaches to the
+running engine rather than launching the game. Start it with `orrin run` —
+a Debug build, which keeps locals and line numbers; `--release` optimises them
+away — then:
+
+- **VS Code**, with the C# extension: Run and Debug, **Attach to Orrin**. It
+  finds the engine by its process name, `orrin-core`; **Pick a process to
+  attach to** asks instead.
+- **Rider**: Run ▸ Attach to Process…, and pick `orrin-core`.
+
+The engine loads `{assembly}.pdb` alongside `{assembly}.dll`, which is what lets
+a breakpoint in `scripts/` bind to the code that is running.
+
+## Testing
+
+```
+orrin test
+```
+
+builds the scripts and runs every `[Test]` method in them inside the engine,
+with no window: each in an empty world, playing, a frame at a time. A test that
+returns `IEnumerator` waits a frame at each `yield return null`. `orrin test
+Spinner` runs only the tests whose name contains `Spinner`. The command exits
+non-zero when a test fails, so CI can run it as it is.
 "#
     )
 }
@@ -251,24 +307,35 @@ build that fails leaves the running session untouched.
 /// a bare `dotnet build`). Either way `Private="false"` keeps `Orrin.dll` out
 /// of this project's output: a second copy is a second set of types, and every
 /// Behaviour cast across the boundary would fail.
+///
+/// The analyzer behind ORRIN001 follows the same split: a project reference in
+/// the checkout, and beside `Orrin.dll` elsewhere, where it is optional so that
+/// bindings shipped without it still build.
 fn csproj(assembly: &str, checkout: Option<&Path>, root: &Path) -> String {
     let scripts_dir = root.join("scripts");
-    let reference = checkout
-        .and_then(|checkout| {
-            relative_path(&scripts_dir, &checkout.join("scripting/Orrin/Orrin.csproj"))
-        })
-        .map(|path| {
-            format!(
-                r#"    <ProjectReference Include="{}" Private="false" />"#,
-                path.to_string_lossy().replace('\\', "/")
-            )
-        })
-        .unwrap_or_else(|| {
-            r#"    <Reference Include="Orrin" Private="false">
+    let in_checkout = |project: &str| {
+        let checkout = checkout?;
+        let path = relative_path(&scripts_dir, &checkout.join(project))?;
+        Some(path.to_string_lossy().replace('\\', "/"))
+    };
+    let reference = match (
+        in_checkout("scripting/Orrin/Orrin.csproj"),
+        in_checkout("scripting/Orrin.Analyzers/Orrin.Analyzers.csproj"),
+    ) {
+        (Some(bindings), Some(analyzers)) => format!(
+            r#"    <ProjectReference Include="{bindings}" Private="false" />
+    <!-- ORRIN001, a Behaviour field the registry cannot save. Loaded by the
+         compiler, never referenced by the game assembly. -->
+    <ProjectReference Include="{analyzers}"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" />"#
+        ),
+        _ => r#"    <Reference Include="Orrin" Private="false">
       <HintPath>$(OrrinBindings)/Orrin.dll</HintPath>
-    </Reference>"#
-                .to_string()
-        });
+    </Reference>
+    <!-- ORRIN001, a Behaviour field the registry cannot save. -->
+    <Analyzer Include="$(OrrinBindings)/Orrin.Analyzers.dll" Condition="Exists('$(OrrinBindings)/Orrin.Analyzers.dll')" />"#
+            .to_string(),
+    };
 
     format!(
         r#"<Project Sdk="Microsoft.NET.Sdk">
@@ -326,29 +393,35 @@ namespace {assembly};
 // time on reload to work out which fields you have actually changed.
 public class Main : Behaviour
 {{
-    public float SpinSpeed = 45f;
     public float Height = 1.5f;
-
-    private Entity _cube;
-    private float _spin;
 
     public override void OnStart()
     {{
         var spawn = Transform.Identity;
         spawn.Position = new Vector3(0f, Height, 0f);
-        _cube = World.SpawnRenderable("cube", "gold", spawn);
+        var cube = World.SpawnRenderable("cube", "gold", spawn);
+        World.AddScript<Spinner>(cube);
         World.AddScript<FlyCamera>(World.Spawn());
-        Debug.Log($"{name} started; cube = {{_cube}}");
+        Debug.Log($"{name} started; cube = {{cube}}");
     }}
+}}
+
+// Turns the entity it is attached to. A Behaviour moves its own entity, through
+// LocalTransform, so the cube carries one of these rather than Main reaching
+// over to turn it.
+public class Spinner : Behaviour
+{{
+    public float SpinSpeed = 45f;
+
+    private float _spin;
 
     public override void OnUpdate(float deltaTime)
     {{
         _spin += SpinSpeed * deltaTime;
 
-        var t = Transform.Identity;
-        t.Position = new Vector3(0f, Height, 0f);
+        var t = LocalTransform;
         t.Rotation = Quaternion.Euler(0f, _spin, 0f);
-        Native.SetTransform(_cube, t);
+        LocalTransform = t;
     }}
 }}
 "#
@@ -395,6 +468,43 @@ public class FlyCamera : Behaviour
 
         var speed = Speed * (Input.GetKey(KeyCode.LeftShift) ? Boost : 1f);
         Camera.Place(Camera.position + move * (speed * deltaTime), facing);
+    }}
+}}
+"#
+    )
+}
+
+fn tests_cs(assembly: &str) -> String {
+    format!(
+        r#"using System.Collections;
+
+using Orrin;
+using Orrin.Math;
+using Orrin.Testing;
+
+namespace {assembly};
+
+// Run by `orrin test`. Each [Test] starts in an empty world that is playing,
+// and a test that returns IEnumerator gets one frame of 1/60 s at every
+// `yield return null`: physics, then every Behaviour's OnStart and OnUpdate.
+public static class Tests
+{{
+    [Test]
+    public static IEnumerator ASpinnerTurnsAtItsSpeed()
+    {{
+        var cube = World.Spawn(Transform.Identity);
+        cube.AddScript<Spinner>();
+
+        // Its first frame: the Spinner is created, starts and updates once.
+        yield return null;
+        var spinner = cube.GetBehaviour<Spinner>();
+        Assert.That(spinner is not null, "the Spinner was attached");
+
+        // A second's worth of frames in all, so it has turned SpinSpeed degrees.
+        yield return Wait.Frames(59);
+        var expected = Quaternion.Euler(0f, spinner!.SpinSpeed, 0f) * Vector3.forward;
+        var facing = cube.LocalTransform.Rotation * Vector3.forward;
+        Assert.AreApproximatelyEqual(expected, facing, 1e-3f, "facing after one second");
     }}
 }}
 "#
@@ -481,6 +591,84 @@ mod tests {
         // A second copy of Orrin.dll in the game's output would mean a second
         // set of types, and every Behaviour cast across the boundary failing.
         assert!(csproj.contains(r#"Private="false""#));
+        // ORRIN001 comes from the analyzer laid beside the bindings, and a
+        // bindings directory without one must still build.
+        assert!(
+            csproj.contains(
+                r#"<Analyzer Include="$(OrrinBindings)/Orrin.Analyzers.dll" Condition="Exists('$(OrrinBindings)/Orrin.Analyzers.dll')" />"#
+            ),
+            "{csproj}"
+        );
+    }
+
+    /// The checkout shape, which `examples/hello-orrin` is: both the bindings
+    /// and the analyzer by relative project path.
+    #[test]
+    fn a_project_inside_a_checkout_references_the_analyzer_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checkout = dir.path();
+        for marker in ["crates/core/Cargo.toml", "scripting/Orrin/Orrin.csproj"] {
+            write(&checkout.join(marker), "").expect("marker");
+        }
+        std::fs::create_dir(checkout.join("examples")).expect("examples");
+        scaffold("test-game", &checkout.join("examples")).expect("scaffold");
+
+        let csproj =
+            std::fs::read_to_string(checkout.join("examples/test-game/scripts/TestGame.csproj"))
+                .expect("csproj");
+        assert!(
+            csproj.contains(
+                r#"<ProjectReference Include="../../../scripting/Orrin/Orrin.csproj" Private="false" />"#
+            ),
+            "{csproj}"
+        );
+        // `ReferenceOutputAssembly="false"` is what keeps the analyzer, and the
+        // Roslyn it is built on, out of the game assembly's references.
+        assert!(
+            csproj.contains(
+                r#"<ProjectReference Include="../../../scripting/Orrin.Analyzers/Orrin.Analyzers.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" />"#
+            ),
+            "{csproj}"
+        );
+        assert!(!csproj.contains("<Analyzer Include"), "{csproj}");
+        assert!(!csproj.contains("HintPath"), "{csproj}");
+    }
+
+    /// The game assembly runs inside the engine's process, so a debugger is
+    /// attached to that rather than launched.
+    #[test]
+    fn a_scaffolded_project_can_attach_a_debugger_to_the_engine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        scaffold("test-game", dir.path()).expect("scaffold");
+        let root = dir.path().join("test-game");
+
+        let text = std::fs::read_to_string(root.join(".vscode/launch.json")).expect("launch.json");
+        let launch: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let attach = launch["configurations"]
+            .as_array()
+            .expect("a configurations array")
+            .iter()
+            .find(|c| c["type"] == "coreclr" && c["request"] == "attach")
+            .unwrap_or_else(|| panic!("no coreclr attach configuration: {text}"));
+        assert_eq!(attach["processName"], "orrin-core", "{text}");
+
+        let readme = std::fs::read_to_string(root.join("README.md")).expect("README");
+        assert!(readme.contains("## Debugging"), "{readme}");
+        assert!(readme.contains("Rider"), "{readme}");
+    }
+
+    /// `Orrin.Native` is the bindings' own plumbing, not API a game may call.
+    #[test]
+    fn the_scaffolded_scripts_use_only_the_public_api() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        scaffold("test-game", dir.path()).expect("scaffold");
+        let scripts = dir.path().join("test-game/scripts");
+
+        for file in ["Main.cs", "FlyCamera.cs"] {
+            let source = std::fs::read_to_string(scripts.join(file)).expect(file);
+            assert!(!source.contains("Native."), "{file}:\n{source}");
+        }
     }
 
     /// A new project can be walked around as soon as it runs, in the editor's
@@ -500,6 +688,26 @@ mod tests {
         }
         let main = std::fs::read_to_string(scripts.join("Main.cs")).expect("Main.cs");
         assert!(main.contains("World.AddScript<FlyCamera>"), "{main}");
+    }
+
+    /// `orrin test` has something to run in a new project, written against the
+    /// scaffold's own Behaviours and nothing internal.
+    #[test]
+    fn a_scaffolded_project_has_a_test() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        scaffold("test-game", dir.path()).expect("scaffold");
+        let root = dir.path().join("test-game");
+
+        let tests = std::fs::read_to_string(root.join("scripts/Tests.cs")).expect("Tests.cs");
+        assert!(tests.contains("namespace TestGame;"), "{tests}");
+        assert!(tests.contains("using Orrin.Testing;"), "{tests}");
+        assert!(tests.contains("[Test]"), "{tests}");
+        assert!(tests.contains("AddScript<Spinner>"), "{tests}");
+        assert!(!tests.contains("Native."), "{tests}");
+
+        let readme = std::fs::read_to_string(root.join("README.md")).expect("README");
+        assert!(readme.contains("Tests.cs"), "{readme}");
+        assert!(readme.contains("orrin test"), "{readme}");
     }
 
     #[test]

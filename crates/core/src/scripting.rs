@@ -4,18 +4,21 @@
 //! engine's own `LocalTransform`, so they're defined here and assembled into the
 //! table with `..orrin_script::default_api()`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString, c_char};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use glam::{Mat4, Quat, Vec3};
 
 use orrin_ecs::{Entity, FxHashMap, World};
-use orrin_registry::{AssetId, ComponentId, Registry, ScriptBridge, Value, ValueError};
+use orrin_registry::{
+    AssetId, ComponentId, EntityId, FieldInfo, FieldPath, PathSegment, Registry, ScriptBridge,
+    Value, ValueError,
+};
 use orrin_script::{
-    CCamera, CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi, ScriptHost,
+    CCamera, CCollision, CEntity, CTransform, GameAssemblyStatus, Hooks, OrrinApi, ScriptHost,
 };
 
 use crate::asset_db::{AssetDatabase, AssetKind, LoadState};
@@ -24,8 +27,8 @@ use crate::scene::prefab::{self, Prefabs};
 use crate::scene::{
     ActionId, Actions, ActiveCamera, Assets, CameraComponent, Collider, ColliderShape, DebugLines,
     InputState, LoadedScenes, LocalTransform, LogLevel, MaterialHandle, MeshHandle, Name, Parent,
-    PendingScripts, Rect, SceneHandle, ScriptComponent, Tag, TextAnchor, TextStyle, Time,
-    Transform, UiCanvas, WorldTransform, color_bytes,
+    PendingScripts, Rect, SceneHandle, ScriptComponent, Scripts, Tag, TextAnchor, TextStyle, Time,
+    Transform, UiCanvas, WorldTransform, canonical_type_name, color_bytes,
 };
 
 extern "C" fn get_transform(entity: CEntity, out: *mut CTransform) -> bool {
@@ -353,8 +356,17 @@ fn with_time<R: Default>(query: impl FnOnce(&Time) -> R) -> R {
     })
 }
 
+thread_local! {
+    /// The step being dispatched while `run_physics` is inside OnFixedUpdate:
+    /// `Time.deltaTime` reads it there, as Unity's does. A property of the
+    /// dispatch, not of any world, so it is not a resource.
+    static FIXED_STEP: Cell<Option<f32>> = const { Cell::new(None) };
+}
+
 extern "C" fn time_delta() -> f32 {
-    with_time(|time| time.delta_time())
+    FIXED_STEP
+        .get()
+        .unwrap_or_else(|| with_time(|time| time.delta_time()))
 }
 
 extern "C" fn time_total() -> f32 {
@@ -363,6 +375,51 @@ extern "C" fn time_total() -> f32 {
 
 extern "C" fn time_frame_count() -> u64 {
     with_time(|time| time.frame_count())
+}
+
+extern "C" fn time_unscaled_delta() -> f32 {
+    with_time(|time| time.unscaled_delta_time())
+}
+
+extern "C" fn time_fixed_delta() -> f32 {
+    orrin_script::with_world(crate::physics::STEP, |world| {
+        crate::physics::step_length(world)
+    })
+}
+
+// The scale is the transport's (see `scene::play`), so a session's end resets
+// it. A world with no transport yet — a test, a story — gets one on the first
+// write, as `set_cursor_locked` does with its request.
+extern "C" fn time_scale() -> f32 {
+    orrin_script::with_world(1.0, |world| {
+        world
+            .get_resource::<crate::scene::Play>()
+            .map_or(1.0, |play| play.time_scale())
+    })
+}
+
+extern "C" fn set_time_scale(scale: f32) {
+    orrin_script::with_world((), |world| {
+        if world.get_resource::<crate::scene::Play>().is_none() {
+            world.insert_resource(crate::scene::Play::default());
+        }
+        world
+            .resource_mut::<crate::scene::Play>()
+            .set_time_scale(scale);
+    });
+}
+
+extern "C" fn scroll_delta(out: *mut [f32; 2]) {
+    if out.is_null() {
+        return;
+    }
+    let wheel = orrin_script::with_world((0.0, 0.0), |world| {
+        world
+            .get_resource::<InputState>()
+            .map_or((0.0, 0.0), |input| input.wheel())
+    });
+    // SAFETY: C# passes two writable floats.
+    unsafe { out.write_unaligned([wheel.0, wheel.1]) };
 }
 
 // Read-only world inspection for scripts. These are leaf calls: any RefCell
@@ -713,6 +770,133 @@ extern "C" fn physics_raycast(
         };
         // SAFETY: C# passes a pointer to `size` writable bytes, just checked to
         // be a whole `CRaycastHit`; unaligned, as in `read_c`.
+        unsafe { out.write_unaligned(hit) };
+        true
+    })
+}
+
+// The overlaps and shape casts take one `CShapeQuery` and its byte size,
+// checked like a component's. An overlap writes what fits into the caller's
+// buffer and returns how many there were, `find_all_by_tag`'s protocol; a cast
+// writes one `CRaycastHit`, as `physics_raycast` does.
+
+thread_local! {
+    /// Every overlap a script asks for collects here, so asking allocates
+    /// nothing once the buffer has grown to the largest answer.
+    static OVERLAPS: RefCell<Vec<Entity>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The query C# passed and the shape it places, or `None` for one this engine
+/// cannot read.
+fn read_shape_query(
+    query: *const orrin_script::CShapeQuery,
+    size: u32,
+) -> Option<(crate::physics::QueryShape, orrin_script::CShapeQuery)> {
+    let expected = std::mem::size_of::<orrin_script::CShapeQuery>();
+    if query.is_null() || size as usize != expected {
+        tracing::warn!(
+            "Physics: C# passed a {size}-byte shape query and the engine's is {expected}; \
+             rebuild scripting/Orrin so the bindings match the engine"
+        );
+        return None;
+    }
+    // SAFETY: C# passes a pointer to `size` readable bytes, just checked to be
+    // a whole `CShapeQuery`; unaligned, as in `read_c`.
+    let query = unsafe { query.read_unaligned() };
+    let center = Vec3::from_array(query.center);
+    let shape = match query.shape {
+        0 => crate::physics::QueryShape::Sphere {
+            center,
+            radius: query.size[0],
+        },
+        1 => {
+            // C#'s `default` Quaternion is all zeroes, which turns nothing.
+            let rotation = Quat::from_array(query.rotation);
+            let rotation = if rotation == Quat::from_xyzw(0.0, 0.0, 0.0, 0.0) {
+                Quat::IDENTITY
+            } else {
+                rotation
+            };
+            crate::physics::QueryShape::Box {
+                center,
+                half_extents: Vec3::from_array(query.size),
+                rotation,
+            }
+        }
+        other => {
+            tracing::warn!("Physics: query shape {other} is not one this engine knows");
+            return None;
+        }
+    };
+    Some((shape, query))
+}
+
+extern "C" fn physics_overlap(
+    query: *const orrin_script::CShapeQuery,
+    size: u32,
+    out: *mut CEntity,
+    capacity: u32,
+) -> u32 {
+    let Some((shape, query)) = read_shape_query(query, size) else {
+        return 0;
+    };
+    let capacity = if out.is_null() { 0 } else { capacity as usize };
+    orrin_script::with_world(0, |world| {
+        OVERLAPS.with_borrow_mut(|found| {
+            crate::physics::overlap(world, shape, query.layers, query.hit_triggers != 0, found);
+            for (slot, entity) in found.iter().take(capacity).enumerate() {
+                let entity = CEntity {
+                    index: entity.index,
+                    generation: entity.generation,
+                };
+                // SAFETY: C# passes `capacity` writable `CEntity` slots, and
+                // `slot` is below it.
+                unsafe { out.add(slot).write_unaligned(entity) };
+            }
+            found.len() as u32
+        })
+    })
+}
+
+extern "C" fn physics_shape_cast(
+    query: *const orrin_script::CShapeQuery,
+    size: u32,
+    out: *mut orrin_script::CRaycastHit,
+    hit_size: u32,
+) -> bool {
+    if out.is_null() || hit_size as usize != std::mem::size_of::<orrin_script::CRaycastHit>() {
+        tracing::warn!(
+            "Physics: C# passed a {hit_size}-byte hit and the engine's is {}; rebuild \
+             scripting/Orrin so the bindings match the engine",
+            std::mem::size_of::<orrin_script::CRaycastHit>()
+        );
+        return false;
+    }
+    let Some((shape, query)) = read_shape_query(query, size) else {
+        return false;
+    };
+    orrin_script::with_world(false, |world| {
+        let Some(hit) = crate::physics::shape_cast(
+            world,
+            shape,
+            Vec3::from_array(query.direction),
+            query.max_distance,
+            query.layers,
+            query.hit_triggers != 0,
+        ) else {
+            return false;
+        };
+        let hit = orrin_script::CRaycastHit {
+            entity: CEntity {
+                index: hit.entity.index,
+                generation: hit.entity.generation,
+            },
+            point: hit.point.to_array(),
+            normal: hit.normal.to_array(),
+            distance: hit.distance,
+        };
+        // SAFETY: C# passes a pointer to `hit_size` writable bytes, just
+        // checked to be a whole `CRaycastHit`; unaligned, as in `read_c`.
         unsafe { out.write_unaligned(hit) };
         true
     })
@@ -2672,13 +2856,15 @@ extern "C" fn debug_draw_line(
 struct PropertyBags;
 
 impl PropertyBags {
-    /// The GCHandle for `entity`'s behaviour, if it is the type this vtable
-    /// entry belongs to. An entity carries at most one `ScriptComponent`, so
-    /// two script components on one entity is simply not a state that exists.
+    /// The GCHandle for `entity`'s behaviour of the type this vtable entry
+    /// belongs to. An entity carries at most one Behaviour of each type, so the
+    /// type name picks out exactly one of its [`Scripts`]; both sides hold it in
+    /// [`canonical_type_name`]'s form, which is what lets an exact comparison
+    /// find a Behaviour that `World.AddScript<T>` attached.
     fn handle(world: &World, entity: Entity, type_name: &str) -> Option<u64> {
         world
-            .get::<ScriptComponent>(entity)
-            .filter(|script| script.type_name == type_name)
+            .get::<Scripts>(entity)?
+            .get(type_name)
             .map(|script| script.handle)
     }
 }
@@ -2690,7 +2876,10 @@ impl ScriptBridge for PropertyBags {
 
     fn read(&self, world: &World, entity: Entity, type_name: &str) -> Option<Value> {
         let bytes = orrin_script::read_bag(Self::handle(world, entity, type_name)?)?;
-        match orrin_registry::wire::decode(&bytes) {
+        let mut id_of = |index, generation| {
+            crate::scene::entity_ref::id_of(world, Entity { index, generation })
+        };
+        match orrin_registry::wire::decode_bag(&bytes, &mut id_of) {
             Ok(value) => Some(value),
             Err(error) => {
                 tracing::error!("{type_name}'s property bag did not decode: {error}");
@@ -2712,8 +2901,21 @@ impl ScriptBridge for PropertyBags {
                 type_name.to_owned(),
             ));
         };
+        let mut handles = Vec::new();
+        live_handles(
+            world,
+            type_name,
+            value,
+            &mut FieldPath::empty(),
+            &mut handles,
+        );
         let mut bytes = Vec::new();
-        orrin_registry::wire::encode(value, &mut bytes);
+        orrin_registry::wire::encode_bag(value, &mut bytes, &mut |id| {
+            handles
+                .iter()
+                .find_map(|&(known, handle)| (known == id).then_some(handle))
+                .unwrap_or((0, 0))
+        });
         if orrin_script::write_bag(handle, &bytes) {
             Ok(())
         } else {
@@ -2727,11 +2929,7 @@ impl ScriptBridge for PropertyBags {
     }
 
     fn remove(&self, world: &mut World, entity: Entity, type_name: &str) {
-        if Self::handle(world, entity, type_name).is_some() {
-            // Dropping the component is what tears the managed object down; see
-            // `ScriptComponent`'s `Drop`.
-            let _ = world.remove::<ScriptComponent>(entity);
-        }
+        Scripts::remove(world, entity, type_name);
     }
 
     /// An empty struct rather than a panic when the managed side cannot answer:
@@ -2746,7 +2944,9 @@ impl ScriptBridge for PropertyBags {
         let Some(bytes) = orrin_script::default_bag(&name) else {
             return empty;
         };
-        match orrin_registry::wire::decode(&bytes) {
+        // A fresh instance belongs to no world, so any handle its constructor
+        // left in a field names nothing a default could carry.
+        match orrin_registry::wire::decode_bag(&bytes, &mut |_, _| EntityId::NIL) {
             Ok(value) => value,
             Err(error) => {
                 tracing::error!("{type_name}'s defaults did not decode: {error}");
@@ -2754,6 +2954,109 @@ impl ScriptBridge for PropertyBags {
             }
         }
     }
+}
+
+/// One entry of `Orrin.PropertyBag.Components`: a `[Component]` Behaviour and
+/// what its fields' presentation attributes say.
+struct Listed {
+    id: String,
+    type_name: String,
+    name: String,
+    fields: Vec<FieldInfo>,
+}
+
+impl Listed {
+    /// `None` when the entry lacks an id, a type or a name. A field entry that
+    /// is malformed is dropped alone: presentation is not worth refusing a
+    /// component over.
+    fn read(entry: &Value) -> Option<Self> {
+        let text = |value: &Value, name: &str| match value.field(name) {
+            Some(Value::String(text)) => Some(text.clone()),
+            _ => None,
+        };
+        let fields = match entry.field("fields") {
+            Some(Value::List(fields)) => fields
+                .iter()
+                .filter_map(|field| {
+                    let range = match field.field("range") {
+                        Some(Value::List(bounds)) => match bounds[..] {
+                            [Value::F32(min), Value::F32(max)] => Some((min, max)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    Some(FieldInfo {
+                        name: text(field, "name")?,
+                        header: text(field, "header").filter(|text| !text.is_empty()),
+                        tooltip: text(field, "tooltip").filter(|text| !text.is_empty()),
+                        range,
+                        hidden: matches!(field.field("hidden"), Some(Value::Bool(true))),
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        Some(Self {
+            id: text(entry, "id")?,
+            type_name: text(entry, "type")?,
+            name: text(entry, "name")?,
+            fields,
+        })
+    }
+}
+
+/// The live handle for every entity reference in `value`, by id, appended to
+/// `out`.
+///
+/// One that names nothing here — another scene's entity, a deleted one, a
+/// handle that was already stale when the file was saved — is written as the
+/// null handle, never as whatever holds a similar slot, and is logged once with
+/// the field it sits in.
+fn live_handles(
+    world: &World,
+    type_name: &str,
+    value: &Value,
+    path: &mut FieldPath,
+    out: &mut Vec<(EntityId, (u32, u32))>,
+) {
+    match value {
+        Value::Entity(id) if !id.is_nil() && !out.iter().any(|(known, _)| known == id) => {
+            let handle = match crate::scene::entity_ref::entity_of(world, *id) {
+                Some(entity) => (entity.index, entity.generation),
+                None => {
+                    tracing::warn!(
+                        "`{path}` of `{type_name}` refers to entity {id}, which is not loaded, so \
+                         it was set to Entity.Null — the entity may be in another scene, have \
+                         been deleted, or have been gone already when this was saved"
+                    );
+                    (0, 0)
+                }
+            };
+            out.push((*id, handle));
+        }
+        Value::Struct(fields) | Value::Enum { fields, .. } => {
+            for (name, field) in fields {
+                path.push(PathSegment::Field(name.clone()));
+                live_handles(world, type_name, field, path, out);
+                path.pop();
+            }
+        }
+        Value::List(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(PathSegment::Index(index));
+                live_handles(world, type_name, item, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The bridge every script component's registry entry answers through. Public
+/// so a Behaviour no game assembly lists — the bindings' own test probes — can
+/// be registered by hand with [`Registry::register_script`].
+pub fn bridge() -> Arc<dyn ScriptBridge> {
+    Arc::new(PropertyBags)
 }
 
 fn build_api() -> OrrinApi {
@@ -2844,7 +3147,128 @@ fn build_api() -> OrrinApi {
         audio_stop_music,
         audio_set_master_volume,
         audio_set_music_volume,
+        time_unscaled_delta,
+        time_fixed_delta,
+        time_scale,
+        set_time_scale,
+        scroll_delta,
+        physics_overlap,
+        physics_shape_cast,
         ..orrin_script::default_api()
+    }
+}
+
+/// Time spent in managed code per Behaviour type, every hook included, for
+/// the Scripts panel's "Time each script". A world resource.
+///
+/// A switch of its own, off by default, because it perturbs what it measures:
+/// on, every dispatch is bracketed by two clock reads, which on a frame of ten
+/// thousand idle Behaviours is a large share of what the tick costs. Off, the
+/// dispatch path reads no clock at all — the tick looks at `enabled` once and
+/// each call is then the call. The time is accumulated per type through the
+/// index each instance resolved at attach ([`ScriptComponent::type_index`]),
+/// not by name per call.
+#[derive(Default)]
+pub struct ScriptTimings {
+    pub enabled: bool,
+    /// By type index; cleared whenever the switch is found off.
+    rows: Vec<TimingRow>,
+}
+
+/// Frames the average is taken over: about a second at 60 fps.
+const TIMING_WINDOW: usize = 60;
+
+pub struct TimingRow {
+    /// In the form [`canonical_type_name`] gives.
+    pub type_name: String,
+    pub last_frame: Duration,
+    window: [Duration; TIMING_WINDOW],
+    next: usize,
+    filled: usize,
+    sum: Duration,
+}
+
+impl TimingRow {
+    fn new(type_name: String) -> Self {
+        Self {
+            type_name,
+            last_frame: Duration::ZERO,
+            window: [Duration::ZERO; TIMING_WINDOW],
+            next: 0,
+            filled: 0,
+            sum: Duration::ZERO,
+        }
+    }
+
+    fn push(&mut self, frame: Duration) {
+        self.sum = self.sum - self.window[self.next] + frame;
+        self.window[self.next] = frame;
+        self.next = (self.next + 1) % TIMING_WINDOW;
+        self.filled = (self.filled + 1).min(TIMING_WINDOW);
+        self.last_frame = frame;
+    }
+
+    /// Over the last [`TIMING_WINDOW`] frames, or as many as there have been.
+    pub fn average(&self) -> Duration {
+        self.sum / self.filled.max(1) as u32
+    }
+}
+
+impl ScriptTimings {
+    pub fn rows(&self) -> impl Iterator<Item = &TimingRow> {
+        self.rows.iter()
+    }
+
+    fn record(&mut self, type_index: usize, type_name: &str, frame: Duration) {
+        while self.rows.len() <= type_index {
+            self.rows.push(TimingRow::new(String::new()));
+        }
+        let row = &mut self.rows[type_index];
+        if row.type_name.is_empty() {
+            row.type_name = type_name.to_owned();
+        }
+        row.push(frame);
+    }
+}
+
+/// Managed time per type index for the frame in progress, taken out of
+/// [`Scripting`] for a dispatch window. Off, a dispatch is the call alone.
+struct Clock {
+    on: bool,
+    spent: Vec<Duration>,
+}
+
+impl Clock {
+    fn time<R>(&mut self, type_index: u32, call: impl FnOnce() -> R) -> R {
+        if !self.on {
+            return call();
+        }
+        let start = Instant::now();
+        let result = call();
+        if let Some(spent) = self.spent.get_mut(type_index as usize) {
+            *spent += start.elapsed();
+        }
+        result
+    }
+}
+
+/// Every Behaviour type attached this session, by the index its instances
+/// carry. Only grows, so an index stays valid across a reload.
+#[derive(Default)]
+struct Types {
+    index: FxHashMap<String, u32>,
+    names: Vec<String>,
+}
+
+impl Types {
+    fn resolve(&mut self, type_name: &str) -> u32 {
+        if let Some(&index) = self.index.get(type_name) {
+            return index;
+        }
+        let index = self.names.len() as u32;
+        self.names.push(type_name.to_owned());
+        self.index.insert(type_name.to_owned(), index);
+        index
     }
 }
 
@@ -2913,17 +3337,104 @@ impl ReloadOutcome {
     }
 }
 
+/// The two assemblies a run loads, and the entry type and scripts directory
+/// the game's was found by. Resolved in one place so that the editor and the
+/// test runner load a project's code the same way.
+pub struct GameAssemblies {
+    pub bindings_dir: PathBuf,
+    pub game_dll: PathBuf,
+    pub entry: String,
+    pub scripts_dir: PathBuf,
+}
+
+impl GameAssemblies {
+    /// Each follows env > manifest > built-in default, with its own env
+    /// override. `Err` says why there is nothing to load, and how to fix it.
+    pub fn locate(project: Option<&orrin_project::Project>) -> Result<Self, String> {
+        const BINDINGS: &str = "scripting/Orrin";
+        const DEMO_SCRIPTS: &str = "scripting/DemoGame";
+        const DEMO_ENTRY: &str = "DemoGame.Game, DemoGame";
+
+        let bindings_dir = match std::env::var("ORRIN_SCRIPT_DIR") {
+            Ok(dir) => Some(PathBuf::from(dir)),
+            // Next to the executable is the shipped layout, and it is the only
+            // one that works from inside a project directory. The cwd-relative
+            // probe is the repo checkout, where the bindings are still an
+            // unbuilt source tree.
+            Err(_) => Scripting::bindings_beside_executable()
+                .or_else(|| Scripting::find_bindings_dir(Path::new(BINDINGS))),
+        };
+        let Some(bindings_dir) = bindings_dir else {
+            return Err(format!(
+                "no Orrin bindings next to the engine, and none under {BINDINGS} \
+                 (run `dotnet build {BINDINGS}`, or set ORRIN_SCRIPT_DIR)"
+            ));
+        };
+
+        let entry = std::env::var("ORRIN_ENTRY")
+            .ok()
+            .or_else(|| project.map(|project| project.entry_type().to_string()))
+            .unwrap_or_else(|| DEMO_ENTRY.to_string());
+
+        // Without a project this is the engine's own demo game, which is a
+        // normal game assembly like any other — one loading path, so the demo
+        // exercises hot reload exactly as a user's project does.
+        let scripts_dir = project
+            .map(|project| project.scripts_dir())
+            .unwrap_or_else(|| PathBuf::from(DEMO_SCRIPTS));
+
+        let shipped_dll = project.and_then(orrin_project::Project::game_assembly);
+        let game_dll = match std::env::var("ORRIN_GAME_DLL") {
+            Ok(path) => Some(PathBuf::from(path)),
+            Err(_) if shipped_dll.is_some() => shipped_dll,
+            Err(_) => match Scripting::assembly_of(&entry) {
+                Some(assembly) => Scripting::find_game_assembly(&scripts_dir, assembly),
+                None => {
+                    return Err(format!(
+                        "entry `{entry}` names no assembly — it must be assembly-qualified \
+                         (`MyGame.Main, MyGame`) so the engine knows which DLL to load"
+                    ));
+                }
+            },
+        };
+        let Some(game_dll) = game_dll else {
+            return Err(format!(
+                "no built game assembly for `{entry}` under {} \
+                 (run `dotnet build` there, or set ORRIN_GAME_DLL)",
+                scripts_dir.display()
+            ));
+        };
+
+        Ok(Self {
+            bindings_dir,
+            game_dll,
+            entry,
+            scripts_dir,
+        })
+    }
+}
+
 /// One script's lifecycle state for the duration of a tick, lifted out of the
 /// world so no storage borrow is held while C# runs. Written back at the end of
 /// the tick.
 struct Pending {
     entity: Entity,
     handle: u64,
+    hooks: Hooks,
+    type_index: u32,
     started: bool,
     enabled: bool,
     active: bool,
     /// Set the moment a hook throws this tick, so the later phases (collision,
     /// update) skip a script that faulted during activation.
+    faulted: bool,
+}
+
+/// A Behaviour `OnFixedUpdate` is dispatched to this frame.
+struct Stepped {
+    entity: Entity,
+    handle: u64,
+    type_index: u32,
     faulted: bool,
 }
 
@@ -2940,15 +3451,29 @@ pub struct Scripting {
     /// future re-entry into a `RefCell` panic instead of a compile error, and
     /// the whole point of the window is that C# may call back in.
     pending: RefCell<Vec<Pending>>,
-    /// `entity -> index into pending`, so routing a collision event costs a
-    /// hash lookup instead of a scan over every scripted entity. Built only on
-    /// ticks that actually have events.
-    routing: RefCell<FxHashMap<Entity, usize>>,
+    /// `entity -> start..end in pending`, so routing a collision event costs a
+    /// hash lookup instead of a scan over every scripted entity. An entity's
+    /// Behaviours are contiguous in `pending`, in attach order, because they are
+    /// collected from one [`Scripts`]. Built only on ticks that actually have
+    /// events.
+    routing: RefCell<FxHashMap<Entity, (u32, u32)>>,
     /// This tick's pointer events, swapped out of the world for the dispatch
     /// and back, cleared, so neither side reallocates.
     pointer_events: RefCell<crate::ui::events::UiEvents>,
     /// The tweens that finished since the last tick, likewise.
     finished_tweens: RefCell<Vec<crate::ui::tween::TweenId>>,
+    /// `run_physics`'s scratch, kept for the allocation as `pending` is.
+    stepped: RefCell<Vec<Stepped>>,
+    /// Whether some live Behaviour's type overrides OnFixedUpdate, or a Stay
+    /// callback. Set by an attach, and recomputed by every tick's collection,
+    /// which sees them all: so never false while one exists, and the physics
+    /// phase of a world with none pays no sweep over every Behaviour to find
+    /// that out, and Jolt's resting pairs no Stay events nobody reads.
+    fixed_wanted: Cell<bool>,
+    stays_wanted: Cell<bool>,
+    types: RefCell<Types>,
+    /// Managed time per type for the frame in progress; see [`ScriptTimings`].
+    spent: RefCell<Vec<Duration>>,
 }
 
 impl Scripting {
@@ -3062,6 +3587,11 @@ impl Scripting {
             routing: RefCell::new(FxHashMap::default()),
             pointer_events: RefCell::new(crate::ui::events::UiEvents::default()),
             finished_tweens: RefCell::new(Vec::new()),
+            stepped: RefCell::new(Vec::new()),
+            fixed_wanted: Cell::new(false),
+            stays_wanted: Cell::new(false),
+            types: RefCell::new(Types::default()),
+            spent: RefCell::new(Vec::new()),
         };
         match scripting.stage() {
             Ok(()) => {}
@@ -3107,7 +3637,9 @@ impl Scripting {
     ///   `RefCell` borrow of the storage the teardown loop needs mutably — a
     ///   runtime panic, not a compile error.
     /// - **Capture precedes destroy, and commit follows both.** Dropping the
-    ///   component frees its `GCHandle`, leaving nothing to snapshot; and
+    ///   component frees its `GCHandle`, leaving nothing to snapshot — and an
+    ///   entity's [`Scripts`] go all at once, so every instance is captured
+    ///   before any entity's are destroyed; and
     ///   `commit_game` retires the old load context only once *every* handle
     ///   into it is gone. Faulted scripts are included for that second reason:
     ///   skipping them strands a handle and leaks a context per reload after.
@@ -3128,27 +3660,30 @@ impl Scripting {
             snapshot: u64,
         }
 
+        // In attach order within each entity, which re-creating them in this
+        // order below preserves.
         let mut pending: Vec<Reloading> = Vec::new();
-        world
-            .query::<&ScriptComponent>()
-            .for_each(|entity, script| {
-                pending.push(Reloading {
-                    entity,
-                    handle: script.handle,
-                    type_name: script.type_name.clone(),
-                    enabled: script.enabled,
-                    started: script.started,
-                    snapshot: 0,
-                })
-            });
+        world.query::<&Scripts>().for_each(|entity, scripts| {
+            pending.extend(scripts.iter().map(|script| Reloading {
+                entity,
+                handle: script.handle,
+                type_name: script.type_name.clone(),
+                enabled: script.enabled,
+                started: script.started,
+                snapshot: 0,
+            }))
+        });
 
         for script in pending.iter_mut() {
             script.snapshot = self.host.capture_state(script.handle);
+        }
+        for script in &pending {
             // Dropped here and not bound to anything: the `Drop` impl is what
             // fires OnDisable/OnDestroy (against the old code, correctly) and
             // frees the handle. A binding that outlived the commit below would
-            // pin the retired assembly.
-            let _ = world.remove::<ScriptComponent>(script.entity);
+            // pin the retired assembly. An entity's later entries find nothing
+            // left to remove.
+            let _ = world.remove::<Scripts>(script.entity);
         }
 
         let status = self.host.commit_game();
@@ -3199,8 +3734,8 @@ impl Scripting {
     /// Run outside any dispatch window, since it creates managed objects, and
     /// before the tick, so they get their OnEnable and OnStart on it. One that
     /// cannot be created is kept as data, never dropped: a type renamed since
-    /// the save, a game assembly that is not loaded, or a second Behaviour on an
-    /// entity that can carry only one.
+    /// the save, a game assembly that is not loaded, or a second Behaviour of a
+    /// type the entity already carries.
     pub fn attach_pending(&self, world: &mut World, registry: &Registry) {
         let mut waiting = Vec::new();
         world
@@ -3218,15 +3753,6 @@ impl Scripting {
                     crate::scene::persist::keep_unapplied(world, entity, (id, value));
                     continue;
                 };
-                if world.has::<ScriptComponent>(entity) {
-                    tracing::warn!(
-                        "entity {} already has a Behaviour, and carries one at most; `{id}` was \
-                         kept but not attached",
-                        entity.index()
-                    );
-                    crate::scene::persist::keep_unapplied(world, entity, (id, value));
-                    continue;
-                }
                 if self.attach_with(world, entity, &binding.type_name, false, true) == 0 {
                     crate::scene::persist::keep_unapplied(world, entity, (id, value));
                     continue;
@@ -3238,14 +3764,19 @@ impl Scripting {
         }
     }
 
-    /// Attach a C# `Behaviour` (by assembly-qualified type name) to `entity`.
-    /// A no-op when the type isn't in the loaded game assembly.
+    /// Attach a C# `Behaviour` (by assembly-qualified type name) to `entity`,
+    /// after any it already carries. A no-op when the type isn't in the loaded
+    /// game assembly, or when the entity already carries one of that type.
     pub fn attach(&self, world: &mut World, entity: Entity, type_name: &str) {
         self.attach_with(world, entity, type_name, false, true);
     }
 
     /// `attach`, with the lifecycle position a hot reload has to carry over.
-    /// Returns the new managed handle, or `0` if the type could not be created.
+    /// Returns the new managed handle, or `0` if the type could not be created
+    /// or the entity already carries one.
+    ///
+    /// The duplicate is refused before anything managed runs, so a refused
+    /// attach constructs nothing and destroys nothing.
     pub fn attach_with(
         &self,
         world: &mut World,
@@ -3254,10 +3785,22 @@ impl Scripting {
         started: bool,
         enabled: bool,
     ) -> u64 {
-        let Ok(name) = CString::new(type_name) else {
+        let type_name = canonical_type_name(type_name);
+        if world
+            .get::<Scripts>(entity)
+            .is_some_and(|scripts| scripts.get(&type_name).is_some())
+        {
+            tracing::warn!(
+                "entity {} already has a `{type_name}`, and carries one Behaviour of each type \
+                 at most; the second was not attached",
+                entity.index()
+            );
+            return 0;
+        }
+        let Ok(name) = CString::new(type_name.as_str()) else {
             return 0;
         };
-        let handle = self.host.create(
+        let (handle, hooks) = self.host.create(
             CEntity {
                 index: entity.index,
                 generation: entity.generation,
@@ -3274,19 +3817,33 @@ impl Scripting {
             );
         }
         if handle != 0 {
-            world.insert(
-                entity,
-                ScriptComponent {
-                    handle,
-                    type_name: type_name.to_owned(),
-                    started,
-                    // Desired-on from birth; `active` stays false until the
-                    // first tick actually dispatches OnEnable.
-                    enabled,
-                    active: false,
-                    faulted: false,
-                },
-            );
+            if hooks.contains(Hooks::FIXED_UPDATE) {
+                self.fixed_wanted.set(true);
+            }
+            if hooks.intersects(Hooks::COLLISION_STAY | Hooks::TRIGGER_STAY) {
+                self.stays_wanted.set(true);
+            }
+            let type_index = self.types.borrow_mut().resolve(&type_name);
+            let script = ScriptComponent {
+                handle,
+                type_name,
+                hooks,
+                type_index,
+                started,
+                // Desired-on from birth; `active` stays false until the
+                // first tick actually dispatches OnEnable.
+                enabled,
+                active: false,
+                faulted: false,
+            };
+            if !world.has::<Scripts>(entity) {
+                world.insert(entity, Scripts::default());
+            }
+            // A stale entity has no `Scripts`, and `script` is dropped, which
+            // destroys it. `push` refuses only a duplicate, ruled out above.
+            if let Some(mut scripts) = world.get_mut::<Scripts>(entity) {
+                let _ = scripts.push(script);
+            }
         }
         handle
     }
@@ -3325,6 +3882,31 @@ impl Scripting {
             .unwrap_or_default();
         world.insert_resource(crate::ui::story::StoryArgs::default());
         (built, args)
+    }
+
+    /// The simple name of the game assembly this session loaded, which is the
+    /// one a project's tests are listed from.
+    pub fn game_assembly_name(&self) -> Option<&str> {
+        self.game_dll.file_stem()?.to_str()
+    }
+
+    /// Every `[Test]` the live assembly named `assembly` declares.
+    pub fn tests(&self, assembly: &str) -> Vec<orrin_script::TestCase> {
+        self.host.tests(assembly)
+    }
+
+    /// One turn of a test — `turn` is [`ScriptHost::begin_test`] or one of
+    /// its siblings — in a dispatch window over `world`, then what it queued
+    /// applied, as after a tick.
+    pub fn test_turn(
+        &self,
+        world: &mut World,
+        registry: &Registry,
+        turn: impl FnOnce(&ScriptHost) -> orrin_script::TestStep,
+    ) -> orrin_script::TestStep {
+        let step = orrin_script::with_active_world(world, || turn(&self.host));
+        self.apply_commands(world, registry);
+        step
     }
 
     /// Run the completion callbacks of every tween that finished since the
@@ -3375,18 +3957,15 @@ impl Scripting {
             return 0;
         };
 
-        let bridge: Arc<dyn ScriptBridge> = Arc::new(PropertyBags);
+        let bridge = bridge();
         let mut registered = 0;
         for entry in entries {
-            let (
-                Some(Value::String(id)),
-                Some(Value::String(type_name)),
-                Some(Value::String(name)),
-            ) = (
-                entry.field("id").cloned(),
-                entry.field("type").cloned(),
-                entry.field("name").cloned(),
-            )
+            let Some(Listed {
+                id,
+                type_name,
+                name,
+                fields,
+            }) = Listed::read(&entry)
             else {
                 tracing::error!("a component listing entry was missing id, type or name");
                 continue;
@@ -3409,17 +3988,136 @@ impl Scripting {
                 );
                 continue;
             }
-            registry.register_script(component_id, name, type_name, Arc::clone(&bridge));
+            registry.register_script(
+                component_id,
+                name,
+                canonical_type_name(&type_name),
+                fields,
+                Arc::clone(&bridge),
+            );
             registered += 1;
         }
         registered
     }
 
-    /// Request an activation change; the transition (OnEnable/OnDisable) is
-    /// dispatched by the next `tick`, not here.
-    pub fn set_enabled(&self, world: &mut World, entity: Entity, enabled: bool) {
-        if let Some(mut script) = world.get_mut::<ScriptComponent>(entity) {
+    /// Request an activation change for `entity`'s Behaviour of `type_name`;
+    /// the transition (OnEnable/OnDisable) is dispatched by the next `tick`,
+    /// not here. The others on the entity are untouched.
+    pub fn set_enabled(&self, world: &mut World, entity: Entity, type_name: &str, enabled: bool) {
+        let type_name = canonical_type_name(type_name);
+        if let Some(mut scripts) = world.get_mut::<Scripts>(entity)
+            && let Some(script) = scripts.get_mut(&type_name)
+        {
             script.enabled = enabled;
+        }
+    }
+
+    /// The frame's physics phase with scripts in it: [`physics::run`], with
+    /// `OnFixedUpdate` dispatched before each step it takes to every active,
+    /// started, unfaulted Behaviour whose type overrides it, in the order
+    /// [`tick`](Self::tick) dispatches OnUpdate. A Behaviour attached since the
+    /// last tick has not started, so it is first told of a step on the frame
+    /// after its OnStart.
+    ///
+    /// Each step's dispatch is a window of its own, opened inside the physics
+    /// callback with no world borrow held. Structural changes queued there land
+    /// once, after the frame's last step and before the tick: a body cannot be
+    /// built or dropped between two steps anyway (see the `physics` module), and
+    /// a scene load applied there would despawn the world under the step loop.
+    ///
+    /// [`physics::run`]: crate::physics::run
+    pub fn run_physics(&self, world: &mut World, registry: &Registry, delta: f32) {
+        if let Some(mut collisions) = world.get_resource_mut::<CollisionState>() {
+            collisions.report_stays = self.stays_wanted.get();
+        }
+        let mut stepped = self.stepped.take();
+        stepped.clear();
+        if self.fixed_wanted.get() {
+            world.query::<&Scripts>().for_each(|entity, scripts| {
+                stepped.extend(
+                    scripts
+                        .iter()
+                        .filter(|script| {
+                            script.hooks.contains(Hooks::FIXED_UPDATE)
+                                && script.active
+                                && script.started
+                                && !script.faulted
+                        })
+                        .map(|script| Stepped {
+                            entity,
+                            handle: script.handle,
+                            type_index: script.type_index,
+                            faulted: false,
+                        }),
+                )
+            });
+        }
+        if stepped.is_empty() {
+            crate::physics::run(world, delta);
+            self.stepped.replace(stepped);
+            return;
+        }
+
+        let mut clock = self.clock(world);
+        crate::physics::run_with(
+            world,
+            delta,
+            Some(&mut |world: &mut World, step: f32| {
+                crate::profile_scope!("fixed update");
+                FIXED_STEP.set(Some(step));
+                orrin_script::with_active_world(world, || {
+                    for script in stepped.iter_mut().filter(|script| !script.faulted) {
+                        let host = &self.host;
+                        if clock.time(script.type_index, || host.fixed_update(script.handle, step))
+                        {
+                            script.faulted = true;
+                        }
+                    }
+                });
+                FIXED_STEP.set(None);
+            }),
+        );
+        self.spent.replace(clock.spent);
+
+        for script in stepped.iter().filter(|script| script.faulted) {
+            if let Some(mut scripts) = world.get_mut::<Scripts>(script.entity)
+                && let Some(component) = scripts.iter_mut().find(|c| c.handle == script.handle)
+            {
+                component.faulted = true;
+            }
+        }
+        self.apply_commands(world, registry);
+        self.stepped.replace(stepped);
+    }
+
+    /// The frame's timing accumulator, out of `self` for a dispatch window and
+    /// sized to every type attached so far while the switch is on.
+    fn clock(&self, world: &World) -> Clock {
+        let on = world
+            .get_resource::<ScriptTimings>()
+            .is_some_and(|timings| timings.enabled);
+        let mut spent = self.spent.take();
+        if on {
+            spent.resize(self.types.borrow().names.len(), Duration::ZERO);
+        }
+        Clock { on, spent }
+    }
+
+    /// Hand the frame's managed time to [`ScriptTimings`] and start the next.
+    fn publish_timings(&self, world: &World) {
+        let mut spent = self.spent.borrow_mut();
+        let Some(mut timings) = world.get_resource_mut::<ScriptTimings>() else {
+            spent.clear();
+            return;
+        };
+        if !timings.enabled {
+            timings.rows.clear();
+            spent.clear();
+            return;
+        }
+        let types = self.types.borrow();
+        for (index, time) in spent.iter_mut().enumerate() {
+            timings.record(index, &types.names[index], std::mem::take(time));
         }
     }
 
@@ -3427,46 +4125,62 @@ impl Scripting {
     /// dispatch — so the ABI's `&mut World` reconstruction never aliases.
     ///
     /// Dispatch order inside the window mirrors Unity: activation transitions
-    /// (OnEnable/OnStart/OnDisable), then this frame's collision callbacks,
-    /// then its pointer events, then OnUpdate.
+    /// (OnEnable/OnStart/OnDisable), then this frame's collision callbacks —
+    /// enter, stay and exit, in the order the steps raised them — then its
+    /// pointer events, then OnUpdate. Within each phase an entity's Behaviours
+    /// run in attach order. OnFixedUpdate is not here: it runs in the physics
+    /// phase, before this, through [`run_physics`](Self::run_physics).
     pub fn tick(&self, world: &mut World, registry: &Registry, delta_time: f32) {
         // First, and whether or not anything else runs: a callback is game
         // code with no behaviour behind it, and a story may have nothing else.
         let finished = self.finish_tweens(world);
         let mut pending = self.pending.take();
         pending.clear();
-        world
-            .query::<&ScriptComponent>()
-            .for_each(|entity, script| {
-                // Already-faulted scripts are inert: never collected, never
-                // dispatched to, until something clears the flag.
-                if script.faulted {
-                    return;
-                }
-                pending.push(Pending {
-                    entity,
-                    handle: script.handle,
-                    started: script.started,
-                    enabled: script.enabled,
-                    active: script.active,
-                    faulted: false,
-                })
-            });
+        let mut overridden = Hooks::NONE;
+        world.query::<&Scripts>().for_each(|entity, scripts| {
+            for script in scripts.iter() {
+                overridden |= script.hooks;
+            }
+            // Already-faulted scripts are inert: never collected, never
+            // dispatched to, until something clears the flag.
+            pending.extend(
+                scripts
+                    .iter()
+                    .filter(|script| !script.faulted)
+                    .map(|script| Pending {
+                        entity,
+                        handle: script.handle,
+                        hooks: script.hooks,
+                        type_index: script.type_index,
+                        started: script.started,
+                        enabled: script.enabled,
+                        active: script.active,
+                        faulted: false,
+                    }),
+            )
+        });
+        self.fixed_wanted
+            .set(overridden.contains(Hooks::FIXED_UPDATE));
+        self.stays_wanted
+            .set(overridden.intersects(Hooks::COLLISION_STAY | Hooks::TRIGGER_STAY));
         if pending.is_empty() {
             self.pending.replace(pending);
             if finished {
                 self.apply_commands(world, registry);
             }
+            self.publish_timings(world);
             return;
         }
 
         // Take this frame's collision events before the dispatch window opens
         // — the resource borrow must not be held while C# can re-enter the
-        // world. Leftovers on an early return are cleared by the next
-        // `physics::run`.
-        let events: Vec<CollisionEvent> = world
+        // world — and give the buffer back afterwards, so the steps refill it
+        // rather than a new one each frame. Leftovers on an early return are
+        // cleared by the next `physics::run`.
+        let mut events: Vec<CollisionEvent> = world
             .get_resource_mut::<CollisionState>()
             .map_or_else(Vec::new, |mut state| std::mem::take(&mut state.events));
+        let mut clock = self.clock(world);
 
         // Built here and not inside the window, and only when there is
         // something to route: a tick with no collisions should not pay for an
@@ -3479,95 +4193,101 @@ impl Scripting {
         let mut routing = self.routing.take();
         routing.clear();
         if !events.is_empty() || !pointer_events.is_empty() {
-            routing.extend(
-                pending
-                    .iter()
-                    .enumerate()
-                    .map(|(i, script)| (script.entity, i)),
-            );
+            let mut start = 0;
+            for run in pending.chunk_by(|a, b| a.entity == b.entity) {
+                let end = start + run.len();
+                routing.insert(run[0].entity, (start as u32, end as u32));
+                start = end;
+            }
         }
 
         orrin_script::with_active_world(world, || {
+            let host = &self.host;
             for script in &mut pending {
+                let (handle, type_index) = (script.handle, script.type_index);
                 if script.enabled && !script.active {
                     // Mirror the managed side, which flips its own `Active`
                     // before invoking the hook: if OnEnable/OnStart throws, the
                     // state still advances and we just stop dispatching.
                     script.active = true;
-                    if self.host.enable(script.handle) {
+                    if clock.time(type_index, || host.enable(handle)) {
                         script.faulted = true;
                         continue;
                     }
                     if !script.started {
                         script.started = true;
-                        if self.host.start(script.handle) {
+                        if clock.time(type_index, || host.start(handle)) {
                             script.faulted = true;
                         }
                     }
                 } else if !script.enabled && script.active {
                     script.active = false;
-                    if self.host.disable(script.handle) {
+                    if clock.time(type_index, || host.disable(handle)) {
                         script.faulted = true;
                     }
                 }
             }
 
-            // Route each event to both participants' scripts (if any). The
-            // stored normal points a → b, so b's callback sees it negated —
-            // "from me toward the other", both sides.
+            // Route each event to every script on both participants. The
+            // stored normal and relative velocity are a's, so b's callbacks
+            // see both negated — "from me toward the other", both sides.
             for event in &events {
                 for (target, other, flip) in [(event.a, event.b, false), (event.b, event.a, true)] {
-                    // An entity holds at most one `ScriptComponent`, so the
-                    // index names the same entry the linear scan used to find.
-                    // The activation flags are still re-read per event, since a
-                    // fault raised by an earlier one must stop delivery here.
-                    let Some(&index) = routing.get(&target) else {
+                    let Some(&(start, end)) = routing.get(&target) else {
                         continue;
                     };
-                    let script = &mut pending[index];
-                    if !script.active || script.faulted {
-                        continue;
-                    }
-                    let normal = if flip { -event.normal } else { event.normal };
+                    let sign = if flip { -1.0 } else { 1.0 };
                     let collision = CCollision {
                         other: CEntity {
                             index: other.index,
                             generation: other.generation,
                         },
                         point: event.point.to_array(),
-                        normal: normal.to_array(),
+                        normal: (event.normal * sign).to_array(),
+                        relative_velocity: (event.relative_velocity * sign).to_array(),
                     };
-                    let faulted = match (event.kind, event.trigger) {
-                        (CollisionEventKind::Enter, false) => {
-                            self.host.collision_enter(script.handle, &collision)
+                    // The activation flags are re-read per event, since a fault
+                    // raised by an earlier one must stop delivery here.
+                    for script in &mut pending[start as usize..end as usize] {
+                        if !script.active || script.faulted {
+                            continue;
                         }
-                        (CollisionEventKind::Exit, false) => {
-                            self.host.collision_exit(script.handle, &collision)
+                        let handle = script.handle;
+                        let call: fn(&ScriptHost, u64, &CCollision) -> bool =
+                            match (event.kind, event.trigger) {
+                                (CollisionEventKind::Enter, false) => ScriptHost::collision_enter,
+                                (CollisionEventKind::Exit, false) => ScriptHost::collision_exit,
+                                (CollisionEventKind::Enter, true) => ScriptHost::trigger_enter,
+                                (CollisionEventKind::Exit, true) => ScriptHost::trigger_exit,
+                                // A stay is a call per step per pair, made only
+                                // to a type that overrides it.
+                                (CollisionEventKind::Stay, false)
+                                    if script.hooks.contains(Hooks::COLLISION_STAY) =>
+                                {
+                                    ScriptHost::collision_stay
+                                }
+                                (CollisionEventKind::Stay, true)
+                                    if script.hooks.contains(Hooks::TRIGGER_STAY) =>
+                                {
+                                    ScriptHost::trigger_stay
+                                }
+                                (CollisionEventKind::Stay, _) => continue,
+                            };
+                        if clock.time(script.type_index, || call(host, handle, &collision)) {
+                            script.faulted = true;
                         }
-                        (CollisionEventKind::Enter, true) => {
-                            self.host.trigger_enter(script.handle, &collision)
-                        }
-                        (CollisionEventKind::Exit, true) => {
-                            self.host.trigger_exit(script.handle, &collision)
-                        }
-                    };
-                    if faulted {
-                        script.faulted = true;
                     }
                 }
             }
 
-            // Offered up each event's chain to the first behaviour that
-            // handles it. One that is inactive, faulted or has no handler
-            // passes it on, as a disabled component does in uGUI.
+            // Offered up each event's chain, and within an entity in attach
+            // order, to the first behaviour that handles it. One that is
+            // inactive, faulted or has no handler passes it on, as a disabled
+            // component does in uGUI.
             crate::ui::events::deliver(&pointer_events, |entity, event| {
-                let Some(&index) = routing.get(&entity) else {
+                let Some(&(start, end)) = routing.get(&entity) else {
                     return false;
                 };
-                let script = &mut pending[index];
-                if !script.active || script.faulted {
-                    return false;
-                }
                 let payload = orrin_script::CPointerEvent {
                     position: event.position,
                     press_position: event.press_position,
@@ -3577,44 +4297,68 @@ impl Scripting {
                     },
                     button: 0,
                 };
-                match self
-                    .host
-                    .pointer(script.handle, event.kind as u32, &payload)
-                {
-                    orrin_script::Delivery::Handled => true,
-                    orrin_script::Delivery::Unhandled => false,
-                    orrin_script::Delivery::Faulted => {
-                        script.faulted = true;
-                        true
+                for script in &mut pending[start as usize..end as usize] {
+                    if !script.active || script.faulted {
+                        continue;
+                    }
+                    let handle = script.handle;
+                    match clock.time(script.type_index, || {
+                        host.pointer(handle, event.kind as u32, &payload)
+                    }) {
+                        orrin_script::Delivery::Handled => return true,
+                        orrin_script::Delivery::Unhandled => {}
+                        orrin_script::Delivery::Faulted => {
+                            script.faulted = true;
+                            return true;
+                        }
                     }
                 }
+                false
             });
 
             for script in &mut pending {
-                if script.active && !script.faulted && self.host.update(script.handle, delta_time) {
+                let handle = script.handle;
+                if script.active
+                    && !script.faulted
+                    && clock.time(script.type_index, || host.update(handle, delta_time))
+                {
                     script.faulted = true;
                 }
             }
         });
         pointer_events.clear();
+        self.spent.replace(clock.spent);
+        events.clear();
+        if let Some(mut state) = world.get_resource_mut::<CollisionState>() {
+            state.events = events;
+        }
 
         // Structural changes the scripts queued land now, after every script
         // has run — so this frame's extraction already sees new renderables.
         self.apply_commands(world, registry);
 
-        for script in &pending {
-            if let Some(mut component) = world.get_mut::<ScriptComponent>(script.entity) {
-                component.active = script.active;
-                component.started = script.started;
-                // Persist a fault raised this tick so every future tick skips
-                // it; a script that threw during OnUpdate does not run again.
-                component.faulted = script.faulted;
+        // Matched by handle rather than by position: the commands above may
+        // have attached more to an entity, or despawned it.
+        for run in pending.chunk_by(|a, b| a.entity == b.entity) {
+            let Some(mut scripts) = world.get_mut::<Scripts>(run[0].entity) else {
+                continue;
+            };
+            for script in run {
+                if let Some(component) = scripts.iter_mut().find(|c| c.handle == script.handle) {
+                    component.active = script.active;
+                    component.started = script.started;
+                    // Persist a fault raised this tick so every future tick
+                    // skips it; a script that threw during OnUpdate does not
+                    // run again.
+                    component.faulted = script.faulted;
+                }
             }
         }
 
         self.pending.replace(pending);
         self.routing.replace(routing);
         self.pointer_events.replace(pointer_events);
+        self.publish_timings(world);
     }
 
     /// Apply the structural changes scripts queued during a dispatch. Runs
@@ -3695,6 +4439,52 @@ mod tests {
     use crate::scene::LogBuffer;
     use crate::scene::prefab::{Prefab, PrefabInstance};
     use orrin_registry::AssetId;
+
+    /// The listing `Orrin.MathTests` encodes for its `TunedProbe`, whose
+    /// `Speed` carries `[Header("Motion")]`, `[Tooltip("Metres a second")]`
+    /// and `[Range(0, 10)]`, `Secret` carries `[HideInInspector]`, and `Plain`
+    /// nothing — so it has no entry. The C# side asserts the same bytes.
+    const LISTING_GOLDEN: &str = concat!(
+        "0a010000000804000000020000006964040a000000746573742e74756e65640400000074797065041b000000",
+        "54756e656450726f62652c204f7272696e2e4d6174685465737473040000006e616d65040a00000054756e65",
+        "6450726f6265060000006669656c64730a020000000805000000040000006e616d6504050000005370656564",
+        "0600000068656164657204060000004d6f74696f6e07000000746f6f6c746970040f0000004d657472657320",
+        "61207365636f6e640500000072616e67650a02000000030000000003000020410600000068696464656e0000",
+        "0805000000040000006e616d6504060000005365637265740600000068656164657204000000000700000074",
+        "6f6f6c74697004000000000500000072616e67650a000000000600000068696464656e0001",
+    );
+
+    #[test]
+    fn a_listing_entry_carries_its_fields_presentation() {
+        let bytes: Vec<u8> = (0..LISTING_GOLDEN.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&LISTING_GOLDEN[i..i + 2], 16).unwrap())
+            .collect();
+        let Ok(Value::List(entries)) = orrin_registry::wire::decode(&bytes) else {
+            panic!("the listing is a list");
+        };
+        let listed = Listed::read(&entries[0]).expect("a well-formed entry");
+        assert_eq!(listed.id, "test.tuned");
+        assert_eq!(listed.type_name, "TunedProbe, Orrin.MathTests");
+        assert_eq!(listed.name, "TunedProbe");
+        assert_eq!(
+            listed.fields,
+            vec![
+                FieldInfo {
+                    name: "Speed".to_owned(),
+                    header: Some("Motion".to_owned()),
+                    tooltip: Some("Metres a second".to_owned()),
+                    range: Some((0.0, 10.0)),
+                    hidden: false,
+                },
+                FieldInfo {
+                    name: "Secret".to_owned(),
+                    hidden: true,
+                    ..FieldInfo::default()
+                },
+            ]
+        );
+    }
 
     /// What `emit` put on the stream, as `(level, line)`.
     fn logged(emit: impl FnOnce()) -> Vec<(LogLevel, String)> {
@@ -5718,5 +6508,145 @@ mod tests {
         assert!(world.is_alive(entity));
         let local = world.get::<LocalTransform>(entity).unwrap();
         assert_eq!(local.translation, Vec3::new(1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn a_script_reads_the_scaled_delta_and_the_real_one() {
+        let mut world = World::new();
+        let mut time = Time::new();
+        time.update(0.04, 0.5);
+        world.insert_resource(time);
+
+        let read =
+            orrin_script::with_active_world(&mut world, || (time_delta(), time_unscaled_delta()));
+
+        assert_eq!(read, (0.02, 0.04));
+    }
+
+    /// The scale lives on the transport, which a test world may not have yet:
+    /// the first write brings one, and a negative scale is pause.
+    #[test]
+    fn a_script_sets_the_time_scale_on_the_transport() {
+        let mut world = World::new();
+
+        let read = orrin_script::with_active_world(&mut world, || {
+            let before = time_scale();
+            set_time_scale(0.5);
+            let after = time_scale();
+            set_time_scale(-1.0);
+            (before, after, time_scale())
+        });
+
+        assert_eq!(read, (1.0, 0.5, 0.0));
+        assert_eq!(world.resource::<crate::scene::Play>().time_scale(), 0.0);
+    }
+
+    #[test]
+    fn the_fixed_delta_is_the_scenes_step() {
+        let mut world = World::new();
+        world.spawn_entity().with(crate::scene::PhysicsSettings {
+            steps_per_second: 120,
+            ..Default::default()
+        });
+
+        let step = orrin_script::with_active_world(&mut world, || time_fixed_delta());
+
+        assert_eq!(step, 1.0 / 120.0);
+    }
+
+    #[test]
+    fn a_script_reads_the_wheel_for_the_frame_it_turned() {
+        let mut world = World::new();
+        let mut input = InputState::new();
+        input.scroll_wheel((0.5, 1.0));
+        input.scroll_wheel((0.0, -3.0));
+        world.insert_resource(input);
+
+        let mut turned = [9.0; 2];
+        orrin_script::with_active_world(&mut world, || scroll_delta(&mut turned));
+        world.resource_mut::<InputState>().end_frame();
+        let mut next = [9.0; 2];
+        orrin_script::with_active_world(&mut world, || scroll_delta(&mut next));
+
+        assert_eq!(turned, [0.5, -2.0]);
+        assert_eq!(next, [0.0, 0.0]);
+    }
+
+    fn sphere_query(center: [f32; 3], radius: f32) -> orrin_script::CShapeQuery {
+        orrin_script::CShapeQuery {
+            shape: 0,
+            center,
+            size: [radius, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            direction: [0.0, 0.0, -1.0],
+            max_distance: 100.0,
+            layers: u32::MAX,
+            hit_triggers: 0,
+        }
+    }
+
+    /// The `find_all_by_tag` protocol: what fits is written, and the count is
+    /// of everything found, so the caller can tell its buffer was short.
+    #[test]
+    fn an_overlap_writes_what_fits_and_counts_everything() {
+        let mut world = physics_world();
+        let mut row: Vec<Entity> = [-1.5, 0.0, 1.5]
+            .into_iter()
+            .map(|x| collider_at(&mut world, Vec3::new(x, 0.0, 0.0)))
+            .collect();
+        row.sort_unstable_by_key(|e| (e.index, e.generation));
+        physics_frame(&mut world);
+        let query = sphere_query([0.0; 3], 3.0);
+        let mut out = [CEntity::NULL; 2];
+
+        let (total, short) = orrin_script::with_active_world(&mut world, || {
+            let total = physics_overlap(
+                &query,
+                size_of::<orrin_script::CShapeQuery>(),
+                out.as_mut_ptr(),
+                2,
+            );
+            let short = physics_overlap(
+                &query,
+                size_of::<orrin_script::CShapeQuery>() - 4,
+                out.as_mut_ptr(),
+                2,
+            );
+            (total, short)
+        });
+
+        assert_eq!(total, 3);
+        assert_eq!(out.map(entity_of), [row[0], row[1]]);
+        assert_eq!(short, 0, "a query of the wrong size is refused");
+    }
+
+    #[test]
+    fn a_shape_cast_writes_its_hit() {
+        let mut world = physics_world();
+        let wall = collider_at(&mut world, Vec3::new(0.0, 0.0, -5.0));
+        physics_frame(&mut world);
+        let mut query = sphere_query([0.0; 3], 0.5);
+        query.shape = 1;
+        query.size = [0.5; 3];
+        let mut hit = orrin_script::CRaycastHit {
+            entity: CEntity::NULL,
+            point: [0.0; 3],
+            normal: [0.0; 3],
+            distance: 0.0,
+        };
+
+        let found = orrin_script::with_active_world(&mut world, || {
+            physics_shape_cast(
+                &query,
+                size_of::<orrin_script::CShapeQuery>(),
+                &mut hit,
+                size_of::<orrin_script::CRaycastHit>(),
+            )
+        });
+
+        assert!(found);
+        assert_eq!(entity_of(hit.entity), wall);
+        assert!((hit.distance - 4.0).abs() < 1e-3, "{}", hit.distance);
+        assert!(Vec3::from_array(hit.normal).abs_diff_eq(Vec3::Z, 1e-3));
     }
 }

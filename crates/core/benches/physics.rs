@@ -15,12 +15,18 @@
 //!   settled pile goes to sleep within half a second and costs almost nothing,
 //!   so each iteration is the first step of a freshly built pile — the frame a
 //!   pile is knocked over, not the frame after it settles.
+//!
+//! And one group that is not a step: `queries`, a script's overlap and sphere
+//! cast against the `plain` world, at the two sizes where a level's static
+//! colliders start to matter. The overlap is a metre-radius sphere at the
+//! origin, asserted to find something; the cast sweeps a
+//! quarter-metre sphere ten metres along +x through the same field.
 
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use glam::Vec3;
 
-use orrin_core::physics::{self, CollisionState, Motion, PhysicsState, STEP};
+use orrin_core::physics::{self, CollisionState, Motion, PhysicsState, QueryShape, STEP};
 use orrin_core::scene::{Collider, ColliderShape, LocalTransform, RigidBody, Transform};
 use orrin_ecs::World;
 
@@ -202,5 +208,40 @@ fn awake_pile(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, plain, moving, awake_pile);
+fn queries(c: &mut Criterion) {
+    let mut group = c.benchmark_group("physics_query");
+    for count in [1_000, 5_000] {
+        let mut world = plain_world(count);
+        physics::run(&mut world, STEP);
+        let around = QueryShape::Sphere {
+            center: Vec3::ZERO,
+            radius: 1.0,
+        };
+        let mut found = Vec::new();
+        physics::overlap(&world, around, u32::MAX, true, &mut found);
+        assert!(!found.is_empty(), "the overlap found nothing to measure");
+
+        group.bench_function(format!("overlap_sphere/{count}"), |b| {
+            b.iter(|| {
+                physics::overlap(black_box(&world), around, u32::MAX, true, &mut found);
+                found.len()
+            })
+        });
+
+        let ball = QueryShape::Sphere {
+            center: Vec3::ZERO,
+            radius: 0.25,
+        };
+        assert!(
+            physics::shape_cast(&world, ball, Vec3::X, 10.0, u32::MAX, true).is_some(),
+            "the cast hit nothing to measure"
+        );
+        group.bench_function(format!("sphere_cast/{count}"), |b| {
+            b.iter(|| physics::shape_cast(black_box(&world), ball, Vec3::X, 10.0, u32::MAX, true))
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, plain, moving, awake_pile, queries);
 criterion_main!(benches);

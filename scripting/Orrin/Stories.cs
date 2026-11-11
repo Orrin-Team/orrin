@@ -20,8 +20,16 @@ namespace Orrin;
 [AttributeUsage(AttributeTargets.Method, Inherited = false)]
 public sealed class StoryAttribute : Attribute
 {
+    /// <summary>
+    /// What the Storybook lists the story as, slashes grouping it; null lists it as
+    /// <c>Type/Method</c>.
+    /// </summary>
     public string? Name { get; }
 
+    /// <summary>
+    /// Mark the method as a story listed as <paramref name="name"/>, or as
+    /// <c>Type/Method</c> without one.
+    /// </summary>
     public StoryAttribute(string? name = null) => Name = name;
 }
 

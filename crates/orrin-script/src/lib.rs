@@ -281,6 +281,24 @@ pub struct OrrinApi {
     pub audio_stop_music: extern "C" fn(),
     pub audio_set_master_volume: extern "C" fn(f32),
     pub audio_set_music_volume: extern "C" fn(f32),
+    // Time scale, appended after audio. `time_delta` above reads game time —
+    // the frame scaled by the transport, or the step itself inside
+    // OnFixedUpdate — and `time_unscaled_delta` the real frame;
+    // `time_fixed_delta` is the scene's physics step. A scale below zero is
+    // zero and one that is not finite is ignored.
+    pub time_unscaled_delta: extern "C" fn() -> f32,
+    pub time_fixed_delta: extern "C" fn() -> f32,
+    pub time_scale: extern "C" fn() -> f32,
+    pub set_time_scale: extern "C" fn(f32),
+    // The wheel, appended after the time scale: this frame's turn in lines, x
+    // right and y away from the user, less whatever the editor claimed.
+    pub scroll_delta: extern "C" fn(*mut [f32; 2]),
+    // Shape queries, appended after the wheel. Each takes a `CShapeQuery` and
+    // its byte size. `physics_overlap` writes at most the given count of
+    // entities and returns how many there were, `find_all_by_tag`'s protocol;
+    // `physics_shape_cast` writes a `CRaycastHit` of the size given.
+    pub physics_overlap: extern "C" fn(*const CShapeQuery, u32, *mut CEntity, u32) -> u32,
+    pub physics_shape_cast: extern "C" fn(*const CShapeQuery, u32, *mut CRaycastHit, u32) -> bool,
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -397,7 +415,31 @@ pub fn default_api() -> OrrinApi {
         audio_stop_music: stub_audio_stop_music,
         audio_set_master_volume: stub_audio_volume,
         audio_set_music_volume: stub_audio_volume,
+        time_unscaled_delta: stub_time_seconds,
+        time_fixed_delta: stub_time_seconds,
+        time_scale: stub_time_scale,
+        set_time_scale: stub_audio_volume,
+        scroll_delta: stub_mouse_delta,
+        physics_overlap: stub_physics_overlap,
+        physics_shape_cast: stub_physics_shape_cast,
     }
+}
+
+extern "C" fn stub_time_scale() -> f32 {
+    1.0
+}
+
+extern "C" fn stub_physics_overlap(_: *const CShapeQuery, _: u32, _: *mut CEntity, _: u32) -> u32 {
+    0
+}
+
+extern "C" fn stub_physics_shape_cast(
+    _: *const CShapeQuery,
+    _: u32,
+    _: *mut CRaycastHit,
+    _: u32,
+) -> bool {
+    false
 }
 
 extern "C" fn stub_audio_play(_: *const CSound, _: u32) -> u64 {
@@ -1213,6 +1255,24 @@ pub struct CRaycastHit {
     pub distance: f32,
 }
 
+/// A sphere or a box placed in the world, for `physics_overlap` and
+/// `physics_shape_cast`; matches C# `Orrin.ShapeQuery`. `shape` is 0 for a
+/// sphere, whose radius is `size[0]`, and 1 for a box, whose half extents are
+/// `size`. `rotation` is x, y, z, w and turns a box only. `direction` and
+/// `max_distance` are read by the cast alone; `hit_triggers` is a flag.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CShapeQuery {
+    pub shape: u32,
+    pub center: [f32; 3],
+    pub size: [f32; 3],
+    pub rotation: [f32; 4],
+    pub direction: [f32; 3],
+    pub max_distance: f32,
+    pub layers: u32,
+    pub hit_triggers: u32,
+}
+
 /// C ABI `ui::ScrollFrame`; matches C# `Orrin.ScrollFrame`. `scrollbar` is C#
 /// `Orrin.ScrollbarVisibility`.
 #[repr(C)]
@@ -1271,14 +1331,72 @@ pub enum Delivery {
 }
 
 /// C ABI collision event payload, as seen by one participant: the *other*
-/// entity, the world-space contact point, and the contact normal pointing from
-/// the receiving entity toward `other`. Matches the C# `Orrin.Collision`.
+/// entity, the world-space contact point, the contact normal pointing from
+/// the receiving entity toward `other`, and the receiver's velocity at the
+/// contact less `other`'s, in m/s. Matches the C# `Orrin.Collision`.
+///
+/// Handed over by pointer and never size-checked per call, so it only ever
+/// grows at the end: a stale bindings build reads a prefix of it.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CCollision {
     pub other: CEntity,
     pub point: [f32; 3],
     pub normal: [f32; 3],
+    pub relative_velocity: [f32; 3],
+}
+
+/// The optional hooks a Behaviour's type overrides, as `Behaviours.Create`
+/// reports them. The bits are lock-step with the constants in C#
+/// `Orrin.Behaviours`.
+///
+/// A hook the engine may call per physics step, or per touching pair per step,
+/// is a managed transition per call whether or not the type wrote a body for
+/// it — thousands of resting crates would pay for an empty base method. So the
+/// managed side reads the type's overrides once, when it builds the instance,
+/// and the engine skips the call for a hook that is not here. Read at creation
+/// rather than per call because a type cannot change while it is loaded: a hot
+/// reload re-creates every instance, and with it this answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hooks(u32);
+
+impl Hooks {
+    pub const NONE: Self = Self(0);
+    pub const FIXED_UPDATE: Self = Self(1);
+    pub const COLLISION_STAY: Self = Self(1 << 1);
+    pub const TRIGGER_STAY: Self = Self(1 << 2);
+
+    pub fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Whether every hook in `other` is overridden.
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Whether any hook in `other` is overridden.
+    pub fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+impl std::ops::BitOr for Hooks {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitOrAssign for Hooks {
+    fn bitor_assign(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
 }
 
 /// Outcome of a game-assembly operation. The discriminants are lock-step with
@@ -1344,7 +1462,8 @@ impl std::fmt::Display for GameAssemblyStatus {
 /// `HostfxrContext` keeps the runtime resident for the host's lifetime.
 pub struct ScriptHost {
     _context: HostfxrContext<InitializedForRuntimeConfig>,
-    create_fn: extern "system" fn(CEntity, *const c_char) -> u64,
+    // Writes the type's `Hooks` bits through the out-pointer.
+    create_fn: extern "system" fn(CEntity, *const c_char, *mut u32) -> u64,
     // The lifecycle hooks return a fault byte (0 = clean, nonzero = the C# hook
     // threw and was contained): the managed side never lets an exception cross
     // into these native frames, and reports it here so the engine can disable
@@ -1358,6 +1477,9 @@ pub struct ScriptHost {
     collision_exit_fn: extern "system" fn(u64, *const CCollision) -> u8,
     trigger_enter_fn: extern "system" fn(u64, *const CCollision) -> u8,
     trigger_exit_fn: extern "system" fn(u64, *const CCollision) -> u8,
+    fixed_update_fn: extern "system" fn(u64, f32) -> u8,
+    collision_stay_fn: extern "system" fn(u64, *const CCollision) -> u8,
+    trigger_stay_fn: extern "system" fn(u64, *const CCollision) -> u8,
     // Returns 0 handled, 1 faulted, 2 not handled; see `Delivery`.
     pointer_fn: extern "system" fn(u64, u32, *const CPointerEvent) -> u8,
     // Runs and forgets whatever the game asked to happen when tween `id`
@@ -1370,6 +1492,16 @@ pub struct ScriptHost {
     // Build the story named by the UTF-8 bytes onto the canvas entity; returns
     // 0, 1 when it threw, 2 when no story has that name.
     story_build_fn: extern "system" fn(*const u8, u32, CEntity) -> u8,
+    // The tests of the assembly named by the first UTF-8 bytes, by the
+    // `get_tag` protocol: one `name\tmax frames\tscene` line each.
+    test_list_fn: extern "system" fn(*const u8, u32, *mut u8, i32) -> i32,
+    // Start the test named by the second bytes in that assembly; then carry it
+    // on after each frame, or stop it. Each returns a `TestStep` byte.
+    test_begin_fn: extern "system" fn(*const u8, u32, *const u8, u32) -> u8,
+    test_resume_fn: extern "system" fn() -> u8,
+    test_abandon_fn: extern "system" fn() -> u8,
+    // Why the last test failed, `file\tline\tmessage`, by the same protocol.
+    test_failure_fn: extern "system" fn(*mut u8, i32) -> i32,
     // Game-assembly swap. These live in `Orrin.dll`, which is in the default
     // (uncollectible) load context, so the pointers stay valid across every
     // reload of the game assembly — the whole reason the bindings and the game
@@ -1381,6 +1513,9 @@ pub struct ScriptHost {
     state_capture_fn: extern "system" fn(u64) -> u64,
     state_apply_fn: extern "system" fn(u64, u64) -> u8,
     state_discard_fn: extern "system" fn(),
+    /// Every hook call made into managed code, so a test can tell a call that
+    /// was skipped from one that was made and returned at once.
+    dispatched: Cell<u64>,
 }
 
 /// The .NET runtime an exported game carries, beside its `Orrin.dll`: a
@@ -1431,8 +1566,11 @@ impl ScriptHost {
         #[rustfmt::skip]
         let (
             init, create_fn, start_fn, update_fn, enable_fn, disable_fn,
-            collision_enter_fn, collision_exit_fn, trigger_enter_fn, trigger_exit_fn, pointer_fn,
-            tween_complete_fn, story_names_fn, story_build_fn, destroy,
+            collision_enter_fn, collision_exit_fn, trigger_enter_fn, trigger_exit_fn,
+            fixed_update_fn, collision_stay_fn, trigger_stay_fn, pointer_fn,
+            tween_complete_fn, story_names_fn, story_build_fn,
+            test_list_fn, test_begin_fn, test_resume_fn, test_abandon_fn, test_failure_fn,
+            destroy,
             game_load_fn, game_commit_fn, game_rollback_fn, game_unload_fn,
             state_capture_fn, state_apply_fn, state_discard_fn,
             bag_read, bag_write, bag_default, bag_components,
@@ -1443,7 +1581,7 @@ impl ScriptHost {
                     pdcstr!("Orrin.Bootstrap, Orrin"),
                     pdcstr!("Init"),
                 )?,
-                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(CEntity, *const c_char) -> u64>(
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(CEntity, *const c_char, *mut u32) -> u64>(
                     pdcstr!("Orrin.Behaviours, Orrin"),
                     pdcstr!("Create"),
                 )?,
@@ -1479,6 +1617,18 @@ impl ScriptHost {
                     pdcstr!("Orrin.Behaviours, Orrin"),
                     pdcstr!("TriggerExit"),
                 )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, f32) -> u8>(
+                    pdcstr!("Orrin.Behaviours, Orrin"),
+                    pdcstr!("FixedUpdate"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision) -> u8>(
+                    pdcstr!("Orrin.Behaviours, Orrin"),
+                    pdcstr!("CollisionStay"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision) -> u8>(
+                    pdcstr!("Orrin.Behaviours, Orrin"),
+                    pdcstr!("TriggerStay"),
+                )?,
                 *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, u32, *const CPointerEvent) -> u8>(
                     pdcstr!("Orrin.Behaviours, Orrin"),
                     pdcstr!("Pointer"),
@@ -1494,6 +1644,26 @@ impl ScriptHost {
                 *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const u8, u32, CEntity) -> u8>(
                     pdcstr!("Orrin.Stories, Orrin"),
                     pdcstr!("Build"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const u8, u32, *mut u8, i32) -> i32>(
+                    pdcstr!("Orrin.Testing.TestRunner, Orrin"),
+                    pdcstr!("List"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const u8, u32, *const u8, u32) -> u8>(
+                    pdcstr!("Orrin.Testing.TestRunner, Orrin"),
+                    pdcstr!("Begin"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn() -> u8>(
+                    pdcstr!("Orrin.Testing.TestRunner, Orrin"),
+                    pdcstr!("Resume"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn() -> u8>(
+                    pdcstr!("Orrin.Testing.TestRunner, Orrin"),
+                    pdcstr!("Abandon"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*mut u8, i32) -> i32>(
+                    pdcstr!("Orrin.Testing.TestRunner, Orrin"),
+                    pdcstr!("Failure"),
                 )?,
                 // Teardown is a process-wide global, not a `ScriptHost` method:
                 // it must stay reachable from `ScriptComponent::drop`, which
@@ -1577,10 +1747,18 @@ impl ScriptHost {
             collision_exit_fn,
             trigger_enter_fn,
             trigger_exit_fn,
+            fixed_update_fn,
+            collision_stay_fn,
+            trigger_stay_fn,
             pointer_fn,
             tween_complete_fn,
             story_names_fn,
             story_build_fn,
+            test_list_fn,
+            test_begin_fn,
+            test_resume_fn,
+            test_abandon_fn,
+            test_failure_fn,
             game_load_fn,
             game_commit_fn,
             game_rollback_fn,
@@ -1588,6 +1766,7 @@ impl ScriptHost {
             state_capture_fn,
             state_apply_fn,
             state_discard_fn,
+            dispatched: Cell::new(0),
         })
     }
 
@@ -1640,51 +1819,79 @@ impl ScriptHost {
     }
 
     /// Instantiate a `Behaviour` by assembly-qualified type name, attached to
-    /// `entity`. Returns its `GCHandle` (as `u64`), or `0` on failure.
-    pub fn create(&self, entity: CEntity, type_name: &CStr) -> u64 {
-        (self.create_fn)(entity, type_name.as_ptr())
+    /// `entity`. Returns its `GCHandle` (as `u64`), or `0` on failure, and the
+    /// optional hooks its type overrides.
+    pub fn create(&self, entity: CEntity, type_name: &CStr) -> (u64, Hooks) {
+        let mut hooks = 0u32;
+        let handle = (self.create_fn)(entity, type_name.as_ptr(), &mut hooks);
+        (handle, Hooks::from_bits(hooks))
+    }
+
+    /// How many hook calls have been made into managed code since boot.
+    pub fn dispatched(&self) -> u64 {
+        self.dispatched.get()
+    }
+
+    fn dispatch<R>(&self, call: impl FnOnce() -> R) -> R {
+        self.dispatched.set(self.dispatched.get() + 1);
+        call()
     }
 
     // Each hook returns `true` if the C# side caught an exception (the script is
     // now faulted and should not be dispatched to again until the fault clears).
 
     pub fn start(&self, handle: u64) -> bool {
-        (self.start_fn)(handle) != 0
+        self.dispatch(|| (self.start_fn)(handle) != 0)
     }
 
     pub fn update(&self, handle: u64, delta_time: f32) -> bool {
-        (self.update_fn)(handle, delta_time) != 0
+        self.dispatch(|| (self.update_fn)(handle, delta_time) != 0)
     }
 
     pub fn enable(&self, handle: u64) -> bool {
-        (self.enable_fn)(handle) != 0
+        self.dispatch(|| (self.enable_fn)(handle) != 0)
     }
 
     pub fn disable(&self, handle: u64) -> bool {
-        (self.disable_fn)(handle) != 0
+        self.dispatch(|| (self.disable_fn)(handle) != 0)
+    }
+
+    /// Only for a behaviour whose [`Hooks`] has [`Hooks::FIXED_UPDATE`].
+    pub fn fixed_update(&self, handle: u64, step: f32) -> bool {
+        self.dispatch(|| (self.fixed_update_fn)(handle, step) != 0)
     }
 
     pub fn collision_enter(&self, handle: u64, collision: &CCollision) -> bool {
-        (self.collision_enter_fn)(handle, collision) != 0
+        self.dispatch(|| (self.collision_enter_fn)(handle, collision) != 0)
+    }
+
+    /// Only for a behaviour whose [`Hooks`] has [`Hooks::COLLISION_STAY`].
+    pub fn collision_stay(&self, handle: u64, collision: &CCollision) -> bool {
+        self.dispatch(|| (self.collision_stay_fn)(handle, collision) != 0)
     }
 
     pub fn collision_exit(&self, handle: u64, collision: &CCollision) -> bool {
-        (self.collision_exit_fn)(handle, collision) != 0
+        self.dispatch(|| (self.collision_exit_fn)(handle, collision) != 0)
     }
 
     /// The trigger half of the same pair: a contact where either side is a
     /// trigger goes here instead.
     pub fn trigger_enter(&self, handle: u64, collision: &CCollision) -> bool {
-        (self.trigger_enter_fn)(handle, collision) != 0
+        self.dispatch(|| (self.trigger_enter_fn)(handle, collision) != 0)
+    }
+
+    /// Only for a behaviour whose [`Hooks`] has [`Hooks::TRIGGER_STAY`].
+    pub fn trigger_stay(&self, handle: u64, collision: &CCollision) -> bool {
+        self.dispatch(|| (self.trigger_stay_fn)(handle, collision) != 0)
     }
 
     pub fn trigger_exit(&self, handle: u64, collision: &CCollision) -> bool {
-        (self.trigger_exit_fn)(handle, collision) != 0
+        self.dispatch(|| (self.trigger_exit_fn)(handle, collision) != 0)
     }
 
     /// Offer pointer event `kind` (C# `Orrin.PointerEventKind`) to a behaviour.
     pub fn pointer(&self, handle: u64, kind: u32, event: &CPointerEvent) -> Delivery {
-        match (self.pointer_fn)(handle, kind, event) {
+        match self.dispatch(|| (self.pointer_fn)(handle, kind, event)) {
             0 => Delivery::Handled,
             1 => Delivery::Faulted,
             _ => Delivery::Unhandled,
@@ -1727,6 +1934,116 @@ impl ScriptHost {
             _ => StoryBuild::Missing,
         }
     }
+
+    /// Every `[Test]` in the live assembly named `assembly`, in name order.
+    /// Calls no engine function, so it needs no dispatch window.
+    pub fn tests(&self, assembly: &str) -> Vec<TestCase> {
+        let Some(bytes) = fetch_bag(|buffer, capacity| {
+            (self.test_list_fn)(assembly.as_ptr(), assembly.len() as u32, buffer, capacity)
+        }) else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(3, '\t');
+                let name = fields.next().filter(|name| !name.is_empty())?;
+                let max_frames = fields.next()?.parse().ok()?;
+                let scene = fields.next().filter(|scene| !scene.is_empty());
+                Some(TestCase {
+                    name: name.to_owned(),
+                    max_frames,
+                    scene: scene.map(str::to_owned),
+                })
+            })
+            .collect()
+    }
+
+    /// Start test `name` of `assembly`, inside a dispatch window the caller
+    /// has opened, and run it to its end or its first yield.
+    pub fn begin_test(&self, assembly: &str, name: &str) -> TestStep {
+        TestStep::from_raw((self.test_begin_fn)(
+            assembly.as_ptr(),
+            assembly.len() as u32,
+            name.as_ptr(),
+            name.len() as u32,
+        ))
+    }
+
+    /// Carry the running test on after a frame, inside a dispatch window.
+    pub fn resume_test(&self) -> TestStep {
+        TestStep::from_raw((self.test_resume_fn)())
+    }
+
+    /// Stop the running test as out of frames, inside a dispatch window: its
+    /// `finally` blocks run.
+    pub fn abandon_test(&self) -> TestStep {
+        TestStep::from_raw((self.test_abandon_fn)())
+    }
+
+    /// Why the last test failed: the script file and line it failed on, when
+    /// there is one, and the message.
+    pub fn test_failure(&self) -> (Option<(String, u32)>, String) {
+        let text = fetch_bag(|buffer, capacity| (self.test_failure_fn)(buffer, capacity))
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        let mut fields = text.splitn(3, '\t');
+        let file = fields.next().unwrap_or_default();
+        let line = fields
+            .next()
+            .and_then(|line| line.parse().ok())
+            .unwrap_or(0);
+        let message = fields.next().unwrap_or_default().to_owned();
+        let location = (!file.is_empty()).then(|| (file.to_owned(), line));
+        (location, message)
+    }
+}
+
+/// One `[Test]` the game declares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestCase {
+    /// `Namespace.Type.Method`.
+    pub name: String,
+    /// Frames it may run before it fails as hung.
+    pub max_frames: u32,
+    /// A scene to load first, relative to the project's assets directory.
+    pub scene: Option<String>,
+}
+
+/// Where a test stands after a turn. The bytes are lock-step with C#
+/// `Orrin.Testing.TestRunner`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestStep {
+    Passed,
+    /// Waiting on a frame.
+    Running,
+    /// No test by that name, or none running to resume.
+    Missing,
+    /// An `Assert` failed.
+    AssertionFailed,
+    /// It threw anything else.
+    Threw,
+    /// A Behaviour threw from a hook while it ran.
+    Faulted,
+    /// Abandoned with frames used up.
+    OverBudget,
+    /// The method cannot be run as a test, or yielded what nothing waits on.
+    Malformed,
+}
+
+impl TestStep {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Passed,
+            1 => Self::Running,
+            2 => Self::Missing,
+            3 => Self::AssertionFailed,
+            4 => Self::Threw,
+            5 => Self::Faulted,
+            6 => Self::OverBudget,
+            _ => Self::Malformed,
+        }
+    }
 }
 
 /// What a story's builder did. The bytes are lock-step with C# `Orrin.Stories`.
@@ -1764,5 +2081,8 @@ mod tests {
         assert_eq!(size_of::<CAudioSource>(), 44);
         assert_eq!(size_of::<CSound>(), 60);
         assert_eq!(size_of::<CMeshRenderer>(), 32);
+        assert_eq!(size_of::<CCollision>(), 44);
+        assert_eq!(size_of::<CRaycastHit>(), 36);
+        assert_eq!(size_of::<CShapeQuery>(), 68);
     }
 }

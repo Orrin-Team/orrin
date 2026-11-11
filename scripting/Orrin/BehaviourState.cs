@@ -236,28 +236,59 @@ public static unsafe class BehaviourState
         // An auto-property's storage is a compiler-generated field carrying none
         // of the author's attributes — `[Transient]` sits on the property, so
         // without this mapping it is silently ignored and the field is preserved
-        // against the author's stated intent. `<Name>k__BackingField` is a Roslyn
-        // implementation detail with no supported API to replace it; if the
-        // mangling changes this stops working and nothing fails loudly.
+        // against the author's stated intent.
+        return PropertyOf(field)?.IsDefined(typeof(TransientAttribute), inherit: true) is true;
+    }
+
+    /// The auto-property `field` is the storage of, or null. Shared with
+    /// [PropertyBag], whose inspector attributes sit on the property too.
+    internal static PropertyInfo? PropertyOf(FieldInfo field)
+    {
+        // `<Name>k__BackingField` is a Roslyn implementation detail with no
+        // supported API to replace it; if the mangling changes this stops
+        // working and nothing fails loudly.
         var name = field.Name;
         if (!name.StartsWith('<') || !name.EndsWith(">k__BackingField", StringComparison.Ordinal))
-            return false;
+            return null;
 
         // NonPublic is required: a private auto-property still yields a field
         // here, and its property would otherwise not be found.
-        var property = field.DeclaringType?.GetProperty(
+        return field.DeclaringType?.GetProperty(
             name[1..name.IndexOf('>')],
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        return property?.IsDefined(typeof(TransientAttribute), inherit: true) is true;
     }
 
     /// Convert a live field value into something safe to outlive the assembly.
     /// Returns false when the type is outside the closed set.
     /// Kept in lock-step with [`TryApply`]: it must accept exactly what this
     /// emits. Widen one without the other and fields silently stop restoring.
-    static bool TryCapture(FieldInfo field, object instance, out object? value)
+    static bool TryCapture(FieldInfo field, object instance, out object? value) =>
+        TryCaptureValue(field.FieldType, field.GetValue(instance), out value);
+
+    static bool TryCaptureValue(Type type, object? live, out object? value)
     {
-        var type = field.FieldType;
+        if (PropertyBag.ElementType(type) is { } element)
+        {
+            // Copied item by item through the rules below rather than kept: the
+            // list belongs to the instance about to be destroyed, and a list of
+            // game enums would hold boxes from the game assembly.
+            if (live is not System.Collections.IList items)
+            {
+                value = null;
+                return true;
+            }
+            var copied = new object?[items.Count];
+            for (var i = 0; i < copied.Length; i++)
+            {
+                if (!TryCaptureValue(element, items[i], out copied[i]))
+                {
+                    value = null;
+                    return false;
+                }
+            }
+            value = new ListValue(type.IsArray, copied);
+            return true;
+        }
 
         if (type.IsEnum)
         {
@@ -265,7 +296,7 @@ public static unsafe class BehaviourState
             // a live reference into the collectible context. The transient box
             // `GetValue` produces is fine — it is a local.
             var raw = Convert.ChangeType(
-                field.GetValue(instance),
+                live,
                 type.GetEnumUnderlyingType(),
                 CultureInfo.InvariantCulture);
             value = new EnumValue(type.FullName ?? type.Name, raw!);
@@ -283,7 +314,7 @@ public static unsafe class BehaviourState
             || type == typeof(decimal)
             || (type.IsValueType && type.Assembly == Bindings))
         {
-            value = field.GetValue(instance);
+            value = live;
             return true;
         }
 
@@ -298,7 +329,43 @@ public static unsafe class BehaviourState
     /// rather than an edge case.
     static bool TryApply(FieldInfo field, object instance, object? value)
     {
-        var type = field.FieldType;
+        if (!TryRestore(field.FieldType, value, out var restored))
+            return false;
+        field.SetValue(instance, restored);
+        return true;
+    }
+
+    static bool TryRestore(Type type, object? value, out object? restored)
+    {
+        restored = null;
+        if (value is ListValue list)
+        {
+            // The same shape it was captured from: `int[]` -> `List<int>` is a
+            // retyping like any other, and resets rather than converts.
+            if (PropertyBag.ElementType(type) is not { } element || type.IsArray != list.IsArray)
+                return false;
+            var items = new object?[list.Items.Length];
+            for (var i = 0; i < items.Length; i++)
+            {
+                if (!TryRestore(element, list.Items[i], out items[i]))
+                    return false;
+            }
+            if (type.IsArray)
+            {
+                var array = Array.CreateInstance(element, items.Length);
+                for (var i = 0; i < items.Length; i++)
+                    array.SetValue(items[i], i);
+                restored = array;
+            }
+            else
+            {
+                var rebuilt = (System.Collections.IList)Activator.CreateInstance(type)!;
+                foreach (var item in items)
+                    rebuilt.Add(item);
+                restored = rebuilt;
+            }
+            return true;
+        }
 
         if (value is EnumValue captured)
         {
@@ -312,7 +379,7 @@ public static unsafe class BehaviourState
                 return false;
             try
             {
-                field.SetValue(instance, Enum.ToObject(type, captured.Underlying));
+                restored = Enum.ToObject(type, captured.Underlying);
                 return true;
             }
             catch (Exception)
@@ -328,10 +395,7 @@ public static unsafe class BehaviourState
             // Not a no-op: `IsInstanceOfType(null)` is always false, so without
             // this branch a captured null falls through to "not restored" and
             // the constructor's value resurrects state the program discarded.
-            if (type.IsValueType)
-                return false;
-            field.SetValue(instance, null);
-            return true;
+            return !type.IsValueType;
         }
 
         // No coercion by design: `int Health` -> `float Health` resets to the
@@ -339,11 +403,22 @@ public static unsafe class BehaviourState
         if (!type.IsInstanceOfType(value))
             return false;
 
-        field.SetValue(instance, value);
+        restored = value;
         return true;
     }
 
     /// An enum captured structurally: the boxed enum itself would be a
     /// game-assembly instance and would pin the load context.
     readonly record struct EnumValue(string TypeName, object Underlying);
+
+    /// A <see cref="List{T}"/> or `T[]` captured as its items, each captured as a field of
+    /// the element type would be. Compared by items, so a list still equal to
+    /// its constructor's is not mistaken for state the user established.
+    sealed record ListValue(bool IsArray, object?[] Items)
+    {
+        public bool Equals(ListValue? other) =>
+            other is not null && IsArray == other.IsArray && Items.SequenceEqual(other.Items);
+
+        public override int GetHashCode() => HashCode.Combine(IsArray, Items.Length);
+    }
 }

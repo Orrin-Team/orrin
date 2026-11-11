@@ -51,6 +51,7 @@ public enum CanvasScaleMode : uint
 [StructLayout(LayoutKind.Sequential)]
 public struct Canvas
 {
+    /// <summary>How the canvas's units map to the window's pixels.</summary>
     public CanvasScaleMode ScaleMode;
 
     /// <summary>The window size a <c>ScaleWithScreen</c> layout is authored at.</summary>
@@ -65,6 +66,7 @@ public struct Canvas
     /// <summary>Canvases draw lowest first.</summary>
     public int SortOrder;
 
+    /// <summary>One unit to a physical pixel, with a 1920 x 1080 reference resolution matched on width.</summary>
     public Canvas()
     {
         ScaleMode = CanvasScaleMode.ConstantPixel;
@@ -88,11 +90,23 @@ public struct Canvas
 [StructLayout(LayoutKind.Sequential)]
 public struct RectTransform
 {
+    /// <summary>The anchor box's top-left corner, as a fraction of the parent.</summary>
     public Vector2 AnchorMin;
+    /// <summary>The anchor box's bottom-right corner, as a fraction of the parent.</summary>
     public Vector2 AnchorMax;
+    /// <summary>
+    /// The point the element is placed by and scales about, as a fraction of its own
+    /// rectangle from its top left.
+    /// </summary>
     public Vector2 Pivot;
+    /// <summary>Where the pivot stands from its place in the anchor box, in canvas units, y down.</summary>
     public Vector2 AnchoredPosition;
+    /// <summary>
+    /// Canvas units added to the anchor box's span of the parent: with the anchors
+    /// together, the element's size.
+    /// </summary>
     public Vector2 SizeDelta;
+    /// <summary>Scales the element and everything under it about its pivot.</summary>
     public Vector2 Scale;
 
     /// <summary>Centred in its parent, 100 units square.</summary>
@@ -125,6 +139,7 @@ public struct Image
 
     uint _raycastTarget;
 
+    /// <summary>Plain white, unsliced, and stopping the pointer.</summary>
     public Image()
     {
         Color = Color.white;
@@ -163,11 +178,13 @@ public struct Text
     /// <summary>The height of a line's ascent and descent, in canvas units.</summary>
     public float Size;
 
+    /// <summary>Where the text sits in the rectangle.</summary>
     public TextAnchor Anchor;
 
     uint _wrap;
     uint _raycastTarget;
 
+    /// <summary>Dark grey, 24 units, at the top left, wrapping, and letting the pointer through.</summary>
     public Text()
     {
         Color = new Color(0.196f, 0.196f, 0.196f);
@@ -191,6 +208,10 @@ public struct Text
         set => _wrap = value ? 1u : 0u;
     }
 
+    /// <summary>
+    /// Whether the pointer stops here rather than reaching what is behind. Off for a
+    /// new <see cref="Text"/>.
+    /// </summary>
     public bool RaycastTarget
     {
         readonly get => _raycastTarget != 0;
@@ -207,13 +228,21 @@ public struct Text
 [StructLayout(LayoutKind.Sequential)]
 public struct Button
 {
+    /// <summary>The image's tint while the pointer is elsewhere.</summary>
     public Color Normal;
+    /// <summary>The image's tint while the pointer is over it.</summary>
     public Color Hover;
+    /// <summary>The image's tint while it is pressed.</summary>
     public Color Pressed;
+    /// <summary>The image's tint while it is not <see cref="Interactable"/>.</summary>
     public Color Disabled;
 
     uint _interactable;
 
+    /// <summary>
+    /// Interactable: white, a shade darker under the pointer and darker again
+    /// pressed, and half-transparent grey when disabled.
+    /// </summary>
     public Button()
     {
         Normal = Color.white;
@@ -260,6 +289,7 @@ public struct Gradient
     /// <summary>A fraction of the element's size.</summary>
     public Vector2 Offset;
 
+    /// <summary>White to black, left to right.</summary>
     public Gradient()
     {
         Start = Color.white;
@@ -299,6 +329,7 @@ public struct Corner
     /// </summary>
     public float RadiusFraction;
 
+    /// <summary>The curve the corner is cut along.</summary>
     public CornerStyle Style;
 
     /// <summary>
@@ -307,6 +338,7 @@ public struct Corner
     /// </summary>
     public float Exponent;
 
+    /// <summary>Round, with an 8-unit radius.</summary>
     public Corner()
     {
         Radius = 8f;
@@ -321,7 +353,9 @@ public enum StrokePlacement : uint
 {
     /// <summary>Wholly inside the box.</summary>
     Inside,
+    /// <summary>Straddling the edge, half inside the box and half out.</summary>
     Center,
+    /// <summary>Wholly outside the box.</summary>
     Outside,
 }
 
@@ -340,8 +374,10 @@ public struct Stroke
     /// <summary>In canvas units.</summary>
     public float Thickness;
 
+    /// <summary>Where the stroke sits against the edge it follows.</summary>
     public StrokePlacement Placement;
 
+    /// <summary>Black, 2 units thick, inside the box.</summary>
     public Stroke()
     {
         Color = Color.black;
@@ -367,6 +403,7 @@ public struct Shadow
     /// <summary>Grows the shadow's box on every side before it is blurred; negative shrinks it.</summary>
     public float Spread;
 
+    /// <summary>Half-transparent black, 4 units down, with an 8-unit blur.</summary>
     public Shadow()
     {
         Color = new Color(0f, 0f, 0f, 0.5f);
@@ -385,6 +422,7 @@ public enum ScrollbarVisibility : uint
     /// <summary>On every scrolling axis.</summary>
     Always,
 
+    /// <summary>On no axis.</summary>
     Never,
 }
 
@@ -418,11 +456,16 @@ public struct ScrollFrame
     /// <summary>sRGB, straight alpha.</summary>
     public Color ScrollbarColor;
 
+    /// <summary>When the bars are drawn.</summary>
     public ScrollbarVisibility Scrollbar;
 
     uint _horizontal;
     uint _vertical;
 
+    /// <summary>
+    /// Scrolling vertically only, 40 units a notch, with a 6-unit bar while the
+    /// content is taller than the frame.
+    /// </summary>
     public ScrollFrame()
     {
         ContentSize = Vector2.zero;

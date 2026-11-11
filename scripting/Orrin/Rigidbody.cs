@@ -20,16 +20,19 @@ public struct Rigidbody
     /// <summary>Kilograms. Must be positive.</summary>
     public float Mass;
 
+    /// <summary>A multiple of the scene's gravity: 1 falls as everything does, 0 floats.</summary>
     public float GravityScale;
 
     /// <summary>The fraction of velocity lost per second.</summary>
     public float LinearDamping;
 
+    /// <summary>The fraction of angular velocity lost per second.</summary>
     public float AngularDamping;
 
     uint _continuous;
     uint _lockRotation;
 
+    /// <summary>The engine's default: a dynamic 1 kg body under the scene's gravity, damped by 0.05.</summary>
     public Rigidbody()
     {
         Mass = 1f;

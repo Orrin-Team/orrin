@@ -1037,7 +1037,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "orrin-scene 3 min-reader 3\n\nentity {root_id}\n  orrin.prefab\n    source = asset({DOOR_ID})\n"
+                "orrin-scene 4 min-reader 4\n\nentity {root_id}\n  orrin.prefab\n    source = asset({DOOR_ID})\n"
             )
         );
     }
@@ -1165,7 +1165,7 @@ mod tests {
         let root = EntityId::new();
         let missing = AssetId::new();
         let text = format!(
-            "orrin-scene 3 min-reader 3\n\nentity {root}\n  orrin.prefab\n    overrides\n      [0]\n        \
+            "orrin-scene 4 min-reader 4\n\nentity {root}\n  orrin.prefab\n    overrides\n      [0]\n        \
              component = \"orrin.tag\"\n        entity = entity({ROOT})\n        path = \"\"\n        \
              value = \"x\"\n    source = asset({missing})\n"
         );
@@ -1189,7 +1189,7 @@ mod tests {
     fn an_override_that_no_longer_fits_is_reported_and_kept() {
         let root = EntityId::new();
         let text = format!(
-            "orrin-scene 3 min-reader 3\n\nentity {root}\n  orrin.prefab\n    overrides\n      [0]\n        \
+            "orrin-scene 4 min-reader 4\n\nentity {root}\n  orrin.prefab\n    overrides\n      [0]\n        \
              component = \"orrin.transform\"\n        entity = entity({PANEL})\n        \
              path = \"skew\"\n        value = 0.5\n    source = asset({DOOR_ID})\n"
         );

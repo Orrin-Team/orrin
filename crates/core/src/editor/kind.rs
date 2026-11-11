@@ -13,7 +13,7 @@ use orrin_ecs::{Entity, World};
 
 use super::{catalog, icons, theme};
 #[cfg(feature = "scripting")]
-use crate::scene::ScriptComponent;
+use crate::scene::Scripts;
 use crate::scene::registry as ids;
 use crate::scene::{CameraComponent, Light, MeshHandle};
 
@@ -56,7 +56,7 @@ impl Kind {
             return ui;
         }
         #[cfg(feature = "scripting")]
-        if world.has::<ScriptComponent>(entity) {
+        if world.has::<Scripts>(entity) {
             return Self::Script;
         }
         Self::Group

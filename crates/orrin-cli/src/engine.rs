@@ -212,6 +212,54 @@ pub fn built_bindings(checkout: &Path) -> Option<PathBuf> {
     best.map(|(_, dir)| dir)
 }
 
+pub const ANALYZER_DLL: &str = "Orrin.Analyzers.dll";
+
+/// Copy the checkout's `Orrin.Analyzers.dll` beside `bindings` when they are
+/// that checkout's `scripting/Orrin/bin/<configuration>/<tfm>/`.
+///
+/// A game csproj outside the tree finds the analyzer only beside `Orrin.dll`,
+/// and building the bindings does not put it there: they reference it as an
+/// analyzer, which is never copied to an output. Copying it from
+/// `Orrin.csproj` instead would also put it in the bindings' publish, which an
+/// export ships whole. Any other directory is left alone: an install lays down
+/// its own analyzer, and a missing one costs only the warning.
+pub fn place_analyzer(bindings: &Path) -> Result<(), String> {
+    let Ok(bindings) = bindings.canonicalize() else {
+        return Ok(());
+    };
+    let Some(checkout) = checkout_containing(&bindings) else {
+        return Ok(());
+    };
+    let (Some(configuration), Some(bin)) = (
+        bindings.parent().and_then(Path::file_name),
+        bindings.parent().and_then(Path::parent),
+    ) else {
+        return Ok(());
+    };
+    if bin != checkout.join("scripting/Orrin/bin") {
+        return Ok(());
+    }
+
+    // The compiler loads analyzers into its own netstandard2.0 host, so the
+    // analyzer has no other framework to be built for.
+    let built = checkout
+        .join("scripting/Orrin.Analyzers/bin")
+        .join(configuration)
+        .join("netstandard2.0")
+        .join(ANALYZER_DLL);
+    let Ok(contents) = std::fs::read(&built) else {
+        return Ok(());
+    };
+    let placed = bindings.join(ANALYZER_DLL);
+    // Rewritten only when it changed, since the analyzer is an input to the
+    // game's compile and a fresh timestamp would rebuild it every time.
+    if std::fs::read(&placed).is_ok_and(|current| current == contents) {
+        return Ok(());
+    }
+    std::fs::write(&placed, contents)
+        .map_err(|err| format!("could not write {}: {err}", placed.display()))
+}
+
 /// Start Orrin Hub and return without waiting for it: the one installed beside
 /// this CLI, else a build of the checkout this CLI came from.
 pub fn launch_hub() -> Result<(), String> {
@@ -260,6 +308,72 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn touch(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn fake_checkout() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("crates/core/Cargo.toml"), "");
+        touch(&dir.path().join("scripting/Orrin/Orrin.csproj"), "");
+        dir
+    }
+
+    /// A project outside the checkout references the analyzer by path beside
+    /// `Orrin.dll`, so a checkout's bindings have to carry the analyzer built
+    /// in the same configuration.
+    #[test]
+    fn a_checkouts_bindings_get_the_analyzer_built_beside_them() {
+        let dir = fake_checkout();
+        let root = dir.path().canonicalize().unwrap();
+        let bindings = root.join("scripting/Orrin/bin/Release/net10.0");
+        touch(&bindings.join("Orrin.dll"), "bindings");
+        let analyzers = root.join("scripting/Orrin.Analyzers/bin");
+        touch(
+            &analyzers.join("Debug/netstandard2.0/Orrin.Analyzers.dll"),
+            "debug",
+        );
+        touch(
+            &analyzers.join("Release/netstandard2.0/Orrin.Analyzers.dll"),
+            "release",
+        );
+
+        place_analyzer(&bindings).unwrap();
+        let placed = bindings.join(ANALYZER_DLL);
+        assert_eq!(std::fs::read_to_string(&placed).unwrap(), "release");
+
+        touch(
+            &analyzers.join("Release/netstandard2.0/Orrin.Analyzers.dll"),
+            "rebuilt",
+        );
+        place_analyzer(&bindings).unwrap();
+        assert_eq!(std::fs::read_to_string(&placed).unwrap(), "rebuilt");
+    }
+
+    /// Only a checkout's own build output is written to: a directory named by
+    /// `$ORRIN_SCRIPT_DIR` or an install is not the CLI's to add files to, and
+    /// an analyzer that was never built is no reason to fail a build.
+    #[test]
+    fn nothing_is_placed_outside_a_checkouts_build_output() {
+        let dir = fake_checkout();
+        let root = dir.path().canonicalize().unwrap();
+        touch(
+            &root.join("scripting/Orrin.Analyzers/bin/Debug/netstandard2.0/Orrin.Analyzers.dll"),
+            "debug",
+        );
+
+        let elsewhere = root.join("installed");
+        touch(&elsewhere.join("Orrin.dll"), "bindings");
+        place_analyzer(&elsewhere).unwrap();
+        assert!(!elsewhere.join(ANALYZER_DLL).exists());
+
+        let unbuilt = root.join("scripting/Orrin/bin/Release/net10.0");
+        touch(&unbuilt.join("Orrin.dll"), "bindings");
+        place_analyzer(&unbuilt).unwrap();
+        assert!(!unbuilt.join(ANALYZER_DLL).exists());
     }
 
     /// The editor `orrin run` opens from a checkout is the optimised engine,

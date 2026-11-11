@@ -26,7 +26,7 @@ namespace DemoGame;
 // The body is never rotated: its Transform is the physics step's, and writing
 // a rotation every frame would teleport it each time. The view turns a camera
 // of its own instead, placed at the eye every frame — and the BallLauncher, when
-// there is one, rides on that camera, because an entity holds one behaviour.
+// there is one, rides on that camera, since it fires along the view.
 [Component("demo.fps_player")]
 public class FpsPlayer : Behaviour
 {
@@ -58,12 +58,17 @@ public class FpsPlayer : Behaviour
     [Transient] bool _crouching;
     [Transient] Entity _camera;
 
-    // Each player's camera, to the player: what the launcher on a camera
-    // reads the velocity it inherits from.
-    static readonly Dictionary<Entity, Entity> Owners = new();
-
-    public static Entity? OwnerOf(Entity camera) =>
-        Owners.TryGetValue(camera, out var player) ? player : null;
+    // The player a camera belongs to: what the launcher on a camera reads the
+    // velocity it inherits from.
+    public static Entity? OwnerOf(Entity camera)
+    {
+        foreach (var player in World.FindAll<FpsPlayer>())
+        {
+            if (player._camera == camera)
+                return player.Entity;
+        }
+        return null;
+    }
 
     Vector3 Gravity => new(0f, -9.81f * GravityScale, 0f);
 
@@ -88,13 +93,10 @@ public class FpsPlayer : Behaviour
         });
         _camera = World.Spawn(Transform.Identity);
         World.AddCamera(_camera, new CameraComponent { FieldOfView = FieldOfView, Priority = 100 });
-        Owners[_camera] = Entity;
         if (Launcher)
             World.AddScript<BallLauncher>(_camera);
         PlaceCamera();
     }
-
-    public override void OnDisable() => Owners.Remove(_camera);
 
     public override void OnUpdate(float deltaTime)
     {
@@ -204,7 +206,7 @@ public class FpsPlayer : Behaviour
         var camera = Transform.Identity;
         camera.Position = body.Position + Vector3.up * (EyeAboveCentre * body.Scale.y);
         camera.Rotation = Quaternion.Euler(_pitch, _yaw, 0f);
-        Native.SetTransform(_camera, camera);
+        _camera.LocalTransform = camera;
     }
 
     static float Axis(KeyCode positive, KeyCode negative) =>

@@ -114,7 +114,7 @@ fn every_story_builds_and_lays_out_as_recorded() {
         let mut actual = format!("{name} at {}x{}\n\nbuilt\n", SCREEN[0], SCREEN[1]);
         record(&world, &mut actual);
         for _ in 0..120 {
-            world.resource_mut::<Time>().update(FRAME);
+            world.resource_mut::<Time>().update(FRAME, 1.0);
             scripting.attach_pending(&mut world, &registry);
             scripting.tick(&mut world, &registry, FRAME);
             orrin_core::ui::tween::advance(&world, FRAME);

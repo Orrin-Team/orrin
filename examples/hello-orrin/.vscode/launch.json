@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Attach to Orrin",
+      "type": "coreclr",
+      "request": "attach",
+      "processName": "orrin-core"
+    },
+    {
+      "name": "Pick a process to attach to",
+      "type": "coreclr",
+      "request": "attach",
+      "processId": "${command:pickProcess}"
+    }
+  ]
+}

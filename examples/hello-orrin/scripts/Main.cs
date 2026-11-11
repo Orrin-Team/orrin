@@ -19,6 +19,9 @@ public class Main : Behaviour
     private Entity _cube;
     private float _spin;
 
+    /// <summary>The cube OnStart spawned, which <c>Tests.cs</c> looks at.</summary>
+    public Entity Cube => _cube;
+
     public override void OnStart()
     {
         var spawn = Transform.Identity;
@@ -34,6 +37,6 @@ public class Main : Behaviour
         var t = Transform.Identity;
         t.Position = new Vector3(0f, Height, 0f);
         t.Rotation = Quaternion.Euler(0f, _spin, 0f);
-        Native.SetTransform(_cube, t);
+        _cube.LocalTransform = t;
     }
 }

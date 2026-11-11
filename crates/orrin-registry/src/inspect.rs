@@ -12,8 +12,14 @@
 //! variants and the element's default, which the v1 vtable does not carry —
 //! and a caller that could only offer half the variants would be worse than one
 //! that offers none.
+//!
+//! A script component is drawn by [`annotated`] instead, which honours what
+//! its fields' attributes say about presentation and hands every entity
+//! reference to the caller — naming an entity needs the world, which no
+//! function here can see.
 
 use crate::value::Value;
+use crate::{EntityId, FieldInfo};
 
 /// Draw `value`'s widgets, reporting whether the user moved any of them.
 pub type InspectFn = fn(&mut egui::Ui, &mut Value) -> bool;
@@ -72,6 +78,17 @@ pub fn property_with<R>(
     add: impl FnOnce(&mut egui::Ui) -> R,
     trail: impl FnOnce(&mut egui::Ui),
 ) -> R {
+    property_row(ui, label, None, add, trail)
+}
+
+/// [`property_with`], with `hint` shown on hover over the label.
+fn property_row<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    hint: Option<&str>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+    trail: impl FnOnce(&mut egui::Ui),
+) -> R {
     ui.horizontal(|ui| {
         let height = ui.spacing().interact_size.y;
         let size = egui::vec2(label_width(ui), height);
@@ -88,8 +105,11 @@ pub fn property_with<R>(
             rect.left() + LABEL_INSET,
             rect.center().y - galley.size().y / 2.0,
         );
-        if galley.elided {
-            response.on_hover_text(label);
+        match (hint, galley.elided) {
+            (Some(hint), true) => drop(response.on_hover_text(format!("{label}\n{hint}"))),
+            (Some(hint), false) => drop(response.on_hover_text(hint)),
+            (None, true) => drop(response.on_hover_text(label)),
+            (None, false) => {}
         }
         ui.painter()
             .galley(at, galley, ui.visuals().weak_text_color());
@@ -148,15 +168,24 @@ pub fn compact(value: f32) -> String {
 /// number drags and types as any `DragValue` does; the chip scrubs too, so a
 /// field whose number is being edited still has a handle.
 pub fn axes(ui: &mut egui::Ui, values: [&mut f32; 3], speed: f64, suffix: &str) -> bool {
+    axis_fields(ui, values, speed, suffix)
+}
+
+/// [`axes`] for any number of them, X first.
+fn axis_fields<const N: usize>(
+    ui: &mut egui::Ui,
+    values: [&mut f32; N],
+    speed: f64,
+    suffix: &str,
+) -> bool {
     let height = ui.spacing().interact_size.y;
-    let width = ((ui.available_width() - 2.0 * AXIS_GAP) / 3.0)
+    let width = ((ui.available_width() - (N - 1) as f32 * AXIS_GAP) / N as f32)
         .floor()
         .max(CHIP_WIDTH + 16.0);
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = AXIS_GAP;
-        let [x, y, z] = values;
-        for (axis, value) in [x, y, z].into_iter().enumerate() {
+        for (axis, value) in values.into_iter().enumerate() {
             changed |= axis_field(ui, axis, value, speed, suffix, egui::vec2(width, height));
         }
     });
@@ -260,25 +289,104 @@ fn axis_field(
     changed | response.changed()
 }
 
+/// Draws one entity reference for a caller that can see the world, reporting
+/// whether it was retargeted.
+pub type EntityFn<'a> = dyn FnMut(&mut egui::Ui, &mut EntityId) -> bool + 'a;
+
 /// The default [`InspectFn`]: one row per field, nested under a collapsing
 /// header wherever a field is itself composite.
 pub fn value(ui: &mut egui::Ui, value: &mut Value) -> bool {
+    draw(ui, value, &mut entity_id)
+}
+
+/// A script component's bag, each top-level field drawn as `fields` describes
+/// it and every entity reference by `entity`.
+///
+/// A `[Range]` slider bounds only what a drag can produce: a value already
+/// outside it is drawn as it is, and stays so until someone moves the slider.
+pub fn annotated(
+    ui: &mut egui::Ui,
+    value: &mut Value,
+    fields: &[FieldInfo],
+    entity: &mut EntityFn,
+) -> bool {
+    let Value::Struct(bag) = value else {
+        return draw(ui, value, entity);
+    };
+    let mut changed = false;
+    for (name, field) in bag {
+        let info = fields.iter().find(|info| info.name == *name);
+        if info.is_some_and(|info| info.hidden) {
+            continue;
+        }
+        if let Some(header) = info.and_then(|info| info.header.as_deref()) {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(LABEL_INSET);
+                ui.label(egui::RichText::new(header).strong());
+            });
+        }
+        let hint = info.and_then(|info| info.tooltip.as_deref());
+        changed |= match info.and_then(|info| info.range) {
+            Some(range) if matches!(field, Value::F32(_) | Value::I32(_) | Value::U32(_)) => {
+                property_row(
+                    ui,
+                    &label(name),
+                    hint,
+                    |ui| slider(ui, field, range),
+                    |_| {},
+                )
+            }
+            _ => row(ui, name, hint, field, entity),
+        };
+    }
+    changed
+}
+
+fn draw(ui: &mut egui::Ui, value: &mut Value, entity: &mut EntityFn) -> bool {
     match value {
-        Value::Struct(fields) => fields_rows(ui, fields),
+        Value::Struct(fields) => fields_rows(ui, fields, entity),
         Value::Enum { variant, fields } => {
             // The variant is shown, not chosen — see the module docs.
             property(ui, "variant", |ui| ui.label(variant.as_str()));
-            fields_rows(ui, fields)
+            fields_rows(ui, fields, entity)
         }
         Value::List(items) => {
             let mut changed = false;
             for (index, item) in items.iter_mut().enumerate() {
-                changed |= row(ui, &format!("[{index}]"), item);
+                changed |= row(ui, &format!("[{index}]"), None, item, entity);
             }
             changed
         }
-        leaf => ui.horizontal(|ui| self::leaf(ui, leaf)).inner,
+        leaf => ui.horizontal(|ui| self::leaf(ui, leaf, entity)).inner,
     }
+}
+
+/// `SliderClamping::Edits`, not egui's default `Always`, which clamps the value
+/// it is handed as it draws — and would rewrite a saved value the moment its
+/// row came on screen.
+fn slider(ui: &mut egui::Ui, value: &mut Value, (min, max): (f32, f32)) -> bool {
+    let clamping = egui::SliderClamping::Edits;
+    let response = match value {
+        Value::F32(v) => ui.add(egui::Slider::new(v, min..=max).clamping(clamping)),
+        Value::I32(v) => {
+            ui.add(egui::Slider::new(v, min.ceil() as i32..=max.floor() as i32).clamping(clamping))
+        }
+        Value::U32(v) => ui.add(
+            egui::Slider::new(v, min.ceil().max(0.0) as u32..=max.floor().max(0.0) as u32)
+                .clamping(clamping),
+        ),
+        _ => return false,
+    };
+    response.changed()
+}
+
+/// Retargeting a reference needs a picker over the live world, which is one
+/// level above a function that has only the value. Shown so the link is at
+/// least visible.
+fn entity_id(ui: &mut egui::Ui, id: &mut EntityId) -> bool {
+    ui.weak(id.to_string());
+    false
 }
 
 /// A snake_case field name as a label: `is_trigger` reads "Is trigger".
@@ -291,10 +399,10 @@ fn label(name: &str) -> String {
     out
 }
 
-fn fields_rows(ui: &mut egui::Ui, fields: &mut [(String, Value)]) -> bool {
+fn fields_rows(ui: &mut egui::Ui, fields: &mut [(String, Value)], entity: &mut EntityFn) -> bool {
     let mut changed = false;
     for (name, field) in fields {
-        changed |= row(ui, name, field);
+        changed |= row(ui, name, None, field, entity);
     }
     changed
 }
@@ -302,20 +410,34 @@ fn fields_rows(ui: &mut egui::Ui, fields: &mut [(String, Value)]) -> bool {
 /// A leaf gets a label beside its widget; anything composite gets a header it
 /// can be folded away under, because a component of components otherwise fills
 /// the panel with rows whose nesting is invisible.
-fn row(ui: &mut egui::Ui, name: &str, field: &mut Value) -> bool {
+fn row(
+    ui: &mut egui::Ui,
+    name: &str,
+    hint: Option<&str>,
+    field: &mut Value,
+    entity: &mut EntityFn,
+) -> bool {
     match field {
         Value::Struct(_) | Value::Enum { .. } | Value::List(_) => {
-            egui::CollapsingHeader::new(label(name))
+            let shown = egui::CollapsingHeader::new(label(name))
                 .default_open(true)
-                .show(ui, |ui| value(ui, field))
-                .body_returned
-                .unwrap_or(false)
+                .show(ui, |ui| draw(ui, field, entity));
+            if let Some(hint) = hint {
+                shown.header_response.on_hover_text(hint);
+            }
+            shown.body_returned.unwrap_or(false)
         }
-        leaf => property(ui, &label(name), |ui| self::leaf(ui, leaf)),
+        leaf => property_row(
+            ui,
+            &label(name),
+            hint,
+            |ui| self::leaf(ui, leaf, entity),
+            |_| {},
+        ),
     }
 }
 
-fn leaf(ui: &mut egui::Ui, value: &mut Value) -> bool {
+fn leaf(ui: &mut egui::Ui, value: &mut Value, entity: &mut EntityFn) -> bool {
     match value {
         Value::Bool(v) => ui.checkbox(v, "").changed(),
         Value::I32(v) => ui.add(egui::DragValue::new(v)).changed(),
@@ -324,13 +446,9 @@ fn leaf(ui: &mut egui::Ui, value: &mut Value) -> bool {
         Value::String(v) => ui.text_edit_singleline(v).changed(),
         Value::Vec3(v) => axes(ui, [&mut v.x, &mut v.y, &mut v.z], DRAG_SPEED, ""),
         Value::Quat(v) => quat(ui, v),
-        // Retargeting a reference needs a picker over the live world, which is
-        // one level above a function that has only the value. Shown so the link
-        // is at least visible.
-        Value::Entity(id) => {
-            ui.weak(id.to_string());
-            false
-        }
+        Value::Vec2(v) => axis_fields(ui, [&mut v.x, &mut v.y], DRAG_SPEED, ""),
+        Value::Color(v) => colour(ui, v),
+        Value::Entity(id) => entity(ui, id),
         // Assigned by dropping an asset from the editor's browser onto the row,
         // which hands over an `AssetId` payload. There is no picker because this
         // function cannot see the asset index.
@@ -357,6 +475,20 @@ fn leaf(ui: &mut egui::Ui, value: &mut Value) -> bool {
         // Routed to `value` by `row` and never reached here.
         Value::Struct(_) | Value::Enum { .. } | Value::List(_) => false,
     }
+}
+
+/// The swatch the UI components use, over the same unclamped floats. Written
+/// back only when the swatch moved: it holds eight bits a channel and nothing
+/// above 1.0, so writing every frame would round a tint nobody touched.
+fn colour(ui: &mut egui::Ui, rgba: &mut [f32; 4]) -> bool {
+    let before = rgba.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8);
+    let mut bytes = before;
+    ui.color_edit_button_srgba_unmultiplied(&mut bytes);
+    if bytes == before {
+        return false;
+    }
+    *rgba = bytes.map(|channel| f32::from(channel) / 255.0);
+    true
 }
 
 /// Edited as Euler degrees in the same convention as the C# scripting API
@@ -388,7 +520,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    use crate::EntityId;
+    use crate::{EntityId, FieldInfo};
     use glam::{EulerRot, Quat, Vec3};
 
     /// One of every variant, nested, so that adding a `Value` variant without
@@ -410,6 +542,10 @@ mod tests {
                 Value::Quat(Quat::from_euler(EulerRot::YXZ, 0.3, 0.4, 0.5)),
             ),
             ("target", Value::Entity(EntityId::NIL)),
+            ("offset", Value::Vec2(glam::Vec2::new(0.5, -1.0))),
+            // Past 1.0 and not on a byte boundary: drawn through an 8-bit
+            // swatch, which must not round it on the way past.
+            ("tint", Value::Color([1.7, 0.123_456, 0.0, 0.5])),
             ("points", Value::List(vec![Value::F32(0.5)])),
             (
                 "light",
@@ -552,6 +688,200 @@ mod tests {
         assert_eq!(value, 7.0);
         assert!(!scrub(&mut value, 0.0, 0.5));
         assert_eq!(value, 7.0);
+    }
+
+    /// A two-component vector reads as X and Y the way a three-component one
+    /// reads as X, Y and Z — and has no third chip to suggest a Z it lacks.
+    #[test]
+    fn a_vector2_is_drawn_with_two_axis_colours() {
+        let mut v = Value::Vec2(glam::Vec2::new(1.0, 2.0));
+        let fills = painted_fills(|ui| {
+            value(ui, &mut v);
+        });
+        assert!(fills.contains(&AXIS[0]) && fills.contains(&AXIS[1]));
+        assert!(!fills.contains(&AXIS[2]));
+    }
+
+    /// Every text a frame painted, with where.
+    fn painted_text(
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        draw: &mut dyn FnMut(&mut egui::Ui),
+    ) -> Vec<(String, egui::Rect)> {
+        fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text.visual_bounding_rect()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| draw(ui));
+        });
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn circles(draw: &mut dyn FnMut(&mut egui::Ui)) -> usize {
+        fn count(shape: &egui::Shape) -> usize {
+            match shape {
+                egui::Shape::Circle(_) => 1,
+                egui::Shape::Vec(shapes) => shapes.iter().map(count).sum(),
+                _ => 0,
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut n = 0;
+        for _ in 0..2 {
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| draw(ui));
+            });
+            n = output.shapes.iter().map(|c| count(&c.shape)).sum();
+        }
+        n
+    }
+
+    fn tuned() -> (Value, Vec<FieldInfo>) {
+        let bag = Value::strukt([
+            ("Speed", Value::F32(4.0)),
+            ("Secret", Value::I32(7)),
+            ("Target", Value::Entity(EntityId::NIL)),
+        ]);
+        let fields = vec![
+            FieldInfo {
+                name: "Speed".to_owned(),
+                header: Some("Motion".to_owned()),
+                tooltip: Some("Metres a second".to_owned()),
+                range: Some((0.0, 10.0)),
+                hidden: false,
+            },
+            FieldInfo {
+                name: "Secret".to_owned(),
+                hidden: true,
+                ..FieldInfo::default()
+            },
+        ];
+        (bag, fields)
+    }
+
+    fn no_entity(_: &mut egui::Ui, _: &mut EntityId) -> bool {
+        false
+    }
+
+    /// `[Range]` is the one attribute that changes the widget: a slider, whose
+    /// handle is the only circle an inspector row paints.
+    #[test]
+    fn a_ranged_field_is_a_slider_and_an_unranged_one_is_not() {
+        let (bag, fields) = tuned();
+        let mut ranged = bag.clone();
+        assert_eq!(
+            circles(&mut |ui| {
+                annotated(ui, &mut ranged, &fields, &mut no_entity);
+            }),
+            1
+        );
+        let mut plain = bag;
+        assert_eq!(
+            circles(&mut |ui| {
+                annotated(ui, &mut plain, &[], &mut no_entity);
+            }),
+            0
+        );
+    }
+
+    /// `[HideInInspector]` leaves the field out of the panel and in the value,
+    /// which is what makes it still saved and still reloaded.
+    #[test]
+    fn a_hidden_field_is_not_drawn_and_a_header_is_drawn_above_its_field() {
+        let (mut bag, fields) = tuned();
+        let ctx = egui::Context::default();
+        let mut text = Vec::new();
+        for _ in 0..2 {
+            text = painted_text(&ctx, Default::default(), &mut |ui| {
+                annotated(ui, &mut bag, &fields, &mut no_entity);
+            });
+        }
+        let at = |needle: &str| {
+            text.iter()
+                .find(|(t, _)| t == needle)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("`{needle}` was not painted: {text:?}"))
+        };
+        assert!(!text.iter().any(|(t, _)| t == "Secret"), "{text:?}");
+        assert!(at("Motion").bottom() <= at("Speed").top());
+        assert_eq!(bag.field("Secret"), Some(&Value::I32(7)));
+    }
+
+    /// `[Tooltip]` is shown on hover over the field's label.
+    #[test]
+    fn a_tooltip_shows_over_its_fields_label() {
+        let (mut bag, fields) = tuned();
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| style.interaction.tooltip_delay = 0.0);
+        let mut text = Vec::new();
+        for _ in 0..2 {
+            text = painted_text(&ctx, Default::default(), &mut |ui| {
+                annotated(ui, &mut bag, &fields, &mut no_entity);
+            });
+        }
+        assert!(!text.iter().any(|(t, _)| t == "Metres a second"));
+        let label = text.iter().find(|(t, _)| t == "Speed").unwrap().1;
+        let hover = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(label.center())],
+            ..Default::default()
+        };
+        painted_text(&ctx, hover, &mut |ui| {
+            annotated(ui, &mut bag, &fields, &mut no_entity);
+        });
+        for _ in 0..3 {
+            text = painted_text(&ctx, Default::default(), &mut |ui| {
+                annotated(ui, &mut bag, &fields, &mut no_entity);
+            });
+        }
+        assert!(text.iter().any(|(t, _)| t == "Metres a second"), "{text:?}");
+    }
+
+    /// A slider bounds what it can produce, not what it is shown: a value a
+    /// scene saved outside the range is drawn as it is and not written back.
+    #[test]
+    fn a_range_does_not_clamp_a_value_it_did_not_produce() {
+        let (bag, fields) = tuned();
+        let mut far = bag.clone();
+        *far.field_mut("Speed").unwrap() = Value::F32(50.0);
+        let drawn = RefCell::new(far.clone());
+        egui::__run_test_ui(|ui| {
+            assert!(!annotated(
+                ui,
+                &mut drawn.borrow_mut(),
+                &fields,
+                &mut no_entity
+            ));
+        });
+        assert_eq!(drawn.into_inner(), far);
+    }
+
+    /// Entity references are drawn by whoever can see the world, through the
+    /// callback, wherever they sit in the bag.
+    #[test]
+    fn every_entity_reference_goes_through_the_callback() {
+        let bag = RefCell::new(Value::strukt([
+            ("Target", Value::Entity(EntityId::NIL)),
+            ("Others", Value::List(vec![Value::Entity(EntityId::NIL); 2])),
+        ]));
+        let calls = std::cell::Cell::new(0);
+        egui::__run_test_ui(|ui| {
+            calls.set(0);
+            annotated(ui, &mut bag.borrow_mut(), &[], &mut |_, _| {
+                calls.set(calls.get() + 1);
+                false
+            });
+        });
+        assert_eq!(calls.get(), 3);
     }
 
     #[test]

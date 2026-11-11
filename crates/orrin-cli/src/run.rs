@@ -1,15 +1,25 @@
+use std::path::PathBuf;
+
+use orrin_project::Project;
+
 use crate::engine::{self, BINDINGS_ENV};
 use crate::{Fallible, ProjectArgs, build, display_path};
 
-pub fn run(args: &ProjectArgs, no_build: bool, dev: bool, engine_args: &[String]) -> Fallible {
-    let (project, bindings) = if no_build {
+/// The project and its bindings, built first unless `no_build`: what `run`
+/// and `test` both launch the engine on.
+pub fn prepare(args: &ProjectArgs, no_build: bool) -> Result<(Project, Option<PathBuf>), String> {
+    if no_build {
         let project = args.locate()?;
         let bindings = engine::find_bindings(project.root());
-        (project, bindings)
+        Ok((project, bindings))
     } else {
         let built = build::build(args)?;
-        (built.project, built.bindings)
-    };
+        Ok((built.project, built.bindings))
+    }
+}
+
+pub fn run(args: &ProjectArgs, no_build: bool, dev: bool, engine_args: &[String]) -> Fallible {
+    let (project, bindings) = prepare(args, no_build)?;
 
     let engine = engine::find(project.root(), !dev)?;
 

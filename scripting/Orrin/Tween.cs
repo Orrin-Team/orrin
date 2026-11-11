@@ -51,26 +51,38 @@ public enum TweenProperty : uint
 /// </summary>
 public enum EaseStyle : uint
 {
+    /// <summary>Constant speed, whatever the direction.</summary>
     Linear,
+    /// <summary>A quarter of a cosine wave: the gentlest of the curves.</summary>
     Sine,
+    /// <summary>As <see cref="EaseDirection.In"/>, t².</summary>
     Quad,
+    /// <summary>As <see cref="EaseDirection.In"/>, t³.</summary>
     Cubic,
+    /// <summary>As <see cref="EaseDirection.In"/>, t⁴.</summary>
     Quart,
+    /// <summary>As <see cref="EaseDirection.In"/>, t⁵.</summary>
     Quint,
+    /// <summary>As <see cref="EaseDirection.In"/>, 2^(10t − 10): all but still, then sudden.</summary>
     Expo,
+    /// <summary>As <see cref="EaseDirection.In"/>, a quarter circle: 1 − √(1 − t²).</summary>
     Circ,
     /// <summary>Pulls back past the start before it moves.</summary>
     Back,
     /// <summary>Overshoots and rings like a spring.</summary>
     Elastic,
+    /// <summary>Bounces to rest like a dropped ball, at the end the direction shapes.</summary>
     Bounce,
 }
 
 /// <summary>Which end of the curve the style shapes. Lock-step with <c>ui::tween::EaseDirection</c>.</summary>
 public enum EaseDirection : uint
 {
+    /// <summary>The style's own curve: slow to leave the start.</summary>
     In,
+    /// <summary>The curve mirrored: slow to reach the end.</summary>
     Out,
+    /// <summary>In for the first half, Out for the second: slow at both ends.</summary>
     InOut,
 }
 
@@ -79,7 +91,9 @@ public readonly struct TweenInfo
 {
     /// <summary>Seconds from start to end.</summary>
     public readonly float Duration;
+    /// <summary>The shape of the curve.</summary>
     public readonly EaseStyle Style;
+    /// <summary>Which end of the curve the style shapes.</summary>
     public readonly EaseDirection Direction;
     /// <summary>Seconds to wait, once, before the first cycle.</summary>
     public readonly float Delay;
@@ -88,6 +102,10 @@ public readonly struct TweenInfo
     /// <summary>Each cycle runs back to the start after reaching the end.</summary>
     public readonly bool Reverses;
 
+    /// <summary>
+    /// Each argument is the field of the same name. The defaults are a one-second
+    /// <see cref="EaseStyle.Quad"/> <see cref="EaseDirection.Out"/> that runs once.
+    /// </summary>
     public TweenInfo(
         float duration = 1f,
         EaseStyle style = EaseStyle.Quad,
@@ -159,21 +177,47 @@ public readonly struct Tween : IEquatable<Tween>
         return this;
     }
 
+    /// <summary>
+    /// Ease <paramref name="entity"/>'s <paramref name="property"/> from where it is
+    /// now to <paramref name="to"/>, as <paramref name="info"/> describes. For a float
+    /// property: one of another shape throws <see cref="ArgumentException"/>. A tween
+    /// the engine refuses has an <see cref="Id"/> of zero.
+    /// </summary>
     public static Tween To(Entity entity, TweenProperty property, float to, TweenInfo info) =>
         Play(entity, property, 1, null, new Vector4(to, 0f, 0f, 0f), info);
 
+    /// <summary>
+    /// <see cref="To(Entity, TweenProperty, float, TweenInfo)"/> for a
+    /// <see cref="Vector2"/> property.
+    /// </summary>
     public static Tween To(Entity entity, TweenProperty property, Vector2 to, TweenInfo info) =>
         Play(entity, property, 2, null, new Vector4(to.x, to.y, 0f, 0f), info);
 
+    /// <summary>
+    /// <see cref="To(Entity, TweenProperty, float, TweenInfo)"/> for a
+    /// <see cref="Color"/> property.
+    /// </summary>
     public static Tween To(Entity entity, TweenProperty property, Color to, TweenInfo info) =>
         Play(entity, property, 4, null, Lanes(to), info);
 
+    /// <summary>
+    /// <see cref="To(Entity, TweenProperty, float, TweenInfo)"/>, starting from
+    /// <paramref name="from"/> rather than from where the property is now.
+    /// </summary>
     public static Tween FromTo(Entity entity, TweenProperty property, float from, float to, TweenInfo info) =>
         Play(entity, property, 1, new Vector4(from, 0f, 0f, 0f), new Vector4(to, 0f, 0f, 0f), info);
 
+    /// <summary>
+    /// <see cref="FromTo(Entity, TweenProperty, float, float, TweenInfo)"/> for a
+    /// <see cref="Vector2"/> property.
+    /// </summary>
     public static Tween FromTo(Entity entity, TweenProperty property, Vector2 from, Vector2 to, TweenInfo info) =>
         Play(entity, property, 2, new Vector4(from.x, from.y, 0f, 0f), new Vector4(to.x, to.y, 0f, 0f), info);
 
+    /// <summary>
+    /// <see cref="FromTo(Entity, TweenProperty, float, float, TweenInfo)"/> for a
+    /// <see cref="Color"/> property.
+    /// </summary>
     public static Tween FromTo(Entity entity, TweenProperty property, Color from, Color to, TweenInfo info) =>
         Play(entity, property, 4, Lanes(from), Lanes(to), info);
 
@@ -214,10 +258,15 @@ public readonly struct Tween : IEquatable<Tween>
         return new Tween(Native.TweenPlay(entity, request));
     }
 
+    /// <inheritdoc/>
     public bool Equals(Tween other) => Id == other.Id;
+    /// <inheritdoc/>
     public override bool Equals(object? obj) => obj is Tween other && Equals(other);
+    /// <inheritdoc/>
     public override int GetHashCode() => Id.GetHashCode();
+    /// <summary>Whether both are the same tween.</summary>
     public static bool operator ==(Tween a, Tween b) => a.Equals(b);
+    /// <summary>Whether they are different tweens.</summary>
     public static bool operator !=(Tween a, Tween b) => !a.Equals(b);
 }
 

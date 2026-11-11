@@ -18,6 +18,8 @@ pub mod stats;
 #[cfg(feature = "scripting")]
 pub mod storybook;
 pub mod systems;
+#[cfg(feature = "scripting")]
+pub mod testing;
 pub mod threads;
 pub mod ui;
 

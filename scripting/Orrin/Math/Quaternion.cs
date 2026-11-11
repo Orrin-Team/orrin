@@ -15,11 +15,16 @@ namespace Orrin.Math;
 [StructLayout(LayoutKind.Sequential)]
 public readonly struct Quaternion : IEquatable<Quaternion>
 {
+    /// <summary>The vector part's x: the rotation axis's x times sin(angle / 2).</summary>
     public readonly float x;
+    /// <summary>The vector part's y: the rotation axis's y times sin(angle / 2).</summary>
     public readonly float y;
+    /// <summary>The vector part's z: the rotation axis's z times sin(angle / 2).</summary>
     public readonly float z;
+    /// <summary>The scalar part: cos(angle / 2).</summary>
     public readonly float w;
 
+    /// <summary>A quaternion from its four components, as given: nothing normalizes them.</summary>
     public Quaternion(float x, float y, float z, float w)
     {
         this.x = x;
@@ -28,8 +33,13 @@ public readonly struct Quaternion : IEquatable<Quaternion>
         this.w = w;
     }
 
+    /// <summary>No rotation: (0, 0, 0, 1).</summary>
     public static Quaternion identity => new(0f, 0f, 0f, 1f);
 
+    /// <summary>
+    /// This rotation scaled to unit length, or <see cref="identity"/> if it is too
+    /// small to normalize.
+    /// </summary>
     public Quaternion normalized
     {
         get
@@ -104,6 +114,10 @@ public readonly struct Quaternion : IEquatable<Quaternion>
         return qy * qx * qz;
     }
 
+    /// <summary>
+    /// <see cref="Euler(float, float, float)"/> from a vector of degrees: x pitch,
+    /// y yaw, z roll.
+    /// </summary>
     public static Quaternion Euler(Vector3 eulerDegrees) =>
         Euler(eulerDegrees.x, eulerDegrees.y, eulerDegrees.z);
 
@@ -133,6 +147,10 @@ public readonly struct Quaternion : IEquatable<Quaternion>
         return FromBasis(xAxis, yAxis, zAxis);
     }
 
+    /// <summary>
+    /// <see cref="LookRotation(Vector3, Vector3)"/>, keeping up as close to
+    /// <see cref="Vector3.up"/> as possible.
+    /// </summary>
     public static Quaternion LookRotation(Vector3 forward) => LookRotation(forward, Vector3.up);
 
     /// <summary>The shortest-arc rotation taking one direction to another.</summary>
@@ -159,12 +177,17 @@ public readonly struct Quaternion : IEquatable<Quaternion>
         return new Quaternion(cross.x, cross.y, cross.z, 1f + dot).normalized;
     }
 
+    /// <summary>
+    /// The four-component dot product. Its magnitude is 1 for unit rotations that
+    /// are the same, whichever sign either carries.
+    /// </summary>
     public static float Dot(Quaternion a, Quaternion b) =>
         a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 
     /// <summary>The reverse rotation (assumes a unit quaternion).</summary>
     public static Quaternion Inverse(Quaternion q) => new(-q.x, -q.y, -q.z, q.w);
 
+    /// <summary><paramref name="q"/>'s <see cref="normalized"/>.</summary>
     public static Quaternion Normalize(Quaternion q) => q.normalized;
 
     /// <summary>Unsigned angle between two rotations, in degrees.</summary>
@@ -180,6 +203,7 @@ public readonly struct Quaternion : IEquatable<Quaternion>
     public static Quaternion Slerp(Quaternion a, Quaternion b, float t) =>
         SlerpUnclamped(a, b, Mathf.Clamp01(t));
 
+    /// <summary><see cref="Slerp"/> without the clamp on <paramref name="t"/>.</summary>
     public static Quaternion SlerpUnclamped(Quaternion a, Quaternion b, float t)
     {
         var dot = Dot(a, b);
@@ -216,6 +240,7 @@ public readonly struct Quaternion : IEquatable<Quaternion>
     public static Quaternion Lerp(Quaternion a, Quaternion b, float t) =>
         LerpUnclamped(a, b, Mathf.Clamp01(t));
 
+    /// <summary><see cref="Lerp"/> without the clamp on <paramref name="t"/>.</summary>
     public static Quaternion LerpUnclamped(Quaternion a, Quaternion b, float t)
     {
         if (Dot(a, b) < 0f)
@@ -252,9 +277,15 @@ public readonly struct Quaternion : IEquatable<Quaternion>
         return point + rotation.w * t + Vector3.Cross(qv, t);
     }
 
+    /// <summary>
+    /// Exact equality of every component. <c>q</c> and <c>-q</c> are the same
+    /// rotation but compare unequal; <see cref="Angle"/> is the test for the same
+    /// rotation.
+    /// </summary>
     public static bool operator ==(Quaternion a, Quaternion b) =>
         a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
 
+    /// <summary>Whether any component differs.</summary>
     public static bool operator !=(Quaternion a, Quaternion b) => !(a == b);
 
     /// <summary>Quaternion from an orthonormal right-handed basis (matrix columns).</summary>
@@ -288,10 +319,14 @@ public readonly struct Quaternion : IEquatable<Quaternion>
         }
     }
 
+    /// <inheritdoc/>
     public bool Equals(Quaternion other) => this == other;
+    /// <inheritdoc/>
     public override bool Equals(object? obj) => obj is Quaternion other && this == other;
+    /// <inheritdoc/>
     public override int GetHashCode() => HashCode.Combine(x, y, z, w);
 
+    /// <summary>The components to four decimal places, in the invariant culture.</summary>
     public override string ToString() =>
         string.Create(CultureInfo.InvariantCulture, $"({x:F4}, {y:F4}, {z:F4}, {w:F4})");
 }

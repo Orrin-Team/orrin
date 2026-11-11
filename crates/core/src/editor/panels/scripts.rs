@@ -7,22 +7,23 @@
 //! the same route: it decides whether a green build raises that request, never
 //! whether a swap happens here.
 
+use std::time::Duration;
+
 use orrin_ecs::World;
 
 use crate::build_watcher::{BuildState, BuildStatus};
 use crate::editor::icons;
 use crate::editor::state::EditorState;
 use crate::editor::theme::{ERROR, OK, PENDING};
-use crate::scene::ScriptComponent;
+use crate::scene::Scripts;
+use crate::scripting::{ScriptTimings, TimingRow};
 
 pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
     let mut live = 0usize;
     let mut faulted = 0usize;
-    world.query::<&ScriptComponent>().for_each(|_, script| {
-        live += 1;
-        if script.faulted {
-            faulted += 1;
-        }
+    world.query::<&Scripts>().for_each(|_, scripts| {
+        live += scripts.len();
+        faulted += scripts.iter().filter(|script| script.faulted).count();
     });
 
     if ui.button("Reload scripts").clicked() {
@@ -43,6 +44,55 @@ pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
             &format!("{faulted} faulted — a reload clears them"),
         );
     }
+    ui.separator();
+    timings(ui, world);
+}
+
+fn timings(ui: &mut egui::Ui, world: &World) {
+    let Some(mut timings) = world.get_resource_mut::<ScriptTimings>() else {
+        return;
+    };
+    ui.checkbox(&mut timings.enabled, "Time each script");
+    ui.label(
+        egui::RichText::new(
+            "Time in managed code per Behaviour type, every hook included, in ms. \
+             The numbers include the cost of measuring: two clock reads around \
+             every call, which on many small scripts is much of what they cost.",
+        )
+        .weak()
+        .small(),
+    );
+    if !timings.enabled {
+        return;
+    }
+
+    let mut rows: Vec<&TimingRow> = timings
+        .rows()
+        .filter(|row| row.average() > Duration::ZERO)
+        .collect();
+    if rows.is_empty() {
+        ui.weak("Nothing has run yet.");
+        return;
+    }
+    rows.sort_by_key(|row| std::cmp::Reverse(row.average()));
+    let ms = |time: Duration| format!("{:.3}", time.as_secs_f64() * 1e3);
+    egui::Grid::new("script timings")
+        .num_columns(3)
+        .striped(true)
+        .spacing([10.0, 2.0])
+        .show(ui, |ui| {
+            for heading in ["", "last", "avg"] {
+                ui.label(egui::RichText::new(heading).weak().small());
+            }
+            ui.end_row();
+            for row in rows {
+                let short = row.type_name.split(',').next().unwrap_or(&row.type_name);
+                ui.label(short).on_hover_text(&row.type_name);
+                ui.monospace(ms(row.last_frame));
+                ui.monospace(ms(row.average()));
+                ui.end_row();
+            }
+        });
 }
 
 fn show_build_state(ui: &mut egui::Ui, status: &BuildStatus) {

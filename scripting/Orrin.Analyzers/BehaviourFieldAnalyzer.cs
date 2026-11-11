@@ -38,8 +38,8 @@ public sealed class BehaviourFieldAnalyzer : DiagnosticAnalyzer
         messageFormat:
             "'{0}' is of type '{1}', which the component registry cannot save, and it is not "
             + "marked [Transient] — it will not survive a save, and may not survive a hot reload. "
-            + "Mark it [Transient], or use bool, int, uint, float, string, Vector3, Quaternion, "
-            + "AssetRef<T>, or an enum.",
+            + "Mark it [Transient], or use bool, int, uint, float, string, Vector2, Vector3, "
+            + "Quaternion, Color, Entity, AssetRef<T>, an enum, or a List<T> or T[] of one of those.",
         category: "Orrin.Registry",
         defaultSeverity: DiagnosticSeverity.Warning,
         isEnabledByDefault: true,
@@ -48,7 +48,7 @@ public sealed class BehaviourFieldAnalyzer : DiagnosticAnalyzer
             + "A field outside it must say so, so that losing its value is a decision rather "
             + "than a surprise.");
 
-    /// The engine's two visible value types, matched by full name rather than by
+    /// The engine's visible value types, matched by full name rather than by
     /// symbol identity: the analyzer has no reference to the Orrin assembly's own
     /// compilation, and a name is what survives that.
     ///
@@ -58,8 +58,11 @@ public sealed class BehaviourFieldAnalyzer : DiagnosticAnalyzer
     /// way for an analyzer to be useless. `SpecialType` is the identity the
     /// compiler actually guarantees.
     static readonly ImmutableHashSet<string> VisibleEngineTypes = ImmutableHashSet.Create(
+        "Orrin.Math.Vector2",
         "Orrin.Math.Vector3",
-        "Orrin.Math.Quaternion");
+        "Orrin.Math.Quaternion",
+        "Orrin.Math.Color",
+        "Orrin.Entity");
 
     static readonly ImmutableHashSet<SpecialType> VisiblePrimitives = ImmutableHashSet.Create(
         SpecialType.System_Boolean,
@@ -71,6 +74,8 @@ public sealed class BehaviourFieldAnalyzer : DiagnosticAnalyzer
     /// Generic, so matched on its definition: `AssetRef<Prefab>` and every other
     /// instantiation share it.
     const string AssetRefType = "Orrin.AssetRef<T>";
+
+    const string ListType = "System.Collections.Generic.List<T>";
 
     const string BehaviourType = "Orrin.Behaviour";
     const string TransientAttribute = "Orrin.TransientAttribute";
@@ -118,9 +123,24 @@ public sealed class BehaviourFieldAnalyzer : DiagnosticAnalyzer
         return false;
     }
 
+    /// A `List<T>` or one-dimensional `T[]` is visible when `T` is and is not
+    /// itself a list — the rule `PropertyBag.IsVisible` applies.
+    static bool IsVisible(ITypeSymbol type) =>
+        ElementType(type) is { } element
+            ? ElementType(element) is null && IsVisibleLeaf(element)
+            : IsVisibleLeaf(type);
+
+    static ITypeSymbol? ElementType(ITypeSymbol type) => type switch
+    {
+        IArrayTypeSymbol { Rank: 1 } array => array.ElementType,
+        INamedTypeSymbol { IsGenericType: true } named
+            when named.OriginalDefinition.ToDisplayString() == ListType => named.TypeArguments[0],
+        _ => null,
+    };
+
     /// An enum is visible whatever its underlying type: the bag writes the
     /// member's name, so the width never reaches the wire.
-    static bool IsVisible(ITypeSymbol type) =>
+    static bool IsVisibleLeaf(ITypeSymbol type) =>
         type.TypeKind == TypeKind.Enum
         || VisiblePrimitives.Contains(type.SpecialType)
         || VisibleEngineTypes.Contains(type.ToDisplayString())

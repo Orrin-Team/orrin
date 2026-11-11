@@ -22,7 +22,7 @@ use crate::editor::state::EditorState;
 use crate::editor::widgets;
 use crate::gfx::vulkan::material_preview;
 #[cfg(feature = "scripting")]
-use crate::scene::ScriptComponent;
+use crate::scene::Scripts;
 use crate::scene::prefab;
 use crate::scene::{
     AssetPreviews, Assets, Light, LocalTransform, LogBuffer, LogLevel, MaterialHandle, MeshHandle,
@@ -90,7 +90,7 @@ pub fn body(
             audio_section(ui, world, state, entity, &filter, &overridden);
             super::ui_sections::sections(ui, world, state, entity, &filter);
             #[cfg(feature = "scripting")]
-            script_section(ui, world, entity, &filter);
+            script_sections(ui, world, registry, state, entity, &filter, &overridden);
             registered_sections(ui, world, registry, state, entity, &filter, &overridden);
             if filter.is_empty() {
                 ui.add_space(8.0);
@@ -422,7 +422,8 @@ fn registered_sections(
     overridden: &[orrin_registry::ComponentId],
 ) {
     for vtable in registry.components() {
-        if HAND_DRAWN.contains(&vtable.id) {
+        // A Behaviour's fields are drawn in its own script section.
+        if HAND_DRAWN.contains(&vtable.id) || vtable.script.is_some() {
             continue;
         }
         let Some(before) = vtable.read(world, entity) else {
@@ -439,11 +440,7 @@ fn registered_sections(
         }
 
         let mut after = before.clone();
-        let tint = if vtable.script.is_some() {
-            crate::editor::theme::KIND_SCRIPT
-        } else {
-            ui.visuals().weak_text_color()
-        };
+        let tint = ui.visuals().weak_text_color();
         let (_, icon) = catalog::describe(vtable);
         let id = ui.id().with(("component", vtable.id.as_str()));
         let mut remove = false;
@@ -1265,59 +1262,231 @@ pub(super) fn texture_slot(ui: &mut egui::Ui, world: &World, texture: &mut Optio
         });
 }
 
+/// One section per Behaviour on the entity, in attach order: its lifecycle
+/// rows, and, when its type is a registered component, its fields and a way to
+/// remove it alone.
+///
+/// A Behaviour with no `[Component]` has no id for the edit pipeline to name,
+/// so it cannot be removed here: a removal that skipped the pipeline would be
+/// the one edit undo never saw.
 #[cfg(feature = "scripting")]
-fn script_section(ui: &mut egui::Ui, world: &World, entity: Entity, filter: &Filter) {
-    let Some(mut script) = world.get_mut::<ScriptComponent>(entity) else {
-        return;
-    };
-    let Some(rows) = filter.section("Script", &["Behaviour", "Enabled", "State"]) else {
-        return;
-    };
-    let id = ui.id().with("script");
-    widgets::section(
-        ui,
-        id,
-        icons::file_code(),
-        crate::editor::theme::KIND_SCRIPT,
-        "Script",
-        None,
-        |ui| {
-            if rows.shows("Behaviour") {
-                let type_name = script.type_name.clone();
-                widgets::property(ui, "Behaviour", |ui| ui.label(figures(type_name)));
+fn script_sections(
+    ui: &mut egui::Ui,
+    world: &World,
+    registry: &Registry,
+    state: &mut EditorState,
+    entity: Entity,
+    filter: &Filter,
+    overridden: &[orrin_registry::ComponentId],
+) {
+    struct Shown {
+        type_name: String,
+        enabled: bool,
+        faulted: bool,
+        active: bool,
+        started: bool,
+    }
+    // Copied out, because reading a Behaviour's fields through the registry
+    // borrows the same storage.
+    let shown: Vec<Shown> = world
+        .get::<Scripts>(entity)
+        .map(|scripts| {
+            scripts
+                .iter()
+                .map(|script| Shown {
+                    type_name: script.type_name.clone(),
+                    enabled: script.enabled,
+                    faulted: script.faulted,
+                    active: script.active,
+                    started: script.started,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for script in shown {
+        let vtable = registry.components().find(|vtable| {
+            vtable
+                .script
+                .as_ref()
+                .is_some_and(|binding| binding.type_name == script.type_name)
+        });
+        let title = vtable.map_or_else(
+            || {
+                let qualified = script.type_name.split(',').next().unwrap_or_default();
+                qualified
+                    .rsplit(['.', '+'])
+                    .next()
+                    .unwrap_or(qualified)
+                    .to_owned()
+            },
+            |vtable| vtable.name.to_string(),
+        );
+        let before = vtable.and_then(|vtable| vtable.read(world, entity));
+        let annotations = vtable
+            .and_then(|vtable| vtable.script.as_ref())
+            .map_or(&[][..], |binding| &binding.fields[..]);
+        let hidden = |name: &str| {
+            annotations
+                .iter()
+                .any(|info| info.hidden && info.name == name)
+        };
+        let mut labels = vec!["Behaviour", "Enabled", "State"];
+        if let Some(
+            orrin_registry::Value::Struct(fields) | orrin_registry::Value::Enum { fields, .. },
+        ) = &before
+        {
+            labels.extend(
+                fields
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .filter(|name| !hidden(name)),
+            );
+        }
+        let Some(rows) = filter.section(&title, &labels) else {
+            continue;
+        };
+
+        let mut enabled = script.enabled;
+        let mut clear_fault = false;
+        let mut after = before.clone();
+        let mut remove = false;
+        let mut menu = |ui: &mut egui::Ui| {
+            if ui.button("Remove component").clicked() {
+                remove = true;
+                ui.close_menu();
             }
-            if rows.shows("Enabled") {
-                // Only the desired state is written here; the script tick sees
-                // the change next frame and dispatches OnEnable/OnDisable itself.
-                widgets::property(ui, "Enabled", |ui| ui.checkbox(&mut script.enabled, ""));
-            }
-            if rows.shows("State") {
-                widgets::property(ui, "State", |ui| {
-                    if script.faulted {
-                        // A hook threw and the engine disabled the script (see
-                        // the log for the exception). Clearing re-arms it from
-                        // next tick — the manual counterpart to "re-enable on
-                        // hot reload".
-                        icons::labelled(
-                            ui,
-                            icons::warning(),
-                            crate::editor::theme::ERROR,
-                            "faulted",
-                        );
-                        if ui.small_button("Clear fault").clicked() {
-                            script.faulted = false;
+        };
+        let id = ui.id().with(("script", script.type_name.as_str()));
+        let title_colour = vtable
+            .is_some_and(|vtable| overridden.contains(&vtable.id))
+            .then_some(crate::editor::theme::PREFAB);
+        let touched = widgets::section_titled(
+            ui,
+            id,
+            icons::file_code(),
+            crate::editor::theme::KIND_SCRIPT,
+            &title,
+            title_colour,
+            vtable.map(|_| &mut menu as &mut dyn FnMut(&mut egui::Ui)),
+            |ui| {
+                if rows.shows("Behaviour") {
+                    widgets::property(ui, "Behaviour", |ui| {
+                        ui.label(figures(script.type_name.clone()))
+                    });
+                }
+                if rows.shows("Enabled") {
+                    // Only the desired state is written here; the script tick
+                    // sees the change next frame and dispatches
+                    // OnEnable/OnDisable itself.
+                    widgets::property(ui, "Enabled", |ui| ui.checkbox(&mut enabled, ""));
+                }
+                if rows.shows("State") {
+                    widgets::property(ui, "State", |ui| {
+                        if script.faulted {
+                            // A hook threw and the engine disabled the script
+                            // (see the log for the exception). Clearing re-arms
+                            // it from next tick — the manual counterpart to
+                            // "re-enable on hot reload".
+                            icons::labelled(
+                                ui,
+                                icons::warning(),
+                                crate::editor::theme::ERROR,
+                                "faulted",
+                            );
+                            if ui.small_button("Clear fault").clicked() {
+                                clear_fault = true;
+                            }
+                        } else {
+                            ui.weak(match (script.active, script.started) {
+                                (true, _) => "active",
+                                (false, true) => "inactive",
+                                (false, false) => "not started",
+                            });
                         }
-                    } else {
-                        ui.weak(match (script.active, script.started) {
-                            (true, _) => "active",
-                            (false, true) => "inactive",
-                            (false, false) => "not started",
-                        });
-                    }
-                });
+                    });
+                }
+                match after.as_mut() {
+                    Some(after) => script_fields(ui, world, after, annotations),
+                    None => false,
+                }
+            },
+        )
+        .unwrap_or(false);
+        drop(menu);
+
+        if (enabled != script.enabled || clear_fault)
+            && let Some(mut scripts) = world.get_mut::<Scripts>(entity)
+            && let Some(live) = scripts.get_mut(&script.type_name)
+        {
+            live.enabled = enabled;
+            if clear_fault {
+                live.faulted = false;
             }
-        },
-    );
+        }
+        if let Some(vtable) = vtable {
+            if remove {
+                state.request_remove_component(entity, vtable.id.clone());
+            } else if touched && let Some(after) = after {
+                state.edit(entity, vtable.id.clone(), after);
+            }
+        }
+    }
+}
+
+/// A Behaviour's fields, as their attributes ask, with every entity reference
+/// drawn as an [`entity_slot`].
+#[cfg(feature = "scripting")]
+fn script_fields(
+    ui: &mut egui::Ui,
+    world: &World,
+    value: &mut orrin_registry::Value,
+    fields: &[orrin_registry::FieldInfo],
+) -> bool {
+    orrin_registry::inspect::annotated(ui, value, fields, &mut |ui, id| entity_slot(ui, world, id))
+}
+
+/// One entity reference: the target's name, a drop target for a row dragged
+/// out of the hierarchy, and a menu to clear it — [`texture_slot`]'s
+/// interaction, over the world rather than the asset index.
+///
+/// A drag carrying several rows is refused rather than resolved to one of
+/// them: which one was meant is not something the slot can know.
+#[cfg(feature = "scripting")]
+fn entity_slot(ui: &mut egui::Ui, world: &World, id: &mut orrin_registry::EntityId) -> bool {
+    use crate::scene::entity_ref;
+
+    let name = match entity_ref::entity_of(world, *id) {
+        Some(target) => world.get::<Name>(target).map_or_else(
+            || format!("Entity {}", target.index()),
+            |name| name.0.clone(),
+        ),
+        None if id.is_nil() => "None".to_owned(),
+        None => "Missing entity".to_owned(),
+    };
+    let slot =
+        ui.add(egui::Button::new(figures(name)).min_size(egui::vec2(ui.available_width(), 0.0)));
+    let mut changed = false;
+    if egui::DragAndDrop::has_payload_of_type::<Vec<Entity>>(&slot.ctx)
+        && let Some(dragged) = slot.dnd_release_payload::<Vec<Entity>>()
+        && let [target] = dragged[..]
+    {
+        let dropped = entity_ref::id_of(world, target);
+        changed = dropped != *id;
+        *id = dropped;
+    }
+    slot.on_hover_text("Drop an entity from the hierarchy here. Right-click to clear")
+        .context_menu(|ui| {
+            if ui
+                .add_enabled(!id.is_nil(), egui::Button::new("Clear"))
+                .clicked()
+            {
+                *id = orrin_registry::EntityId::NIL;
+                changed = true;
+                ui.close_menu();
+            }
+        });
+    changed
 }
 
 /// Range is where the light is cut off, not how far it carries — inverse-square
@@ -2084,6 +2253,106 @@ mod tests {
             assert!(!(vtable.inspect)(ui, &mut drawn.borrow_mut()));
         });
         assert_eq!(drawn.into_inner(), before);
+    }
+
+    /// Every text the frame painted, with where.
+    #[cfg(feature = "scripting")]
+    fn texts(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text.visual_bounding_rect()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// A Behaviour's entity field reads as the entity it names, as `None` when
+    /// it names nothing, and as missing when the entity it named is gone.
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn an_entity_field_shows_its_targets_name() {
+        let mut world = World::new();
+        let door = world.spawn();
+        world.insert(door, Name::new("Door"));
+        let gone = world.spawn();
+        let gone_id = crate::scene::entity_ref::id_of(&world, gone);
+        world.despawn(gone);
+        let mut bag = Value::strukt([
+            (
+                "Target",
+                Value::Entity(crate::scene::entity_ref::id_of(&world, door)),
+            ),
+            ("Nothing", Value::Entity(orrin_registry::EntityId::NIL)),
+            ("Lost", Value::Entity(gone_id)),
+        ]);
+        let ctx = egui::Context::default();
+        let mut painted = Vec::new();
+        for _ in 0..2 {
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    script_fields(ui, &world, &mut bag, &[]);
+                });
+            });
+            painted = texts(&output);
+        }
+        let shown: Vec<&str> = painted.iter().map(|(text, _)| text.as_str()).collect();
+        for expected in ["Door", "None", "Missing entity"] {
+            assert!(shown.contains(&expected), "{expected} not in {shown:?}");
+        }
+    }
+
+    /// A row dragged out of the hierarchy and let go over the slot points the
+    /// field at it.
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn dropping_a_hierarchy_row_on_an_entity_field_assigns_it() {
+        let mut world = World::new();
+        let door = world.spawn();
+        world.insert(door, Name::new("Door"));
+        let mut bag = Value::strukt([("Target", Value::Entity(orrin_registry::EntityId::NIL))]);
+        let ctx = egui::Context::default();
+        let draw = |input: egui::RawInput, bag: &mut Value| {
+            let mut changed = false;
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    changed |= script_fields(ui, &world, bag, &[]);
+                });
+            });
+            (changed, texts(&output))
+        };
+        draw(Default::default(), &mut bag);
+        let (_, painted) = draw(Default::default(), &mut bag);
+        let slot = painted.iter().find(|(text, _)| text == "None").unwrap().1;
+
+        egui::DragAndDrop::set_payload(&ctx, vec![door]);
+        let release = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(slot.center()),
+                egui::Event::PointerButton {
+                    pos: slot.center(),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let (changed, _) = draw(release, &mut bag);
+        assert!(changed);
+        assert_eq!(
+            bag.field("Target"),
+            Some(&Value::Entity(crate::scene::entity_ref::id_of(
+                &world, door
+            )))
+        );
     }
 
     #[test]

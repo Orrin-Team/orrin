@@ -43,7 +43,7 @@ fn main() {
     };
 
     let type_name = CString::new(type_name).unwrap();
-    let handle = host.create(CEntity::NULL, &type_name);
+    let (handle, _) = host.create(CEntity::NULL, &type_name);
     println!("[host] created behaviour handle = {handle:#x}");
 
     host.enable(handle);

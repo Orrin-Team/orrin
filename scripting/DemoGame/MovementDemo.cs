@@ -28,7 +28,7 @@ public class MovementDemo : Behaviour
         spawn.Position = Origin + new Vector3(0f, 1.2f, 25f);
         var player = World.Spawn(spawn);
         World.AddScript<FpsPlayer>(player);
-        Native.Log("movement demo: Play, click to lock the mouse; WASD, Space, Ctrl to slide, click to fire");
+        Debug.Log("movement demo: Play, click to lock the mouse; WASD, Space, Ctrl to slide, click to fire");
     }
 
     public override void OnUpdate(float deltaTime)

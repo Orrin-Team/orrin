@@ -131,6 +131,8 @@ pub struct App {
 struct Scripts {
     scripting: crate::scripting::Scripting,
     watcher: Option<crate::build_watcher::BuildWatcher>,
+    /// The scripts' source, which the console's script attributions open.
+    dir: std::path::PathBuf,
 }
 
 impl App {
@@ -347,6 +349,8 @@ impl App {
         // it either way, and `Off` is how it explains itself.
         #[cfg(feature = "scripting")]
         world.insert_resource(crate::build_watcher::BuildStatus::default());
+        #[cfg(feature = "scripting")]
+        world.insert_resource(crate::scripting::ScriptTimings::default());
     }
 
     /// Read the project's `input.toml`, if it has one.
@@ -483,74 +487,19 @@ impl App {
     #[cfg(feature = "scripting")]
     fn boot_scripting(&mut self) -> Option<Scripts> {
         use crate::build_watcher::{BuildStatus, BuildWatcher};
-        use crate::scripting::Scripting;
-        use std::path::{Path, PathBuf};
+        use crate::scripting::{GameAssemblies, Scripting};
 
-        const BINDINGS: &str = "scripting/Orrin";
-        const DEMO_SCRIPTS: &str = "scripting/DemoGame";
-        const DEMO_ENTRY: &str = "DemoGame.Game, DemoGame";
-
-        let bindings_dir = match std::env::var("ORRIN_SCRIPT_DIR") {
-            Ok(dir) => Some(PathBuf::from(dir)),
-            // Next to the executable is the shipped layout, and it is the only
-            // one that works from inside a project directory. The cwd-relative
-            // probe is the repo checkout, where the bindings are still an
-            // unbuilt source tree.
-            Err(_) => Scripting::bindings_beside_executable()
-                .or_else(|| Scripting::find_bindings_dir(Path::new(BINDINGS))),
-        };
-        let Some(bindings_dir) = bindings_dir else {
-            tracing::warn!(
-                "scripting disabled: no Orrin bindings next to the engine, and none \
-                 under {BINDINGS} (run `dotnet build {BINDINGS}`, or set ORRIN_SCRIPT_DIR)"
-            );
-            return None;
-        };
-
-        let entry = std::env::var("ORRIN_ENTRY")
-            .ok()
-            .or_else(|| {
-                self.project
-                    .as_ref()
-                    .map(|project| project.entry_type().to_string())
-            })
-            .unwrap_or_else(|| DEMO_ENTRY.to_string());
-
-        // Without a project this is the engine's own demo game, which is a
-        // normal game assembly like any other — one loading path, so the demo
-        // exercises hot reload exactly as a user's project does.
-        let scripts_dir = self
-            .project
-            .as_ref()
-            .map(|project| project.scripts_dir())
-            .unwrap_or_else(|| PathBuf::from(DEMO_SCRIPTS));
-
-        let shipped_dll = self
-            .project
-            .as_ref()
-            .and_then(orrin_project::Project::game_assembly);
-        let game_dll = match std::env::var("ORRIN_GAME_DLL") {
-            Ok(path) => Some(PathBuf::from(path)),
-            Err(_) if shipped_dll.is_some() => shipped_dll,
-            Err(_) => match Scripting::assembly_of(&entry) {
-                Some(assembly) => Scripting::find_game_assembly(&scripts_dir, assembly),
-                None => {
-                    tracing::warn!(
-                        "scripting disabled: entry `{entry}` names no assembly — it must be \
-                         assembly-qualified (`MyGame.Main, MyGame`) so the engine knows which \
-                         DLL to load"
-                    );
-                    return None;
-                }
-            },
-        };
-        let Some(game_dll) = game_dll else {
-            tracing::warn!(
-                "scripting disabled: no built game assembly for `{entry}` under {} \
-                 (run `dotnet build` there, or set ORRIN_GAME_DLL)",
-                scripts_dir.display()
-            );
-            return None;
+        let GameAssemblies {
+            bindings_dir,
+            game_dll,
+            entry,
+            scripts_dir,
+        } = match GameAssemblies::locate(self.project.as_ref()) {
+            Ok(found) => found,
+            Err(reason) => {
+                tracing::warn!("scripting disabled: {reason}");
+                return None;
+            }
         };
 
         let scripting = Scripting::boot(&bindings_dir, &game_dll)?;
@@ -595,7 +544,11 @@ impl App {
             }
         };
 
-        Some(Scripts { scripting, watcher })
+        Some(Scripts {
+            scripting,
+            watcher,
+            dir: scripts_dir,
+        })
     }
 }
 
@@ -645,17 +598,21 @@ impl ApplicationHandler for App {
         // developer can always point a run at something else without editing
         // the manifest.
         #[cfg(feature = "scripting")]
-        if let Some(scripts) = self.boot_scripting() {
+        let scripts_dir = self.boot_scripting().map(|scripts| {
             self.stories.refresh(&self.world, &scripts.scripting);
             self.scripting = Some(scripts.scripting);
             self.build_watcher = scripts.watcher;
-        }
+            scripts.dir
+        });
+        #[cfg(not(feature = "scripting"))]
+        let scripts_dir = None;
 
         let editor = Editor::new(
             event_loop,
             window.clone(),
             renderer.max_texture_side(),
             self.project.as_ref(),
+            scripts_dir,
         );
 
         if self.shipped {
@@ -764,7 +721,10 @@ impl ApplicationHandler for App {
                     Some(prev) => (now - prev).as_secs_f32().min(MAX_DELTA),
                     None => 0.0,
                 };
-                self.world.resource_mut::<Time>().update(delta);
+                // `delta` stays the real frame for everything of the editor's —
+                // the fly camera, the storybook — and for the renderer;
+                // `game_delta` is what the simulation advances by.
+                let game_delta = crate::scene::advance_time(&self.world, delta);
                 self.world.resource_mut::<FrameStats>().record(delta);
 
                 // Before the resolve, so a binding saved this frame is the one
@@ -843,7 +803,7 @@ impl ApplicationHandler for App {
 
                 if simulate {
                     profile_scope!("spin");
-                    systems::spin(&self.world, delta);
+                    systems::spin(&self.world, game_delta);
                 }
 
                 // Collision reads world transforms, so they have to be current
@@ -855,10 +815,19 @@ impl ApplicationHandler for App {
 
                 // After the transform-mutating systems and before the script
                 // tick, so the events scripts receive match the positions
-                // they'll read this frame.
+                // they'll read this frame. Through the script host when there
+                // is one, which dispatches OnFixedUpdate between the steps.
                 if simulate {
                     profile_scope!("physics");
-                    crate::physics::run(&mut self.world, delta);
+                    #[cfg(feature = "scripting")]
+                    match &self.scripting {
+                        Some(scripting) => {
+                            scripting.run_physics(&mut self.world, &self.registry, game_delta)
+                        }
+                        None => crate::physics::run(&mut self.world, game_delta),
+                    }
+                    #[cfg(not(feature = "scripting"))]
+                    crate::physics::run(&mut self.world, game_delta);
                 }
 
                 // The UI is immediate: what this tick draws replaces the last
@@ -941,7 +910,7 @@ impl ApplicationHandler for App {
                         scripting.attach_pending(&mut self.world, &self.registry);
                         if simulate {
                             profile_scope!("script tick");
-                            scripting.tick(&mut self.world, &self.registry, delta);
+                            scripting.tick(&mut self.world, &self.registry, game_delta);
                         }
                     }
                 }
@@ -952,7 +921,7 @@ impl ApplicationHandler for App {
                 // scene they were driving.
                 if simulate {
                     profile_scope!("tweens");
-                    crate::ui::tween::advance(&self.world, delta);
+                    crate::ui::tween::advance(&self.world, game_delta);
                 } else if !self.world.resource::<crate::scene::Play>().is_live() {
                     self.world
                         .resource_mut::<crate::ui::tween::UiTweens>()
@@ -1156,7 +1125,7 @@ impl ApplicationHandler for App {
                 // Stamped into this frame's GPU queries so the readback, some
                 // frames later, can file its spans against the right frame.
                 let profiler_frame = self.world.resource::<Profiler>().frame_index();
-                let dt = self.world.resource::<Time>().delta_time();
+                let dt = self.world.resource::<Time>().unscaled_delta_time();
 
                 // Asked for every frame rather than only on a change: the renderer
                 // compares against what it applied and recreates the swapchain

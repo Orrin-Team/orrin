@@ -42,9 +42,11 @@ Scaffolds a project directory, matching the canonical layout in
   README.md
   assets/               .gitkeep
   scenes/               .gitkeep
+  .vscode/launch.json   attach a C# debugger to the running engine
   scripts/
     <Name>.csproj       AssemblyName matches the entry type's assembly half
     Main.cs             the entry Behaviour — a spinning cube
+    Tests.cs            a test of the cube's Spinner, which `orrin test` runs
 ```
 
 The name is turned into a PascalCase assembly name (`space-shooter` →
@@ -65,12 +67,21 @@ reference gets committed:
 
 Both use `Private="false"`, so no second `Orrin.dll` lands in the game's output.
 
+The Behaviour-field analyzer (ORRIN001) is referenced the same two ways: as an
+analyzer `ProjectReference` to `scripting/Orrin.Analyzers` in a checkout, and
+as `$(OrrinBindings)/Orrin.Analyzers.dll` elsewhere, conditional on the file
+existing so bindings without it still build. Neither is ever copied into the
+game's output.
+
 ### `orrin build [--release] [--project DIR]`
 
 1. Locates the project by walking up from the current directory for
    `orrin.toml`.
 2. Builds the engine bindings if this is a checkout that has never built them —
-   a game assembly cannot compile without `Orrin.dll`.
+   a game assembly cannot compile without `Orrin.dll`. When the bindings are a
+   checkout's build output, the analyzer built in the same configuration is
+   copied beside them; it is not part of the bindings' publish, so an export
+   never carries it.
 3. Runs `dotnet build` on `scripts.dir`, passing the resolved bindings path.
 4. Writes `.orrin/assets.toml`: every file under `assets.dir` with its size,
    mtime, and whether a `.meta` sidecar sits beside it.
@@ -95,6 +106,33 @@ at the speed the game will; the first launch compiles it, later ones reuse it.
 `Debug.DrawLine` and friends, so leave it off while editing.
 Arguments after `--` are forwarded to the engine. The engine's exit status
 becomes the CLI's.
+
+### `orrin test [FILTER] [--release] [--dev] [--no-build] [--project DIR] [--format text|json]`
+
+`orrin build`, then the engine's headless test mode on the project: the engine
+starts with no window and no renderer, loads the game assembly exactly as
+`orrin run` would, and runs every public static method marked
+`[Orrin.Testing.Test]` — or, with `FILTER`, every one whose full name
+(`Namespace.Type.Method`) contains it.
+
+Each test gets a fresh, empty world with the resources a playing game has, at
+a fixed frame of 1/60 s. A `void` test runs once; one returning `IEnumerator`
+gets one frame — physics, then the script tick — at every `yield return null`,
+and longer at `Wait.Frames(n)` or `Wait.Seconds(s)`. A test fails when it
+throws (an `Assert` included), when a Behaviour faults while it runs, or when
+it is still running after its frame budget (`[Test(MaxFrames = …)]`, 10 000 by
+default). `[Test(Scene = "…")]` loads a scene from the assets directory first.
+
+The engine prints one line a test and a summary; `--format json` prints one
+JSON document instead, for CI. This command's own line goes to stderr, so with
+`--no-build` stdout is the engine's report alone — a build streams the
+compiler's output to stdout ahead of it. The exit status is the engine's: **0**
+when every test passed, **1** when one failed or `FILTER` matched none, **2**
+when the tests could not be run at all (no .NET, no built assembly).
+`--release`, `--dev` and `--no-build` mean what they mean to `orrin run`.
+
+The engine binary takes the same thing directly: `orrin-core --test [FILTER]
+[--format json]`, run from the project directory.
 
 ### `orrin export [--platform mac|linux|windows] [--out DIR] [--project DIR]`
 
@@ -172,7 +210,7 @@ they are editing.
 
 ## `$ORRIN_SCRIPT_DIR`
 
-`orrin run` resolves the bindings directory and passes it to the engine, unless
+`orrin run` and `orrin test` resolve the bindings directory and pass it to the engine, unless
 the variable is already set. This is what makes running from inside a project
 directory work in a checkout: the engine's own fallback probes
 `scripting/Orrin/bin/` relative to cwd, which does not resolve once cwd is the

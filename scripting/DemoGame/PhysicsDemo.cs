@@ -15,7 +15,7 @@ public class PhysicsDemo : Behaviour
     public float Shove = 40f;
 
     public override void OnStart() =>
-        Native.Log("physics demo: Space throws a ball, E shoves what the camera looks at");
+        Debug.Log("physics demo: Space throws a ball, E shoves what the camera looks at");
 
     public override void OnUpdate(float deltaTime)
     {
@@ -42,11 +42,11 @@ public class PhysicsDemo : Behaviour
     {
         if (!Physics.Raycast(Camera.position, Camera.forward, out var hit, 50f))
         {
-            Native.Log("nothing ahead");
+            Debug.Log("nothing ahead");
             return;
         }
         var shoved = Physics.AddForce(hit.Entity, Camera.forward * Shove, ForceMode.Impulse);
-        Native.Log(shoved ? $"shoved {hit.Entity} at {hit.Distance:F1} m" : $"{hit.Entity} has no rigid body to shove");
+        Debug.Log(shoved ? $"shoved {hit.Entity} at {hit.Distance:F1} m" : $"{hit.Entity} has no rigid body to shove");
     }
 }
 
@@ -56,6 +56,6 @@ public class Thud : Behaviour
     {
         var speed = Physics.GetVelocity(Entity).magnitude;
         if (speed > 2f)
-            Native.Log($"{Entity} hit {collision.Other} at {speed:F1} m/s");
+            Debug.Log($"{Entity} hit {collision.Other} at {speed:F1} m/s");
     }
 }

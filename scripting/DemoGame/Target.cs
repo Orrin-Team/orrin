@@ -11,7 +11,7 @@ public class Target : Behaviour
     public string Material = "gold";
     public string Flash = "neon";
 
-    [Transient] float _flashing;
+    [Transient] TimerHandle? _flash;
 
     public static int TotalHits { get; private set; }
 
@@ -19,21 +19,13 @@ public class Target : Behaviour
 
     public override void OnCollisionEnter(Collision collision)
     {
-        if (Native.GetTag(collision.Other) != "ball")
+        if (collision.Other.Tag != "ball")
             return;
         Hits++;
         TotalHits++;
         World.SetMaterial(Entity, Flash);
-        _flashing = 0.2f;
-    }
-
-    public override void OnUpdate(float deltaTime)
-    {
-        if (_flashing <= 0f)
-            return;
-        _flashing -= deltaTime;
-        if (_flashing <= 0f)
-            World.SetMaterial(Entity, Material);
+        _flash?.Cancel();
+        _flash = After(0.2f, () => World.SetMaterial(Entity, Material));
     }
 }
 

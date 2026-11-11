@@ -32,7 +32,7 @@ pub use pending_scripts::PendingScripts;
 pub use physics_settings::{PHYSICS_LAYERS, PhysicsSettings};
 pub use rigid_body::RigidBody;
 #[cfg(feature = "scripting")]
-pub use script::ScriptComponent;
+pub use script::{ScriptComponent, Scripts, canonical_type_name};
 pub use spin::Spin;
 pub use tag::Tag;
 pub use unknown::UnknownComponents;

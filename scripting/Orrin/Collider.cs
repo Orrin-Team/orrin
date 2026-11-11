@@ -43,6 +43,7 @@ public abstract class Collider
     }
 }
 
+/// <summary>A box centred on the entity.</summary>
 public sealed class BoxCollider : Collider
 {
     /// <summary>Half the box's size on each axis; the default matches the unit cube mesh.</summary>
@@ -51,6 +52,7 @@ public sealed class BoxCollider : Collider
     private protected override (ColliderShape, Vector3) Describe() => (ColliderShape.Box, HalfExtents);
 }
 
+/// <summary>A sphere centred on the entity.</summary>
 public sealed class SphereCollider : Collider
 {
     /// <summary>The default matches the unit sphere mesh.</summary>
@@ -63,6 +65,7 @@ public sealed class SphereCollider : Collider
 /// <summary>Along the local Y axis: two hemispheres <see cref="HalfHeight"/> either side of the centre.</summary>
 public sealed class CapsuleCollider : Collider
 {
+    /// <summary>The radius of the caps and of the cylinder between them.</summary>
     public float Radius { get; init; } = 0.5f;
 
     /// <summary>Excludes the caps: the whole is 2 × (HalfHeight + Radius) tall.</summary>
@@ -75,8 +78,10 @@ public sealed class CapsuleCollider : Collider
 /// <summary>Along the local Y axis.</summary>
 public sealed class CylinderCollider : Collider
 {
+    /// <summary>The radius of its round faces.</summary>
     public float Radius { get; init; } = 0.5f;
 
+    /// <summary>Half its height, along the local Y axis.</summary>
     public float HalfHeight { get; init; } = 0.5f;
 
     private protected override (ColliderShape, Vector3) Describe() =>

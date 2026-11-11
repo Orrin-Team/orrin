@@ -96,6 +96,26 @@ pub struct ScriptBinding {
     /// Assembly-qualified managed type name, as `Behaviours.Create` takes it.
     pub type_name: String,
     pub bridge: Arc<dyn ScriptBridge>,
+    /// How the inspector presents the fields the Behaviour annotated; a field
+    /// with nothing to say has no entry.
+    pub fields: Vec<FieldInfo>,
+}
+
+/// What a Behaviour's `[Header]`, `[Tooltip]`, `[Range]` and
+/// `[HideInInspector]` say about one field.
+///
+/// Presentation only. Nothing here reaches `read`, `write`, `diff` or a scene
+/// file, so annotating a field can never change what is saved — the reason it
+/// rides on the binding rather than in the bag.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FieldInfo {
+    pub name: String,
+    pub header: Option<String>,
+    pub tooltip: Option<String>,
+    /// What the slider can produce. A value outside it — loaded from a scene,
+    /// set by a script — is shown as it is rather than clamped.
+    pub range: Option<(f32, f32)>,
+    pub hidden: bool,
 }
 
 /// Everything the engine can do with one component type without knowing it.
@@ -367,6 +387,7 @@ impl Registry {
         id: ComponentId,
         name: impl Into<String>,
         type_name: impl Into<String>,
+        fields: Vec<FieldInfo>,
         bridge: Arc<dyn ScriptBridge>,
     ) {
         let name = name.into();
@@ -379,6 +400,7 @@ impl Registry {
             script: Some(ScriptBinding {
                 type_name: type_name.into(),
                 bridge,
+                fields,
             }),
             has: |v, world, entity| {
                 let b = v.binding();
@@ -731,12 +753,14 @@ mod tests {
             ComponentId::owned("game.spinner"),
             "Spinner",
             "Game.Spinner, Game",
+            Vec::new(),
             bridge.clone(),
         );
         registry.register_script(
             ComponentId::owned("game.hover"),
             "Hover",
             "Game.Hover, Game",
+            Vec::new(),
             bridge.clone(),
         );
         (registry, bridge)
@@ -845,7 +869,13 @@ mod tests {
     #[should_panic(expected = "already registered")]
     fn a_script_component_cannot_take_an_engine_id() {
         let bridge = FakeScripts::with([("A", Value::Bool(true)), ("B", Value::Bool(true))]);
-        registry().register_script(ComponentId::new("test.speed"), "Speed", "A", bridge);
+        registry().register_script(
+            ComponentId::new("test.speed"),
+            "Speed",
+            "A",
+            Vec::new(),
+            bridge,
+        );
     }
 
     fn registry() -> Registry {

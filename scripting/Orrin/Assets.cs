@@ -33,53 +33,69 @@ static class AssetKinds
     }
 }
 
+/// <summary>
 /// Whether what an asset reference draws is the asset yet. Lock-step with
-/// `LOAD_*` in orrin-script: append, never renumber.
+/// <c>LOAD_*</c> in orrin-script: append, never renumber.
+/// </summary>
 public enum AssetState : uint
 {
-    /// Importing; a placeholder draws in its place until it is ready.
+    /// <summary>Importing; a placeholder draws in its place until it is ready.</summary>
     Loading = 0,
+    /// <summary>Imported: the asset itself draws.</summary>
     Ready = 1,
+    /// <summary>
     /// Missing or broken. A placeholder draws in its place, and the engine has
     /// logged an error naming the asset.
+    /// </summary>
     Failed = 2,
 }
 
-/// A glTF 2.0 file under the project's assets directory, imported as one mesh.
+/// <summary>A glTF 2.0 file under the project's assets directory, imported as one mesh.</summary>
 public sealed class Mesh : Asset
 {
     Mesh() { }
 }
 
-/// A PNG or JPEG under the project's assets directory.
+/// <summary>A PNG or JPEG under the project's assets directory.</summary>
 public sealed class Texture : Asset
 {
     Texture() { }
 }
 
-/// A `.omat` file under the project's assets directory, or a material the
+/// <summary>
+/// A <c>.omat</c> file under the project's assets directory, or a material the
 /// engine builds, which is always ready.
+/// </summary>
 public sealed class Material : Asset
 {
     Material() { }
 }
 
+/// <summary>
 /// A TrueType or OpenType file under the project's assets directory, for
 /// <see cref="UI"/> text.
+/// </summary>
 public sealed class Font : Asset
 {
     Font() { }
 }
 
+/// <summary>
+/// Finding an asset by its path, for tools. Game code holds an
+/// <see cref="AssetRef{T}"/> instead.
+/// </summary>
 public static class Assets
 {
-    /// The asset at `path`, relative to the project's assets directory with `/`
-    /// separators, e.g. `"props/door.oprefab"`.
-    ///
+    /// <summary>
+    /// The asset at <paramref name="path"/>, relative to the project's assets
+    /// directory with <c>/</c> separators, e.g. <c>"props/door.oprefab"</c>.
+    /// </summary>
+    /// <remarks>
     /// The one place a path becomes a reference, for tools. Game code should
-    /// hold an `AssetRef<T>` field instead: a path in code breaks the day the
+    /// hold an <see cref="AssetRef{T}"/> field instead: a path in code breaks the day the
     /// file moves, and a reference does not. Logs and returns the null
-    /// reference if there is no `T` at `path`.
+    /// reference if there is no <typeparamref name="T"/> at <paramref name="path"/>.
+    /// </remarks>
     public static AssetRef<T> Find<T>(string path) where T : Asset
     {
         var (id, kind) = Native.FindAsset(path);

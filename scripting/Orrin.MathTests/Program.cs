@@ -4,6 +4,9 @@
 // non-zero on any failure. Dependency-free on purpose — convert to xunit when
 // the scripting side grows a real test suite.
 
+using System.Reflection;
+using System.Xml.Linq;
+
 using Orrin;
 using Orrin.Math;
 
@@ -245,6 +248,29 @@ unsafe
     Check(sizeof(Orrin.Rigidbody) == 28, "Rigidbody is seven words");
     Check(sizeof(Orrin.ColliderData) == 32, "ColliderData is a shape, a Vector3 and four words");
     Check(sizeof(Orrin.RaycastHit) == 36, "RaycastHit is an Entity, two Vector3s and a float");
+    Check(sizeof(Orrin.Collision) == 44, "Collision is an Entity and three Vector3s");
+    // The shape queries, lock-step with CShapeQuery.
+    Check(sizeof(Orrin.ShapeQuery) == 68, "ShapeQuery is a shape, three Vector3s, a Quaternion and three words");
+    // Key codes appended after RightAlt, as keys.rs numbers them: each group's
+    // first and last, so an implicit increment that skipped would show.
+    Check((uint)Orrin.KeyCode.F1 == 55 && (uint)Orrin.KeyCode.F12 == 66, "F1..F12 are 55..66");
+    Check((uint)Orrin.KeyCode.Minus == 67 && (uint)Orrin.KeyCode.BackQuote == 77, "Minus..BackQuote are 67..77");
+    Check((uint)Orrin.KeyCode.Keypad0 == 78 && (uint)Orrin.KeyCode.Keypad9 == 87, "Keypad0..9 are 78..87");
+    Check((uint)Orrin.KeyCode.KeypadPlus == 88 && (uint)Orrin.KeyCode.KeypadEnter == 93, "KeypadPlus..Enter are 88..93");
+    Check((uint)Orrin.KeyCode.Insert == 94 && (uint)Orrin.KeyCode.CapsLock == 100, "Insert..CapsLock are 94..100");
+    // The optional hooks `Behaviours.Create` reports, lock-step with
+    // `orrin_script::Hooks`: what the engine reads to skip a per-step call.
+    Check(Orrin.Behaviours.FixedUpdateHook == 1
+        && Orrin.Behaviours.CollisionStayHook == 2
+        && Orrin.Behaviours.TriggerStayHook == 4,
+        "the hook bits number as the engine does");
+    Check(Orrin.Behaviours.HooksOf(typeof(Orrin.Tests.IdleProbe)) == 0,
+        "a behaviour overriding nothing reports no hooks");
+    Check(Orrin.Behaviours.HooksOf(typeof(Orrin.Tests.SecondSteppedProbe)) == Orrin.Behaviours.FixedUpdateHook,
+        "an OnFixedUpdate inherited from a base class counts");
+    Check(Orrin.Behaviours.HooksOf(typeof(Orrin.Tests.ContactProbe))
+        == (Orrin.Behaviours.CollisionStayHook | Orrin.Behaviours.TriggerStayHook),
+        "the Stay callbacks are reported apart from the other contact callbacks");
     Check((uint)Orrin.ComponentKind.Rigidbody == 14, "ComponentKind.Rigidbody is 14");
     Check((uint)Orrin.ForceMode.Impulse == 1 && (uint)Orrin.ForceMode.Acceleration == 3,
         "ForceMode numbers as the engine does");
@@ -365,8 +391,9 @@ const string BagGolden =
     + "08000000526f746174696f6e060000000000000000000000000000803f"
     + "040000004d6f6465090400000053706f7400000000";
 
-// Every variant, including the two a Behaviour cannot express. Written by Rust;
-// the decoder must step over what it cannot represent and still land the rest.
+// Every variant of the original eleven, including a tag 7 entity id, which a
+// Behaviour never receives (its references cross as handles). Written by Rust;
+// the decoder must step over what it cannot assign and still land the rest.
 const string FullGolden =
     "080a000000"
     + "020000006f6e0001"
@@ -405,9 +432,8 @@ Check(
     "only representable, non-transient, writable fields are visible");
 
 // The lenient half. A buffer whose fields this build does not have must be
-// stepped over rather than throwing or desynchronizing — including the `Entity`
-// and `List` values no Behaviour can express, which is the case `FullGolden`
-// exists for. Field names are matched ordinally, so none of its lower-case names
+// stepped over rather than throwing or desynchronizing — including a tag 7
+// entity id and a list, which is the case `FullGolden` exists for. Field names are matched ordinally, so none of its lower-case names
 // land on BagProbe's.
 var untouched = new BagProbe { Speed = 99f };
 PropertyBag.Decode(untouched, Convert.FromHexString(FullGolden));
@@ -470,6 +496,55 @@ var stepped = new BagProbe { Speed = 99f };
 PropertyBag.Decode(stepped, Convert.FromHexString(AssetGolden));
 Check(stepped.Speed == 99f, "an asset field this type lacks is stepped over");
 
+// The tags appended after the asset one — Vector2 (12), Color (13) and a live
+// entity handle (14) — plus lists, which a Behaviour can now hold. These are the
+// bytes `wire::tests::the_bag_of_the_appended_field_types_has_not_moved` pins.
+// An `Entity` crosses as its handle rather than as tag 7's sixteen-byte id: the
+// handle is all this side has, and the engine translates it where the world is.
+const string ShapesGolden =
+    "0805000000"
+    + "060000004f66667365740c0000803f00000040"
+    + "0400000054696e740d0000803f0000003f000000000000803f"
+    + "06000000546172676574" + "0e0500000002000000"
+    + "0500000053746570730a02000000" + "01010000000102000000"
+    + "0700000057656967687473" + "0a01000000030000003f";
+
+var shapes = new ShapeProbe();
+Check(Hex(PropertyBag.Encode(shapes)) == ShapesGolden, "Vector2, Color, Entity and list fields encode to the golden bytes");
+var blank = new ShapeProbe { Offset = Vector2.zero, Tint = Color.clear, Target = Entity.Null, Steps = [], Weights = [] };
+PropertyBag.Decode(blank, Convert.FromHexString(ShapesGolden));
+Check(blank.Offset == new Vector2(1f, 2f) && blank.Tint == new Color(1f, 0.5f, 0f, 1f), "bag round trip: Vector2 and Color");
+Check(blank.Target == new Entity(5, 2), "bag round trip: an Entity is its live handle");
+Check(blank.Steps.SequenceEqual([1, 2]) && blank.Weights.SequenceEqual([0.5f]), "bag round trip: List<int> and float[]");
+
+// A list whose elements this build reads as another type leaves the field
+// alone rather than half-filling it, and the reader still steps over it whole.
+var retyped = new ShapeProbe { Weights = [9f] };
+PropertyBag.Decode(retyped, Convert.FromHexString(
+    "0802000000" + "0700000057656967687473" + "0a01000000" + "0400000000"
+    + "060000004f66667365740c0000803f00000040"));
+Check(retyped.Weights.SequenceEqual([9f]) && retyped.Offset == new Vector2(1f, 2f),
+    "a list of the wrong element type is stepped over and left alone");
+
+Check(
+    PropertyBag.VisibleFields(typeof(ShapeProbe)).Select(f => f.Name).SequenceEqual(
+        ["Offset", "Tint", "Target", "Steps", "Weights"]),
+    "Vector2, Color, Entity, List<T> and T[] are visible");
+
+// A component's listing entry carries its fields' presentation attributes,
+// only for the fields that have some. The bytes
+// `scripting::tests::a_listing_entry_carries_its_fields_presentation` decodes.
+const string ListingGolden =
+    "0a010000000804000000020000006964040a000000746573742e74756e65640400000074797065041b000000"
+    + "54756e656450726f62652c204f7272696e2e4d6174685465737473040000006e616d65040a00000054756e65"
+    + "6450726f6265060000006669656c64730a020000000805000000040000006e616d6504050000005370656564"
+    + "0600000068656164657204060000004d6f74696f6e07000000746f6f6c746970040f0000004d657472657320"
+    + "61207365636f6e640500000072616e67650a02000000030000000003000020410600000068696464656e0000"
+    + "0805000000040000006e616d6504060000005365637265740600000068656164657204000000000700000074"
+    + "6f6f6c74697004000000000500000072616e67650a000000000600000068696464656e0001";
+Check(Hex(PropertyBag.Listing([typeof(TunedProbe)])) == ListingGolden,
+    "a listing entry encodes its fields' attributes to the golden bytes");
+
 // --- log attribution -----------------------------------------------------------
 //
 // A log line names its script from the path the compiler recorded, which is in
@@ -480,6 +555,109 @@ Check(Native.ScriptName(@"C:\game\scripts\Spinner.cs") == "Spinner", "a Windows 
 Check(Native.ScriptName("Spinner.cs") == "Spinner", "a bare file names its script");
 Check(Native.ScriptName("/scripts.v2/Spinner") == "Spinner", "a dot in a directory is not an extension");
 Check(Native.ScriptName("") == "", "no path is no name");
+
+// --- API documentation -----------------------------------------------------------
+//
+// A script author's editor reads the bindings' documentation out of Orrin.xml
+// beside the Orrin.dll a project references, and shows only what is inside its
+// elements: a plain `///` line compiles into the file and is displayed by
+// nothing. So the check reads the file the build wrote, not the source, and asks
+// for a <summary> (or an <inheritdoc/>) on every member a script can reach.
+// That is stricter than CS1591, which a plain `///` line satisfies, and is why
+// Orrin.csproj turns CS1591 off rather than having two lists of exemptions.
+
+// The bindings' own build output, which a project outside the checkout
+// references by path: this program's output directory, moved from
+// scripting/Orrin.MathTests to scripting/Orrin.
+var output = new DirectoryInfo(Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory));
+var docPath = Path.Combine(
+    output.Parent!.Parent!.Parent!.Parent!.FullName, "Orrin", "bin", output.Parent.Name, output.Name, "Orrin.xml");
+XDocument? apiDoc = null;
+if (!File.Exists(docPath))
+{
+    Check(false, $"Orrin.xml is written beside the bindings' Orrin.dll (looked for {docPath})");
+}
+else
+{
+    try
+    {
+        apiDoc = XDocument.Load(docPath);
+    }
+    catch (System.Xml.XmlException e)
+    {
+        Check(false, $"Orrin.xml is well-formed ({e.Message})");
+    }
+}
+
+if (apiDoc is not null)
+{
+    var members = new Dictionary<string, XElement>();
+    foreach (var member in apiDoc.Descendants("member"))
+        members.TryAdd((string)member.Attribute("name")!, member);
+    bool Documented(string id) =>
+        members.TryGetValue(id, out var member)
+        && (member.Element("inheritdoc") is not null
+            || !string.IsNullOrWhiteSpace(member.Element("summary")?.Value));
+
+    // A fixed sample, spelled out by hand: it is what the coverage sweep below
+    // stands on, since an id spelled differently from the compiler's would
+    // read as undocumented rather than as a bug in the spelling.
+    foreach (var (member, id) in new (MemberInfo, string)[]
+    {
+        (typeof(Entity), "T:Orrin.Entity"),
+        (typeof(Behaviour).GetMethod(nameof(Behaviour.OnUpdate))!, "M:Orrin.Behaviour.OnUpdate(System.Single)"),
+        (typeof(Behaviour).GetMethod(nameof(Behaviour.OnFixedUpdate))!, "M:Orrin.Behaviour.OnFixedUpdate(System.Single)"),
+        (typeof(Time).GetProperty(nameof(Time.timeScale))!, "P:Orrin.Time.timeScale"),
+        (typeof(Physics).GetMethod(
+                nameof(Physics.OverlapSphere), [typeof(Vector3), typeof(float), typeof(Span<Entity>), typeof(uint), typeof(bool)])!,
+            "M:Orrin.Physics.OverlapSphere(Orrin.Math.Vector3,System.Single,System.Span{Orrin.Entity},System.UInt32,System.Boolean)"),
+        (typeof(Physics).GetMethod(nameof(Physics.Raycast))!,
+            "M:Orrin.Physics.Raycast(Orrin.Math.Vector3,Orrin.Math.Vector3,Orrin.RaycastHit@,System.Single,System.UInt32,System.Boolean)"),
+        (typeof(World).GetMethod(nameof(World.AddScript))!, "M:Orrin.World.AddScript``1(Orrin.Entity)"),
+        (typeof(Vector3).GetMethod(nameof(Vector3.Cross))!, "M:Orrin.Math.Vector3.Cross(Orrin.Math.Vector3,Orrin.Math.Vector3)"),
+        (typeof(Orrin.Testing.TestAttribute), "T:Orrin.Testing.TestAttribute"),
+    })
+    {
+        Check(DocIds.Of(member) == id, $"DocIds spells {id} as the compiler does (got {DocIds.Of(member)})");
+        Check(Documented(id), $"{id} has a summary in Orrin.xml");
+    }
+
+    // Public only because the engine calls into them through function
+    // pointers, or because the reload machinery lives in this assembly.
+    var engineOnly = new HashSet<Type>
+    {
+        typeof(OrrinApi), typeof(Bootstrap), typeof(Behaviours), typeof(BehaviourState),
+        typeof(GameAssembly), typeof(PropertyBag), typeof(Stories), typeof(Tweens),
+        typeof(Orrin.Testing.TestRunner),
+    };
+    // Enums whose members say everything their names say; the type carries
+    // what is not obvious, such as a key code being a physical position.
+    var selfNaming = new HashSet<Type>
+    {
+        typeof(KeyCode), typeof(MouseButton), typeof(TextAnchor), typeof(ComponentKind),
+    };
+
+    var undocumented = new List<string>();
+    foreach (var type in typeof(Entity).Assembly.GetExportedTypes())
+    {
+        if (engineOnly.Contains(type))
+            continue;
+        if (!Documented(DocIds.Of(type)))
+            undocumented.Add(DocIds.Of(type));
+        if (selfNaming.Contains(type))
+            continue;
+        foreach (var member in type.GetMembers(
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static
+            | BindingFlags.DeclaredOnly))
+        {
+            if (DocIds.ScriptVisible(member) && !Documented(DocIds.Of(member)))
+                undocumented.Add(DocIds.Of(member));
+        }
+    }
+    Check(undocumented.Count == 0,
+        $"every script-facing member has a summary in Orrin.xml; {undocumented.Count} do not:\n  "
+        + string.Join("\n  ", undocumented.Order()));
+}
 
 Console.WriteLine($"{passed} passed, {failures} failed");
 return failures == 0 ? 0 : 1;
@@ -502,7 +680,25 @@ sealed class BagProbe : Behaviour
     [Transient]
     public float Cache = 3f;
     public readonly int Constant = 5;
-    public Vector2 Unrepresentable = new(1, 2);
+    public Vector4 Unrepresentable = new(1, 2, 3, 4);
+}
+
+sealed class ShapeProbe : Behaviour
+{
+    public Vector2 Offset = new(1f, 2f);
+    public Color Tint = new(1f, 0.5f, 0f, 1f);
+    public Entity Target = new(5, 2);
+    public List<int> Steps = [1, 2];
+    public float[] Weights = [0.5f];
+}
+
+[Component("test.tuned")]
+sealed class TunedProbe : Behaviour
+{
+    [Header("Motion"), Tooltip("Metres a second"), Range(0f, 10f)]
+    public float Speed = 4f;
+    [HideInInspector] public int Secret = 7;
+    public bool Plain = true;
 }
 
 sealed class ClickProbe : Behaviour, IPointerClickHandler
@@ -539,4 +735,83 @@ sealed class AssetProbe : Behaviour
 sealed class SkinProbe : Behaviour
 {
     public AssetRef<Material> Skin;
+}
+
+/// The compiler's documentation ids (ECMA-334 annex D) for what reflection
+/// hands back, so a member can be looked up in Orrin.xml. Covers the shapes the
+/// bindings' public surface has; anything else throws rather than guessing.
+static class DocIds
+{
+    public static string Of(MemberInfo member) => member switch
+    {
+        Type type => "T:" + Name(type),
+        FieldInfo field => $"F:{Name(field.DeclaringType!)}.{field.Name}",
+        PropertyInfo property => $"P:{Name(property.DeclaringType!)}.{property.Name}"
+            + Parameters(property.GetIndexParameters()),
+        EventInfo @event => $"E:{Name(@event.DeclaringType!)}.{@event.Name}",
+        MethodBase method => Method(method),
+        _ => throw new NotSupportedException($"no documentation id for {member}"),
+    };
+
+    /// Public or protected, and written by hand: accessors, `value__` and the
+    /// parameterless constructor a class gets for free are not. A struct has
+    /// one in metadata only when it declares it.
+    public static bool ScriptVisible(MemberInfo member) => member switch
+    {
+        Type => false,
+        FieldInfo field => (field.IsPublic || field.IsFamily || field.IsFamilyOrAssembly) && !field.IsSpecialName,
+        PropertyInfo property => property.GetAccessors(nonPublic: true).Any(Reachable),
+        EventInfo @event => @event.AddMethod is { } add && Reachable(add),
+        ConstructorInfo constructor => Reachable(constructor) && !constructor.IsStatic
+            && (constructor.GetParameters().Length > 0 || constructor.DeclaringType!.IsValueType),
+        MethodInfo method => Reachable(method) && !Generated(method)
+            && (!method.IsSpecialName || method.Name.StartsWith("op_")),
+        _ => false,
+    };
+
+    static bool Reachable(MethodBase method) => method.IsPublic || method.IsFamily || method.IsFamilyOrAssembly;
+
+    // An auto-property's accessors carry the attribute too, which is why it is
+    // asked only of a method that stands on its own.
+    static bool Generated(MethodBase method) =>
+        method.GetCustomAttribute<System.Runtime.CompilerServices.CompilerGeneratedAttribute>() is not null;
+
+    static string Method(MethodBase method)
+    {
+        var name = method is ConstructorInfo ? (method.IsStatic ? "#cctor" : "#ctor") : method.Name;
+        var id = $"M:{Name(method.DeclaringType!)}.{name}";
+        if (method.IsGenericMethodDefinition)
+            id += "``" + method.GetGenericArguments().Length;
+        id += Parameters(method.GetParameters());
+        if (method is MethodInfo { Name: "op_Implicit" or "op_Explicit" } conversion)
+            id += "~" + Reference(conversion.ReturnType);
+        return id;
+    }
+
+    static string Parameters(ParameterInfo[] parameters) => parameters.Length == 0
+        ? ""
+        : "(" + string.Join(",", parameters.Select(parameter => Reference(parameter.ParameterType))) + ")";
+
+    static string Name(Type type) => (type.FullName ?? throw new NotSupportedException($"no full name for {type}"))
+        .Replace('+', '.');
+
+    static string Reference(Type type)
+    {
+        if (type.IsByRef)
+            return Reference(type.GetElementType()!) + "@";
+        if (type.IsPointer)
+            return Reference(type.GetElementType()!) + "*";
+        if (type.IsArray)
+            return Reference(type.GetElementType()!)
+                + (type.GetArrayRank() == 1 ? "[]" : "[" + string.Join(",", Enumerable.Repeat("0:", type.GetArrayRank())) + "]");
+        if (type.IsGenericParameter)
+            return (type.DeclaringMethod is null ? "`" : "``") + type.GenericParameterPosition;
+        if (type.IsGenericType)
+        {
+            var definition = Name(type.GetGenericTypeDefinition());
+            return definition[..definition.LastIndexOf('`')]
+                + "{" + string.Join(",", type.GetGenericArguments().Select(Reference)) + "}";
+        }
+        return Name(type);
+    }
 }

@@ -161,30 +161,15 @@ fn write_scalar(out: &mut String, value: &Value) {
         }
         Value::F32(v) => write_f32(out, *v),
         Value::String(v) => write_string(out, v),
-        Value::Vec3(v) => {
-            out.push('(');
-            for (i, component) in [v.x, v.y, v.z].into_iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                write_f32(out, component);
-            }
-            out.push(')');
-        }
-        Value::Quat(v) => {
-            // Written as the quaternion it is. The inspector converts to euler
-            // for display, but the file must not: euler is lossy and
-            // convention-dependent, so a save/load round-trip through it would
-            // quietly perturb every rotation.
-            out.push('(');
-            for (i, component) in [v.x, v.y, v.z, v.w].into_iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                write_f32(out, component);
-            }
-            out.push(')');
-        }
+        Value::Vec3(v) => write_tuple(out, "", &v.to_array()),
+        // Written as the quaternion it is. The inspector converts to euler
+        // for display, but the file must not: euler is lossy and
+        // convention-dependent, so a save/load round-trip through it would
+        // quietly perturb every rotation.
+        Value::Quat(v) => write_tuple(out, "", &v.to_array()),
+        Value::Vec2(v) => write_tuple(out, "", &v.to_array()),
+        // Named, because four bare floats already mean a quaternion.
+        Value::Color(v) => write_tuple(out, "rgba", v),
         Value::Entity(id) => {
             let _ = write!(out, "entity({id})");
         }
@@ -195,6 +180,18 @@ fn write_scalar(out: &mut String, value: &Value) {
         // Routed to `write_fields` by `write_named` and never reached here.
         Value::Struct(_) | Value::Enum { .. } => out.push_str("{}"),
     }
+}
+
+fn write_tuple(out: &mut String, name: &str, components: &[f32]) {
+    out.push_str(name);
+    out.push('(');
+    for (i, component) in components.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write_f32(out, *component);
+    }
+    out.push(')');
 }
 
 /// `{:?}` rather than `{}`: both print the shortest representation that
