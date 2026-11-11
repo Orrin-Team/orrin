@@ -3337,6 +3337,83 @@ impl ReloadOutcome {
     }
 }
 
+/// The two assemblies a run loads, and the entry type and scripts directory
+/// the game's was found by. Resolved in one place so that the editor and the
+/// test runner load a project's code the same way.
+pub struct GameAssemblies {
+    pub bindings_dir: PathBuf,
+    pub game_dll: PathBuf,
+    pub entry: String,
+    pub scripts_dir: PathBuf,
+}
+
+impl GameAssemblies {
+    /// Each follows env > manifest > built-in default, with its own env
+    /// override. `Err` says why there is nothing to load, and how to fix it.
+    pub fn locate(project: Option<&orrin_project::Project>) -> Result<Self, String> {
+        const BINDINGS: &str = "scripting/Orrin";
+        const DEMO_SCRIPTS: &str = "scripting/DemoGame";
+        const DEMO_ENTRY: &str = "DemoGame.Game, DemoGame";
+
+        let bindings_dir = match std::env::var("ORRIN_SCRIPT_DIR") {
+            Ok(dir) => Some(PathBuf::from(dir)),
+            // Next to the executable is the shipped layout, and it is the only
+            // one that works from inside a project directory. The cwd-relative
+            // probe is the repo checkout, where the bindings are still an
+            // unbuilt source tree.
+            Err(_) => Scripting::bindings_beside_executable()
+                .or_else(|| Scripting::find_bindings_dir(Path::new(BINDINGS))),
+        };
+        let Some(bindings_dir) = bindings_dir else {
+            return Err(format!(
+                "no Orrin bindings next to the engine, and none under {BINDINGS} \
+                 (run `dotnet build {BINDINGS}`, or set ORRIN_SCRIPT_DIR)"
+            ));
+        };
+
+        let entry = std::env::var("ORRIN_ENTRY")
+            .ok()
+            .or_else(|| project.map(|project| project.entry_type().to_string()))
+            .unwrap_or_else(|| DEMO_ENTRY.to_string());
+
+        // Without a project this is the engine's own demo game, which is a
+        // normal game assembly like any other — one loading path, so the demo
+        // exercises hot reload exactly as a user's project does.
+        let scripts_dir = project
+            .map(|project| project.scripts_dir())
+            .unwrap_or_else(|| PathBuf::from(DEMO_SCRIPTS));
+
+        let shipped_dll = project.and_then(orrin_project::Project::game_assembly);
+        let game_dll = match std::env::var("ORRIN_GAME_DLL") {
+            Ok(path) => Some(PathBuf::from(path)),
+            Err(_) if shipped_dll.is_some() => shipped_dll,
+            Err(_) => match Scripting::assembly_of(&entry) {
+                Some(assembly) => Scripting::find_game_assembly(&scripts_dir, assembly),
+                None => {
+                    return Err(format!(
+                        "entry `{entry}` names no assembly — it must be assembly-qualified \
+                         (`MyGame.Main, MyGame`) so the engine knows which DLL to load"
+                    ));
+                }
+            },
+        };
+        let Some(game_dll) = game_dll else {
+            return Err(format!(
+                "no built game assembly for `{entry}` under {} \
+                 (run `dotnet build` there, or set ORRIN_GAME_DLL)",
+                scripts_dir.display()
+            ));
+        };
+
+        Ok(Self {
+            bindings_dir,
+            game_dll,
+            entry,
+            scripts_dir,
+        })
+    }
+}
+
 /// One script's lifecycle state for the duration of a tick, lifted out of the
 /// world so no storage borrow is held while C# runs. Written back at the end of
 /// the tick.
@@ -3805,6 +3882,31 @@ impl Scripting {
             .unwrap_or_default();
         world.insert_resource(crate::ui::story::StoryArgs::default());
         (built, args)
+    }
+
+    /// The simple name of the game assembly this session loaded, which is the
+    /// one a project's tests are listed from.
+    pub fn game_assembly_name(&self) -> Option<&str> {
+        self.game_dll.file_stem()?.to_str()
+    }
+
+    /// Every `[Test]` the live assembly named `assembly` declares.
+    pub fn tests(&self, assembly: &str) -> Vec<orrin_script::TestCase> {
+        self.host.tests(assembly)
+    }
+
+    /// One turn of a test — `turn` is [`ScriptHost::begin_test`] or one of
+    /// its siblings — in a dispatch window over `world`, then what it queued
+    /// applied, as after a tick.
+    pub fn test_turn(
+        &self,
+        world: &mut World,
+        registry: &Registry,
+        turn: impl FnOnce(&ScriptHost) -> orrin_script::TestStep,
+    ) -> orrin_script::TestStep {
+        let step = orrin_script::with_active_world(world, || turn(&self.host));
+        self.apply_commands(world, registry);
+        step
     }
 
     /// Run the completion callbacks of every tween that finished since the

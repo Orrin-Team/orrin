@@ -39,6 +39,7 @@ pub fn scaffold(name: &str, parent: &Path) -> Fallible {
         (".vscode/launch.json", LAUNCH.to_string()),
         ("scripts/Main.cs", main_cs(name, &assembly)),
         ("scripts/FlyCamera.cs", fly_camera_cs(&assembly)),
+        ("scripts/Tests.cs", tests_cs(&assembly)),
         (
             &format!("scripts/{assembly}.csproj"),
             csproj(&assembly, checkout.as_deref(), &anchor.join(name)),
@@ -221,6 +222,7 @@ fn readme(name: &str, assembly: &str) -> String {
             "the entry Behaviour named by `scripts.entry`",
         ),
         ("    FlyCamera.cs", "WASD and right-drag to move the camera"),
+        ("    Tests.cs", "tests `orrin test` runs, with no window"),
         ("  scenes/", "scene files"),
         (
             "  .vscode/launch.json",
@@ -283,6 +285,18 @@ away — then:
 
 The engine loads `{assembly}.pdb` alongside `{assembly}.dll`, which is what lets
 a breakpoint in `scripts/` bind to the code that is running.
+
+## Testing
+
+```
+orrin test
+```
+
+builds the scripts and runs every `[Test]` method in them inside the engine,
+with no window: each in an empty world, playing, a frame at a time. A test that
+returns `IEnumerator` waits a frame at each `yield return null`. `orrin test
+Spinner` runs only the tests whose name contains `Spinner`. The command exits
+non-zero when a test fails, so CI can run it as it is.
 "#
     )
 }
@@ -454,6 +468,43 @@ public class FlyCamera : Behaviour
 
         var speed = Speed * (Input.GetKey(KeyCode.LeftShift) ? Boost : 1f);
         Camera.Place(Camera.position + move * (speed * deltaTime), facing);
+    }}
+}}
+"#
+    )
+}
+
+fn tests_cs(assembly: &str) -> String {
+    format!(
+        r#"using System.Collections;
+
+using Orrin;
+using Orrin.Math;
+using Orrin.Testing;
+
+namespace {assembly};
+
+// Run by `orrin test`. Each [Test] starts in an empty world that is playing,
+// and a test that returns IEnumerator gets one frame of 1/60 s at every
+// `yield return null`: physics, then every Behaviour's OnStart and OnUpdate.
+public static class Tests
+{{
+    [Test]
+    public static IEnumerator ASpinnerTurnsAtItsSpeed()
+    {{
+        var cube = World.Spawn(Transform.Identity);
+        cube.AddScript<Spinner>();
+
+        // Its first frame: the Spinner is created, starts and updates once.
+        yield return null;
+        var spinner = cube.GetBehaviour<Spinner>();
+        Assert.That(spinner is not null, "the Spinner was attached");
+
+        // A second's worth of frames in all, so it has turned SpinSpeed degrees.
+        yield return Wait.Frames(59);
+        var expected = Quaternion.Euler(0f, spinner!.SpinSpeed, 0f) * Vector3.forward;
+        var facing = cube.LocalTransform.Rotation * Vector3.forward;
+        Assert.AreApproximatelyEqual(expected, facing, 1e-3f, "facing after one second");
     }}
 }}
 "#
@@ -637,6 +688,26 @@ mod tests {
         }
         let main = std::fs::read_to_string(scripts.join("Main.cs")).expect("Main.cs");
         assert!(main.contains("World.AddScript<FlyCamera>"), "{main}");
+    }
+
+    /// `orrin test` has something to run in a new project, written against the
+    /// scaffold's own Behaviours and nothing internal.
+    #[test]
+    fn a_scaffolded_project_has_a_test() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        scaffold("test-game", dir.path()).expect("scaffold");
+        let root = dir.path().join("test-game");
+
+        let tests = std::fs::read_to_string(root.join("scripts/Tests.cs")).expect("Tests.cs");
+        assert!(tests.contains("namespace TestGame;"), "{tests}");
+        assert!(tests.contains("using Orrin.Testing;"), "{tests}");
+        assert!(tests.contains("[Test]"), "{tests}");
+        assert!(tests.contains("AddScript<Spinner>"), "{tests}");
+        assert!(!tests.contains("Native."), "{tests}");
+
+        let readme = std::fs::read_to_string(root.join("README.md")).expect("README");
+        assert!(readme.contains("Tests.cs"), "{readme}");
+        assert!(readme.contains("orrin test"), "{readme}");
     }
 
     #[test]

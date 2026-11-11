@@ -46,6 +46,7 @@ Scaffolds a project directory, matching the canonical layout in
   scripts/
     <Name>.csproj       AssemblyName matches the entry type's assembly half
     Main.cs             the entry Behaviour — a spinning cube
+    Tests.cs            a test of the cube's Spinner, which `orrin test` runs
 ```
 
 The name is turned into a PascalCase assembly name (`space-shooter` →
@@ -105,6 +106,33 @@ at the speed the game will; the first launch compiles it, later ones reuse it.
 `Debug.DrawLine` and friends, so leave it off while editing.
 Arguments after `--` are forwarded to the engine. The engine's exit status
 becomes the CLI's.
+
+### `orrin test [FILTER] [--release] [--dev] [--no-build] [--project DIR] [--format text|json]`
+
+`orrin build`, then the engine's headless test mode on the project: the engine
+starts with no window and no renderer, loads the game assembly exactly as
+`orrin run` would, and runs every public static method marked
+`[Orrin.Testing.Test]` — or, with `FILTER`, every one whose full name
+(`Namespace.Type.Method`) contains it.
+
+Each test gets a fresh, empty world with the resources a playing game has, at
+a fixed frame of 1/60 s. A `void` test runs once; one returning `IEnumerator`
+gets one frame — physics, then the script tick — at every `yield return null`,
+and longer at `Wait.Frames(n)` or `Wait.Seconds(s)`. A test fails when it
+throws (an `Assert` included), when a Behaviour faults while it runs, or when
+it is still running after its frame budget (`[Test(MaxFrames = …)]`, 10 000 by
+default). `[Test(Scene = "…")]` loads a scene from the assets directory first.
+
+The engine prints one line a test and a summary; `--format json` prints one
+JSON document instead, for CI. This command's own line goes to stderr, so with
+`--no-build` stdout is the engine's report alone — a build streams the
+compiler's output to stdout ahead of it. The exit status is the engine's: **0**
+when every test passed, **1** when one failed or `FILTER` matched none, **2**
+when the tests could not be run at all (no .NET, no built assembly).
+`--release`, `--dev` and `--no-build` mean what they mean to `orrin run`.
+
+The engine binary takes the same thing directly: `orrin-core --test [FILTER]
+[--format json]`, run from the project directory.
 
 ### `orrin export [--platform mac|linux|windows] [--out DIR] [--project DIR]`
 
@@ -182,7 +210,7 @@ they are editing.
 
 ## `$ORRIN_SCRIPT_DIR`
 
-`orrin run` resolves the bindings directory and passes it to the engine, unless
+`orrin run` and `orrin test` resolve the bindings directory and pass it to the engine, unless
 the variable is already set. This is what makes running from inside a project
 directory work in a checkout: the engine's own fallback probes
 `scripting/Orrin/bin/` relative to cwd, which does not resolve once cwd is the

@@ -11,6 +11,7 @@ hello-orrin/
   scripts/               C# game code
     HelloOrrin.csproj   builds HelloOrrin.dll, this project's game assembly
     Main.cs              the entry Behaviour named by `scripts.entry`
+    Tests.cs             a test `orrin test` runs, with no window
   scenes/                .fscene files
   .vscode/launch.json   attaches VS Code's C# debugger to the engine
   .orrin/               engine-generated, gitignored: cache + asset index
@@ -71,6 +72,17 @@ picks up where it left off rather than snapping back to zero.
 A build that fails, or leaves a DLL the runtime rejects, is refused: the reload
 is staged before anything is torn down, so the session keeps running the code it
 already had and says so in the console.
+
+## Testing
+
+```bash
+cd examples/hello-orrin && ../../target/debug/orrin test
+```
+
+builds the scripts and runs `scripts/Tests.cs` inside the engine with no
+window: `Main` attached to an empty world, a frame for its OnStart to spawn the
+cube, then a second's worth of frames for the cube to turn `SpinSpeed` degrees.
+The command exits non-zero if a test fails.
 
 ## Debugging
 

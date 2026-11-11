@@ -19,6 +19,9 @@ public class Main : Behaviour
     private Entity _cube;
     private float _spin;
 
+    /// <summary>The cube OnStart spawned, which <c>Tests.cs</c> looks at.</summary>
+    public Entity Cube => _cube;
+
     public override void OnStart()
     {
         var spawn = Transform.Identity;

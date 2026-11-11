@@ -146,6 +146,7 @@ public static unsafe class Behaviours
             + $"— disabling this script until reload.\n{e.StackTrace}",
             behaviour.GetType().Name,
             0);
+        Testing.TestRunner.NoteFault(behaviour.GetType().Name, method, e);
         return Faulted;
     }
 

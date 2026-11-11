@@ -1492,6 +1492,16 @@ pub struct ScriptHost {
     // Build the story named by the UTF-8 bytes onto the canvas entity; returns
     // 0, 1 when it threw, 2 when no story has that name.
     story_build_fn: extern "system" fn(*const u8, u32, CEntity) -> u8,
+    // The tests of the assembly named by the first UTF-8 bytes, by the
+    // `get_tag` protocol: one `name\tmax frames\tscene` line each.
+    test_list_fn: extern "system" fn(*const u8, u32, *mut u8, i32) -> i32,
+    // Start the test named by the second bytes in that assembly; then carry it
+    // on after each frame, or stop it. Each returns a `TestStep` byte.
+    test_begin_fn: extern "system" fn(*const u8, u32, *const u8, u32) -> u8,
+    test_resume_fn: extern "system" fn() -> u8,
+    test_abandon_fn: extern "system" fn() -> u8,
+    // Why the last test failed, `file\tline\tmessage`, by the same protocol.
+    test_failure_fn: extern "system" fn(*mut u8, i32) -> i32,
     // Game-assembly swap. These live in `Orrin.dll`, which is in the default
     // (uncollectible) load context, so the pointers stay valid across every
     // reload of the game assembly — the whole reason the bindings and the game
@@ -1558,7 +1568,9 @@ impl ScriptHost {
             init, create_fn, start_fn, update_fn, enable_fn, disable_fn,
             collision_enter_fn, collision_exit_fn, trigger_enter_fn, trigger_exit_fn,
             fixed_update_fn, collision_stay_fn, trigger_stay_fn, pointer_fn,
-            tween_complete_fn, story_names_fn, story_build_fn, destroy,
+            tween_complete_fn, story_names_fn, story_build_fn,
+            test_list_fn, test_begin_fn, test_resume_fn, test_abandon_fn, test_failure_fn,
+            destroy,
             game_load_fn, game_commit_fn, game_rollback_fn, game_unload_fn,
             state_capture_fn, state_apply_fn, state_discard_fn,
             bag_read, bag_write, bag_default, bag_components,
@@ -1632,6 +1644,26 @@ impl ScriptHost {
                 *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const u8, u32, CEntity) -> u8>(
                     pdcstr!("Orrin.Stories, Orrin"),
                     pdcstr!("Build"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const u8, u32, *mut u8, i32) -> i32>(
+                    pdcstr!("Orrin.Testing.TestRunner, Orrin"),
+                    pdcstr!("List"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*const u8, u32, *const u8, u32) -> u8>(
+                    pdcstr!("Orrin.Testing.TestRunner, Orrin"),
+                    pdcstr!("Begin"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn() -> u8>(
+                    pdcstr!("Orrin.Testing.TestRunner, Orrin"),
+                    pdcstr!("Resume"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn() -> u8>(
+                    pdcstr!("Orrin.Testing.TestRunner, Orrin"),
+                    pdcstr!("Abandon"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(*mut u8, i32) -> i32>(
+                    pdcstr!("Orrin.Testing.TestRunner, Orrin"),
+                    pdcstr!("Failure"),
                 )?,
                 // Teardown is a process-wide global, not a `ScriptHost` method:
                 // it must stay reachable from `ScriptComponent::drop`, which
@@ -1722,6 +1754,11 @@ impl ScriptHost {
             tween_complete_fn,
             story_names_fn,
             story_build_fn,
+            test_list_fn,
+            test_begin_fn,
+            test_resume_fn,
+            test_abandon_fn,
+            test_failure_fn,
             game_load_fn,
             game_commit_fn,
             game_rollback_fn,
@@ -1895,6 +1932,116 @@ impl ScriptHost {
             0 => StoryBuild::Built,
             1 => StoryBuild::Faulted,
             _ => StoryBuild::Missing,
+        }
+    }
+
+    /// Every `[Test]` in the live assembly named `assembly`, in name order.
+    /// Calls no engine function, so it needs no dispatch window.
+    pub fn tests(&self, assembly: &str) -> Vec<TestCase> {
+        let Some(bytes) = fetch_bag(|buffer, capacity| {
+            (self.test_list_fn)(assembly.as_ptr(), assembly.len() as u32, buffer, capacity)
+        }) else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(3, '\t');
+                let name = fields.next().filter(|name| !name.is_empty())?;
+                let max_frames = fields.next()?.parse().ok()?;
+                let scene = fields.next().filter(|scene| !scene.is_empty());
+                Some(TestCase {
+                    name: name.to_owned(),
+                    max_frames,
+                    scene: scene.map(str::to_owned),
+                })
+            })
+            .collect()
+    }
+
+    /// Start test `name` of `assembly`, inside a dispatch window the caller
+    /// has opened, and run it to its end or its first yield.
+    pub fn begin_test(&self, assembly: &str, name: &str) -> TestStep {
+        TestStep::from_raw((self.test_begin_fn)(
+            assembly.as_ptr(),
+            assembly.len() as u32,
+            name.as_ptr(),
+            name.len() as u32,
+        ))
+    }
+
+    /// Carry the running test on after a frame, inside a dispatch window.
+    pub fn resume_test(&self) -> TestStep {
+        TestStep::from_raw((self.test_resume_fn)())
+    }
+
+    /// Stop the running test as out of frames, inside a dispatch window: its
+    /// `finally` blocks run.
+    pub fn abandon_test(&self) -> TestStep {
+        TestStep::from_raw((self.test_abandon_fn)())
+    }
+
+    /// Why the last test failed: the script file and line it failed on, when
+    /// there is one, and the message.
+    pub fn test_failure(&self) -> (Option<(String, u32)>, String) {
+        let text = fetch_bag(|buffer, capacity| (self.test_failure_fn)(buffer, capacity))
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        let mut fields = text.splitn(3, '\t');
+        let file = fields.next().unwrap_or_default();
+        let line = fields
+            .next()
+            .and_then(|line| line.parse().ok())
+            .unwrap_or(0);
+        let message = fields.next().unwrap_or_default().to_owned();
+        let location = (!file.is_empty()).then(|| (file.to_owned(), line));
+        (location, message)
+    }
+}
+
+/// One `[Test]` the game declares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestCase {
+    /// `Namespace.Type.Method`.
+    pub name: String,
+    /// Frames it may run before it fails as hung.
+    pub max_frames: u32,
+    /// A scene to load first, relative to the project's assets directory.
+    pub scene: Option<String>,
+}
+
+/// Where a test stands after a turn. The bytes are lock-step with C#
+/// `Orrin.Testing.TestRunner`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestStep {
+    Passed,
+    /// Waiting on a frame.
+    Running,
+    /// No test by that name, or none running to resume.
+    Missing,
+    /// An `Assert` failed.
+    AssertionFailed,
+    /// It threw anything else.
+    Threw,
+    /// A Behaviour threw from a hook while it ran.
+    Faulted,
+    /// Abandoned with frames used up.
+    OverBudget,
+    /// The method cannot be run as a test, or yielded what nothing waits on.
+    Malformed,
+}
+
+impl TestStep {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Passed,
+            1 => Self::Running,
+            2 => Self::Missing,
+            3 => Self::AssertionFailed,
+            4 => Self::Threw,
+            5 => Self::Faulted,
+            6 => Self::OverBudget,
+            _ => Self::Malformed,
         }
     }
 }

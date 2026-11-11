@@ -487,74 +487,19 @@ impl App {
     #[cfg(feature = "scripting")]
     fn boot_scripting(&mut self) -> Option<Scripts> {
         use crate::build_watcher::{BuildStatus, BuildWatcher};
-        use crate::scripting::Scripting;
-        use std::path::{Path, PathBuf};
+        use crate::scripting::{GameAssemblies, Scripting};
 
-        const BINDINGS: &str = "scripting/Orrin";
-        const DEMO_SCRIPTS: &str = "scripting/DemoGame";
-        const DEMO_ENTRY: &str = "DemoGame.Game, DemoGame";
-
-        let bindings_dir = match std::env::var("ORRIN_SCRIPT_DIR") {
-            Ok(dir) => Some(PathBuf::from(dir)),
-            // Next to the executable is the shipped layout, and it is the only
-            // one that works from inside a project directory. The cwd-relative
-            // probe is the repo checkout, where the bindings are still an
-            // unbuilt source tree.
-            Err(_) => Scripting::bindings_beside_executable()
-                .or_else(|| Scripting::find_bindings_dir(Path::new(BINDINGS))),
-        };
-        let Some(bindings_dir) = bindings_dir else {
-            tracing::warn!(
-                "scripting disabled: no Orrin bindings next to the engine, and none \
-                 under {BINDINGS} (run `dotnet build {BINDINGS}`, or set ORRIN_SCRIPT_DIR)"
-            );
-            return None;
-        };
-
-        let entry = std::env::var("ORRIN_ENTRY")
-            .ok()
-            .or_else(|| {
-                self.project
-                    .as_ref()
-                    .map(|project| project.entry_type().to_string())
-            })
-            .unwrap_or_else(|| DEMO_ENTRY.to_string());
-
-        // Without a project this is the engine's own demo game, which is a
-        // normal game assembly like any other — one loading path, so the demo
-        // exercises hot reload exactly as a user's project does.
-        let scripts_dir = self
-            .project
-            .as_ref()
-            .map(|project| project.scripts_dir())
-            .unwrap_or_else(|| PathBuf::from(DEMO_SCRIPTS));
-
-        let shipped_dll = self
-            .project
-            .as_ref()
-            .and_then(orrin_project::Project::game_assembly);
-        let game_dll = match std::env::var("ORRIN_GAME_DLL") {
-            Ok(path) => Some(PathBuf::from(path)),
-            Err(_) if shipped_dll.is_some() => shipped_dll,
-            Err(_) => match Scripting::assembly_of(&entry) {
-                Some(assembly) => Scripting::find_game_assembly(&scripts_dir, assembly),
-                None => {
-                    tracing::warn!(
-                        "scripting disabled: entry `{entry}` names no assembly — it must be \
-                         assembly-qualified (`MyGame.Main, MyGame`) so the engine knows which \
-                         DLL to load"
-                    );
-                    return None;
-                }
-            },
-        };
-        let Some(game_dll) = game_dll else {
-            tracing::warn!(
-                "scripting disabled: no built game assembly for `{entry}` under {} \
-                 (run `dotnet build` there, or set ORRIN_GAME_DLL)",
-                scripts_dir.display()
-            );
-            return None;
+        let GameAssemblies {
+            bindings_dir,
+            game_dll,
+            entry,
+            scripts_dir,
+        } = match GameAssemblies::locate(self.project.as_ref()) {
+            Ok(found) => found,
+            Err(reason) => {
+                tracing::warn!("scripting disabled: {reason}");
+                return None;
+            }
         };
 
         let scripting = Scripting::boot(&bindings_dir, &game_dll)?;
