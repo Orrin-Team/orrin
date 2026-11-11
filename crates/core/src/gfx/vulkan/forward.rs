@@ -57,7 +57,7 @@ pub(super) const TEXTURE_SET: usize = 2;
 const WHITE_TEXTURE: u32 = 0;
 const FLAT_NORMAL_TEXTURE: u32 = 1;
 
-/// Feature bits in [`GpuMaterial::flags`], mirrored by `shading.glsl`.
+/// Feature bits in [`GpuMaterial::flags`], mirrored by `shaders/material.glsl`.
 ///
 /// The whole point of the word: a draw is one batch and a batch is one
 /// (mesh, material) pair, so every invocation of a draw reads the same flags —
@@ -1700,11 +1700,11 @@ mod tests {
         assert_eq!(cutoff(0.5), 0.5);
     }
 
-    /// std430 derives an array's stride from its element, so the mirrors in
-    /// `prepass.frag` and `shadow.frag` step through the table at whatever pitch
-    /// this struct is — a mirror one block short reads every material past the
-    /// first out of the middle of its neighbour. Nothing in either shader can
-    /// notice, which is why the size is pinned here.
+    /// std430 derives an array's stride from its element, so every pass steps
+    /// through the table at the pitch of the one mirror in
+    /// `shaders/material.glsl` — a mirror one block short reads every material
+    /// past the first out of the middle of its neighbour. No shader can notice,
+    /// which is why the size is pinned here.
     #[test]
     fn the_material_block_is_the_size_both_shader_mirrors_declare() {
         // 15 vec4-sized blocks: base colour, emissive, params, texture indices,

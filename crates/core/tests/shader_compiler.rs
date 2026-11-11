@@ -12,7 +12,8 @@ use std::fs;
 use std::path::Path;
 
 use orrin_core::gfx::shaders::{
-    LAYOUT_WIDTHS, SHADERS, SOURCES, SOURCES_HASH, ShaderBlob, ShaderId, Stage, compile,
+    CompiledShader, LAYOUT_WIDTHS, SHADERS, SOURCES, SOURCES_HASH, ShaderBlob, ShaderId, Stage,
+    compile,
 };
 
 fn source_of(blob: &ShaderBlob) -> &'static str {
@@ -111,6 +112,117 @@ fn a_compile_error_names_the_file_it_was_given() {
     .unwrap_err();
     assert!(error.contains("materials/rock.oshader"), "{error}");
     assert!(error.contains("nope"), "{error}");
+}
+
+/// Every manifest row a custom surface function is stitched into: each variant
+/// of the forward, transparency and refraction passes and of the prepass. The
+/// masked shadow pass tests alpha at the unmarched coordinate and is not one.
+fn surface_passes() -> Vec<&'static ShaderBlob> {
+    const FILES: [&str; 5] = [
+        "forward.frag",
+        "forward_sss.frag",
+        "oit.frag",
+        "refraction.frag",
+        "prepass.frag",
+    ];
+    let passes: Vec<_> = SHADERS
+        .iter()
+        .filter(|blob| FILES.contains(&blob.path))
+        .collect();
+    for id in [
+        ShaderId::ForwardFrag,
+        ShaderId::ForwardSssFrag,
+        ShaderId::OitFrag,
+        ShaderId::RefractionFrag,
+        ShaderId::PrepassFrag,
+        ShaderId::PrepassFragMasked,
+    ] {
+        assert!(passes.iter().any(|blob| blob.name == id.blob().name));
+    }
+    passes
+}
+
+/// `blob` with its own manifest defines plus `ORRIN_CUSTOM_SURFACE`, and
+/// `surface` standing in as `custom_surface.glsl`.
+fn compile_with_surface(blob: &ShaderBlob, surface: &str) -> Result<CompiledShader, String> {
+    let mut defines = blob.defines.to_vec();
+    defines.push(("ORRIN_CUSTOM_SURFACE", "1"));
+    compile(
+        source_of(blob),
+        blob.stage,
+        blob.path,
+        &defines,
+        &[("custom_surface.glsl", surface)],
+    )
+}
+
+const EMPTY_SURFACE: &str = "void surface(in SurfaceIn i, inout SurfaceOut o) {}\n";
+
+#[test]
+fn an_empty_surface_function_binds_exactly_what_the_built_in_shader_binds() {
+    for blob in surface_passes() {
+        let compiled = compile_with_surface(blob, EMPTY_SURFACE)
+            .unwrap_or_else(|e| panic!("{}: {e}", blob.name));
+        assert_eq!(
+            compiled.bindings.resources, blob.bindings.resources,
+            "{}",
+            blob.name
+        );
+        assert_eq!(
+            compiled.bindings.push_constant_bytes, blob.bindings.push_constant_bytes,
+            "{}",
+            blob.name
+        );
+        assert_eq!(
+            compiled.bindings.workgroup_size, blob.bindings.workgroup_size,
+            "{}",
+            blob.name
+        );
+    }
+}
+
+#[test]
+fn a_surface_function_that_reads_every_input_and_writes_every_output_compiles_in_every_pass() {
+    let surface = "void surface(in SurfaceIn i, inout SurfaceOut o) {\n\
+                   \x20   float facing = dot(i.world_normal, i.view_dir);\n\
+                   \x20   o.albedo = i.vertex_color * fract(i.world_position) * facing;\n\
+                   \x20   o.alpha = i.uv.x;\n\
+                   \x20   o.metallic = i.uv.y;\n\
+                   \x20   o.roughness = 0.5;\n\
+                   \x20   o.emissive = vec3(facing);\n\
+                   \x20   o.normal = vec3(0.0, 0.0, 1.0);\n\
+                   }\n";
+    for blob in surface_passes() {
+        let compiled =
+            compile_with_surface(blob, surface).unwrap_or_else(|e| panic!("{}: {e}", blob.name));
+        let empty = compile_with_surface(blob, EMPTY_SURFACE).unwrap();
+        assert!(
+            compiled.spirv != empty.spirv,
+            "{}: the surface function did not reach the shader",
+            blob.name
+        );
+        assert_eq!(
+            compiled.bindings.resources, blob.bindings.resources,
+            "{}",
+            blob.name
+        );
+    }
+}
+
+#[test]
+fn every_surface_pass_compiles_the_custom_function_it_is_given() {
+    let broken = "void surface(in SurfaceIn i, inout SurfaceOut o) { not_a_builtin(); }\n";
+    for blob in surface_passes() {
+        let error = compile_with_surface(blob, broken)
+            .err()
+            .unwrap_or_else(|| panic!("{}: compiled without the surface function", blob.name));
+        assert!(
+            error.contains("custom_surface.glsl"),
+            "{}: {error}",
+            blob.name
+        );
+        assert!(error.contains("not_a_builtin"), "{}: {error}", blob.name);
+    }
 }
 
 #[test]

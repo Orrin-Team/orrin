@@ -20,27 +20,10 @@ layout(location = 0) in vec2 v_uv;
 // The material row this instance is drawn with. See `shadow.vert`.
 layout(location = 1) flat in uint v_material;
 
-// Mirrors GpuMaterial in forward.rs, as `prepass.frag` does and for the same
-// std430 reason: the stride comes from the struct, so a short mirror would read
-// every material past the first out of its neighbour. Only `base_color.a`, the
-// albedo index and the cutoff are used.
-struct GpuMaterial {
-    vec4 base_color;
-    vec4 emissive;
-    vec4 params;
-    uvec4 tex_indices;
-    vec4 clearcoat;
-    vec4 sheen;
-    vec4 anisotropy;
-    vec4 transmission;
-    vec4 attenuation;
-    vec4 subsurface;
-    vec4 subsurface_radius;
-    vec4 parallax;
-    vec4 alpha;       // x = the alpha a MASKED fragment must reach to survive
-    uvec4 tex_indices_ext;
-    uvec4 tex_flags;
-};
+// The forward pass's material table, through the row `material.glsl` declares
+// for every pass that reads it. Only `base_color.a`, the albedo index and the
+// cutoff are used; the rest is there for the stride.
+#include "material.glsl"
 layout(set = 1, binding = 0, std430) readonly buffer Materials {
     GpuMaterial materials[];
 };
@@ -50,6 +33,13 @@ layout(set = 1, binding = 0, std430) readonly buffer Materials {
 const int MAX_TEXTURES = 192;
 layout(set = 2, binding = 0) uniform texture2D u_textures[MAX_TEXTURES];
 layout(set = 2, binding = 1) uniform sampler u_sampler;
+
+vec4 sample_tex(uint index, vec2 uv) {
+    return texture(sampler2D(u_textures[index], u_sampler), uv);
+}
+// For `material_alpha`, the one definition of the alpha the forward pass's
+// coverage and the prepass's `discard` cut along.
+#include "surface.glsl"
 #endif
 
 void main() {
@@ -61,9 +51,7 @@ void main() {
     // moves texels by centimetres and a cutout's alpha is flat across those
     // centimetres in every atlas anyone authors, so the unmarched coordinate is
     // the right answer rather than a cheaper one.
-    float alpha = m.base_color.a
-        * texture(sampler2D(u_textures[m.tex_indices.x], u_sampler), v_uv).a;
-    if (alpha < m.alpha.x) {
+    if (material_alpha(m, sample_tex(m.tex_indices.x, v_uv)) < m.alpha.x) {
         discard;
     }
 #endif

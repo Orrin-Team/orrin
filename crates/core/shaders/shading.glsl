@@ -130,51 +130,9 @@ uint light_cluster(vec2 frag, float view_depth) {
     return (z * CLUSTER_TILES_Y + tile.y) * CLUSTER_TILES_X + tile.x;
 }
 
-// Mirrors GpuMaterial in forward.rs. std430 packs this exactly like
-// the Rust #[repr(C)] struct because every field is 16 bytes.
-struct GpuMaterial {
-    vec4 base_color;   // rgb = albedo, a = opacity
-    vec4 emissive;     // rgb = emissive
-    vec4 params;       // x = metallic, y = roughness, z = reflectance, w = ior
-    uvec4 tex_indices; // x=albedo, y=normal, z=metal-rough, w=emissive
-    vec4 clearcoat;    // x = strength, y = perceptual roughness
-    vec4 sheen;        // rgb = colour, a = perceptual roughness
-    vec4 anisotropy;   // x = strength, y = cos(rotation), z = sin(rotation)
-    vec4 transmission; // x = transmission, y = thickness, z = attenuation distance
-    vec4 attenuation;  // rgb = what the volume absorbs over `transmission.z`
-    vec4 subsurface;   // rgb = scattering tint, a = forward-scatter power
-    vec4 subsurface_radius; // rgb = per-channel mean free path, metres
-    vec4 parallax;     // x = height field depth in metres, y = min steps, z = max steps
-    vec4 alpha;        // x = the alpha a MASKED fragment must reach to survive
-    uvec4 tex_indices_ext; // x=clearcoat, y=clearcoat normal, z=sheen, w=anisotropy
-    uvec4 tex_flags;       // x = transmission map, y = feature flags, z = subsurface, w = height
-};
-
-// Feature bits in `tex_flags.y`, mirroring `material_flags` in forward.rs.
-//
-// `v_material` is one value for a whole draw, so every test against these is a
-// coherent branch: a draw either takes a lobe or does not, and a material that
-// never asked for one pays a single comparison rather than the lobe's cost.
-#ifdef ORRIN_FLAT_SURFACE
-// The flat forward pipelines' build: a material drawn with one uses none of the
-// optional lobes, so every test of their bits folds to false and the compiler
-// removes the lobes outright. Their presence alone costs every material a
-// quarter of the forward pass — see `ForwardPipelines` in forward.rs.
-const uint MATERIAL_CLEARCOAT    = 0u;
-const uint MATERIAL_SHEEN        = 0u;
-const uint MATERIAL_ANISOTROPY   = 0u;
-const uint MATERIAL_TRANSMISSION = 0u;
-const uint MATERIAL_SUBSURFACE   = 0u;
-const uint MATERIAL_PARALLAX     = 0u;
-#else
-const uint MATERIAL_CLEARCOAT    = 1u << 0;
-const uint MATERIAL_SHEEN        = 1u << 1;
-const uint MATERIAL_ANISOTROPY   = 1u << 2;
-const uint MATERIAL_TRANSMISSION = 1u << 3;
-const uint MATERIAL_SUBSURFACE   = 1u << 4;
-const uint MATERIAL_PARALLAX     = 1u << 5;
-#endif
-const uint MATERIAL_MASKED       = 1u << 6;
+// The material row and its feature bits, shared with the prepass and the shadow
+// pass so the three cannot disagree about the table's stride.
+#include "material.glsl"
 
 // Material table indexed by the per-draw material_index. A storage
 // buffer so the array can be sized at runtime (one entry per material).
@@ -253,6 +211,7 @@ float parallax_height(uint index, vec2 uv, vec2 dx, vec2 dy) {
 }
 #include "parallax.glsl"
 #include "normal_map.glsl"
+#include "surface.glsl"
 
 // The decal projector's one texture read, gradients handed in for the reason the
 // march's are. See decals.glsl.
@@ -897,7 +856,7 @@ float cone_falloff(SpotLight light, vec3 L) {
 // built on: what is read here is per fragment, what `brdf` does with it is per
 // light. Anything that ended up on the wrong side of that line would be paid for
 // once per light for no reason.
-Surface read_surface(GpuMaterial m, out float alpha) {
+Surface read_surface(GpuMaterial m, out float alpha, out vec3 emissive) {
     Surface s;
     s.flags = m.tex_flags.y;
 
@@ -934,28 +893,23 @@ Surface read_surface(GpuMaterial m, out float alpha) {
         );
     }
 
-    // Sample the maps. Missing maps point at the default textures, so
-    // these multiplies become no-ops. Albedo/emissive images are sRGB
-    // (decoded to linear on sample); metal-rough is linear data.
-    vec4 albedo_tex = sample_tex(m.tex_indices.x, s.uv);
-    vec4 mr_tex     = sample_tex(m.tex_indices.z, s.uv);
+    SurfaceIn i;
+    i.uv = s.uv;
+    i.world_position = v_world_pos;
+    i.world_normal = TBN[2];
+    i.view_dir = s.V;
+    i.vertex_color = v_color;
+    SurfaceOut o = resolve_surface(m, i);
 
-    // Vertex color tints the material albedo; drop `* v_color` for a
-    // pure material/texture color.
-    s.albedo = m.base_color.rgb * v_color * albedo_tex.rgb;
-    // The albedo map's alpha multiplies the material's, the same way its rgb
-    // multiplies the base colour. An opaque draw ignores the result; a blended
-    // one weights everything below by it.
-    alpha = clamp(m.base_color.a * albedo_tex.a, 0.0, 1.0);
-    // glTF metallic-roughness convention: G = roughness, B = metallic.
-    s.metallic = clamp(m.params.x * mr_tex.b, 0.0, 1.0);
-    // Floor avoids a singular highlight.
-    s.perceptual_roughness = clamp(m.params.y * mr_tex.g, 0.04, 1.0);
+    s.albedo = o.albedo;
+    alpha = o.alpha;
+    s.metallic = o.metallic;
+    s.perceptual_roughness = o.roughness;
+    emissive = o.emissive;
     float reflectance = m.params.z;
 
     // Tangent-space normal map -> world space via the TBN basis.
-    vec3 n_tangent = tangent_normal(sample_tex(m.tex_indices.y, s.uv));
-    s.N = normalize(TBN * n_tangent);
+    s.N = normalize(TBN * o.normal);
 
     // Decals, here and not a line either side of it. After the normal, because
     // the angle fade asks which way this surface faces and the mapped normal is
@@ -1212,12 +1166,11 @@ Shaded shade_surface() {
     GpuMaterial m = materials[v_material];
 
     float alpha;
-    Surface s = read_surface(m, alpha);
-    // After the surface, not before: the coordinate every map is read at is what
-    // `read_surface` resolves, and a glowing filament that stayed behind while
-    // the brick around it moved would be the parallax failing in the one place
-    // it is most visible.
-    vec3 emis_tex = sample_tex(m.tex_indices.w, s.uv).rgb;
+    // Read with the other maps, at the coordinate `read_surface` resolves: a
+    // glowing filament that stayed behind while the brick around it moved would
+    // be the parallax failing in the one place it is most visible.
+    vec3 emissive;
+    Surface s = read_surface(m, alpha, emissive);
     bool scatters = (s.flags & MATERIAL_SUBSURFACE) != 0u;
 
 #if defined(ORRIN_TRANSPARENT) || defined(ORRIN_REFRACTIVE)
@@ -1389,7 +1342,7 @@ Shaded shade_surface() {
     // in nits, so it needs no conversion — it is the one material quantity in the
     // same unit as the target it is written into. Not diffusible: a filament is
     // where it is, and spreading it would be a bloom rather than a scattering.
-    color += m.emissive.rgb * emis_tex;
+    color += emissive;
 
     // Both halves lose what the air absorbed, and only one of them gains what it
     // scattered in. Summing the two afterwards gives back exactly the fogged

@@ -143,7 +143,7 @@ void apply_decals(
             // glTF's packing, as everywhere else: G = roughness, B = metallic.
             vec4 mr = decal_sample(d.tex.z, uv, duv_dx, duv_dy);
             metallic = mix(metallic, clamp(d.params.x * mr.b, 0.0, 1.0), coverage);
-            // The same floor `read_surface` applies, for the same reason: a
+            // The same floor `standard_surface` applies, for the same reason: a
             // roughness at zero is a singular highlight, and a decal is as able
             // to ask for one as a material is.
             perceptual_roughness =
