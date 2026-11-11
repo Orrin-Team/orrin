@@ -37,3 +37,12 @@ class FaultingProbe : OrderProbe
 /// Does nothing at all: what the scripts bench ticks, so its number is the
 /// engine's dispatch rather than a script's work.
 class IdleProbe : Behaviour;
+
+/// Overrides the per-step hooks with empty bodies: one of these in a world is
+/// what makes the scripts bench's physics phase sweep for OnFixedUpdate and
+/// report stays.
+class SteppedIdleProbe : Behaviour
+{
+    public override void OnFixedUpdate(float fixedDeltaTime) { }
+    public override void OnCollisionStay(Collision other) { }
+}

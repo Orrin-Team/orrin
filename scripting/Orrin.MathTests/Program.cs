@@ -245,6 +245,20 @@ unsafe
     Check(sizeof(Orrin.Rigidbody) == 28, "Rigidbody is seven words");
     Check(sizeof(Orrin.ColliderData) == 32, "ColliderData is a shape, a Vector3 and four words");
     Check(sizeof(Orrin.RaycastHit) == 36, "RaycastHit is an Entity, two Vector3s and a float");
+    Check(sizeof(Orrin.Collision) == 44, "Collision is an Entity and three Vector3s");
+    // The optional hooks `Behaviours.Create` reports, lock-step with
+    // `orrin_script::Hooks`: what the engine reads to skip a per-step call.
+    Check(Orrin.Behaviours.FixedUpdateHook == 1
+        && Orrin.Behaviours.CollisionStayHook == 2
+        && Orrin.Behaviours.TriggerStayHook == 4,
+        "the hook bits number as the engine does");
+    Check(Orrin.Behaviours.HooksOf(typeof(Orrin.Tests.IdleProbe)) == 0,
+        "a behaviour overriding nothing reports no hooks");
+    Check(Orrin.Behaviours.HooksOf(typeof(Orrin.Tests.SecondSteppedProbe)) == Orrin.Behaviours.FixedUpdateHook,
+        "an OnFixedUpdate inherited from a base class counts");
+    Check(Orrin.Behaviours.HooksOf(typeof(Orrin.Tests.ContactProbe))
+        == (Orrin.Behaviours.CollisionStayHook | Orrin.Behaviours.TriggerStayHook),
+        "the Stay callbacks are reported apart from the other contact callbacks");
     Check((uint)Orrin.ComponentKind.Rigidbody == 14, "ComponentKind.Rigidbody is 14");
     Check((uint)Orrin.ForceMode.Impulse == 1 && (uint)Orrin.ForceMode.Acceleration == 3,
         "ForceMode numbers as the engine does");

@@ -20,6 +20,21 @@ public abstract class Behaviour
 
     public virtual void OnUpdate(float deltaTime) { }
 
+    /// <summary>
+    /// Called before each physics step, while the behaviour is active and
+    /// started — so never on the frame it starts. A frame takes as many steps
+    /// as the time it covers, which can be none or several, and they all run
+    /// before that frame's OnUpdate. A <see cref="ForceMode.Force"/> asked for
+    /// here is held for the one step that follows, and a body's transform reads
+    /// where the last step left it. Spawns, despawns and other structural
+    /// changes land after the frame's last step, before OnUpdate.
+    /// </summary>
+    /// <remarks>
+    /// The engine calls it only on a type that overrides it, so a behaviour
+    /// without one costs nothing per step.
+    /// </remarks>
+    public virtual void OnFixedUpdate(float fixedDeltaTime) { }
+
     public virtual void OnDisable() { }
 
     public virtual void OnDestroy() { }
@@ -27,6 +42,15 @@ public abstract class Behaviour
     /// Fired the first frame this entity's collider overlaps another; the
     /// engine dispatches collision callbacks before OnUpdate each tick.
     public virtual void OnCollisionEnter(Collision other) { }
+
+    /// <summary>
+    /// Fired once for every physics step a pair is still touching after the
+    /// step it entered on, in the collision phase of the frame that took the
+    /// steps. A pair at rest whose bodies have fallen asleep is still touching
+    /// — it never exits — but is not reported again until one of them wakes.
+    /// Called only on a type that overrides it.
+    /// </summary>
+    public virtual void OnCollisionStay(Collision other) { }
 
     /// Fired the first frame a previously-overlapping pair separates. The
     /// payload carries the *last known* contact — there is no contact this
@@ -37,6 +61,12 @@ public abstract class Behaviour
     /// trigger: something entered this entity's trigger, or this entity
     /// entered one. A trigger never calls OnCollisionEnter.
     public virtual void OnTriggerEnter(Collision other) { }
+
+    /// <summary>
+    /// <see cref="OnCollisionStay"/> for a trigger pair, which never calls
+    /// OnCollisionStay.
+    /// </summary>
+    public virtual void OnTriggerStay(Collision other) { }
 
     /// Fired when a trigger pair separates; carries the last known contact.
     public virtual void OnTriggerExit(Collision other) { }

@@ -1,13 +1,15 @@
 //! What game code may ask of the simulation between steps: push a body, read
 //! or set its velocity, cast a ray.
 //!
-//! Scripts run after the step, at the display's rate rather than the step's,
-//! and there is no fixed-rate callback. So a [`ForceMode::Force`] or
-//! [`ForceMode::Acceleration`] is read as *held for the frame it was asked in*
-//! and applied as the impulse that is, `force * delta`: a second of pushing is
-//! the same push at 60 fps as at 144. Unity reads the same call as one step's
-//! worth, which is why it asks for it from `FixedUpdate`; here it is right from
-//! `OnUpdate`.
+//! A push is asked for from one of two places, and a [`ForceMode::Force`] or
+//! [`ForceMode::Acceleration`] is read as *held for as long as that place
+//! lasts*, applied as the impulse that is, `force * held`. Between frames — a
+//! script's `OnUpdate`, which runs after the steps at the display's rate — it
+//! is held for the frame, so a second of pushing is the same push at 60 fps as
+//! at 144. From [`run_with`](super::run_with)'s callback — `OnFixedUpdate` — it
+//! is held for the one step the callback precedes, as Unity reads it from
+//! `FixedUpdate`. Either way a second of pushing is a second of force; the
+//! choice is whether a script wants to react once a step.
 //!
 //! A body spawned this frame has no Jolt body until the next physics run — and
 //! from a script, no `RigidBody` either, since a script's components are added
@@ -29,13 +31,14 @@ use crate::scene::PHYSICS_LAYERS;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ForceMode {
-    /// Newtons (or newton-metres), held for the frame.
+    /// Newtons (or newton-metres), held for the frame, or for the step when
+    /// asked before one.
     Force,
     /// N·s, all at once.
     Impulse,
     /// m/s, regardless of mass.
     VelocityChange,
-    /// m/s², regardless of mass, held for the frame.
+    /// m/s², regardless of mass, held like a `Force`.
     Acceleration,
 }
 
@@ -100,7 +103,7 @@ fn push(world: &World, entity: Entity, push: impl FnOnce(f32) -> Push) -> bool {
     let Some(mut state) = world.get_resource_mut::<PhysicsState>() else {
         return false;
     };
-    let delta = state.frame_delta;
+    let delta = state.held_for;
     let body = state.simulation.as_ref().map(|simulation| {
         let tracked = simulation.bodies.get(&entity)?;
         Some((tracked.id, tracked.motion()))

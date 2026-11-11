@@ -83,6 +83,7 @@ impl Game<'_> {
                 b,
                 point: Vec3::ZERO,
                 normal: Vec3::Y,
+                relative_velocity: Vec3::ZERO,
                 trigger,
             });
     }

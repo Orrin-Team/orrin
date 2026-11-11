@@ -9,6 +9,15 @@
 //! - `tick`: N entities, one Behaviour each, no events. The common frame.
 //! - `tick_with_collisions`: the same with a collision event on every tenth
 //!   entity, which is what builds the routing index.
+//! - `physics_then_tick`: the physics phase and the tick together, three steps
+//!   a frame, over N crates resting on a floor whose Behaviour overrides
+//!   neither OnFixedUpdate nor a Stay callback. `plain` steps through
+//!   `physics::run`, which knows nothing of scripts; `scripted` through
+//!   `Scripting::run_physics`, as `app.rs` does. The two should not differ:
+//!   that is the claim that a hook nobody overrides costs nothing per step.
+//!   `listening` adds one Behaviour that overrides both, which turns on the
+//!   sweep for OnFixedUpdate and the stays — what a world pays once anything
+//!   uses them, with every crate still opting out.
 //!
 //! Needs both C# assemblies built (`dotnet build scripting/Orrin` and
 //! `dotnet build scripting/DemoGame`) and measures nothing without them.
@@ -18,15 +27,22 @@ use std::path::Path;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use glam::Vec3;
 
-use orrin_core::physics::{CollisionEvent, CollisionEventKind, CollisionState};
-use orrin_core::scene::register_components;
+use orrin_core::physics::{self, CollisionEvent, CollisionEventKind, CollisionState, PhysicsState};
+use orrin_core::scene::{
+    Collider, ColliderShape, LocalTransform, RigidBody, Transform, propagate_transforms,
+    register_components,
+};
 use orrin_core::scripting::Scripting;
 use orrin_ecs::{Entity, World};
 use orrin_registry::Registry;
 
 const COUNTS: [usize; 3] = [100, 1_000, 10_000];
+/// The physics bench's sizes, so a body count means the same in both.
+const BODY_COUNTS: [usize; 3] = [100, 1_000, 5_000];
 const IDLE: &str = "Orrin.Tests.IdleProbe, Orrin";
+const STEPPED_IDLE: &str = "Orrin.Tests.SteppedIdleProbe, Orrin";
 const FRAME: f32 = 1.0 / 60.0;
+const THREE_STEPS: f32 = 3.0 * physics::STEP;
 
 fn boot() -> Option<Scripting> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -48,6 +64,57 @@ fn scripted(scripting: &Scripting, registry: &Registry, count: usize) -> (World,
         .collect();
     scripting.tick(&mut world, registry, FRAME);
     (world, entities)
+}
+
+/// `count` crates in a grid on a floor, each with one Behaviour that overrides
+/// no per-step hook, plus one that overrides both when `listening`. Stepped
+/// until the pile has settled, as a level's props spend most of their time.
+fn resting(scripting: &Scripting, registry: &Registry, count: usize, listening: bool) -> World {
+    let mut world = World::new();
+    world.insert_resource(CollisionState::default());
+    world.insert_resource(PhysicsState::default());
+    let side = (count as f32).sqrt().ceil() as usize;
+    let half = side as f32 * 0.75 + 2.0;
+    world
+        .spawn_entity()
+        .with(LocalTransform::from(Transform::from_translation(
+            Vec3::new(0.0, -0.5, 0.0),
+        )))
+        .with(Collider {
+            shape: ColliderShape::Box {
+                half_extents: Vec3::new(half, 0.5, half),
+            },
+            ..Collider::default()
+        });
+    for index in 0..count {
+        let at = Vec3::new(
+            (index % side) as f32 * 1.5 - half + 2.0,
+            0.5,
+            (index / side) as f32 * 1.5 - half + 2.0,
+        );
+        let entity = world
+            .spawn_entity()
+            .with(LocalTransform::from(Transform::from_translation(at)))
+            .with(Collider {
+                shape: ColliderShape::Box {
+                    half_extents: Vec3::splat(0.5),
+                },
+                ..Collider::default()
+            })
+            .with(RigidBody::default())
+            .id();
+        scripting.attach(&mut world, entity, IDLE);
+    }
+    if listening {
+        let entity = world.spawn();
+        scripting.attach(&mut world, entity, STEPPED_IDLE);
+    }
+    for _ in 0..90 {
+        propagate_transforms(&mut world);
+        scripting.run_physics(&mut world, registry, THREE_STEPS);
+        scripting.tick(&mut world, registry, THREE_STEPS);
+    }
+    world
 }
 
 fn bench(c: &mut Criterion) {
@@ -79,6 +146,7 @@ fn bench(c: &mut Criterion) {
                 b: *chunk.last().unwrap(),
                 point: Vec3::ZERO,
                 normal: Vec3::Y,
+                relative_velocity: Vec3::ZERO,
                 trigger: false,
             })
             .collect();
@@ -90,6 +158,36 @@ fn bench(c: &mut Criterion) {
                     .events
                     .clone_from(&events);
                 scripting.tick(&mut world, &registry, FRAME)
+            })
+        });
+    }
+    group.finish();
+
+    let mut group = c.benchmark_group("physics_then_tick");
+    for count in BODY_COUNTS {
+        group.throughput(Throughput::Elements(count as u64));
+        let mut world = resting(&scripting, &registry, count, false);
+        group.bench_function(format!("plain/{count}"), |b| {
+            b.iter(|| {
+                propagate_transforms(&mut world);
+                physics::run(&mut world, THREE_STEPS);
+                scripting.tick(&mut world, &registry, THREE_STEPS);
+            })
+        });
+        let mut world = resting(&scripting, &registry, count, false);
+        group.bench_function(format!("scripted/{count}"), |b| {
+            b.iter(|| {
+                propagate_transforms(&mut world);
+                scripting.run_physics(&mut world, &registry, THREE_STEPS);
+                scripting.tick(&mut world, &registry, THREE_STEPS);
+            })
+        });
+        let mut world = resting(&scripting, &registry, count, true);
+        group.bench_function(format!("listening/{count}"), |b| {
+            b.iter(|| {
+                propagate_transforms(&mut world);
+                scripting.run_physics(&mut world, &registry, THREE_STEPS);
+                scripting.tick(&mut world, &registry, THREE_STEPS);
             })
         });
     }

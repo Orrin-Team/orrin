@@ -1271,14 +1271,72 @@ pub enum Delivery {
 }
 
 /// C ABI collision event payload, as seen by one participant: the *other*
-/// entity, the world-space contact point, and the contact normal pointing from
-/// the receiving entity toward `other`. Matches the C# `Orrin.Collision`.
+/// entity, the world-space contact point, the contact normal pointing from
+/// the receiving entity toward `other`, and the receiver's velocity at the
+/// contact less `other`'s, in m/s. Matches the C# `Orrin.Collision`.
+///
+/// Handed over by pointer and never size-checked per call, so it only ever
+/// grows at the end: a stale bindings build reads a prefix of it.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CCollision {
     pub other: CEntity,
     pub point: [f32; 3],
     pub normal: [f32; 3],
+    pub relative_velocity: [f32; 3],
+}
+
+/// The optional hooks a Behaviour's type overrides, as `Behaviours.Create`
+/// reports them. The bits are lock-step with the constants in C#
+/// `Orrin.Behaviours`.
+///
+/// A hook the engine may call per physics step, or per touching pair per step,
+/// is a managed transition per call whether or not the type wrote a body for
+/// it — thousands of resting crates would pay for an empty base method. So the
+/// managed side reads the type's overrides once, when it builds the instance,
+/// and the engine skips the call for a hook that is not here. Read at creation
+/// rather than per call because a type cannot change while it is loaded: a hot
+/// reload re-creates every instance, and with it this answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hooks(u32);
+
+impl Hooks {
+    pub const NONE: Self = Self(0);
+    pub const FIXED_UPDATE: Self = Self(1);
+    pub const COLLISION_STAY: Self = Self(1 << 1);
+    pub const TRIGGER_STAY: Self = Self(1 << 2);
+
+    pub fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Whether every hook in `other` is overridden.
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Whether any hook in `other` is overridden.
+    pub fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+impl std::ops::BitOr for Hooks {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitOrAssign for Hooks {
+    fn bitor_assign(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
 }
 
 /// Outcome of a game-assembly operation. The discriminants are lock-step with
@@ -1344,7 +1402,8 @@ impl std::fmt::Display for GameAssemblyStatus {
 /// `HostfxrContext` keeps the runtime resident for the host's lifetime.
 pub struct ScriptHost {
     _context: HostfxrContext<InitializedForRuntimeConfig>,
-    create_fn: extern "system" fn(CEntity, *const c_char) -> u64,
+    // Writes the type's `Hooks` bits through the out-pointer.
+    create_fn: extern "system" fn(CEntity, *const c_char, *mut u32) -> u64,
     // The lifecycle hooks return a fault byte (0 = clean, nonzero = the C# hook
     // threw and was contained): the managed side never lets an exception cross
     // into these native frames, and reports it here so the engine can disable
@@ -1358,6 +1417,9 @@ pub struct ScriptHost {
     collision_exit_fn: extern "system" fn(u64, *const CCollision) -> u8,
     trigger_enter_fn: extern "system" fn(u64, *const CCollision) -> u8,
     trigger_exit_fn: extern "system" fn(u64, *const CCollision) -> u8,
+    fixed_update_fn: extern "system" fn(u64, f32) -> u8,
+    collision_stay_fn: extern "system" fn(u64, *const CCollision) -> u8,
+    trigger_stay_fn: extern "system" fn(u64, *const CCollision) -> u8,
     // Returns 0 handled, 1 faulted, 2 not handled; see `Delivery`.
     pointer_fn: extern "system" fn(u64, u32, *const CPointerEvent) -> u8,
     // Runs and forgets whatever the game asked to happen when tween `id`
@@ -1381,6 +1443,9 @@ pub struct ScriptHost {
     state_capture_fn: extern "system" fn(u64) -> u64,
     state_apply_fn: extern "system" fn(u64, u64) -> u8,
     state_discard_fn: extern "system" fn(),
+    /// Every hook call made into managed code, so a test can tell a call that
+    /// was skipped from one that was made and returned at once.
+    dispatched: Cell<u64>,
 }
 
 /// The .NET runtime an exported game carries, beside its `Orrin.dll`: a
@@ -1431,7 +1496,8 @@ impl ScriptHost {
         #[rustfmt::skip]
         let (
             init, create_fn, start_fn, update_fn, enable_fn, disable_fn,
-            collision_enter_fn, collision_exit_fn, trigger_enter_fn, trigger_exit_fn, pointer_fn,
+            collision_enter_fn, collision_exit_fn, trigger_enter_fn, trigger_exit_fn,
+            fixed_update_fn, collision_stay_fn, trigger_stay_fn, pointer_fn,
             tween_complete_fn, story_names_fn, story_build_fn, destroy,
             game_load_fn, game_commit_fn, game_rollback_fn, game_unload_fn,
             state_capture_fn, state_apply_fn, state_discard_fn,
@@ -1443,7 +1509,7 @@ impl ScriptHost {
                     pdcstr!("Orrin.Bootstrap, Orrin"),
                     pdcstr!("Init"),
                 )?,
-                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(CEntity, *const c_char) -> u64>(
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(CEntity, *const c_char, *mut u32) -> u64>(
                     pdcstr!("Orrin.Behaviours, Orrin"),
                     pdcstr!("Create"),
                 )?,
@@ -1478,6 +1544,18 @@ impl ScriptHost {
                 *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision) -> u8>(
                     pdcstr!("Orrin.Behaviours, Orrin"),
                     pdcstr!("TriggerExit"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, f32) -> u8>(
+                    pdcstr!("Orrin.Behaviours, Orrin"),
+                    pdcstr!("FixedUpdate"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision) -> u8>(
+                    pdcstr!("Orrin.Behaviours, Orrin"),
+                    pdcstr!("CollisionStay"),
+                )?,
+                *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, *const CCollision) -> u8>(
+                    pdcstr!("Orrin.Behaviours, Orrin"),
+                    pdcstr!("TriggerStay"),
                 )?,
                 *loader.get_function_with_unmanaged_callers_only::<extern "system" fn(u64, u32, *const CPointerEvent) -> u8>(
                     pdcstr!("Orrin.Behaviours, Orrin"),
@@ -1577,6 +1655,9 @@ impl ScriptHost {
             collision_exit_fn,
             trigger_enter_fn,
             trigger_exit_fn,
+            fixed_update_fn,
+            collision_stay_fn,
+            trigger_stay_fn,
             pointer_fn,
             tween_complete_fn,
             story_names_fn,
@@ -1588,6 +1669,7 @@ impl ScriptHost {
             state_capture_fn,
             state_apply_fn,
             state_discard_fn,
+            dispatched: Cell::new(0),
         })
     }
 
@@ -1640,51 +1722,79 @@ impl ScriptHost {
     }
 
     /// Instantiate a `Behaviour` by assembly-qualified type name, attached to
-    /// `entity`. Returns its `GCHandle` (as `u64`), or `0` on failure.
-    pub fn create(&self, entity: CEntity, type_name: &CStr) -> u64 {
-        (self.create_fn)(entity, type_name.as_ptr())
+    /// `entity`. Returns its `GCHandle` (as `u64`), or `0` on failure, and the
+    /// optional hooks its type overrides.
+    pub fn create(&self, entity: CEntity, type_name: &CStr) -> (u64, Hooks) {
+        let mut hooks = 0u32;
+        let handle = (self.create_fn)(entity, type_name.as_ptr(), &mut hooks);
+        (handle, Hooks::from_bits(hooks))
+    }
+
+    /// How many hook calls have been made into managed code since boot.
+    pub fn dispatched(&self) -> u64 {
+        self.dispatched.get()
+    }
+
+    fn dispatch<R>(&self, call: impl FnOnce() -> R) -> R {
+        self.dispatched.set(self.dispatched.get() + 1);
+        call()
     }
 
     // Each hook returns `true` if the C# side caught an exception (the script is
     // now faulted and should not be dispatched to again until the fault clears).
 
     pub fn start(&self, handle: u64) -> bool {
-        (self.start_fn)(handle) != 0
+        self.dispatch(|| (self.start_fn)(handle) != 0)
     }
 
     pub fn update(&self, handle: u64, delta_time: f32) -> bool {
-        (self.update_fn)(handle, delta_time) != 0
+        self.dispatch(|| (self.update_fn)(handle, delta_time) != 0)
     }
 
     pub fn enable(&self, handle: u64) -> bool {
-        (self.enable_fn)(handle) != 0
+        self.dispatch(|| (self.enable_fn)(handle) != 0)
     }
 
     pub fn disable(&self, handle: u64) -> bool {
-        (self.disable_fn)(handle) != 0
+        self.dispatch(|| (self.disable_fn)(handle) != 0)
+    }
+
+    /// Only for a behaviour whose [`Hooks`] has [`Hooks::FIXED_UPDATE`].
+    pub fn fixed_update(&self, handle: u64, step: f32) -> bool {
+        self.dispatch(|| (self.fixed_update_fn)(handle, step) != 0)
     }
 
     pub fn collision_enter(&self, handle: u64, collision: &CCollision) -> bool {
-        (self.collision_enter_fn)(handle, collision) != 0
+        self.dispatch(|| (self.collision_enter_fn)(handle, collision) != 0)
+    }
+
+    /// Only for a behaviour whose [`Hooks`] has [`Hooks::COLLISION_STAY`].
+    pub fn collision_stay(&self, handle: u64, collision: &CCollision) -> bool {
+        self.dispatch(|| (self.collision_stay_fn)(handle, collision) != 0)
     }
 
     pub fn collision_exit(&self, handle: u64, collision: &CCollision) -> bool {
-        (self.collision_exit_fn)(handle, collision) != 0
+        self.dispatch(|| (self.collision_exit_fn)(handle, collision) != 0)
     }
 
     /// The trigger half of the same pair: a contact where either side is a
     /// trigger goes here instead.
     pub fn trigger_enter(&self, handle: u64, collision: &CCollision) -> bool {
-        (self.trigger_enter_fn)(handle, collision) != 0
+        self.dispatch(|| (self.trigger_enter_fn)(handle, collision) != 0)
+    }
+
+    /// Only for a behaviour whose [`Hooks`] has [`Hooks::TRIGGER_STAY`].
+    pub fn trigger_stay(&self, handle: u64, collision: &CCollision) -> bool {
+        self.dispatch(|| (self.trigger_stay_fn)(handle, collision) != 0)
     }
 
     pub fn trigger_exit(&self, handle: u64, collision: &CCollision) -> bool {
-        (self.trigger_exit_fn)(handle, collision) != 0
+        self.dispatch(|| (self.trigger_exit_fn)(handle, collision) != 0)
     }
 
     /// Offer pointer event `kind` (C# `Orrin.PointerEventKind`) to a behaviour.
     pub fn pointer(&self, handle: u64, kind: u32, event: &CPointerEvent) -> Delivery {
-        match (self.pointer_fn)(handle, kind, event) {
+        match self.dispatch(|| (self.pointer_fn)(handle, kind, event)) {
             0 => Delivery::Handled,
             1 => Delivery::Faulted,
             _ => Delivery::Unhandled,
@@ -1764,5 +1874,6 @@ mod tests {
         assert_eq!(size_of::<CAudioSource>(), 44);
         assert_eq!(size_of::<CSound>(), 60);
         assert_eq!(size_of::<CMeshRenderer>(), 32);
+        assert_eq!(size_of::<CCollision>(), 44);
     }
 }

@@ -11,6 +11,21 @@
 //! scripts know. Whichever body wakes first, Jolt re-reports the contact on
 //! that step if it still holds, and a dormant pair it does not re-report has
 //! genuinely parted and exits then.
+//!
+//! **A pair stays on every step after the one it entered on**, up to the one
+//! it exits on, and only while it is not dormant: a pile at rest is still
+//! touching, but nothing is happening to it, and reporting thousands of
+//! sleeping pairs every step would make a settled pile cost what a falling one
+//! does. Stays are recorded only when [`CollisionState::report_stays`] asks,
+//! because most pairs have nobody listening and each would be an event a step.
+//!
+//! **A contact carries the closing velocity**, `a`'s velocity at the point
+//! less `b`'s, taken in the callback — before the step's solver has stopped
+//! the bodies, which is what makes it the speed of the impact rather than of
+//! what is left after it. Jolt has already applied the step's gravity by
+//! then, so a pair at rest reads `g * step` rather than zero.
+//!
+//! [`CollisionState::report_stays`]: super::CollisionState::report_stays
 
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +43,7 @@ pub(super) enum Change {
         b: BodyId,
         point: Vec3,
         normal: Vec3,
+        relative_velocity: Vec3,
         persisted: bool,
     },
     Part {
@@ -42,16 +58,21 @@ pub(super) struct Recorder(pub(super) Arc<Mutex<Vec<Change>>>);
 
 impl Recorder {
     fn touch(&self, a: &Body, b: &Body, manifold: &ContactManifold<'_>, persisted: bool) {
-        let point = if manifold.relative_points_on1.is_empty() {
+        let point = from_jolt(if manifold.relative_points_on1.is_empty() {
             manifold.base_offset
         } else {
             manifold.world_point_on1(0)
+        });
+        let velocity_at = |body: &Body| {
+            let arm = point - from_jolt(body.center_of_mass_position());
+            from_jolt(body.linear_velocity()) + from_jolt(body.angular_velocity()).cross(arm)
         };
         self.0.lock().unwrap().push(Change::Touch {
             a: a.id(),
             b: b.id(),
-            point: from_jolt(point),
+            point,
             normal: from_jolt(manifold.world_space_normal),
+            relative_velocity: velocity_at(a) - velocity_at(b),
             persisted,
         });
     }
@@ -92,6 +113,8 @@ struct Touching {
     bodies: (BodyId, BodyId),
     trigger: bool,
     dormant: bool,
+    /// Entered on the step in progress, so not yet staying.
+    entered: bool,
 }
 
 /// Which pairs are touching, and through how many sub-shape contacts.
@@ -119,15 +142,18 @@ impl Pairs {
                     b: b_id,
                     point,
                     normal,
+                    relative_velocity,
                     persisted,
                 } => {
                     let (Some(&a), Some(&b)) = (entities.get(&a_id), entities.get(&b_id)) else {
                         continue;
                     };
                     let key = pair_key(a, b);
+                    let sign = if key.0 == a { 1.0 } else { -1.0 };
                     let contact = Contact {
                         point,
-                        normal: if key.0 == a { normal } else { -normal },
+                        normal: normal * sign,
+                        relative_velocity: relative_velocity * sign,
                     };
                     let touching = self.touching.entry(key).or_insert(Touching {
                         contact,
@@ -135,6 +161,7 @@ impl Pairs {
                         bodies: (a_id, b_id),
                         trigger: bodies.is_sensor(a_id) || bodies.is_sensor(b_id),
                         dormant: false,
+                        entered: false,
                     });
                     touching.contact = contact;
                     // Re-reported: whichever body woke, the pair still holds.
@@ -142,6 +169,7 @@ impl Pairs {
                     if !persisted {
                         touching.count += 1;
                         if touching.count == 1 && !woke {
+                            touching.entered = true;
                             events.push(CollisionEvent::new(
                                 CollisionEventKind::Enter,
                                 key,
@@ -178,14 +206,28 @@ impl Pairs {
     }
 
     /// End of a step: a dormant pair with a body awake again that Jolt did not
-    /// re-report this step — which would have cleared it — has parted.
-    pub(super) fn settle(&mut self, bodies: &BodyInterface<'_>, events: &mut Vec<CollisionEvent>) {
+    /// re-report this step — which would have cleared it — has parted. Every
+    /// other pair that is awake and did not enter on this step stays.
+    pub(super) fn settle(
+        &mut self,
+        bodies: &BodyInterface<'_>,
+        events: &mut Vec<CollisionEvent>,
+        report_stays: bool,
+    ) {
         self.touching.retain(|&pair, touching| {
             let (a, b) = touching.bodies;
             let parted = touching.dormant && (bodies.is_active(a) || bodies.is_active(b));
+            let entered = std::mem::take(&mut touching.entered);
             if parted {
                 events.push(CollisionEvent::new(
                     CollisionEventKind::Exit,
+                    pair,
+                    touching.contact,
+                    touching.trigger,
+                ));
+            } else if report_stays && !touching.dormant && !entered {
+                events.push(CollisionEvent::new(
+                    CollisionEventKind::Stay,
                     pair,
                     touching.contact,
                     touching.trigger,

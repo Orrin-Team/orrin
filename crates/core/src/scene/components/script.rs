@@ -31,10 +31,18 @@ use orrin_ecs::{Entity, World};
 /// because a hot reload has to re-instantiate the script *after* the managed
 /// object is gone: by the time the new assembly is live, the only surviving
 /// record of what used to be attached here is this string.
+///
+/// `hooks` is which optional hooks the type overrides, as the managed side
+/// reported when it built the instance: the per-step ones are skipped for a
+/// type without them. `type_index` is the type's row in the script host's
+/// per-type table, resolved once here so that timing a call indexes rather
+/// than hashes a name.
 #[derive(Debug)]
 pub struct ScriptComponent {
     pub handle: u64,
     pub type_name: String,
+    pub hooks: orrin_script::Hooks,
+    pub type_index: u32,
     pub started: bool,
     pub enabled: bool,
     pub active: bool,

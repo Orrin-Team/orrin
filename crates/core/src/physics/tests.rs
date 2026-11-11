@@ -1161,3 +1161,257 @@ fn a_push_waits_for_a_rigid_body_added_after_it() {
         "the dropped push moved a wall"
     );
 }
+
+/// What `Scripting::run_physics` does each frame while a Behaviour overrides
+/// OnFixedUpdate.
+fn frame_with(world: &mut World, delta: f32, before_step: &mut dyn FnMut(&mut World, f32)) {
+    propagate_transforms(world);
+    run_with(world, delta, Some(before_step));
+}
+
+/// Once per step and only then: a frame shorter than a step takes none, and
+/// one three steps long takes three, each told the step's length.
+#[test]
+fn a_callback_runs_once_before_each_step_a_frame_takes() {
+    let mut world = test_world();
+    spawn(&mut world, Vec3::ZERO, cube(0.5), Some(weightless()));
+
+    let mut steps = Vec::new();
+    let mut counts = Vec::new();
+    for delta in [0.5 * STEP, STEP, 3.0 * STEP] {
+        let before = steps.len();
+        frame_with(&mut world, delta, &mut |_, step| steps.push(step));
+        counts.push(steps.len() - before);
+    }
+
+    assert_eq!(counts, [0, 1, 3]);
+    assert!(steps.iter().all(|&step| step == STEP), "{steps:?}");
+}
+
+/// A callback runs between steps, so the transform it reads is the last
+/// step's result rather than the frame's interpolated pose, and what it asks
+/// of a body lands in the step that follows it.
+#[test]
+fn a_callback_reads_the_last_step_and_its_push_lands_in_the_next() {
+    let mut world = test_world();
+    let body = spawn(&mut world, Vec3::ZERO, cube(0.5), Some(frictionless(1.0)));
+    frame(&mut world, STEP);
+
+    let mut seen = Vec::new();
+    frame_with(&mut world, 3.0 * STEP, &mut |world, _| {
+        seen.push(position(world, body).x);
+        if seen.len() == 1 {
+            assert!(set_velocity(world, body, Some(Vec3::X), None));
+        }
+    });
+
+    assert_eq!(seen.len(), 3);
+    for (step, x) in seen.iter().enumerate() {
+        assert!(
+            (x - step as f32 * STEP).abs() < 1e-5,
+            "callback {step} read x = {x}: {seen:?}"
+        );
+    }
+}
+
+/// From a callback a Force is held for the one step that follows it, so a
+/// second of pushing before every step is the same push at any frame rate:
+/// force over mass, times the steps it was held for.
+#[test]
+fn a_force_asked_before_a_step_is_held_for_that_step() {
+    let pushed = |fps: f32| {
+        let mut world = test_world();
+        let body = spawn(&mut world, Vec3::ZERO, cube(0.5), Some(frictionless(2.0)));
+        frame(&mut world, 1.0 / fps);
+        let mut steps = 0u32;
+        for _ in 0..fps.round() as u32 {
+            frame_with(&mut world, 1.0 / fps, &mut |world, _| {
+                steps += 1;
+                assert!(add_force(
+                    world,
+                    body,
+                    Vec3::new(10.0, 0.0, 0.0),
+                    ForceMode::Force
+                ));
+            });
+        }
+        (velocity_of(&world, body).x, steps)
+    };
+
+    for fps in [30.0, 144.0] {
+        let (v, steps) = pushed(fps);
+        let expected = 10.0 / 2.0 * steps as f32 * STEP;
+        assert!(
+            (v - expected).abs() < 1e-3,
+            "{fps} fps: {v} m/s after {steps} steps, not {expected}"
+        );
+        assert!(steps.abs_diff(60) <= 1, "{fps} fps took {steps} steps");
+    }
+}
+
+/// A transform written from a callback moves the body before the step it
+/// precedes, keeping its velocity, as one written between frames does before
+/// the next frame's.
+#[test]
+fn a_transform_written_before_a_step_teleports_the_body_for_it() {
+    let mut world = test_world();
+    let body = spawn(&mut world, Vec3::ZERO, cube(0.5), Some(frictionless(1.0)));
+    frame(&mut world, STEP);
+    set_velocity(&world, body, Some(Vec3::X), None);
+
+    let mut seen = Vec::new();
+    frame_with(&mut world, 2.0 * STEP, &mut |world, _| {
+        seen.push(position(world, body).x);
+        if seen.len() == 1 {
+            world.get_mut::<LocalTransform>(body).unwrap().translation.x = 10.0;
+        }
+    });
+
+    assert!((seen[1] - (10.0 + STEP)).abs() < 1e-4, "{seen:?}");
+    let v = velocity_of(&world, body);
+    assert!(
+        (v.x - 1.0).abs() < 1e-4,
+        "the teleport lost its velocity: {v}"
+    );
+}
+
+fn report_stays(world: &World) {
+    world.resource_mut::<CollisionState>().report_stays = true;
+}
+
+/// A ball crossing a trigger at 2 m/s, three steps a frame.
+fn crossing(world: &mut World) -> (Entity, Entity) {
+    let trigger = spawn(world, Vec3::ZERO, cube(1.0), None);
+    edit_collider(world, trigger, |c| c.is_trigger = true);
+    let ball = spawn(
+        world,
+        Vec3::new(-2.0, 0.0, 0.0),
+        ColliderShape::Sphere { radius: 0.25 },
+        Some(frictionless(1.0)),
+    );
+    frame(world, STEP);
+    set_velocity(world, ball, Some(Vec3::new(2.0, 0.0, 0.0)), None);
+    (trigger, ball)
+}
+
+/// A pair still touching after the step it entered on is reported again on
+/// every step after, up to the one it exits on — and only when asked, since
+/// most pairs have nobody listening.
+#[test]
+fn a_touching_pair_stays_each_step_between_enter_and_exit() {
+    let mut world = test_world();
+    let (trigger, ball) = crossing(&mut world);
+    report_stays(&world);
+
+    let mut frames = Vec::new();
+    for _ in 0..40 {
+        frame(&mut world, 3.0 * STEP);
+        frames.push(events(&world));
+        let collisions = world.resource::<CollisionState>();
+        assert!(collisions.events.iter().all(|event| event.trigger));
+    }
+
+    let entered = frames
+        .iter()
+        .position(|events| events.contains(&(CollisionEventKind::Enter, trigger, ball)))
+        .expect("the ball never entered");
+    let exited = frames
+        .iter()
+        .position(|events| events.contains(&(CollisionEventKind::Exit, trigger, ball)))
+        .expect("the ball never left");
+    assert!(exited > entered + 1, "{frames:?}");
+    for events in &frames[entered + 1..exited] {
+        assert_eq!(
+            events,
+            &[(CollisionEventKind::Stay, trigger, ball); 3],
+            "{frames:?}"
+        );
+    }
+    let all: Vec<_> = frames.concat();
+    assert_eq!(
+        all.first(),
+        Some(&(CollisionEventKind::Enter, trigger, ball))
+    );
+    assert_eq!(all.last(), Some(&(CollisionEventKind::Exit, trigger, ball)));
+
+    let mut world = test_world();
+    crossing(&mut world);
+    for _ in 0..40 {
+        frame(&mut world, 3.0 * STEP);
+        assert!(
+            !events(&world)
+                .iter()
+                .any(|(kind, ..)| *kind == CollisionEventKind::Stay),
+            "a stay nobody asked for was reported"
+        );
+    }
+}
+
+/// A pair asleep against each other is dormant: still touching, so it never
+/// exits, and nothing happening to it, so it does not stay either.
+#[test]
+fn a_dormant_pair_does_not_stay() {
+    let mut world = test_world();
+    let floor = floor(&mut world);
+    let resting = spawn(
+        &mut world,
+        Vec3::new(0.0, 0.5, 0.0),
+        cube(0.5),
+        Some(RigidBody::default()),
+    );
+    report_stays(&world);
+
+    let mut stays = Vec::new();
+    for _ in 0..180 {
+        frame(&mut world, STEP);
+        let events = events(&world);
+        assert!(!events.contains(&(CollisionEventKind::Exit, floor, resting)));
+        stays.push(
+            events
+                .iter()
+                .filter(|(kind, ..)| *kind == CollisionEventKind::Stay)
+                .count(),
+        );
+    }
+
+    assert!(stays[1..10].iter().all(|&n| n == 1), "{stays:?}");
+    assert!(stays[120..].iter().all(|&n| n == 0), "{stays:?}");
+}
+
+/// A contact says how fast the pair was closing, a's velocity at the point
+/// less b's, so its component along the normal (a toward b) is the closing
+/// speed.
+#[test]
+fn a_contact_carries_its_closing_velocity() {
+    let mut world = test_world();
+    let wall = spawn(&mut world, Vec3::new(3.0, 0.0, 0.0), cube(0.5), None);
+    let body = spawn(&mut world, Vec3::ZERO, cube(0.5), Some(frictionless(1.0)));
+    frame(&mut world, STEP);
+    set_velocity(&world, body, Some(Vec3::new(4.0, 0.0, 0.0)), None);
+
+    let mut enter = None;
+    for _ in 0..60 {
+        frame(&mut world, STEP);
+        let collisions = world.resource::<CollisionState>();
+        enter = collisions
+            .events
+            .iter()
+            .find(|event| event.kind == CollisionEventKind::Enter)
+            .copied();
+        if enter.is_some() {
+            break;
+        }
+    }
+
+    let enter = enter.expect("the body never reached the wall");
+    let ours = if enter.a == body { 1.0 } else { -1.0 };
+    assert!(enter.a == wall || enter.b == wall);
+    let expected = Vec3::new(4.0, 0.0, 0.0) * ours;
+    assert!(
+        (enter.relative_velocity - expected).length() < 0.05,
+        "relative velocity {} at the enter, not {expected}",
+        enter.relative_velocity
+    );
+    let closing = enter.relative_velocity.dot(enter.normal);
+    assert!((closing - 4.0).abs() < 0.05, "closing at {closing} m/s");
+}

@@ -4,11 +4,11 @@
 //! engine's own `LocalTransform`, so they're defined here and assembled into the
 //! table with `..orrin_script::default_api()`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString, c_char};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use glam::{Mat4, Quat, Vec3};
 
@@ -18,7 +18,7 @@ use orrin_registry::{
     Value, ValueError,
 };
 use orrin_script::{
-    CCamera, CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi, ScriptHost,
+    CCamera, CCollision, CEntity, CTransform, GameAssemblyStatus, Hooks, OrrinApi, ScriptHost,
 };
 
 use crate::asset_db::{AssetDatabase, AssetKind, LoadState};
@@ -2970,6 +2970,120 @@ fn build_api() -> OrrinApi {
     }
 }
 
+/// Time spent in managed code per Behaviour type, every hook included, for
+/// the Scripts panel's "Time each script". A world resource.
+///
+/// A switch of its own, off by default, because it perturbs what it measures:
+/// on, every dispatch is bracketed by two clock reads, which on a frame of ten
+/// thousand idle Behaviours is a large share of what the tick costs. Off, the
+/// dispatch path reads no clock at all — the tick looks at `enabled` once and
+/// each call is then the call. The time is accumulated per type through the
+/// index each instance resolved at attach ([`ScriptComponent::type_index`]),
+/// not by name per call.
+#[derive(Default)]
+pub struct ScriptTimings {
+    pub enabled: bool,
+    /// By type index; cleared whenever the switch is found off.
+    rows: Vec<TimingRow>,
+}
+
+/// Frames the average is taken over: about a second at 60 fps.
+const TIMING_WINDOW: usize = 60;
+
+pub struct TimingRow {
+    /// In the form [`canonical_type_name`] gives.
+    pub type_name: String,
+    pub last_frame: Duration,
+    window: [Duration; TIMING_WINDOW],
+    next: usize,
+    filled: usize,
+    sum: Duration,
+}
+
+impl TimingRow {
+    fn new(type_name: String) -> Self {
+        Self {
+            type_name,
+            last_frame: Duration::ZERO,
+            window: [Duration::ZERO; TIMING_WINDOW],
+            next: 0,
+            filled: 0,
+            sum: Duration::ZERO,
+        }
+    }
+
+    fn push(&mut self, frame: Duration) {
+        self.sum = self.sum - self.window[self.next] + frame;
+        self.window[self.next] = frame;
+        self.next = (self.next + 1) % TIMING_WINDOW;
+        self.filled = (self.filled + 1).min(TIMING_WINDOW);
+        self.last_frame = frame;
+    }
+
+    /// Over the last [`TIMING_WINDOW`] frames, or as many as there have been.
+    pub fn average(&self) -> Duration {
+        self.sum / self.filled.max(1) as u32
+    }
+}
+
+impl ScriptTimings {
+    pub fn rows(&self) -> impl Iterator<Item = &TimingRow> {
+        self.rows.iter()
+    }
+
+    fn record(&mut self, type_index: usize, type_name: &str, frame: Duration) {
+        while self.rows.len() <= type_index {
+            self.rows.push(TimingRow::new(String::new()));
+        }
+        let row = &mut self.rows[type_index];
+        if row.type_name.is_empty() {
+            row.type_name = type_name.to_owned();
+        }
+        row.push(frame);
+    }
+}
+
+/// Managed time per type index for the frame in progress, taken out of
+/// [`Scripting`] for a dispatch window. Off, a dispatch is the call alone.
+struct Clock {
+    on: bool,
+    spent: Vec<Duration>,
+}
+
+impl Clock {
+    fn time<R>(&mut self, type_index: u32, call: impl FnOnce() -> R) -> R {
+        if !self.on {
+            return call();
+        }
+        let start = Instant::now();
+        let result = call();
+        if let Some(spent) = self.spent.get_mut(type_index as usize) {
+            *spent += start.elapsed();
+        }
+        result
+    }
+}
+
+/// Every Behaviour type attached this session, by the index its instances
+/// carry. Only grows, so an index stays valid across a reload.
+#[derive(Default)]
+struct Types {
+    index: FxHashMap<String, u32>,
+    names: Vec<String>,
+}
+
+impl Types {
+    fn resolve(&mut self, type_name: &str) -> u32 {
+        if let Some(&index) = self.index.get(type_name) {
+            return index;
+        }
+        let index = self.names.len() as u32;
+        self.names.push(type_name.to_owned());
+        self.index.insert(type_name.to_owned(), index);
+        index
+    }
+}
+
 /// What a reload did, for the editor console.
 ///
 /// Failures are deliberately non-fatal and non-destructive: a reload that can't
@@ -3041,11 +3155,21 @@ impl ReloadOutcome {
 struct Pending {
     entity: Entity,
     handle: u64,
+    hooks: Hooks,
+    type_index: u32,
     started: bool,
     enabled: bool,
     active: bool,
     /// Set the moment a hook throws this tick, so the later phases (collision,
     /// update) skip a script that faulted during activation.
+    faulted: bool,
+}
+
+/// A Behaviour `OnFixedUpdate` is dispatched to this frame.
+struct Stepped {
+    entity: Entity,
+    handle: u64,
+    type_index: u32,
     faulted: bool,
 }
 
@@ -3073,6 +3197,18 @@ pub struct Scripting {
     pointer_events: RefCell<crate::ui::events::UiEvents>,
     /// The tweens that finished since the last tick, likewise.
     finished_tweens: RefCell<Vec<crate::ui::tween::TweenId>>,
+    /// `run_physics`'s scratch, kept for the allocation as `pending` is.
+    stepped: RefCell<Vec<Stepped>>,
+    /// Whether some live Behaviour's type overrides OnFixedUpdate, or a Stay
+    /// callback. Set by an attach, and recomputed by every tick's collection,
+    /// which sees them all: so never false while one exists, and the physics
+    /// phase of a world with none pays no sweep over every Behaviour to find
+    /// that out, and Jolt's resting pairs no Stay events nobody reads.
+    fixed_wanted: Cell<bool>,
+    stays_wanted: Cell<bool>,
+    types: RefCell<Types>,
+    /// Managed time per type for the frame in progress; see [`ScriptTimings`].
+    spent: RefCell<Vec<Duration>>,
 }
 
 impl Scripting {
@@ -3186,6 +3322,11 @@ impl Scripting {
             routing: RefCell::new(FxHashMap::default()),
             pointer_events: RefCell::new(crate::ui::events::UiEvents::default()),
             finished_tweens: RefCell::new(Vec::new()),
+            stepped: RefCell::new(Vec::new()),
+            fixed_wanted: Cell::new(false),
+            stays_wanted: Cell::new(false),
+            types: RefCell::new(Types::default()),
+            spent: RefCell::new(Vec::new()),
         };
         match scripting.stage() {
             Ok(()) => {}
@@ -3394,7 +3535,7 @@ impl Scripting {
         let Ok(name) = CString::new(type_name.as_str()) else {
             return 0;
         };
-        let handle = self.host.create(
+        let (handle, hooks) = self.host.create(
             CEntity {
                 index: entity.index,
                 generation: entity.generation,
@@ -3411,9 +3552,18 @@ impl Scripting {
             );
         }
         if handle != 0 {
+            if hooks.contains(Hooks::FIXED_UPDATE) {
+                self.fixed_wanted.set(true);
+            }
+            if hooks.intersects(Hooks::COLLISION_STAY | Hooks::TRIGGER_STAY) {
+                self.stays_wanted.set(true);
+            }
+            let type_index = self.types.borrow_mut().resolve(&type_name);
             let script = ScriptComponent {
                 handle,
                 type_name,
+                hooks,
+                type_index,
                 started,
                 // Desired-on from birth; `active` stays false until the
                 // first tick actually dispatches OnEnable.
@@ -3572,20 +3722,133 @@ impl Scripting {
         }
     }
 
+    /// The frame's physics phase with scripts in it: [`physics::run`], with
+    /// `OnFixedUpdate` dispatched before each step it takes to every active,
+    /// started, unfaulted Behaviour whose type overrides it, in the order
+    /// [`tick`](Self::tick) dispatches OnUpdate. A Behaviour attached since the
+    /// last tick has not started, so it is first told of a step on the frame
+    /// after its OnStart.
+    ///
+    /// Each step's dispatch is a window of its own, opened inside the physics
+    /// callback with no world borrow held. Structural changes queued there land
+    /// once, after the frame's last step and before the tick: a body cannot be
+    /// built or dropped between two steps anyway (see the `physics` module), and
+    /// a scene load applied there would despawn the world under the step loop.
+    ///
+    /// [`physics::run`]: crate::physics::run
+    pub fn run_physics(&self, world: &mut World, registry: &Registry, delta: f32) {
+        if let Some(mut collisions) = world.get_resource_mut::<CollisionState>() {
+            collisions.report_stays = self.stays_wanted.get();
+        }
+        let mut stepped = self.stepped.take();
+        stepped.clear();
+        if self.fixed_wanted.get() {
+            world.query::<&Scripts>().for_each(|entity, scripts| {
+                stepped.extend(
+                    scripts
+                        .iter()
+                        .filter(|script| {
+                            script.hooks.contains(Hooks::FIXED_UPDATE)
+                                && script.active
+                                && script.started
+                                && !script.faulted
+                        })
+                        .map(|script| Stepped {
+                            entity,
+                            handle: script.handle,
+                            type_index: script.type_index,
+                            faulted: false,
+                        }),
+                )
+            });
+        }
+        if stepped.is_empty() {
+            crate::physics::run(world, delta);
+            self.stepped.replace(stepped);
+            return;
+        }
+
+        let mut clock = self.clock(world);
+        crate::physics::run_with(
+            world,
+            delta,
+            Some(&mut |world: &mut World, step: f32| {
+                crate::profile_scope!("fixed update");
+                orrin_script::with_active_world(world, || {
+                    for script in stepped.iter_mut().filter(|script| !script.faulted) {
+                        let host = &self.host;
+                        if clock.time(script.type_index, || host.fixed_update(script.handle, step))
+                        {
+                            script.faulted = true;
+                        }
+                    }
+                });
+            }),
+        );
+        self.spent.replace(clock.spent);
+
+        for script in stepped.iter().filter(|script| script.faulted) {
+            if let Some(mut scripts) = world.get_mut::<Scripts>(script.entity)
+                && let Some(component) = scripts.iter_mut().find(|c| c.handle == script.handle)
+            {
+                component.faulted = true;
+            }
+        }
+        self.apply_commands(world, registry);
+        self.stepped.replace(stepped);
+    }
+
+    /// The frame's timing accumulator, out of `self` for a dispatch window and
+    /// sized to every type attached so far while the switch is on.
+    fn clock(&self, world: &World) -> Clock {
+        let on = world
+            .get_resource::<ScriptTimings>()
+            .is_some_and(|timings| timings.enabled);
+        let mut spent = self.spent.take();
+        if on {
+            spent.resize(self.types.borrow().names.len(), Duration::ZERO);
+        }
+        Clock { on, spent }
+    }
+
+    /// Hand the frame's managed time to [`ScriptTimings`] and start the next.
+    fn publish_timings(&self, world: &World) {
+        let mut spent = self.spent.borrow_mut();
+        let Some(mut timings) = world.get_resource_mut::<ScriptTimings>() else {
+            spent.clear();
+            return;
+        };
+        if !timings.enabled {
+            timings.rows.clear();
+            spent.clear();
+            return;
+        }
+        let types = self.types.borrow();
+        for (index, time) in spent.iter_mut().enumerate() {
+            timings.record(index, &types.names[index], std::mem::take(time));
+        }
+    }
+
     /// Tick every script. Collect handles first, drop the world borrow, then
     /// dispatch — so the ABI's `&mut World` reconstruction never aliases.
     ///
     /// Dispatch order inside the window mirrors Unity: activation transitions
-    /// (OnEnable/OnStart/OnDisable), then this frame's collision callbacks,
-    /// then its pointer events, then OnUpdate. Within each phase an entity's
-    /// Behaviours run in attach order.
+    /// (OnEnable/OnStart/OnDisable), then this frame's collision callbacks —
+    /// enter, stay and exit, in the order the steps raised them — then its
+    /// pointer events, then OnUpdate. Within each phase an entity's Behaviours
+    /// run in attach order. OnFixedUpdate is not here: it runs in the physics
+    /// phase, before this, through [`run_physics`](Self::run_physics).
     pub fn tick(&self, world: &mut World, registry: &Registry, delta_time: f32) {
         // First, and whether or not anything else runs: a callback is game
         // code with no behaviour behind it, and a story may have nothing else.
         let finished = self.finish_tweens(world);
         let mut pending = self.pending.take();
         pending.clear();
+        let mut overridden = Hooks::NONE;
         world.query::<&Scripts>().for_each(|entity, scripts| {
+            for script in scripts.iter() {
+                overridden |= script.hooks;
+            }
             // Already-faulted scripts are inert: never collected, never
             // dispatched to, until something clears the flag.
             pending.extend(
@@ -3595,6 +3858,8 @@ impl Scripting {
                     .map(|script| Pending {
                         entity,
                         handle: script.handle,
+                        hooks: script.hooks,
+                        type_index: script.type_index,
                         started: script.started,
                         enabled: script.enabled,
                         active: script.active,
@@ -3602,21 +3867,28 @@ impl Scripting {
                     }),
             )
         });
+        self.fixed_wanted
+            .set(overridden.contains(Hooks::FIXED_UPDATE));
+        self.stays_wanted
+            .set(overridden.intersects(Hooks::COLLISION_STAY | Hooks::TRIGGER_STAY));
         if pending.is_empty() {
             self.pending.replace(pending);
             if finished {
                 self.apply_commands(world, registry);
             }
+            self.publish_timings(world);
             return;
         }
 
         // Take this frame's collision events before the dispatch window opens
         // — the resource borrow must not be held while C# can re-enter the
-        // world. Leftovers on an early return are cleared by the next
-        // `physics::run`.
-        let events: Vec<CollisionEvent> = world
+        // world — and give the buffer back afterwards, so the steps refill it
+        // rather than a new one each frame. Leftovers on an early return are
+        // cleared by the next `physics::run`.
+        let mut events: Vec<CollisionEvent> = world
             .get_resource_mut::<CollisionState>()
             .map_or_else(Vec::new, |mut state| std::mem::take(&mut state.events));
+        let mut clock = self.clock(world);
 
         // Built here and not inside the window, and only when there is
         // something to route: a tick with no collisions should not pay for an
@@ -3638,46 +3910,49 @@ impl Scripting {
         }
 
         orrin_script::with_active_world(world, || {
+            let host = &self.host;
             for script in &mut pending {
+                let (handle, type_index) = (script.handle, script.type_index);
                 if script.enabled && !script.active {
                     // Mirror the managed side, which flips its own `Active`
                     // before invoking the hook: if OnEnable/OnStart throws, the
                     // state still advances and we just stop dispatching.
                     script.active = true;
-                    if self.host.enable(script.handle) {
+                    if clock.time(type_index, || host.enable(handle)) {
                         script.faulted = true;
                         continue;
                     }
                     if !script.started {
                         script.started = true;
-                        if self.host.start(script.handle) {
+                        if clock.time(type_index, || host.start(handle)) {
                             script.faulted = true;
                         }
                     }
                 } else if !script.enabled && script.active {
                     script.active = false;
-                    if self.host.disable(script.handle) {
+                    if clock.time(type_index, || host.disable(handle)) {
                         script.faulted = true;
                     }
                 }
             }
 
             // Route each event to every script on both participants. The
-            // stored normal points a → b, so b's callbacks see it negated —
-            // "from me toward the other", both sides.
+            // stored normal and relative velocity are a's, so b's callbacks
+            // see both negated — "from me toward the other", both sides.
             for event in &events {
                 for (target, other, flip) in [(event.a, event.b, false), (event.b, event.a, true)] {
                     let Some(&(start, end)) = routing.get(&target) else {
                         continue;
                     };
-                    let normal = if flip { -event.normal } else { event.normal };
+                    let sign = if flip { -1.0 } else { 1.0 };
                     let collision = CCollision {
                         other: CEntity {
                             index: other.index,
                             generation: other.generation,
                         },
                         point: event.point.to_array(),
-                        normal: normal.to_array(),
+                        normal: (event.normal * sign).to_array(),
+                        relative_velocity: (event.relative_velocity * sign).to_array(),
                     };
                     // The activation flags are re-read per event, since a fault
                     // raised by an earlier one must stop delivery here.
@@ -3685,21 +3960,28 @@ impl Scripting {
                         if !script.active || script.faulted {
                             continue;
                         }
-                        let faulted = match (event.kind, event.trigger) {
-                            (CollisionEventKind::Enter, false) => {
-                                self.host.collision_enter(script.handle, &collision)
-                            }
-                            (CollisionEventKind::Exit, false) => {
-                                self.host.collision_exit(script.handle, &collision)
-                            }
-                            (CollisionEventKind::Enter, true) => {
-                                self.host.trigger_enter(script.handle, &collision)
-                            }
-                            (CollisionEventKind::Exit, true) => {
-                                self.host.trigger_exit(script.handle, &collision)
-                            }
-                        };
-                        if faulted {
+                        let handle = script.handle;
+                        let call: fn(&ScriptHost, u64, &CCollision) -> bool =
+                            match (event.kind, event.trigger) {
+                                (CollisionEventKind::Enter, false) => ScriptHost::collision_enter,
+                                (CollisionEventKind::Exit, false) => ScriptHost::collision_exit,
+                                (CollisionEventKind::Enter, true) => ScriptHost::trigger_enter,
+                                (CollisionEventKind::Exit, true) => ScriptHost::trigger_exit,
+                                // A stay is a call per step per pair, made only
+                                // to a type that overrides it.
+                                (CollisionEventKind::Stay, false)
+                                    if script.hooks.contains(Hooks::COLLISION_STAY) =>
+                                {
+                                    ScriptHost::collision_stay
+                                }
+                                (CollisionEventKind::Stay, true)
+                                    if script.hooks.contains(Hooks::TRIGGER_STAY) =>
+                                {
+                                    ScriptHost::trigger_stay
+                                }
+                                (CollisionEventKind::Stay, _) => continue,
+                            };
+                        if clock.time(script.type_index, || call(host, handle, &collision)) {
                             script.faulted = true;
                         }
                     }
@@ -3727,10 +4009,10 @@ impl Scripting {
                     if !script.active || script.faulted {
                         continue;
                     }
-                    match self
-                        .host
-                        .pointer(script.handle, event.kind as u32, &payload)
-                    {
+                    let handle = script.handle;
+                    match clock.time(script.type_index, || {
+                        host.pointer(handle, event.kind as u32, &payload)
+                    }) {
                         orrin_script::Delivery::Handled => return true,
                         orrin_script::Delivery::Unhandled => {}
                         orrin_script::Delivery::Faulted => {
@@ -3743,12 +4025,21 @@ impl Scripting {
             });
 
             for script in &mut pending {
-                if script.active && !script.faulted && self.host.update(script.handle, delta_time) {
+                let handle = script.handle;
+                if script.active
+                    && !script.faulted
+                    && clock.time(script.type_index, || host.update(handle, delta_time))
+                {
                     script.faulted = true;
                 }
             }
         });
         pointer_events.clear();
+        self.spent.replace(clock.spent);
+        events.clear();
+        if let Some(mut state) = world.get_resource_mut::<CollisionState>() {
+            state.events = events;
+        }
 
         // Structural changes the scripts queued land now, after every script
         // has run — so this frame's extraction already sees new renderables.
@@ -3775,6 +4066,7 @@ impl Scripting {
         self.pending.replace(pending);
         self.routing.replace(routing);
         self.pointer_events.replace(pointer_events);
+        self.publish_timings(world);
     }
 
     /// Apply the structural changes scripts queued during a dispatch. Runs

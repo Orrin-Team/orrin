@@ -264,7 +264,7 @@ fn create(host: &ScriptHost, type_name: &str) -> u64 {
 
 fn create_at(host: &ScriptHost, type_name: &str, index: u32, generation: u32) -> u64 {
     let name = CString::new(type_name).unwrap();
-    host.create(CEntity { index, generation }, &name)
+    host.create(CEntity { index, generation }, &name).0
 }
 
 #[test]

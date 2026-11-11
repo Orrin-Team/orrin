@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Runtime.InteropServices;
 
 namespace Orrin;
@@ -7,6 +8,8 @@ namespace Orrin;
 ///   1. ctor + Entity assignment   — `Create`, when the engine attaches the script
 ///   2. OnEnable                   — first activation, and every re-activation
 ///   3. OnStart                    — once, on the first tick the behaviour is active
+///   3a. OnFixedUpdate             — before every physics step while active,
+///                                   from the frame after OnStart
 ///   4. OnUpdate                   — every tick while active
 ///   5. OnDisable                  — every deactivation; also fired by `Destroy`
 ///                                   if the behaviour is still active
@@ -29,6 +32,35 @@ public static unsafe class Behaviours
     // Only from `Pointer`: the behaviour has no handler for the event, so the
     // engine offers it to the parent next. Rust's `orrin_script::Delivery`.
     const byte Unhandled = 2;
+
+    // The optional hooks a type overrides, reported by `Create`. Lock-step with
+    // Rust's `orrin_script::Hooks`.
+    internal const uint FixedUpdateHook = 1;
+    internal const uint CollisionStayHook = 1 << 1;
+    internal const uint TriggerStayHook = 1 << 2;
+
+    /// The optional hooks `type` overrides: those the engine may call once per
+    /// physics step, or once per touching pair per step. The engine skips the
+    /// call for any not reported here, so a type that only overrides OnUpdate
+    /// costs nothing per step however many of it there are.
+    ///
+    /// Read by reflection at every `Create` rather than cached, because a cache
+    /// keyed by `Type` would pin the game's load context through a reload.
+    internal static uint HooksOf(Type type)
+    {
+        uint hooks = 0;
+        if (Overrides(type, nameof(Behaviour.OnFixedUpdate), typeof(float)))
+            hooks |= FixedUpdateHook;
+        if (Overrides(type, nameof(Behaviour.OnCollisionStay), typeof(Collision)))
+            hooks |= CollisionStayHook;
+        if (Overrides(type, nameof(Behaviour.OnTriggerStay), typeof(Collision)))
+            hooks |= TriggerStayHook;
+        return hooks;
+    }
+
+    static bool Overrides(Type type, string name, Type parameter) =>
+        type.GetMethod(name, BindingFlags.Public | BindingFlags.Instance, [parameter])?.DeclaringType
+            != typeof(Behaviour);
 
     // The handle is a GCHandle passed across the ABI as a fixed-width ulong, to
     // match Rust's `u64` fn-pointer signatures exactly. Using `nint` here would
@@ -118,8 +150,9 @@ public static unsafe class Behaviours
     }
 
     [UnmanagedCallersOnly]
-    public static ulong Create(Entity entity, byte* typeName)
+    public static ulong Create(Entity entity, byte* typeName, uint* hooks)
     {
+        *hooks = 0;
         var name = Marshal.PtrToStringUTF8((nint)typeName);
         if (name is null)
             return 0;
@@ -133,6 +166,7 @@ public static unsafe class Behaviours
             behaviour.Entity = entity;
             var handle = (ulong)GCHandle.ToIntPtr(GCHandle.Alloc(behaviour));
             Index(entity, handle);
+            *hooks = HooksOf(type);
             return handle;
         }
         catch (Exception e)
@@ -175,6 +209,22 @@ public static unsafe class Behaviours
         catch (Exception e)
         {
             return Fault(behaviour, nameof(Behaviour.OnUpdate), e);
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    public static byte FixedUpdate(ulong handle, float fixedDeltaTime)
+    {
+        if (Resolve(handle) is not { } behaviour)
+            return Ok;
+        try
+        {
+            behaviour.OnFixedUpdate(fixedDeltaTime);
+            return Ok;
+        }
+        catch (Exception e)
+        {
+            return Fault(behaviour, nameof(Behaviour.OnFixedUpdate), e);
         }
     }
 
@@ -235,6 +285,22 @@ public static unsafe class Behaviours
     }
 
     [UnmanagedCallersOnly]
+    public static byte CollisionStay(ulong handle, Collision* collision)
+    {
+        if (Resolve(handle) is not { } behaviour)
+            return Ok;
+        try
+        {
+            behaviour.OnCollisionStay(*collision);
+            return Ok;
+        }
+        catch (Exception e)
+        {
+            return Fault(behaviour, nameof(Behaviour.OnCollisionStay), e);
+        }
+    }
+
+    [UnmanagedCallersOnly]
     public static byte CollisionExit(ulong handle, Collision* collision)
     {
         if (Resolve(handle) is not { } behaviour)
@@ -263,6 +329,22 @@ public static unsafe class Behaviours
         catch (Exception e)
         {
             return Fault(behaviour, nameof(Behaviour.OnTriggerEnter), e);
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    public static byte TriggerStay(ulong handle, Collision* collision)
+    {
+        if (Resolve(handle) is not { } behaviour)
+            return Ok;
+        try
+        {
+            behaviour.OnTriggerStay(*collision);
+            return Ok;
+        }
+        catch (Exception e)
+        {
+            return Fault(behaviour, nameof(Behaviour.OnTriggerStay), e);
         }
     }
 

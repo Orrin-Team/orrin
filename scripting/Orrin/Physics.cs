@@ -7,7 +7,10 @@ namespace Orrin;
 /// <summary>How a push is read. Numbering is lock-step with the engine's.</summary>
 public enum ForceMode : uint
 {
-    /// <summary>Newtons (newton-metres for a torque), held for this frame.</summary>
+    /// <summary>
+    /// Newtons (newton-metres for a torque), held for this frame — or, asked
+    /// from OnFixedUpdate, for the step that follows.
+    /// </summary>
     Force = 0,
 
     /// <summary>N·s, all at once.</summary>
@@ -16,7 +19,7 @@ public enum ForceMode : uint
     /// <summary>m/s (rad/s), regardless of mass.</summary>
     VelocityChange = 2,
 
-    /// <summary>m/s² (rad/s²), regardless of mass, held for this frame.</summary>
+    /// <summary>m/s² (rad/s²), regardless of mass, held like a Force.</summary>
     Acceleration = 3,
 }
 
@@ -45,10 +48,11 @@ public readonly struct RaycastHit
 /// transformed parent — can be pushed; anything else returns false.
 /// </summary>
 /// <remarks>
-/// Call it from OnUpdate. A <see cref="ForceMode.Force"/> or
-/// <see cref="ForceMode.Acceleration"/> is held for the frame it is asked in,
-/// so pushing every frame for a second is the same push at any frame rate. A
-/// body spawned this frame can be pushed at once; the push waits for it.
+/// A <see cref="ForceMode.Force"/> or <see cref="ForceMode.Acceleration"/> is
+/// held for as long as the hook it is asked from covers: the frame, from
+/// OnUpdate, or the step that follows, from OnFixedUpdate. Pushing every frame
+/// or every step for a second is the same push at any frame rate. A body
+/// spawned this frame can be pushed at once; the push waits for it.
 /// </remarks>
 public static class Physics
 {

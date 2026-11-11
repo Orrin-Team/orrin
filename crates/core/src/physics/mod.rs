@@ -33,6 +33,24 @@
 //! finds contacts before it moves anything, so an overlap a kinematic body is
 //! moved into is reported the step after the one that moved it.
 //!
+//! **Game code can run before each step, through a callback.** [`run_with`]
+//! calls its caller back ahead of every step the frame takes, with the step's
+//! length: the seam a script host's `OnFixedUpdate` goes through, so this
+//! module never learns what is on the other side of it. The callback is
+//! handed the world as a step would see it. The simulation is back in
+//! [`PhysicsState`], so a push or a velocity read reaches the body. Every
+//! dynamic body's transform — local, and world, since a dynamic body is a root
+//! — is the last step's pose rather than the frame's interpolated one; its
+//! children are not, and wait for the frame's propagation. A
+//! [`ForceMode::Force`] or `Acceleration` asked for there is held for that one
+//! step rather than for the frame (see `control`). A dynamic body's position or
+//! rotation written there teleports it before the step. Anything else that
+//! rebuilds what Jolt holds — a body added, removed or reshaped, a kinematic or
+//! static collider moved — waits for the next frame's `sync`, as it would from
+//! anywhere: that is a sweep of every collider, so it is once a frame. With no
+//! callback none of this runs; with one it is two passes over the dynamic
+//! bodies a step.
+//!
 //! **The scene's [`PhysicsSettings`]** are read every frame. Gravity and the step
 //! rate apply at once; the layer matrix is baked into Jolt's broadphase filter,
 //! so changing it rebuilds the world, and every pair touching at that moment
@@ -101,8 +119,9 @@ pub struct PhysicsState {
     told: FxHashSet<(Entity, Notice)>,
     /// Pushes on bodies the next run will create; see `control`.
     pending: Vec<(Entity, control::Push)>,
-    /// The last frame's delta, which a force held for a frame is held for.
-    frame_delta: f32,
+    /// How long a Force or Acceleration asked for now is held: the last
+    /// frame's delta, or one step while [`run_with`]'s callback runs.
+    held_for: f32,
 }
 
 /// Something about an entity's body worth one line in the log.
@@ -205,6 +224,20 @@ struct Tracked {
 }
 
 impl Tracked {
+    /// An edit to a dynamic body's transform: the body jumps there and keeps
+    /// its velocity.
+    fn teleport(&mut self, bodies: &jolt::BodyInterface<'_>, pose: Pose) {
+        bodies.set_position_and_rotation(
+            self.id,
+            to_jolt(pose.0),
+            to_jolt_quat(pose.1),
+            Activation::Activate,
+        );
+        self.previous = pose;
+        self.current = pose;
+        self.pose = pose;
+    }
+
     fn motion(&self) -> Motion {
         match self.spec.kind {
             Kind::Dynamic => Motion::Dynamic,
@@ -332,19 +365,35 @@ impl Simulation {
     }
 }
 
+/// What [`run_with`] calls before each step: the world, and the step's length.
+pub type BeforeStep<'a> = dyn FnMut(&mut World, f32) + 'a;
+
 /// Step the simulation by a frame's `delta` and write the dynamic bodies'
 /// poses back. Reads world transforms, so it runs after propagation.
 pub fn run(world: &mut World, delta: f32) {
+    run_with(world, delta, None);
+}
+
+/// [`run`], calling `before_step` with the step's length ahead of every step
+/// the frame takes — none, or several. What the world looks like to it is in
+/// the module docs.
+pub fn run_with(world: &mut World, delta: f32, before_step: Option<&mut BeforeStep<'_>>) {
     let settings = scene_settings(world);
     let (simulation, mut pending) = {
         let mut state = world.resource_mut::<PhysicsState>();
         if state.failed {
             return;
         }
-        state.frame_delta = delta;
+        state.held_for = delta;
         (state.simulation.take(), std::mem::take(&mut state.pending))
     };
-    let mut events = std::mem::take(&mut world.resource_mut::<CollisionState>().events);
+    let (mut events, report_stays) = {
+        let mut collisions = world.resource_mut::<CollisionState>();
+        (
+            std::mem::take(&mut collisions.events),
+            collisions.report_stays,
+        )
+    };
     events.clear();
 
     let simulation = match simulation {
@@ -379,13 +428,27 @@ pub fn run(world: &mut World, delta: f32) {
     let mut notices = Vec::new();
     sync(world, &mut simulation, &mut events, &mut notices);
     control::apply_pending(&simulation, &mut pending);
-    step(&mut simulation, &settings, delta, &mut events);
+    // Handed back before the steps, so a push a callback asks of a body that
+    // does not exist yet is kept for the next run.
+    world.resource_mut::<PhysicsState>().pending = pending;
+    let stepped = step(
+        world,
+        simulation,
+        &settings,
+        delta,
+        &mut events,
+        report_stays,
+        before_step,
+    );
+    let Some(mut simulation) = stepped else {
+        world.resource_mut::<CollisionState>().events = events;
+        return;
+    };
     write_back(world, &mut simulation, settings.step());
 
     world.resource_mut::<CollisionState>().events = events;
     let mut state = world.resource_mut::<PhysicsState>();
     state.simulation = Some(simulation);
-    state.pending = pending;
     notices.retain(|told| state.told.insert(told.clone()));
     drop(state);
     if !notices.is_empty() {
@@ -421,6 +484,10 @@ fn scene_settings(world: &World) -> PhysicsSettings {
 
 /// Bring the bodies in line with the world: create, rebuild and destroy them,
 /// pick up edits to dynamic transforms, and aim the rest at theirs.
+// Out of line on purpose: inlined into `run_with` alongside the step callback's
+// machinery, the frame of 1 000 static colliders in the physics bench measured
+// 7% slower.
+#[inline(never)]
 fn sync(
     world: &World,
     simulation: &mut Simulation,
@@ -537,19 +604,7 @@ fn sync(
         tracked.seen = true;
         if tracked.pose != pose {
             match tracked.spec.kind {
-                Kind::Dynamic => {
-                    simulation
-                        .system
-                        .body_interface()
-                        .set_position_and_rotation(
-                            tracked.id,
-                            to_jolt(pose.0),
-                            to_jolt_quat(pose.1),
-                            Activation::Activate,
-                        );
-                    tracked.previous = pose;
-                    tracked.current = pose;
-                }
+                Kind::Dynamic => tracked.teleport(&simulation.system.body_interface(), pose),
                 Kind::Static if !tracked.moved => simulation.promote(&mut tracked),
                 _ => {}
             }
@@ -577,12 +632,17 @@ fn sync(
     }
 }
 
+/// Take the frame's steps. `None` when a callback reset the simulation under
+/// it, which ends the run there.
 fn step(
-    simulation: &mut Simulation,
+    world: &mut World,
+    mut simulation: Simulation,
     settings: &PhysicsSettings,
     delta: f32,
     events: &mut Vec<CollisionEvent>,
-) {
+    report_stays: bool,
+    mut before_step: Option<&mut BeforeStep<'_>>,
+) -> Option<Simulation> {
     let step = settings.step();
     simulation.accumulator += delta;
     let mut steps = 0;
@@ -590,6 +650,9 @@ fn step(
         if steps == settings.max_steps_per_frame.max(1) {
             simulation.accumulator %= step;
             break;
+        }
+        if let Some(before_step) = before_step.as_deref_mut() {
+            simulation = call_before_step(world, simulation, step, delta, before_step)?;
         }
         {
             let bodies = simulation.system.body_interface();
@@ -612,7 +675,7 @@ fn step(
 
         let Simulation {
             system, temp, jobs, ..
-        } = simulation;
+        } = &mut simulation;
         if let Err(error) = system.update(step, 1, temp, jobs) {
             tracing::warn!("physics step overflowed Jolt's limits: {error}");
         }
@@ -629,11 +692,70 @@ fn step(
             .pairs
             .apply(&mut changes, &simulation.entities, &bodies, events);
         drop(changes);
-        simulation.pairs.settle(&bodies, events);
+        simulation.pairs.settle(&bodies, events, report_stays);
 
         simulation.accumulator -= step;
         steps += 1;
     }
+    Some(simulation)
+}
+
+/// Hand the world to `before_step` as it stands between two steps — see the
+/// module docs — and take back whatever it moved.
+fn call_before_step(
+    world: &mut World,
+    mut simulation: Simulation,
+    step: f32,
+    delta: f32,
+    before_step: &mut BeforeStep<'_>,
+) -> Option<Simulation> {
+    for (&entity, tracked) in simulation.bodies.iter_mut() {
+        if tracked.spec.kind != Kind::Dynamic || tracked.pose == tracked.current {
+            continue;
+        }
+        let (translation, rotation) = tracked.current;
+        if let Some(mut local) = world.get_mut::<LocalTransform>(entity) {
+            local.translation = translation;
+            local.rotation = rotation;
+        }
+        if let Some(mut placed) = world.get_mut::<WorldTransform>(entity) {
+            placed.0 = glam::Mat4::from_scale_rotation_translation(
+                tracked.spec.scale,
+                rotation,
+                translation,
+            );
+        }
+        tracked.pose = tracked.current;
+    }
+
+    {
+        let mut state = world.resource_mut::<PhysicsState>();
+        state.simulation = Some(simulation);
+        state.held_for = step;
+    }
+    before_step(world, step);
+    let mut simulation = {
+        let mut state = world.resource_mut::<PhysicsState>();
+        state.held_for = delta;
+        state.simulation.take()?
+    };
+
+    let Simulation { system, bodies, .. } = &mut simulation;
+    let interface = system.body_interface();
+    for (&entity, tracked) in bodies.iter_mut() {
+        if tracked.spec.kind != Kind::Dynamic {
+            continue;
+        }
+        let Some(local) = world.get::<LocalTransform>(entity) else {
+            continue;
+        };
+        let pose = (local.translation, local.rotation);
+        drop(local);
+        if pose != tracked.pose {
+            tracked.teleport(&interface, pose);
+        }
+    }
+    Some(simulation)
 }
 
 /// Blend each dynamic body between its last two steps by how far the frame

@@ -349,6 +349,8 @@ impl App {
         // it either way, and `Off` is how it explains itself.
         #[cfg(feature = "scripting")]
         world.insert_resource(crate::build_watcher::BuildStatus::default());
+        #[cfg(feature = "scripting")]
+        world.insert_resource(crate::scripting::ScriptTimings::default());
     }
 
     /// Read the project's `input.toml`, if it has one.
@@ -865,9 +867,18 @@ impl ApplicationHandler for App {
 
                 // After the transform-mutating systems and before the script
                 // tick, so the events scripts receive match the positions
-                // they'll read this frame.
+                // they'll read this frame. Through the script host when there
+                // is one, which dispatches OnFixedUpdate between the steps.
                 if simulate {
                     profile_scope!("physics");
+                    #[cfg(feature = "scripting")]
+                    match &self.scripting {
+                        Some(scripting) => {
+                            scripting.run_physics(&mut self.world, &self.registry, delta)
+                        }
+                        None => crate::physics::run(&mut self.world, delta),
+                    }
+                    #[cfg(not(feature = "scripting"))]
                     crate::physics::run(&mut self.world, delta);
                 }
 
