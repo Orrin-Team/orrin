@@ -8,6 +8,8 @@ one that is right.
 hello-orrin/
   orrin.toml            project manifest — the engine reads this from cwd (or any parent)
   assets/                source assets + .meta sidecars
+    shaders/rising_bands.oshader   a surface shader
+    materials/rising_bands.omat    a material drawn through it
   scripts/               C# game code
     HelloOrrin.csproj   builds HelloOrrin.dll, this project's game assembly
     Main.cs              the entry Behaviour named by `scripts.entry`
@@ -73,6 +75,82 @@ A build that fails, or leaves a DLL the runtime rejects, is refused: the reload
 is staged before anything is torn down, so the session keeps running the code it
 already had and says so in the console.
 
+## Writing a surface shader
+
+The sphere beside the cube is drawn with `assets/materials/rising_bands.omat`,
+which names the surface shader `assets/shaders/rising_bands.oshader`: bands of
+light climbing the object in world space over a dark, rough base. A surface
+shader says what a material's surface *is*; the engine still lights, shadows and
+reflects it like any other material.
+
+A `.oshader` is GLSL holding `param` lines and one function:
+
+```glsl
+param color glow = (1.0, 0.35, 0.08, 1.0);
+param float speed = 0.5 : range(0, 4);
+
+void surface(in SurfaceIn i, inout SurfaceOut o) {
+    float line = smoothstep(0.7, 1.0, sin(i.world_position.y * 20.0 - i.time * speed));
+    o.emissive += glow.rgb * 600.0 * line;
+}
+```
+
+**Parameters** are what a material sets in the inspector, one per line,
+outside any `{}`: `param <type> <name> [= <default>] [: <hint>, ...];`
+
+| Type | Default written as | Omitted, it is | Hints |
+| --- | --- | --- | --- |
+| `float` | `0.5` | `0` | `range(min, max)`: the inspector's slider |
+| `vec2` `vec3` `vec4` | `(x, y, ...)` | zeros | |
+| `color` | `(r, g, b)` or `(r, g, b, a)`, linear | opaque white | |
+| `texture` | `white`, `black` or `normal` | `white` | `srgb` or `linear`: how a dropped image imports |
+
+A parameter is a global of its name inside the function. Read a texture with
+`sample_param(name, uv)`.
+
+**`SurfaceIn i`** is where the surface is: `uv` (after any parallax),
+`world_position`, `world_normal` (the geometric normal, unit length),
+`view_dir` (towards the eye, unit length), `vertex_color`, and `time` in
+seconds.
+
+**`SurfaceOut o`** arrives holding what the material alone would draw, so
+change only what the shader is for: `albedo`, `alpha`, `metallic`, `roughness`
+(perceptual), `emissive` (cd/m², the unit of every light in the engine — a
+lit wall is about a hundred) and `normal` (tangent space). The engine clamps
+what comes back to the ranges a material can have.
+
+**Not allowed**, each an error at its line:
+
+- writing `gl_FragDepth`: depth is settled before the surface is shaded;
+- `discard`: lower `o.alpha` on a material whose blend is Masked instead, so
+  every pass cuts along the same line;
+- a `layout`, `uniform` or `buffer`: parameters are the shader's only inputs;
+- `#version`, `#extension`, `#include` or `#line`: the engine's pass shader owns
+  them;
+- a parameter named like something the engine's shaders already declare.
+
+A Masked material casts the shadow of its standard alpha, not of the alpha the
+shader writes.
+
+**Editing.** Double-click the shader in the Assets tab, or press Edit on the
+material inspector's Shader row, to open it in the Shader tab: highlighted
+code, its errors at their lines, the parameters it declares and a sphere drawn
+with it. Save (or Cmd/Ctrl+S) compiles it and every material using it changes
+within a frame or two. Any other editor works as well: the engine watches the
+file and recompiles it on save. **New surface shader** in the Assets tab writes
+a commented starting point.
+
+**Errors** are listed in the Shader tab and logged as `path:line: message`. A
+shader that does not compile changes nothing on screen: the last version that
+compiled keeps drawing, and a material whose shader has never compiled draws as
+a standard material until it does.
+
+A material stores only the values that differ from the shader's defaults
+(`rising_bands.omat` sets `glow` and `speed`), so changing a default in the
+shader reaches every material that did not override it. A value for a
+parameter the shader no longer declares is kept in the file and listed in the
+inspector to be removed.
+
 ## Testing
 
 ```bash
@@ -82,7 +160,9 @@ cd examples/hello-orrin && ../../target/debug/orrin test
 builds the scripts and runs `scripts/Tests.cs` inside the engine with no
 window: `Main` attached to an empty world, a frame for its OnStart to spawn the
 cube, then a second's worth of frames for the cube to turn `SpinSpeed` degrees.
-The command exits non-zero if a test fails.
+The command exits non-zero if a test fails. A test's world has no asset
+database, so `Main`'s lookup of the sphere's material logs a warning there and
+the sphere stays clay.
 
 ## Debugging
 

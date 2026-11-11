@@ -282,3 +282,109 @@ fn the_variants_are_exactly_the_manifest_rows_that_run_the_custom_function() {
     );
     assert!(SHADERS.len() > names.len());
 }
+
+/// Every file under `dir` whose extension is `extension`, sorted.
+fn files_under(dir: &std::path::Path, extension: &str, found: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        // A project's build output and engine cache are not its sources.
+        if name.to_string_lossy().starts_with('.')
+            || ["bin", "obj"].contains(&&*name.to_string_lossy())
+        {
+            continue;
+        }
+        if path.is_dir() {
+            files_under(&path, extension, found);
+        } else if path.extension().is_some_and(|e| e == extension) {
+            found.push(path);
+        }
+    }
+    found.sort();
+}
+
+/// The asset id a sidecar holds.
+fn sidecar_id(asset: &std::path::Path) -> orrin_registry::AssetId {
+    let meta = std::fs::read_to_string(format!("{}.meta", asset.display()))
+        .unwrap_or_else(|e| panic!("{}.meta: {e}", asset.display()));
+    let line = meta
+        .lines()
+        .find_map(|line| line.strip_prefix("id = "))
+        .unwrap_or_else(|| panic!("{}.meta has no id", asset.display()));
+    line.trim_matches('"').parse().unwrap()
+}
+
+/// The shipped examples are what a newcomer copies, so they cannot be allowed
+/// to rot: every `.oshader` under `examples/` compiles in every variant, and
+/// every `.omat` that names one sets only parameters it declares, as the type
+/// it declares them — the database would only warn about either, at run time.
+#[test]
+fn every_example_shader_compiles_and_its_materials_set_what_it_declares() {
+    use orrin_core::asset_db::material::{self, ShaderValue};
+    use orrin_core::gfx::surface::ParamKind;
+
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let mut shaders = Vec::new();
+    files_under(&examples, "oshader", &mut shaders);
+    assert!(
+        !shaders.is_empty(),
+        "no example shaders under {}",
+        examples.display()
+    );
+    let mut tables = std::collections::HashMap::new();
+    for path in &shaders {
+        let text = std::fs::read_to_string(path).unwrap();
+        let name = path.display().to_string();
+        let shader =
+            SurfaceShader::parse(&text).unwrap_or_else(|errors| panic!("{name}: {errors:#?}"));
+        let artifact = compile(&shader, &name).unwrap_or_else(|errors| {
+            panic!(
+                "{}",
+                errors
+                    .iter()
+                    .map(|e| e.located(&name))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+        assert_compiled_in_every_variant(&artifact);
+        tables.insert(sidecar_id(path), artifact.params);
+    }
+
+    let mut materials = Vec::new();
+    files_under(&examples, "omat", &mut materials);
+    for path in &materials {
+        let name = path.display().to_string();
+        let text = std::fs::read_to_string(path).unwrap();
+        let file = material::parse(&text, &name).unwrap();
+        assert_eq!(
+            material::write(&file),
+            text,
+            "{name}: not as the editor saves it"
+        );
+        let Some(shader) = file.shader else { continue };
+        let table = tables
+            .get(&shader)
+            .unwrap_or_else(|| panic!("{name} names shader {shader}, which no example has"));
+        for (param, value) in &file.shader_values {
+            let declared = table
+                .get(param)
+                .unwrap_or_else(|| {
+                    panic!("{name} sets `{param}`, which its shader does not declare")
+                })
+                .kind;
+            let matches = matches!(
+                (declared, value),
+                (ParamKind::Float { .. }, ShaderValue::Float(_))
+                    | (ParamKind::Vec2 { .. }, ShaderValue::Vec2(_))
+                    | (ParamKind::Vec3 { .. }, ShaderValue::Vec3(_))
+                    | (
+                        ParamKind::Vec4 { .. } | ParamKind::Color { .. },
+                        ShaderValue::Vec4(_)
+                    )
+                    | (ParamKind::Texture { .. }, ShaderValue::Texture(_))
+            );
+            assert!(matches, "{name}: `{param}` is a {}", declared.type_name());
+        }
+    }
+}
