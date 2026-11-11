@@ -13,6 +13,13 @@
 //! constant once a metal-rough map is involved; the normal it reflects about is
 //! the mapped one for the same reason, or reflections slide over bumps the lit
 //! image clearly has. SSAO reads the better normals too.
+//!
+//! A material read through a surface shader is drawn here by that shader's
+//! twin of the plain or the masked pipeline (`surface`), for the same reason:
+//! the normal, `f0`, roughness and cutout this pass reports have to be the
+//! ones the forward pass shaded. The two built-in surfaces are one range per
+//! mask, since this pass's shader takes no lobe; each surface shader is a range
+//! of its own (`cull::Draws::regions_by_surface_shader`).
 
 use crate::gfx::format::SampleCount;
 use crate::gfx::rhi::{
@@ -23,7 +30,8 @@ use crate::gfx::rhi::{
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{PositionVertex, SurfaceVertex};
 
-use super::cull::Draws;
+use super::cull::{Draws, Surface};
+use super::surface::{Surfaces, Twin};
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -81,6 +89,36 @@ pub(super) struct FrameUbo {
     view_proj: [[f32; 4]; 4],
 }
 
+/// The prepass pipeline, built-in or a surface shader's twin of it.
+fn pipeline_desc(
+    fragment: crate::gfx::rhi::ShaderRef,
+    cull: CullMode,
+) -> GraphicsPipelineDesc<'static> {
+    GraphicsPipelineDesc {
+        vertex: ShaderId::PrepassVert.into(),
+        fragment,
+        color_formats: &[NORMAL_FORMAT, VELOCITY_FORMAT, MATERIAL_FORMAT],
+        depth_format: Some(DEPTH_FORMAT),
+        vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
+        cull,
+        depth_test: Some(DepthTest {
+            write: true,
+            compare: crate::gfx::depth::NEARER,
+        }),
+        partial_texture_set: Some(TEXTURE_SET as u32),
+        dynamic_depth_bias: false,
+        samples: SampleCount::Sample1,
+        alpha_to_coverage: false,
+        immutable_samplers: &[],
+        blend: Blend::None,
+        topology: Topology::Triangles,
+        mask_extra_attachments: false,
+        attachment_blends: &[],
+        layout_from: None,
+        layout_prefix_from: None,
+    }
+}
+
 pub struct GeometryPrepass {
     pipeline: PipelineId,
     /// The same pass for a `Masked` run: back faces kept, and a fragment shader
@@ -101,29 +139,7 @@ pub struct GeometryPrepass {
 impl GeometryPrepass {
     pub fn new(device_rhi: &Device) -> Self {
         let pipeline = |fragment: ShaderId, cull| {
-            device_rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
-                vertex: ShaderId::PrepassVert.into(),
-                fragment: fragment.into(),
-                color_formats: &[NORMAL_FORMAT, VELOCITY_FORMAT, MATERIAL_FORMAT],
-                depth_format: Some(DEPTH_FORMAT),
-                vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
-                cull,
-                depth_test: Some(DepthTest {
-                    write: true,
-                    compare: crate::gfx::depth::NEARER,
-                }),
-                partial_texture_set: Some(TEXTURE_SET as u32),
-                dynamic_depth_bias: false,
-                samples: SampleCount::Sample1,
-                alpha_to_coverage: false,
-                immutable_samplers: &[],
-                blend: Blend::None,
-                topology: Topology::Triangles,
-                mask_extra_attachments: false,
-                attachment_blends: &[],
-                layout_from: None,
-                layout_prefix_from: None,
-            })
+            device_rhi.create_graphics_pipeline(&pipeline_desc(fragment.into(), cull))
         };
         let pipeline_plain = pipeline(ShaderId::PrepassFrag, CullMode::Back);
         // Two-sided for a cutout, matching the forward pass. The two rasterise
@@ -144,6 +160,26 @@ impl GeometryPrepass {
             masked_pipeline,
             sampler,
         }
+    }
+
+    /// A surface shader's twin of the plain or the masked pipeline: the same
+    /// state with `fragment`, the four sets lifted, and set 5 for the
+    /// parameters.
+    pub(super) fn build_twin(
+        &self,
+        device: &Device,
+        masked: bool,
+        fragment: crate::gfx::rhi::ShaderModuleId,
+    ) -> Result<PipelineId, String> {
+        let (built_in, cull) = if masked {
+            (self.masked_pipeline, CullMode::None)
+        } else {
+            (self.pipeline, CullMode::Back)
+        };
+        device.try_create_graphics_pipeline(&GraphicsPipelineDesc {
+            layout_prefix_from: Some((built_in, TEXTURE_SET as u32 + 1)),
+            ..pipeline_desc(fragment.into(), cull)
+        })
     }
 
     /// Upload the camera block once for every pass in the frame that reads it.
@@ -223,6 +259,7 @@ impl GeometryPrepass {
         object_set: BindGroupId,
         material_set: BindGroupId,
         texture_set: BindGroupId,
+        surfaces: Surfaces<'_>,
     ) {
         let frame_set = device.create_transient_bind_group(
             self.pipeline,
@@ -261,17 +298,29 @@ impl GeometryPrepass {
         // between draws changes them. See `mesh`.
         encoder.bind_geometry(false);
 
-        // One multi-draw per mask, over the commands the dispatch wrote — the
+        // One multi-draw per mask for the built-in surfaces, and one per mask
+        // for each surface shader, over the commands the dispatch wrote — the
         // same ones the forward pass draws.
         for region in draws.regions_by_surface_shader() {
-            bind_all(
-                encoder,
-                if region.variant.masked {
-                    self.masked_pipeline
-                } else {
-                    self.pipeline
-                },
-            );
+            let masked = region.variant.masked;
+            let twin = match region.variant.surface {
+                Surface::Custom(slot) => surfaces.for_slot(slot, Twin::Prepass { masked }),
+                _ => None,
+            };
+            match twin {
+                Some((pipeline, group)) => {
+                    bind_all(encoder, pipeline);
+                    encoder.bind_group(crate::gfx::surface::PARAMS_BINDING.0, group);
+                }
+                None => bind_all(
+                    encoder,
+                    if masked {
+                        self.masked_pipeline
+                    } else {
+                        self.pipeline
+                    },
+                ),
+            }
             encoder.draw_indexed_indirect(region.commands, region.range);
         }
     }

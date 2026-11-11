@@ -82,7 +82,10 @@
 //! caught by mapping the compiler's complaint back to the declaration. The
 //! user's text follows a `#line` with parameter lines blanked, so every other
 //! compiler error lands on the line the user wrote; one that cannot is reported
-//! against the file with the compiler's own message.
+//! against the file with the compiler's own message. [`ParamBuffer`] is the
+//! CPU half of the buffer every backend keeps — each material's values by name,
+//! repacked when a value or a table changes — and [`SurfaceClock`] is the time
+//! in word 0; `gfx::vulkan::surface` is the GPU half.
 //!
 //! **Variants.** A surface shader compiles once per manifest row whose shader
 //! calls `resolve_surface`, less the `ORRIN_FLAT_SURFACE` rows — a custom surface
@@ -106,12 +109,17 @@
 //! `shader-compiler` feature.
 
 mod artifact;
+mod buffer;
 #[cfg(feature = "shader-compiler")]
 mod compile;
 mod params;
 mod parse;
 
 pub use artifact::{CompiledVariant, DecodeError, SurfaceArtifact};
+pub use buffer::{
+    DRAWN_VARIANTS, ParamBuffer, SurfaceClock, SurfaceShaderError, SurfaceShaderHandle,
+    check_artifact,
+};
 #[cfg(feature = "shader-compiler")]
 pub use compile::{compile, variants};
 pub use params::{

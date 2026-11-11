@@ -46,6 +46,10 @@
 //!   subsurface scattering and volumetric fog. The frame the async-compute
 //!   question is actually about: with them off, the whole compute half of the
 //!   graph is a fifth of a millisecond.
+//! - `ORRIN_PERF_SURFACE=1` reads every material through one surface shader
+//!   with a parameter and the time in it: what the feature costs in use, from
+//!   the extra classes, the twins and the parameter buffer. Needs the default
+//!   `shader-compiler` feature.
 //! - `ORRIN_PERF_MSAA=1` rasterises the forward pass at four samples. The other
 //!   half of the comparison `TaaSettings::msaa` exists for: multisampled, the
 //!   pass writes and resolves its own targets and cannot depth-test `EQUAL`
@@ -75,6 +79,38 @@ use orrin_core::scene::{
 };
 use orrin_core::systems::{self, FrameGeometry};
 use orrin_ecs::World;
+
+#[cfg(feature = "shader-compiler")]
+fn read_every_material_through_a_surface_shader(renderer: &mut VulkanRenderer) {
+    use orrin_core::gfx::RenderBackend;
+    use orrin_core::gfx::surface::{ParamValue, SurfaceShader, compile};
+    use orrin_core::scene::MaterialHandle;
+    let shader = SurfaceShader::parse(
+        "param color tint = (1, 0.9, 0.8, 1);\n\
+         void surface(in SurfaceIn i, inout SurfaceOut o) {\n\
+         \x20   o.albedo *= tint.rgb * (0.9 + 0.1 * sin(i.time));\n\
+         }\n",
+    )
+    .expect("the shader parses");
+    let artifact = compile(&shader, "perf.oshader").expect("the shader compiles");
+    let handle = renderer
+        .load_surface_shader(&artifact)
+        .expect("the shader loads");
+    let values = [("tint".to_string(), ParamValue::Vec4([1.0, 0.95, 0.9, 1.0]))];
+    let mut count = 0;
+    while renderer
+        .set_material_surface(MaterialHandle(count), Some((handle, &values)))
+        .is_ok()
+    {
+        count += 1;
+    }
+    println!("surface shader on all {count} materials");
+}
+
+#[cfg(not(feature = "shader-compiler"))]
+fn read_every_material_through_a_surface_shader(_: &mut VulkanRenderer) {
+    panic!("ORRIN_PERF_SURFACE needs the shader-compiler feature");
+}
 
 /// Frames whose numbers are thrown away: the temporal resolve has no history on
 /// its first, auto-exposure adapts over several, and the graph compiles on the
@@ -197,6 +233,10 @@ fn frame_cost() {
         for entity in drawn {
             world.despawn(entity);
         }
+    }
+
+    if env_usize("ORRIN_PERF_SURFACE", 0) != 0 {
+        read_every_material_through_a_surface_shader(&mut renderer);
     }
 
     world.insert_resource(SsaoSettings {

@@ -21,10 +21,18 @@
 //! pass ends — so a second pass cannot read it without giving up that property
 //! and the DRAM it saves. The prepass depth is already resident because SSAO,
 //! TAA and the rest sample it.
+//!
+//! A blended material read through a surface shader draws with that shader's
+//! twin of the accumulation pipeline (`surface`), whose layout is these five
+//! sets plus the parameters'. The list is drawn in its own order and the
+//! pipeline switched where the run's material asks for another, never
+//! regrouped: the sums do not care about order, and the instance list was
+//! written in this one.
 
 use crate::gfx::rhi::{
     Binding, BindingResource, Blend, ComputePipelineDesc, CullMode, DepthTest, Device, Encoder,
-    GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, TextureViewId, Topology, Viewport,
+    GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, ShaderModuleId, ShaderRef,
+    TextureViewId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
@@ -32,6 +40,7 @@ use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 use super::PassCtx;
 use super::forward::ForwardSets;
 use super::hdr::HDR_WIDE_FORMAT;
+use super::surface::{Surfaces, Twin};
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -52,6 +61,43 @@ pub(super) const ACCUM_FORMAT: crate::gfx::format::Format = HDR_WIDE_FORMAT;
 /// nothing a viewer can see.
 pub(super) const REVEAL_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::R8Unorm;
 
+/// The accumulation pipeline, built-in or a surface shader's twin of it. The
+/// caller says whose layout it takes.
+fn pipeline_desc(fragment: ShaderRef) -> GraphicsPipelineDesc<'static> {
+    GraphicsPipelineDesc {
+        // The forward pass's vertex shader, unchanged: a blended surface is
+        // the same geometry with the same per-object rows, and `shading.glsl`
+        // reads the same varyings from it.
+        vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
+        // Both faces, unlike every other geometry pass. A closed opaque solid
+        // hides its own back faces; a transparent one does not, and culling
+        // them is what makes a glass sphere look like a decal of one.
+        cull: CullMode::None,
+        // Tested against the opaque scene, never written: two blended
+        // surfaces must not occlude each other, or the order they were
+        // submitted in would decide which survived — the exact dependence
+        // this algorithm exists to remove.
+        depth_test: Some(DepthTest {
+            write: false,
+            compare: crate::gfx::depth::NEARER,
+        }),
+        depth_format: Some(DEPTH_FORMAT),
+        // accum: plain addition, commutative, which is what makes the draw
+        // order irrelevant. reveal: `dst = dst * (1 - src)`, commutative for
+        // the same reason — and why the target is cleared to 1.0 rather than
+        // to 0.
+        attachment_blends: &[Blend::Additive, Blend::Revealage],
+        topology: Topology::Triangles,
+        layout_from: None,
+        layout_prefix_from: None,
+        ..GraphicsPipelineDesc::fullscreen(
+            ShaderId::ForwardVert,
+            fragment,
+            &[ACCUM_FORMAT, REVEAL_FORMAT],
+        )
+    }
+}
+
 pub struct OitPass {
     pipeline: PipelineId,
     composite_pipeline: PipelineId,
@@ -65,36 +111,8 @@ impl OitPass {
     /// derived — see the module docs.
     pub fn new(device: &Device, forward: PipelineId) -> Self {
         let pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-            // The forward pass's vertex shader, unchanged: a blended surface is
-            // the same geometry with the same per-object rows, and `shading.glsl`
-            // reads the same varyings from it.
-            vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
-            // Both faces, unlike every other geometry pass. A closed opaque solid
-            // hides its own back faces; a transparent one does not, and culling
-            // them is what makes a glass sphere look like a decal of one.
-            cull: CullMode::None,
-            // Tested against the opaque scene, never written: two blended
-            // surfaces must not occlude each other, or the order they were
-            // submitted in would decide which survived — the exact dependence
-            // this algorithm exists to remove.
-            depth_test: Some(DepthTest {
-                write: false,
-                compare: crate::gfx::depth::NEARER,
-            }),
-            depth_format: Some(DEPTH_FORMAT),
-            // accum: plain addition, commutative, which is what makes the draw
-            // order irrelevant. reveal: `dst = dst * (1 - src)`, commutative for
-            // the same reason — and why the target is cleared to 1.0 rather than
-            // to 0.
-            attachment_blends: &[Blend::Additive, Blend::Revealage],
-            topology: Topology::Triangles,
             layout_from: Some(forward),
-            layout_prefix_from: None,
-            ..GraphicsPipelineDesc::fullscreen(
-                ShaderId::ForwardVert,
-                ShaderId::OitFrag,
-                &[ACCUM_FORMAT, REVEAL_FORMAT],
-            )
+            ..pipeline_desc(ShaderId::OitFrag.into())
         });
         let composite_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
             shader: ShaderId::OitCompositeComp.into(),
@@ -115,6 +133,19 @@ impl OitPass {
         }
     }
 
+    /// A surface shader's twin of the accumulation pipeline: the forward
+    /// layout's five sets lifted, and set 5 for the parameters.
+    pub(super) fn build_twin(
+        &self,
+        device: &Device,
+        fragment: ShaderModuleId,
+    ) -> Result<PipelineId, String> {
+        device.try_create_graphics_pipeline(&GraphicsPipelineDesc {
+            layout_prefix_from: Some((self.pipeline, 5)),
+            ..pipeline_desc(fragment.into())
+        })
+    }
+
     /// Accumulate every blended surface. Recorded inside this pass's own render
     /// pass; `sets` are the forward pass's, which this pipeline's layout is.
     #[allow(clippy::too_many_arguments)]
@@ -127,21 +158,17 @@ impl OitPass {
         view: &FrameView,
         extent: [u32; 2],
         object_base: u32,
+        surfaces: Surfaces<'_>,
     ) {
         builder.set_viewport(Viewport {
             origin: [0.0, 0.0],
             extent: [extent[0] as f32, extent[1] as f32],
             depth_range: [0.0, 1.0],
         });
-        builder.bind_pipeline(self.pipeline);
-        for (set, group) in sets.groups().into_iter().enumerate() {
-            builder.bind_group(set as u32, group);
-        }
-
         // The arena is bound for the pass, not per draw: a mesh is a span into
-        // it. The matrix is pushed once for the same reason — what used to vary
-        // per run, the material and the first object row, travels with the
-        // instance now.
+        // it. The matrix is pushed with each pipeline for the same reason —
+        // what used to vary per run, the material and the first object row,
+        // travels with the instance now.
         builder.bind_geometry(false);
         let mut words = [0u32; 16];
         for (word, float) in words
@@ -150,13 +177,32 @@ impl OitPass {
         {
             *word = float.to_bits();
         }
-        builder.push_constants(&words);
 
+        // Runs whose material a surface shader reads draw with its twin. The
+        // order is the list's, never regrouped for the sake of fewer binds:
+        // nothing about it matters to the sums, and it is the order the
+        // instance list was written in.
+        let mut bound = None;
         for run in draws.runs() {
             let item = draws.item(run.start);
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
+            let twin = surfaces.for_material(item.material.0, Twin::Transparency);
+            let pipeline = twin.unwrap_or(self.pipeline);
+            if bound != Some(pipeline) {
+                builder.bind_pipeline(pipeline);
+                for (set, group) in sets.groups().into_iter().enumerate() {
+                    builder.bind_group(set as u32, group);
+                }
+                if twin.is_some()
+                    && let Some(group) = surfaces.group(Twin::Transparency)
+                {
+                    builder.bind_group(crate::gfx::surface::PARAMS_BINDING.0, group);
+                }
+                builder.push_constants(&words);
+                bound = Some(pipeline);
+            }
             // The transparent rows follow the ones before them in the shared object
             // buffer, so a run's `firstInstance` is its start plus where that
             // block began.
