@@ -5,8 +5,13 @@ edition.workspace = true
 description = "Compiling an Orrin shader: GLSL to SPIR-V, and that SPIR-V to MSL"
 
 [dependencies]
-# shaderc is the compiler vulkano-shaders already builds, from source with
-# CMake; spirv-cross2 is the translator MoltenVK runs these shaders through
-# today.
-shaderc = "0.8"
+# shaderc builds from source with CMake unless it finds a system copy, as it
+# does in the Vulkan SDK; spirv-cross2 is the translator MoltenVK runs these
+# shaders through today.
+#
+# Static even when a system copy is found: the engine links this crate, and a
+# shared shaderc is an `@rpath` the engine's executable has no rpath for, so it
+# would start only under `cargo run`. `the_engine_starts_with_no_library_path`
+# in `crates/core/tests/shader_compiler.rs` holds it there.
+shaderc = { version = "0.8", features = ["prefer-static-linking"] }
 spirv-cross2 = { version = "0.7", default-features = false, features = ["msl"] }

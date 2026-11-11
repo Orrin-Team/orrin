@@ -271,3 +271,27 @@ fn every_file_under_shaders_is_embedded_and_hashed() {
         orrin_shaderc::sources_hash(SOURCES.iter().copied(), LAYOUT_WIDTHS.iter().copied())
     );
 }
+
+/// The engine links the compiler, so it must load with no library path set:
+/// the CLI's `$ORRIN_ENGINE` and an installed editor launch the executable
+/// directly, and only cargo sets one. Where shaderc-sys finds a system shaderc
+/// — the Vulkan SDK's in `/usr/local/lib` on a Mac — it links the shared
+/// library unless asked not to, as `@rpath/libshaderc_shared.1.dylib` in a
+/// binary that has no rpath, and the process dies in the loader before `main`.
+#[cfg(not(feature = "export"))]
+#[test]
+fn the_engine_starts_with_no_library_path() {
+    let nowhere = std::env::temp_dir().join("orrin-no-project-here");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_orrin-core"))
+        .arg("--pack-assets")
+        .arg(&nowhere)
+        .arg(nowhere.join("pack"))
+        .env_remove("DYLD_LIBRARY_PATH")
+        .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+        .env_remove("LD_LIBRARY_PATH")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{}\n{stderr}", output.status);
+    assert!(!stderr.contains("Library not loaded"), "{stderr}");
+}
