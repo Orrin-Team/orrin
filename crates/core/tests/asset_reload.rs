@@ -575,6 +575,7 @@ fn an_inspector_edit_of_a_material_reaches_the_next_frame_and_its_file() {
 }
 
 /// A surface shader whose default tint is `rgb`, written over the albedo.
+#[cfg(feature = "shader-compiler")]
 fn tint_shader(rgb: &str) -> String {
     format!(
         "param color tint = ({rgb}, 1.0);\n\

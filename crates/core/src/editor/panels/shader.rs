@@ -451,14 +451,12 @@ fn picker(
         .get(current)
         .map_or_else(|| current.to_string(), |entry| entry.name().to_owned());
     let font = egui::TextStyle::Button.resolve(ui.style());
-    // The button's icon and padding, as `tool_button` lays them out.
-    let fitted = fit(ui, &name, &font, max - 30.0);
-    let response = widgets::tool_button(
+    // The button's icon, padding and chevron, as `picker_button` lays them out.
+    let fitted = fit(ui, &name, &font, max - 30.0 - widgets::PICKER_CHEVRON);
+    let response = widgets::picker_button(
         ui,
         icons::file_code(),
-        None,
-        Some(egui::RichText::new(&fitted)),
-        Tool::Command,
+        egui::RichText::new(&fitted),
         "Open another surface shader",
     );
     let response = if fitted != name {

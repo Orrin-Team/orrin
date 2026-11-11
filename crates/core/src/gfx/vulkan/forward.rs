@@ -1821,7 +1821,7 @@ mod tests {
     /// past the first out of the middle of its neighbour. No shader can notice,
     /// which is why the size is pinned here.
     #[test]
-    fn the_material_block_is_the_size_both_shader_mirrors_declare() {
+    fn the_material_block_is_the_size_material_glsl_declares() {
         // 16 vec4-sized blocks: base colour, emissive, params, texture indices,
         // the five lobes' blocks, the two subsurface blocks, parallax, alpha,
         // the extended indices, the flags, and the surface shader's word.

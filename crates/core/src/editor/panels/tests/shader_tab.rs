@@ -511,6 +511,31 @@ fn a_long_name_gives_way_to_the_header_buttons() {
     assert!(save.right() <= body.right(), "{save:?} {body:?}");
 }
 
+/// The shader's name in the header carries the chevron the editor's other
+/// pickers do, after the name and inside the button that opens the list.
+#[test]
+fn the_header_name_shows_a_chevron_and_opens_the_list() {
+    let dir = project("shader-tab-chevron", TINT, None);
+    let mut editor = editor_on(&dir);
+    open_glow(&mut editor);
+    let name = painted_in_tab(&editor, "glow");
+    let chevron = crate::editor::icons::chevron_down().glyph();
+    let at = editor
+        .painted_icons()
+        .into_iter()
+        .find(|(glyph, rect, _)| {
+            *glyph == chevron
+                && rect.left() > name.right()
+                && (rect.center().y - name.center().y).abs() < 4.0
+        })
+        .expect("a chevron after the shader's name")
+        .1;
+    assert!(!editor.painted_contains("Filter shaders"));
+    editor.click(at.center());
+    editor.frames(1);
+    assert!(editor.painted_contains("Filter shaders"));
+}
+
 /// The colour a painted string was drawn in.
 fn colour_of(editor: &Harness, label: &str) -> egui::Color32 {
     fn find(shape: &egui::Shape, label: &str, out: &mut Option<egui::Color32>) {
@@ -1102,15 +1127,38 @@ fn an_undeclared_value_is_listed_and_removable() {
 }
 
 #[test]
-fn a_shader_that_never_compiled_says_so_in_place_of_its_parameters() {
+fn a_shader_with_errors_says_how_many_in_place_of_its_parameters() {
     let file = MaterialFile {
         shader: Some(glow()),
         ..MaterialFile::default()
     };
-    let (_dir, mut editor) = inspecting_brick("shader-row-never", BROKEN, &file);
+    let (_dir, mut editor) = inspecting_brick("shader-row-errors", BROKEN, &file);
     scroll_inspector(&mut editor);
     assert!(
-        editor.painted_contains("glow has not compiled yet"),
+        editor.painted_contains("glow has 1 error"),
+        "{:?}",
+        editor.painted()
+    );
+    assert!(!editor.painted_contains("has not compiled yet"));
+    let edit = in_inspector(&editor, "Edit");
+    editor.click(edit.center());
+    editor.frames(3);
+    assert_eq!(shader(&editor).open(), Some(glow()));
+}
+
+/// A shader with no errors to show — here one the project does not have — has
+/// simply not compiled.
+#[test]
+fn a_shader_that_never_compiled_says_so_in_place_of_its_parameters() {
+    let missing: AssetId = "5f0c3a4e-0000-4000-8000-0000000000d9".parse().unwrap();
+    let file = MaterialFile {
+        shader: Some(missing),
+        ..MaterialFile::default()
+    };
+    let (_dir, mut editor) = inspecting_brick("shader-row-never", TINT, &file);
+    scroll_inspector(&mut editor);
+    assert!(
+        editor.painted_contains(&format!("{missing} has not compiled yet")),
         "{:?}",
         editor.painted()
     );

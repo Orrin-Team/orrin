@@ -1340,15 +1340,23 @@ fn shader_rows(
         .get(shader)
         .map_or_else(|| shader.to_string(), |entry| entry.name().to_owned());
     let Some(table) = db.shader_params(shader).cloned() else {
-        let compiling = super::shader::Status::of(&db, shader) == super::shader::Status::Compiling;
-        let said = if compiling {
-            format!("{name} is compiling")
-        } else {
-            format!("{name} has not compiled yet")
+        let status = super::shader::Status::of(&db, shader);
+        let (said, (icon, colour)) = match status {
+            super::shader::Status::Compiling => (
+                format!("{name} is compiling"),
+                (icons::warning(), crate::editor::theme::PENDING),
+            ),
+            super::shader::Status::Errors(_) => {
+                (format!("{name} has {}", status.label()), status.icon())
+            }
+            super::shader::Status::Compiled => (
+                format!("{name} has not compiled yet"),
+                (icons::warning(), crate::editor::theme::PENDING),
+            ),
         };
         widgets::padded(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                icons::labelled(ui, icons::warning(), crate::editor::theme::PENDING, &said);
+                icons::labelled(ui, icon, colour, &said);
                 if ui
                     .button("Edit")
                     .on_hover_text("Its parameters are listed once it compiles")
