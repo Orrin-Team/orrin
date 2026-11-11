@@ -168,8 +168,10 @@ pub(super) struct SurfaceShaders {
 }
 
 /// The renderer's means of building one twin: which pass builds `Twin` with
-/// the given fragment shader.
-pub(super) type Builder<'a> = dyn Fn(Twin, ShaderModuleId) -> Result<PipelineId, String> + 'a;
+/// the given fragment shader. `Sync`, because a swap builds its twins across
+/// the pool.
+pub(super) type Builder<'a> =
+    dyn Fn(Twin, ShaderModuleId) -> Result<PipelineId, String> + Sync + 'a;
 
 impl SurfaceShaders {
     /// `white` and `normal` are the renderer's default texture slots; black is
@@ -366,12 +368,16 @@ pub(super) fn params_group(
     before: &[Binding],
 ) -> BindGroupId {
     let (set, binding) = crate::gfx::surface::PARAMS_BINDING;
-    let mut bindings = before.to_vec();
-    bindings.push(Binding {
+    let params = Binding {
         binding,
         resource: BindingResource::StorageBuffer(params),
-    });
-    device.create_transient_bind_group(pipeline, set, &bindings)
+    };
+    // On the stack: this runs every frame, and the most a twin's set 5 holds
+    // before the parameters is the refraction pass's two views.
+    let mut bindings = [params; 3];
+    bindings[..before.len()].copy_from_slice(before);
+    bindings[before.len()] = params;
+    device.create_transient_bind_group(pipeline, set, &bindings[..=before.len()])
 }
 
 /// The pipeline and set 5 a run of `material` draws with as `twin`, if a
@@ -425,32 +431,38 @@ fn load_modules(device: &Device, artifact: &SurfaceArtifact) -> [ShaderModuleId;
 /// Every twin in `twins`, or none of them and the error: what was built before
 /// a failure is destroyed with the modules, so a refused artifact leaves
 /// nothing behind.
+///
+/// Built across the pool, since each is a driver compile of a few hundred
+/// milliseconds and a swap rebuilds every twin a shader has. Both drivers
+/// allow it: their pools and caches are behind mutexes held only to look up or
+/// insert, Vulkan synchronises a pipeline cache created without
+/// `EXTERNALLY_SYNCHRONIZED` itself, and a Metal device compiles from any
+/// thread — a loaded shader's function is compiled once under its own lock, so
+/// two twins of one variant wait for the same compile rather than repeat it.
 fn build_all(
     device: &Device,
     modules: &[ShaderModuleId; 8],
     twins: &[Twin],
     build: &Builder<'_>,
 ) -> Result<Vec<(Twin, PipelineId)>, SurfaceShaderError> {
-    let mut built = Vec::with_capacity(twins.len());
-    for &twin in twins {
+    let results = crate::threads::map(twins, |&twin| {
         let index = DRAWN_VARIANTS
             .iter()
             .position(|id| *id == twin.variant())
             .expect("every twin's variant is a drawn one");
-        match build(twin, modules[index]) {
-            Ok(pipeline) => built.push((twin, pipeline)),
-            Err(error) => {
-                for (_, pipeline) in built {
-                    device.destroy_pipeline(pipeline);
-                }
-                for module in modules {
-                    device.destroy_shader(*module);
-                }
-                return Err(SurfaceShaderError::Pipeline(error));
-            }
+        build(twin, modules[index]).map(|pipeline| (twin, pipeline))
+    });
+    if let Some(error) = results.iter().find_map(|result| result.as_ref().err()) {
+        let error = SurfaceShaderError::Pipeline(error.clone());
+        for (_, pipeline) in results.into_iter().flatten() {
+            device.destroy_pipeline(pipeline);
         }
+        for module in modules {
+            device.destroy_shader(*module);
+        }
+        return Err(error);
     }
-    Ok(built)
+    Ok(results.into_iter().flatten().collect())
 }
 
 #[cfg(test)]

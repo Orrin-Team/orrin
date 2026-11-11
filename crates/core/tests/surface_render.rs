@@ -799,6 +799,115 @@ fn the_preview_shows_the_function(make: fn([u32; 2]) -> VulkanRenderer, backend:
     assert!(g > 2 * r.max(b), "{backend}: the sphere shows the function");
 }
 
+/// The forward pass's other attachment shapes — four samples, the subsurface
+/// target, and both at once — each draw through a twin of their own: a
+/// function that paints the block green must land on the standard green
+/// material's pixels in every one, opaque and cut out alike.
+fn every_attachment_shape_draws_through_its_twin(
+    make: fn([u32; 2]) -> VulkanRenderer,
+    backend: &str,
+) {
+    let waxy = Material {
+        subsurface_color: Vec3::new(0.9, 0.4, 0.3),
+        thickness: 0.2,
+        ..grey(0.5)
+    };
+    let cutout = Material {
+        blend: BlendMode::Masked,
+        ..grey(0.5)
+    };
+    for (msaa, subsurface) in [(true, false), (false, true), (true, true)] {
+        for (subject, kind) in [(waxy, "opaque"), (cutout, "masked")] {
+            let shape = move |_: &mut VulkanRenderer, rig: &mut Rig| {
+                rig.world.insert_resource(TaaSettings {
+                    enabled: false,
+                    msaa,
+                    ..TaaSettings::default()
+                });
+                rig.world.insert_resource(SubsurfaceSettings {
+                    enabled: subsurface,
+                    ..SubsurfaceSettings::default()
+                });
+            };
+            let green = Vec3::new(0.05, 0.7, 0.1);
+            let before = shoot(make, Shape::Block, subject, shape, nothing);
+            let reference = shoot(make, Shape::Block, subject, shape, |renderer, rig| {
+                renderer.update_material(
+                    rig.subject,
+                    &Material {
+                        base_color: green,
+                        ..subject
+                    },
+                )
+            });
+            let custom = shoot(make, Shape::Block, subject, shape, |renderer, rig| {
+                attach(renderer, rig.subject, GREEN, &[])
+            });
+            let name = format!(
+                "{backend}-msaa{}-sss{}-{kind}",
+                msaa as u8, subsurface as u8
+            );
+            save(&custom, EXTENT, &name);
+            let moved = diff(&before, &reference, ROUNDING);
+            let d = diff(&custom, &reference, ROUNDING);
+            println!("{name}: against a standard green {d:?}; green moved {moved:?}");
+            assert!(moved.over > 2_000, "{name}: the block is on screen");
+            assert_eq!(d.over, 0, "{name}: {d:?}");
+        }
+    }
+}
+
+/// A shader that loads but whose blended twin the driver refuses, on the
+/// frame that first needs it: the frame goes on, and the material draws as
+/// the standard one it would be without the shader. The refusal is an error
+/// on both drivers, as in [`broken`], and only the blended queue's variant
+/// carries it, so the load itself — which builds the opaque twins — succeeds.
+fn a_twin_that_fails_on_first_use_draws_the_material_as_standard(
+    make: fn([u32; 2]) -> VulkanRenderer,
+    backend: &str,
+) {
+    let glass = Material {
+        base_color: Vec3::splat(0.6),
+        alpha: 0.5,
+        blend: BlendMode::Blend,
+        ..grey(0.2)
+    };
+    let mut artifact = compiled(GREEN);
+    let mut corrupted = 0;
+    for variant in &mut artifact.variants {
+        if variant.builtin() == Some(orrin_core::gfx::shaders::ShaderId::OitFrag) {
+            variant.shader.msl = "this is not metal".into();
+            variant.shader.spirv = b"this is not spir-v".to_vec();
+            corrupted += 1;
+        }
+    }
+    assert_eq!(
+        corrupted, 1,
+        "{backend}: the blended variant is in the artifact"
+    );
+
+    let before = shoot(make, Shape::Block, glass, nothing, nothing);
+    let green = shoot(make, Shape::Block, glass, nothing, |renderer, rig| {
+        attach(renderer, rig.subject, GREEN, &[])
+    });
+    let failed = shoot(make, Shape::Block, glass, nothing, |renderer, rig| {
+        let shader = renderer
+            .load_surface_shader(&artifact)
+            .expect("the opaque twins build");
+        renderer
+            .set_material_surface(rig.subject, Some((shader, &[])))
+            .unwrap();
+    });
+    save(&failed, EXTENT, &format!("{backend}-failed-twin"));
+    let painted = diff(&before, &green, ROUNDING);
+    let d = diff(&failed, &before, ROUNDING);
+    println!(
+        "{backend}: a failed blended twin against the standard glass {d:?}; green {painted:?}"
+    );
+    assert!(painted.over > 1_000, "{backend}: the function would show");
+    assert_eq!(d.over, 0, "{backend}: drawn as standard: {d:?}");
+}
+
 /// What building a surface shader's pipelines costs, cold: a fresh source each
 /// run, so no driver cache has seen it.
 fn report_build_times(make: fn([u32; 2]) -> VulkanRenderer, backend: &str) {
@@ -901,5 +1010,7 @@ on_every_backend!(
     a_parameter_and_the_time_reach_the_function,
     a_swap_takes_effect_and_a_broken_one_changes_nothing,
     the_preview_shows_the_function,
+    every_attachment_shape_draws_through_its_twin,
+    a_twin_that_fails_on_first_use_draws_the_material_as_standard,
     report_build_times,
 );
