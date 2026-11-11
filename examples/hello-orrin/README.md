@@ -77,9 +77,10 @@ already had and says so in the console.
 
 ## Writing a surface shader
 
-The sphere beside the cube is drawn with `assets/materials/rising_bands.omat`,
-which names the surface shader `assets/shaders/rising_bands.oshader`: bands of
-light climbing the object in world space over a dark, rough base. A surface
+Press Play and `Main` spawns a sphere beside the cube, drawn with
+`assets/materials/rising_bands.omat`, which names the surface shader
+`assets/shaders/rising_bands.oshader`: bands of light climbing the object in
+world space over a dark, rough base. A surface
 shader says what a material's surface *is*; the engine still lights, shadows and
 reflects it like any other material.
 

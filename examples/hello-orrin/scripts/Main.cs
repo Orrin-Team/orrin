@@ -48,8 +48,11 @@ public class Main : Behaviour
     {
         // The sphere's renderer lands when OnStart's spawn applies, so the
         // material goes on the first frame that finds it.
-        if (!_banded && _bands.IsValid)
-            _banded = World.SetMaterial(_sphere, _bands);
+        if (!_banded && _bands.IsValid && World.SetMaterial(_sphere, _bands))
+        {
+            _banded = true;
+            Debug.Log("the sphere is drawn with materials/rising_bands.omat");
+        }
 
         _spin += SpinSpeed * deltaTime;
 
