@@ -256,7 +256,6 @@ fn typing_saving_and_reverting() {
     type_text(&mut editor, "// edited\n");
     assert!(shader(&editor).is_dirty());
     assert!(shader(&editor).text().contains("// edited"));
-    editor.frames(1);
 
     let typed = shader(&editor).text().to_owned();
     editor.click(in_tab(&editor, "Save")).frames(1);
@@ -276,11 +275,10 @@ fn typing_saving_and_reverting() {
     editor.frames(1);
     assert!(editor.painted_contains("Compiled"));
 
+    // No frame between the typing and the click: the bar is drawn after the
+    // code, so the frame that typed already offered Revert.
     type_text(&mut editor, "junk");
     assert!(shader(&editor).is_dirty());
-    // A frame for the bar to hear the text changed: egui hits a click
-    // against the widgets as the frame before laid them out.
-    editor.frames(1);
     editor.click(in_tab(&editor, "Revert")).frames(1);
     assert_eq!(shader(&editor).text(), typed);
     assert!(!shader(&editor).is_dirty());
@@ -379,6 +377,174 @@ fn a_clean_buffer_follows_the_file_and_a_dirty_one_keeps_its_text() {
     assert_eq!(shader(&editor).text(), again);
     assert!(!shader(&editor).is_dirty());
     assert!(!shader(&editor).changed_on_disk());
+}
+
+/// The editor with the Shader tab alone in its one leaf, its body about `size`.
+fn alone(editor: &mut Harness, size: egui::Vec2) {
+    editor.dock =
+        crate::editor::dock::Dock::from_saved(Some(egui_dock::DockState::new(vec![Tab::Shader])));
+    let bars = BAR_HEIGHT + 24.0 + TAB_BAR_HEIGHT;
+    editor.input.screen_rect = Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        size + egui::vec2(0.0, bars),
+    ));
+    editor.frames(3);
+}
+
+fn painted_in_tab(editor: &Harness, label: &str) -> egui::Rect {
+    let body = editor.tab_body(Tab::Shader);
+    editor
+        .painted_text_rects()
+        .into_iter()
+        .find(|(text, rect)| without_icons(text) == label && body.intersects(*rect))
+        .unwrap_or_else(|| panic!("no {label:?} in the Shader tab: {:?}", editor.painted()))
+        .1
+}
+
+/// The empty state's words and its two ways in sit on the tab's centre line,
+/// whatever its width.
+#[test]
+fn the_empty_state_is_centred() {
+    let dir = Dir::new("shader-tab-centred");
+    let mut editor = editor_on(&dir);
+    for size in [egui::vec2(1040.0, 220.0), egui::vec2(420.0, 600.0)] {
+        alone(&mut editor, size);
+        let middle = editor.tab_body(Tab::Shader).center().x;
+        for label in ["New surface shader", "Open a shader"] {
+            let at = painted_in_tab(&editor, label).center().x;
+            assert!(
+                (at - middle).abs() < 2.0,
+                "{label} at {at}, centre {middle}"
+            );
+        }
+        let words = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| text.starts_with("A surface shader is"))
+            .unwrap()
+            .1;
+        assert!(
+            (words.center().x - middle).abs() < 2.0,
+            "{words:?} {middle}"
+        );
+        assert!(words.width() <= 400.0, "a readable measure: {words:?}");
+    }
+}
+
+/// In a dock too short for both, the sphere and the parameters take turns
+/// rather than the sphere pushing the list out of sight.
+#[test]
+fn in_a_short_dock_the_preview_and_parameters_take_turns() {
+    let dir = project("shader-tab-short", EVERY_KIND, None);
+    let mut editor = editor_on(&dir);
+    open_glow(&mut editor);
+    alone(&mut editor, egui::vec2(1040.0, 220.0));
+    let body = editor.tab_body(Tab::Shader);
+    let material = painted_in_tab(&editor, "The shader's defaults");
+    assert!(body.contains_rect(material), "{material:?} in {body:?}");
+
+    editor
+        .click(painted_in_tab(&editor, "Parameters").center())
+        .frames(1);
+    let row = painted_in_tab(&editor, "float = 0.5, 0 to 1");
+    assert!(body.contains_rect(row), "{row:?} in {body:?}");
+    assert!(!editor.painted_contains("The shader's defaults"));
+}
+
+/// A long default is cut to the column, never drawn past the tab's edge.
+#[test]
+fn the_parameter_list_stays_inside_its_column() {
+    let dir = project("shader-tab-column", EVERY_KIND, None);
+    let mut editor = editor_on(&dir);
+    open_glow(&mut editor);
+    alone(&mut editor, egui::vec2(900.0, 700.0));
+    let body = editor.tab_body(Tab::Shader);
+    let rows: Vec<egui::Rect> = editor
+        .painted_text_rects()
+        .into_iter()
+        .filter(|(text, rect)| {
+            ["float", "vec", "color", "texture"]
+                .iter()
+                .any(|kind| text.starts_with(kind))
+                && text.contains(" = ")
+                && !text.contains("param")
+                && body.intersects(*rect)
+        })
+        .map(|(_, rect)| rect)
+        .collect();
+    assert_eq!(rows.len(), 7, "{:?}", editor.painted());
+    for row in rows {
+        assert!(row.right() <= body.right() + 0.5, "{row:?} past {body:?}");
+    }
+}
+
+/// A long name in a narrow tab is shortened before it reaches Save.
+#[test]
+fn a_long_name_gives_way_to_the_header_buttons() {
+    let dir = project("shader-tab-long-name", TINT, None);
+    dir.write(
+        "a_rather_long_surface_shader_name_for_wet_cobblestones.oshader",
+        TINT.as_bytes(),
+    );
+    let mut editor = editor_on(&dir);
+    let id = editor
+        .world
+        .resource::<AssetDatabase>()
+        .find("a_rather_long_surface_shader_name_for_wet_cobblestones.oshader")
+        .unwrap()
+        .id;
+    editor.state.open_shader(id);
+    editor.frames(3);
+    alone(&mut editor, egui::vec2(420.0, 600.0));
+    let body = editor.tab_body(Tab::Shader);
+    let name = editor
+        .painted_text_rects()
+        .into_iter()
+        .find(|(text, rect)| without_icons(text).starts_with("a_rather") && body.intersects(*rect))
+        .expect("the name, or its start")
+        .1;
+    let status = painted_in_tab(&editor, "Compiled");
+    let revert = painted_in_tab(&editor, "Revert");
+    let save = painted_in_tab(&editor, "Save");
+    assert!(name.right() < status.left(), "{name:?} {status:?}");
+    assert!(status.right() < revert.left(), "{status:?} {revert:?}");
+    assert!(save.right() <= body.right(), "{save:?} {body:?}");
+}
+
+/// The colour a painted string was drawn in.
+fn colour_of(editor: &Harness, label: &str) -> egui::Color32 {
+    fn find(shape: &egui::Shape, label: &str, out: &mut Option<egui::Color32>) {
+        match shape {
+            egui::Shape::Text(text) if without_icons(text.galley.text()) == label => {
+                let section = text.galley.job.sections.last().map(|s| s.format.color);
+                *out = text.override_text_color.or(section);
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, label, out)),
+            _ => {}
+        }
+    }
+    let mut out = None;
+    for clipped in &editor.output.as_ref().unwrap().shapes {
+        find(&clipped.shape, label, &mut out);
+    }
+    out.unwrap_or_else(|| panic!("no {label:?} painted"))
+}
+
+/// Save that cannot be pressed looks it: while the file changed under the
+/// typed text it is drawn dimmer than Revert beside it, which can.
+#[test]
+fn save_looks_disabled_while_it_waits_on_a_choice() {
+    let dir = project("shader-tab-disabled", TINT, None);
+    let mut editor = editor_on(&dir);
+    open_glow(&mut editor);
+    type_text(&mut editor, "// mine\n");
+    save_elsewhere(&mut editor, &dir, &format!("// theirs\n{TINT}"));
+    editor
+        .ctx
+        .memory_mut(|memory| memory.surrender_focus(code_id()));
+    editor.frames(2);
+    assert!(shader(&editor).changed_on_disk());
+    assert_ne!(colour_of(&editor, "Save"), colour_of(&editor, "Revert"));
 }
 
 /// Another shader asked for over unsaved text waits on what becomes of it.
@@ -830,6 +996,46 @@ fn the_parameter_group_follows_the_table_and_reset_removes_a_value() {
     apply(&mut editor);
     assert_eq!(brick_file(&editor).shader_value("speed"), None);
     assert!(editor.state.history.undo_label().is_some());
+}
+
+/// A vector's fields share the value column, however wide their figures: a
+/// four-component row ends where a two-component one does.
+#[test]
+fn vector_fields_share_the_value_column() {
+    const VECTORS: &str = "\
+param vec2 pair = (0.25, 0.75);
+param vec4 four = (1, 0.5, 0.25, 0.125);
+void surface(in SurfaceIn i, inout SurfaceOut o) {
+    o.albedo = vec3(pair, four.w);
+}
+";
+    let file = MaterialFile {
+        shader: Some(glow()),
+        ..MaterialFile::default()
+    };
+    let (_dir, mut editor) = inspecting_brick("shader-row-vectors", VECTORS, &file);
+    editor.dock = crate::editor::dock::Dock::from_saved(Some(egui_dock::DockState::new(vec![
+        Tab::Inspector,
+    ])));
+    editor.input.screen_rect = Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(340.0, 1100.0),
+    ));
+    editor.frames(3);
+    scroll_inspector(&mut editor);
+    let field = editor.ctx.style().visuals.widgets.inactive.weak_bg_fill;
+    let right_of = |label: &str| {
+        let row = in_inspector(&editor, label);
+        editor
+            .painted_fills()
+            .into_iter()
+            .filter(|(rect, fill)| *fill == field && (rect.center().y - row.center().y).abs() < 6.0)
+            .map(|(rect, _)| rect.right())
+            .fold(f32::MIN, f32::max)
+    };
+    let (pair, four) = (right_of("pair"), right_of("four"));
+    assert!(pair > 0.0, "the pair's fields were found");
+    assert!(four <= pair + 0.5, "four ends at {four}, pair at {pair}");
 }
 
 /// A texture dropped on a texture parameter's slot is its value.

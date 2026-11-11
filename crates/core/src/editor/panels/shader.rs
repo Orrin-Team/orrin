@@ -36,7 +36,15 @@
 //! `panels::shortcuts`, and Cmd/Ctrl+S saves the shader instead.
 //!
 //! **Shape follows the dock.** Wider than [`WIDE`], the preview and parameters
-//! sit in a column beside the code; narrower, below it.
+//! sit in a column beside the code; narrower, below it. Where that region is
+//! shorter than [`TALL`] — the bottom dock, most of the time — the two take
+//! turns behind a switch rather than stacking, because a stacked sphere fills
+//! the height and pushes the parameters out of sight.
+//!
+//! **The header is drawn last.** Its row is reserved first and filled after
+//! the code, so Save and Revert answer the text as typed this frame: egui hits
+//! a click against the widgets the frame before laid out, and a header drawn
+//! ahead of the code would take one frame more to accept a Save.
 
 use std::time::SystemTime;
 
@@ -62,9 +70,24 @@ pub fn code_id() -> egui::Id {
 
 /// From this width the preview and parameters sit beside the code.
 const WIDE: f32 = 640.0;
-/// The side column's width when they do.
-const SIDE: f32 = 260.0;
+/// The side column's share of the tab when they do, and its bounds.
+const SIDE: f32 = 0.28;
+const SIDE_MIN: f32 = 260.0;
+const SIDE_MAX: f32 = 340.0;
+/// From this height the preview and parameters stack; below it they take turns.
+const TALL: f32 = 360.0;
 const ERROR_ROW: f32 = 20.0;
+/// The empty state's measure: its sentence wraps here rather than across a
+/// wide dock.
+const EMPTY_MEASURE: f32 = 380.0;
+
+/// Which of the two a short side region shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Pane {
+    #[default]
+    Preview,
+    Parameters,
+}
 
 /// What the sphere previews the shader on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -97,6 +120,7 @@ pub struct ShaderEditor {
     /// Put the cursor at the start of this line, counted from one.
     goto: Option<u32>,
     preview: PreviewOn,
+    pane: Pane,
     highlighter: Highlighter,
 }
 
@@ -374,7 +398,16 @@ fn save(world: &World, editor: &mut ShaderEditor) -> bool {
 /// With nothing open: what a surface shader is, and the two ways to start.
 fn empty(ui: &mut egui::Ui, db: &AssetDatabase, action: &mut Option<Action>) {
     ui.add_space(24.0);
-    ui.vertical_centered(|ui| {
+    let width = ui.available_width().min(EMPTY_MEASURE);
+    let middle = ui.max_rect().center().x;
+    let column = egui::Rect::from_x_y_ranges(
+        middle - width / 2.0..=middle + width / 2.0,
+        ui.cursor().top()..=ui.max_rect().bottom(),
+    );
+    let builder = egui::UiBuilder::new()
+        .max_rect(column)
+        .layout(egui::Layout::top_down(egui::Align::Center));
+    ui.scope_builder(builder, |ui| {
         ui.label(icons::text(
             icons::code(),
             20.0,
@@ -385,45 +418,91 @@ fn empty(ui: &mut egui::Ui, db: &AssetDatabase, action: &mut Option<Action>) {
             "A surface shader is a short GLSL function that changes what a material's \
              surface is; the engine still lights and draws it.",
         );
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let buttons = 2.0 * 150.0;
-            ui.add_space(((ui.available_width() - buttons) / 2.0).max(0.0));
-            if ui
-                .add(egui::Button::new(icons::with_label(
-                    icons::file_plus(),
-                    None,
-                    "New surface shader",
-                )))
-                .clicked()
-            {
-                *action = Some(Action::New);
-            }
-            picker(ui, db, None, "Open a shader", action);
-        });
+        ui.add_space(12.0);
+        let size = egui::vec2(180.0, 0.0);
+        let new = egui::Button::new(icons::with_label(
+            icons::file_plus(),
+            None,
+            "New surface shader",
+        ))
+        .min_size(size);
+        if ui.add(new).clicked() {
+            *action = Some(Action::New);
+        }
+        let open = egui::Button::new(icons::with_label(icons::file_code(), None, "Open a shader"))
+            .min_size(size);
+        let response = ui
+            .add(open)
+            .on_hover_text("Open one of the project's surface shaders");
+        shader_list(ui, db, None, &response, action);
     });
 }
 
-/// A button naming `current`, or saying `prompt`, that lists the project's
-/// shaders to open.
+/// The header's button naming `current`, at most `max` wide, that lists the
+/// project's shaders to open.
 fn picker(
     ui: &mut egui::Ui,
     db: &AssetDatabase,
-    current: Option<AssetId>,
-    prompt: &str,
+    current: AssetId,
+    max: f32,
     action: &mut Option<Action>,
 ) {
-    let name = current
-        .and_then(|id| db.get(id))
-        .map_or_else(|| prompt.to_owned(), |entry| entry.name().to_owned());
+    let name = db
+        .get(current)
+        .map_or_else(|| current.to_string(), |entry| entry.name().to_owned());
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    // The button's icon and padding, as `tool_button` lays them out.
+    let fitted = fit(ui, &name, &font, max - 30.0);
     let response = widgets::tool_button(
         ui,
         icons::file_code(),
         None,
-        Some(egui::RichText::new(name).strong()),
+        Some(egui::RichText::new(&fitted)),
         Tool::Command,
         "Open another surface shader",
     );
+    let response = if fitted != name {
+        response.on_hover_text(&name)
+    } else {
+        response
+    };
+    shader_list(ui, db, Some(current), &response, action);
+}
+
+fn width_of(ui: &egui::Ui, text: &str, font: &egui::FontId) -> f32 {
+    ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    })
+}
+
+/// `text`, cut with an ellipsis to fit `max` points.
+fn fit(ui: &egui::Ui, text: &str, font: &egui::FontId, max: f32) -> String {
+    if width_of(ui, text, font) <= max {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut keep = chars.len();
+    while keep > 1 {
+        keep -= 1;
+        let cut: String = chars[..keep].iter().chain(['…'].iter()).collect();
+        if width_of(ui, &cut, font) <= max {
+            return cut;
+        }
+    }
+    "…".to_owned()
+}
+
+/// The list of the project's shaders `response` opens, and New below it.
+fn shader_list(
+    ui: &mut egui::Ui,
+    db: &AssetDatabase,
+    current: Option<AssetId>,
+    response: &egui::Response,
+    action: &mut Option<Action>,
+) {
     let popup = ui.make_persistent_id("shader_picker");
     if response.clicked() {
         ui.memory_mut(|memory| memory.toggle_popup(popup));
@@ -431,7 +510,7 @@ fn picker(
     egui::popup_below_widget(
         ui,
         popup,
-        &response,
+        response,
         egui::PopupCloseBehavior::CloseOnClickOutside,
         |ui| {
             ui.set_width(240.0);
@@ -453,11 +532,29 @@ fn picker(
                 .show(ui, |ui| {
                     for entry in shaders {
                         let selected = Some(entry.id) == current;
-                        let button = egui::Button::new(entry.name())
+                        // Every row framed, so every name keeps one left edge;
+                        // the rest show their frame only under the pointer.
+                        let hover = ui.painter().add(egui::Shape::Noop);
+                        let mut button = egui::Button::new(entry.name())
                             .selected(selected)
-                            .frame(selected)
+                            .wrap_mode(egui::TextWrapMode::Truncate)
                             .min_size(egui::vec2(ui.available_width(), 0.0));
-                        if ui.add(button).on_hover_text(&entry.path).clicked() {
+                        if !selected {
+                            button = button
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE);
+                        }
+                        let response = ui.add(button);
+                        if !selected && response.hovered() {
+                            let visuals = &ui.visuals().widgets.hovered;
+                            let fill = egui::Shape::rect_filled(
+                                response.rect,
+                                visuals.corner_radius,
+                                visuals.weak_bg_fill,
+                            );
+                            ui.painter().set(hover, fill);
+                        }
+                        if response.on_hover_text(&entry.path).clicked() {
                             *action = Some(Action::Open(entry.id));
                             ui.memory_mut(|memory| memory.close_popup());
                         }
@@ -497,7 +594,8 @@ fn open(
         *action = Some(Action::Save);
     }
 
-    header(ui, db, editor, id, status, action);
+    let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y + 2.0);
+    let (_, header_rect) = ui.allocate_space(row);
     notices(ui, db, editor, action);
     ui.add_space(4.0);
 
@@ -505,7 +603,7 @@ fn open(
     let wide = full.width() >= WIDE;
     let gap = 8.0;
     let (main, side) = if wide {
-        let split = full.right() - SIDE;
+        let split = full.right() - (full.width() * SIDE).clamp(SIDE_MIN, SIDE_MAX);
         (
             egui::Rect::from_min_max(full.min, egui::pos2(split - gap, full.bottom())),
             egui::Rect::from_min_max(egui::pos2(split, full.top()), full.max),
@@ -543,16 +641,72 @@ fn open(
     let mut previewed = None;
     if side.height() > 0.0 {
         ui.scope_builder(egui::UiBuilder::new().max_rect(side), |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("shader_side")
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    previewed = preview(ui, db, editor, id, material);
-                    parameters(ui, db, id);
+            if side.height() >= TALL {
+                egui::ScrollArea::vertical()
+                    .id_salt("shader_side")
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        let weak = ui.visuals().weak_text_color();
+                        let section = ui.id().with("shader_preview");
+                        widgets::section(
+                            ui,
+                            section,
+                            icons::palette(),
+                            weak,
+                            "Preview",
+                            None,
+                            |ui| {
+                                previewed = preview(ui, db, editor, id, material, 160.0);
+                            },
+                        );
+                        let section = ui.id().with("shader_parameters");
+                        widgets::section(
+                            ui,
+                            section,
+                            icons::sliders(),
+                            weak,
+                            "Parameters",
+                            None,
+                            |ui| {
+                                parameters(ui, db, id);
+                            },
+                        );
+                    });
+            } else {
+                ui.horizontal(|ui| {
+                    for (pane, icon, label) in [
+                        (Pane::Preview, icons::palette(), "Preview"),
+                        (Pane::Parameters, icons::sliders(), "Parameters"),
+                    ] {
+                        let on = editor.pane == pane;
+                        let hint = format!("Show the {}", label.to_lowercase());
+                        if widgets::icon_label_button(ui, icon, label, on, &hint).clicked() {
+                            editor.pane = pane;
+                        }
+                    }
                 });
+                ui.add_space(4.0);
+                match editor.pane {
+                    Pane::Preview => {
+                        // The combo below the sphere and the gap above it.
+                        let room = ui.available_height() - ui.spacing().interact_size.y - 10.0;
+                        previewed = preview(ui, db, editor, id, material, room);
+                    }
+                    Pane::Parameters => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("shader_side")
+                            .auto_shrink(false)
+                            .show(ui, |ui| parameters(ui, db, id));
+                    }
+                }
+            }
         });
     }
     ui.advance_cursor_after_rect(full);
+    let builder = egui::UiBuilder::new()
+        .max_rect(header_rect)
+        .layout(egui::Layout::left_to_right(egui::Align::Center));
+    ui.scope_builder(builder, |ui| header(ui, db, editor, id, status, action));
     previewed
 }
 
@@ -566,49 +720,55 @@ fn header(
     status: Status,
     action: &mut Option<Action>,
 ) {
-    ui.horizontal(|ui| {
-        picker(ui, db, Some(id), "Open a shader", action);
-        if editor.dirty {
-            let (rect, response) =
-                ui.allocate_exact_size(egui::Vec2::splat(10.0), egui::Sense::hover());
-            ui.painter()
-                .circle_filled(rect.center(), 3.5, ui.visuals().text_color());
-            response.on_hover_text("Unsaved changes");
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let (icon, colour) = status.icon();
+    let label = status.label();
+    // The status, the unsaved dot and the two buttons keep their room; the
+    // name gets what is left.
+    let buttons = width_of(ui, "Revert", &font) + width_of(ui, "Save", &font) + 2.0 * 30.0;
+    let shown = width_of(ui, &label, &font) + icons::ROW + 12.0;
+    let spacing = 5.0 * ui.spacing().item_spacing.x + 6.0 + 10.0;
+    let max = (ui.available_width() - buttons - shown - spacing).max(60.0);
+    picker(ui, db, id, max, action);
+    if editor.dirty {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::Vec2::splat(10.0), egui::Sense::hover());
+        ui.painter()
+            .circle_filled(rect.center(), 3.5, ui.visuals().text_color());
+        response.on_hover_text("Unsaved changes");
+    }
+    ui.add_space(6.0);
+    let shown = ui
+        .horizontal(|ui| icons::labelled(ui, icon, colour, &label))
+        .response;
+    if let Status::Errors(_) = status {
+        shown.on_hover_text(
+            "Errors in the last save; the last version that compiled is still drawn",
+        );
+    }
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let (save, hint) = match (editor.dirty, editor.changed_on_disk) {
+            (_, true) => (
+                Tool::Disabled,
+                "The file changed on disk. Reload it, or keep your text, before saving",
+            ),
+            (true, false) => (Tool::Command, "Save and compile (Cmd/Ctrl+S in the code)"),
+            (false, false) => (Tool::Disabled, "Nothing to save"),
+        };
+        let text = Some(egui::RichText::new("Save"));
+        if widgets::tool_button(ui, icons::floppy_disk(), None, text, save, hint).clicked() {
+            *action = Some(Action::Save);
         }
-        ui.add_space(6.0);
-        let (icon, colour) = status.icon();
-        let shown = ui
-            .horizontal(|ui| icons::labelled(ui, icon, colour, &status.label()))
-            .response;
-        if let Status::Errors(_) = status {
-            shown.on_hover_text(
-                "Errors in the last save; the last version that compiled is still drawn",
-            );
+        let revert = if editor.dirty {
+            Tool::Command
+        } else {
+            Tool::Disabled
+        };
+        let text = Some(egui::RichText::new("Revert"));
+        let hint = "Throw away the unsaved text and read the file again";
+        if widgets::tool_button(ui, icons::rotate_ccw(), None, text, revert, hint).clicked() {
+            *action = Some(Action::Reload);
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (save, hint) = match (editor.dirty, editor.changed_on_disk) {
-                (_, true) => (
-                    Tool::Disabled,
-                    "The file changed on disk. Reload it, or keep your text, before saving",
-                ),
-                (true, false) => (Tool::Command, "Save and compile (Cmd/Ctrl+S in the code)"),
-                (false, false) => (Tool::Disabled, "Nothing to save"),
-            };
-            let text = Some(egui::RichText::new("Save"));
-            if widgets::tool_button(ui, icons::floppy_disk(), None, text, save, hint).clicked() {
-                *action = Some(Action::Save);
-            }
-            let revert = if editor.dirty {
-                Tool::Command
-            } else {
-                Tool::Disabled
-            };
-            let text = Some(egui::RichText::new("Revert"));
-            let hint = "Throw away the unsaved text and read the file again";
-            if widgets::tool_button(ui, icons::rotate_ccw(), None, text, revert, hint).clicked() {
-                *action = Some(Action::Reload);
-            }
-        });
     });
 }
 
@@ -859,100 +1019,84 @@ fn error_list(ui: &mut egui::Ui, editor: &mut ShaderEditor, errors: &[SurfaceErr
         });
 }
 
-/// The sphere, and which material it is drawn as.
+/// The sphere, at most `largest` points a side, and which material it is
+/// drawn as.
 fn preview(
     ui: &mut egui::Ui,
     db: &AssetDatabase,
     editor: &mut ShaderEditor,
     id: AssetId,
     material: Option<MaterialHandle>,
+    largest: f32,
 ) -> Option<crate::gfx::vulkan::material_preview::Subject> {
-    let weak = ui.visuals().weak_text_color();
     let mut subject = None;
-    widgets::section(
-        ui,
-        ui.id().with("shader_preview"),
-        icons::palette(),
-        weak,
-        "Preview",
-        None,
-        |ui| {
-            let side = ui.available_width().clamp(96.0, 160.0);
-            if let Some(material) = material {
-                ui.vertical_centered(|ui| {
-                    subject = Some(widgets::material_preview(
-                        ui,
-                        Viewer::Shader,
-                        material,
-                        side,
-                    ));
-                });
-            }
-            ui.add_space(6.0);
-            let users = users(db, id);
-            let defaults = "The shader's defaults";
-            let shown = match editor.preview {
-                PreviewOn::Material(chosen) => users.iter().find(|(m, _)| *m == chosen),
-                PreviewOn::Defaults => None,
-                PreviewOn::First => users.first(),
-            }
-            .map_or(defaults, |(_, name)| name.as_str());
-            widgets::property(ui, "Material", |ui| {
-                egui::ComboBox::from_id_salt("shader_preview_material")
-                    .selected_text(shown)
-                    .width(ui.available_width())
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(shown == defaults, defaults).clicked() {
-                            editor.preview = PreviewOn::Defaults;
-                        }
-                        for (material, name) in &users {
-                            if ui.selectable_label(shown == name, name).clicked() {
-                                editor.preview = PreviewOn::Material(*material);
-                            }
-                        }
-                    })
-                    .response
-                    .on_hover_text("Preview on a material that uses this shader")
-            });
-        },
-    );
+    let side = ui.available_width().min(largest).clamp(64.0, 160.0);
+    if let Some(material) = material {
+        ui.vertical_centered(|ui| {
+            subject = Some(widgets::material_preview(
+                ui,
+                Viewer::Shader,
+                material,
+                side,
+            ));
+        });
+    }
+    ui.add_space(6.0);
+    let users = users(db, id);
+    let defaults = "The shader's defaults";
+    let shown = match editor.preview {
+        PreviewOn::Material(chosen) => users.iter().find(|(m, _)| *m == chosen),
+        PreviewOn::Defaults => None,
+        PreviewOn::First => users.first(),
+    }
+    .map_or(defaults, |(_, name)| name.as_str());
+    widgets::property(ui, "Material", |ui| {
+        egui::ComboBox::from_id_salt("shader_preview_material")
+            .selected_text(shown)
+            .width(ui.available_width())
+            .truncate()
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(shown == defaults, defaults).clicked() {
+                    editor.preview = PreviewOn::Defaults;
+                }
+                for (material, name) in &users {
+                    if ui.selectable_label(shown == name, name).clicked() {
+                        editor.preview = PreviewOn::Material(*material);
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Preview on a material that uses this shader")
+    });
     subject
 }
 
 /// What the last good compile declared, read-only: values are a material's.
 fn parameters(ui: &mut egui::Ui, db: &AssetDatabase, id: AssetId) {
-    let weak = ui.visuals().weak_text_color();
-    widgets::section(
-        ui,
-        ui.id().with("shader_parameters"),
-        icons::sliders(),
-        weak,
-        "Parameters",
-        None,
-        |ui| {
-            let Some(table) = db.shader_params(id) else {
-                widgets::padded(ui, |ui| {
-                    ui.weak("They are listed once the shader has compiled.")
-                });
-                return;
-            };
-            if table.params.is_empty() {
-                widgets::padded(ui, |ui| ui.weak("This shader declares none."));
+    let Some(table) = db.shader_params(id) else {
+        widgets::padded(ui, |ui| {
+            ui.weak("They are listed once the shader has compiled.")
+        });
+        return;
+    };
+    if table.params.is_empty() {
+        widgets::padded(ui, |ui| ui.weak("This shader declares none."));
+    }
+    for param in &table.params {
+        widgets::property(ui, &param.name, |ui| {
+            if let ParamKind::Color { default } = param.kind {
+                let colour = egui::Rgba::from_rgba_unmultiplied(
+                    default[0], default[1], default[2], default[3],
+                );
+                egui::color_picker::show_color(ui, colour, egui::vec2(12.0, 12.0));
             }
-            for param in &table.params {
-                widgets::property(ui, &param.name, |ui| {
-                    if let ParamKind::Color { default } = param.kind {
-                        let colour = egui::Rgba::from_rgba_unmultiplied(
-                            default[0], default[1], default[2], default[3],
-                        );
-                        egui::color_picker::show_color(ui, colour, egui::vec2(12.0, 12.0));
-                    }
-                    ui.label(figures(describe(&param.kind)))
-                        .on_hover_text("Set per material, in the inspector's Material section");
-                });
-            }
-        },
-    );
+            let described = describe(&param.kind);
+            let hint =
+                format!("{described}\nSet per material, in the inspector's Material section");
+            ui.add(egui::Label::new(figures(described)).truncate())
+                .on_hover_text(hint);
+        });
+    }
 }
 
 /// A parameter's type, default and hints, as a line.

@@ -177,7 +177,10 @@ pub fn tool_button(
     icons::paint(ui, icon, at, colour);
     if let Some(galley) = galley {
         let at = egui::pos2(at.right() + PAD, rect.center().y - galley.size().y / 2.0);
-        ui.painter().galley(at, galley, colour);
+        // The galley was laid out with the text colour already resolved, so
+        // the state's colour has to override it rather than be a fallback.
+        ui.painter()
+            .galley_with_override_text_color(at, galley, colour);
     }
 
     response.on_hover_text(hint)

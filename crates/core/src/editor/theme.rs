@@ -206,8 +206,44 @@ impl Theme {
         v.widgets.open.weak_bg_fill = rgb(self.widget);
         v.widgets.open.corner_radius = radius;
 
+        // The dark base emphasises text, and lifts a hovered or pressed
+        // control's, towards white; on a light panel that is towards the
+        // panel, so a light theme takes the same step towards black.
+        if luma(rgb(self.text)) < luma(rgb(self.panel)) {
+            let strong = rgb(self.text).lerp_to_gamma(Color32::BLACK, 0.6);
+            v.widgets.hovered.fg_stroke.color = strong;
+            v.widgets.active.fg_stroke.color = strong;
+            v.widgets.open.fg_stroke.color = strong;
+            v.widgets.inactive.fg_stroke.color = rgb(self.text);
+            // A pressed control's dark text then needs a light press.
+            let pressed = rgb(self.panel).lerp_to_gamma(self.accent(), 0.35);
+            v.widgets.active.bg_fill = pressed;
+            v.widgets.active.weak_bg_fill = pressed;
+        }
+
         v
     }
+}
+
+fn luma(c: Color32) -> f32 {
+    0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32
+}
+
+/// WCAG's contrast ratio between two opaque colours.
+fn contrast(a: Color32, b: Color32) -> f32 {
+    let linear = |c: Color32| {
+        let channel = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+    };
+    let (a, b) = (linear(a), linear(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
 /// Every theme this session can switch between: the built-in first, then
@@ -321,9 +357,8 @@ impl Syntax {
     /// each reads on the field in a dark theme or a light one.
     pub fn of(visuals: &Visuals) -> Self {
         let text = visuals.text_color();
-        let luma =
-            |c: Color32| 0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32;
-        let light = luma(text) < luma(visuals.extreme_bg_color);
+        let field = visuals.extreme_bg_color;
+        let light = luma(text) < luma(field);
         let turned = |turn: f32| {
             let mut hsva = egui::ecolor::Hsva::from(visuals.selection.stroke.color);
             hsva.h = (hsva.h + turn).rem_euclid(1.0);
@@ -333,7 +368,15 @@ impl Syntax {
             } else {
                 hsva.v.max(0.9)
             };
-            Color32::from(hsva).lerp_to_gamma(text, 0.25)
+            // A hue that is pale at any strength (yellow on white) goes on
+            // towards the text until it reads at WCAG AA.
+            let mut colour = Color32::from(hsva).lerp_to_gamma(text, 0.25);
+            let mut toward = 0.25;
+            while contrast(colour, field) < 4.6 && toward < 1.0 {
+                toward += 0.05;
+                colour = Color32::from(hsva).lerp_to_gamma(text, toward);
+            }
+            colour
         };
         Self {
             text,
@@ -605,6 +648,96 @@ accent = [140, 120, 255]
         assert_ne!(themed.keyword, syntax.keyword);
         assert_ne!(themed.engine, syntax.engine);
         assert_ne!(themed.text, syntax.text);
+    }
+
+    const PAPER: &str = r#"
+name = "Paper"
+text = [36, 38, 44]
+panel = [238, 239, 242]
+window = [246, 246, 248]
+extreme = [252, 252, 253]
+faint = [230, 231, 235]
+widget = [226, 228, 232]
+widget_hover = [214, 216, 222]
+outline = [206, 208, 214]
+accent = [38, 104, 220]
+"#;
+
+    /// WCAG's contrast ratio, with a translucent colour first laid over `on`.
+    fn contrast(colour: Color32, on: Color32) -> f32 {
+        let over = |c: u8, b: u8| {
+            let a = colour.a() as f32 / 255.0;
+            c as f32 + b as f32 * (1.0 - a)
+        };
+        let lum = |r: f32, g: f32, b: f32| {
+            let lin = |c: f32| {
+                let c = c / 255.0;
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+        };
+        let a = lum(
+            over(colour.r(), on.r()),
+            over(colour.g(), on.g()),
+            over(colour.b(), on.b()),
+        );
+        let b = lum(on.r() as f32, on.g() as f32, on.b() as f32);
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// Emphasis and hover move text away from the panel in either kind of
+    /// theme. egui's dark base moves them towards white, which on a light
+    /// panel is towards nothing at all.
+    #[test]
+    fn strong_and_hovered_text_read_in_a_light_theme() {
+        let paper: Theme = toml::from_str(PAPER).unwrap();
+        let v = paper.visuals();
+        assert!(contrast(v.strong_text_color(), v.panel_fill) >= 7.0);
+        let hovered = &v.widgets.hovered;
+        assert!(contrast(hovered.text_color(), hovered.bg_fill) >= 4.5);
+        let active = &v.widgets.active;
+        assert!(contrast(active.text_color(), active.bg_fill) >= 4.5);
+
+        let dark = Theme::default().visuals();
+        assert_eq!(
+            dark.strong_text_color(),
+            Visuals::dark().strong_text_color()
+        );
+        assert_eq!(
+            dark.widgets.hovered.text_color(),
+            Visuals::dark().widgets.hovered.text_color()
+        );
+    }
+
+    /// Every class of code reads on the code's field to WCAG AA in a dark
+    /// theme and a light one; comments, which are meant to recede, to the
+    /// large-text bar.
+    #[test]
+    fn code_colours_meet_contrast_in_either_theme() {
+        let paper: Theme = toml::from_str(PAPER).unwrap();
+        for theme in [Theme::default(), paper] {
+            let v = theme.visuals();
+            let field = v.extreme_bg_color;
+            let syntax = Syntax::of(&v);
+            for (name, colour) in [
+                ("text", syntax.text),
+                ("keyword", syntax.keyword),
+                ("type", syntax.kind),
+                ("number", syntax.number),
+                ("preprocessor", syntax.preprocessor),
+                ("engine", syntax.engine),
+                ("param", syntax.param),
+            ] {
+                let ratio = contrast(colour, field);
+                assert!(ratio >= 4.5, "{} {name} {colour:?}: {ratio}", theme.name);
+            }
+            let ratio = contrast(syntax.comment, field);
+            assert!(ratio >= 3.0, "{} comment: {ratio}", theme.name);
+        }
     }
 
     #[test]

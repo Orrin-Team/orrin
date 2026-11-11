@@ -1537,6 +1537,9 @@ fn param_row(ui: &mut egui::Ui, world: &World, file: &mut MaterialFile, param: &
                 ui.add(egui::DragValue::new(v).speed(0.01));
             }
             (Field::Vector(values, n), _) => {
+                // A field grows to fit its figures past the share it is given;
+                // a narrower pad keeps four of them inside the column.
+                ui.spacing_mut().button_padding.x = 3.0;
                 let gap = ui.spacing().item_spacing.x;
                 let width = ((ui.available_width() - gap * (*n as f32 - 1.0)) / *n as f32).floor();
                 for value in values.iter_mut().take(*n) {
