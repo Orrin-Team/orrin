@@ -91,8 +91,8 @@ session are not a baseline.
   parameter buffer that changes only when a value does; a binding of a
   shader's own, or a per-frame value in that buffer (the time is not there, on
   purpose), is a design change. An artifact read from disk is trusted only by
-  its integrity and sources hashes, and a test never hands a driver SPIR-V it
-  built or edited: MoltenVK crashes on well-framed invalid SPIR-V.
+  its integrity and sources hashes, and a test never hands a driver SPIR-V that
+  frames and parses and is still invalid: MoltenVK crashes the process on it.
   `gfx/surface/mod.rs` is the design.
 - **`unsafe`.** Confined to FFI (`scripting.rs`, `orrin-script`) and raw ash
   recording (`record.rs`); forbidden in `orrin-ecs`. New `unsafe` anywhere else
