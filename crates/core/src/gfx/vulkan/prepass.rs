@@ -70,6 +70,8 @@ pub(super) struct FrameUbo {
     proj: [[f32; 4]; 4],
     inv_proj: [[f32; 4]; 4],
     prev_view_proj: [[f32; 4]; 4],
+    /// xy = the NDC offset baked into `proj`, z = what a surface shader's
+    /// `i.time` reads, the value the forward family's lighting block carries.
     jitter: [f32; 4],
     /// `proj * view`, premultiplied on the CPU — the identical `Mat4` the
     /// forward pass pushes as a push constant.
@@ -183,13 +185,18 @@ impl GeometryPrepass {
     }
 
     /// Upload the camera block once for every pass in the frame that reads it.
-    pub(super) fn begin_frame(&self, device: &Device, view: &FrameView) -> BufferId {
+    pub(super) fn begin_frame(
+        &self,
+        device: &Device,
+        view: &FrameView,
+        surface_time: f32,
+    ) -> BufferId {
         let frame = FrameUbo {
             view: view.view.to_cols_array_2d(),
             proj: view.proj.to_cols_array_2d(),
             inv_proj: view.proj.inverse().to_cols_array_2d(),
             prev_view_proj: view.prev_view_proj.to_cols_array_2d(),
-            jitter: [view.jitter.x, view.jitter.y, 0.0, 0.0],
+            jitter: [view.jitter.x, view.jitter.y, surface_time, 0.0],
             view_proj: view.view_proj.to_cols_array_2d(),
         };
         device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&frame))

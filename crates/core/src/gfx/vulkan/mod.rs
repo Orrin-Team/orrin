@@ -2328,6 +2328,9 @@ impl VulkanRenderer {
             }
         }
         let surface_frame = self.surfaces.begin_frame(&self.device, dt);
+        // Read once, and written into the lighting block and the prepass's
+        // camera block alike, so the prepass cuts where the forward pass shades.
+        let surface_time = surface_frame.map_or(0.0, |frame| frame.time);
 
         // The output this redraw writes is named for the resolve here, and the
         // redraw counted as done: nothing past this point abandons the frame.
@@ -2366,6 +2369,7 @@ impl VulkanRenderer {
                     material_set,
                     texture_set,
                     object_set,
+                    surface_time,
                 );
                 let variant = self.variant_of(material.0);
                 let surfaces = surface::Surfaces {
@@ -2504,7 +2508,7 @@ impl VulkanRenderer {
             .frame
             .ids
             .prepass
-            .map(|_| self.prepass.begin_frame(&self.device, &view));
+            .map(|_| self.prepass.begin_frame(&self.device, &view, surface_time));
         // The AO extent rather than the frame's: the noise tiles per AO texel,
         // so a half-res target that scaled the pattern by the window would
         // stretch the rotation across two pixels and band the result.
@@ -2616,6 +2620,7 @@ impl VulkanRenderer {
             self.fog
                 .volume_or_fallback(self.frame.ids.fog.map(|ids| self.table.texture(ids.volume))),
             self.fog.sampler(),
+            surface_time,
         );
 
         // The whole frame, in the order the compiler derived. Nothing below

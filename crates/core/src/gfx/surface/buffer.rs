@@ -1,7 +1,7 @@
 use std::fmt;
 
+use super::SurfaceArtifact;
 use super::params::{DefaultTexture, Ignored, ParamTable, ParamValue};
-use super::{FRAME_WORDS, SurfaceArtifact};
 use crate::gfx::shaders::ShaderId;
 use crate::scene::MaterialHandle;
 
@@ -95,6 +95,11 @@ struct Attached {
 /// table, each material's shader and *named* values, and the words packed from
 /// them.
 ///
+/// Nothing in it changes from frame to frame — the time reaches a surface
+/// function through blocks its passes upload anyway — so a renderer uploads it
+/// only when [`take_changed`](Self::take_changed) says it was repacked, as it
+/// rebuilds the material table only after an edit.
+///
 /// Values are kept by name rather than as packed words because a replaced
 /// shader may lay its parameters out differently, and the only way to put a
 /// material's colour back where the new table wants it is to pack it again from
@@ -106,6 +111,8 @@ pub struct ParamBuffer {
     tables: Vec<ParamTable>,
     attached: Vec<Option<Attached>>,
     words: Vec<[u32; 4]>,
+    /// Repacked since a renderer last took the words.
+    changed: bool,
     /// The bindless index of each [`DefaultTexture`], in declaration order.
     defaults: [u32; 3],
 }
@@ -117,7 +124,8 @@ impl ParamBuffer {
         Self {
             tables: Vec::new(),
             attached: Vec::new(),
-            words: vec![[0; 4]; FRAME_WORDS as usize],
+            words: Vec::new(),
+            changed: true,
             defaults: [
                 DefaultTexture::White,
                 DefaultTexture::Black,
@@ -236,17 +244,20 @@ impl ParamBuffer {
             .map(|(index, _)| MaterialHandle(index as u32))
     }
 
-    /// The whole buffer: the frame's words, then every block.
+    /// The whole buffer: every block, in material order.
     pub fn words(&self) -> &[[u32; 4]] {
         &self.words
     }
 
-    pub fn set_time(&mut self, seconds: f32) {
-        self.words[0][0] = seconds.to_bits();
+    /// The words, if they were repacked since the last call: what a renderer
+    /// uploads, once, on the frame after a change.
+    pub fn take_changed(&mut self) -> Option<&[[u32; 4]]> {
+        std::mem::take(&mut self.changed).then_some(&self.words)
     }
 
     fn repack(&mut self) -> Vec<(MaterialHandle, Ignored)> {
-        self.words.truncate(FRAME_WORDS as usize);
+        self.changed = true;
+        self.words.clear();
         let defaults = self.defaults;
         let mut ignored = Vec::new();
         for (index, attached) in self.attached.iter_mut().enumerate() {
@@ -277,6 +288,11 @@ impl ParamBuffer {
 /// wrapped at [`PERIOD`](Self::PERIOD), as Godot wraps its `TIME`, so a float
 /// still resolves a sixtieth of a second after a long session. A capture pins
 /// it, so its pixels do not depend on how many frames it warmed up for.
+///
+/// Ticked once a frame, and that one value is written into every block a pass
+/// running the function reads it from — the forward family's lighting block and
+/// the prepass's camera block — so the two cannot cut or shade at different
+/// times.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SurfaceClock {
     seconds: f64,

@@ -265,6 +265,7 @@ fn to_gpu_lighting(
     irradiance: [Vec3; SH9],
     environment_yaw: f32,
     env_specular: Vec3,
+    surface_time: f32,
 ) -> GpuLighting {
     let camera_pos = camera.position;
     let (w, h) = (extent[0] as f32, extent[1] as f32);
@@ -293,7 +294,7 @@ fn to_gpu_lighting(
         ],
         params: [
             count as f32,
-            lighting.shininess,
+            surface_time,
             lighting.specular_strength,
             spot_count as f32,
         ],
@@ -445,8 +446,8 @@ struct GpuLighting {
     sun_direction: [f32; 4],
     /// rgb = sun color, w = illuminance in lux on a surface facing it.
     sun_color: [f32; 4],
-    /// x = point light count, y = shininess, z = specular strength,
-    /// w = spot light count.
+    /// x = point light count, y = what a surface shader's `i.time` reads,
+    /// z = specular strength, w = spot light count. Only `y` is read.
     params: [f32; 4],
     /// x=w, y=h, z=1/w, w=1/h
     viewport: [f32; 4],
@@ -614,7 +615,7 @@ pub(super) struct NeutralBlocks {
 
 /// The lighting block the material preview shades with. Kept as the block so
 /// what decides whether the preview is redrawn is exactly what it is drawn
-/// with.
+/// with — less a surface shader's time, which is the frame's it is redrawn in.
 pub(super) struct PreviewLighting(GpuLighting);
 
 impl PreviewLighting {
@@ -634,6 +635,7 @@ impl PreviewLighting {
             irradiance,
             environment_yaw,
             env_specular,
+            0.0,
         ))
     }
 
@@ -1149,6 +1151,7 @@ impl ForwardPass {
         fog: BufferId,
         fog_volume: TextureViewId,
         fog_sampler: SamplerId,
+        surface_time: f32,
     ) -> ForwardSets {
         // Both halves fall back to the scene's flat ambient when nothing is
         // loaded — the diffuse as a band-0-only series, the specular as a tint
@@ -1165,6 +1168,7 @@ impl ForwardPass {
             irradiance,
             environment.yaw,
             env_specular,
+            surface_time,
         );
         let lighting_buffer =
             device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&lighting_block));
@@ -1383,11 +1387,14 @@ impl ForwardPass {
         material_set: BindGroupId,
         texture_set: BindGroupId,
         object_set: BindGroupId,
+        surface_time: f32,
     ) -> ForwardSets {
+        let mut block = lighting.0;
+        block.params[1] = surface_time;
         self.assemble(
             device,
             LightingSet {
-                lighting: device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&lighting.0)),
+                lighting: device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&block)),
                 decals: blocks.decals,
                 points: blocks.points,
                 spots: blocks.spots,

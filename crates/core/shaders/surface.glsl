@@ -18,7 +18,15 @@
 //     vec4 sample_tex(uint index, vec2 uv)
 //
 // as it defines `parallax_height` for `parallax.glsl`, because each pass binds
-// its texture array under its own name.
+// its texture array under its own name — and, if it calls `resolve_surface`
+// under `ORRIN_CUSTOM_SURFACE`,
+//
+//     float surface_time()
+//
+// for the same reason: the time rides in a block the pass uploads every frame
+// anyway, the lighting block or the prepass's camera block, both written from
+// the one clock reading the renderer takes a frame. Not in `SurfaceParams`,
+// which would then change every frame and take its descriptor sets with it.
 //
 // With `ORRIN_CUSTOM_SURFACE` defined, `resolve_surface` hands the standard
 // reading to `void surface(in SurfaceIn i, inout SurfaceOut o)` from
@@ -50,7 +58,7 @@ struct SurfaceIn {
     vec3 view_dir;
     vec3 vertex_color;
 #ifdef ORRIN_CUSTOM_SURFACE
-    /// Seconds, from `SurfaceParams`, so that only a custom surface pays for it.
+    /// Seconds, from `surface_time()`, so that only a custom surface pays for it.
     float time;
 #endif
 };
@@ -99,23 +107,31 @@ SurfaceOut standard_surface(GpuMaterial m, SurfaceIn i) {
 }
 
 #ifdef ORRIN_CUSTOM_SURFACE
-// Word 0 is the frame's and the same for every material: x = time in seconds.
-// A material's own parameters start at `words[m.surface.x]`. The forward family
-// and the prepass read this one buffer, which is what makes the two animate in
-// step. Declared only here, so no built-in shader's layout gains a binding.
+// Every material's parameters, which change only when a value or a shader
+// does. A material's own start at `words[m.surface.x]`. Declared only here, so
+// no built-in shader's layout gains a binding.
 layout(set = 5, binding = 2, std430) readonly buffer SurfaceParams {
     vec4 words[];
 } surface_params;
 
 #include "custom_surface.glsl"
+
+// Declared rather than required up front: the masked shadow pass includes this
+// file and never calls `resolve_surface`, so it defines none.
+float surface_time();
 #endif
 
 SurfaceOut resolve_surface(GpuMaterial m, SurfaceIn i) {
     SurfaceOut o = standard_surface(m, i);
 #ifdef ORRIN_CUSTOM_SURFACE
-    i.time = surface_params.words[0].x;
+    i.time = surface_time();
 #ifdef ORRIN_SURFACE_PARAMETERS
     surface_parameters(m.surface.x);
+#else
+    // Read although nothing uses it: a pipeline layout holds only what its
+    // shaders read, and every twin binds this buffer at set 5. Word 0 always
+    // exists, since the renderer never uploads it empty.
+    vec4 bound = surface_params.words[0];
 #endif
     surface(i, o);
     // Only behind the hook: the standard reading keeps to these ranges already,

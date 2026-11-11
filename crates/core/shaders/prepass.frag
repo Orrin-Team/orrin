@@ -43,9 +43,31 @@ const int MAX_TEXTURES = 192;
 layout(set = 3, binding = 0) uniform texture2D u_textures[MAX_TEXTURES];
 layout(set = 3, binding = 1) uniform sampler u_sampler;
 
+// The camera block, declared here as well as in the vertex stage. This pass
+// reports normals in view space and a decal is authored in world space, so the
+// rotation between them is needed in the fragment stage — and it has to be
+// *this* frame's, not one derived from anything else, for the reason every pass
+// that rasterises geometry takes its matrices from `taa::FrameView`. Ahead of
+// `surface.glsl`, because `jitter.z` is the time a surface function reads: the
+// value the forward family reads out of its lighting block, from one clock
+// reading, so the cut this pass makes is the one the forward pass shades.
+layout(set = 0, binding = 0) uniform Frame {
+    mat4 view;
+    mat4 proj;
+    mat4 inv_proj;
+    mat4 prev_view_proj;
+    vec4 jitter;
+} frame;
+
 vec4 sample_tex(uint index, vec2 uv) {
     return texture(sampler2D(u_textures[index], u_sampler), uv);
 }
+
+#ifdef ORRIN_CUSTOM_SURFACE
+float surface_time() {
+    return frame.jitter.z;
+}
+#endif
 
 float parallax_height(uint index, vec2 uv, vec2 dx, vec2 dy) {
     return textureGrad(sampler2D(u_textures[index], u_sampler), uv, dx, dy).r;
@@ -58,19 +80,6 @@ vec4 decal_sample(uint index, vec2 uv, vec2 dx, vec2 dy) {
     return textureGrad(sampler2D(u_textures[index], u_sampler), uv, dx, dy);
 }
 #include "decals.glsl"
-
-// The camera block, declared here as well as in the vertex stage. This pass
-// reports normals in view space and a decal is authored in world space, so the
-// rotation between them is needed in the fragment stage — and it has to be
-// *this* frame's, not one derived from anything else, for the reason every pass
-// that rasterises geometry takes its matrices from `taa::FrameView`.
-layout(set = 0, binding = 0) uniform Frame {
-    mat4 view;
-    mat4 proj;
-    mat4 inv_proj;
-    mat4 prev_view_proj;
-    vec4 jitter;
-} frame;
 
 void main() {
     GpuMaterial m = materials[v_material];

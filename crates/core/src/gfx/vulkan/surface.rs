@@ -38,14 +38,21 @@
 //! rests on.
 //!
 //! **The parameter buffer** is packed on the CPU only when a value or a table
-//! changes ([`ParamBuffer`]); a frame writes the time into word 0 and uploads
-//! the words like any other per-frame block — a few hundred bytes, against a
-//! persistent buffer that would need a copy and a barrier the graph does not
-//! own, or a host write under a frame still reading it. A session with no
-//! surface shader loaded does none of this.
+//! changes ([`ParamBuffer`]), and uploaded then the way the material table is:
+//! a new buffer written at creation, the old one retired through the device's
+//! frame-delayed destroy, so a frame in flight keeps reading the words it
+//! started with and nothing needs a copy or a barrier the graph does not own.
+//! The time is not in it (`gfx::surface`), so a frame that changed nothing
+//! touches neither the buffer nor the sets over it. The forward family's set 5
+//! and the prepass's are persistent groups over the buffer, held until it or
+//! the twins they were built against are replaced; the refraction twin's set 5
+//! also names two graph images, so it is asked of `create_bind_group` like the
+//! built-in's. A session with no surface shader loaded does none of this.
 
+use crate::gfx::graph::BufferUsage;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BindingResource, BlockKind, BufferId, Device, PipelineId, ShaderModuleId,
+    BindGroupId, Binding, BindingResource, BufferDesc, BufferId, Device, MemoryLocation,
+    PipelineId, ShaderModuleId,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::surface::{
@@ -150,7 +157,8 @@ impl Entry {
 /// What a frame binds for its surface shaders, resolved before it records.
 #[derive(Clone, Copy)]
 pub(super) struct SurfaceFrame {
-    /// This frame's `SurfaceParams`.
+    /// What `i.time` reads this frame, for the blocks that carry it.
+    pub time: f32,
     pub params: BufferId,
     /// Set 5 of every forward, transparency and preview twin.
     forward: Option<BindGroupId>,
@@ -163,6 +171,11 @@ pub(super) struct SurfaceShaders {
     entries: Vec<Entry>,
     pub book: ParamBuffer,
     clock: SurfaceClock,
+    /// The book's words on the device, and the forward family's and the
+    /// prepass's set 5 over them. `None` until a frame needs one.
+    params: Option<BufferId>,
+    forward: Option<BindGroupId>,
+    prepass: Option<BindGroupId>,
     /// Whether the renderer has made the black default texture yet.
     black: bool,
 }
@@ -184,6 +197,9 @@ impl SurfaceShaders {
                 DefaultTexture::Normal => normal,
             }),
             clock: SurfaceClock::default(),
+            params: None,
+            forward: None,
+            prepass: None,
             black: false,
         }
     }
@@ -292,6 +308,7 @@ impl SurfaceShaders {
         for module in old_modules {
             device.destroy_shader(module);
         }
+        self.retire_sets(device);
         Ok(was_failed)
     }
 
@@ -329,16 +346,37 @@ impl SurfaceShaders {
         failed
     }
 
-    /// Advance the clock, upload the buffer and build this frame's two shared
-    /// sets — or nothing at all while no shader is loaded.
+    /// Advance the clock, upload the buffer if it changed and build whichever
+    /// of the two shared sets is missing — or nothing at all while no shader
+    /// is loaded. The one place the clock is read in a frame.
     pub(super) fn begin_frame(&mut self, device: &Device, dt: f32) -> Option<SurfaceFrame> {
         if self.entries.is_empty() {
             return None;
         }
         let time = self.clock.tick(dt);
-        self.book.set_time(time);
-        let params =
-            device.upload_block(BlockKind::Storage, bytemuck::cast_slice(self.book.words()));
+        let uploaded = self.book.take_changed().map(|words| {
+            // Never empty: no buffer has size zero, and a function with no
+            // parameters reads word 0 to keep the binding (`surface.glsl`).
+            let words = if words.is_empty() { &[[0; 4]] } else { words };
+            let bytes: &[u8] = bytemuck::cast_slice(words);
+            device.create_buffer_bytes(
+                BufferDesc {
+                    size: bytes.len() as u64,
+                    usage: BufferUsage::STORAGE_BUFFER,
+                    location: MemoryLocation::GpuOnly,
+                },
+                bytes,
+            )
+        });
+        if let Some(buffer) = uploaded {
+            if let Some(old) = self.params.replace(buffer) {
+                device.destroy_buffer(old);
+            }
+            self.retire_sets(device);
+        }
+        let params = self
+            .params
+            .expect("the first frame with a shader uploads the buffer");
         // Any twin of each family will do: the set holds the one binding in
         // every one of them, so the layouts are identical and the set binds to
         // all of them.
@@ -350,34 +388,58 @@ impl SurfaceShaders {
                 .find(|(twin, _)| family(*twin))
                 .map(|(_, pipeline)| *pipeline)
         };
-        let group = |pipeline| params_group(device, pipeline, params, &[]);
+        let group = |pipeline| {
+            let (set, binding) = crate::gfx::surface::PARAMS_BINDING;
+            device.create_persistent_bind_group(
+                pipeline,
+                set,
+                &[Binding {
+                    binding,
+                    resource: BindingResource::StorageBuffer(params),
+                }],
+            )
+        };
+        if self.forward.is_none() {
+            self.forward = find(Twin::forward_family).map(group);
+        }
+        if self.prepass.is_none() {
+            self.prepass = find(|twin| matches!(twin, Twin::Prepass { .. })).map(group);
+        }
         Some(SurfaceFrame {
+            time,
             params,
-            forward: find(Twin::forward_family).map(group),
-            prepass: find(|twin| matches!(twin, Twin::Prepass { .. })).map(group),
+            forward: self.forward,
+            prepass: self.prepass,
         })
+    }
+
+    /// Drop both shared sets, to be built again over the current buffer and
+    /// the current twins by the next frame that needs them.
+    fn retire_sets(&mut self, device: &Device) {
+        for group in [self.forward.take(), self.prepass.take()]
+            .into_iter()
+            .flatten()
+        {
+            device.destroy_bind_group(group);
+        }
     }
 }
 
-/// Set 5 of a twin: the parameter buffer at its binding, after whatever the
-/// built-in's own set 5 already holds.
+/// Set 5 of a refraction twin: the parameter buffer at its binding, after the
+/// two scene views the built-in's own set 5 holds. Asked of the device's cache,
+/// as the built-in's is, since all three outlive the frame.
 pub(super) fn params_group(
     device: &Device,
     pipeline: PipelineId,
     params: BufferId,
-    before: &[Binding],
+    before: &[Binding; 2],
 ) -> BindGroupId {
     let (set, binding) = crate::gfx::surface::PARAMS_BINDING;
     let params = Binding {
         binding,
         resource: BindingResource::StorageBuffer(params),
     };
-    // On the stack: this runs every frame, and the most a twin's set 5 holds
-    // before the parameters is the refraction pass's two views.
-    let mut bindings = [params; 3];
-    bindings[..before.len()].copy_from_slice(before);
-    bindings[before.len()] = params;
-    device.create_transient_bind_group(pipeline, set, &bindings[..=before.len()])
+    device.create_bind_group(pipeline, set, &[before[0], before[1], params])
 }
 
 /// The pipeline and set 5 a run of `material` draws with as `twin`, if a

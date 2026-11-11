@@ -43,6 +43,7 @@ pub struct HeadlessBackend {
     /// Surface shaders are bookkept exactly as the renderer bookkeeps them —
     /// tables, attachments, packing — with nothing built.
     surfaces: ParamBuffer,
+    surface_uploads: u32,
 }
 
 impl Default for HeadlessBackend {
@@ -57,6 +58,7 @@ impl Default for HeadlessBackend {
             bc: false,
             last_texture: None,
             surfaces: ParamBuffer::new(|texture| texture as u32),
+            surface_uploads: 0,
         }
     }
 }
@@ -118,6 +120,12 @@ impl HeadlessBackend {
     /// discriminant here.
     pub fn surface_buffer(&self) -> &ParamBuffer {
         &self.surfaces
+    }
+
+    /// How many frames uploaded the surface parameters, which the renderer
+    /// does on exactly these frames.
+    pub fn surface_uploads(&self) -> u32 {
+        self.surface_uploads
     }
 }
 
@@ -253,5 +261,8 @@ impl RenderBackend for HeadlessBackend {
         _fog: &FogSettings,
         _dt: f32,
     ) {
+        if self.surfaces.loaded() > 0 && self.surfaces.take_changed().is_some() {
+            self.surface_uploads += 1;
+        }
     }
 }

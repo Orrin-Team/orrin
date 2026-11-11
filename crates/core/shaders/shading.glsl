@@ -80,7 +80,7 @@ layout(set = 0, binding = 0) uniform Lighting {
     vec4 ambient;       // rgb = color, w = luminance (cd/m2)
     vec4 sun_direction; // xyz = direction toward the sun (normalized)
     vec4 sun_color;     // rgb = color, w = illuminance (lux)
-    vec4 params;        // x = point light count (y,z legacy), w = spot count
+    vec4 params;        // x = point light count, y = surface time (s), z legacy, w = spot count
     vec4 viewport;      // x=w, y=h, z=1/w, w=1/h
     // The four cascade fields, nested rather than written out flat. std140 lays
     // the struct out at exactly the offsets the flat fields had, so `GpuLighting`
@@ -203,6 +203,12 @@ layout(set = 3, binding = 9) uniform Fog {
 vec4 sample_tex(uint index, vec2 uv) {
     return texture(sampler2D(textures[index], tex_sampler), uv);
 }
+
+#ifdef ORRIN_CUSTOM_SURFACE
+float surface_time() {
+    return lighting.params.y;
+}
+#endif
 
 // The one sample the parallax march makes, with the gradients it is handed
 // rather than the ones this fragment could derive. See parallax.glsl.

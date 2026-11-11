@@ -58,13 +58,23 @@
 //! plus [`PARAMS_BINDING`], and its SPIR-V may hold no more `OpKill`s and no
 //! `FragDepth` the built-in lacks — so a macro that pastes `dis##card` together
 //! is caught there. The rule is "plus exactly that buffer", not "plus at most":
-//! `resolve_surface` reads the time from it in every variant, so a function that
-//! reads nothing still binds it, and a pipeline built for a surface shader binds
-//! it unconditionally.
+//! `resolve_surface` reads a word of it in every variant, so a function that
+//! declares no parameter still binds it, and a pipeline built for a surface
+//! shader binds it unconditionally — a pipeline layout holds only the bindings
+//! its shaders read.
+//!
+//! **The time** is not in that buffer. `i.time` comes from a block every pass
+//! that runs the function uploads each frame anyway — `Lighting::params.y` for
+//! the forward family, `Frame::jitter.z` for the prepass — through a
+//! `surface_time()` each includer defines, as it defines `sample_tex`. The
+//! renderer reads [`SurfaceClock`] once a frame and writes that one value into
+//! both, which is what keeps the prepass cutting where the forward pass shades.
+//! It costs a built-in shader nothing: both components were uploaded and unread
+//! before they carried it.
 //!
 //! **Parameters** live in one storage buffer, `SurfaceParams` at
-//! [`PARAMS_BINDING`], of `vec4` words. The first [`FRAME_WORDS`] are the
-//! frame's (`x` = time); a material's block starts at the word in its
+//! [`PARAMS_BINDING`], of `vec4` words that change only with a value or a
+//! table; a material's block starts at the word in its
 //! `GpuMaterial::surface.x`, and [`ParamTable::words`] builds one from the
 //! shader's defaults and a material's values, reporting rather than failing on a
 //! value the shader no longer declares or declares as another type. A block
@@ -84,8 +94,8 @@
 //! compiler error lands on the line the user wrote; one that cannot is reported
 //! against the file with the compiler's own message. [`ParamBuffer`] is the
 //! CPU half of the buffer every backend keeps — each material's values by name,
-//! repacked when a value or a table changes — and [`SurfaceClock`] is the time
-//! in word 0; `gfx::vulkan::surface` is the GPU half.
+//! repacked, and uploaded, only when a value or a table changes;
+//! `gfx::vulkan::surface` is the GPU half.
 //!
 //! **Variants.** A surface shader compiles once per manifest row whose shader
 //! calls `resolve_surface`, less the `ORRIN_FLAT_SURFACE` rows — a custom surface
@@ -131,7 +141,3 @@ pub use parse::{SurfaceError, SurfaceShader};
 /// `(set, binding)` of the `SurfaceParams` buffer every surface variant binds,
 /// and the only binding it may add to its built-in shader's.
 pub const PARAMS_BINDING: (u32, u32) = (5, 2);
-
-/// The words at the start of `SurfaceParams` that belong to the frame rather
-/// than to a material, so the first material block starts here.
-pub const FRAME_WORDS: u32 = 1;

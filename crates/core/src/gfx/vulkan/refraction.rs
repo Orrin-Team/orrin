@@ -34,10 +34,11 @@
 //!
 //! A transmissive material read through a surface shader draws with that
 //! shader's twin of the draw pipeline (`surface`). Its set 5 is this pass's
-//! two views plus the parameter buffer, so it gets a set of its own, built on
-//! the first run that needs it each frame. The queue stays back to front: the
-//! pipeline follows the runs, switching to a twin and back as the order asks,
-//! rather than the runs being grouped by pipeline.
+//! two views plus the parameter buffer, so it gets a set of its own, asked of
+//! the device's cache on the first run that needs it, as the built-in's is.
+//! The queue stays back to front: the pipeline follows the runs, switching to
+//! a twin and back as the order asks, rather than the runs being grouped by
+//! pipeline.
 
 use crate::gfx::rhi::{
     Binding, BindingResource, Blend, ComputePipelineDesc, CullMode, DepthTest, Device, Encoder,
@@ -256,11 +257,10 @@ impl RefractionPass {
                 },
             },
         ];
-        let scene_set = device.create_bind_group(self.pipeline, SCENE_SET as u32, &scene);
-        // A twin's set 5 is the same two views plus the parameters, built the
-        // first time the queue reaches a twin. Not cached: the parameters are a
-        // fresh block every frame, so it would miss every frame.
-        let mut twin_set = None;
+        // Each set 5 is asked for the first time the queue reaches a run that
+        // binds it: the built-in's two views, or a twin's same two views plus
+        // the parameters. A queue drawn wholly through twins asks for one.
+        let (mut scene_set, mut twin_set) = (None, None);
 
         builder.set_viewport(Viewport {
             origin: [0.0, 0.0],
@@ -302,7 +302,9 @@ impl RefractionPass {
                 let set = match twin {
                     Some((pipeline, params)) => *twin_set
                         .get_or_insert_with(|| params_group(device, pipeline, params, &scene)),
-                    None => scene_set,
+                    None => *scene_set.get_or_insert_with(|| {
+                        device.create_bind_group(self.pipeline, SCENE_SET as u32, &scene)
+                    }),
                 };
                 builder.bind_group(SCENE_SET as u32, set);
                 builder.push_constants(&words);

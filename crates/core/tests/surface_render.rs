@@ -74,6 +74,13 @@ void surface(in SurfaceIn i, inout SurfaceOut o) {
 }
 ";
 
+/// The stripes, moving across the quad with the time.
+const MOVING_STRIPES: &str = "\
+void surface(in SurfaceIn i, inout SurfaceOut o) {
+    o.alpha = step(0.5, fract(i.uv.x * 4.0 + i.time));
+}
+";
+
 const CLOCK: &str = "\
 void surface(in SurfaceIn i, inout SurfaceOut o) {
     o.albedo = vec3(fract(i.time));
@@ -497,23 +504,19 @@ fn the_prepass_reads_the_function_too(make: fn([u32; 2]) -> VulkanRenderer, back
     assert_eq!(d.over, 0, "{backend}: {d:?}");
 }
 
-fn a_masked_function_cuts_holes_with_no_seam(make: fn([u32; 2]) -> VulkanRenderer, backend: &str) {
-    let mut renderer = make(EXTENT);
-    let red = Material {
-        base_color: Vec3::new(0.8, 0.05, 0.05),
-        blend: BlendMode::Masked,
-        ..grey(0.6)
-    };
-    let mut rig = rig(&mut renderer, Shape::Card, red);
-    let solid = rig.draw(&mut renderer);
-    let shader = renderer.load_surface_shader(&compiled(STRIPES)).unwrap();
-    renderer
-        .set_material_surface(rig.subject, Some((shader, &[])))
-        .unwrap();
-    let cut = rig.draw(&mut renderer);
-    save(&solid, EXTENT, &format!("{backend}-card"));
-    save(&cut, EXTENT, &format!("{backend}-stripes"));
+/// What a cut card left of itself, by pixel: the card's area in the solid
+/// frame, and of it what the cut frame kept, what shows what is behind (and of
+/// that the wall), and what is neither.
+#[derive(Debug)]
+struct Cut {
+    area: usize,
+    kept: usize,
+    through: usize,
+    walls: usize,
+    neither: usize,
+}
 
+fn cut(solid: &[u8], cut: &[u8]) -> Cut {
     let dominant = |p: &[u8], c: usize| {
         let others = (0..3)
             .filter(|o| *o != c)
@@ -525,28 +528,61 @@ fn a_masked_function_cuts_holes_with_no_seam(make: fn([u32; 2]) -> VulkanRendere
     let reddish = |p: &[u8]| dominant(p, 0);
     let greenish = |p: &[u8]| dominant(p, 1);
     let card: Vec<bool> = solid.chunks(4).map(reddish).collect();
-    let area = card.iter().filter(|c| **c).count();
     // Through a hole is the wall, or the ground below the wall's foot; never
     // the clear colour, which is what a hole the prepass did not cut shows.
     let dark = |p: &[u8]| p[..3].iter().all(|c| *c < 24);
-    let (mut kept, mut through, mut neither) = (0, 0, 0);
+    let mut found = Cut {
+        area: card.iter().filter(|c| **c).count(),
+        kept: 0,
+        through: 0,
+        walls: 0,
+        neither: 0,
+    };
     for (pixel, inside) in cut.chunks(4).zip(&card) {
         if !inside {
             continue;
         }
+        if greenish(pixel) {
+            found.walls += 1;
+        }
         if reddish(pixel) {
-            kept += 1;
+            found.kept += 1;
         } else if dark(pixel) {
-            neither += 1;
+            found.neither += 1;
         } else {
-            through += 1;
+            found.through += 1;
         }
     }
-    let walls = cut
-        .chunks(4)
-        .zip(&card)
-        .filter(|(p, inside)| **inside && greenish(p))
-        .count();
+    found
+}
+
+fn red_card() -> Material {
+    Material {
+        base_color: Vec3::new(0.8, 0.05, 0.05),
+        blend: BlendMode::Masked,
+        ..grey(0.6)
+    }
+}
+
+fn a_masked_function_cuts_holes_with_no_seam(make: fn([u32; 2]) -> VulkanRenderer, backend: &str) {
+    let mut renderer = make(EXTENT);
+    let mut rig = rig(&mut renderer, Shape::Card, red_card());
+    let solid = rig.draw(&mut renderer);
+    let shader = renderer.load_surface_shader(&compiled(STRIPES)).unwrap();
+    renderer
+        .set_material_surface(rig.subject, Some((shader, &[])))
+        .unwrap();
+    let striped = rig.draw(&mut renderer);
+    save(&solid, EXTENT, &format!("{backend}-card"));
+    save(&striped, EXTENT, &format!("{backend}-stripes"));
+
+    let Cut {
+        area,
+        kept,
+        through,
+        walls,
+        neither,
+    } = cut(&solid, &striped);
     println!(
         "{backend}: card {area} pixels: {kept} kept, {through} show what is behind ({walls} of \
          them the wall), {neither} dark"
@@ -564,6 +600,51 @@ fn a_masked_function_cuts_holes_with_no_seam(make: fn([u32; 2]) -> VulkanRendere
     assert!(
         neither <= area / 100,
         "{backend}: {neither} pixels of the card are neither the card nor the wall"
+    );
+}
+
+/// The stripes again, moved a quarter of a period by the time: the prepass cuts
+/// the depth the forward pass shades against, so the two reading different
+/// times leaves the card's colour gone from a quarter of it and nothing drawn
+/// in its place — the clear colour, which is neither card nor wall.
+fn the_prepass_and_the_forward_pass_cut_at_one_time(
+    make: fn([u32; 2]) -> VulkanRenderer,
+    backend: &str,
+) {
+    let mut renderer = make(EXTENT);
+    let mut rig = rig(&mut renderer, Shape::Card, red_card());
+    let solid = rig.draw(&mut renderer);
+    let shader = renderer
+        .load_surface_shader(&compiled(MOVING_STRIPES))
+        .unwrap();
+    renderer
+        .set_material_surface(rig.subject, Some((shader, &[])))
+        .unwrap();
+    let mut at = |time| {
+        rig.settings.surface_time = Some(time);
+        rig.draw(&mut renderer)
+    };
+    let still = at(0.0);
+    let moved = at(0.25);
+    save(&moved, EXTENT, &format!("{backend}-moving-stripes"));
+
+    let shifted = diff(&still, &moved, ROUNDING);
+    let found = cut(&solid, &moved);
+    println!("{backend}: stripes moved by the time {shifted:?}; at 0.25 s {found:?}");
+    assert!(found.area > 2_000, "{backend}: the card is on screen");
+    assert!(
+        found.neither <= found.area / 100,
+        "{backend}: {} pixels of the card are neither the card nor the wall",
+        found.neither
+    );
+    let half = |n: usize| n as f32 / found.area as f32;
+    assert!(
+        (0.35..0.65).contains(&half(found.through)),
+        "{backend}: the holes show the wall behind them"
+    );
+    assert!(
+        shifted.over > found.area / 4,
+        "{backend}: the time moved the cut"
     );
 }
 
@@ -1006,6 +1087,7 @@ on_every_backend!(
     a_colour_parameter_paints_the_object_and_nothing_else,
     the_prepass_reads_the_function_too,
     a_masked_function_cuts_holes_with_no_seam,
+    the_prepass_and_the_forward_pass_cut_at_one_time,
     the_blended_queues_draw_through_the_function,
     a_parameter_and_the_time_reach_the_function,
     a_swap_takes_effect_and_a_broken_one_changes_nothing,
