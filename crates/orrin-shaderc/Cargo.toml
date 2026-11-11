@@ -1,0 +1,12 @@
+[package]
+name = "orrin-shaderc"
+version.workspace = true
+edition.workspace = true
+description = "Compiling an Orrin shader: GLSL to SPIR-V, and that SPIR-V to MSL"
+
+[dependencies]
+# shaderc is the compiler vulkano-shaders already builds, from source with
+# CMake; spirv-cross2 is the translator MoltenVK runs these shaders through
+# today.
+shaderc = "0.8"
+spirv-cross2 = { version = "0.7", default-features = false, features = ["msl"] }

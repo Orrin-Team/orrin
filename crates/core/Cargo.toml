@@ -7,6 +7,7 @@ edition.workspace = true
 orrin-project.workspace =  true
 orrin-script = { workspace = true, optional = true }
 orrin-build = { workspace = true, optional = true }
+orrin-shaderc = { workspace = true, optional = true }
 orrin-ecs.workspace = true
 # `egui` turns on the registry's inspector vtable entry. No new dependency:
 # egui is already below.
@@ -85,7 +86,7 @@ vk2dfd = "0.1.0"
 winit.workspace = true
 
 [features]
-default = ["scripting"]
+default = ["scripting", "shader-compiler"]
 # C# scripting, on by default: it is what the engine *is*, and a second-class
 # build shape is one nobody compiles until it has already rotted.
 #
@@ -97,6 +98,17 @@ default = ["scripting"]
 # The build watcher rides along: rebuild-on-save has nothing to reload without
 # scripting.
 scripting = ["dep:orrin-script", "dep:orrin-build"]
+# Compiling shaders at runtime, which is how the editor turns a material's
+# surface shader into SPIR-V and MSL (`gfx::shaders::compile`). On by default
+# for the reason scripting is: the editor is the ordinary build.
+#
+# An exported game never compiles a shader — it ships compiled artifacts — so
+# `orrin export` builds without it. What it costs the editor (macOS arm64):
+# shaderc and spirv-cross2 are already built for build.rs, and a dev build
+# shares that build, but a release build makes a second, optimised one. Once
+# something calls `compile` they are linked in, ~3.6 MB of release binary
+# (26.8 -> 30.4 MB); until then the linker drops them.
+shader-compiler = ["dep:orrin-shaderc"]
 # An exported game rather than the editor: trace and debug events are compiled
 # out, and warnings and errors are also written to a log file beside the
 # executable — see `logging::LogConfig::for_this_build`. The game is found from
@@ -131,12 +143,10 @@ harness = false
 required-features = ["scripting"]
 
 [build-dependencies]
-# Compile every shader once to SPIR-V and translate it to MSL (see build.rs).
-# shaderc is the compiler vulkano-shaders already builds; spirv-cross2 is the
-# translator MoltenVK runs these shaders through today. Neither is linked into
-# the engine, so neither can move the cold-start gate.
-shaderc = "0.8"
-spirv-cross2 = { version = "0.7", default-features = false, features = ["msl"] }
+# Compile every shader once to SPIR-V and translate it to MSL (see build.rs),
+# through the crate that is the one way to compile an Orrin shader. It is linked
+# into the engine only with `shader-compiler`.
+orrin-shaderc.workspace = true
 
 # Native Metal beside Vulkan, on macOS only: the driver in `gfx/metal`. The
 # bindings are generated per class and default to all of them, which is the

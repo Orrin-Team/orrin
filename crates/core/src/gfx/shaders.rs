@@ -12,6 +12,14 @@
 //! own index, push constants sit at one fixed slot, vertex streams start at a
 //! fixed base) is emitted from the build script alongside the table, because
 //! the translator is what has to agree with it.
+//!
+//! With the `shader-compiler` feature, [`compile`] compiles a shader at runtime
+//! through the same `orrin-shaderc` the build uses, against the embedded
+//! [`SOURCES`] and the layout rebuilt from [`LAYOUT_WIDTHS`], so a built-in
+//! shader compiled here comes out byte for byte as the table has it —
+//! `tests/shader_compiler.rs` asserts exactly that. [`CompiledShader`] exists
+//! without the feature, because an exported game loads compiled shaders and
+//! compiles none.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stage {
@@ -64,7 +72,35 @@ pub struct ShaderBlob {
     pub bindings: BindingMap,
 }
 
+/// A shader compiled at runtime: a [`ShaderBlob`] that owns its data. It has
+/// no `path`, because its source was never a file under `shaders/`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CompiledShader {
+    pub name: String,
+    pub stage: Stage,
+    pub defines: Vec<(String, String)>,
+    /// Little-endian SPIR-V words.
+    pub spirv: Vec<u8>,
+    pub msl: String,
+    pub bindings: CompiledBindings,
+}
+
+/// A [`BindingMap`] that owns its resources.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CompiledBindings {
+    pub resources: Vec<Resource>,
+    pub push_constant_bytes: u32,
+    /// Only a compute shader has one.
+    pub workgroup_size: Option<[u32; 3]>,
+}
+
+#[cfg(feature = "shader-compiler")]
+mod runtime;
+#[cfg(feature = "shader-compiler")]
+pub use runtime::compile;
+
 include!(concat!(env!("OUT_DIR"), "/shaders.rs"));
+include!(concat!(env!("OUT_DIR"), "/shader_sources.rs"));
 
 impl ShaderId {
     pub fn blob(self) -> &'static ShaderBlob {
