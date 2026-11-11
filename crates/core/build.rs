@@ -11,8 +11,9 @@
 //! engine.
 //!
 //! `shaders.rs` is the table. `shader_sources.rs` is what a runtime compile needs
-//! to agree with it: the widths table the layout was built from and, with the
-//! `shader-compiler` feature, every file under `shaders/` and a hash over both.
+//! to agree with it: the widths table the layout was built from, a hash over it
+//! and every file under `shaders/`, and, with the `shader-compiler` feature, the
+//! files themselves.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -255,7 +256,8 @@ fn main() {
          pub static SOURCES: &[(&str, &str)] = &[\n{sources}];\n\n\
          /// `orrin_shaderc::sources_hash` over [`SOURCES`] and [`LAYOUT_WIDTHS`]:\n\
          /// what a compiled shader records to say which engine it was built for.\n\
-         #[cfg(feature = \"shader-compiler\")]\n\
+         /// Without the `shader-compiler` feature too: an exported game compares\n\
+         /// against it and compiles nothing.\n\
          pub const SOURCES_HASH: u64 = {hash:#018x};\n"
     );
     fs::write(out_dir.join("shader_sources.rs"), generated).unwrap();

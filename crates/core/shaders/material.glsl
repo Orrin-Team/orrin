@@ -28,6 +28,7 @@ struct GpuMaterial {
     vec4 alpha;        // x = the alpha a MASKED fragment must reach to survive
     uvec4 tex_indices_ext; // x=clearcoat, y=clearcoat normal, z=sheen, w=anisotropy
     uvec4 tex_flags;       // x = transmission map, y = feature flags, z = subsurface, w = height
+    uvec4 surface;         // x = the first word of this material's parameters in SurfaceParams
 };
 
 // Feature bits in `tex_flags.y`, mirroring `material_flags` in forward.rs.

@@ -22,12 +22,16 @@
 //
 // With `ORRIN_CUSTOM_SURFACE` defined, `resolve_surface` hands the standard
 // reading to `void surface(in SurfaceIn i, inout SurfaceOut o)` from
-// `custom_surface.glsl`, which the runtime compiler supplies rather than any
-// file on disk, and then holds the result to the ranges the standard reading
-// keeps to, so a custom function cannot hand the lighting a value no material
-// could. The masked shadow pass reads only `material_alpha`, at the unmarched
-// coordinate and with no world position to build a `SurfaceIn` from, so the
-// hook does not reach it.
+// `custom_surface.glsl`, and then holds the result to the ranges the standard
+// reading keeps to, so a custom function cannot hand the lighting a value no
+// material could. The runtime compiler supplies that file (`gfx::surface`
+// generates it); the one on disk holds the empty function, so that one manifest
+// row can compile this path and put `SurfaceParams` in the argument buffer
+// layout every shader is translated against. A generated file that defines
+// `ORRIN_SURFACE_PARAMETERS` also defines `surface_parameters(uint base)`, which
+// is called with the material's first word to load its parameters. The masked
+// shadow pass reads only `material_alpha`, at the unmarched coordinate and with
+// no world position to build a `SurfaceIn` from, so the hook does not reach it.
 
 #ifndef ORRIN_SURFACE_GLSL
 #define ORRIN_SURFACE_GLSL
@@ -45,6 +49,10 @@ struct SurfaceIn {
     /// Unit length, from the surface toward the eye.
     vec3 view_dir;
     vec3 vertex_color;
+#ifdef ORRIN_CUSTOM_SURFACE
+    /// Seconds, from `SurfaceParams`, so that only a custom surface pays for it.
+    float time;
+#endif
 };
 
 struct SurfaceOut {
@@ -91,12 +99,24 @@ SurfaceOut standard_surface(GpuMaterial m, SurfaceIn i) {
 }
 
 #ifdef ORRIN_CUSTOM_SURFACE
+// Word 0 is the frame's and the same for every material: x = time in seconds.
+// A material's own parameters start at `words[m.surface.x]`. The forward family
+// and the prepass read this one buffer, which is what makes the two animate in
+// step. Declared only here, so no built-in shader's layout gains a binding.
+layout(set = 5, binding = 2, std430) readonly buffer SurfaceParams {
+    vec4 words[];
+} surface_params;
+
 #include "custom_surface.glsl"
 #endif
 
 SurfaceOut resolve_surface(GpuMaterial m, SurfaceIn i) {
     SurfaceOut o = standard_surface(m, i);
 #ifdef ORRIN_CUSTOM_SURFACE
+    i.time = surface_params.words[0].x;
+#ifdef ORRIN_SURFACE_PARAMETERS
+    surface_parameters(m.surface.x);
+#endif
     surface(i, o);
     // Only behind the hook: the standard reading keeps to these ranges already,
     // and normalising a normal that every pass normalises again after rotating

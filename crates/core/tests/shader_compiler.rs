@@ -12,8 +12,8 @@ use std::fs;
 use std::path::Path;
 
 use orrin_core::gfx::shaders::{
-    CompiledShader, LAYOUT_WIDTHS, SHADERS, SOURCES, SOURCES_HASH, ShaderBlob, ShaderId, Stage,
-    compile,
+    CompiledShader, LAYOUT_WIDTHS, Resource, ResourceKind, SHADERS, SOURCES, SOURCES_HASH,
+    ShaderBlob, ShaderId, Stage, compile,
 };
 
 fn source_of(blob: &ShaderBlob) -> &'static str {
@@ -116,7 +116,8 @@ fn a_compile_error_names_the_file_it_was_given() {
 
 /// Every manifest row a custom surface function is stitched into: each variant
 /// of the forward, transparency and refraction passes and of the prepass. The
-/// masked shadow pass tests alpha at the unmarched coordinate and is not one.
+/// masked shadow pass tests alpha at the unmarched coordinate and is not one,
+/// and the row that already compiles the custom path is not stitched into.
 fn surface_passes() -> Vec<&'static ShaderBlob> {
     const FILES: [&str; 5] = [
         "forward.frag",
@@ -128,6 +129,12 @@ fn surface_passes() -> Vec<&'static ShaderBlob> {
     let passes: Vec<_> = SHADERS
         .iter()
         .filter(|blob| FILES.contains(&blob.path))
+        .filter(|blob| {
+            !blob
+                .defines
+                .iter()
+                .any(|(key, _)| *key == "ORRIN_CUSTOM_SURFACE")
+        })
         .collect();
     for id in [
         ShaderId::ForwardFrag,
@@ -158,13 +165,30 @@ fn compile_with_surface(blob: &ShaderBlob, surface: &str) -> Result<CompiledShad
 
 const EMPTY_SURFACE: &str = "void surface(in SurfaceIn i, inout SurfaceOut o) {}\n";
 
+/// What `blob` binds, plus the parameter buffer every custom surface reads its
+/// time from, as the build's own custom-surface row reflected it.
+fn with_surface_params(blob: &ShaderBlob) -> Vec<Resource> {
+    let params = *ShaderId::PrepassFragCustomSurface
+        .blob()
+        .bindings
+        .resources
+        .iter()
+        .find(|r| (r.set, r.binding) == (5, 2))
+        .expect("the custom-surface row binds SurfaceParams");
+    assert_eq!(params.kind, ResourceKind::StorageBuffer);
+    let mut resources = blob.bindings.resources.to_vec();
+    resources.push(params);
+    resources
+}
+
 #[test]
-fn an_empty_surface_function_binds_exactly_what_the_built_in_shader_binds() {
+fn an_empty_surface_function_binds_what_the_built_in_shader_binds_and_the_parameters() {
     for blob in surface_passes() {
         let compiled = compile_with_surface(blob, EMPTY_SURFACE)
             .unwrap_or_else(|e| panic!("{}: {e}", blob.name));
         assert_eq!(
-            compiled.bindings.resources, blob.bindings.resources,
+            compiled.bindings.resources,
+            with_surface_params(blob),
             "{}",
             blob.name
         );
@@ -202,7 +226,8 @@ fn a_surface_function_that_reads_every_input_and_writes_every_output_compiles_in
             blob.name
         );
         assert_eq!(
-            compiled.bindings.resources, blob.bindings.resources,
+            compiled.bindings.resources,
+            with_surface_params(blob),
             "{}",
             blob.name
         );

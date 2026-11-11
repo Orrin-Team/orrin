@@ -127,6 +127,9 @@ pub(crate) struct GpuMaterial {
     /// rather than in a float field so the shader can test them without
     /// `floatBitsToUint`.
     tex_flags: [u32; 4],
+    /// `x` = the first word of this material's parameters in a surface shader's
+    /// parameter buffer (`gfx::surface`). Only a custom surface reads it.
+    surface: [u32; 4],
 }
 
 impl GpuMaterial {
@@ -1635,6 +1638,7 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
             // texture gives its lobe.
             m.height_texture.map_or(WHITE_TEXTURE, |h| h.0),
         ],
+        surface: [0; 4],
     }
 }
 
@@ -1707,9 +1711,9 @@ mod tests {
     /// which is why the size is pinned here.
     #[test]
     fn the_material_block_is_the_size_both_shader_mirrors_declare() {
-        // 15 vec4-sized blocks: base colour, emissive, params, texture indices,
+        // 16 vec4-sized blocks: base colour, emissive, params, texture indices,
         // the five lobes' blocks, the two subsurface blocks, parallax, alpha,
-        // the extended indices, and the flags.
-        assert_eq!(std::mem::size_of::<GpuMaterial>(), 15 * 16);
+        // the extended indices, the flags, and the surface shader's word.
+        assert_eq!(std::mem::size_of::<GpuMaterial>(), 16 * 16);
     }
 }

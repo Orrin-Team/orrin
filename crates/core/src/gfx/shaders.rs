@@ -15,9 +15,10 @@
 //! through the same `orrin-shaderc` the build uses, against the embedded
 //! [`SOURCES`] and the layout rebuilt from [`LAYOUT_WIDTHS`], so a built-in
 //! shader compiled here comes out byte for byte as the table has it —
-//! `tests/shader_compiler.rs` asserts exactly that. [`CompiledShader`] exists
-//! without the feature, because an exported game loads compiled shaders and
-//! compiles none.
+//! `tests/shader_compiler.rs` asserts exactly that. [`CompiledShader`] and
+//! [`SOURCES_HASH`] exist without the feature, because an exported game loads
+//! compiled shaders, checks which sources they were built from, and compiles
+//! none.
 //!
 //! A driver reads a table entry and a shader handed to `Device::load_shader`
 //! through one [`ShaderView`], so there is no second path for a loaded shader to

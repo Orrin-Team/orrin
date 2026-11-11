@@ -45,6 +45,7 @@ overlay_vert vertex overlay.vert
 prefilter_cube_frag fragment prefilter_cube.frag
 prepass_frag fragment prepass.frag
 prepass_frag_masked fragment prepass.frag ORRIN_MASKED=1
+prepass_frag_custom_surface fragment prepass.frag ORRIN_CUSTOM_SURFACE=1
 prepass_vert vertex prepass.vert
 refraction_frag fragment refraction.frag
 refraction_composite_comp compute refraction_composite.comp
