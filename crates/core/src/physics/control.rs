@@ -1,5 +1,5 @@
 //! What game code may ask of the simulation between steps: push a body, read
-//! or set its velocity, cast a ray.
+//! or set its velocity, cast a ray or a shape, or ask what overlaps one.
 //!
 //! A push is asked for from one of two places, and a [`ForceMode::Force`] or
 //! [`ForceMode::Acceleration`] is read as *held for as long as that place
@@ -19,12 +19,22 @@
 //! rigid body, throw" in one `OnStart` works; the cost is that `true` for such
 //! an entity means the push was taken, not that it will land. A push on a body
 //! that exists and is not dynamic is refused at once.
+//!
+//! The queries all filter alike — a layer mask, and triggers passed through
+//! unless asked for — and all read Jolt as the last run left it. So a collider
+//! added since has no body to find, and one moved since is found where the run
+//! put it: a static one keeps its old place until a step carries it, because a
+//! moved static becomes kinematic and a kinematic body moves only by stepping.
+//! The shapes a query sweeps or tests are one unit sphere and one unit box,
+//! built with the simulation and scaled per query, so asking costs no shape.
 
-use glam::Vec3;
-use jolt::{BodyInterface, QueryFilter};
+use std::ops::ControlFlow;
+
+use glam::{Quat, Vec3};
+use jolt::{BodyInterface, QueryFilter, Shape};
 use orrin_ecs::{Entity, World};
 
-use super::{Kind, Motion, PhysicsState, Simulation, Tracked, from_jolt, to_jolt};
+use super::{Kind, Motion, PhysicsState, Simulation, from_jolt, to_jolt, to_jolt_quat};
 use crate::scene::PHYSICS_LAYERS;
 
 /// How a push is read. Lock-step with C# `Orrin.ForceMode`.
@@ -192,18 +202,7 @@ pub fn raycast(
     let length = max_distance.min(MAX_RAY);
     let state = world.get_resource::<PhysicsState>()?;
     let simulation = state.simulation.as_ref()?;
-    let wanted = |tracked: &Tracked| {
-        let collider = tracked.spec.collider;
-        let layer = collider.layer.min(PHYSICS_LAYERS - 1);
-        layers & (1 << layer) != 0 && (hit_triggers || !collider.is_trigger)
-    };
-    let accept = |id: jolt::BodyId| {
-        simulation
-            .entities
-            .get(&id)
-            .and_then(|entity| simulation.bodies.get(entity))
-            .is_some_and(wanted)
-    };
+    let accept = |id| accepts(simulation, id, layers, hit_triggers);
     let filter = QueryFilter::new().with_body_filter(&accept);
     let hit = simulation
         .system
@@ -226,4 +225,148 @@ pub(super) fn apply_pending(simulation: &Simulation, pending: &mut Vec<(Entity, 
             push.apply(&bodies, tracked.id);
         }
     }
+}
+
+/// Whether a query on `layers` sees body `id`.
+fn accepts(simulation: &Simulation, id: jolt::BodyId, layers: u32, hit_triggers: bool) -> bool {
+    simulation
+        .entities
+        .get(&id)
+        .and_then(|entity| simulation.bodies.get(entity))
+        .is_some_and(|tracked| {
+            let collider = tracked.spec.collider;
+            let layer = collider.layer.min(PHYSICS_LAYERS - 1);
+            layers & (1 << layer) != 0 && (hit_triggers || !collider.is_trigger)
+        })
+}
+
+/// A volume a query tests or sweeps, placed in the world.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum QueryShape {
+    Sphere {
+        center: Vec3,
+        radius: f32,
+    },
+    Box {
+        center: Vec3,
+        half_extents: Vec3,
+        rotation: Quat,
+    },
+}
+
+/// The unit shapes every query is scaled from.
+pub(super) struct QueryShapes {
+    sphere: Shape,
+    cuboid: Shape,
+}
+
+impl QueryShapes {
+    pub(super) fn new() -> jolt::Result<Self> {
+        Ok(Self {
+            sphere: Shape::sphere(1.0)?,
+            // No convex radius, which Jolt would scale along with the box and
+            // so round a thin query's corners off by its own width.
+            cuboid: Shape::cuboid_with_convex_radius(jolt::Vec3::new(1.0, 1.0, 1.0), 0.0)?,
+        })
+    }
+}
+
+impl QueryShape {
+    /// The unit shape, its scale and where it stands, or `None` for a shape
+    /// with no volume or a placement that is not finite.
+    fn placed(self, shapes: &QueryShapes) -> Option<(&Shape, jolt::Vec3, jolt::Mat44)> {
+        let (shape, scale, center, rotation) = match self {
+            Self::Sphere { center, radius } => {
+                (&shapes.sphere, Vec3::splat(radius), center, Quat::IDENTITY)
+            }
+            Self::Box {
+                center,
+                half_extents,
+                rotation,
+            } => {
+                let length = rotation.length();
+                if !(length.is_finite() && length > 0.0) {
+                    return None;
+                }
+                (&shapes.cuboid, half_extents, center, rotation / length)
+            }
+        };
+        if !(scale.is_finite() && scale.min_element() > 0.0 && center.is_finite()) {
+            return None;
+        }
+        let at = jolt::Mat44::from_rotation_translation(to_jolt_quat(rotation), to_jolt(center));
+        Some((shape, to_jolt(scale), at))
+    }
+}
+
+/// Every entity whose collider `shape` overlaps, on a layer whose bit is set in
+/// `layers`, triggers only if `hit_triggers`. Written into `out`, which is
+/// cleared first, once each and in entity order: Jolt reports a mesh once per
+/// triangle it touches and in no order, and neither is what a script asked.
+pub fn overlap(
+    world: &World,
+    shape: QueryShape,
+    layers: u32,
+    hit_triggers: bool,
+    out: &mut Vec<Entity>,
+) {
+    out.clear();
+    let Some(state) = world.get_resource::<PhysicsState>() else {
+        return;
+    };
+    let Some(simulation) = state.simulation.as_ref() else {
+        return;
+    };
+    let Some((unit, scale, at)) = shape.placed(&simulation.queries) else {
+        return;
+    };
+    let accept = |id| accepts(simulation, id, layers, hit_triggers);
+    let filter = QueryFilter::new().with_body_filter(&accept);
+    simulation
+        .system
+        .collide_shape(unit, scale, &at, 0.0, &filter, |hit| {
+            if let Some(&entity) = simulation.entities.get(&hit.body_id) {
+                out.push(entity);
+            }
+            ControlFlow::Continue(())
+        });
+    out.sort_unstable_by_key(|entity| (entity.index, entity.generation));
+    out.dedup();
+}
+
+/// The first collider `shape` meets swept along `direction` for at most
+/// `max_distance`, filtered as [`overlap`] filters. `distance` is how far the
+/// shape travelled, `point` where it touched and `normal` the surface's there.
+/// A shape that starts inside a collider hits it at distance zero.
+pub fn shape_cast(
+    world: &World,
+    shape: QueryShape,
+    direction: Vec3,
+    max_distance: f32,
+    layers: u32,
+    hit_triggers: bool,
+) -> Option<RaycastHit> {
+    let direction = direction.try_normalize()?;
+    if max_distance.is_nan() || max_distance <= 0.0 {
+        return None;
+    }
+    let length = max_distance.min(MAX_RAY);
+    let state = world.get_resource::<PhysicsState>()?;
+    let simulation = state.simulation.as_ref()?;
+    let (unit, scale, at) = shape.placed(&simulation.queries)?;
+    let accept = |id| accepts(simulation, id, layers, hit_triggers);
+    let filter = QueryFilter::new().with_body_filter(&accept);
+    let hit = simulation.system.cast_shape_closest(
+        unit,
+        scale,
+        &at,
+        to_jolt(direction * length),
+        &filter,
+    )?;
+    Some(RaycastHit {
+        entity: *simulation.entities.get(&hit.body_id)?,
+        point: from_jolt(hit.contact_point_on2),
+        normal: from_jolt(hit.normal()),
+        distance: hit.fraction * length,
+    })
 }

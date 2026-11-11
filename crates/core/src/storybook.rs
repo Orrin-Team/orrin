@@ -152,7 +152,7 @@ impl StoryRunner {
             return;
         };
         with_lent(main, &mut open.world, &mut self.input, extent, |world| {
-            world.resource_mut::<Time>().update(delta);
+            world.resource_mut::<Time>().update(delta, 1.0);
             let size = world.resource::<GameScreen>().size;
             world
                 .resource_mut::<UiCanvas>()

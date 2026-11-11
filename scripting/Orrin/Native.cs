@@ -148,6 +148,20 @@ public unsafe struct OrrinApi
     public delegate* unmanaged<void> AudioStopMusic;
     public delegate* unmanaged<float, void> AudioSetMasterVolume;
     public delegate* unmanaged<float, void> AudioSetMusicVolume;
+    // Time scale, appended after audio; never reordered above it. TimeDelta
+    // above is game time; these are the real frame, the physics step, and the
+    // scale itself.
+    public delegate* unmanaged<float> TimeUnscaledDelta;
+    public delegate* unmanaged<float> TimeFixedDelta;
+    public delegate* unmanaged<float> TimeScale;
+    public delegate* unmanaged<float, void> SetTimeScale;
+    // The wheel, appended after the time scale: two floats, as MouseDelta.
+    public delegate* unmanaged<float*, void> ScrollDelta;
+    // Shape queries, appended after the wheel. A ShapeQuery and its byte size;
+    // an overlap writes at most the given count of entities and returns how
+    // many there were, a cast writes a RaycastHit of the size given.
+    public delegate* unmanaged<byte*, uint, Entity*, uint, uint> PhysicsOverlap;
+    public delegate* unmanaged<byte*, uint, byte*, uint, byte> PhysicsShapeCast;
 }
 
 internal static unsafe class Native
@@ -438,6 +452,13 @@ internal static unsafe class Native
         return new Vector2(xy[0], xy[1]);
     }
 
+    internal static Vector2 ScrollDelta()
+    {
+        var xy = stackalloc float[2];
+        _api.ScrollDelta(xy);
+        return new Vector2(xy[0], xy[1]);
+    }
+
     internal static void SetCursorLocked(bool locked) => _api.SetCursorLocked(locked ? (byte)1 : (byte)0);
 
     internal static bool CursorLocked() => _api.CursorLocked() != 0;
@@ -505,6 +526,22 @@ internal static unsafe class Native
                 maxDistance, layers, hitTriggers ? (byte)1 : (byte)0, (byte*)p, (uint)sizeof(RaycastHit)) != 0;
     }
 
+    internal static int PhysicsOverlap(in ShapeQuery query, Span<Entity> results)
+    {
+        fixed (ShapeQuery* q = &query)
+        fixed (Entity* p = results)
+            return (int)_api.PhysicsOverlap((byte*)q, (uint)sizeof(ShapeQuery), p, (uint)results.Length);
+    }
+
+    internal static bool PhysicsShapeCast(in ShapeQuery query, out RaycastHit hit)
+    {
+        hit = default;
+        fixed (ShapeQuery* q = &query)
+        fixed (RaycastHit* p = &hit)
+            return _api.PhysicsShapeCast(
+                (byte*)q, (uint)sizeof(ShapeQuery), (byte*)p, (uint)sizeof(RaycastHit)) != 0;
+    }
+
     internal static bool TweenPlaying(ulong id) => _api.TweenPlaying(id) != 0;
 
     internal static float StoryFloat(string name, float @default, float min, float max)
@@ -534,6 +571,14 @@ internal static unsafe class Native
     public static float TimeTotal() => _api.TimeTotal();
 
     public static ulong TimeFrameCount() => _api.TimeFrameCount();
+
+    internal static float TimeUnscaledDelta() => _api.TimeUnscaledDelta();
+
+    internal static float TimeFixedDelta() => _api.TimeFixedDelta();
+
+    internal static float TimeScale() => _api.TimeScale();
+
+    internal static void SetTimeScale(float scale) => _api.SetTimeScale(scale);
 
     /// The handle for an action name, interning it on first use. Stable for the
     /// life of the process: a binding reload changes what it points at, never

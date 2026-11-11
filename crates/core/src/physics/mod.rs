@@ -83,7 +83,10 @@ mod events;
 pub mod outline;
 mod shapes;
 
-pub use control::{ForceMode, RaycastHit, add_force, add_torque, raycast, set_velocity, velocity};
+pub use control::{
+    ForceMode, QueryShape, RaycastHit, add_force, add_torque, overlap, raycast, set_velocity,
+    shape_cast, velocity,
+};
 pub use events::{CollisionEvent, CollisionEventKind, CollisionState, Contact, pair_key};
 
 use crate::scene::{
@@ -171,6 +174,7 @@ struct Simulation {
     changes: Arc<Mutex<Vec<contacts::Change>>>,
     pairs: contacts::Pairs,
     shapes: shapes::Cache,
+    queries: control::QueryShapes,
     accumulator: f32,
 }
 
@@ -284,6 +288,7 @@ impl Simulation {
             changes,
             pairs: contacts::Pairs::default(),
             shapes: shapes::Cache::default(),
+            queries: control::QueryShapes::new()?,
             accumulator: 0.0,
         })
     }
@@ -470,6 +475,18 @@ pub fn motion(world: &World, entity: Entity) -> Option<Motion> {
     let state = world.get_resource::<PhysicsState>()?;
     let tracked = state.simulation.as_ref()?.bodies.get(&entity)?;
     Some(tracked.motion())
+}
+
+/// The scene's fixed step in seconds: what `Time.fixedDeltaTime` reads, and
+/// what a step takes whatever the time scale. Read without cloning the
+/// settings, since a script may ask every frame.
+pub fn step_length(world: &World) -> f32 {
+    let mut step = STEP;
+    world.query::<&PhysicsSettings>().find(|_, settings| {
+        step = settings.step();
+        true
+    });
+    step
 }
 
 /// The first entity's [`PhysicsSettings`], or the defaults.

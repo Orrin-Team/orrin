@@ -246,6 +246,15 @@ unsafe
     Check(sizeof(Orrin.ColliderData) == 32, "ColliderData is a shape, a Vector3 and four words");
     Check(sizeof(Orrin.RaycastHit) == 36, "RaycastHit is an Entity, two Vector3s and a float");
     Check(sizeof(Orrin.Collision) == 44, "Collision is an Entity and three Vector3s");
+    // The shape queries, lock-step with CShapeQuery.
+    Check(sizeof(Orrin.ShapeQuery) == 68, "ShapeQuery is a shape, three Vector3s, a Quaternion and three words");
+    // Key codes appended after RightAlt, as keys.rs numbers them: each group's
+    // first and last, so an implicit increment that skipped would show.
+    Check((uint)Orrin.KeyCode.F1 == 55 && (uint)Orrin.KeyCode.F12 == 66, "F1..F12 are 55..66");
+    Check((uint)Orrin.KeyCode.Minus == 67 && (uint)Orrin.KeyCode.BackQuote == 77, "Minus..BackQuote are 67..77");
+    Check((uint)Orrin.KeyCode.Keypad0 == 78 && (uint)Orrin.KeyCode.Keypad9 == 87, "Keypad0..9 are 78..87");
+    Check((uint)Orrin.KeyCode.KeypadPlus == 88 && (uint)Orrin.KeyCode.KeypadEnter == 93, "KeypadPlus..Enter are 88..93");
+    Check((uint)Orrin.KeyCode.Insert == 94 && (uint)Orrin.KeyCode.CapsLock == 100, "Insert..CapsLock are 94..100");
     // The optional hooks `Behaviours.Create` reports, lock-step with
     // `orrin_script::Hooks`: what the engine reads to skip a per-step call.
     Check(Orrin.Behaviours.FixedUpdateHook == 1

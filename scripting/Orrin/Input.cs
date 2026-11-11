@@ -29,6 +29,37 @@ public enum KeyCode : uint
     RightControl = 52,
     LeftAlt = 53,
     RightAlt = 54,
+
+    F1 = 55, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+
+    Minus = 67,
+    Equals = 68,
+    LeftBracket = 69,
+    RightBracket = 70,
+    Backslash = 71,
+    Semicolon = 72,
+    Quote = 73,
+    Comma = 74,
+    Period = 75,
+    Slash = 76,
+    BackQuote = 77,
+
+    Keypad0 = 78, Keypad1, Keypad2, Keypad3, Keypad4,
+    Keypad5, Keypad6, Keypad7, Keypad8, Keypad9,
+    KeypadPlus = 88,
+    KeypadMinus = 89,
+    KeypadMultiply = 90,
+    KeypadDivide = 91,
+    KeypadPeriod = 92,
+    KeypadEnter = 93,
+
+    Insert = 94,
+    Delete = 95,
+    Home = 96,
+    End = 97,
+    PageUp = 98,
+    PageDown = 99,
+    CapsLock = 100,
 }
 
 public enum MouseButton : uint
@@ -124,6 +155,14 @@ public static class Input
     /// whether or not the cursor moves, so it keeps coming at a screen edge
     /// and while the cursor is locked.
     public static Vector2 mouseDelta => Native.MouseDelta();
+
+    /// <summary>
+    /// How far the wheel turned this frame, in lines: x right, y away from the
+    /// user. A trackpad's pixels arrive at the rate the editor camera reads
+    /// them. Zero while the editor has the pointer, so scrolling a panel does
+    /// not also zoom the game.
+    /// </summary>
+    public static Vector2 scrollDelta => Native.ScrollDelta();
 
     /// Hide the cursor and hold it in the window, for mouse look. A request:
     /// the window holds it only while the game runs and has focus, and in the

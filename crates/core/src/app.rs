@@ -776,7 +776,10 @@ impl ApplicationHandler for App {
                     Some(prev) => (now - prev).as_secs_f32().min(MAX_DELTA),
                     None => 0.0,
                 };
-                self.world.resource_mut::<Time>().update(delta);
+                // `delta` stays the real frame for everything of the editor's —
+                // the fly camera, the storybook — and for the renderer;
+                // `game_delta` is what the simulation advances by.
+                let game_delta = crate::scene::advance_time(&self.world, delta);
                 self.world.resource_mut::<FrameStats>().record(delta);
 
                 // Before the resolve, so a binding saved this frame is the one
@@ -855,7 +858,7 @@ impl ApplicationHandler for App {
 
                 if simulate {
                     profile_scope!("spin");
-                    systems::spin(&self.world, delta);
+                    systems::spin(&self.world, game_delta);
                 }
 
                 // Collision reads world transforms, so they have to be current
@@ -874,12 +877,12 @@ impl ApplicationHandler for App {
                     #[cfg(feature = "scripting")]
                     match &self.scripting {
                         Some(scripting) => {
-                            scripting.run_physics(&mut self.world, &self.registry, delta)
+                            scripting.run_physics(&mut self.world, &self.registry, game_delta)
                         }
-                        None => crate::physics::run(&mut self.world, delta),
+                        None => crate::physics::run(&mut self.world, game_delta),
                     }
                     #[cfg(not(feature = "scripting"))]
-                    crate::physics::run(&mut self.world, delta);
+                    crate::physics::run(&mut self.world, game_delta);
                 }
 
                 // The UI is immediate: what this tick draws replaces the last
@@ -962,7 +965,7 @@ impl ApplicationHandler for App {
                         scripting.attach_pending(&mut self.world, &self.registry);
                         if simulate {
                             profile_scope!("script tick");
-                            scripting.tick(&mut self.world, &self.registry, delta);
+                            scripting.tick(&mut self.world, &self.registry, game_delta);
                         }
                     }
                 }
@@ -973,7 +976,7 @@ impl ApplicationHandler for App {
                 // scene they were driving.
                 if simulate {
                     profile_scope!("tweens");
-                    crate::ui::tween::advance(&self.world, delta);
+                    crate::ui::tween::advance(&self.world, game_delta);
                 } else if !self.world.resource::<crate::scene::Play>().is_live() {
                     self.world
                         .resource_mut::<crate::ui::tween::UiTweens>()
@@ -1177,7 +1180,7 @@ impl ApplicationHandler for App {
                 // Stamped into this frame's GPU queries so the readback, some
                 // frames later, can file its spans against the right frame.
                 let profiler_frame = self.world.resource::<Profiler>().frame_index();
-                let dt = self.world.resource::<Time>().delta_time();
+                let dt = self.world.resource::<Time>().unscaled_delta_time();
 
                 // Asked for every frame rather than only on a change: the renderer
                 // compares against what it applied and recreates the swapchain

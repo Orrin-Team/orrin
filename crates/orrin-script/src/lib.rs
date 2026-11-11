@@ -281,6 +281,24 @@ pub struct OrrinApi {
     pub audio_stop_music: extern "C" fn(),
     pub audio_set_master_volume: extern "C" fn(f32),
     pub audio_set_music_volume: extern "C" fn(f32),
+    // Time scale, appended after audio. `time_delta` above reads game time —
+    // the frame scaled by the transport, or the step itself inside
+    // OnFixedUpdate — and `time_unscaled_delta` the real frame;
+    // `time_fixed_delta` is the scene's physics step. A scale below zero is
+    // zero and one that is not finite is ignored.
+    pub time_unscaled_delta: extern "C" fn() -> f32,
+    pub time_fixed_delta: extern "C" fn() -> f32,
+    pub time_scale: extern "C" fn() -> f32,
+    pub set_time_scale: extern "C" fn(f32),
+    // The wheel, appended after the time scale: this frame's turn in lines, x
+    // right and y away from the user, less whatever the editor claimed.
+    pub scroll_delta: extern "C" fn(*mut [f32; 2]),
+    // Shape queries, appended after the wheel. Each takes a `CShapeQuery` and
+    // its byte size. `physics_overlap` writes at most the given count of
+    // entities and returns how many there were, `find_all_by_tag`'s protocol;
+    // `physics_shape_cast` writes a `CRaycastHit` of the size given.
+    pub physics_overlap: extern "C" fn(*const CShapeQuery, u32, *mut CEntity, u32) -> u32,
+    pub physics_shape_cast: extern "C" fn(*const CShapeQuery, u32, *mut CRaycastHit, u32) -> bool,
 }
 
 /// The handle `action_id` returns when there is no engine behind the table.
@@ -397,7 +415,31 @@ pub fn default_api() -> OrrinApi {
         audio_stop_music: stub_audio_stop_music,
         audio_set_master_volume: stub_audio_volume,
         audio_set_music_volume: stub_audio_volume,
+        time_unscaled_delta: stub_time_seconds,
+        time_fixed_delta: stub_time_seconds,
+        time_scale: stub_time_scale,
+        set_time_scale: stub_audio_volume,
+        scroll_delta: stub_mouse_delta,
+        physics_overlap: stub_physics_overlap,
+        physics_shape_cast: stub_physics_shape_cast,
     }
+}
+
+extern "C" fn stub_time_scale() -> f32 {
+    1.0
+}
+
+extern "C" fn stub_physics_overlap(_: *const CShapeQuery, _: u32, _: *mut CEntity, _: u32) -> u32 {
+    0
+}
+
+extern "C" fn stub_physics_shape_cast(
+    _: *const CShapeQuery,
+    _: u32,
+    _: *mut CRaycastHit,
+    _: u32,
+) -> bool {
+    false
 }
 
 extern "C" fn stub_audio_play(_: *const CSound, _: u32) -> u64 {
@@ -1213,6 +1255,24 @@ pub struct CRaycastHit {
     pub distance: f32,
 }
 
+/// A sphere or a box placed in the world, for `physics_overlap` and
+/// `physics_shape_cast`; matches C# `Orrin.ShapeQuery`. `shape` is 0 for a
+/// sphere, whose radius is `size[0]`, and 1 for a box, whose half extents are
+/// `size`. `rotation` is x, y, z, w and turns a box only. `direction` and
+/// `max_distance` are read by the cast alone; `hit_triggers` is a flag.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CShapeQuery {
+    pub shape: u32,
+    pub center: [f32; 3],
+    pub size: [f32; 3],
+    pub rotation: [f32; 4],
+    pub direction: [f32; 3],
+    pub max_distance: f32,
+    pub layers: u32,
+    pub hit_triggers: u32,
+}
+
 /// C ABI `ui::ScrollFrame`; matches C# `Orrin.ScrollFrame`. `scrollbar` is C#
 /// `Orrin.ScrollbarVisibility`.
 #[repr(C)]
@@ -1875,5 +1935,7 @@ mod tests {
         assert_eq!(size_of::<CSound>(), 60);
         assert_eq!(size_of::<CMeshRenderer>(), 32);
         assert_eq!(size_of::<CCollision>(), 44);
+        assert_eq!(size_of::<CRaycastHit>(), 36);
+        assert_eq!(size_of::<CShapeQuery>(), 68);
     }
 }

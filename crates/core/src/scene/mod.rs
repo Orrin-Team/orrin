@@ -81,7 +81,7 @@ pub use ssao::SsaoSettings;
 pub use ssr::SsrSettings;
 pub use subsurface::SubsurfaceSettings;
 pub use taa::TaaSettings;
-pub use time::Time;
+pub use time::{Time, advance_time};
 pub use transform::Transform;
 pub use transparency::{RefractionSettings, TransparencySettings};
 pub use ui::{

@@ -356,8 +356,17 @@ fn with_time<R: Default>(query: impl FnOnce(&Time) -> R) -> R {
     })
 }
 
+thread_local! {
+    /// The step being dispatched while `run_physics` is inside OnFixedUpdate:
+    /// `Time.deltaTime` reads it there, as Unity's does. A property of the
+    /// dispatch, not of any world, so it is not a resource.
+    static FIXED_STEP: Cell<Option<f32>> = const { Cell::new(None) };
+}
+
 extern "C" fn time_delta() -> f32 {
-    with_time(|time| time.delta_time())
+    FIXED_STEP
+        .get()
+        .unwrap_or_else(|| with_time(|time| time.delta_time()))
 }
 
 extern "C" fn time_total() -> f32 {
@@ -366,6 +375,51 @@ extern "C" fn time_total() -> f32 {
 
 extern "C" fn time_frame_count() -> u64 {
     with_time(|time| time.frame_count())
+}
+
+extern "C" fn time_unscaled_delta() -> f32 {
+    with_time(|time| time.unscaled_delta_time())
+}
+
+extern "C" fn time_fixed_delta() -> f32 {
+    orrin_script::with_world(crate::physics::STEP, |world| {
+        crate::physics::step_length(world)
+    })
+}
+
+// The scale is the transport's (see `scene::play`), so a session's end resets
+// it. A world with no transport yet — a test, a story — gets one on the first
+// write, as `set_cursor_locked` does with its request.
+extern "C" fn time_scale() -> f32 {
+    orrin_script::with_world(1.0, |world| {
+        world
+            .get_resource::<crate::scene::Play>()
+            .map_or(1.0, |play| play.time_scale())
+    })
+}
+
+extern "C" fn set_time_scale(scale: f32) {
+    orrin_script::with_world((), |world| {
+        if world.get_resource::<crate::scene::Play>().is_none() {
+            world.insert_resource(crate::scene::Play::default());
+        }
+        world
+            .resource_mut::<crate::scene::Play>()
+            .set_time_scale(scale);
+    });
+}
+
+extern "C" fn scroll_delta(out: *mut [f32; 2]) {
+    if out.is_null() {
+        return;
+    }
+    let wheel = orrin_script::with_world((0.0, 0.0), |world| {
+        world
+            .get_resource::<InputState>()
+            .map_or((0.0, 0.0), |input| input.wheel())
+    });
+    // SAFETY: C# passes two writable floats.
+    unsafe { out.write_unaligned([wheel.0, wheel.1]) };
 }
 
 // Read-only world inspection for scripts. These are leaf calls: any RefCell
@@ -716,6 +770,133 @@ extern "C" fn physics_raycast(
         };
         // SAFETY: C# passes a pointer to `size` writable bytes, just checked to
         // be a whole `CRaycastHit`; unaligned, as in `read_c`.
+        unsafe { out.write_unaligned(hit) };
+        true
+    })
+}
+
+// The overlaps and shape casts take one `CShapeQuery` and its byte size,
+// checked like a component's. An overlap writes what fits into the caller's
+// buffer and returns how many there were, `find_all_by_tag`'s protocol; a cast
+// writes one `CRaycastHit`, as `physics_raycast` does.
+
+thread_local! {
+    /// Every overlap a script asks for collects here, so asking allocates
+    /// nothing once the buffer has grown to the largest answer.
+    static OVERLAPS: RefCell<Vec<Entity>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The query C# passed and the shape it places, or `None` for one this engine
+/// cannot read.
+fn read_shape_query(
+    query: *const orrin_script::CShapeQuery,
+    size: u32,
+) -> Option<(crate::physics::QueryShape, orrin_script::CShapeQuery)> {
+    let expected = std::mem::size_of::<orrin_script::CShapeQuery>();
+    if query.is_null() || size as usize != expected {
+        tracing::warn!(
+            "Physics: C# passed a {size}-byte shape query and the engine's is {expected}; \
+             rebuild scripting/Orrin so the bindings match the engine"
+        );
+        return None;
+    }
+    // SAFETY: C# passes a pointer to `size` readable bytes, just checked to be
+    // a whole `CShapeQuery`; unaligned, as in `read_c`.
+    let query = unsafe { query.read_unaligned() };
+    let center = Vec3::from_array(query.center);
+    let shape = match query.shape {
+        0 => crate::physics::QueryShape::Sphere {
+            center,
+            radius: query.size[0],
+        },
+        1 => {
+            // C#'s `default` Quaternion is all zeroes, which turns nothing.
+            let rotation = Quat::from_array(query.rotation);
+            let rotation = if rotation == Quat::from_xyzw(0.0, 0.0, 0.0, 0.0) {
+                Quat::IDENTITY
+            } else {
+                rotation
+            };
+            crate::physics::QueryShape::Box {
+                center,
+                half_extents: Vec3::from_array(query.size),
+                rotation,
+            }
+        }
+        other => {
+            tracing::warn!("Physics: query shape {other} is not one this engine knows");
+            return None;
+        }
+    };
+    Some((shape, query))
+}
+
+extern "C" fn physics_overlap(
+    query: *const orrin_script::CShapeQuery,
+    size: u32,
+    out: *mut CEntity,
+    capacity: u32,
+) -> u32 {
+    let Some((shape, query)) = read_shape_query(query, size) else {
+        return 0;
+    };
+    let capacity = if out.is_null() { 0 } else { capacity as usize };
+    orrin_script::with_world(0, |world| {
+        OVERLAPS.with_borrow_mut(|found| {
+            crate::physics::overlap(world, shape, query.layers, query.hit_triggers != 0, found);
+            for (slot, entity) in found.iter().take(capacity).enumerate() {
+                let entity = CEntity {
+                    index: entity.index,
+                    generation: entity.generation,
+                };
+                // SAFETY: C# passes `capacity` writable `CEntity` slots, and
+                // `slot` is below it.
+                unsafe { out.add(slot).write_unaligned(entity) };
+            }
+            found.len() as u32
+        })
+    })
+}
+
+extern "C" fn physics_shape_cast(
+    query: *const orrin_script::CShapeQuery,
+    size: u32,
+    out: *mut orrin_script::CRaycastHit,
+    hit_size: u32,
+) -> bool {
+    if out.is_null() || hit_size as usize != std::mem::size_of::<orrin_script::CRaycastHit>() {
+        tracing::warn!(
+            "Physics: C# passed a {hit_size}-byte hit and the engine's is {}; rebuild \
+             scripting/Orrin so the bindings match the engine",
+            std::mem::size_of::<orrin_script::CRaycastHit>()
+        );
+        return false;
+    }
+    let Some((shape, query)) = read_shape_query(query, size) else {
+        return false;
+    };
+    orrin_script::with_world(false, |world| {
+        let Some(hit) = crate::physics::shape_cast(
+            world,
+            shape,
+            Vec3::from_array(query.direction),
+            query.max_distance,
+            query.layers,
+            query.hit_triggers != 0,
+        ) else {
+            return false;
+        };
+        let hit = orrin_script::CRaycastHit {
+            entity: CEntity {
+                index: hit.entity.index,
+                generation: hit.entity.generation,
+            },
+            point: hit.point.to_array(),
+            normal: hit.normal.to_array(),
+            distance: hit.distance,
+        };
+        // SAFETY: C# passes a pointer to `hit_size` writable bytes, just
+        // checked to be a whole `CRaycastHit`; unaligned, as in `read_c`.
         unsafe { out.write_unaligned(hit) };
         true
     })
@@ -2966,6 +3147,13 @@ fn build_api() -> OrrinApi {
         audio_stop_music,
         audio_set_master_volume,
         audio_set_music_volume,
+        time_unscaled_delta,
+        time_fixed_delta,
+        time_scale,
+        set_time_scale,
+        scroll_delta,
+        physics_overlap,
+        physics_shape_cast,
         ..orrin_script::default_api()
     }
 }
@@ -3774,6 +3962,7 @@ impl Scripting {
             delta,
             Some(&mut |world: &mut World, step: f32| {
                 crate::profile_scope!("fixed update");
+                FIXED_STEP.set(Some(step));
                 orrin_script::with_active_world(world, || {
                     for script in stepped.iter_mut().filter(|script| !script.faulted) {
                         let host = &self.host;
@@ -3783,6 +3972,7 @@ impl Scripting {
                         }
                     }
                 });
+                FIXED_STEP.set(None);
             }),
         );
         self.spent.replace(clock.spent);
@@ -6216,5 +6406,145 @@ mod tests {
         assert!(world.is_alive(entity));
         let local = world.get::<LocalTransform>(entity).unwrap();
         assert_eq!(local.translation, Vec3::new(1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn a_script_reads_the_scaled_delta_and_the_real_one() {
+        let mut world = World::new();
+        let mut time = Time::new();
+        time.update(0.04, 0.5);
+        world.insert_resource(time);
+
+        let read =
+            orrin_script::with_active_world(&mut world, || (time_delta(), time_unscaled_delta()));
+
+        assert_eq!(read, (0.02, 0.04));
+    }
+
+    /// The scale lives on the transport, which a test world may not have yet:
+    /// the first write brings one, and a negative scale is pause.
+    #[test]
+    fn a_script_sets_the_time_scale_on_the_transport() {
+        let mut world = World::new();
+
+        let read = orrin_script::with_active_world(&mut world, || {
+            let before = time_scale();
+            set_time_scale(0.5);
+            let after = time_scale();
+            set_time_scale(-1.0);
+            (before, after, time_scale())
+        });
+
+        assert_eq!(read, (1.0, 0.5, 0.0));
+        assert_eq!(world.resource::<crate::scene::Play>().time_scale(), 0.0);
+    }
+
+    #[test]
+    fn the_fixed_delta_is_the_scenes_step() {
+        let mut world = World::new();
+        world.spawn_entity().with(crate::scene::PhysicsSettings {
+            steps_per_second: 120,
+            ..Default::default()
+        });
+
+        let step = orrin_script::with_active_world(&mut world, || time_fixed_delta());
+
+        assert_eq!(step, 1.0 / 120.0);
+    }
+
+    #[test]
+    fn a_script_reads_the_wheel_for_the_frame_it_turned() {
+        let mut world = World::new();
+        let mut input = InputState::new();
+        input.scroll_wheel((0.5, 1.0));
+        input.scroll_wheel((0.0, -3.0));
+        world.insert_resource(input);
+
+        let mut turned = [9.0; 2];
+        orrin_script::with_active_world(&mut world, || scroll_delta(&mut turned));
+        world.resource_mut::<InputState>().end_frame();
+        let mut next = [9.0; 2];
+        orrin_script::with_active_world(&mut world, || scroll_delta(&mut next));
+
+        assert_eq!(turned, [0.5, -2.0]);
+        assert_eq!(next, [0.0, 0.0]);
+    }
+
+    fn sphere_query(center: [f32; 3], radius: f32) -> orrin_script::CShapeQuery {
+        orrin_script::CShapeQuery {
+            shape: 0,
+            center,
+            size: [radius, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            direction: [0.0, 0.0, -1.0],
+            max_distance: 100.0,
+            layers: u32::MAX,
+            hit_triggers: 0,
+        }
+    }
+
+    /// The `find_all_by_tag` protocol: what fits is written, and the count is
+    /// of everything found, so the caller can tell its buffer was short.
+    #[test]
+    fn an_overlap_writes_what_fits_and_counts_everything() {
+        let mut world = physics_world();
+        let mut row: Vec<Entity> = [-1.5, 0.0, 1.5]
+            .into_iter()
+            .map(|x| collider_at(&mut world, Vec3::new(x, 0.0, 0.0)))
+            .collect();
+        row.sort_unstable_by_key(|e| (e.index, e.generation));
+        physics_frame(&mut world);
+        let query = sphere_query([0.0; 3], 3.0);
+        let mut out = [CEntity::NULL; 2];
+
+        let (total, short) = orrin_script::with_active_world(&mut world, || {
+            let total = physics_overlap(
+                &query,
+                size_of::<orrin_script::CShapeQuery>(),
+                out.as_mut_ptr(),
+                2,
+            );
+            let short = physics_overlap(
+                &query,
+                size_of::<orrin_script::CShapeQuery>() - 4,
+                out.as_mut_ptr(),
+                2,
+            );
+            (total, short)
+        });
+
+        assert_eq!(total, 3);
+        assert_eq!(out.map(entity_of), [row[0], row[1]]);
+        assert_eq!(short, 0, "a query of the wrong size is refused");
+    }
+
+    #[test]
+    fn a_shape_cast_writes_its_hit() {
+        let mut world = physics_world();
+        let wall = collider_at(&mut world, Vec3::new(0.0, 0.0, -5.0));
+        physics_frame(&mut world);
+        let mut query = sphere_query([0.0; 3], 0.5);
+        query.shape = 1;
+        query.size = [0.5; 3];
+        let mut hit = orrin_script::CRaycastHit {
+            entity: CEntity::NULL,
+            point: [0.0; 3],
+            normal: [0.0; 3],
+            distance: 0.0,
+        };
+
+        let found = orrin_script::with_active_world(&mut world, || {
+            physics_shape_cast(
+                &query,
+                size_of::<orrin_script::CShapeQuery>(),
+                &mut hit,
+                size_of::<orrin_script::CRaycastHit>(),
+            )
+        });
+
+        assert!(found);
+        assert_eq!(entity_of(hit.entity), wall);
+        assert!((hit.distance - 4.0).abs() < 1e-3, "{}", hit.distance);
+        assert!(Vec3::from_array(hit.normal).abs_diff_eq(Vec3::Z, 1e-3));
     }
 }

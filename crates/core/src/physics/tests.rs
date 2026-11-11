@@ -1415,3 +1415,310 @@ fn a_contact_carries_its_closing_velocity() {
     let closing = enter.relative_velocity.dot(enter.normal);
     assert!((closing - 4.0).abs() < 0.05, "closing at {closing} m/s");
 }
+
+/// How many steps a second of 60 fps frames takes with the transport at
+/// `scale`, each frame's delta coming through `advance_time` as `app.rs`'s does.
+fn steps_in_a_second_at(scale: f32) -> (usize, Vec<f32>) {
+    let mut world = test_world();
+    world.insert_resource(crate::scene::Time::new());
+    let mut play = crate::scene::Play::default();
+    play.set(crate::scene::PlayState::Playing);
+    play.set_time_scale(scale);
+    world.insert_resource(play);
+    spawn(&mut world, Vec3::ZERO, cube(0.5), Some(weightless()));
+
+    let mut steps = Vec::new();
+    let mut unscaled = Vec::new();
+    for _ in 0..60 {
+        let delta = crate::scene::advance_time(&world, STEP);
+        unscaled.push(world.resource::<crate::scene::Time>().unscaled_delta_time());
+        frame_with(&mut world, delta, &mut |_, step| steps.push(step));
+    }
+    assert!(steps.iter().all(|&step| step == STEP), "{steps:?}");
+    (steps.len(), unscaled)
+}
+
+/// The time scale slows the simulation by taking fewer steps of the same
+/// length, never shorter ones; the clock it is measured against is untouched.
+#[test]
+fn the_time_scale_takes_fewer_steps_of_the_same_length() {
+    let (full, unscaled) = steps_in_a_second_at(1.0);
+    let (half, _) = steps_in_a_second_at(0.5);
+    let (paused, _) = steps_in_a_second_at(0.0);
+
+    assert!((59..=60).contains(&full), "{full} steps at scale 1");
+    assert!(
+        half.abs_diff(full / 2) <= 1,
+        "{half} steps at 0.5, {full} at 1"
+    );
+    assert_eq!(paused, 0, "a paused game steps nothing");
+    assert!(unscaled.iter().all(|&delta| delta == STEP), "{unscaled:?}");
+}
+
+#[test]
+fn the_step_length_is_the_scenes() {
+    let mut world = test_world();
+    assert_eq!(step_length(&world), STEP);
+    settings(
+        &mut world,
+        PhysicsSettings {
+            steps_per_second: 120,
+            ..PhysicsSettings::default()
+        },
+    );
+    assert_eq!(step_length(&world), 1.0 / 120.0);
+}
+
+/// A wall straight ahead down -z, a trigger to the right, and a mesh collider
+/// to the left, each one metre across.
+fn query_world() -> (World, Entity, Entity, Entity) {
+    let mut world = test_world();
+    let mesh = with_cube_mesh(&mut world);
+    let wall = spawn(&mut world, Vec3::new(0.0, 0.0, -5.0), cube(0.5), None);
+    let trigger = spawn(&mut world, Vec3::new(5.0, 0.0, 0.0), cube(0.5), None);
+    edit_collider(&world, trigger, |c| c.is_trigger = true);
+    let solid_mesh = spawn(
+        &mut world,
+        Vec3::new(-5.0, 0.0, 0.0),
+        ColliderShape::Mesh,
+        None,
+    );
+    world.insert(solid_mesh, mesh);
+    frame(&mut world, STEP);
+    (world, wall, trigger, solid_mesh)
+}
+
+fn sphere(center: Vec3, radius: f32) -> QueryShape {
+    QueryShape::Sphere { center, radius }
+}
+
+fn overlapping(world: &World, shape: QueryShape, layers: u32, hit_triggers: bool) -> Vec<Entity> {
+    let mut found = vec![Entity {
+        index: 999,
+        generation: 9,
+    }];
+    overlap(world, shape, layers, hit_triggers, &mut found);
+    found
+}
+
+#[test]
+fn a_sphere_finds_what_it_overlaps_and_nothing_else() {
+    let (world, wall, _, _) = query_world();
+
+    assert_eq!(
+        overlapping(
+            &world,
+            sphere(Vec3::new(0.0, 0.0, -4.0), 0.6),
+            u32::MAX,
+            false
+        ),
+        [wall],
+        "the buffer is replaced, not appended to"
+    );
+    assert!(
+        overlapping(
+            &world,
+            sphere(Vec3::new(0.0, 0.0, -3.0), 0.4),
+            u32::MAX,
+            false
+        )
+        .is_empty()
+    );
+}
+
+/// A mesh collider is many triangles and Jolt reports a hit per triangle; a
+/// script asked which entities, so each is named once.
+#[test]
+fn an_overlap_names_each_entity_once_in_entity_order() {
+    let (world, wall, trigger, mesh) = query_world();
+
+    let all = overlapping(&world, sphere(Vec3::ZERO, 6.0), u32::MAX, true);
+
+    let mut expected = vec![wall, trigger, mesh];
+    expected.sort_unstable_by_key(|e| (e.index, e.generation));
+    assert_eq!(all, expected);
+}
+
+#[test]
+fn an_overlap_skips_layers_its_mask_leaves_out() {
+    let (world, wall, _, mesh) = query_world();
+    edit_collider(&world, wall, |c| c.layer = 2);
+    let mut world = world;
+    frame(&mut world, STEP);
+
+    assert_eq!(
+        overlapping(&world, sphere(Vec3::ZERO, 6.0), !(1 << 2), false),
+        [mesh]
+    );
+}
+
+#[test]
+fn an_overlap_counts_triggers_only_when_asked() {
+    let (world, _, trigger, _) = query_world();
+    let at_trigger = sphere(Vec3::new(4.0, 0.0, 0.0), 0.6);
+
+    assert!(overlapping(&world, at_trigger, u32::MAX, false).is_empty());
+    assert_eq!(overlapping(&world, at_trigger, u32::MAX, true), [trigger]);
+}
+
+/// The box is turned, not just placed: a long thin box reaches the wall only
+/// once it is rotated to point at it.
+#[test]
+fn an_overlap_box_is_turned_by_its_rotation() {
+    let (world, wall, _, _) = query_world();
+    let thin = |rotation| QueryShape::Box {
+        center: Vec3::new(0.0, 0.0, -2.0),
+        half_extents: Vec3::new(3.0, 0.1, 0.1),
+        rotation,
+    };
+
+    assert!(overlapping(&world, thin(Quat::IDENTITY), u32::MAX, false).is_empty());
+    assert_eq!(
+        overlapping(
+            &world,
+            thin(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+            u32::MAX,
+            false
+        ),
+        [wall]
+    );
+}
+
+#[test]
+fn a_sphere_cast_stops_where_the_sphere_first_touches() {
+    let (world, wall, _, _) = query_world();
+
+    let hit = shape_cast(
+        &world,
+        sphere(Vec3::ZERO, 0.5),
+        -Vec3::Z,
+        100.0,
+        u32::MAX,
+        false,
+    )
+    .expect("the wall is straight ahead");
+
+    assert_eq!(hit.entity, wall);
+    assert!((hit.distance - 4.0).abs() < 1e-3, "{hit:?}");
+    assert!(hit.normal.abs_diff_eq(Vec3::Z, 1e-3), "{hit:?}");
+    assert!(
+        hit.point.abs_diff_eq(Vec3::new(0.0, 0.0, -4.5), 1e-3),
+        "{hit:?}"
+    );
+}
+
+#[test]
+fn a_cast_stops_at_its_length() {
+    let (world, _, _, _) = query_world();
+    assert!(
+        shape_cast(
+            &world,
+            sphere(Vec3::ZERO, 0.5),
+            -Vec3::Z,
+            3.9,
+            u32::MAX,
+            false
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn a_cast_passes_layers_its_mask_leaves_out_and_triggers_unless_asked() {
+    let (world, wall, trigger, _) = query_world();
+    edit_collider(&world, wall, |c| c.layer = 2);
+    let mut world = world;
+    frame(&mut world, STEP);
+    let ahead = sphere(Vec3::ZERO, 0.5);
+    let right = sphere(Vec3::ZERO, 0.5);
+
+    assert!(shape_cast(&world, ahead, -Vec3::Z, 100.0, !(1 << 2), false).is_none());
+    assert!(shape_cast(&world, right, Vec3::X, 100.0, u32::MAX, false).is_none());
+    let hit = shape_cast(&world, right, Vec3::X, 100.0, u32::MAX, true).unwrap();
+    assert_eq!(hit.entity, trigger);
+    assert!((hit.distance - 4.0).abs() < 1e-3, "{hit:?}");
+}
+
+#[test]
+fn a_box_cast_meets_the_wall_face_on() {
+    let (world, wall, _, _) = query_world();
+    let crate_ = QueryShape::Box {
+        center: Vec3::ZERO,
+        half_extents: Vec3::splat(0.5),
+        rotation: Quat::IDENTITY,
+    };
+
+    let hit = shape_cast(&world, crate_, -Vec3::Z, 100.0, u32::MAX, false).unwrap();
+
+    assert_eq!(hit.entity, wall);
+    assert!((hit.distance - 4.0).abs() < 1e-3, "{hit:?}");
+    assert!(hit.normal.abs_diff_eq(Vec3::Z, 1e-3), "{hit:?}");
+    assert!((hit.point.z + 4.5).abs() < 1e-3, "{hit:?}");
+}
+
+#[test]
+fn a_degenerate_query_finds_nothing() {
+    let (world, _, _, _) = query_world();
+    assert!(overlapping(&world, sphere(Vec3::ZERO, 0.0), u32::MAX, true).is_empty());
+    assert!(overlapping(&world, sphere(Vec3::ZERO, f32::NAN), u32::MAX, true).is_empty());
+    assert!(
+        shape_cast(
+            &world,
+            sphere(Vec3::ZERO, 0.5),
+            Vec3::ZERO,
+            10.0,
+            u32::MAX,
+            true
+        )
+        .is_none()
+    );
+}
+
+/// A query sees the simulation as the last run left it: a collider spawned
+/// since is not there yet, and a wall moved since is still where it was.
+#[test]
+fn a_query_sees_the_world_as_of_the_last_physics_run() {
+    let (mut world, wall, _, _) = query_world();
+    let late = spawn(&mut world, Vec3::new(0.0, 5.0, 0.0), cube(0.5), None);
+    world.get_mut::<LocalTransform>(wall).unwrap().translation = Vec3::new(0.0, 0.0, -20.0);
+    propagate_transforms(&mut world);
+
+    assert!(
+        overlapping(
+            &world,
+            sphere(Vec3::new(0.0, 5.0, 0.0), 0.6),
+            u32::MAX,
+            false
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        overlapping(
+            &world,
+            sphere(Vec3::new(0.0, 0.0, -5.0), 0.6),
+            u32::MAX,
+            false
+        ),
+        [wall]
+    );
+
+    frame(&mut world, STEP);
+    assert_eq!(
+        overlapping(
+            &world,
+            sphere(Vec3::new(0.0, 5.0, 0.0), 0.6),
+            u32::MAX,
+            false
+        ),
+        [late]
+    );
+    assert!(
+        overlapping(
+            &world,
+            sphere(Vec3::new(0.0, 0.0, -5.0), 0.6),
+            u32::MAX,
+            false
+        )
+        .is_empty()
+    );
+}

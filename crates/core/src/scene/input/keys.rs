@@ -110,6 +110,52 @@ pub const KEYS: &[Key] = &[
     key("RightControl", 52, KeyCode::ControlRight),
     aliased("LeftAlt", 53, KeyCode::AltLeft, &["Alt"]),
     key("RightAlt", 54, KeyCode::AltRight),
+    key("F1", 55, KeyCode::F1),
+    key("F2", 56, KeyCode::F2),
+    key("F3", 57, KeyCode::F3),
+    key("F4", 58, KeyCode::F4),
+    key("F5", 59, KeyCode::F5),
+    key("F6", 60, KeyCode::F6),
+    key("F7", 61, KeyCode::F7),
+    key("F8", 62, KeyCode::F8),
+    key("F9", 63, KeyCode::F9),
+    key("F10", 64, KeyCode::F10),
+    key("F11", 65, KeyCode::F11),
+    key("F12", 66, KeyCode::F12),
+    key("Minus", 67, KeyCode::Minus),
+    key("Equals", 68, KeyCode::Equal),
+    key("LeftBracket", 69, KeyCode::BracketLeft),
+    key("RightBracket", 70, KeyCode::BracketRight),
+    key("Backslash", 71, KeyCode::Backslash),
+    key("Semicolon", 72, KeyCode::Semicolon),
+    aliased("Quote", 73, KeyCode::Quote, &["Apostrophe"]),
+    key("Comma", 74, KeyCode::Comma),
+    key("Period", 75, KeyCode::Period),
+    key("Slash", 76, KeyCode::Slash),
+    aliased("BackQuote", 77, KeyCode::Backquote, &["Backtick"]),
+    key("Keypad0", 78, KeyCode::Numpad0),
+    key("Keypad1", 79, KeyCode::Numpad1),
+    key("Keypad2", 80, KeyCode::Numpad2),
+    key("Keypad3", 81, KeyCode::Numpad3),
+    key("Keypad4", 82, KeyCode::Numpad4),
+    key("Keypad5", 83, KeyCode::Numpad5),
+    key("Keypad6", 84, KeyCode::Numpad6),
+    key("Keypad7", 85, KeyCode::Numpad7),
+    key("Keypad8", 86, KeyCode::Numpad8),
+    key("Keypad9", 87, KeyCode::Numpad9),
+    key("KeypadPlus", 88, KeyCode::NumpadAdd),
+    key("KeypadMinus", 89, KeyCode::NumpadSubtract),
+    key("KeypadMultiply", 90, KeyCode::NumpadMultiply),
+    key("KeypadDivide", 91, KeyCode::NumpadDivide),
+    key("KeypadPeriod", 92, KeyCode::NumpadDecimal),
+    key("KeypadEnter", 93, KeyCode::NumpadEnter),
+    key("Insert", 94, KeyCode::Insert),
+    key("Delete", 95, KeyCode::Delete),
+    key("Home", 96, KeyCode::Home),
+    key("End", 97, KeyCode::End),
+    key("PageUp", 98, KeyCode::PageUp),
+    key("PageDown", 99, KeyCode::PageDown),
+    key("CapsLock", 100, KeyCode::CapsLock),
 ];
 
 /// Mouse buttons, by the number [`super::InputState`] and the C# `MouseButton`
@@ -219,9 +265,72 @@ pub fn key_by_name(name: &str) -> Option<u32> {
 }
 
 /// The engine code for a winit key, or `None` for one the engine has no name
-/// for. Linear over a few dozen rows, on an event that arrives at human speed.
+/// for. Linear over the table, on an event that arrives at human speed.
 pub fn key_from_winit(code: KeyCode) -> Option<u32> {
     KEYS.iter()
         .find(|key| key.winit == code)
         .map(|key| key.code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_appended_keys_arrive_under_their_codes() {
+        let cases = [
+            (KeyCode::F1, 55),
+            (KeyCode::F12, 66),
+            (KeyCode::Minus, 67),
+            (KeyCode::Quote, 73),
+            (KeyCode::Backquote, 77),
+            (KeyCode::Numpad0, 78),
+            (KeyCode::Numpad9, 87),
+            (KeyCode::NumpadEnter, 93),
+            (KeyCode::Insert, 94),
+            (KeyCode::PageDown, 99),
+            (KeyCode::CapsLock, 100),
+        ];
+        for (winit, code) in cases {
+            assert_eq!(key_from_winit(winit), Some(code), "{winit:?}");
+        }
+    }
+
+    #[test]
+    fn the_appended_keys_are_named_as_unity_names_them() {
+        for (name, code) in [
+            ("F5", 59),
+            ("LeftBracket", 69),
+            ("Apostrophe", 73),
+            ("Keypad7", 85),
+            ("KeypadPlus", 88),
+            ("Delete", 95),
+        ] {
+            assert_eq!(key_by_name(name), Some(code), "{name}");
+        }
+    }
+
+    /// A row pasted twice is a key that silently answers to the wrong code.
+    #[test]
+    fn no_two_rows_share_a_code_a_winit_key_or_a_name() {
+        for (i, a) in KEYS.iter().enumerate() {
+            for b in &KEYS[i + 1..] {
+                assert_ne!(a.code, b.code, "{} and {}", a.name, b.name);
+                assert_ne!(a.winit, b.winit, "{} and {}", a.name, b.name);
+                let spellings = |key: &Key| {
+                    std::iter::once(key.name)
+                        .chain(key.aliases.iter().copied())
+                        .map(str::to_ascii_lowercase)
+                        .collect::<Vec<_>>()
+                };
+                let theirs = spellings(b);
+                assert!(
+                    spellings(a).iter().all(|name| !theirs.contains(name)),
+                    "{} and {} share a spelling",
+                    a.name,
+                    b.name
+                );
+            }
+        }
+    }
 }
