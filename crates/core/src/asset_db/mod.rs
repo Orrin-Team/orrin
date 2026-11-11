@@ -75,6 +75,12 @@
 //! asset's is. A material whose shader has never compiled draws as a standard
 //! material.
 //!
+//! The shader editor saves through [`write_shader`](AssetDatabase::write_shader),
+//! which queues the import as it writes, so a save reads as compiling from that
+//! moment. It is not an edit: the text editor keeps its own undo, and a shader
+//! save is a file written, as an external editor's would be. The text written is
+//! remembered as a material's is, so the watcher hearing it imports nothing.
+//!
 //! A material's shader values reach the backend whenever the material is
 //! uploaded or reread and whenever its shader first loads; a value the shader
 //! ignores is a warning ([`take_warnings`](AssetDatabase::take_warnings)), once
@@ -1002,6 +1008,7 @@ impl AssetDatabase {
 
         let mut seen: FxHashMap<AssetId, String> = FxHashMap::default();
         let mut queue = Vec::new();
+        let mut heard = Vec::new();
         for entry in &mut self.entries {
             entry.on_disk = false;
         }
@@ -1050,8 +1057,10 @@ impl AssetDatabase {
                     entry.on_disk = true;
                     entry.bytes = bytes;
                     entry.modified = modified;
-                    if changed || is_touched(entry) {
+                    if changed {
                         queue.push(entry.id);
+                    } else if is_touched(entry) {
+                        heard.push((entry.id, path));
                     }
                 }
                 None => {
@@ -1072,6 +1081,11 @@ impl AssetDatabase {
             }
         }
         self.entries.sort_by(|a, b| a.path.cmp(&b.path));
+        for (id, path) in heard {
+            if !self.is_own_save(id, &path) {
+                queue.push(id);
+            }
+        }
         for id in queue {
             self.queue(id);
         }

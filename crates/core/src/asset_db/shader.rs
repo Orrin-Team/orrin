@@ -177,6 +177,9 @@ pub(super) struct Shader {
     errors: Vec<SurfaceError>,
     /// A drawn material names it, so it is loaded into the backend.
     wanted: bool,
+    /// The text the editor last saved and queued, until the file is heard
+    /// holding something else.
+    written: Option<String>,
 }
 
 impl Shader {
@@ -249,6 +252,59 @@ impl AssetDatabase {
             NEW_SHADER,
             AssetKind::Shader,
         )
+    }
+
+    /// Write `text` as shader `id`'s file, through a temporary file and a
+    /// rename, and queue its import at once. Unlike a material, a text that
+    /// does not compile is still written: its errors are what the shader
+    /// editor shows. What is written is remembered, so the watcher hearing it
+    /// does not import it a second time.
+    pub fn write_shader(&mut self, id: AssetId, text: &str) -> Result<(), String> {
+        let path = self.shader_file(id)?;
+        let rel = self.path_of(id);
+        super::write_atomically(&path, text)
+            .map_err(|error| format!("could not write {rel}: {error}"))?;
+        let metadata = std::fs::metadata(&path).ok();
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.bytes = metadata.as_ref().map_or(text.len() as u64, |m| m.len());
+            entry.modified = metadata.and_then(|m| m.modified().ok());
+        }
+        self.queue(id);
+        self.shaders.entry(id).or_default().written = Some(text.to_owned());
+        Ok(())
+    }
+
+    /// Whether a change heard at shader `id`'s `path` is the editor's own last
+    /// save rather than something new. Anything else forgets that save, so a
+    /// later save that puts its text back is heard.
+    pub(super) fn is_own_save(&mut self, id: AssetId, path: &std::path::Path) -> bool {
+        let Some(shader) = self.shaders.get_mut(&id) else {
+            return false;
+        };
+        let Some(written) = &shader.written else {
+            return false;
+        };
+        let same = std::fs::read_to_string(path).is_ok_and(|text| text == *written);
+        if !same {
+            shader.written = None;
+        }
+        same
+    }
+
+    /// A material at the defaults drawn through shader `id` with none of its
+    /// parameters set, for the shader editor to preview a shader no material
+    /// uses yet. It has no file and is never listed; the handle is the same
+    /// one for the session, pending until the next update binds it.
+    pub fn shader_preview_material(&mut self, id: AssetId) -> Result<MaterialHandle, String> {
+        self.shader_file(id)?;
+        let material = AssetId::named("shader-preview", &id.to_string());
+        self.material_files
+            .entry(material)
+            .or_insert_with(|| super::material::MaterialFile {
+                shader: Some(id),
+                ..Default::default()
+            });
+        Ok(MaterialHandle(self.materials.promise(material)))
     }
 
     /// Mark shader `id` as drawn and its handle, queueing its artifact when
@@ -1055,6 +1111,102 @@ void surface(in SurfaceIn i, inout SurfaceOut o) {
             save(&world, &dir, "fx/glow.oshader", WEAR_THEN_TINT);
             settle(&world, &mut backend);
             assert_eq!(warnings(&world), once, "the shader changed");
+        }
+
+        /// The shader editor's save: written, queued at once — so the editor can
+        /// say it is compiling from the moment of the save — and imported once,
+        /// the watcher hearing that save being nothing new.
+        #[test]
+        fn a_shader_the_editor_saves_is_written_queued_and_imported_once() {
+            let dir = Dir::new("shader-write");
+            shader_project(&dir, TINT, &MaterialFile::default());
+            let mut db = open(&dir);
+            assert!(db.wait_idle(WAIT));
+            db.update(&World::new(), &mut HeadlessBackend::new());
+
+            db.write_shader(glow(), WEAR_THEN_TINT).unwrap();
+            let file = dir.path().join("fx/glow.oshader");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), WEAR_THEN_TINT);
+            let entry = db.get(glow()).unwrap();
+            assert_eq!(entry.status, Status::Queued, "compiling from the save on");
+            assert_eq!(entry.bytes, WEAR_THEN_TINT.len() as u64);
+
+            db.notice(file.clone());
+            db.apply_changes();
+            let mut backend = HeadlessBackend::new();
+            for _ in 0..3 {
+                assert!(db.wait_idle(WAIT));
+                assert_eq!(db.update(&World::new(), &mut backend), Vec::<String>::new());
+            }
+            let Status::Imported { cached: false, .. } = db.get(glow()).unwrap().status else {
+                panic!(
+                    "an import of the echo would have found the save's artifact cached: {:?}",
+                    db.get(glow()).unwrap().status
+                );
+            };
+            assert_eq!(db.shader_params(glow()).unwrap().params[0].name, "wear");
+
+            // Another program's save is heard, and so is one that puts back
+            // the text the editor last wrote.
+            for (text, broken) in [(BROKEN, true), (WEAR_THEN_TINT, false)] {
+                dir.write("fx/glow.oshader", text.as_bytes());
+                db.notice(file.clone());
+                db.apply_changes();
+                assert_eq!(db.get(glow()).unwrap().status, Status::Queued);
+                assert!(db.wait_idle(WAIT));
+                db.update(&World::new(), &mut backend);
+                assert_eq!(!db.shader_errors(glow()).is_empty(), broken, "{text}");
+            }
+
+            let brick = db.find("brick.omat").unwrap().id;
+            assert_eq!(
+                db.write_shader(brick, TINT),
+                Err("`brick.omat` is a material, not a surface shader".to_owned())
+            );
+        }
+
+        /// What the shader editor previews a shader on when no material in
+        /// the project uses it: a material of its own at the defaults, drawn
+        /// through the shader with every parameter at the shader's default.
+        #[test]
+        fn a_shader_previews_on_a_material_of_its_own_at_its_defaults() {
+            let dir = Dir::new("shader-preview");
+            shader_project(&dir, TINT, &MaterialFile::default());
+            let mut world = World::new();
+            world.insert_resource(crate::scene::MeshBounds::default());
+            world.insert_resource(crate::scene::AssetPreviews::default());
+            world.insert_resource(crate::scene::MaterialBlends::default());
+            world.insert_resource(open(&dir));
+            let mut backend = HeadlessBackend::new();
+
+            let preview = |world: &World| {
+                world
+                    .resource_mut::<AssetDatabase>()
+                    .shader_preview_material(glow())
+                    .unwrap()
+            };
+            let pending = preview(&world);
+            assert_eq!(preview(&world), pending, "one for the session");
+            assert_eq!(settle(&world, &mut backend), Vec::<String>::new());
+
+            let bound = preview(&world);
+            assert_eq!(bound.0 & PENDING, 0, "bound between frames");
+            assert_eq!(backend.surface_buffer().shader_of(bound), handle(&world));
+            assert_eq!(
+                block(&backend, bound)[0],
+                [1.0f32; 4].map(f32::to_bits),
+                "tint at its default"
+            );
+            let db = world.resource::<AssetDatabase>();
+            assert_eq!(db.iter().count(), 2, "not an asset: nothing new is offered");
+            let brick = db.find("brick.omat").unwrap().id;
+            drop(db);
+            assert!(
+                world
+                    .resource_mut::<AssetDatabase>()
+                    .shader_preview_material(brick)
+                    .is_err()
+            );
         }
 
         #[test]
