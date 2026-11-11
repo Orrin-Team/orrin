@@ -299,6 +299,69 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
     });
 }
 
+/// The colours code is set in, one per [`Class`](super::glsl::Class).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Syntax {
+    pub text: Color32,
+    pub comment: Color32,
+    pub keyword: Color32,
+    pub kind: Color32,
+    pub number: Color32,
+    pub preprocessor: Color32,
+    pub engine: Color32,
+    pub param: Color32,
+}
+
+impl Syntax {
+    /// Derived from the theme rather than added to it, so every theme file
+    /// still parses and a user theme recolours code too. Plain text and
+    /// comments are the theme's two text colours; the rest are the accent
+    /// turned round the hue circle, held to one strength and pulled a quarter
+    /// of the way to the text colour, so that no class outshouts the code and
+    /// each reads on the field in a dark theme or a light one.
+    pub fn of(visuals: &Visuals) -> Self {
+        let text = visuals.text_color();
+        let luma =
+            |c: Color32| 0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32;
+        let light = luma(text) < luma(visuals.extreme_bg_color);
+        let turned = |turn: f32| {
+            let mut hsva = egui::ecolor::Hsva::from(visuals.selection.stroke.color);
+            hsva.h = (hsva.h + turn).rem_euclid(1.0);
+            hsva.s = hsva.s.clamp(0.4, 0.65);
+            hsva.v = if light {
+                hsva.v.min(0.55)
+            } else {
+                hsva.v.max(0.9)
+            };
+            Color32::from(hsva).lerp_to_gamma(text, 0.25)
+        };
+        Self {
+            text,
+            comment: visuals.weak_text_color(),
+            keyword: turned(0.0),
+            kind: turned(-0.12),
+            number: turned(0.46),
+            preprocessor: turned(0.36),
+            engine: turned(0.2),
+            param: turned(-0.3),
+        }
+    }
+
+    pub fn of_class(&self, class: super::glsl::Class) -> Color32 {
+        use super::glsl::Class;
+        match class {
+            Class::Text => self.text,
+            Class::Comment => self.comment,
+            Class::Keyword => self.keyword,
+            Class::Type => self.kind,
+            Class::Number => self.number,
+            Class::Preprocessor => self.preprocessor,
+            Class::Engine => self.engine,
+            Class::Param => self.param,
+        }
+    }
+}
+
 /// The rim of anything floating: a faint light line rather than a border drawn
 /// around it.
 pub const FLOATING_EDGE: Color32 = Color32::from_rgba_premultiplied(18, 18, 20, 18);
@@ -503,6 +566,45 @@ accent = [140, 120, 255]
 
         assert_eq!(ctx.style().animation_time, 0.120);
         assert_eq!(ctx.style().spacing.indent, 14.0);
+    }
+
+    /// Code is coloured from the theme, so a user theme recolours it too: the
+    /// accent leads, comments recede, and every class keeps a colour of its
+    /// own that still reads against the field it is typed into.
+    #[test]
+    fn code_colours_come_from_the_theme() {
+        let syntax = Syntax::of(&Theme::default().visuals());
+        let classes = [
+            syntax.text,
+            syntax.comment,
+            syntax.keyword,
+            syntax.kind,
+            syntax.number,
+            syntax.preprocessor,
+            syntax.engine,
+            syntax.param,
+        ];
+        let unique: std::collections::HashSet<_> = classes.iter().collect();
+        assert_eq!(unique.len(), classes.len(), "{syntax:?}");
+
+        let visuals = Theme::default().visuals();
+        assert_eq!(syntax.text, visuals.text_color());
+        assert_eq!(syntax.comment, visuals.weak_text_color());
+        let luma =
+            |c: Color32| 0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32;
+        let field = luma(visuals.extreme_bg_color);
+        for colour in classes {
+            assert!(
+                luma(colour) > field + 60.0,
+                "{colour:?} is lost on the field"
+            );
+        }
+
+        let void: Theme = toml::from_str(VOID).unwrap();
+        let themed = Syntax::of(&void.visuals());
+        assert_ne!(themed.keyword, syntax.keyword);
+        assert_ne!(themed.engine, syntax.engine);
+        assert_ne!(themed.text, syntax.text);
     }
 
     #[test]

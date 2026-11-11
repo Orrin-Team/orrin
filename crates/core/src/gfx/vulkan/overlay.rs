@@ -57,6 +57,7 @@ impl UserTexture {
         egui::TextureId::User(match self {
             Self::MaterialPreview(Viewer::Inspector) => 0,
             Self::MaterialPreview(Viewer::Browser) => 1,
+            Self::MaterialPreview(Viewer::Shader) => 2,
         })
     }
 }

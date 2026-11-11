@@ -286,7 +286,7 @@ fn append(into: &mut CpuMesh, mut part: CpuMesh, world: Mat4) {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use std::io::Cursor;
 
     use super::*;
@@ -294,11 +294,7 @@ pub(super) mod tests {
     use crate::asset_db::tests::Dir;
     use crate::gfx::thumbnail::Pixels;
 
-    pub(in crate::asset_db) fn png(
-        width: u32,
-        height: u32,
-        pixel: impl Fn(u32, u32) -> [u8; 4],
-    ) -> Vec<u8> {
+    pub(crate) fn png(width: u32, height: u32, pixel: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
         let image = image::RgbaImage::from_fn(width, height, |x, y| image::Rgba(pixel(x, y)));
         let mut bytes = Cursor::new(Vec::new());
         image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();

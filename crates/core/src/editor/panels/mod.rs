@@ -10,6 +10,7 @@ pub(super) mod performance;
 pub(super) mod scenes;
 #[cfg(feature = "scripting")]
 pub(super) mod scripts;
+pub(super) mod shader;
 mod status_bar;
 pub(super) mod storybook;
 mod ui_sections;
@@ -192,9 +193,11 @@ fn game_screen(
 }
 
 /// The few keys every editor answers the same way. Each one stands aside while
-/// a text field has focus, where the same key edits text.
+/// a text field has focus, where the same key edits text — save and play
+/// included while the focus is the Shader tab's code, which saves itself.
 fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
-    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+    let coding = ctx.memory(|memory| memory.has_focus(shader::code_id()));
+    if !coding && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
         state.request_scene(SceneRequest::Save);
     }
     // Most specific first, as with redo below.
@@ -202,7 +205,8 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
         egui::Modifiers::COMMAND | egui::Modifiers::ALT,
         egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
     );
-    if ctx.input_mut(|input| input.consume_key(alt, egui::Key::P)) {
+    if coding {
+    } else if ctx.input_mut(|input| input.consume_key(alt, egui::Key::P)) {
         state.request_step();
     } else if ctx.input_mut(|input| input.consume_key(shift, egui::Key::P)) {
         state.request_pause();
@@ -287,6 +291,9 @@ mod tests {
             .filter(|c| !('\u{e000}'..='\u{f8ff}').contains(c))
             .collect()
     }
+
+    #[cfg(feature = "shader-compiler")]
+    mod shader_tab;
 
     fn themes_default() -> &'static theme::Theme {
         static THEME: std::sync::OnceLock<theme::Theme> = std::sync::OnceLock::new();
@@ -829,7 +836,7 @@ mod tests {
         editor.world.insert_resource(crate::scene::Assets::new());
 
         editor.frames(2);
-        assert_eq!(editor.state.material_previews, [None, None]);
+        assert_eq!(editor.state.material_previews, [None, None, None]);
 
         editor.state.selection.set(entity);
         editor.frames(2);

@@ -743,6 +743,7 @@ fn the_preview_shows_the_function(make: fn([u32; 2]) -> VulkanRenderer, backend:
                     orbit: Orbit::default(),
                 }),
                 None,
+                None,
             ],
             ..Default::default()
         };

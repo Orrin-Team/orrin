@@ -31,7 +31,8 @@
 //! frame.
 //!
 //! **Who it is for.** Each editor view that shows one — the inspector's
-//! Material section, the Import tab's material — is a [`Viewer`] with images
+//! Material section, the Import tab's material, the Shader tab's — is a
+//! [`Viewer`] with images
 //! and a schedule of its own, so two views can show two materials at once. A
 //! frame redraws at most one of them, taking turns when both are due, which
 //! keeps the passes in the graph to one pair however many views there are.
@@ -89,10 +90,11 @@ pub const OUTPUT_FORMAT: Format = Format::Rgba8Srgb;
 pub enum Viewer {
     Inspector,
     Browser,
+    Shader,
 }
 
 impl Viewer {
-    pub const ALL: [Self; VIEWERS] = [Self::Inspector, Self::Browser];
+    pub const ALL: [Self; VIEWERS] = [Self::Inspector, Self::Browser, Self::Shader];
 
     /// The egui texture the view paints its sphere with.
     pub fn texture(self) -> egui::TextureId {
@@ -100,7 +102,7 @@ impl Viewer {
     }
 }
 
-const VIEWERS: usize = 2;
+const VIEWERS: usize = 3;
 
 /// Where the camera stands round the sphere, in degrees: `yaw` about the
 /// vertical and `pitch` above the view it starts from.
@@ -794,12 +796,14 @@ mod tests {
     /// Two views due in the same frames take turns; one alone has every frame.
     #[test]
     fn views_due_together_take_turns() {
-        assert_eq!(next_due([false, false], 0), None);
-        assert_eq!(next_due([false, true], 0), Some(Viewer::Browser));
-        assert_eq!(next_due([true, false], 1), Some(Viewer::Inspector));
-        assert_eq!(next_due([true, true], 0), Some(Viewer::Inspector));
-        assert_eq!(next_due([true, true], 1), Some(Viewer::Browser));
-        assert_eq!(next_due([true, true], 2), Some(Viewer::Inspector));
+        assert_eq!(next_due([false, false, false], 0), None);
+        assert_eq!(next_due([false, true, false], 0), Some(Viewer::Browser));
+        assert_eq!(next_due([true, false, false], 1), Some(Viewer::Inspector));
+        assert_eq!(next_due([true, true, false], 0), Some(Viewer::Inspector));
+        assert_eq!(next_due([true, true, false], 1), Some(Viewer::Browser));
+        assert_eq!(next_due([true, true, false], 2), Some(Viewer::Inspector));
+        assert_eq!(next_due([true, false, true], 1), Some(Viewer::Shader));
+        assert_eq!(next_due([true, true, true], 3), Some(Viewer::Inspector));
     }
 
     /// A view is never shown larger than the picture was drawn, at any

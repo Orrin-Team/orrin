@@ -9,6 +9,7 @@ pub(crate) mod catalog;
 mod dock;
 mod export;
 mod gizmo;
+mod glsl;
 mod icons;
 mod kind;
 mod panels;

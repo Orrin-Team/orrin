@@ -14,12 +14,14 @@ use orrin_registry::{AssetId, Reflect, Registry};
 
 use super::{color_row, figures};
 use crate::asset_db::AssetDatabase;
+use crate::asset_db::material::{MaterialFile, ShaderValue};
 use crate::editor::catalog;
 use crate::editor::icons;
 use crate::editor::kind::Kind;
 use crate::editor::previews::Previews;
 use crate::editor::state::EditorState;
 use crate::editor::widgets;
+use crate::gfx::surface::{DefaultTexture, Param, ParamKind};
 use crate::gfx::vulkan::material_preview;
 #[cfg(feature = "scripting")]
 use crate::scene::Scripts;
@@ -1121,8 +1123,13 @@ fn material_section(
         "Emission",
         "Blend",
     ];
+    let shader_labels = asset
+        .as_ref()
+        .map(|(_, file)| shader_labels(world, file))
+        .unwrap_or_default();
     if asset.is_some() {
         labels.extend(MAPS.map(|(label, _)| label));
+        labels.extend(shader_labels.iter().map(String::as_str));
     }
     let Some(rows) = filter.section("Material", &labels) else {
         return;
@@ -1133,6 +1140,7 @@ fn material_section(
     let id = ui.id().with("material");
     let weak = ui.visuals().weak_text_color();
     let mut previewed = None;
+    let mut edit_shader = None;
     widgets::section(ui, id, icons::palette(), weak, "Material", None, |ui| {
         if rows.shows("Preview") {
             // Drawn by the renderer this frame, through the frame's own
@@ -1209,8 +1217,12 @@ fn material_section(
                     widgets::property(ui, label, |ui| texture_slot(ui, world, texture));
                 }
             }
+            shader_rows(ui, world, file, rows, &mut edit_shader);
         }
     });
+    if let Some(shader) = edit_shader {
+        state.open_shader(shader);
+    }
 
     if previewed.is_some() {
         state.material_previews[material_preview::Viewer::Inspector as usize] = previewed;
@@ -1222,7 +1234,9 @@ fn material_section(
         || before.emissive != after.emissive;
     match (asset, slots) {
         (Some((id, file)), Some(mut changed)) => {
-            if edited || changed.textures != file.textures {
+            let shaded =
+                changed.shader != file.shader || changed.shader_values != file.shader_values;
+            if edited || shaded || changed.textures != file.textures {
                 changed.material = after;
                 state.edit_material(id, changed);
             }
@@ -1239,9 +1253,14 @@ fn material_section(
 /// for another, and a menu to empty it. Whether a drop is a texture is the
 /// edit's to decide, so a refusal is named in the console like any other.
 pub(super) fn texture_slot(ui: &mut egui::Ui, world: &World, texture: &mut Option<AssetId>) {
+    texture_slot_or(ui, world, texture, "—");
+}
+
+/// [`texture_slot`], saying `empty` while it holds nothing.
+fn texture_slot_or(ui: &mut egui::Ui, world: &World, texture: &mut Option<AssetId>, empty: &str) {
     let name = match *texture {
         Some(id) => database_name(world, Some(id)).unwrap_or_else(|| format!("missing {id}")),
-        None => "—".to_owned(),
+        None => empty.to_owned(),
     };
     let slot =
         ui.add(egui::Button::new(figures(name)).min_size(egui::vec2(ui.available_width(), 0.0)));
@@ -1260,6 +1279,300 @@ pub(super) fn texture_slot(ui: &mut egui::Ui, world: &World, texture: &mut Optio
                 ui.close_menu();
             }
         });
+}
+
+/// The labels the shader rows of `file` answer a filter by.
+fn shader_labels(world: &World, file: &MaterialFile) -> Vec<String> {
+    let mut labels = vec!["Shader".to_owned()];
+    let table = world
+        .get_resource::<AssetDatabase>()
+        .zip(file.shader)
+        .and_then(|(db, shader)| db.shader_params(shader).cloned());
+    labels.extend(table.into_iter().flat_map(|t| t.params).map(|p| p.name));
+    labels.extend(file.shader_values.iter().map(|(name, _)| name.clone()));
+    labels
+}
+
+/// The surface shader a material asset is drawn through, and below it one row
+/// per parameter the shader declares, in its order, generated from its last
+/// good compile. A value at the shader's default is not in the file, and the
+/// row shows the default; a value set offers to go back to it, which takes it
+/// out of the file. Values the shader does not declare — most often a
+/// parameter since renamed — are kept by the file, so they are listed here to
+/// be seen and removed. Every change is an edit of `file`, which the caller
+/// posts through the edit pipeline as it does the built-in rows.
+fn shader_rows(
+    ui: &mut egui::Ui,
+    world: &World,
+    file: &mut MaterialFile,
+    rows: Rows,
+    edit: &mut Option<AssetId>,
+) {
+    let Some(db) = world.get_resource::<AssetDatabase>() else {
+        return;
+    };
+    let weak = ui.visuals().weak_text_color();
+    if rows.shows("Shader") {
+        let named = file.shader;
+        let mut editing = None;
+        widgets::property_with(
+            ui,
+            "Shader",
+            |ui| shader_picker(ui, &db, file, edit),
+            |ui| {
+                if let Some(shader) = named
+                    && icons::button(ui, icons::arrow_square_out(), 12.0, weak, false)
+                        .on_hover_text("Edit in the Shader tab")
+                        .clicked()
+                {
+                    editing = Some(shader);
+                }
+            },
+        );
+        if editing.is_some() {
+            *edit = editing;
+        }
+    }
+    let Some(shader) = file.shader else {
+        return;
+    };
+    let name = db
+        .get(shader)
+        .map_or_else(|| shader.to_string(), |entry| entry.name().to_owned());
+    let Some(table) = db.shader_params(shader).cloned() else {
+        let compiling = super::shader::Status::of(&db, shader) == super::shader::Status::Compiling;
+        let said = if compiling {
+            format!("{name} is compiling")
+        } else {
+            format!("{name} has not compiled yet")
+        };
+        widgets::padded(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                icons::labelled(ui, icons::warning(), crate::editor::theme::PENDING, &said);
+                if ui
+                    .button("Edit")
+                    .on_hover_text("Its parameters are listed once it compiles")
+                    .clicked()
+                {
+                    *edit = Some(shader);
+                }
+            });
+        });
+        return;
+    };
+    drop(db);
+    for param in &table.params {
+        if rows.shows(&param.name) {
+            param_row(ui, world, file, param);
+        }
+    }
+    let undeclared: Vec<String> = file
+        .shader_values
+        .iter()
+        .map(|(set, _)| set.clone())
+        .filter(|set| table.get(set).is_none())
+        .collect();
+    for set in undeclared {
+        if !rows.shows(&set) {
+            continue;
+        }
+        let mut remove = false;
+        widgets::property_with(
+            ui,
+            &set,
+            |ui| {
+                ui.horizontal(|ui| {
+                    icons::labelled(
+                        ui,
+                        icons::warning(),
+                        crate::editor::theme::PENDING,
+                        &format!("Not declared by {name}"),
+                    );
+                })
+                .response
+                .on_hover_text("The file keeps it, and the shader ignores it");
+            },
+            |ui| {
+                remove = icons::button(ui, icons::x(), 12.0, weak, false)
+                    .on_hover_text("Remove this value from the file")
+                    .clicked();
+            },
+        );
+        if remove {
+            file.set_shader_value(&set, None);
+        }
+    }
+}
+
+/// The Shader row's slot: the project's surface shaders to pick from, a
+/// shader asset dropped on it, and a menu to edit or clear it.
+fn shader_picker(
+    ui: &mut egui::Ui,
+    db: &AssetDatabase,
+    file: &mut MaterialFile,
+    edit: &mut Option<AssetId>,
+) {
+    let mut choices = vec![Choice {
+        name: "None".to_owned(),
+        handle: None,
+    }];
+    choices.extend(
+        db.iter()
+            .filter(|entry| entry.kind == crate::asset_db::AssetKind::Shader)
+            .map(|entry| Choice {
+                name: entry.name().to_owned(),
+                handle: Some(entry.id),
+            }),
+    );
+    let current = file.shader;
+    let subtitle = match current {
+        Some(shader) => super::shader::Status::of(db, shader).label(),
+        None => "Drawn as a standard material".to_owned(),
+    };
+    let fallback = current.map(|id| format!("missing {id}"));
+    let mut dropped = None;
+    let mut clear = false;
+    let picked = picker(
+        ui,
+        "shader",
+        choices,
+        Some(current),
+        fallback,
+        |ui, name| {
+            let slot = widgets::asset_slot(ui, None, icons::file_code(), name, &subtitle);
+            take_drop(&slot, &mut dropped);
+            slot.context_menu(|ui| {
+                if let Some(shader) = current
+                    && ui.button("Edit").clicked()
+                {
+                    *edit = Some(shader);
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(current.is_some(), egui::Button::new("Clear shader"))
+                    .clicked()
+                {
+                    clear = true;
+                    ui.close_menu();
+                }
+            });
+            slot.on_hover_text("Click to pick a surface shader, or drop one here")
+        },
+        &mut |_, _| None,
+    );
+    if let Some(picked) = picked {
+        file.shader = picked;
+    }
+    if dropped.is_some() {
+        file.shader = dropped;
+    }
+    if clear {
+        file.shader = None;
+    }
+}
+
+/// One parameter's value as its row edits it: the file's, or the shader's
+/// default when the file has none of the declared type.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Field {
+    Float(f32),
+    /// The first `n` components.
+    Vector([f32; 4], usize),
+    /// Linear and unmultiplied, as the base colour is.
+    Color([f32; 4]),
+    /// `None` is the shader's default texture.
+    Texture(Option<AssetId>),
+}
+
+impl Field {
+    fn of(kind: &ParamKind, set: Option<ShaderValue>) -> Self {
+        let pad = |v: &[f32]| std::array::from_fn(|i| v.get(i).copied().unwrap_or(0.0));
+        match (*kind, set) {
+            (ParamKind::Float { .. }, Some(ShaderValue::Float(v))) => Self::Float(v),
+            (ParamKind::Float { default, .. }, _) => Self::Float(default),
+            (ParamKind::Vec2 { .. }, Some(ShaderValue::Vec2(v))) => Self::Vector(pad(&v), 2),
+            (ParamKind::Vec2 { default }, _) => Self::Vector(pad(&default), 2),
+            (ParamKind::Vec3 { .. }, Some(ShaderValue::Vec3(v))) => Self::Vector(pad(&v), 3),
+            (ParamKind::Vec3 { default }, _) => Self::Vector(pad(&default), 3),
+            (ParamKind::Vec4 { .. }, Some(ShaderValue::Vec4(v))) => Self::Vector(v, 4),
+            (ParamKind::Vec4 { default }, _) => Self::Vector(default, 4),
+            (ParamKind::Color { .. }, Some(ShaderValue::Vec4(v))) => Self::Color(v),
+            (ParamKind::Color { default }, _) => Self::Color(default),
+            (ParamKind::Texture { .. }, Some(ShaderValue::Texture(id))) => Self::Texture(Some(id)),
+            (ParamKind::Texture { .. }, _) => Self::Texture(None),
+        }
+    }
+
+    /// What the file holds for it; `None` takes it out, back to the default.
+    fn stored(self) -> Option<ShaderValue> {
+        Some(match self {
+            Self::Float(v) => ShaderValue::Float(v),
+            Self::Vector([x, y, ..], 2) => ShaderValue::Vec2([x, y]),
+            Self::Vector([x, y, z, _], 3) => ShaderValue::Vec3([x, y, z]),
+            Self::Vector(v, _) | Self::Color(v) => ShaderValue::Vec4(v),
+            Self::Texture(id) => ShaderValue::Texture(id?),
+        })
+    }
+}
+
+fn param_row(ui: &mut egui::Ui, world: &World, file: &mut MaterialFile, param: &Param) {
+    let set = file.shader_value(&param.name);
+    let before = Field::of(&param.kind, set);
+    let mut after = before;
+    let mut reset = false;
+    widgets::property_with(
+        ui,
+        &param.name,
+        |ui| match (&mut after, param.kind) {
+            (
+                Field::Float(v),
+                ParamKind::Float {
+                    range: Some([min, max]),
+                    ..
+                },
+            ) => {
+                ui.add(egui::Slider::new(v, min..=max));
+            }
+            (Field::Float(v), _) => {
+                ui.add(egui::DragValue::new(v).speed(0.01));
+            }
+            (Field::Vector(values, n), _) => {
+                let gap = ui.spacing().item_spacing.x;
+                let width = ((ui.available_width() - gap * (*n as f32 - 1.0)) / *n as f32).floor();
+                for value in values.iter_mut().take(*n) {
+                    ui.add_sized(
+                        egui::vec2(width, ui.spacing().interact_size.y),
+                        egui::DragValue::new(value).speed(0.01),
+                    );
+                }
+            }
+            (Field::Color(rgba), _) => {
+                ui.color_edit_button_rgba_unmultiplied(rgba);
+            }
+            (Field::Texture(texture), ParamKind::Texture { default, .. }) => {
+                let empty = match default {
+                    DefaultTexture::White => "white (default)",
+                    DefaultTexture::Black => "black (default)",
+                    DefaultTexture::Normal => "flat normal (default)",
+                };
+                texture_slot_or(ui, world, texture, empty);
+            }
+            (Field::Texture(_), _) => {}
+        },
+        |ui| {
+            if set.is_some() {
+                let weak = ui.visuals().weak_text_color();
+                reset = icons::button(ui, icons::rotate_ccw(), 12.0, weak, false)
+                    .on_hover_text("Back to the shader's default")
+                    .clicked();
+            }
+        },
+    );
+    if reset {
+        file.set_shader_value(&param.name, None);
+    } else if after != before {
+        file.set_shader_value(&param.name, after.stored());
+    }
 }
 
 /// One section per Behaviour on the entity, in attach order: its lifecycle
@@ -2353,6 +2666,79 @@ mod tests {
                 &world, door
             )))
         );
+    }
+
+    /// Each kind of parameter edits as the value its file holds: a colour
+    /// as a `Vec4`, a vector as one of its own length, a texture by asset —
+    /// and a row with nothing in the file starts at the shader's default.
+    #[test]
+    fn each_parameter_kind_is_edited_as_its_own_value() {
+        let rock: AssetId = "5f0c3a4e-0000-4000-8000-0000000000e1".parse().unwrap();
+        let kinds = [
+            (
+                ParamKind::Float {
+                    default: 0.5,
+                    range: Some([0.0, 1.0]),
+                },
+                Field::Float(0.5),
+                Field::Float(0.75),
+                Some(ShaderValue::Float(0.75)),
+            ),
+            (
+                ParamKind::Vec2 {
+                    default: [1.0, 2.0],
+                },
+                Field::Vector([1.0, 2.0, 0.0, 0.0], 2),
+                Field::Vector([3.0, 2.0, 0.0, 0.0], 2),
+                Some(ShaderValue::Vec2([3.0, 2.0])),
+            ),
+            (
+                ParamKind::Vec3 {
+                    default: [1.0, 2.0, 3.0],
+                },
+                Field::Vector([1.0, 2.0, 3.0, 0.0], 3),
+                Field::Vector([1.0, 2.0, 4.0, 0.0], 3),
+                Some(ShaderValue::Vec3([1.0, 2.0, 4.0])),
+            ),
+            (
+                ParamKind::Vec4 {
+                    default: [1.0, 2.0, 3.0, 4.0],
+                },
+                Field::Vector([1.0, 2.0, 3.0, 4.0], 4),
+                Field::Vector([1.0, 2.0, 3.0, 5.0], 4),
+                Some(ShaderValue::Vec4([1.0, 2.0, 3.0, 5.0])),
+            ),
+            (
+                ParamKind::Color {
+                    default: [1.0, 0.5, 0.25, 1.0],
+                },
+                Field::Color([1.0, 0.5, 0.25, 1.0]),
+                Field::Color([0.0, 0.5, 0.25, 1.0]),
+                Some(ShaderValue::Vec4([0.0, 0.5, 0.25, 1.0])),
+            ),
+            (
+                ParamKind::Texture {
+                    default: DefaultTexture::White,
+                    color_space: crate::gfx::surface::ColorSpace::Srgb,
+                },
+                Field::Texture(None),
+                Field::Texture(Some(rock)),
+                Some(ShaderValue::Texture(rock)),
+            ),
+        ];
+        for (kind, default, edited, stored) in kinds {
+            assert_eq!(Field::of(&kind, None), default, "{kind:?}");
+            assert_eq!(edited.stored(), stored, "{kind:?}");
+            assert_eq!(Field::of(&kind, stored), edited, "{kind:?} reads back");
+        }
+        // A value of another type than the shader declares shows the default.
+        let color = ParamKind::Color { default: [1.0; 4] };
+        assert_eq!(
+            Field::of(&color, Some(ShaderValue::Float(2.0))),
+            Field::Color([1.0; 4])
+        );
+        // An emptied texture slot is the default, which is no value at all.
+        assert_eq!(Field::Texture(None).stored(), None);
     }
 
     #[test]
