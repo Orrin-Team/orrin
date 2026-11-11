@@ -10,11 +10,16 @@ namespace Orrin.Math;
 [StructLayout(LayoutKind.Sequential)]
 public readonly struct Color : IEquatable<Color>
 {
+    /// <summary>Red, nominally 0 to 1.</summary>
     public readonly float r;
+    /// <summary>Green, nominally 0 to 1.</summary>
     public readonly float g;
+    /// <summary>Blue, nominally 0 to 1.</summary>
     public readonly float b;
+    /// <summary>Alpha: 1 is opaque, 0 invisible.</summary>
     public readonly float a;
 
+    /// <summary>A colour from its components, opaque unless <paramref name="a"/> says otherwise.</summary>
     public Color(float r, float g, float b, float a = 1f)
     {
         this.r = r;
@@ -23,14 +28,23 @@ public readonly struct Color : IEquatable<Color>
         this.a = a;
     }
 
+    /// <summary>(1, 1, 1), opaque.</summary>
     public static Color white => new(1f, 1f, 1f);
+    /// <summary>(0, 0, 0), opaque.</summary>
     public static Color black => new(0f, 0f, 0f);
+    /// <summary>(1, 0, 0), opaque.</summary>
     public static Color red => new(1f, 0f, 0f);
+    /// <summary>(0, 1, 0), opaque.</summary>
     public static Color green => new(0f, 1f, 0f);
+    /// <summary>(0, 0, 1), opaque.</summary>
     public static Color blue => new(0f, 0f, 1f);
+    /// <summary>(1, 1, 0), opaque.</summary>
     public static Color yellow => new(1f, 1f, 0f);
+    /// <summary>(0, 1, 1), opaque.</summary>
     public static Color cyan => new(0f, 1f, 1f);
+    /// <summary>(1, 0, 1), opaque.</summary>
     public static Color magenta => new(1f, 0f, 1f);
+    /// <summary>(0.5, 0.5, 0.5), opaque.</summary>
     public static Color gray => new(0.5f, 0.5f, 0.5f);
     /// <summary>Fully transparent black.</summary>
     public static Color clear => new(0f, 0f, 0f, 0f);
@@ -77,6 +91,10 @@ public readonly struct Color : IEquatable<Color>
     /// <summary>Linear interpolation; <paramref name="t"/> is clamped to [0, 1].</summary>
     public static Color Lerp(Color a, Color b, float t) => LerpUnclamped(a, b, Mathf.Clamp01(t));
 
+    /// <summary>
+    /// <see cref="Lerp"/> without the clamp: a <paramref name="t"/> outside [0, 1]
+    /// extrapolates.
+    /// </summary>
     public static Color LerpUnclamped(Color a, Color b, float t) => new(
         a.r + (b.r - a.r) * t,
         a.g + (b.g - a.g) * t,
@@ -86,25 +104,37 @@ public readonly struct Color : IEquatable<Color>
     /// <summary>This color with a different alpha.</summary>
     public Color WithAlpha(float alpha) => new(r, g, b, alpha);
 
+    /// <summary>Component-wise sum, alpha included.</summary>
     public static Color operator +(Color a, Color b) => new(a.r + b.r, a.g + b.g, a.b + b.b, a.a + b.a);
+    /// <summary>Component-wise difference, alpha included.</summary>
     public static Color operator -(Color a, Color b) => new(a.r - b.r, a.g - b.g, a.b - b.b, a.a - b.a);
     /// <summary>Component-wise (modulate) multiplication.</summary>
     public static Color operator *(Color a, Color b) => new(a.r * b.r, a.g * b.g, a.b * b.b, a.a * b.a);
+    /// <summary>Every component, alpha included, multiplied by <paramref name="s"/>.</summary>
     public static Color operator *(Color c, float s) => new(c.r * s, c.g * s, c.b * s, c.a * s);
+    /// <summary>Every component, alpha included, multiplied by <paramref name="s"/>.</summary>
     public static Color operator *(float s, Color c) => new(c.r * s, c.g * s, c.b * s, c.a * s);
 
+    /// <summary>Exact equality of every component, with no tolerance.</summary>
     public static bool operator ==(Color a, Color b) =>
         a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
 
+    /// <summary>Whether any component differs.</summary>
     public static bool operator !=(Color a, Color b) => !(a == b);
 
+    /// <summary>r, g, b and a as x, y, z and w.</summary>
     public static explicit operator Vector4(Color c) => new(c.r, c.g, c.b, c.a);
+    /// <summary>x, y, z and w as r, g, b and a.</summary>
     public static explicit operator Color(Vector4 v) => new(v.x, v.y, v.z, v.w);
 
+    /// <inheritdoc/>
     public bool Equals(Color other) => this == other;
+    /// <inheritdoc/>
     public override bool Equals(object? obj) => obj is Color other && this == other;
+    /// <inheritdoc/>
     public override int GetHashCode() => HashCode.Combine(r, g, b, a);
 
+    /// <summary><c>RGBA(r, g, b, a)</c> to three decimal places, in the invariant culture.</summary>
     public override string ToString() =>
         string.Create(CultureInfo.InvariantCulture, $"RGBA({r:F3}, {g:F3}, {b:F3}, {a:F3})");
 }

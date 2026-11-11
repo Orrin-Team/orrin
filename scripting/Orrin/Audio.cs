@@ -53,8 +53,16 @@ public struct AudioSource
     /// <summary>Past this distance the rolloff stops changing anything.</summary>
     public float MaxDistance;
 
+    /// <summary>
+    /// How the sound quietens between <see cref="MinDistance"/> and
+    /// <see cref="MaxDistance"/>.
+    /// </summary>
     public AudioRolloff Rolloff;
 
+    /// <summary>
+    /// The engine's default: a volume of 1, playing on start, spatial, undimmed
+    /// within 1 m and rolling off inversely to 50 m.
+    /// </summary>
     public AudioSource()
     {
         Volume = 1f;
@@ -72,6 +80,7 @@ public struct AudioSource
         set => _clip = AssetBytes.Of(value.Id);
     }
 
+    /// <summary>Starts again from the beginning each time it ends.</summary>
     public bool Loop
     {
         readonly get => _loop != 0;
@@ -124,14 +133,19 @@ public readonly struct SoundHandle : IEquatable<SoundHandle>
     /// <summary>False once the sound has ended, been stopped, or was refused.</summary>
     public bool IsPlaying => Id != 0 && Native.AudioPlaying(Id);
 
+    /// <inheritdoc/>
     public bool Equals(SoundHandle other) => Id == other.Id;
 
+    /// <inheritdoc/>
     public override bool Equals(object? obj) => obj is SoundHandle other && Equals(other);
 
+    /// <inheritdoc/>
     public override int GetHashCode() => Id.GetHashCode();
 
+    /// <summary>Whether both are the same sound.</summary>
     public static bool operator ==(SoundHandle a, SoundHandle b) => a.Id == b.Id;
 
+    /// <summary>Whether they are different sounds.</summary>
     public static bool operator !=(SoundHandle a, SoundHandle b) => a.Id != b.Id;
 }
 
@@ -201,6 +215,7 @@ public static class Audio
     public static SoundHandle PlayMusic(AssetRef<AudioClip> clip, bool loop = true) =>
         new(Native.AudioPlayMusic(clip.Id, loop));
 
+    /// <summary>Stop what the music channel is playing.</summary>
     public static void StopMusic() => Native.AudioStopMusic();
 
     /// <summary>The music channel's gain, under <see cref="MasterVolume"/>.</summary>

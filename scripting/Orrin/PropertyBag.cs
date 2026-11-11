@@ -22,7 +22,7 @@ namespace Orrin;
 ///
 /// The visible set is closed to the types that have a `Value` variant on the
 /// Rust side: bool, int, uint, float, string, Vector2, Vector3, Quaternion,
-/// Color, enums, `AssetRef<T>`, `Entity`, and a `List<T>` or `T[]` of any of
+/// Color, enums, <see cref="AssetRef{T}"/>, `Entity`, and a <see cref="List{T}"/> or `T[]` of any of
 /// those.
 ///
 /// An `Entity` crosses as its live handle (tag 14), not as tag 7's persistent
@@ -584,7 +584,7 @@ public static unsafe class PropertyBag
               || type == typeof(Entity)
               || (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(AssetRef<>));
 
-    /// What a `List<T>` or a one-dimensional `T[]` holds; null for anything else.
+    /// What a <see cref="List{T}"/> or a one-dimensional `T[]` holds; null for anything else.
     internal static Type? ElementType(Type type)
     {
         if (type.IsArray)

@@ -2,6 +2,7 @@ namespace Orrin;
 
 // Numbering is lock-step with the `kind` match in the renderer's scripting.rs
 // (same rule as KeyCode: append, never renumber).
+/// <summary>The engine's numbering of the components a script can reach.</summary>
 public enum ComponentKind : uint
 {
     Transform = 0,

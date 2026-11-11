@@ -4,6 +4,9 @@
 // non-zero on any failure. Dependency-free on purpose — convert to xunit when
 // the scripting side grows a real test suite.
 
+using System.Reflection;
+using System.Xml.Linq;
+
 using Orrin;
 using Orrin.Math;
 
@@ -553,6 +556,109 @@ Check(Native.ScriptName("Spinner.cs") == "Spinner", "a bare file names its scrip
 Check(Native.ScriptName("/scripts.v2/Spinner") == "Spinner", "a dot in a directory is not an extension");
 Check(Native.ScriptName("") == "", "no path is no name");
 
+// --- API documentation -----------------------------------------------------------
+//
+// A script author's editor reads the bindings' documentation out of Orrin.xml
+// beside the Orrin.dll a project references, and shows only what is inside its
+// elements: a plain `///` line compiles into the file and is displayed by
+// nothing. So the check reads the file the build wrote, not the source, and asks
+// for a <summary> (or an <inheritdoc/>) on every member a script can reach.
+// That is stricter than CS1591, which a plain `///` line satisfies, and is why
+// Orrin.csproj turns CS1591 off rather than having two lists of exemptions.
+
+// The bindings' own build output, which a project outside the checkout
+// references by path: this program's output directory, moved from
+// scripting/Orrin.MathTests to scripting/Orrin.
+var output = new DirectoryInfo(Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory));
+var docPath = Path.Combine(
+    output.Parent!.Parent!.Parent!.Parent!.FullName, "Orrin", "bin", output.Parent.Name, output.Name, "Orrin.xml");
+XDocument? apiDoc = null;
+if (!File.Exists(docPath))
+{
+    Check(false, $"Orrin.xml is written beside the bindings' Orrin.dll (looked for {docPath})");
+}
+else
+{
+    try
+    {
+        apiDoc = XDocument.Load(docPath);
+    }
+    catch (System.Xml.XmlException e)
+    {
+        Check(false, $"Orrin.xml is well-formed ({e.Message})");
+    }
+}
+
+if (apiDoc is not null)
+{
+    var members = new Dictionary<string, XElement>();
+    foreach (var member in apiDoc.Descendants("member"))
+        members.TryAdd((string)member.Attribute("name")!, member);
+    bool Documented(string id) =>
+        members.TryGetValue(id, out var member)
+        && (member.Element("inheritdoc") is not null
+            || !string.IsNullOrWhiteSpace(member.Element("summary")?.Value));
+
+    // A fixed sample, spelled out by hand: it is what the coverage sweep below
+    // stands on, since an id spelled differently from the compiler's would
+    // read as undocumented rather than as a bug in the spelling.
+    foreach (var (member, id) in new (MemberInfo, string)[]
+    {
+        (typeof(Entity), "T:Orrin.Entity"),
+        (typeof(Behaviour).GetMethod(nameof(Behaviour.OnUpdate))!, "M:Orrin.Behaviour.OnUpdate(System.Single)"),
+        (typeof(Behaviour).GetMethod(nameof(Behaviour.OnFixedUpdate))!, "M:Orrin.Behaviour.OnFixedUpdate(System.Single)"),
+        (typeof(Time).GetProperty(nameof(Time.timeScale))!, "P:Orrin.Time.timeScale"),
+        (typeof(Physics).GetMethod(
+                nameof(Physics.OverlapSphere), [typeof(Vector3), typeof(float), typeof(Span<Entity>), typeof(uint), typeof(bool)])!,
+            "M:Orrin.Physics.OverlapSphere(Orrin.Math.Vector3,System.Single,System.Span{Orrin.Entity},System.UInt32,System.Boolean)"),
+        (typeof(Physics).GetMethod(nameof(Physics.Raycast))!,
+            "M:Orrin.Physics.Raycast(Orrin.Math.Vector3,Orrin.Math.Vector3,Orrin.RaycastHit@,System.Single,System.UInt32,System.Boolean)"),
+        (typeof(World).GetMethod(nameof(World.AddScript))!, "M:Orrin.World.AddScript``1(Orrin.Entity)"),
+        (typeof(Vector3).GetMethod(nameof(Vector3.Cross))!, "M:Orrin.Math.Vector3.Cross(Orrin.Math.Vector3,Orrin.Math.Vector3)"),
+        (typeof(Orrin.Testing.TestAttribute), "T:Orrin.Testing.TestAttribute"),
+    })
+    {
+        Check(DocIds.Of(member) == id, $"DocIds spells {id} as the compiler does (got {DocIds.Of(member)})");
+        Check(Documented(id), $"{id} has a summary in Orrin.xml");
+    }
+
+    // Public only because the engine calls into them through function
+    // pointers, or because the reload machinery lives in this assembly.
+    var engineOnly = new HashSet<Type>
+    {
+        typeof(OrrinApi), typeof(Bootstrap), typeof(Behaviours), typeof(BehaviourState),
+        typeof(GameAssembly), typeof(PropertyBag), typeof(Stories), typeof(Tweens),
+        typeof(Orrin.Testing.TestRunner),
+    };
+    // Enums whose members say everything their names say; the type carries
+    // what is not obvious, such as a key code being a physical position.
+    var selfNaming = new HashSet<Type>
+    {
+        typeof(KeyCode), typeof(MouseButton), typeof(TextAnchor), typeof(ComponentKind),
+    };
+
+    var undocumented = new List<string>();
+    foreach (var type in typeof(Entity).Assembly.GetExportedTypes())
+    {
+        if (engineOnly.Contains(type))
+            continue;
+        if (!Documented(DocIds.Of(type)))
+            undocumented.Add(DocIds.Of(type));
+        if (selfNaming.Contains(type))
+            continue;
+        foreach (var member in type.GetMembers(
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static
+            | BindingFlags.DeclaredOnly))
+        {
+            if (DocIds.ScriptVisible(member) && !Documented(DocIds.Of(member)))
+                undocumented.Add(DocIds.Of(member));
+        }
+    }
+    Check(undocumented.Count == 0,
+        $"every script-facing member has a summary in Orrin.xml; {undocumented.Count} do not:\n  "
+        + string.Join("\n  ", undocumented.Order()));
+}
+
 Console.WriteLine($"{passed} passed, {failures} failed");
 return failures == 0 ? 0 : 1;
 
@@ -629,4 +735,83 @@ sealed class AssetProbe : Behaviour
 sealed class SkinProbe : Behaviour
 {
     public AssetRef<Material> Skin;
+}
+
+/// The compiler's documentation ids (ECMA-334 annex D) for what reflection
+/// hands back, so a member can be looked up in Orrin.xml. Covers the shapes the
+/// bindings' public surface has; anything else throws rather than guessing.
+static class DocIds
+{
+    public static string Of(MemberInfo member) => member switch
+    {
+        Type type => "T:" + Name(type),
+        FieldInfo field => $"F:{Name(field.DeclaringType!)}.{field.Name}",
+        PropertyInfo property => $"P:{Name(property.DeclaringType!)}.{property.Name}"
+            + Parameters(property.GetIndexParameters()),
+        EventInfo @event => $"E:{Name(@event.DeclaringType!)}.{@event.Name}",
+        MethodBase method => Method(method),
+        _ => throw new NotSupportedException($"no documentation id for {member}"),
+    };
+
+    /// Public or protected, and written by hand: accessors, `value__` and the
+    /// parameterless constructor a class gets for free are not. A struct has
+    /// one in metadata only when it declares it.
+    public static bool ScriptVisible(MemberInfo member) => member switch
+    {
+        Type => false,
+        FieldInfo field => (field.IsPublic || field.IsFamily || field.IsFamilyOrAssembly) && !field.IsSpecialName,
+        PropertyInfo property => property.GetAccessors(nonPublic: true).Any(Reachable),
+        EventInfo @event => @event.AddMethod is { } add && Reachable(add),
+        ConstructorInfo constructor => Reachable(constructor) && !constructor.IsStatic
+            && (constructor.GetParameters().Length > 0 || constructor.DeclaringType!.IsValueType),
+        MethodInfo method => Reachable(method) && !Generated(method)
+            && (!method.IsSpecialName || method.Name.StartsWith("op_")),
+        _ => false,
+    };
+
+    static bool Reachable(MethodBase method) => method.IsPublic || method.IsFamily || method.IsFamilyOrAssembly;
+
+    // An auto-property's accessors carry the attribute too, which is why it is
+    // asked only of a method that stands on its own.
+    static bool Generated(MethodBase method) =>
+        method.GetCustomAttribute<System.Runtime.CompilerServices.CompilerGeneratedAttribute>() is not null;
+
+    static string Method(MethodBase method)
+    {
+        var name = method is ConstructorInfo ? (method.IsStatic ? "#cctor" : "#ctor") : method.Name;
+        var id = $"M:{Name(method.DeclaringType!)}.{name}";
+        if (method.IsGenericMethodDefinition)
+            id += "``" + method.GetGenericArguments().Length;
+        id += Parameters(method.GetParameters());
+        if (method is MethodInfo { Name: "op_Implicit" or "op_Explicit" } conversion)
+            id += "~" + Reference(conversion.ReturnType);
+        return id;
+    }
+
+    static string Parameters(ParameterInfo[] parameters) => parameters.Length == 0
+        ? ""
+        : "(" + string.Join(",", parameters.Select(parameter => Reference(parameter.ParameterType))) + ")";
+
+    static string Name(Type type) => (type.FullName ?? throw new NotSupportedException($"no full name for {type}"))
+        .Replace('+', '.');
+
+    static string Reference(Type type)
+    {
+        if (type.IsByRef)
+            return Reference(type.GetElementType()!) + "@";
+        if (type.IsPointer)
+            return Reference(type.GetElementType()!) + "*";
+        if (type.IsArray)
+            return Reference(type.GetElementType()!)
+                + (type.GetArrayRank() == 1 ? "[]" : "[" + string.Join(",", Enumerable.Repeat("0:", type.GetArrayRank())) + "]");
+        if (type.IsGenericParameter)
+            return (type.DeclaringMethod is null ? "`" : "``") + type.GenericParameterPosition;
+        if (type.IsGenericType)
+        {
+            var definition = Name(type.GetGenericTypeDefinition());
+            return definition[..definition.LastIndexOf('`')]
+                + "{" + string.Join(",", type.GetGenericArguments().Select(Reference)) + "}";
+        }
+        return Name(type);
+    }
 }

@@ -10,10 +10,15 @@ namespace Orrin;
 /// </summary>
 public enum PointerEventKind : uint
 {
+    /// <summary>See <see cref="IPointerEnterHandler"/>.</summary>
     Enter,
+    /// <summary>See <see cref="IPointerExitHandler"/>.</summary>
     Exit,
+    /// <summary>See <see cref="IPointerDownHandler"/>.</summary>
     Down,
+    /// <summary>See <see cref="IPointerUpHandler"/>.</summary>
     Up,
+    /// <summary>See <see cref="IPointerClickHandler"/>.</summary>
     Click,
 }
 
@@ -35,8 +40,10 @@ public readonly struct PointerEvent
     /// </summary>
     public readonly Entity Target;
 
+    /// <summary>The button; the pointer events are the left button's.</summary>
     public readonly MouseButton Button;
 
+    /// <summary>An event made by hand, each argument the field of the same name.</summary>
     public PointerEvent(Vector2 position, Vector2 pressPosition, Entity target, MouseButton button)
     {
         Position = position;
@@ -52,12 +59,14 @@ public readonly struct PointerEvent
 /// </summary>
 public interface IPointerEnterHandler
 {
+    /// <inheritdoc cref="IPointerEnterHandler"/>
     void OnPointerEnter(PointerEvent pointer);
 }
 
 /// <summary>The pointer is no longer over this element or anything under it.</summary>
 public interface IPointerExitHandler
 {
+    /// <inheritdoc cref="IPointerExitHandler"/>
     void OnPointerExit(PointerEvent pointer);
 }
 
@@ -68,6 +77,7 @@ public interface IPointerExitHandler
 /// </summary>
 public interface IPointerDownHandler
 {
+    /// <inheritdoc cref="IPointerDownHandler"/>
     void OnPointerDown(PointerEvent pointer);
 }
 
@@ -77,6 +87,7 @@ public interface IPointerDownHandler
 /// </summary>
 public interface IPointerUpHandler
 {
+    /// <inheritdoc cref="IPointerUpHandler"/>
     void OnPointerUp(PointerEvent pointer);
 }
 
@@ -86,6 +97,7 @@ public interface IPointerUpHandler
 /// </summary>
 public interface IPointerClickHandler
 {
+    /// <inheritdoc cref="IPointerClickHandler"/>
     void OnPointerClick(PointerEvent pointer);
 }
 

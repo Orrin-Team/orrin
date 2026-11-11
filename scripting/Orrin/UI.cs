@@ -66,13 +66,20 @@ public static class UI
     /// <summary>The height of a line's ascent and descent, in physical pixels.</summary>
     public static float FontSize { get; set; } = 18f;
 
+    /// <summary>What colour <see cref="Label"/> and <see cref="Button"/> set their text in.</summary>
     public static Color TextColor { get; set; } = Color.white;
 
     /// <summary>Where <see cref="Label"/> sets its text. A button's is always centred.</summary>
     public static TextAnchor Alignment { get; set; } = TextAnchor.UpperLeft;
 
+    /// <summary>A <see cref="Button"/>'s fill while the pointer is elsewhere.</summary>
     public static Color ButtonColor { get; set; } = new(0.16f, 0.16f, 0.18f, 0.9f);
+    /// <summary>A <see cref="Button"/>'s fill while the pointer is over it.</summary>
     public static Color ButtonHoverColor { get; set; } = new(0.26f, 0.26f, 0.3f, 0.95f);
+    /// <summary>
+    /// A <see cref="Button"/>'s fill while the left button is held over it, having
+    /// gone down on it.
+    /// </summary>
     public static Color ButtonPressedColor { get; set; } = new(0.1f, 0.1f, 0.11f, 1f);
 
     /// <summary>Fill <paramref name="rect"/> with <paramref name="color"/>.</summary>

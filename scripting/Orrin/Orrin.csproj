@@ -10,6 +10,17 @@
     <!-- Emit Orrin.runtimeconfig.json next to the DLL so the Rust host can load
          it via hostfxr's initialize_for_runtime_config. -->
     <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <!-- Orrin.xml beside Orrin.dll is where a game project's editor finds the
+         API's documentation, in every layout: a project outside the checkout
+         references this output directory by path. It is a developer's file,
+         so the publish an export ships whole leaves it out. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PublishDocumentationFile>false</PublishDocumentationFile>
+    <!-- CS1591 is satisfied by a plain `///` line, which no editor displays.
+         Orrin.MathTests asks for a <summary> on every script-facing member
+         instead, and names what it exempts: the engine's entry points, which
+         are public only so the host can call them. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
 
   <!-- Debug.DrawLine/DrawRay are [Conditional("ORRIN_DEBUG")]. Define the symbol

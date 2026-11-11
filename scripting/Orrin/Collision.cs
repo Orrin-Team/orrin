@@ -8,16 +8,20 @@ namespace Orrin;
 // sequential 4-byte fields; Orrin.Math types are layout-compatible by
 // construction). It only ever grows at the end: the engine hands it over by
 // pointer, unchecked.
+/// <summary>
+/// A contact between this entity's collider and another's, as the collision and
+/// trigger callbacks receive it, seen from this entity's side.
+/// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public readonly struct Collision
 {
-    /// The other entity involved in the collision.
+    /// <summary>The other entity involved in the collision.</summary>
     public readonly Entity Other;
 
-    /// World-space contact point.
+    /// <summary>World-space contact point.</summary>
     public readonly Vector3 ContactPoint;
 
-    /// Unit contact normal, pointing from this entity toward Other.
+    /// <summary>Unit contact normal, pointing from this entity toward Other.</summary>
     public readonly Vector3 Normal;
 
     /// <summary>
@@ -31,6 +35,7 @@ public readonly struct Collision
     /// </summary>
     public readonly Vector3 RelativeVelocity;
 
+    /// <inheritdoc/>
     public override string ToString() =>
         $"Collision(other: {Other}, at: {ContactPoint}, normal: {Normal}, relative velocity: {RelativeVelocity})";
 }

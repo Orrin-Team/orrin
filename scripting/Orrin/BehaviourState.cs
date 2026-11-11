@@ -411,7 +411,7 @@ public static unsafe class BehaviourState
     /// game-assembly instance and would pin the load context.
     readonly record struct EnumValue(string TypeName, object Underlying);
 
-    /// A `List<T>` or `T[]` captured as its items, each captured as a field of
+    /// A <see cref="List{T}"/> or `T[]` captured as its items, each captured as a field of
     /// the element type would be. Compared by items, so a list still equal to
     /// its constructor's is not mistaken for state the user established.
     sealed record ListValue(bool IsArray, object?[] Items)

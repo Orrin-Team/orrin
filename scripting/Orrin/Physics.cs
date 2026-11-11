@@ -28,6 +28,7 @@ public enum ForceMode : uint
 [StructLayout(LayoutKind.Sequential)]
 public readonly struct RaycastHit
 {
+    /// <summary>The entity whose collider was hit.</summary>
     public readonly Entity Entity;
 
     /// <summary>World space.</summary>
@@ -39,6 +40,7 @@ public readonly struct RaycastHit
     /// <summary>Metres from the ray's origin.</summary>
     public readonly float Distance;
 
+    /// <inheritdoc/>
     public override string ToString() => $"RaycastHit({Entity} at {Point}, normal {Normal}, {Distance} m)";
 }
 
@@ -102,9 +104,19 @@ public static class Physics
     /// <summary>Every layer, for a ray that should see them all.</summary>
     public const uint AllLayers = uint.MaxValue;
 
+    /// <summary>
+    /// Push <paramref name="entity"/>'s body through its centre of mass along the
+    /// world-space <paramref name="force"/>, read as <paramref name="mode"/> says.
+    /// False, pushing nothing, for a force that is not finite.
+    /// </summary>
     public static bool AddForce(Entity entity, Vector3 force, ForceMode mode = ForceMode.Force) =>
         Native.PhysicsAddForce(entity, force, mode);
 
+    /// <summary>
+    /// Turn <paramref name="entity"/>'s body about the world-space axis of
+    /// <paramref name="torque"/>, its length the strength, read as
+    /// <paramref name="mode"/> says. False for a torque that is not finite.
+    /// </summary>
     public static bool AddTorque(Entity entity, Vector3 torque, ForceMode mode = ForceMode.Force) =>
         Native.PhysicsAddTorque(entity, torque, mode);
 
@@ -112,6 +124,10 @@ public static class Physics
     public static Vector3 GetVelocity(Entity entity) =>
         Native.PhysicsGetVelocity(entity, angular: false, out var velocity) ? velocity : Vector3.zero;
 
+    /// <summary>
+    /// Replace <paramref name="entity"/>'s velocity with <paramref name="velocity"/>,
+    /// in m/s, world space. False for a velocity that is not finite.
+    /// </summary>
     public static bool SetVelocity(Entity entity, Vector3 velocity) =>
         Native.PhysicsSetVelocity(entity, angular: false, velocity);
 
@@ -119,6 +135,10 @@ public static class Physics
     public static Vector3 GetAngularVelocity(Entity entity) =>
         Native.PhysicsGetVelocity(entity, angular: true, out var velocity) ? velocity : Vector3.zero;
 
+    /// <summary>
+    /// Replace <paramref name="entity"/>'s spin with <paramref name="velocity"/>, in
+    /// rad/s about each world axis. False for a velocity that is not finite.
+    /// </summary>
     public static bool SetAngularVelocity(Entity entity, Vector3 velocity) =>
         Native.PhysicsSetVelocity(entity, angular: true, velocity);
 

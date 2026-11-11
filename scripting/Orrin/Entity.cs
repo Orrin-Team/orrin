@@ -4,44 +4,67 @@ using System.Runtime.InteropServices;
 namespace Orrin;
 
 // Layout must match Rust CEntity.
+/// <summary>
+/// A handle to an entity: the slot it occupies and which spawn in that slot it
+/// names. The all-zeroes value is <see cref="Null"/>.
+/// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public readonly struct Entity : IEquatable<Entity>
 {
+    /// <summary>
+    /// The entity's slot. The engine never allocates slot 0, so an index of 0 is the
+    /// null handle.
+    /// </summary>
     public readonly uint Index;
+    /// <summary>
+    /// Which spawn in its slot this handle names. A despawn and a respawn in the same
+    /// slot bumps it, so a stale handle never equals the new occupant's.
+    /// </summary>
     public readonly uint Generation;
 
+    /// <summary>
+    /// A handle from its two parts. Nothing checks that it names a live entity.
+    /// </summary>
     public Entity(uint index, uint generation)
     {
         Index = index;
         Generation = generation;
     }
 
+    /// <summary>
     /// The null handle: what a failed SpawnRenderable or lookup returns, and
-    /// what `default(Entity)` is. Must match Rust CEntity::NULL ({0, 0}).
-    ///
-    /// All-zeroes deliberately. C# gives every struct an all-zeroes `default`
-    /// that types cannot override, so an `Entity` field you never assigned —
+    /// what <c>default(Entity)</c> is. Must match Rust CEntity::NULL ({0, 0}).
+    /// </summary>
+    /// <remarks>
+    /// All-zeroes deliberately. C# gives every struct an all-zeroes <c>default</c>
+    /// that types cannot override, so an <see cref="Entity"/> field you never assigned —
     /// most often one a hot reload could not restore — reads as this value. The
     /// engine reserves entity slot 0 and never allocates it, so the handle
-    /// names nothing and `IsValid` catches the uninitialized case for free.
+    /// names nothing and <see cref="IsValid"/> catches the uninitialized case for free.
+    /// </remarks>
     public static Entity Null => new(0, 0);
 
+    /// <summary>
     /// False for the null handle (e.g. a SpawnRenderable given an unknown asset,
     /// an ABI call made outside the script dispatch window, or a field that was
     /// never assigned). This only rules out the null sentinel — it does NOT
     /// detect a stale handle to an entity that has since been despawned; use
     /// HasComponent or a World lookup for that.
+    /// </summary>
     public bool IsValid => Index != 0;
 
-    /// True while this handle is live and the entity has a T component.
+    /// <summary>True while this handle is live and the entity has a T component.</summary>
     public bool HasComponent<T>() where T : struct =>
         Native.HasComponent(this, ComponentKinds.Of<T>());
 
+    /// <summary>
     /// Typed read of an engine component, or null if the entity lacks it (or
     /// the handle is stale). Components come back by value; write back through
-    /// the corresponding setter (`LocalTransform`, `SetTag`, World.SetCamera).
+    /// the corresponding setter (<see cref="LocalTransform"/>, <see cref="SetTag"/>,
+    /// World.SetCamera).
     /// Supports Transform, Tag and CameraComponent — script-defined components
     /// arrive with the byte-blob milestone.
+    /// </summary>
     public T? GetComponent<T>() where T : struct
     {
         // typeof dispatch per supported component; the (T)(object) round-trip
@@ -129,20 +152,27 @@ public readonly struct Entity : IEquatable<Entity>
         return behaviour is not null;
     }
 
+    /// <summary>
     /// Handle equality: same index and generation. Two handles being equal means
     /// they name the same spawn of the same entity — a despawn-and-respawn at the
     /// same index bumps the generation, so a stale handle won't compare equal to
     /// the new occupant.
+    /// </summary>
     public static bool operator ==(Entity a, Entity b) =>
         a.Index == b.Index && a.Generation == b.Generation;
 
+    /// <summary>True when the handles differ in index or generation.</summary>
     public static bool operator !=(Entity a, Entity b) => !(a == b);
 
+    /// <inheritdoc/>
     public bool Equals(Entity other) => this == other;
 
+    /// <inheritdoc/>
     public override bool Equals(object? obj) => obj is Entity other && this == other;
 
+    /// <inheritdoc/>
     public override int GetHashCode() => HashCode.Combine(Index, Generation);
 
+    /// <summary>The handle as <c>Entity(7v1)</c>: index 7, generation 1.</summary>
     public override string ToString() => $"Entity({Index}v{Generation})";
 }

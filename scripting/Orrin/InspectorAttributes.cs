@@ -9,7 +9,9 @@ namespace Orrin;
 [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
 public sealed class RangeAttribute(float min, float max) : Attribute
 {
+    /// <summary>The slider's lowest value.</summary>
     public float Min { get; } = min;
+    /// <summary>The slider's highest value.</summary>
     public float Max { get; } = max;
 }
 
@@ -17,6 +19,7 @@ public sealed class RangeAttribute(float min, float max) : Attribute
 [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
 public sealed class TooltipAttribute(string text) : Attribute
 {
+    /// <summary>Shown when the pointer rests on the field's label.</summary>
     public string Text { get; } = text;
 }
 
@@ -27,6 +30,7 @@ public sealed class TooltipAttribute(string text) : Attribute
 [AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
 public sealed class HeaderAttribute(string text) : Attribute
 {
+    /// <summary>The label drawn above the field.</summary>
     public string Text { get; } = text;
 }
 
