@@ -30,11 +30,12 @@ pub use desc::{
     Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, ColorAttachment,
     ComputePipelineDesc, CullMode, DepthAttachment, DepthCompare, DepthRect, DepthTest, Feature,
     GeometryStream, GraphicsPipelineDesc, LoadOp, MemoryLocation, RenderTargets, SamplerDesc,
-    StoreOp, TextureDesc, TextureDimension, TextureSwizzle, Topology, VertexAttribute,
+    ShaderRef, StoreOp, TextureDesc, TextureDimension, TextureSwizzle, Topology, VertexAttribute,
     VertexFormat, VertexStream, Viewport,
 };
 
 use super::format::Format;
+use super::shaders::CompiledShader;
 use super::vulkan::driver::{VkDriver, VkEncoder};
 use crate::geom::Aabb;
 use crate::gfx::Vertex;
@@ -105,12 +106,44 @@ impl Device {
         device_dispatch!(self, driver => driver.create_sampler(desc))
     }
 
+    /// Hand the device a shader compiled at runtime or read from an artifact.
+    /// Nothing is built yet, so a broken shader is reported by the first
+    /// [`try_create_graphics_pipeline`](Self::try_create_graphics_pipeline)
+    /// that uses it.
+    pub fn load_shader(&self, shader: &CompiledShader) -> ShaderModuleId {
+        device_dispatch!(self, driver => driver.load_shader(shader))
+    }
+
+    /// Retire a loaded shader. Pipelines already built from it are unaffected.
+    pub fn destroy_shader(&self, shader: ShaderModuleId) {
+        device_dispatch!(self, driver => driver.destroy_shader(shader))
+    }
+
+    /// Panics if the pipeline cannot be built, which for the built-in shaders is
+    /// a bug in the engine. A loaded shader goes through
+    /// [`try_create_graphics_pipeline`](Self::try_create_graphics_pipeline).
     pub fn create_graphics_pipeline(&self, desc: &GraphicsPipelineDesc) -> PipelineId {
-        device_dispatch!(self, driver => driver.create_graphics_pipeline(desc))
+        self.try_create_graphics_pipeline(desc)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// The pipeline, or why the driver refused it, naming the shader.
+    pub fn try_create_graphics_pipeline(
+        &self,
+        desc: &GraphicsPipelineDesc,
+    ) -> Result<PipelineId, String> {
+        device_dispatch!(self, driver => driver.try_create_graphics_pipeline(desc))
     }
 
     pub fn create_compute_pipeline(&self, desc: &ComputePipelineDesc) -> PipelineId {
-        device_dispatch!(self, driver => driver.create_compute_pipeline(desc))
+        self.create_compute_pipeline_with_samplers(desc, &[])
+    }
+
+    pub fn try_create_compute_pipeline(
+        &self,
+        desc: &ComputePipelineDesc,
+    ) -> Result<PipelineId, String> {
+        device_dispatch!(self, driver => driver.try_create_compute_pipeline_with_samplers(desc, &[]))
     }
 
     pub fn create_compute_pipeline_with_samplers(
@@ -119,8 +152,14 @@ impl Device {
         immutable_samplers: &[(u32, u32, SamplerId)],
     ) -> PipelineId {
         device_dispatch!(self, driver => {
-            driver.create_compute_pipeline_with_samplers(desc, immutable_samplers)
+            driver.try_create_compute_pipeline_with_samplers(desc, immutable_samplers)
         })
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Retire a pipeline once the frames that may have recorded it are done.
+    pub fn destroy_pipeline(&self, pipeline: PipelineId) {
+        device_dispatch!(self, driver => driver.destroy_pipeline(pipeline))
     }
 
     /// A bind group kept until [`destroy_bind_group`](Self::destroy_bind_group),
@@ -504,6 +543,8 @@ handles! {
     PipelineId,
     /// One descriptor set / argument buffer's worth of bindings.
     BindGroupId,
+    /// A shader loaded at runtime, as opposed to one the build embedded.
+    ShaderModuleId,
 }
 
 #[cfg(test)]
@@ -515,5 +556,37 @@ mod tests {
         let texture = TextureId(3);
         let buffer = BufferId(3);
         assert_eq!(texture.index(), buffer.index());
+    }
+
+    #[test]
+    fn either_kind_of_shader_converts_into_a_reference_to_itself() {
+        use crate::gfx::shaders::ShaderId;
+        let built_in: ShaderRef = ShaderId::FullscreenVert.into();
+        assert_eq!(built_in, ShaderRef::BuiltIn(ShaderId::FullscreenVert));
+        let loaded: ShaderRef = ShaderModuleId(0).into();
+        assert_eq!(loaded, ShaderRef::Loaded(ShaderModuleId(0)));
+        assert_ne!(built_in, loaded);
+        assert_ne!(loaded, ShaderRef::from(ShaderModuleId(1)));
+        assert_ne!(built_in, ShaderRef::from(ShaderId::TonemapFrag));
+    }
+
+    /// A description is compared to decide whether a pipeline needs rebuilding,
+    /// so a loaded shader in it has to take part in that comparison.
+    #[test]
+    fn a_pipeline_description_takes_a_loaded_shader_beside_a_built_in_one() {
+        use crate::gfx::shaders::ShaderId;
+        let desc =
+            GraphicsPipelineDesc::fullscreen(ShaderId::FullscreenVert, ShaderModuleId(2), &[]);
+        assert_eq!(desc.vertex, ShaderRef::BuiltIn(ShaderId::FullscreenVert));
+        assert_eq!(desc.fragment, ShaderRef::Loaded(ShaderModuleId(2)));
+        let copy = desc;
+        assert_eq!(copy, desc);
+        assert_ne!(
+            GraphicsPipelineDesc {
+                fragment: ShaderModuleId(3).into(),
+                ..desc
+            },
+            desc
+        );
     }
 }

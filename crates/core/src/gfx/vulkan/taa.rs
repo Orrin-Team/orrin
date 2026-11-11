@@ -90,7 +90,7 @@ pub struct TaaPass {
 impl TaaPass {
     pub fn new(device: &Device) -> Self {
         let pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
-            shader: ShaderId::TaaResolveComp,
+            shader: ShaderId::TaaResolveComp.into(),
         });
         let sampler = |linear: bool| {
             device.create_sampler(SamplerDesc {

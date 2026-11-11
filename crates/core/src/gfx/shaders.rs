@@ -4,9 +4,7 @@
 //! `build.rs` produces the table: one GLSL compile per manifest row to SPIR-V,
 //! then MSL translated from that same SPIR-V. A Vulkan driver consumes the
 //! SPIR-V and a Metal one the MSL, so the two cannot disagree about what a shader
-//! says. Nothing reads this yet; it is the input the RHI drivers are built
-//! against, and `tests/shader_translation.rs` is what holds it honest without a
-//! GPU.
+//! says. `tests/shader_translation.rs` is what holds it honest without a GPU.
 //!
 //! The buffer-index assignment (a descriptor set is the argument buffer at its
 //! own index, push constants sit at one fixed slot, vertex streams start at a
@@ -20,6 +18,10 @@
 //! `tests/shader_compiler.rs` asserts exactly that. [`CompiledShader`] exists
 //! without the feature, because an exported game loads compiled shaders and
 //! compiles none.
+//!
+//! A driver reads a table entry and a shader handed to `Device::load_shader`
+//! through one [`ShaderView`], so there is no second path for a loaded shader to
+//! drift along.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stage {
@@ -92,6 +94,64 @@ pub struct CompiledBindings {
     pub push_constant_bytes: u32,
     /// Only a compute shader has one.
     pub workgroup_size: Option<[u32; 3]>,
+}
+
+/// What a driver reads of a shader, borrowed from either kind.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShaderView<'a> {
+    pub name: &'a str,
+    pub spirv: &'a [u8],
+    pub msl: &'a str,
+    pub resources: &'a [Resource],
+    pub push_constant_bytes: u32,
+    pub workgroup_size: Option<[u32; 3]>,
+}
+
+impl ShaderBlob {
+    pub(crate) fn view(&self) -> ShaderView<'_> {
+        ShaderView {
+            name: self.name,
+            spirv: self.spirv,
+            msl: self.msl,
+            resources: self.bindings.resources,
+            push_constant_bytes: self.bindings.push_constant_bytes,
+            workgroup_size: self.bindings.workgroup_size,
+        }
+    }
+}
+
+impl CompiledShader {
+    pub(crate) fn view(&self) -> ShaderView<'_> {
+        ShaderView {
+            name: &self.name,
+            spirv: &self.spirv,
+            msl: &self.msl,
+            resources: &self.bindings.resources,
+            push_constant_bytes: self.bindings.push_constant_bytes,
+            workgroup_size: self.bindings.workgroup_size,
+        }
+    }
+}
+
+impl From<&ShaderBlob> for CompiledShader {
+    fn from(blob: &ShaderBlob) -> Self {
+        Self {
+            name: blob.name.to_string(),
+            stage: blob.stage,
+            defines: blob
+                .defines
+                .iter()
+                .map(|&(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            spirv: blob.spirv.to_vec(),
+            msl: blob.msl.to_string(),
+            bindings: CompiledBindings {
+                resources: blob.bindings.resources.to_vec(),
+                push_constant_bytes: blob.bindings.push_constant_bytes,
+                workgroup_size: blob.bindings.workgroup_size,
+            },
+        }
+    }
 }
 
 #[cfg(feature = "shader-compiler")]

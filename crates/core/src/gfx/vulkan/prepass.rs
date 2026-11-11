@@ -100,10 +100,10 @@ pub struct GeometryPrepass {
 
 impl GeometryPrepass {
     pub fn new(device_rhi: &Device) -> Self {
-        let pipeline = |fragment, cull| {
+        let pipeline = |fragment: ShaderId, cull| {
             device_rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
-                vertex: ShaderId::PrepassVert,
-                fragment,
+                vertex: ShaderId::PrepassVert.into(),
+                fragment: fragment.into(),
                 color_formats: &[NORMAL_FORMAT, VELOCITY_FORMAT, MATERIAL_FORMAT],
                 depth_format: Some(DEPTH_FORMAT),
                 vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],

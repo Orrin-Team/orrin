@@ -97,7 +97,7 @@ impl OitPass {
             )
         });
         let composite_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
-            shader: ShaderId::OitCompositeComp,
+            shader: ShaderId::OitCompositeComp.into(),
         });
         let nearest_clamp = device.create_sampler(SamplerDesc {
             linear: false,

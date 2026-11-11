@@ -838,8 +838,8 @@ impl ForwardPass {
                         // the `invariant` declaration in each.
                         samples: SampleCount| {
             rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
-                vertex: ShaderId::ForwardVert,
-                fragment,
+                vertex: ShaderId::ForwardVert.into(),
+                fragment: fragment.into(),
                 color_formats: colors,
                 depth_format: Some(DEPTH_FORMAT),
                 vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],

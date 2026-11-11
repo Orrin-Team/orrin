@@ -385,10 +385,10 @@ impl CullPass {
     pub(super) fn new(device: &Device) -> Self {
         Self {
             reset_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
-                shader: ShaderId::CullResetComp,
+                shader: ShaderId::CullResetComp.into(),
             }),
             cull_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
-                shader: ShaderId::CullComp,
+                shader: ShaderId::CullComp.into(),
             }),
             commands: allocate_commands(device, 1),
             commands_len: 1,

@@ -133,10 +133,10 @@ impl RefractionPass {
                 max_lod: None,
             }),
             pyramid_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
-                shader: ShaderId::ColorPyramidComp,
+                shader: ShaderId::ColorPyramidComp.into(),
             }),
             composite_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
-                shader: ShaderId::RefractionCompositeComp,
+                shader: ShaderId::RefractionCompositeComp.into(),
             }),
             pyramid_sampler: device.create_sampler(SamplerDesc {
                 linear: true,

@@ -16,8 +16,8 @@ mod pipeline;
 mod resources;
 pub(crate) mod window;
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -66,6 +66,7 @@ pub struct MtlDriver {
     arenas: Mutex<[[Arena; FRAME_SLOTS as usize]; 6]>,
     pipelines: Mutex<Pool<pipeline::Pipe>>,
     functions: Mutex<pipeline::Functions>,
+    shaders: Mutex<Pool<Arc<pipeline::Loaded>>>,
     bind_groups: Mutex<Pool<bind::Group>>,
     encoders: Mutex<bind::EncoderCache>,
     geometry: Mutex<Shared<geometry::Geometry>>,
@@ -107,6 +108,7 @@ impl MtlDriver {
             })),
             pipelines: Mutex::new(Pool::new(FRAME_SLOTS)),
             functions: Mutex::new(Default::default()),
+            shaders: Mutex::new(Pool::new(FRAME_SLOTS)),
             bind_groups: Mutex::new(Pool::new(FRAME_SLOTS)),
             encoders: Mutex::new(Default::default()),
             geometry: Mutex::new(Shared(geometry)),
@@ -145,6 +147,7 @@ impl MtlDriver {
         self.buffers.lock().unwrap().collect(frame);
         self.samplers.lock().unwrap().collect(frame);
         self.pipelines.lock().unwrap().collect(frame);
+        self.shaders.lock().unwrap().collect(frame);
         self.bind_groups.lock().unwrap().collect(frame);
         let slot = (frame % FRAME_SLOTS) as usize;
         for kind in self.arenas.lock().unwrap().iter_mut() {

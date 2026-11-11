@@ -98,7 +98,11 @@ pub struct SsrPass {
 
 impl SsrPass {
     pub fn new(device: &Device) -> Self {
-        let pipeline = |shader| device.create_compute_pipeline(&ComputePipelineDesc { shader });
+        let pipeline = |shader: ShaderId| {
+            device.create_compute_pipeline(&ComputePipelineDesc {
+                shader: shader.into(),
+            })
+        };
         let hiz_pipeline = pipeline(ShaderId::HizBuildComp);
         let source_pipeline = pipeline(ShaderId::ColorPyramidComp);
         let trace_pipeline = pipeline(ShaderId::SsrTraceComp);

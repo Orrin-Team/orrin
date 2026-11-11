@@ -69,7 +69,11 @@ pub struct SubsurfacePass {
 
 impl SubsurfacePass {
     pub fn new(device: &Device) -> Self {
-        let pipeline = |shader| device.create_compute_pipeline(&ComputePipelineDesc { shader });
+        let pipeline = |shader: ShaderId| {
+            device.create_compute_pipeline(&ComputePipelineDesc {
+                shader: shader.into(),
+            })
+        };
         let blur_pipeline = pipeline(ShaderId::SssBlurComp);
         let composite_pipeline = pipeline(ShaderId::SssCompositeComp);
 

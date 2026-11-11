@@ -1,7 +1,27 @@
-use super::{BufferId, PipelineId, SamplerId, TextureViewId};
+use super::{BufferId, PipelineId, SamplerId, ShaderModuleId, TextureViewId};
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::graph::{BufferUsage, ImageUsage};
 use crate::gfx::shaders::ShaderId;
+
+/// The shader a pipeline stage runs: one the build embedded, or one handed to
+/// [`Device::load_shader`](super::Device::load_shader) at runtime.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ShaderRef {
+    BuiltIn(ShaderId),
+    Loaded(ShaderModuleId),
+}
+
+impl From<ShaderId> for ShaderRef {
+    fn from(shader: ShaderId) -> Self {
+        ShaderRef::BuiltIn(shader)
+    }
+}
+
+impl From<ShaderModuleId> for ShaderRef {
+    fn from(shader: ShaderModuleId) -> Self {
+        ShaderRef::Loaded(shader)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TextureDimension {
@@ -165,8 +185,8 @@ pub struct Viewport {
 /// passes that need more, never ahead of them.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct GraphicsPipelineDesc<'a> {
-    pub vertex: ShaderId,
-    pub fragment: ShaderId,
+    pub vertex: ShaderRef,
+    pub fragment: ShaderRef,
     pub color_formats: &'a [Format],
     pub depth_format: Option<Format>,
     pub vertex_streams: &'a [VertexStream],
@@ -202,10 +222,14 @@ pub struct GraphicsPipelineDesc<'a> {
 
 impl<'a> GraphicsPipelineDesc<'a> {
     /// A full-screen triangle pass: no vertex input, no culling, no depth.
-    pub fn fullscreen(vertex: ShaderId, fragment: ShaderId, color_formats: &'a [Format]) -> Self {
+    pub fn fullscreen(
+        vertex: impl Into<ShaderRef>,
+        fragment: impl Into<ShaderRef>,
+        color_formats: &'a [Format],
+    ) -> Self {
         Self {
-            vertex,
-            fragment,
+            vertex: vertex.into(),
+            fragment: fragment.into(),
             color_formats,
             depth_format: None,
             vertex_streams: &[],
@@ -228,7 +252,7 @@ impl<'a> GraphicsPipelineDesc<'a> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ComputePipelineDesc {
-    pub shader: ShaderId,
+    pub shader: ShaderRef,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

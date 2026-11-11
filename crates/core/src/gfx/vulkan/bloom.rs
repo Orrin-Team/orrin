@@ -66,7 +66,11 @@ pub struct BloomPass {
 
 impl BloomPass {
     pub fn new(device: &Device) -> Self {
-        let pipeline = |shader| device.create_compute_pipeline(&ComputePipelineDesc { shader });
+        let pipeline = |shader: ShaderId| {
+            device.create_compute_pipeline(&ComputePipelineDesc {
+                shader: shader.into(),
+            })
+        };
         Self {
             prefilter_pipeline: pipeline(ShaderId::BloomPrefilterComp),
             downsample_pipeline: pipeline(ShaderId::BloomDownsampleComp),

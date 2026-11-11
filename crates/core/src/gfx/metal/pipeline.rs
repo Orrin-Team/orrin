@@ -1,4 +1,4 @@
-//! Pipelines from the embedded MSL.
+//! Pipelines from the embedded MSL, or a loaded shader's.
 //!
 //! Each shader's translated source is compiled to a function on first use and
 //! kept; a pipeline is that function plus the fixed-function state the RHI
@@ -17,15 +17,57 @@ use objc2_metal::{
     MTLRenderPipelineState, MTLSize, MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
 };
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use super::convert::pixel_format;
-use super::{MtlDriver, Shared};
+use super::{Held, MtlDriver, Shared, bind};
 use crate::gfx::format::SampleCount;
 use crate::gfx::rhi::{
     Blend, ComputePipelineDesc, CullMode, DepthCompare, GraphicsPipelineDesc, PipelineId,
-    SamplerId, Topology, VertexFormat, VertexStream,
+    SamplerId, ShaderModuleId, ShaderRef, Topology, VertexFormat, VertexStream,
 };
-use crate::gfx::shaders::{ShaderId, VERTEX_STREAM_BASE};
+use crate::gfx::shaders::{CompiledShader, ShaderId, ShaderView, VERTEX_STREAM_BASE};
+
+/// A shader as a pipeline holds it. A loaded one is held by the pipelines built
+/// from it rather than looked up by handle, so retiring the handle leaves them
+/// whole; and it carries its own compiled function and argument encoders,
+/// because in the driver-wide caches, keyed by an id the pool recycles, they
+/// would be found again by the next shader to land in its slot.
+#[derive(Clone)]
+pub(super) enum MtlShader {
+    BuiltIn(ShaderId),
+    Loaded(Arc<Loaded>),
+}
+
+impl MtlShader {
+    pub(super) fn view(&self) -> ShaderView<'_> {
+        match self {
+            MtlShader::BuiltIn(id) => id.blob().view(),
+            MtlShader::Loaded(loaded) => loaded.shader.view(),
+        }
+    }
+}
+
+/// A loaded shader's MSL and binding map; its SPIR-V is dropped at load.
+pub(super) struct Loaded {
+    shader: CompiledShader,
+    function: Mutex<Option<Held<dyn MTLFunction>>>,
+    pub(super) encoders: Mutex<HashMap<u32, bind::Encoding>>,
+}
+
+impl Loaded {
+    pub(super) fn new(shader: &CompiledShader) -> Self {
+        Self {
+            shader: CompiledShader {
+                spirv: Vec::new(),
+                ..shader.clone()
+            },
+            function: Mutex::new(None),
+            encoders: Mutex::new(HashMap::new()),
+        }
+    }
+}
 
 pub(super) enum Pipe {
     Render(RenderPipe),
@@ -38,11 +80,10 @@ impl Pipe {
         (match self {
             Pipe::Render(render) => render
                 .vertex
-                .blob()
-                .bindings
+                .view()
                 .push_constant_bytes
-                .max(render.fragment.blob().bindings.push_constant_bytes),
-            Pipe::Compute(compute) => compute.shader.blob().bindings.push_constant_bytes,
+                .max(render.fragment.view().push_constant_bytes),
+            Pipe::Compute(compute) => compute.shader.view().push_constant_bytes,
         }) as usize
     }
 }
@@ -52,8 +93,8 @@ pub(super) struct RenderPipe {
     pub depth: Option<Shared<Retained<ProtocolObject<dyn MTLDepthStencilState>>>>,
     pub cull: MTLCullMode,
     pub topology: MTLPrimitiveType,
-    pub vertex: ShaderId,
-    pub fragment: ShaderId,
+    pub vertex: MtlShader,
+    pub fragment: MtlShader,
     /// Samplers Vulkan bakes into the set layout, which a bind group here has to
     /// write itself because nothing else will: `(set, binding, sampler)`.
     pub immutable: Vec<(u32, u32, SamplerId)>,
@@ -61,23 +102,84 @@ pub(super) struct RenderPipe {
 
 pub(super) struct ComputePipe {
     pub state: Shared<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
-    pub shader: ShaderId,
+    pub shader: MtlShader,
     pub threads: MTLSize,
     pub immutable: Vec<(u32, u32, SamplerId)>,
 }
 
-/// Compiled functions, one per shader.
+/// The built-in shaders' compiled functions. A loaded shader keeps its own.
 pub(super) type Functions = HashMap<ShaderId, Shared<Retained<ProtocolObject<dyn MTLFunction>>>>;
 
 impl MtlDriver {
-    /// The shader's entry function, compiling its library the first time.
-    pub(super) fn function(&self, shader: ShaderId) -> Retained<ProtocolObject<dyn MTLFunction>> {
-        let mut functions = self.functions.lock().unwrap();
-        if let Some(function) = functions.get(&shader) {
-            return function.0.clone();
+    pub fn load_shader(&self, shader: &CompiledShader) -> ShaderModuleId {
+        ShaderModuleId(
+            self.shaders
+                .lock()
+                .unwrap()
+                .insert(Arc::new(Loaded::new(shader))),
+        )
+    }
+
+    pub fn destroy_shader(&self, shader: ShaderModuleId) {
+        self.shaders
+            .lock()
+            .unwrap()
+            .remove(shader.0, self.frame.load(Ordering::Relaxed));
+    }
+
+    pub fn destroy_pipeline(&self, pipeline: PipelineId) {
+        self.pipelines
+            .lock()
+            .unwrap()
+            .remove(pipeline.0, self.frame.load(Ordering::Relaxed));
+    }
+
+    fn shader(&self, shader: ShaderRef) -> Result<MtlShader, String> {
+        match shader {
+            ShaderRef::BuiltIn(id) => Ok(MtlShader::BuiltIn(id)),
+            ShaderRef::Loaded(id) => self
+                .shaders
+                .lock()
+                .unwrap()
+                .get(id.0)
+                .cloned()
+                .map(MtlShader::Loaded)
+                .ok_or_else(|| format!("loaded shader {} was destroyed", id.0)),
         }
-        let blob = shader.blob();
-        let source = NSString::from_str(blob.msl);
+    }
+
+    /// The shader's entry function, compiling its library the first time.
+    pub(super) fn function(
+        &self,
+        shader: &MtlShader,
+    ) -> Result<Retained<ProtocolObject<dyn MTLFunction>>, String> {
+        match shader {
+            MtlShader::BuiltIn(id) => {
+                let mut functions = self.functions.lock().unwrap();
+                if let Some(function) = functions.get(id) {
+                    return Ok(function.0.clone());
+                }
+                let function = self.compile(shader.view())?;
+                functions.insert(*id, Shared(function.clone()));
+                Ok(function)
+            }
+            MtlShader::Loaded(loaded) => {
+                let mut kept = loaded.function.lock().unwrap();
+                if let Some(function) = &*kept {
+                    return Ok(function.0.clone());
+                }
+                let function = self.compile(shader.view())?;
+                *kept = Some(Shared(function.clone()));
+                Ok(function)
+            }
+        }
+    }
+
+    fn compile(
+        &self,
+        shader: ShaderView,
+    ) -> Result<Retained<ProtocolObject<dyn MTLFunction>>, String> {
+        let source = NSString::from_str(shader.msl);
         // `invariant gl_Position` becomes `[[position, invariant]]`, which Metal
         // honours only when told to: without it the prepass and the forward pass
         // can disagree on a depth by a bit, and the forward pass's `Equal` test
@@ -87,25 +189,37 @@ impl MtlDriver {
         let library = self
             .device
             .newLibraryWithSource_options_error(&source, Some(&options))
-            .unwrap_or_else(|error| panic!("{} does not compile as MSL: {error}", blob.name));
+            .map_err(|error| format!("{} does not compile as MSL: {error}", shader.name))?;
         // The translator's name for a GLSL `main`.
-        let function = library
+        library
             .newFunctionWithName(ns_string!("main0"))
-            .unwrap_or_else(|| panic!("{} has no entry point", blob.name));
-        functions.insert(shader, Shared(function.clone()));
-        function
+            .ok_or_else(|| format!("{} has no entry point", shader.name))
     }
 
-    pub fn create_graphics_pipeline(&self, desc: &GraphicsPipelineDesc) -> PipelineId {
-        let vertex = self.function(desc.vertex);
-        let fragment = self.function(desc.fragment);
+    pub fn try_create_graphics_pipeline(
+        &self,
+        desc: &GraphicsPipelineDesc,
+    ) -> Result<PipelineId, String> {
+        let vertex_shader = self.shader(desc.vertex)?;
+        let fragment_shader = self.shader(desc.fragment)?;
+        let vertex = self.function(&vertex_shader)?;
+        let fragment = self.function(&fragment_shader)?;
+        let named = |e: &dyn std::fmt::Display| {
+            format!(
+                "{} with {}: {e}",
+                vertex_shader.view().name,
+                fragment_shader.view().name
+            )
+        };
 
         let descriptor = MTLRenderPipelineDescriptor::new();
         descriptor.setVertexFunction(Some(&vertex));
         descriptor.setFragmentFunction(Some(&fragment));
         if !desc.vertex_streams.is_empty() {
-            descriptor
-                .setVertexDescriptor(Some(&vertex_descriptor(desc.vertex, desc.vertex_streams)));
+            descriptor.setVertexDescriptor(Some(&vertex_descriptor(
+                &vertex_shader,
+                desc.vertex_streams,
+            )));
         }
         let attachments = descriptor.colorAttachments();
         for (index, &format) in desc.color_formats.iter().enumerate() {
@@ -145,7 +259,7 @@ impl MtlDriver {
         let state = self
             .device
             .newRenderPipelineStateWithDescriptor_error(&descriptor)
-            .unwrap_or_else(|error| panic!("a render pipeline is invalid: {error}"));
+            .map_err(|error| named(&error))?;
 
         let depth = desc.depth_test.map(|test| {
             let stencil = MTLDepthStencilDescriptor::new();
@@ -157,12 +271,12 @@ impl MtlDriver {
                 DepthCompare::GreaterOrEqual => MTLCompareFunction::GreaterEqual,
             });
             stencil.setDepthWriteEnabled(test.write);
-            Shared(
-                self.device
-                    .newDepthStencilStateWithDescriptor(&stencil)
-                    .expect("failed to create a depth state"),
-            )
+            self.device
+                .newDepthStencilStateWithDescriptor(&stencil)
+                .map(Shared)
+                .ok_or_else(|| named(&"the device made no depth state"))
         });
+        let depth = depth.transpose()?;
 
         // What this pipeline's own description bakes in, then what the pipeline
         // whose layout it borrows does: a pipeline built to share another's sets
@@ -190,28 +304,31 @@ impl MtlDriver {
                 Topology::Triangles => MTLPrimitiveType::Triangle,
                 Topology::Lines => MTLPrimitiveType::Line,
             },
-            vertex: desc.vertex,
-            fragment: desc.fragment,
+            vertex: vertex_shader,
+            fragment: fragment_shader,
             immutable,
         });
-        PipelineId(self.pipelines.lock().unwrap().insert(pipe))
+        Ok(PipelineId(self.pipelines.lock().unwrap().insert(pipe)))
     }
 
-    pub fn create_compute_pipeline(&self, desc: &ComputePipelineDesc) -> PipelineId {
-        let function = self.function(desc.shader);
+    fn try_create_compute_pipeline(
+        &self,
+        desc: &ComputePipelineDesc,
+    ) -> Result<PipelineId, String> {
+        let shader = self.shader(desc.shader)?;
+        let function = self.function(&shader)?;
+        let name = shader.view().name;
         let state = self
             .device
             .newComputePipelineStateWithFunction_error(&function)
-            .unwrap_or_else(|error| panic!("a compute pipeline is invalid: {error}"));
-        let [x, y, z] = desc
-            .shader
-            .blob()
-            .bindings
+            .map_err(|error| format!("{name}: {error}"))?;
+        let [x, y, z] = shader
+            .view()
             .workgroup_size
-            .expect("a compute shader declares its workgroup size");
+            .ok_or_else(|| format!("{name} declares no workgroup size"))?;
         let pipe = Pipe::Compute(ComputePipe {
             state: Shared(state),
-            shader: desc.shader,
+            shader,
             threads: MTLSize {
                 width: x as usize,
                 height: y as usize,
@@ -219,17 +336,17 @@ impl MtlDriver {
             },
             immutable: Vec::new(),
         });
-        PipelineId(self.pipelines.lock().unwrap().insert(pipe))
+        Ok(PipelineId(self.pipelines.lock().unwrap().insert(pipe)))
     }
 
     /// A comparison or fixed sampler is an ordinary argument-buffer sampler
     /// here, so the layouts Vulkan needs baked in need nothing.
-    pub fn create_compute_pipeline_with_samplers(
+    pub fn try_create_compute_pipeline_with_samplers(
         &self,
         desc: &ComputePipelineDesc,
         immutable_samplers: &[(u32, u32, SamplerId)],
-    ) -> PipelineId {
-        let id = self.create_compute_pipeline(desc);
+    ) -> Result<PipelineId, String> {
+        let id = self.try_create_compute_pipeline(desc)?;
         if let Pipe::Compute(compute) = self
             .pipelines
             .lock()
@@ -239,7 +356,7 @@ impl MtlDriver {
         {
             compute.immutable = immutable_samplers.to_vec();
         }
-        id
+        Ok(id)
     }
 
     /// The samplers a pipeline has baked into its layout.
@@ -321,8 +438,11 @@ pub(super) fn stage_in_attributes(msl: &str) -> Vec<(&str, u32)> {
         .collect()
 }
 
-fn vertex_descriptor(shader: ShaderId, streams: &[VertexStream]) -> Retained<MTLVertexDescriptor> {
-    let attributes_of = stage_in_attributes(shader.blob().msl);
+fn vertex_descriptor(
+    shader: &MtlShader,
+    streams: &[VertexStream],
+) -> Retained<MTLVertexDescriptor> {
+    let attributes_of = stage_in_attributes(shader.view().msl);
     let descriptor = MTLVertexDescriptor::new();
     for (slot, stream) in streams.iter().enumerate() {
         let buffer = (VERTEX_STREAM_BASE as usize) + slot;
@@ -363,8 +483,10 @@ fn vertex_descriptor(shader: ShaderId, streams: &[VertexStream]) -> Retained<MTL
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use crate::gfx::rhi::{Device, TextureViewId};
+    use crate::gfx::vulkan::driver::tests as shared;
 
     /// The vertex streams' attribute names are what bind them to the shader, so
     /// every one a stream declares has to be an input of the shader it is used
@@ -381,5 +503,80 @@ mod tests {
     #[test]
     fn a_shader_without_vertex_inputs_has_none() {
         assert!(stage_in_attributes(ShaderId::FullscreenVert.blob().msl).is_empty());
+    }
+
+    pub(in crate::gfx::metal) fn loaded(id: ShaderId) -> MtlShader {
+        MtlShader::Loaded(Arc::new(Loaded::new(&CompiledShader::from(id.blob()))))
+    }
+
+    /// A loaded shader is read through the same accessor as a built-in one, so
+    /// the same bytes have to give the same answers.
+    #[test]
+    fn a_loaded_shader_reads_as_the_built_in_one_it_was_made_from() {
+        let built_in = MtlShader::BuiltIn(ShaderId::PrepassVert);
+        let loaded = loaded(ShaderId::PrepassVert);
+        assert_eq!(
+            stage_in_attributes(loaded.view().msl),
+            stage_in_attributes(built_in.view().msl)
+        );
+        assert_eq!(loaded.view().name, built_in.view().name);
+        assert_eq!(loaded.view().resources, built_in.view().resources);
+        assert_eq!(
+            loaded.view().push_constant_bytes,
+            built_in.view().push_constant_bytes
+        );
+        assert!(
+            loaded.view().spirv.is_empty(),
+            "Metal keeps the MSL, not the SPIR-V"
+        );
+    }
+
+    // On a device: the Vulkan driver's test bodies, against this driver.
+
+    fn metal() -> Device {
+        Device::Metal(MtlDriver::new().expect("this machine runs the Metal backend"))
+    }
+
+    fn read_metal(device: &Device, view: TextureViewId) -> Vec<u8> {
+        device.metal().read_texture(view)
+    }
+
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_loaded_shader_draws_what_its_built_in_twin_draws_on_metal() {
+        shared::a_loaded_shader_draws_what_its_built_in_twin_draws(&metal(), &read_metal);
+    }
+
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn msl_that_does_not_compile_is_an_error_on_metal() {
+        let broken = CompiledShader {
+            msl: "this is not Metal".to_string(),
+            ..CompiledShader::from(ShaderId::OutlineMaskFrag.blob())
+        };
+        shared::a_broken_loaded_shader_is_an_error(&metal(), &broken);
+    }
+
+    /// The library compiles and has its `main0`; it is the pipeline state that
+    /// Metal refuses, because an integer output cannot be written to a UNORM
+    /// attachment.
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_pipeline_metal_cannot_build_is_an_error_on_metal() {
+        let broken = CompiledShader {
+            name: "integer_output".to_string(),
+            msl: "#include <metal_stdlib>\nusing namespace metal;\n\
+                  struct main0_out { int4 f_color [[color(0)]]; };\n\
+                  fragment main0_out main0() { main0_out out = {}; out.f_color = int4(1); return out; }\n"
+                .to_string(),
+            ..CompiledShader::from(ShaderId::OutlineMaskFrag.blob())
+        };
+        shared::a_broken_loaded_shader_is_an_error(&metal(), &broken);
+    }
+
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn retired_pipelines_and_shaders_are_recycled_safely_on_metal() {
+        shared::retired_pipelines_and_shaders_are_recycled_safely(&metal(), &read_metal);
     }
 }
