@@ -10,6 +10,7 @@ mod diagnostics;
 mod dof;
 pub mod edit;
 pub mod entities;
+pub mod entity_ref;
 mod environment;
 mod fog;
 mod hdr;

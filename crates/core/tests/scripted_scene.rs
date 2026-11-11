@@ -52,7 +52,7 @@ fn a_saved_behaviour_comes_back_attached_with_its_fields() {
     // From a scene.
     let id = EntityId::new();
     let text = format!(
-        "orrin-scene 3 min-reader 3\n\nentity {id} \"Fan\"\n  demo.spinner\n    \
+        "orrin-scene 4 min-reader 4\n\nentity {id} \"Fan\"\n  demo.spinner\n    \
          DegreesPerSecond = 45.0\n"
     );
     let mut world = World::new();
@@ -103,7 +103,7 @@ fn field(world: &World, registry: &Registry, entity: Entity, id: &str, name: &st
 fn two_on_one_entity_save_load_and_reload(scripting: &Scripting, registry: &mut Registry) {
     let id = EntityId::new();
     let text = format!(
-        "orrin-scene 3 min-reader 3\n\nentity {id} \"Shuttle\"\n  demo.target\n    \
+        "orrin-scene 4 min-reader 4\n\nentity {id} \"Shuttle\"\n  demo.target\n    \
          Hits = 3\n  demo.shuttle\n    Distance = 9.0\n"
     );
     let mut world = World::new();

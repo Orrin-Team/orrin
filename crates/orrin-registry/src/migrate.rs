@@ -22,7 +22,7 @@ use crate::scene::FORMAT_VERSION;
 type Migration = fn(&str) -> String;
 
 /// `MIGRATIONS[n]` takes version `n + 1` to `n + 2`.
-const MIGRATIONS: [Migration; FORMAT_VERSION as usize - 1] = [v1_to_v2, v2_to_v3];
+const MIGRATIONS: [Migration; FORMAT_VERSION as usize - 1] = [v1_to_v2, v2_to_v3, v3_to_v4];
 
 /// Bring `text`, written at `version`, up to [`FORMAT_VERSION`]. `version` is
 /// at least 1 and below the current one; the header parser has checked both.
@@ -125,6 +125,21 @@ fn v2_to_v3(text: &str) -> String {
         }
     }
 
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Version 4 added spellings — `(x, y)` for a two-component vector and
+/// `rgba(r, g, b, a)` for a colour — and changed none, so a version 3 file is
+/// already a version 4 body. Its minimum reader moved too: a version 3 reader
+/// meets those spellings as errors on their own lines, which the header exists
+/// to turn into one refusal that names both versions.
+fn v3_to_v4(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    if let Some(header) = lines.iter_mut().find(|line| !line.trim().is_empty()) {
+        *header = "orrin-scene 4 min-reader 4";
+    }
     let mut out = lines.join("\n");
     out.push('\n');
     out
@@ -265,6 +280,25 @@ entity 00000000-0000-0000-0000-000000000001
         assert_eq!(
             mesh,
             Some(crate::Value::Asset(crate::AssetId::named("mesh", "cube")))
+        );
+    }
+
+    /// Version 4 only added spellings, so the step is the header and nothing
+    /// else — and every line stays where its author put it.
+    #[test]
+    fn v3_to_v4_rewrites_only_the_header() {
+        let v3 = "orrin-scene 3 min-reader 3
+
+entity 00000000-0000-0000-0000-000000000001 \"A\"
+  orrin.tag = \"(1.0, 2.0)\"
+";
+        assert_eq!(
+            v3_to_v4(v3),
+            "orrin-scene 4 min-reader 4
+
+entity 00000000-0000-0000-0000-000000000001 \"A\"
+  orrin.tag = \"(1.0, 2.0)\"
+"
         );
     }
 

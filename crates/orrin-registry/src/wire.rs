@@ -12,6 +12,14 @@
 //! therefore permanent: append, never renumber — the same rule `ComponentKind`
 //! and `KeyCode` follow.
 //!
+//! **Entity references cross as live handles.** A Behaviour's `Entity` field
+//! holds a slot, which is all the managed side has; a [`Value`] holds an
+//! [`EntityId`], which is all a file may. So a bag crosses with
+//! [`encode_bag`]/[`decode_bag`], whose caller holds the world the slot means
+//! something in and translates each reference at the boundary. The plain
+//! [`decode`] refuses a handle rather than invent an id for it. Tag `ENTITY`
+//! stays the persistent form, for buffers that never meet a world.
+//!
 //! Not the scene format. That one is text, sorted and deterministic so a git
 //! diff means something (architecture §2.4); this one is read once by a process
 //! that wrote it a microsecond earlier, so it keeps declaration order and
@@ -36,6 +44,10 @@ mod tag {
     pub const ENUM: u8 = 9;
     pub const LIST: u8 = 10;
     pub const ASSET: u8 = 11;
+    pub const VEC2: u8 = 12;
+    pub const COLOR: u8 = 13;
+    /// A live entity handle: index, then generation.
+    pub const HANDLE: u8 = 14;
 }
 
 /// How deep a decoded value may nest.
@@ -61,6 +73,8 @@ pub enum WireError {
     TooDeep,
     /// A complete value, followed by bytes that are not part of it.
     Trailing,
+    /// A live entity handle, read by a caller with no world to resolve it in.
+    Handle,
 }
 
 impl fmt::Display for WireError {
@@ -75,6 +89,9 @@ impl fmt::Display for WireError {
             Self::BadUtf8 => f.write_str("a string field was not valid UTF-8"),
             Self::TooDeep => write!(f, "a value nested deeper than {MAX_DEPTH} levels"),
             Self::Trailing => f.write_str("the buffer holds more than one value"),
+            Self::Handle => {
+                f.write_str("a live entity handle reached a decoder with no world to resolve it in")
+            }
         }
     }
 }
@@ -87,6 +104,22 @@ impl std::error::Error for WireError {}
 /// boundary every frame keeps one buffer instead of allocating per component —
 /// the same reason `FrameGeometry` reuses its vectors.
 pub fn encode(value: &Value, out: &mut Vec<u8>) {
+    write(value, out, &mut None);
+}
+
+/// [`encode`] for a Behaviour's bag: every entity reference is written as the
+/// live handle `handle_of` gives for it, `(0, 0)` being the null handle.
+pub fn encode_bag(
+    value: &Value,
+    out: &mut Vec<u8>,
+    handle_of: &mut dyn FnMut(EntityId) -> (u32, u32),
+) {
+    write(value, out, &mut Some(handle_of));
+}
+
+type HandleOf<'a> = Option<&'a mut dyn FnMut(EntityId) -> (u32, u32)>;
+
+fn write(value: &Value, out: &mut Vec<u8>, handle_of: &mut HandleOf) {
     match value {
         Value::Bool(v) => {
             out.push(tag::BOOL);
@@ -112,38 +145,50 @@ pub fn encode(value: &Value, out: &mut Vec<u8>) {
         }
         Value::Vec3(v) => {
             out.push(tag::VEC3);
-            for component in v.to_array() {
-                out.extend_from_slice(&component.to_bits().to_le_bytes());
-            }
+            write_floats(&v.to_array(), out);
         }
         Value::Quat(v) => {
             out.push(tag::QUAT);
-            for component in v.to_array() {
-                out.extend_from_slice(&component.to_bits().to_le_bytes());
+            write_floats(&v.to_array(), out);
+        }
+        Value::Vec2(v) => {
+            out.push(tag::VEC2);
+            write_floats(&v.to_array(), out);
+        }
+        Value::Color(v) => {
+            out.push(tag::COLOR);
+            write_floats(v, out);
+        }
+        Value::Entity(id) => match handle_of {
+            Some(handle_of) => {
+                let (index, generation) = handle_of(*id);
+                out.push(tag::HANDLE);
+                out.extend_from_slice(&index.to_le_bytes());
+                out.extend_from_slice(&generation.to_le_bytes());
             }
-        }
-        Value::Entity(id) => {
-            out.push(tag::ENTITY);
-            out.extend_from_slice(&id.to_bytes());
-        }
+            None => {
+                out.push(tag::ENTITY);
+                out.extend_from_slice(&id.to_bytes());
+            }
+        },
         Value::Asset(id) => {
             out.push(tag::ASSET);
             out.extend_from_slice(&id.to_bytes());
         }
         Value::Struct(fields) => {
             out.push(tag::STRUCT);
-            write_fields(fields, out);
+            write_fields(fields, out, handle_of);
         }
         Value::Enum { variant, fields } => {
             out.push(tag::ENUM);
             write_str(variant, out);
-            write_fields(fields, out);
+            write_fields(fields, out, handle_of);
         }
         Value::List(items) => {
             out.push(tag::LIST);
             write_len(items.len(), out);
             for item in items {
-                encode(item, out);
+                write(item, out, handle_of);
             }
         }
     }
@@ -151,7 +196,27 @@ pub fn encode(value: &Value, out: &mut Vec<u8>) {
 
 /// Read exactly one value out of `bytes`.
 pub fn decode(bytes: &[u8]) -> Result<Value, WireError> {
-    let mut reader = Reader { bytes, at: 0 };
+    read(bytes, None)
+}
+
+/// [`decode`] for a Behaviour's bag: every live handle becomes the id `id_of`
+/// gives for its index and generation.
+pub fn decode_bag(
+    bytes: &[u8],
+    id_of: &mut dyn FnMut(u32, u32) -> EntityId,
+) -> Result<Value, WireError> {
+    read(bytes, Some(id_of))
+}
+
+fn read<'a>(
+    bytes: &'a [u8],
+    id_of: Option<&'a mut dyn FnMut(u32, u32) -> EntityId>,
+) -> Result<Value, WireError> {
+    let mut reader = Reader {
+        bytes,
+        at: 0,
+        id_of,
+    };
     let value = reader.value(0)?;
     if reader.at != reader.bytes.len() {
         return Err(WireError::Trailing);
@@ -159,16 +224,22 @@ pub fn decode(bytes: &[u8]) -> Result<Value, WireError> {
     Ok(value)
 }
 
+fn write_floats(values: &[f32], out: &mut Vec<u8>) {
+    for value in values {
+        out.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+}
+
 fn write_str(value: &str, out: &mut Vec<u8>) {
     write_len(value.len(), out);
     out.extend_from_slice(value.as_bytes());
 }
 
-fn write_fields(fields: &[(String, Value)], out: &mut Vec<u8>) {
+fn write_fields(fields: &[(String, Value)], out: &mut Vec<u8>, handle_of: &mut HandleOf) {
     write_len(fields.len(), out);
     for (name, value) in fields {
         write_str(name, out);
-        encode(value, out);
+        write(value, out, handle_of);
     }
 }
 
@@ -181,6 +252,7 @@ fn write_len(len: usize, out: &mut Vec<u8>) {
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
+    id_of: Option<&'a mut dyn FnMut(u32, u32) -> EntityId>,
 }
 
 impl Reader<'_> {
@@ -255,9 +327,21 @@ impl Reader<'_> {
                 self.f32()?,
                 self.f32()?,
             ))),
+            tag::VEC2 => Ok(Value::Vec2(glam::Vec2::new(self.f32()?, self.f32()?))),
+            tag::COLOR => Ok(Value::Color([
+                self.f32()?,
+                self.f32()?,
+                self.f32()?,
+                self.f32()?,
+            ])),
             tag::ENTITY => {
                 let bytes: [u8; 16] = self.take(16)?.try_into().expect("took sixteen bytes");
                 Ok(Value::Entity(EntityId::from_bytes(bytes)))
+            }
+            tag::HANDLE => {
+                let (index, generation) = (self.u32()?, self.u32()?);
+                let id_of = self.id_of.as_mut().ok_or(WireError::Handle)?;
+                Ok(Value::Entity(id_of(index, generation)))
             }
             tag::ASSET => {
                 let bytes: [u8; 16] = self.take(16)?.try_into().expect("took sixteen bytes");
@@ -436,8 +520,10 @@ mod tests {
     /// asserts the same string — which is the only check that the two
     /// implementations of this grammar actually agree.
     ///
-    /// It stops short of `golden_value` because a Behaviour cannot express an
-    /// `Entity` reference or a list; see `Orrin.PropertyBag` for why.
+    /// It stops short of `golden_value`: a Behaviour's entity reference crosses
+    /// as a live handle rather than tag 7's id, and the field types appended
+    /// since are pinned by their own vectors below, so this one keeps meaning
+    /// what it meant.
     #[test]
     fn the_bag_a_behaviour_encodes_to_has_not_moved() {
         let mut bytes = Vec::new();
@@ -471,9 +557,66 @@ mod tests {
         round_trip(&Value::Asset(id));
     }
 
+    /// The three tags appended after the asset one, pinned beside it for the
+    /// same reason. `Orrin.MathTests` encodes a Behaviour with these fields and
+    /// asserts the same bytes, then decodes them back.
+    #[test]
+    fn the_bag_of_the_appended_field_types_has_not_moved() {
+        let target: EntityId = "00000000-0000-4000-8000-000000000005".parse().unwrap();
+        let mut bytes = Vec::new();
+        encode_bag(&shapes_bag(target), &mut bytes, &mut |id| {
+            assert_eq!(id, target);
+            (5, 2)
+        });
+        assert_eq!(hex(&bytes), SHAPES_GOLDEN);
+
+        let decoded = decode_bag(&bytes, &mut |index, generation| {
+            assert_eq!((index, generation), (5, 2));
+            target
+        });
+        assert_eq!(decoded, Ok(shapes_bag(target)));
+    }
+
+    fn shapes_bag(target: EntityId) -> Value {
+        Value::strukt([
+            ("Offset", Value::Vec2(glam::Vec2::new(1.0, 2.0))),
+            ("Tint", Value::Color([1.0, 0.5, 0.0, 1.0])),
+            ("Target", Value::Entity(target)),
+            ("Steps", Value::List(vec![Value::I32(1), Value::I32(2)])),
+            ("Weights", Value::List(vec![Value::F32(0.5)])),
+        ])
+    }
+
+    /// A live handle names a slot in one world, so only a caller holding that
+    /// world can turn it into an identity. Without one it is refused, never
+    /// read as some id that would then name the wrong entity.
+    #[test]
+    fn a_live_handle_is_refused_by_the_plain_decoder() {
+        let bytes = [tag::HANDLE, 5, 0, 0, 0, 2, 0, 0, 0];
+        assert_eq!(decode(&bytes), Err(WireError::Handle));
+    }
+
+    #[test]
+    fn the_appended_leaves_round_trip() {
+        round_trip(&Value::Vec2(glam::Vec2::new(-0.0, f32::INFINITY)));
+        round_trip(&Value::Color([0.0, 2.5, 1.0, 0.25]));
+    }
+
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
+
+    const SHAPES_GOLDEN: &str = concat!(
+        "0805000000",                                         // Struct, 5 fields
+        "060000004f66667365740c0000803f00000040",             // Offset = Vec2 (1, 2)
+        "0400000054696e740d0000803f0000003f000000000000803f", // Tint = Color (1, 0.5, 0, 1)
+        "06000000546172676574",                               // Target =
+        "0e0500000002000000",                                 //   the live handle (5, 2)
+        "0500000053746570730a02000000",                       // Steps, a list of 2:
+        "01010000000102000000",                               //   I32 1, I32 2
+        "0700000057656967687473",                             // Weights =
+        "0a01000000030000003f",                               //   [0.5]
+    );
 
     const BAG_GOLDEN: &str = concat!(
         "0808000000",                                                 // Struct, 8 fields

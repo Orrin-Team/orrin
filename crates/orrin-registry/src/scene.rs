@@ -14,12 +14,12 @@ use crate::{AssetId, EntityId};
 /// Bumped whenever the grammar changes in a way older files don't satisfy.
 /// Migrations are explicit functions kept in the repo; a file whose version
 /// isn't handled is refused by name rather than parsed optimistically.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// The oldest reader that can read what this build writes, stated in every
 /// header next to the version. A change an older reader can tolerate bumps
 /// [`FORMAT_VERSION`] and leaves this alone, so that reader is not locked out.
-pub const MIN_READER_VERSION: u32 = 3;
+pub const MIN_READER_VERSION: u32 = 4;
 
 /// The component written on an entity's header line rather than among its
 /// components, when it holds a string.
@@ -412,26 +412,43 @@ fn parse_scalar(text: &str, line: usize) -> Result<Value, ParseError> {
             .map_err(|_| ParseError::new(line, format!("`{body}` is not an asset id")));
     }
 
-    if let Some(rest) = text.strip_prefix('(') {
-        let body = rest
-            .strip_suffix(')')
-            .ok_or_else(|| ParseError::new(line, "unterminated vector"))?;
-        let parts: Result<Vec<f32>, ParseError> =
-            body.split(',').map(|p| parse_f32(p.trim(), line)).collect();
-        let parts = parts?;
-        return match parts.len() {
-            3 => Ok(Value::Vec3(glam::Vec3::new(parts[0], parts[1], parts[2]))),
-            4 => Ok(Value::Quat(glam::Quat::from_xyzw(
-                parts[0], parts[1], parts[2], parts[3],
-            ))),
-            n => Err(ParseError::new(
+    if let Some(rest) = text.strip_prefix("rgba(") {
+        let parts = parse_tuple(rest, line, "unterminated colour")?;
+        return match parts[..] {
+            [r, g, b, a] => Ok(Value::Color([r, g, b, a])),
+            _ => Err(ParseError::new(
                 line,
-                format!("a vector has 3 components and a quaternion 4, found {n}"),
+                format!("a colour has 4 components, found {}", parts.len()),
+            )),
+        };
+    }
+
+    if let Some(rest) = text.strip_prefix('(') {
+        let parts = parse_tuple(rest, line, "unterminated vector")?;
+        return match parts[..] {
+            [x, y] => Ok(Value::Vec2(glam::Vec2::new(x, y))),
+            [x, y, z] => Ok(Value::Vec3(glam::Vec3::new(x, y, z))),
+            [x, y, z, w] => Ok(Value::Quat(glam::Quat::from_xyzw(x, y, z, w))),
+            _ => Err(ParseError::new(
+                line,
+                format!(
+                    "a vector has 2 or 3 components and a quaternion 4, found {}",
+                    parts.len()
+                ),
             )),
         };
     }
 
     parse_number(text, line)
+}
+
+/// The comma-separated floats of a tuple whose opening bracket is already
+/// consumed.
+fn parse_tuple(rest: &str, line: usize, unterminated: &str) -> Result<Vec<f32>, ParseError> {
+    let body = rest
+        .strip_suffix(')')
+        .ok_or_else(|| ParseError::new(line, unterminated))?;
+    body.split(',').map(|p| parse_f32(p.trim(), line)).collect()
 }
 
 /// Integers carry no width in the file — `3` could be an `i32` or a `u32` — so

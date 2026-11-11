@@ -13,7 +13,10 @@ use std::time::SystemTime;
 use glam::{Mat4, Quat, Vec3};
 
 use orrin_ecs::{Entity, FxHashMap, World};
-use orrin_registry::{AssetId, ComponentId, Registry, ScriptBridge, Value, ValueError};
+use orrin_registry::{
+    AssetId, ComponentId, EntityId, FieldInfo, FieldPath, PathSegment, Registry, ScriptBridge,
+    Value, ValueError,
+};
 use orrin_script::{
     CCamera, CCollision, CEntity, CTransform, GameAssemblyStatus, OrrinApi, ScriptHost,
 };
@@ -2692,7 +2695,10 @@ impl ScriptBridge for PropertyBags {
 
     fn read(&self, world: &World, entity: Entity, type_name: &str) -> Option<Value> {
         let bytes = orrin_script::read_bag(Self::handle(world, entity, type_name)?)?;
-        match orrin_registry::wire::decode(&bytes) {
+        let mut id_of = |index, generation| {
+            crate::scene::entity_ref::id_of(world, Entity { index, generation })
+        };
+        match orrin_registry::wire::decode_bag(&bytes, &mut id_of) {
             Ok(value) => Some(value),
             Err(error) => {
                 tracing::error!("{type_name}'s property bag did not decode: {error}");
@@ -2714,8 +2720,21 @@ impl ScriptBridge for PropertyBags {
                 type_name.to_owned(),
             ));
         };
+        let mut handles = Vec::new();
+        live_handles(
+            world,
+            type_name,
+            value,
+            &mut FieldPath::empty(),
+            &mut handles,
+        );
         let mut bytes = Vec::new();
-        orrin_registry::wire::encode(value, &mut bytes);
+        orrin_registry::wire::encode_bag(value, &mut bytes, &mut |id| {
+            handles
+                .iter()
+                .find_map(|&(known, handle)| (known == id).then_some(handle))
+                .unwrap_or((0, 0))
+        });
         if orrin_script::write_bag(handle, &bytes) {
             Ok(())
         } else {
@@ -2744,7 +2763,9 @@ impl ScriptBridge for PropertyBags {
         let Some(bytes) = orrin_script::default_bag(&name) else {
             return empty;
         };
-        match orrin_registry::wire::decode(&bytes) {
+        // A fresh instance belongs to no world, so any handle its constructor
+        // left in a field names nothing a default could carry.
+        match orrin_registry::wire::decode_bag(&bytes, &mut |_, _| EntityId::NIL) {
             Ok(value) => value,
             Err(error) => {
                 tracing::error!("{type_name}'s defaults did not decode: {error}");
@@ -2752,6 +2773,109 @@ impl ScriptBridge for PropertyBags {
             }
         }
     }
+}
+
+/// One entry of `Orrin.PropertyBag.Components`: a `[Component]` Behaviour and
+/// what its fields' presentation attributes say.
+struct Listed {
+    id: String,
+    type_name: String,
+    name: String,
+    fields: Vec<FieldInfo>,
+}
+
+impl Listed {
+    /// `None` when the entry lacks an id, a type or a name. A field entry that
+    /// is malformed is dropped alone: presentation is not worth refusing a
+    /// component over.
+    fn read(entry: &Value) -> Option<Self> {
+        let text = |value: &Value, name: &str| match value.field(name) {
+            Some(Value::String(text)) => Some(text.clone()),
+            _ => None,
+        };
+        let fields = match entry.field("fields") {
+            Some(Value::List(fields)) => fields
+                .iter()
+                .filter_map(|field| {
+                    let range = match field.field("range") {
+                        Some(Value::List(bounds)) => match bounds[..] {
+                            [Value::F32(min), Value::F32(max)] => Some((min, max)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    Some(FieldInfo {
+                        name: text(field, "name")?,
+                        header: text(field, "header").filter(|text| !text.is_empty()),
+                        tooltip: text(field, "tooltip").filter(|text| !text.is_empty()),
+                        range,
+                        hidden: matches!(field.field("hidden"), Some(Value::Bool(true))),
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        Some(Self {
+            id: text(entry, "id")?,
+            type_name: text(entry, "type")?,
+            name: text(entry, "name")?,
+            fields,
+        })
+    }
+}
+
+/// The live handle for every entity reference in `value`, by id, appended to
+/// `out`.
+///
+/// One that names nothing here — another scene's entity, a deleted one, a
+/// handle that was already stale when the file was saved — is written as the
+/// null handle, never as whatever holds a similar slot, and is logged once with
+/// the field it sits in.
+fn live_handles(
+    world: &World,
+    type_name: &str,
+    value: &Value,
+    path: &mut FieldPath,
+    out: &mut Vec<(EntityId, (u32, u32))>,
+) {
+    match value {
+        Value::Entity(id) if !id.is_nil() && !out.iter().any(|(known, _)| known == id) => {
+            let handle = match crate::scene::entity_ref::entity_of(world, *id) {
+                Some(entity) => (entity.index, entity.generation),
+                None => {
+                    tracing::warn!(
+                        "`{path}` of `{type_name}` refers to entity {id}, which is not loaded, so \
+                         it was set to Entity.Null — the entity may be in another scene, have \
+                         been deleted, or have been gone already when this was saved"
+                    );
+                    (0, 0)
+                }
+            };
+            out.push((*id, handle));
+        }
+        Value::Struct(fields) | Value::Enum { fields, .. } => {
+            for (name, field) in fields {
+                path.push(PathSegment::Field(name.clone()));
+                live_handles(world, type_name, field, path, out);
+                path.pop();
+            }
+        }
+        Value::List(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(PathSegment::Index(index));
+                live_handles(world, type_name, item, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The bridge every script component's registry entry answers through. Public
+/// so a Behaviour no game assembly lists — the bindings' own test probes — can
+/// be registered by hand with [`Registry::register_script`].
+pub fn bridge() -> Arc<dyn ScriptBridge> {
+    Arc::new(PropertyBags)
 }
 
 fn build_api() -> OrrinApi {
@@ -3393,18 +3517,15 @@ impl Scripting {
             return 0;
         };
 
-        let bridge: Arc<dyn ScriptBridge> = Arc::new(PropertyBags);
+        let bridge = bridge();
         let mut registered = 0;
         for entry in entries {
-            let (
-                Some(Value::String(id)),
-                Some(Value::String(type_name)),
-                Some(Value::String(name)),
-            ) = (
-                entry.field("id").cloned(),
-                entry.field("type").cloned(),
-                entry.field("name").cloned(),
-            )
+            let Some(Listed {
+                id,
+                type_name,
+                name,
+                fields,
+            }) = Listed::read(&entry)
             else {
                 tracing::error!("a component listing entry was missing id, type or name");
                 continue;
@@ -3431,6 +3552,7 @@ impl Scripting {
                 component_id,
                 name,
                 canonical_type_name(&type_name),
+                fields,
                 Arc::clone(&bridge),
             );
             registered += 1;
@@ -3733,6 +3855,52 @@ mod tests {
     use crate::scene::LogBuffer;
     use crate::scene::prefab::{Prefab, PrefabInstance};
     use orrin_registry::AssetId;
+
+    /// The listing `Orrin.MathTests` encodes for its `TunedProbe`, whose
+    /// `Speed` carries `[Header("Motion")]`, `[Tooltip("Metres a second")]`
+    /// and `[Range(0, 10)]`, `Secret` carries `[HideInInspector]`, and `Plain`
+    /// nothing — so it has no entry. The C# side asserts the same bytes.
+    const LISTING_GOLDEN: &str = concat!(
+        "0a010000000804000000020000006964040a000000746573742e74756e65640400000074797065041b000000",
+        "54756e656450726f62652c204f7272696e2e4d6174685465737473040000006e616d65040a00000054756e65",
+        "6450726f6265060000006669656c64730a020000000805000000040000006e616d6504050000005370656564",
+        "0600000068656164657204060000004d6f74696f6e07000000746f6f6c746970040f0000004d657472657320",
+        "61207365636f6e640500000072616e67650a02000000030000000003000020410600000068696464656e0000",
+        "0805000000040000006e616d6504060000005365637265740600000068656164657204000000000700000074",
+        "6f6f6c74697004000000000500000072616e67650a000000000600000068696464656e0001",
+    );
+
+    #[test]
+    fn a_listing_entry_carries_its_fields_presentation() {
+        let bytes: Vec<u8> = (0..LISTING_GOLDEN.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&LISTING_GOLDEN[i..i + 2], 16).unwrap())
+            .collect();
+        let Ok(Value::List(entries)) = orrin_registry::wire::decode(&bytes) else {
+            panic!("the listing is a list");
+        };
+        let listed = Listed::read(&entries[0]).expect("a well-formed entry");
+        assert_eq!(listed.id, "test.tuned");
+        assert_eq!(listed.type_name, "TunedProbe, Orrin.MathTests");
+        assert_eq!(listed.name, "TunedProbe");
+        assert_eq!(
+            listed.fields,
+            vec![
+                FieldInfo {
+                    name: "Speed".to_owned(),
+                    header: Some("Motion".to_owned()),
+                    tooltip: Some("Metres a second".to_owned()),
+                    range: Some((0.0, 10.0)),
+                    hidden: false,
+                },
+                FieldInfo {
+                    name: "Secret".to_owned(),
+                    hidden: true,
+                    ..FieldInfo::default()
+                },
+            ]
+        );
+    }
 
     /// What `emit` put on the stream, as `(level, line)`.
     fn logged(emit: impl FnOnce()) -> Vec<(LogLevel, String)> {

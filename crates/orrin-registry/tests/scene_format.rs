@@ -1,7 +1,7 @@
 //! The scene format's central property: `parse(write(doc)) == doc`, for every
 //! shape `Value` can take.
 
-use glam::{Quat, Vec3};
+use glam::{Quat, Vec2, Vec3};
 use orrin_registry::{
     AssetId, ComponentId, EntityId, FORMAT_VERSION, MIN_READER_VERSION, SceneDocument, SceneEntity,
     Value, parse, parse_value_document, write_document, write_value_document,
@@ -47,10 +47,46 @@ fn every_leaf_survives_the_round_trip() {
             ("test.rotation", Value::Quat(Quat::IDENTITY)),
             ("test.target", Value::Entity(EntityId::new())),
             ("test.prefab", Value::Asset(AssetId::new())),
+            ("test.offset", Value::Vec2(Vec2::new(-1.5, 0.25))),
+            ("test.tint", Value::Color([1.0, 0.5, 0.0, 2.5])),
         ])],
     });
 
-    assert!(text.starts_with("orrin-scene 3 min-reader 3\n"));
+    assert!(text.starts_with("orrin-scene 4 min-reader 4\n"));
+}
+
+/// A two-component vector is a tuple of two, and a colour is spelled as one,
+/// so a reader can tell it from a quaternion without knowing the component.
+#[test]
+fn a_vector2_and_a_colour_have_spellings_of_their_own() {
+    let text = round_trip(SceneDocument {
+        entities: vec![entity(vec![
+            ("test.offset", Value::Vec2(Vec2::new(1.0, -2.0))),
+            ("test.tint", Value::Color([1.0, 0.5, 0.0, 1.0])),
+        ])],
+    });
+    assert!(text.contains("test.offset = (1.0, -2.0)\n"), "{text}");
+    assert!(
+        text.contains("test.tint = rgba(1.0, 0.5, 0.0, 1.0)\n"),
+        "{text}"
+    );
+
+    let base = "orrin-scene 4 min-reader 4\n\nentity 00000000-0000-0000-0000-000000000001\n";
+    let err = parse(&format!("{base}  test.tint = rgba(1.0, 0.5)\n")).unwrap_err();
+    assert_eq!(err.line, 4);
+    assert_eq!(err.message, "a colour has 4 components, found 2");
+}
+
+/// The version is what tells a reader of version 3 that a file may hold the
+/// spellings above, which it would otherwise fail on line by line.
+#[test]
+fn a_version_3_file_still_reads() {
+    let v3 = "orrin-scene 3 min-reader 3\n\nentity 00000000-0000-0000-0000-000000000001\n  test.n = (1.0, 2.0, 3.0)\n";
+    let document = parse(v3).unwrap();
+    assert_eq!(
+        document.entities[0].components[0].1,
+        Value::Vec3(Vec3::new(1.0, 2.0, 3.0))
+    );
 }
 
 /// An asset reference has its own spelling rather than being a string that
@@ -169,7 +205,7 @@ fn entities_are_written_in_id_order_whatever_order_they_arrived_in() {
 fn an_empty_scene_is_just_a_header() {
     let mut text = String::new();
     write_document(&mut text, &SceneDocument::default());
-    assert_eq!(text, "orrin-scene 3 min-reader 3\n");
+    assert_eq!(text, "orrin-scene 4 min-reader 4\n");
     assert_eq!(parse(&text).unwrap(), SceneDocument::default());
 }
 
@@ -186,7 +222,7 @@ fn a_file_needing_a_newer_reader_names_both_versions() {
     assert_eq!(
         err.to_string(),
         "line 1: scene format version 99 needs a reader of version 98 or later \
-         (this build reads up to 3)"
+         (this build reads up to 4)"
     );
 }
 
@@ -241,7 +277,7 @@ entity 00000000-0000-0000-0000-000000000001
     write_document(&mut text, &document);
     assert_eq!(
         text,
-        r#"orrin-scene 3 min-reader 3
+        r#"orrin-scene 4 min-reader 4
 
 entity 00000000-0000-0000-0000-000000000001 "Door \"A\""
   orrin.tag = 7
@@ -256,7 +292,7 @@ fn a_migrated_file_reports_errors_on_its_own_lines() {
 
 entity 00000000-0000-0000-0000-000000000001
   orrin.name = "Door"
-  orrin.tag = (1.0, 2.0)
+  orrin.tag = (1.0)
 "#;
     let err = parse(v1).unwrap_err();
     assert_eq!(err.line, 5);
@@ -282,7 +318,7 @@ fn an_entity_header_carries_its_name() {
     });
     assert_eq!(
         text,
-        r#"orrin-scene 3 min-reader 3
+        r#"orrin-scene 4 min-reader 4
 
 entity 00000000-0000-0000-0000-000000000001 "Door \"A\""
   orrin.tag = 7
@@ -339,7 +375,7 @@ fn syntax_errors_carry_their_line() {
     let err = parse(&format!("{base}  name = \"unterminated\n")).unwrap_err();
     assert_eq!(err.line, 4);
 
-    let err = parse(&format!("{base}  name = (1.0, 2.0)\n")).unwrap_err();
+    let err = parse(&format!("{base}  name = (1.0)\n")).unwrap_err();
     assert!(err.message.contains("3 components"));
 
     let err = parse(&format!("{base}      deep = 1\n")).unwrap_err();

@@ -21,16 +21,19 @@ namespace Orrin;
 /// worse, could observe a Behaviour halfway through its own `OnUpdate`.
 ///
 /// The visible set is closed to the types that have a `Value` variant on the
-/// Rust side: bool, int, uint, float, string, Vector3, Quaternion, enums, and
-/// `AssetRef<T>`.
-/// Deliberately absent for now:
-/// - `Entity`, because a slot handle means nothing in a saved file. Persisting
-///   one needs the engine's slot-to-EntityId translation, which lives where the
-///   world is in scope — the same reason `orrin.parent` is resolved a level
-///   above the registry rather than in a conversion.
-/// - `Vector2`, `Vector4`, `Color`, arrays and lists, which need a `Value`
-///   variant or a resize rule that no component has yet asked for. A variant
-///   there lands in the scene format forever, so it waits for a demand.
+/// Rust side: bool, int, uint, float, string, Vector2, Vector3, Quaternion,
+/// Color, enums, `AssetRef<T>`, `Entity`, and a `List<T>` or `T[]` of any of
+/// those.
+///
+/// An `Entity` crosses as its live handle (tag 14), not as tag 7's persistent
+/// id, because the handle is all a Behaviour holds. The engine's bridge turns it
+/// into the target's id on the way out and back into a slot on the way in, where
+/// the world is in scope — the same place `orrin.parent` is resolved. Tag 7
+/// never reaches this side, and is stepped over if it does.
+///
+/// Deliberately absent for now: `Vector4`, which has no `Value` variant. A
+/// variant lands in the scene format forever, so it waits for a demand. So do
+/// lists of lists, which the inspector cannot draw usefully.
 ///
 /// A field outside that set is left alone: not saved, not inspectable, and
 /// reported by the analyzer so it is a decision rather than a surprise. It is
@@ -55,6 +58,9 @@ public static unsafe class PropertyBag
         public const byte Enum = 9;
         public const byte List = 10;
         public const byte Asset = 11;
+        public const byte Vec2 = 12;
+        public const byte Color = 13;
+        public const byte Handle = 14;
     }
 
     /// Negative returns from every entry point below. A non-negative result is
@@ -132,7 +138,8 @@ public static unsafe class PropertyBag
     }
 
     /// Every registry-visible Behaviour in the currently loaded game assemblies,
-    /// as a `List` of `{ id, type, name }` structs.
+    /// as a `List` of `{ id, type, name, fields }` structs — `fields` being what
+    /// [Listing] says.
     ///
     /// This is the game assembly's half of `register_components`: the engine
     /// calls it after each load and registers what comes back, then drops those
@@ -145,40 +152,20 @@ public static unsafe class PropertyBag
     {
         try
         {
-            var found = new List<(string Id, string Type, string Name)>();
+            var found = new List<Type>();
             foreach (var assembly in GameAssembly.CurrentAssemblies)
             {
                 foreach (var type in assembly.GetTypes())
                 {
-                    if (type.IsAbstract || !type.IsSubclassOf(typeof(Behaviour)))
-                        continue;
-                    if (type.GetCustomAttribute<ComponentAttribute>() is not { } component)
-                        continue;
-                    var qualified = $"{type.FullName}, {assembly.GetName().Name}";
-                    found.Add((component.Id, qualified, component.Name ?? type.Name));
+                    if (!type.IsAbstract && type.IsSubclassOf(typeof(Behaviour))
+                        && type.IsDefined(typeof(ComponentAttribute), inherit: false))
+                        found.Add(type);
                 }
             }
-
-            // Sorted by id so that the engine's registration order — and so the
-            // inspector's section order — does not depend on the order
-            // reflection happens to hand back types in.
-            found.Sort((a, b) => string.CompareOrdinal(a.Id, b.Id));
-
-            var writer = new Writer();
-            writer.Byte(Tag.List);
-            writer.U32((uint)found.Count);
-            foreach (var (id, type, name) in found)
-            {
-                writer.Byte(Tag.Struct);
-                writer.U32(3);
-                writer.Field("id", Tag.String);
-                writer.Str(id);
-                writer.Field("type", Tag.String);
-                writer.Str(type);
-                writer.Field("name", Tag.String);
-                writer.Str(name);
-            }
-            return writer.CopyTo(buffer, capacity);
+            var bytes = Listing(found);
+            if (bytes.Length <= capacity && buffer is not null)
+                bytes.CopyTo(new Span<byte>(buffer, capacity));
+            return bytes.Length;
         }
         catch (Exception e)
         {
@@ -186,6 +173,83 @@ public static unsafe class PropertyBag
             return Failed;
         }
     }
+
+    /// The listing [Components] returns for `types`, each of which carries
+    /// `[Component]`. A field's entry says what its `[Header]`, `[Tooltip]`,
+    /// `[Range]` and `[HideInInspector]` ask of the inspector, and only a field
+    /// with at least one has an entry. Presentation travels here rather than in
+    /// the bag so that it can never change what is saved.
+    internal static byte[] Listing(IEnumerable<Type> types)
+    {
+        var found = types
+            .Select(type => (Type: type, Component: type.GetCustomAttribute<ComponentAttribute>()!))
+            .ToList();
+        // Sorted by id so that the engine's registration order — and so the
+        // inspector's section order — does not depend on the order
+        // reflection happens to hand back types in.
+        found.Sort((a, b) => string.CompareOrdinal(a.Component.Id, b.Component.Id));
+
+        var writer = new Writer();
+        writer.Byte(Tag.List);
+        writer.U32((uint)found.Count);
+        foreach (var (type, component) in found)
+        {
+            writer.Byte(Tag.Struct);
+            writer.U32(4);
+            writer.Field("id", Tag.String);
+            writer.Str(component.Id);
+            writer.Field("type", Tag.String);
+            writer.Str($"{type.FullName}, {type.Assembly.GetName().Name}");
+            writer.Field("name", Tag.String);
+            writer.Str(component.Name ?? type.Name);
+
+            var annotated = new List<(string Name, HeaderAttribute? Header, TooltipAttribute? Tooltip,
+                RangeAttribute? Range, bool Hidden)>();
+            foreach (var field in VisibleFields(type))
+            {
+                var header = Attribute<HeaderAttribute>(field);
+                var tooltip = Attribute<TooltipAttribute>(field);
+                var range = Attribute<RangeAttribute>(field);
+                var hidden = Attribute<HideInInspectorAttribute>(field) is not null;
+                if (header is not null || tooltip is not null || range is not null || hidden)
+                    annotated.Add((field.Name, header, tooltip, range, hidden));
+            }
+            writer.Field("fields", Tag.List);
+            writer.U32((uint)annotated.Count);
+            foreach (var (name, header, tooltip, range, hidden) in annotated)
+            {
+                writer.Byte(Tag.Struct);
+                writer.U32(5);
+                writer.Field("name", Tag.String);
+                writer.Str(name);
+                writer.Field("header", Tag.String);
+                writer.Str(header?.Text ?? "");
+                writer.Field("tooltip", Tag.String);
+                writer.Str(tooltip?.Text ?? "");
+                writer.Field("range", Tag.List);
+                if (range is null)
+                {
+                    writer.U32(0);
+                }
+                else
+                {
+                    writer.U32(2);
+                    writer.Byte(Tag.F32);
+                    writer.F32(range.Min);
+                    writer.Byte(Tag.F32);
+                    writer.F32(range.Max);
+                }
+                writer.Field("hidden", Tag.Bool);
+                writer.Byte(hidden ? (byte)1 : (byte)0);
+            }
+        }
+        return writer.ToArray();
+    }
+
+    /// `T` on the field, or on the auto-property it backs.
+    static T? Attribute<T>(FieldInfo field) where T : Attribute =>
+        field.GetCustomAttribute<T>(inherit: true)
+        ?? BehaviourState.PropertyOf(field)?.GetCustomAttribute<T>(inherit: true);
 
     /// The encode and decode halves without the FFI around them, for
     /// `Orrin.MathTests` — which is where the claim that this file and
@@ -219,6 +283,21 @@ public static unsafe class PropertyBag
 
     static void WriteValue(ref Writer writer, Type type, object? value)
     {
+        if (ElementType(type) is { } element)
+        {
+            // A null list is written as an empty one, for the reason a null
+            // string is written as "" below.
+            var items = value as System.Collections.IList;
+            writer.Byte(Tag.List);
+            writer.U32((uint)(items?.Count ?? 0));
+            if (items is not null)
+            {
+                foreach (var item in items)
+                    WriteValue(ref writer, element, item);
+            }
+            return;
+        }
+
         if (type.IsEnum)
         {
             // Written as its member name, not its underlying integer. Reordering
@@ -266,6 +345,23 @@ public static unsafe class PropertyBag
                 writer.F32(v.y);
                 writer.F32(v.z);
                 writer.F32(v.w);
+                break;
+            case Vector2 v:
+                writer.Byte(Tag.Vec2);
+                writer.F32(v.x);
+                writer.F32(v.y);
+                break;
+            case Color v:
+                writer.Byte(Tag.Color);
+                writer.F32(v.r);
+                writer.F32(v.g);
+                writer.F32(v.b);
+                writer.F32(v.a);
+                break;
+            case Entity v:
+                writer.Byte(Tag.Handle);
+                writer.U32(v.Index);
+                writer.U32(v.Generation);
                 break;
             case IAssetRef v:
                 writer.Byte(Tag.Asset);
@@ -353,6 +449,21 @@ public static unsafe class PropertyBag
                 var v = new Quaternion(reader.F32(), reader.F32(), reader.F32(), reader.F32());
                 return target == typeof(Quaternion) ? v : null;
             }
+            case Tag.Vec2:
+            {
+                var v = new Vector2(reader.F32(), reader.F32());
+                return target == typeof(Vector2) ? v : null;
+            }
+            case Tag.Color:
+            {
+                var v = new Color(reader.F32(), reader.F32(), reader.F32(), reader.F32());
+                return target == typeof(Color) ? v : null;
+            }
+            case Tag.Handle:
+            {
+                var v = new Entity(reader.U32(), reader.U32());
+                return target == typeof(Entity) ? v : null;
+            }
             case Tag.Entity:
             {
                 reader.Skip(16);
@@ -396,10 +507,35 @@ public static unsafe class PropertyBag
             }
             case Tag.List:
             {
-                var items = reader.U32();
-                for (var i = 0; i < items; i++)
-                    ReadValue(ref reader, null);
-                return null;
+                var count = checked((int)reader.U32());
+                var element = target is null ? null : ElementType(target);
+                var items = new List<object>(element is null ? 0 : count);
+                var fits = element is not null;
+                for (var i = 0; i < count; i++)
+                {
+                    // Every item is read even after one has failed to fit, so
+                    // the reader lands at the end of the list either way.
+                    if (ReadValue(ref reader, element) is { } item)
+                        items.Add(item);
+                    else
+                        fits = false;
+                }
+                // All or nothing, as for any other field: a list whose element
+                // type changed keeps its constructor value rather than a
+                // partial copy of the saved one.
+                if (!fits || element is null)
+                    return null;
+                if (target!.IsArray)
+                {
+                    var array = Array.CreateInstance(element, items.Count);
+                    for (var i = 0; i < items.Count; i++)
+                        array.SetValue(items[i], i);
+                    return array;
+                }
+                var list = (System.Collections.IList)Activator.CreateInstance(target)!;
+                foreach (var item in items)
+                    list.Add(item);
+                return list;
             }
             default:
                 throw new InvalidOperationException($"value tag {tag} is not one this build knows");
@@ -433,15 +569,30 @@ public static unsafe class PropertyBag
     }
 
     static bool IsVisible(Type type) =>
-        type.IsEnum
-        || type == typeof(bool)
-        || type == typeof(int)
-        || type == typeof(uint)
-        || type == typeof(float)
-        || type == typeof(string)
-        || type == typeof(Vector3)
-        || type == typeof(Quaternion)
-        || (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(AssetRef<>));
+        ElementType(type) is { } element
+            ? ElementType(element) is null && IsVisible(element)
+            : type.IsEnum
+              || type == typeof(bool)
+              || type == typeof(int)
+              || type == typeof(uint)
+              || type == typeof(float)
+              || type == typeof(string)
+              || type == typeof(Vector2)
+              || type == typeof(Vector3)
+              || type == typeof(Quaternion)
+              || type == typeof(Color)
+              || type == typeof(Entity)
+              || (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(AssetRef<>));
+
+    /// What a `List<T>` or a one-dimensional `T[]` holds; null for anything else.
+    internal static Type? ElementType(Type type)
+    {
+        if (type.IsArray)
+            return type.GetArrayRank() == 1 ? type.GetElementType() : null;
+        return type.IsGenericType && type.GetGenericTypeDefinition() == typeof(List<>)
+            ? type.GetGenericArguments()[0]
+            : null;
+    }
 
     /// Grows by doubling and copies out once, so an entry point never has to
     /// guess a size and the caller never sees a partial buffer.

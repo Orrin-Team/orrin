@@ -122,6 +122,10 @@ fn identical(a: &Value, b: &Value) -> bool {
         (Value::Quat(x), Value::Quat(y)) => {
             x.to_array().map(f32::to_bits) == y.to_array().map(f32::to_bits)
         }
+        (Value::Vec2(x), Value::Vec2(y)) => {
+            x.to_array().map(f32::to_bits) == y.to_array().map(f32::to_bits)
+        }
+        (Value::Color(x), Value::Color(y)) => x.map(f32::to_bits) == y.map(f32::to_bits),
         (Value::Struct(x), Value::Struct(y)) => same_fields(x, y) && fields_identical(x, y),
         (
             Value::Enum {
@@ -241,6 +245,19 @@ mod tests {
                 Value::Vec3(Vec3::new(4.0, 0.0, 0.0))
             )]
         );
+    }
+
+    /// The appended leaves compare by bits like every other float, so a NaN
+    /// tint is not an edit and a moved one is a single change.
+    #[test]
+    fn a_vec2_and_a_colour_compare_bitwise() {
+        let tint = |alpha| Value::Color([f32::NAN, 0.0, 1.0, alpha]);
+        assert_eq!(diff(&tint(1.0), &tint(1.0)), Vec::new());
+        assert_eq!(diff(&tint(1.0), &tint(0.5)).len(), 1);
+
+        let offset = |x| Value::Vec2(glam::Vec2::new(x, f32::NAN));
+        assert_eq!(diff(&offset(1.0), &offset(1.0)), Vec::new());
+        assert_eq!(diff(&offset(0.0), &offset(-0.0)).len(), 1);
     }
 
     #[test]

@@ -57,6 +57,7 @@ impl_leaf!(bool, Bool, "bool");
 impl_leaf!(String, String, "string");
 impl_leaf!(glam::Vec3, Vec3, "vec3");
 impl_leaf!(glam::Quat, Quat, "quat");
+impl_leaf!(glam::Vec2, Vec2, "vec2");
 impl_leaf!(crate::EntityId, Entity, "entity");
 impl_leaf!(crate::AssetId, Asset, "asset");
 

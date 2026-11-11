@@ -29,6 +29,10 @@ pub enum Value {
     String(String),
     Vec3(glam::Vec3),
     Quat(glam::Quat),
+    Vec2(glam::Vec2),
+    /// RGBA, unpremultiplied and unclamped — a C# `Color` as it is, so a
+    /// tint above 1.0 survives the round trip.
+    Color([f32; 4]),
     /// A reference to another entity, by its persistent identity. There is
     /// deliberately no variant for a raw `orrin_ecs::Entity` — see
     /// [`EntityId`](crate::EntityId).
@@ -84,6 +88,8 @@ impl Value {
             Value::String(_) => "string",
             Value::Vec3(_) => "vec3",
             Value::Quat(_) => "quat",
+            Value::Vec2(_) => "vec2",
+            Value::Color(_) => "color",
             Value::Entity(_) => "entity",
             Value::Asset(_) => "asset",
             Value::Struct(_) => "struct",
@@ -362,6 +368,12 @@ mod tests {
         for text in [".x", "x.", "x..y", "x[", "x[a]", "x[1]y", "x y"] {
             assert!(text.parse::<FieldPath>().is_err(), "`{text}` parsed");
         }
+    }
+
+    #[test]
+    fn the_appended_leaves_name_themselves() {
+        assert_eq!(Value::Vec2(glam::Vec2::ZERO).type_name(), "vec2");
+        assert_eq!(Value::Color([0.0; 4]).type_name(), "color");
     }
 
     #[test]

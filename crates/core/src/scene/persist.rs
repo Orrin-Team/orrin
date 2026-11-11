@@ -580,7 +580,7 @@ mod tests {
         let id = EntityId::new();
         let teapot = AssetId::named("mesh", "teapot");
         let text =
-            format!("orrin-scene 3 min-reader 3\n\nentity {id}\n  orrin.mesh = asset({teapot})\n");
+            format!("orrin-scene 4 min-reader 4\n\nentity {id}\n  orrin.mesh = asset({teapot})\n");
 
         let mut world = World::new();
         world.insert_resource(assets());
@@ -621,7 +621,7 @@ mod tests {
         assert_eq!(
             save(&mut world, &registry),
             format!(
-                "orrin-scene 3 min-reader 3\n\nentity {id}\n  orrin.material = asset({})\n  orrin.mesh = asset({})\n",
+                "orrin-scene 4 min-reader 4\n\nentity {id}\n  orrin.material = asset({})\n  orrin.mesh = asset({})\n",
                 AssetId::named("material", "gold"),
                 AssetId::named("mesh", "cube")
             )
@@ -682,7 +682,7 @@ mod tests {
         let registry = registry();
         let id = EntityId::new();
         let text = format!(
-            "orrin-scene 3 min-reader 3\n\nentity {id}\n  game.enemy\n    aggression = 0.75\n    name = \"Boss\"\n"
+            "orrin-scene 4 min-reader 4\n\nentity {id}\n  game.enemy\n    aggression = 0.75\n    name = \"Boss\"\n"
         );
 
         let mut world = World::new();
@@ -699,7 +699,7 @@ mod tests {
     fn a_value_the_type_rejects_is_kept_rather_than_dropped() {
         let registry = registry();
         let id = EntityId::new();
-        let text = format!("orrin-scene 3 min-reader 3\n\nentity {id} \"Cube\"\n  orrin.tag = 7\n");
+        let text = format!("orrin-scene 4 min-reader 4\n\nentity {id} \"Cube\"\n  orrin.tag = 7\n");
 
         let mut world = World::new();
         let issues = load(&text, &mut world, &registry).unwrap();
@@ -727,7 +727,7 @@ mod tests {
                 .unwrap()
         });
         let text = format!(
-            "orrin-scene 3 min-reader 3\n\n\
+            "orrin-scene 4 min-reader 4\n\n\
              entity {a} \"A\"\n  orrin.tag = 7\n\n\
              entity {b} \"B\"\n  orrin.tag = \"ok\"\n\n\
              entity {c} \"C\"\n  game.enemy = 1\n  orrin.tag = 8\n"
@@ -779,7 +779,7 @@ mod tests {
         let registry = registry();
         let mut world = World::new();
         let text = save(&mut world, &registry);
-        assert_eq!(text, "orrin-scene 3 min-reader 3\n");
+        assert_eq!(text, "orrin-scene 4 min-reader 4\n");
 
         let mut loaded = World::new();
         assert!(load(&text, &mut loaded, &registry).unwrap().is_empty());
@@ -1040,11 +1040,12 @@ mod tests {
             ComponentId::new("demo.spinner"),
             "Spinner",
             "DemoGame.Spinner, DemoGame",
+            Vec::new(),
             std::sync::Arc::new(NoHost),
         );
         let id = EntityId::new();
         let text = format!(
-            "orrin-scene 3 min-reader 3\n\nentity {id}\n  demo.spinner\n    DegreesPerSecond = 45.0\n"
+            "orrin-scene 4 min-reader 4\n\nentity {id}\n  demo.spinner\n    DegreesPerSecond = 45.0\n"
         );
 
         let mut world = World::new();
