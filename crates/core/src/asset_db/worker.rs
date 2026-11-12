@@ -23,9 +23,10 @@ use std::time::Duration;
 use orrin_registry::AssetId;
 
 use super::cache::{Artifact, Cache, CacheKey, Summary};
-use super::import;
 use super::sidecar::{AssetKind, Settings};
 use super::texture::Target;
+use super::{import, shader};
+use crate::gfx::surface::{SurfaceArtifact, SurfaceError};
 use crate::gfx::thumbnail::Thumbnail;
 use crate::scene::{MeshPreview, render_mesh};
 
@@ -57,6 +58,7 @@ pub struct Job {
 pub enum Payload {
     Texture(super::cache::TextureArtifact),
     Mesh(crate::scene::CpuMesh, MeshPreview),
+    Shader(SurfaceArtifact),
 }
 
 /// A job that went through.
@@ -73,10 +75,29 @@ pub struct Imported {
     pub summary: Option<Summary>,
 }
 
+/// Why a job did not go through.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportError {
+    /// What to tell the user, naming the file.
+    pub message: String,
+    /// A surface shader's errors, each at its line, which `message` lists
+    /// located; empty for every other kind.
+    pub lines: Vec<SurfaceError>,
+}
+
+impl From<String> for ImportError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            lines: Vec::new(),
+        }
+    }
+}
+
 /// A job's outcome, sent back to the database.
 pub struct Done {
     pub job: Job,
-    pub outcome: Result<Imported, String>,
+    pub outcome: Result<Imported, ImportError>,
 }
 
 /// Run `job` against `cache`: read the inputs, hash them, and import only when
@@ -87,17 +108,19 @@ pub struct Done {
 /// cache but does not read is rebuilt when it is brought back, rather than
 /// trusted or reported, since a damaged cache file is never the user's problem.
 /// One without its thumbnail — a cache written before there were any — is
-/// imported again to make one.
-pub fn run(job: &Job, cache: &Cache) -> Result<Imported, String> {
+/// imported again to make one. A surface shader goes its own way
+/// ([`shader::import`]): it has no thumbnail, and its artifact comes back
+/// whether or not anything draws it.
+pub fn run(job: &Job, cache: &Cache) -> Result<Imported, ImportError> {
     if let Some(key) = job.packed {
-        return unpack(job, cache, key);
+        return Ok(unpack(job, cache, key)?);
     }
     let Some(importer) = import::importer(job.kind) else {
-        return Err(format!(
+        return Err(ImportError::from(format!(
             "{} is a {}, which is not imported",
             job.rel,
             job.kind.label()
-        ));
+        )));
     };
     let inputs = import::read_inputs(job.kind, &job.source, &job.rel)?;
     // The source is hashed under a fixed name, so renaming or moving a file
@@ -115,6 +138,9 @@ pub fn run(job: &Job, cache: &Cache) -> Result<Imported, String> {
         .collect();
     let settings = import::key_settings(job.kind, &job.settings, job.target);
     let key = super::cache::key(importer, &settings, &named);
+    if job.kind == AssetKind::Shader {
+        return shader::import(job, cache, key, &inputs[0].1, shader::COMPILER);
+    }
     let read = || {
         inputs
             .iter()
@@ -179,7 +205,21 @@ pub fn run(job: &Job, cache: &Cache) -> Result<Imported, String> {
 /// [`run`] for a pack: the artifact under `key`, as it is.
 fn unpack(job: &Job, cache: &Cache, key: CacheKey) -> Result<Imported, String> {
     let artifact = match cache.load(key) {
+        Some(Ok(Artifact::Shader(shader))) if !shader.matches_this_build() => {
+            return Err(format!(
+                "{}: its packed artifact was compiled by another build of the engine than this \
+                 one, so its materials draw without it; export the game again",
+                job.rel
+            ));
+        }
         Some(Ok(artifact)) => artifact,
+        Some(Err(error)) if job.kind == AssetKind::Shader => {
+            return Err(format!(
+                "{}: its packed artifact cannot be read, so its materials draw without it: \
+                 {error}. Export the game again",
+                job.rel
+            ));
+        }
         Some(Err(error)) => return Err(format!("{}: its packed artifact {error}", job.rel)),
         None => {
             return Err(format!(
@@ -198,9 +238,10 @@ fn unpack(job: &Job, cache: &Cache, key: CacheKey) -> Result<Imported, String> {
     })
 }
 
-fn payload(artifact: Artifact) -> Payload {
+pub(super) fn payload(artifact: Artifact) -> Payload {
     match artifact {
         Artifact::Texture(texture) => Payload::Texture(texture),
+        Artifact::Shader(shader) => Payload::Shader(shader),
         Artifact::Mesh(mesh) => {
             let preview = render_mesh(&mesh);
             Payload::Mesh(mesh, preview)
@@ -323,7 +364,10 @@ fn serve(shared: &Shared, cache: &Cache, results: &Sender<Done>) {
 /// bug in a decoder or an encoder must fail alone: if it took the thread with
 /// it, every later import would wait forever and the browser would say
 /// "importing" until the editor closed.
-fn guarded(rel: &str, run: impl FnOnce() -> Result<Imported, String>) -> Result<Imported, String> {
+fn guarded(
+    rel: &str,
+    run: impl FnOnce() -> Result<Imported, ImportError>,
+) -> Result<Imported, ImportError> {
     // Unwind-safe in fact: the job and the cache are only read, and the cache
     // is written through a temporary file and a rename, so a panic part-way
     // leaves nothing a later import would trust.
@@ -333,10 +377,10 @@ fn guarded(rel: &str, run: impl FnOnce() -> Result<Imported, String>) -> Result<
             .map(|message| (*message).to_owned())
             .or_else(|| panic.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "with no message".to_owned());
-        Err(format!(
+        Err(ImportError::from(format!(
             "{rel} could not be imported: the importer panicked ({message}). This is an \
              engine bug; the file is worth keeping for a report"
-        ))
+        )))
     })
 }
 
@@ -350,7 +394,7 @@ mod tests {
             panic!("a panic is a failed import");
         };
         assert_eq!(
-            err,
+            err.message,
             "rocks/rock.png could not be imported: the importer panicked (seed table \
              overflow). This is an engine bug; the file is worth keeping for a report"
         );

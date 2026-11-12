@@ -6,7 +6,9 @@
 //! `replace_mesh` change what the next frame samples and rasterises, through
 //! the arena, the bindless texture array and GPU culling, without the handle
 //! an entity holds ever changing — and, on a device that samples BC, that the
-//! compressed chain is what is uploaded and what the shaders read right.
+//! compressed chain is what is uploaded and what the shaders read right. A
+//! surface shader is the same promise for `replace_surface_shader`: a save is
+//! recompiled into the handle the material already reads through.
 //!
 //! `#[ignore]`d for the reason `offscreen.rs` is: it needs a GPU. Run it with:
 //!
@@ -142,7 +144,7 @@ fn cached(world: &World, id: orrin_registry::AssetId) -> TextureLevels {
     let bytes = std::fs::read(db.cache_dir().join(key.to_string())).unwrap();
     match Artifact::decode(&bytes).unwrap() {
         Artifact::Texture(texture) => texture,
-        Artifact::Mesh(_) => panic!("a texture"),
+        other => panic!("a texture, not {other:?}"),
     }
 }
 
@@ -196,6 +198,7 @@ fn an_edited_texture_and_mesh_reach_the_next_frame() {
             albedo: Some(paint),
             ..Default::default()
         },
+        ..Default::default()
     };
     dir.write("painted.omat", material::write(&painted).as_bytes());
     let target = Target::of(&renderer);
@@ -286,7 +289,7 @@ fn leaning_normal_map(target: Target) -> TextureLevels {
     .unwrap()
     {
         Artifact::Texture(texture) => texture,
-        Artifact::Mesh(_) => panic!("a texture"),
+        other => panic!("a texture, not {other:?}"),
     }
 }
 
@@ -406,6 +409,7 @@ fn brick(base_color: Vec3) -> String {
             ..Material::default()
         },
         textures: material::MaterialTextures::default(),
+        ..Default::default()
     })
 }
 
@@ -546,7 +550,11 @@ fn an_inspector_edit_of_a_material_reaches_the_next_frame_and_its_file() {
     let drawn = centre(&capture::render(&mut world, &mut renderer, &settings));
     assert!(is_red(drawn), "a red material draws red: {drawn:?}");
 
-    let mut green = *world.resource::<AssetDatabase>().material_file(id).unwrap();
+    let mut green = world
+        .resource::<AssetDatabase>()
+        .material_file(id)
+        .unwrap()
+        .clone();
     green.material.base_color = Vec3::new(0.0, 1.0, 0.0);
     let mut editor = SceneEditor::new(&mut world, &registry, &mut history);
     editor.set_material(id, green).unwrap();
@@ -564,4 +572,173 @@ fn an_inspector_edit_of_a_material_reaches_the_next_frame_and_its_file() {
     let drawn = centre(&capture::render(&mut world, &mut renderer, &settings));
     assert!(is_red(drawn), "undone to red: {drawn:?}");
     assert_eq!(on_disk(), brick(Vec3::new(1.0, 0.0, 0.0)));
+}
+
+/// A surface shader whose default tint is `rgb`, written over the albedo.
+#[cfg(feature = "shader-compiler")]
+fn tint_shader(rgb: &str) -> String {
+    format!(
+        "param color tint = ({rgb}, 1.0);\n\
+         void surface(in SurfaceIn i, inout SurfaceOut o) {{\n    o.albedo = tint.rgb;\n}}\n"
+    )
+}
+
+/// A `.oshader` saved on disk reaches the screen: the material drawn through
+/// it shows the shader's colour, a resave recompiles it into the same handle,
+/// a save that does not compile changes no pixel and says where it is wrong,
+/// and the next good save recovers.
+#[cfg(feature = "shader-compiler")]
+#[test]
+#[ignore = "needs a GPU"]
+fn an_edited_surface_shader_reaches_the_next_frame_and_a_broken_one_changes_nothing() {
+    surface_shader_reload(capture::offscreen_renderer, "shader");
+}
+
+/// [`an_edited_surface_shader_reaches_the_next_frame_and_a_broken_one_changes_nothing`]
+/// on the native Metal driver, which loads the artifact's MSL rather than its
+/// SPIR-V.
+#[cfg(all(feature = "shader-compiler", target_os = "macos"))]
+#[test]
+#[ignore = "needs a Metal device"]
+fn an_edited_surface_shader_reaches_the_next_frame_on_metal() {
+    surface_shader_reload(
+        |extent| VulkanRenderer::offscreen_metal(extent).expect("a Metal device"),
+        "shader-metal",
+    );
+}
+
+#[cfg(feature = "shader-compiler")]
+fn surface_shader_reload(renderer: fn([u32; 2]) -> VulkanRenderer, name: &str) {
+    use orrin_core::asset_db::material::MaterialFile;
+    orrin_core::logging::init(orrin_core::logging::LogConfig::for_this_build());
+    let settings = CaptureSettings {
+        extent: [128, 128],
+        camera: Some(Camera {
+            position: Vec3::new(0.0, 0.0, 3.0),
+            target: Vec3::ZERO,
+            ..Camera::default()
+        }),
+        ..CaptureSettings::default()
+    };
+    let mut renderer = renderer(settings.extent);
+    let mut world = World::new();
+    capture::prepare(&mut world, &mut renderer, &settings);
+    let hdr = HdrSettings {
+        auto_exposure: false,
+        exposure_compensation: 3.0,
+        ..*world.resource::<HdrSettings>()
+    };
+    world.insert_resource(hdr);
+    let drawn: Vec<_> = world
+        .entities()
+        .filter(|&entity| world.has::<MeshHandle>(entity))
+        .collect();
+    for entity in drawn {
+        world.despawn(entity);
+    }
+
+    let dir = Dir::new(name);
+    dir.write("quad.gltf", quad_gltf(0.0).as_bytes());
+    dir.write("quad.bin", &quad_bin());
+    dir.write("glow.oshader", tint_shader("1.0, 0.0, 0.0").as_bytes());
+    let glow: orrin_registry::AssetId = "5f0c3a4e-0000-4000-8000-0000000000e1".parse().unwrap();
+    dir.write("glow.oshader.meta", format!("id = \"{glow}\"\n").as_bytes());
+    let brick = MaterialFile {
+        material: Material {
+            base_color: Vec3::ONE,
+            metallic: 0.0,
+            roughness: 1.0,
+            ..Material::default()
+        },
+        shader: Some(glow),
+        ..MaterialFile::default()
+    };
+    dir.write("brick.omat", material::write(&brick).as_bytes());
+    let target = Target::of(&renderer);
+    let (db, issues) = AssetDatabase::open_for(dir.path(), dir.path().join(".cache"), target);
+    assert!(issues.is_empty(), "{issues:?}");
+    let quad = db.find("quad.gltf").unwrap().id;
+    let brick = db.find("brick.omat").unwrap().id;
+    world.insert_resource(db);
+    let mesh = world.resource_mut::<AssetDatabase>().mesh(quad).unwrap();
+    let pending = world
+        .resource_mut::<AssetDatabase>()
+        .material(brick)
+        .unwrap();
+    let entity = world.spawn();
+    world.insert(entity, LocalTransform::new(Transform::default()));
+    world.insert(entity, mesh);
+    world.insert(entity, pending);
+    for _ in 0..3 {
+        between_frames(&mut world, &mut renderer);
+        assert!(world.resource::<AssetDatabase>().wait_idle(WAIT));
+    }
+    let handle = world
+        .resource_mut::<AssetDatabase>()
+        .surface_shader(glow)
+        .unwrap()
+        .expect("loaded");
+
+    let drawn = centre(&capture::render(&mut world, &mut renderer, &settings));
+    println!("drawn through the red shader: {drawn:?}");
+    assert!(is_red(drawn), "the shader's red: {drawn:?}");
+
+    edit(
+        &mut world,
+        &mut renderer,
+        &dir,
+        "glow.oshader",
+        tint_shader("0.0, 1.0, 0.0").as_bytes(),
+    );
+    let drawn = centre(&capture::render(&mut world, &mut renderer, &settings));
+    println!("resaved green: {drawn:?}");
+    assert!(is_green(drawn), "resaved green: {drawn:?}");
+
+    let broken = "param color tint = (0.0, 0.0, 1.0, 1.0);\n\
+                  void surface(in SurfaceIn i, inout SurfaceOut o) {\n    o.albedo = tint.rgb * nothing_by_this_name;\n}\n";
+    edit(
+        &mut world,
+        &mut renderer,
+        &dir,
+        "glow.oshader",
+        broken.as_bytes(),
+    );
+    let still = centre(&capture::render(&mut world, &mut renderer, &settings));
+    println!("after a broken save: {still:?}");
+    assert_eq!(
+        still, drawn,
+        "a save that does not compile changes no pixel"
+    );
+    let errors = world
+        .resource::<AssetDatabase>()
+        .shader_errors(glow)
+        .to_vec();
+    println!("{errors:#?}");
+    assert!(!errors.is_empty());
+    assert!(
+        errors.iter().all(|error| error.line == Some(3)),
+        "{errors:?}"
+    );
+
+    edit(
+        &mut world,
+        &mut renderer,
+        &dir,
+        "glow.oshader",
+        tint_shader("1.0, 0.0, 0.0").as_bytes(),
+    );
+    let drawn = centre(&capture::render(&mut world, &mut renderer, &settings));
+    println!("recovered red: {drawn:?}");
+    assert!(is_red(drawn), "recovered: {drawn:?}");
+    let db = world.resource::<AssetDatabase>();
+    assert!(db.shader_errors(glow).is_empty());
+    drop(db);
+    assert_eq!(
+        world
+            .resource_mut::<AssetDatabase>()
+            .surface_shader(glow)
+            .unwrap(),
+        Some(handle),
+        "one handle throughout"
+    );
 }

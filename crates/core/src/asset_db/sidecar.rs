@@ -54,6 +54,8 @@ pub enum AssetKind {
     /// A WAV, Ogg Vorbis or MP3 file, decoded as it is by `audio`.
     Audio,
     Folder,
+    /// A `.oshader` surface shader, compiled on import.
+    Shader,
 }
 
 impl AssetKind {
@@ -73,6 +75,7 @@ impl AssetKind {
             crate::scene::loaded::EXTENSION => Some(Self::Scene),
             "ttf" | "otf" => Some(Self::Font),
             "wav" | "ogg" | "mp3" => Some(Self::Audio),
+            super::shader::EXTENSION => Some(Self::Shader),
             _ => None,
         }
     }
@@ -88,6 +91,7 @@ impl AssetKind {
             Self::Font => "font",
             Self::Audio => "sound",
             Self::Folder => "folder",
+            Self::Shader => "surface shader",
         }
     }
 }
@@ -170,7 +174,8 @@ impl Settings {
             | AssetKind::Scene
             | AssetKind::Font
             | AssetKind::Audio
-            | AssetKind::Folder => Self::None,
+            | AssetKind::Folder
+            | AssetKind::Shader => Self::None,
         }
     }
 
@@ -476,6 +481,10 @@ mod tests {
         assert_eq!(AssetKind::of_path("sfx/door.WAV"), Some(AssetKind::Audio));
         assert_eq!(AssetKind::of_path("theme.ogg"), Some(AssetKind::Audio));
         assert_eq!(AssetKind::of_path("theme.mp3"), Some(AssetKind::Audio));
+        assert_eq!(
+            AssetKind::of_path("fx/glow.oshader"),
+            Some(AssetKind::Shader)
+        );
         assert_eq!(AssetKind::of_path("tree.bin"), None);
         assert_eq!(AssetKind::of_path("a.png.meta"), None);
         assert_eq!(AssetKind::of_path("png"), None);

@@ -12,6 +12,7 @@ pub mod rhi;
 pub mod sh;
 pub mod shaders;
 pub mod shadows;
+pub mod surface;
 mod texel;
 pub mod thumbnail;
 pub mod ui;
@@ -858,6 +859,37 @@ pub trait RenderBackend {
     /// Baking is synchronous — it happens once, at load, and the alternative is
     /// a half-written cubemap visible to the first frame.
     fn load_environment(&mut self, pixels: &[f32], width: u32, height: u32);
+    /// Load a compiled surface shader. Refused if it was compiled by another
+    /// build, lacks a variant this renderer draws with, would be one more than
+    /// [`MAX_SURFACE_SHADERS`](vulkan::MAX_SURFACE_SHADERS), or does not build
+    /// a pipeline.
+    fn load_surface_shader(
+        &mut self,
+        artifact: &surface::SurfaceArtifact,
+    ) -> Result<surface::SurfaceShaderHandle, surface::SurfaceShaderError>;
+    /// Swap what `shader` draws with, staged: everything the new artifact needs
+    /// is built before anything changes, so on an error the old one keeps
+    /// drawing and nothing else moved. On success the next frame draws with
+    /// it, every material using it is repacked from its named values, and what
+    /// the new parameters ignore of those values comes back per material.
+    fn replace_surface_shader(
+        &mut self,
+        shader: surface::SurfaceShaderHandle,
+        artifact: &surface::SurfaceArtifact,
+    ) -> Result<Vec<(MaterialHandle, surface::Ignored)>, surface::SurfaceShaderError>;
+    /// Read `material`'s surface through a loaded shader with these values, by
+    /// parameter name, or through none. A texture value is the index the caller
+    /// resolved its image to. Returns what the shader ignores of the values.
+    fn set_material_surface(
+        &mut self,
+        material: MaterialHandle,
+        surface: Option<(
+            surface::SurfaceShaderHandle,
+            &[(String, surface::ParamValue)],
+        )>,
+    ) -> Result<Vec<surface::Ignored>, surface::SurfaceShaderError>;
+    /// The parameters a loaded shader declares, as last loaded or replaced.
+    fn surface_params(&self, shader: surface::SurfaceShaderHandle) -> Option<&surface::ParamTable>;
     fn resize(&mut self, extent: [u32; 2]);
     /// `dt` is the seconds elapsed since the last frame — what any temporal
     /// effect a backend runs needs, exposure adaptation being the first of them.

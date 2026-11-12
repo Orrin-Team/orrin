@@ -26,6 +26,12 @@
 //!
 //! `ORRIN_PIPELINE_CACHE` overrides the path; setting it empty turns the cache
 //! off, which is what a cold-start measurement wants.
+//!
+//! **Only built-in shaders go in.** A pipeline with a stage loaded at run time —
+//! a surface shader's twin — is built with no cache: every save of a shader is a
+//! new module, nothing here prunes, and MoltenVK compiles every shader the blob
+//! holds when the cache is created. A 28 MB cache grown that way held the
+//! editor's window for 85 s on a cold Metal shader cache.
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -1,0 +1,54 @@
+// A bed of coals: heat climbs through the object in slow cells, each one
+// glowing where it is hot and crusting over to charcoal where it is not.
+//
+// Where rising_bands.oshader adds a light of its own, this one only moves the
+// light its material already has: `o.emissive` arrives holding the material's
+// emission, and the function decides where on the body that emission is.
+
+// How far the heat climbs in a second, in metres.
+param float rise = 0.12 : range(0, 1);
+// The size of one coal, in metres.
+param float coal = 0.14 : range(0.03, 0.6);
+// How fast a coal breathes brighter and dimmer.
+param float flicker = 1.6 : range(0, 8);
+// What the hottest coal multiplies the material's emission by.
+param float peak = 4.5 : range(1, 12);
+
+// A shader may define helpers beside `surface`. They share the engine's
+// shader with everything else in it, so give them names of their own.
+float ember_hash(vec3 p) {
+    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yxz + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+// Value noise: a hash at each lattice corner, blended smoothly.
+float ember_noise(vec3 p) {
+    vec3 cell = floor(p);
+    vec3 t = fract(p);
+    t = t * t * (3.0 - 2.0 * t);
+    float x00 = mix(ember_hash(cell), ember_hash(cell + vec3(1, 0, 0)), t.x);
+    float x10 = mix(ember_hash(cell + vec3(0, 1, 0)), ember_hash(cell + vec3(1, 1, 0)), t.x);
+    float x01 = mix(ember_hash(cell + vec3(0, 0, 1)), ember_hash(cell + vec3(1, 0, 1)), t.x);
+    float x11 = mix(ember_hash(cell + vec3(0, 1, 1)), ember_hash(cell + vec3(1, 1, 1)), t.x);
+    return mix(mix(x00, x10, t.y), mix(x01, x11, t.y), t.z);
+}
+
+void surface(in SurfaceIn i, inout SurfaceOut o) {
+    // In world space, so the pattern belongs to the fire rather than to the
+    // mesh's UVs, and it is the pattern that moves: the mesh stands still.
+    vec3 p = i.world_position / coal;
+    p.y -= i.time * rise / coal;
+
+    // Two octaves for the shape of the coals, and a third that only moves in
+    // time, which is the breathing.
+    float shape = ember_noise(p) * 0.65 + ember_noise(p * 2.7 + 19.0) * 0.35;
+    float breath = ember_noise(vec3(p.xz * 0.6, i.time * flicker));
+    float heat = smoothstep(0.38, 0.78, shape + (breath - 0.5) * 0.25);
+
+    // Cubed, so the light gathers in the cracks instead of washing the body.
+    float glow = heat * heat * heat;
+    o.emissive *= glow * peak;
+    o.albedo = mix(vec3(0.015), o.albedo, heat);
+    o.roughness = mix(1.0, 0.7, heat);
+}

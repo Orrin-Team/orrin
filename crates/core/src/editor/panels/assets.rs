@@ -79,6 +79,8 @@ enum Action {
     Rescan,
     /// A material at the default parameters, in this folder.
     NewMaterial(String),
+    /// The surface shader template, in this folder.
+    NewShader(String),
     /// Edit this path's name in place, starting from this text.
     StartRename(String, String),
     Rename(String, String),
@@ -286,6 +288,13 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
                 Err(error) => log_error(world, error),
             }
         }
+        Some(Action::NewShader(folder)) => {
+            let created = world.resource_mut::<AssetDatabase>().create_shader(&folder);
+            match created {
+                Ok(id) => state.revealed_asset = Some(id),
+                Err(error) => log_error(world, error),
+            }
+        }
         Some(Action::StartRename(path, text)) => {
             place.renaming = Some(Renaming {
                 path,
@@ -470,6 +479,10 @@ fn rename_item(ui: &mut egui::Ui, path: &str, name: &str, action: &mut Option<Ac
 fn new_material_item(ui: &mut egui::Ui, folder: &str, action: &mut Option<Action>) {
     if ui.button("New material").clicked() {
         *action = Some(Action::NewMaterial(folder.to_owned()));
+        ui.close_menu();
+    }
+    if ui.button("New surface shader").clicked() {
+        *action = Some(Action::NewShader(folder.to_owned()));
         ui.close_menu();
     }
 }
@@ -664,7 +677,7 @@ const SORTS: [(AssetSort, &str); 4] = [
 
 /// The kinds the browser can be narrowed to. Folders are not among them: a
 /// kind lists the whole project, where a folder has nowhere to be opened.
-const KINDS: [(AssetKind, &str); 7] = [
+const KINDS: [(AssetKind, &str); 8] = [
     (AssetKind::Texture, "Textures"),
     (AssetKind::Mesh, "Meshes"),
     (AssetKind::Material, "Materials"),
@@ -672,6 +685,7 @@ const KINDS: [(AssetKind, &str); 7] = [
     (AssetKind::Scene, "Scenes"),
     (AssetKind::Font, "Fonts"),
     (AssetKind::Audio, "Sounds"),
+    (AssetKind::Shader, "Surface shaders"),
 ];
 
 fn plural(kind: AssetKind) -> String {
@@ -807,7 +821,7 @@ impl Cells<'_> {
         }
         response
             .on_hover_text(format!(
-                "{}\nRight-click to rename, tint, or make a material in it",
+                "{}\nRight-click to rename, tint, or make a material or shader in it",
                 folder.path
             ))
             .context_menu(|ui| {
@@ -879,6 +893,11 @@ impl Cells<'_> {
                 weak,
                 "Double-click to hear it, or drag onto an audio source's clip",
             ),
+            AssetKind::Shader => (
+                icons::file_code(),
+                weak,
+                "Double-click to edit it. Assign it to a material asset to draw through it",
+            ),
             AssetKind::Prefab | AssetKind::Folder => (icons::layers(), weak, PLACE_HINT),
         };
         let (status, detail) = match (&entry.status, self.db.state(entry.id)) {
@@ -923,6 +942,9 @@ impl Cells<'_> {
         if entry.kind == AssetKind::Audio && response.double_clicked() {
             *self.action = Some(Action::TogglePreview(entry.id));
         }
+        if entry.kind == AssetKind::Shader && response.double_clicked() {
+            self.state.open_shader(entry.id);
+        }
         if entry.kind == AssetKind::Scene && response.double_clicked() {
             let path = self.db.dir().join(&entry.path);
             self.state.request_open_scene(path.to_string_lossy());
@@ -932,6 +954,10 @@ impl Cells<'_> {
         response
             .on_hover_text(format!("{}\n{}\n{detail}\n{hint}", entry.path, entry.id))
             .context_menu(|ui| {
+                if entry.kind == AssetKind::Shader && ui.button("Edit").clicked() {
+                    self.state.open_shader(entry.id);
+                    ui.close_menu();
+                }
                 rename_item(ui, &entry.path, entry.name(), self.action);
                 if ui.button("Import settings").clicked() {
                     self.state.revealed_asset = Some(entry.id);

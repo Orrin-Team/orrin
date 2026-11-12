@@ -66,10 +66,10 @@ pub struct ExposurePass {
 impl ExposurePass {
     pub fn new(device: &Device) -> Self {
         let histogram_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
-            shader: ShaderId::LuminanceHistogramComp,
+            shader: ShaderId::LuminanceHistogramComp.into(),
         });
         let average_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
-            shader: ShaderId::LuminanceAverageComp,
+            shader: ShaderId::LuminanceAverageComp.into(),
         });
 
         let sampler = device.create_sampler(SamplerDesc {

@@ -11,7 +11,7 @@ Join the [discord](https://discord.gg/sY8YBGFmRy) to discuss the development or 
 
 * **Fit to purpose** - Select the options and features you need for your game and not be held back by the unnecessary. Many game engines are generalized this game engine is makes it your own.
 
-* **Iteration** - Test and change code on the run. Orrin allows you to edit and test code while running the project unlike many mainstream engines.
+* **Iteration** - Test and change code on the run. Orrin allows you to edit and test code, and the surface shaders your materials are drawn with, while running the project unlike many mainstream engines.
 
 * **Real Time Collaboration** - (Feature not released) Orrin allows you to edit projects with teams of people in real time without conflict. 
 
@@ -47,6 +47,18 @@ cd my-game
 `orrin new` scaffolds the manifest, a `.csproj`, and an entry `Behaviour`;
 `orrin run` builds the scripts, indexes the assets, and launches the engine on
 the project. See [`crates/orrin-cli/README.md`](crates/orrin-cli/README.md).
+
+### Surface shaders
+
+A material can be drawn through a surface shader: a `.oshader` file of GLSL
+that declares its parameters and rewrites what the surface is (albedo,
+roughness, emission, normal) while the engine still lights, shadows and
+reflects it. Edit one in the editor's Shader tab, or in any editor, and save:
+it recompiles and the materials using it change within a frame or two, and one
+that does not compile leaves the last good version drawing. An exported game
+ships the compiled shaders, not a compiler.
+[`examples/hello-orrin`](examples/hello-orrin/README.md#writing-a-surface-shader)
+has one, and says how to write your own.
 
 ## Contributing
 

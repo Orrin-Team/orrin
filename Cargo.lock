@@ -3127,6 +3127,7 @@ dependencies = [
  "orrin-project",
  "orrin-registry",
  "orrin-script",
+ "orrin-shaderc",
  "pollster",
  "raw-window-metal",
  "rayon",
@@ -3135,8 +3136,6 @@ dependencies = [
  "ron",
  "rusty_dds",
  "serde",
- "shaderc",
- "spirv-cross2",
  "sysinfo",
  "toml",
  "tracing",
@@ -3224,6 +3223,14 @@ version = "0.1.0"
 dependencies = [
  "netcorehost",
  "orrin-ecs",
+]
+
+[[package]]
+name = "orrin-shaderc"
+version = "0.1.0"
+dependencies = [
+ "shaderc",
+ "spirv-cross2",
 ]
 
 [[package]]

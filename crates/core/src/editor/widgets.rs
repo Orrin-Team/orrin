@@ -118,6 +118,34 @@ pub fn tool_button(
     state: Tool,
     hint: &str,
 ) -> egui::Response {
+    tool_button_with(ui, icon, tint, text, state, hint, false)
+}
+
+/// A [`Tool::Command`] button naming the current choice, with the chevron
+/// [`asset_slot`] draws after it, so it reads as opening a list rather than
+/// doing something.
+pub fn picker_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    text: egui::RichText,
+    hint: &str,
+) -> egui::Response {
+    tool_button_with(ui, icon, None, Some(text), Tool::Command, hint, true)
+}
+
+/// How much wider [`picker_button`] is than [`tool_button`] with the same text.
+pub const PICKER_CHEVRON: f32 = CHEVRON + 4.0;
+const CHEVRON: f32 = 12.0;
+
+fn tool_button_with(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    tint: Option<egui::Color32>,
+    text: Option<egui::RichText>,
+    state: Tool,
+    hint: &str,
+    chevron: bool,
+) -> egui::Response {
     const PAD: f32 = 5.0;
     let height = ui.spacing().interact_size.y + 2.0;
     let glyph = icons::ROW - 2.0;
@@ -131,7 +159,7 @@ pub fn tool_button(
     });
     let width = galley.as_ref().map_or(height, |galley| {
         PAD + glyph + PAD + galley.size().x + PAD + 1.0
-    });
+    }) + if chevron { PICKER_CHEVRON } else { 0.0 };
     let sense = if state == Tool::Disabled {
         Sense::hover()
     } else {
@@ -177,7 +205,18 @@ pub fn tool_button(
     icons::paint(ui, icon, at, colour);
     if let Some(galley) = galley {
         let at = egui::pos2(at.right() + PAD, rect.center().y - galley.size().y / 2.0);
-        ui.painter().galley(at, galley, colour);
+        // The galley was laid out with the text colour already resolved, so
+        // the state's colour has to override it rather than be a fallback.
+        ui.painter()
+            .galley_with_override_text_color(at, galley, colour);
+    }
+    if chevron {
+        let at = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - PAD - CHEVRON / 2.0, rect.center().y),
+            egui::Vec2::splat(CHEVRON),
+        );
+        let weak = ui.visuals().weak_text_color();
+        icons::paint(ui, icons::chevron_down(), at, weak);
     }
 
     response.on_hover_text(hint)
@@ -532,7 +571,7 @@ pub fn asset_slot(
     );
     let chevron = egui::Rect::from_center_size(
         egui::pos2(rect.right() - 12.0, rect.center().y),
-        egui::Vec2::splat(12.0),
+        egui::Vec2::splat(CHEVRON),
     );
     icons::paint(ui, icons::chevron_down(), chevron, weak);
 

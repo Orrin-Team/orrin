@@ -1,0 +1,49 @@
+// Water: a flat surface that moves by its normal alone.
+//
+// A surface shader cannot move a vertex, so these waves are not geometry. The
+// mesh stays a plane and only the direction each pixel faces changes, which is
+// all the lighting asks about: the sky reflected off it wobbles, and on a
+// material whose blend is Transmissive (water.omat) so does everything seen
+// through it, because the engine bends that view by this normal.
+
+// How many of the longest waves fit across the surface.
+param float ripples = 5.0 : range(1, 40);
+// How far the waves tip the surface. 0 is a mirror.
+param float steepness = 0.3 : range(0, 1);
+param float speed = 1.0 : range(0, 4);
+// The way the waves travel, along the surface's UVs.
+param vec2 wind = (1.0, 0.35);
+
+// The slope of the surface at `uv`: a handful of wave trains, each shorter
+// and fainter than the last and heading a little off the wind.
+vec2 water_slope(vec2 uv, float time) {
+    vec2 heading = normalize(wind);
+    vec2 slope = vec2(0.0);
+    float frequency = ripples * 6.2831853;
+    float weight = 1.0;
+    for (int train = 0; train < 7; ++train) {
+        float turn = sin(float(train) * 1.7) * 0.9;
+        vec2 dir = vec2(
+            cos(turn) * heading.x - sin(turn) * heading.y,
+            sin(turn) * heading.x + cos(turn) * heading.y);
+        // Short waves travel slower than long ones, as they do on real water,
+        // which is what stops the pattern repeating as one rigid sheet.
+        float phase = dot(dir, uv) * frequency - time * speed * sqrt(frequency);
+        // exp(sin - 1) has a sharper crest and a flatter trough than a sine.
+        float crest = exp(sin(phase) - 1.0) * cos(phase);
+        slope += dir * crest * weight;
+        // Each train is pushed sideways by the one before it.
+        uv += dir * crest * weight * 0.25 / frequency;
+        frequency *= 1.41;
+        weight *= 0.78;
+    }
+    return slope;
+}
+
+void surface(in SurfaceIn i, inout SurfaceOut o) {
+    // Along the UVs rather than in world space, unlike rising_bands.oshader:
+    // `o.normal` is in tangent space, whose axes are the UVs' own, so a slope
+    // measured along them needs no change of basis on any mesh.
+    vec2 slope = water_slope(i.uv, i.time) * steepness;
+    o.normal = normalize(vec3(-slope, 1.0));
+}

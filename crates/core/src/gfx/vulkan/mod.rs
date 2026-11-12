@@ -33,6 +33,7 @@ mod shadow;
 mod ssao;
 mod ssr;
 mod subsurface;
+mod surface;
 mod swapchain;
 mod taa;
 mod texture;
@@ -133,6 +134,9 @@ use self::timestamps::GpuTimestamps;
 
 use self::convert::{engine_format, vk_format};
 use self::driver::{VkDriver, VkEncoder};
+use super::surface::{
+    Ignored, ParamTable, ParamValue, SurfaceArtifact, SurfaceShaderError, SurfaceShaderHandle,
+};
 use super::{
     DrawList, MAX_TEXTURES, Material, RenderBackend, SceneLighting, TextureHandle, TextureLevels,
 };
@@ -164,6 +168,7 @@ pub(crate) const MSAA_SAMPLES: crate::gfx::format::SampleCount =
 pub(crate) const OFFSCREEN_FORMAT: crate::gfx::format::Format =
     crate::gfx::format::Format::Rgba8Srgb;
 
+pub use cull::MAX_SURFACE_SHADERS;
 pub use gizmo::GizmoVertex;
 pub use outline::OutlineItem;
 pub use overlay::OverlayFrame;
@@ -335,6 +340,12 @@ pub struct VulkanRenderer {
     /// A second window drawing only a UI frame, while one is open. See
     /// `ui_window`.
     ui_window: Option<ui_window::UiWindow>,
+    /// Every loaded surface shader, its twins, and the parameter buffer. See
+    /// `surface`.
+    surfaces: surface::SurfaceShaders,
+    /// Each material's blend mode, by handle: which queue draws it, and so
+    /// which twins a surface shader reading it needs.
+    blends: Vec<crate::gfx::BlendMode>,
 }
 
 /// The frame's commands as they are being recorded: a Vulkan command buffer, or
@@ -503,6 +514,80 @@ pub(crate) struct VkBackend {
 }
 
 impl VulkanRenderer {
+    /// The class `material`'s batches draw in: its built-in one, with the
+    /// surface swapped for a working surface shader that reads it.
+    fn variant_of(&self, material: u32) -> cull::Variant {
+        let built_in = self
+            .materials
+            .get(material as usize)
+            .map_or(cull::Variant::STANDARD, GpuMaterial::built_in_variant);
+        self.surfaces.variant(material, built_in)
+    }
+
+    /// Every material's class, for comparing across a change to `shader`.
+    fn variants_of(&self, shader: SurfaceShaderHandle) -> Vec<cull::Variant> {
+        self.surfaces
+            .book
+            .materials_using(shader)
+            .map(|material| self.variant_of(material.0))
+            .collect()
+    }
+
+    /// The twins a load or a replace builds before it answers: the two every
+    /// opaque material reading the shader needs in the frame's current shape,
+    /// which is also what proves the artifact builds at all.
+    fn first_twins(&self) -> [surface::Twin; 2] {
+        [
+            surface::Twin::Forward {
+                msaa: self.config.msaa,
+                subsurface: self.config.subsurface,
+                masked: false,
+            },
+            surface::Twin::Prepass { masked: false },
+        ]
+    }
+
+    /// Write each material's block start into its record, and rebuild the
+    /// table only if one moved.
+    fn sync_surface_bases(&mut self) {
+        let mut moved = false;
+        for (index, material) in self.materials.iter_mut().enumerate() {
+            let base = self
+                .surfaces
+                .book
+                .base_of(MaterialHandle(index as u32))
+                .unwrap_or(0);
+            moved |= material.set_surface_base(base);
+        }
+        if moved {
+            self.invalidate_material_sets();
+        }
+    }
+
+    /// The texture a surface shader's `black` parameters default to. Made when
+    /// the first shader loads, so a session with none has no such slot.
+    fn create_black_texture(&mut self) {
+        if self.textures.len() >= MAX_TEXTURES {
+            tracing::warn!(
+                "texture cap reached ({MAX_TEXTURES}); a surface shader's black textures \
+                 default to white"
+            );
+            return;
+        }
+        let black =
+            self.device
+                .create_texture_2d(&[0, 0, 0, 255], [1, 1], EngineFormat::Rgba8Unorm);
+        self.surfaces.set_black(self.textures.len() as u32);
+        self.textures.push(black);
+        self.invalidate_texture_sets();
+    }
+
+    /// Hold `i.time` at `seconds`, or let it run again with `None`. For a
+    /// capture, whose pixels must not depend on how long it warmed up.
+    pub fn pin_surface_time(&mut self, seconds: Option<f32>) {
+        self.surfaces.pin_time(seconds);
+    }
+
     /// Retire the material table and every group that binds it. The device frees
     /// them once the frames still reading them are done, so an edit costs a
     /// rebuild on the next frame and nothing once it is let go.
@@ -804,6 +889,8 @@ impl VulkanRenderer {
             #[cfg(target_os = "macos")]
             metal_overlay: None,
             ui_window: None,
+            surfaces: surface::SurfaceShaders::new(0, 1),
+            blends: vec![crate::gfx::BlendMode::default()],
             backend,
         }
     }
@@ -1347,16 +1434,26 @@ impl RenderBackend for VulkanRenderer {
     fn load_material(&mut self, material: &Material) -> MaterialHandle {
         let handle = MaterialHandle(self.materials.len() as u32);
         self.materials.push(forward::to_gpu_material(material));
+        self.blends.push(material.blend);
         self.invalidate_material_sets();
         handle
     }
 
     fn update_material(&mut self, handle: MaterialHandle, material: &Material) {
-        let Some(slot) = self.materials.get_mut(handle.0 as usize) else {
+        if handle.0 as usize >= self.materials.len() {
             tracing::warn!("material {} was never loaded; edit ignored", handle.0);
             return;
-        };
+        }
+        let before = self.variant_of(handle.0);
+        let slot = &mut self.materials[handle.0 as usize];
         *slot = forward::to_gpu_material(material);
+        slot.set_surface_base(self.surfaces.book.base_of(handle).unwrap_or(0));
+        self.blends[handle.0 as usize] = material.blend;
+        // Masking a material or giving it a lobe moves its batches to another
+        // pipeline's class, which the cull's per-row cache cannot see.
+        if self.variant_of(handle.0) != before {
+            self.cull.forget_classes();
+        }
         // The same invalidation an upload does: the buffer and the sets that
         // bind it are rebuilt on the next frame. An edit costs a rebuild per
         // frame while a slider is dragged, and nothing once it is let go.
@@ -1432,6 +1529,66 @@ impl RenderBackend for VulkanRenderer {
         self.environment
             .set_source(&self.device, pixels, [width, height]);
         self.preview_inputs += 1;
+    }
+
+    fn load_surface_shader(
+        &mut self,
+        artifact: &SurfaceArtifact,
+    ) -> Result<SurfaceShaderHandle, SurfaceShaderError> {
+        if !self.surfaces.has_black() {
+            self.create_black_texture();
+        }
+        let first = self.first_twins();
+        let passes = twin_passes!(self);
+        let build = |twin, fragment| passes.build(twin, fragment);
+        let handle = self.surfaces.load(&self.device, artifact, &first, &build)?;
+        self.preview_inputs += 1;
+        Ok(handle)
+    }
+
+    fn replace_surface_shader(
+        &mut self,
+        shader: SurfaceShaderHandle,
+        artifact: &SurfaceArtifact,
+    ) -> Result<Vec<(MaterialHandle, Ignored)>, SurfaceShaderError> {
+        let first = self.first_twins();
+        let before = self.variants_of(shader);
+        let passes = twin_passes!(self);
+        let build = |twin, fragment| passes.build(twin, fragment);
+        self.surfaces
+            .replace(&self.device, shader, artifact, &first, &build)?;
+        let warnings = self
+            .surfaces
+            .book
+            .replace(shader, artifact.params.clone())?;
+        self.sync_surface_bases();
+        if self.variants_of(shader) != before {
+            self.cull.forget_classes();
+        }
+        self.preview_inputs += 1;
+        Ok(warnings)
+    }
+
+    fn set_material_surface(
+        &mut self,
+        material: MaterialHandle,
+        surface: Option<(SurfaceShaderHandle, &[(String, ParamValue)])>,
+    ) -> Result<Vec<Ignored>, SurfaceShaderError> {
+        if material.0 as usize >= self.materials.len() {
+            return Err(SurfaceShaderError::UnknownMaterial(material));
+        }
+        let before = self.variant_of(material.0);
+        let ignored = self.surfaces.book.attach(material, surface)?;
+        self.sync_surface_bases();
+        if self.variant_of(material.0) != before {
+            self.cull.forget_classes();
+        }
+        self.preview_inputs += 1;
+        Ok(ignored)
+    }
+
+    fn surface_params(&self, shader: SurfaceShaderHandle) -> Option<&ParamTable> {
+        self.surfaces.book.table(shader)
     }
 
     fn resize(&mut self, extent: [u32; 2]) {
@@ -2131,6 +2288,50 @@ impl VulkanRenderer {
         let shadow_material_set = self.shadow_material_set.unwrap();
         let shadow_texture_set = self.shadow_texture_set.unwrap();
 
+        // Every twin this frame draws a material with is built here, before
+        // anything records, so recording only ever looks one up — and a shader
+        // that fails to build one leaves the frame drawing its materials as
+        // standard rather than a pass finding a hole. In the shape the graph
+        // just compiled, since that is the render pass each twin draws in.
+        if self.surfaces.loaded() > 0 {
+            let msaa = self.frame.ids.msaa.is_some();
+            let subsurface = self.frame.ids.subsurface.is_some();
+            let previewed = preview
+                .as_ref()
+                .map(|(_, request)| request.subject.material.0);
+            let (materials, blends) = (&self.materials, &self.blends);
+            let wants = |material: u32| {
+                use crate::gfx::BlendMode;
+                use surface::Twin;
+                let masked = materials[material as usize].is_masked();
+                let preview =
+                    (previewed == Some(material)).then_some(Twin::MaterialPreview { masked });
+                match blends[material as usize] {
+                    BlendMode::Opaque | BlendMode::Masked => [
+                        Some(Twin::Forward {
+                            msaa,
+                            subsurface,
+                            masked,
+                        }),
+                        Some(Twin::Prepass { masked }),
+                        preview,
+                    ],
+                    BlendMode::Blend => [Some(Twin::Transparency), None, preview],
+                    BlendMode::Transmissive => [Some(Twin::Refraction), None, preview],
+                }
+            };
+            let passes = twin_passes!(self);
+            let build = |twin, fragment| passes.build(twin, fragment);
+            if self.surfaces.ensure(wants, &build) {
+                self.cull.forget_classes();
+                self.preview_inputs += 1;
+            }
+        }
+        let surface_frame = self.surfaces.begin_frame(&self.device, dt);
+        // Read once, and written into the lighting block and the prepass's
+        // camera block alike, so the prepass cuts where the forward pass shades.
+        let surface_time = surface_frame.map_or(0.0, |frame| frame.time);
+
         // The output this redraw writes is named for the resolve here, and the
         // redraw counted as done: nothing past this point abandons the frame.
         let preview_frame = match (self.frame.ids.material_preview, &preview) {
@@ -2168,15 +2369,23 @@ impl VulkanRenderer {
                     material_set,
                     texture_set,
                     object_set,
+                    surface_time,
                 );
-                let gpu = &self.materials[material.0 as usize];
+                let variant = self.variant_of(material.0);
+                let surfaces = surface::Surfaces {
+                    shaders: &self.surfaces,
+                    frame: surface_frame,
+                };
+                let twin = surface::Twin::MaterialPreview {
+                    masked: variant.masked,
+                };
                 let camera = material_preview::camera(request.subject.orbit);
                 Some(material_preview::PreviewFrame {
                     sets,
-                    variant: cull::Variant {
-                        masked: gpu.is_masked(),
-                        lobed: gpu.is_lobed(),
-                    },
+                    variant,
+                    surface: surfaces
+                        .for_material(material.0, twin)
+                        .zip(surfaces.group(twin)),
                     view_proj: camera.projection(1.0) * camera.view(),
                     exposure: request.exposure,
                 })
@@ -2243,6 +2452,7 @@ impl VulkanRenderer {
         let cull_frame = {
             let meshes = &self.meshes;
             let materials = &self.materials;
+            let surfaces = &self.surfaces;
             self.cull.prepare(
                 &self.device,
                 draws,
@@ -2252,11 +2462,10 @@ impl VulkanRenderer {
                         .map(|mesh| (mesh.span, mesh.bounds))
                 },
                 |material| {
-                    let material = materials.get(material as usize);
-                    cull::Variant {
-                        masked: material.is_some_and(GpuMaterial::is_masked),
-                        lobed: material.is_some_and(GpuMaterial::is_lobed),
-                    }
+                    let built_in = materials
+                        .get(material as usize)
+                        .map_or(cull::Variant::STANDARD, GpuMaterial::built_in_variant);
+                    surfaces.variant(material, built_in)
                 },
                 cull_views.len() as u32,
             )
@@ -2299,7 +2508,7 @@ impl VulkanRenderer {
             .frame
             .ids
             .prepass
-            .map(|_| self.prepass.begin_frame(&self.device, &view));
+            .map(|_| self.prepass.begin_frame(&self.device, &view, surface_time));
         // The AO extent rather than the frame's: the noise tiles per AO texel,
         // so a half-res target that scaled the pattern by the window would
         // stretch the rotation across two pixels and band the result.
@@ -2411,6 +2620,7 @@ impl VulkanRenderer {
             self.fog
                 .volume_or_fallback(self.frame.ids.fog.map(|ids| self.table.texture(ids.volume))),
             self.fog.sampler(),
+            surface_time,
         );
 
         // The whole frame, in the order the compiler derived. Nothing below
@@ -2543,6 +2753,10 @@ impl VulkanRenderer {
                 .map_or(&[], |frame| frame.outline.as_slice()),
             material_preview: self.material_preview.as_ref(),
             preview_frame,
+            surfaces: surface::Surfaces {
+                shaders: &self.surfaces,
+                frame: surface_frame,
+            },
         };
 
         // What the overlay drawn over this frame samples for each preview.
@@ -2884,6 +3098,57 @@ impl VulkanRenderer {
     }
 }
 
+/// The passes that own a built-in pipeline a surface shader twins, borrowed
+/// apart from the shaders themselves so a twin can be built while they change.
+/// A macro rather than a method because a method would borrow all of `self`.
+macro_rules! twin_passes {
+    ($renderer:expr) => {
+        TwinPasses {
+            device: &$renderer.device,
+            forward: &$renderer.forward,
+            prepass: &$renderer.prepass,
+            oit: &$renderer.oit,
+            refraction: &$renderer.refraction,
+        }
+    };
+}
+use twin_passes;
+
+struct TwinPasses<'a> {
+    device: &'a Device,
+    forward: &'a ForwardPass,
+    prepass: &'a GeometryPrepass,
+    oit: &'a OitPass,
+    refraction: &'a RefractionPass,
+}
+
+impl TwinPasses<'_> {
+    /// Ask the pass that owns `twin`'s built-in pipeline to build it with
+    /// `fragment`.
+    fn build(
+        &self,
+        twin: surface::Twin,
+        fragment: crate::gfx::rhi::ShaderModuleId,
+    ) -> Result<crate::gfx::rhi::PipelineId, String> {
+        use surface::Twin;
+        match twin {
+            Twin::Forward {
+                msaa,
+                subsurface,
+                masked,
+            } => self
+                .forward
+                .build_twin(self.device, msaa, subsurface, masked, fragment),
+            Twin::Prepass { masked } => self.prepass.build_twin(self.device, masked, fragment),
+            Twin::Transparency => self.oit.build_twin(self.device, fragment),
+            Twin::Refraction => self.refraction.build_twin(self.device, fragment),
+            Twin::MaterialPreview { masked } => {
+                material_preview::build_twin(self.device, self.forward, masked, fragment)
+            }
+        }
+    }
+}
+
 /// Everything one frame records from, in a shape a worker can hold.
 ///
 /// The passes' own state, the compiled schedule, and what this frame resolved
@@ -2987,6 +3252,9 @@ struct FrameRecord<'a> {
     outline_items: &'a [OutlineItem],
     material_preview: Option<&'a material_preview::MaterialPreviewPass>,
     preview_frame: Option<material_preview::PreviewFrame>,
+    /// The twins and parameters of every loaded surface shader, for the passes
+    /// that draw a material through one.
+    surfaces: surface::Surfaces<'a>,
 }
 
 /// The material the overlay wants shown, resolved against this frame's light.
@@ -3857,6 +4125,7 @@ impl FrameRecord<'_> {
                     self.prepass_object_set.unwrap(),
                     self.prepass_material_set,
                     self.prepass_texture_set,
+                    self.surfaces,
                 );
             }
             // Both AO passes take their viewport from the target they draw
@@ -3930,6 +4199,7 @@ impl FrameRecord<'_> {
                     &self.forward_sets,
                     subsurface,
                     msaa,
+                    self.surfaces,
                 );
                 // Between the geometry and the lines, and it has to be:
                 // after the geometry so the depth test rejects the sky
@@ -3973,6 +4243,7 @@ impl FrameRecord<'_> {
                     &self.view,
                     self.extent,
                     self.objects.transparent_base,
+                    self.surfaces,
                 );
             }
             PassBody::RefractionDraw => {
@@ -3995,6 +4266,7 @@ impl FrameRecord<'_> {
                     &self.view,
                     self.extent,
                     self.objects.refractive_base,
+                    self.surfaces,
                 );
             }
             PassBody::Tonemap => {

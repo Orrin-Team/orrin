@@ -72,7 +72,11 @@ pub struct DofPass {
 
 impl DofPass {
     pub fn new(device: &Device) -> Self {
-        let pipeline = |shader| device.create_compute_pipeline(&ComputePipelineDesc { shader });
+        let pipeline = |shader: ShaderId| {
+            device.create_compute_pipeline(&ComputePipelineDesc {
+                shader: shader.into(),
+            })
+        };
         let prefilter_pipeline = pipeline(ShaderId::DofPrefilterComp);
         let tile_max_pipeline = pipeline(ShaderId::DofTileMaxComp);
         let gather_pipeline = pipeline(ShaderId::DofGatherComp);

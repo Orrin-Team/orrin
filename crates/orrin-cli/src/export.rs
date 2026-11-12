@@ -505,13 +505,16 @@ fn publish(
 /// `--release` is the workspace's most optimised profile — level 3, ThinLTO,
 /// one codegen unit — and the symbols are stripped on top. Fat LTO was
 /// measured against it with `tests/perf.rs` at `ORRIN_STRESS=4000` and made no
-/// difference to any CPU phase, so a slower link buys nothing here.
+/// difference to any CPU phase, so a slower link buys nothing here. Default
+/// features are off so the editor's shader compiler stays out of a game, which
+/// ships its shaders compiled; scripting is named back in.
 fn engine_args(builder: Builder, target: Target) -> Vec<String> {
     builder
         .build_args()
         .iter()
         .copied()
-        .chain(["--release", "-p", "orrin-core", "--features", "export"])
+        .chain(["--release", "-p", "orrin-core", "--no-default-features"])
+        .chain(["--features", "scripting,export"])
         .chain(["--target", target.triple])
         .map(str::to_owned)
         .collect()
@@ -729,8 +732,10 @@ mod tests {
         assert_eq!(Builder::Zigbuild.build_args(), ["zigbuild"]);
     }
 
-    /// Exports ship the release build with the `export` feature, and the
-    /// executable is looked for where that build writes it.
+    /// Exports ship the release build with scripting and the `export` feature
+    /// and nothing else the editor has on by default — the shader compiler
+    /// above all, since a game ships its shaders compiled — and the executable
+    /// is looked for where that build writes it.
     #[test]
     fn the_engine_is_built_for_release_with_the_export_feature() {
         let windows = Target::of(Platform::Windows);
@@ -744,7 +749,11 @@ mod tests {
             args[at + 1].clone()
         };
         assert!(args.iter().any(|arg| arg == "--release"), "{args:?}");
-        assert_eq!(after("--features"), "export");
+        assert!(
+            args.iter().any(|arg| arg == "--no-default-features"),
+            "{args:?}"
+        );
+        assert_eq!(after("--features"), "scripting,export");
         assert_eq!(after("--target"), "x86_64-pc-windows-msvc");
 
         assert_eq!(

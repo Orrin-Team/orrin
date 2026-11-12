@@ -11,6 +11,11 @@
 //! produces are indistinguishable from a live one's.
 
 use crate::geom::Aabb;
+use crate::gfx::surface::{
+    Ignored, ParamBuffer, ParamTable, ParamValue, SurfaceArtifact, SurfaceShaderError,
+    SurfaceShaderHandle, check_artifact,
+};
+use crate::gfx::vulkan::MAX_SURFACE_SHADERS;
 use crate::gfx::{
     DecalInstance, DrawList, Material, RenderBackend, SceneLighting, TexelFormat, TextureHandle,
     TextureLevels,
@@ -22,7 +27,6 @@ use crate::scene::{
 };
 
 /// Counts uploads and derives mesh bounds; does no GPU work of any kind.
-#[derive(Default)]
 pub struct HeadlessBackend {
     mesh_bounds: Vec<Aabb>,
     /// Each material as last loaded or updated, by handle.
@@ -36,6 +40,27 @@ pub struct HeadlessBackend {
     bc: bool,
     /// The format and level count of the last texture swapped in.
     last_texture: Option<(TexelFormat, usize)>,
+    /// Surface shaders are bookkept exactly as the renderer bookkeeps them —
+    /// tables, attachments, packing — with nothing built.
+    surfaces: ParamBuffer,
+    surface_uploads: u32,
+}
+
+impl Default for HeadlessBackend {
+    fn default() -> Self {
+        Self {
+            mesh_bounds: Vec::new(),
+            materials: Vec::new(),
+            material_updates: 0,
+            textures: Vec::new(),
+            mesh_replacements: 0,
+            texture_replacements: 0,
+            bc: false,
+            last_texture: None,
+            surfaces: ParamBuffer::new(|texture| texture as u32),
+            surface_uploads: 0,
+        }
+    }
 }
 
 impl HeadlessBackend {
@@ -88,6 +113,19 @@ impl HeadlessBackend {
     /// The format and level count of the last texture swapped in.
     pub fn last_texture(&self) -> Option<(TexelFormat, usize)> {
         self.last_texture
+    }
+
+    /// The surface parameters as the renderer would upload them. A default
+    /// texture packs as its [`DefaultTexture`](crate::gfx::surface::DefaultTexture)
+    /// discriminant here.
+    pub fn surface_buffer(&self) -> &ParamBuffer {
+        &self.surfaces
+    }
+
+    /// How many frames uploaded the surface parameters, which the renderer
+    /// does on exactly these frames.
+    pub fn surface_uploads(&self) -> u32 {
+        self.surface_uploads
     }
 }
 
@@ -160,6 +198,44 @@ impl RenderBackend for HeadlessBackend {
 
     fn load_environment(&mut self, _pixels: &[f32], _width: u32, _height: u32) {}
 
+    fn load_surface_shader(
+        &mut self,
+        artifact: &SurfaceArtifact,
+    ) -> Result<SurfaceShaderHandle, SurfaceShaderError> {
+        check_artifact(artifact)?;
+        if self.surfaces.loaded() >= MAX_SURFACE_SHADERS {
+            return Err(SurfaceShaderError::TooMany);
+        }
+        Ok(self.surfaces.load(artifact.params.clone()))
+    }
+
+    fn replace_surface_shader(
+        &mut self,
+        shader: SurfaceShaderHandle,
+        artifact: &SurfaceArtifact,
+    ) -> Result<Vec<(MaterialHandle, Ignored)>, SurfaceShaderError> {
+        if self.surfaces.table(shader).is_none() {
+            return Err(SurfaceShaderError::UnknownShader(shader));
+        }
+        check_artifact(artifact)?;
+        self.surfaces.replace(shader, artifact.params.clone())
+    }
+
+    fn set_material_surface(
+        &mut self,
+        material: MaterialHandle,
+        surface: Option<(SurfaceShaderHandle, &[(String, ParamValue)])>,
+    ) -> Result<Vec<Ignored>, SurfaceShaderError> {
+        if material.0 as usize >= self.materials.len() {
+            return Err(SurfaceShaderError::UnknownMaterial(material));
+        }
+        self.surfaces.attach(material, surface)
+    }
+
+    fn surface_params(&self, shader: SurfaceShaderHandle) -> Option<&ParamTable> {
+        self.surfaces.table(shader)
+    }
+
     fn resize(&mut self, _extent: [u32; 2]) {}
 
     fn render(
@@ -185,5 +261,8 @@ impl RenderBackend for HeadlessBackend {
         _fog: &FogSettings,
         _dt: f32,
     ) {
+        if self.surfaces.loaded() > 0 && self.surfaces.take_changed().is_some() {
+            self.surface_uploads += 1;
+        }
     }
 }

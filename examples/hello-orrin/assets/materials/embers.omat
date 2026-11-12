@@ -1,0 +1,28 @@
+orrin-material 2 min-reader 2
+
+alpha = 1.0
+alpha_cutoff = 0.5
+anisotropy = 0.0
+anisotropy_rotation = 0.0
+attenuation_color = (1.0, 1.0, 1.0)
+attenuation_distance = inf
+base_color = (0.25, 0.1, 0.05)
+blend = Opaque
+clearcoat = 0.0
+clearcoat_roughness = 0.03
+emissive = (2600.0, 900.0, 260.0)
+ior = 1.5
+metallic = 0.0
+parallax_depth = 0.02
+parallax_max_steps = 32
+parallax_min_steps = 8
+reflectance = 0.5
+roughness = 0.9
+shader = asset(5d581be4-45f2-4039-b1e1-10075b8af304)
+sheen_color = (0.0, 0.0, 0.0)
+sheen_roughness = 0.3
+subsurface_color = (0.0, 0.0, 0.0)
+subsurface_forward_scatter = 12.0
+subsurface_radius = (0.0048, 0.0017, 0.0011)
+thickness = 0.0
+transmission = 0.0

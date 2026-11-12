@@ -1,0 +1,30 @@
+// Bands of light that climb an object, over a dark, rough base: hot metal
+// cooling between the lines. See "Writing a surface shader" in the project's
+// README for the whole vocabulary.
+//
+// A surface shader says what the surface *is*. The engine still lights it,
+// shadows it and reflects it like any other material.
+
+// Each `param` is a value a material drawn through this shader can set in the
+// inspector; one that sets nothing gets the default written here.
+param color glow = (1.0, 0.35, 0.08, 1.0);
+// Emission is a luminance, in cd/m2 (nits), like every light in the engine. A
+// lit wall sits near a hundred, so a few hundred reads as glowing.
+param float brightness = 600.0 : range(0, 4000);
+param float bands_per_metre = 3.0 : range(0.5, 12);
+param float speed = 0.5 : range(0, 4);
+
+// `o` arrives holding what the material alone would have drawn, so a shader
+// changes only what it is for.
+void surface(in SurfaceIn i, inout SurfaceOut o) {
+    // Measured in world space rather than along the UVs, so two objects with
+    // this material side by side carry one set of bands between them.
+    float phase = i.world_position.y * bands_per_metre - i.time * speed;
+    // A sine through each band, sharpened into thin lines: 1 on a line, 0
+    // between them.
+    float line = smoothstep(0.7, 1.0, sin(phase * 6.2831853));
+
+    o.albedo = mix(o.albedo * 0.25, glow.rgb, line);
+    o.roughness = mix(0.85, 0.3, line);
+    o.emissive += glow.rgb * brightness * line;
+}

@@ -305,6 +305,7 @@ fn settings(ui: &mut egui::Ui, entry: &Entry, draft: &mut Draft, action: &mut Op
                 AssetKind::Material => "A material is read as it is. Edit it in the inspector.",
                 AssetKind::Font => "A font is read as it is: it has nothing to import.",
                 AssetKind::Audio => "A sound is read as it is: it is decoded when it plays.",
+                AssetKind::Shader => "A surface shader has no settings: it compiles when saved.",
                 _ => "A prefab is read as it is: it has nothing to import.",
             });
             return;
@@ -348,6 +349,7 @@ fn glyph_of(kind: AssetKind) -> icons::Icon {
         AssetKind::Font => icons::text_t(),
         AssetKind::Audio => icons::file_audio(),
         AssetKind::Folder => icons::folder(),
+        AssetKind::Shader => icons::file_code(),
     }
 }
 

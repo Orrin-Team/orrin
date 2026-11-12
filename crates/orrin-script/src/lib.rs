@@ -1008,6 +1008,9 @@ pub fn default_bag(type_name: &CStr) -> Option<Vec<u8>> {
 /// Every registry-visible Behaviour in the live game assemblies, encoded as a
 /// list of `{ id, type, name }`. The game assembly's half of
 /// `register_components`, re-read after each swap.
+// An `extern` fn is `Fn` only on newer nightlies, whose clippy then calls the
+// closure below redundant; older ones do not build without it.
+#[allow(clippy::redundant_closure)]
 pub fn component_bags() -> Option<Vec<u8>> {
     let ptr = bag::COMPONENTS.load(Ordering::Acquire);
     if ptr == 0 {

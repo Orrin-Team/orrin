@@ -278,6 +278,8 @@ pub struct EditorState {
     /// The Scene Manager's filter over the project's scenes.
     pub scenes_query: String,
     pub assets_view: AssetView,
+    /// The Shader tab's open shader and its unsaved text.
+    pub shader: super::panels::shader::ShaderEditor,
     /// The asset the browser marks, and the Import tab shows: the last one
     /// clicked there, or the prefab "Show in Assets" pointed at.
     pub revealed_asset: Option<AssetId>,
@@ -465,6 +467,7 @@ impl Default for EditorState {
             assets_query: String::new(),
             scenes_query: String::new(),
             assets_view: AssetView::default(),
+            shader: Default::default(),
             revealed_asset: None,
             gizmo_mode: GizmoMode::Select,
             gizmo_space: GizmoSpace::World,
@@ -712,6 +715,12 @@ impl EditorState {
     pub fn reveal_asset(&mut self, id: AssetId) {
         self.revealed_asset = Some(id);
         self.reveal_request = true;
+    }
+
+    /// Open shader `id` in the Shader tab, and bring the tab forward.
+    pub fn open_shader(&mut self, id: AssetId) {
+        self.shader.request(id);
+        self.request_dock(DockRequest::Show(super::dock::Tab::Shader));
     }
 
     pub fn take_reveal_request(&mut self) -> bool {

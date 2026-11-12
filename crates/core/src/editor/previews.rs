@@ -112,7 +112,8 @@ impl Previews {
             | AssetKind::Scene
             | AssetKind::Font
             | AssetKind::Audio
-            | AssetKind::Folder => {
+            | AssetKind::Folder
+            | AssetKind::Shader => {
                 return None;
             }
         };
@@ -324,7 +325,7 @@ mod tests {
         };
         assert!(surface.albedo.is_some(), "with its albedo on it");
 
-        let mut file = *db.material_file(material).unwrap();
+        let mut file = db.material_file(material).unwrap().clone();
         file.material.roughness = 0.1;
         db.preview_material(material, file).unwrap();
         let after = previews.asset(&ctx, &db, material).unwrap();

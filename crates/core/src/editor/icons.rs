@@ -98,6 +98,7 @@ icons! {
     circle => '\u{e18a}',
     circle_dot => '\u{ece0}',
     circle_x => '\u{e4f8}',
+    code => '\u{e1bc}',
     cube_transparent => '\u{ec7c}',
     cursor_click => '\u{e7c8}',
     ear => '\u{e70c}',

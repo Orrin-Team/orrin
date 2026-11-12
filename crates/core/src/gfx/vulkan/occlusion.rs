@@ -109,7 +109,7 @@ pub(super) struct OcclusionPass {
 impl OcclusionPass {
     pub(super) fn new(device: &Device) -> Self {
         let pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
-            shader: ShaderId::HizOcclusionComp,
+            shader: ShaderId::HizOcclusionComp.into(),
         });
         let sampler = device.create_sampler(SamplerDesc {
             linear: false,

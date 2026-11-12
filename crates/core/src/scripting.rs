@@ -1190,7 +1190,7 @@ extern "C" fn find_asset(path: *const c_char, out: *mut u8) -> u32 {
                 AssetKind::Scene => orrin_script::ASSET_SCENE,
                 AssetKind::Font => orrin_script::ASSET_FONT,
                 AssetKind::Audio => orrin_script::ASSET_AUDIO,
-                AssetKind::Folder => return None,
+                AssetKind::Folder | AssetKind::Shader => return None,
             };
             Some((entry.id, kind))
         });
@@ -5541,10 +5541,10 @@ mod tests {
             );
             drop(tree);
             world.insert_resource(pointer);
-            assert_eq!(
-                orrin_script::with_active_world(&mut world, || ui_pointer_over()),
-                over
-            );
+            // The closure: see `orrin_script::component_bags`.
+            #[allow(clippy::redundant_closure)]
+            let answered = orrin_script::with_active_world(&mut world, || ui_pointer_over());
+            assert_eq!(answered, over);
         }
     }
 
@@ -6549,6 +6549,8 @@ mod tests {
             ..Default::default()
         });
 
+        // The closure: see `orrin_script::component_bags`.
+        #[allow(clippy::redundant_closure)]
         let step = orrin_script::with_active_world(&mut world, || time_fixed_delta());
 
         assert_eq!(step, 1.0 / 120.0);

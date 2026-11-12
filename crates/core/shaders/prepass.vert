@@ -46,7 +46,8 @@ layout(set = 0, binding = 0) uniform Frame {
     mat4 proj;
     mat4 inv_proj;
     mat4 prev_view_proj;
-    // xy = the NDC offset baked into `proj`.
+    // xy = the NDC offset baked into `proj`, z = a surface shader's time,
+    // which only the fragment stage reads.
     vec4 jitter;
     // `proj * view`, premultiplied CPU-side. See the FrameUbo doc comment.
     mat4 view_proj;

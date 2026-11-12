@@ -10,6 +10,7 @@ edition = "2024"
 orrin-script = { path = "crates/orrin-script" }
 orrin-project = { path = "crates/orrin-project" }
 orrin-build = { path = "crates/orrin-build" }
+orrin-shaderc = { path = "crates/orrin-shaderc" }
 orrin-ecs = { path = "crates/orrin-ecs" }
 orrin-registry = { path = "crates/orrin-registry" }
 orrin-macros = { path = "crates/orrin-macros" }

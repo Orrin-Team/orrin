@@ -66,7 +66,11 @@ pub struct MotionBlurPass {
 
 impl MotionBlurPass {
     pub fn new(device: &Device) -> Self {
-        let pipeline = |shader| device.create_compute_pipeline(&ComputePipelineDesc { shader });
+        let pipeline = |shader: ShaderId| {
+            device.create_compute_pipeline(&ComputePipelineDesc {
+                shader: shader.into(),
+            })
+        };
         let tile_max_pipeline = pipeline(ShaderId::MotionBlurTileMaxComp);
         let neighbour_max_pipeline = pipeline(ShaderId::MotionBlurNeighbourMaxComp);
         let gather_pipeline = pipeline(ShaderId::MotionBlurGatherComp);

@@ -113,6 +113,10 @@ pub struct CaptureSettings {
     /// The editor's wireframe draw mode, through the same overlay frame the
     /// editor hands the renderer, with nothing else in it.
     pub wireframe: Option<crate::gfx::vulkan::wireframe::Wireframe>,
+    /// What a surface shader's `i.time` reads, or `None` to let it run from
+    /// the fixed step below. Pinned by default, so a capture of an animated
+    /// surface does not depend on how many frames it warmed up for.
+    pub surface_time: Option<f32>,
 }
 
 impl Default for CaptureSettings {
@@ -134,6 +138,7 @@ impl Default for CaptureSettings {
             scene: SceneChoice::default(),
             camera: None,
             wireframe: None,
+            surface_time: Some(0.0),
         }
     }
 }
@@ -260,6 +265,7 @@ pub fn render(
             ..Default::default()
         });
 
+    renderer.pin_surface_time(settings.surface_time);
     for _ in 0..settings.frames.max(1) {
         // Extraction reads *world* transforms, and a freshly built scene has
         // only local ones — the propagation that derives them is a system, not

@@ -75,10 +75,10 @@ pub struct ShadowPass {
 
 impl ShadowPass {
     pub fn new(device: &Device) -> Self {
-        let pipeline = |vertex, fragment, cull| {
+        let pipeline = |vertex: ShaderId, fragment: ShaderId, cull| {
             device.create_graphics_pipeline(&GraphicsPipelineDesc {
-                vertex,
-                fragment,
+                vertex: vertex.into(),
+                fragment: fragment.into(),
                 // No color attachments to blend into.
                 color_formats: &[],
                 depth_format: Some(SHADOW_FORMAT),

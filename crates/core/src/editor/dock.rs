@@ -67,6 +67,7 @@ pub enum Tab {
     Assets,
     Import,
     Storybook,
+    Shader,
 }
 
 impl Tab {
@@ -74,13 +75,14 @@ impl Tab {
     /// even in a build without the feature: the variant stays so a layout file
     /// written by one build still loads in the other, and the tab says why it
     /// is empty instead of vanishing.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Hierarchy,
         Self::Scenes,
         Self::Inspector,
         Self::Environment,
         Self::Console,
         Self::Assets,
+        Self::Shader,
         Self::Import,
         Self::Performance,
         Self::Scripts,
@@ -100,6 +102,7 @@ impl Tab {
             Self::Assets => icons::box_(),
             Self::Import => icons::info(),
             Self::Storybook => icons::palette(),
+            Self::Shader => icons::code(),
         }
     }
 
@@ -115,6 +118,7 @@ impl Tab {
             Self::Assets => "Assets",
             Self::Import => "Import",
             Self::Storybook => "Storybook",
+            Self::Shader => "Shader",
         }
     }
 }
@@ -177,6 +181,7 @@ pub fn default_layout() -> DockState<Tab> {
         vec![
             Tab::Console,
             Tab::Assets,
+            Tab::Shader,
             Tab::Performance,
             Tab::Scripts,
             Tab::Storybook,
@@ -800,6 +805,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
                 ui.weak("This build was compiled without the `scripting` feature.");
             }
             Tab::Storybook => panels::storybook::body(ui, self.world),
+            Tab::Shader => panels::shader::body(ui, self.world, self.state),
         }
     }
 }
@@ -877,6 +883,45 @@ mod tests {
             dock.tab.hovered.outline_color
         );
         assert_ne!(themed.tab.active.bg_fill, dock.tab.active.bg_fill);
+    }
+
+    /// The default layout as it was written before the Shader tab existed.
+    /// A variant is only ever added, so a file like this one still loads, the
+    /// tab is simply closed in it, and asking for it brings it back beside the
+    /// tools it shares a leaf with by default.
+    const BEFORE_THE_SHADER_TAB: &str = r#"(surfaces:[Main((nodes:[Horizontal(rect:(min:(x:inf,y:inf),max:(x:-inf,y:-inf)),fraction:0.1875,fully_collapsed:false,collapsed_leaf_count:0),Leaf(rect:(min:(x:inf,y:inf),max:(x:-inf,y:-inf)),viewport:(min:(x:inf,y:inf),max:(x:-inf,y:-inf)),tabs:[Hierarchy,Scenes],active:(0),scroll:0.0,collapsed:false),Horizontal(rect:(min:(x:inf,y:inf),max:(x:-inf,y:-inf)),fraction:0.6923,fully_collapsed:false,collapsed_leaf_count:0),Empty,Empty,Vertical(rect:(min:(x:inf,y:inf),max:(x:-inf,y:-inf)),fraction:0.7043,fully_collapsed:false,collapsed_leaf_count:0),Leaf(rect:(min:(x:inf,y:inf),max:(x:-inf,y:-inf)),viewport:(min:(x:inf,y:inf),max:(x:-inf,y:-inf)),tabs:[Inspector,Environment,Import],active:(0),scroll:0.0,collapsed:false),Empty,Empty,Empty,Empty,Empty,Leaf(rect:(min:(x:inf,y:inf),max:(x:-inf,y:-inf)),viewport:(min:(x:inf,y:inf),max:(x:-inf,y:-inf)),tabs:[Console,Assets,Performance,Scripts,Storybook],active:(0),scroll:0.0,collapsed:false),Empty,Empty],focused_node:Some((12)),collapsed:false,collapsed_leaf_count:0))],focused_surface:None,translations:(tab_context_menu:(close_button:"Close",eject_button:"Eject"),leaf:(close_button_disabled_tooltip:"This leaf contains non-closable tabs.",close_all_button:"Close window",close_all_button_menu_hint:"Right click to close this window.",close_all_button_modifier_hint:"Press modifier keys (Shift by default) to close this window.",close_all_button_modifier_menu_hint:"Press modifier keys (Shift by default) or right click to close this window.",close_all_button_disabled_tooltip:"This window contains non-closable tabs.",minimize_button:"Minimize window",minimize_button_menu_hint:"Right click to minimize this window.",minimize_button_modifier_hint:"Press modifier keys (Shift by default) to minimize this window.",minimize_button_modifier_menu_hint:"Press modifier keys (Shift by default) or right click to minimize this window.")))"#;
+
+    #[test]
+    fn a_layout_saved_before_the_shader_tab_still_loads() {
+        let dir = crate::asset_db::tests::Dir::new("dock-before-shader");
+        dir.write(
+            "editor.ron",
+            format!("(layout: Some({BEFORE_THE_SHADER_TAB}), layout_version: 2)").as_bytes(),
+        );
+        let prefs = super::super::prefs::PrefsFile::new(Some(dir.path().to_owned())).load();
+        let mut dock = Dock::from_saved(Some(prefs.layout.expect("the layout is kept")));
+        assert!(dock.is_open(Tab::Console));
+        assert!(!dock.is_open(Tab::Shader));
+
+        dock.bring_forward(Tab::Shader);
+        let leaf = |tab| dock.state().find_tab(&tab).map(|(s, n, _)| (s, n));
+        assert_eq!(
+            leaf(Tab::Shader),
+            leaf(Tab::Console),
+            "beside its default neighbours"
+        );
+    }
+
+    /// A tool is listed, named and pictured like every other: the View menu
+    /// and the tab strip are both built from these.
+    #[test]
+    fn the_shader_tab_is_a_tool_of_its_own() {
+        assert!(Tab::ALL.contains(&Tab::Shader));
+        assert_eq!(Tab::Shader.title(), "Shader");
+        for other in Tab::ALL.into_iter().filter(|tab| *tab != Tab::Shader) {
+            assert_ne!(other.icon(), Tab::Shader.icon(), "{}", other.title());
+            assert_ne!(other.title(), Tab::Shader.title());
+        }
     }
 
     #[test]

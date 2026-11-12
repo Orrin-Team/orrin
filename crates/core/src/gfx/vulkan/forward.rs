@@ -11,8 +11,9 @@ use crate::gfx::{
 };
 use crate::scene::{Camera, EnvironmentSettings};
 
-use super::cull::Draws;
+use super::cull::{Draws, Surface};
 use super::subsurface::SUBSURFACE_FORMAT;
+use super::surface::{Surfaces, Twin};
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 use super::{MSAA_SAMPLES, ShadowFrame, VulkanRenderer};
@@ -22,7 +23,7 @@ use crate::gfx::rhi::MeshSpan;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferDesc, BufferId, CullMode,
     DepthCompare, DepthTest, Device, Encoder, GraphicsPipelineDesc, MemoryLocation, PipelineId,
-    SamplerDesc, SamplerId, TextureViewId, Topology, Viewport,
+    SamplerDesc, SamplerId, ShaderModuleId, ShaderRef, TextureViewId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 
@@ -57,7 +58,7 @@ pub(super) const TEXTURE_SET: usize = 2;
 const WHITE_TEXTURE: u32 = 0;
 const FLAT_NORMAL_TEXTURE: u32 = 1;
 
-/// Feature bits in [`GpuMaterial::flags`], mirrored by `shading.glsl`.
+/// Feature bits in [`GpuMaterial::flags`], mirrored by `shaders/material.glsl`.
 ///
 /// The whole point of the word: a draw is one batch and a batch is one
 /// (mesh, material) pair, so every invocation of a draw reads the same flags —
@@ -127,6 +128,9 @@ pub(crate) struct GpuMaterial {
     /// rather than in a float field so the shader can test them without
     /// `floatBitsToUint`.
     tex_flags: [u32; 4],
+    /// `x` = the first word of this material's parameters in a surface shader's
+    /// parameter buffer (`gfx::surface`). Only a custom surface reads it.
+    surface: [u32; 4],
 }
 
 impl GpuMaterial {
@@ -146,6 +150,25 @@ impl GpuMaterial {
     /// flag word for the reason `is_masked` is.
     pub(super) fn is_lobed(&self) -> bool {
         self.tex_flags[1] & material_flags::LOBES != 0
+    }
+
+    /// Point the record at its block in the surface parameters. Returns
+    /// whether that moved it.
+    pub(super) fn set_surface_base(&mut self, base: u32) -> bool {
+        std::mem::replace(&mut self.surface[0], base) != base
+    }
+
+    /// The class a batch of this material draws in when no surface shader
+    /// reads it.
+    pub(super) fn built_in_variant(&self) -> super::cull::Variant {
+        super::cull::Variant {
+            masked: self.is_masked(),
+            surface: if self.is_lobed() {
+                super::cull::Surface::Lobed
+            } else {
+                super::cull::Surface::Flat
+            },
+        }
     }
 }
 
@@ -242,6 +265,7 @@ fn to_gpu_lighting(
     irradiance: [Vec3; SH9],
     environment_yaw: f32,
     env_specular: Vec3,
+    surface_time: f32,
 ) -> GpuLighting {
     let camera_pos = camera.position;
     let (w, h) = (extent[0] as f32, extent[1] as f32);
@@ -270,7 +294,7 @@ fn to_gpu_lighting(
         ],
         params: [
             count as f32,
-            lighting.shininess,
+            surface_time,
             lighting.specular_strength,
             spot_count as f32,
         ],
@@ -422,8 +446,8 @@ struct GpuLighting {
     sun_direction: [f32; 4],
     /// rgb = sun color, w = illuminance in lux on a surface facing it.
     sun_color: [f32; 4],
-    /// x = point light count, y = shininess, z = specular strength,
-    /// w = spot light count.
+    /// x = point light count, y = what a surface shader's `i.time` reads,
+    /// z = specular strength, w = spot light count. Only `y` is read.
     params: [f32; 4],
     /// x=w, y=h, z=1/w, w=1/h
     viewport: [f32; 4],
@@ -591,7 +615,7 @@ pub(super) struct NeutralBlocks {
 
 /// The lighting block the material preview shades with. Kept as the block so
 /// what decides whether the preview is redrawn is exactly what it is drawn
-/// with.
+/// with — less a surface shader's time, which is the frame's it is redrawn in.
 pub(super) struct PreviewLighting(GpuLighting);
 
 impl PreviewLighting {
@@ -611,6 +635,7 @@ impl PreviewLighting {
             irradiance,
             environment_yaw,
             env_specular,
+            0.0,
         ))
     }
 
@@ -654,8 +679,9 @@ impl ForwardSets {
 /// *frame* — it decides which render pass is open and therefore how many colour
 /// attachments a pipeline must declare — while `masked` is a property of a
 /// *run*, so both of those have to exist at once whichever frame it is.
-/// Every forward pipeline one sample count needs, in the four variants a batch
-/// can be (see `cull::Variant`), each with and without the subsurface target.
+/// Every forward pipeline one sample count needs, in the four built-in variants
+/// a batch can be (see `cull::Variant`), each with and without the subsurface
+/// target.
 ///
 /// The `flat` ones run `shading.glsl` compiled with `ORRIN_FLAT_SURFACE`, which
 /// takes the optional lobes out — clear coat, sheen, anisotropy, transmission,
@@ -665,6 +691,12 @@ impl ForwardSets {
 /// cost every material a quarter of the pass (forward 0.77 -> 0.58 ms on the
 /// demo, M5 Pro, with the lobes compiled out), as register pressure and the
 /// occupancy it costs. One source still, as a define, so the two cannot drift.
+///
+/// These are the built-in surfaces' classes only. A surface shader is a class
+/// per mask of its own (`cull::Surface::Custom`), always compiled against every
+/// lobe, and drawn by its twins of the lobed pipelines here, which
+/// `ForwardPass::build_twin` makes on first use and `surface` keeps — so the
+/// pipelines that exist for the whole session are still these sixteen.
 struct ForwardPipelines {
     plain: PipelineId,
     subsurface: PipelineId,
@@ -682,9 +714,12 @@ struct ForwardPipelines {
 
 impl ForwardPipelines {
     /// The pipeline a batch of `variant` draws with in a frame that does or
-    /// does not diffuse subsurface light.
+    /// does not diffuse subsurface light. A surface shader's batches draw with
+    /// the lobed one when it has no twin to draw them, which is the standard
+    /// material it was compiled against.
     fn for_variant(&self, variant: super::cull::Variant, subsurface: bool) -> PipelineId {
-        match (variant.masked, variant.lobed, subsurface) {
+        let lobed = variant.surface != super::cull::Surface::Flat;
+        match (variant.masked, lobed, subsurface) {
             (false, false, false) => self.flat,
             (false, false, true) => self.flat_subsurface,
             (false, true, false) => self.plain,
@@ -777,7 +812,9 @@ pub struct ForwardPass {
     /// [`ForwardPipelines`] for the two axes, and `single_render_pass` for the
     /// third. All eight are built from the same shader modules and the same
     /// immutable shadow sampler, so they are set compatible and the executor's
-    /// five descriptor sets bind to any of them.
+    /// five descriptor sets bind to any of them. A surface shader's twins of
+    /// them are built by [`build_twin`](Self::build_twin) from the same
+    /// [`pipeline_desc`] and kept with the shader, in `surface`.
     multisampled: ForwardPipelines,
     single: ForwardPipelines,
     /// Per-frame storage for the decal block. Owned here rather than by a decal
@@ -812,72 +849,14 @@ impl ForwardPass {
             max_lod: None,
         });
         let samplers = [(SHADOW_SET as u32, SHADOW_SAMPLER_BINDING, shadow_sampler)];
-        let pipeline = |colors: &[Format],
-                        fragment: ShaderId,
-                        // Inverted from the obvious sense, and named for what it
-                        // selects: back faces are culled for ordinary opaque
-                        // geometry and kept for `BlendMode::Masked`, because a
-                        // cutout sheet has no back to cull.
-                        cull_back: bool,
-                        // How many samples the render pass rasterises at, and —
-                        // because the two are the same decision — where the depth
-                        // being tested came from.
-                        //
-                        // At more than one sample this pass rasterises its own
-                        // depth buffer: the test is `Less` and the pass writes,
-                        // and a masked run spends the extra samples on the
-                        // cutout's edge through alpha to coverage.
-                        //
-                        // At one sample there is no second depth buffer. The
-                        // geometry prepass's is attached read-only and the test
-                        // is `EQUAL` against it, which is the whole point: every
-                        // fragment that is not the front-most surface is killed
-                        // before it shades, so the pass has perfect early-Z and
-                        // zero shading overdraw. It depends on the two vertex
-                        // shaders agreeing on `gl_Position` to the last bit — see
-                        // the `invariant` declaration in each.
-                        samples: SampleCount| {
-            rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
-                vertex: ShaderId::ForwardVert,
-                fragment,
-                color_formats: colors,
-                depth_format: Some(DEPTH_FORMAT),
-                vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
-                cull: if cull_back {
-                    CullMode::Back
-                } else {
-                    CullMode::None
-                },
-                depth_test: Some(if samples == SampleCount::Sample1 {
-                    DepthTest {
-                        write: false,
-                        compare: DepthCompare::Equal,
-                    }
-                } else {
-                    DepthTest {
-                        write: true,
-                        compare: crate::gfx::depth::NEARER,
-                    }
-                }),
-                // The material textures, of which a scene writes only the ones it
-                // loaded. Set on the layout because it is the *layout* the short
-                // write is legal against — and this layout is also the one the
-                // transparency and refraction pipelines lift, so both inherit it.
-                partial_texture_set: Some(TEXTURE_SET as u32),
-                dynamic_depth_bias: false,
+        let pipeline = |colors: &[Format], fragment: ShaderId, cull_back: bool, samples| {
+            rhi.create_graphics_pipeline(&pipeline_desc(
+                colors,
+                fragment.into(),
+                cull_back,
                 samples,
-                // Only where there are samples to spend. At one sample the cutout
-                // is cut by the `discard` in the shader this variant was built
-                // from instead, along the same line.
-                alpha_to_coverage: !cull_back && samples != SampleCount::Sample1,
-                immutable_samplers: &samplers,
-                blend: Blend::None,
-                topology: Topology::Triangles,
-                mask_extra_attachments: false,
-                attachment_blends: &[],
-                layout_from: None,
-                layout_prefix_from: None,
-            })
+                &samplers,
+            ))
         };
         let msaa = MSAA_SAMPLES;
         let one = SampleCount::Sample1;
@@ -978,6 +957,42 @@ impl ForwardPass {
         } else {
             &self.single
         }
+    }
+
+    /// A surface shader's twin of the pipeline a `masked` run draws with in
+    /// this attachment shape: [`pipeline_desc`] with `fragment` in it, and the
+    /// built-in's five sets lifted rather than derived, for the reason the
+    /// refraction pass lifts them — set 3 holds the shadow sampler immutably.
+    pub(super) fn build_twin(
+        &self,
+        device: &Device,
+        msaa: bool,
+        subsurface: bool,
+        masked: bool,
+        fragment: ShaderModuleId,
+    ) -> Result<PipelineId, String> {
+        let colors = self.targets.colors(msaa, subsurface);
+        let built_in = self.pipelines(msaa).for_variant(
+            super::cull::Variant {
+                masked,
+                surface: super::cull::Surface::Lobed,
+            },
+            subsurface,
+        );
+        device.try_create_graphics_pipeline(&GraphicsPipelineDesc {
+            layout_prefix_from: Some((built_in, 5)),
+            ..pipeline_desc(
+                &colors,
+                fragment.into(),
+                !masked,
+                if msaa {
+                    MSAA_SAMPLES
+                } else {
+                    SampleCount::Sample1
+                },
+                &[],
+            )
+        })
     }
 
     /// The layout the transparency pass builds its own pipeline with. Shared
@@ -1137,6 +1152,7 @@ impl ForwardPass {
         fog: BufferId,
         fog_volume: TextureViewId,
         fog_sampler: SamplerId,
+        surface_time: f32,
     ) -> ForwardSets {
         // Both halves fall back to the scene's flat ambient when nothing is
         // loaded — the diffuse as a band-0-only series, the specular as a tint
@@ -1153,6 +1169,7 @@ impl ForwardPass {
             irradiance,
             environment.yaw,
             env_specular,
+            surface_time,
         );
         let lighting_buffer =
             device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&lighting_block));
@@ -1371,11 +1388,14 @@ impl ForwardPass {
         material_set: BindGroupId,
         texture_set: BindGroupId,
         object_set: BindGroupId,
+        surface_time: f32,
     ) -> ForwardSets {
+        let mut block = lighting.0;
+        block.params[1] = surface_time;
         self.assemble(
             device,
             LightingSet {
-                lighting: device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&lighting.0)),
+                lighting: device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&block)),
                 decals: blocks.decals,
                 points: blocks.points,
                 spots: blocks.spots,
@@ -1413,6 +1433,7 @@ impl ForwardPass {
         // pipeline bound here cannot disagree with the render pass the
         // framebuffer already opened around it.
         msaa: bool,
+        surfaces: Surfaces<'_>,
     ) {
         // The jittered one, from the frame's shared view: every pass that
         // rasterises geometry has to agree on it to a subpixel.
@@ -1434,10 +1455,11 @@ impl ForwardPass {
         {
             *word = value.to_bits();
         }
-        // The descriptor sets are rebound with the incoming pipeline. All four
-        // layouts are built from the same stages and the same immutable shadow
-        // sampler, so they are set compatible and this is a formality — but it
-        // is the formality that keeps it true if one of them ever stops being.
+        // The descriptor sets are rebound with the incoming pipeline. Every
+        // layout's first five sets are built from the same stages and the same
+        // immutable shadow sampler, or lifted from one that was by a surface
+        // shader's twin, so they are set compatible and this is a formality —
+        // but it is the formality that keeps it true if one ever stops being.
         let groups = sets.groups();
         let bind_all = |builder: &mut Encoder, pipeline: PipelineId| {
             builder.bind_pipeline(pipeline);
@@ -1458,13 +1480,106 @@ impl ForwardPass {
         // for the pass rather than once per mesh. See `mesh`.
         builder.bind_geometry(false);
 
-        // One multi-draw per pipeline variant, over the commands the dispatch
+        // One multi-draw per pipeline class, over the commands the dispatch
         // wrote: the recording cost scales with neither the entity count nor
-        // the distinct mesh/material pairs, only with the four variants.
+        // the distinct mesh/material pairs, only with the classes — four, and
+        // two more for each surface shader a scene draws.
         for region in draws.regions() {
-            bind_all(builder, pipelines.for_variant(region.variant, subsurface));
+            let twin = match region.variant.surface {
+                Surface::Custom(slot) => surfaces.for_slot(
+                    slot,
+                    Twin::Forward {
+                        msaa,
+                        subsurface,
+                        masked: region.variant.masked,
+                    },
+                ),
+                _ => None,
+            };
+            match twin {
+                Some((pipeline, group)) => {
+                    bind_all(builder, pipeline);
+                    builder.bind_group(crate::gfx::surface::PARAMS_BINDING.0, group);
+                }
+                None => bind_all(builder, pipelines.for_variant(region.variant, subsurface)),
+            }
             builder.draw_indexed_indirect(region.commands, region.range);
         }
+    }
+}
+
+/// One forward pipeline: the state every built-in one and every surface
+/// shader's twin of it are built from, so the two cannot differ in anything but
+/// the fragment shader. `samplers` is the shadow sampler a built-in bakes into
+/// set 3; a twin passes none and lifts the set instead.
+fn pipeline_desc<'a>(
+    colors: &'a [Format],
+    fragment: ShaderRef,
+    // Inverted from the obvious sense, and named for what it
+    // selects: back faces are culled for ordinary opaque
+    // geometry and kept for `BlendMode::Masked`, because a
+    // cutout sheet has no back to cull.
+    cull_back: bool,
+    // How many samples the render pass rasterises at, and —
+    // because the two are the same decision — where the depth
+    // being tested came from.
+    //
+    // At more than one sample this pass rasterises its own
+    // depth buffer: the test is `Less` and the pass writes,
+    // and a masked run spends the extra samples on the
+    // cutout's edge through alpha to coverage.
+    //
+    // At one sample there is no second depth buffer. The
+    // geometry prepass's is attached read-only and the test
+    // is `EQUAL` against it, which is the whole point: every
+    // fragment that is not the front-most surface is killed
+    // before it shades, so the pass has perfect early-Z and
+    // zero shading overdraw. It depends on the two vertex
+    // shaders agreeing on `gl_Position` to the last bit — see
+    // the `invariant` declaration in each.
+    samples: SampleCount,
+    samplers: &'a [(u32, u32, SamplerId)],
+) -> GraphicsPipelineDesc<'a> {
+    GraphicsPipelineDesc {
+        vertex: ShaderId::ForwardVert.into(),
+        fragment,
+        color_formats: colors,
+        depth_format: Some(DEPTH_FORMAT),
+        vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
+        cull: if cull_back {
+            CullMode::Back
+        } else {
+            CullMode::None
+        },
+        depth_test: Some(if samples == SampleCount::Sample1 {
+            DepthTest {
+                write: false,
+                compare: DepthCompare::Equal,
+            }
+        } else {
+            DepthTest {
+                write: true,
+                compare: crate::gfx::depth::NEARER,
+            }
+        }),
+        // The material textures, of which a scene writes only the ones it
+        // loaded. Set on the layout because it is the *layout* the short
+        // write is legal against — and this layout is also the one the
+        // transparency and refraction pipelines lift, so both inherit it.
+        partial_texture_set: Some(TEXTURE_SET as u32),
+        dynamic_depth_bias: false,
+        samples,
+        // Only where there are samples to spend. At one sample the cutout
+        // is cut by the `discard` in the shader this variant was built
+        // from instead, along the same line.
+        alpha_to_coverage: !cull_back && samples != SampleCount::Sample1,
+        immutable_samplers: samplers,
+        blend: Blend::None,
+        topology: Topology::Triangles,
+        mask_extra_attachments: false,
+        attachment_blends: &[],
+        layout_from: None,
+        layout_prefix_from: None,
     }
 }
 
@@ -1635,6 +1750,7 @@ pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
             // texture gives its lobe.
             m.height_texture.map_or(WHITE_TEXTURE, |h| h.0),
         ],
+        surface: [0; 4],
     }
 }
 
@@ -1700,16 +1816,16 @@ mod tests {
         assert_eq!(cutoff(0.5), 0.5);
     }
 
-    /// std430 derives an array's stride from its element, so the mirrors in
-    /// `prepass.frag` and `shadow.frag` step through the table at whatever pitch
-    /// this struct is — a mirror one block short reads every material past the
-    /// first out of the middle of its neighbour. Nothing in either shader can
-    /// notice, which is why the size is pinned here.
+    /// std430 derives an array's stride from its element, so every pass steps
+    /// through the table at the pitch of the one mirror in
+    /// `shaders/material.glsl` — a mirror one block short reads every material
+    /// past the first out of the middle of its neighbour. No shader can notice,
+    /// which is why the size is pinned here.
     #[test]
-    fn the_material_block_is_the_size_both_shader_mirrors_declare() {
-        // 15 vec4-sized blocks: base colour, emissive, params, texture indices,
+    fn the_material_block_is_the_size_material_glsl_declares() {
+        // 16 vec4-sized blocks: base colour, emissive, params, texture indices,
         // the five lobes' blocks, the two subsurface blocks, parallax, alpha,
-        // the extended indices, and the flags.
-        assert_eq!(std::mem::size_of::<GpuMaterial>(), 15 * 16);
+        // the extended indices, the flags, and the surface shader's word.
+        assert_eq!(std::mem::size_of::<GpuMaterial>(), 16 * 16);
     }
 }

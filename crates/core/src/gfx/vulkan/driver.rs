@@ -61,11 +61,11 @@ use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, BufferId,
     ComputePipelineDesc, CullMode, DepthCompare, DepthRect, Encoder, Feature, GraphicsPipelineDesc,
-    LoadOp, MeshSpan, PipelineId, Pool, RenderTargets, SamplerDesc, SamplerId, StoreOp,
-    TextureDesc, TextureDimension, TextureSwizzle, TextureViewId, Topology, VertexFormat,
-    VertexStream, Viewport,
+    LoadOp, MeshSpan, PipelineId, Pool, RenderTargets, SamplerDesc, SamplerId, ShaderModuleId,
+    ShaderRef, StoreOp, TextureDesc, TextureDimension, TextureSwizzle, TextureViewId, Topology,
+    VertexFormat, VertexStream, Viewport,
 };
-use crate::gfx::shaders::ShaderId;
+use crate::gfx::shaders::{CompiledBindings, CompiledShader};
 
 #[derive(Clone)]
 enum PipelineObject {
@@ -89,6 +89,9 @@ pub struct VkDriver {
     buffers: Mutex<Pool<Subbuffer<[u8]>>>,
     samplers: Mutex<Pool<Arc<Sampler>>>,
     pipelines: Mutex<Pool<PipelineObject>>,
+    /// Loaded shaders as SPIR-V and a name: a layout here is reflected from the
+    /// SPIR-V, so the MSL and the binding map are dropped at load.
+    shaders: Mutex<Pool<Arc<CompiledShader>>>,
     uniforms: Arena,
     storage: Arena,
     staging: Arena,
@@ -168,6 +171,7 @@ impl VkDriver {
             buffers: Mutex::new(Pool::new(frames_in_flight)),
             samplers: Mutex::new(Pool::new(frames_in_flight)),
             pipelines: Mutex::new(Pool::new(frames_in_flight)),
+            shaders: Mutex::new(Pool::new(frames_in_flight)),
             uniforms,
             staging,
             indices,
@@ -193,6 +197,7 @@ impl VkDriver {
         self.buffers.lock().unwrap().collect(frame);
         self.samplers.lock().unwrap().collect(frame);
         self.pipelines.lock().unwrap().collect(frame);
+        self.shaders.lock().unwrap().collect(frame);
         self.bind_groups.lock().unwrap().collect(frame);
     }
 
@@ -688,20 +693,115 @@ impl VkDriver {
         recorder.submit_and_wait(&self.ctx);
     }
 
-    pub fn create_graphics_pipeline(&self, desc: &GraphicsPipelineDesc) -> PipelineId {
+    pub fn load_shader(&self, shader: &CompiledShader) -> ShaderModuleId {
+        let kept = CompiledShader {
+            name: shader.name.clone(),
+            stage: shader.stage,
+            defines: Vec::new(),
+            spirv: shader.spirv.clone(),
+            msl: String::new(),
+            bindings: CompiledBindings {
+                resources: Vec::new(),
+                ..shader.bindings.clone()
+            },
+        };
+        ShaderModuleId(self.shaders.lock().unwrap().insert(Arc::new(kept)))
+    }
+
+    pub fn destroy_shader(&self, shader: ShaderModuleId) {
+        self.shaders
+            .lock()
+            .unwrap()
+            .remove(shader.0, self.frame.load(Ordering::Relaxed));
+    }
+
+    pub fn destroy_pipeline(&self, pipeline: PipelineId) {
+        self.pipelines
+            .lock()
+            .unwrap()
+            .remove(pipeline.0, self.frame.load(Ordering::Relaxed));
+    }
+
+    /// `shader`'s `main` as a fresh module, and the shader's name for errors.
+    /// The one way either kind of shader becomes a module.
+    fn entry_point(
+        &self,
+        shader: ShaderRef,
+    ) -> Result<(vulkano::shader::EntryPoint, String), String> {
+        let loaded: Arc<CompiledShader>;
+        let view = match shader {
+            ShaderRef::BuiltIn(id) => id.blob().view(),
+            ShaderRef::Loaded(id) => {
+                loaded = self
+                    .shaders
+                    .lock()
+                    .expect("a pass panicked while using the device")
+                    .get(id.0)
+                    .cloned()
+                    .ok_or_else(|| format!("loaded shader {} was destroyed", id.0))?;
+                loaded.view()
+            }
+        };
+        let words = spirv_words(view.spirv).map_err(|e| format!("{}: {e}", view.name))?;
+        // SAFETY: vulkano asks for valid SPIR-V. A built-in shader's words are
+        // shaderc's output for a manifest entry, which `build.rs` also reflects
+        // and translates, failing the build if either cannot parse it. A loaded
+        // shader's are the same compiler's output through `orrin-shaderc`, and
+        // that they still are exactly that output is the guarantee of whoever
+        // made the `CompiledShader`. What is checked here is framing:
+        // `spirv_words` refuses anything but a little-endian SPIR-V header and
+        // a body its instructions tile, and vulkano then parses every
+        // instruction and checks the version and capabilities against the
+        // device. Well-formed instructions that mean something invalid are not
+        // caught by either, and MoltenVK has been seen to crash on them.
+        let module = unsafe {
+            ShaderModule::new(self.ctx.device.clone(), ShaderModuleCreateInfo::new(&words))
+        }
+        .map_err(|e| format!("{}: {}", view.name, reason(e)))?;
+        let entry = module
+            .entry_point("main")
+            .ok_or_else(|| format!("{} has no main", view.name))?;
+        Ok((entry, view.name.to_string()))
+    }
+
+    /// The persistent pipeline cache, unless a stage was loaded at run time.
+    /// A loaded shader is a surface shader's variant, a new module with every
+    /// save, while the cache is machine-wide and never pruned — and MoltenVK
+    /// compiles everything it holds when it is created, so caching these made
+    /// the editor's startup grow with every edit.
+    fn cache_for(
+        &self,
+        stages: &[ShaderRef],
+    ) -> Option<Arc<vulkano::pipeline::cache::PipelineCache>> {
+        if stages
+            .iter()
+            .any(|stage| matches!(stage, ShaderRef::Loaded(_)))
+        {
+            None
+        } else {
+            self.ctx.pipeline_cache()
+        }
+    }
+
+    pub fn try_create_graphics_pipeline(
+        &self,
+        desc: &GraphicsPipelineDesc,
+    ) -> Result<PipelineId, String> {
         let device = &self.ctx.device;
-        let vertex = entry_point(&self.ctx, desc.vertex);
+        let (vertex, vertex_name) = self.entry_point(desc.vertex)?;
+        let (fragment, fragment_name) = self.entry_point(desc.fragment)?;
+        let named = |e: &dyn std::fmt::Display| format!("{vertex_name} with {fragment_name}: {e}");
         let stages = [
             PipelineShaderStageCreateInfo::new(vertex.clone()),
-            PipelineShaderStageCreateInfo::new(entry_point(&self.ctx, desc.fragment)),
+            PipelineShaderStageCreateInfo::new(fragment),
         ];
         let vertex_input = if desc.vertex_streams.is_empty() {
             VertexInputState::default()
         } else {
             let descriptions: Vec<_> = desc.vertex_streams.iter().map(vertex_buffer).collect();
-            descriptions
-                .definition(&vertex)
-                .expect("a vertex stream does not match the shader's inputs")
+            descriptions.definition(&vertex).map_err(|e| {
+                format!("{vertex_name}: a vertex stream does not match the shader's inputs: {e}")
+            })?
         };
         let lifted = desc.layout_from.map(|source| {
             lookup(&self.pipelines, source.0, "pipeline")
@@ -714,35 +814,41 @@ impl VkDriver {
                 .mark_texture_array_partial(&mut layout_info, set as usize);
         }
         for &(set, binding, sampler) in desc.immutable_samplers {
-            layout_info.set_layouts[set as usize]
-                .bindings
-                .get_mut(&binding)
-                .expect("an immutable sampler names a binding the shaders declare")
+            immutable_binding(&mut layout_info, set, binding)
+                .map_err(|e| named(&e))?
                 .immutable_samplers = vec![lookup(&self.samplers, sampler.0, "sampler")];
         }
-        let layout = lifted.unwrap_or_else(|| {
-            let mut info = layout_info
-                .into_pipeline_layout_create_info(device.clone())
-                .unwrap();
-            if let Some((source, count)) = desc.layout_prefix_from {
-                // The source's own objects, not a second set derived from the
-                // same declarations: deriving them would give layouts that match
-                // binding for binding and still fail to bind, because an
-                // immutable sampler is compared by identity.
-                let source = lookup(&self.pipelines, source.0, "pipeline");
-                info.set_layouts.splice(
-                    ..count as usize,
-                    source.layout().set_layouts()[..count as usize]
-                        .iter()
-                        .cloned(),
-                );
+        let layout = match lifted {
+            Some(layout) => layout,
+            None => {
+                let mut info = layout_info
+                    .into_pipeline_layout_create_info(device.clone())
+                    .map_err(|e| named(&format_args!("{e:?}")))?;
+                if let Some((source, count)) = desc.layout_prefix_from {
+                    // The source's own objects, not a second set derived from the
+                    // same declarations: deriving them would give layouts that match
+                    // binding for binding and still fail to bind, because an
+                    // immutable sampler is compared by identity.
+                    let source = lookup(&self.pipelines, source.0, "pipeline");
+                    let count = count as usize;
+                    if info.set_layouts.len() < count || source.layout().set_layouts().len() < count
+                    {
+                        return Err(named(&format_args!(
+                            "{count} set layouts are borrowed, and the shaders or the source declare fewer"
+                        )));
+                    }
+                    info.set_layouts.splice(
+                        ..count,
+                        source.layout().set_layouts()[..count].iter().cloned(),
+                    );
+                }
+                PipelineLayout::new(device.clone(), info).map_err(|e| named(&reason(e)))?
             }
-            PipelineLayout::new(device.clone(), info).unwrap()
-        });
+        };
         let colors: Vec<_> = desc.color_formats.iter().map(|&f| vk_format(f)).collect();
         let pipeline = GraphicsPipeline::new(
             device.clone(),
-            self.ctx.pipeline_cache(),
+            self.cache_for(&[desc.vertex, desc.fragment]),
             GraphicsPipelineCreateInfo {
                 stages: stages.into_iter().collect(),
                 vertex_input_state: Some(vertex_input),
@@ -826,13 +932,13 @@ impl VkDriver {
                 ..GraphicsPipelineCreateInfo::layout(layout)
             },
         )
-        .unwrap();
-        PipelineId(
+        .map_err(|e| named(&reason(e)))?;
+        Ok(PipelineId(
             self.pipelines
                 .lock()
                 .unwrap()
                 .insert(PipelineObject::Graphics(pipeline)),
-        )
+        ))
     }
 
     /// A descriptor set built outside the RHI, for the frame being recorded.
@@ -843,47 +949,40 @@ impl VkDriver {
         BindGroupId(index)
     }
 
-    pub fn create_compute_pipeline(&self, desc: &ComputePipelineDesc) -> PipelineId {
-        self.create_compute_pipeline_with_samplers(desc, &[])
-    }
-
     /// A compute pipeline with samplers baked into its set layout, as
     /// `(set, binding, sampler)`. Needed where a device must not be handed a
     /// written comparison sampler.
-    pub fn create_compute_pipeline_with_samplers(
+    pub fn try_create_compute_pipeline_with_samplers(
         &self,
         desc: &ComputePipelineDesc,
         immutable_samplers: &[(u32, u32, SamplerId)],
-    ) -> PipelineId {
+    ) -> Result<PipelineId, String> {
         let device = &self.ctx.device;
-        let stage = PipelineShaderStageCreateInfo::new(entry_point(&self.ctx, desc.shader));
+        let (entry, name) = self.entry_point(desc.shader)?;
+        let named = |e: &dyn std::fmt::Display| format!("{name}: {e}");
+        let stage = PipelineShaderStageCreateInfo::new(entry);
         let mut layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage]);
         for &(set, binding, sampler) in immutable_samplers {
-            layout_info.set_layouts[set as usize]
-                .bindings
-                .get_mut(&binding)
-                .expect("an immutable sampler names a binding the shader declares")
+            immutable_binding(&mut layout_info, set, binding)
+                .map_err(|e| named(&e))?
                 .immutable_samplers = vec![lookup(&self.samplers, sampler.0, "sampler")];
         }
-        let layout = PipelineLayout::new(
-            device.clone(),
-            layout_info
-                .into_pipeline_layout_create_info(device.clone())
-                .unwrap(),
-        )
-        .unwrap();
+        let info = layout_info
+            .into_pipeline_layout_create_info(device.clone())
+            .map_err(|e| named(&format_args!("{e:?}")))?;
+        let layout = PipelineLayout::new(device.clone(), info).map_err(|e| named(&reason(e)))?;
         let pipeline = ComputePipeline::new(
             device.clone(),
-            self.ctx.pipeline_cache(),
+            self.cache_for(&[desc.shader]),
             ComputePipelineCreateInfo::stage_layout(stage, layout),
         )
-        .unwrap();
-        PipelineId(
+        .map_err(|e| named(&reason(e)))?;
+        Ok(PipelineId(
             self.pipelines
                 .lock()
                 .unwrap()
                 .insert(PipelineObject::Compute(pipeline)),
-        )
+        ))
     }
 
     /// A persistent bind group: built afresh and kept until [`destroy_bind_group`],
@@ -1211,25 +1310,72 @@ fn vertex_buffer(stream: &VertexStream) -> VertexBufferDescription {
     }
 }
 
-fn entry_point(ctx: &VkContext, shader: ShaderId) -> vulkano::shader::EntryPoint {
-    let blob = shader.blob();
-    let words: Vec<u32> = blob
-        .spirv
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| u32::from_le_bytes(*word))
-        .collect();
-    // SAFETY: the words are the output of shaderc for a shader in the build
-    // manifest, compiled and cross-translated by `build.rs`, which fails the
-    // build on anything SPIR-V-invalid; vulkano validates the module's own
-    // capabilities against the device when it creates it.
-    let module =
-        unsafe { ShaderModule::new(ctx.device.clone(), ShaderModuleCreateInfo::new(&words)) }
-            .unwrap_or_else(|e| panic!("{}: {e}", blob.name));
-    module
-        .entry_point("main")
-        .unwrap_or_else(|| panic!("{} has no main", blob.name))
+/// What vulkano refused, rather than its summary that a validation error
+/// occurred.
+fn reason(error: vulkano::Validated<vulkano::VulkanError>) -> String {
+    match error {
+        vulkano::Validated::Error(error) => error.to_string(),
+        vulkano::Validated::ValidationError(error) => error.to_string(),
+    }
+}
+
+/// The binding an immutable sampler is baked into, or an error naming it when
+/// the shaders do not declare it.
+fn immutable_binding(
+    layout: &mut PipelineDescriptorSetLayoutCreateInfo,
+    set: u32,
+    binding: u32,
+) -> Result<&mut vulkano::descriptor_set::layout::DescriptorSetLayoutBinding, String> {
+    layout
+        .set_layouts
+        .get_mut(set as usize)
+        .and_then(|set_layout| set_layout.bindings.get_mut(&binding))
+        .ok_or_else(|| {
+            format!(
+                "an immutable sampler names set {set} binding {binding}, which no stage declares"
+            )
+        })
+}
+
+const SPIRV_MAGIC: u32 = 0x0723_0203;
+const SPIRV_HEADER_WORDS: usize = 5;
+
+/// `bytes` as SPIR-V words, or why they cannot be: not whole words, shorter
+/// than a header, not little-endian SPIR-V at all, or a body whose
+/// instructions do not tile it.
+fn spirv_words(bytes: &[u8]) -> Result<Vec<u32>, String> {
+    let (words, rest) = bytes.as_chunks::<4>();
+    if !rest.is_empty() {
+        return Err(format!(
+            "{} bytes is not a whole number of SPIR-V words",
+            bytes.len()
+        ));
+    }
+    if words.len() < SPIRV_HEADER_WORDS {
+        return Err(format!(
+            "{} words is shorter than a SPIR-V header",
+            words.len()
+        ));
+    }
+    let words: Vec<u32> = words.iter().map(|word| u32::from_le_bytes(*word)).collect();
+    if words[0] != SPIRV_MAGIC {
+        return Err(format!(
+            "starts with {:#010x}, not the little-endian SPIR-V magic number",
+            words[0]
+        ));
+    }
+    let mut at = SPIRV_HEADER_WORDS;
+    while at < words.len() {
+        let count = (words[at] >> 16) as usize;
+        if count == 0 || at + count > words.len() {
+            return Err(format!(
+                "the instruction at word {at} claims {count} words of the {} left",
+                words.len() - at
+            ));
+        }
+        at += count;
+    }
+    Ok(words)
 }
 
 /// Forwards to a [`Recorder`], remembering the bound pipeline's layout because
@@ -1707,10 +1853,14 @@ fn generate_cube_mips(builder: &mut Recorder, image: &Arc<Image>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use vulkano::pipeline::graphics::vertex_input::Vertex as _;
 
     use super::*;
+    use crate::gfx::format::SampleCount;
+    use crate::gfx::graph::ImageUsage;
+    use crate::gfx::rhi::Device;
+    use crate::gfx::shaders::ShaderId;
     use crate::gfx::{PositionVertex, SurfaceVertex};
 
     /// The RHI's description of a stream is written by hand beside the vertex
@@ -1741,5 +1891,434 @@ mod tests {
     #[test]
     fn the_surface_stream_matches_its_derived_layout() {
         agrees(&SurfaceVertex::STREAM, SurfaceVertex::per_vertex());
+    }
+
+    #[test]
+    fn every_built_in_shaders_bytes_pass_the_spirv_check() {
+        for blob in crate::gfx::shaders::SHADERS {
+            let words = spirv_words(blob.spirv).unwrap_or_else(|e| panic!("{}: {e}", blob.name));
+            assert_eq!(words.len() * 4, blob.spirv.len());
+        }
+    }
+
+    /// What reaches the `unsafe` module creation has to at least be a whole
+    /// SPIR-V word stream; a loaded shader's bytes come from a file.
+    #[test]
+    fn bytes_that_cannot_be_spirv_are_refused_before_the_driver_sees_them() {
+        let spirv = ShaderId::FullscreenVert.blob().spirv;
+        assert!(spirv_words(&[]).is_err(), "an empty stream");
+        assert!(
+            spirv_words(&spirv[..spirv.len() - 1]).is_err(),
+            "a stream cut mid-word"
+        );
+        assert!(spirv_words(&spirv[..8]).is_err(), "shorter than a header");
+        let mut no_magic = spirv.to_vec();
+        no_magic[0] ^= 0xff;
+        assert!(spirv_words(&no_magic).is_err(), "no magic number");
+        let big_endian: Vec<u8> = spirv
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|word| word.iter().rev().copied())
+            .collect();
+        assert!(spirv_words(&big_endian).is_err(), "the wrong byte order");
+    }
+
+    /// vulkano asserts every instruction is at least one word long, so a
+    /// zeroed word count would panic inside it rather than return an error.
+    #[test]
+    fn a_body_whose_instructions_do_not_frame_is_refused() {
+        let spirv = ShaderId::FullscreenVert.blob().spirv;
+        let first = SPIRV_HEADER_WORDS * 4;
+        let mut zero_count = spirv.to_vec();
+        zero_count[first + 2..first + 4].fill(0);
+        assert!(
+            spirv_words(&zero_count).is_err(),
+            "an instruction of no words"
+        );
+        assert!(
+            spirv_words(&spirv[..first + 4]).is_err(),
+            "an instruction that runs past the end"
+        );
+    }
+
+    // Loaded shaders on a device. The bodies take the device and a readback,
+    // so the Metal driver's tests run exactly these against its own device.
+
+    const SIDE: u32 = 8;
+    const FORMATS: [Format; 1] = [Format::Rgba8Unorm];
+    /// What `outline_mask.frag` writes: its push constant's second vec4.
+    const PUSHED: [f32; 4] = [1.0, 0.5, 0.25, 1.0];
+
+    fn vulkan() -> Device {
+        let instance = crate::capture::headless_instance();
+        let ctx = Arc::new(VkContext::new(&instance, None));
+        Device::Vulkan(VkDriver::new(ctx, 2))
+    }
+
+    fn read_vulkan(device: &Device, view: TextureViewId) -> Vec<u8> {
+        let driver = device.vulkan();
+        let image = driver.vk_view(view).image().clone();
+        let readback = Buffer::new_slice::<u8>(
+            driver.ctx.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: vulkano::buffer::BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+                ..Default::default()
+            },
+            u64::from(SIDE * SIDE * 4),
+        )
+        .unwrap();
+        let mut recorder = Recorder::new(&driver.ctx);
+        recorder
+            .image_barrier(record::color_to_transfer_src(
+                image.clone(),
+                record::levels(&image, 0..1),
+            ))
+            .copy_image_to_buffer(
+                vulkano::command_buffer::CopyImageToBufferInfo::image_buffer(
+                    image,
+                    readback.clone(),
+                ),
+            );
+        recorder.submit_and_wait(&driver.ctx);
+        readback.read().unwrap().to_vec()
+    }
+
+    pub(crate) fn loaded(device: &Device, shader: ShaderId) -> ShaderModuleId {
+        device.load_shader(&CompiledShader::from(shader.blob()))
+    }
+
+    fn target(device: &Device) -> TextureViewId {
+        device.create_texture(&TextureDesc {
+            format: Format::Rgba8Unorm,
+            dimension: TextureDimension::D2,
+            extent: [SIDE, SIDE, 1],
+            mip_levels: 1,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC,
+            memoryless: false,
+        })
+    }
+
+    fn fullscreen(
+        device: &Device,
+        vertex: impl Into<ShaderRef>,
+        fragment: impl Into<ShaderRef>,
+    ) -> Result<PipelineId, String> {
+        device.try_create_graphics_pipeline(&GraphicsPipelineDesc::fullscreen(
+            vertex, fragment, &FORMATS,
+        ))
+    }
+
+    fn draw(
+        device: &Device,
+        pipeline: PipelineId,
+        push: &[u32],
+        group: Option<BindGroupId>,
+    ) -> TextureViewId {
+        let output = target(device);
+        device.record_blocking(|encoder| {
+            encoder.begin_rendering_fresh(output);
+            encoder.bind_pipeline(pipeline);
+            encoder.set_viewport(Viewport {
+                origin: [0.0; 2],
+                extent: [SIDE as f32; 2],
+                depth_range: [0.0, 1.0],
+            });
+            if let Some(group) = group {
+                encoder.bind_group(0, group);
+            }
+            encoder.push_constants(push);
+            encoder.draw(3, 1, 0, 0);
+            encoder.end_rendering();
+        });
+        output
+    }
+
+    fn pixels(
+        device: &Device,
+        read: &dyn Fn(&Device, TextureViewId) -> Vec<u8>,
+        pipeline: PipelineId,
+        push: &[u32],
+        group: Option<BindGroupId>,
+    ) -> Vec<u8> {
+        read(device, draw(device, pipeline, push, group))
+    }
+
+    fn mask_push() -> [u32; 20] {
+        let mut push = [0; 20];
+        for (word, value) in push[16..].iter_mut().zip(PUSHED) {
+            *word = value.to_bits();
+        }
+        push
+    }
+
+    /// One selected texel in the middle of the mask, so `outline.frag` draws a
+    /// ring around it.
+    fn outline_inputs(device: &Device) -> (TextureViewId, SamplerId) {
+        let mut mask = vec![0u8; (SIDE * SIDE * 4) as usize];
+        let middle = ((SIDE / 2 * SIDE + SIDE / 2) * 4) as usize;
+        mask[middle..middle + 4].copy_from_slice(&[255, 0, 0, 255]);
+        let mask = device.create_texture_2d(&mask, [SIDE, SIDE], Format::Rgba8Unorm);
+        let sampler = device.create_sampler(SamplerDesc {
+            linear: false,
+            mipmap_linear: false,
+            repeat: false,
+            compare: false,
+            anisotropy: None,
+            max_lod: None,
+        });
+        (mask, sampler)
+    }
+
+    fn outline_group(
+        device: &Device,
+        pipeline: PipelineId,
+        mask: TextureViewId,
+        sampler: SamplerId,
+    ) -> BindGroupId {
+        device.create_bind_group(
+            pipeline,
+            0,
+            &[Binding {
+                binding: 0,
+                resource: BindingResource::SampledTexture {
+                    view: mask,
+                    sampler,
+                },
+            }],
+        )
+    }
+
+    fn outline_push() -> [u32; 9] {
+        let mut push = [0; 9];
+        for (word, value) in push
+            .iter_mut()
+            .zip([1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0])
+        {
+            *word = value.to_bits();
+        }
+        push[8] = 1;
+        push
+    }
+
+    /// A built-in shader's own bytes, loaded, draw what the built-in draws:
+    /// as the fragment stage beside a built-in vertex stage, and as both.
+    pub(crate) fn a_loaded_shader_draws_what_its_built_in_twin_draws(
+        device: &Device,
+        read: &dyn Fn(&Device, TextureViewId) -> Vec<u8>,
+    ) {
+        device.begin_frame(0);
+        let built_in = fullscreen(device, ShaderId::FullscreenVert, ShaderId::OutlineMaskFrag)
+            .expect("the built-in pipeline");
+        let fragment = loaded(device, ShaderId::OutlineMaskFrag);
+        let vertex = loaded(device, ShaderId::FullscreenVert);
+        let half = fullscreen(device, ShaderId::FullscreenVert, fragment)
+            .expect("a loaded fragment stage");
+        let whole = fullscreen(device, vertex, fragment).expect("two loaded stages");
+
+        let expected = pixels(device, read, built_in, &mask_push(), None);
+        for (texel, want) in expected[..4].iter().zip([255u8, 128, 64, 255]) {
+            assert!(texel.abs_diff(want) <= 1, "{:?}", &expected[..4]);
+        }
+        assert_eq!(pixels(device, read, half, &mask_push(), None), expected);
+        assert_eq!(pixels(device, read, whole, &mask_push(), None), expected);
+
+        // And one that reads a descriptor set, through a loaded shader's own
+        // set layout or argument encoder.
+        let (mask, sampler) = outline_inputs(device);
+        let built_in = fullscreen(device, ShaderId::FullscreenVert, ShaderId::OutlineFrag).unwrap();
+        let fragment = loaded(device, ShaderId::OutlineFrag);
+        let outline = fullscreen(device, ShaderId::FullscreenVert, fragment).unwrap();
+        let expected = pixels(
+            device,
+            read,
+            built_in,
+            &outline_push(),
+            Some(outline_group(device, built_in, mask, sampler)),
+        );
+        assert!(
+            expected.chunks(4).any(|texel| texel[0] > 0),
+            "the outline drew nothing; the test is not looking at one"
+        );
+        let got = pixels(
+            device,
+            read,
+            outline,
+            &outline_push(),
+            Some(outline_group(device, outline, mask, sampler)),
+        );
+        assert_eq!(got, expected);
+    }
+
+    /// `broken` is refused by whatever the backend asks to build it, and the
+    /// error names it.
+    pub(crate) fn a_broken_loaded_shader_is_an_error(device: &Device, broken: &CompiledShader) {
+        device.begin_frame(0);
+        let fragment = device.load_shader(broken);
+        let error = fullscreen(device, ShaderId::FullscreenVert, fragment)
+            .expect_err("a broken shader built a pipeline");
+        assert!(error.contains(&broken.name), "{error}");
+        println!("refused: {error}");
+    }
+
+    /// Retiring a pipeline and a loaded shader frees their slots after the
+    /// frames in flight, and nothing built from them reads a recycled slot.
+    pub(crate) fn retired_pipelines_and_shaders_are_recycled_safely(
+        device: &Device,
+        read: &dyn Fn(&Device, TextureViewId) -> Vec<u8>,
+    ) {
+        let mut frame = 0;
+        let mut next_frame = || {
+            frame += 1;
+            device.begin_frame(frame);
+        };
+        device.begin_frame(0);
+        let (mask, sampler) = outline_inputs(device);
+        let built_in = fullscreen(device, ShaderId::FullscreenVert, ShaderId::OutlineFrag).unwrap();
+        let expected = pixels(
+            device,
+            read,
+            built_in,
+            &outline_push(),
+            Some(outline_group(device, built_in, mask, sampler)),
+        );
+        let outline_shader = loaded(device, ShaderId::OutlineFrag);
+        let outline = fullscreen(device, ShaderId::FullscreenVert, outline_shader).unwrap();
+
+        // The pipeline outlives its shader's handle, and the slot that handle
+        // named going to a different shader changes nothing about it.
+        device.destroy_shader(outline_shader);
+        for _ in 0..4 {
+            next_frame();
+            draw(
+                device,
+                outline,
+                &outline_push(),
+                Some(outline_group(device, outline, mask, sampler)),
+            );
+        }
+        let mask_shader = loaded(device, ShaderId::OutlineMaskFrag);
+        assert_eq!(mask_shader, outline_shader, "the retired slot is reused");
+        let mask_pipeline = fullscreen(device, ShaderId::FullscreenVert, mask_shader).unwrap();
+        let got = pixels(
+            device,
+            read,
+            outline,
+            &outline_push(),
+            Some(outline_group(device, outline, mask, sampler)),
+        );
+        assert_eq!(got, expected);
+        let masked = pixels(device, read, mask_pipeline, &mask_push(), None);
+        assert!(masked[0] > 250, "{:?}", &masked[..4]);
+
+        device.destroy_pipeline(outline);
+        device.destroy_pipeline(mask_pipeline);
+        device.destroy_shader(mask_shader);
+        for _ in 0..4 {
+            next_frame();
+            draw(
+                device,
+                built_in,
+                &outline_push(),
+                Some(outline_group(device, built_in, mask, sampler)),
+            );
+        }
+        assert!(
+            fullscreen(device, ShaderId::FullscreenVert, mask_shader).is_err(),
+            "a retired shader handle is refused, not followed"
+        );
+        let again = fullscreen(
+            device,
+            ShaderId::FullscreenVert,
+            loaded(device, ShaderId::OutlineMaskFrag),
+        )
+        .unwrap();
+        assert!(
+            again == outline || again == mask_pipeline,
+            "a retired pipeline slot is reused"
+        );
+        assert_eq!(pixels(device, read, again, &mask_push(), None), masked);
+    }
+
+    #[test]
+    #[ignore = "needs a Vulkan device"]
+    fn a_loaded_shader_draws_what_its_built_in_twin_draws_on_vulkan() {
+        a_loaded_shader_draws_what_its_built_in_twin_draws(&vulkan(), &read_vulkan);
+    }
+
+    /// The header and the framing are intact, so the check ahead of the
+    /// `unsafe` passes it on; the `OpReturn` before the last `OpFunctionEnd`
+    /// has become an opcode SPIR-V does not have, which vulkano's parser
+    /// refuses. A body that parses and is still invalid — the same module with
+    /// those two instructions cut off — gets past vulkano to MoltenVK, whose
+    /// translator reports "Function was not terminated" and then crashes the
+    /// process, so that case cannot be a test here.
+    #[test]
+    #[ignore = "needs a Vulkan device"]
+    fn an_unknown_opcode_in_a_spirv_body_is_an_error_on_vulkan() {
+        let mut broken = CompiledShader::from(ShaderId::OutlineMaskFrag.blob());
+        let at = broken.spirv.len() - 8;
+        assert_eq!(
+            broken.spirv[at..],
+            [0x0001_00fd_u32, 0x0001_0038]
+                .map(u32::to_le_bytes)
+                .concat(),
+            "the last two instructions are OpReturn and OpFunctionEnd"
+        );
+        broken.spirv[at..at + 4].copy_from_slice(&0x0001_ffff_u32.to_le_bytes());
+        spirv_words(&broken.spirv).expect("the framing is intact");
+        a_broken_loaded_shader_is_an_error(&vulkan(), &broken);
+    }
+
+    /// A pipeline with a stage loaded at run time — a surface shader's twin —
+    /// adds nothing to the persistent pipeline cache. Every save of a shader is
+    /// a new module, the cache is machine-wide and never pruned, and MoltenVK
+    /// compiles every shader the file holds when the cache is created: before
+    /// this, a cache grown by sessions of shader edits held the editor's window
+    /// for over a minute at startup.
+    #[cfg(feature = "shader-compiler")]
+    #[test]
+    #[ignore = "needs a Vulkan device"]
+    fn a_loaded_shader_leaves_the_persistent_pipeline_cache_alone_on_vulkan() {
+        let device = vulkan();
+        let cache = device
+            .vulkan()
+            .ctx
+            .pipeline_cache()
+            .expect("a pipeline cache");
+        // A constant no earlier run wrote, so no earlier run cached this shader.
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let source = format!(
+            "#version 450\nlayout(location = 0) out vec4 colour;\n\
+             void main() {{ colour = vec4(float({salt}u) * 1e-9); }}\n"
+        );
+        let compiled = crate::gfx::shaders::compile(
+            &source,
+            crate::gfx::shaders::Stage::Fragment,
+            "salted.frag",
+            &[],
+            &[],
+        )
+        .unwrap();
+        let fragment = device.load_shader(&compiled);
+        let before = cache.get_data().unwrap().len();
+        fullscreen(&device, ShaderId::FullscreenVert, fragment).expect("a pipeline");
+        assert_eq!(cache.get_data().unwrap().len(), before);
+    }
+
+    #[test]
+    #[ignore = "needs a Vulkan device"]
+    fn retired_pipelines_and_shaders_are_recycled_safely_on_vulkan() {
+        retired_pipelines_and_shaders_are_recycled_safely(&vulkan(), &read_vulkan);
     }
 }

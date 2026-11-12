@@ -14,6 +14,7 @@
 //! it holds and the encoder declares it when the group is bound.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use objc2::rc::Retained;
@@ -23,7 +24,7 @@ use objc2_metal::{
     MTLResourceUsage,
 };
 
-use super::pipeline::Pipe;
+use super::pipeline::{MtlShader, Pipe};
 use super::{MtlDriver, Shared};
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, PipelineId, SamplerId, TextureViewId,
@@ -87,10 +88,9 @@ fn declared_ids(msl: &str, set: u32) -> HashMap<u32, bool> {
         .collect()
 }
 
-fn find_in(shader: ShaderId, set: u32, binding: u32) -> Option<Resource> {
+fn find_in(shader: &MtlShader, set: u32, binding: u32) -> Option<Resource> {
     shader
-        .blob()
-        .bindings
+        .view()
         .resources
         .iter()
         .find(|resource| resource.set == set && resource.binding == binding)
@@ -99,22 +99,62 @@ fn find_in(shader: ShaderId, set: u32, binding: u32) -> Option<Resource> {
 
 /// One stage's argument encoder over a set's buffer, and the ids it declares.
 struct StageWriter<'a> {
-    shader: ShaderId,
-    declared: &'a HashMap<u32, bool>,
-    encoder: &'a ProtocolObject<dyn MTLArgumentEncoder>,
+    shader: &'a MtlShader,
+    encoding: Arc<(HashMap<u32, bool>, super::Held<dyn MTLArgumentEncoder>)>,
+}
+
+impl StageWriter<'_> {
+    fn declared(&self) -> &HashMap<u32, bool> {
+        &self.encoding.0
+    }
+
+    fn encoder(&self) -> &ProtocolObject<dyn MTLArgumentEncoder> {
+        &self.encoding.1.0
+    }
 }
 
 /// What a (shader, set) pair costs to work out: creating an argument encoder is
-/// about 30 microseconds and the set is rebuilt many times a frame.
-pub(super) type EncoderCache =
-    HashMap<(ShaderId, u32), Option<(HashMap<u32, bool>, super::Held<dyn MTLArgumentEncoder>)>>;
+/// about 30 microseconds and the set is rebuilt many times a frame. `None` for
+/// a set the shader declares nothing in.
+pub(super) type Encoding = Option<Arc<(HashMap<u32, bool>, super::Held<dyn MTLArgumentEncoder>)>>;
+
+/// The built-in shaders' encodings. A loaded shader keeps its own.
+pub(super) type EncoderCache = HashMap<(ShaderId, u32), Encoding>;
 
 impl MtlDriver {
-    fn shaders_of(&self, pipeline: PipelineId) -> [Option<ShaderId>; 2] {
+    fn shaders_of(&self, pipeline: PipelineId) -> [Option<MtlShader>; 2] {
         self.with_pipe(pipeline, |pipe| match pipe {
-            Pipe::Render(render) => [Some(render.vertex), Some(render.fragment)],
-            Pipe::Compute(compute) => [Some(compute.shader), None],
+            Pipe::Render(render) => [Some(render.vertex.clone()), Some(render.fragment.clone())],
+            Pipe::Compute(compute) => [Some(compute.shader.clone()), None],
         })
+    }
+
+    /// `shader`'s encoding of `set`, made on first use and kept wherever the
+    /// shader's kind keeps it. `cache` is the caller's, held for the whole build.
+    fn encoding(&self, cache: &mut EncoderCache, shader: &MtlShader, set: u32) -> Encoding {
+        let make = || {
+            let declared = declared_ids(shader.view().msl, set);
+            if declared.is_empty() {
+                return None;
+            }
+            let function = self
+                .function(shader)
+                .expect("a pipeline's shaders compiled when it was built");
+            // SAFETY: `set` is a buffer index this function declares an
+            // argument buffer at, which `declared_ids` just established.
+            let encoder = unsafe { function.newArgumentEncoderWithBufferIndex(set as usize) };
+            Some(Arc::new((declared, super::Shared(encoder))))
+        };
+        match shader {
+            MtlShader::BuiltIn(id) => cache.entry((*id, set)).or_insert_with(make).clone(),
+            MtlShader::Loaded(loaded) => loaded
+                .encoders
+                .lock()
+                .unwrap()
+                .entry(set)
+                .or_insert_with(make)
+                .clone(),
+        }
     }
 
     /// Write `bindings` into a fresh argument buffer for each stage of
@@ -131,28 +171,13 @@ impl MtlDriver {
         // Held for the whole build: an argument encoder is not thread safe and
         // the cached ones are shared.
         let mut cache = self.encoders.lock().unwrap();
-        for shader in shaders.into_iter().flatten() {
-            cache.entry((shader, set)).or_insert_with(|| {
-                let declared = declared_ids(shader.blob().msl, set);
-                if declared.is_empty() {
-                    return None;
-                }
-                let function = self.function(shader);
-                // SAFETY: `set` is a buffer index this function declares an
-                // argument buffer at, which `declared_ids` just established.
-                let encoder = unsafe { function.newArgumentEncoderWithBufferIndex(set as usize) };
-                Some((declared, super::Shared(encoder)))
-            });
-        }
         let writers: Vec<StageWriter> = shaders
-            .into_iter()
+            .iter()
             .flatten()
             .filter_map(|shader| {
-                let (declared, encoder) = cache.get(&(shader, set))?.as_ref()?;
                 Some(StageWriter {
                     shader,
-                    declared,
-                    encoder: &encoder.0,
+                    encoding: self.encoding(&mut cache, shader, set)?,
                 })
             })
             .collect();
@@ -161,7 +186,7 @@ impl MtlDriver {
         }
         // Every stage's struct has the same slots, so any encoder's length is
         // the buffer's.
-        let length = writers[0].encoder.encodedLength().max(8) as u64;
+        let length = writers[0].encoder().encodedLength().max(8) as u64;
         let (buffer, offset) = if persistent {
             let buffer = self
                 .device
@@ -176,7 +201,7 @@ impl MtlDriver {
             // at the alignment the arena and a fresh buffer both give.
             unsafe {
                 writer
-                    .encoder
+                    .encoder()
                     .setArgumentBuffer_offset(Some(&buffer), offset as usize)
             };
         }
@@ -185,7 +210,7 @@ impl MtlDriver {
         let writer_of = |id: u32| {
             writers
                 .iter()
-                .find(|writer| writer.declared.contains_key(&id))
+                .find(|writer| writer.declared().contains_key(&id))
         };
 
         let mut uses = Vec::new();
@@ -215,7 +240,7 @@ impl MtlDriver {
                     let index = slot(&mut next_in_array);
                     if let Some(writer) = writer_of(resource.index) {
                         self.write_texture(
-                            writer.encoder,
+                            writer.encoder(),
                             index,
                             view,
                             MTLResourceUsage::Read,
@@ -226,14 +251,14 @@ impl MtlDriver {
                     if resource.kind == ResourceKind::CombinedImageSampler
                         && let Some(writer) = writer_of(at)
                     {
-                        self.write_sampler(writer.encoder, at, sampler);
+                        self.write_sampler(writer.encoder(), at, sampler);
                     }
                 }
                 BindingResource::Texture(view) => {
                     let index = slot(&mut next_in_array);
                     if let Some(writer) = writer_of(resource.index) {
                         self.write_texture(
-                            writer.encoder,
+                            writer.encoder(),
                             index,
                             view,
                             MTLResourceUsage::Read,
@@ -245,7 +270,7 @@ impl MtlDriver {
                     let index = slot(&mut next_in_array);
                     if let Some(writer) = writer_of(resource.index) {
                         self.write_texture(
-                            writer.encoder,
+                            writer.encoder(),
                             index,
                             view,
                             MTLResourceUsage::Read | MTLResourceUsage::Write,
@@ -255,7 +280,7 @@ impl MtlDriver {
                 }
                 BindingResource::Sampler(sampler) => {
                     if let Some(writer) = writer_of(resource.index) {
-                        self.write_sampler(writer.encoder, resource.index, sampler);
+                        self.write_sampler(writer.encoder(), resource.index, sampler);
                     }
                 }
                 BindingResource::Geometry(stream) => {
@@ -272,7 +297,7 @@ impl MtlDriver {
                     };
                     // SAFETY: a live buffer, from its start.
                     unsafe {
-                        writer.encoder.setBuffer_offset_atIndex(
+                        writer.encoder().setBuffer_offset_atIndex(
                             Some(buffer),
                             0,
                             resource.index as usize,
@@ -291,7 +316,7 @@ impl MtlDriver {
                     let buf = self.buffer(id);
                     let written = writers
                         .iter()
-                        .any(|writer| writer.declared.get(&resource.index) == Some(&true));
+                        .any(|writer| writer.declared().get(&resource.index) == Some(&true));
                     let usage = if written
                         && matches!(binding.resource, BindingResource::StorageBuffer(_))
                     {
@@ -301,7 +326,7 @@ impl MtlDriver {
                     };
                     // SAFETY: a live buffer and an offset inside it.
                     unsafe {
-                        writer.encoder.setBuffer_offset_atIndex(
+                        writer.encoder().setBuffer_offset_atIndex(
                             Some(&buf.buffer.0),
                             buf.offset as usize,
                             resource.index as usize,
@@ -327,7 +352,7 @@ impl MtlDriver {
                 continue;
             };
             if let Some(writer) = writer_of(resource.index) {
-                self.write_sampler(writer.encoder, resource.index, sampler);
+                self.write_sampler(writer.encoder(), resource.index, sampler);
             }
         }
         self.insert_group(
@@ -438,7 +463,7 @@ impl MtlDriver {
         let length = shaders
             .into_iter()
             .flatten()
-            .find_map(|shader| find_in(shader, set, 0))
+            .find_map(|shader| find_in(&shader, set, 0))
             .map_or(textures.len(), |r| r.count as usize);
         let mut bindings: Vec<Binding> = (0..length)
             .map(|i| Binding {
@@ -483,7 +508,29 @@ impl MtlDriver {
 
 #[cfg(test)]
 mod declared_tests {
-    use super::declared_ids;
+    use super::{MtlShader, declared_ids, find_in};
+    use crate::gfx::metal::pipeline::tests::loaded;
+    use crate::gfx::shaders::ShaderId;
+
+    #[test]
+    fn a_loaded_shader_declares_the_ids_and_bindings_its_built_in_twin_does() {
+        let built_in = MtlShader::BuiltIn(ShaderId::ForwardFrag);
+        let loaded = loaded(ShaderId::ForwardFrag);
+        for set in 0..6 {
+            assert_eq!(
+                declared_ids(loaded.view().msl, set),
+                declared_ids(built_in.view().msl, set),
+                "set {set}"
+            );
+            for binding in 0..8 {
+                assert_eq!(
+                    find_in(&loaded, set, binding),
+                    find_in(&built_in, set, binding)
+                );
+            }
+        }
+        assert!(!declared_ids(loaded.view().msl, 0).is_empty());
+    }
 
     #[test]
     fn a_const_buffer_is_declared_read_only_and_a_pad_is_not_declared() {

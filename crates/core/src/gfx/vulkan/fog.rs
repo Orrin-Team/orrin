@@ -168,12 +168,12 @@ impl FogPass {
         });
         let scatter_pipeline = device.create_compute_pipeline_with_samplers(
             &ComputePipelineDesc {
-                shader: ShaderId::FogScatterComp,
+                shader: ShaderId::FogScatterComp.into(),
             },
             &[(0, SHADOW_SAMPLER_BINDING, shadow_sampler)],
         );
         let integrate_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
-            shader: ShaderId::FogIntegrateComp,
+            shader: ShaderId::FogIntegrateComp.into(),
         });
 
         let sampler = |linear: bool| {

@@ -123,7 +123,7 @@ pub fn find(start: &Path, release: bool) -> Result<Engine, String> {
 /// anything, so the same symlink would work on one platform and not the other.
 fn current_exe() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    Some(exe.canonicalize().unwrap_or(exe))
+    Some(orrin_project::canonical(&exe).unwrap_or(exe))
 }
 
 fn beside_executable() -> Option<PathBuf> {

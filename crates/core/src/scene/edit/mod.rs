@@ -135,7 +135,7 @@ impl<'a> SceneEditor<'a> {
                 "material asset {id}: there is no asset database"
             )));
         };
-        let current = db.material_file(id).copied().ok_or_else(|| {
+        let current = db.material_file(id).cloned().ok_or_else(|| {
             let name = db
                 .get(id)
                 .map_or_else(|| id.to_string(), |e| e.path.clone());
@@ -206,7 +206,7 @@ impl<'a> SceneEditor<'a> {
         let after = self
             .world
             .get_resource::<AssetDatabase>()
-            .and_then(|db| db.material_file(pending.id).copied());
+            .and_then(|db| db.material_file(pending.id).cloned());
         let Some(after) = after else {
             return Ok(None);
         };
@@ -1064,7 +1064,11 @@ mod tests {
         id: AssetId,
         edit: impl FnOnce(&mut MaterialFile),
     ) -> MaterialFile {
-        let mut file = *world.resource::<AssetDatabase>().material_file(id).unwrap();
+        let mut file = world
+            .resource::<AssetDatabase>()
+            .material_file(id)
+            .unwrap()
+            .clone();
         edit(&mut file);
         file
     }
@@ -1074,7 +1078,11 @@ mod tests {
     }
 
     fn drawn(world: &World, id: AssetId) -> MaterialFile {
-        *world.resource::<AssetDatabase>().material_file(id).unwrap()
+        world
+            .resource::<AssetDatabase>()
+            .material_file(id)
+            .unwrap()
+            .clone()
     }
 
     #[test]
@@ -1085,7 +1093,7 @@ mod tests {
         let rough = brick_with(&world, id, |file| file.material.roughness = 0.75);
 
         let mut editor = SceneEditor::new(&mut world, &registry, &mut history);
-        editor.set_material(id, rough).unwrap();
+        editor.set_material(id, rough.clone()).unwrap();
         editor.try_commit().unwrap();
         let edited = on_disk(&dir);
         assert_eq!(edited, material::write(&rough), "written when it commits");
@@ -1154,6 +1162,76 @@ mod tests {
         assert_eq!(editor.undo().unwrap().as_deref(), Some("Edit brick"));
         assert_eq!(editor.undo().unwrap(), None, "a refused drop is no step");
         assert_eq!(on_disk(&dir), HAND_WRITTEN);
+    }
+
+    /// A shader parameter is a field of the material like any other: its
+    /// edit is one undoable step that writes the file, and its undo and redo
+    /// put back the values as well as the text.
+    #[test]
+    fn a_shader_parameter_edit_is_undone_and_redone_like_any_material_edit() {
+        use crate::asset_db::material::ShaderValue;
+        let registry = registry();
+        let (dir, mut world, id) = material_world("edit-omat-shader");
+        dir.write("glow.oshader", b"");
+        world.resource_mut::<AssetDatabase>().rescan();
+        let (glow, rock, tree) = {
+            let db = world.resource::<AssetDatabase>();
+            let id = |path| db.find(path).unwrap().id;
+            (id("glow.oshader"), id("rock.png"), id("tree.glb"))
+        };
+        let mut history = History::default();
+        let mut editor = SceneEditor::new(&mut world, &registry, &mut history);
+
+        let shaded = brick_with(editor.world(), id, |file| {
+            file.shader = Some(glow);
+            file.set_shader_value("wear", Some(ShaderValue::Float(0.25)));
+        });
+        editor.set_material(id, shaded).unwrap();
+        editor.try_commit().unwrap();
+        let first = on_disk(&dir);
+        let worn = brick_with(editor.world(), id, |file| {
+            file.set_shader_value("wear", Some(ShaderValue::Float(0.75)));
+            file.set_shader_value("mask", Some(ShaderValue::Texture(rock)));
+        });
+        editor.set_material(id, worn).unwrap();
+        editor.try_commit().unwrap();
+        let second = on_disk(&dir);
+        let saved = material::parse(&second, "brick.omat").unwrap();
+        assert_eq!(saved.shader, Some(glow));
+        assert_eq!(saved.shader_value("wear"), Some(ShaderValue::Float(0.75)));
+
+        assert_eq!(editor.undo().unwrap().as_deref(), Some("Edit brick"));
+        assert_eq!(on_disk(&dir), first);
+        let drawn_now = drawn(editor.world(), id);
+        assert_eq!(
+            drawn_now.shader_value("wear"),
+            Some(ShaderValue::Float(0.25))
+        );
+        assert_eq!(drawn_now.shader_value("mask"), None);
+        editor.redo().unwrap();
+        assert_eq!(on_disk(&dir), second);
+        assert_eq!(
+            drawn(editor.world(), id).shader_value("mask"),
+            Some(ShaderValue::Texture(rock))
+        );
+        editor.undo().unwrap();
+        editor.undo().unwrap();
+        assert_eq!(on_disk(&dir), HAND_WRITTEN);
+        assert_eq!(drawn(editor.world(), id).shader, None);
+
+        let meshed = brick_with(editor.world(), id, |file| file.shader = Some(tree));
+        assert_eq!(
+            editor.set_material(id, meshed).unwrap_err().0,
+            "brick.omat: `shader` takes a surface shader, not `tree.glb`, which is a mesh"
+        );
+        let mismasked = brick_with(editor.world(), id, |file| {
+            file.set_shader_value("mask", Some(ShaderValue::Texture(tree)))
+        });
+        assert_eq!(
+            editor.set_material(id, mismasked).unwrap_err().0,
+            "brick.omat: shader parameter `mask` takes a texture, not `tree.glb`, which is a \
+             mesh"
+        );
     }
 
     /// A write that fails names the file, and the material goes back to what

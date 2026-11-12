@@ -16,43 +16,22 @@ layout(location = 0) out vec4 f_normal;
 layout(location = 1) out vec2 f_velocity;
 layout(location = 2) out vec4 f_material;
 
-// Mirrors GpuMaterial in forward.rs, field for field: the two passes read the
-// same buffer through their own layouts, so a change here is a change there.
+// The forward pass's material table, through the one declaration of its row:
+// the passes read the same buffer through their own layouts, so a change there
+// is a change to both.
 //
-// The lobe blocks are declared but unread, and both halves of that are
-// deliberate. Declared, because std430 derives the array stride from the struct
-// and a short mirror would step through the table at the wrong pitch — every
-// material past the first would be read out of the middle of its neighbour.
-// Unread, because this pass writes the *base* layer's f0 and roughness and
-// `ssr_resolve.comp` subtracts exactly that: the clear coat's own reflection
-// stays image-based, so nothing here has a second lobe to describe.
+// The lobe blocks are in the row but unread here, deliberately: this pass
+// writes the *base* layer's f0 and roughness and `ssr_resolve.comp` subtracts
+// exactly that. The clear coat's own reflection stays image-based, so nothing
+// here has a second lobe to describe.
 //
 // Parallax is the one that is read, because it is not a lobe: it changes *where*
 // the maps are sampled rather than what is done with them, so this pass and the
-// forward pass have to march the same ray to be describing one pixel.
-struct GpuMaterial {
-    vec4 base_color;
-    vec4 emissive;
-    vec4 params;      // x = metallic, y = roughness, z = reflectance, w = ior
-    uvec4 tex_indices; // [albedo, normal, metal-rough, emissive]
-    vec4 clearcoat;
-    vec4 sheen;
-    vec4 anisotropy;
-    vec4 transmission;
-    vec4 attenuation;
-    vec4 subsurface;
-    vec4 subsurface_radius;
-    // Read here, unlike the blocks around it: the march moves the coordinate
-    // every one of the three outputs below is sampled at, so a prepass that
-    // skipped it would report the flat wall's normal for the pixel the forward
-    // pass shaded one brick along.
-    vec4 parallax;    // x = height field depth in metres, y = min steps, z = max steps
-    // Read only by the ORRIN_MASKED variant below, and declared unconditionally
-    // for the stride reason the lobe blocks are.
-    vec4 alpha;       // x = the alpha a MASKED fragment must reach to survive
-    uvec4 tex_indices_ext;
-    uvec4 tex_flags;  // x = transmission map, y = feature flags, z = subsurface, w = height
-};
+// forward pass have to march the same ray to be describing one pixel. A prepass
+// that skipped it would report the flat wall's normal for the pixel the forward
+// pass shaded one brick along. The cutoff in `alpha` is read only by the
+// ORRIN_MASKED variant below.
+#include "material.glsl"
 layout(set = 2, binding = 0, std430) readonly buffer Materials {
     GpuMaterial materials[];
 };
@@ -64,30 +43,14 @@ const int MAX_TEXTURES = 192;
 layout(set = 3, binding = 0) uniform texture2D u_textures[MAX_TEXTURES];
 layout(set = 3, binding = 1) uniform sampler u_sampler;
 
-vec4 sample_tex(uint index, vec2 uv) {
-    return texture(sampler2D(u_textures[index], u_sampler), uv);
-}
-
-// Feature bits in `tex_flags.y`; only the one this pass acts on is named here.
-// Mirrors `material_flags` in forward.rs, as `shading.glsl` does.
-const uint MATERIAL_PARALLAX = 1u << 5;
-
-float parallax_height(uint index, vec2 uv, vec2 dx, vec2 dy) {
-    return textureGrad(sampler2D(u_textures[index], u_sampler), uv, dx, dy).r;
-}
-#include "parallax.glsl"
-#include "normal_map.glsl"
-
-vec4 decal_sample(uint index, vec2 uv, vec2 dx, vec2 dy) {
-    return textureGrad(sampler2D(u_textures[index], u_sampler), uv, dx, dy);
-}
-#include "decals.glsl"
-
 // The camera block, declared here as well as in the vertex stage. This pass
 // reports normals in view space and a decal is authored in world space, so the
 // rotation between them is needed in the fragment stage — and it has to be
 // *this* frame's, not one derived from anything else, for the reason every pass
-// that rasterises geometry takes its matrices from `taa::FrameView`.
+// that rasterises geometry takes its matrices from `taa::FrameView`. Ahead of
+// `surface.glsl`, because `jitter.z` is the time a surface function reads: the
+// value the forward family reads out of its lighting block, from one clock
+// reading, so the cut this pass makes is the one the forward pass shades.
 layout(set = 0, binding = 0) uniform Frame {
     mat4 view;
     mat4 proj;
@@ -95,6 +58,28 @@ layout(set = 0, binding = 0) uniform Frame {
     mat4 prev_view_proj;
     vec4 jitter;
 } frame;
+
+vec4 sample_tex(uint index, vec2 uv) {
+    return texture(sampler2D(u_textures[index], u_sampler), uv);
+}
+
+#ifdef ORRIN_CUSTOM_SURFACE
+float surface_time() {
+    return frame.jitter.z;
+}
+#endif
+
+float parallax_height(uint index, vec2 uv, vec2 dx, vec2 dy) {
+    return textureGrad(sampler2D(u_textures[index], u_sampler), uv, dx, dy).r;
+}
+#include "parallax.glsl"
+#include "normal_map.glsl"
+#include "surface.glsl"
+
+vec4 decal_sample(uint index, vec2 uv, vec2 dx, vec2 dy) {
+    return textureGrad(sampler2D(u_textures[index], u_sampler), uv, dx, dy);
+}
+#include "decals.glsl"
 
 void main() {
     GpuMaterial m = materials[v_material];
@@ -124,11 +109,23 @@ void main() {
         );
     }
 
-    // Same reads and the same conventions as forward.frag: glTF packs roughness
-    // in G and metallic in B, and the roughness floor keeps the highlight from
-    // going singular.
-    vec4  mr_tex     = sample_tex(m.tex_indices.z, uv);
-    vec4  albedo_tex = sample_tex(m.tex_indices.x, uv);
+    // The same reading `shading.glsl` makes, from the same file, so it has to be
+    // handed the same values: world space, not this pass's view space.
+    SurfaceIn i;
+    i.uv = uv;
+    i.world_position = v_world_pos;
+    i.vertex_color = v_color;
+#ifdef ORRIN_CUSTOM_SURFACE
+    mat3 view_to_world = transpose(mat3(frame.view));
+    i.world_normal = view_to_world * TBN[2];
+    i.view_dir = view_to_world * normalize(-v_view_pos);
+#else
+    // Only a custom surface function reads these, so only its build pays for
+    // rotating them out of view space.
+    i.world_normal = vec3(0.0);
+    i.view_dir = vec3(0.0);
+#endif
+    SurfaceOut o = resolve_surface(m, i);
 
 #ifdef ORRIN_MASKED
     // This target is one sample, so there is no coverage to spend and the cut is
@@ -141,18 +138,17 @@ void main() {
     // In a variant of its own rather than behind a flag test, so that the plain
     // prepass shader still contains no `discard` and keeps its early depth test:
     // a cutout must not cost every other opaque material in the scene.
-    if (m.base_color.a * albedo_tex.a < m.alpha.x) {
+    if (o.alpha < m.alpha.x) {
         discard;
     }
 #endif
 
-    vec3  albedo     = m.base_color.rgb * v_color * albedo_tex.rgb;
-    float metallic   = clamp(m.params.x * mr_tex.b, 0.0, 1.0);
-    float roughness  = clamp(m.params.y * mr_tex.g, 0.04, 1.0);
+    vec3  albedo     = o.albedo;
+    float metallic   = o.metallic;
+    float roughness  = o.roughness;
     float reflectance = m.params.z;
 
-    vec3 n_tangent = tangent_normal(sample_tex(m.tex_indices.y, uv));
-    vec3 view_normal = normalize(TBN * n_tangent);
+    vec3 view_normal = normalize(TBN * o.normal);
 
     // The same stamp `read_surface` applies, in the same order, to the same four
     // quantities — which is the whole point of it being one file. `view` is

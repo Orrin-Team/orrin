@@ -34,7 +34,7 @@ fn draw(renderer: &mut VulkanRenderer, material: MaterialHandle) -> Vec<u8> {
         material,
         orbit: Orbit::default(),
     };
-    frame(renderer, [Some(subject), None]);
+    frame(renderer, [Some(subject), None, None]);
     renderer
         .read_material_preview(Viewer::Inspector)
         .expect("a frame that asked for the preview leaves one to read")
@@ -173,7 +173,7 @@ fn check(mut renderer: VulkanRenderer, backend: &str) {
         })
     };
     for _ in 0..2 {
-        frame(&mut renderer, [at(clay), at(moss)]);
+        frame(&mut renderer, [at(clay), at(moss), None]);
     }
     let inspector = renderer.read_material_preview(Viewer::Inspector).unwrap();
     let browser = renderer.read_material_preview(Viewer::Browser).unwrap();

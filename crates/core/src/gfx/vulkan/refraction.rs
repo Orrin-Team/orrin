@@ -31,10 +31,19 @@
 //! forward pass. Its layout is not the forward pass's — it has a sixth set — but
 //! the first five are identical binding for binding, which is all Vulkan's set
 //! compatibility rule asks.
+//!
+//! A transmissive material read through a surface shader draws with that
+//! shader's twin of the draw pipeline (`surface`). Its set 5 is this pass's
+//! two views plus the parameter buffer, so it gets a set of its own, asked of
+//! the device's cache on the first run that needs it, as the built-in's is.
+//! The queue stays back to front: the pipeline follows the runs, switching to
+//! a twin and back as the order asks, rather than the runs being grouped by
+//! pipeline.
 
 use crate::gfx::rhi::{
     Binding, BindingResource, Blend, ComputePipelineDesc, CullMode, DepthTest, Device, Encoder,
-    GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, TextureViewId, Viewport,
+    GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, ShaderModuleId, ShaderRef,
+    TextureViewId, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
@@ -42,6 +51,7 @@ use crate::gfx::{DrawList, PositionVertex, SurfaceVertex};
 use super::PassCtx;
 use super::forward::ForwardSets;
 use super::hdr::HDR_WIDE_FORMAT;
+use super::surface::{Surfaces, Twin, params_group};
 use super::swapchain::DEPTH_FORMAT;
 use super::taa::FrameView;
 
@@ -59,6 +69,46 @@ pub(super) const SCENE_LEVELS: u32 = 7;
 /// Where `refraction.frag` declares the scene pyramid — one past the five sets
 /// it shares with the forward pass.
 const SCENE_SET: usize = 5;
+
+/// The refraction pipeline, built-in or a surface shader's twin of it, with
+/// its first five sets lifted from `layout`.
+fn pipeline_desc(fragment: ShaderRef, layout: PipelineId) -> GraphicsPipelineDesc<'static> {
+    GraphicsPipelineDesc {
+        // Front faces only, unlike the transparency accumulation, which draws
+        // both. There the two faces of a glass sphere are two surfaces that
+        // each scatter light; here the material's *thickness* already stands
+        // for the far side, so drawing the back face would refract the same
+        // volume a second time and composite it over the first.
+        cull: CullMode::Back,
+        // Tested against the opaque scene, never written. Two refractive
+        // surfaces are ordered by the back-to-front sort instead, which is
+        // what the premultiplied blend expects — a depth write would let the
+        // nearer of two glass panes reject the farther before it had been
+        // composited under it.
+        depth_test: Some(DepthTest {
+            write: false,
+            compare: crate::gfx::depth::NEARER,
+        }),
+        depth_format: Some(DEPTH_FORMAT),
+        vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
+        // Premultiplied `over`. The fragment already composited its own
+        // background, so what accumulates here is radiance that has replaced
+        // what was behind it, carrying the coverage that says how much of the
+        // pixel it replaced.
+        blend: Blend::Premultiplied,
+        // Sets 0 through 4 are *the forward pipeline's own objects*, not a
+        // second set derived from the same declarations. Deriving them would
+        // produce layouts that match binding for binding and still fail to
+        // bind: set 3 holds the shadow comparison sampler immutably, and
+        // Vulkan compares immutable samplers by identity. Lifting the objects
+        // is what makes the five sets the executor already built bind to this
+        // pipeline at all.
+        layout_prefix_from: Some((layout, SCENE_SET as u32)),
+        // The forward pass's vertex shader, unchanged: a refractive surface is
+        // the same geometry read from the same per-object rows.
+        ..GraphicsPipelineDesc::fullscreen(ShaderId::ForwardVert, fragment, &[ACCUM_FORMAT])
+    }
+}
 
 pub struct RefractionPass {
     pipeline: PipelineId,
@@ -82,45 +132,8 @@ impl RefractionPass {
     /// as the transparency pass shares it — this pass needs a sixth set — but its
     /// first five set layouts are lifted from it verbatim; see `build_pipeline`.
     pub fn new(device: &Device, forward: PipelineId) -> Self {
-        let pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-            // Front faces only, unlike the transparency accumulation, which draws
-            // both. There the two faces of a glass sphere are two surfaces that
-            // each scatter light; here the material's *thickness* already stands
-            // for the far side, so drawing the back face would refract the same
-            // volume a second time and composite it over the first.
-            cull: CullMode::Back,
-            // Tested against the opaque scene, never written. Two refractive
-            // surfaces are ordered by the back-to-front sort instead, which is
-            // what the premultiplied blend expects — a depth write would let the
-            // nearer of two glass panes reject the farther before it had been
-            // composited under it.
-            depth_test: Some(DepthTest {
-                write: false,
-                compare: crate::gfx::depth::NEARER,
-            }),
-            depth_format: Some(DEPTH_FORMAT),
-            vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
-            // Premultiplied `over`. The fragment already composited its own
-            // background, so what accumulates here is radiance that has replaced
-            // what was behind it, carrying the coverage that says how much of the
-            // pixel it replaced.
-            blend: Blend::Premultiplied,
-            // Sets 0 through 4 are *the forward pipeline's own objects*, not a
-            // second set derived from the same declarations. Deriving them would
-            // produce layouts that match binding for binding and still fail to
-            // bind: set 3 holds the shadow comparison sampler immutably, and
-            // Vulkan compares immutable samplers by identity. Lifting the objects
-            // is what makes the five sets the executor already built bind to this
-            // pipeline at all.
-            layout_prefix_from: Some((forward, SCENE_SET as u32)),
-            // The forward pass's vertex shader, unchanged: a refractive surface is
-            // the same geometry read from the same per-object rows.
-            ..GraphicsPipelineDesc::fullscreen(
-                ShaderId::ForwardVert,
-                ShaderId::RefractionFrag,
-                &[ACCUM_FORMAT],
-            )
-        });
+        let pipeline = device
+            .create_graphics_pipeline(&pipeline_desc(ShaderId::RefractionFrag.into(), forward));
 
         Self {
             pipeline,
@@ -133,10 +146,10 @@ impl RefractionPass {
                 max_lod: None,
             }),
             pyramid_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
-                shader: ShaderId::ColorPyramidComp,
+                shader: ShaderId::ColorPyramidComp.into(),
             }),
             composite_pipeline: device.create_compute_pipeline(&ComputePipelineDesc {
-                shader: ShaderId::RefractionCompositeComp,
+                shader: ShaderId::RefractionCompositeComp.into(),
             }),
             pyramid_sampler: device.create_sampler(SamplerDesc {
                 linear: true,
@@ -155,6 +168,17 @@ impl RefractionPass {
                 max_lod: Some(0.0),
             }),
         }
+    }
+
+    /// A surface shader's twin of the draw pipeline. Its set 5 is this pass's
+    /// two views plus the parameters, so it is lifted with the first five only
+    /// and gets a set of its own at record time.
+    pub(super) fn build_twin(
+        &self,
+        device: &Device,
+        fragment: ShaderModuleId,
+    ) -> Result<PipelineId, String> {
+        device.try_create_graphics_pipeline(&pipeline_desc(fragment.into(), self.pipeline))
     }
 
     /// Reduce the lit frame into the pyramid a refractive surface samples its
@@ -213,45 +237,40 @@ impl RefractionPass {
         view: &FrameView,
         extent: [u32; 2],
         object_base: u32,
+        surfaces: Surfaces<'_>,
     ) {
-        let scene_set = device.create_bind_group(
-            self.pipeline,
-            SCENE_SET as u32,
-            &[
-                Binding {
-                    binding: 0,
-                    resource: BindingResource::SampledTexture {
-                        view: blur,
-                        sampler: self.mip_sampler,
-                    },
+        let scene = [
+            Binding {
+                binding: 0,
+                resource: BindingResource::SampledTexture {
+                    view: blur,
+                    sampler: self.mip_sampler,
                 },
-                // The frame itself, for the smooth end of the roughness range —
-                // no mips to step between, so the plain linear sampler.
-                Binding {
-                    binding: 1,
-                    resource: BindingResource::SampledTexture {
-                        view: sharp,
-                        sampler: self.pyramid_sampler,
-                    },
+            },
+            // The frame itself, for the smooth end of the roughness range —
+            // no mips to step between, so the plain linear sampler.
+            Binding {
+                binding: 1,
+                resource: BindingResource::SampledTexture {
+                    view: sharp,
+                    sampler: self.pyramid_sampler,
                 },
-            ],
-        );
+            },
+        ];
+        // Each set 5 is asked for the first time the queue reaches a run that
+        // binds it: the built-in's two views, or a twin's same two views plus
+        // the parameters. A queue drawn wholly through twins asks for one.
+        let (mut scene_set, mut twin_set) = (None, None);
 
         builder.set_viewport(Viewport {
             origin: [0.0, 0.0],
             extent: [extent[0] as f32, extent[1] as f32],
             depth_range: [0.0, 1.0],
         });
-        builder.bind_pipeline(self.pipeline);
-        for (set, group) in sets.groups().into_iter().enumerate() {
-            builder.bind_group(set as u32, group);
-        }
-        builder.bind_group(SCENE_SET as u32, scene_set);
-
         // The arena is bound for the pass, not per draw: a mesh is a span into
-        // it. The matrix is pushed once for the same reason — what used to vary
-        // per run, the material and the first object row, travels with the
-        // instance now.
+        // it. The matrix is pushed with each pipeline for the same reason —
+        // what used to vary per run, the material and the first object row,
+        // travels with the instance now.
         builder.bind_geometry(false);
         let mut words = [0u32; 16];
         for (word, float) in words
@@ -260,13 +279,37 @@ impl RefractionPass {
         {
             *word = float.to_bits();
         }
-        builder.push_constants(&words);
 
+        // Back to front, and the order is the point, so the pipeline follows
+        // the runs rather than the runs being grouped by pipeline: a run whose
+        // material a surface shader reads switches to its twin, and the next
+        // run that does not switches back.
+        let mut bound = None;
         for run in draws.runs() {
             let item = draws.item(run.start);
             let Some(mesh) = renderer.meshes.get(item.mesh.0 as usize) else {
                 continue;
             };
+            let twin = surfaces
+                .for_material(item.material.0, Twin::Refraction)
+                .zip(surfaces.params());
+            let pipeline = twin.map_or(self.pipeline, |(pipeline, _)| pipeline);
+            if bound != Some(pipeline) {
+                builder.bind_pipeline(pipeline);
+                for (set, group) in sets.groups().into_iter().enumerate() {
+                    builder.bind_group(set as u32, group);
+                }
+                let set = match twin {
+                    Some((pipeline, params)) => *twin_set
+                        .get_or_insert_with(|| params_group(device, pipeline, params, &scene)),
+                    None => *scene_set.get_or_insert_with(|| {
+                        device.create_bind_group(self.pipeline, SCENE_SET as u32, &scene)
+                    }),
+                };
+                builder.bind_group(SCENE_SET as u32, set);
+                builder.push_constants(&words);
+                bound = Some(pipeline);
+            }
             // The refractive rows follow the ones before them in the shared object
             // buffer, so a run's `firstInstance` is its start plus where that
             // block began.

@@ -15,7 +15,8 @@
 //! another's — and that is when this becomes a cryptographic hash. Because the
 //! cache is disposable, the switch costs one reimport and no migration.
 //!
-//! **A texture is a KTX2 file; a mesh is the engine's own layout.** A texture
+//! **A texture is a KTX2 file; a mesh is the engine's own layout; a surface
+//! shader is its own checked artifact.** A texture
 //! artifact holds its whole mip chain in the format the GPU samples — BC7 or
 //! BC5 where the device has block compression, RGBA8 where it does not (see
 //! `asset_db::texture`) — in the standard container, so it opens in KTX tools
@@ -24,7 +25,10 @@
 //! worth a parser for that. What the cache saves is the work: a decode, a mip
 //! chain and a compression are tens of milliseconds to seconds where reading
 //! the artifact is a copy. When a layout changes, [`FORMAT`] moves, which
-//! reimports everything once.
+//! reimports everything once. A surface shader is the
+//! [`SurfaceArtifact`] an exported game loads, encoded by `gfx::surface`
+//! behind its own magic, version and integrity hash; what it saves is a
+//! compile, a third of a second a shader.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -32,6 +36,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use xxhash_rust::xxh3::Xxh3;
 
 use super::ktx;
+use crate::gfx::surface::SurfaceArtifact;
 use crate::gfx::thumbnail::{Pixels, Thumbnail};
 use crate::gfx::{TexelFormat, Vertex};
 use crate::scene::CpuMesh;
@@ -102,6 +107,7 @@ pub type TextureArtifact = crate::gfx::TextureLevels;
 pub enum Artifact {
     Texture(TextureArtifact),
     Mesh(CpuMesh),
+    Shader(SurfaceArtifact),
 }
 
 impl std::fmt::Debug for Artifact {
@@ -121,6 +127,12 @@ impl std::fmt::Debug for Artifact {
                 m.vertices.len(),
                 m.indices.len()
             ),
+            Self::Shader(s) => write!(
+                f,
+                "Shader({} parameters, {} variants)",
+                s.params.params.len(),
+                s.variants.len()
+            ),
         }
     }
 }
@@ -129,6 +141,7 @@ impl Artifact {
     pub fn encode(&self) -> Vec<u8> {
         let mesh = match self {
             Self::Texture(texture) => return ktx::write(texture),
+            Self::Shader(shader) => return shader.encode(),
             Self::Mesh(mesh) => mesh,
         };
         let mut out = Vec::new();
@@ -155,6 +168,11 @@ impl Artifact {
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         if bytes.starts_with(&ktx::IDENTIFIER) {
             return ktx::read(bytes).map(Self::Texture);
+        }
+        if bytes.starts_with(&SurfaceArtifact::MAGIC) {
+            return SurfaceArtifact::decode(bytes)
+                .map(Self::Shader)
+                .map_err(|error| error.to_string());
         }
         if bytes.len() < 4 || &bytes[..4] != MAGIC {
             return Err("not an Orrin cache artifact".to_owned());

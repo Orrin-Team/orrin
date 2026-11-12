@@ -6,7 +6,10 @@
 //! draws it — every lobe, the normal and height maps, the cutout — rather than
 //! a second description of it that could drift. The CPU thumbnails in
 //! `gfx::thumbnail` remain for lists, where a picture per row has to cost
-//! nothing; this is the one large view, of the one material being edited.
+//! nothing; this is the one large view, of the one material being edited. A
+//! material read through a surface shader is drawn by that shader's twin of
+//! the sphere's pipeline (`surface`), which is what makes this the view a
+//! shader is previewed in while it is written.
 //!
 //! **What it is lit by.** The scene's sky, ambient and environment yaw, so a
 //! metal reflects the world it will be seen in, and a studio key light of its
@@ -28,7 +31,8 @@
 //! frame.
 //!
 //! **Who it is for.** Each editor view that shows one — the inspector's
-//! Material section, the Import tab's material — is a [`Viewer`] with images
+//! Material section, the Import tab's material, the Shader tab's — is a
+//! [`Viewer`] with images
 //! and a schedule of its own, so two views can show two materials at once. A
 //! frame redraws at most one of them, taking turns when both are due, which
 //! keeps the passes in the graph to one pair however many views there are.
@@ -62,8 +66,8 @@ use crate::gfx::graph::ImageUsage;
 use crate::gfx::images::ImageEntry;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, CullMode, DepthTest, Device, Encoder,
-    GraphicsPipelineDesc, MeshSpan, PipelineId, SamplerDesc, SamplerId, TextureDesc,
-    TextureDimension, TextureViewId, Topology, Viewport,
+    GraphicsPipelineDesc, MeshSpan, PipelineId, SamplerDesc, SamplerId, ShaderModuleId, ShaderRef,
+    TextureDesc, TextureDimension, TextureViewId, Topology, Viewport,
 };
 use crate::gfx::sh::{self, SH9};
 use crate::gfx::shaders::ShaderId;
@@ -86,10 +90,11 @@ pub const OUTPUT_FORMAT: Format = Format::Rgba8Srgb;
 pub enum Viewer {
     Inspector,
     Browser,
+    Shader,
 }
 
 impl Viewer {
-    pub const ALL: [Self; VIEWERS] = [Self::Inspector, Self::Browser];
+    pub const ALL: [Self; VIEWERS] = [Self::Inspector, Self::Browser, Self::Shader];
 
     /// The egui texture the view paints its sphere with.
     pub fn texture(self) -> egui::TextureId {
@@ -97,7 +102,7 @@ impl Viewer {
     }
 }
 
-const VIEWERS: usize = 2;
+const VIEWERS: usize = 3;
 
 /// Where the camera stands round the sphere, in degrees: `yaw` about the
 /// vertical and `pitch` above the view it starts from.
@@ -293,11 +298,52 @@ pub(super) fn next_due(due: [bool; VIEWERS], turn: usize) -> Option<Viewer> {
         .map(|index| Viewer::ALL[index])
 }
 
+/// The sphere's pipeline, built-in or a surface shader's twin of it.
+fn sphere_desc(fragment: ShaderRef, cull: CullMode) -> GraphicsPipelineDesc<'static> {
+    GraphicsPipelineDesc {
+        vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
+        cull,
+        depth_test: Some(DepthTest {
+            write: true,
+            compare: crate::gfx::depth::NEARER,
+        }),
+        depth_format: Some(DEPTH_FORMAT),
+        topology: Topology::Triangles,
+        ..GraphicsPipelineDesc::fullscreen(ShaderId::ForwardVert, fragment, &[HDR_WIDE_FORMAT])
+    }
+}
+
+/// A surface shader's twin of the sphere's plain or cutout pipeline: the
+/// forward layout's five sets lifted, and set 5 for the parameters. A free
+/// function because the preview pass is built on first use and a twin may be
+/// asked for first.
+pub(super) fn build_twin(
+    device: &Device,
+    forward: &ForwardPass,
+    masked: bool,
+    fragment: ShaderModuleId,
+) -> Result<PipelineId, String> {
+    device.try_create_graphics_pipeline(&GraphicsPipelineDesc {
+        layout_prefix_from: Some((forward.layout_source(), 5)),
+        ..sphere_desc(
+            fragment.into(),
+            if masked {
+                CullMode::None
+            } else {
+                CullMode::Back
+            },
+        )
+    })
+}
+
 /// One redraw: the sets the sphere binds, where it is seen from, and how it
 /// is tonemapped.
 pub(super) struct PreviewFrame {
     pub sets: ForwardSets,
     pub variant: Variant,
+    /// A surface shader's twin and the set 5 it binds, when one reads the
+    /// material; the variant's built-in pipeline otherwise.
+    pub surface: Option<(PipelineId, BindGroupId)>,
     pub view_proj: Mat4,
     pub exposure: f32,
 }
@@ -326,24 +372,12 @@ pub(super) struct MaterialPreviewPass {
 
 impl MaterialPreviewPass {
     pub(super) fn new(device: &Device, forward: &ForwardPass) -> Self {
-        let pipeline = |fragment, cull| {
+        let pipeline = |fragment: ShaderId, cull| {
             device.create_graphics_pipeline(&GraphicsPipelineDesc {
-                vertex_streams: &[PositionVertex::STREAM, SurfaceVertex::STREAM],
-                cull,
-                depth_test: Some(DepthTest {
-                    write: true,
-                    compare: crate::gfx::depth::NEARER,
-                }),
-                depth_format: Some(DEPTH_FORMAT),
-                topology: Topology::Triangles,
                 // The forward pipeline's layout, so the frame's material and
                 // texture sets bind here unchanged — see `oit.rs`.
                 layout_from: Some(forward.layout_source()),
-                ..GraphicsPipelineDesc::fullscreen(
-                    ShaderId::ForwardVert,
-                    fragment,
-                    &[HDR_WIDE_FORMAT],
-                )
+                ..sphere_desc(fragment.into(), cull)
             })
         };
         let pipelines = [
@@ -460,9 +494,14 @@ impl MaterialPreviewPass {
             depth_range: [0.0, 1.0],
         });
         let variant = frame.variant;
-        encoder.bind_pipeline(self.pipelines[variant.masked as usize * 2 + variant.lobed as usize]);
+        let lobed = variant.surface != super::cull::Surface::Flat;
+        let built_in = self.pipelines[variant.masked as usize * 2 + lobed as usize];
+        encoder.bind_pipeline(frame.surface.map_or(built_in, |(pipeline, _)| pipeline));
         for (set, group) in frame.sets.groups().iter().enumerate() {
             encoder.bind_group(set as u32, *group);
+        }
+        if let Some((_, group)) = frame.surface {
+            encoder.bind_group(crate::gfx::surface::PARAMS_BINDING.0, group);
         }
         encoder.push_constants(&words);
         encoder.bind_geometry(false);
@@ -757,12 +796,14 @@ mod tests {
     /// Two views due in the same frames take turns; one alone has every frame.
     #[test]
     fn views_due_together_take_turns() {
-        assert_eq!(next_due([false, false], 0), None);
-        assert_eq!(next_due([false, true], 0), Some(Viewer::Browser));
-        assert_eq!(next_due([true, false], 1), Some(Viewer::Inspector));
-        assert_eq!(next_due([true, true], 0), Some(Viewer::Inspector));
-        assert_eq!(next_due([true, true], 1), Some(Viewer::Browser));
-        assert_eq!(next_due([true, true], 2), Some(Viewer::Inspector));
+        assert_eq!(next_due([false, false, false], 0), None);
+        assert_eq!(next_due([false, true, false], 0), Some(Viewer::Browser));
+        assert_eq!(next_due([true, false, false], 1), Some(Viewer::Inspector));
+        assert_eq!(next_due([true, true, false], 0), Some(Viewer::Inspector));
+        assert_eq!(next_due([true, true, false], 1), Some(Viewer::Browser));
+        assert_eq!(next_due([true, true, false], 2), Some(Viewer::Inspector));
+        assert_eq!(next_due([true, false, true], 1), Some(Viewer::Shader));
+        assert_eq!(next_due([true, true, true], 3), Some(Viewer::Inspector));
     }
 
     /// A view is never shown larger than the picture was drawn, at any

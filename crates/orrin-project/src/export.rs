@@ -155,7 +155,7 @@ impl Project {
     pub fn from_export(manifest_path: &Path) -> Result<Project, ProjectError> {
         let export = ExportManifest::read(manifest_path)?;
         let dir = manifest_path.parent().unwrap_or(Path::new("."));
-        let root = dir.canonicalize().map_err(|source| ProjectError::Io {
+        let root = crate::canonical(dir).map_err(|source| ProjectError::Io {
             path: dir.to_path_buf(),
             source,
         })?;
@@ -243,7 +243,7 @@ entry = "SpaceShooter.Main, SpaceShooter"
         manifest.start_scene = Some(PathBuf::from("compiled-assets/scenes/level.orrin"));
         let out = tempfile::tempdir().expect("tempdir");
         manifest.write(out.path()).expect("write");
-        let root = out.path().canonicalize().expect("canonicalize");
+        let root = crate::canonical(out.path()).expect("canonicalize");
 
         let game = Project::from_export(&root.join(FILE_NAME)).expect("export loads");
 
