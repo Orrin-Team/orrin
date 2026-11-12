@@ -1,0 +1,193 @@
+orrin-scene 4 min-reader 4
+
+entity 1163793b-df57-4e23-9844-00124ce2fce0 "Sunken Ball"
+  orrin.material = asset(f610b6d8-ee31-8bfe-a02c-c0ed133fbbba)
+  orrin.mesh = asset(5b869669-2d73-8a43-941b-a103cdb4e954)
+  orrin.transform
+    rotation = (0.0, 0.0, 0.0, 1.0)
+    scale = (0.7, 0.7, 0.7)
+    translation = (3.6, 0.3, -3.0)
+
+entity 14758fa1-eba1-429c-965b-c7b647529bcd "Banded Cube"
+  orrin.material = asset(d2ec48c7-068b-4c35-b832-82eec77dbe0a)
+  orrin.mesh = asset(2bf58a85-e279-81d3-8d52-d2ab771cce86)
+  orrin.transform
+    rotation = (0.0, 0.0, 0.0, 1.0)
+    scale = (1.0, 1.6, 1.0)
+    translation = (1.25, 0.8, -2.5)
+
+entity 2fedeaed-9a47-400b-ab66-cf1cf052628b "Pool Kerb East"
+  orrin.material = asset(a45a3765-c854-8726-b801-91394b1c3407)
+  orrin.mesh = asset(2bf58a85-e279-81d3-8d52-d2ab771cce86)
+  orrin.transform
+    rotation = (0.0, 0.0, 0.0, 1.0)
+    scale = (0.25, 0.4, 3.0)
+    translation = (5.825, 0.2, -2.5)
+
+entity 47704b7f-e1de-451f-a825-c04b619ac81b "Pool Kerb West"
+  orrin.material = asset(a45a3765-c854-8726-b801-91394b1c3407)
+  orrin.mesh = asset(2bf58a85-e279-81d3-8d52-d2ab771cce86)
+  orrin.transform
+    rotation = (0.0, 0.0, 0.0, 1.0)
+    scale = (0.25, 0.4, 3.0)
+    translation = (2.5749998, 0.2, -2.5)
+
+entity 56e1ee33-9a17-41dc-8dd7-76b9fa807305 "Ground"
+  orrin.material = asset(672a214b-dcb6-83bf-940e-0c769e877d1e)
+  orrin.mesh = asset(2bf58a85-e279-81d3-8d52-d2ab771cce86)
+  orrin.transform
+    rotation = (0.0, 0.0, 0.0, 1.0)
+    scale = (16.0, 0.5, 12.0)
+    translation = (1.5, -0.25, -2.5)
+
+entity 92b5fff0-46e4-44e8-a7d6-061d9677c419 "Banded Sphere"
+  orrin.material = asset(d2ec48c7-068b-4c35-b832-82eec77dbe0a)
+  orrin.mesh = asset(5b869669-2d73-8a43-941b-a103cdb4e954)
+  orrin.transform
+    rotation = (0.0, 0.0, 0.0, 1.0)
+    scale = (1.2, 1.2, 1.2)
+    translation = (0.1, 0.6, -2.5)
+
+entity 965cfb6f-c7f3-4f87-b2df-1501bb8bfc82 "Pool Floor"
+  orrin.material = asset(2d482b8a-325e-8460-91a7-4c0cb93a622a)
+  orrin.mesh = asset(36ff97a2-9285-8e67-a40a-7b1fe0739ba7)
+  orrin.transform
+    rotation = (0.0, 0.0, 0.0, 1.0)
+    scale = (3.0, 1.0, 3.0)
+    translation = (4.2, 0.01, -2.5)
+
+entity b9ca7a25-bcea-49bd-85eb-6af6357f70ec "Render Settings"
+  orrin.render_settings
+    ambient
+      color = (0.6, 0.7, 1.0)
+      nits = 600.0
+    bloom
+      enabled = true
+      radius = 1.0
+      scatter = 0.7
+      strength = 0.06
+    contact_shadows
+      bias = 0.02
+      enabled = true
+      fade_distance = 25.0
+      intensity = 1.0
+      ray_length = 0.25
+      steps = 16
+      thickness = 0.2
+    decals
+      enabled = true
+    dof
+      enabled = false
+      f_number = 2.8
+      focus_distance = 4.0
+      sensor_height = 24.0
+    environment
+      background = (0.0, 0.0, 0.0)
+      exposure_offset = 0.0
+      hdri = "builtin:dusk"
+      show_skybox = true
+      sky_luminance = 30.0
+      yaw = 0.0
+    exposure
+      adaptation_brighten = 0.4
+      adaptation_darken = 1.2
+      auto_exposure = true
+      exposure_compensation = 0.0
+      manual_ev100 = 12.0
+      max_log_luminance = 17.0
+      min_log_luminance = -8.0
+    fog
+      albedo = (0.92, 0.94, 1.0)
+      anisotropy = 0.7
+      density = 0.0
+      distance = 64.0
+      feedback = 0.9
+      height = 0.0
+      height_falloff = 0.1
+      volumetric = true
+    motion_blur
+      enabled = false
+      shutter_angle = 180.0
+    refraction
+      enabled = true
+    shadows
+      atlas_resolution = 4096
+      atlas_tile_size = 512
+      cascade_count = 4
+      constant_bias = 1.25
+      enabled = true
+      lambda = 0.75
+      max_distance = 100.0
+      pullback = 50.0
+      punctual_constant_bias = 2.0
+      punctual_enabled = true
+      punctual_near = 0.05
+      punctual_slope_bias = 3.0
+      resolution = 2048
+      slope_bias = 2.5
+      strength = 1.0
+    ssao
+      bias = 0.025
+      enabled = true
+      half_resolution = true
+      power = 1.0
+      radius = 1.0
+    ssr
+      enabled = false
+      intensity = 1.0
+      max_distance = 50.0
+      max_roughness = 0.6
+      max_steps = 64
+      thickness = 0.5
+    subsurface
+      enabled = false
+      max_radius = 48.0
+      profile = (1.0, 0.354, 0.229)
+    taa
+      enabled = true
+      feedback = 0.92
+      jitter_scale = 1.0
+      msaa = false
+    transparency
+      enabled = true
+
+entity b9d66fed-596b-4d88-840b-c011728e9352 "Coals"
+  orrin.material = asset(4f0461af-ef3e-4b3a-9b6c-763df80f285d)
+  orrin.mesh = asset(5b869669-2d73-8a43-941b-a103cdb4e954)
+  orrin.transform
+    rotation = (0.0, 0.0, 0.0, 1.0)
+    scale = (1.1, 1.1, 1.1)
+    translation = (-1.7, 0.55, -2.5)
+
+entity bb392408-62e4-427c-8c1e-6c04c5b90ea1 "Pool Kerb South"
+  orrin.material = asset(a45a3765-c854-8726-b801-91394b1c3407)
+  orrin.mesh = asset(2bf58a85-e279-81d3-8d52-d2ab771cce86)
+  orrin.transform
+    rotation = (0.0, 0.0, 0.0, 1.0)
+    scale = (3.5, 0.4, 0.25)
+    translation = (4.2, 0.2, -0.875)
+
+entity cf39dd8c-a7e9-40a1-bf21-e12ea9803144 "Pool Kerb North"
+  orrin.material = asset(a45a3765-c854-8726-b801-91394b1c3407)
+  orrin.mesh = asset(2bf58a85-e279-81d3-8d52-d2ab771cce86)
+  orrin.transform
+    rotation = (0.0, 0.0, 0.0, 1.0)
+    scale = (3.5, 0.4, 0.25)
+    translation = (4.2, 0.2, -4.125)
+
+entity f9a6900c-5912-45bb-8063-63f5b6356ad6 "Water"
+  orrin.material = asset(8915923f-e27c-4e4a-90d7-3c6014a34708)
+  orrin.mesh = asset(36ff97a2-9285-8e67-a40a-7b1fe0739ba7)
+  orrin.transform
+    rotation = (0.0, 0.0, 0.0, 1.0)
+    scale = (3.0, 1.0, 3.0)
+    translation = (4.2, 0.3, -2.5)
+
+entity fe95841c-b8a3-40d5-808e-c34f1c39d7ad "Sun"
+  orrin.light = Directional
+    color = (1.0, 0.97, 0.92)
+    lux = 250.0
+  orrin.transform
+    rotation = (-0.4703885, 0.18815541, 0.0, 0.86216706)
+    scale = (1.0, 1.0, 1.0)
+    translation = (0.0, 0.0, 0.0)

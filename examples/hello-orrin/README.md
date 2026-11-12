@@ -9,7 +9,10 @@ hello-orrin/
   orrin.toml            project manifest — the engine reads this from cwd (or any parent)
   assets/                source assets + .meta sidecars
     shaders/rising_bands.oshader   a surface shader
-    materials/rising_bands.omat    a material drawn through it
+    shaders/embers.oshader         another, with helper functions
+    shaders/water.oshader          a third, which writes the normal
+    materials/*.omat               one material drawn through each
+    scenes/surface_shaders.orrin   a scene of objects drawn with them
   scripts/               C# game code
     HelloOrrin.csproj   builds HelloOrrin.dll, this project's game assembly
     Main.cs              the entry Behaviour named by `scripts.entry`
@@ -77,14 +80,25 @@ already had and says so in the console.
 
 ## Writing a surface shader
 
-Press Play and `Main` spawns a sphere beside the cube, drawn with
+Double-click `scenes/surface_shaders.orrin` in the Scenes tab, or in the Assets
+tab, to open a scene built to show them. A sphere and a block share
+`rising_bands.omat`, and the bands run through both at one height because the
+shader measures in world space. Beside them a sphere of coals is drawn through
+`embers.oshader`, which adds no light of its own and only decides where its
+material's emission is. The pool is a flat plane whose waves are
+`water.oshader` tipping its normal: `water.omat` is Transmissive, so the paved
+floor and the ball seen through it bend with every ripple. All three move in the
+editor without pressing Play, and saving a shader changes the scene.
+
+Press Play and `Main` also spawns a sphere beside the cube, drawn with
 `assets/materials/rising_bands.omat`, which names the surface shader
 `assets/shaders/rising_bands.oshader`: bands of light climbing the object in
 world space over a dark, rough base. A surface
 shader says what a material's surface *is*; the engine still lights, shadows and
 reflects it like any other material.
 
-A `.oshader` is GLSL holding `param` lines and one function:
+A `.oshader` is GLSL holding `param` lines, one `surface` function and any
+helpers it calls:
 
 ```glsl
 param color glow = (1.0, 0.35, 0.08, 1.0);
@@ -147,7 +161,7 @@ compiled keeps drawing, and a material whose shader has never compiled draws as
 a standard material until it does.
 
 A material stores only the values that differ from the shader's defaults
-(`rising_bands.omat` sets `glow` and `speed`), so changing a default in the
+(`rising_bands.omat` sets `glow` and `speed`, the other two nothing), so changing a default in the
 shader reaches every material that did not override it. A value for a
 parameter the shader no longer declares is kept in the file and listed in the
 inspector to be removed.

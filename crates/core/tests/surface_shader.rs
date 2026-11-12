@@ -388,3 +388,91 @@ fn every_example_shader_compiles_and_its_materials_set_what_it_declares() {
         }
     }
 }
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let (source, target) = (entry.path(), to.join(entry.file_name()));
+        if source.is_dir() {
+            copy_tree(&source, &target);
+        } else {
+            std::fs::copy(&source, &target).unwrap();
+        }
+    }
+}
+
+/// hello-orrin's `surface_shaders.orrin` is the scene a newcomer opens to see
+/// a surface shader, so it is held to opening clean in its own project: every
+/// asset it names resolves, each exhibit's material is read through a shader
+/// that compiled, and the file is as the editor would save it back.
+#[test]
+fn hello_orrins_scene_opens_with_each_exhibit_drawn_through_its_shader() {
+    use orrin_core::asset_db::{self, AssetDatabase, Target};
+    use orrin_core::gfx::HeadlessBackend;
+    use orrin_core::scene::{self, MaterialHandle, Name};
+
+    const SCENE: &str = "scenes/surface_shaders.orrin";
+    // A copy, so the database's cache and anything it writes beside a file
+    // land outside the repository.
+    let dir = std::env::temp_dir().join(format!("orrin-hello-scene-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let assets =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/hello-orrin/assets");
+    copy_tree(&assets, &dir);
+
+    let mut backend = HeadlessBackend::new();
+    let mut world = orrin_ecs::World::new();
+    scene::entities::install_library(&mut world, &mut backend);
+    let (db, issues) = AssetDatabase::open_for(&dir, dir.join(".cache"), Target::of(&backend));
+    assert!(issues.is_empty(), "{issues:?}");
+    world.insert_resource(db);
+    let mut registry = orrin_registry::Registry::new();
+    scene::register_components(&mut registry);
+
+    let text = std::fs::read_to_string(dir.join(SCENE)).unwrap();
+    let issues = scene::load(&text, &mut world, &registry).unwrap();
+    assert!(
+        issues.is_empty(),
+        "{}",
+        issues
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    for _ in 0..3 {
+        asset_db::service(&world, &mut backend);
+        assert!(
+            world
+                .resource::<AssetDatabase>()
+                .wait_idle(std::time::Duration::from_secs(60))
+        );
+    }
+
+    let mut exhibits = Vec::new();
+    world
+        .query::<(&Name, &MaterialHandle)>()
+        .for_each(|_, (name, material)| exhibits.push((name.as_str().to_owned(), *material)));
+    let through_a_shader = |name: &str| {
+        let (_, material) = exhibits
+            .iter()
+            .find(|(exhibit, _)| exhibit == name)
+            .unwrap_or_else(|| panic!("no `{name}` among {exhibits:?}"));
+        backend.surface_buffer().shader_of(*material).is_some()
+    };
+    assert!(through_a_shader("Coals"));
+    assert!(through_a_shader("Banded Sphere"));
+    assert!(through_a_shader("Banded Cube"));
+    assert!(through_a_shader("Water"));
+    assert!(
+        !through_a_shader("Ground"),
+        "the ground is a standard material"
+    );
+
+    assert_eq!(
+        scene::save(&mut world, &registry),
+        text,
+        "not as the editor saves it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
