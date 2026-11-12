@@ -104,6 +104,34 @@ impl std::error::Error for ProjectError {
     }
 }
 
+/// `dir` canonicalized, in the form other programs take.
+///
+/// On Windows `canonicalize` answers `\\?\D:\project`, and a project root in
+/// that form reaches every path joined onto it: MSBuild refuses a project there
+/// (MSB4019, from its glob over `obj/`), and no printed path is ever relative,
+/// because the working directory is not spelled that way.
+pub fn canonical(dir: &Path) -> std::io::Result<PathBuf> {
+    let path = dir.canonicalize()?;
+    #[cfg(windows)]
+    if let Some(plain) = path.to_str().and_then(without_verbatim_prefix) {
+        return Ok(PathBuf::from(plain));
+    }
+    Ok(path)
+}
+
+/// `\\?\D:\project` as `D:\project`. `None` where the prefix is doing work: a
+/// share or a volume has no drive-letter spelling, and past `MAX_PATH` only
+/// the verbatim form names the file.
+#[cfg(any(windows, test))]
+fn without_verbatim_prefix(path: &str) -> Option<&str> {
+    const MAX_PATH: usize = 260;
+    let plain = path.strip_prefix(r"\\?\")?;
+    let drive = plain.as_bytes();
+    let on_a_drive =
+        drive.len() >= 3 && drive[0].is_ascii_alphabetic() && drive[1] == b':' && drive[2] == b'\\';
+    (on_a_drive && plain.len() < MAX_PATH).then_some(plain)
+}
+
 #[derive(Debug)]
 pub struct Project {
     root: PathBuf,
@@ -140,7 +168,7 @@ impl Project {
         // canonicalize: symlinked or `..`-laden checkouts collapse to one
         // absolute form instead of leaking into every path the accessors build.
         let dir = manifest_path.parent().unwrap_or(Path::new("."));
-        let root = dir.canonicalize().map_err(|source| ProjectError::Io {
+        let root = canonical(dir).map_err(|source| ProjectError::Io {
             path: dir.to_path_buf(),
             source,
         })?;
@@ -292,8 +320,33 @@ entry = "MyGame.Main, MyGame"
     fn project_dir(body: &str) -> (TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("orrin.toml"), body).expect("write manifest");
-        let root = dir.path().canonicalize().expect("canonicalize");
+        let root = canonical(dir.path()).expect("canonicalize");
         (dir, root)
+    }
+
+    #[test]
+    fn a_verbatim_drive_path_loses_its_prefix_and_nothing_else_does() {
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\D:\a\orrin\scripting\Orrin"),
+            Some(r"D:\a\orrin\scripting\Orrin")
+        );
+        // Already plain, or not a Windows path at all.
+        assert_eq!(without_verbatim_prefix(r"D:\a\orrin"), None);
+        assert_eq!(without_verbatim_prefix("/home/me/project"), None);
+        // A share and a volume have no drive-letter spelling to fall back to.
+        assert_eq!(without_verbatim_prefix(r"\\?\UNC\server\share\game"), None);
+        assert_eq!(without_verbatim_prefix(r"\\?\Volume{4c1b02c1}\game"), None);
+        // Past MAX_PATH only the verbatim form names the file.
+        let long = format!(r"\\?\D:\{}", "deep\\".repeat(60));
+        assert!(long.len() > 260);
+        assert_eq!(without_verbatim_prefix(&long), None);
+    }
+
+    #[test]
+    fn a_loaded_projects_root_is_a_path_other_programs_take() {
+        let (dir, _root) = project_dir(VALID);
+        let project = Project::load(&dir.path().join("orrin.toml")).expect("loads");
+        assert!(!project.root().to_string_lossy().starts_with(r"\\?\"));
     }
 
     #[test]
@@ -370,7 +423,7 @@ entry = "MyGame.Main, MyGame"
     #[test]
     fn locate_returns_none_without_a_manifest() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().canonicalize().expect("canonicalize");
+        let root = canonical(dir.path()).expect("canonicalize");
 
         // Walks all the way to `/` without a hit: absence is not an error, it
         // just means "not an Orrin project".
