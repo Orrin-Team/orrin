@@ -19,6 +19,7 @@ mod preview;
 mod previews;
 mod rect_tool;
 mod selection;
+pub mod settings;
 pub(crate) mod source;
 mod state;
 mod theme;
@@ -49,6 +50,7 @@ pub struct Editor {
     dock: Dock,
     prefs: Prefs,
     prefs_file: PrefsFile,
+    settings: settings::SettingsStore,
     previews: Previews,
     /// Kept between frames for its allocations.
     frame: OverlayFrame,
@@ -65,6 +67,7 @@ pub struct Editor {
 impl Drop for Editor {
     fn drop(&mut self) {
         self.save_layout();
+        self.settings.flush();
         self.state.autosave.wait();
     }
 }
@@ -96,6 +99,7 @@ impl Editor {
         max_texture_side: usize,
         project: Option<&orrin_project::Project>,
         scripts_dir: Option<std::path::PathBuf>,
+        mut settings: settings::SettingsStore,
     ) -> Self {
         let ctx = egui::Context::default();
         let input = egui_winit::State::new(
@@ -109,16 +113,19 @@ impl Editor {
             Some(max_texture_side),
         );
 
-        let mut themes = project.map_or_else(ThemeSet::default, |project| {
-            ThemeSet::load(&project.themes_dir())
-        });
         let prefs_file = PrefsFile::new(project.map(|project| project.editor_dir()));
         let mut prefs = prefs_file.load();
-        if let Some(name) = &prefs.theme {
-            themes.select(name);
-        }
+        settings.seed(prefs.theme.take(), prefs.icons.take());
+        let mut themes = ThemeSet::load(
+            settings
+                .themes_dir()
+                .into_iter()
+                .chain(project.map(|project| project.themes_dir())),
+        );
         let mut state = EditorState::new(project);
         state.script_files = source::ScriptFiles::new(scripts_dir);
+        state.environment = settings::Environment::of_process();
+        settings.begin(&ctx, &mut state, &mut themes);
         if let Some(steps) = prefs.snap {
             state.snap_steps = steps;
         }
@@ -127,9 +134,6 @@ impl Editor {
         }
         if let Some(view) = prefs.assets {
             state.assets_view = view;
-        }
-        if let Some(tints) = prefs.icons {
-            state.icon_tints = tints;
         }
         icons::install(&ctx);
         theme::install_fonts(&ctx);
@@ -144,6 +148,7 @@ impl Editor {
             dock: Dock::from_saved(prefs.layout.take()),
             prefs,
             prefs_file,
+            settings,
             previews: Previews::default(),
             frame: OverlayFrame::default(),
             last_layout_check: std::time::Instant::now(),
@@ -203,6 +208,7 @@ impl Editor {
             dock,
             prefs,
             prefs_file,
+            settings,
             previews,
             ..
         } = self;
@@ -220,7 +226,12 @@ impl Editor {
             start_export(state, platform);
         }
         if let Some((file, line)) = state.take_open_source_request() {
-            source::open(&file, line);
+            source::open(
+                &file,
+                line,
+                &state.settings.scripting.editor,
+                &state.environment,
+            );
         }
         for (level, line) in state.export.service() {
             if level >= crate::scene::LogLevel::Error {
@@ -252,24 +263,7 @@ impl Editor {
             prefs.preview = Some(state.preview);
             prefs_file.save(prefs);
         }
-
-        // Kept once a colour has stopped being dragged in its picker.
-        if prefs.icons.unwrap_or_default() != state.icon_tints
-            && !ctx.input(|input| input.pointer.any_down())
-        {
-            prefs.icons = Some(state.icon_tints);
-            prefs_file.save(prefs);
-        }
-
-        // Restyling mid-frame would leave the panels already drawn on the old
-        // palette, so a pick takes effect on the next one.
-        if let Some(name) = state.take_theme_request()
-            && themes.select(&name)
-        {
-            theme::apply(ctx, themes.active());
-            prefs.theme = Some(name);
-            prefs_file.save(prefs);
-        }
+        settings.settle(ctx, world, state, themes);
 
         self.save_layout_if_settled();
     }
@@ -351,6 +345,11 @@ impl Editor {
                     lines.push(from, to, color, now, 0.0);
                 }
             });
+    }
+
+    /// How the user likes the fly camera, for the controller `App` owns.
+    pub fn fly_camera(&self) -> crate::camera_controller::FlyCamera {
+        self.state.settings.viewport
     }
 
     /// Whether the editor moved the camera since the last call — see

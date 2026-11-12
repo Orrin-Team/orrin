@@ -721,6 +721,24 @@ mod tests {
         }
     }
 
+    /// A layout test must not depend on whose machine it ran on: the harness
+    /// is built from defaults, and only the windowed editor is handed a user
+    /// directory to read settings from.
+    #[test]
+    fn the_harness_reads_no_user_settings() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor.frames(1);
+        assert_eq!(
+            editor.state.settings,
+            crate::editor::settings::Settings::default()
+        );
+        assert_eq!(editor.state.environment.editor_override(), None);
+        assert_eq!(
+            *editor.world.resource::<crate::scene::PresentSettings>(),
+            crate::scene::PresentSettings::default()
+        );
+    }
+
     /// The tree is the panel. A toolbar row that takes the panel's whole rect
     /// leaves it nothing to draw into, and nothing about that is a panic — the
     /// editor just comes up empty.

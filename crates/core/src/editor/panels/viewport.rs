@@ -478,7 +478,7 @@ pub fn gizmo(
                 Emphasis::Rest
             }
         };
-        let tints = state.icon_tints;
+        let tints = state.settings.appearance.icons;
         pick::each_marker(world, |entity, at, kind| {
             if (at - camera.position).dot(forward) <= camera.near {
                 return;

@@ -568,6 +568,17 @@ impl ApplicationHandler for App {
                 .unwrap(),
         );
         let size = window.inner_size();
+        // The one place the user's directory is resolved: everything else is
+        // handed it, so a test or a harness never reads the settings of
+        // whoever ran it. An exported game is not the editor and keeps none.
+        let settings = crate::editor::settings::SettingsStore::open(if self.shipped {
+            None
+        } else {
+            orrin_project::user::dir()
+        });
+        // Before the swapchain exists, so the saved present mode is the one it
+        // is built with rather than a recreate on the first frame.
+        settings.current().apply_to_world(&self.world);
         let present = *self.world.resource::<PresentSettings>();
         let mut renderer = match self.instance.as_ref() {
             Some(instance) => {
@@ -613,7 +624,9 @@ impl ApplicationHandler for App {
             renderer.max_texture_side(),
             self.project.as_ref(),
             scripts_dir,
+            settings,
         );
+        self.camera_controller.configure(editor.fly_camera());
 
         if self.shipped {
             // A game is played, not edited: there is no transport to press, and
@@ -950,6 +963,7 @@ impl ApplicationHandler for App {
                 if ui_due {
                     profile_scope!("editor");
                     active.editor.run(&mut self.world, &self.registry);
+                    self.camera_controller.configure(active.editor.fly_camera());
                     if active.editor.take_camera_moved() {
                         self.camera_controller
                             .sync_from(&self.world.resource::<Camera>());

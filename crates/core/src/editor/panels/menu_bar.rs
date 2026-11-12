@@ -536,7 +536,9 @@ fn view(ui: &mut egui::Ui, state: &mut EditorState, themes: &ThemeSet, dock: &mu
             }
         }
     });
-    ui.menu_button("Icon colours", |ui| icon_colours(ui, &mut state.icon_tints));
+    ui.menu_button("Icon colours", |ui| {
+        icon_colours(ui, &mut state.settings.appearance.icons)
+    });
     ui.menu_button("Theme", |ui| {
         let active = themes.active().name.clone();
         for name in themes.names() {

@@ -295,7 +295,11 @@ pub struct EditorState {
     pub show_stats: bool,
     /// Every collider's outline, rather than only the selection's.
     pub show_colliders: bool,
-    pub icon_tints: IconTints,
+    /// How the user likes the editor, in every project. Edited here by any
+    /// panel; `Editor::run` applies and keeps a change. See `editor::settings`.
+    pub settings: super::settings::Settings,
+    /// What the environment overrides of `settings` for this run.
+    pub environment: super::settings::Environment,
     /// How the viewport draws the scene: shaded, or as its edges. `None` is
     /// shaded, which is what the renderer is handed too.
     pub wireframe: Option<crate::gfx::vulkan::wireframe::Wireframe>,
@@ -479,7 +483,8 @@ impl Default for EditorState {
             scale_linked: false,
             show_stats: false,
             show_colliders: false,
-            icon_tints: IconTints::default(),
+            settings: Default::default(),
+            environment: Default::default(),
             wireframe: None,
             material_previews: Default::default(),
             gizmo_drag: None,

@@ -4,7 +4,8 @@
 /// name a graphics API — `gfx::vulkan::swapchain` does the mapping, the same
 /// rule that keeps [`RenderBackend`](crate::gfx::RenderBackend) implementable
 /// twice.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum VsyncMode {
     /// Capped to the display's refresh, no tearing. The only mode a driver has
     /// to support, so it is also what the other three fall back to.

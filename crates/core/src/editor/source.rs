@@ -6,14 +6,18 @@
 //! compiling machine's — so the file is found again by name under the scripts
 //! directory, and a name two files share is answered with nothing rather than
 //! a guess. [`command`] decides how to open it: `ORRIN_EDITOR` when set, else
-//! VS Code's `code -g` when it is on the PATH, else the platform's opener,
-//! which knows no line. It is pure so that choice is tested in CI, where no
-//! editor is installed; [`open`] is the spawn around it.
+//! the user's setting, whose `Auto` is VS Code's `code -g` when it is on the
+//! PATH, else the platform's opener, which knows no line. It is pure so that
+//! choice is tested in CI, where no editor is installed; [`open`] is the spawn
+//! around it.
 //!
-//! `ORRIN_EDITOR` is split on whitespace, with `{file}` and `{line}` replaced
-//! inside each argument — `rider --line {line} {file}`, `zed {file}:{line}` —
-//! and the file appended when no argument names `{file}`. There is no shell
-//! quoting, so an editor whose path has a space in it is named by the PATH.
+//! `ORRIN_EDITOR`, and a custom editor in the settings, is split on whitespace,
+//! with `{file}` and `{line}` replaced inside each argument —
+//! `rider --line {line} {file}`, `zed {file}:{line}` — and the file appended
+//! when no argument names `{file}`. There is no shell quoting, so an editor
+//! whose path has a space in it is named by the PATH. A preset is a template of
+//! the same kind whose program is looked up on the PATH, and run by name when
+//! it is not there: the user chose it, so it is not quietly replaced.
 //!
 //! The child is spawned and waited on by a thread of its own: exec and a slow
 //! editor CLI stay off the frame, the child is reaped, and a failure reaches
@@ -24,6 +28,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use super::settings::{Environment, ExternalEditor};
+
 pub const EDITOR_ENV: &str = "ORRIN_EDITOR";
 
 /// VS Code's command-line launcher. On Windows it is a batch file in the
@@ -32,6 +38,15 @@ pub const EDITOR_ENV: &str = "ORRIN_EDITOR";
 const CODE: &[&str] = &["code.cmd", "code.exe"];
 #[cfg(not(windows))]
 const CODE: &[&str] = &["code"];
+
+/// Rider's launcher: the Toolbox's script, or the standalone install's
+/// executable on Windows.
+#[cfg(windows)]
+const RIDER: &[&str] = &["rider.cmd", "rider64.exe"];
+#[cfg(not(windows))]
+const RIDER: &[&str] = &["rider"];
+
+const ZED: &[&str] = &["zed"];
 
 /// What opens a file with whatever the platform associates it with.
 const OPENER: &str = if cfg!(target_os = "macos") {
@@ -117,31 +132,38 @@ pub struct Launch {
 }
 
 /// How to open `file` at `line` (1-based; `0` for unknown): `editor` is
-/// `ORRIN_EDITOR`'s value, and `on_path` finds a program by name.
+/// `ORRIN_EDITOR`'s value, which wins over `setting`, and `on_path` finds a
+/// program by name.
 pub fn command(
     editor: Option<&str>,
+    setting: &ExternalEditor,
     file: &Path,
     line: u32,
     on_path: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Launch {
     let line = line.max(1);
-    if let Some(editor) = editor.filter(|editor| !editor.trim().is_empty()) {
-        let mut words = editor.split_whitespace();
+    let given = |template: &&str| !template.trim().is_empty();
+    let custom = match setting {
+        ExternalEditor::Custom(template) => Some(template.as_str()),
+        _ => None,
+    };
+    if let Some(template) = editor.filter(given).or(custom.filter(given)) {
+        let mut words = template.split_whitespace();
         let program = words.next().unwrap_or_default().into();
-        let file = file.to_string_lossy();
-        let mut named = false;
-        let mut args: Vec<OsString> = words
-            .map(|word| {
-                named |= word.contains("{file}");
-                word.replace("{file}", &file)
-                    .replace("{line}", &line.to_string())
-                    .into()
-            })
-            .collect();
-        if !named {
-            args.push(file.into_owned().into());
-        }
-        return Launch { program, args };
+        return expand(program, words, file, line);
+    }
+    let preset = |names: &[&str], args: &str| {
+        let program = names
+            .iter()
+            .find_map(|name| on_path(name))
+            .unwrap_or_else(|| names[0].into());
+        expand(program, args.split_whitespace(), file, line)
+    };
+    match setting {
+        ExternalEditor::VsCode => return preset(CODE, "-g {file}:{line}"),
+        ExternalEditor::Rider => return preset(RIDER, "--line {line} {file}"),
+        ExternalEditor::Zed => return preset(ZED, "{file}:{line}"),
+        ExternalEditor::Auto | ExternalEditor::Custom(_) => {}
     }
     if let Some(code) = CODE.iter().find_map(|name| on_path(name)) {
         let mut at = file.as_os_str().to_owned();
@@ -157,6 +179,28 @@ pub fn command(
     }
 }
 
+fn expand<'a>(
+    program: PathBuf,
+    words: impl Iterator<Item = &'a str>,
+    file: &Path,
+    line: u32,
+) -> Launch {
+    let file = file.to_string_lossy();
+    let mut named = false;
+    let mut args: Vec<OsString> = words
+        .map(|word| {
+            named |= word.contains("{file}");
+            word.replace("{file}", &file)
+                .replace("{line}", &line.to_string())
+                .into()
+        })
+        .collect();
+    if !named {
+        args.push(file.into_owned().into());
+    }
+    Launch { program, args }
+}
+
 /// The first `name` on `path`, a `PATH` value.
 pub fn on_path(path: Option<&OsString>, name: &str) -> Option<PathBuf> {
     std::env::split_paths(path?)
@@ -165,10 +209,9 @@ pub fn on_path(path: Option<&OsString>, name: &str) -> Option<PathBuf> {
 }
 
 /// Open `file` at `line` in the user's editor, without waiting for it.
-pub fn open(file: &Path, line: u32) {
-    let editor = std::env::var(EDITOR_ENV).ok();
+pub fn open(file: &Path, line: u32, setting: &ExternalEditor, environment: &Environment) {
     let path = std::env::var_os("PATH");
-    let launch = command(editor.as_deref(), file, line, &|name| {
+    let launch = command(environment.editor(), setting, file, line, &|name| {
         on_path(path.as_ref(), name)
     });
     let shown = file.display().to_string();
@@ -245,6 +288,7 @@ mod tests {
         assert_eq!(
             command(
                 Some("rider --line {line} {file}"),
+                &ExternalEditor::Auto,
                 Path::new(FILE),
                 14,
                 &code
@@ -256,7 +300,14 @@ mod tests {
             "the override wins over a `code` on the PATH"
         );
         assert_eq!(
-            command(Some("zed {file}:{line}"), Path::new(FILE), 14, &code).args,
+            command(
+                Some("zed {file}:{line}"),
+                &ExternalEditor::Auto,
+                Path::new(FILE),
+                14,
+                &code
+            )
+            .args,
             args(&["/game/scripts/Spinner.cs:14"])
         );
     }
@@ -266,6 +317,7 @@ mod tests {
         assert_eq!(
             command(
                 Some("  gedit  --new-window "),
+                &ExternalEditor::Auto,
                 Path::new(FILE),
                 14,
                 &nothing_on_path
@@ -281,7 +333,14 @@ mod tests {
     fn a_blank_override_is_no_override() {
         let code = |name: &str| (name == CODE[0]).then(|| PathBuf::from("/usr/bin/code"));
         assert_eq!(
-            command(Some("   "), Path::new(FILE), 14, &code).program,
+            command(
+                Some("   "),
+                &ExternalEditor::Auto,
+                Path::new(FILE),
+                14,
+                &code
+            )
+            .program,
             PathBuf::from("/usr/bin/code")
         );
     }
@@ -290,7 +349,7 @@ mod tests {
     fn vs_code_on_the_path_is_asked_to_go_to_the_line() {
         let code = |name: &str| (name == CODE[0]).then(|| PathBuf::from("/opt/code/bin/code"));
         assert_eq!(
-            command(None, Path::new(FILE), 14, &code),
+            command(None, &ExternalEditor::Auto, Path::new(FILE), 14, &code),
             Launch {
                 program: "/opt/code/bin/code".into(),
                 args: args(&["-g", "/game/scripts/Spinner.cs:14"]),
@@ -303,11 +362,18 @@ mod tests {
     fn an_unknown_line_opens_at_the_top() {
         let code = |name: &str| (name == CODE[0]).then(|| PathBuf::from("code"));
         assert_eq!(
-            command(None, Path::new(FILE), 0, &code).args,
+            command(None, &ExternalEditor::Auto, Path::new(FILE), 0, &code).args,
             args(&["-g", "/game/scripts/Spinner.cs:1"])
         );
         assert_eq!(
-            command(Some("subl {file}:{line}"), Path::new(FILE), 0, &code).args,
+            command(
+                Some("subl {file}:{line}"),
+                &ExternalEditor::Auto,
+                Path::new(FILE),
+                0,
+                &code
+            )
+            .args,
             args(&["/game/scripts/Spinner.cs:1"])
         );
     }
@@ -315,11 +381,108 @@ mod tests {
     #[test]
     fn with_no_editor_the_platform_opens_the_file_without_a_line() {
         assert_eq!(
-            command(None, Path::new(FILE), 14, &nothing_on_path),
+            command(
+                None,
+                &ExternalEditor::Auto,
+                Path::new(FILE),
+                14,
+                &nothing_on_path
+            ),
             Launch {
                 program: OPENER.into(),
                 args: args(&[FILE]),
             }
+        );
+    }
+
+    #[test]
+    fn the_environment_beats_the_setting() {
+        let code = |_: &str| Some(PathBuf::from("/usr/bin/code"));
+        assert_eq!(
+            command(
+                Some("zed {file}:{line}"),
+                &ExternalEditor::Rider,
+                Path::new(FILE),
+                14,
+                &code
+            ),
+            Launch {
+                program: "zed".into(),
+                args: args(&["/game/scripts/Spinner.cs:14"]),
+            }
+        );
+    }
+
+    #[test]
+    fn each_preset_opens_the_file_at_its_line() {
+        let code = |name: &str| (name == CODE[0]).then(|| PathBuf::from("/opt/code/bin/code"));
+        assert_eq!(
+            command(None, &ExternalEditor::VsCode, Path::new(FILE), 14, &code),
+            Launch {
+                program: "/opt/code/bin/code".into(),
+                args: args(&["-g", "/game/scripts/Spinner.cs:14"]),
+            }
+        );
+        assert_eq!(
+            command(
+                None,
+                &ExternalEditor::VsCode,
+                Path::new(FILE),
+                14,
+                &nothing_on_path
+            ),
+            Launch {
+                program: CODE[0].into(),
+                args: args(&["-g", "/game/scripts/Spinner.cs:14"]),
+            },
+            "a preset is what the user asked for, so it is run by name rather than replaced"
+        );
+        assert_eq!(
+            command(
+                None,
+                &ExternalEditor::Rider,
+                Path::new(FILE),
+                14,
+                &nothing_on_path
+            ),
+            Launch {
+                program: RIDER[0].into(),
+                args: args(&["--line", "14", FILE]),
+            }
+        );
+        assert_eq!(
+            command(None, &ExternalEditor::Zed, Path::new(FILE), 14, &code),
+            Launch {
+                program: "zed".into(),
+                args: args(&["/game/scripts/Spinner.cs:14"]),
+            }
+        );
+    }
+
+    #[test]
+    fn a_custom_editor_reads_like_the_override() {
+        let custom = ExternalEditor::Custom("subl --wait {file}:{line}".into());
+        assert_eq!(
+            command(None, &custom, Path::new(FILE), 14, &nothing_on_path),
+            Launch {
+                program: "subl".into(),
+                args: args(&["--wait", "/game/scripts/Spinner.cs:14"]),
+            }
+        );
+        let blank = ExternalEditor::Custom("  ".into());
+        assert_eq!(
+            command(None, &blank, Path::new(FILE), 14, &nothing_on_path).program,
+            PathBuf::from(OPENER),
+            "a blank template is no editor, as a blank override is"
+        );
+    }
+
+    #[test]
+    fn a_blank_override_leaves_a_custom_editor_in_charge() {
+        let custom = ExternalEditor::Custom("subl {file}".into());
+        assert_eq!(
+            command(Some(" "), &custom, Path::new(FILE), 14, &nothing_on_path).program,
+            PathBuf::from("subl")
         );
     }
 
