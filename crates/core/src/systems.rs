@@ -8,9 +8,18 @@ use crate::gfx::{
     RenderItem, SceneLighting, SpotLight,
 };
 use crate::scene::{
-    AmbientLight, Camera, Culling, Decal, DecalSettings, Light, LocalTransform, MAX_CONE_ANGLE,
-    MIN_CONE_ANGLE, MaterialBlends, MaterialHandle, MeshBounds, MeshHandle, Spin, WorldTransform,
+    AmbientLight, Camera, Culling, Decal, DecalSettings, EditorHidden, Light, LocalTransform,
+    MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialBlends, MaterialHandle, MeshBounds, MeshHandle, Spin,
+    WorldTransform,
 };
+
+/// What the editor has hidden from its view, or `None` when that is nothing —
+/// always, in a game — so a sweep pays one branch per entity for the feature.
+fn shown_only(world: &World) -> Option<std::cell::Ref<'_, EditorHidden>> {
+    world
+        .get_resource::<EditorHidden>()
+        .filter(|hidden| !hidden.is_empty())
+}
 
 pub fn spin(world: &World, dt: f32) {
     world
@@ -137,6 +146,7 @@ pub fn extract_geometry(world: &World, aspect: f32, out: &mut FrameGeometry) {
     let frustum = camera.as_ref().map(|c| c.frustum(aspect));
     let bounds = world.get_resource::<MeshBounds>();
     let blends = world.get_resource::<MaterialBlends>();
+    let hidden = shown_only(world);
     let mut total = 0usize;
 
     let sweep = crate::profile::scope("sweep");
@@ -144,6 +154,12 @@ pub fn extract_geometry(world: &World, aspect: f32, out: &mut FrameGeometry) {
         .query::<(&WorldTransform, &MeshHandle, Option<&MaterialHandle>)>()
         .for_each(|entity, (transform, mesh, material)| {
             total += 1;
+            if hidden
+                .as_ref()
+                .is_some_and(|hidden| hidden.contains(entity))
+            {
+                return;
+            }
             let model = transform.0;
 
             let material = material.copied().unwrap_or(MaterialHandle(0));
@@ -300,10 +316,14 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
     }
 
     let mut has_sun = false;
+    let hidden = shown_only(world);
     // World, not local: a light in a group lights from where the group puts
     // it. Callers propagate first, as they do for the geometry.
     world.query::<(&WorldTransform, &Light)>().for_each(
-        |_entity, (transform, light)| match *light {
+        |entity, (transform, light)| match *light {
+            _ if hidden
+                .as_ref()
+                .is_some_and(|hidden| hidden.contains(entity)) => {}
             Light::Directional { color, lux } => {
                 // The shader supports one directional light, so the first wins.
                 if !has_sun {
@@ -955,10 +975,17 @@ pub fn extract_decals(world: &World, aspect: f32, out: &mut Vec<DecalInstance>) 
     // projection cannot disagree about how big a decal is.
     let unit = Aabb::from_points([Vec3::splat(-0.5), Vec3::splat(0.5)]);
 
+    let hidden = shown_only(world);
     let mut found: Vec<(f32, DecalInstance, i32)> = Vec::new();
     world
         .query::<(&WorldTransform, &Decal)>()
-        .for_each(|_entity, (transform, decal)| {
+        .for_each(|entity, (transform, decal)| {
+            if hidden
+                .as_ref()
+                .is_some_and(|hidden| hidden.contains(entity))
+            {
+                return;
+            }
             let model = transform.0;
             if cull
                 && frustum
@@ -1183,5 +1210,86 @@ mod geometry_tests {
             first >= second,
             "runs are front to back: {first} then {second}"
         );
+    }
+}
+
+#[cfg(test)]
+mod hidden_tests {
+    use super::{FrameGeometry, extract_decals, extract_geometry, extract_lighting};
+    use crate::gfx::SceneLighting;
+    use crate::scene::editor_hidden::{self, EditorHidden};
+    use crate::scene::{
+        Camera, Decal, Light, LocalTransform, MeshHandle, Play, PlayState, Transform,
+        propagate_transforms,
+    };
+    use glam::Vec3;
+    use orrin_ecs::{Entity, World};
+    use orrin_registry::EntityId;
+
+    /// A mesh, a decal and a point light, each on an entity of its own, with
+    /// the editor's hidden set installed and nothing in it yet.
+    fn scene() -> (World, [Entity; 3]) {
+        let mut world = World::new();
+        world.insert_resource(Camera::default());
+        world.insert_resource(Play::default());
+        world.insert_resource(EditorHidden::default());
+        let place = || LocalTransform::from(Transform::from_translation(Vec3::ZERO));
+        let mesh = world.spawn_entity().with(place()).with(MeshHandle(0)).id();
+        let decal = world
+            .spawn_entity()
+            .with(place())
+            .with(Decal::default())
+            .id();
+        let light = world
+            .spawn_entity()
+            .with(place())
+            .with(Light::point(Vec3::ONE, 800.0, 5.0))
+            .id();
+        for entity in [mesh, decal, light] {
+            world.insert(entity, EntityId::new());
+        }
+        (world, [mesh, decal, light])
+    }
+
+    fn hide(world: &mut World, entity: Entity) {
+        let id = *world.get::<EntityId>(entity).unwrap();
+        world.resource_mut::<EditorHidden>().toggle(id);
+    }
+
+    /// How many meshes, decals and point lights the frame extracts.
+    fn extracted(world: &mut World) -> [usize; 3] {
+        propagate_transforms(world);
+        editor_hidden::refresh(world);
+        let mut geometry = FrameGeometry::default();
+        extract_geometry(world, 16.0 / 9.0, &mut geometry);
+        let mut decals = Vec::new();
+        extract_decals(world, 16.0 / 9.0, &mut decals);
+        let mut lighting = SceneLighting::default();
+        extract_lighting(world, &mut lighting);
+        [
+            geometry.visible().len(),
+            decals.len(),
+            lighting.point_lights.len(),
+        ]
+    }
+
+    #[test]
+    fn what_the_editor_hides_is_not_drawn_or_lit() {
+        let (mut world, entities) = scene();
+        assert_eq!(extracted(&mut world), [1, 1, 1]);
+        for entity in entities {
+            hide(&mut world, entity);
+        }
+        assert_eq!(extracted(&mut world), [0, 0, 0]);
+    }
+
+    #[test]
+    fn what_the_editor_hides_is_drawn_while_the_game_plays() {
+        let (mut world, entities) = scene();
+        for entity in entities {
+            hide(&mut world, entity);
+        }
+        world.resource_mut::<Play>().set(PlayState::Playing);
+        assert_eq!(extracted(&mut world), [1, 1, 1]);
     }
 }

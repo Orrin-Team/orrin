@@ -103,6 +103,8 @@ icons! {
     cursor_click => '\u{e7c8}',
     ear => '\u{e70c}',
     ellipsis => '\u{e1fe}',
+    eye => '\u{e220}',
+    eye_slash => '\u{e224}',
     file_audio => '\u{ea20}',
     file_code => '\u{e914}',
     file_plus => '\u{e236}',

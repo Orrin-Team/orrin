@@ -88,6 +88,7 @@ pub fn body(
             mesh_section(ui, world, state, entity, previews, &filter);
             material_section(ui, world, state, entity, previews, &filter);
             light_section(ui, world, state, entity, &filter);
+            folder_section(ui, world, state, entity, &filter);
             physics_section(ui, world, state, entity, &filter);
             audio_section(ui, world, state, entity, &filter, &overridden);
             super::ui_sections::sections(ui, world, state, entity, &filter);
@@ -384,8 +385,9 @@ fn prefab_section(
 /// which is what makes a component the engine has never heard of, registered by
 /// a game assembly after a hot reload, inspectable without a panel being written
 /// for it.
-const HAND_DRAWN: [orrin_registry::ComponentId; 17] = [
+const HAND_DRAWN: [orrin_registry::ComponentId; 18] = [
     crate::scene::registry::TRANSFORM,
+    crate::scene::registry::FOLDER,
     crate::scene::registry::NAME,
     crate::scene::registry::LIGHT,
     crate::scene::registry::MESH,
@@ -1962,6 +1964,62 @@ fn light_section(
     let after = light.to_value();
     if !orrin_registry::diff(&before.to_value(), &after).is_empty() {
         state.edit(entity, crate::scene::registry::LIGHT, after);
+    }
+}
+
+/// A folder's tint: a switch, since most folders have none, and a colour
+/// picker beside it while it is on.
+fn folder_section(
+    ui: &mut egui::Ui,
+    world: &World,
+    state: &mut EditorState,
+    entity: Entity,
+    filter: &Filter,
+) {
+    use crate::editor::kind::{folder_tint, from_srgb_bytes, srgb_bytes};
+    use crate::scene::Folder;
+
+    /// What switching the tint on starts from: the asset browser's blue.
+    const FIRST_TINT: [u8; 3] = [0x4f, 0x8e, 0xe8];
+
+    let Some(before) = world.get::<Folder>(entity).map(|folder| *folder) else {
+        return;
+    };
+    if filter.section("Folder", &["Tint"]).is_none() {
+        return;
+    }
+    let mut folder = before;
+    let icon_tint = folder_tint(world, entity).unwrap_or(ui.visuals().weak_text_color());
+    widgets::section(
+        ui,
+        ui.id().with("folder"),
+        icons::folder(),
+        icon_tint,
+        "Folder",
+        None,
+        |ui| {
+            widgets::property(ui, "Tint", |ui| {
+                ui.horizontal(|ui| {
+                    let mut on = folder.tint.is_some();
+                    if ui
+                        .checkbox(&mut on, "")
+                        .on_hover_text("The colour its icon is drawn in, in the hierarchy")
+                        .changed()
+                    {
+                        folder.tint = on.then(|| from_srgb_bytes(FIRST_TINT));
+                    }
+                    if let Some(tint) = &mut folder.tint {
+                        let mut bytes = srgb_bytes(*tint);
+                        if ui.color_edit_button_srgb(&mut bytes).changed() {
+                            *tint = from_srgb_bytes(bytes);
+                        }
+                    }
+                });
+            });
+        },
+    );
+    if folder != before {
+        state.edit(entity, crate::scene::registry::FOLDER, folder.to_value());
     }
 }
 

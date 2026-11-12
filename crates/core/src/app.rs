@@ -979,6 +979,10 @@ impl ApplicationHandler for App {
                 {
                     profile_scope!("propagate");
                     crate::scene::propagate_transforms(&mut self.world);
+                    // Every frame rather than with the editor's UI, whose
+                    // rebuilds are spaced out: a child spawned under something
+                    // hidden must not draw in between.
+                    crate::scene::editor_hidden::refresh(&mut self.world);
                 }
                 // After the propagation, so an outline is where its body is
                 // drawn this frame.

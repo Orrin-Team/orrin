@@ -2,7 +2,9 @@
 //! drag to reparent, and the scene's counts at the foot. A prefab dragged in
 //! from the asset browser is placed under whatever row it is let go over, and
 //! the rows of a prefab instance wear the prefab colour, with what can be done
-//! to the instance on the right-click menu.
+//! to the instance on the right-click menu. A folder is a row with no place of
+//! its own (`scene::Folder`), and a row's eye hides it from the editor's view
+//! and nowhere else (`scene::editor_hidden`).
 //!
 //! Rows are laid out flat, one fixed-height rect each, rather than as nested
 //! collapsing headers. That is what lets a row fill the panel edge to edge —
@@ -35,16 +37,20 @@ struct Node {
     /// visible — drop it and the tree collapses out from under the match.
     visible: bool,
     prefab: Role,
-    lock: Lock,
+    /// Whether it can be picked in the scene: [`Locked`](crate::scene::Locked).
+    lock: Mark,
+    /// Whether the editor's view leaves it out: see `scene::editor_hidden`.
+    hidden: Mark,
+    folder: Option<crate::scene::Folder>,
 }
 
-/// Whether a row can be picked in the scene.
+/// A row's state for a toggle whose effect reaches everything under it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Lock {
-    Open,
-    /// [`Locked`](crate::scene::Locked) itself.
+enum Mark {
+    Off,
+    /// Set on the row itself.
     Own,
-    /// Under something that is.
+    /// Under a row that has it set.
     Inherited,
 }
 
@@ -268,21 +274,23 @@ fn snapshot(world: &mut World, query: &str) -> Vec<Node> {
             visible: true,
             prefab: Role::None,
             lock: if world.has::<crate::scene::Locked>(entity) {
-                Lock::Own
+                Mark::Own
             } else {
-                Lock::Open
+                Mark::Off
             },
+            hidden: hidden_mark(world, entity),
+            folder: world.get::<crate::scene::Folder>(entity).map(|f| *f),
         })
         .collect();
     // Parents come before children in this order, so one pass carries a lock
     // down every subtree.
     for index in 0..nodes.len() {
-        if nodes[index].lock == Lock::Open {
+        if nodes[index].lock == Mark::Off {
             continue;
         }
         for child in nodes[index].children.clone() {
-            if nodes[child].lock == Lock::Open {
-                nodes[child].lock = Lock::Inherited;
+            if nodes[child].lock == Mark::Off {
+                nodes[child].lock = Mark::Inherited;
             }
         }
     }
@@ -305,6 +313,25 @@ fn snapshot(world: &mut World, query: &str) -> Vec<Node> {
         }
     }
     nodes
+}
+
+/// Whether the editor hides `entity` itself or through an ancestor. The
+/// inherited half is read from the derived table rather than walked here,
+/// since the renderer has already paid for it.
+fn hidden_mark(world: &World, entity: Entity) -> Mark {
+    let Some(hidden) = world.get_resource::<crate::scene::EditorHidden>() else {
+        return Mark::Off;
+    };
+    if world
+        .get::<orrin_registry::EntityId>(entity)
+        .is_some_and(|id| hidden.hides_id(*id))
+    {
+        Mark::Own
+    } else if hidden.contains(entity) {
+        Mark::Inherited
+    } else {
+        Mark::Off
+    }
 }
 
 /// Mark each node's place in a prefab instance.
@@ -448,7 +475,19 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
         egui::pos2(x + 7.0, rect.center().y),
         egui::Vec2::splat(icons::ROW - 2.0),
     );
-    icons::paint(ui, node.kind.icon(), glyph, node.kind.tint(weak));
+    let tint = node
+        .folder
+        .and_then(|folder| folder.tint)
+        .map_or(node.kind.tint(weak), |tint| {
+            let [r, g, b] = crate::editor::kind::srgb_bytes(tint);
+            egui::Color32::from_rgb(r, g, b)
+        });
+    let tint = if node.hidden != Mark::Off && !selected {
+        tint.gamma_multiply(0.45)
+    } else {
+        tint
+    };
+    icons::paint(ui, node.kind.icon(), glyph, tint);
     x = glyph.right() + 6.0;
 
     // The delete affordance sits clear of the floating scroll bar, which
@@ -458,15 +497,18 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
         egui::pos2(rect.right() - scroll_gutter(ui) - 10.0, rect.center().y),
         egui::Vec2::splat(18.0),
     );
-    // The lock sits beside the cross while the row is hovered, and at the end
-    // of a locked row otherwise, so what is locked reads down the column.
-    let lock_slot = if hovered {
-        cross.translate(egui::vec2(-20.0, 0.0))
-    } else {
-        cross
-    };
-    let shows_lock = hovered || node.lock != Lock::Open;
-    let text_right = if shows_lock {
+    // The lock and the eye keep fixed columns, the eye left of the lock, and
+    // both step left while the row is hovered to make room for the cross —
+    // so what is locked, and what is hidden, each reads down one column.
+    let step = |columns: f32| cross.translate(egui::vec2(-20.0 * columns, 0.0));
+    let shift = if hovered { 1.0 } else { 0.0 };
+    let lock_slot = step(shift);
+    let eye_slot = step(shift + 1.0);
+    let shows_lock = hovered || node.lock != Mark::Off;
+    let shows_eye = hovered || node.hidden != Mark::Off;
+    let text_right = if shows_eye {
+        eye_slot.left() - 4.0
+    } else if shows_lock {
         lock_slot.left() - 4.0
     } else {
         rect.right() - widgets::PAD
@@ -478,6 +520,12 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
         theme::PREFAB
     } else {
         visuals.text_color()
+    };
+    // Dimmed rather than recoloured, so a hidden prefab row still reads as one.
+    let colour = if node.hidden != Mark::Off && !selected {
+        colour.gamma_multiply(0.45)
+    } else {
+        colour
     };
     // Coloured in the layout, not at the paint: a plain `WidgetText` bakes the
     // style's text colour into its galley, and the painter's colour then only
@@ -499,13 +547,8 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
         colour,
     );
     if !node.children.is_empty() && !hovered {
-        let right = if shows_lock {
-            lock_slot.left() - 4.0
-        } else {
-            rect.right() - widgets::PAD
-        };
         ui.painter().text(
-            egui::pos2(right, rect.center().y),
+            egui::pos2(text_right, rect.center().y),
             egui::Align2::RIGHT_CENTER,
             node.children.len().to_string(),
             egui::TextStyle::Monospace.resolve(ui.style()),
@@ -514,37 +557,41 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
     }
 
     if shows_lock {
-        let glyph = match node.lock {
-            Lock::Open => icons::lock_open(),
-            Lock::Own | Lock::Inherited => icons::lock(),
-        };
-        let resting = match node.lock {
-            Lock::Own => visuals.text_color(),
-            Lock::Open | Lock::Inherited => weak,
-        };
-        if hovered && node.lock != Lock::Inherited {
-            let id = open_id(node.entity).with("lock");
-            let toggle = ui.interact(lock_slot, id, egui::Sense::click());
-            let colour = if toggle.hovered() {
-                visuals.strong_text_color()
+        let toggled = toggle(
+            ui,
+            lock_slot,
+            open_id(node.entity).with("lock"),
+            node.lock,
+            hovered,
+            [icons::lock_open(), icons::lock()],
+            [
+                "Lock: keep it from being picked in the scene",
+                "Unlock: let it be picked in the scene again",
+            ],
+        );
+        if toggled {
+            if node.lock == Mark::Own {
+                state.request_remove_component(node.entity, crate::scene::registry::LOCKED);
             } else {
-                resting
-            };
-            icons::paint(ui, glyph, lock_slot.shrink(3.0), colour);
-            let hint = if node.lock == Lock::Own {
-                "Unlock: let it be picked in the scene again"
-            } else {
-                "Lock: keep it from being picked in the scene"
-            };
-            if toggle.on_hover_text(hint).clicked() {
-                if node.lock == Lock::Own {
-                    state.request_remove_component(node.entity, crate::scene::registry::LOCKED);
-                } else {
-                    state.request_add_component(node.entity, crate::scene::registry::LOCKED);
-                }
+                state.request_add_component(node.entity, crate::scene::registry::LOCKED);
             }
-        } else {
-            icons::paint(ui, glyph, lock_slot.shrink(3.0), resting);
+        }
+    }
+    if shows_eye {
+        let toggled = toggle(
+            ui,
+            eye_slot,
+            open_id(node.entity).with("eye"),
+            node.hidden,
+            hovered,
+            [icons::eye(), icons::eye_slash()],
+            [
+                "Hide from the editor's view; the game still draws it",
+                "Show in the editor's view again",
+            ],
+        );
+        if toggled {
+            state.request_toggle_hidden(node.entity);
         }
     }
 
@@ -605,12 +652,49 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
     accept_drop(&response, node.entity, state);
 }
 
+/// One of a row's inherited toggles, the lock or the eye: `glyphs` and
+/// `hints` are its off and on states. Clickable only on a hovered row and only
+/// where the row holds the mark itself, since an inherited one is undone on
+/// the row it came from. Reports whether it was clicked.
+fn toggle(
+    ui: &egui::Ui,
+    slot: egui::Rect,
+    id: egui::Id,
+    mark: Mark,
+    hovered: bool,
+    glyphs: [icons::Icon; 2],
+    hints: [&str; 2],
+) -> bool {
+    let visuals = ui.visuals();
+    let on = mark != Mark::Off;
+    let glyph = glyphs[on as usize];
+    let resting = match mark {
+        Mark::Own => visuals.text_color(),
+        Mark::Off | Mark::Inherited => visuals.weak_text_color(),
+    };
+    if !hovered || mark == Mark::Inherited {
+        icons::paint(ui, glyph, slot.shrink(3.0), resting);
+        return false;
+    }
+    let response = ui.interact(slot, id, egui::Sense::click());
+    let colour = if response.hovered() {
+        visuals.strong_text_color()
+    } else {
+        resting
+    };
+    icons::paint(ui, glyph, slot.shrink(3.0), colour);
+    response.on_hover_text(hints[on as usize]).clicked()
+}
+
 /// What a right-click on a row offers: the selection as a new prefab, the
 /// whole-instance actions when the row is part of one, and Delete.
 fn row_menu(ui: &mut egui::Ui, node: &Node, state: &mut EditorState) {
     if ui.button("Save as prefab").clicked() {
         state.request_save_prefab();
         ui.close_menu();
+    }
+    if let Some(folder) = node.folder {
+        tint_menu(ui, node.entity, folder, state);
     }
     if node.prefab != Role::None {
         ui.separator();
@@ -630,6 +714,41 @@ fn row_menu(ui: &mut egui::Ui, node: &Node, state: &mut EditorState) {
     if ui.button("Delete").clicked() {
         state.request_despawn_selection();
         ui.close_menu();
+    }
+}
+
+/// A folder's tint, picked freely, or taken off.
+fn tint_menu(
+    ui: &mut egui::Ui,
+    entity: Entity,
+    folder: crate::scene::Folder,
+    state: &mut EditorState,
+) {
+    use crate::editor::kind::{from_srgb_bytes, srgb_bytes};
+    use orrin_registry::Reflect;
+
+    ui.separator();
+    let mut tinted = folder;
+    ui.menu_button("Tint", |ui| {
+        let [r, g, b] = folder.tint.map_or([0x4f, 0x8e, 0xe8], srgb_bytes);
+        let mut colour = egui::Color32::from_rgb(r, g, b);
+        if egui::color_picker::color_picker_color32(
+            ui,
+            &mut colour,
+            egui::color_picker::Alpha::Opaque,
+        ) {
+            tinted.tint = Some(from_srgb_bytes([colour.r(), colour.g(), colour.b()]));
+        }
+        if ui
+            .add_enabled(folder.tint.is_some(), egui::Button::new("No tint"))
+            .clicked()
+        {
+            tinted.tint = None;
+            ui.close_menu();
+        }
+    });
+    if tinted != folder {
+        state.edit(entity, crate::scene::registry::FOLDER, tinted.to_value());
     }
 }
 

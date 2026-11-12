@@ -297,6 +297,46 @@ mod tests {
         assert_eq!(world.resource::<UiCanvas>().commands().len(), 1);
     }
 
+    /// An element the editor hides is still laid out, so what is under it
+    /// keeps its place, but nothing under it is drawn.
+    #[test]
+    fn what_the_editor_hides_is_laid_out_and_not_drawn() {
+        let mut world = World::new();
+        menu(&mut world);
+        world.insert_resource(crate::scene::EditorHidden::default());
+        let button = named(&world, "Button");
+        let id = orrin_registry::EntityId::new();
+        world.insert(button, id);
+        world
+            .resource_mut::<crate::scene::EditorHidden>()
+            .toggle(id);
+        crate::scene::editor_hidden::refresh(&mut world);
+
+        update(&mut world, [1920, 1080]);
+        let tree = world.resource::<UiTree>();
+        assert_eq!(tree.layout.elements().len(), 3);
+        // The panel's image alone: the button and its label are hidden.
+        assert_eq!(
+            tree.canvas.commands().len(),
+            1,
+            "{:?}",
+            tree.canvas.commands()
+        );
+        drop(tree);
+
+        // And through the recording path a modifier puts it on.
+        world.insert(button, Stroke::default());
+        world.insert(button, Shadow::default());
+        update(&mut world, [1920, 1080]);
+        let tree = world.resource::<UiTree>();
+        assert_eq!(
+            tree.canvas.commands().len(),
+            1,
+            "{:?}",
+            tree.canvas.commands()
+        );
+    }
+
     /// What the world has is remembered between frames, and forgotten the
     /// moment its structure changes: a modifier or a scroll frame added to a
     /// tree that had none is drawn by the very next update.

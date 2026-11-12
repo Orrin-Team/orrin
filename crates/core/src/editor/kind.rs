@@ -15,10 +15,12 @@ use super::{catalog, icons, theme};
 #[cfg(feature = "scripting")]
 use crate::scene::Scripts;
 use crate::scene::registry as ids;
-use crate::scene::{CameraComponent, Light, MeshHandle};
+use crate::scene::{CameraComponent, Folder, Light, MeshHandle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    /// [`Folder`](crate::scene::Folder): holds rows, and has no place.
+    Folder,
     /// Nothing drawn and nothing lit: a transform others hang off.
     Group,
     Mesh,
@@ -40,6 +42,11 @@ pub enum Kind {
 
 impl Kind {
     pub fn of(world: &World, entity: Entity) -> Self {
+        // First: being a folder is the author's choice, not something read
+        // off what the entity happens to hold.
+        if world.has::<Folder>(entity) {
+            return Self::Folder;
+        }
         if let Some(light) = world.get::<Light>(entity) {
             return match *light {
                 Light::Directional { .. } => Self::Sun,
@@ -85,6 +92,7 @@ impl Kind {
 
     pub fn icon(self) -> icons::Icon {
         match self {
+            Self::Folder => icons::folder(),
             Self::Group => icons::circle(),
             Self::Mesh => icons::box_(),
             Self::Light => icons::lightbulb(),
@@ -104,7 +112,7 @@ impl Kind {
     /// the `Ui` knows, so it is passed in.
     pub fn tint(self, weak: Color32) -> Color32 {
         match self {
-            Self::Group => weak,
+            Self::Folder | Self::Group => weak,
             Self::Mesh => theme::KIND_MESH,
             Self::Light | Self::Sun => theme::KIND_LIGHT,
             Self::Camera => theme::KIND_CAMERA,
@@ -120,6 +128,7 @@ impl Kind {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Folder => "Folder",
             Self::Group => "Group",
             Self::Mesh => "Mesh",
             Self::Light => "Light",
@@ -134,6 +143,24 @@ impl Kind {
             Self::ScrollFrame => "Scroll Frame",
         }
     }
+}
+
+/// The colour `entity`'s folder icon is drawn in, if it is a tinted folder.
+pub fn folder_tint(world: &World, entity: Entity) -> Option<Color32> {
+    let tint = world.get::<Folder>(entity)?.tint?;
+    let [r, g, b] = srgb_bytes(tint);
+    Some(Color32::from_rgb(r, g, b))
+}
+
+/// A folder tint as the bytes egui's sRGB colour picker edits.
+pub fn srgb_bytes(tint: glam::Vec3) -> [u8; 3] {
+    tint.to_array()
+        .map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// [`srgb_bytes`] the other way.
+pub fn from_srgb_bytes(bytes: [u8; 3]) -> glam::Vec3 {
+    glam::Vec3::from_array(bytes.map(|byte| byte as f32 / 255.0))
 }
 
 #[cfg(test)]
@@ -193,6 +220,18 @@ mod tests {
         world.insert(camera, MeshHandle(0));
         world.insert(camera, crate::scene::CameraComponent::default());
         assert_eq!(Kind::of(&world, camera), Kind::Camera);
+    }
+
+    /// A folder is a folder whatever else is put on it: being one is a choice
+    /// the author made, not something read off what it happens to hold.
+    #[test]
+    fn a_folder_is_a_folder() {
+        let mut world = World::new();
+        let folder = world.spawn();
+        world.insert(folder, crate::scene::Folder::default());
+        assert_eq!(Kind::of(&world, folder), Kind::Folder);
+        world.insert(folder, Light::default());
+        assert_eq!(Kind::of(&world, folder), Kind::Folder);
     }
 
     /// A UI element is named by what it does before what it shows: a button

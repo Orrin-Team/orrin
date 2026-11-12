@@ -41,6 +41,7 @@ const TABLE: &[(ComponentId, Group, Icon)] = &[
     (id::NAME, Group::General, icons::textbox()),
     (id::TAG, Group::General, icons::tag()),
     (id::LOCKED, Group::General, icons::lock()),
+    (id::FOLDER, Group::General, icons::folder()),
     (id::SPIN, Group::General, icons::refresh()),
     (id::MESH, Group::Rendering, icons::box_()),
     (id::MATERIAL, Group::Rendering, icons::palette()),

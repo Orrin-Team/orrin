@@ -48,6 +48,8 @@ pub fn draw(
     dock: &mut Dock,
     previews: &mut Previews,
 ) {
+    // Before anything reads it: the tree's eyes, the viewport's reach.
+    crate::scene::editor_hidden::refresh(world);
     shortcuts(ctx, world, state);
     // Asked for by a tool's own controls last frame, while the dock was
     // drawing them and so could not move.
@@ -1389,6 +1391,95 @@ mod tests {
         editor.state.apply(&mut editor.world, &editor.registry);
         assert!(named(&editor.world, "Point Light").is_none());
         assert!(editor.state.selection.is_empty());
+    }
+
+    /// A folder has no transform, which is what keeps it from moving what is
+    /// filed in it, and it is undone like any other spawn.
+    #[test]
+    fn a_new_folder_has_no_transform_and_can_be_undone() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        editor
+            .state
+            .request_spawn(crate::editor::state::SpawnKind::Folder);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let folder = named(&editor.world, "Folder").expect("spawned");
+        assert!(editor.world.has::<crate::scene::Folder>(folder));
+        assert!(!editor.world.has::<LocalTransform>(folder));
+        assert_eq!(editor.state.selection.entities(), [folder]);
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(named(&editor.world, "Folder").is_none());
+    }
+
+    /// A folder's row wears the folder icon, in its tint when it has one.
+    #[test]
+    fn a_folder_row_shows_its_icon_in_its_tint() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let folder = editor.world.spawn();
+        editor.world.insert(folder, Name("Props".to_owned()));
+        let tint = glam::Vec3::new(0.9, 0.5, 0.1);
+        editor
+            .world
+            .insert(folder, crate::scene::Folder { tint: Some(tint) });
+        editor.frames(2);
+        let band = row_band(&editor, "Props");
+        let glyph = crate::editor::icons::folder().glyph();
+        let (_, _, colour) = editor
+            .painted_icons()
+            .into_iter()
+            .find(|(g, rect, _)| *g == glyph && band.contains(rect.center()))
+            .expect("a folder icon on the row");
+        assert_eq!(colour, egui::Color32::from_rgb(230, 128, 26));
+    }
+
+    /// A tint is an optional field, so setting one adds it to the value and
+    /// clearing it takes it away: both an edit, and both undone.
+    #[test]
+    fn a_folder_s_tint_is_an_edit_both_ways() {
+        use orrin_registry::Reflect;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let folder = editor.world.spawn();
+        editor.world.insert(folder, crate::scene::Folder::default());
+        let tinted = crate::scene::Folder {
+            tint: Some(glam::Vec3::new(0.2, 0.4, 0.6)),
+        };
+        let tint = |editor: &Harness| {
+            editor
+                .world
+                .get::<crate::scene::Folder>(folder)
+                .unwrap()
+                .tint
+        };
+        for (value, expected) in [
+            (tinted, tinted.tint),
+            (crate::scene::Folder::default(), None),
+        ] {
+            editor
+                .state
+                .edit(folder, crate::scene::registry::FOLDER, value.to_value());
+            editor.state.apply(&mut editor.world, &editor.registry);
+            assert_eq!(tint(&editor), expected);
+        }
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(tint(&editor), tinted.tint, "undoing the clear");
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(tint(&editor), None, "undoing the tint");
+    }
+
+    /// The tint is set in the inspector with a colour picker, behind a switch,
+    /// since most folders have none.
+    #[test]
+    fn a_folder_s_tint_is_switched_on_in_the_inspector() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let folder = editor.world.spawn();
+        editor.world.insert(folder, Name("Props".to_owned()));
+        editor.world.insert(folder, crate::scene::Folder::default());
+        editor.state.selection.set(folder);
+        editor.frames(2);
+        assert!(editor.painted_contains("Tint"), "{:?}", editor.painted());
     }
 
     /// Where the editor is looking, so it opens on what the author framed.
@@ -3732,6 +3823,78 @@ mod tests {
                 "{name} shows no lock"
             );
         }
+    }
+
+    /// The eye sits on the row beside the lock. Hiding is a view setting,
+    /// not an edit: nothing to undo, and the scene is not left unsaved.
+    #[test]
+    fn a_row_s_eye_hides_its_entity_from_the_view_without_an_edit() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let crate_ = editor.spawn("Crate");
+        editor.frames(2);
+        let band = row_band(&editor, "Crate");
+        editor.hover(band.center()).frames(1);
+        let eye = icon_in(&editor, crate::editor::icons::eye(), band)
+            .expect("an open eye on the hovered row");
+        editor.click(eye);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor.frames(1);
+        assert!(crate::scene::editor_hidden::is_hidden(
+            &editor.world,
+            crate_
+        ));
+        assert!(!editor.state.scene_dirty(), "hiding left the scene unsaved");
+
+        let band = row_band(&editor, "Crate");
+        editor.hover(band.center()).frames(1);
+        let eye = icon_in(&editor, crate::editor::icons::eye_slash(), band)
+            .expect("a closed eye on the hidden row");
+        editor.click(eye);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor.frames(1);
+        assert!(!crate::scene::editor_hidden::is_hidden(
+            &editor.world,
+            crate_
+        ));
+    }
+
+    /// A hidden row says so without being hovered, and its children say they
+    /// are hidden through it.
+    #[test]
+    fn a_hidden_row_and_its_children_show_the_closed_eye() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let crate_ = editor.spawn("Crate");
+        let lid = editor.spawn("Lid");
+        crate::scene::reparent(&mut editor.world, lid, Some(crate_), false).unwrap();
+        editor.state.request_toggle_hidden(crate_);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor.frames(2);
+        for name in ["Crate", "Lid"] {
+            let band = row_band(&editor, name);
+            assert!(
+                icon_in(&editor, crate::editor::icons::eye_slash(), band).is_some(),
+                "{name} shows no closed eye"
+            );
+        }
+    }
+
+    /// What the editor hides is out of reach in the viewport and draws no
+    /// outline, even selected.
+    #[test]
+    fn a_hidden_entity_is_neither_hovered_nor_outlined() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (cube, at) = cube_under_the_viewport_centre(&mut editor);
+        editor.state.selection.set(cube);
+        editor.hover(at).frames(1);
+        assert_eq!(editor.state.hovered, Some(cube));
+        assert_eq!(editor.state.outline.len(), 1);
+
+        editor.state.request_toggle_hidden(cube);
+        editor.state.apply(&mut editor.world, &editor.registry);
+        editor.hover(at).frames(1);
+        assert_eq!(editor.state.hovered, None);
+        assert!(editor.state.outline.is_empty());
+        assert!(editor.state.selection.contains(cube), "still selected");
     }
 
     #[test]
