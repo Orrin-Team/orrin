@@ -44,6 +44,8 @@ const FILE_FLOOR: LogLevel = LogLevel::Warning;
 /// What every crate but the engine's own is held to.
 const FOREIGN_FLOOR: LogLevel = LogLevel::Warning;
 
+pub const ENV: &str = "ORRIN_LOG";
+
 /// The console's own capacity: anything queued past it would fall off the far
 /// end of the `LogBuffer` on arrival anyway.
 const QUEUE_CAPACITY: usize = 1024;
@@ -86,6 +88,12 @@ impl LogConfig {
     /// names a different floor either way, though it cannot bring back the
     /// trace and debug events an export build compiled out.
     pub fn for_this_build() -> Self {
+        Self::for_this_build_with(None)
+    }
+
+    /// [`for_this_build`](Self::for_this_build) with the windowed editor's
+    /// saved floor, which `ORRIN_LOG` still overrides.
+    pub fn for_this_build_with(saved: Option<LogLevel>) -> Self {
         let mut config = if cfg!(feature = "export") {
             match std::env::current_exe() {
                 Ok(executable) => Self::export(&executable),
@@ -97,22 +105,44 @@ impl LogConfig {
         } else {
             Self::editor()
         };
-        if let Ok(Some(level)) = floor_named(std::env::var("ORRIN_LOG").ok().as_deref()) {
-            config.min_level = level;
-        }
+        config.min_level = floor(std::env::var(ENV).ok().as_deref(), saved, config.min_level);
         config
     }
 }
 
+/// The floor a run logs at: `ORRIN_LOG` when it names a level, else the saved
+/// one, else this build's.
+pub fn floor(env: Option<&str>, saved: Option<LogLevel>, build: LogLevel) -> LogLevel {
+    floor_named(env).ok().flatten().or(saved).unwrap_or(build)
+}
+
+/// Run `read` with its warnings handed back rather than logged, for work that
+/// happens before [`init`] installs the stream and would otherwise reach no
+/// subscriber at all.
+pub fn heard<T>(read: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let (stream, console, _) = Stream::new(LogConfig {
+        min_level: LogLevel::Warning,
+        stderr: false,
+        console: true,
+        file: None,
+    });
+    let value = tracing::subscriber::with_default(stream, read);
+    let said = lock(&console.0)
+        .drain(..)
+        .map(|entry| entry.message)
+        .collect();
+    (value, said)
+}
+
 /// The floor `ORRIN_LOG` asks for, if it is set — or, for a value that names
 /// no level, what to say about it.
-fn floor_named(raw: Option<&str>) -> Result<Option<LogLevel>, String> {
+pub fn floor_named(raw: Option<&str>) -> Result<Option<LogLevel>, String> {
     match raw.map(str::trim) {
         None | Some("") => Ok(None),
         Some(name) => LogLevel::parse(name).map(Some).ok_or_else(|| {
             format!(
                 "ORRIN_LOG: unknown level `{name}` (expected trace, debug, info, warn or \
-                 error); keeping this build's default"
+                 error); ignoring it"
             )
         }),
     }
@@ -309,7 +339,7 @@ pub fn init(config: LogConfig) -> ConsoleQueue {
             if let Some(complaint) = complaint {
                 tracing::warn!("{complaint}");
             }
-            if let Err(complaint) = floor_named(std::env::var("ORRIN_LOG").ok().as_deref()) {
+            if let Err(complaint) = floor_named(std::env::var(ENV).ok().as_deref()) {
                 tracing::warn!("{complaint}");
             }
             console
@@ -381,6 +411,28 @@ mod tests {
         assert_eq!(floor_named(Some("WARN")), Ok(Some(LogLevel::Warning)));
         let complaint = floor_named(Some("loud")).unwrap_err();
         assert!(complaint.contains("`loud`"), "{complaint}");
+    }
+
+    #[test]
+    fn the_environment_beats_the_setting_which_beats_the_build() {
+        use LogLevel::{Debug, Info, Trace, Warning};
+        assert_eq!(floor(Some("warn"), Some(Debug), Trace), Warning);
+        assert_eq!(floor(None, Some(Debug), Trace), Debug);
+        assert_eq!(floor(None, None, Info), Info);
+        assert_eq!(floor(Some("  "), Some(Debug), Trace), Debug, "blank");
+        assert_eq!(floor(Some("loud"), Some(Debug), Trace), Debug, "misspelt");
+    }
+
+    /// What runs before the stream exists is heard anyway, once it does.
+    #[test]
+    fn a_warning_before_the_stream_exists_is_handed_back() {
+        let (value, said) = heard(|| {
+            tracing::info!("not a warning");
+            tracing::warn!("settings.toml could not be read");
+            7
+        });
+        assert_eq!(value, 7);
+        assert_eq!(said, ["settings.toml could not be read"]);
     }
 
     #[test]

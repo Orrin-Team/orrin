@@ -38,6 +38,14 @@
 //! to the project root, as the manifest spells every path, not to the assets
 //! folder the asset database lists it from.
 //!
+//! **Startup rows apply on restart.** They decide what the `ORRIN_*`
+//! variables read once at startup decided alone, so a change is kept at once
+//! and taken by the next start. The page counts what differs from what this
+//! run started with and offers the restart, saving the scene first when it has
+//! unsaved work. A row the environment sets shows the environment's value and
+//! is not counted: the next run inherits the same environment, so it would not
+//! apply that change either.
+//!
 //! **Any width.** Docked into a column the sidebar folds into one page picker.
 //!
 //! **Closed, it costs nothing:** the dock does not call [`body`]. Open, it is
@@ -57,8 +65,8 @@ use crate::asset_db::{AssetDatabase, AssetKind};
 use crate::editor::dock::Tab;
 use crate::editor::icons;
 use crate::editor::settings::{
-    AUTOSAVE_SECS, BOOST, ExternalEditor, FLY_SPEED, SCROLL_SPEED, SENSITIVITY, SWAPCHAIN_IMAGES,
-    Settings, UI_SCALE,
+    AUTOSAVE_SECS, BOOST, Backend, ExternalEditor, FLY_SPEED, LogFloor, SCROLL_SPEED, SENSITIVITY,
+    SWAPCHAIN_IMAGES, Settings, Startup, UI_SCALE, Validation,
 };
 use crate::editor::state::{DockRequest, EditorState, IconTints};
 use crate::editor::theme::{self, ThemeSet};
@@ -84,16 +92,18 @@ pub enum Page {
     Scripting,
     Saving,
     Display,
+    Startup,
 }
 
 impl Page {
     const PROJECT: [Self; 3] = [Self::General, Self::Scenes, Self::Scripts];
-    const ORRIN: [Self; 5] = [
+    const ORRIN: [Self; 6] = [
         Self::Appearance,
         Self::Viewport,
         Self::Scripting,
         Self::Saving,
         Self::Display,
+        Self::Startup,
     ];
 
     fn title(self) -> &'static str {
@@ -106,6 +116,7 @@ impl Page {
             Self::Scripting => "Scripting",
             Self::Saving => "Saving",
             Self::Display => "Display",
+            Self::Startup => "Startup",
         }
     }
 
@@ -161,6 +172,19 @@ enum Field {
     Interval,
     Present,
     Images,
+    Backend,
+    Threads,
+    Validation,
+    Log,
+}
+
+impl Field {
+    fn is_startup(self) -> bool {
+        matches!(
+            self,
+            Self::Backend | Self::Threads | Self::Validation | Self::Log
+        )
+    }
 }
 
 struct Row {
@@ -364,6 +388,50 @@ const ROWS: &[Row] = &[
         "How many images the window cycles through; three suits an uncapped mode",
         "buffering triple double latency",
     ),
+    row(
+        Page::Startup,
+        Field::Backend,
+        "Graphics backend",
+        "The graphics API the editor draws through",
+        "vulkan metal gpu graphics api renderer moltenvk",
+    ),
+    row(
+        Page::Startup,
+        Field::Threads,
+        "Worker threads",
+        "How many threads the engine's parallel work runs on",
+        "threads cores cpu parallel pool workers",
+    ),
+    row(
+        Page::Startup,
+        Field::Validation,
+        "Validation layers",
+        "Vulkan's checks on every GPU call: slower, and names what went wrong",
+        "validation debug layer vulkan khronos gpu errors",
+    ),
+    row(
+        Page::Startup,
+        Field::Log,
+        "Log level",
+        "The quietest message the log keeps",
+        "log verbose logging trace debug quiet console",
+    ),
+];
+
+/// Metal is a macOS API, so elsewhere it is not offered.
+const BACKENDS: &[Backend] = if cfg!(target_os = "macos") {
+    &[Backend::Auto, Backend::Vulkan, Backend::Metal]
+} else {
+    &[Backend::Auto, Backend::Vulkan]
+};
+const VALIDATIONS: [Validation; 3] = [Validation::Auto, Validation::On, Validation::Off];
+const LOG_FLOORS: [LogFloor; 6] = [
+    LogFloor::Default,
+    LogFloor::Trace,
+    LogFloor::Debug,
+    LogFloor::Info,
+    LogFloor::Warn,
+    LogFloor::Error,
 ];
 
 /// A setting that lives in another tool, found by search and left there.
@@ -788,6 +856,9 @@ fn page(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
     ui.label(egui::RichText::new(page.title()).strong());
     ui.add(egui::Label::new(egui::RichText::new(page.scope()).color(weak)).wrap());
     ui.add_space(10.0);
+    if page == Page::Startup {
+        restart_line(ui, cx.state);
+    }
     let unread = match &panel.manifest.loaded {
         Some(Err(error)) if page.is_project() => Some(error.clone()),
         _ => None,
@@ -886,6 +957,12 @@ fn results(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
         .id_salt("settings results")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            if ROWS
+                .iter()
+                .any(|row| row.page == Page::Startup && matches(row))
+            {
+                restart_line(ui, cx.state);
+            }
             let mut any = false;
             for page in Page::PROJECT.into_iter().chain(Page::ORRIN) {
                 if !ROWS.iter().any(|row| row.page == page && matches(row)) {
@@ -932,6 +1009,39 @@ fn results(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
         });
 }
 
+/// What a Startup change is waiting on, and the way to it: weak text and an
+/// ordinary button, since saturated colour is the diagnostics'.
+fn restart_line(ui: &mut egui::Ui, state: &mut EditorState) {
+    let pending = state
+        .settings
+        .startup
+        .changes_from(&state.started_with, &state.environment);
+    if pending == 0 {
+        return;
+    }
+    let text = match pending {
+        1 => "Restart Orrin to apply 1 change".to_owned(),
+        n => format!("Restart Orrin to apply {n} changes"),
+    };
+    let label = if state.scene_dirty() {
+        "Save and restart"
+    } else {
+        "Restart now"
+    };
+    let playing = state.playing();
+    let weak = ui.visuals().weak_text_color();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(text).color(weak));
+        let button = ui
+            .add_enabled(!playing, egui::Button::new(label))
+            .on_disabled_hover_text(PLAYING);
+        if button.clicked() {
+            state.request_restart();
+        }
+    });
+    ui.add_space(10.0);
+}
+
 fn heading(ui: &mut egui::Ui, title: &str, scope: &str) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(title).strong());
@@ -968,9 +1078,15 @@ fn help(ui: &egui::Ui, top: egui::Pos2, label: f32, key: &str, text: &str) {
 
 fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Row) {
     let field = row.field;
-    let locked = (field == Field::Editor)
-        .then(|| cx.state.environment.editor_override())
-        .flatten();
+    let env = &cx.state.environment;
+    let locked = match field {
+        Field::Editor => env.editor_override(),
+        Field::Backend => env.backend_override(),
+        Field::Threads => env.threads_override(),
+        Field::Validation => env.validation_override(),
+        Field::Log => env.log_override(),
+        _ => None,
+    };
     let built = cfg!(feature = "scripting") || !matches!(field, Field::Editor | Field::Reload);
     let live = locked.is_none() && built;
     let changed = !is_default(field, &cx.state.settings, &cx.defaults);
@@ -983,7 +1099,14 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
         ui,
         row.label,
         |ui| {
-            ui.add_enabled_ui(live, |ui| control(ui, cx, panel, field));
+            ui.add_enabled_ui(live, |ui| {
+                if locked.is_some() && field.is_startup() {
+                    let mut chosen = cx.state.environment.over(&cx.state.settings.startup);
+                    startup_control(ui, field, &mut chosen);
+                } else {
+                    control(ui, cx, panel, field);
+                }
+            });
         },
         |ui| {
             if changed && live {
@@ -1019,6 +1142,20 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
     }
     if let Some(var) = locked {
         note(ui, &format!("Set by {var} for this run"), weak);
+    }
+    if field.is_startup() {
+        note(ui, "Applies on restart", weak);
+    }
+    if field == Field::Threads {
+        let auto = crate::threads::automatic();
+        note(ui, &format!("Auto is {auto} on this computer"), weak);
+    }
+    if field == Field::Validation && cx.state.backend == crate::gfx::BackendChoice::Metal {
+        note(
+            ui,
+            "Validation is Vulkan's; this run draws through Metal",
+            weak,
+        );
     }
     if field == Field::Editor
         && let ExternalEditor::Custom(command) = &cx.state.settings.scripting.editor
@@ -1201,6 +1338,9 @@ fn control(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, field: Fie
                 SWAPCHAIN_IMAGES,
             ));
         }
+        Field::Backend | Field::Threads | Field::Validation | Field::Log => {
+            startup_control(ui, field, &mut settings.startup);
+        }
         Field::Name
         | Field::Version
         | Field::Location
@@ -1210,6 +1350,84 @@ fn control(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, field: Fie
         | Field::ScriptsFolder
         | Field::AssetsFolder
         | Field::Command => {}
+    }
+}
+
+/// A Startup row's picker over `startup`, which a locked row hands in as a
+/// copy holding the environment's values.
+fn startup_control(ui: &mut egui::Ui, field: Field, startup: &mut Startup) {
+    let combo = |salt: &str, shown: &str| {
+        egui::ComboBox::from_id_salt(("settings startup", salt.to_owned()))
+            .width(ui.available_width())
+            .selected_text(shown.to_owned())
+    };
+    match field {
+        Field::Backend => {
+            let backend = &mut startup.backend;
+            combo("backend", backend_label(*backend)).show_ui(ui, |ui| {
+                for &option in BACKENDS {
+                    ui.selectable_value(backend, option, backend_label(option));
+                }
+            });
+        }
+        Field::Threads => {
+            let threads = &mut startup.threads;
+            combo("threads", &threads_label(*threads)).show_ui(ui, |ui| {
+                ui.selectable_value(threads, None, "Auto");
+                let cores = u32::try_from(crate::threads::cores()).unwrap_or(u32::MAX);
+                for count in 1..=cores {
+                    ui.selectable_value(threads, Some(count), count.to_string());
+                }
+            });
+        }
+        Field::Validation => {
+            let validation = &mut startup.validation;
+            combo("validation", validation_label(*validation)).show_ui(ui, |ui| {
+                for option in VALIDATIONS {
+                    ui.selectable_value(validation, option, validation_label(option));
+                }
+            });
+        }
+        Field::Log => {
+            let log = &mut startup.log;
+            combo("log", log_label(*log)).show_ui(ui, |ui| {
+                for option in LOG_FLOORS {
+                    ui.selectable_value(log, option, log_label(option));
+                }
+            });
+        }
+        _ => {}
+    }
+}
+
+fn backend_label(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Auto => "Auto",
+        Backend::Vulkan => "Vulkan",
+        Backend::Metal => "Metal",
+    }
+}
+
+fn threads_label(threads: Option<u32>) -> String {
+    threads.map_or_else(|| "Auto".to_owned(), |count| count.to_string())
+}
+
+fn validation_label(validation: Validation) -> &'static str {
+    match validation {
+        Validation::Auto => "Auto",
+        Validation::On => "On",
+        Validation::Off => "Off",
+    }
+}
+
+fn log_label(log: LogFloor) -> &'static str {
+    match log {
+        LogFloor::Default => "Default",
+        LogFloor::Trace => "Trace",
+        LogFloor::Debug => "Debug",
+        LogFloor::Info => "Info",
+        LogFloor::Warn => "Warn",
+        LogFloor::Error => "Error",
     }
 }
 
@@ -1252,6 +1470,10 @@ fn is_default(field: Field, s: &Settings, d: &Settings) -> bool {
         Field::Interval => s.saving.autosave_interval_secs == d.saving.autosave_interval_secs,
         Field::Present => s.display.vsync == d.display.vsync,
         Field::Images => s.display.images == d.display.images,
+        Field::Backend => s.startup.backend == d.startup.backend,
+        Field::Threads => s.startup.threads == d.startup.threads,
+        Field::Validation => s.startup.validation == d.startup.validation,
+        Field::Log => s.startup.log == d.startup.log,
         _ => tint(s.appearance.icons, field) == tint(d.appearance.icons, field),
     }
 }
@@ -1271,6 +1493,10 @@ fn restore(field: Field, s: &mut Settings, d: &Settings) {
         Field::Interval => s.saving.autosave_interval_secs = d.saving.autosave_interval_secs,
         Field::Present => s.display.vsync = d.display.vsync,
         Field::Images => s.display.images = d.display.images,
+        Field::Backend => s.startup.backend = d.startup.backend,
+        Field::Threads => s.startup.threads = d.startup.threads,
+        Field::Validation => s.startup.validation = d.startup.validation,
+        Field::Log => s.startup.log = d.startup.log,
         _ => {
             if let (Some(to), Some(from)) = (
                 tint_mut(&mut s.appearance.icons, field),
@@ -1298,6 +1524,10 @@ fn default_text(field: Field, d: &Settings) -> String {
         Field::Interval => format!("{} s", d.saving.autosave_interval_secs),
         Field::Present => vsync_label(d.display.vsync).to_owned(),
         Field::Images => d.display.images.to_string(),
+        Field::Backend => backend_label(d.startup.backend).to_owned(),
+        Field::Threads => threads_label(d.startup.threads),
+        Field::Validation => validation_label(d.startup.validation).to_owned(),
+        Field::Log => log_label(d.startup.log).to_owned(),
         _ => tint(d.appearance.icons, field)
             .map_or_else(String::new, |[r, g, b]| format!("#{r:02X}{g:02X}{b:02X}")),
     }
@@ -1499,6 +1729,12 @@ mod tests {
         moved.saving.autosave_interval_secs = 600;
         moved.display.vsync = crate::scene::VsyncMode::Immediate;
         moved.display.images = 4;
+        moved.startup = crate::editor::settings::Startup {
+            backend: crate::editor::settings::Backend::Vulkan,
+            threads: Some(3),
+            validation: crate::editor::settings::Validation::On,
+            log: crate::editor::settings::LogFloor::Warn,
+        };
         for row in ROWS.iter().filter(|row| !row.page.is_project()) {
             if row.field == Field::Theme {
                 continue;

@@ -517,3 +517,235 @@ fn the_project_name_in_the_top_bar_opens_project_settings() {
     assert!(editor.dock.is_open(Tab::Settings));
     assert!(editor.painted_contains("Shared with everyone who opens this project"));
 }
+
+fn startup_note_count(editor: &Harness) -> usize {
+    in_settings(editor, "Applies on restart").len()
+}
+
+/// Pick `option` from the combo box showing `current` on the row `label`.
+fn pick(editor: &mut Harness, label: &str, current: &str, option: &str) {
+    let row = in_settings(editor, label)[0];
+    let combo = *in_settings(editor, current)
+        .iter()
+        .find(|at| (at.y - row.y).abs() < 6.0)
+        .unwrap_or_else(|| panic!("{label}'s picker shows {current}"));
+    editor.click(combo).frames(2);
+    let choice = *in_settings(editor, option)
+        .last()
+        .unwrap_or_else(|| panic!("{label}'s picker offers {option}"));
+    editor.click(choice).frames(2);
+}
+
+fn restart_line(editor: &Harness) -> Option<String> {
+    editor
+        .painted()
+        .into_iter()
+        .find(|text| text.starts_with("Restart Orrin to apply"))
+}
+
+/// The four choices that were environment variables, each with the one fact
+/// about it that matters: nothing happens until the next start.
+#[test]
+fn the_startup_page_lists_four_rows_that_apply_on_restart() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    editor.state.backend = crate::gfx::BackendChoice::Vulkan;
+    open(&mut editor, Some(Page::Startup));
+    for label in [
+        "Graphics backend",
+        "Worker threads",
+        "Validation layers",
+        "Log level",
+    ] {
+        assert!(!in_settings(&editor, label).is_empty(), "{label}");
+    }
+    assert_eq!(startup_note_count(&editor), 4);
+    let auto = crate::threads::automatic();
+    assert!(editor.painted_contains(&format!("Auto is {auto} on this computer")));
+    assert!(restart_line(&editor).is_none(), "nothing changed yet");
+    assert!(!editor.painted_contains("this run draws through Metal"));
+}
+
+/// Validation is a Vulkan layer, so a run on Metal says it does nothing here.
+#[test]
+fn validation_says_it_is_vulkans_on_a_metal_run() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    editor.state.backend = crate::gfx::BackendChoice::Metal;
+    open(&mut editor, Some(Page::Startup));
+    assert!(editor.painted_contains("Validation is Vulkan's; this run draws through Metal"));
+}
+
+#[test]
+fn a_startup_row_the_environment_sets_says_which_variable_and_shows_its_value() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    editor.state.environment =
+        Environment::from_vars(|name| (name == "ORRIN_THREADS").then(|| "3".to_owned()));
+    editor.state.settings.startup.threads = Some(5);
+    open(&mut editor, Some(Page::Startup));
+    assert!(editor.painted_contains("Set by ORRIN_THREADS for this run"));
+
+    let row = in_settings(&editor, "Worker threads")[0];
+    let shown = in_settings(&editor, "3")
+        .into_iter()
+        .find(|at| (at.y - row.y).abs() < 6.0)
+        .expect("the row shows the environment's 3, not the saved 5");
+    let autos = in_settings(&editor, "Auto").len();
+    editor.click(shown).frames(2);
+    assert_eq!(
+        in_settings(&editor, "Auto").len(),
+        autos,
+        "the picker did not open"
+    );
+    assert_eq!(editor.state.settings.startup.threads, Some(5));
+    assert!(
+        restart_line(&editor).is_none(),
+        "a value the environment overrides waits on nothing"
+    );
+}
+
+/// A change waits for a restart, says so once at the top, and taking it
+/// back takes the line away.
+#[test]
+fn a_changed_startup_row_asks_for_a_restart_until_it_is_put_back() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    open(&mut editor, Some(Page::Startup));
+
+    pick(&mut editor, "Log level", "Default", "Debug");
+    assert_eq!(
+        editor.state.settings.startup.log,
+        crate::editor::settings::LogFloor::Debug
+    );
+    assert_eq!(
+        restart_line(&editor).as_deref(),
+        Some("Restart Orrin to apply 1 change")
+    );
+    let line = in_settings(&editor, "Restart Orrin to apply 1 change")[0];
+    let first = in_settings(&editor, "Graphics backend")[0];
+    assert!(line.y < first.y, "at the top of the page");
+    assert!(!in_settings(&editor, "Restart now").is_empty());
+
+    editor.state.settings.startup.validation = crate::editor::settings::Validation::Off;
+    editor.frames(2);
+    assert_eq!(
+        restart_line(&editor).as_deref(),
+        Some("Restart Orrin to apply 2 changes")
+    );
+
+    editor.state.settings.startup.validation = crate::editor::settings::Validation::Auto;
+    editor.frames(1);
+    pick(&mut editor, "Log level", "Debug", "Default");
+    assert!(restart_line(&editor).is_none());
+}
+
+#[test]
+fn search_finds_worker_threads_under_startup_with_the_restart_line_above() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    editor.state.settings.startup.threads = Some(2);
+    open(&mut editor, None);
+    editor.state.settings_panel.set_query("cores");
+    editor.frames(2);
+    let heading = in_settings(&editor, "Startup")[0];
+    let row = in_settings(&editor, "Worker threads")[0];
+    assert!(row.y > heading.y, "listed under its page");
+    let line = in_settings(&editor, "Restart Orrin to apply 1 change")[0];
+    assert!(line.y < heading.y, "above the results");
+
+    editor.state.settings_panel.set_query("fly");
+    editor.frames(2);
+    assert!(
+        restart_line(&editor).is_none(),
+        "not above unrelated results"
+    );
+}
+
+#[test]
+fn clicking_restart_raises_the_restart_request_and_nothing_else() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    editor.state.settings.startup.backend = crate::editor::settings::Backend::Vulkan;
+    open(&mut editor, Some(Page::Startup));
+    let settings = editor.state.settings.clone();
+    let button = in_settings(&editor, "Restart now")[0];
+    editor.click(button).frames(1);
+    editor.state.apply(&mut editor.world, &editor.registry);
+
+    assert!(editor.state.take_restart_request());
+    assert!(!editor.state.take_restart_request(), "once");
+    assert_eq!(editor.state.settings, settings);
+    assert!(!editor.state.scene_dirty());
+    assert!(!std::path::Path::new(&editor.state.scene_path).exists());
+}
+
+/// Restarting over unsaved work saves it first, and only a save that
+/// happened lets the restart go ahead.
+#[test]
+fn with_unsaved_work_the_button_saves_and_then_restarts() {
+    let dir = Dir::new("settings-save-and-restart");
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    let scene = dir.path().join("level.orrin");
+    editor.state.scene_path = scene.to_string_lossy().into_owned();
+    editor.state.settings.startup.threads = Some(2);
+    editor
+        .state
+        .request_spawn(crate::editor::state::SpawnKind::Folder);
+    editor.state.apply(&mut editor.world, &editor.registry);
+    assert!(editor.state.scene_dirty());
+    open(&mut editor, Some(Page::Startup));
+    assert!(in_settings(&editor, "Restart now").is_empty());
+
+    let button = in_settings(&editor, "Save and restart")[0];
+    editor.click(button).frames(1);
+    assert!(!editor.state.take_restart_request(), "not before the save");
+    editor.state.apply(&mut editor.world, &editor.registry);
+    assert!(scene.is_file(), "saved");
+    assert!(!editor.state.scene_dirty());
+    assert!(editor.state.take_restart_request());
+}
+
+#[test]
+fn a_save_that_fails_cancels_the_restart_and_says_so() {
+    let dir = Dir::new("settings-save-fails");
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    editor.state.scene_path = dir
+        .path()
+        .join("missing/level.orrin")
+        .to_string_lossy()
+        .into_owned();
+    editor.state.settings.startup.threads = Some(2);
+    editor
+        .state
+        .request_spawn(crate::editor::state::SpawnKind::Folder);
+    editor.state.apply(&mut editor.world, &editor.registry);
+    open(&mut editor, Some(Page::Startup));
+
+    let button = in_settings(&editor, "Save and restart")[0];
+    editor.click(button).frames(1);
+    editor.state.apply(&mut editor.world, &editor.registry);
+    assert!(!editor.state.take_restart_request());
+    assert!(editor.state.scene_dirty());
+    let log: Vec<String> = editor
+        .world
+        .resource::<crate::scene::LogBuffer>()
+        .iter()
+        .map(|entry| entry.message.clone())
+        .collect();
+    assert!(
+        log.iter().any(|line| line.contains("restart cancelled")),
+        "{log:?}"
+    );
+}
+
+/// The scene a game is played in is not what a save would write, so the
+/// restart waits for Stop.
+#[test]
+fn restarting_is_closed_while_the_game_plays() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    editor.state.settings.startup.threads = Some(2);
+    editor.state.request_play();
+    editor.state.apply(&mut editor.world, &editor.registry);
+    assert!(editor.state.playing());
+    open(&mut editor, Some(Page::Startup));
+
+    let button = in_settings(&editor, "Restart now")[0];
+    editor.click(button).frames(1);
+    editor.state.apply(&mut editor.world, &editor.registry);
+    assert!(!editor.state.take_restart_request());
+}

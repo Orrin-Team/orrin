@@ -742,6 +742,15 @@ mod tests {
             *editor.world.resource::<crate::scene::PresentSettings>(),
             crate::scene::PresentSettings::default()
         );
+        // Nor how the user likes Orrin started, nor the variables that start it.
+        assert_eq!(
+            editor.state.started_with,
+            crate::editor::settings::Startup::default()
+        );
+        assert_eq!(
+            editor.state.environment,
+            crate::editor::settings::Environment::default()
+        );
     }
 
     /// The tree is the panel. A toolbar row that takes the panel's whole rect

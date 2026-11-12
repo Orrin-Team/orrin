@@ -35,6 +35,14 @@
 //! zoom multiplies the display's own scale, which `egui_winit` refreshes when
 //! the window moves to another screen; a fixed pixels per point would be wrong
 //! on the second one.
+//!
+//! **Startup is read before there is an editor.** The backend, the worker
+//! threads, validation and the log floor were environment variables alone,
+//! read once as the process starts, so `App::run` opens the store first —
+//! before the log stream exists, which is why [`SettingsStore::open`] hands
+//! back what it has to say instead of logging it. They apply on restart:
+//! `EditorState::started_with` keeps what this run began with, and the
+//! Settings tab counts the difference.
 
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
@@ -47,7 +55,8 @@ use super::state::EditorState;
 pub use super::state::IconTints;
 use super::theme::ThemeSet;
 pub use crate::camera_controller::FlyCamera;
-use crate::scene::{PresentSettings, VsyncMode};
+use crate::gfx::BackendChoice;
+use crate::scene::{LogLevel, PresentSettings, VsyncMode};
 
 const FILE: &str = "settings.toml";
 const BAD: &str = "settings.toml.bad";
@@ -69,6 +78,116 @@ pub struct Settings {
     pub scripting: Scripting,
     pub saving: Saving,
     pub display: Display,
+    pub startup: Startup,
+}
+
+/// What a run is started with. Each default is what the engine does with no
+/// `ORRIN_*` variable set.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Startup {
+    #[serde(deserialize_with = "or_default")]
+    pub backend: Backend,
+    /// The pool's workers; `None` is one short of the machine.
+    #[serde(deserialize_with = "or_default")]
+    pub threads: Option<u32>,
+    #[serde(deserialize_with = "or_default")]
+    pub validation: Validation,
+    #[serde(deserialize_with = "or_default")]
+    pub log: LogFloor,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    /// `BackendChoice::DEFAULT`, or Vulkan where Metal cannot start.
+    #[default]
+    Auto,
+    Vulkan,
+    Metal,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Validation {
+    /// On in a debug build.
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFloor {
+    /// This build's own floor.
+    #[default]
+    Default,
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl From<LogLevel> for LogFloor {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Trace => Self::Trace,
+            LogLevel::Debug => Self::Debug,
+            LogLevel::Info => Self::Info,
+            LogLevel::Warning => Self::Warn,
+            LogLevel::Error => Self::Error,
+        }
+    }
+}
+
+impl Startup {
+    pub fn backend_choice(&self) -> Option<BackendChoice> {
+        match self.backend {
+            Backend::Auto => None,
+            Backend::Vulkan => Some(BackendChoice::Vulkan),
+            Backend::Metal => Some(BackendChoice::Metal),
+        }
+    }
+
+    pub fn threads(&self) -> Option<usize> {
+        self.threads.map(|threads| threads as usize)
+    }
+
+    pub fn validation(&self) -> Option<bool> {
+        match self.validation {
+            Validation::Auto => None,
+            Validation::On => Some(true),
+            Validation::Off => Some(false),
+        }
+    }
+
+    pub fn log_floor(&self) -> Option<LogLevel> {
+        Some(match self.log {
+            LogFloor::Default => return None,
+            LogFloor::Trace => LogLevel::Trace,
+            LogFloor::Debug => LogLevel::Debug,
+            LogFloor::Info => LogLevel::Info,
+            LogFloor::Warn => LogLevel::Warning,
+            LogFloor::Error => LogLevel::Error,
+        })
+    }
+
+    /// How many values differ from `started` that the next run will take,
+    /// which leaves out every one `env` decides.
+    pub fn changes_from(&self, started: &Startup, env: &Environment) -> usize {
+        let (now, then) = (env.over(self), env.over(started));
+        [
+            now.backend != then.backend,
+            now.threads != then.threads,
+            now.validation != then.validation,
+            now.log != then.log,
+        ]
+        .into_iter()
+        .filter(|&changed| changed)
+        .count()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -208,6 +327,8 @@ impl Settings {
         *saving = (*saving).clamp(*AUTOSAVE_SECS.start(), *AUTOSAVE_SECS.end());
         let images = &mut self.display.images;
         *images = (*images).clamp(*SWAPCHAIN_IMAGES.start(), *SWAPCHAIN_IMAGES.end());
+        // Rayon reads zero as every core, which is what Auto exists to avoid.
+        self.startup.threads = self.startup.threads.filter(|&threads| threads > 0);
     }
 
     /// Hands the world the settings it holds as resources.
@@ -289,6 +410,10 @@ where
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Environment {
     editor: Option<String>,
+    backend: Option<Backend>,
+    threads: Option<u32>,
+    validation: Option<Validation>,
+    log: Option<LogFloor>,
 }
 
 impl Environment {
@@ -296,9 +421,26 @@ impl Environment {
         Self::from_vars(|name| std::env::var(name).ok())
     }
 
+    /// Each variable read the way the engine reads it at startup, so a row is
+    /// locked exactly when the variable decides: a thread count of zero or a
+    /// misspelt level is no override, and a backend name that cannot be
+    /// honoured runs Vulkan, which is what its row then shows.
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
+        let set = |name| var(name).filter(|value: &String| !value.trim().is_empty());
         Self {
-            editor: var(super::source::EDITOR_ENV).filter(|value| !value.trim().is_empty()),
+            editor: set(super::source::EDITOR_ENV),
+            backend: set(BackendChoice::ENV).map(|name| match BackendChoice::parse(Some(&name)) {
+                Ok(BackendChoice::Metal) => Backend::Metal,
+                Ok(BackendChoice::Vulkan) | Err(_) => Backend::Vulkan,
+            }),
+            threads: crate::threads::named(set(crate::threads::ENV).as_deref())
+                .map(|threads| u32::try_from(threads).unwrap_or(u32::MAX)),
+            validation: crate::app::validation_named(set(crate::app::VALIDATION_ENV).as_deref())
+                .map(|on| if on { Validation::On } else { Validation::Off }),
+            log: crate::logging::floor_named(set(crate::logging::ENV).as_deref())
+                .ok()
+                .flatten()
+                .map(LogFloor::from),
         }
     }
 
@@ -310,6 +452,34 @@ impl Environment {
     /// The variable that chooses the external editor this run, if one does.
     pub fn editor_override(&self) -> Option<&'static str> {
         self.editor.is_some().then_some(super::source::EDITOR_ENV)
+    }
+
+    pub fn backend_override(&self) -> Option<&'static str> {
+        self.backend.is_some().then_some(BackendChoice::ENV)
+    }
+
+    pub fn threads_override(&self) -> Option<&'static str> {
+        self.threads.is_some().then_some(crate::threads::ENV)
+    }
+
+    pub fn validation_override(&self) -> Option<&'static str> {
+        self.validation
+            .is_some()
+            .then_some(crate::app::VALIDATION_ENV)
+    }
+
+    pub fn log_override(&self) -> Option<&'static str> {
+        self.log.is_some().then_some(crate::logging::ENV)
+    }
+
+    /// `startup` with what this run's environment chose in place of it.
+    pub fn over(&self, startup: &Startup) -> Startup {
+        Startup {
+            backend: self.backend.unwrap_or(startup.backend),
+            threads: self.threads.or(startup.threads),
+            validation: self.validation.unwrap_or(startup.validation),
+            log: self.log.unwrap_or(startup.log),
+        }
     }
 }
 
@@ -334,7 +504,10 @@ impl SettingsStore {
     /// missing file is the defaults; one that cannot be read is named and is
     /// the defaults too, since refusing to open the editor over a preference
     /// would be the worse failure.
-    pub fn open(user_dir: Option<PathBuf>) -> Self {
+    ///
+    /// Hands back the warnings reading it raised rather than logging them: the
+    /// windowed editor opens it before the log stream exists.
+    pub fn open(user_dir: Option<PathBuf>) -> (Self, Vec<String>) {
         let mut store = Self {
             dir: user_dir,
             applied: Settings::default(),
@@ -344,11 +517,13 @@ impl SettingsStore {
             pushed: false,
         };
         let Some(path) = store.path() else {
-            return store;
+            return (store, Vec::new());
         };
-        let read = std::fs::read_to_string(&path)
-            .map_err(|error| error.to_string())
-            .and_then(|text| Settings::from_toml(&text).map_err(|error| error.to_string()));
+        let (read, mut said) = crate::logging::heard(|| {
+            std::fs::read_to_string(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|text| Settings::from_toml(&text).map_err(|error| error.to_string()))
+        });
         match read {
             Ok(settings) => {
                 store.found = true;
@@ -356,15 +531,15 @@ impl SettingsStore {
             }
             Err(_) if !path.exists() => {}
             Err(error) => {
-                tracing::warn!(
+                said.push(format!(
                     "ignoring {} — {error}; it is kept as {BAD} when a setting next changes",
                     path.display()
-                );
+                ));
                 store.found = true;
                 store.malformed = true;
             }
         }
-        store
+        (store, said)
     }
 
     fn path(&self) -> Option<PathBuf> {
@@ -472,6 +647,7 @@ impl SettingsStore {
         themes: &mut ThemeSet,
     ) {
         state.settings.clone_from(&self.applied);
+        state.started_with.clone_from(&self.applied.startup);
         themes.select(self.applied.appearance.theme_name());
         ctx.set_zoom_factor(self.applied.appearance.ui_scale);
         state.autosave.configure(self.applied.saving.every());
@@ -552,7 +728,7 @@ mod tests {
             self.0.join(FILE)
         }
 
-        fn store(&self) -> SettingsStore {
+        fn store(&self) -> (SettingsStore, Vec<String>) {
             SettingsStore::open(Some(self.0.clone()))
         }
     }
@@ -622,8 +798,8 @@ mod tests {
     #[test]
     fn settings_round_trip() {
         let dir = Scratch::new("round-trip");
-        save(&mut dir.store(), unusual());
-        assert_eq!(*dir.store().current(), unusual());
+        save(&mut dir.store().0, unusual());
+        assert_eq!(*dir.store().0.current(), unusual());
     }
 
     /// Deviations only, as a material's shader values and a Behaviour's
@@ -635,7 +811,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.viewport.fly_speed = 12.0;
         settings.appearance.icons.camera = [9, 9, 9];
-        save(&mut dir.store(), settings);
+        save(&mut dir.store().0, settings);
 
         let text = std::fs::read_to_string(dir.file()).unwrap();
         assert!(text.contains("fly_speed = 12"), "{text}");
@@ -663,7 +839,7 @@ mod tests {
         );
         assert_eq!(Settings::default().to_toml().as_deref(), Some(""));
 
-        let mut store = dir.store();
+        let mut store = dir.store().0;
         store.seed(None, None);
         save(&mut store, Settings::default());
         assert!(!dir.file().exists(), "nothing to say, so no file");
@@ -685,7 +861,7 @@ mod tests {
             "[appearance]\ntheme = \"Void\"\nsparkle = true\n\n[telemetry]\nlevel = 3\n",
         )
         .unwrap();
-        let store = dir.store();
+        let store = dir.store().0;
         assert_eq!(store.current().appearance.theme.as_deref(), Some("Void"));
     }
 
@@ -698,7 +874,7 @@ mod tests {
             "[scripting]\neditor = \"fleet\"\nreload_after_rebuild = false\n",
         )
         .unwrap();
-        let settings = dir.store().current().clone();
+        let settings = dir.store().0.current().clone();
         assert_eq!(settings.scripting.editor, ExternalEditor::Auto);
         assert!(!settings.scripting.reload_after_rebuild);
     }
@@ -709,7 +885,7 @@ mod tests {
         let typed = "[viewport]\nfly_speed = \"fast\n";
         std::fs::write(dir.file(), typed).unwrap();
 
-        let mut store = dir.store();
+        let mut store = dir.store().0;
         assert_eq!(*store.current(), Settings::default());
         assert_eq!(
             std::fs::read_to_string(dir.file()).unwrap(),
@@ -724,7 +900,7 @@ mod tests {
             std::fs::read_to_string(dir.0.join("settings.toml.bad")).unwrap(),
             typed
         );
-        assert_eq!(*dir.store().current(), settings);
+        assert_eq!(*dir.store().0.current(), settings);
 
         settings.viewport.boost = 3.0;
         save(&mut store, settings);
@@ -744,7 +920,7 @@ mod tests {
              [saving]\nautosave_interval_secs = 1\n[display]\nimages = 40\n",
         )
         .unwrap();
-        let settings = dir.store().current().clone();
+        let settings = dir.store().0.current().clone();
         assert_eq!(settings.appearance.ui_scale, *UI_SCALE.end());
         assert_eq!(settings.viewport.fly_speed, FlyCamera::default().fly_speed);
         assert_eq!(settings.viewport.boost, *BOOST.start());
@@ -757,7 +933,7 @@ mod tests {
 
     #[test]
     fn with_no_directory_nothing_is_read_or_written() {
-        let mut store = SettingsStore::open(None);
+        let mut store = SettingsStore::open(None).0;
         assert_eq!(*store.current(), Settings::default());
         assert_eq!(store.themes_dir(), None);
         save(&mut store, unusual());
@@ -771,7 +947,7 @@ mod tests {
     #[test]
     fn the_users_themes_sit_beside_the_settings() {
         let dir = Scratch::new("themes-dir");
-        assert_eq!(dir.store().themes_dir(), Some(dir.0.join("themes")));
+        assert_eq!(dir.store().0.themes_dir(), Some(dir.0.join("themes")));
     }
 
     /// The bug this module exists to fix: a theme picked in one project was
@@ -787,7 +963,7 @@ mod tests {
         std::fs::write(other.0.join("editor.ron"), "(theme: Some(\"orrin-dark\"))").unwrap();
 
         let world = world();
-        let mut store = user.store();
+        let mut store = user.store().0;
         store.seed(PrefsFile::new(Some(one.0.clone())).load().theme, None);
         let mut themes = ThemeSet::load([user.0.join("themes")]);
         let mut state = EditorState::default();
@@ -795,7 +971,7 @@ mod tests {
         settle(&mut store, &world, &mut state, &mut themes, false);
         assert_eq!(themes.active().name, "Void");
 
-        let mut store = user.store();
+        let mut store = user.store().0;
         store.seed(PrefsFile::new(Some(other.0.clone())).load().theme, None);
         assert_eq!(store.current().appearance.theme.as_deref(), Some("Void"));
         assert!(
@@ -809,7 +985,7 @@ mod tests {
         let user = Scratch::new("built-in");
         theme_file(&user.0.join("themes"), "Void");
         let world = world();
-        let mut store = user.store();
+        let mut store = user.store().0;
         let mut themes = ThemeSet::load([user.0.join("themes")]);
         let mut state = EditorState::default();
         state.request_theme("Void");
@@ -846,14 +1022,14 @@ mod tests {
         .unwrap();
         let prefs = PrefsFile::new(Some(project.0.clone())).load();
 
-        let mut store = user.store();
+        let mut store = user.store().0;
         store.seed(prefs.theme, prefs.icons);
         let seeded = store.current().clone();
         assert_eq!(seeded.appearance.theme.as_deref(), Some("Void"));
         assert_eq!(seeded.appearance.icons.light, [1, 2, 3]);
-        assert_eq!(*user.store().current(), seeded, "and kept at once");
+        assert_eq!(*user.store().0.current(), seeded, "and kept at once");
 
-        let mut store = user.store();
+        let mut store = user.store().0;
         store.seed(Some("Another".into()), None);
         assert_eq!(
             store.current().appearance.theme.as_deref(),
@@ -866,20 +1042,20 @@ mod tests {
     fn a_change_is_kept_once_the_pointer_lets_go() {
         let dir = Scratch::new("pointer");
         let world = world();
-        let mut store = dir.store();
+        let mut store = dir.store().0;
         let mut themes = ThemeSet::default();
         let mut state = EditorState::default();
         state.settings.viewport.fly_speed = 9.0;
         settle(&mut store, &world, &mut state, &mut themes, true);
         assert!(!dir.file().exists(), "not while a slider is held");
         settle(&mut store, &world, &mut state, &mut themes, false);
-        assert_eq!(dir.store().current().viewport.fly_speed, 9.0);
+        assert_eq!(dir.store().0.current().viewport.fly_speed, 9.0);
     }
 
     #[test]
     fn a_change_reaches_the_world_and_the_editors_own_state() {
         let world = world();
-        let mut store = SettingsStore::open(None);
+        let mut store = SettingsStore::open(None).0;
         let mut themes = ThemeSet::default();
         let mut state = EditorState::default();
         state.settings.display.vsync = VsyncMode::Mailbox;
@@ -910,7 +1086,7 @@ mod tests {
     fn a_resource_edited_by_its_own_panel_is_kept() {
         let dir = Scratch::new("from-world");
         let world = world();
-        let mut store = dir.store();
+        let mut store = dir.store().0;
         let mut themes = ThemeSet::default();
         let mut state = EditorState::default();
         settle(&mut store, &world, &mut state, &mut themes, false);
@@ -924,7 +1100,7 @@ mod tests {
         }
         settle(&mut store, &world, &mut state, &mut themes, false);
 
-        let kept = dir.store().current().clone();
+        let kept = dir.store().0.current().clone();
         assert_eq!(kept.display.vsync, VsyncMode::Immediate);
         #[cfg(feature = "scripting")]
         assert!(!kept.scripting.reload_after_rebuild);
@@ -935,10 +1111,10 @@ mod tests {
     #[test]
     fn the_first_frame_gives_the_world_the_saved_settings() {
         let dir = Scratch::new("first-frame");
-        save(&mut dir.store(), unusual());
+        save(&mut dir.store().0, unusual());
 
         let world = world();
-        let mut store = dir.store();
+        let mut store = dir.store().0;
         let mut state = EditorState::default();
         state.settings = store.current().clone();
         settle(
@@ -952,7 +1128,7 @@ mod tests {
             *world.resource::<PresentSettings>(),
             unusual().display.present()
         );
-        assert_eq!(*dir.store().current(), unusual());
+        assert_eq!(*dir.store().0.current(), unusual());
     }
 
     #[cfg(feature = "scripting")]
@@ -981,6 +1157,147 @@ mod tests {
         assert_eq!(blank.editor(), None);
         assert_eq!(blank.editor_override(), None);
         assert_eq!(Environment::default().editor_override(), None);
+    }
+
+    /// No `[startup]` is today's behaviour with no variable set, and a default
+    /// is never written; a choice is, by name.
+    #[test]
+    fn startup_defaults_write_nothing_and_a_change_round_trips() {
+        let dir = Scratch::new("startup");
+        std::fs::write(dir.file(), "[viewport]\nfly_speed = 12.0\n").unwrap();
+        assert_eq!(dir.store().0.current().startup, Startup::default());
+        assert_eq!(Startup::default().backend_choice(), None);
+        assert_eq!(Startup::default().threads(), None);
+        assert_eq!(Startup::default().validation(), None);
+        assert_eq!(Startup::default().log_floor(), None);
+
+        let mut settings = Settings::default();
+        settings.viewport.fly_speed = 12.0;
+        save(&mut dir.store().0, settings.clone());
+        let text = std::fs::read_to_string(dir.file()).unwrap();
+        assert!(!text.contains("startup"), "{text}");
+
+        settings.startup = Startup {
+            backend: Backend::Vulkan,
+            threads: Some(4),
+            validation: Validation::Off,
+            log: LogFloor::Debug,
+        };
+        save(&mut dir.store().0, settings.clone());
+        let text = std::fs::read_to_string(dir.file()).unwrap();
+        for line in [
+            "[startup]",
+            "backend = \"vulkan\"",
+            "threads = 4",
+            "validation = \"off\"",
+            "log = \"debug\"",
+        ] {
+            assert!(text.contains(line), "{line} in\n{text}");
+        }
+        let read = dir.store().0.current().startup.clone();
+        assert_eq!(read, settings.startup);
+        assert_eq!(
+            read.backend_choice(),
+            Some(crate::gfx::BackendChoice::Vulkan)
+        );
+        assert_eq!(read.threads(), Some(4));
+        assert_eq!(read.validation(), Some(false));
+        assert_eq!(read.log_floor(), Some(crate::scene::LogLevel::Debug));
+    }
+
+    /// A hand edit that names something this build does not know costs that
+    /// one value; zero threads is rayon's "all of them" and is Auto here.
+    #[test]
+    fn a_startup_value_this_build_cannot_read_is_auto() {
+        let dir = Scratch::new("startup-unknown");
+        std::fs::write(
+            dir.file(),
+            "[startup]\nbackend = \"dx12\"\nthreads = 0\nvalidation = \"maybe\"\nlog = \"debug\"\n",
+        )
+        .unwrap();
+        let (store, said) = dir.store();
+        let startup = &store.current().startup;
+        assert_eq!(startup.backend, Backend::Auto);
+        assert_eq!(startup.threads, None);
+        assert_eq!(startup.validation, Validation::Auto);
+        assert_eq!(startup.log, LogFloor::Debug);
+        assert!(said.iter().any(|line| line.contains("dx12")), "{said:?}");
+    }
+
+    /// The store is opened before the log stream exists, so what it has to
+    /// say comes back to be logged once it does.
+    #[test]
+    fn what_the_store_says_while_opening_is_handed_back() {
+        let dir = Scratch::new("startup-heard");
+        std::fs::write(dir.file(), "[viewport\n").unwrap();
+        let (_, said) = dir.store();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains(&dir.file().display().to_string()),
+            "{said:?}"
+        );
+        assert!(SettingsStore::open(None).1.is_empty());
+    }
+
+    #[test]
+    fn every_startup_variable_overrides_and_says_so() {
+        let vars = |name: &str| {
+            Some(
+                match name {
+                    "ORRIN_BACKEND" => "Vulkan",
+                    "ORRIN_THREADS" => "3",
+                    "ORRIN_VALIDATION" => "0",
+                    "ORRIN_LOG" => "warn",
+                    _ => return None,
+                }
+                .to_owned(),
+            )
+        };
+        let set = Environment::from_vars(vars);
+        assert_eq!(set.backend_override(), Some("ORRIN_BACKEND"));
+        assert_eq!(set.threads_override(), Some("ORRIN_THREADS"));
+        assert_eq!(set.validation_override(), Some("ORRIN_VALIDATION"));
+        assert_eq!(set.log_override(), Some("ORRIN_LOG"));
+        assert_eq!(
+            set.over(&Startup::default()),
+            Startup {
+                backend: Backend::Vulkan,
+                threads: Some(3),
+                validation: Validation::Off,
+                log: LogFloor::Warn,
+            }
+        );
+
+        for unset in [
+            Environment::default(),
+            Environment::from_vars(|_| Some("  ".to_owned())),
+        ] {
+            assert_eq!(unset.backend_override(), None);
+            assert_eq!(unset.threads_override(), None);
+            assert_eq!(unset.validation_override(), None);
+            assert_eq!(unset.log_override(), None);
+        }
+        // What the engine would not take is no override either, so the row
+        // stays the user's.
+        let nonsense = Environment::from_vars(|name| {
+            matches!(name, "ORRIN_THREADS" | "ORRIN_LOG").then(|| "lots".to_owned())
+        });
+        assert_eq!(nonsense.threads_override(), None);
+        assert_eq!(nonsense.log_override(), None);
+    }
+
+    /// The restart line counts what the user changed that the next run will
+    /// actually pick up: a row the environment decides is not one.
+    #[test]
+    fn a_change_the_environment_overrides_is_not_waiting_on_a_restart() {
+        let started = Startup::default();
+        let mut now = started.clone();
+        assert_eq!(now.changes_from(&started, &Environment::default()), 0);
+        now.threads = Some(2);
+        now.log = LogFloor::Info;
+        assert_eq!(now.changes_from(&started, &Environment::default()), 2);
+        let threads = Environment::from_vars(|name| (name == "ORRIN_THREADS").then(|| "6".into()));
+        assert_eq!(now.changes_from(&started, &threads), 1);
     }
 
     #[test]

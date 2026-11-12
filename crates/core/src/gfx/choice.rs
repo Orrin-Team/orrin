@@ -1,7 +1,7 @@
 //! Which graphics API a run uses.
 
-/// `ORRIN_BACKEND` names it. Metal is macOS only and the default on Apple
-/// silicon; everywhere else Vulkan is.
+/// `ORRIN_BACKEND` names it, else the windowed editor's saved setting. Metal is
+/// macOS only and the default on Apple silicon; everywhere else Vulkan is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendChoice {
     Vulkan,
@@ -9,6 +9,8 @@ pub enum BackendChoice {
 }
 
 impl BackendChoice {
+    pub const ENV: &str = "ORRIN_BACKEND";
+
     /// What an unset `ORRIN_BACKEND` means.
     pub const DEFAULT: Self = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Self::Metal
@@ -33,25 +35,67 @@ impl BackendChoice {
         }
     }
 
+    /// `named` is `ORRIN_BACKEND`, `saved` the user's setting (`None` is Auto)
+    /// and `metal` whether this machine can draw through Metal, asked only of
+    /// a choice that is not the variable's.
+    ///
+    /// The `Err` is the variable's alone, for the caller to report before it
+    /// falls back to Vulkan. Otherwise the backend, and what to say about a
+    /// fallback.
+    pub fn resolve(
+        named: Option<&str>,
+        saved: Option<Self>,
+        metal: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(Self, Option<String>), String> {
+        if named.is_some_and(|name| !name.trim().is_empty()) {
+            // Named, it is honoured as named or refused: the renderer fails
+            // loudly on a Metal it cannot start, so a measurement is never
+            // labelled with a backend it did not run on.
+            return Self::parse(named).map(|choice| (choice, None));
+        }
+        // A default or a saved choice this machine cannot honour falls back
+        // instead, and says so. A saved one that refused would leave editing
+        // the file by hand as the only way back into the editor.
+        let choice = saved.unwrap_or(Self::DEFAULT);
+        if choice != Self::Metal {
+            return Ok((choice, None));
+        }
+        Ok(match metal().err() {
+            None => (Self::Metal, None),
+            Some(reason) if saved.is_some() => (
+                Self::Vulkan,
+                Some(format!(
+                    "the saved backend Metal cannot start ({reason}); using Vulkan"
+                )),
+            ),
+            Some(reason) => (
+                Self::Vulkan,
+                Some(format!("Metal is unavailable ({reason}); using Vulkan")),
+            ),
+        })
+    }
+
     /// The choice the environment makes, warning and using Vulkan when it
     /// cannot be honoured.
     pub fn from_env() -> Self {
-        let named = std::env::var("ORRIN_BACKEND").ok();
-        let choice = Self::parse(named.as_deref()).unwrap_or_else(|reason| {
-            tracing::warn!("{reason}; using Vulkan");
-            Self::Vulkan
-        });
-        // A default that this machine cannot honour falls back; a named one
-        // fails loudly at startup instead, so a comparison is never mislabelled.
-        #[cfg(target_os = "macos")]
-        if choice == Self::Metal
-            && named.as_deref().is_none_or(|name| name.trim().is_empty())
-            && let Err(reason) = crate::gfx::metal::MtlDriver::new()
-        {
-            tracing::warn!("Metal is unavailable ({reason}); using Vulkan");
-            return Self::Vulkan;
+        Self::from_env_and(None)
+    }
+
+    /// [`resolve`](Self::resolve) for this process, logging what it says.
+    pub fn from_env_and(saved: Option<Self>) -> Self {
+        let named = std::env::var(Self::ENV).ok();
+        match Self::resolve(named.as_deref(), saved, metal_available) {
+            Ok((choice, warning)) => {
+                if let Some(warning) = warning {
+                    tracing::warn!("{warning}");
+                }
+                choice
+            }
+            Err(reason) => {
+                tracing::warn!("{reason}; using Vulkan");
+                Self::Vulkan
+            }
         }
-        choice
     }
 
     pub fn label(self) -> &'static str {
@@ -60,6 +104,16 @@ impl BackendChoice {
             Self::Metal => "Metal",
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn metal_available() -> Result<(), String> {
+    crate::gfx::metal::MtlDriver::new().map(drop)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn metal_available() -> Result<(), String> {
+    Err("it needs macOS".to_owned())
 }
 
 #[cfg(test)]
@@ -109,5 +163,68 @@ mod tests {
     #[test]
     fn metal_is_refused_off_macos() {
         assert!(BackendChoice::parse(Some("metal")).is_err());
+    }
+
+    fn available() -> Result<(), String> {
+        Ok(())
+    }
+
+    fn unavailable() -> Result<(), String> {
+        Err("no Metal device".to_owned())
+    }
+
+    #[test]
+    fn the_environment_beats_the_setting_which_beats_the_default() {
+        use BackendChoice::{Metal, Vulkan};
+        let chosen = |named, saved| BackendChoice::resolve(named, saved, available);
+        assert_eq!(chosen(Some("vulkan"), Some(Metal)), Ok((Vulkan, None)));
+        assert_eq!(chosen(None, Some(Vulkan)), Ok((Vulkan, None)));
+        assert_eq!(
+            chosen(Some("  "), Some(Vulkan)),
+            Ok((Vulkan, None)),
+            "blank"
+        );
+        assert_eq!(chosen(None, None), Ok((BackendChoice::DEFAULT, None)));
+    }
+
+    /// A saved choice is somebody's preference from another day, perhaps
+    /// another machine: it must not be able to stop the editor opening, so it
+    /// falls back as Auto does and says so by name.
+    #[test]
+    fn a_saved_backend_this_machine_cannot_honour_falls_back_and_is_named() {
+        let (backend, warning) =
+            BackendChoice::resolve(None, Some(BackendChoice::Metal), unavailable).unwrap();
+        assert_eq!(backend, BackendChoice::Vulkan);
+        let warning = warning.expect("the fallback is said");
+        assert!(warning.contains("Metal"), "{warning}");
+    }
+
+    /// The same name in the environment is a measurement's label, so it is
+    /// never substituted: off macOS it is an error, and on macOS it is honoured
+    /// without asking, leaving the renderer to refuse it loudly.
+    #[test]
+    fn the_same_name_in_the_environment_is_not_substituted() {
+        let named = BackendChoice::resolve(Some("metal"), None, || -> Result<(), String> {
+            panic!("a named backend is not probed")
+        });
+        if cfg!(target_os = "macos") {
+            assert_eq!(named, Ok((BackendChoice::Metal, None)));
+        } else {
+            assert!(named.is_err(), "{named:?}");
+        }
+        assert!(
+            BackendChoice::resolve(Some("dx12"), Some(BackendChoice::Vulkan), available).is_err()
+        );
+    }
+
+    #[test]
+    fn auto_on_a_machine_without_metal_is_vulkan_with_a_word_about_it() {
+        let (backend, warning) = BackendChoice::resolve(None, None, unavailable).unwrap();
+        assert_eq!(backend, BackendChoice::Vulkan);
+        assert_eq!(
+            warning.is_some(),
+            BackendChoice::DEFAULT == BackendChoice::Metal,
+            "{warning:?}"
+        );
     }
 }

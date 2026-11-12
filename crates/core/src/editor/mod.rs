@@ -100,6 +100,7 @@ impl Editor {
         project: Option<&orrin_project::Project>,
         scripts_dir: Option<std::path::PathBuf>,
         mut settings: settings::SettingsStore,
+        backend: crate::gfx::BackendChoice,
     ) -> Self {
         let ctx = egui::Context::default();
         let input = egui_winit::State::new(
@@ -126,6 +127,7 @@ impl Editor {
         state.script_files = source::ScriptFiles::new(scripts_dir);
         state.environment = settings::Environment::of_process();
         state.settings_file = settings.file();
+        state.backend = backend;
         settings.begin(&ctx, &mut state, &mut themes);
         if let Some(steps) = prefs.snap {
             state.snap_steps = steps;
@@ -357,6 +359,12 @@ impl Editor {
     /// `EditorState::take_camera_moved`.
     pub fn take_camera_moved(&mut self) -> bool {
         self.state.take_camera_moved()
+    }
+
+    /// Whether the user asked to restart Orrin since the last call; see
+    /// `EditorState::request_restart`.
+    pub fn take_restart_request(&mut self) -> bool {
+        self.state.take_restart_request()
     }
 
     /// Whether the user asked for a script reload since the last call. Drained

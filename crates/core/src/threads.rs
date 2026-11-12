@@ -46,22 +46,40 @@ use rayon::prelude::*;
 /// others.
 static POOL: OnceLock<()> = OnceLock::new();
 
-/// How many workers the pool is asked for.
+pub const ENV: &str = "ORRIN_THREADS";
+
+/// How many workers the pool is asked for, given `ORRIN_THREADS`, the user's
+/// setting and the machine's logical cores.
 ///
-/// `ORRIN_THREADS` overrides the default, and is the control every later A/B
-/// measurement uses. Zero and unparseable values fall back to the default
-/// rather than to rayon's own meaning for zero, which is "all of them" — the one
-/// answer this module exists to avoid.
-fn requested() -> usize {
-    if let Some(threads) = std::env::var("ORRIN_THREADS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
+/// `ORRIN_THREADS` overrides the setting, and is the control every later A/B
+/// measurement uses. Zero and unparseable values are no override, rather than
+/// rayon's own meaning for zero, which is "all of them" — the one answer this
+/// module exists to avoid. A saved count of one asks for exactly what
+/// `ORRIN_THREADS=1` does, so it is the same serial path.
+pub fn requested_for(env: Option<&str>, saved: Option<usize>, cores: usize) -> usize {
+    named(env)
+        .or(saved.filter(|&threads| threads > 0))
+        .unwrap_or_else(|| automatic_for(cores))
+}
+
+/// The count `ORRIN_THREADS` names, if it names one the pool would take.
+pub fn named(env: Option<&str>) -> Option<usize> {
+    env.and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|&threads| threads > 0)
-    {
-        return threads;
-    }
-    let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
+}
+
+fn automatic_for(cores: usize) -> usize {
     cores.saturating_sub(1).max(1)
+}
+
+/// This machine's logical cores.
+pub fn cores() -> usize {
+    std::thread::available_parallelism().map_or(1, |cores| cores.get())
+}
+
+/// What the pool is sized to on this machine when nothing names a count.
+pub fn automatic() -> usize {
+    automatic_for(cores())
 }
 
 /// Build the global pool. Idempotent, and cheap enough after the first call to
@@ -71,8 +89,15 @@ fn requested() -> usize {
 /// the sizing above was not applied, which is worth one line on stderr and
 /// nothing more — [`count`] then reports what is actually there.
 pub fn init() {
+    init_with(None);
+}
+
+/// [`init`], sized by the windowed editor's saved count where `ORRIN_THREADS`
+/// names none. Only the first call of either sizes the pool.
+pub fn init_with(saved: Option<usize>) {
     POOL.get_or_init(|| {
-        let threads = requested();
+        let env = std::env::var(ENV).ok();
+        let threads = requested_for(env.as_deref(), saved, cores());
         let built = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|index| format!("orrin-worker-{index}"))
@@ -322,6 +347,41 @@ mod tests {
             deferred.wait();
             assert!(ran.load(Ordering::SeqCst));
         });
+    }
+
+    #[test]
+    fn the_environment_beats_the_setting_which_beats_the_default() {
+        assert_eq!(requested_for(Some("3"), Some(5), 16), 3);
+        assert_eq!(requested_for(None, Some(5), 16), 5);
+        assert_eq!(
+            requested_for(None, None, 16),
+            15,
+            "one short of the machine"
+        );
+        assert_eq!(requested_for(Some(" "), Some(5), 16), 5, "blank");
+        assert_eq!(requested_for(None, None, 1), 1);
+    }
+
+    /// Rayon reads zero as "all of them", the one answer this module exists to
+    /// avoid, so zero and nonsense are no override at all.
+    #[test]
+    fn zero_and_nonsense_fall_back() {
+        for raw in ["0", "lots", "-2"] {
+            assert_eq!(requested_for(Some(raw), Some(5), 16), 5, "{raw}");
+            assert_eq!(requested_for(Some(raw), None, 16), 15, "{raw}");
+            assert_eq!(named(Some(raw)), None, "{raw}");
+        }
+        assert_eq!(requested_for(None, Some(0), 16), 15, "a saved zero");
+        assert_eq!(named(Some(" 4 ")), Some(4));
+    }
+
+    /// A setting of one asks for exactly what `ORRIN_THREADS=1` does, so it is
+    /// the same serial path rather than a pool of one.
+    #[test]
+    fn a_setting_of_one_is_the_serial_path() {
+        let threads = requested_for(None, Some(1), 16);
+        assert_eq!(threads, requested_for(Some("1"), None, 16));
+        pool(threads).install(|| assert!(!is_parallel()));
     }
 
     /// A task on the pool that panics would otherwise abort the process,

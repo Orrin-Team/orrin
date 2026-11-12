@@ -305,6 +305,11 @@ pub struct EditorState {
     /// Where `settings` is kept; `None` when there is no user directory and
     /// nothing is saved.
     pub settings_file: Option<PathBuf>,
+    /// `settings.startup` as this run began with it, which a change there is
+    /// waiting on a restart to differ from.
+    pub started_with: super::settings::Startup,
+    /// What this run draws through.
+    pub backend: crate::gfx::BackendChoice,
     /// The Settings tab's page, search and unsaved fields.
     pub settings_panel: super::panels::settings::SettingsPanel,
     /// How the viewport draws the scene: shaded, or as its edges. `None` is
@@ -435,6 +440,11 @@ pub struct EditorState {
     /// Serviced by `apply`: Stop despawns the fork, for the reason a load is
     /// deferred.
     transport_request: Option<Transport>,
+    /// Drained by the app after the UI pass, which closes the window and
+    /// starts the program again once the event loop has returned.
+    restart_request: bool,
+    /// Save the scene, then raise `restart_request` if that worked.
+    restart_after_save: bool,
     /// What Stop goes back to. `Some` exactly while the game is live.
     fork: Option<Fork>,
     pub autosave: Autosave,
@@ -493,6 +503,8 @@ impl Default for EditorState {
             settings: Default::default(),
             environment: Default::default(),
             settings_file: None,
+            started_with: Default::default(),
+            backend: crate::gfx::BackendChoice::DEFAULT,
             settings_panel: Default::default(),
             wireframe: None,
             material_previews: Default::default(),
@@ -540,6 +552,8 @@ impl Default for EditorState {
             script_reload_request: false,
             open_source_request: None,
             transport_request: None,
+            restart_request: false,
+            restart_after_save: false,
             fork: None,
             autosave: Autosave::new(PathBuf::from(".orrin/autosave"), Instant::now()),
         }
@@ -868,6 +882,20 @@ impl EditorState {
         self.open_source_request.take()
     }
 
+    /// Close Orrin and start it again, saving the scene first when it has
+    /// unsaved work.
+    pub fn request_restart(&mut self) {
+        if self.scene_dirty() {
+            self.restart_after_save = true;
+        } else {
+            self.restart_request = true;
+        }
+    }
+
+    pub fn take_restart_request(&mut self) -> bool {
+        std::mem::take(&mut self.restart_request)
+    }
+
     pub fn apply(&mut self, world: &mut World, registry: &Registry) {
         self.apply_edits(world, registry);
         // Not through the edit pipeline: what the editor shows is not the
@@ -922,6 +950,20 @@ impl EditorState {
         if let Some(request) = self.scene_request.take() {
             let (level, message) = self.scene(world, registry, request);
             log(world, level, message);
+        }
+        if std::mem::take(&mut self.restart_after_save) {
+            let (level, message) = self.scene(world, registry, SceneRequest::Save);
+            let saved = level != LogLevel::Error && !self.playing();
+            log(world, level, message);
+            if saved {
+                self.restart_request = true;
+            } else {
+                log(
+                    world,
+                    LogLevel::Warning,
+                    "restart cancelled: the scene was not saved".to_owned(),
+                );
+            }
         }
         if let Some(path) = self.open_after_save.take() {
             let (level, message) = self.scene(world, registry, SceneRequest::Save);
