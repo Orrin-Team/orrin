@@ -111,17 +111,17 @@ pub(super) struct Filter {
 }
 
 impl Filter {
-    fn new(query: &str) -> Self {
+    pub(super) fn new(query: &str) -> Self {
         Self {
             query: query.trim().to_lowercase(),
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.query.is_empty()
     }
 
-    fn hits(&self, text: &str) -> bool {
+    pub(super) fn hits(&self, text: &str) -> bool {
         text.to_lowercase().contains(&self.query)
     }
 

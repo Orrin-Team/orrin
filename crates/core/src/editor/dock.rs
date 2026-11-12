@@ -40,6 +40,7 @@ use orrin_registry::Registry;
 use super::panels;
 use super::previews::Previews;
 use super::state::{DockRequest, EditorState};
+use super::theme::ThemeSet;
 
 /// Fractions rather than pixels, because a split is a proportion of its parent
 /// and the window has no fixed size. Measured to land on the widths the design
@@ -68,6 +69,7 @@ pub enum Tab {
     Import,
     Storybook,
     Shader,
+    Settings,
 }
 
 impl Tab {
@@ -75,6 +77,10 @@ impl Tab {
     /// even in a build without the feature: the variant stays so a layout file
     /// written by one build still loads in the other, and the tab says why it
     /// is empty instead of vanishing.
+    ///
+    /// `Settings` is not: it is opened by command (Edit ▸ Settings…, Ctrl+,)
+    /// into a window rather than toggled in place, and it is in no default
+    /// leaf to toggle it back into.
     pub const ALL: [Self; 11] = [
         Self::Hierarchy,
         Self::Scenes,
@@ -103,6 +109,7 @@ impl Tab {
             Self::Import => icons::info(),
             Self::Storybook => icons::palette(),
             Self::Shader => icons::code(),
+            Self::Settings => icons::gear(),
         }
     }
 
@@ -119,6 +126,7 @@ impl Tab {
             Self::Import => "Import",
             Self::Storybook => "Storybook",
             Self::Shader => "Shader",
+            Self::Settings => "Settings",
         }
     }
 }
@@ -265,7 +273,26 @@ impl Dock {
             DockRequest::Show(tab) => self.bring_forward(tab),
             DockRequest::Float(tab) => self.float(tab),
             DockRequest::Dock(tab) => self.dock_back(tab),
+            DockRequest::Open(tab) => self.open(tab),
         }
+    }
+
+    /// Bring `tab` forward wherever the user put it; closed, open it in a
+    /// window of [`designed_size`] in the middle of the dock's region.
+    fn open(&mut self, tab: Tab) {
+        if !self.is_open(tab) {
+            let size = designed_size(tab).min(self.region.size() * 0.9);
+            let rect = if self.region.is_finite() {
+                egui::Rect::from_center_size(self.region.center(), size)
+            } else {
+                egui::Rect::from_min_size(egui::pos2(80.0, 80.0), size)
+            };
+            let surface = self.state.add_window(vec![tab]);
+            if let Some(window) = self.state.get_window_state_mut(surface) {
+                window.set_position(rect.min).set_size(rect.size());
+            }
+        }
+        self.activate(tab);
     }
 
     /// Move `tab` into a window of its own, opening it if it was closed. The
@@ -418,6 +445,7 @@ impl Dock {
         world: &mut World,
         state: &mut EditorState,
         registry: &Registry,
+        themes: &ThemeSet,
         previews: &mut Previews,
     ) {
         let floating = Tab::ALL.map(|tab| self.is_floating(tab));
@@ -425,6 +453,7 @@ impl Dock {
             world,
             state,
             registry,
+            themes,
             previews,
             floating,
             buttons: Vec::new(),
@@ -550,6 +579,16 @@ impl Dock {
 /// the Console does not come away as wide as the strip it was docked in.
 const WINDOW_SIZE: egui::Vec2 = egui::vec2(360.0, 560.0);
 const FLOAT_MIN: egui::Vec2 = egui::vec2(260.0, 220.0);
+
+/// What a tool opened by command into a window of its own starts at: room
+/// for Settings' sidebar beside a page of rows, without covering the scene
+/// its rows act on.
+fn designed_size(tab: Tab) -> egui::Vec2 {
+    match tab {
+        Tab::Settings => egui::vec2(760.0, 520.0),
+        _ => WINDOW_SIZE,
+    }
+}
 
 /// Where a newly floated tool's window goes inside `region`, the area the dock
 /// had last frame — or a fixed spot before the first frame has measured it.
@@ -717,6 +756,7 @@ struct Viewer<'a> {
     world: &'a mut World,
     state: &'a mut EditorState,
     registry: &'a Registry,
+    themes: &'a ThemeSet,
     previews: &'a mut Previews,
     /// Which tools are in windows, by their place in [`Tab::ALL`].
     floating: [bool; Tab::ALL.len()],
@@ -806,6 +846,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
             }
             Tab::Storybook => panels::storybook::body(ui, self.world),
             Tab::Shader => panels::shader::body(ui, self.world, self.state),
+            Tab::Settings => panels::settings::body(ui, self.world, self.state, self.themes),
         }
     }
 }

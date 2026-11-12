@@ -125,6 +125,7 @@ impl Editor {
         let mut state = EditorState::new(project);
         state.script_files = source::ScriptFiles::new(scripts_dir);
         state.environment = settings::Environment::of_process();
+        state.settings_file = settings.file();
         settings.begin(&ctx, &mut state, &mut themes);
         if let Some(steps) = prefs.snap {
             state.snap_steps = steps;

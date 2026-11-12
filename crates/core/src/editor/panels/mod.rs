@@ -10,6 +10,7 @@ pub(super) mod performance;
 pub(super) mod scenes;
 #[cfg(feature = "scripting")]
 pub(super) mod scripts;
+pub(super) mod settings;
 pub(super) mod shader;
 mod status_bar;
 pub(super) mod storybook;
@@ -60,7 +61,7 @@ pub fn draw(
     // the same frame rather than the next one.
     menu_bar::show(ctx, world, registry, state, themes, dock);
     status_bar::show(ctx, world, state, themes);
-    dock.show(ctx, world, state, registry, previews);
+    dock.show(ctx, world, state, registry, themes, previews);
     // Before the viewport's tools, which show the screen this sets.
     game_screen(ctx, world, state, dock.viewport());
     if let Some(rect) = dock.viewport() {
@@ -202,6 +203,9 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
     if !coding && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
         state.request_scene(SceneRequest::Save);
     }
+    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+        state.open_settings(None);
+    }
     // Most specific first, as with redo below.
     let (alt, shift) = (
         egui::Modifiers::COMMAND | egui::Modifiers::ALT,
@@ -294,6 +298,7 @@ mod tests {
             .collect()
     }
 
+    mod settings_tab;
     #[cfg(feature = "shader-compiler")]
     mod shader_tab;
 

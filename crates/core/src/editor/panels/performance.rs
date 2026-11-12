@@ -90,6 +90,24 @@ pub fn body(ui: &mut egui::Ui, world: &World) {
     measurement(ui, world);
 }
 
+pub(super) const VSYNC_MODES: [VsyncMode; 4] = [
+    VsyncMode::Fifo,
+    VsyncMode::FifoRelaxed,
+    VsyncMode::Mailbox,
+    VsyncMode::Immediate,
+];
+
+/// One wording for a present mode, here and in Settings, which edit the same
+/// value.
+pub(super) fn vsync_label(mode: VsyncMode) -> &'static str {
+    match mode {
+        VsyncMode::Fifo => "Fifo (vsync)",
+        VsyncMode::FifoRelaxed => "Fifo relaxed (vsync, tears when late)",
+        VsyncMode::Mailbox => "Mailbox (uncapped)",
+        VsyncMode::Immediate => "Immediate (uncapped, tears)",
+    }
+}
+
 /// The knobs that move a frame-time number without moving a pixel.
 ///
 /// Grouped, and grouped *here* rather than beside the effects they sit next to in
@@ -107,22 +125,11 @@ fn measurement(ui: &mut egui::Ui, world: &World) {
         .default_open(true)
         .show(ui, |ui| {
             if let Some(mut present) = world.get_resource_mut::<PresentSettings>() {
-                let label = |mode: VsyncMode| match mode {
-                    VsyncMode::Fifo => "Fifo (vsync)",
-                    VsyncMode::FifoRelaxed => "Fifo relaxed (vsync, tears when late)",
-                    VsyncMode::Mailbox => "Mailbox (uncapped)",
-                    VsyncMode::Immediate => "Immediate (uncapped, tears)",
-                };
                 egui::ComboBox::from_label("Present mode")
-                    .selected_text(label(present.vsync))
+                    .selected_text(vsync_label(present.vsync))
                     .show_ui(ui, |ui| {
-                        for mode in [
-                            VsyncMode::Fifo,
-                            VsyncMode::FifoRelaxed,
-                            VsyncMode::Mailbox,
-                            VsyncMode::Immediate,
-                        ] {
-                            ui.selectable_value(&mut present.vsync, mode, label(mode));
+                        for mode in VSYNC_MODES {
+                            ui.selectable_value(&mut present.vsync, mode, vsync_label(mode));
                         }
                     })
                     .response

@@ -16,6 +16,7 @@
 use orrin_ecs::World;
 use orrin_registry::Registry;
 
+use super::settings::Page;
 use crate::editor::catalog;
 use crate::editor::dock::{Dock, Tab};
 use crate::editor::icons;
@@ -106,9 +107,19 @@ pub fn show(
                     } else {
                         ui.label(super::figures(&state.scene_path));
                     }
-                    if let Some(project) = &state.project_name {
+                    if let Some(project) = state.project_name.clone() {
                         ui.weak("/");
-                        ui.weak(project);
+                        let weak = ui.visuals().weak_text_color();
+                        let name = egui::Label::new(egui::RichText::new(project).color(weak))
+                            .sense(egui::Sense::click());
+                        if ui
+                            .add(name)
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text("Project settings")
+                            .clicked()
+                        {
+                            state.open_settings(Some(Page::General));
+                        }
                     }
                 });
             });
@@ -247,6 +258,15 @@ fn file(ui: &mut egui::Ui, state: &mut EditorState, dock: &mut Dock) {
     // allowance and drags the menu out with it.
     ui.add(egui::TextEdit::singleline(&mut state.scene_path).desired_width(MENU_WIDTH - 12.0));
     ui.separator();
+    ui.add_enabled_ui(state.project_root.is_some(), |ui| {
+        if command(ui, "Project settings…", "") {
+            state.open_settings(Some(Page::General));
+        }
+    })
+    .response
+    .on_disabled_hover_text(
+        "Project settings need a project: open one with `orrin run` or Orrin Hub",
+    );
     export(ui, state);
     ui.separator();
     unbuilt(ui, "Import…");
@@ -334,6 +354,10 @@ fn edit(ui: &mut egui::Ui, world: &mut World, registry: &Registry, state: &mut E
             state.request_redo();
         }
     });
+    ui.separator();
+    if command(ui, "Settings…", "Ctrl+,") {
+        state.open_settings(None);
+    }
 }
 
 /// What can be spawned. Shared with the hierarchy's add button, so the two

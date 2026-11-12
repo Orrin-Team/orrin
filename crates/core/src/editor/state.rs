@@ -193,6 +193,8 @@ pub enum DockRequest {
     Float(super::dock::Tab),
     /// Back where the default layout keeps it.
     Dock(super::dock::Tab),
+    /// Forward wherever it is, or, closed, into a window of its designed size.
+    Open(super::dock::Tab),
 }
 
 /// What becomes of unsaved work when another scene is opened over it.
@@ -300,6 +302,11 @@ pub struct EditorState {
     pub settings: super::settings::Settings,
     /// What the environment overrides of `settings` for this run.
     pub environment: super::settings::Environment,
+    /// Where `settings` is kept; `None` when there is no user directory and
+    /// nothing is saved.
+    pub settings_file: Option<PathBuf>,
+    /// The Settings tab's page, search and unsaved fields.
+    pub settings_panel: super::panels::settings::SettingsPanel,
     /// How the viewport draws the scene: shaded, or as its edges. `None` is
     /// shaded, which is what the renderer is handed too.
     pub wireframe: Option<crate::gfx::vulkan::wireframe::Wireframe>,
@@ -485,6 +492,8 @@ impl Default for EditorState {
             show_colliders: false,
             settings: Default::default(),
             environment: Default::default(),
+            settings_file: None,
+            settings_panel: Default::default(),
             wireframe: None,
             material_previews: Default::default(),
             gizmo_drag: None,
@@ -730,6 +739,13 @@ impl EditorState {
     pub fn open_shader(&mut self, id: AssetId) {
         self.shader.request(id);
         self.request_dock(DockRequest::Show(super::dock::Tab::Shader));
+    }
+
+    /// Open the Settings tab on `page`, or on the Orrin page last viewed this
+    /// session for `None`, with its search field focused.
+    pub fn open_settings(&mut self, page: Option<super::panels::settings::Page>) {
+        self.settings_panel.show(page);
+        self.request_dock(DockRequest::Open(super::dock::Tab::Settings));
     }
 
     pub fn take_reveal_request(&mut self) -> bool {

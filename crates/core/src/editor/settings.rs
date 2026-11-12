@@ -371,6 +371,12 @@ impl SettingsStore {
         self.dir.as_ref().map(|dir| dir.join(FILE))
     }
 
+    /// Where the settings are kept, whether or not anything has been written
+    /// there yet; `None` when nothing is saved.
+    pub fn file(&self) -> Option<PathBuf> {
+        self.path()
+    }
+
     pub fn current(&self) -> &Settings {
         &self.applied
     }
