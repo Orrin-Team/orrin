@@ -219,6 +219,7 @@ pub enum PrefabAction {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SpawnKind {
+    Folder,
     Cube,
     Sphere,
     Plane,
@@ -232,6 +233,7 @@ impl SpawnKind {
     /// What the new entity is called.
     pub fn name(self) -> &'static str {
         match self {
+            SpawnKind::Folder => "Folder",
             SpawnKind::Cube => "Cube",
             SpawnKind::Sphere => "Sphere",
             SpawnKind::Plane => "Plane",
@@ -380,6 +382,7 @@ pub struct EditorState {
     /// like the rest: the inspector is mid-way through drawing that entity's
     /// components when the menu is clicked.
     add_request: Option<(Entity, orrin_registry::ComponentId)>,
+    hide_requests: Vec<Entity>,
     /// `(child, new parent)`, with `None` meaning "detach to a root". Requested
     /// rather than applied inline for the same reason as the two above: the
     /// hierarchy panel is iterating a snapshot of the tree while it builds, and
@@ -509,6 +512,7 @@ impl Default for EditorState {
             delete_request: None,
             despawn_request: Vec::new(),
             add_request: None,
+            hide_requests: Vec::new(),
             reparent_request: Vec::new(),
             instantiate_request: None,
             prefab_request: None,
@@ -807,6 +811,12 @@ impl EditorState {
         self.revert_request.push((entity, component, path));
     }
 
+    /// Hide `entity` and what is under it from the editor's view, or show it
+    /// again. See `scene::editor_hidden`.
+    pub fn request_toggle_hidden(&mut self, entity: Entity) {
+        self.hide_requests.push(entity);
+    }
+
     pub fn request_add_component(&mut self, entity: Entity, id: orrin_registry::ComponentId) {
         self.add_request = Some((entity, id));
     }
@@ -839,6 +849,18 @@ impl EditorState {
 
     pub fn apply(&mut self, world: &mut World, registry: &Registry) {
         self.apply_edits(world, registry);
+        // Not through the edit pipeline: what the editor shows is not the
+        // scene, so it is neither undone nor left unsaved.
+        for entity in std::mem::take(&mut self.hide_requests) {
+            if !world.is_alive(entity) {
+                continue;
+            }
+            let id = scene::edit::ensure_id(world, entity);
+            if world.get_resource::<scene::EditorHidden>().is_none() {
+                world.insert_resource(scene::EditorHidden::default());
+            }
+            world.resource_mut::<scene::EditorHidden>().toggle(id);
+        }
         if let Some((action, entity)) = self.prefab_request.take()
             && world.is_alive(entity)
         {
@@ -1656,6 +1678,13 @@ fn spawn(world: &mut World, kind: SpawnKind, selected: Option<Entity>) -> Option
 fn spawn_object(world: &mut World, kind: SpawnKind) -> Option<Entity> {
     match kind {
         SpawnKind::Ui(_) => None,
+        // No transform, which is what makes it a folder: see `Folder`.
+        SpawnKind::Folder => {
+            let folder = world.spawn();
+            world.insert(folder, Name::new(kind.name()));
+            world.insert(folder, scene::Folder::default());
+            Some(folder)
+        }
         SpawnKind::Cube | SpawnKind::Sphere | SpawnKind::Plane => {
             let mesh_name = match kind {
                 SpawnKind::Cube => "cube",

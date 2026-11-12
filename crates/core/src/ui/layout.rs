@@ -107,6 +107,8 @@ const UNCLIPPED: u32 = u32::MAX;
 /// [`Layout::draws`]'s bits.
 const HAS_IMAGE: u8 = 1;
 const HAS_TEXT: u8 = 2;
+/// Left out of the editor's view, and so of every draw, modifiers included.
+const HIDDEN: u8 = 4;
 
 /// Every canvas's tree, resolved for one window size, in draw order.
 #[derive(Default)]
@@ -183,9 +185,15 @@ impl Layout {
     }
 
     /// Whether element `index` has an `Image`, and whether it has a `Text`.
+    /// Neither, for an element the editor hides.
     pub fn draws(&self, index: usize) -> (bool, bool) {
         let drawn = self.drawn[index];
         (drawn & HAS_IMAGE != 0, drawn & HAS_TEXT != 0)
+    }
+
+    /// Whether the editor hides element `index`: see `scene::editor_hidden`.
+    pub fn is_hidden(&self, index: usize) -> bool {
+        self.drawn[index] & HIDDEN != 0
     }
 
     /// What element `index` may be drawn on and hit in, if a scroll frame
@@ -311,6 +319,12 @@ fn resolve_with<const SCROLLING: bool>(
     let mut clips = std::mem::take(&mut out.clips);
     clips.clear();
 
+    // Laid out regardless, so what is under it keeps its place; only what
+    // it draws is withheld.
+    let hidden = world
+        .get_resource::<crate::scene::EditorHidden>()
+        .filter(|hidden| !hidden.is_empty());
+
     world.query::<&Canvas>().for_each(|entity, canvas| {
         if !under_a_canvas(world, entity) {
             out.canvases.push(CanvasRoot {
@@ -384,9 +398,12 @@ fn resolve_with<const SCROLLING: bool>(
             let image = world.get::<Image>(at.entity).map(|i| i.raycast_target);
             let text = world.get::<Text>(at.entity).map(|t| t.raycast_target);
             let raycast = scroll.is_some() || image == Some(true) || text == Some(true);
-            out.drawn.push(
-                (u8::from(image.is_some()) * HAS_IMAGE) | (u8::from(text.is_some()) * HAS_TEXT),
-            );
+            out.drawn
+                .push(if hidden.as_ref().is_some_and(|h| h.contains(at.entity)) {
+                    HIDDEN
+                } else {
+                    (u8::from(image.is_some()) * HAS_IMAGE) | (u8::from(text.is_some()) * HAS_TEXT)
+                });
             let this = out.elements.len() as u32;
             let screen_rect = Rect::new(screen_min.x, screen_min.y, screen_size.x, screen_size.y);
             out.elements.push(Element {

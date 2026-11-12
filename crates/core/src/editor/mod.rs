@@ -328,7 +328,9 @@ impl Editor {
         world
             .query::<(&crate::scene::WorldTransform, &crate::scene::Collider)>()
             .for_each(|entity, (transform, collider)| {
-                if !all && !selection.contains(entity) {
+                if (!all && !selection.contains(entity))
+                    || crate::scene::editor_hidden::is_hidden(world, entity)
+                {
                     return;
                 }
                 let geometry = collider

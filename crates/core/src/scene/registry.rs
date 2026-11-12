@@ -1,7 +1,7 @@
 use orrin_registry::{ComponentId, Registry};
 
 use super::{
-    AudioListener, AudioSource, CameraComponent, Collider, Light, LocalTransform, Locked,
+    AudioListener, AudioSource, CameraComponent, Collider, Folder, Light, LocalTransform, Locked,
     MaterialHandle, MeshHandle, Name, PhysicsSettings, RenderSettings, RigidBody, Spin, Tag,
 };
 
@@ -16,6 +16,7 @@ pub const AUDIO_SOURCE: ComponentId = ComponentId::new("orrin.audio_source");
 pub const AUDIO_LISTENER: ComponentId = ComponentId::new("orrin.audio_listener");
 pub const SPIN: ComponentId = ComponentId::new("orrin.spin");
 pub const LOCKED: ComponentId = ComponentId::new("orrin.locked");
+pub const FOLDER: ComponentId = ComponentId::new("orrin.folder");
 pub const RENDER_SETTINGS: ComponentId = ComponentId::new("orrin.render_settings");
 pub const CAMERA: ComponentId = ComponentId::new("orrin.camera");
 pub const CANVAS: ComponentId = ComponentId::new("orrin.ui.canvas");
@@ -84,6 +85,7 @@ pub fn register_components(registry: &mut Registry) {
     registry.register::<AudioListener>(AUDIO_LISTENER, "Audio Listener");
     registry.register::<Spin>(SPIN, "Spin");
     registry.register::<Locked>(LOCKED, "Locked");
+    registry.register::<Folder>(FOLDER, "Folder");
     registry.register::<RenderSettings>(RENDER_SETTINGS, "Render Settings");
     registry.register::<PhysicsSettings>(PHYSICS_SETTINGS, "Physics Settings");
     registry.register::<CameraComponent>(CAMERA, "Camera");
@@ -110,6 +112,33 @@ mod tests {
 
     use super::*;
     use crate::scene::{CameraComponent, ColliderShape, Transform};
+
+    /// A folder is part of how a scene is organised, so it is saved with its
+    /// tint, and one with no tint writes none.
+    #[test]
+    fn a_folder_survives_a_save_and_a_load() {
+        let mut registry = Registry::new();
+        register_components(&mut registry);
+        let mut world = World::new();
+        let plain = world.spawn();
+        world.insert(plain, crate::scene::Folder::default());
+        let text = crate::scene::save(&mut world, &registry);
+        assert!(text.contains("orrin.folder"), "{text}");
+        assert!(!text.contains("tint"), "{text}");
+
+        let tinted = crate::scene::Folder {
+            tint: Some(Vec3::new(0.9, 0.5, 0.1)),
+        };
+        world.insert(plain, tinted);
+        let text = crate::scene::save(&mut world, &registry);
+        let mut loaded = World::new();
+        crate::scene::load(&text, &mut loaded, &registry).unwrap();
+        let entity = loaded.entities().next().unwrap();
+        assert_eq!(
+            loaded.get::<crate::scene::Folder>(entity).as_deref(),
+            Some(&tinted)
+        );
+    }
 
     /// What is locked is how the scene is meant to be worked on, so it is
     /// saved with it.

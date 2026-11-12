@@ -110,14 +110,18 @@ fn record(
         let image = has_image
             .then(|| world.get::<Image>(entity).map(|image| *image))
             .flatten();
-        let modifiers = Modifiers::of(
-            world,
-            present,
-            entity,
-            element.rect,
-            pixels,
-            image.is_some(),
-        )
+        let modifiers = if layout.is_hidden(index) {
+            None
+        } else {
+            Modifiers::of(
+                world,
+                present,
+                entity,
+                element.rect,
+                pixels,
+                image.is_some(),
+            )
+        }
         .unwrap_or_default();
         let draw = Draw {
             world,
@@ -258,7 +262,7 @@ fn bars(
     clip: &mut Option<Rect>,
     out: &mut UiCanvas,
 ) {
-    if view.bars == [None, None] {
+    if view.bars == [None, None] || layout.is_hidden(view.element as usize) {
         return;
     }
     let entity = layout.elements()[view.element as usize].entity;

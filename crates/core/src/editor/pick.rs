@@ -60,6 +60,8 @@ pub fn is_locked(world: &World, entity: Entity) -> bool {
     false
 }
 
+pub use crate::scene::editor_hidden::is_hidden;
+
 /// Which of the three a light is, which its marker says at a glance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LightKind {
@@ -82,7 +84,9 @@ pub fn each_marker(world: &World, mut visit: impl FnMut(Entity, Vec3, Marker)) {
     world
         .query::<&WorldTransform>()
         .for_each(|entity, transform| {
-            if let Some(marker) = marker_of(world, entity) {
+            if let Some(marker) = marker_of(world, entity)
+                && !is_hidden(world, entity)
+            {
                 visit(entity, transform.translation(), marker);
             }
         });
@@ -113,7 +117,9 @@ fn marker_of(world: &World, entity: Entity) -> Option<Marker> {
 /// what shows it. They are worn so a scene says which of its objects make a
 /// sound and which one hears.
 pub fn each_badge(world: &World, mut visit: impl FnMut(Entity, Vec3, Marker, usize)) {
-    let worn = |entity: Entity, marker: Marker| marker_of(world, entity) != Some(marker);
+    let worn = |entity: Entity, marker: Marker| {
+        marker_of(world, entity) != Some(marker) && !is_hidden(world, entity)
+    };
     world
         .query::<(&AudioSource, &WorldTransform)>()
         .for_each(|entity, (_, transform)| {
@@ -158,7 +164,7 @@ pub fn each_camera(world: &World, mut visit: impl FnMut(Entity, Mat4, &CameraCom
     world
         .query::<(&CameraComponent, &WorldTransform)>()
         .for_each(|entity, (lens, transform)| {
-            if Some(entity) != looked_through {
+            if Some(entity) != looked_through && !is_hidden(world, entity) {
                 visit(entity, transform.0, lens, Some(entity) == active);
             }
         });
@@ -236,7 +242,7 @@ fn mesh_hit(world: &World, origin: Vec3, direction: Vec3) -> Option<(f32, Entity
             let Some(aabb) = bounds.get(*mesh) else {
                 return;
             };
-            if is_locked(world, entity) {
+            if is_locked(world, entity) || is_hidden(world, entity) {
                 return;
             }
             let inverse = model.0.inverse();
@@ -547,6 +553,49 @@ mod tests {
         world.despawn(front);
         let lamp = light(&mut world, Vec3::ZERO);
         world.insert(lamp, Locked);
+        assert_eq!(pick_at(&world, &camera, screen(), middle), None);
+    }
+
+    /// What the editor hides is out of reach as well as out of sight: a click
+    /// lands on what is behind it, and a hidden light shows no marker.
+    #[test]
+    fn a_click_passes_through_what_is_hidden() {
+        use crate::scene::EditorHidden;
+        use orrin_registry::EntityId;
+
+        let camera = Camera::default();
+        let toward = (camera.position - camera.target).normalize();
+        let middle = on_screen(Vec3::ZERO);
+        // A real local transform, because the hidden set derives through the
+        // hierarchy, whose rebuild strips a world transform nothing produces.
+        let hide = |world: &mut World, entity: Entity| {
+            for placed in world.entities().collect::<Vec<_>>() {
+                if let Some(at) = world.get::<WorldTransform>(placed).map(|w| w.translation()) {
+                    let local = crate::scene::Transform::from_translation(at);
+                    world.insert(placed, crate::scene::LocalTransform::from(local));
+                }
+            }
+            let id = EntityId::new();
+            world.insert(entity, id);
+            world.resource_mut::<EditorHidden>().toggle(id);
+            crate::scene::editor_hidden::refresh(world);
+            crate::scene::propagate_transforms(world);
+        };
+
+        let mut world = world();
+        world.insert_resource(EditorHidden::default());
+        world.insert_resource(crate::scene::Play::default());
+        let behind = mesh(&mut world, Mat4::from_translation(-toward * 3.0));
+        let front = mesh(&mut world, Mat4::IDENTITY);
+        hide(&mut world, front);
+        assert_eq!(pick_at(&world, &camera, screen(), middle), Some(behind));
+
+        world.despawn(behind);
+        let lamp = light(&mut world, Vec3::ZERO);
+        hide(&mut world, lamp);
+        let mut seen = Vec::new();
+        each_marker(&world, |entity, _, _| seen.push(entity));
+        assert!(!seen.contains(&lamp), "a hidden light's marker is drawn");
         assert_eq!(pick_at(&world, &camera, screen(), middle), None);
     }
 

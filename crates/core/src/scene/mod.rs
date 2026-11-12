@@ -9,6 +9,7 @@ mod decal;
 mod diagnostics;
 mod dof;
 pub mod edit;
+pub mod editor_hidden;
 pub mod entities;
 pub mod entity_ref;
 mod environment;
@@ -42,9 +43,9 @@ pub use assets::Assets;
 pub use bloom::BloomSettings;
 pub use camera::{ActiveCamera, Camera, active_camera, follow_active_camera};
 pub use components::{
-    AmbientLight, AudioListener, AudioSource, CameraComponent, Collider, ColliderShape, Light,
-    LocalTransform, Locked, MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialHandle, MeshHandle, Name,
-    PHYSICS_LAYERS, Parent, PendingScripts, PhysicsSettings, RigidBody, Rolloff, Spin, Tag,
+    AmbientLight, AudioListener, AudioSource, CameraComponent, Collider, ColliderShape, Folder,
+    Light, LocalTransform, Locked, MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialHandle, MeshHandle,
+    Name, PHYSICS_LAYERS, Parent, PendingScripts, PhysicsSettings, RigidBody, Rolloff, Spin, Tag,
     UnknownComponents, WorldTransform,
 };
 #[cfg(feature = "scripting")]
@@ -55,6 +56,7 @@ pub use debug::{DebugLine, DebugLines, LogBuffer, LogEntry, LogLevel};
 pub use decal::{Decal, DecalSettings};
 pub use diagnostics::Diagnostics;
 pub use dof::DofSettings;
+pub use editor_hidden::EditorHidden;
 pub use environment::{EnvironmentSettings, Hdri, HdriError, load_hdri, sky_pixels};
 pub use fog::FogSettings;
 pub use hdr::HdrSettings;

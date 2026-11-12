@@ -661,6 +661,9 @@ fn outline(world: &World, state: &mut EditorState) {
     state.outline.clear();
     let hierarchy = world.get_resource::<Hierarchy>();
     let item = |entity: Entity, selected: bool| {
+        if pick::is_hidden(world, entity) {
+            return None;
+        }
         let mesh = *world.get::<MeshHandle>(entity)?;
         let model = world.get::<WorldTransform>(entity)?.0;
         Some(OutlineItem {
@@ -807,7 +810,7 @@ pub fn marquee(
                 inside.push(entity);
             }
         });
-    inside.retain(|&entity| !pick::is_locked(world, entity));
+    inside.retain(|&entity| !pick::is_locked(world, entity) && !pick::is_hidden(world, entity));
     inside.sort_by_key(|entity| entity.index());
     if !add {
         state.selection.clear();
@@ -859,7 +862,9 @@ pub fn select_on_click(
 fn ui_at(world: &World, layout: &crate::ui::Layout, pos: egui::Pos2, ppp: f32) -> Option<usize> {
     let at = [pos.x * ppp, pos.y * ppp];
     layout.elements().iter().rposition(|element| {
-        crate::ui::layout::contains(element.rect, at) && !pick::is_locked(world, element.entity)
+        crate::ui::layout::contains(element.rect, at)
+            && !pick::is_locked(world, element.entity)
+            && !pick::is_hidden(world, element.entity)
     })
 }
 

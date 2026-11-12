@@ -339,6 +339,18 @@ fn edit(ui: &mut egui::Ui, world: &mut World, registry: &Registry, state: &mut E
 /// What can be spawned. Shared with the hierarchy's add button, so the two
 /// lists cannot drift apart.
 pub fn spawn_entries(ui: &mut egui::Ui, state: &mut EditorState) {
+    if ui
+        .add(egui::Button::new(icons::with_label(
+            icons::folder(),
+            None,
+            "Folder",
+        )))
+        .clicked()
+    {
+        state.request_spawn(SpawnKind::Folder);
+        ui.close_menu();
+    }
+    ui.separator();
     for (label, kind) in [
         ("Cube", SpawnKind::Cube),
         ("Sphere", SpawnKind::Sphere),

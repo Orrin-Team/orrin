@@ -592,7 +592,7 @@ impl<'a> SceneEditor<'a> {
 }
 
 /// The id `entity` is addressed by in ops, given one if it has none yet.
-fn ensure_id(world: &mut World, entity: Entity) -> EntityId {
+pub(crate) fn ensure_id(world: &mut World, entity: Entity) -> EntityId {
     if let Some(id) = world.get::<EntityId>(entity) {
         return *id;
     }
