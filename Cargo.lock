@@ -3203,6 +3203,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -4693,6 +4694,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
