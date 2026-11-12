@@ -1,4 +1,5 @@
 pub mod export;
+pub mod user;
 
 use crate::ProjectError::ParentDirInPath;
 use serde::Deserialize;
