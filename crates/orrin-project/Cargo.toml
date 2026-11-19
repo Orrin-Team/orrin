@@ -8,6 +8,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 # `orrin.json`, an export's manifest. Already in the engine's tree through gltf.
 serde_json = "1"
+# Editing `orrin.toml` without losing its comments and layout. Shares its
+# parser and writer with `toml`; adds `indexmap`.
+toml_edit = "0.25"
 
 [dev-dependencies]
 tempfile = "3"

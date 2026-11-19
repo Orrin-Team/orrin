@@ -1,6 +1,8 @@
-//! Editor preferences: what the *user* chose, as opposed to what the project
-//! is. Lives at `<project>/.orrin/editor.ron`, which is why none of it belongs
-//! in `orrin.toml` — a manifest is checked in and shared, a preference is not.
+//! Editor preferences: where the user left this project's tools, as opposed to
+//! what the project is. Lives at `<project>/.orrin/editor.ron`, which is why
+//! none of it belongs in `orrin.toml` — a manifest is checked in and shared, a
+//! preference is not. How the user likes Orrin in every project, the theme
+//! among it, is `settings` in their own directory instead.
 //!
 //! RON rather than TOML because the dock layout this file will hold is a tree
 //! of enums, which TOML cannot express without inventing a schema for it. User
@@ -20,6 +22,10 @@ const LAYOUT_VERSION: u32 = 2;
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
+    /// Read from a file an older editor wrote, to seed the user's settings on
+    /// their first run, and never written again: the theme and the icon
+    /// colours follow the person rather than the project.
+    #[serde(skip_serializing)]
     pub theme: Option<String>,
     /// The whole dock tree. `None` on a first run, and after a layout written
     /// by a build whose tab set no longer parses — [`PrefsFile::load`] falls
@@ -33,7 +39,8 @@ pub struct Prefs {
     /// The resolution the viewport previews; `None` until the user first
     /// picks one.
     pub preview: Option<super::preview::Preview>,
-    /// The viewport icons' colours; `None` until the user first changes one.
+    /// Seeding only, as `theme` is.
+    #[serde(skip_serializing)]
     pub icons: Option<super::state::IconTints>,
     /// Which [`LAYOUT_VERSION`] `layout` was saved under. Absent, and so zero,
     /// in every file written before the field existed.
@@ -90,12 +97,12 @@ impl PrefsFile {
         }
         let prefs = &Prefs {
             layout_version: LAYOUT_VERSION,
-            theme: prefs.theme.clone(),
+            theme: None,
             layout: prefs.layout.clone(),
             snap: prefs.snap,
             assets: prefs.assets,
             preview: prefs.preview,
-            icons: prefs.icons,
+            icons: None,
         };
         let text = match ron::ser::to_string_pretty(prefs, ron::ser::PrettyConfig::default()) {
             Ok(text) => text,
@@ -158,20 +165,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Both moved to the user's settings: an old file's are read once, to seed
+    /// them, and a project's file never holds them again.
     #[test]
-    fn icon_tints_round_trip() {
+    fn the_theme_and_icons_are_read_from_an_old_file_but_never_written() {
         let dir = scratch("icon-tints");
+        std::fs::write(
+            dir.join(FILE),
+            "(theme: Some(\"Void\"), icons: Some((listener: (10, 200, 90))))",
+        )
+        .unwrap();
         let file = PrefsFile::new(Some(dir.clone()));
-        let tints = super::super::state::IconTints {
-            listener: [10, 200, 90],
-            ..Default::default()
-        };
-        file.save(&Prefs {
-            icons: Some(tints),
-            ..Prefs::default()
-        });
+        let prefs = file.load();
+        assert_eq!(prefs.theme.as_deref(), Some("Void"));
+        assert_eq!(prefs.icons.unwrap().listener, [10, 200, 90]);
 
-        assert_eq!(file.load().icons, Some(tints));
+        file.save(&prefs);
+        let text = std::fs::read_to_string(dir.join(FILE)).unwrap();
+        assert!(!text.contains("theme") && !text.contains("icons"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

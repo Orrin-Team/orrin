@@ -1,4 +1,8 @@
+mod edit;
 pub mod export;
+pub mod user;
+
+pub use edit::ManifestEdit;
 
 use crate::ProjectError::ParentDirInPath;
 use serde::Deserialize;
@@ -64,6 +68,24 @@ pub enum ProjectError {
     UnsupportedVersion {
         found: u32,
     },
+    Empty {
+        field: &'static str,
+    },
+    UnqualifiedEntry {
+        value: String,
+    },
+    NotUnicode {
+        field: &'static str,
+        value: PathBuf,
+    },
+    /// An edit of a game made by `orrin export`, which has `orrin.json` instead.
+    Exported {
+        root: PathBuf,
+    },
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for ProjectError {
@@ -91,6 +113,27 @@ impl std::fmt::Display for ProjectError {
                 f,
                 "unsupported `format_version` {found}; this engine supports {SUPPORTED_FORMAT_VERSION}"
             ),
+            Self::Empty { field } => write!(f, "`{field}` must not be empty; give it a value"),
+            Self::UnqualifiedEntry { value } => write!(
+                f,
+                "`scripts.entry` is `{value}`, which names no assembly; \
+                 write it as `Namespace.Type, Assembly`"
+            ),
+            Self::NotUnicode { field, value } => write!(
+                f,
+                "`{field}` must be valid Unicode to be written to `orrin.toml`, got `{}`; \
+                 rename the file",
+                value.display()
+            ),
+            Self::Exported { root } => write!(
+                f,
+                "{} is an exported game, which has no `orrin.toml` to edit; \
+                 change the project it was exported from and export it again",
+                root.display()
+            ),
+            Self::Write { path, source } => {
+                write!(f, "could not write {}: {source}", path.display())
+            }
         }
     }
 }
@@ -98,7 +141,7 @@ impl std::fmt::Display for ProjectError {
 impl std::error::Error for ProjectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
+            Self::Io { source, .. } | Self::Write { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -156,13 +199,7 @@ impl Project {
             path: manifest_path.to_path_buf(),
             source,
         })?;
-
-        let manifest: Manifest = toml::from_str(&text).map_err(|err| ProjectError::Parse {
-            path: manifest_path.to_path_buf(),
-            message: err.to_string(),
-        })?;
-
-        validate(&manifest)?;
+        let manifest = parse(manifest_path, &text)?;
 
         // The root is every relative path's base, so resolve it once here and
         // canonicalize: symlinked or `..`-laden checkouts collapse to one
@@ -234,6 +271,23 @@ impl Project {
             .and_then(|scenes| scenes.persistent.as_ref())
             .map(|persistent| self.root.join(persistent))
     }
+    /// [`start_scene`](Self::start_scene) as the manifest spells it, relative
+    /// to the root.
+    pub fn start_scene_relative(&self) -> Option<&Path> {
+        self.manifest.scenes.as_ref()?.start.as_deref()
+    }
+    pub fn persistent_scene_relative(&self) -> Option<&Path> {
+        self.manifest.scenes.as_ref()?.persistent.as_deref()
+    }
+}
+
+fn parse(manifest_path: &Path, text: &str) -> Result<Manifest, ProjectError> {
+    let manifest: Manifest = toml::from_str(text).map_err(|err| ProjectError::Parse {
+        path: manifest_path.to_path_buf(),
+        message: err.to_string(),
+    })?;
+    validate(&manifest)?;
+    Ok(manifest)
 }
 
 fn validate(manifest: &Manifest) -> Result<(), ProjectError> {

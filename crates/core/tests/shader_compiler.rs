@@ -286,6 +286,8 @@ fn the_engine_starts_with_no_library_path() {
         .arg("--pack-assets")
         .arg(&nowhere)
         .arg(nowhere.join("pack"))
+        // Not configured by the settings of whoever runs the test.
+        .env(orrin_project::user::DIR_ENV, nowhere.join("user"))
         .env_remove("DYLD_LIBRARY_PATH")
         .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
         .env_remove("LD_LIBRARY_PATH")

@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 
 use orrin_registry::SceneDocument;
 
-/// How long unsaved work goes without a copy.
+/// How long unsaved work goes without a copy, unless the user's settings say
+/// otherwise.
 pub const INTERVAL: Duration = Duration::from_secs(120);
 
 pub struct Autosave {
@@ -35,6 +36,8 @@ pub struct Autosave {
     /// The history version the last copy holds.
     written: Option<u64>,
     job: Option<JoinHandle<Result<PathBuf, String>>>,
+    /// `None` while autosave is off.
+    every: Option<Duration>,
 }
 
 impl Autosave {
@@ -44,7 +47,13 @@ impl Autosave {
             since: now,
             written: None,
             job: None,
+            every: Some(INTERVAL),
         }
+    }
+
+    /// How often a copy is owed; `None` turns autosave off.
+    pub fn configure(&mut self, every: Option<Duration>) {
+        self.every = every;
     }
 
     /// Where the copy of the scene at `scene_path` goes.
@@ -67,7 +76,9 @@ impl Autosave {
     pub fn due(&self, now: Instant, version: u64) -> bool {
         self.job.is_none()
             && self.written != Some(version)
-            && now.saturating_duration_since(self.since) >= INTERVAL
+            && self
+                .every
+                .is_some_and(|every| now.saturating_duration_since(self.since) >= every)
     }
 
     /// Write `document` to `path` on a thread of its own.
@@ -143,6 +154,23 @@ mod tests {
         let autosave = Autosave::new(scratch("interval"), start);
         assert!(!autosave.due(start + INTERVAL / 2, 1));
         assert!(autosave.due(start + INTERVAL, 1));
+    }
+
+    #[test]
+    fn a_configured_interval_replaces_the_default() {
+        let start = Instant::now();
+        let mut autosave = Autosave::new(scratch("configured"), start);
+        autosave.configure(Some(Duration::from_secs(30)));
+        assert!(!autosave.due(start + Duration::from_secs(29), 1));
+        assert!(autosave.due(start + Duration::from_secs(30), 1));
+    }
+
+    #[test]
+    fn autosave_turned_off_owes_nothing() {
+        let start = Instant::now();
+        let mut autosave = Autosave::new(scratch("off"), start);
+        autosave.configure(None);
+        assert!(!autosave.due(start + INTERVAL * 100, 1));
     }
 
     #[test]

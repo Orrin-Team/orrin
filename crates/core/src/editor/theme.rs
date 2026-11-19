@@ -64,8 +64,9 @@ pub const ROW_BAND: Color32 = Color32::from_rgba_premultiplied(5, 5, 5, 5);
 
 pub const BUILT_IN: &str = "orrin-dark";
 
-/// One editor palette. Serialised as the `*.toml` a user drops in
-/// `<project>/.orrin/themes/`, so every field is a plain `[r, g, b]` triple.
+/// One editor palette. Serialised as the `*.toml` a user drops in the
+/// `themes/` beside their settings or in `<project>/.orrin/themes/`, so every
+/// field is a plain `[r, g, b]` triple.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Theme {
     pub name: String,
@@ -246,8 +247,8 @@ fn contrast(a: Color32, b: Color32) -> f32 {
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
-/// Every theme this session can switch between: the built-in first, then
-/// whatever `<project>/.orrin/themes/` holds.
+/// Every theme this session can switch between: the built-in first, then the
+/// user's own, then whatever `<project>/.orrin/themes/` holds.
 pub struct ThemeSet {
     themes: Vec<Theme>,
     active: usize,
@@ -263,14 +264,22 @@ impl Default for ThemeSet {
 }
 
 impl ThemeSet {
-    /// Read `*.toml` themes from `dir`, in filename order so two machines list
-    /// them the same way. A theme that fails to parse is named on stderr and
-    /// skipped — one bad file must not cost the user the rest of their set.
-    pub fn load(dir: &Path) -> Self {
+    /// Read `*.toml` themes from each of `dirs`, in filename order so two
+    /// machines list them the same way. A theme that fails to parse is named on
+    /// stderr and skipped — one bad file must not cost the user the rest of
+    /// their set. A later directory's theme replaces an earlier one's of the
+    /// same name, so the project's, read last, is the narrower scope that wins.
+    pub fn load<P: AsRef<Path>>(dirs: impl IntoIterator<Item = P>) -> Self {
         let mut set = Self::default();
+        for dir in dirs {
+            set.load_dir(dir.as_ref());
+        }
+        set
+    }
 
+    fn load_dir(&mut self, dir: &Path) {
         let Ok(entries) = std::fs::read_dir(dir) else {
-            return set;
+            return;
         };
         let mut paths: Vec<_> = entries
             .flatten()
@@ -281,12 +290,17 @@ impl ThemeSet {
 
         for path in paths {
             match std::fs::read_to_string(&path).map(|text| toml::from_str::<Theme>(&text)) {
-                Ok(Ok(theme)) => set.themes.push(theme),
+                Ok(Ok(theme)) => match self.themes[1..]
+                    .iter_mut()
+                    .find(|loaded| loaded.name == theme.name)
+                {
+                    Some(loaded) => *loaded = theme,
+                    None => self.themes.push(theme),
+                },
                 Ok(Err(e)) => tracing::warn!("{} is not a theme: {e}", path.display()),
                 Err(e) => tracing::warn!("cannot read {}: {e}", path.display()),
             }
         }
-        set
     }
 
     pub fn active(&self) -> &Theme {
@@ -749,7 +763,40 @@ accent = [38, 104, 220]
 
     #[test]
     fn a_missing_themes_directory_still_gives_the_built_in() {
-        let set = ThemeSet::load(std::path::Path::new("this/does/not/exist"));
+        let set = ThemeSet::load([std::path::Path::new("this/does/not/exist")]);
         assert_eq!(set.names().collect::<Vec<_>>(), [BUILT_IN]);
+    }
+
+    fn theme_file(dir: &std::path::Path, file: &str, name: &str, accent: [u8; 3]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let theme = Theme {
+            name: name.to_owned(),
+            accent,
+            ..Theme::default()
+        };
+        std::fs::write(dir.join(file), toml::to_string(&theme).unwrap()).unwrap();
+    }
+
+    /// The user's directory is read first and the project's second, and on a
+    /// shared name the project's wins: the narrower scope decides, as an
+    /// environment variable does over a setting.
+    #[test]
+    fn the_users_themes_and_the_projects_load_together_and_the_project_wins_a_clash() {
+        let root = std::env::temp_dir().join(format!("orrin-theme-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (user, project) = (root.join("user"), root.join("project"));
+        theme_file(&user, "mine.toml", "Mine", [1, 1, 1]);
+        theme_file(&user, "shared.toml", "Shared", [2, 2, 2]);
+        theme_file(&project, "shared.toml", "Shared", [3, 3, 3]);
+        theme_file(&project, "theirs.toml", "Theirs", [4, 4, 4]);
+
+        let mut set = ThemeSet::load([&user, &project]);
+        assert_eq!(
+            set.names().collect::<Vec<_>>(),
+            [BUILT_IN, "Mine", "Shared", "Theirs"]
+        );
+        assert!(set.select("Shared"));
+        assert_eq!(set.active().accent, [3, 3, 3]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -30,6 +30,13 @@
 //! pointer, and the lone tab of a window carries that window with it. Drops
 //! onto a tool are still egui_dock's, so splitting and re-docking are
 //! unchanged.
+//!
+//! **Escape closes Settings in its window, and only when it is Settings'
+//! key.** Escape already puts a field back, dismisses a list or a menu,
+//! clears the selection and frees a running game's cursor, so the window
+//! comes after the first three and instead of the last two only while it is
+//! what was pressed or asked for last — see [`Dock::close_on_escape`]. Docked,
+//! Settings is a tool among the others, and none of them closes on a key.
 
 use egui_dock::{DockArea, DockState, NodeIndex, Style};
 use serde::{Deserialize, Serialize};
@@ -40,6 +47,7 @@ use orrin_registry::Registry;
 use super::panels;
 use super::previews::Previews;
 use super::state::{DockRequest, EditorState};
+use super::theme::ThemeSet;
 
 /// Fractions rather than pixels, because a split is a proportion of its parent
 /// and the window has no fixed size. Measured to land on the widths the design
@@ -68,6 +76,7 @@ pub enum Tab {
     Import,
     Storybook,
     Shader,
+    Settings,
 }
 
 impl Tab {
@@ -75,6 +84,11 @@ impl Tab {
     /// even in a build without the feature: the variant stays so a layout file
     /// written by one build still loads in the other, and the tab says why it
     /// is empty instead of vanishing.
+    ///
+    /// `Settings` is not: it is opened by command (Edit ▸ Settings…, Ctrl+,)
+    /// into a window rather than toggled in place, and it is in no default
+    /// leaf to toggle it back into. It closes from the ✕ on its own tab, and
+    /// in its window on Escape.
     pub const ALL: [Self; 11] = [
         Self::Hierarchy,
         Self::Scenes,
@@ -103,6 +117,7 @@ impl Tab {
             Self::Import => icons::info(),
             Self::Storybook => icons::palette(),
             Self::Shader => icons::code(),
+            Self::Settings => icons::gear(),
         }
     }
 
@@ -119,6 +134,7 @@ impl Tab {
             Self::Import => "Import",
             Self::Storybook => "Storybook",
             Self::Shader => "Shader",
+            Self::Settings => "Settings",
         }
     }
 }
@@ -134,6 +150,12 @@ pub struct Dock {
     /// The tab under the primary button since it went down, if it went down
     /// on one. See the module docs on dragging a tab out.
     grab: Option<Grab>,
+    /// Whether Settings is what was pressed or asked for last, rather than
+    /// the scene or another tool. egui_dock's focused leaf cannot say: a press
+    /// on the scene, which is no leaf, leaves it where it was.
+    settings_in_use: bool,
+    /// Whether Escape closes Settings, as the frame last drawn left things.
+    escape_closes: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -206,6 +228,8 @@ impl Dock {
             tools: Vec::new(),
             viewport: None,
             grab: None,
+            settings_in_use: false,
+            escape_closes: false,
         }
     }
 
@@ -227,6 +251,7 @@ impl Dock {
     /// leaf with two others is only one tab wide on screen, so a command that
     /// points at one has to be able to reveal it.
     pub fn activate(&mut self, tab: Tab) {
+        self.settings_in_use = tab == Tab::Settings;
         if let Some(location) = self.state.find_tab(&tab) {
             self.state.set_active_tab(location);
             self.state
@@ -265,7 +290,26 @@ impl Dock {
             DockRequest::Show(tab) => self.bring_forward(tab),
             DockRequest::Float(tab) => self.float(tab),
             DockRequest::Dock(tab) => self.dock_back(tab),
+            DockRequest::Open(tab) => self.open(tab),
         }
+    }
+
+    /// Bring `tab` forward wherever the user put it; closed, open it in a
+    /// window of [`designed_size`] in the middle of the dock's region.
+    fn open(&mut self, tab: Tab) {
+        if !self.is_open(tab) {
+            let size = designed_size(tab).min(self.region.size() * 0.9);
+            let rect = if self.region.is_finite() {
+                egui::Rect::from_center_size(self.region.center(), size)
+            } else {
+                egui::Rect::from_min_size(egui::pos2(80.0, 80.0), size)
+            };
+            let surface = self.state.add_window(vec![tab]);
+            if let Some(window) = self.state.get_window_state_mut(surface) {
+                window.set_position(rect.min).set_size(rect.size());
+            }
+        }
+        self.activate(tab);
     }
 
     /// Move `tab` into a window of its own, opening it if it was closed. The
@@ -386,6 +430,64 @@ impl Dock {
         }
     }
 
+    /// Close Settings if Escape was pressed and the last frame left the key
+    /// to it. Decided then, by [`arm_escape`](Self::arm_escape), rather than
+    /// now: egui drops the keyboard focus on Escape before any of the editor
+    /// runs, and a field that held it is the first thing Escape belongs to.
+    /// The press is consumed, so it does not clear the selection as well.
+    pub fn close_on_escape(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.escape_closes)
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            && let Some(location) = self.state.find_tab(&Tab::Settings)
+        {
+            self.state.remove_tab(location);
+        }
+    }
+
+    /// Whether Settings would be the window Escape closes: in a window, the
+    /// tab that window shows, and the last thing pressed or asked for.
+    pub fn settings_takes_escape(&self) -> bool {
+        self.settings_in_use
+            && self
+                .state
+                .find_tab(&Tab::Settings)
+                .is_some_and(|(surface, node, index)| {
+                    !surface.is_main()
+                        && matches!(
+                            &self.state[surface][node],
+                            egui_dock::Node::Leaf { active, .. } if *active == index
+                        )
+                })
+    }
+
+    /// Say at the end of a frame whether the next Escape closes Settings.
+    pub fn arm_escape(&mut self, closes: bool) {
+        self.escape_closes = closes;
+    }
+
+    /// Follow presses to whichever of Settings and everything else took the
+    /// last one. A press on a menu or an open list moves nothing: it belongs
+    /// to whatever opened it.
+    fn track_press(&mut self, ctx: &egui::Context, settings: Option<egui::LayerId>) {
+        let pressed = ctx.input(|input| {
+            let pointer = &input.pointer;
+            pointer
+                .any_pressed()
+                .then(|| pointer.interact_pos())
+                .flatten()
+        });
+        let Some(pos) = pressed else {
+            return;
+        };
+        let layer = ctx.layer_id_at(pos);
+        if layer.is_some_and(|layer| {
+            !matches!(layer.order, egui::Order::Background | egui::Order::Middle)
+        }) {
+            return;
+        }
+        self.settings_in_use = layer.is_some() && layer == settings;
+    }
+
     /// Put `tab` back where the default layout keeps it, by finding a tool it
     /// shares a leaf with there. Falling back to the first leaf would drop a
     /// reopened Console on top of the Hierarchy.
@@ -418,6 +520,7 @@ impl Dock {
         world: &mut World,
         state: &mut EditorState,
         registry: &Registry,
+        themes: &ThemeSet,
         previews: &mut Previews,
     ) {
         let floating = Tab::ALL.map(|tab| self.is_floating(tab));
@@ -425,6 +528,7 @@ impl Dock {
             world,
             state,
             registry,
+            themes,
             previews,
             floating,
             buttons: Vec::new(),
@@ -449,7 +553,8 @@ impl Dock {
                     // Tools open and close from the View menu. A ✕ on every tab
                     // and a collapse arrow on every strip was chrome repeated
                     // above each tool for something done a few times a day.
-                    .show_close_buttons(false)
+                    // So this is on for the one tab `Viewer::closeable` names.
+                    .show_close_buttons(true)
                     .show_leaf_collapse_buttons(false)
                     .show_add_buttons(false)
                     // One stray click on the far-right ✕ would close every tool
@@ -488,7 +593,13 @@ impl Dock {
                     }
                 }
             });
+        let settings = viewer
+            .buttons
+            .iter()
+            .find(|(tab, ..)| *tab == Tab::Settings)
+            .map(|(_, _, layer)| *layer);
         self.track_grab(ctx, viewer.pressed);
+        self.track_press(ctx, settings);
 
         let Self {
             state,
@@ -550,6 +661,16 @@ impl Dock {
 /// the Console does not come away as wide as the strip it was docked in.
 const WINDOW_SIZE: egui::Vec2 = egui::vec2(360.0, 560.0);
 const FLOAT_MIN: egui::Vec2 = egui::vec2(260.0, 220.0);
+
+/// What a tool opened by command into a window of its own starts at: room
+/// for Settings' sidebar beside a page of rows, without covering the scene
+/// its rows act on.
+fn designed_size(tab: Tab) -> egui::Vec2 {
+    match tab {
+        Tab::Settings => egui::vec2(760.0, 520.0),
+        _ => WINDOW_SIZE,
+    }
+}
 
 /// Where a newly floated tool's window goes inside `region`, the area the dock
 /// had last frame — or a fixed spot before the first frame has measured it.
@@ -717,6 +838,7 @@ struct Viewer<'a> {
     world: &'a mut World,
     state: &'a mut EditorState,
     registry: &'a Registry,
+    themes: &'a ThemeSet,
     previews: &'a mut Previews,
     /// Which tools are in windows, by their place in [`Tab::ALL`].
     floating: [bool; Tab::ALL.len()],
@@ -748,6 +870,12 @@ impl egui_dock::TabViewer for Viewer<'_> {
         if response.is_pointer_button_down_on() {
             self.pressed = Some(*tab);
         }
+    }
+
+    /// Settings alone: the View menu does not list it, so its own tab is the
+    /// only place it can be closed from.
+    fn closeable(&mut self, tab: &mut Tab) -> bool {
+        !Tab::ALL.contains(tab)
     }
 
     fn context_menu(
@@ -806,6 +934,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
             }
             Tab::Storybook => panels::storybook::body(ui, self.world),
             Tab::Shader => panels::shader::body(ui, self.world, self.state),
+            Tab::Settings => panels::settings::body(ui, self.world, self.state, self.themes),
         }
     }
 }

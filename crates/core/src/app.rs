@@ -122,6 +122,33 @@ pub struct App {
     /// Kept alive for the process: dropping the messenger stops validation
     /// output, which is exactly when you need it most.
     _debug_messenger: Option<DebugUtilsMessenger>,
+    /// Opened at the start of [`run`](App::run), since what a run starts with
+    /// is in it, and handed to the editor when the window exists.
+    settings: Option<crate::editor::settings::SettingsStore>,
+    /// The floor the log stream was installed with, for the run banner.
+    log_floor: LogLevel,
+    /// The editor asked to start again once the event loop has returned.
+    restart: bool,
+}
+
+/// How this process was started, so a restart can start it the same way.
+struct Launch {
+    exe: PathBuf,
+    args: Vec<std::ffi::OsString>,
+    cwd: PathBuf,
+}
+
+impl Launch {
+    /// Read as the process starts rather than as it restarts: on Linux
+    /// `current_exe` reads `/proc/self/exe`, which names a binary rebuilt since
+    /// as `… (deleted)`.
+    fn of_this_process() -> Option<Self> {
+        Some(Self {
+            exe: std::env::current_exe().ok()?,
+            args: std::env::args_os().skip(1).collect(),
+            cwd: std::env::current_dir().ok()?,
+        })
+    }
 }
 
 /// What `boot_scripting` produced: the live host, and the watcher that keeps it
@@ -137,27 +164,51 @@ struct Scripts {
 
 impl App {
     pub fn run() {
-        // First, so that everything below it — and every exit it takes — is
-        // heard.
-        let console = crate::logging::init(crate::logging::LogConfig::for_this_build());
+        let shipped = cfg!(feature = "export");
+        let launch = Launch::of_this_process();
+
+        // The one place the user's directory is resolved: everything else is
+        // handed it, so a test or a harness never reads the settings of
+        // whoever ran it. An exported game is not the editor and keeps none.
+        // Before the log stream, whose floor is one of the settings, so what
+        // reading them has to say is logged once the stream exists.
+        let (settings, heard) = crate::editor::settings::SettingsStore::open(if shipped {
+            None
+        } else {
+            orrin_project::user::dir()
+        });
+        let startup = settings.current().startup.clone();
+
+        // First of what logs, so that everything below it — and every exit it
+        // takes — is heard.
+        let log = crate::logging::LogConfig::for_this_build_with(startup.log_floor());
+        let log_floor = log.min_level;
+        let console = crate::logging::init(log);
+        for line in heard {
+            tracing::warn!("{line}");
+        }
 
         // Before anything that might dispatch into it — the scene build decodes
         // textures across it, and that happens on the first `resumed`.
-        crate::threads::init();
+        crate::threads::init_with(startup.threads());
 
         let event_loop = EventLoop::new().unwrap();
         event_loop.set_control_flow(ControlFlow::Poll);
 
-        let backend = BackendChoice::from_env();
+        let backend = BackendChoice::from_env_and(startup.backend_choice());
+        let validate = should_validate(
+            std::env::var(VALIDATION_ENV).ok().as_deref(),
+            startup.validation(),
+            cfg!(debug_assertions),
+        );
         let (instance, debug_messenger) = match backend {
             BackendChoice::Vulkan => {
-                let (instance, messenger) = create_vulkan_instance(&event_loop);
+                let (instance, messenger) = create_vulkan_instance(&event_loop, validate);
                 (Some(instance), messenger)
             }
             BackendChoice::Metal => (None, None),
         };
 
-        let shipped = cfg!(feature = "export");
         if shipped
             && !crate::profile::shipped_game_profiles(
                 std::env::var("ORRIN_PROFILE").ok().as_deref(),
@@ -245,6 +296,9 @@ impl App {
             cursor_grabbed: false,
             stress: StressSpec::from_env().filter(|spec| !spec.is_empty()),
             _debug_messenger: debug_messenger,
+            settings: Some(settings),
+            log_floor,
+            restart: false,
         };
 
         crate::scene::register_components(&mut app.registry);
@@ -259,6 +313,14 @@ impl App {
         app.load_prefabs();
 
         event_loop.run_app(&mut app).unwrap();
+        // Only once the app is gone: the editor's `Drop` keeps the settings and
+        // the layout and waits for autosave, and the world goes before the
+        // script host. `run_app` returns on every platform this builds for.
+        let restart = app.restart;
+        drop(app);
+        if restart {
+            relaunch(launch);
+        }
     }
 
     /// The game this executable was exported as, from the `orrin.json` beside
@@ -568,6 +630,13 @@ impl ApplicationHandler for App {
                 .unwrap(),
         );
         let size = window.inner_size();
+        let settings = self
+            .settings
+            .take()
+            .unwrap_or_else(|| crate::editor::settings::SettingsStore::open(None).0);
+        // Before the swapchain exists, so the saved present mode is the one it
+        // is built with rather than a recreate on the first frame.
+        settings.current().apply_to_world(&self.world);
         let present = *self.world.resource::<PresentSettings>();
         let mut renderer = match self.instance.as_ref() {
             Some(instance) => {
@@ -613,7 +682,10 @@ impl ApplicationHandler for App {
             renderer.max_texture_side(),
             self.project.as_ref(),
             scripts_dir,
+            settings,
+            self.backend,
         );
+        self.camera_controller.configure(editor.fly_camera());
 
         if self.shipped {
             // A game is played, not edited: there is no transport to press, and
@@ -624,7 +696,13 @@ impl ApplicationHandler for App {
             self.world.resource_mut::<Diagnostics>().overlay = false;
         }
 
-        print_run_banner(&self.world, &renderer, self.backend, self.scene);
+        print_run_banner(
+            &self.world,
+            &renderer,
+            self.scene,
+            self._debug_messenger.is_some(),
+            self.log_floor,
+        );
 
         self.active = Some(Active {
             window,
@@ -700,12 +778,7 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => {
-                // Its surface before its window, which the renderer cannot
-                // promise once the app is being torn down.
-                active.renderer.close_ui_window();
-                event_loop.exit();
-            }
+            WindowEvent::CloseRequested => close(&mut active.renderer, event_loop),
             WindowEvent::Resized(size) => {
                 active.renderer.resize([size.width, size.height]);
             }
@@ -950,6 +1023,7 @@ impl ApplicationHandler for App {
                 if ui_due {
                     profile_scope!("editor");
                     active.editor.run(&mut self.world, &self.registry);
+                    self.camera_controller.configure(active.editor.fly_camera());
                     if active.editor.take_camera_moved() {
                         self.camera_controller
                             .sync_from(&self.world.resource::<Camera>());
@@ -1220,6 +1294,13 @@ impl ApplicationHandler for App {
                 #[cfg(feature = "scripting")]
                 self.stories.end_frame();
 
+                // After the frame, and by the way closing the window goes, so
+                // the editor is dropped exactly as it is then.
+                if editor.take_restart_request() {
+                    self.restart = true;
+                    close(renderer, event_loop);
+                }
+
                 // Last, so every scope guard above has dropped and this frame's
                 // CPU spans are complete. Its GPU spans arrive later and are
                 // filed against this frame by index.
@@ -1247,6 +1328,31 @@ impl ApplicationHandler for App {
         if let Some(active) = self.active.as_ref() {
             active.window.request_redraw();
         }
+    }
+}
+
+fn close(renderer: &mut VulkanRenderer, event_loop: &ActiveEventLoop) {
+    // Its surface before its window, which the renderer cannot promise once
+    // the app is being torn down.
+    renderer.close_ui_window();
+    event_loop.exit();
+}
+
+/// Start this program again as [`Launch`] says it was started. Nothing is
+/// waited on: the new process is the session from here.
+fn relaunch(launch: Option<Launch>) {
+    let Some(Launch { exe, args, cwd }) = launch else {
+        tracing::error!(
+            "cannot restart: where this executable is could not be read; start Orrin again"
+        );
+        return;
+    };
+    match relaunch_command(&exe, &args, &cwd).spawn() {
+        Ok(_) => tracing::info!("restarting {}", exe.display()),
+        Err(error) => tracing::error!(
+            "cannot restart {}: {error}; start Orrin again",
+            exe.display()
+        ),
     }
 }
 
@@ -1323,6 +1429,7 @@ fn pressed_overlay_toggle(event: &WindowEvent) -> bool {
 /// messenger that has to live as long as it does.
 fn create_vulkan_instance(
     event_loop: &EventLoop<()>,
+    validate: bool,
 ) -> (Arc<Instance>, Option<DebugUtilsMessenger>) {
     let library = VulkanLibrary::new().expect("failed to load vulkan library");
     let mut enabled_extensions = Surface::required_extensions(event_loop).unwrap();
@@ -1331,7 +1438,7 @@ fn create_vulkan_instance(
     // when the layer isn't installed, so a machine without the Vulkan SDK
     // (and CI) still runs — a GPU crash with no named cause is the thing
     // this exists to prevent.
-    let validation = should_validate() && has_validation_layer(&library);
+    let validation = validate && has_validation_layer(&library);
     if validation {
         enabled_extensions.ext_debug_utils = true;
     }
@@ -1354,7 +1461,7 @@ fn create_vulkan_instance(
     let debug_messenger = validation.then(|| attach_debug_messenger(&instance));
     if validation {
         tracing::info!("Vulkan validation layer enabled");
-    } else if should_validate() {
+    } else if validate {
         tracing::warn!(
             "validation requested but `{VALIDATION_LAYER}` isn't installed; \
              GPU errors will not be named (install the Vulkan SDK)"
@@ -1478,8 +1585,9 @@ fn metal_surface(_: &Window) -> Result<crate::gfx::vulkan::UiSurface, String> {
 fn print_run_banner(
     world: &World,
     renderer: &VulkanRenderer,
-    backend: BackendChoice,
     scene: SceneChoice,
+    validating: bool,
+    log_floor: LogLevel,
 ) {
     let present = renderer
         .applied_present()
@@ -1487,8 +1595,8 @@ fn print_run_banner(
     let extent = renderer.extent();
 
     tracing::info!(
-        "run config: {} build | {} | debug assertions {} | validation {} | present {} | \
-         {}x{} | MSAA {} | overlay {} | GPU pass timings {} | scene {}",
+        "run config: {} build | {} | debug assertions {} | validation {} | threads {} | \
+         log {} | present {} | {}x{} | MSAA {} | overlay {} | GPU pass timings {} | scene {}",
         if cfg!(debug_assertions) {
             "unoptimised"
         } else {
@@ -1496,7 +1604,11 @@ fn print_run_banner(
         },
         renderer.device_label(),
         on_off(cfg!(debug_assertions)),
-        on_off(should_validate() && backend == BackendChoice::Vulkan),
+        // Whether the layer is on, not whether it was asked for: a machine
+        // without the SDK, or a Metal run, has none.
+        on_off(validating),
+        crate::threads::count(),
+        log_floor.tag().to_ascii_lowercase(),
         present,
         extent[0],
         extent[1],
@@ -1519,15 +1631,35 @@ fn on_off(value: bool) -> &'static str {
 }
 
 const VALIDATION_LAYER: &str = "VK_LAYER_KHRONOS_validation";
+pub(crate) const VALIDATION_ENV: &str = "ORRIN_VALIDATION";
 
 /// On by default in dev builds; `ORRIN_VALIDATION=0`/`1` overrides either way,
-/// so a release build can be checked without rebuilding it as debug.
-fn should_validate() -> bool {
-    match std::env::var("ORRIN_VALIDATION").ok().as_deref() {
-        Some("0") | Some("false") => false,
-        Some(_) => true,
-        None => cfg!(debug_assertions),
+/// so a release build can be checked without rebuilding it as debug, and the
+/// editor's saved choice stands between the two.
+fn should_validate(env: Option<&str>, saved: Option<bool>, debug: bool) -> bool {
+    validation_named(env).or(saved).unwrap_or(debug)
+}
+
+/// What `ORRIN_VALIDATION` asks for: `0` and `false` are off, anything else
+/// set is on.
+pub(crate) fn validation_named(env: Option<&str>) -> Option<bool> {
+    match env.map(str::trim) {
+        None | Some("") => None,
+        Some("0") | Some("false") => Some(false),
+        Some(_) => Some(true),
     }
+}
+
+/// Starting this program again as it was started: the same executable,
+/// arguments and working directory, with the environment inherited.
+fn relaunch_command(
+    exe: &std::path::Path,
+    args: &[std::ffi::OsString],
+    cwd: &std::path::Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(exe);
+    command.args(args).current_dir(cwd);
+    command
 }
 
 fn has_validation_layer(library: &Arc<VulkanLibrary>) -> bool {
@@ -1604,5 +1736,47 @@ fn load_environment(
             tracing::info!("environment baked from `{hdri}` ({width}x{height})");
         }
         Err(error) => tracing::error!("{error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    #[test]
+    fn validation_takes_the_environment_then_the_setting_then_the_build() {
+        assert!(!should_validate(Some("0"), Some(true), true));
+        assert!(!should_validate(Some("false"), Some(true), true));
+        assert!(should_validate(Some("1"), Some(false), false));
+        assert!(!should_validate(None, Some(false), true));
+        assert!(should_validate(None, Some(true), false));
+        assert!(should_validate(None, None, true), "on in a debug build");
+        assert!(!should_validate(None, None, false), "off in a release one");
+        assert!(!should_validate(Some(" "), Some(false), true), "blank");
+        assert_eq!(validation_named(Some(" ")), None);
+        assert_eq!(validation_named(Some("0")), Some(false));
+    }
+
+    /// The same program, in the same place, asked the same thing: what the
+    /// user typed to start it is what starts it again.
+    #[test]
+    fn the_relaunch_is_the_same_executable_arguments_and_directory() {
+        let exe = Path::new("/opt/orrin/orrin-core");
+        let args = [OsString::from("--flag"), OsString::from("two words")];
+        let cwd = Path::new("/home/someone/game");
+        let command = relaunch_command(exe, &args, cwd);
+        assert_eq!(command.get_program(), exe.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--flag", "two words"]
+        );
+        assert_eq!(command.get_current_dir(), Some(cwd));
+        assert_eq!(
+            command.get_envs().count(),
+            0,
+            "the environment is inherited untouched"
+        );
     }
 }

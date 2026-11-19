@@ -111,6 +111,7 @@ icons! {
     floppy_disk => '\u{e248}',
     folder => '\u{e25a}',
     frame_corners => '\u{e626}',
+    gear => '\u{e270}',
     globe => '\u{e288}',
     gradient => '\u{eb42}',
     grid => '\u{e296}',

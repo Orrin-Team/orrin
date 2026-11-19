@@ -193,6 +193,8 @@ pub enum DockRequest {
     Float(super::dock::Tab),
     /// Back where the default layout keeps it.
     Dock(super::dock::Tab),
+    /// Forward wherever it is, or, closed, into a window of its designed size.
+    Open(super::dock::Tab),
 }
 
 /// What becomes of unsaved work when another scene is opened over it.
@@ -295,7 +297,21 @@ pub struct EditorState {
     pub show_stats: bool,
     /// Every collider's outline, rather than only the selection's.
     pub show_colliders: bool,
-    pub icon_tints: IconTints,
+    /// How the user likes the editor, in every project. Edited here by any
+    /// panel; `Editor::run` applies and keeps a change. See `editor::settings`.
+    pub settings: super::settings::Settings,
+    /// What the environment overrides of `settings` for this run.
+    pub environment: super::settings::Environment,
+    /// Where `settings` is kept; `None` when there is no user directory and
+    /// nothing is saved.
+    pub settings_file: Option<PathBuf>,
+    /// `settings.startup` as this run began with it, which a change there is
+    /// waiting on a restart to differ from.
+    pub started_with: super::settings::Startup,
+    /// What this run draws through.
+    pub backend: crate::gfx::BackendChoice,
+    /// The Settings tab's page, search and unsaved fields.
+    pub settings_panel: super::panels::settings::SettingsPanel,
     /// How the viewport draws the scene: shaded, or as its edges. `None` is
     /// shaded, which is what the renderer is handed too.
     pub wireframe: Option<crate::gfx::vulkan::wireframe::Wireframe>,
@@ -343,6 +359,10 @@ pub struct EditorState {
     /// open gesture stays open. Set by the panels once a frame's widgets
     /// have run.
     holding: bool,
+    /// Whether a field held the keyboard when the last frame ended. egui lets
+    /// go of it on Escape before the editor runs, so on that frame this is the
+    /// only record that the key was a field's.
+    typing: bool,
     undo_request: bool,
     redo_request: bool,
     /// Not an edit: the camera is the editor's, not the scene's, so framing
@@ -424,6 +444,11 @@ pub struct EditorState {
     /// Serviced by `apply`: Stop despawns the fork, for the reason a load is
     /// deferred.
     transport_request: Option<Transport>,
+    /// Drained by the app after the UI pass, which closes the window and
+    /// starts the program again once the event loop has returned.
+    restart_request: bool,
+    /// Save the scene, then raise `restart_request` if that worked.
+    restart_after_save: bool,
     /// What Stop goes back to. `Some` exactly while the game is live.
     fork: Option<Fork>,
     pub autosave: Autosave,
@@ -479,7 +504,12 @@ impl Default for EditorState {
             scale_linked: false,
             show_stats: false,
             show_colliders: false,
-            icon_tints: IconTints::default(),
+            settings: Default::default(),
+            environment: Default::default(),
+            settings_file: None,
+            started_with: Default::default(),
+            backend: crate::gfx::BackendChoice::DEFAULT,
+            settings_panel: Default::default(),
             wireframe: None,
             material_previews: Default::default(),
             gizmo_drag: None,
@@ -496,6 +526,7 @@ impl Default for EditorState {
             edits: Vec::new(),
             material_edits: Vec::new(),
             holding: false,
+            typing: false,
             undo_request: false,
             redo_request: false,
             frame_request: false,
@@ -526,6 +557,8 @@ impl Default for EditorState {
             script_reload_request: false,
             open_source_request: None,
             transport_request: None,
+            restart_request: false,
+            restart_after_save: false,
             fork: None,
             autosave: Autosave::new(PathBuf::from(".orrin/autosave"), Instant::now()),
         }
@@ -727,6 +760,13 @@ impl EditorState {
         self.request_dock(DockRequest::Show(super::dock::Tab::Shader));
     }
 
+    /// Open the Settings tab on `page`, or on the Orrin page last viewed this
+    /// session for `None`, with its search field focused.
+    pub fn open_settings(&mut self, page: Option<super::panels::settings::Page>) {
+        self.settings_panel.show(page);
+        self.request_dock(DockRequest::Open(super::dock::Tab::Settings));
+    }
+
     pub fn take_reveal_request(&mut self) -> bool {
         std::mem::take(&mut self.reveal_request)
     }
@@ -776,6 +816,16 @@ impl EditorState {
     /// Keep the open gesture open through this frame, or let it close.
     pub fn hold(&mut self, holding: bool) {
         self.holding = holding;
+    }
+
+    /// Record whether a field holds the keyboard as this frame ends.
+    pub fn set_typing(&mut self, typing: bool) {
+        self.typing = typing;
+    }
+
+    /// Whether a field held the keyboard when the last frame ended.
+    pub fn was_typing(&self) -> bool {
+        self.typing
     }
 
     /// Point the camera at the selection, near enough to fill the view.
@@ -847,6 +897,20 @@ impl EditorState {
         self.open_source_request.take()
     }
 
+    /// Close Orrin and start it again, saving the scene first when it has
+    /// unsaved work.
+    pub fn request_restart(&mut self) {
+        if self.scene_dirty() {
+            self.restart_after_save = true;
+        } else {
+            self.restart_request = true;
+        }
+    }
+
+    pub fn take_restart_request(&mut self) -> bool {
+        std::mem::take(&mut self.restart_request)
+    }
+
     pub fn apply(&mut self, world: &mut World, registry: &Registry) {
         self.apply_edits(world, registry);
         // Not through the edit pipeline: what the editor shows is not the
@@ -901,6 +965,20 @@ impl EditorState {
         if let Some(request) = self.scene_request.take() {
             let (level, message) = self.scene(world, registry, request);
             log(world, level, message);
+        }
+        if std::mem::take(&mut self.restart_after_save) {
+            let (level, message) = self.scene(world, registry, SceneRequest::Save);
+            let saved = level != LogLevel::Error && !self.playing();
+            log(world, level, message);
+            if saved {
+                self.restart_request = true;
+            } else {
+                log(
+                    world,
+                    LogLevel::Warning,
+                    "restart cancelled: the scene was not saved".to_owned(),
+                );
+            }
         }
         if let Some(path) = self.open_after_save.take() {
             let (level, message) = self.scene(world, registry, SceneRequest::Save);

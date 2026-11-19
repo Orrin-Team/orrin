@@ -10,6 +10,37 @@ use crate::scene::Camera;
 // Just under 90°, so the camera can't flip over at the poles.
 const PITCH_LIMIT: f32 = 1.55;
 
+/// What a [`FlyCamera::sensitivity`] of 1 turns the view by, in radians per
+/// pixel of mouse motion.
+const LOOK_RADIANS_PER_PIXEL: f32 = 0.0025;
+
+/// How the fly camera moves: the user's to set, and kept with their other
+/// settings rather than with any project.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct FlyCamera {
+    /// Metres a second.
+    pub fly_speed: f32,
+    /// What Shift multiplies `fly_speed` by.
+    pub boost: f32,
+    /// A multiple of the base look rate, about 0.14 degrees per pixel of mouse
+    /// motion; a raw radians-per-pixel figure is too small a number to set.
+    pub sensitivity: f32,
+    /// Metres per notch of the scroll wheel.
+    pub scroll_speed: f32,
+}
+
+impl Default for FlyCamera {
+    fn default() -> Self {
+        Self {
+            fly_speed: 6.0,
+            boost: 4.0,
+            sensitivity: 1.0,
+            scroll_speed: 1.5,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Keys {
     forward: bool,
@@ -30,10 +61,7 @@ impl Keys {
 pub struct CameraController {
     yaw: f32,
     pitch: f32,
-    move_speed: f32,
-    boost: f32,
-    sensitivity: f32,
-    scroll_speed: f32,
+    fly: FlyCamera,
 
     looking: bool,
     keys: Keys,
@@ -46,10 +74,7 @@ impl Default for CameraController {
         Self {
             yaw: 0.0,
             pitch: 0.0,
-            move_speed: 6.0,
-            boost: 4.0,
-            sensitivity: 0.0025,
-            scroll_speed: 1.5,
+            fly: FlyCamera::default(),
             looking: false,
             keys: Keys::default(),
             look_delta: (0.0, 0.0),
@@ -61,6 +86,10 @@ impl Default for CameraController {
 impl CameraController {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn configure(&mut self, fly: FlyCamera) {
+        self.fly = fly;
     }
 
     pub fn sync_from(&mut self, camera: &Camera) {
@@ -150,15 +179,15 @@ impl CameraController {
         // environment panel) are respected, then fold in this frame's look delta.
         self.sync_from(camera);
         if self.looking {
-            self.yaw += self.look_delta.0 * self.sensitivity;
-            self.pitch = (self.pitch - self.look_delta.1 * self.sensitivity)
-                .clamp(-PITCH_LIMIT, PITCH_LIMIT);
+            let rate = self.fly.sensitivity * LOOK_RADIANS_PER_PIXEL;
+            self.yaw += self.look_delta.0 * rate;
+            self.pitch = (self.pitch - self.look_delta.1 * rate).clamp(-PITCH_LIMIT, PITCH_LIMIT);
         }
 
         let forward = forward_dir(self.yaw, self.pitch);
         let right = forward.cross(Vec3::Y).normalize_or_zero();
 
-        let speed = self.move_speed * if self.keys.fast { self.boost } else { 1.0 } * dt;
+        let speed = self.fly.fly_speed * if self.keys.fast { self.fly.boost } else { 1.0 } * dt;
         let mut pos = camera.position;
         if self.keys.forward {
             pos += forward * speed;
@@ -178,7 +207,7 @@ impl CameraController {
         if self.keys.down {
             pos -= Vec3::Y * speed;
         }
-        pos += forward * self.scroll * self.scroll_speed;
+        pos += forward * self.scroll * self.fly.scroll_speed;
 
         camera.position = pos;
         camera.target = pos + forward;
@@ -193,4 +222,66 @@ fn forward_dir(yaw: f32, pitch: f32) -> Vec3 {
     let (sy, cy) = yaw.sin_cos();
     let (sp, cp) = pitch.sin_cos();
     Vec3::new(sy * cp, sp, -cy * cp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn camera() -> Camera {
+        Camera {
+            position: Vec3::ZERO,
+            target: Vec3::NEG_Z,
+            ..Camera::default()
+        }
+    }
+
+    #[test]
+    fn the_default_moves_as_the_camera_always_has() {
+        let mut controller = CameraController::new();
+        let mut camera = camera();
+        controller.keys.forward = true;
+        controller.update(&mut camera, 0.5);
+        assert!((camera.position - Vec3::new(0.0, 0.0, -3.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn the_fly_camera_moves_at_the_configured_speed() {
+        let mut controller = CameraController::new();
+        controller.configure(FlyCamera {
+            fly_speed: 10.0,
+            boost: 3.0,
+            ..FlyCamera::default()
+        });
+        let mut camera = camera();
+        controller.keys.forward = true;
+        controller.update(&mut camera, 0.5);
+        assert!((camera.position.z + 5.0).abs() < 1e-4, "{camera:?}");
+
+        controller.keys.fast = true;
+        controller.update(&mut camera, 0.5);
+        assert!((camera.position.z + 20.0).abs() < 1e-4, "{camera:?}");
+    }
+
+    #[test]
+    fn the_look_and_the_wheel_follow_the_configuration() {
+        let mut controller = CameraController::new();
+        controller.configure(FlyCamera {
+            sensitivity: 2.0,
+            scroll_speed: 4.0,
+            ..FlyCamera::default()
+        });
+        let mut camera = camera();
+        controller.looking = true;
+        controller.look_delta = (100.0, 0.0);
+        controller.update(&mut camera, 0.0);
+        let turned = 100.0 * LOOK_RADIANS_PER_PIXEL * 2.0;
+        assert!((controller.yaw - turned).abs() < 1e-5, "{}", controller.yaw);
+
+        controller.looking = false;
+        let before = camera.position;
+        controller.scroll = 1.0;
+        controller.update(&mut camera, 0.0);
+        assert!(((camera.position - before).length() - 4.0).abs() < 1e-4);
+    }
 }

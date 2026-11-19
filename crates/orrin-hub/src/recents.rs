@@ -264,20 +264,9 @@ fn canonical(dir: &Path) -> PathBuf {
     }
 }
 
-/// Where the list lives: the platform's per-user settings directory.
+/// Where the list lives: Orrin's per-user directory.
 pub fn file() -> Option<PathBuf> {
-    let dir = if cfg!(target_os = "macos") {
-        std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join("Library/Application Support/Orrin"))
-    } else if cfg!(windows) {
-        std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("Orrin"))
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .map(|dir| dir.join("orrin"))
-    }?;
-    Some(dir.join("hub.json"))
+    orrin_project::user::dir().map(|dir| dir.join("hub.json"))
 }
 
 #[cfg(test)]
