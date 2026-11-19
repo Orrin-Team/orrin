@@ -186,7 +186,7 @@ pub fn run(job: &Job, cache: &Cache, blender: Option<&Blender>) -> Result<Import
         Some(Err(_)) | None => {
             let exported = if blend {
                 let blender = blender.cloned().unwrap_or_default();
-                let glb = blend::export(&job.rel, &inputs[0].1, &blender)?;
+                let glb = blend::export(&job.rel, &inputs[0].1, &blender, cache.dir())?;
                 Some([(job.rel.clone(), glb)])
             } else {
                 None

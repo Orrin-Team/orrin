@@ -15,10 +15,14 @@
 //! **Blender opens the bytes that were hashed.** `import` hands an importer the
 //! bytes the cache key hashed, never a second read of a file that may be
 //! mid-save. Blender has to open a file, so those bytes are written to a private
-//! temporary `.blend` and Blender opens that, never the source in place. A
-//! `.blend` is therefore imported alone: data it links from another `.blend` by
-//! relative path is not part of the asset, and is not tracked as an input
-//! either. The temporary directory goes on every way out, a panic included.
+//! `.blend` in a directory of the export's own, readable by its owner alone,
+//! inside the project's cache rather than a shared temporary directory, where a
+//! guessable name is a race another user can win. Blender opens that, never the
+//! source in place. A `.blend` is therefore imported alone: data it links from
+//! another `.blend` by relative path is not part of the asset, and is not
+//! tracked as an input either. The directory goes on every way out, a panic
+//! included; one a crashed run left is emptied before its name is used again,
+//! and its dotted name is never an artifact's.
 //!
 //! **Nothing in the file runs.** `--disable-autoexec` is not optional: a
 //! `.blend` from a cloned repository must not run the scripts embedded in it
@@ -186,15 +190,16 @@ fn version_of(dir: &str) -> Option<Vec<u32>> {
         .collect()
 }
 
-/// `bytes`, the `.blend` at `rel`, exported by Blender as GLB bytes.
-pub fn export(rel: &str, bytes: &[u8], blender: &Blender) -> Result<Vec<u8>, String> {
+/// `bytes`, the `.blend` at `rel`, exported by Blender as GLB bytes through a
+/// directory of its own in `cache`.
+pub fn export(rel: &str, bytes: &[u8], blender: &Blender, cache: &Path) -> Result<Vec<u8>, String> {
     let failed = |why: String| format!("{rel} could not be exported: {why}");
     let exe = locate(
         std::env::var_os("ORRIN_BLENDER"),
         blender.configured.as_deref(),
     )
     .ok_or_else(|| failed(format!("no Blender was found to export it. {FIX}")))?;
-    let scratch = Scratch::new().map_err(failed)?;
+    let scratch = Scratch::new(cache).map_err(failed)?;
     let copy = scratch.0.join("source.blend");
     let out = scratch.0.join("export.glb");
     let log = scratch.0.join("blender.log");
@@ -284,17 +289,28 @@ fn printed(log: &Path) -> String {
 struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new() -> Result<Self, String> {
+    /// In `cache` under a dotted name, which no artifact's key can be.
+    fn new(cache: &Path) -> Result<Self, String> {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "orrin-blend-{}-{}",
+        std::fs::create_dir_all(cache)
+            .map_err(|error| format!("{} could not be created: {error}", cache.display()))?;
+        Self::at(cache.join(format!(
+            ".blend-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        // One left by an earlier process of the same id could hold a GLB that
-        // would be read as this export's.
+        )))
+    }
+
+    fn at(dir: PathBuf) -> Result<Self, String> {
+        // One a crashed process of the same id left could hold a GLB that
+        // would be read as this export's. Created rather than created-if-absent
+        // after that, so nothing made in between is adopted either.
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&dir)
             .map_err(|error| format!("{} could not be created: {error}", dir.display()))?;
         Ok(Self(dir))
     }
@@ -437,10 +453,33 @@ mod tests {
         let copy = Path::new(copy);
         assert_ne!(copy, source);
         assert!(copy.extension().is_some_and(|e| e == "blend"), "{copy:?}");
-        assert!(
-            !copy.parent().unwrap().exists(),
-            "the private copy is cleaned up"
+        let scratch = copy.parent().unwrap();
+        assert_eq!(
+            scratch.parent(),
+            Some(dir.path().join(".cache").as_path()),
+            "the private copy is made in the project's cache, not a shared temporary directory"
         );
+        assert!(
+            scratch
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with('.')),
+            "dotted, so it can never be taken for an artifact: {scratch:?}"
+        );
+        assert!(!scratch.exists(), "the private copy is cleaned up");
+    }
+
+    /// A directory a crashed export left under the name this one is given is
+    /// emptied first, so a GLB in it is never read as this export's output.
+    #[cfg(unix)]
+    #[test]
+    fn a_scratch_directory_a_crashed_run_left_is_never_read_as_this_exports() {
+        use std::os::unix::fs::PermissionsExt;
+        let cache = Dir::new("blend-scratch-left");
+        let left = cache.write(".blend-1-0/export.glb", b"left by a crash");
+        let scratch = Scratch::at(left.parent().unwrap().to_owned()).unwrap();
+        assert!(!left.exists());
+        let mode = std::fs::metadata(&scratch.0).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "readable by its owner alone: {mode:o}");
     }
 
     /// A failed first import draws the placeholder, and the message carries
@@ -484,6 +523,10 @@ mod tests {
             "the placeholder"
         );
         let copy = PathBuf::from(&args(&tools)[5]);
+        assert!(
+            copy.starts_with(dir.path().join(".cache")),
+            "in the project's cache: {copy:?}"
+        );
         assert!(
             !copy.parent().unwrap().exists(),
             "cleaned up on failure too"
@@ -616,7 +659,13 @@ mod tests {
 
         let bytes = std::fs::read(&source).unwrap();
         let started = Instant::now();
-        let glb = export("models/crate.blend", &bytes, &configured(blender.clone())).unwrap();
+        let glb = export(
+            "models/crate.blend",
+            &bytes,
+            &configured(blender.clone()),
+            &dir.path().join(".cache"),
+        )
+        .unwrap();
         eprintln!(
             "Blender exported {} bytes of .blend to {} bytes of GLB in {:?}",
             bytes.len(),
