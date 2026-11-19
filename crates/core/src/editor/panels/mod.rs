@@ -51,6 +51,8 @@ pub fn draw(
 ) {
     // Before anything reads it: the tree's eyes, the viewport's reach.
     crate::scene::editor_hidden::refresh(world);
+    // Before `shortcuts`, whose Escape is the selection's.
+    dock.close_on_escape(ctx);
     shortcuts(ctx, world, state);
     // Asked for by a tool's own controls last frame, while the dock was
     // drawing them and so could not move.
@@ -95,9 +97,34 @@ pub fn draw(
     // A drag ends with the button and a typed edit with the field, so the
     // gesture they make stays open while either is still held. Read after the
     // widgets, which are what let go of the focus.
-    let holding = ctx.input(|input| input.pointer.any_down())
-        || ctx.memory(|memory| memory.focused().is_some());
+    let typing = ctx.memory(|memory| memory.focused().is_some());
+    let holding = ctx.input(|input| input.pointer.any_down()) || typing;
     state.hold(holding);
+    state.set_typing(typing);
+    let closes = dock.settings_takes_escape() && escape_is_free(ctx, world, state);
+    dock.arm_escape(closes);
+}
+
+/// Whether an Escape pressed next has nothing more particular to do than
+/// close a window: no field to put back or leave, no menu, list or dialog in
+/// front to dismiss, and no cursor a running game is holding, which the app
+/// frees on the same key before the editor draws (`scene::input::cursor`).
+fn escape_is_free(ctx: &egui::Context, world: &World, state: &EditorState) -> bool {
+    let typing = ctx.wants_keyboard_input() && !state.settings_panel.search_is_idle();
+    let in_front = ctx.memory(|memory| {
+        memory
+            .areas()
+            .visible_layer_ids()
+            .iter()
+            .any(|layer| layer.order == egui::Order::Foreground)
+    });
+    let locked = world
+        .get_resource::<crate::scene::Play>()
+        .is_some_and(|play| play.is_live())
+        && world
+            .get_resource::<crate::scene::CursorLock>()
+            .is_some_and(|lock| lock.requested);
+    !(typing || in_front || locked)
 }
 
 /// The one question every delete asks, whichever tool it came from: what goes,
@@ -252,7 +279,11 @@ fn shortcuts(ctx: &egui::Context, world: &World, state: &mut EditorState) {
     {
         state.request_despawn_selection();
     }
+    // The focus check above cannot see a field on the frame Escape arrives:
+    // egui has already taken the keyboard from it. Taking the key here would
+    // hide it from the field, which then commits instead of putting back.
     if selected
+        && !state.was_typing()
         && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
         state.selection.clear();
@@ -1745,6 +1776,42 @@ mod tests {
         editor.frames(2);
         editor.click(row_of(&editor, "brick.omat"));
         assert_eq!(editor.state.revealed_asset, Some(brick));
+    }
+
+    /// Escape in a field is spent on the field: it does not also clear the
+    /// selection behind it.
+    #[test]
+    fn escape_in_a_rename_leaves_the_selection_alone() {
+        use crate::asset_db::AssetDatabase;
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let dir = crate::asset_db::tests::Dir::new("panel-rename-selected");
+        dir.write("rock.png", b"");
+        let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        editor.world.insert_resource(db);
+        let cube = editor.spawn("Cube");
+        editor.state.selection.set(cube);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+
+        let at = row_of(&editor, "rock.png");
+        secondary_click(&mut editor, at);
+        editor.click(row_of(&editor, "Rename"));
+        editor.frames(1);
+        editor
+            .input
+            .events
+            .push(egui::Event::Text("boulder".to_owned()));
+        editor.frames(1);
+        editor.input.events.clear();
+        editor.key(egui::Key::Escape).frames(1);
+
+        let db = editor.world.resource::<AssetDatabase>();
+        assert!(db.find("rock.png").is_some(), "Escape renames nothing");
+        drop(db);
+        assert!(!editor.state.selection.is_empty(), "the rename's Escape");
+
+        editor.key(egui::Key::Escape).frames(1);
+        assert!(editor.state.selection.is_empty(), "and the next is its own");
     }
 
     /// Rename, from a row's menu or F2 over the browser, edits the name in

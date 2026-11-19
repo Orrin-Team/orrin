@@ -1,12 +1,12 @@
 //! The Settings tab: one window over two scopes, because the question people
 //! cannot answer from a setting's name is who it affects.
 //!
-//! **Two scopes, said every time.** *Project* pages edit `orrin.toml`, which
-//! is checked in and shared; *Orrin* pages edit `EditorState::settings`, which
+//! **Two scopes, said once.** *Project* pages edit `orrin.toml`, which is
+//! checked in and shared; *Orrin* pages edit `EditorState::settings`, which
 //! follows this person across projects (see `editor::settings`). The sidebar
-//! groups pages by scope, each page says its scope in one line under its
-//! title, and its footer names the file it writes. Search crosses both and
-//! names the scope beside every page it lists.
+//! groups pages under those two names, and that heading is the whole
+//! statement: a page is its title and its rows. Search crosses both with no
+//! sidebar in sight, so there each page is followed by its group's name.
 //!
 //! **Rows are data.** A `Row` is a page, a label, help and the words people
 //! type for it, and the `Field` it edits; search, the changed marker, reset
@@ -24,7 +24,8 @@
 //! `SettingsStore::settle` applies and saves at the end of the frame, and a
 //! Project row commits through `ManifestEdit` on Enter, on losing focus, or on
 //! a pick — Escape puts a field back. Neither goes in the undo history, which
-//! is the scene's. The one held value is the UI scale: a UI that rescales
+//! is the scene's. With nothing to put back, Escape closes the window the tab
+//! floats in (`Dock::close_on_escape`). The one held value is the UI scale: a UI that rescales
 //! under the pointer cannot be dragged, so the tab keeps the dragged value and
 //! hands it over when the pointer lets go.
 //!
@@ -124,20 +125,13 @@ impl Page {
         Self::PROJECT.contains(&self)
     }
 
-    fn scope(self) -> &'static str {
+    /// The sidebar heading the page is under, beside its name in search
+    /// results.
+    fn group(self) -> &'static str {
         if self.is_project() {
-            "Shared with everyone who opens this project"
+            "Project"
         } else {
-            "Only you, on this computer"
-        }
-    }
-
-    /// The scope again, short, beside a page's name in search results.
-    fn scope_short(self) -> &'static str {
-        if self.is_project() {
-            "project, shared"
-        } else {
-            "Orrin, this computer"
+            "Orrin"
         }
     }
 }
@@ -516,6 +510,9 @@ pub struct SettingsPanel {
     /// Where Edit ▸ Settings… opens: the Orrin page last viewed this session.
     last_orrin: Page,
     focus_search: bool,
+    /// Whether the keyboard is in the search field with nothing typed, which
+    /// is how the tab opens and not a field in use.
+    search_idle: bool,
     /// The UI scale while its slider is held.
     scale: Option<f32>,
     /// Text fields with focus, and what they hold until they commit.
@@ -544,6 +541,12 @@ impl SettingsPanel {
         self.select(page.unwrap_or(self.last_orrin));
         self.query.clear();
         self.focus_search = true;
+    }
+
+    /// Whether the search field holds the keyboard and no text: nothing an
+    /// Escape would be putting back or leaving.
+    pub fn search_is_idle(&self) -> bool {
+        self.search_idle
     }
 
     #[cfg(test)]
@@ -689,6 +692,7 @@ pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState, themes: &
     if std::mem::take(&mut panel.focus_search) {
         search.request_focus();
     }
+    panel.search_idle = search.has_focus() && panel.query.is_empty();
     ui.add_space(6.0);
 
     let root = state.project_root.clone();
@@ -767,7 +771,6 @@ fn sidebar(ui: &mut egui::Ui, state: &EditorState, panel: &mut SettingsPanel) {
     }
     ui.add_space(14.0);
     ui.label(egui::RichText::new("Orrin").strong());
-    ui.label(egui::RichText::new("this computer").color(weak));
     ui.add_space(2.0);
     for page in Page::ORRIN {
         entry(ui, panel, page);
@@ -834,7 +837,7 @@ fn picker(ui: &mut egui::Ui, state: &EditorState, panel: &mut SettingsPanel) {
                 ui.add(egui::Label::new(egui::RichText::new(NO_PROJECT).color(weak)).wrap());
             }
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("Orrin, this computer").color(weak));
+            ui.label(egui::RichText::new("Orrin").color(weak));
             for page in Page::ORRIN {
                 if ui
                     .selectable_label(panel.page == page, page.title())
@@ -849,12 +852,11 @@ fn picker(ui: &mut egui::Ui, state: &EditorState, panel: &mut SettingsPanel) {
     }
 }
 
-/// The selected page: its title, its scope, its rows and the file it writes.
+/// The selected page: its title and its rows.
 fn page(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
     let page = panel.page;
     let weak = ui.visuals().weak_text_color();
     ui.label(egui::RichText::new(page.title()).strong());
-    ui.add(egui::Label::new(egui::RichText::new(page.scope()).color(weak)).wrap());
     ui.add_space(10.0);
     if page == Page::Startup {
         restart_line(ui, cx.state);
@@ -883,16 +885,10 @@ fn page(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
                     rows_of(ui, cx, panel, |row| row.page == page);
                 }
             }
-            ui.add_space(16.0);
-            let file = if page.is_project() {
-                cx.state
-                    .project_root
-                    .as_ref()
-                    .map(|root| root.join("orrin.toml"))
-            } else {
-                cx.state.settings_file.clone()
-            };
-            footer(ui, file.as_deref());
+            if !page.is_project() && cx.state.settings_file.is_none() {
+                ui.add_space(16.0);
+                ui.label(egui::RichText::new("Not saved: no user directory").color(weak));
+            }
         });
 }
 
@@ -907,29 +903,6 @@ fn unloadable(ui: &mut egui::Ui, error: &str, state: &EditorState) {
     }
 }
 
-/// The file the page writes, and a way to it.
-fn footer(ui: &mut egui::Ui, file: Option<&Path>) {
-    let weak = ui.visuals().weak_text_color();
-    let Some(file) = file else {
-        ui.label(egui::RichText::new("Not saved: no user directory").color(weak));
-        return;
-    };
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .button("Reveal")
-                .on_hover_text("Show the folder it is in")
-                .clicked()
-            {
-                crate::editor::export::reveal(file.parent().unwrap_or(file));
-            }
-            let path = crate::editor::state::plain(file.display().to_string());
-            ui.add(egui::Label::new(super::figures(&path).color(weak)).truncate())
-                .on_hover_text(path);
-        });
-    });
-}
-
 /// The rows `keep` accepts, in the order they are declared.
 fn rows_of(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, keep: impl Fn(&Row) -> bool) {
     for row in ROWS.iter().filter(|row| keep(row)) {
@@ -941,7 +914,7 @@ fn rows_of(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, keep: impl
     }
 }
 
-/// Every row that matches, under its page's name and scope, then the
+/// Every row that matches, under its page's name and group, then the
 /// settings other tools own.
 fn results(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
     let filter = Filter::new(&panel.query);
@@ -969,7 +942,7 @@ fn results(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
                     continue;
                 }
                 any = true;
-                heading(ui, page.title(), page.scope_short());
+                heading(ui, page.title(), page.group());
                 rows_of(ui, cx, panel, |row| row.page == page && matches(row));
                 ui.add_space(10.0);
             }

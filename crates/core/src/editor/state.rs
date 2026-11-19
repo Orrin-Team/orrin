@@ -359,6 +359,10 @@ pub struct EditorState {
     /// open gesture stays open. Set by the panels once a frame's widgets
     /// have run.
     holding: bool,
+    /// Whether a field held the keyboard when the last frame ended. egui lets
+    /// go of it on Escape before the editor runs, so on that frame this is the
+    /// only record that the key was a field's.
+    typing: bool,
     undo_request: bool,
     redo_request: bool,
     /// Not an edit: the camera is the editor's, not the scene's, so framing
@@ -522,6 +526,7 @@ impl Default for EditorState {
             edits: Vec::new(),
             material_edits: Vec::new(),
             holding: false,
+            typing: false,
             undo_request: false,
             redo_request: false,
             frame_request: false,
@@ -811,6 +816,16 @@ impl EditorState {
     /// Keep the open gesture open through this frame, or let it close.
     pub fn hold(&mut self, holding: bool) {
         self.holding = holding;
+    }
+
+    /// Record whether a field holds the keyboard as this frame ends.
+    pub fn set_typing(&mut self, typing: bool) {
+        self.typing = typing;
+    }
+
+    /// Whether a field held the keyboard when the last frame ended.
+    pub fn was_typing(&self) -> bool {
+        self.typing
     }
 
     /// Point the camera at the selection, near enough to fill the view.

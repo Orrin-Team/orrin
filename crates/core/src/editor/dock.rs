@@ -30,6 +30,13 @@
 //! pointer, and the lone tab of a window carries that window with it. Drops
 //! onto a tool are still egui_dock's, so splitting and re-docking are
 //! unchanged.
+//!
+//! **Escape closes Settings in its window, and only when it is Settings'
+//! key.** Escape already puts a field back, dismisses a list or a menu,
+//! clears the selection and frees a running game's cursor, so the window
+//! comes after the first three and instead of the last two only while it is
+//! what was pressed or asked for last — see [`Dock::close_on_escape`]. Docked,
+//! Settings is a tool among the others, and none of them closes on a key.
 
 use egui_dock::{DockArea, DockState, NodeIndex, Style};
 use serde::{Deserialize, Serialize};
@@ -80,7 +87,8 @@ impl Tab {
     ///
     /// `Settings` is not: it is opened by command (Edit ▸ Settings…, Ctrl+,)
     /// into a window rather than toggled in place, and it is in no default
-    /// leaf to toggle it back into.
+    /// leaf to toggle it back into. It closes from the ✕ on its own tab, and
+    /// in its window on Escape.
     pub const ALL: [Self; 11] = [
         Self::Hierarchy,
         Self::Scenes,
@@ -142,6 +150,12 @@ pub struct Dock {
     /// The tab under the primary button since it went down, if it went down
     /// on one. See the module docs on dragging a tab out.
     grab: Option<Grab>,
+    /// Whether Settings is what was pressed or asked for last, rather than
+    /// the scene or another tool. egui_dock's focused leaf cannot say: a press
+    /// on the scene, which is no leaf, leaves it where it was.
+    settings_in_use: bool,
+    /// Whether Escape closes Settings, as the frame last drawn left things.
+    escape_closes: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -214,6 +228,8 @@ impl Dock {
             tools: Vec::new(),
             viewport: None,
             grab: None,
+            settings_in_use: false,
+            escape_closes: false,
         }
     }
 
@@ -235,6 +251,7 @@ impl Dock {
     /// leaf with two others is only one tab wide on screen, so a command that
     /// points at one has to be able to reveal it.
     pub fn activate(&mut self, tab: Tab) {
+        self.settings_in_use = tab == Tab::Settings;
         if let Some(location) = self.state.find_tab(&tab) {
             self.state.set_active_tab(location);
             self.state
@@ -413,6 +430,64 @@ impl Dock {
         }
     }
 
+    /// Close Settings if Escape was pressed and the last frame left the key
+    /// to it. Decided then, by [`arm_escape`](Self::arm_escape), rather than
+    /// now: egui drops the keyboard focus on Escape before any of the editor
+    /// runs, and a field that held it is the first thing Escape belongs to.
+    /// The press is consumed, so it does not clear the selection as well.
+    pub fn close_on_escape(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.escape_closes)
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            && let Some(location) = self.state.find_tab(&Tab::Settings)
+        {
+            self.state.remove_tab(location);
+        }
+    }
+
+    /// Whether Settings would be the window Escape closes: in a window, the
+    /// tab that window shows, and the last thing pressed or asked for.
+    pub fn settings_takes_escape(&self) -> bool {
+        self.settings_in_use
+            && self
+                .state
+                .find_tab(&Tab::Settings)
+                .is_some_and(|(surface, node, index)| {
+                    !surface.is_main()
+                        && matches!(
+                            &self.state[surface][node],
+                            egui_dock::Node::Leaf { active, .. } if *active == index
+                        )
+                })
+    }
+
+    /// Say at the end of a frame whether the next Escape closes Settings.
+    pub fn arm_escape(&mut self, closes: bool) {
+        self.escape_closes = closes;
+    }
+
+    /// Follow presses to whichever of Settings and everything else took the
+    /// last one. A press on a menu or an open list moves nothing: it belongs
+    /// to whatever opened it.
+    fn track_press(&mut self, ctx: &egui::Context, settings: Option<egui::LayerId>) {
+        let pressed = ctx.input(|input| {
+            let pointer = &input.pointer;
+            pointer
+                .any_pressed()
+                .then(|| pointer.interact_pos())
+                .flatten()
+        });
+        let Some(pos) = pressed else {
+            return;
+        };
+        let layer = ctx.layer_id_at(pos);
+        if layer.is_some_and(|layer| {
+            !matches!(layer.order, egui::Order::Background | egui::Order::Middle)
+        }) {
+            return;
+        }
+        self.settings_in_use = layer.is_some() && layer == settings;
+    }
+
     /// Put `tab` back where the default layout keeps it, by finding a tool it
     /// shares a leaf with there. Falling back to the first leaf would drop a
     /// reopened Console on top of the Hierarchy.
@@ -478,7 +553,8 @@ impl Dock {
                     // Tools open and close from the View menu. A ✕ on every tab
                     // and a collapse arrow on every strip was chrome repeated
                     // above each tool for something done a few times a day.
-                    .show_close_buttons(false)
+                    // So this is on for the one tab `Viewer::closeable` names.
+                    .show_close_buttons(true)
                     .show_leaf_collapse_buttons(false)
                     .show_add_buttons(false)
                     // One stray click on the far-right ✕ would close every tool
@@ -517,7 +593,13 @@ impl Dock {
                     }
                 }
             });
+        let settings = viewer
+            .buttons
+            .iter()
+            .find(|(tab, ..)| *tab == Tab::Settings)
+            .map(|(_, _, layer)| *layer);
         self.track_grab(ctx, viewer.pressed);
+        self.track_press(ctx, settings);
 
         let Self {
             state,
@@ -788,6 +870,12 @@ impl egui_dock::TabViewer for Viewer<'_> {
         if response.is_pointer_button_down_on() {
             self.pressed = Some(*tab);
         }
+    }
+
+    /// Settings alone: the View menu does not list it, so its own tab is the
+    /// only place it can be closed from.
+    fn closeable(&mut self, tab: &mut Tab) -> bool {
+        !Tab::ALL.contains(tab)
     }
 
     fn context_menu(

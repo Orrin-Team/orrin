@@ -187,7 +187,7 @@ fn the_sidebar_folds_into_a_picker_when_narrow() {
 
         assert!(shows("Fly speed"), "{width}: the page draws");
         assert!(shows("Viewport"), "{width}: the page is named");
-        assert_eq!(shows("this computer"), sidebar, "{width}: {painted:?}");
+        assert_eq!(shows("Orrin"), sidebar, "{width}: {painted:?}");
         assert_eq!(shows("Appearance"), sidebar, "{width}: {painted:?}");
 
         let mut spilling = Vec::new();
@@ -201,6 +201,62 @@ fn the_sidebar_folds_into_a_picker_when_narrow() {
         }
         assert!(spilling.is_empty(), "{width}: past the edge: {spilling:?}");
     }
+}
+
+/// The sidebar's two headings are where scope is said. A page is its title
+/// and its rows: no line under the title repeating the heading, and no path
+/// to the file it writes under the rows.
+#[test]
+fn a_page_is_its_title_and_its_rows() {
+    let (_dir, mut editor) = project("settings-plain");
+    open(&mut editor, Some(Page::Appearance));
+    assert!(!in_settings(&editor, "Orrin").is_empty(), "the heading");
+    for gone in ["this computer", "Only you, on this computer"] {
+        assert!(in_settings(&editor, gone).is_empty(), "{gone}");
+    }
+    assert!(
+        editor.painted_contains("Not saved: no user directory"),
+        "still said: it is a warning, not a place"
+    );
+
+    editor.state.settings_file = Some("/somewhere/orrin/settings.toml".into());
+    editor.frames(2);
+    assert!(!editor.painted_contains("settings.toml"));
+    assert!(!editor.painted_contains("Not saved"));
+    assert!(in_settings(&editor, "Reveal").is_empty());
+
+    open(&mut editor, Some(Page::General));
+    assert!(!editor.painted_contains("Shared with everyone"));
+    assert!(!editor.painted_contains("orrin.toml"));
+    assert_eq!(
+        in_settings(&editor, "Reveal").len(),
+        1,
+        "the Location row's own"
+    );
+}
+
+/// A search lists pages from both groups with no sidebar beside them, so each
+/// is followed by its group's name, and by nothing more.
+#[test]
+fn a_search_names_the_group_each_page_is_in() {
+    let (_dir, mut editor) = project("settings-search-groups");
+    open(&mut editor, None);
+    let beside = |editor: &Harness, page: &str, group: &str| {
+        let pages = in_settings(editor, page);
+        in_settings(editor, group)
+            .iter()
+            .any(|g| pages.iter().any(|p| (p.y - g.y).abs() < 4.0 && g.x > p.x))
+    };
+
+    editor.state.settings_panel.set_query("vsync");
+    editor.frames(2);
+    assert!(beside(&editor, "Display", "Orrin"));
+    assert!(!editor.painted_contains("this computer"));
+
+    editor.state.settings_panel.set_query("semver");
+    editor.frames(2);
+    assert!(beside(&editor, "General", "Project"));
+    assert!(!editor.painted_contains("shared"));
 }
 
 /// Search reaches both scopes by what people type, and settings that live
@@ -345,7 +401,10 @@ fn the_ui_scale_applies_when_the_pointer_lets_go() {
 fn renaming_the_project_writes_orrin_toml_and_the_top_bar() {
     let (dir, mut editor) = project("settings-rename");
     open(&mut editor, Some(Page::General));
-    assert!(editor.painted_contains("Shared with everyone who opens this project"));
+    assert!(
+        !in_settings(&editor, "Version").is_empty(),
+        "the General page"
+    );
 
     retype(&mut editor, "hello-orrin", "space-shooter");
     assert_eq!(
@@ -498,7 +557,10 @@ fn file_project_settings_needs_a_project_and_opens_its_general_page() {
     let (_dir, mut editor) = project("settings-file-menu");
     file_project_settings(&mut editor);
     assert!(editor.dock.is_open(Tab::Settings));
-    assert!(editor.painted_contains("Shared with everyone who opens this project"));
+    assert!(
+        !in_settings(&editor, "Version").is_empty(),
+        "the General page"
+    );
     assert!(!in_settings(&editor, "hello-orrin").is_empty());
 }
 
@@ -515,7 +577,10 @@ fn the_project_name_in_the_top_bar_opens_project_settings() {
         .1;
     editor.click(name.center()).frames(3);
     assert!(editor.dock.is_open(Tab::Settings));
-    assert!(editor.painted_contains("Shared with everyone who opens this project"));
+    assert!(
+        !in_settings(&editor, "Version").is_empty(),
+        "the General page"
+    );
 }
 
 fn startup_note_count(editor: &Harness) -> usize {
@@ -748,4 +813,364 @@ fn restarting_is_closed_while_the_game_plays() {
     editor.click(button).frames(1);
     editor.state.apply(&mut editor.world, &editor.registry);
     assert!(!editor.state.take_restart_request());
+}
+
+/// The strip above `tab`'s body: the tabs of the leaf that holds it.
+fn strip_of(editor: &Harness, tab: Tab) -> egui::Rect {
+    let leaf = editor.tab(tab);
+    let body = editor.tab_body(tab);
+    egui::Rect::from_min_max(leaf.min, egui::pos2(leaf.max.x, body.min.y))
+}
+
+/// The middle of the ✕ drawn in `tab`'s strip, which is two diagonal strokes
+/// and the only diagonals a strip holds.
+fn close_button(editor: &Harness, tab: Tab) -> Option<egui::Pos2> {
+    let strip = strip_of(editor, tab);
+    editor
+        .painted_rects_of(|shape| matches!(shape, egui::Shape::LineSegment { .. }))
+        .into_iter()
+        .filter(|rect| rect.width() > 2.0 && rect.height() > 2.0)
+        .filter(|rect| strip.contains(rect.center()))
+        .reduce(|a, b| a.union(b))
+        .map(|rect| rect.center())
+}
+
+/// Settings is opened by command and listed in no menu of tools, so its tab
+/// carries the one ✕ in the dock; every other tool still closes from View.
+#[test]
+fn the_settings_tab_closes_from_its_own_close_button_and_no_other_tab_has_one() {
+    let (_dir, mut editor) = project("settings-close");
+    file_project_settings(&mut editor);
+    assert!(editor.dock.is_floating(Tab::Settings));
+    let windows = editor.dock.state().iter_surfaces().count();
+
+    for tab in Tab::ALL {
+        if editor.dock.is_open(tab) {
+            assert_eq!(close_button(&editor, tab), None, "{tab:?} has no ✕");
+        }
+    }
+    let close = close_button(&editor, Tab::Settings).expect("a ✕ on the Settings tab");
+    editor.click(close).frames(2);
+
+    assert!(!editor.dock.is_open(Tab::Settings));
+    assert_eq!(
+        editor.dock.state().iter_surfaces().count(),
+        windows - 1,
+        "its window went with it"
+    );
+    assert!(!editor.painted_contains("Search settings"));
+    for tab in Tab::ALL {
+        assert!(editor.dock.is_open(tab), "{tab:?} stayed open");
+    }
+
+    // And it comes back the way it came.
+    editor.key_with(egui::Modifiers::COMMAND, egui::Key::Comma);
+    editor.frames(3);
+    assert!(editor.dock.is_floating(Tab::Settings));
+}
+
+/// Docked beside other tools it is still the one tab that closes, and closing
+/// it takes nothing else out of the leaf. The window is wide because "Dock
+/// back" lands it in the left column, whose strip at 1280 scrolls three tabs
+/// and clips the last one's ✕.
+#[test]
+fn docked_settings_still_closes_and_leaves_its_neighbours() {
+    let mut editor = Harness::new(egui::vec2(2560.0, 1000.0));
+    open(&mut editor, None);
+    editor.dock.apply(DockRequest::Dock(Tab::Settings));
+    editor.frames(2);
+    assert!(!editor.dock.is_floating(Tab::Settings));
+
+    let close = close_button(&editor, Tab::Settings).expect("a ✕ on the docked tab");
+    editor.click(close).frames(2);
+    assert!(!editor.dock.is_open(Tab::Settings));
+    for tab in Tab::ALL {
+        assert!(editor.dock.is_open(tab), "{tab:?} stayed open");
+    }
+}
+
+/// Where `tab`'s title is painted in its strip.
+fn tab_title(editor: &Harness, tab: Tab) -> egui::Pos2 {
+    let strip = strip_of(editor, tab);
+    editor
+        .painted_text_rects()
+        .into_iter()
+        .find(|(text, rect)| text == tab.title() && strip.contains(rect.center()))
+        .unwrap_or_else(|| panic!("{tab:?}'s title is in its strip"))
+        .1
+        .center()
+}
+
+/// The tab's menu says it in words, and only this tab's menu does.
+#[test]
+fn the_settings_tabs_menu_offers_close_and_another_tools_does_not() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    open(&mut editor, None);
+
+    // The Inspector's strip is clear of the window Settings opened in.
+    let inspector = tab_title(&editor, Tab::Inspector);
+    editor.right_click(inspector).frames(2);
+    assert!(text_at(&editor, "Float in a window").is_some(), "its menu");
+    assert_eq!(text_at(&editor, "Close"), None);
+    editor.key(egui::Key::Escape).frames(2);
+
+    let settings = tab_title(&editor, Tab::Settings);
+    editor.right_click(settings).frames(2);
+    let close = text_at(&editor, "Close").expect("the menu lists Close");
+    editor.click(close).frames(2);
+    assert!(!editor.dock.is_open(Tab::Settings));
+}
+
+/// A field commits on losing focus, and closing the tab is losing focus:
+/// what was typed is not dropped with the window.
+#[test]
+fn closing_settings_keeps_what_was_typed_into_a_project_field() {
+    let (dir, mut editor) = project("settings-close-typed");
+    open(&mut editor, Some(Page::General));
+    let at = *in_settings(&editor, "hello-orrin")
+        .iter()
+        .max_by(|a, b| a.x.total_cmp(&b.x))
+        .expect("the name field");
+    editor.click(at).frames(1);
+    editor.key_with(egui::Modifiers::COMMAND, egui::Key::A);
+    type_text(&mut editor, "space-shooter");
+
+    let close = close_button(&editor, Tab::Settings).expect("a ✕ on the Settings tab");
+    editor.click(close).frames(2);
+    assert!(!editor.dock.is_open(Tab::Settings));
+    assert_eq!(
+        manifest(&dir),
+        MANIFEST.replace(r#""hello-orrin""#, r#""space-shooter""#)
+    );
+    assert_eq!(editor.state.project_name.as_deref(), Some("space-shooter"));
+}
+
+/// Settings as Ctrl+, opens it, once the window has been measured.
+fn open_by_key(editor: &mut Harness) {
+    editor.frames(2);
+    editor.key_with(egui::Modifiers::COMMAND, egui::Key::Comma);
+    editor.frames(3);
+    assert!(editor.dock.is_floating(Tab::Settings));
+}
+
+fn escape(editor: &mut Harness) {
+    editor.key(egui::Key::Escape).frames(2);
+}
+
+/// A point on the scene itself, clear of the window Settings is in.
+fn on_the_scene(editor: &Harness) -> egui::Pos2 {
+    let viewport = editor.dock.viewport().expect("the scene shows");
+    let at = viewport.left_center() + egui::vec2(60.0, 0.0);
+    assert!(editor.dock.over_scene(&editor.ctx, at), "{at:?}");
+    at
+}
+
+/// Opened by command, the window is what the next Escape answers to.
+#[test]
+fn escape_closes_the_window_settings_was_opened_into() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    open_by_key(&mut editor);
+    let windows = editor.dock.state().iter_surfaces().count();
+
+    escape(&mut editor);
+    assert!(!editor.dock.is_open(Tab::Settings));
+    assert_eq!(
+        editor.dock.state().iter_surfaces().count(),
+        windows - 1,
+        "its window went with it"
+    );
+    for tab in Tab::ALL {
+        assert!(editor.dock.is_open(tab), "{tab:?} stayed open");
+    }
+}
+
+/// One Escape does one thing: the window in front goes first, and what is
+/// selected behind it waits for the next.
+#[test]
+fn escape_closes_settings_before_it_clears_the_selection() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    let cube = editor.spawn("Cube");
+    editor.state.selection.set(cube);
+    open_by_key(&mut editor);
+
+    escape(&mut editor);
+    assert!(!editor.dock.is_open(Tab::Settings));
+    assert!(!editor.state.selection.is_empty(), "the selection is kept");
+
+    escape(&mut editor);
+    assert!(editor.state.selection.is_empty());
+}
+
+/// A Settings window left open beside the scene does not take the scene's
+/// Escape: the key goes to whichever of the two was pressed last.
+#[test]
+fn after_a_press_on_the_scene_escape_is_the_scenes_until_settings_is_pressed() {
+    let mut editor = Harness::new(egui::vec2(2560.0, 1000.0));
+    let cube = editor.spawn("Cube");
+    open_by_key(&mut editor);
+
+    let scene = on_the_scene(&editor);
+    editor.click(scene).frames(2);
+    editor.state.selection.set(cube);
+    editor.frames(1);
+    escape(&mut editor);
+    assert!(editor.dock.is_open(Tab::Settings), "not the scene's Escape");
+    assert!(editor.state.selection.is_empty());
+
+    let search = in_settings(&editor, "Search settings")[0];
+    editor.click(search).frames(2);
+    editor.state.selection.set(cube);
+    editor.frames(1);
+    escape(&mut editor);
+    assert!(!editor.dock.is_open(Tab::Settings));
+    assert!(!editor.state.selection.is_empty());
+}
+
+/// Escape in a field means the field: it goes back to what it held, and only
+/// the Escape after that closes the window.
+#[test]
+fn escape_in_a_project_field_puts_it_back_and_the_next_closes_settings() {
+    let (dir, mut editor) = project("settings-escape-twice");
+    open(&mut editor, Some(Page::General));
+    let at = *in_settings(&editor, "0.1.0")
+        .last()
+        .expect("the version field");
+    editor.click(at).frames(1);
+    editor.key_with(egui::Modifiers::COMMAND, egui::Key::A);
+    type_text(&mut editor, "9.9.9");
+
+    escape(&mut editor);
+    assert!(editor.dock.is_open(Tab::Settings), "the field's Escape");
+    assert!(!in_settings(&editor, "0.1.0").is_empty());
+
+    escape(&mut editor);
+    assert!(!editor.dock.is_open(Tab::Settings));
+    assert_eq!(manifest(&dir), MANIFEST);
+}
+
+/// A search with something typed in it is being used, so Escape leaves the
+/// field and keeps the window; the empty one Settings opens with is not.
+#[test]
+fn escape_leaves_a_search_with_text_in_it_before_it_closes_settings() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    open_by_key(&mut editor);
+    type_text(&mut editor, "theme");
+    editor.frames(1);
+
+    escape(&mut editor);
+    assert!(editor.dock.is_open(Tab::Settings), "the search's Escape");
+    assert!(
+        !in_settings(&editor, "theme").is_empty(),
+        "the query is kept"
+    );
+
+    escape(&mut editor);
+    assert!(!editor.dock.is_open(Tab::Settings));
+}
+
+/// An open list is in front of the window, so it is what Escape dismisses.
+#[test]
+fn escape_dismisses_a_dropdown_before_it_closes_settings() {
+    let (dir, mut editor) = project("settings-escape-dropdown");
+    open(&mut editor, Some(Page::Scenes));
+    let start = in_settings(&editor, "None")
+        .into_iter()
+        .min_by(|a, b| a.y.total_cmp(&b.y))
+        .expect("the start scene's picker");
+    editor.click(start).frames(2);
+    assert!(!in_settings(&editor, "assets/levels/one.orrin").is_empty());
+
+    escape(&mut editor);
+    assert!(editor.dock.is_open(Tab::Settings), "the list's Escape");
+    assert!(in_settings(&editor, "assets/levels/one.orrin").is_empty());
+
+    escape(&mut editor);
+    assert!(!editor.dock.is_open(Tab::Settings));
+    assert_eq!(manifest(&dir), MANIFEST);
+}
+
+/// The same for the tab's own menu.
+#[test]
+fn escape_dismisses_the_tabs_menu_before_it_closes_settings() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    open_by_key(&mut editor);
+    let title = tab_title(&editor, Tab::Settings);
+    editor.right_click(title).frames(2);
+    assert!(text_at(&editor, "Close").is_some(), "its menu");
+
+    escape(&mut editor);
+    assert!(editor.dock.is_open(Tab::Settings), "the menu's Escape");
+    assert_eq!(text_at(&editor, "Close"), None);
+
+    escape(&mut editor);
+    assert!(!editor.dock.is_open(Tab::Settings));
+}
+
+/// Docked, Settings is a tool among the others, and none of those closes on
+/// Escape.
+#[test]
+fn escape_does_not_close_settings_docked_among_the_tools() {
+    let mut editor = Harness::new(egui::vec2(2560.0, 1000.0));
+    open_by_key(&mut editor);
+    editor.dock.apply(DockRequest::Dock(Tab::Settings));
+    editor.frames(2);
+    assert!(!editor.dock.is_floating(Tab::Settings));
+
+    let search = in_settings(&editor, "Search settings")[0];
+    editor.click(search).frames(2);
+    escape(&mut editor);
+    escape(&mut editor);
+    assert!(editor.dock.is_open(Tab::Settings));
+}
+
+/// In the editor Escape is how a running game's cursor is got back, and that
+/// press is spent on it.
+#[test]
+fn the_escape_that_frees_a_games_cursor_does_not_also_close_settings() {
+    let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+    open_by_key(&mut editor);
+    editor.state.request_play();
+    editor.state.apply(&mut editor.world, &editor.registry);
+    assert!(editor.state.playing());
+    editor
+        .world
+        .resource_mut::<crate::scene::CursorLock>()
+        .requested = true;
+    editor.frames(1);
+
+    // The app drops the request on the frame Escape arrives, before the
+    // editor draws.
+    editor
+        .world
+        .resource_mut::<crate::scene::CursorLock>()
+        .requested = false;
+    escape(&mut editor);
+    assert!(editor.dock.is_open(Tab::Settings), "the cursor's Escape");
+
+    escape(&mut editor);
+    assert!(!editor.dock.is_open(Tab::Settings));
+}
+
+/// Escape in a field is the field's, whatever is selected behind it. egui has
+/// let go of the keyboard by the time the editor sees the key, so the
+/// selection's Escape once took it, and the field committed what it was
+/// meant to drop.
+#[test]
+fn escape_in_a_project_field_writes_nothing_with_an_entity_selected() {
+    let (dir, mut editor) = project("settings-escape-selected");
+    let cube = editor.spawn("Cube");
+    editor.state.selection.set(cube);
+    open(&mut editor, Some(Page::General));
+    let at = *in_settings(&editor, "0.1.0")
+        .last()
+        .expect("the version field");
+    editor.click(at).frames(1);
+    editor.key_with(egui::Modifiers::COMMAND, egui::Key::A);
+    type_text(&mut editor, "9.9.9");
+
+    escape(&mut editor);
+    assert_eq!(manifest(&dir), MANIFEST);
+    assert!(!in_settings(&editor, "0.1.0").is_empty());
+    assert!(!editor.state.selection.is_empty(), "not the selection's");
+    assert!(editor.dock.is_open(Tab::Settings));
 }
