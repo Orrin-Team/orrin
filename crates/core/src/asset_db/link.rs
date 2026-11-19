@@ -1317,6 +1317,255 @@ mod tests {
         );
     }
 
+    /// The headless Blender's half of the test below: open the add-on's
+    /// session from the repository, stream, then edit in Object and in Edit
+    /// Mode, each step announced on stdout and released by a line on stdin.
+    /// Timers do not run in the background, so it ticks the session itself,
+    /// after evaluating the depsgraph as the window manager would.
+    const DRIVE: &str = r#"
+import bpy, bmesh, sys, time
+import numpy as np
+sys.dont_write_bytecode = True
+tools, port = sys.argv[sys.argv.index("--") + 1:][:2]
+sys.path.insert(0, tools)
+from orrin_link import extract, live
+
+session = live.Session(int(port))
+session.start()
+
+def step(name, done):
+    deadline = time.monotonic() + 20
+    while not done():
+        bpy.context.evaluated_depsgraph_get()
+        session.tick()
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"{name}: {session.status_line()}")
+        time.sleep(0.005)
+    print("@orrin", name, flush=True)
+    assert sys.stdin.readline().strip() == "go", name
+
+def sent_another():
+    before = session.client.sent
+    return lambda: session.client.sent > before
+
+mesh = extract.extract(bpy.context.evaluated_depsgraph_get())
+a, b, c = (mesh.positions[mesh.indices.reshape(-1, 3)[:, i]] for i in range(3))
+facing = np.cross(b - a, c - a)
+shading = mesh.normals[mesh.indices.reshape(-1, 3)].sum(axis=1)
+assert (np.einsum("ij,ij->i", facing, shading) > 0).all(), "a triangle faces away from its normals"
+
+step("live", lambda: session.status_line() == "Streaming models/crate.blend")
+
+cube = bpy.data.objects["Cube"]
+done = sent_another()
+cube.location.z += 2
+step("moved", done)
+
+bpy.context.view_layer.objects.active = cube
+bpy.ops.object.mode_set(mode="EDIT")
+edit = bmesh.from_edit_mesh(cube.data)
+for vertex in edit.verts:
+    if vertex.co.x > 0:
+        vertex.co.x += 3
+done = sent_another()
+bmesh.update_edit_mesh(cube.data)
+step("edited", done)
+assert cube.mode == "EDIT", "still in Edit Mode"
+assert max(v.co.x for v in cube.data.vertices) < 2, "the edit was read, not committed"
+"#;
+
+    fn near(a: Aabb, b: Aabb) -> bool {
+        (a.min - b.min).abs().max_element() < 1e-4 && (a.max - b.max).abs().max_element() < 1e-4
+    }
+
+    /// The add-on and the engine agree, through a real Blender: a file with a
+    /// modifier, a mirrored copy and a hidden object streams the triangles and
+    /// the bounds its export imports as, an edit in Object Mode and one in
+    /// Edit Mode each reach the slot, and Blender exiting gives it back.
+    #[test]
+    #[ignore = "needs Blender"]
+    fn blender_streams_what_its_export_imports_and_gives_it_back_when_it_exits() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let blender = crate::asset_db::blend::locate(std::env::var_os("ORRIN_BLENDER"), None)
+            .expect("no Blender found; set ORRIN_BLENDER");
+        let tools = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/blender");
+        let dir = Dir::new("link-blender");
+        let source = dir.path().join("models").join("crate.blend");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let made = Command::new(&blender)
+            .args([
+                "--background",
+                "--factory-startup",
+                "--python-exit-code",
+                "1",
+            ])
+            .arg("--python-expr")
+            .arg(
+                "import bpy, sys\n\
+                 cube = bpy.data.objects['Cube']\n\
+                 cube.location = (0, 0, 3)\n\
+                 cube.modifiers.new('bevel', 'BEVEL').width = 0.2\n\
+                 mirrored = cube.copy()\n\
+                 mirrored.location = (-4, 0, 3)\n\
+                 mirrored.scale = (-1, 1, 1)\n\
+                 bpy.context.collection.objects.link(mirrored)\n\
+                 bpy.ops.mesh.primitive_uv_sphere_add(location=(10, 0, 0))\n\
+                 bpy.context.active_object.hide_set(True)\n\
+                 bpy.ops.wm.save_as_mainfile(filepath=sys.argv[sys.argv.index('--') + 1])",
+            )
+            .arg("--")
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+
+        let mut db = open(&dir);
+        db.set_link(Some(0)).unwrap();
+        let port = db.link_status().unwrap().port;
+        let id = db.find("models/crate.blend").unwrap().id;
+        let (world, entity) = drawing(db, id);
+        let mut backend = HeadlessBackend::new();
+        update(&world, &mut backend);
+        assert!(world.resource::<AssetDatabase>().wait_idle(WAIT));
+        let errors = update(&world, &mut backend);
+        assert!(errors.is_empty(), "{errors:?}");
+        let slot = handle(&world, entity);
+        let triangles = |world: &World| {
+            let table = world.resource::<MeshBounds>();
+            table.geometry(slot).map_or(0, |g| g.triangles.len())
+        };
+        let disk = backend.mesh_bounds(slot).unwrap();
+        let disk_triangles = triangles(&world);
+        assert!(
+            disk_triangles > 12,
+            "the bevel is applied: {disk_triangles}"
+        );
+
+        let log = dir.path().join("blender.log");
+        let started = Instant::now();
+        let mut child = Command::new(&blender)
+            .args([
+                "--background",
+                "--factory-startup",
+                "--disable-autoexec",
+                "--python-exit-code",
+                "1",
+            ])
+            .arg(&source)
+            .arg("--python-expr")
+            .arg(DRIVE)
+            .arg("--")
+            .arg(&tools)
+            .arg(port.to_string())
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let (said, heard) = mpsc::channel::<String>();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if said.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut stdin = child.stdin.take().unwrap();
+        let printed = || std::fs::read_to_string(&log).unwrap_or_default();
+
+        // Frames run while Blender works, as the editor's would: the engine
+        // answers `live` from `update`.
+        let until = |what: &str,
+                     child: &mut std::process::Child,
+                     backend: &mut HeadlessBackend,
+                     done: &dyn Fn(&World, &HeadlessBackend) -> bool| {
+            let from = Instant::now();
+            let mut announced = false;
+            loop {
+                update(&world, backend);
+                while let Ok(line) = heard.try_recv() {
+                    announced |= line == format!("@orrin {what}");
+                }
+                if announced && done(&world, backend) {
+                    return from.elapsed();
+                }
+                let exited = child.try_wait().unwrap();
+                assert!(
+                    exited.is_none() && from.elapsed() < WAIT,
+                    "{what}: Blender {}; it printed:\n{}",
+                    exited.map_or("timed out".to_owned(), |status| format!(
+                        "exited with {status}"
+                    )),
+                    printed()
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        until("live", &mut child, &mut backend, &|world, _| {
+            let db = world.resource::<AssetDatabase>();
+            db.link_status().unwrap().live == ["models/crate.blend"]
+        });
+        let live = started.elapsed();
+        let streamed = backend.mesh_bounds(slot).unwrap();
+        assert!(
+            near(streamed, disk),
+            "{streamed:?} against the file's {disk:?}"
+        );
+        assert_eq!(triangles(&world), disk_triangles, "the file's triangles");
+        writeln!(stdin, "go").unwrap();
+
+        let moved = until("moved", &mut child, &mut backend, &|_, backend| {
+            let now = backend.mesh_bounds(slot).unwrap();
+            (now.max.y - (disk.max.y + 2.0)).abs() < 1e-4
+        });
+        writeln!(stdin, "go").unwrap();
+
+        let edited = until("edited", &mut child, &mut backend, &|_, backend| {
+            let now = backend.mesh_bounds(slot).unwrap();
+            (now.max.x - (disk.max.x + 3.0)).abs() < 1e-4
+        });
+        writeln!(stdin, "go").unwrap();
+        drop(stdin);
+
+        let status = child.wait().unwrap();
+        assert!(status.success(), "Blender failed:\n{}", printed());
+        let gone = until_back(&world, &mut backend);
+        assert!(near(backend.mesh_bounds(slot).unwrap(), disk));
+        assert_eq!(triangles(&world), disk_triangles);
+        eprintln!(
+            "{disk_triangles} triangles; from starting Blender to live {live:?}, an Object Mode \
+             move to the slot {moved:?}, an Edit Mode edit {edited:?}, and the file back \
+             {gone:?} after Blender exited"
+        );
+    }
+
+    /// Frames until no asset is live, then the import of the file.
+    fn until_back(world: &World, backend: &mut HeadlessBackend) -> Duration {
+        let from = Instant::now();
+        while !world
+            .resource::<AssetDatabase>()
+            .link_status()
+            .unwrap()
+            .live
+            .is_empty()
+        {
+            update(world, backend);
+            assert!(from.elapsed() < WAIT, "the asset stayed live");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(world.resource::<AssetDatabase>().wait_idle(WAIT));
+        update(world, backend);
+        from.elapsed()
+    }
+
     /// A grid of `side` x `side` quads in the XZ plane, `2 x side^2`
     /// triangles, with shared vertices as a smooth-shaded grid has them.
     fn grid(path: &str, side: u32, lift: f32) -> Vec<u8> {
