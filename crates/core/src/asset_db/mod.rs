@@ -86,6 +86,17 @@
 //! ignores is a warning ([`take_warnings`](AssetDatabase::take_warnings)), once
 //! per change and never per frame.
 //!
+//! # Blender files
+//!
+//! A `.blend` is a mesh asset like a `.glb` ([`blend`]): the import thread runs
+//! Blender headless to export it as a GLB and imports that through the glTF
+//! mesh path, so a save in Blender reaches the slot the way any save does.
+//! Which Blender runs is `ORRIN_BLENDER`, else the path the editor gives
+//! [`set_blender`](AssetDatabase::set_blender), else an installed one; setting
+//! it queues every `.blend` that failed again. Without one, a `.blend` already
+//! in the cache still loads and one that is not fails by name, saying where to
+//! set the path. An exported game never runs Blender.
+//!
 //! # What is not here
 //!
 //! Engine-built assets — the demo library's cube and gold, a model the demo
@@ -94,6 +105,7 @@
 //! [`AssetId::named`], so a scene can reference one the same way it
 //! references a file.
 
+pub mod blend;
 pub mod cache;
 mod handles;
 pub mod import;
@@ -233,6 +245,8 @@ pub struct AssetDatabase {
     attached_surfaces: FxHashMap<AssetId, shader::Attached>,
     /// Warnings found between frames, for [`take_warnings`](Self::take_warnings).
     warnings: Vec<String>,
+    /// How a `.blend` is exported, as last handed to the import thread.
+    blender: blend::Blender,
 }
 
 impl AssetDatabase {
@@ -295,8 +309,39 @@ impl AssetDatabase {
             shaders: FxHashMap::default(),
             attached_surfaces: FxHashMap::default(),
             warnings: Vec::new(),
+            blender: blend::Blender::default(),
         };
         (db, issues)
+    }
+
+    /// Export a `.blend` with the Blender at `path` from now on, or with an
+    /// installed one for `None`; `ORRIN_BLENDER` overrides either. Every
+    /// `.blend` that failed to import is queued again, so fixing the path needs
+    /// no restart.
+    pub fn set_blender(&mut self, path: Option<PathBuf>) {
+        let blender = blend::Blender {
+            configured: path,
+            ..self.blender.clone()
+        };
+        self.configure_blender(blender);
+    }
+
+    fn configure_blender(&mut self, blender: blend::Blender) {
+        if let Some(worker) = &self.worker {
+            worker.set_blender(blender.clone());
+        }
+        self.blender = blender;
+        let failed: Vec<AssetId> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry.status, Status::Failed(_)) && blend::is_blend(Path::new(&entry.path))
+            })
+            .map(|entry| entry.id)
+            .collect();
+        for id in failed {
+            self.queue(id);
+        }
     }
 
     /// Reimport whatever changes under the directory from now on.
@@ -1218,6 +1263,17 @@ impl AssetDatabase {
         if done.job.payload {
             self.awaiting.remove(&id);
         }
+        // Exported with a Blender replaced while it ran, which `set_blender`
+        // could not queue again because it had not failed yet.
+        if done.outcome.is_err()
+            && done
+                .blender
+                .as_ref()
+                .is_some_and(|ran| *ran != self.blender)
+        {
+            self.queue(id);
+            return;
+        }
         let resident = self.resident(id);
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
             return;
@@ -1864,7 +1920,7 @@ pub(crate) mod tests {
         }
     }
 
-    const WAIT: Duration = Duration::from_secs(20);
+    pub(crate) const WAIT: Duration = Duration::from_secs(20);
 
     pub(crate) fn open(dir: &Dir) -> AssetDatabase {
         let (db, issues) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
@@ -2114,7 +2170,7 @@ pub(crate) mod tests {
 
     /// A world that draws `id`'s mesh on one entity, as a loaded scene would
     /// leave it: holding the pending handle the registry was given.
-    fn drawing(db: AssetDatabase, id: AssetId) -> (World, orrin_ecs::Entity) {
+    pub(crate) fn drawing(db: AssetDatabase, id: AssetId) -> (World, orrin_ecs::Entity) {
         let mut world = World::new();
         world.insert_resource(MeshBounds::default());
         world.insert_resource(crate::scene::AssetPreviews::default());
@@ -2131,7 +2187,7 @@ pub(crate) mod tests {
         world.resource_mut::<AssetDatabase>().update(world, backend)
     }
 
-    fn handle(world: &World, entity: orrin_ecs::Entity) -> MeshHandle {
+    pub(crate) fn handle(world: &World, entity: orrin_ecs::Entity) -> MeshHandle {
         *world.get::<MeshHandle>(entity).unwrap()
     }
 

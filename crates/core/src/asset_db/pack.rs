@@ -22,6 +22,11 @@
 //! packing engine is the editor's build, so a shader the cache has no artifact
 //! for is compiled while packing; one that does not compile stops the pack by
 //! name, as a texture that does not import does.
+//!
+//! A `.blend` is packed as its mesh artifact, never the file, so a game never
+//! runs Blender. One the cache lacks is exported while packing, by the Blender
+//! `ORRIN_BLENDER` names or an installed one: the packing process is not the
+//! editor and is handed no configured path.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
