@@ -161,7 +161,7 @@ impl VkDriver {
                 ..Default::default()
             },
         );
-        let arena = RwLock::new(MeshArena::new(&ctx));
+        let arena = RwLock::new(MeshArena::new(&ctx, frames_in_flight));
         let uploads = super::upload::Uploads::new(&ctx);
         Self {
             ctx,
@@ -191,8 +191,29 @@ impl VkDriver {
             .upload(&self.ctx, vertices, indices)
     }
 
+    pub fn replace_mesh(
+        &self,
+        old: MeshSpan,
+        old_vertices: u32,
+        vertices: &[Vertex],
+        indices: &[u32],
+    ) -> (MeshSpan, Aabb) {
+        let mut arena = self
+            .arena
+            .write()
+            .expect("a pass panicked while using the device");
+        arena.retire(old, old_vertices, self.frame.load(Ordering::Relaxed));
+        arena.upload(&self.ctx, vertices, indices)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn geometry_ends(&self) -> (u32, u32) {
+        self.arena.read().unwrap().ends()
+    }
+
     pub fn begin_frame(&self, frame: u64) {
         self.frame.store(frame, Ordering::Relaxed);
+        self.arena.write().unwrap().collect(frame);
         self.views.lock().unwrap().collect(frame);
         self.buffers.lock().unwrap().collect(frame);
         self.samplers.lock().unwrap().collect(frame);

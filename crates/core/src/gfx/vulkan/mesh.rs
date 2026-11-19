@@ -13,15 +13,24 @@
 //! `vertexOffset` — fields `VkDrawIndexedIndirectCommand` already carries, which
 //! is what lets one multi-draw cover every batch a view kept.
 //!
-//! # Growth
+//! # Growth and reuse
 //!
-//! Meshes are appended and never freed — `load_mesh` pushes and nothing pops —
-//! so placement is a bump allocator and a mesh's span is stable for the life of
-//! the renderer. When a buffer runs out, a larger one is allocated and the old
-//! contents are copied into its front, which leaves every span already handed
-//! out still correct. The old buffer stays alive as long as a recorded frame
-//! holds it: [`Recorder::bind_vertex_buffers`](super::record::Recorder) keeps
-//! what it binds.
+//! A loaded mesh's span is stable until the mesh is replaced, and then it is
+//! retired: once the frames that may still draw from it have retired, later
+//! uploads land in its space. Where a mesh goes and when retired space is free
+//! again are `rhi::geometry`'s arithmetic, shared with Metal; an upload takes
+//! free space that fits and moves the end only when none does.
+//!
+//! When a buffer runs out, a larger one is allocated and the old contents are
+//! copied into its front, which leaves every span already handed out still
+//! correct. The old buffer stays alive as long as a recorded frame holds it:
+//! [`Recorder::bind_vertex_buffers`](super::record::Recorder) keeps what it
+//! binds. The copy is not waited for, which reuse makes a hazard on one path
+//! only. A staged upload is a copy too, ordered behind the growth by the
+//! barrier every arena copy ends with. A wide-BAR upload is a host write the
+//! queue knows nothing of, so one placed below the end — space the copy may
+//! still be writing — waits for the copies in flight first; one placed at the
+//! end needs nothing, since the end never comes back down.
 //!
 //! # Why the two upload paths survive
 //!
@@ -70,7 +79,7 @@ pub(crate) struct MeshArena {
 }
 
 impl MeshArena {
-    pub(super) fn new(ctx: &VkContext) -> Self {
+    pub(super) fn new(ctx: &VkContext, frames_in_flight: u64) -> Self {
         let host_visible = ctx.profile.wide_bar();
         Self {
             positions: allocate(ctx, POSITION_USAGE, INITIAL_VERTICES, host_visible),
@@ -81,7 +90,7 @@ impl MeshArena {
                 host_visible,
             ),
             indices: allocate(ctx, INDEX_USAGE, INITIAL_INDICES, host_visible),
-            placement: Placement::default(),
+            placement: Placement::new(frames_in_flight),
             host_visible,
             pending: Vec::new(),
         }
@@ -132,13 +141,20 @@ impl MeshArena {
         // two GPU streams are halves of it.
         let (positions, surfaces): (Vec<_>, Vec<_>) = vertices.iter().map(Vertex::split).unzip();
 
-        self.reserve(ctx, positions.len() as u64, indices.len() as u64);
+        let held = self.placement.ends();
         let span = self
             .placement
             .place(positions.len() as u32, indices.len() as u32);
+        self.reserve(ctx, held, self.placement.ends());
 
         let vertex_offset = span.vertex_offset as u64;
         if self.host_visible {
+            let reused = (!positions.is_empty() && (span.vertex_offset as u32) < held.0)
+                || (!indices.is_empty() && span.first_index < held.1);
+            // Below the end a growth copy still on the queue may be writing.
+            if reused {
+                self.settle();
+            }
             write_directly(&self.positions, vertex_offset, &positions);
             write_directly(&self.surfaces, vertex_offset, &surfaces);
             write_directly(&self.indices, u64::from(span.first_index), indices);
@@ -165,14 +181,29 @@ impl MeshArena {
         (span, bounds)
     }
 
-    /// Make room for one more mesh, growing whichever of the three buffers is
-    /// short and copying what is already in it across.
-    fn reserve(&mut self, ctx: &VkContext, vertices: u64, indices: u64) {
-        let held_vertices = u64::from(self.placement.vertices);
-        let held_indices = u64::from(self.placement.indices);
-        let positions = grown(self.positions.len(), held_vertices + vertices);
-        let surfaces = grown(self.surfaces.len(), held_vertices + vertices);
-        let index_capacity = grown(self.indices.len(), held_indices + indices);
+    /// Retire a replaced mesh's span as of `frame`. See [`Placement::retire`].
+    pub(super) fn retire(&mut self, span: MeshSpan, vertices: u32, frame: u64) {
+        self.placement.retire(span, vertices, frame);
+    }
+
+    /// Return to the arena every retired span whose frames are done.
+    pub(super) fn collect(&mut self, frame: u64) {
+        self.placement.collect(frame);
+    }
+
+    #[cfg(test)]
+    pub(super) fn ends(&self) -> (u32, u32) {
+        self.placement.ends()
+    }
+
+    /// Grow whichever of the three buffers is short of `needed` — vertices,
+    /// indices — copying the `held` they already hold across.
+    fn reserve(&mut self, ctx: &VkContext, held: (u32, u32), needed: (u32, u32)) {
+        let held_vertices = u64::from(held.0);
+        let held_indices = u64::from(held.1);
+        let positions = grown(self.positions.len(), u64::from(needed.0));
+        let surfaces = grown(self.surfaces.len(), u64::from(needed.0));
+        let index_capacity = grown(self.indices.len(), u64::from(needed.1));
         if positions.is_none() && surfaces.is_none() && index_capacity.is_none() {
             return;
         }
@@ -181,7 +212,7 @@ impl MeshArena {
         // rare, but it happens while a scene is loading, a few times over. The
         // copies fill `0..held` of the new buffers while the host goes on
         // writing the spans placed past `held`, so the two never touch the same
-        // bytes.
+        // bytes; a span placed below it waits for them first (`upload`).
         let mut builder = Recorder::new(ctx);
         if let Some(capacity) = positions {
             self.positions = regrow(
@@ -233,6 +264,13 @@ impl MeshArena {
             &[],
             &[],
         ));
+    }
+
+    /// Block until every arena copy on the queue has finished.
+    fn settle(&mut self) {
+        for copy in self.pending.drain(..) {
+            copy.retire();
+        }
     }
 }
 
@@ -381,4 +419,135 @@ fn allocate<T: BufferContents>(
         len,
     )
     .expect("failed to allocate the mesh arena")
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::Vec3;
+    use orrin_ecs::World;
+
+    use super::super::VulkanRenderer;
+    use crate::capture::{self, CaptureSettings};
+    use crate::gfx::{Material, RenderBackend, Vertex};
+    use crate::scene::{Camera, CpuMesh, LocalTransform, MeshHandle, Transform};
+
+    /// A unit square facing the camera, centred `x` along from the middle of
+    /// the frame. Every one is the same size, which is the case a streamed
+    /// mesh is in between edits.
+    fn square(x: f32) -> CpuMesh {
+        let corner = |dx: f32, dy: f32| Vertex {
+            position: [x + dx, dy, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            color: [1.0; 3],
+            uv: [dx + 0.5, dy + 0.5],
+            tangent: [1.0, 0.0, 0.0, 1.0],
+        };
+        CpuMesh {
+            vertices: vec![
+                corner(-0.5, -0.5),
+                corner(0.5, -0.5),
+                corner(0.5, 0.5),
+                corner(-0.5, 0.5),
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+        }
+    }
+
+    fn centre_is_red(frame: &(Vec<u8>, [u32; 2])) -> (bool, [u8; 3]) {
+        let (pixels, [width, height]) = frame;
+        let at = ((height / 2 * width + width / 2) * 4) as usize;
+        let [r, g, b] = [pixels[at], pixels[at + 1], pixels[at + 2]];
+        (
+            r > g.saturating_add(40) && r > b.saturating_add(40),
+            [r, g, b],
+        )
+    }
+
+    /// A square replaced over and over, alternately across the middle of the
+    /// frame and beside it, through the real renderer: the arena stops growing
+    /// within a few replaces, later replaces land in space earlier ones held,
+    /// and what each frame draws and what `mesh_bounds` says are the new
+    /// square's — so nothing draws through a span the replace gave back.
+    fn a_replaced_mesh_reuses_its_arena_space(mut renderer: VulkanRenderer) {
+        crate::logging::init(crate::logging::LogConfig::for_this_build());
+        let settings = CaptureSettings {
+            extent: [64, 64],
+            frames: 2,
+            taa: false,
+            camera: Some(Camera {
+                position: Vec3::new(0.0, 0.0, 3.0),
+                target: Vec3::ZERO,
+                ..Camera::default()
+            }),
+            ..CaptureSettings::default()
+        };
+        let mut world = World::new();
+        capture::prepare(&mut world, &mut renderer, &settings);
+        let drawn: Vec<_> = world
+            .entities()
+            .filter(|&entity| world.has::<MeshHandle>(entity))
+            .collect();
+        for entity in drawn {
+            world.despawn(entity);
+        }
+
+        let red = renderer.load_material(&Material {
+            base_color: Vec3::new(1.0, 0.0, 0.0),
+            metallic: 0.0,
+            roughness: 1.0,
+            ..Material::default()
+        });
+        let mesh = renderer.load_mesh(&square(0.0));
+        let entity = world.spawn();
+        world.insert(entity, LocalTransform::new(Transform::default()));
+        world.insert(entity, mesh);
+        world.insert(entity, red);
+        let (covered, pixel) =
+            centre_is_red(&capture::render(&mut world, &mut renderer, &settings));
+        assert!(covered, "the square is drawn across the middle: {pixel:?}");
+
+        let loaded = renderer.device.geometry_ends();
+        let mut ends = Vec::new();
+        let mut spans = Vec::new();
+        for replace in 0..24 {
+            let x = if replace % 2 == 0 { 2.0 } else { 0.0 };
+            let next = square(x);
+            renderer.replace_mesh(mesh, &next);
+            let (covered, pixel) =
+                centre_is_red(&capture::render(&mut world, &mut renderer, &settings));
+            assert_eq!(
+                covered,
+                x == 0.0,
+                "replace {replace} draws the square at x = {x}: {pixel:?}"
+            );
+            assert_eq!(renderer.mesh_bounds(mesh), Some(next.bounds()));
+            ends.push(renderer.device.geometry_ends());
+            spans.push(renderer.meshes[mesh.0 as usize].span);
+        }
+
+        println!("arena ends with the square loaded: {loaded:?}, after each replace: {ends:?}");
+        assert!(
+            ends[8..].iter().all(|&end| end == ends[8]),
+            "the arena kept growing: {ends:?}"
+        );
+        assert!(
+            spans[8..].iter().all(|span| spans[..8].contains(span)),
+            "later replaces land where earlier ones did: {spans:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_replaced_mesh_reuses_its_arena_space_on_vulkan() {
+        a_replaced_mesh_reuses_its_arena_space(capture::offscreen_renderer([64, 64]));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "needs a Metal device"]
+    fn a_replaced_mesh_reuses_its_arena_space_on_metal() {
+        a_replaced_mesh_reuses_its_arena_space(
+            VulkanRenderer::offscreen_metal([64, 64]).expect("a Metal device"),
+        );
+    }
 }

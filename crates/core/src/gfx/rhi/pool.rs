@@ -7,6 +7,13 @@
 //! that rule is written down, in place of each pass holding its resources alive
 //! by hand.
 
+/// Whether a resource let go of during frame `removed` is out of every frame's
+/// reach once frame `frame` begins. Beginning a frame waits for the one
+/// `frames_in_flight` before it, so by then each frame up to `removed` is done.
+pub(crate) fn has_retired(removed: u64, frames_in_flight: u64, frame: u64) -> bool {
+    removed + frames_in_flight <= frame
+}
+
 pub(crate) struct Pool<T> {
     slots: Vec<Option<T>>,
     pending: Vec<bool>,
@@ -68,7 +75,7 @@ impl<T> Pool<T> {
         let depth = self.frames_in_flight;
         let (slots, free) = (&mut self.slots, &mut self.free);
         self.retiring.retain(|&(index, removed)| {
-            let retired = removed + depth <= frame;
+            let retired = has_retired(removed, depth, frame);
             if retired {
                 slots[index as usize] = None;
                 free.push(index);

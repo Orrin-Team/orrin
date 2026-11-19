@@ -1408,23 +1408,33 @@ impl RenderBackend for VulkanRenderer {
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle {
         let (span, bounds) = self.device.upload_mesh(&mesh.vertices, &mesh.indices);
         let handle = MeshHandle(self.meshes.len() as u32);
-        self.meshes.push(GpuMesh { span, bounds });
+        self.meshes.push(GpuMesh {
+            span,
+            bounds,
+            vertices: mesh.vertices.len() as u32,
+        });
         handle
     }
 
-    /// The new geometry is appended to the arena like any upload and the slot
-    /// pointed at it. The old span is left where it is rather than reused:
-    /// frames still in flight may be drawing from it, and the arena has no
-    /// free list to return it to. A reimport therefore costs its size in arena
-    /// space until the session ends, which is an editor's cost and not a
-    /// game's — an exported game never reimports.
+    /// The new geometry is placed in the arena like any upload and the slot
+    /// pointed at it. The old span is retired rather than freed: frames still
+    /// in flight may be drawing from it, so its space takes later uploads only
+    /// once they have retired. A mesh replaced many times a second therefore
+    /// holds a few copies' worth of the arena rather than growing it by its
+    /// size on every replace.
     fn replace_mesh(&mut self, handle: MeshHandle, mesh: &CpuMesh) {
         let Some(slot) = self.meshes.get_mut(handle.0 as usize) else {
             tracing::warn!("mesh {} was never loaded; reimport ignored", handle.0);
             return;
         };
-        let (span, bounds) = self.device.upload_mesh(&mesh.vertices, &mesh.indices);
-        *slot = GpuMesh { span, bounds };
+        let (span, bounds) =
+            self.device
+                .replace_mesh(slot.span, slot.vertices, &mesh.vertices, &mesh.indices);
+        *slot = GpuMesh {
+            span,
+            bounds,
+            vertices: mesh.vertices.len() as u32,
+        };
     }
 
     fn mesh_bounds(&self, mesh: MeshHandle) -> Option<Aabb> {
