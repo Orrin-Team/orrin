@@ -686,7 +686,7 @@ fn derive_normals(positions: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
 /// a generated basis can be wrong in a way that looks like a lighting bug: a
 /// mirrored UV island has the opposite handedness, and a normal map read through
 /// the wrong one lights from the wrong side along one axis only.
-fn derive_tangents(
+pub(crate) fn derive_tangents(
     positions: &[Vec3],
     normals: &[Vec3],
     uvs: &[Vec2],

@@ -97,6 +97,15 @@
 //! in the cache still loads and one that is not fails by name, saying where to
 //! set the path. An exported game never runs Blender.
 //!
+//! # The live link
+//!
+//! A Blender add-on can stream the `.blend` it has open into the slot that
+//! asset already has, without a save, over a loopback socket the editor
+//! listens on ([`set_link`](AssetDatabase::set_link)). [`link`] is the design
+//! and the wire protocol. While an asset is live its slot is the stream's, so a
+//! disk import that finishes meanwhile updates the entry and leaves the slot
+//! alone; when the link lets go, the slot goes back to what is on disk.
+//!
 //! # What is not here
 //!
 //! Engine-built assets — the demo library's cube and gold, a model the demo
@@ -110,6 +119,7 @@ pub mod cache;
 mod handles;
 pub mod import;
 mod ktx;
+pub mod link;
 pub mod material;
 pub mod pack;
 pub mod shader;
@@ -126,6 +136,7 @@ use orrin_ecs::{FxBuildHasher, FxHashMap, World};
 use orrin_registry::AssetId;
 
 pub use cache::CacheKey;
+pub use link::LinkStatus;
 pub use sidecar::{AssetKind, MeshSettings, Settings, TextureSettings, Tint, Usage};
 pub use texture::{Target, TexelFormat};
 
@@ -247,6 +258,11 @@ pub struct AssetDatabase {
     warnings: Vec<String>,
     /// How a `.blend` is exported, as last handed to the import thread.
     blender: blend::Blender,
+    /// The live link, while it is listening.
+    link: Option<link::Link>,
+    /// What happened that is worth a console line and is no fault, for
+    /// [`take_notes`](Self::take_notes).
+    notes: Vec<String>,
 }
 
 impl AssetDatabase {
@@ -310,6 +326,8 @@ impl AssetDatabase {
             attached_surfaces: FxHashMap::default(),
             warnings: Vec::new(),
             blender: blend::Blender::default(),
+            link: None,
+            notes: Vec::new(),
         };
         (db, issues)
     }
@@ -988,9 +1006,15 @@ impl AssetDatabase {
     }
 
     /// Warnings found since the last call: values a material's shader
-    /// ignores, each reported once per change.
+    /// ignores, and what the live link refused, each reported once per change.
     pub fn take_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.warnings)
+    }
+
+    /// What happened since the last call that is worth a line and is no
+    /// fault: the live link's connections and the assets going live and back.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
     }
 
     /// Everything [`service`] does, returning the errors it would log.
@@ -1012,6 +1036,7 @@ impl AssetDatabase {
         }
 
         self.bind_meshes(world, backend, &mut errors);
+        self.serve_link(world, backend);
         self.refresh_materials(world, backend, &mut errors);
         self.bind_materials(world, backend, &mut errors);
         errors
@@ -1134,6 +1159,7 @@ impl AssetDatabase {
         for id in queue {
             self.queue(id);
         }
+        self.let_go_moved();
         issues
     }
 
@@ -1275,6 +1301,7 @@ impl AssetDatabase {
             return;
         }
         let resident = self.resident(id);
+        let live = self.is_live(id);
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
             return;
         };
@@ -1311,6 +1338,9 @@ impl AssetDatabase {
                 entry.status = Status::Failed(message.clone());
                 let kind = entry.kind;
                 match resident {
+                    Some(_) if live => errors.push(format!(
+                        "{message}. Still drawing what Blender is streaming"
+                    )),
                     // A broken save of an asset already on screen keeps the
                     // last version that imported: the error says what to fix,
                     // and the scene stays usable while it is fixed.
@@ -1344,7 +1374,7 @@ impl AssetDatabase {
                 let Some(slot) = self.meshes.handle(id).filter(|h| h & PENDING == 0) else {
                     return;
                 };
-                if self.meshes.resident(id).and_then(|r| r.key) == Some(key) {
+                if self.meshes.resident(id).and_then(|r| r.key) == Some(key) || self.is_live(id) {
                     return;
                 }
                 let handle = MeshHandle(slot);
@@ -1872,6 +1902,9 @@ pub fn service(world: &World, backend: &mut impl RenderBackend) {
     }
     for warning in db.take_warnings() {
         tracing::warn!("{warning}");
+    }
+    for note in db.take_notes() {
+        tracing::info!("{note}");
     }
 }
 
