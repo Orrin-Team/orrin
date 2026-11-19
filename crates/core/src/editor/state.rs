@@ -312,6 +312,10 @@ pub struct EditorState {
     pub backend: crate::gfx::BackendChoice,
     /// The Settings tab's page, search and unsaved fields.
     pub settings_panel: super::panels::settings::SettingsPanel,
+    /// Why the live link is not listening, as `SettingsStore` last heard it.
+    pub link_error: Option<String>,
+    /// Settings ▸ Blender's Install add-on, running or as it last ended.
+    pub addon: super::blender::Install,
     /// How the viewport draws the scene: shaded, or as its edges. `None` is
     /// shaded, which is what the renderer is handed too.
     pub wireframe: Option<crate::gfx::vulkan::wireframe::Wireframe>,
@@ -510,6 +514,8 @@ impl Default for EditorState {
             started_with: Default::default(),
             backend: crate::gfx::BackendChoice::DEFAULT,
             settings_panel: Default::default(),
+            link_error: None,
+            addon: Default::default(),
             wireframe: None,
             material_previews: Default::default(),
             gizmo_drag: None,

@@ -271,7 +271,7 @@ pub fn export(rel: &str, bytes: &[u8], blender: &Blender, cache: &Path) -> Resul
 }
 
 /// The last lines Blender printed, for a message.
-fn printed(log: &Path) -> String {
+pub(crate) fn printed(log: &Path) -> String {
     let text = std::fs::read(log).unwrap_or_default();
     let text = String::from_utf8_lossy(&text);
     let lines: Vec<&str> = text

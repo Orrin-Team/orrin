@@ -630,7 +630,7 @@ impl ApplicationHandler for App {
                 .unwrap(),
         );
         let size = window.inner_size();
-        let settings = self
+        let mut settings = self
             .settings
             .take()
             .unwrap_or_else(|| crate::editor::settings::SettingsStore::open(None).0);
@@ -653,6 +653,8 @@ impl ApplicationHandler for App {
             crate::scene::entities::install_library(&mut self.world, &mut renderer);
             self.open_game();
         } else {
+            // Blender's path and the live link, and every change to them.
+            settings.drive_blender(&self.world);
             self.scene.begin(&mut self.world, &mut renderer);
         }
         if let Some(spec) = self.stress {

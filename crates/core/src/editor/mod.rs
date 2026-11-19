@@ -4,6 +4,7 @@
 //! `gfx/vulkan/overlay.rs`).
 
 mod autosave;
+mod blender;
 mod cadence;
 pub(crate) mod catalog;
 mod dock;
@@ -85,7 +86,10 @@ fn start_export(state: &mut EditorState, platform: orrin_project::export::Platfo
         beside.as_deref(),
         std::env::var_os("PATH"),
     )
-    .and_then(|cli| state.export.start(&cli, &root, &name, platform));
+    .and_then(|cli| {
+        let blender = state.settings.blender.path.as_deref();
+        state.export.start(&cli, &root, &name, platform, blender)
+    });
     match started {
         Ok(()) => tracing::info!("export: {name} for {}", export::label(platform)),
         Err(error) => tracing::error!("export: {error}"),
@@ -242,6 +246,11 @@ impl Editor {
             } else {
                 tracing::info!("{line}");
             }
+        }
+        match state.addon.service() {
+            Some(Ok(done)) => tracing::info!("{done}"),
+            Some(Err(failed)) => tracing::error!("{failed}"),
+            None => {}
         }
 
         // Kept once the pointer lets go, rather than on every frame a step is

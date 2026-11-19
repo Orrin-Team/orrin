@@ -26,7 +26,8 @@
 //! A `.blend` is packed as its mesh artifact, never the file, so a game never
 //! runs Blender. One the cache lacks is exported while packing, by the Blender
 //! `ORRIN_BLENDER` names or an installed one: the packing process is not the
-//! editor and is handed no configured path.
+//! editor and reads no settings, so File ▸ Export hands it the path set in
+//! Settings ▸ Blender as `ORRIN_BLENDER`, unless that is already set.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

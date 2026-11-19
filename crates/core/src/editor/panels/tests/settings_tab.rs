@@ -296,6 +296,59 @@ fn search_finds_settings_by_what_people_type_and_says_where_others_live() {
     assert!(!editor.painted_contains("Present mode"));
 }
 
+/// The Blender page's rows are found by what people type for them, under
+/// their page and its group, like every other row.
+#[test]
+fn search_finds_the_blender_rows() {
+    let (_dir, mut editor) = project("settings-search-blender");
+    open(&mut editor, None);
+    for (query, row) in [
+        ("executable", "Blender"),
+        ("meshsync", "Live link"),
+        ("localhost", "Port"),
+        ("extension", "Add-on"),
+    ] {
+        editor.state.settings_panel.set_query(query);
+        editor.frames(2);
+        let heading = in_settings(&editor, "Blender");
+        let found = in_settings(&editor, row);
+        assert!(
+            heading
+                .iter()
+                .any(|h| found.iter().any(|r| r.y > h.y + 4.0)),
+            "{query}: {row} under the Blender page: {heading:?} {found:?}"
+        );
+    }
+    editor.state.settings_panel.set_query("install add-on");
+    editor.frames(2);
+    assert!(!in_settings(&editor, "Install add-on").is_empty());
+}
+
+/// `ORRIN_BLENDER` decides which Blender runs, so the path row says so; the
+/// link row says what the link is doing, which with it off is nothing.
+#[test]
+fn the_blender_page_says_what_overrides_its_path_and_what_the_link_is_doing() {
+    let (_dir, mut editor) = project("settings-blender-page");
+    editor.state.environment = Environment::from_vars(|name| {
+        (name == "ORRIN_BLENDER").then(|| "/opt/blender/blender".to_owned())
+    });
+    open(&mut editor, Some(Page::Blender));
+    assert!(editor.painted_contains("Set by ORRIN_BLENDER for this run"));
+    assert!(
+        !in_settings(&editor, "/opt/blender/blender").is_empty(),
+        "its value shown"
+    );
+
+    editor.state.settings.blender.live_link = false;
+    editor.frames(2);
+    assert!(!in_settings(&editor, "Off").is_empty());
+
+    editor.state.settings.blender.live_link = true;
+    editor.state.link_error = Some("the live link could not listen on 127.0.0.1:47103".into());
+    editor.frames(2);
+    assert!(editor.painted_contains("The live link could not listen on 127.0.0.1:47103"));
+}
+
 fn reset_glyphs(editor: &Harness) -> Vec<egui::Rect> {
     let tab = editor.tab(Tab::Settings);
     let reset = crate::editor::icons::rotate_ccw().glyph();
