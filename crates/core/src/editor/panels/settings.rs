@@ -1365,24 +1365,30 @@ fn connections(ui: &mut egui::Ui, state: &mut EditorState) {
     let weak = ui.visuals().weak_text_color();
     let mut close = None;
     for peer in &state.remote_peers {
+        let last = peer
+            .last
+            .as_deref()
+            .map_or_else(String::new, |method| format!(" · last {method}"));
+        let requests = match peer.requests {
+            1 => "1 request".to_owned(),
+            n => format!("{n} requests"),
+        };
+        let line = format!("{} · {requests}{last}", for_how_long(peer.since.elapsed()));
+        let client = peer.client.as_deref().unwrap_or("unknown client");
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(peer.client.as_deref().unwrap_or("unknown client")).strong(),
-            );
-            let last = peer
-                .last
-                .as_deref()
-                .map_or_else(String::new, |method| format!(" · last {method}"));
-            let requests = match peer.requests {
-                1 => "1 request".to_owned(),
-                n => format!("{n} requests"),
-            };
-            let line = format!("{} · {requests}{last}", for_how_long(peer.since.elapsed()));
-            ui.add(egui::Label::new(egui::RichText::new(line).small().color(weak)).truncate());
-            if ui.small_button("Disconnect").clicked() {
-                close = Some(peer.id);
-            }
+            // The button first, from the right, so it is whole at any width
+            // and the text gives way to it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Disconnect").clicked() {
+                    close = Some(peer.id);
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(client).strong()).truncate());
+                    let detail = egui::RichText::new(&line).small().color(weak);
+                    ui.add(egui::Label::new(detail).truncate());
+                });
+            });
         });
     }
     if close.is_some() {
