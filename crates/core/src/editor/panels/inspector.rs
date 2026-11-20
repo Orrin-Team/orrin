@@ -848,7 +848,7 @@ fn mesh_section(
     );
     // Posted as the asset's id, the form a scene file holds them in.
     let assets = world.resource::<Assets>();
-    if let Some(id) = picked_mesh.and_then(|handle| assets.mesh_id(handle)) {
+    if let Some(id) = picked_mesh {
         assign_mesh(state, entity, id);
     }
     if let Some(id) = picked_material.and_then(|handle| assets.material_id(handle)) {
@@ -986,45 +986,79 @@ fn picker<H: Copy + PartialEq>(
     chosen.filter(|&handle| Some(handle) != current)
 }
 
+/// A row of the Mesh picker. A project mesh is listed by its id rather than a
+/// handle: resolving one issues a slot and can pull its import forward, which
+/// listing it must not do.
+#[derive(Clone, Copy, PartialEq)]
+enum MeshChoice {
+    Engine(MeshHandle),
+    Asset(AssetId),
+}
+
+/// The engine's meshes first, by name, then the project's, by path: the
+/// built-in shapes stay where they have always been, and a path keeps a
+/// folder's meshes together.
 fn mesh_picker(
     ui: &mut egui::Ui,
     world: &World,
     entity: Entity,
     previews: &mut Previews,
     dropped: &mut Option<AssetId>,
-) -> Option<MeshHandle> {
-    let mut choices: Vec<Choice<MeshHandle>> = world
-        .resource::<Assets>()
+) -> Option<AssetId> {
+    let assets = world.resource::<Assets>();
+    let db = world.get_resource::<AssetDatabase>();
+    let mut choices: Vec<Choice<MeshChoice>> = assets
         .meshes()
         .map(|(name, handle)| Choice {
             name: name.to_owned(),
-            handle,
+            handle: MeshChoice::Engine(handle),
         })
         .collect();
     choices.sort_by(|a, b| a.name.cmp(&b.name));
-    let current = world.get::<MeshHandle>(entity).map(|h| *h);
-    let texture = current.and_then(|handle| previews.mesh(ui.ctx(), world, handle));
-    let subtitle = current
+    let mut project: Vec<Choice<MeshChoice>> = db
+        .iter()
+        .flat_map(|db| db.iter())
+        .filter(|entry| entry.kind == crate::asset_db::AssetKind::Mesh)
+        .map(|entry| Choice {
+            name: entry.path.clone(),
+            handle: MeshChoice::Asset(entry.id),
+        })
+        .collect();
+    project.sort_by(|a, b| a.name.cmp(&b.name));
+    choices.extend(project);
+
+    let handle = world.get::<MeshHandle>(entity).map(|h| *h);
+    let imported = handle.and_then(|handle| db.as_ref()?.mesh_id(handle));
+    let current = handle.map(|handle| match imported {
+        Some(id) => MeshChoice::Asset(id),
+        None => MeshChoice::Engine(handle),
+    });
+    let texture = handle.and_then(|handle| previews.mesh(ui.ctx(), world, handle));
+    let subtitle = handle
         .and_then(|handle| previews.mesh_summary(world, handle))
         .unwrap_or_default();
-    let imported = current.and_then(|handle| {
-        let id = world.get_resource::<AssetDatabase>()?.mesh_id(handle);
-        database_name(world, id)
-    });
+    let fallback = database_name(world, imported);
 
-    picker(
+    let chosen = picker(
         ui,
         "mesh",
         choices,
         current,
-        imported,
+        fallback,
         |ui, name| {
             let slot = widgets::asset_slot(ui, texture.as_ref(), icons::box_(), name, &subtitle);
             take_drop(&slot, dropped);
-            slot.on_hover_text("Click to pick an engine mesh, or drop a mesh asset here")
+            slot.on_hover_text("Click to pick a mesh, or drop a mesh asset here")
         },
-        &mut |ctx, handle| previews.mesh(ctx, world, handle),
-    )
+        &mut |ctx, choice| match choice {
+            MeshChoice::Engine(handle) => previews.mesh(ctx, world, handle),
+            MeshChoice::Asset(id) => previews.asset(ctx, db.as_ref()?, id),
+        },
+    )?;
+    match chosen {
+        MeshChoice::Engine(handle) => assets.mesh_id(handle),
+        MeshChoice::Asset(id) => Some(id),
+    }
 }
 
 fn material_picker(

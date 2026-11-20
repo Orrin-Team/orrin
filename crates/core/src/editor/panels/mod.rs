@@ -2892,6 +2892,56 @@ mod tests {
         assert_eq!(logged, ["`stone.png` is a texture, not a prefab"]);
     }
 
+    /// The Mesh slot's list offers the project's meshes beside the engine's,
+    /// and picking one is the same single edit a drop on the slot makes.
+    #[test]
+    fn the_mesh_picker_offers_the_projects_meshes_and_picking_one_is_one_undoable_edit() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (_dir, [rock, _]) = mesh_project(&mut editor, "panel-mesh-picker");
+        editor
+            .world
+            .resource_mut::<crate::scene::Assets>()
+            .insert_mesh("cube", crate::scene::MeshHandle(0));
+        let crate_ = editor.spawn("Crate");
+        editor.world.insert(crate_, crate::scene::MeshHandle(0));
+        editor.world.insert(crate_, crate::scene::MaterialHandle(0));
+        editor.state.selection.set(crate_);
+        editor.frames(2);
+
+        editor.click(row_of(&editor, "cube"));
+        editor.frames(1);
+        assert!(editor.painted_contains("rock.glb"));
+        assert!(!editor.painted_contains("stone.png"));
+
+        editor.click(row_of(&editor, "rock.glb"));
+        editor.state.apply(&mut editor.world, &editor.registry);
+        let handle = *editor
+            .world
+            .get::<crate::scene::MeshHandle>(crate_)
+            .unwrap();
+        assert_eq!(
+            editor
+                .world
+                .resource::<crate::asset_db::AssetDatabase>()
+                .mesh_id(handle),
+            Some(rock)
+        );
+        assert_eq!(editor.state.history.undo_label(), Some("Edit Mesh"));
+        editor.frames(1);
+        assert!(editor.painted_contains("rock.glb"), "the slot names it");
+        assert!(!editor.painted_contains("cube"));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert_eq!(
+            *editor
+                .world
+                .get::<crate::scene::MeshHandle>(crate_)
+                .unwrap(),
+            crate::scene::MeshHandle(0)
+        );
+    }
+
     #[test]
     fn a_mesh_dropped_on_a_row_is_placed_under_it() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
