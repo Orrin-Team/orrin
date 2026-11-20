@@ -3219,6 +3219,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrin-remote"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "orrin-script"
 version = "0.1.0"
 dependencies = [

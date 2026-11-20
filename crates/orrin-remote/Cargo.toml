@@ -1,0 +1,13 @@
+[package]
+name = "orrin-remote"
+version.workspace = true
+edition.workspace = true
+description = "The editor remote's wire, discovery file and blocking client"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# Request and response bodies. Already in the tree through orrin-project.
+serde_json = "1"
+# The token's randomness: the OS generator, through the crate `EntityId::new`
+# already draws from.
+uuid.workspace = true
