@@ -1183,7 +1183,9 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
                     && let Some(mut on) = locked.and(cx.state.environment.remote())
                 {
                     ui.checkbox(&mut on, "");
-                } else if let (Some(_), Some(path)) = (locked, cx.state.environment.blender()) {
+                } else if field == Field::BlenderPath
+                    && let Some(path) = locked.and(cx.state.environment.blender())
+                {
                     let mut shown = path.to_owned();
                     ui.add(egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
                 } else {
