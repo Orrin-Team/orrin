@@ -285,12 +285,9 @@ impl Remote {
                 if !open(holding.peer) {
                     return false;
                 }
-                holding.held.frames += 1;
                 let answer = match holding.held.poll(world, state) {
                     Some(answer) => answer,
-                    None if holding.held.frames >= command::DEADLINE => {
-                        Err(holding.held.expired(world))
-                    }
+                    None if holding.held.overdue() => Err(holding.held.expired(world)),
                     None => return true,
                 };
                 shared.send(holding.peer, encoded(holding.id, "editor_command", answer));

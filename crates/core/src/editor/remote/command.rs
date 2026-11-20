@@ -18,6 +18,7 @@
 //! one that needs it is refused rather than left to time out.
 
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use orrin_ecs::World;
 use serde::Deserialize;
@@ -27,11 +28,14 @@ use super::answer;
 use crate::editor::state::{DEFAULT_SCENE_PATH, EditorState, OpenChoice, SceneRequest, plain};
 use crate::scene::{Camera, Diagnostics, LogBuffer, LogLevel, Play, PlayState, Time};
 
-/// How many frames a held command may take before it is answered as timed
-/// out. Everything here lands within two or three; the rest is room for a
-/// frame that stalls, and at a thousand frames a second it is still most of a
-/// second.
-pub(super) const DEADLINE: u32 = 600;
+/// How long a held command may take before it is answered as timed out. In
+/// time rather than frames, because what makes one late is a frame that stalls
+/// — a large scene loads, and a reload runs, synchronously on the frame's
+/// thread — and the frame count is lowest exactly then. Twenty seconds covers
+/// a load of seconds with room to spare, and stays under the client's own
+/// thirty (`orrin_remote::client`), so the editor's account of what it saw
+/// reaches the client before the client gives up on it.
+pub(super) const DEADLINE: Duration = Duration::from_secs(20);
 
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -69,7 +73,7 @@ pub(super) struct Held {
     /// The console's next number when it was raised, so the answer can quote
     /// what the editor said about it.
     said_from: u64,
-    pub(super) frames: u32,
+    raised: Instant,
 }
 
 enum Wait {
@@ -110,7 +114,7 @@ pub(super) fn editor_command(
             said_from: world
                 .get_resource::<LogBuffer>()
                 .map_or(0, |log| log.next_number()),
-            frames: 0,
+            raised: Instant::now(),
         }))
     };
     match command {
@@ -349,12 +353,17 @@ impl Held {
         }
     }
 
+    /// Whether it has waited past [`DEADLINE`].
+    pub(super) fn overdue(&self) -> bool {
+        self.raised.elapsed() >= DEADLINE
+    }
+
     /// The answer at the deadline: what can be seen, and that it timed out.
     pub(super) fn expired(&self, world: &World) -> String {
         let said = self.said(world);
         let mut answer = format!(
-            "the command was raised but no effect was seen within {DEADLINE} frames; play is \
-             {}",
+            "the command was raised but no effect was seen within {} s; play is {}",
+            DEADLINE.as_secs(),
             self.play(world)["play"]
         );
         if !said.is_empty() {
