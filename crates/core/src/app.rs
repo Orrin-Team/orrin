@@ -1235,8 +1235,8 @@ impl ApplicationHandler for App {
                     .renderer
                     .set_present(*self.world.resource::<PresentSettings>());
 
-                if active.editor.take_screenshot_request() {
-                    active.renderer.request_screenshot();
+                if let Some(view) = active.editor.take_screenshot_request() {
+                    active.renderer.request_screenshot(view);
                 }
 
                 let Active {

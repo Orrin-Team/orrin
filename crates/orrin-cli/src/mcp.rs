@@ -55,8 +55,9 @@ const INSTRUCTIONS: &str = "Orrin is a game engine. The live tools read and chan
      Entities are named by EntityId (a UUID), or #slot for one never saved. Scene text is \
      Orrin's scene grammar, the one in the project's .orrin files. Change the open scene only \
      with scene_edit, each call one undo step the developer can take back; edit scripts, shaders \
-     and materials as files and the editor picks the save up. screenshot shows the scene; quote \
-     frame_stats' banner with any number taken from it.";
+     and materials as files and the editor picks the save up. screenshot shows the game as a \
+     player sees it, or the scene alone; quote frame_stats' banner with any number taken from \
+     it.";
 
 /// The editor tools, which are the remote's methods by the same names.
 const LIVE: [&str; 9] = [
@@ -824,9 +825,13 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "screenshot",
-            "The scene as the editor's viewport renders it, without the editor drawn over \
-             it, as a PNG no larger than max_size on its longest side.",
-            json!({"max_size": {"type": "integer", "minimum": 16, "maximum": 4096, "description": "Longest side in pixels (default 1024)"}}),
+            "What the editor's viewport renders, as a PNG no larger than max_size on its \
+             longest side: by default the game as a player sees it, its UI included; or the \
+             scene alone. Never the editor's own panels or marks.",
+            json!({
+                "view": {"type": "string", "enum": ["game", "scene"], "description": "game: the scene and the game's UI (default); scene: the scene alone"},
+                "max_size": {"type": "integer", "minimum": 16, "maximum": 4096, "description": "Longest side in pixels (default 1024)"},
+            }),
             Hint::Reads,
         ),
         scene_edit(),

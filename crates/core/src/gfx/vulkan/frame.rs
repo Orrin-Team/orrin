@@ -199,12 +199,23 @@ pub struct FrameConfig {
     /// editor is showing one *and* something it shows changed. See
     /// [`material_preview`](super::material_preview).
     pub material_preview: bool,
-    /// Whether this frame also tonemaps the scene into an image of its own,
-    /// for `VulkanRenderer::take_screenshot` to read back: the editor's remote
-    /// asked for one. Off is the frame exactly as it is without the feature —
-    /// no node, no image, no barrier — and a frame that asks recompiles the
-    /// graph twice, as one that redraws the material sphere does.
-    pub screenshot: bool,
+    /// Whether this frame also draws the picture into an image of its own,
+    /// for `VulkanRenderer::take_screenshot` to read back, and which picture:
+    /// the editor's remote asked for one. `None` is the frame exactly as it is
+    /// without the feature — no node, no image, no barrier — and a frame that
+    /// asks recompiles the graph twice, as one that redraws the material
+    /// sphere does.
+    pub screenshot: Option<ShotView>,
+}
+
+/// What a screenshot shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShotView {
+    /// The scene alone, tonemapped.
+    Scene,
+    /// The scene with the game's own UI over it, and none of the editor's
+    /// marks: what a player sees.
+    Game,
 }
 
 /// Which piece of engine code a graph node runs.
@@ -309,6 +320,8 @@ pub enum PassBody {
     /// The tonemap again, into the screenshot's own image: the scene with
     /// nothing drawn over it.
     Screenshot,
+    /// The game's UI again, over that.
+    ScreenshotUi,
     Overlay,
     ShadowCascade(u32),
     /// Every point and spot light's faces, in one pass over one atlas. A tile is
@@ -1779,7 +1792,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // format so the tonemap's own pipeline draws it. Only reads of what the
     // tonemap already reads, so the frame's other images keep their usage,
     // and it ends sampled because the readback leaves it that way.
-    let screenshot = config.screenshot.then(|| {
+    let screenshot = config.screenshot.map(|view| {
         let image = builder.import_image(
             "screenshot",
             ImageDesc::new(config.color_format),
@@ -1795,6 +1808,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         }
         let id = pass.access(image, Access::ColorAttachment).build();
         record(id, PassBody::Screenshot, &mut bodies);
+        // The game's UI, drawn the second time from the same frame of it, after
+        // the tonemap by registration — the two write the one image.
+        if view == ShotView::Game && config.ui {
+            let id = builder
+                .pass("screenshot_ui", PassKind::Inline)
+                .access(image, Access::ColorAttachment)
+                .build();
+            record(id, PassBody::ScreenshotUi, &mut bodies);
+        }
         image
     });
 

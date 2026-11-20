@@ -353,6 +353,10 @@ pub(super) fn rendering_info(
         PassBody::Screenshot => color_only(overwritten(
             images.texture(ids.screenshot.expect("a screenshot pass without its image")),
         )),
+        // Over that, as the game's UI draws over the window's.
+        PassBody::ScreenshotUi => color_only(drawn_over(
+            images.texture(ids.screenshot.expect("a screenshot pass without its image")),
+        )),
         // Every pixel written by the full-screen resolve.
         PassBody::MaterialPreviewResolve => color_only(overwritten(
             images.texture(

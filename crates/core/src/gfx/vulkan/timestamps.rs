@@ -501,7 +501,7 @@ mod tests {
             occlusion_culling: false,
             wireframe: None,
             material_preview: false,
-            screenshot: false,
+            screenshot: None,
         };
         let frame = declare(config).expect("the busiest frame must compile");
 

@@ -181,7 +181,7 @@ pub type Pixels = (Vec<u8>, [u32; 2]);
 /// [`VulkanRenderer::take_screenshot`].
 #[derive(Clone, Copy)]
 enum Screenshot {
-    Asked,
+    Asked(frame::ShotView),
     Drawn {
         view: TextureViewId,
         extent: [u32; 2],
@@ -854,7 +854,7 @@ impl VulkanRenderer {
             occlusion_culling,
             wireframe: None,
             material_preview: false,
-            screenshot: false,
+            screenshot: None,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -948,11 +948,11 @@ impl VulkanRenderer {
         Some(self.read_sampled(view, [side, side]))
     }
 
-    /// Ask the next frame to tonemap the scene into an image of its own as
-    /// well, for [`take_screenshot`](Self::take_screenshot) once it has drawn.
-    /// The scene alone: no game UI, no outline, no handles, no editor.
-    pub fn request_screenshot(&mut self) {
-        self.screenshot.get_or_insert(Screenshot::Asked);
+    /// Ask the next frame to draw `view` into an image of its own as well,
+    /// for [`take_screenshot`](Self::take_screenshot) once it has drawn: the
+    /// scene, or the scene and the game's UI. Never the editor's marks.
+    pub fn request_screenshot(&mut self, view: frame::ShotView) {
+        self.screenshot.get_or_insert(Screenshot::Asked(view));
     }
 
     /// The screenshot the last frame drew, as tightly packed sRGB RGBA8 rows
@@ -2065,7 +2065,10 @@ impl VulkanRenderer {
             occlusion_culling: self.occlusion_culling,
             wireframe: overlay.as_ref().and_then(|frame| frame.wireframe),
             material_preview: preview_due,
-            screenshot: matches!(self.screenshot, Some(Screenshot::Asked)),
+            screenshot: match self.screenshot {
+                Some(Screenshot::Asked(view)) => Some(view),
+                _ => None,
+            },
         });
 
         // Each cascade the cache does not redraw this frame is swapped back to
@@ -2476,7 +2479,7 @@ impl VulkanRenderer {
         // drawn. One the size of the frame, made for this frame alone and
         // retired once it is read, so nothing is held between screenshots.
         if let Some(id) = self.frame.ids.screenshot
-            && matches!(self.screenshot, Some(Screenshot::Asked))
+            && matches!(self.screenshot, Some(Screenshot::Asked(_)))
         {
             let extent = self.backend.extent();
             let format = self.backend.format();
@@ -4402,7 +4405,7 @@ impl FrameRecord<'_> {
                 self.hdr
                     .record_tonemap(self.device, encoder, self.extent, hdr, exposure, bloom);
             }
-            PassBody::Ui => {
+            PassBody::Ui | PassBody::ScreenshotUi => {
                 if let Some(frame) = self.ui_frame {
                     self.ui.record(self.device, encoder, frame, self.extent);
                 }

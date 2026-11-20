@@ -1,9 +1,13 @@
-//! `screenshot`: the scene as the viewport renders it, without the editor
-//! drawn over it, as a PNG scaled to fit `max_size` — an image is paid for in
-//! the model's context, so it travels no larger than asked.
+//! `screenshot`: what the viewport renders, as a PNG scaled to fit
+//! `max_size` — an image is paid for in the model's context, so it travels no
+//! larger than asked. `view` is `game`, the scene with the game's own UI over
+//! it as a player sees it, or `scene`, the scene alone. `editor`, the window
+//! as the developer sees it, is refused: the egui overlay is drawn by a pass
+//! outside the graph, in a submission of its own, and no route found draws or
+//! reads it for a screenshot without changing every frame.
 //!
 //! **On the frame path only when asked.** The request asks the renderer for
-//! one, the next frame tonemaps the scene a second time into an image of its
+//! one, the next frame draws the picture a second time into an image of its
 //! own (`FrameConfig::screenshot`), and the frame after that frame's readback
 //! hands the pixels here. A frame nobody asked of compiles and records the
 //! frame it always did. The readback waits for its frame, as a capture does;
@@ -18,6 +22,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{Peer, Shared};
+use crate::gfx::vulkan::frame::ShotView;
 
 /// What `max_size` is when not given: enough to read a scene by, a fraction
 /// of a full window.
@@ -28,12 +33,29 @@ const DEFAULT_SIZE: u32 = 1024;
 struct Params {
     /// The longest side the PNG may have, in pixels.
     max_size: Option<u32>,
+    view: Option<String>,
 }
 
-/// The longest side a screenshot may be asked for at, from `params`.
-pub(super) fn max_size(params: &Value) -> Result<u32, String> {
+/// The longest side a screenshot may be asked for at, and what it shows,
+/// from `params`.
+pub(super) fn asked(params: &Value) -> Result<(u32, ShotView), String> {
     let params: Params = super::answer::params_of(params)?;
-    Ok(params.max_size.unwrap_or(DEFAULT_SIZE).clamp(16, 4096))
+    let view = match params.view.as_deref() {
+        None | Some("game") => ShotView::Game,
+        Some("scene") => ShotView::Scene,
+        Some("editor") => {
+            return Err(
+                "`editor` is not offered: the editor's own UI cannot be drawn into a \
+                        screenshot without a change to every frame. Ask for `game` or `scene`"
+                    .to_owned(),
+            );
+        }
+        Some(other) => return Err(format!("`{other}` is not a view; `game` or `scene`")),
+    };
+    Ok((
+        params.max_size.unwrap_or(DEFAULT_SIZE).clamp(16, 4096),
+        view,
+    ))
 }
 
 /// A screenshot asked for, and whether the renderer has been asked yet.
@@ -41,6 +63,7 @@ pub(super) struct Shot {
     pub(super) peer: Peer,
     pub(super) id: u64,
     pub(super) max_size: u32,
+    pub(super) view: ShotView,
     pub(super) raised: Instant,
     pub(super) asked: bool,
 }

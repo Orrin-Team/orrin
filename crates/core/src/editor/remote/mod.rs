@@ -402,12 +402,13 @@ impl Remote {
         for Waiting { peer, request } in batch.drain(..) {
             let answer = match answer::answer(&request, world, registry, state) {
                 answer::Reply::Now(answer) => answer,
-                answer::Reply::Screenshot(max_size) => {
+                answer::Reply::Screenshot(max_size, view) => {
                     if !shots.iter().any(|shot| shot.peer == peer) {
                         shots.push(shot::Shot {
                             peer,
                             id: request.id,
                             max_size,
+                            view,
                             raised: std::time::Instant::now(),
                             asked: false,
                         });
@@ -454,15 +455,19 @@ impl Remote {
         }
     }
 
-    /// Whether a screenshot was asked for since the last call: the renderer is
-    /// to draw one into the next frame. A check of an empty list otherwise.
-    pub fn wants_screenshot(&mut self) -> bool {
-        let mut wanted = false;
-        for shot in self.shots.iter_mut().filter(|shot| !shot.asked) {
-            shot.asked = true;
-            wanted = true;
+    /// What screenshot was asked for since the last call, if one was: the
+    /// renderer is to draw it into the next frame. A check of an empty list
+    /// otherwise.
+    pub fn wants_screenshot(&mut self) -> Option<crate::gfx::vulkan::frame::ShotView> {
+        // One picture in flight at a time: another view waits for the next.
+        if self.shots.iter().any(|shot| shot.asked) {
+            return None;
         }
-        wanted
+        let view = self.shots.first()?.view;
+        for shot in self.shots.iter_mut().filter(|shot| shot.view == view) {
+            shot.asked = true;
+        }
+        Some(view)
     }
 
     /// The frame the renderer was asked for has been read back, in

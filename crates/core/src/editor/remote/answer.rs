@@ -13,7 +13,7 @@
 //! | `asset_find` | `kind`, `path`, `limit`, `offset` | indexed assets: id, path, kind, load state, import error |
 //! | `console_read` | `cursor`, `level`, `limit` | console entries numbered from `cursor`, and the next cursor |
 //! | `frame_stats` | `limit` | the run banner, frame time, and the profiler's CPU phases and GPU passes |
-//! | `screenshot` | `max_size` | the scene as a PNG in a blob frame, then its size and timings ([`shot`](super::shot)) |
+//! | `screenshot` | `view`, `max_size` | the scene as a PNG in a blob frame, then its size and timings ([`shot`](super::shot)) |
 //! | `scene_edit` | `label`, `ops` | the step's label, the ops applied, ids spawned and given |
 //! | `editor_command` | `command` and its own | what the command did, once it can be seen |
 //!
@@ -53,7 +53,7 @@ const METHODS: [&str; 9] = [
 pub(super) enum Reply {
     Now(Result<Value, String>),
     Held(Held),
-    Screenshot(u32),
+    Screenshot(u32, crate::gfx::vulkan::frame::ShotView),
 }
 
 pub(super) fn answer(
@@ -65,8 +65,8 @@ pub(super) fn answer(
     let params = &request.params;
     let method = request.method.as_str();
     let answer = match method {
-        "screenshot" => match super::shot::max_size(params) {
-            Ok(size) => return Reply::Screenshot(size),
+        "screenshot" => match super::shot::asked(params) {
+            Ok((size, view)) => return Reply::Screenshot(size, view),
             Err(refused) => Err(refused),
         },
         "scene_edit" => super::edit::scene_edit(world, registry, state, params),

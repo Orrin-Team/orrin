@@ -225,12 +225,10 @@ impl Editor {
         }
     }
 
-    /// Whether the remote wants the next frame drawn into a screenshot too. A
-    /// check of an `Option` with the remote off.
-    pub fn take_screenshot_request(&mut self) -> bool {
-        self.remote
-            .as_mut()
-            .is_some_and(remote::Remote::wants_screenshot)
+    /// What screenshot the remote wants the next frame to draw too, if any.
+    /// A check of an `Option` with the remote off.
+    pub fn take_screenshot_request(&mut self) -> Option<crate::gfx::vulkan::frame::ShotView> {
+        self.remote.as_mut()?.wants_screenshot()
     }
 
     /// The screenshot the renderer was asked for, read back in `readback`.

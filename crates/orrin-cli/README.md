@@ -219,7 +219,7 @@ test run prints is captured into the tool's result. The tools:
 | `asset_find` | yes | the asset index by kind and path: id, load state, import error |
 | `console_read` | yes | console entries from a cursor, at a minimum level |
 | `frame_stats` | yes | the run banner, frame and GPU time, and the profiler's CPU phases and GPU passes |
-| `screenshot` | yes | the scene without the editor over it, as a PNG image no larger than `max_size` (default 1024) |
+| `screenshot` | yes | the game as a player sees it (`view: game`, the default) or the scene alone (`view: scene`), as a PNG image no larger than `max_size` (default 1024); never the editor's own UI |
 | `scene_edit` | yes | a labelled batch of ops — set, add or remove a component, spawn, despawn, reparent — as one undo step, all or none; edit mode only |
 | `editor_command` | yes | play, pause, step, stop, save, open a scene, undo, redo, reload scripts, select, frame; answered once the effect is seen |
 
