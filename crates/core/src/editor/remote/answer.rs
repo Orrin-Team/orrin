@@ -11,6 +11,7 @@
 //! | `component_list` | `query`, `defaults`, `limit`, `offset` | registered components, each with its default as text |
 //! | `asset_find` | `kind`, `path`, `limit`, `offset` | indexed assets: id, path, kind, load state, import error |
 //! | `console_read` | `cursor`, `level`, `limit` | console entries numbered from `cursor`, and the next cursor |
+//! | `frame_stats` | `limit` | the run banner, frame time, and the profiler's CPU phases and GPU passes |
 //! | `scene_edit` | `label`, `ops` | the step's label, the ops applied, ids spawned and given |
 //! | `editor_command` | `command` and its own | what the command did, once it can be seen |
 //!
@@ -33,12 +34,13 @@ use crate::scene::{Camera, LogBuffer, LogLevel, Name, Play, PlayState, persist};
 
 type FxHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
 
-const METHODS: [&str; 7] = [
+const METHODS: [&str; 8] = [
     "editor_state",
     "scene_read",
     "component_list",
     "asset_find",
     "console_read",
+    "frame_stats",
     "scene_edit",
     "editor_command",
 ];
@@ -82,6 +84,7 @@ fn read(
         "component_list" => component_list(registry, params),
         "asset_find" => asset_find(world, params),
         "console_read" => console_read(world, params),
+        "frame_stats" => frame_stats(world, params),
         other => Err(format!(
             "the editor has no such method; it answers {} (asked for `{other}`)",
             METHODS.join(", ")
@@ -572,4 +575,70 @@ fn console_read(world: &World, params: &Value) -> Result<Value, String> {
         "next": next,
         "lost": oldest.saturating_sub(cursor),
     }))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FrameStatsParams {
+    /// Rows a lane, slowest in the last frame first.
+    limit: Option<usize>,
+}
+
+/// What the Profiler tab shows, with the banner that says how it was
+/// measured. Read, never toggled: the switches that move a frame time are the
+/// developer's.
+fn frame_stats(world: &World, params: &Value) -> Result<Value, String> {
+    let read: FrameStatsParams = params_of(params)?;
+    let limit = bounded(read.limit, 20, 100);
+    let stats = world
+        .get_resource::<crate::stats::FrameStats>()
+        .ok_or_else(|| "this session keeps no frame statistics".to_owned())?;
+    let (min_ms, max_ms) = stats.min_max_ms();
+    let lane = |lane: crate::profile::Lane| -> Vec<Value> {
+        world
+            .get_resource::<crate::profile::Profiler>()
+            .map(|profiler| profiler.aggregate(lane))
+            .unwrap_or_default()
+            .into_iter()
+            .take(limit)
+            .map(|row| {
+                json!({
+                    "name": row.name,
+                    "depth": row.depth,
+                    "last_ms": row.last_ms,
+                    "avg_ms": row.avg_ms,
+                    "max_ms": row.max_ms,
+                    "calls": row.calls,
+                })
+            })
+            .collect()
+    };
+    let per_pass = crate::profile::is_enabled() && crate::profile::gpu_passes_enabled();
+    let mut answer = json!({
+        "banner": stats.run_banner(),
+        "frame_ms": stats.frame_ms(),
+        "fps": stats.fps(),
+        "min_ms": min_ms,
+        "max_ms": max_ms,
+        "gpu_ms": stats.gpu_ms(),
+        "memory_bytes": stats.memory_bytes(),
+        "vram_used": stats.vram_used(),
+        "vram_total": stats.vram_total(),
+        "overlay": world
+            .get_resource::<crate::scene::Diagnostics>()
+            .is_some_and(|diagnostics| diagnostics.overlay),
+        "profiling": crate::profile::is_enabled(),
+        "gpu_pass_timings": per_pass,
+        "cpu": lane(crate::profile::Lane::Cpu),
+        "gpu": lane(crate::profile::Lane::Gpu),
+    });
+    if per_pass {
+        answer["note"] = Value::String(
+            "Time each GPU pass is on: a timestamp pair around every pass makes neighbouring \
+             passes run in turn, so the GPU rows can sum to more than the frame. Compare whole \
+             frames with it off"
+                .to_owned(),
+        );
+    }
+    Ok(answer)
 }

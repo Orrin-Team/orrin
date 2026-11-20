@@ -1616,7 +1616,7 @@ fn print_run_banner(
         .unwrap_or_else(|| "offscreen".to_string());
     let extent = renderer.extent();
 
-    tracing::info!(
+    let banner = format!(
         "run config: {} build | {} | debug assertions {} | validation {} | threads {} | \
          log {} | present {} | {}x{} | MSAA {} | overlay {} | GPU pass timings {} | scene {}",
         if cfg!(debug_assertions) {
@@ -1646,6 +1646,8 @@ fn print_run_banner(
         on_off(crate::profile::is_enabled() && crate::profile::gpu_passes_enabled()),
         scene.label(),
     );
+    tracing::info!("{banner}");
+    world.resource_mut::<FrameStats>().set_run_banner(banner);
 }
 
 fn on_off(value: bool) -> &'static str {

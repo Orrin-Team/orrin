@@ -58,12 +58,13 @@ const INSTRUCTIONS: &str = "Orrin is a game engine. The live tools read and chan
      and materials as files and the editor picks the save up.";
 
 /// The editor tools, which are the remote's methods by the same names.
-const LIVE: [&str; 7] = [
+const LIVE: [&str; 8] = [
     "editor_state",
     "scene_read",
     "component_list",
     "asset_find",
     "console_read",
+    "frame_stats",
     "scene_edit",
     "editor_command",
 ];
@@ -766,6 +767,14 @@ fn tools() -> Vec<Value> {
                 "level": {"type": "string", "enum": ["trace", "debug", "info", "warn", "error"], "description": "The quietest level returned (default info)"},
                 "limit": limit("At most this many entries (default 100)"),
             }),
+            Hint::Reads,
+        ),
+        tool(
+            "frame_stats",
+            "What the editor's Profiler shows: frame time, GPU time, memory, and the CPU phases \
+             and GPU passes slowest first, with the run banner that says how the run was \
+             started. A number means little without the banner beside it.",
+            json!({"limit": limit("Rows a lane (default 20)")}),
             Hint::Reads,
         ),
         scene_edit(),
