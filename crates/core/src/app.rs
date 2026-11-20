@@ -826,6 +826,12 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // An agent's playtest is a device too, and lands where the
+                // window's events have: before the resolve that reads them.
+                active
+                    .editor
+                    .feed_game_input(&mut self.world, active.renderer.extent());
+
                 // Pads are polled, so their frame starts here — before the
                 // resolve that reads them, and gated on focus so a stick held
                 // in a background window drives nothing.
@@ -1420,7 +1426,7 @@ fn apply_cursor_grab(
     let lock = {
         let mut lock = world.resource_mut::<crate::scene::CursorLock>();
         if !live || (escaped && !shipped) {
-            lock.requested = false;
+            lock.request(false, false);
         }
         *lock
     };

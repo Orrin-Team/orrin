@@ -485,6 +485,13 @@ const ROWS: &[Row] = &[
     ),
     row(
         Page::Permissions,
+        Field::Allow(Capability::GameInput),
+        "Send game input",
+        "Press keys, buttons and actions in the playing game, as a playtest",
+        "agent permission allow deny input keyboard mouse gamepad press playtest",
+    ),
+    row(
+        Page::Permissions,
         Field::Allow(Capability::UndoRedo),
         "Undo and redo",
         "Undo and redo the editor's steps, the developer's own included",

@@ -15,6 +15,16 @@
 //! them. Keys and mouse buttons both carry them, which is what lets a tap that
 //! begins and ends inside one frame still reach a script; a pad does not,
 //! because it is sampled rather than evented (see [`super::gamepad`]).
+//!
+//! **Two devices, one answer.** Beside what the window's devices hold there is
+//! a virtual device, which the editor's remote drives for an agent's playtest
+//! (`editor::remote::input`). It is a layer of its own rather than calls into
+//! the real one: a source is down while *either* holds it, an edge fires only
+//! when the union changes, so neither device releases what the other holds,
+//! and losing focus — which lets go of everything real — leaves it alone,
+//! since an agent drives from another window. Everything above reads the
+//! union and cannot tell which device a press came from; only the cursor lock
+//! asks ([`pressed_by_virtual_only`](InputState::pressed_by_virtual_only)).
 
 use std::collections::HashSet;
 
@@ -40,6 +50,20 @@ pub struct InputState {
     wheel: (f32, f32),
     pads: [PadState; MAX_PLAYERS],
     focused: bool,
+    /// Whether a real device pressed anything this frame.
+    real_pressed: bool,
+    virtual_device: Virtual,
+}
+
+/// What the virtual device holds. A pointer it placed stands in for the real
+/// cursor until it lets go: two positions cannot both be where the pointer is.
+#[derive(Default)]
+struct Virtual {
+    keys: HashSet<u32>,
+    mouse: u8,
+    pads: [PadState; MAX_PLAYERS],
+    cursor: Option<(f32, f32)>,
+    pressed: bool,
 }
 
 /// One player's pad. Buttons are level state rather than edges: an action
@@ -128,6 +152,8 @@ impl InputState {
     }
 
     pub fn end_frame(&mut self) {
+        self.real_pressed = false;
+        self.virtual_device.pressed = false;
         self.pressed.clear();
         self.released.clear();
         self.mouse_pressed = 0;
@@ -137,7 +163,7 @@ impl InputState {
     }
 
     pub fn key_down(&self, code: u32) -> bool {
-        self.held.contains(&code)
+        self.held.contains(&code) || self.virtual_device.keys.contains(&code)
     }
 
     pub fn key_pressed(&self, code: u32) -> bool {
@@ -150,7 +176,7 @@ impl InputState {
 
     /// `button`: 0 = left, 1 = right, 2 = middle.
     pub fn mouse_button_down(&self, button: u32) -> bool {
-        button < 3 && self.mouse_held & (1 << button) != 0
+        button < 3 && (self.mouse_held | self.virtual_device.mouse) & (1 << button) != 0
     }
 
     pub fn mouse_button_pressed(&self, button: u32) -> bool {
@@ -163,7 +189,7 @@ impl InputState {
 
     /// Cursor position in window coordinates (physical pixels).
     pub fn cursor(&self) -> (f32, f32) {
-        self.cursor
+        self.virtual_device.cursor.unwrap_or(self.cursor)
     }
 
     #[cfg(test)]
@@ -199,9 +225,11 @@ impl InputState {
     /// so a script sees the key let go exactly once.
     fn clear_held(&mut self) {
         for code in std::mem::take(&mut self.held) {
-            self.released.insert(code);
+            if !self.virtual_device.keys.contains(&code) {
+                self.released.insert(code);
+            }
         }
-        self.mouse_released |= self.mouse_held;
+        self.mouse_released |= self.mouse_held & !self.virtual_device.mouse;
         self.mouse_held = 0;
         for slot in 0..MAX_PLAYERS {
             self.clear_pad(slot);
@@ -219,13 +247,14 @@ impl InputState {
     /// Record a key going down. The `insert` guard also filters OS key-repeat,
     /// which arrives as a second press while the key is already held.
     pub fn press(&mut self, code: u32) {
-        if self.held.insert(code) {
+        if self.held.insert(code) && !self.virtual_device.keys.contains(&code) {
             self.pressed.insert(code);
+            self.real_pressed = true;
         }
     }
 
     pub fn release(&mut self, code: u32) {
-        if self.held.remove(&code) {
+        if self.held.remove(&code) && !self.virtual_device.keys.contains(&code) {
             self.released.insert(code);
         }
     }
@@ -235,7 +264,9 @@ impl InputState {
     pub fn press_mouse_button(&mut self, button: u32) {
         if button < 3 {
             let bit = 1 << button;
-            self.mouse_pressed |= bit & !self.mouse_held;
+            let edge = bit & !self.mouse_held & !self.virtual_device.mouse;
+            self.mouse_pressed |= edge;
+            self.real_pressed |= edge != 0;
             self.mouse_held |= bit;
         }
     }
@@ -243,7 +274,7 @@ impl InputState {
     pub fn release_mouse_button(&mut self, button: u32) {
         if button < 3 {
             let bit = 1 << button;
-            self.mouse_released |= bit & self.mouse_held;
+            self.mouse_released |= bit & self.mouse_held & !self.virtual_device.mouse;
             self.mouse_held &= !bit;
         }
     }
@@ -253,18 +284,31 @@ impl InputState {
     /// plugged in simply reads as unpressed.
     pub fn pad_connected(&self, player: usize) -> bool {
         self.pads.get(player).is_some_and(|pad| pad.connected)
+            || self
+                .virtual_device
+                .pads
+                .get(player)
+                .is_some_and(|pad| pad.connected)
     }
 
     pub fn pad_button_down(&self, player: usize, button: PadButton) -> bool {
-        self.pads
-            .get(player)
-            .is_some_and(|pad| pad.buttons & (1 << button.index()) != 0)
+        let down = |pad: &PadState| pad.buttons & (1 << button.index()) != 0;
+        self.pads.get(player).is_some_and(down)
+            || self.virtual_device.pads.get(player).is_some_and(down)
     }
 
+    /// Whichever device pushes the source further: a stick at rest on one
+    /// does not cancel the other's.
     pub fn pad_axis(&self, player: usize, axis: PadAxis) -> f32 {
-        self.pads
-            .get(player)
-            .map_or(0.0, |pad| pad.axes[axis.index()])
+        let read = |pads: &[PadState; MAX_PLAYERS]| {
+            pads.get(player).map_or(0.0, |pad| pad.axes[axis.index()])
+        };
+        let (real, virtual_value) = (read(&self.pads), read(&self.virtual_device.pads));
+        if virtual_value.abs() > real.abs() {
+            virtual_value
+        } else {
+            real
+        }
     }
 
     pub fn set_pad_button(&mut self, player: usize, button: PadButton, down: bool) {
@@ -282,6 +326,104 @@ impl InputState {
         if let Some(pad) = self.pads.get_mut(player) {
             pad.axes[axis.index()] = value;
         }
+    }
+
+    /// The virtual device presses `code`. An edge only if no real key holds it.
+    pub fn virtual_press(&mut self, code: u32) {
+        if self.virtual_device.keys.insert(code) && !self.held.contains(&code) {
+            self.pressed.insert(code);
+            self.virtual_device.pressed = true;
+        }
+    }
+
+    pub fn virtual_release(&mut self, code: u32) {
+        if self.virtual_device.keys.remove(&code) && !self.held.contains(&code) {
+            self.released.insert(code);
+        }
+    }
+
+    pub fn virtual_press_mouse_button(&mut self, button: u32) {
+        if button < 3 {
+            let bit = 1 << button;
+            let edge = bit & !self.mouse_held & !self.virtual_device.mouse;
+            self.mouse_pressed |= edge;
+            self.virtual_device.pressed |= edge != 0;
+            self.virtual_device.mouse |= bit;
+        }
+    }
+
+    pub fn virtual_release_mouse_button(&mut self, button: u32) {
+        if button < 3 {
+            let bit = 1 << button;
+            self.mouse_released |= bit & self.virtual_device.mouse & !self.mouse_held;
+            self.virtual_device.mouse &= !bit;
+        }
+    }
+
+    /// Hold or let go a pad button on the virtual device's pad for `player`,
+    /// which reads as connected while the device drives it.
+    pub fn virtual_set_pad_button(&mut self, player: usize, button: PadButton, down: bool) {
+        if let Some(pad) = self.virtual_device.pads.get_mut(player) {
+            let bit = 1 << button.index();
+            if down && pad.buttons & bit == 0 {
+                self.virtual_device.pressed = true;
+            }
+            pad.connected = true;
+            if down {
+                pad.buttons |= bit;
+            } else {
+                pad.buttons &= !bit;
+            }
+        }
+    }
+
+    pub fn virtual_set_pad_axis(&mut self, player: usize, axis: PadAxis, value: f32) {
+        if let Some(pad) = self.virtual_device.pads.get_mut(player) {
+            pad.connected = true;
+            pad.axes[axis.index()] = value;
+        }
+    }
+
+    /// Mouse motion, added to whatever the real mouse moved this frame.
+    pub fn virtual_move_mouse(&mut self, (dx, dy): (f32, f32)) {
+        self.mouse_delta.0 += dx;
+        self.mouse_delta.1 += dy;
+    }
+
+    /// Put the pointer at `at`, in window pixels, until the device lets go.
+    pub fn virtual_point(&mut self, at: (f32, f32)) {
+        self.virtual_device.cursor = Some(at);
+    }
+
+    /// Whether the virtual device holds anything at all.
+    pub fn virtual_holds(&self) -> bool {
+        let device = &self.virtual_device;
+        !device.keys.is_empty()
+            || device.mouse != 0
+            || device.cursor.is_some()
+            || device.pads.iter().any(|pad| pad.connected)
+    }
+
+    /// Let go of everything the virtual device holds, with a release edge for
+    /// each source no real device still holds, so a script sees it let go
+    /// exactly once.
+    pub fn virtual_release_all(&mut self) {
+        for code in std::mem::take(&mut self.virtual_device.keys) {
+            if !self.held.contains(&code) {
+                self.released.insert(code);
+            }
+        }
+        self.mouse_released |= self.virtual_device.mouse & !self.mouse_held;
+        self.virtual_device.mouse = 0;
+        self.virtual_device.cursor = None;
+        self.virtual_device.pads = [PadState::default(); MAX_PLAYERS];
+    }
+
+    /// Whether this frame's presses all came from the virtual device: what
+    /// keeps a cursor lock an agent's click asked for from grabbing the
+    /// developer's pointer (see [`super::CursorLock`]).
+    pub fn pressed_by_virtual_only(&self) -> bool {
+        self.virtual_device.pressed && !self.real_pressed
     }
 
     /// Attach or detach a player's pad. Detaching clears its state, for the
@@ -307,4 +449,63 @@ fn mouse_index(button: MouseButton) -> Option<u32> {
         MouseButton::Middle => 2,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const W: u32 = 23;
+
+    /// Each device lets go of its own hold only. Were the two one set, a
+    /// developer tapping a key an agent holds would stop the agent's walk, and
+    /// an agent's release would cut short the developer's.
+    #[test]
+    fn a_real_and_a_virtual_hold_of_one_key_do_not_release_each_other() {
+        let mut input = InputState::new();
+        input.press(W);
+        input.virtual_press(W);
+        assert!(
+            !input.pressed_by_virtual_only(),
+            "the real press came first"
+        );
+        input.end_frame();
+
+        input.release(W);
+        assert!(
+            input.key_down(W),
+            "the real release let go of the agent's hold"
+        );
+        assert!(!input.key_released(W));
+        input.end_frame();
+
+        input.press(W);
+        input.virtual_release(W);
+        assert!(
+            input.key_down(W),
+            "the agent's release let go of the real hold"
+        );
+        assert!(!input.key_released(W) && !input.key_pressed(W));
+        input.end_frame();
+
+        input.virtual_press_mouse_button(0);
+        input.press_mouse_button(0);
+        input.virtual_release_all();
+        assert!(input.mouse_button_down(0));
+        assert!(!input.mouse_button_released(0));
+        input.release_mouse_button(0);
+        assert!(input.mouse_button_released(0));
+    }
+
+    /// Focus is the real devices' business: an agent drives from a terminal,
+    /// and losing focus lets go of what the developer held and nothing else.
+    #[test]
+    fn losing_focus_leaves_the_virtual_device_holding() {
+        let mut input = InputState::new();
+        input.virtual_press(W);
+        input.virtual_set_pad_axis(0, PadAxis::LeftStickY, -1.0);
+        input.on_window_event(&WindowEvent::Focused(false), false);
+        assert!(input.key_down(W));
+        assert_eq!(input.pad_axis(0, PadAxis::LeftStickY), -1.0);
+    }
 }

@@ -16,6 +16,8 @@
 //! | `screenshot` | `view`, `max_size` | the scene as a PNG in a blob frame, then its size and timings ([`shot`](super::shot)) |
 //! | `scene_edit` | `label`, `ops` | the step's label, the ops applied, ids spawned and given |
 //! | `editor_command` | `command` and its own | what the command did, once it can be seen |
+//! | `game_input` | `steps` | once the steps have played in the running game: frames and game seconds elapsed, the play state, warnings logged meanwhile ([`input`](super::input)) |
+//! | `input_names` | none | the game's actions and axes, and every source name a binding and `game_input` accept |
 //!
 //! An entity is named by its [`EntityId`], or by `#slot` when it has none —
 //! one a script spawned, or one never saved. A block `scene_read` returns for
@@ -38,7 +40,7 @@ use orrin_remote::permissions::Access;
 
 type FxHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
 
-const METHODS: [&str; 9] = [
+const METHODS: [&str; 11] = [
     "editor_state",
     "scene_read",
     "component_list",
@@ -48,6 +50,8 @@ const METHODS: [&str; 9] = [
     "screenshot",
     "scene_edit",
     "editor_command",
+    "game_input",
+    "input_names",
 ];
 
 /// An answer now, a command held until its effect can be seen, or a
@@ -56,6 +60,7 @@ pub(super) enum Reply {
     Now(Result<Value, String>),
     Held(Held),
     Screenshot(u32, crate::gfx::vulkan::frame::ShotView),
+    Playtest(Box<super::input::Playtest>),
 }
 
 pub(super) fn answer(
@@ -77,6 +82,21 @@ pub(super) fn answer(
             Err(refused) => Err(refused),
         },
         "scene_edit" => super::edit::scene_edit(world, registry, state, params),
+        "game_input"
+            if !world
+                .get_resource::<Play>()
+                .is_some_and(|play| play.is_live()) =>
+        {
+            Err("the game is not playing; call editor_command play first".to_owned())
+        }
+        "game_input" if state.game_input.busy() => Err(
+            "busy: another game_input sequence is still playing in this editor; one at a time"
+                .to_owned(),
+        ),
+        "game_input" => match super::input::playtest(world, params) {
+            Ok(test) => return Reply::Playtest(Box::new(test)),
+            Err(refused) => Err(refused),
+        },
         "editor_command" => match super::command::editor_command(world, registry, state, params) {
             Ok(Err(held)) => return Reply::Held(held),
             Ok(Ok(done)) => Ok(done),
@@ -101,6 +121,7 @@ fn read(
         "asset_find" => asset_find(world, state, params),
         "console_read" => console_read(world, params),
         "frame_stats" => frame_stats(world, params),
+        "input_names" => params_of::<Nothing>(params).map(|_| super::input::names(world)),
         other => Err(format!(
             "the editor has no such method; it answers {} (asked for `{other}`)",
             METHODS.join(", ")

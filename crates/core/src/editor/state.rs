@@ -324,6 +324,8 @@ pub struct EditorState {
     pub remote_peers_seen: u64,
     /// A connection Settings ▸ Agents asked to close.
     pub remote_disconnect: Option<u64>,
+    /// The remote's virtual input device: an agent's playtest.
+    pub game_input: super::remote::GameInput,
     /// The project's folder rules for agents, or why the file did not read —
     /// which refuses every folder until it is fixed. See Settings ▸
     /// Permissions.
@@ -544,6 +546,7 @@ impl Default for EditorState {
             remote_peers: Vec::new(),
             remote_peers_seen: 0,
             remote_disconnect: None,
+            game_input: Default::default(),
             agent_folders: Ok(orrin_remote::permissions::Folders::default()),
             agent_assets: String::new(),
             agent_folders_changed: false,

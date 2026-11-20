@@ -58,11 +58,13 @@ const INSTRUCTIONS: &str = "Orrin is a game engine. The live tools read and chan
      and materials as files and the editor picks the save up; a scene that is not open is a text \
      file, read and edit it as one. screenshot shows the game as a \
      player sees it, the scene alone, or the editor's window; quote frame_stats' banner with any number taken from \
-     it. What agents may do is the developer's to set in Settings > Permissions: a refusal names \
+     it. To playtest: editor_command play, game_input to press keys, actions and the mouse in the \
+     running game, then screenshot, scene_read or console_read to see what happened, and \
+     editor_command stop. What agents may do is the developer's to set in Settings > Permissions: a refusal names \
      the switch or folder rule, and project_info and editor_state report what is allowed.";
 
 /// The editor tools, which are the remote's methods by the same names.
-const LIVE: [&str; 9] = [
+const LIVE: [&str; 11] = [
     "editor_state",
     "scene_read",
     "component_list",
@@ -72,6 +74,8 @@ const LIVE: [&str; 9] = [
     "screenshot",
     "scene_edit",
     "editor_command",
+    "game_input",
+    "input_names",
 ];
 
 /// What turns the editor's remote on for one run, whatever its settings say:
@@ -710,6 +714,8 @@ enum Hint {
     Builds,
     /// Changes the open scene or the editor's state.
     Changes,
+    /// Drives the running game, which Stop throws away; saves nothing.
+    Plays,
 }
 
 fn tool(name: &str, description: &str, properties: Value, hint: Hint) -> Value {
@@ -720,6 +726,9 @@ fn tool(name: &str, description: &str, properties: Value, hint: Hint) -> Value {
         }
         Hint::Changes => {
             json!({"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false})
+        }
+        Hint::Plays => {
+            json!({"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false})
         }
     };
     json!({
@@ -895,6 +904,34 @@ fn tools() -> Vec<Value> {
                 Hint::Changes,
             ),
             &["command"],
+        ),
+        requiring(
+            tool(
+                "game_input",
+                "Playtest: play input into the running game as a device would, step by step, \
+                 answered once it has played (at most 256 steps and 10 s; a longer test is \
+                 several calls) with frames and game seconds elapsed and how many warnings were \
+                 logged. Each step is one of: press/release/tap (key or source names: W, Space, \
+                 Mouse.Left, Gamepad.South, Gamepad.RightTrigger), press_action/release_action/\
+                 tap_action (action names), axis {name: value}, mouse_move [dx, dy] pixels, \
+                 pointer or click [x, y] from 0..1 of the window's top left (a screenshot's \
+                 fractions), stick {left: [x, y], right: [x, y]}, trigger {left, right}, wait \
+                 {frames|seconds}; plus optional for {frames|seconds} to hold then let go, and \
+                 player 0-3 for pads. Everything pressed is let go when the call ends. \
+                 input_names lists the names.",
+                json!({
+                    "steps": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "object"}, "description": "e.g. [{\"press\": \"W\", \"for\": {\"seconds\": 1}}, {\"tap_action\": \"Jump\"}, {\"wait\": {\"frames\": 10}}]"},
+                }),
+                Hint::Plays,
+            ),
+            &["steps"],
+        ),
+        tool(
+            "input_names",
+            "The game's input actions and axes as its input.toml binds them, and every key, \
+             mouse and gamepad name game_input and the bindings accept.",
+            json!({}),
+            Hint::Reads,
         ),
     ]
 }

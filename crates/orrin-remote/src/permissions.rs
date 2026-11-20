@@ -45,6 +45,7 @@ pub enum Capability {
     FrameStats,
     EditScene,
     PlayControl,
+    GameInput,
     UndoRedo,
     Selection,
     Scenes,
@@ -55,13 +56,14 @@ pub enum Capability {
 }
 
 impl Capability {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::ReadScene,
         Self::Console,
         Self::Screenshot,
         Self::FrameStats,
         Self::EditScene,
         Self::PlayControl,
+        Self::GameInput,
         Self::UndoRedo,
         Self::Selection,
         Self::Scenes,
@@ -80,6 +82,7 @@ impl Capability {
             Self::FrameStats => "frame_stats",
             Self::EditScene => "edit_scene",
             Self::PlayControl => "play_control",
+            Self::GameInput => "game_input",
             Self::UndoRedo => "undo_redo",
             Self::Selection => "selection",
             Self::Scenes => "scenes",
@@ -99,6 +102,7 @@ impl Capability {
             Self::FrameStats => "Frame stats",
             Self::EditScene => "Edit the scene",
             Self::PlayControl => "Play, pause and stop",
+            Self::GameInput => "Send game input",
             Self::UndoRedo => "Undo and redo",
             Self::Selection => "Select and frame",
             Self::Scenes => "Save, open and create scenes",
@@ -121,6 +125,7 @@ pub struct Capabilities {
     pub frame_stats: bool,
     pub edit_scene: bool,
     pub play_control: bool,
+    pub game_input: bool,
     pub undo_redo: bool,
     pub selection: bool,
     pub scenes: bool,
@@ -170,7 +175,10 @@ impl Preset {
     fn allows(self, capability: Capability) -> bool {
         use Capability::*;
         let read = matches!(capability, ReadScene | Console | Screenshot | FrameStats);
-        let edit = matches!(capability, EditScene | PlayControl | UndoRedo | Selection);
+        let edit = matches!(
+            capability,
+            EditScene | PlayControl | GameInput | UndoRedo | Selection
+        );
         match self {
             Self::ReadOnly => read,
             Self::EditScene => read || edit,
@@ -188,6 +196,7 @@ impl Capabilities {
             frame_stats: false,
             edit_scene: false,
             play_control: false,
+            game_input: false,
             undo_redo: false,
             selection: false,
             scenes: false,
@@ -260,6 +269,7 @@ fn capability_mut(capabilities: &mut Capabilities, capability: Capability) -> &m
         Capability::FrameStats => &mut capabilities.frame_stats,
         Capability::EditScene => &mut capabilities.edit_scene,
         Capability::PlayControl => &mut capabilities.play_control,
+        Capability::GameInput => &mut capabilities.game_input,
         Capability::UndoRedo => &mut capabilities.undo_redo,
         Capability::Selection => &mut capabilities.selection,
         Capability::Scenes => &mut capabilities.scenes,
@@ -281,6 +291,7 @@ pub fn required(method: &str, params: &Value) -> Option<Capability> {
         "screenshot" => Screenshot,
         "frame_stats" => FrameStats,
         "scene_edit" => EditScene,
+        "game_input" => GameInput,
         "build_scripts" => BuildScripts,
         "run_tests" => RunTests,
         "editor_open" => OpenEditor,
@@ -524,6 +535,7 @@ mod tests {
         ("editor_state", None, None),
         ("project_info", None, None),
         ("client_info", None, None),
+        ("input_names", None, None),
         ("scene_read", None, Some(Capability::ReadScene)),
         ("component_list", None, Some(Capability::ReadScene)),
         ("asset_find", None, Some(Capability::ReadScene)),
@@ -531,6 +543,7 @@ mod tests {
         ("screenshot", None, Some(Capability::Screenshot)),
         ("frame_stats", None, Some(Capability::FrameStats)),
         ("scene_edit", None, Some(Capability::EditScene)),
+        ("game_input", None, Some(Capability::GameInput)),
         (
             "editor_command",
             Some("play"),

@@ -222,6 +222,8 @@ test run prints is captured into the tool's result. The tools:
 | `screenshot` | yes | the game as a player sees it (`view: game`, the default), the scene alone (`view: scene`), or the editor's window as the developer sees it (`view: editor`), as a PNG image no larger than `max_size` (default 1024) |
 | `scene_edit` | yes | a labelled batch of ops — set, add or remove a component, spawn, despawn, reparent — as one undo step, all or none; edit mode only |
 | `editor_command` | yes | play, pause, step, stop, save, open or create a scene, undo, redo, reload scripts, select, frame, and while the game plays load a scene (additively or not) and unload one; answered once the effect is seen |
+| `game_input` | yes | playtest the running game: keys, mouse, gamepad and actions by name, step by step, released when the call ends; answered with frames and game seconds elapsed and the warnings logged |
+| `input_names` | yes | the game's actions and axes and every source name the bindings accept |
 
 The editor tools reach the editor open on the project through its remote: a
 loopback listener that is off unless Settings ▸ Agents turns it on or
@@ -250,12 +252,24 @@ membership rule (an entity is in its nearest ancestor's scene), and takes a
 scene open, and `load_scene` and `unload_scene` are refused in edit mode. A
 scene that is not open is a text file, read and edited as one.
 
+**Playtesting.** `game_input` is a virtual input device: its presses enter
+where the keyboard's, the mouse's and a pad's do, so bindings, actions,
+scripts, physics and UI events see ordinary input, and the developer's own
+devices keep working beside it. An action named in a step is pressed through a
+source the project's `input.toml` binds it to; `input_names` lists the
+actions, the axes and every source name. It runs only while the game plays —
+a paused game is advanced one stepped frame per input frame — and with the
+editor window unfocused. A cursor lock the game asks for because of an agent's
+click is the game's to see and never grabs the developer's pointer. One call
+is at most 256 steps and 10 s; everything it pressed is let go when it ends,
+however it ends. The switch is "Send game input" in Settings ▸ Permissions.
+
 **Permissions.** Settings ▸ Permissions says what an agent may do, and every
 tool is checked against it: a preset (Read only, Edit scene, Full control —
 the default — or Custom once a switch is changed), one switch for each kind of
 thing (reading the scene, the console, screenshots, frame stats, editing,
-play control, undo and redo, selection, saving and opening scenes, reloading,
-building, testing, opening the editor), and per-project folder rules — none,
+play control, game input, undo and redo, selection, saving and opening scenes,
+reloading, building, testing, opening the editor), and per-project folder rules — none,
 read, or read and write, the longest matching folder deciding — which govern
 which assets `asset_find` lists, which scenes may be opened or saved and which
 prefabs placed. The switches are `[agents.allow]` in the user's

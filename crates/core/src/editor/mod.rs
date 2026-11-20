@@ -247,6 +247,15 @@ impl Editor {
         }
     }
 
+    /// This frame of an agent's playtest, fed before the actions resolve; with
+    /// no remote, any sequence it left is dropped and let go of.
+    pub fn feed_game_input(&mut self, world: &mut World, extent: [u32; 2]) {
+        if self.remote.is_none() {
+            self.state.game_input.cancel();
+        }
+        self.state.game_input.feed(world, extent);
+    }
+
     /// What screenshot the remote wants the next frame to draw too, if any.
     /// A check of an `Option` with the remote off.
     pub fn take_screenshot_request(&mut self) -> Option<crate::gfx::vulkan::frame::ShotView> {

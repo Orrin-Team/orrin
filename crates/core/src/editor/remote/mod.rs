@@ -13,8 +13,10 @@
 //! the scene being edited or the fork a playing game runs on — is in every
 //! answer that reads one ([`answer`] lists the methods). A change to the scene
 //! is a `scene_edit`, one labelled batch through the edit pipeline and one
-//! undo step ([`edit`]); anything else is an `editor_command`, the request its
-//! button raises ([`command`]). There is no other way in.
+//! undo step ([`edit`]); input to a running game is a `game_input` sequence
+//! on a virtual device, which enters where the window's devices do
+//! ([`input`]); anything else is an `editor_command`, the request its button
+//! raises ([`command`]). There is no other way in.
 //!
 //! **Only once asked, and only with the token.** The remote is off unless
 //! Settings ▸ Agents turns it on or `ORRIN_REMOTE=1` does, and it needs a
@@ -70,7 +72,10 @@
 mod answer;
 mod command;
 mod edit;
+mod input;
 mod shot;
+
+pub use input::GameInput;
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -345,7 +350,7 @@ impl Remote {
         state: &mut EditorState,
     ) -> bool {
         let news = self.shared.news.load(Ordering::Acquire);
-        if !news && self.held.is_empty() && self.shots.is_empty() {
+        if !news && self.held.is_empty() && self.shots.is_empty() && !state.game_input.busy() {
             return false;
         }
         crate::profile_scope!("remote");
@@ -372,6 +377,17 @@ impl Remote {
                 shared.send(shot.peer, encoded(shot.id, "screenshot", Err(why)));
                 false
             });
+        }
+        if state.game_input.busy() {
+            let open = |peer: Peer| lock(&shared.connections).open.contains_key(&peer);
+            let allowed = state
+                .settings
+                .agents
+                .allow
+                .check("game_input", &serde_json::Value::Null);
+            if let Some((peer, id, answer)) = state.game_input.settle(world, open, allowed) {
+                shared.send(peer, encoded(id, "game_input", answer));
+            }
         }
         if !held.is_empty() {
             let open = |peer: Peer| lock(&shared.connections).open.contains_key(&peer);
@@ -419,6 +435,10 @@ impl Remote {
                          taken"
                             .to_owned(),
                     )
+                }
+                answer::Reply::Playtest(test) => {
+                    state.game_input.start(*test, peer, request.id);
+                    continue;
                 }
                 answer::Reply::Held(command) => {
                     let mine = held.iter().filter(|holding| holding.peer == peer).count();
