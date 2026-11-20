@@ -13,20 +13,52 @@ pub struct Built {
     pub bindings: Option<PathBuf>,
 }
 
-pub fn build(args: &ProjectArgs) -> Result<Built, String> {
+/// Where a build's own lines and the compiler's output go: to the terminal, as
+/// a person running `orrin` expects, or into a list, for `orrin mcp`, whose
+/// stdout carries nothing but its protocol.
+pub enum Log {
+    Terminal,
+    Captured(Captured),
+}
+
+#[derive(Default)]
+pub struct Captured {
+    pub lines: Vec<String>,
+    /// The compiler's errors and warnings, in `orrin_build::Report::diagnostics`'
+    /// form.
+    pub diagnostics: Vec<String>,
+}
+
+impl Log {
+    pub fn say(&mut self, line: String) {
+        match self {
+            Self::Terminal => println!("{line}"),
+            Self::Captured(captured) => captured.lines.push(line),
+        }
+    }
+
+    pub fn warn(&mut self, line: String) {
+        match self {
+            Self::Terminal => eprintln!("{line}"),
+            Self::Captured(captured) => captured.lines.push(line),
+        }
+    }
+}
+
+pub fn build(args: &ProjectArgs, log: &mut Log) -> Result<Built, String> {
     let project = args.locate()?;
-    println!(
+    log.say(format!(
         "orrin: building `{}` at {}",
         project.name(),
         display_path(project.root())
-    );
+    ));
 
-    let bindings = ensure_bindings(project.root(), args.configuration())?;
+    let bindings = ensure_bindings(project.root(), args.configuration(), log)?;
     if let Some(bindings) = &bindings {
         engine::place_analyzer(bindings)?;
     }
-    build_scripts(&project, args.configuration(), bindings.as_deref())?;
-    index_assets(&project)?;
+    build_scripts(&project, args.configuration(), bindings.as_deref(), log)?;
+    index_assets(&project, log)?;
 
     Ok(Built { project, bindings })
 }
@@ -34,31 +66,40 @@ pub fn build(args: &ProjectArgs) -> Result<Built, String> {
 /// Resolve the engine's bindings, building them first if this is a checkout
 /// that has never built them. A game assembly cannot compile without
 /// `Orrin.dll`, so producing it is part of building the project.
-fn ensure_bindings(start: &Path, configuration: &str) -> Result<Option<PathBuf>, String> {
+fn ensure_bindings(
+    start: &Path,
+    configuration: &str,
+    log: &mut Log,
+) -> Result<Option<PathBuf>, String> {
     if let Some(dir) = engine::find_bindings(start) {
         return Ok(Some(dir));
     }
 
     let Some(checkout) = engine::find_checkout(start) else {
-        eprintln!(
+        log.warn(format!(
             "orrin: warning: no Orrin bindings found; if the build cannot resolve \
              `Orrin.dll`, set ${} to the directory holding it",
             engine::BINDINGS_ENV
-        );
+        ));
         return Ok(None);
     };
 
     let bindings_project = checkout.join("scripting/Orrin");
-    println!(
+    log.say(format!(
         "orrin: building engine bindings ({})",
         display_path(&bindings_project)
-    );
-    dotnet_build(&bindings_project, configuration, None)?;
+    ));
+    dotnet_build(&bindings_project, configuration, None, log)?;
 
     Ok(engine::built_bindings(&checkout))
 }
 
-fn build_scripts(project: &Project, configuration: &str, bindings: Option<&Path>) -> Fallible {
+fn build_scripts(
+    project: &Project,
+    configuration: &str,
+    bindings: Option<&Path>,
+    log: &mut Log,
+) -> Fallible {
     let scripts = project.scripts_dir();
     if !scripts.is_dir() {
         return Err(format!(
@@ -67,20 +108,36 @@ fn build_scripts(project: &Project, configuration: &str, bindings: Option<&Path>
         ));
     }
 
-    dotnet_build(&scripts, configuration, bindings)
+    dotnet_build(&scripts, configuration, bindings, log)
 }
 
-fn dotnet_build(dir: &Path, configuration: &str, bindings: Option<&Path>) -> Fallible {
-    // Inherited, not captured: a terminal build should stream the compiler's
-    // output as it happens. The engine's watcher captures the same invocation
-    // instead, because its output goes to the editor console.
+fn dotnet_build(
+    dir: &Path,
+    configuration: &str,
+    bindings: Option<&Path>,
+    log: &mut Log,
+) -> Fallible {
+    // Inherited on a terminal, which should stream the compiler's output as it
+    // happens. The engine's watcher captures the same invocation instead,
+    // because its output goes to the editor console, and so does `orrin mcp`.
+    let output = match log {
+        Log::Terminal => orrin_build::Output::Inherit,
+        Log::Captured(_) => orrin_build::Output::Capture,
+    };
     let report = orrin_build::Build {
         project_dir: dir,
         configuration,
         bindings,
     }
-    .run(orrin_build::Output::Inherit)
+    .run(output)
     .map_err(|err| err.to_string())?;
+    if let Log::Captured(captured) = log {
+        let diagnostics = report.diagnostics();
+        if !report.success && diagnostics.is_empty() {
+            captured.lines.extend(report.tail(20));
+        }
+        captured.diagnostics.extend(diagnostics);
+    }
 
     if !report.success {
         return Err(format!("`dotnet build {}` failed", display_path(dir)));
@@ -115,7 +172,7 @@ struct Asset {
 /// for now a record of what the project ships. This is deliberately not a
 /// packaging step — nothing is copied or transformed until the asset pipeline
 /// lands.
-fn index_assets(project: &Project) -> Fallible {
+fn index_assets(project: &Project, log: &mut Log) -> Fallible {
     let assets_dir = project.assets_dir();
     let mut assets = Vec::new();
 
@@ -123,10 +180,10 @@ fn index_assets(project: &Project) -> Fallible {
         collect(&assets_dir, &assets_dir, &mut assets)?;
         assets.sort_by(|a, b| a.path.cmp(&b.path));
     } else {
-        println!(
+        log.say(format!(
             "orrin: no assets directory at {}",
             display_path(&assets_dir)
-        );
+        ));
     }
 
     let relative_root = assets_dir
@@ -152,11 +209,11 @@ fn index_assets(project: &Project) -> Fallible {
     std::fs::write(&path, text)
         .map_err(|err| format!("could not write {}: {err}", path.display()))?;
 
-    println!(
+    log.say(format!(
         "orrin: indexed {} asset(s) -> {}",
         inventory.assets.len(),
         display_path(&path)
-    );
+    ));
     Ok(())
 }
 

@@ -1,6 +1,7 @@
 mod build;
 mod engine;
 mod export;
+mod mcp;
 mod new;
 mod run;
 mod test;
@@ -114,6 +115,14 @@ enum Command {
         #[arg(long, value_enum, default_value = "text")]
         format: test::Format,
     },
+
+    /// Serve MCP on stdin and stdout, so an AI agent can read the open editor
+    /// and build and test the project
+    Mcp {
+        /// Directory to search upward from for orrin.toml (default: current)
+        #[arg(long, value_name = "DIR")]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Args)]
@@ -198,7 +207,9 @@ fn main() {
                 out: None,
             },
         ),
-        Command::Build { project, .. } => build::build(&project).map(|_| ()),
+        Command::Build { project, .. } => {
+            build::build(&project, &mut build::Log::Terminal).map(|_| ())
+        }
         Command::Hub => engine::launch_hub(),
         Command::Export {
             project,
@@ -225,6 +236,7 @@ fn main() {
             format,
         } => test::test(&project, filter.as_deref(), no_build, dev, format)
             .map(|code| std::process::exit(code)),
+        Command::Mcp { project } => mcp::serve(project),
     };
 
     if let Err(message) = result {

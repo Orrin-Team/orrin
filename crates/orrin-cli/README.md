@@ -193,6 +193,40 @@ The hub found beside `orrin` is used; otherwise the checkout `orrin` came from
 builds and runs it. Recent projects are kept in `hub.json` in the platform's
 per-user settings directory.
 
+### `orrin mcp [--project DIR]`
+
+An MCP server on stdin and stdout, for an AI agent such as Claude Code:
+newline-delimited JSON-RPC 2.0, tools only. Its client starts it, usually from
+a `.mcp.json` — the editor's Settings ▸ Agents ▸ Copy MCP config writes one
+for the open project:
+
+```json
+{ "mcpServers": { "orrin": { "command": "orrin", "args": ["mcp", "--project", "/path/to/game"] } } }
+```
+
+stdout carries protocol messages and nothing else; everything a build or a
+test run prints is captured into the tool's result. The tools:
+
+| tool | needs the editor | what |
+| --- | --- | --- |
+| `project_info` | no | the manifest, its scenes, whether an editor is attached |
+| `build_scripts` | no | `orrin build`; the compiler's errors and warnings by file and line |
+| `run_tests` | no | `orrin test [filter]`; the engine's JSON report |
+| `editor_open` | no | `orrin run`, detached, with the remote on; waits until it can be reached |
+| `editor_state` | yes | open scene, unsaved or not, play state, selection, camera |
+| `scene_read` | yes | an outline, or whole entities in the scene grammar, by id, subtree or name |
+| `component_list` | yes | every registered component, with its default in the scene grammar |
+| `asset_find` | yes | the asset index by kind and path: id, load state, import error |
+| `console_read` | yes | console entries from a cursor, at a minimum level |
+
+The editor tools reach the editor open on the project through its remote: a
+loopback listener that is off unless Settings ▸ Agents turns it on or
+`ORRIN_REMOTE=1` does — `editor_open` sets that — and that writes its port and
+a token to `.orrin/remote` (`crates/orrin-remote` describes the protocol).
+With no editor attached they answer with an error saying so. `editor_open`
+sends the editor's output to `.orrin/editor.log` and leaves it running when
+the server exits. No tool runs code or writes a file the agent names.
+
 ## How the engine is found
 
 In order, because a wrong guess here is near-invisible:

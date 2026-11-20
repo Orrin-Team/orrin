@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 orrin-project.workspace = true
 orrin-build.workspace = true
+# `orrin mcp` reaches the open editor through its remote.
+orrin-remote.workspace = true
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"

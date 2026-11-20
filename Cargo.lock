@@ -3091,6 +3091,7 @@ dependencies = [
  "clap",
  "orrin-build",
  "orrin-project",
+ "orrin-remote",
  "serde",
  "serde_json",
  "tempfile",
