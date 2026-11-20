@@ -63,6 +63,9 @@ use crate::scene::{LogLevel, PresentSettings, VsyncMode};
 const FILE: &str = "settings.toml";
 /// Read by `asset_db::blend::locate` too, which is what makes it win.
 pub const BLENDER_ENV: &str = "ORRIN_BLENDER";
+/// Turns the remote on (`1`) or off (`0`) for this run, over the setting.
+/// `orrin mcp`'s `editor_open` sets it, so the editor it opens can be reached.
+pub const REMOTE_ENV: &str = "ORRIN_REMOTE";
 const BAD: &str = "settings.toml.bad";
 const THEMES: &str = "themes";
 
@@ -84,6 +87,15 @@ pub struct Settings {
     pub display: Display,
     pub startup: Startup,
     pub blender: Blender,
+    pub agents: Agents,
+}
+
+/// Whether an agent may reach this editor through `orrin mcp`. Off unless
+/// asked for: the remote reads the open scene, and later edits it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Agents {
+    pub remote: bool,
 }
 
 /// Blender, for `.blend` assets and the live link its add-on streams over.
@@ -460,6 +472,7 @@ pub struct Environment {
     validation: Option<Validation>,
     log: Option<LogFloor>,
     blender: Option<String>,
+    remote: Option<bool>,
 }
 
 impl Environment {
@@ -488,7 +501,21 @@ impl Environment {
                 .flatten()
                 .map(LogFloor::from),
             blender: set(BLENDER_ENV),
+            remote: match set(REMOTE_ENV).as_deref().map(str::trim) {
+                Some("1" | "true" | "on") => Some(true),
+                Some("0" | "false" | "off") => Some(false),
+                _ => None,
+            },
         }
+    }
+
+    /// What `ORRIN_REMOTE` decides, when it decides anything.
+    pub fn remote(&self) -> Option<bool> {
+        self.remote
+    }
+
+    pub fn remote_override(&self) -> Option<&'static str> {
+        self.remote.is_some().then_some(REMOTE_ENV)
     }
 
     /// `ORRIN_BLENDER`'s value, when it holds anything.

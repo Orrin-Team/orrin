@@ -678,7 +678,7 @@ impl ApplicationHandler for App {
         #[cfg(not(feature = "scripting"))]
         let scripts_dir = None;
 
-        let editor = Editor::new(
+        let mut editor = Editor::new(
             event_loop,
             window.clone(),
             renderer.max_texture_side(),
@@ -687,6 +687,10 @@ impl ApplicationHandler for App {
             settings,
             self.backend,
         );
+        if !self.shipped {
+            // Listens only once Settings ▸ Agents or `ORRIN_REMOTE` asks.
+            editor.offer_remote();
+        }
         self.camera_controller.configure(editor.fly_camera());
 
         if self.shipped {
@@ -1008,6 +1012,11 @@ impl ApplicationHandler for App {
                 // is about to draw.
                 self.console
                     .drain_into(&mut self.world.resource_mut::<LogBuffer>(), frame);
+
+                // An agent's requests, at the one point in the frame the
+                // remote touches the world: after the drain, so `console_read`
+                // finds this frame's lines, and before the UI, overlay or not.
+                active.editor.serve_remote(&mut self.world, &self.registry);
 
                 // Before extraction: the UI may spawn/despawn/edit entities.
                 //

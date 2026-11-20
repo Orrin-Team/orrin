@@ -19,6 +19,7 @@ mod prefs;
 mod preview;
 mod previews;
 mod rect_tool;
+mod remote;
 mod selection;
 pub mod settings;
 pub(crate) mod source;
@@ -61,6 +62,16 @@ pub struct Editor {
     cadence: cadence::Cadence,
     /// Kept between frames for its allocations.
     outline: Vec<(glam::Vec3, glam::Vec3)>,
+    /// The remote, while it listens.
+    remote: Option<remote::Remote>,
+    /// The project's editor directory, where the remote's file goes, and the
+    /// name it greets a client with. `None` with no project open.
+    remote_home: Option<(std::path::PathBuf, String)>,
+    /// Whether `app.rs` has offered this editor a remote at all, which it
+    /// does only for the windowed editor and never for an exported game.
+    remote_offered: bool,
+    /// Whether the remote should be listening, as last decided.
+    remote_wanted: bool,
 }
 
 /// The last chance to keep a layout: a drag in the final two seconds of a
@@ -161,7 +172,64 @@ impl Editor {
             last_layout_check: std::time::Instant::now(),
             cadence: cadence::Cadence::default(),
             outline: Vec::new(),
+            remote: None,
+            remote_home: project.map(|project| (project.editor_dir(), project.name().to_owned())),
+            remote_offered: false,
+            remote_wanted: false,
         }
+    }
+
+    /// Let the remote listen while Settings ▸ Agents or `ORRIN_REMOTE` says
+    /// it should, from now on. The windowed editor's alone, for the reason
+    /// `SettingsStore::drive_blender` is.
+    pub fn offer_remote(&mut self) {
+        self.remote_offered = true;
+        self.sync_remote();
+    }
+
+    /// Answer what an agent asked since the last frame. See `remote`.
+    pub fn serve_remote(&mut self, world: &mut World, registry: &Registry) {
+        if let Some(remote) = &mut self.remote {
+            remote.serve(world, registry, &mut self.state);
+        }
+    }
+
+    /// Start or stop the remote when what is wanted changed; otherwise
+    /// refresh what the settings page shows of it, which is one atomic load.
+    fn sync_remote(&mut self) {
+        if !self.remote_offered {
+            return;
+        }
+        let want = self.state.environment.remote();
+        let want = want.unwrap_or(self.state.settings.agents.remote);
+        if want == self.remote_wanted {
+            if let (Some(remote), Some(Ok(status))) = (&self.remote, &mut self.state.remote) {
+                *status = remote.status();
+            }
+            return;
+        }
+        self.remote_wanted = want;
+        if self.remote.take().is_some() {
+            tracing::info!("the remote stopped listening");
+        }
+        self.state.remote = want.then(|| {
+            let Some((dir, name)) = &self.remote_home else {
+                return Err("the remote needs a project open: its port and token are \
+                            written to the project's .orrin/remote"
+                    .to_owned());
+            };
+            let started = remote::Remote::start(dir, name).inspect_err(|error| {
+                tracing::warn!("{error}");
+            })?;
+            let status = started.status();
+            tracing::info!(
+                "the remote is listening on 127.0.0.1:{} for agents, found through {}",
+                status.port,
+                orrin_remote::discovery::path(dir).display()
+            );
+            self.remote = Some(started);
+            Ok(status)
+        });
     }
 
     /// Returns `true` if the editor wants the event, so the caller can withhold
@@ -276,6 +344,7 @@ impl Editor {
             prefs_file.save(prefs);
         }
         settings.settle(ctx, world, state, themes);
+        self.sync_remote();
 
         self.save_layout_if_settled();
     }

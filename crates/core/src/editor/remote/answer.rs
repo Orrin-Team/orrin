@@ -1,0 +1,535 @@
+//! What the remote answers, method by method. Each reads what the frame's
+//! thread holds and changes nothing; each answer that lists things is bounded
+//! by a `limit` with a default, and says where the next page starts.
+//!
+//! | method | params | result |
+//! | --- | --- | --- |
+//! | `editor_state` | none | project, open scene, unsaved, play state, world read, selection, camera |
+//! | `scene_read` | `ids`, `root`, `name`, `blocks`, `limit`, `offset` | an outline, or entity blocks in the scene grammar |
+//! | `component_list` | `query`, `defaults`, `limit`, `offset` | registered components, each with its default as text |
+//! | `asset_find` | `kind`, `path`, `limit`, `offset` | indexed assets: id, path, kind, load state, import error |
+//! | `console_read` | `cursor`, `level`, `limit` | console entries numbered from `cursor`, and the next cursor |
+//!
+//! An entity is named by its [`EntityId`], or by `#slot` when it has none —
+//! one a script spawned, or one never saved. A block `scene_read` returns for
+//! an entity with an id is exactly what a save would write for it; one with
+//! none is the debug dump's form, which the scene parser refuses on purpose.
+
+use orrin_ecs::{Entity, FxBuildHasher, FxHashMap, World};
+use orrin_registry::{EntityId, Registry, SceneDocument, SceneEntity};
+use orrin_remote::wire::Request;
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+
+use crate::asset_db::{AssetDatabase, AssetKind, LoadState, Status};
+use crate::editor::state::EditorState;
+use crate::scene::{Camera, LogBuffer, LogLevel, Name, Play, PlayState, persist};
+
+type FxHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
+
+const METHODS: [&str; 5] = [
+    "editor_state",
+    "scene_read",
+    "component_list",
+    "asset_find",
+    "console_read",
+];
+
+pub(super) fn answer(
+    request: &Request,
+    world: &mut World,
+    registry: &Registry,
+    state: &mut EditorState,
+) -> Result<Value, String> {
+    let (world, state, params) = (&*world, &*state, &request.params);
+    let method = request.method.as_str();
+    let answer = match method {
+        "editor_state" => params_of::<Nothing>(params).map(|_| editor_state(world, state)),
+        "scene_read" => scene_read(world, registry, state, params),
+        "component_list" => component_list(registry, params),
+        "asset_find" => asset_find(world, params),
+        "console_read" => console_read(world, params),
+        other => {
+            return Err(format!(
+                "the editor has no method `{other}`; it answers {}",
+                METHODS.join(", ")
+            ));
+        }
+    };
+    answer.map_err(|why| format!("`{method}`: {why}"))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Nothing {}
+
+/// Absent params are every default.
+fn params_of<T: DeserializeOwned + Default>(params: &Value) -> Result<T, String> {
+    if params.is_null() {
+        return Ok(T::default());
+    }
+    T::deserialize(params).map_err(|error| format!("its params do not read: {error}"))
+}
+
+/// `limit` within `1..=max`, `default` when not given.
+fn bounded(limit: Option<usize>, default: usize, max: usize) -> usize {
+    limit.unwrap_or(default).clamp(1, max)
+}
+
+fn page<T>(all: Vec<T>, offset: usize, limit: usize) -> (usize, Vec<T>, Option<usize>) {
+    let total = all.len();
+    let next = (offset.saturating_add(limit) < total).then_some(offset + limit);
+    (
+        total,
+        all.into_iter().skip(offset).take(limit).collect(),
+        next,
+    )
+}
+
+fn world_read(state: &EditorState) -> &'static str {
+    if state.playing() { "play" } else { "edit" }
+}
+
+fn reference(world: &World, entity: Entity) -> String {
+    match world.get::<EntityId>(entity) {
+        Some(id) => id.to_string(),
+        None => format!("#{}", entity.index()),
+    }
+}
+
+/// The live entity `text` names: an [`EntityId`], or `#slot` for one that has
+/// none.
+fn resolve(world: &World, state: &EditorState, text: &str) -> Result<Entity, String> {
+    let read = world_read(state);
+    if let Some(slot) = text.strip_prefix('#') {
+        let slot: u32 = slot
+            .parse()
+            .map_err(|_| format!("`{text}` is not a `#slot`"))?;
+        return world
+            .entities()
+            .find(|&entity| entity.index() == slot && world.get::<EntityId>(entity).is_none())
+            .ok_or_else(|| {
+                format!("no entity without an id is in slot {slot} of the {read} world")
+            });
+    }
+    let id: EntityId = text
+        .parse()
+        .map_err(|_| format!("`{text}` is neither an entity id nor a `#slot`"))?;
+    let mut found = None;
+    world.query::<&EntityId>().for_each(|entity, have| {
+        if *have == id {
+            found = Some(entity);
+        }
+    });
+    found.ok_or_else(|| format!("no entity in the {read} world has id {id}"))
+}
+
+fn editor_state(world: &World, state: &EditorState) -> Value {
+    let play = match world.get_resource::<Play>().map(|play| play.state()) {
+        Some(PlayState::Playing) => "playing",
+        Some(PlayState::Paused) => "paused",
+        Some(PlayState::Editing) | None => "editing",
+    };
+    let selection: Vec<String> = state
+        .selection
+        .entities()
+        .iter()
+        .filter(|&&entity| world.is_alive(entity))
+        .map(|&entity| reference(world, entity))
+        .collect();
+    let camera = world.get_resource::<Camera>().map(|camera| {
+        json!({
+            "position": camera.position.to_array(),
+            "target": camera.target.to_array(),
+        })
+    });
+    json!({
+        "project": state.project_name,
+        "scene": state.scene_path,
+        "unsaved": state.scene_dirty(),
+        "play": play,
+        "world": world_read(state),
+        "selection": selection,
+        "camera": camera,
+    })
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SceneRead {
+    /// Only these entities.
+    ids: Vec<String>,
+    /// Only this entity and everything under it.
+    root: Option<String>,
+    /// Only entities whose name holds this, ignoring case.
+    name: Option<String>,
+    /// Whole blocks in the scene grammar rather than an outline.
+    blocks: bool,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+fn scene_read(
+    world: &World,
+    registry: &Registry,
+    state: &EditorState,
+    params: &Value,
+) -> Result<Value, String> {
+    let read: SceneRead = params_of(params)?;
+    let wanted: Option<FxHashSet<Entity>> = match read.ids.is_empty() {
+        true => None,
+        false => Some(
+            read.ids
+                .iter()
+                .map(|id| resolve(world, state, id))
+                .collect::<Result<_, _>>()?,
+        ),
+    };
+    let root = read
+        .root
+        .as_deref()
+        .map(|root| resolve(world, state, root))
+        .transpose()?;
+    let name = read.name.as_deref().map(str::to_lowercase);
+    let order = persist::save_order(world);
+    let depth = order.len();
+    let matched: Vec<Entity> = order
+        .into_iter()
+        .filter(|&entity| {
+            wanted
+                .as_ref()
+                .is_none_or(|wanted| wanted.contains(&entity))
+                && root.is_none_or(|root| under(world, entity, root, depth))
+                && name.as_ref().is_none_or(|name| {
+                    world
+                        .get::<Name>(entity)
+                        .is_some_and(|have| have.0.to_lowercase().contains(name))
+                })
+        })
+        .collect();
+    let limit = match read.blocks {
+        true => bounded(read.limit, 20, 200),
+        false => bounded(read.limit, 100, 1000),
+    };
+    let (total, entities, next) = page(matched, read.offset, limit);
+    let mut answer = json!({
+        "world": world_read(state),
+        "total": total,
+        "offset": read.offset,
+        "next": next,
+    });
+    if read.blocks {
+        let (scene, unsaved, notes) = blocks(world, registry, &entities);
+        if !scene.is_empty() {
+            answer["scene"] = Value::String(scene);
+        }
+        if !unsaved.is_empty() {
+            answer["unsaved"] = Value::String(unsaved);
+        }
+        if !notes.is_empty() {
+            answer["notes"] = json!(notes);
+        }
+    } else {
+        let outline: Vec<Value> = entities
+            .iter()
+            .map(|&entity| {
+                let components: Vec<&str> = registry
+                    .components()
+                    .filter(|component| component.has(world, entity))
+                    .map(|component| component.id.as_str())
+                    .collect();
+                json!({
+                    "id": reference(world, entity),
+                    "name": world.get::<Name>(entity).map(|name| name.0.clone()),
+                    "parent": persist::live_parent(world, entity)
+                        .map(|parent| reference(world, parent)),
+                    "components": components,
+                })
+            })
+            .collect();
+        answer["entities"] = Value::Array(outline);
+    }
+    Ok(answer)
+}
+
+/// Whether `entity` is `root` or below it. Bounded by the entity count, since
+/// the hierarchy breaks a cycle only at its next propagation.
+fn under(world: &World, mut entity: Entity, root: Entity, steps: usize) -> bool {
+    for _ in 0..=steps {
+        if entity == root {
+            return true;
+        }
+        match persist::live_parent(world, entity) {
+            Some(parent) => entity = parent,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// The save's own blocks for `entities` that have an id, as one document; the
+/// debug dump of those that have none; and what a reader should know about
+/// either.
+fn blocks(
+    world: &World,
+    registry: &Registry,
+    entities: &[Entity],
+) -> (String, String, Vec<String>) {
+    let saved: FxHashMap<EntityId, SceneEntity> = persist::as_saved(world, registry)
+        .into_iter()
+        .map(|block| (block.id, block))
+        .collect();
+    let mut chosen = Vec::new();
+    let mut unsaved = String::new();
+    let mut notes = Vec::new();
+    for &entity in entities {
+        let Some(id) = world.get::<EntityId>(entity).map(|id| *id) else {
+            if !unsaved.is_empty() {
+                unsaved.push('\n');
+            }
+            orrin_registry::write_entity(&mut unsaved, registry, world, entity);
+            continue;
+        };
+        match saved.get(&id) {
+            Some(block) => chosen.push(block.clone()),
+            None => notes.push(format!(
+                "{id} is inside a prefab instance: a save writes it into the instance root's \
+                 `orrin.prefab` record, not as a block of its own"
+            )),
+        }
+        if let Some(parent) = persist::live_parent(world, entity)
+            && world.get::<EntityId>(parent).is_none()
+        {
+            notes.push(format!(
+                "{id}'s parent #{} has no id yet; a save gives it one and writes it as this \
+                 block's `orrin.parent`",
+                parent.index()
+            ));
+        }
+    }
+    if !unsaved.is_empty() {
+        notes.push(
+            "`unsaved` holds entities with no id: the live dump, headed by slot, which no save \
+             has written"
+                .to_owned(),
+        );
+    }
+    let mut scene = String::new();
+    if !chosen.is_empty() {
+        orrin_registry::write_document(&mut scene, &SceneDocument { entities: chosen });
+    }
+    (scene, unsaved, notes)
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ComponentList {
+    /// Only components whose id or name holds this, ignoring case.
+    query: Option<String>,
+    /// Each component's default value, as text; on unless `false`.
+    defaults: Option<bool>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+fn component_list(registry: &Registry, params: &Value) -> Result<Value, String> {
+    let list: ComponentList = params_of(params)?;
+    let query = list.query.as_deref().map(str::to_lowercase);
+    let mut components: Vec<_> = registry
+        .components()
+        .filter(|component| {
+            query.as_ref().is_none_or(|query| {
+                component.id.as_str().to_lowercase().contains(query)
+                    || component.name.to_lowercase().contains(query)
+            })
+        })
+        .collect();
+    components.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    let limit = bounded(list.limit, 200, 1000);
+    let (total, components, next) = page(components, list.offset, limit);
+    let defaults = list.defaults.unwrap_or(true);
+    let components: Vec<Value> = components
+        .into_iter()
+        .map(|component| {
+            let mut entry = json!({
+                "id": component.id.as_str(),
+                "name": component.name,
+                "script": component.script.is_some(),
+            });
+            if defaults {
+                let mut text = String::new();
+                orrin_registry::write_component(
+                    &mut text,
+                    component.id.as_str(),
+                    &component.default(),
+                );
+                entry["default"] = Value::String(text);
+            }
+            entry
+        })
+        .collect();
+    Ok(json!({
+        "total": total,
+        "offset": list.offset,
+        "next": next,
+        "components": components,
+    }))
+}
+
+const KINDS: [(&str, AssetKind); 8] = [
+    ("texture", AssetKind::Texture),
+    ("mesh", AssetKind::Mesh),
+    ("prefab", AssetKind::Prefab),
+    ("material", AssetKind::Material),
+    ("scene", AssetKind::Scene),
+    ("font", AssetKind::Font),
+    ("audio", AssetKind::Audio),
+    ("shader", AssetKind::Shader),
+];
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AssetFind {
+    kind: Option<String>,
+    /// Only assets whose path holds this, ignoring case.
+    path: Option<String>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+fn asset_find(world: &World, params: &Value) -> Result<Value, String> {
+    let find: AssetFind = params_of(params)?;
+    let kind = find
+        .kind
+        .as_deref()
+        .map(|asked| {
+            KINDS
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(asked))
+                .map(|&(_, kind)| kind)
+                .ok_or_else(|| {
+                    let names: Vec<&str> = KINDS.iter().map(|(name, _)| *name).collect();
+                    format!("`{asked}` is not a kind; one of {}", names.join(", "))
+                })
+        })
+        .transpose()?;
+    let db = world.get_resource::<AssetDatabase>().ok_or_else(|| {
+        "no project is open, so there is no asset index; open one with `orrin run`".to_owned()
+    })?;
+    let path = find.path.as_deref().map(str::to_lowercase);
+    let mut entries: Vec<_> = db
+        .iter()
+        .filter(|entry| kind.is_none_or(|kind| entry.kind == kind))
+        .filter(|entry| {
+            path.as_ref()
+                .is_none_or(|path| entry.path.to_lowercase().contains(path))
+        })
+        .collect();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let limit = bounded(find.limit, 50, 500);
+    let (total, entries, next) = page(entries, find.offset, limit);
+    let assets: Vec<Value> = entries
+        .into_iter()
+        .map(|entry| {
+            let kind = KINDS
+                .iter()
+                .find(|(_, kind)| *kind == entry.kind)
+                .map_or(entry.kind.label(), |(name, _)| name);
+            let state = match db.state(entry.id) {
+                LoadState::Loading => "loading",
+                LoadState::Ready => "ready",
+                LoadState::Failed => "failed",
+            };
+            let error = match &entry.status {
+                Status::Failed(error) => Some(error.as_str()),
+                _ => None,
+            };
+            json!({
+                "id": entry.id.to_string(),
+                "path": entry.path,
+                "kind": kind,
+                "state": state,
+                "error": error,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "total": total,
+        "offset": find.offset,
+        "next": next,
+        "assets": assets,
+    }))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ConsoleRead {
+    /// The number of the first entry wanted; 0 is the oldest ever logged.
+    cursor: u64,
+    /// The quietest level returned: trace, debug, info, warn or error.
+    level: Option<String>,
+    limit: Option<usize>,
+}
+
+fn console_read(world: &World, params: &Value) -> Result<Value, String> {
+    let read: ConsoleRead = params_of(params)?;
+    let floor = match read
+        .level
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("info") => LogLevel::Info,
+        Some("trace") => LogLevel::Trace,
+        Some("debug") => LogLevel::Debug,
+        Some("warn" | "warning") => LogLevel::Warning,
+        Some("error") => LogLevel::Error,
+        Some(other) => {
+            return Err(format!(
+                "`{other}` is not a level; one of trace, debug, info, warn, error"
+            ));
+        }
+    };
+    let log = world
+        .get_resource::<LogBuffer>()
+        .ok_or_else(|| "this session has no console".to_owned())?;
+    let limit = bounded(read.limit, 100, 1000);
+    let oldest = log.next_number() - log.len() as u64;
+    // Past the end is a cursor from an editor that has since restarted.
+    let cursor = match read.cursor > log.next_number() {
+        true => oldest,
+        false => read.cursor,
+    };
+    let mut next = log.next_number();
+    let mut entries = Vec::new();
+    for (number, entry) in log.since(cursor) {
+        if entries.len() == limit {
+            next = number;
+            break;
+        }
+        if entry.level < floor {
+            continue;
+        }
+        let level = match entry.level {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warning => "warn",
+            LogLevel::Error => "error",
+        };
+        entries.push(json!({
+            "n": number,
+            "level": level,
+            "message": entry.message,
+            "source": entry.source,
+            "line": (entry.line != 0).then_some(entry.line),
+            "frame": entry.frame,
+        }));
+    }
+    Ok(json!({
+        "entries": entries,
+        "next": next,
+        "lost": oldest.saturating_sub(cursor),
+    }))
+}

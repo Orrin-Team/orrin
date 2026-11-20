@@ -315,6 +315,9 @@ pub struct EditorState {
     pub settings_panel: super::panels::settings::SettingsPanel,
     /// Why the live link is not listening, as `SettingsStore` last heard it.
     pub link_error: Option<String>,
+    /// The remote as Settings ▸ Agents shows it: `None` while it is off, and
+    /// why it is not listening when it should be.
+    pub remote: Option<Result<super::remote::RemoteStatus, String>>,
     /// Settings ▸ Blender's Install add-on, running or as it last ended.
     pub addon: super::blender::Install,
     /// How the viewport draws the scene: shaded, or as its edges. `None` is
@@ -516,6 +519,7 @@ impl Default for EditorState {
             backend: crate::gfx::BackendChoice::DEFAULT,
             settings_panel: Default::default(),
             link_error: None,
+            remote: None,
             addon: Default::default(),
             wireframe: None,
             material_previews: Default::default(),

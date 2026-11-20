@@ -90,6 +90,12 @@ pub fn write_entity(out: &mut String, registry: &Registry, world: &World, entity
     );
 }
 
+/// One component as an entity block holds it, unindented: `id = value` for a
+/// scalar, the id then its fields one level in for anything structured.
+pub fn write_component(out: &mut String, id: &str, value: &Value) {
+    write_named(out, id, value, 0);
+}
+
 /// `entity <header> "<name>"`, then the remaining components sorted by id.
 fn write_block(
     out: &mut String,
