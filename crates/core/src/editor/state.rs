@@ -4,16 +4,17 @@ use std::time::Instant;
 use glam::Vec3;
 
 use orrin_ecs::{Entity, World};
-use orrin_registry::{AssetId, EntityId, Registry};
+use orrin_registry::{AssetId, EntityId, Registry, Resolve};
 
 use super::autosave::Autosave;
 use super::gizmo::{Drag, Handle};
 use super::selection::Selection;
 use crate::asset_db::material::MaterialFile;
+use crate::asset_db::{AssetDatabase, AssetKind};
 use crate::scene::edit::{EditError, History, SceneEditor};
 use crate::scene::{
-    self, Assets, LoadedScenes, LogBuffer, LogLevel, MaterialHandle, Name, Play, PlayState,
-    Prefabs, Time, Transform, entities,
+    self, Assets, LoadedScenes, LogBuffer, LogLevel, MaterialHandle, MeshHandle, Name, Play,
+    PlayState, Prefabs, Time, Transform, entities,
 };
 
 /// Where the editor's Save/Load buttons read and write. Relative to the
@@ -1152,15 +1153,16 @@ impl EditorState {
             n => editor.batch(format!("Reparent {n} entities"), reparent_all),
         }
 
-        if let Some((prefab, parent, at)) = self.instantiate_request.take() {
-            let name = editor
-                .world()
-                .get_resource::<Prefabs>()
-                .and_then(|prefabs| prefabs.get(prefab).map(|p| p.name().to_owned()))
-                .unwrap_or_else(|| prefab.to_string());
+        if let Some((asset, parent, at)) = self.instantiate_request.take() {
+            let name = mesh_name(editor.world(), asset)
+                .or_else(|| {
+                    let prefabs = editor.world().get_resource::<Prefabs>()?;
+                    prefabs.get(asset).map(|p| p.name().to_owned())
+                })
+                .unwrap_or_else(|| asset.to_string());
             let placed =
                 editor.replace(format!("Place {name}"), &[], |world, registry| match place(
-                    world, registry, prefab, parent, at,
+                    world, registry, asset, parent, at,
                 ) {
                     Ok(root) => (Ok(root), vec![root]),
                     Err(error) => (Err(error), Vec::new()),
@@ -1222,19 +1224,29 @@ fn framed(world: &World, selection: &[Entity]) -> Option<scene::Camera> {
     })
 }
 
-/// Spawn an instance of `prefab`, under `parent` when there is one and
-/// standing at `at` when that is given.
+/// Spawn an instance of prefab `asset`, or an entity drawing it when it is a
+/// mesh, under `parent` when there is one and standing at `at` when that is
+/// given.
+///
+/// The mesh case lives here rather than in `scene::prefab`, because a script's
+/// `Prefab.Instantiate` reaches that too and places only prefabs.
 fn place(
     world: &mut World,
     registry: &Registry,
-    prefab: AssetId,
+    asset: AssetId,
     parent: Option<Entity>,
     at: Option<Vec3>,
 ) -> Result<Entity, String> {
-    let (root, issues) = scene::prefab::instantiate(world, registry, prefab)?;
-    for issue in issues {
-        log(world, LogLevel::Warning, issue.to_string());
-    }
+    let root = match mesh_name(world, asset) {
+        Some(name) => spawn_mesh_asset(world, asset, name)?,
+        None => {
+            let (root, issues) = scene::prefab::instantiate(world, registry, asset)?;
+            for issue in issues {
+                log(world, LogLevel::Warning, issue.to_string());
+            }
+            root
+        }
+    };
     // Not `keep_world`: a prefab sits where it was authored to, relative to
     // whatever it was dropped on.
     if let Some(parent) = parent
@@ -1251,6 +1263,32 @@ fn place(
         world.insert(root, local);
     }
     Ok(root)
+}
+
+/// The file stem of `asset` when the project imports it as a mesh.
+fn mesh_name(world: &World, asset: AssetId) -> Option<String> {
+    let db = world.get_resource::<AssetDatabase>()?;
+    let entry = db
+        .get(asset)
+        .filter(|entry| entry.kind == AssetKind::Mesh)?;
+    Some(entry.name().to_owned())
+}
+
+/// An entity called `name` drawing mesh `asset` with a spawned cube's
+/// material. The handle comes from the Mesh slot's own resolution, so a mesh
+/// still importing, or one that failed, draws here as it would there.
+fn spawn_mesh_asset(world: &mut World, asset: AssetId, name: String) -> Result<Entity, String> {
+    let material =
+        default_material(world).ok_or_else(|| format!("no material to draw `{name}` with"))?;
+    let mesh = MeshHandle::from_value(world, &orrin_registry::Value::Asset(asset))
+        .map_err(|error| format!("placing `{name}`: {error}"))?;
+    Ok(entities::spawn_mesh(
+        world,
+        name,
+        Transform::default(),
+        mesh,
+        material,
+    ))
 }
 
 impl EditorState {

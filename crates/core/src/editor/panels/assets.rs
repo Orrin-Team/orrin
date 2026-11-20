@@ -865,7 +865,7 @@ impl Cells<'_> {
             AssetKind::Mesh => (
                 icons::box_(),
                 theme::KIND_MESH,
-                "Drag onto a mesh renderer to draw it",
+                "Drag into the scene to place it, or onto a mesh renderer to draw it",
             ),
             AssetKind::Texture => (
                 icons::image(),

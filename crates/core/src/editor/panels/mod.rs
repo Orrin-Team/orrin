@@ -2803,6 +2803,120 @@ mod tests {
         assert!(placed.y.abs() < 1e-4);
     }
 
+    /// A project holding a mesh, `rock.glb`, and a texture, `stone.png`, with
+    /// the clay material a spawned cube is drawn with. The mesh is a `.glb`
+    /// rather than a `.blend` so the import worker does not start Blender.
+    fn mesh_project(
+        editor: &mut Harness,
+        name: &str,
+    ) -> (crate::asset_db::tests::Dir, [orrin_registry::AssetId; 2]) {
+        let dir = crate::asset_db::tests::Dir::new(name);
+        dir.write("rock.glb", b"");
+        dir.write("stone.png", b"");
+        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
+        let ids = [
+            db.find("rock.glb").unwrap().id,
+            db.find("stone.png").unwrap().id,
+        ];
+        editor.world.insert_resource(db);
+        let mut assets = crate::scene::Assets::new();
+        assets.insert_material("clay", crate::scene::MaterialHandle(0));
+        editor.world.insert_resource(assets);
+        (dir, ids)
+    }
+
+    /// A mesh let go over the scene is placed as a prefab is: a new entity
+    /// named for its file, drawing it with the default material, standing
+    /// under the pointer, selected, and one step to undo. Anything else that
+    /// is not a prefab is still refused by name.
+    #[test]
+    fn a_mesh_dropped_on_the_scene_is_placed_drawing_it_and_a_texture_is_refused() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (_dir, [rock, stone]) = mesh_project(&mut editor, "panel-drop-mesh");
+        editor.frames(2);
+        let at = editor.viewport().center();
+
+        drop_payload(&mut editor, rock, at);
+        let placed = named(&editor.world, "rock").expect("the mesh was placed");
+        let handle = *editor
+            .world
+            .get::<crate::scene::MeshHandle>(placed)
+            .unwrap();
+        assert_eq!(
+            editor
+                .world
+                .resource::<crate::asset_db::AssetDatabase>()
+                .mesh_id(handle),
+            Some(rock)
+        );
+        assert_eq!(
+            editor
+                .world
+                .get::<crate::scene::MaterialHandle>(placed)
+                .map(|m| *m),
+            Some(crate::scene::MaterialHandle(0))
+        );
+        let camera = *editor.world.resource::<crate::scene::Camera>();
+        let expected = super::viewport::ground_point(
+            &camera,
+            1280.0 / 800.0,
+            egui::vec2(at.x / 1280.0 * 2.0 - 1.0, at.y / 800.0 * 2.0 - 1.0),
+        )
+        .expect("the default camera looks down at the ground");
+        let standing = editor
+            .world
+            .get::<LocalTransform>(placed)
+            .unwrap()
+            .translation;
+        assert!(
+            (standing - expected).length() < 1e-4,
+            "{standing} vs {expected}"
+        );
+        assert_eq!(editor.state.selection.primary(), Some(placed));
+        assert_eq!(editor.state.history.undo_label(), Some("Place rock"));
+
+        editor.state.request_undo();
+        editor.state.apply(&mut editor.world, &editor.registry);
+        assert!(!editor.world.is_alive(placed));
+        assert_eq!(named(&editor.world, "rock"), None);
+
+        let before = editor.world.entities().count();
+        drop_payload(&mut editor, stone, at);
+        assert_eq!(editor.world.entities().count(), before);
+        let logged: Vec<String> = editor
+            .world
+            .resource::<crate::scene::LogBuffer>()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        assert_eq!(logged, ["`stone.png` is a texture, not a prefab"]);
+    }
+
+    #[test]
+    fn a_mesh_dropped_on_a_row_is_placed_under_it() {
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let room = editor.spawn("Room");
+        let (_dir, [rock, _]) = mesh_project(&mut editor, "panel-drop-mesh-row");
+        editor.frames(2);
+        let row = editor
+            .painted_text_rects()
+            .into_iter()
+            .find(|(text, _)| text == "Room")
+            .expect("the row is drawn")
+            .1;
+
+        drop_payload(&mut editor, rock, row.center());
+        let placed = named(&editor.world, "rock").expect("the mesh was placed");
+        assert_eq!(
+            editor
+                .world
+                .get::<crate::scene::Parent>(placed)
+                .map(|p| p.get()),
+            Some(room)
+        );
+        assert_eq!(editor.state.selection.primary(), Some(placed));
+    }
+
     /// Every menu has to lay out: one that borrows a resource the others do not
     /// touch only fails when it is opened.
     #[test]
