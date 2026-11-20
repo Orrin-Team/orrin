@@ -329,11 +329,26 @@ impl Server {
         .output()
         .map_err(|err| format!("could not launch the engine ({}): {err}", engine.origin))?;
         let report = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let summary = match output.status.code() {
-            Some(0) => "Every test passed".to_owned(),
-            Some(1) => "A test failed, or the filter matched none".to_owned(),
-            Some(code) => format!("The tests could not be run (the engine exited with {code})"),
-            None => "The engine was stopped by a signal while testing".to_owned(),
+        let counts = serde_json::from_str::<Value>(&report).ok().map(|report| {
+            let count = |key: &str| report.get(key).and_then(Value::as_u64).unwrap_or(0);
+            (count("passed"), count("failed"))
+        });
+        let filter = tests.filter.as_deref().unwrap_or_default();
+        let summary = match (output.status.code(), counts) {
+            (Some(0 | 1), Some((0, 0))) if !filter.is_empty() => {
+                format!("No test's name contains `{filter}`, so none ran")
+            }
+            (Some(0 | 1), Some((0, 0))) => "The project has no tests, so none ran".to_owned(),
+            (Some(0), Some((passed, _))) => format!("All {passed} test(s) passed"),
+            (Some(1), Some((passed, failed))) => {
+                format!("{failed} test(s) failed and {passed} passed")
+            }
+            (Some(0), None) => "Every test passed".to_owned(),
+            (Some(1), None) => "A test failed, or none matched; the report did not read".to_owned(),
+            (Some(code), _) => {
+                format!("The tests could not be run (the engine exited with {code})")
+            }
+            (None, _) => "The engine was stopped by a signal while testing".to_owned(),
         };
         let mut text = vec![summary];
         if !report.is_empty() {
@@ -343,7 +358,11 @@ impl Server {
         if !ran {
             text.push(tail(&String::from_utf8_lossy(&output.stderr), 40));
         }
-        Ok(Answer { text, failed: !ran })
+        let none = counts == Some((0, 0));
+        Ok(Answer {
+            text,
+            failed: !ran || none,
+        })
     }
 
     fn editor_open(&mut self, arguments: &Value) -> Result<Answer, String> {
