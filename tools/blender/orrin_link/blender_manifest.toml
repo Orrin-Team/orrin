@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "orrin_link"
+version = "1.0.0"
+name = "Orrin Live Link"
+tagline = "Stream the open .blend into the Orrin editor as it is edited"
+maintainer = "Orrin"
+type = "add-on"
+
+# `Mesh.corner_normals` arrived in 4.1 and extensions in 4.2.
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-2.0-or-later"]
+
+[permissions]
+network = "Connects to the Orrin editor on this computer, at 127.0.0.1"

@@ -1,6 +1,8 @@
 //! Source bytes to artifacts: PNG and JPEG textures, glTF 2.0 meshes. A
 //! surface shader's import is `asset_db::shader`'s; this module only names its
-//! importer and what its key hashes.
+//! importer and what its key hashes. A `.blend` is a mesh too: it is read here
+//! as its own bytes alone, and `asset_db::blend` has Blender export those to
+//! the GLB this module's mesh import is then given.
 //!
 //! A texture is decoded, scaled to its `max_size`, given its mip chain and
 //! stored in the format its usage takes on the device's [`Target`] — the work
@@ -70,7 +72,8 @@ pub fn key_settings(kind: AssetKind, settings: &Settings, target: Target) -> Str
 }
 
 /// Every file importing `source` reads, source first, as `(name, bytes)`. For
-/// a `.gltf`, its external buffers follow, named by their URIs.
+/// a `.gltf`, its external buffers follow, named by their URIs; a `.blend` is
+/// only itself.
 pub fn read_inputs(
     kind: AssetKind,
     source: &Path,
@@ -79,7 +82,7 @@ pub fn read_inputs(
     let bytes =
         std::fs::read(source).map_err(|error| format!("{rel} could not be read: {error}"))?;
     let mut inputs = Vec::new();
-    if kind == AssetKind::Mesh {
+    if kind == AssetKind::Mesh && !super::blend::is_blend(source) {
         let document = parse_gltf(rel, &bytes)?.document;
         let base = source.parent().unwrap_or(Path::new("."));
         for buffer in document.buffers() {
@@ -531,6 +534,26 @@ pub(crate) mod tests {
   ]
 }}"#
         )
+    }
+
+    /// [`triangle_gltf`] and [`triangle_bin`] as one `.glb`.
+    pub(in crate::asset_db) fn triangle_glb() -> Vec<u8> {
+        let mut json = triangle_gltf("")
+            .replace(r#""uri": "tri%20angle.bin", "#, "")
+            .into_bytes();
+        json.resize(json.len().next_multiple_of(4), b' ');
+        let bin = triangle_bin();
+        let mut glb = Vec::new();
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        glb.extend_from_slice(&((28 + json.len() + bin.len()) as u32).to_le_bytes());
+        glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json);
+        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"BIN\0");
+        glb.extend_from_slice(&bin);
+        glb
     }
 
     fn mesh(dir: &Dir, node: &str, scale: f32) -> Result<CpuMesh, String> {

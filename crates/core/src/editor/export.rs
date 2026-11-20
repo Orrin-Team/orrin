@@ -69,18 +69,28 @@ impl Export {
     }
 
     /// Run `cli export` on the project at `root`, called `name`, for
-    /// `platform`.
+    /// `platform`. The packing process finds Blender only through
+    /// `ORRIN_BLENDER` or an installed one, so a `blender` set in the editor's
+    /// settings is handed down as that variable, unless it is already set.
     pub fn start(
         &mut self,
         cli: &Path,
         root: &Path,
         name: &str,
         platform: Platform,
+        blender: Option<&Path>,
     ) -> Result<(), String> {
         if self.is_running() {
             return Err("an export is already running; wait for it to finish".to_owned());
         }
-        let mut child = std::process::Command::new(cli)
+        let mut command = std::process::Command::new(cli);
+        let env = crate::editor::settings::BLENDER_ENV;
+        if let Some(blender) = blender
+            && std::env::var_os(env).is_none_or(|set| set.is_empty())
+        {
+            command.env(env, blender);
+        }
+        let mut child = command
             .arg("export")
             .arg("--project")
             .arg(root)
@@ -364,7 +374,7 @@ mod tests {
         let mut export = Export::default();
 
         export
-            .start(&cli, &root, "game", Platform::Windows)
+            .start(&cli, &root, "game", Platform::Windows, None)
             .unwrap();
         assert!(export.is_running());
         let logged = finish(&mut export);
@@ -406,7 +416,7 @@ mod tests {
         let mut export = Export::default();
 
         export
-            .start(&cli, dir.path(), "game", Platform::Windows)
+            .start(&cli, dir.path(), "game", Platform::Windows, None)
             .unwrap();
         let logged = finish(&mut export);
 
@@ -432,7 +442,13 @@ mod tests {
             },
         };
         let error = export
-            .start(Path::new("orrin"), Path::new("."), "game", Platform::Linux)
+            .start(
+                Path::new("orrin"),
+                Path::new("."),
+                "game",
+                Platform::Linux,
+                None,
+            )
             .unwrap_err();
         assert!(error.contains("already"), "{error}");
     }

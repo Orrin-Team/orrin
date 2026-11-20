@@ -702,7 +702,7 @@ pub fn instantiate_into(
             .and_then(|db| {
                 let entry = db.get(prefab)?;
                 Some(format!(
-                    "`{}` is a {}, and only a prefab can be placed in the scene",
+                    "`{}` is a {}, not a prefab",
                     entry.path,
                     entry.kind.label()
                 ))
@@ -918,10 +918,7 @@ mod tests {
         world.insert_resource(Prefabs::default());
 
         let err = instantiate(&mut world, &registry(), rock).unwrap_err();
-        assert_eq!(
-            err,
-            "`rocks/rock.png` is a texture, and only a prefab can be placed in the scene"
-        );
+        assert_eq!(err, "`rocks/rock.png` is a texture, not a prefab");
         assert_eq!(world.entities().count(), 0);
     }
 

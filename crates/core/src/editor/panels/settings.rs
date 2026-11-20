@@ -51,7 +51,8 @@
 //!
 //! **Closed, it costs nothing:** the dock does not call [`body`]. Open, it is
 //! a handful of rows a frame and, on a Project page, three file stats a
-//! second: the manifest and the two scenes it names.
+//! second: the manifest and the two scenes it names. The Blender page looks
+//! for Blender, which searches the PATH, once a second.
 
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -91,6 +92,7 @@ pub enum Page {
     Appearance,
     Viewport,
     Scripting,
+    Blender,
     Saving,
     Display,
     Startup,
@@ -98,10 +100,11 @@ pub enum Page {
 
 impl Page {
     const PROJECT: [Self; 3] = [Self::General, Self::Scenes, Self::Scripts];
-    const ORRIN: [Self; 6] = [
+    const ORRIN: [Self; 7] = [
         Self::Appearance,
         Self::Viewport,
         Self::Scripting,
+        Self::Blender,
         Self::Saving,
         Self::Display,
         Self::Startup,
@@ -115,6 +118,7 @@ impl Page {
             Self::Appearance => "Appearance",
             Self::Viewport => "Viewport",
             Self::Scripting => "Scripting",
+            Self::Blender => "Blender",
             Self::Saving => "Saving",
             Self::Display => "Display",
             Self::Startup => "Startup",
@@ -162,6 +166,11 @@ enum Field {
     /// The external editor's own command, while it is Custom.
     Command,
     Reload,
+    BlenderPath,
+    LiveLink,
+    LinkPort,
+    /// Not a setting but an action, found by search like one.
+    AddOn,
     Autosave,
     Interval,
     Present,
@@ -355,6 +364,36 @@ const ROWS: &[Row] = &[
         "hot reload auto build dotnet",
     ),
     row(
+        Page::Blender,
+        Field::BlenderPath,
+        "Blender",
+        "The Blender that exports .blend assets and installs the add-on; empty finds an \
+         installed one",
+        "path executable application app exe location",
+    ),
+    row(
+        Page::Blender,
+        Field::LiveLink,
+        "Live link",
+        "Let the Blender add-on stream the file it has open into the viewport as it is edited, \
+         before it is saved",
+        "stream sync realtime real-time meshsync edit mode",
+    ),
+    row(
+        Page::Blender,
+        Field::LinkPort,
+        "Port",
+        "Where on 127.0.0.1 the live link listens; the add-on's preferences name the same port",
+        "network tcp socket localhost live link",
+    ),
+    row(
+        Page::Blender,
+        Field::AddOn,
+        "Add-on",
+        "Install the Orrin Live Link add-on into that Blender and enable it",
+        "addon install add-on extension plugin live link",
+    ),
+    row(
         Page::Saving,
         Field::Autosave,
         "Autosave",
@@ -518,6 +557,18 @@ pub struct SettingsPanel {
     /// Text fields with focus, and what they hold until they commit.
     typing: Vec<(Field, String)>,
     manifest: Manifest,
+    /// The Blender the Blender page would run, as last looked for.
+    found: Option<Found>,
+}
+
+/// `blend::locate` searches the PATH, so the page asks it at most once a
+/// second, and again at once when the path it was asked with changes.
+struct Found {
+    at: Instant,
+    configured: Option<PathBuf>,
+    env: Option<String>,
+    path: Option<PathBuf>,
+    exists: bool,
 }
 
 /// The project's `orrin.toml` as the tab last read it.
@@ -557,6 +608,34 @@ impl SettingsPanel {
     #[cfg(test)]
     pub fn recheck_now(&mut self) {
         self.manifest.checked = None;
+    }
+
+    /// The Blender `blend::locate` finds for these settings and environment,
+    /// and whether it is there.
+    fn blender(&mut self, state: &EditorState) -> (Option<PathBuf>, bool) {
+        let configured = state.settings.blender.path.as_ref();
+        let env = state.environment.blender();
+        let fresh = self.found.as_ref().is_some_and(|found| {
+            found.at.elapsed() < RECHECK
+                && found.configured.as_ref() == configured
+                && found.env.as_deref() == env
+        });
+        if !fresh {
+            let path = crate::asset_db::blend::locate(
+                env.map(std::ffi::OsString::from),
+                configured.map(PathBuf::as_path),
+            );
+            self.found = Some(Found {
+                at: Instant::now(),
+                configured: configured.cloned(),
+                env: env.map(str::to_owned),
+                exists: path.as_deref().is_some_and(Path::is_file),
+                path,
+            });
+        }
+        self.found
+            .as_ref()
+            .map_or((None, false), |found| (found.path.clone(), found.exists))
     }
 
     fn select(&mut self, page: Page) {
@@ -1054,6 +1133,7 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
     let env = &cx.state.environment;
     let locked = match field {
         Field::Editor => env.editor_override(),
+        Field::BlenderPath => env.blender_override(),
         Field::Backend => env.backend_override(),
         Field::Threads => env.threads_override(),
         Field::Validation => env.validation_override(),
@@ -1076,6 +1156,9 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
                 if locked.is_some() && field.is_startup() {
                     let mut chosen = cx.state.environment.over(&cx.state.settings.startup);
                     startup_control(ui, field, &mut chosen);
+                } else if let (Some(_), Some(path)) = (locked, cx.state.environment.blender()) {
+                    let mut shown = path.to_owned();
+                    ui.add(egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
                 } else {
                     control(ui, cx, panel, field);
                 }
@@ -1130,6 +1213,9 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
             weak,
         );
     }
+    if row.page == Page::Blender {
+        blender_note(ui, cx, panel, field, locked.is_some());
+    }
     if field == Field::Editor
         && let ExternalEditor::Custom(command) = &cx.state.settings.scripting.editor
     {
@@ -1159,6 +1245,76 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
             weak,
         );
     }
+}
+
+/// What only a Blender row can say: which Blender runs, what the link is
+/// doing, how the last install went.
+fn blender_note(ui: &mut egui::Ui, cx: &Cx, panel: &mut SettingsPanel, field: Field, locked: bool) {
+    let weak = ui.visuals().weak_text_color();
+    match field {
+        Field::BlenderPath => match panel.blender(cx.state) {
+            (None, _) => note(
+                ui,
+                "No Blender was found: set its path, or install Blender",
+                theme::ERROR,
+            ),
+            (Some(path), false) => note(
+                ui,
+                &format!("Not found: {} is not a file", path.display()),
+                theme::ERROR,
+            ),
+            (Some(path), true) if !locked && cx.state.settings.blender.path.is_none() => {
+                note(ui, &format!("Using {}", path.display()), weak);
+            }
+            _ => {}
+        },
+        Field::LiveLink => {
+            let (line, colour) = link_line(cx.world, cx.state);
+            note(ui, &line, colour.unwrap_or(weak));
+        }
+        Field::AddOn => match cx.state.addon.last() {
+            Some(Ok(done)) => note(ui, &sentence(done), weak),
+            Some(Err(failed)) => note(ui, &sentence(failed), theme::ERROR),
+            None => {}
+        },
+        _ => {}
+    }
+}
+
+/// The live link's state in a line, and a colour when it is a failure.
+fn link_line(world: &World, state: &EditorState) -> (String, Option<egui::Color32>) {
+    if !state.settings.blender.live_link {
+        return ("Off".to_owned(), None);
+    }
+    if let Some(error) = &state.link_error {
+        return (sentence(error), Some(theme::ERROR));
+    }
+    let Some(db) = world.get_resource::<AssetDatabase>() else {
+        return ("Listens while a project is open".to_owned(), None);
+    };
+    let line = match db.link_status() {
+        None => "Not listening".to_owned(),
+        Some(status) if status.peers == 0 => format!("Listening on 127.0.0.1:{}", status.port),
+        Some(status) => {
+            let who = match status.peers {
+                1 => "1 Blender connected".to_owned(),
+                n => format!("{n} Blenders connected"),
+            };
+            match status.live.as_slice() {
+                [] => who,
+                live => format!("{who}, streaming {}", live.join(", ")),
+            }
+        }
+    };
+    (line, None)
+}
+
+/// A console line as a note on the page: its first letter capitalised.
+fn sentence(line: &str) -> String {
+    let mut chars = line.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 /// A text field that commits on Enter or on losing focus and gives back what
@@ -1279,6 +1435,47 @@ fn control(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, field: Fie
         }
         Field::Reload => {
             ui.checkbox(&mut settings.scripting.reload_after_rebuild, "");
+        }
+        Field::BlenderPath => {
+            let current = settings
+                .blender
+                .path
+                .as_ref()
+                .map_or_else(String::new, |path| path.display().to_string());
+            if let Some(typed) = committed_text(ui, &mut panel.typing, field, &current) {
+                let typed = typed.trim();
+                settings.blender.path = (!typed.is_empty()).then(|| PathBuf::from(typed));
+            }
+        }
+        Field::LiveLink => {
+            ui.checkbox(&mut settings.blender.live_link, "");
+        }
+        Field::LinkPort => {
+            let current = settings.blender.port.to_string();
+            if let Some(port) = committed_text(ui, &mut panel.typing, field, &current)
+                .and_then(|typed| typed.trim().parse::<u16>().ok())
+                .filter(|&port| port != 0)
+            {
+                settings.blender.port = port;
+            }
+        }
+        Field::AddOn => {
+            let (blender, exists) = panel.blender(cx.state);
+            let blender = blender.filter(|_| exists);
+            let running = cx.state.addon.is_running();
+            let label = if running {
+                "Installing…"
+            } else {
+                "Install add-on"
+            };
+            let button = ui
+                .add_enabled(!running && blender.is_some(), egui::Button::new(label))
+                .on_disabled_hover_text("No Blender was found to install it into");
+            if button.clicked()
+                && let Some(blender) = blender
+            {
+                cx.state.addon.start(blender);
+            }
         }
         Field::Autosave => {
             ui.checkbox(&mut settings.saving.autosave, "");
@@ -1447,6 +1644,10 @@ fn is_default(field: Field, s: &Settings, d: &Settings) -> bool {
         Field::Threads => s.startup.threads == d.startup.threads,
         Field::Validation => s.startup.validation == d.startup.validation,
         Field::Log => s.startup.log == d.startup.log,
+        Field::BlenderPath => s.blender.path == d.blender.path,
+        Field::LiveLink => s.blender.live_link == d.blender.live_link,
+        Field::LinkPort => s.blender.port == d.blender.port,
+        Field::AddOn => true,
         _ => tint(s.appearance.icons, field) == tint(d.appearance.icons, field),
     }
 }
@@ -1470,6 +1671,10 @@ fn restore(field: Field, s: &mut Settings, d: &Settings) {
         Field::Threads => s.startup.threads = d.startup.threads,
         Field::Validation => s.startup.validation = d.startup.validation,
         Field::Log => s.startup.log = d.startup.log,
+        Field::BlenderPath => s.blender.path.clone_from(&d.blender.path),
+        Field::LiveLink => s.blender.live_link = d.blender.live_link,
+        Field::LinkPort => s.blender.port = d.blender.port,
+        Field::AddOn => {}
         _ => {
             if let (Some(to), Some(from)) = (
                 tint_mut(&mut s.appearance.icons, field),
@@ -1501,6 +1706,10 @@ fn default_text(field: Field, d: &Settings) -> String {
         Field::Threads => threads_label(d.startup.threads),
         Field::Validation => validation_label(d.startup.validation).to_owned(),
         Field::Log => log_label(d.startup.log).to_owned(),
+        Field::BlenderPath => "empty, an installed Blender".to_owned(),
+        Field::LiveLink => on(d.blender.live_link),
+        Field::LinkPort => d.blender.port.to_string(),
+        Field::AddOn => String::new(),
         _ => tint(d.appearance.icons, field)
             .map_or_else(String::new, |[r, g, b]| format!("#{r:02X}{g:02X}{b:02X}")),
     }
@@ -1708,8 +1917,14 @@ mod tests {
             validation: crate::editor::settings::Validation::On,
             log: crate::editor::settings::LogFloor::Warn,
         };
+        moved.blender = crate::editor::settings::Blender {
+            path: Some("/opt/blender/blender".into()),
+            live_link: !defaults.blender.live_link,
+            port: 47200,
+        };
         for row in ROWS.iter().filter(|row| !row.page.is_project()) {
-            if row.field == Field::Theme {
+            // A pick goes through a request, and installing is an action.
+            if matches!(row.field, Field::Theme | Field::AddOn) {
                 continue;
             }
             assert!(!is_default(row.field, &moved, &defaults), "{}", row.label);

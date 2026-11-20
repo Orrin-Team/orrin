@@ -149,6 +149,7 @@ impl MtlDriver {
         self.pipelines.lock().unwrap().collect(frame);
         self.shaders.lock().unwrap().collect(frame);
         self.bind_groups.lock().unwrap().collect(frame);
+        self.collect_geometry(frame);
         let slot = (frame % FRAME_SLOTS) as usize;
         for kind in self.arenas.lock().unwrap().iter_mut() {
             kind[slot].reset();

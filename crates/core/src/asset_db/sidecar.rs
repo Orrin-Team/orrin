@@ -33,8 +33,8 @@
 //!   RGBA8 — for pixel art and UI, where BC's 4x4 blocks show) and `max_size`
 //!   (the longest side in texels the source is scaled down to fit; `0` keeps
 //!   it as it is).
-//! - mesh: `scale`, multiplying every position, for a file not authored in
-//!   metres.
+//! - mesh (a `.gltf`, `.glb` or `.blend`): `scale`, multiplying every
+//!   position, for a file not authored in metres.
 //! - folder: `tint`, the colour its icon is drawn in, as `"#rrggbb"`.
 
 use std::path::{Path, PathBuf};
@@ -60,7 +60,8 @@ pub enum AssetKind {
 
 impl AssetKind {
     /// The kind a file is imported as, or `None` for a file that is not an
-    /// asset — a glTF's `.bin`, a sidecar, a readme. Never [`Folder`](Self::Folder).
+    /// asset — a glTF's `.bin`, a sidecar, a readme, Blender's `.blend1` backup
+    /// or `.blend@` save in progress. Never [`Folder`](Self::Folder).
     pub fn of_path(path: &str) -> Option<Self> {
         let file = path.rsplit('/').next().unwrap_or(path);
         let (stem, extension) = file.rsplit_once('.')?;
@@ -69,7 +70,7 @@ impl AssetKind {
         }
         match extension.to_ascii_lowercase().as_str() {
             "png" | "jpg" | "jpeg" => Some(Self::Texture),
-            "gltf" | "glb" => Some(Self::Mesh),
+            "gltf" | "glb" | "blend" => Some(Self::Mesh),
             "oprefab" => Some(Self::Prefab),
             super::material::EXTENSION => Some(Self::Material),
             crate::scene::loaded::EXTENSION => Some(Self::Scene),
@@ -485,6 +486,10 @@ mod tests {
             AssetKind::of_path("fx/glow.oshader"),
             Some(AssetKind::Shader)
         );
+        assert_eq!(AssetKind::of_path("m/tree.Blend"), Some(AssetKind::Mesh));
+        // Blender's backup of the previous save, and its file mid-save.
+        assert_eq!(AssetKind::of_path("m/tree.blend1"), None);
+        assert_eq!(AssetKind::of_path("m/tree.blend@"), None);
         assert_eq!(AssetKind::of_path("tree.bin"), None);
         assert_eq!(AssetKind::of_path("a.png.meta"), None);
         assert_eq!(AssetKind::of_path("png"), None);

@@ -94,6 +94,8 @@ enum Action {
     /// Play this sound through the editor's preview, or stop it if it is
     /// the one playing.
     TogglePreview(AssetId),
+    /// Start Blender on this `.blend`.
+    OpenInBlender(String),
 }
 
 /// The browser's place, kept in egui's memory rather than the editor state:
@@ -269,6 +271,26 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
                 }
             }
         }
+        Some(Action::OpenInBlender(path)) => {
+            let file = world.resource::<AssetDatabase>().dir().join(&path);
+            let blender = crate::asset_db::blend::locate(
+                state.environment.blender().map(std::ffi::OsString::from),
+                state.settings.blender.path.as_deref(),
+            );
+            let opened = match blender {
+                Some(blender) => crate::editor::blender::open(&blender, &file),
+                None => Err(format!(
+                    "no Blender was found. {}",
+                    crate::asset_db::blend::FIX
+                )),
+            };
+            if let Err(why) = opened {
+                log_error(
+                    world,
+                    format!("{path} could not be opened in Blender: {why}"),
+                );
+            }
+        }
         Some(Action::Open(path)) => place.folder = path,
         Some(Action::Tint(path, tint)) => {
             let result = world
@@ -396,7 +418,9 @@ fn pick_files() -> Vec<PathBuf> {
         .set_title("Import files into the project")
         .add_filter(
             "Assets",
-            &["png", "jpg", "jpeg", "gltf", "glb", "omat", "oprefab"],
+            &[
+                "png", "jpg", "jpeg", "gltf", "glb", "blend", "omat", "oprefab",
+            ],
         );
     pollster::block_on(dialog.pick_files())
         .unwrap_or_default()
@@ -861,11 +885,18 @@ impl Cells<'_> {
     /// prefab is also placed by a double-click, as in the prefab list.
     fn asset(&mut self, ui: &mut egui::Ui, entry: &Entry) {
         let weak = ui.visuals().weak_text_color();
+        let blend = crate::asset_db::blend::is_blend(std::path::Path::new(&entry.path));
         let (icon, colour, hint) = match entry.kind {
+            AssetKind::Mesh if blend => (
+                icons::box_(),
+                theme::KIND_MESH,
+                "Drag into the scene to place it, or onto a mesh renderer to draw it. \
+                 Double-click to open it in Blender",
+            ),
             AssetKind::Mesh => (
                 icons::box_(),
                 theme::KIND_MESH,
-                "Drag onto a mesh renderer to draw it",
+                "Drag into the scene to place it, or onto a mesh renderer to draw it",
             ),
             AssetKind::Texture => (
                 icons::image(),
@@ -949,6 +980,9 @@ impl Cells<'_> {
             let path = self.db.dir().join(&entry.path);
             self.state.request_open_scene(path.to_string_lossy());
         }
+        if blend && response.double_clicked() {
+            *self.action = Some(Action::OpenInBlender(entry.path.clone()));
+        }
         self.name_field(ui, &entry.path, response.rect);
         carry(ui, &response, entry.id, name);
         response
@@ -956,6 +990,10 @@ impl Cells<'_> {
             .context_menu(|ui| {
                 if entry.kind == AssetKind::Shader && ui.button("Edit").clicked() {
                     self.state.open_shader(entry.id);
+                    ui.close_menu();
+                }
+                if blend && ui.button("Open in Blender").clicked() {
+                    *self.action = Some(Action::OpenInBlender(entry.path.clone()));
                     ui.close_menu();
                 }
                 rename_item(ui, &entry.path, entry.name(), self.action);

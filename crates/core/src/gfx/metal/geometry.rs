@@ -1,10 +1,16 @@
 //! Every mesh's geometry, in three shared buffers: positions, surfaces and
 //! indices, with a mesh as three numbers into them.
 //!
-//! The arithmetic that places a mesh is `rhi::geometry`'s, shared with Vulkan.
-//! Memory is unified here, so an upload is a write into the buffer and growth is
-//! a larger buffer with the old contents copied across; a frame still reading the
-//! old one is safe because a command buffer retains what it bound.
+//! The arithmetic that places a mesh, and that says when a replaced mesh's span
+//! may take another, is `rhi::geometry`'s, shared with Vulkan. Memory is unified
+//! here, so an upload is a write into the buffer and growth is a larger buffer
+//! with the old contents copied across; a frame still reading the old one is
+//! safe because a command buffer retains what it bound. A write into reused
+//! space has no copy on a queue to be ordered behind, so the retirement delay is
+//! the only thing keeping a frame in flight from reading a span half-written
+//! with another mesh.
+
+use std::sync::atomic::Ordering;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -36,7 +42,7 @@ impl Geometry {
             ),
             surfaces: allocate(device, INITIAL_VERTICES * size_of::<SurfaceVertex>() as u64),
             indices: allocate(device, INITIAL_INDICES * 4),
-            placement: Placement::default(),
+            placement: Placement::new(super::FRAME_SLOTS),
         }
     }
 
@@ -49,16 +55,15 @@ impl Geometry {
         let bounds = Aabb::from_points(vertices.iter().map(|v| glam::Vec3::from(v.position)));
         let (positions, surfaces): (Vec<_>, Vec<_>) = vertices.iter().map(Vertex::split).unzip();
 
-        let held_vertices = u64::from(self.placement.vertices);
-        let held_indices = u64::from(self.placement.indices);
-        self.reserve(
-            device,
-            held_vertices + positions.len() as u64,
-            held_indices + indices.len() as u64,
-        );
         let span = self
             .placement
             .place(positions.len() as u32, indices.len() as u32);
+        let (needed_vertices, needed_indices) = self.placement.ends();
+        self.reserve(
+            device,
+            u64::from(needed_vertices),
+            u64::from(needed_indices),
+        );
 
         let vertex_offset = span.vertex_offset as usize;
         write(&self.positions, vertex_offset, &positions);
@@ -134,6 +139,37 @@ impl MtlDriver {
             .expect("a pass panicked while using the device")
             .0
             .upload(&self.device, vertices, indices)
+    }
+
+    pub fn replace_mesh(
+        &self,
+        old: MeshSpan,
+        old_vertices: u32,
+        vertices: &[Vertex],
+        indices: &[u32],
+    ) -> (MeshSpan, Aabb) {
+        let mut geometry = self
+            .geometry
+            .lock()
+            .expect("a pass panicked while using the device");
+        let frame = self.frame.load(Ordering::Relaxed);
+        geometry.0.placement.retire(old, old_vertices, frame);
+        geometry.0.upload(&self.device, vertices, indices)
+    }
+
+    /// Return to the arena every retired span whose frames are done.
+    pub(super) fn collect_geometry(&self, frame: u64) {
+        self.geometry
+            .lock()
+            .expect("a pass panicked while using the device")
+            .0
+            .placement
+            .collect(frame);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn geometry_ends(&self) -> (u32, u32) {
+        self.geometry.lock().unwrap().0.placement.ends()
     }
 }
 

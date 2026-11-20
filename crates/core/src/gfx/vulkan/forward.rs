@@ -35,6 +35,9 @@ pub struct GpuMesh {
     /// vertex data exists on the CPU. Culling reads them through
     /// [`RenderBackend::mesh_bounds`](crate::gfx::RenderBackend::mesh_bounds).
     pub bounds: Aabb,
+    /// How many vertices the span covers, which a draw never needs and the
+    /// arena needs once, to take the span back when the mesh is replaced.
+    pub vertices: u32,
 }
 
 /// Where `forward.frag` declares the cascade comparison sampler. It is bound

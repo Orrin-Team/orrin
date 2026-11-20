@@ -102,6 +102,27 @@ impl Device {
         device_dispatch!(self, driver => driver.upload_mesh(vertices, indices))
     }
 
+    /// [`upload_mesh`](Self::upload_mesh) for a mesh that takes the place of
+    /// the one at `old`, whose span is retired: it takes later uploads once
+    /// every frame that may still draw from it has retired. `old_vertices` is
+    /// that mesh's vertex count, which a span does not carry.
+    pub fn replace_mesh(
+        &self,
+        old: MeshSpan,
+        old_vertices: u32,
+        vertices: &[Vertex],
+        indices: &[u32],
+    ) -> (MeshSpan, Aabb) {
+        device_dispatch!(self, driver => driver.replace_mesh(old, old_vertices, vertices, indices))
+    }
+
+    /// Where each of the arena's two address spaces ends, in vertices and
+    /// indices.
+    #[cfg(test)]
+    pub(crate) fn geometry_ends(&self) -> (u32, u32) {
+        device_dispatch!(self, driver => driver.geometry_ends())
+    }
+
     pub fn create_sampler(&self, desc: SamplerDesc) -> SamplerId {
         device_dispatch!(self, driver => driver.create_sampler(desc))
     }

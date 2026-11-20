@@ -30,7 +30,9 @@
 //! is ignored, so an older engine still opens after a newer one wrote the file.
 //!
 //! **Panels edit `EditorState::settings`** and [`SettingsStore::settle`], at
-//! the end of every editor frame, applies what changed and keeps it. The UI
+//! the end of every editor frame, applies what changed and keeps it. Blender's
+//! path and the live link reach the asset database only once `app.rs` has
+//! called [`SettingsStore::drive_blender`], so no test binds the user's port. The UI
 //! scale is egui's zoom factor rather than its pixels per point, because the
 //! zoom multiplies the display's own scale, which `egui_winit` refreshes when
 //! the window moves to another screen; a fixed pixels per point would be wrong
@@ -59,6 +61,8 @@ use crate::gfx::BackendChoice;
 use crate::scene::{LogLevel, PresentSettings, VsyncMode};
 
 const FILE: &str = "settings.toml";
+/// Read by `asset_db::blend::locate` too, which is what makes it win.
+pub const BLENDER_ENV: &str = "ORRIN_BLENDER";
 const BAD: &str = "settings.toml.bad";
 const THEMES: &str = "themes";
 
@@ -79,6 +83,39 @@ pub struct Settings {
     pub saving: Saving,
     pub display: Display,
     pub startup: Startup,
+    pub blender: Blender,
+}
+
+/// Blender, for `.blend` assets and the live link its add-on streams over.
+/// Handed to the asset database by the windowed editor alone, through
+/// [`SettingsStore::drive_blender`], so no test or harness binds a port.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Blender {
+    /// Its executable; `None` finds an installed one. `ORRIN_BLENDER` wins.
+    #[serde(deserialize_with = "or_default")]
+    pub path: Option<PathBuf>,
+    pub live_link: bool,
+    /// On `127.0.0.1`, never 0: the add-on has to be told it.
+    #[serde(deserialize_with = "or_default")]
+    pub port: u16,
+}
+
+impl Default for Blender {
+    fn default() -> Self {
+        Self {
+            path: None,
+            live_link: true,
+            port: crate::asset_db::link::DEFAULT_PORT,
+        }
+    }
+}
+
+impl Blender {
+    /// What `AssetDatabase::set_link` is asked for.
+    pub fn link(&self) -> Option<u16> {
+        self.live_link.then_some(self.port)
+    }
 }
 
 /// What a run is started with. Each default is what the engine does with no
@@ -329,6 +366,14 @@ impl Settings {
         *images = (*images).clamp(*SWAPCHAIN_IMAGES.start(), *SWAPCHAIN_IMAGES.end());
         // Rayon reads zero as every core, which is what Auto exists to avoid.
         self.startup.threads = self.startup.threads.filter(|&threads| threads > 0);
+        let blender = &mut self.blender;
+        blender.path = blender
+            .path
+            .take()
+            .filter(|path| !path.as_os_str().is_empty());
+        if blender.port == 0 {
+            blender.port = crate::asset_db::link::DEFAULT_PORT;
+        }
     }
 
     /// Hands the world the settings it holds as resources.
@@ -414,6 +459,7 @@ pub struct Environment {
     threads: Option<u32>,
     validation: Option<Validation>,
     log: Option<LogFloor>,
+    blender: Option<String>,
 }
 
 impl Environment {
@@ -441,7 +487,17 @@ impl Environment {
                 .ok()
                 .flatten()
                 .map(LogFloor::from),
+            blender: set(BLENDER_ENV),
         }
+    }
+
+    /// `ORRIN_BLENDER`'s value, when it holds anything.
+    pub fn blender(&self) -> Option<&str> {
+        self.blender.as_deref()
+    }
+
+    pub fn blender_override(&self) -> Option<&'static str> {
+        self.blender.is_some().then_some(BLENDER_ENV)
     }
 
     /// `ORRIN_EDITOR`'s value, when it holds anything.
@@ -497,6 +553,12 @@ pub struct SettingsStore {
     /// Whether the world has been handed `applied` yet. Until it has, a world
     /// resource that differs is the engine's default rather than an edit.
     pushed: bool,
+    /// What the asset database was last handed of `[blender]`; `None` until
+    /// [`drive_blender`](Self::drive_blender), and only the windowed editor
+    /// calls that.
+    handed: Option<Blender>,
+    /// Why the live link is not listening, for the page.
+    link_error: Option<String>,
 }
 
 impl SettingsStore {
@@ -515,6 +577,8 @@ impl SettingsStore {
             malformed: false,
             unsaved: false,
             pushed: false,
+            handed: None,
+            link_error: None,
         };
         let Some(path) = store.path() else {
             return (store, Vec::new());
@@ -633,9 +697,51 @@ impl SettingsStore {
             self.applied.clone_from(settings);
             self.unsaved = true;
         }
+        if self.handed.is_some() {
+            self.hand_blender(world);
+            if state.link_error != self.link_error {
+                state.link_error.clone_from(&self.link_error);
+            }
+        }
         if self.unsaved && !ctx.input(|input| input.pointer.any_down()) {
             self.save();
         }
+    }
+
+    /// Hand the asset database Blender's path and the live link now, and
+    /// every change to them from here on. The windowed editor's alone: an
+    /// exported game has no link, and a test or a harness must never bind the
+    /// user's port.
+    pub fn drive_blender(&mut self, world: &World) {
+        // What a database opens with: no path of the editor's, and no link.
+        self.handed.get_or_insert(Blender {
+            live_link: false,
+            ..Blender::default()
+        });
+        self.hand_blender(world);
+    }
+
+    /// One comparison a frame while nothing changes.
+    fn hand_blender(&mut self, world: &World) {
+        let want = &self.applied.blender;
+        let Some(handed) = self.handed.as_mut().filter(|handed| *handed != want) else {
+            return;
+        };
+        // Without a project there is no database, and none opens later.
+        let Some(mut db) = world.get_resource_mut::<crate::asset_db::AssetDatabase>() else {
+            handed.clone_from(want);
+            return;
+        };
+        if handed.path != want.path {
+            db.set_blender(want.path.clone());
+        }
+        if handed.link() != want.link() {
+            self.link_error = db.set_link(want.link()).err();
+            if let Some(error) = &self.link_error {
+                tracing::warn!("{error}");
+            }
+        }
+        handed.clone_from(want);
     }
 
     /// What applies before the first frame: the theme, the scale and autosave.
@@ -648,6 +754,7 @@ impl SettingsStore {
     ) {
         state.settings.clone_from(&self.applied);
         state.started_with.clone_from(&self.applied.startup);
+        state.link_error.clone_from(&self.link_error);
         themes.select(self.applied.appearance.theme_name());
         ctx.set_zoom_factor(self.applied.appearance.ui_scale);
         state.autosave.configure(self.applied.saving.every());
@@ -785,6 +892,11 @@ mod tests {
         settings.saving.autosave_interval_secs = 300;
         settings.display.vsync = VsyncMode::Immediate;
         settings.display.images = 3;
+        settings.blender = Blender {
+            path: Some("/opt/blender/blender".into()),
+            live_link: false,
+            port: 47200,
+        };
         settings
     }
 
@@ -823,6 +935,9 @@ mod tests {
             "light",
             "scripting",
             "saving",
+            "blender",
+            "live_link",
+            "port =",
         ] {
             assert!(!text.contains(absent), "{absent} in\n{text}");
         }
@@ -917,7 +1032,8 @@ mod tests {
         std::fs::write(
             dir.file(),
             "[appearance]\nui_scale = 9.0\n[viewport]\nfly_speed = nan\nboost = 0.0\n\
-             [saving]\nautosave_interval_secs = 1\n[display]\nimages = 40\n",
+             [saving]\nautosave_interval_secs = 1\n[display]\nimages = 40\n\
+             [blender]\npath = \"\"\nport = 0\n",
         )
         .unwrap();
         let settings = dir.store().0.current().clone();
@@ -929,6 +1045,21 @@ mod tests {
             *AUTOSAVE_SECS.start()
         );
         assert_eq!(settings.display.images, *SWAPCHAIN_IMAGES.end());
+        assert_eq!(
+            settings.blender,
+            Blender::default(),
+            "no path, and a port to listen on"
+        );
+    }
+
+    /// A port no socket can have costs that one value, not the file.
+    #[test]
+    fn a_port_past_65535_is_the_default() {
+        let dir = Scratch::new("blender-port");
+        std::fs::write(dir.file(), "[blender]\nport = 70000\nlive_link = false\n").unwrap();
+        let blender = dir.store().0.current().blender.clone();
+        assert_eq!(blender.port, crate::asset_db::link::DEFAULT_PORT);
+        assert!(!blender.live_link);
     }
 
     #[test]
@@ -1157,6 +1288,17 @@ mod tests {
         assert_eq!(blank.editor(), None);
         assert_eq!(blank.editor_override(), None);
         assert_eq!(Environment::default().editor_override(), None);
+    }
+
+    #[test]
+    fn the_blender_variable_overrides_the_path_and_says_so() {
+        let set = Environment::from_vars(|name| {
+            (name == "ORRIN_BLENDER").then(|| "/opt/blender/blender".to_owned())
+        });
+        assert_eq!(set.blender(), Some("/opt/blender/blender"));
+        assert_eq!(set.blender_override(), Some("ORRIN_BLENDER"));
+        let blank = Environment::from_vars(|_| Some("  ".to_owned()));
+        assert_eq!(blank.blender_override(), None);
     }
 
     /// No `[startup]` is today's behaviour with no variable set, and a default

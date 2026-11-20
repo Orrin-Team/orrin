@@ -13,6 +13,10 @@
 //! browser can say what failed, but an asset the open scene is drawing should
 //! not wait behind a few hundred it is not. A job that brings an artifact back
 //! for the GPU goes in `urgent` and is always taken first.
+//!
+//! One thread means a `.blend`, whose export runs Blender for half a second or
+//! more ([`blend`]), holds up every import queued behind it for that long; that
+//! is accepted rather than given a thread of its own.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -22,6 +26,7 @@ use std::time::Duration;
 
 use orrin_registry::AssetId;
 
+use super::blend::{self, Blender};
 use super::cache::{Artifact, Cache, CacheKey, Summary};
 use super::sidecar::{AssetKind, Settings};
 use super::texture::Target;
@@ -98,6 +103,8 @@ impl From<String> for ImportError {
 pub struct Done {
     pub job: Job,
     pub outcome: Result<Imported, ImportError>,
+    /// The Blender a `.blend` was exported with, read as the job started.
+    pub blender: Option<Blender>,
 }
 
 /// Run `job` against `cache`: read the inputs, hash them, and import only when
@@ -110,8 +117,9 @@ pub struct Done {
 /// One without its thumbnail — a cache written before there were any — is
 /// imported again to make one. A surface shader goes its own way
 /// ([`shader::import`]): it has no thumbnail, and its artifact comes back
-/// whether or not anything draws it.
-pub fn run(job: &Job, cache: &Cache) -> Result<Imported, ImportError> {
+/// whether or not anything draws it. A `.blend` is exported by `blender`, and
+/// only when the cache lacks its artifact, so a cached one needs no Blender.
+pub fn run(job: &Job, cache: &Cache, blender: Option<&Blender>) -> Result<Imported, ImportError> {
     if let Some(key) = job.packed {
         return Ok(unpack(job, cache, key)?);
     }
@@ -122,6 +130,8 @@ pub fn run(job: &Job, cache: &Cache) -> Result<Imported, ImportError> {
             job.kind.label()
         )));
     };
+    let blend = blend::is_blend(&job.source);
+    let importer = if blend { blend::IMPORTER } else { importer };
     let inputs = import::read_inputs(job.kind, &job.source, &job.rel)?;
     // The source is hashed under a fixed name, so renaming or moving a file
     // finds the artifact it already had; the files it reads keep their own
@@ -136,7 +146,11 @@ pub fn run(job: &Job, cache: &Cache) -> Result<Imported, ImportError> {
             )
         })
         .collect();
-    let settings = import::key_settings(job.kind, &job.settings, job.target);
+    let settings = if blend {
+        blend::key_settings(&job.settings)
+    } else {
+        import::key_settings(job.kind, &job.settings, job.target)
+    };
     let key = super::cache::key(importer, &settings, &named);
     if job.kind == AssetKind::Shader {
         return shader::import(job, cache, key, &inputs[0].1, shader::COMPILER);
@@ -170,12 +184,19 @@ pub fn run(job: &Job, cache: &Cache) -> Result<Imported, ImportError> {
     let (artifact, cached, thumbnail) = match found {
         Some(Ok(artifact)) => (artifact, true, pictured),
         Some(Err(_)) | None => {
+            let exported = if blend {
+                let blender = blender.cloned().unwrap_or_default();
+                let glb = blend::export(&job.rel, &inputs[0].1, &blender, cache.dir())?;
+                Some([(job.rel.clone(), glb)])
+            } else {
+                None
+            };
             let (artifact, thumbnail) = import::import_with_thumbnail(
                 job.kind,
                 &job.rel,
                 &job.settings,
                 job.target,
-                &inputs,
+                exported.as_ref().map_or(&inputs[..], |glb| &glb[..]),
             )?;
             let stored = cache.store(key, &artifact).and_then(|()| match &thumbnail {
                 Some(thumbnail) => cache.store_thumbnail(key, thumbnail),
@@ -253,6 +274,7 @@ pub(super) fn payload(artifact: Artifact) -> Payload {
 struct Queue {
     urgent: VecDeque<Job>,
     background: VecDeque<Job>,
+    blender: Blender,
     /// Queued plus running: what [`Worker::wait_idle`] waits on.
     busy: usize,
     closed: bool,
@@ -295,6 +317,11 @@ impl Worker {
         self.shared.changed.notify_all();
     }
 
+    /// Export every `.blend` not yet started with `blender`.
+    pub fn set_blender(&self, blender: Blender) {
+        self.shared.queue.lock().unwrap().blender = blender;
+    }
+
     /// Every job finished since the last call.
     pub fn finished(&self) -> impl Iterator<Item = Done> + '_ {
         self.results.try_iter()
@@ -329,7 +356,7 @@ impl Drop for Worker {
 
 fn serve(shared: &Shared, cache: &Cache, results: &Sender<Done>) {
     loop {
-        let job = {
+        let (job, blender) = {
             let mut queue = shared.queue.lock().unwrap();
             loop {
                 if queue.closed {
@@ -340,15 +367,22 @@ fn serve(shared: &Shared, cache: &Cache, results: &Sender<Done>) {
                     .pop_front()
                     .or_else(|| queue.background.pop_front())
                 {
-                    break job;
+                    let blender = blend::is_blend(&job.source).then(|| queue.blender.clone());
+                    break (job, blender);
                 }
                 queue = shared.changed.wait(queue).unwrap();
             }
         };
-        let outcome = guarded(&job.rel, || run(&job, cache));
+        let outcome = guarded(&job.rel, || run(&job, cache, blender.as_ref()));
         // Sent before `busy` drops, so a caller that saw the queue go idle
         // finds every result already waiting.
-        let gone = results.send(Done { job, outcome }).is_err();
+        let gone = results
+            .send(Done {
+                job,
+                outcome,
+                blender,
+            })
+            .is_err();
         let mut queue = shared.queue.lock().unwrap();
         queue.busy -= 1;
         shared.changed.notify_all();

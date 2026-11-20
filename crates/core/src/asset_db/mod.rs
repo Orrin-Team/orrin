@@ -86,6 +86,26 @@
 //! ignores is a warning ([`take_warnings`](AssetDatabase::take_warnings)), once
 //! per change and never per frame.
 //!
+//! # Blender files
+//!
+//! A `.blend` is a mesh asset like a `.glb` ([`blend`]): the import thread runs
+//! Blender headless to export it as a GLB and imports that through the glTF
+//! mesh path, so a save in Blender reaches the slot the way any save does.
+//! Which Blender runs is `ORRIN_BLENDER`, else the path the editor gives
+//! [`set_blender`](AssetDatabase::set_blender), else an installed one; setting
+//! it queues every `.blend` that failed again. Without one, a `.blend` already
+//! in the cache still loads and one that is not fails by name, saying where to
+//! set the path. An exported game never runs Blender.
+//!
+//! # The live link
+//!
+//! A Blender add-on can stream the `.blend` it has open into the slot that
+//! asset already has, without a save, over a loopback socket the editor
+//! listens on ([`set_link`](AssetDatabase::set_link)). [`link`] is the design
+//! and the wire protocol. While an asset is live its slot is the stream's, so a
+//! disk import that finishes meanwhile updates the entry and leaves the slot
+//! alone; when the link lets go, the slot goes back to what is on disk.
+//!
 //! # What is not here
 //!
 //! Engine-built assets — the demo library's cube and gold, a model the demo
@@ -94,10 +114,12 @@
 //! [`AssetId::named`], so a scene can reference one the same way it
 //! references a file.
 
+pub mod blend;
 pub mod cache;
 mod handles;
 pub mod import;
 mod ktx;
+pub mod link;
 pub mod material;
 pub mod pack;
 pub mod shader;
@@ -114,6 +136,7 @@ use orrin_ecs::{FxBuildHasher, FxHashMap, World};
 use orrin_registry::AssetId;
 
 pub use cache::CacheKey;
+pub use link::LinkStatus;
 pub use sidecar::{AssetKind, MeshSettings, Settings, TextureSettings, Tint, Usage};
 pub use texture::{Target, TexelFormat};
 
@@ -233,6 +256,13 @@ pub struct AssetDatabase {
     attached_surfaces: FxHashMap<AssetId, shader::Attached>,
     /// Warnings found between frames, for [`take_warnings`](Self::take_warnings).
     warnings: Vec<String>,
+    /// How a `.blend` is exported, as last handed to the import thread.
+    blender: blend::Blender,
+    /// The live link, while it is listening.
+    link: Option<link::Link>,
+    /// What happened that is worth a console line and is no fault, for
+    /// [`take_notes`](Self::take_notes).
+    notes: Vec<String>,
 }
 
 impl AssetDatabase {
@@ -295,8 +325,41 @@ impl AssetDatabase {
             shaders: FxHashMap::default(),
             attached_surfaces: FxHashMap::default(),
             warnings: Vec::new(),
+            blender: blend::Blender::default(),
+            link: None,
+            notes: Vec::new(),
         };
         (db, issues)
+    }
+
+    /// Export a `.blend` with the Blender at `path` from now on, or with an
+    /// installed one for `None`; `ORRIN_BLENDER` overrides either. Every
+    /// `.blend` that failed to import is queued again, so fixing the path needs
+    /// no restart.
+    pub fn set_blender(&mut self, path: Option<PathBuf>) {
+        let blender = blend::Blender {
+            configured: path,
+            ..self.blender.clone()
+        };
+        self.configure_blender(blender);
+    }
+
+    fn configure_blender(&mut self, blender: blend::Blender) {
+        if let Some(worker) = &self.worker {
+            worker.set_blender(blender.clone());
+        }
+        self.blender = blender;
+        let failed: Vec<AssetId> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry.status, Status::Failed(_)) && blend::is_blend(Path::new(&entry.path))
+            })
+            .map(|entry| entry.id)
+            .collect();
+        for id in failed {
+            self.queue(id);
+        }
     }
 
     /// Reimport whatever changes under the directory from now on.
@@ -943,9 +1006,15 @@ impl AssetDatabase {
     }
 
     /// Warnings found since the last call: values a material's shader
-    /// ignores, each reported once per change.
+    /// ignores, and what the live link refused, each reported once per change.
     pub fn take_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.warnings)
+    }
+
+    /// What happened since the last call that is worth a line and is no
+    /// fault: the live link's connections and the assets going live and back.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
     }
 
     /// Everything [`service`] does, returning the errors it would log.
@@ -967,6 +1036,7 @@ impl AssetDatabase {
         }
 
         self.bind_meshes(world, backend, &mut errors);
+        self.serve_link(world, backend);
         self.refresh_materials(world, backend, &mut errors);
         self.bind_materials(world, backend, &mut errors);
         errors
@@ -1089,6 +1159,7 @@ impl AssetDatabase {
         for id in queue {
             self.queue(id);
         }
+        self.let_go_moved();
         issues
     }
 
@@ -1218,7 +1289,19 @@ impl AssetDatabase {
         if done.job.payload {
             self.awaiting.remove(&id);
         }
+        // Exported with a Blender replaced while it ran, which `set_blender`
+        // could not queue again because it had not failed yet.
+        if done.outcome.is_err()
+            && done
+                .blender
+                .as_ref()
+                .is_some_and(|ran| *ran != self.blender)
+        {
+            self.queue(id);
+            return;
+        }
         let resident = self.resident(id);
+        let live = self.is_live(id);
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
             return;
         };
@@ -1255,6 +1338,9 @@ impl AssetDatabase {
                 entry.status = Status::Failed(message.clone());
                 let kind = entry.kind;
                 match resident {
+                    Some(_) if live => errors.push(format!(
+                        "{message}. Still drawing what Blender is streaming"
+                    )),
                     // A broken save of an asset already on screen keeps the
                     // last version that imported: the error says what to fix,
                     // and the scene stays usable while it is fixed.
@@ -1288,7 +1374,7 @@ impl AssetDatabase {
                 let Some(slot) = self.meshes.handle(id).filter(|h| h & PENDING == 0) else {
                     return;
                 };
-                if self.meshes.resident(id).and_then(|r| r.key) == Some(key) {
+                if self.meshes.resident(id).and_then(|r| r.key) == Some(key) || self.is_live(id) {
                     return;
                 }
                 let handle = MeshHandle(slot);
@@ -1817,6 +1903,9 @@ pub fn service(world: &World, backend: &mut impl RenderBackend) {
     for warning in db.take_warnings() {
         tracing::warn!("{warning}");
     }
+    for note in db.take_notes() {
+        tracing::info!("{note}");
+    }
 }
 
 /// The directory a project's artifacts are cached in.
@@ -1864,7 +1953,7 @@ pub(crate) mod tests {
         }
     }
 
-    const WAIT: Duration = Duration::from_secs(20);
+    pub(crate) const WAIT: Duration = Duration::from_secs(20);
 
     pub(crate) fn open(dir: &Dir) -> AssetDatabase {
         let (db, issues) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
@@ -2114,7 +2203,7 @@ pub(crate) mod tests {
 
     /// A world that draws `id`'s mesh on one entity, as a loaded scene would
     /// leave it: holding the pending handle the registry was given.
-    fn drawing(db: AssetDatabase, id: AssetId) -> (World, orrin_ecs::Entity) {
+    pub(crate) fn drawing(db: AssetDatabase, id: AssetId) -> (World, orrin_ecs::Entity) {
         let mut world = World::new();
         world.insert_resource(MeshBounds::default());
         world.insert_resource(crate::scene::AssetPreviews::default());
@@ -2131,7 +2220,7 @@ pub(crate) mod tests {
         world.resource_mut::<AssetDatabase>().update(world, backend)
     }
 
-    fn handle(world: &World, entity: orrin_ecs::Entity) -> MeshHandle {
+    pub(crate) fn handle(world: &World, entity: orrin_ecs::Entity) -> MeshHandle {
         *world.get::<MeshHandle>(entity).unwrap()
     }
 
