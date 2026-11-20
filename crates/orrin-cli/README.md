@@ -218,6 +218,8 @@ test run prints is captured into the tool's result. The tools:
 | `component_list` | yes | every registered component, with its default in the scene grammar |
 | `asset_find` | yes | the asset index by kind and path: id, load state, import error |
 | `console_read` | yes | console entries from a cursor, at a minimum level |
+| `scene_edit` | yes | a labelled batch of ops — set, add or remove a component, spawn, despawn, reparent — as one undo step, all or none; edit mode only |
+| `editor_command` | yes | play, pause, step, stop, save, open a scene, undo, redo, reload scripts, select, frame; answered once the effect is seen |
 
 The editor tools reach the editor open on the project through its remote: a
 loopback listener that is off unless Settings ▸ Agents turns it on or
@@ -225,7 +227,17 @@ loopback listener that is off unless Settings ▸ Agents turns it on or
 a token to `.orrin/remote` (`crates/orrin-remote` describes the protocol).
 With no editor attached they answer with an error saying so. `editor_open`
 sends the editor's output to `.orrin/editor.log` and leaves it running when
-the server exits. No tool runs code or writes a file the agent names.
+the server exits.
+
+`scene_edit` is the only way a tool changes the open scene: it goes through the
+editor's edit pipeline, under the label it was given (shown as `Agent: …` in
+the Edit menu), and a batch with one refused op changes nothing and names that
+op. Values are text in the scene grammar, written as `component_list` prints
+them. `editor_command` raises the request the editor's own button raises and
+answers with what happened; it never leaves a dialog open, so opening a scene
+over unsaved work needs `save` or `discard`, and saving one that has never had
+a file needs a `path` inside the project. No tool runs code, and the only file
+a tool writes by name is a scene saved inside the project.
 
 ## How the engine is found
 

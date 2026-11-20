@@ -49,20 +49,23 @@ use crate::{Fallible, ProjectArgs, engine, run, test};
 /// client's own when it is one of these, else the newest.
 const PROTOCOLS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
-const INSTRUCTIONS: &str = "Orrin is a game engine. The live tools read the editor session the \
-     developer has open and need it attached: call editor_open, or ask them to turn on Settings > \
-     Agents > Remote. The others build and test the project with no editor. Entities are named by \
-     EntityId (a UUID), or #slot for one never saved. Scene text is Orrin's scene grammar, the one \
-     in the project's .orrin files; edit scripts, shaders and materials as files and the editor \
-     picks the save up.";
+const INSTRUCTIONS: &str = "Orrin is a game engine. The live tools read and change the editor \
+     session the developer has open, and need it attached: call editor_open, or ask them to turn \
+     on Settings > Agents > Remote. The others build and test the project with no editor. \
+     Entities are named by EntityId (a UUID), or #slot for one never saved. Scene text is \
+     Orrin's scene grammar, the one in the project's .orrin files. Change the open scene only \
+     with scene_edit, each call one undo step the developer can take back; edit scripts, shaders \
+     and materials as files and the editor picks the save up.";
 
 /// The editor tools, which are the remote's methods by the same names.
-const LIVE: [&str; 5] = [
+const LIVE: [&str; 7] = [
     "editor_state",
     "scene_read",
     "component_list",
     "asset_find",
     "console_read",
+    "scene_edit",
+    "editor_command",
 ];
 
 /// What turns the editor's remote on for one run, whatever its settings say:
@@ -616,11 +619,24 @@ fn initialize(params: &Value) -> Value {
     })
 }
 
-fn tool(name: &str, description: &str, properties: Value, read_only: bool) -> Value {
-    let annotations = if read_only {
-        json!({"readOnlyHint": true, "openWorldHint": false})
-    } else {
-        json!({"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false})
+/// What a tool may do, as its annotations tell a client.
+enum Hint {
+    Reads,
+    /// Writes only what a build or a launch writes: outputs, never sources.
+    Builds,
+    /// Changes the open scene or the editor's state.
+    Changes,
+}
+
+fn tool(name: &str, description: &str, properties: Value, hint: Hint) -> Value {
+    let annotations = match hint {
+        Hint::Reads => json!({"readOnlyHint": true, "openWorldHint": false}),
+        Hint::Builds => {
+            json!({"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false})
+        }
+        Hint::Changes => {
+            json!({"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false})
+        }
     };
     json!({
         "name": name,
@@ -634,6 +650,26 @@ fn tool(name: &str, description: &str, properties: Value, read_only: bool) -> Va
     })
 }
 
+/// `tool` with `required` arguments.
+fn requiring(mut tool: Value, required: &[&str]) -> Value {
+    tool["inputSchema"]["required"] = json!(required);
+    tool
+}
+
+/// One op of `scene_edit`'s, by its tag and its own arguments.
+fn op(name: &str, properties: Value, required: &[&str]) -> Value {
+    let mut properties = properties;
+    properties["op"] = json!({"const": name});
+    let mut required = required.to_vec();
+    required.insert(0, "op");
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    })
+}
+
 fn tools() -> Vec<Value> {
     let limit = |what: &str| json!({"type": "integer", "minimum": 1, "description": what});
     let offset = json!({"type": "integer", "minimum": 0, "description": "How many to skip; an answer's `next` is the offset of the page after it"});
@@ -643,14 +679,14 @@ fn tools() -> Vec<Value> {
             "The project's manifest (name, version, entry behaviour, scripts and assets \
              folders), its scenes, and whether an editor is attached. Works with no editor open.",
             json!({}),
-            true,
+            Hint::Reads,
         ),
         tool(
             "build_scripts",
             "Compile the project's C# scripts as `orrin build` does, and index its assets. \
              Returns the compiler's errors and warnings by file, line and column.",
             json!({"release": {"type": "boolean", "description": "Build in Release rather than Debug"}}),
-            false,
+            Hint::Builds,
         ),
         tool(
             "run_tests",
@@ -660,7 +696,7 @@ fn tools() -> Vec<Value> {
                 "filter": {"type": "string", "description": "Only tests whose full name (Namespace.Type.Method) contains this"},
                 "release": {"type": "boolean", "description": "Build the scripts in Release"},
             }),
-            false,
+            Hint::Builds,
         ),
         tool(
             "editor_open",
@@ -671,7 +707,7 @@ fn tools() -> Vec<Value> {
                 "no_build": {"type": "boolean", "description": "Open what was last compiled, without building"},
                 "timeout_secs": {"type": "integer", "minimum": 1, "description": "How long to wait for the editor to listen (default 300: a checkout compiles the engine first)"},
             }),
-            false,
+            Hint::Builds,
         ),
         tool(
             "editor_state",
@@ -679,7 +715,7 @@ fn tools() -> Vec<Value> {
              state, which world reads see (edit, or the playing fork), the selection by entity \
              id, and the camera.",
             json!({}),
-            true,
+            Hint::Reads,
         ),
         tool(
             "scene_read",
@@ -694,7 +730,7 @@ fn tools() -> Vec<Value> {
                 "limit": limit("At most this many entities (default 100 outlined, 20 as blocks)"),
                 "offset": offset,
             }),
-            true,
+            Hint::Reads,
         ),
         tool(
             "component_list",
@@ -706,7 +742,7 @@ fn tools() -> Vec<Value> {
                 "limit": limit("At most this many (default 200)"),
                 "offset": offset,
             }),
-            true,
+            Hint::Reads,
         ),
         tool(
             "asset_find",
@@ -718,7 +754,7 @@ fn tools() -> Vec<Value> {
                 "limit": limit("At most this many (default 50)"),
                 "offset": offset,
             }),
-            true,
+            Hint::Reads,
         ),
         tool(
             "console_read",
@@ -730,7 +766,68 @@ fn tools() -> Vec<Value> {
                 "level": {"type": "string", "enum": ["trace", "debug", "info", "warn", "error"], "description": "The quietest level returned (default info)"},
                 "limit": limit("At most this many entries (default 100)"),
             }),
-            true,
+            Hint::Reads,
+        ),
+        scene_edit(),
+        requiring(
+            tool(
+                "editor_command",
+                "Drive the editor as its buttons do, answered once the effect is seen: play, \
+                 pause, step, stop, save (path for a never-saved scene), open_scene (path; save \
+                 or discard over unsaved changes), undo, redo, reload_scripts, select (ids), \
+                 frame (the camera on the selection).",
+                json!({
+                    "command": {"type": "string", "enum": ["play", "pause", "step", "stop", "save", "open_scene", "undo", "redo", "reload_scripts", "select", "frame"]},
+                    "path": {"type": "string", "description": "save, open_scene: a scene file relative to the project, ending .orrin"},
+                    "save": {"type": "boolean", "description": "open_scene: save unsaved changes first"},
+                    "discard": {"type": "boolean", "description": "open_scene: lose unsaved changes"},
+                    "ids": {"type": "array", "items": {"type": "string"}, "description": "select: entity ids or #slots; empty clears"},
+                }),
+                Hint::Changes,
+            ),
+            &["command"],
         ),
     ]
+}
+
+fn scene_edit() -> Value {
+    let id = json!({"type": "string", "description": "An EntityId, or #slot"});
+    let text = json!({"type": "string", "description": "Components in the scene grammar, each as component_list prints it"});
+    let component = json!({"type": "string", "description": "A component id"});
+    let ops = json!({
+        "type": "array",
+        "items": {"oneOf": [
+            op("set", json!({"entity": id, "text": text}), &["entity", "text"]),
+            op("add_component", json!({"entity": id, "component": component, "text": text}), &["entity", "component"]),
+            op("remove_component", json!({"entity": id, "component": component}), &["entity", "component"]),
+            op("spawn", json!({
+                "id": {"type": "string", "description": "A new UUID of your choosing, for later ops to name"},
+                "name": {"type": "string"},
+                "parent": id,
+                "text": text,
+                "prefab": {"type": "string", "description": "A prefab or mesh asset, by id or path, placed instead"},
+            }), &[]),
+            op("despawn", json!({"entities": {"type": "array", "items": id}}), &["entities"]),
+            op("reparent", json!({
+                "entity": id,
+                "parent": {"type": ["string", "null"], "description": "null makes it a root"},
+                "keep_world": {"type": "boolean", "description": "Stay where it is in the world (default true)"},
+            }), &["entity"]),
+        ]},
+    });
+    requiring(
+        tool(
+            "scene_edit",
+            "Change the open scene: ops applied in order as one undo step named after `label`, \
+             all or none. set replaces only the fields its text names; added and spawned \
+             components fill the rest from their defaults, and a spawn holds only what it is \
+             given (add orrin.transform to place it). Edit mode only.",
+            json!({
+                "label": {"type": "string", "description": "What the step is called in the Edit menu"},
+                "ops": ops,
+            }),
+            Hint::Changes,
+        ),
+        &["label", "ops"],
+    )
 }
