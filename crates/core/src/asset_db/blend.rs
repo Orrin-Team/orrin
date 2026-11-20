@@ -700,4 +700,140 @@ mod tests {
         assert_eq!(bounds.min, glam::Vec3A::new(-1.0, 2.0, -1.0));
         assert_eq!(bounds.max, glam::Vec3A::new(1.0, 4.0, 1.0));
     }
+
+    /// Blender's own save — written to `crate.blend@`, the old file renamed to
+    /// `crate.blend1`, then `@` renamed over it — reaches the slot through the
+    /// watcher alone, and the backup it leaves is not an asset.
+    #[test]
+    #[ignore = "needs Blender"]
+    fn a_save_from_blender_is_reimported_through_the_watcher() {
+        let blender = locate(std::env::var_os("ORRIN_BLENDER"), None)
+            .expect("no Blender found; set ORRIN_BLENDER");
+        let run = |file: Option<&Path>, script: &str, out: &Path| {
+            let mut command = std::process::Command::new(&blender);
+            command.args([
+                "--background",
+                "--factory-startup",
+                "--python-exit-code",
+                "1",
+            ]);
+            if let Some(file) = file {
+                command.arg(file);
+            }
+            let made = command
+                .arg("--python-expr")
+                .arg(script)
+                .arg("--")
+                .arg(out)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+            String::from_utf8_lossy(&made.stdout).into_owned()
+        };
+        let dir = Dir::new("blend-watched");
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        let source = dir.path().join("models").join("crate.blend");
+        let backup = dir.path().join("models").join("crate.blend1");
+        let mut db = opened(&dir, configured(blender.clone()));
+        db.watch().unwrap();
+        let mut backend = HeadlessBackend::new();
+
+        run(
+            None,
+            "import bpy, sys\n\
+             bpy.ops.wm.save_as_mainfile(filepath=sys.argv[sys.argv.index('--') + 1])",
+            &source,
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let id = loop {
+            db.update(&orrin_ecs::World::new(), &mut backend);
+            if let Some(entry) = db.find("models/crate.blend")
+                && matches!(entry.status, Status::Imported { .. })
+            {
+                break entry.id;
+            }
+            assert!(Instant::now() < deadline, "the new file was never imported");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(!backup.exists(), "a first save has nothing to back up");
+        let (world, entity) = drawing(db, id);
+        let bounds = |backend: &HeadlessBackend| backend.mesh_bounds(handle(&world, entity));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            update(&world, &mut backend);
+            if world.resource::<AssetDatabase>().state(id) == LoadState::Ready {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the mesh was never drawn");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let cube = crate::geom::Aabb::from_points([glam::Vec3::splat(-1.0), glam::Vec3::ONE]);
+        assert_eq!(bounds(&backend), Some(cube));
+        let summary = |world: &orrin_ecs::World| {
+            world
+                .resource::<AssetDatabase>()
+                .find("models/crate.blend")
+                .unwrap()
+                .summary
+        };
+        assert!(
+            matches!(
+                summary(&world),
+                Some(crate::asset_db::cache::Summary::Mesh { triangles: 12, .. })
+            ),
+            "{:?}",
+            summary(&world)
+        );
+
+        let printed = run(
+            Some(&source),
+            "import bpy, time\n\
+             bpy.ops.mesh.primitive_cube_add(location=(0, 0, 10))\n\
+             bpy.ops.wm.save_mainfile()\n\
+             print(f'SAVED {time.time()}')",
+            &source,
+        );
+        let saved: f64 = printed
+            .lines()
+            .find_map(|line| line.strip_prefix("SAVED "))
+            .unwrap_or_else(|| panic!("Blender did not say it saved: {printed}"))
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let moved = crate::geom::Aabb::from_points([
+            glam::Vec3::splat(-1.0),
+            glam::Vec3::new(1.0, 11.0, 1.0),
+        ]);
+        while bounds(&backend) != Some(moved) {
+            update(&world, &mut backend);
+            assert!(
+                Instant::now() < deadline,
+                "the save never reached the slot, which draws {:?}",
+                bounds(&backend)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        eprintln!(
+            "Blender's save reached the slot {:.0} ms after save_mainfile returned",
+            (now - saved) * 1000.0
+        );
+        assert!(
+            matches!(
+                summary(&world),
+                Some(crate::asset_db::cache::Summary::Mesh { triangles: 24, .. })
+            ),
+            "{:?}",
+            summary(&world)
+        );
+
+        assert!(backup.is_file(), "the save renamed the old file to .blend1");
+        let db = world.resource::<AssetDatabase>();
+        let paths: Vec<&str> = db.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(paths, ["models/crate.blend"]);
+        assert!(!dir.path().join("models/crate.blend1.meta").exists());
+    }
 }
