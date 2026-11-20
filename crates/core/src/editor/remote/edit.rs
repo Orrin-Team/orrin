@@ -12,6 +12,11 @@
 //! it names over the registry's default, so a transform can be given by its
 //! translation alone.
 //!
+//! **The open scene only.** A spawned entity is in its parent's scene by the
+//! membership rule (`scene::loaded`), so a parent in any other loaded scene is
+//! refused with that reason; in edit mode the open scene is the only one
+//! loaded, and the case cannot arise.
+//!
 //! **Refused, not merged or split:** an edit while the game plays, since that
 //! world is a fork Stop throws away; and an edit while the developer is mid
 //! gesture — a drag, or a field being typed into — since a batch closes the
@@ -248,7 +253,11 @@ fn apply(
             prefab,
         } => {
             let parent = match parent {
-                Some(parent) => Some(find(editor, parent)?),
+                Some(text) => {
+                    let parent = find(editor, text)?;
+                    in_active_scene(editor.world(), parent, text)?;
+                    Some(parent)
+                }
                 None => None,
             };
             let root = match prefab {
@@ -290,7 +299,11 @@ fn apply(
         } => {
             let child = find(editor, entity)?;
             let parent = match parent {
-                Some(parent) => Some(find(editor, parent)?),
+                Some(text) => {
+                    let parent = find(editor, text)?;
+                    in_active_scene(editor.world(), parent, text)?;
+                    Some(parent)
+                }
                 None => None,
             };
             if *keep_world {
@@ -301,6 +314,28 @@ fn apply(
                 .map_err(|error| error.to_string())
         }
     }
+}
+
+/// Whether `entity` is in the active scene, the one an edit changes. Edit
+/// mode has that scene alone loaded, so this refuses nothing today; it is
+/// what keeps a child out of a scene no save of the open scene would write,
+/// should another ever be loaded while editing — the membership rule would
+/// otherwise put the child in its parent's scene.
+fn in_active_scene(world: &orrin_ecs::World, entity: Entity, text: &str) -> Result<(), String> {
+    use crate::scene::loaded::{LoadedScenes, scene_of};
+    let Some(loaded) = world.get_resource::<LoadedScenes>() else {
+        return Ok(());
+    };
+    let scene = scene_of(world, entity);
+    if scene == loaded.active().handle {
+        return Ok(());
+    }
+    let name = loaded.get(scene).map_or("", |scene| scene.name.as_str());
+    Err(format!(
+        "{text} is in the loaded scene `{name}` (handle {}), not the open one; a child is in \
+         its parent's scene, and an edit changes the open scene only",
+        scene.get()
+    ))
 }
 
 fn unregistered(id: &ComponentId) -> String {

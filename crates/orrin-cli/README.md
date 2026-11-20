@@ -221,7 +221,7 @@ test run prints is captured into the tool's result. The tools:
 | `frame_stats` | yes | the run banner, frame and GPU time, and the profiler's CPU phases and GPU passes |
 | `screenshot` | yes | the game as a player sees it (`view: game`, the default) or the scene alone (`view: scene`), as a PNG image no larger than `max_size` (default 1024); never the editor's own UI |
 | `scene_edit` | yes | a labelled batch of ops — set, add or remove a component, spawn, despawn, reparent — as one undo step, all or none; edit mode only |
-| `editor_command` | yes | play, pause, step, stop, save, open a scene, undo, redo, reload scripts, select, frame; answered once the effect is seen |
+| `editor_command` | yes | play, pause, step, stop, save, open or create a scene, undo, redo, reload scripts, select, frame, and while the game plays load a scene (additively or not) and unload one; answered once the effect is seen |
 
 The editor tools reach the editor open on the project through its remote: a
 loopback listener that is off unless Settings ▸ Agents turns it on or
@@ -240,6 +240,15 @@ answers with what happened; it never leaves a dialog open, so opening a scene
 over unsaved work needs `save` or `discard`, and saving one that has never had
 a file needs a `path` inside the project. No tool runs code, and the only file
 a tool writes by name is a scene saved inside the project.
+
+**Scenes.** `editor_state` lists every loaded scene — its handle, file, role
+(active, additive or persistent), entity count, and for the active one whether
+it has unsaved changes — and the project's start and persistent scenes. With
+more than one loaded, `scene_read` says which scene each entity is in, by the
+membership rule (an entity is in its nearest ancestor's scene), and takes a
+`scene` filter. Additive loading is a playing game's: the editor itself has one
+scene open, and `load_scene` and `unload_scene` are refused in edit mode. A
+scene that is not open is a text file, read and edited as one.
 
 **Permissions.** Settings ▸ Permissions says what an agent may do, and every
 tool is checked against it: a preset (Read only, Edit scene, Full control —

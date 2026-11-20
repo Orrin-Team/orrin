@@ -55,7 +55,8 @@ const INSTRUCTIONS: &str = "Orrin is a game engine. The live tools read and chan
      Entities are named by EntityId (a UUID), or #slot for one never saved. Scene text is \
      Orrin's scene grammar, the one in the project's .orrin files. Change the open scene only \
      with scene_edit, each call one undo step the developer can take back; edit scripts, shaders \
-     and materials as files and the editor picks the save up. screenshot shows the game as a \
+     and materials as files and the editor picks the save up; a scene that is not open is a text \
+     file, read and edit it as one. screenshot shows the game as a \
      player sees it, or the scene alone; quote frame_stats' banner with any number taken from \
      it. What agents may do is the developer's to set in Settings > Permissions: a refusal names \
      the switch or folder rule, and project_info and editor_state report what is allowed.";
@@ -808,6 +809,7 @@ fn tools() -> Vec<Value> {
             json!({
                 "ids": {"type": "array", "items": {"type": "string"}, "description": "Only these entities, by EntityId or #slot"},
                 "root": {"type": "string", "description": "Only this entity and everything under it"},
+                "scene": {"type": "integer", "minimum": 1, "description": "Only the loaded scene with this handle, from editor_state"},
                 "name": {"type": "string", "description": "Only entities whose name contains this, ignoring case"},
                 "blocks": {"type": "boolean", "description": "Whole entity blocks in the scene grammar instead of an outline"},
                 "limit": limit("At most this many entities (default 100 outlined, 20 as blocks)"),
@@ -876,13 +878,18 @@ fn tools() -> Vec<Value> {
                 "editor_command",
                 "Drive the editor as its buttons do, answered once the effect is seen: play, \
                  pause, step, stop, save (path for a never-saved scene), open_scene (path; save \
-                 or discard over unsaved changes), undo, redo, reload_scripts, select (ids), \
-                 frame (the camera on the selection).",
+                 or discard over unsaved changes), new_scene (name; discard over unsaved \
+                 changes), undo, redo, reload_scripts, select (ids), frame (the camera on the \
+                 selection), and while the game plays load_scene (path, additive) and \
+                 unload_scene (handle).",
                 json!({
-                    "command": {"type": "string", "enum": ["play", "pause", "step", "stop", "save", "open_scene", "undo", "redo", "reload_scripts", "select", "frame"]},
-                    "path": {"type": "string", "description": "save, open_scene: a scene file relative to the project, ending .orrin"},
+                    "command": {"type": "string", "enum": ["play", "pause", "step", "stop", "save", "open_scene", "new_scene", "undo", "redo", "reload_scripts", "select", "frame", "load_scene", "unload_scene"]},
+                    "path": {"type": "string", "description": "save, open_scene, load_scene: a scene file relative to the project, ending .orrin"},
+                    "name": {"type": "string", "description": "new_scene: its file name, without .orrin"},
                     "save": {"type": "boolean", "description": "open_scene: save unsaved changes first"},
-                    "discard": {"type": "boolean", "description": "open_scene: lose unsaved changes"},
+                    "discard": {"type": "boolean", "description": "open_scene, new_scene: lose unsaved changes"},
+                    "additive": {"type": "boolean", "description": "load_scene: beside the loaded scenes rather than in place of the active one"},
+                    "handle": {"type": "integer", "minimum": 1, "description": "unload_scene: the scene's handle, from editor_state"},
                     "ids": {"type": "array", "items": {"type": "string"}, "description": "select: entity ids or #slots; empty clears"},
                 }),
                 Hint::Changes,

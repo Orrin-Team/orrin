@@ -11,6 +11,15 @@
 //! outcome known. One whose effect never shows is answered at its deadline
 //! with what can be seen, and says so.
 //!
+//! **Scenes.** `new_scene` is the editor's own request, under the unsaved-work
+//! rule `open_scene` keeps. `load_scene` and `unload_scene` act on a playing
+//! game only — the editor opens one scene at a time, and additive scenes are a
+//! running game's — and run at once, by the functions a script's
+//! `SceneManager` call ends in: the remote is served after the frame's script
+//! tick and outside any dispatch window, where a load may despawn script
+//! instances, so they need not wait in a queue for the next tick as a
+//! script's must.
+//!
 //! **Nothing waits on the developer.** A command that would open a dialog is
 //! refused instead: opening a scene over unsaved work needs `save` or
 //! `discard`, and saving a scene that has never had a file needs a `path`.
@@ -21,11 +30,13 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use orrin_ecs::World;
+use orrin_registry::Registry;
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
 
 use super::answer;
 use crate::editor::state::{DEFAULT_SCENE_PATH, EditorState, OpenChoice, SceneRequest, plain};
+use crate::scene::loaded::{self, LoadedScenes, SceneHandle};
 use crate::scene::{Camera, Diagnostics, LogBuffer, LogLevel, Play, PlayState, Time};
 use orrin_remote::permissions::Access;
 
@@ -63,6 +74,21 @@ enum Command {
         ids: Vec<String>,
     },
     Frame,
+    NewScene {
+        name: String,
+        #[serde(default)]
+        save: bool,
+        #[serde(default)]
+        discard: bool,
+    },
+    LoadScene {
+        path: String,
+        #[serde(default)]
+        additive: bool,
+    },
+    UnloadScene {
+        handle: u32,
+    },
 }
 
 /// A command raised and not yet seen to land.
@@ -90,13 +116,20 @@ enum Wait {
 /// Run `params`' command: answered now when it is refused or immediate, held
 /// otherwise.
 pub(super) fn editor_command(
-    world: &World,
+    world: &mut World,
+    registry: &Registry,
     state: &mut EditorState,
     params: &Json,
 ) -> Result<Result<Json, Held>, String> {
     let command: Command = answer::params_of_required(params)?;
     let live = state.playing();
-    let needs_ui = !matches!(command, Command::ReloadScripts | Command::Select { .. });
+    let needs_ui = !matches!(
+        command,
+        Command::ReloadScripts
+            | Command::Select { .. }
+            | Command::LoadScene { .. }
+            | Command::UnloadScene { .. }
+    );
     if needs_ui
         && world
             .get_resource::<Diagnostics>()
@@ -108,13 +141,14 @@ pub(super) fn editor_command(
                 .to_owned(),
         );
     }
+    let said_from = world
+        .get_resource::<LogBuffer>()
+        .map_or(0, |log| log.next_number());
     let hold = |wait: Wait, state: &EditorState| {
         Ok(Err(Held {
             wait,
             applied: state.applied(),
-            said_from: world
-                .get_resource::<LogBuffer>()
-                .map_or(0, |log| log.next_number()),
+            said_from,
             raised: Instant::now(),
         }))
     };
@@ -240,6 +274,54 @@ pub(super) fn editor_command(
         Command::ReloadScripts => {
             reload(state).and_then(|count| hold(Wait::Reload { count }, state))
         }
+        Command::NewScene { .. } if live => Err(
+            "the game is playing: a new scene would replace the game's world. Stop it first"
+                .to_owned(),
+        ),
+        Command::NewScene {
+            name,
+            save,
+            discard,
+        } => {
+            if save {
+                return Err(
+                    "a new scene opens on the frame its request lands, before a save asked for \
+                     with it could; save first (editor_command save), then ask for the new scene"
+                        .to_owned(),
+                );
+            }
+            if state.scene_dirty() && !discard {
+                return Err(
+                    "the open scene has unsaved changes: save it first, or pass `discard: true` \
+                     to lose them"
+                        .to_owned(),
+                );
+            }
+            let file = crate::editor::state::new_scene_path(world, &name)?;
+            writable(state, &file)?;
+            state.request_new_scene(name);
+            hold(
+                Wait::Open {
+                    path: plain(file.display().to_string()),
+                },
+                state,
+            )
+        }
+        Command::LoadScene { .. } | Command::UnloadScene { .. } if !live => Err(
+            "scenes load beside each other only while the game plays: the editor has one scene \
+             open at a time. Open another with open_scene, or play first"
+                .to_owned(),
+        ),
+        Command::LoadScene { path, additive } => {
+            load_scene(world, registry, state, &path, additive).map(Ok)
+        }
+        Command::UnloadScene { handle } => {
+            let handle =
+                SceneHandle::from_raw(handle).ok_or_else(|| "no scene has handle 0".to_owned())?;
+            loaded::unload(world, handle)?;
+            state.selection.retain_alive(world);
+            Ok(Ok(json!({"unloaded": handle.get()})))
+        }
         Command::Select { ids } => {
             let entities = ids
                 .iter()
@@ -273,6 +355,54 @@ fn reload(state: &mut EditorState) -> Result<u64, String> {
 #[cfg(not(feature = "scripting"))]
 fn reload(_: &mut EditorState) -> Result<u64, String> {
     Err("this editor was built without scripting, so there are no scripts to reload".to_owned())
+}
+
+/// Load the scene at `path` into the playing game, in place of the active one
+/// or beside it, by the functions a script's `SceneManager` call ends in.
+/// Done here and now rather than queued as a script's is: the remote is
+/// served outside any dispatch window, after the frame's script tick, which
+/// is where a load may despawn script instances.
+fn load_scene(
+    world: &mut World,
+    registry: &Registry,
+    state: &mut EditorState,
+    path: &str,
+    additive: bool,
+) -> Result<Json, String> {
+    let file = in_project(state, path)?;
+    answer::permit(
+        &state.agent_folders,
+        state.project_root.as_deref(),
+        &file,
+        Access::Read,
+    )?;
+    let scene = loaded::asset_at(world, &file)
+        .ok_or_else(|| format!("{path} is not a scene asset the project indexes"))?;
+    let (document, name) = loaded::read(world, scene)?;
+    let (handle, issues) = if additive {
+        let handle = world.resource_mut::<LoadedScenes>().reserve();
+        let issues = loaded::load_additive(
+            world,
+            registry,
+            handle,
+            &document,
+            name.clone(),
+            Some(scene),
+            false,
+        );
+        (handle, issues)
+    } else {
+        let issues = loaded::load(world, registry, &document, name.clone(), Some(scene));
+        (world.resource::<LoadedScenes>().active().handle, issues)
+    };
+    state.selection.retain_alive(world);
+    let issues: Vec<String> = issues.iter().map(ToString::to_string).collect();
+    Ok(json!({
+        "loaded": name,
+        "handle": handle.get(),
+        "additive": additive,
+        "issues": issues,
+    }))
 }
 
 /// Whether the folder rules let an agent write `file`: what a save of it

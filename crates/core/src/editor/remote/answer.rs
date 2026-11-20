@@ -7,8 +7,8 @@
 //! | method | params | result |
 //! | --- | --- | --- |
 //! | `client_info` | `name`, `version` | nothing: who the client is, for Settings ▸ Agents, answered by its connection's own thread |
-//! | `editor_state` | none | project, agents connected, open scene, unsaved, play state, world read, selection, camera |
-//! | `scene_read` | `ids`, `root`, `name`, `blocks`, `limit`, `offset` | an outline, or entity blocks in the scene grammar |
+//! | `editor_state` | none | project, agents connected, permissions, loaded scenes and the project's start and persistent ones, open scene, unsaved, play state, world read, selection, camera |
+//! | `scene_read` | `ids`, `root`, `name`, `scene`, `blocks`, `limit`, `offset` | an outline, or entity blocks in the scene grammar; each entity's scene when several are loaded |
 //! | `component_list` | `query`, `defaults`, `limit`, `offset` | registered components, each with its default as text |
 //! | `asset_find` | `kind`, `path`, `limit`, `offset` | indexed assets: id, path, kind, load state, import error |
 //! | `console_read` | `cursor`, `level`, `limit` | console entries numbered from `cursor`, and the next cursor |
@@ -27,11 +27,12 @@ use orrin_registry::{EntityId, Registry, SceneDocument, SceneEntity};
 use orrin_remote::wire::Request;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::command::Held;
 use crate::asset_db::{AssetDatabase, AssetKind, LoadState, Status};
 use crate::editor::state::EditorState;
+use crate::scene::loaded::{LoadedScenes, scene_of};
 use crate::scene::{Camera, LogBuffer, LogLevel, Name, Play, PlayState, persist};
 use orrin_remote::permissions::Access;
 
@@ -76,7 +77,7 @@ pub(super) fn answer(
             Err(refused) => Err(refused),
         },
         "scene_edit" => super::edit::scene_edit(world, registry, state, params),
-        "editor_command" => match super::command::editor_command(world, state, params) {
+        "editor_command" => match super::command::editor_command(world, registry, state, params) {
             Ok(Err(held)) => return Reply::Held(held),
             Ok(Ok(done)) => Ok(done),
             Err(refused) => Err(refused),
@@ -208,6 +209,49 @@ pub(super) fn find(world: &World, text: &str, read: &str) -> Result<Entity, Stri
     found.ok_or_else(|| format!("no entity in the {read} world has id {id}"))
 }
 
+/// Every loaded scene, the active one first: its handle, name, file, role,
+/// how many entities belong to it by the membership rule, and for the active
+/// one whether it has unsaved changes.
+fn loaded_scenes(world: &World, state: &EditorState) -> Vec<Value> {
+    let Some(loaded) = world.get_resource::<LoadedScenes>() else {
+        return Vec::new();
+    };
+    let mut counts: FxHashMap<u32, usize> = FxHashMap::default();
+    for entity in world.entities() {
+        *counts.entry(scene_of(world, entity).get()).or_default() += 1;
+    }
+    let db = world.get_resource::<AssetDatabase>();
+    let active = loaded.active().handle;
+    loaded
+        .iter()
+        .map(|scene| {
+            let path = scene
+                .asset
+                .and_then(|asset| Some(db.as_ref()?.get(asset)?.path.clone()))
+                .map(|path| match state.agent_assets.as_str() {
+                    "" => path,
+                    assets => format!("{assets}/{path}"),
+                });
+            let role = match scene {
+                _ if scene.handle == active => "active",
+                scene if scene.persistent => "persistent",
+                _ => "additive",
+            };
+            let mut entry = json!({
+                "handle": scene.handle.get(),
+                "name": scene.name,
+                "path": path,
+                "role": role,
+                "entities": counts.get(&scene.handle.get()).copied().unwrap_or(0),
+            });
+            if scene.handle == active {
+                entry["unsaved"] = Value::Bool(state.scene_dirty());
+            }
+            entry
+        })
+        .collect()
+}
+
 pub(super) fn selection(world: &World, state: &EditorState) -> Vec<String> {
     state
         .selection
@@ -225,6 +269,12 @@ fn editor_state(world: &World, state: &EditorState) -> Value {
         Some(PlayState::Editing) | None => "editing",
     };
     let selection = selection(world, state);
+    let scenes = loaded_scenes(world, state);
+    let manifest = state
+        .project_root
+        .as_ref()
+        .and_then(|root| orrin_project::Project::load(&root.join("orrin.toml")).ok());
+    let shown = |path: Option<&std::path::Path>| path.map(|path| path.display().to_string());
     let camera = world.get_resource::<Camera>().map(|camera| {
         json!({
             "position": camera.position.to_array(),
@@ -247,6 +297,11 @@ fn editor_state(world: &World, state: &EditorState) -> Value {
     json!({
         "project": state.project_name,
         "agents": agents,
+        "scenes": scenes,
+        "start_scene": manifest.as_ref().and_then(|p| shown(p.start_scene_relative())),
+        "persistent_scene": manifest
+            .as_ref()
+            .and_then(|p| shown(p.persistent_scene_relative())),
         "permissions": orrin_remote::permissions::summary(
             &state.settings.agents.allow,
             &state.agent_folders,
@@ -271,6 +326,8 @@ struct SceneRead {
     name: Option<String>,
     /// Whole blocks in the scene grammar rather than an outline.
     blocks: bool,
+    /// Only the entities of the loaded scene with this handle.
+    scene: Option<u32>,
     limit: Option<usize>,
     offset: usize,
 }
@@ -311,8 +368,15 @@ fn scene_read(
                         .get::<Name>(entity)
                         .is_some_and(|have| have.0.to_lowercase().contains(name))
                 })
+                && read
+                    .scene
+                    .is_none_or(|scene| scene_of(world, entity).get() == scene)
         })
         .collect();
+    // With one scene loaded every entity is in it, and saying so is noise.
+    let several = world
+        .get_resource::<LoadedScenes>()
+        .is_some_and(|loaded| loaded.iter().nth(1).is_some());
     let limit = match read.blocks {
         true => bounded(read.limit, 20, 200),
         false => bounded(read.limit, 100, 1000),
@@ -335,6 +399,16 @@ fn scene_read(
         if !notes.is_empty() {
             answer["notes"] = json!(notes);
         }
+        if several {
+            let in_scene: Map<String, Value> = entities
+                .iter()
+                .map(|&entity| {
+                    let handle = scene_of(world, entity).get();
+                    (reference(world, entity), Value::from(handle))
+                })
+                .collect();
+            answer["in_scene"] = Value::Object(in_scene);
+        }
     } else {
         let outline: Vec<Value> = entities
             .iter()
@@ -344,13 +418,17 @@ fn scene_read(
                     .filter(|component| component.has(world, entity))
                     .map(|component| component.id.as_str())
                     .collect();
-                json!({
+                let mut entry = json!({
                     "id": reference(world, entity),
                     "name": world.get::<Name>(entity).map(|name| name.0.clone()),
                     "parent": persist::live_parent(world, entity)
                         .map(|parent| reference(world, parent)),
                     "components": components,
-                })
+                });
+                if several {
+                    entry["in_scene"] = Value::from(scene_of(world, entity).get());
+                }
+                entry
             })
             .collect();
         answer["entities"] = Value::Array(outline);
@@ -797,5 +875,56 @@ mod tests {
             .set(Capability::ReadScene, false);
         let refused = call(&mut world, &mut state, "asset_find", Value::Null).unwrap_err();
         assert!(refused.contains("Read scene and assets"), "{refused}");
+    }
+
+    /// The membership rule, as an agent reads it: an entity a script parented
+    /// under an additive scene's entity carries no tag of its own and is in
+    /// that scene, not the active one. Reported wrong, an agent would edit or
+    /// save it as the open scene's.
+    #[test]
+    fn an_entity_under_an_additive_scenes_entity_is_reported_in_that_scene() {
+        use crate::scene::loaded;
+        let mut registry = Registry::new();
+        crate::scene::register_components(&mut registry);
+        let mut world = World::default();
+        crate::App::install_default_resources(&mut world);
+        let scene = |name: &str, id: &str| {
+            orrin_registry::parse(&format!(
+                "orrin-scene 4 min-reader 4\n\nentity {id} \"{name}\"\n"
+            ))
+            .unwrap()
+        };
+        let floor = scene("Floor", "1163793b-df57-4e23-9844-00124ce2fce0");
+        loaded::load(&mut world, &registry, &floor, "base", None);
+        let lamp = scene("Lamp", "14758fa1-eba1-429c-965b-c7b647529bcd");
+        let handle = world.resource_mut::<LoadedScenes>().reserve();
+        loaded::load_additive(&mut world, &registry, handle, &lamp, "extra", None, false);
+        let lamp = world
+            .entities()
+            .find(|&e| world.get::<Name>(e).is_some_and(|name| name.0 == "Lamp"))
+            .unwrap();
+        let shade = world.spawn();
+        world.insert(shade, Name::new("Shade"));
+        crate::scene::reparent(&mut world, shade, Some(lamp), false).unwrap();
+
+        let mut state = EditorState::default();
+        let outline = call(&mut world, &mut state, "scene_read", Value::Null).unwrap();
+        let in_scene = |name: &str| {
+            outline["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entity| entity["name"] == name)
+                .map(|entity| entity["in_scene"].clone())
+                .unwrap()
+        };
+        let active = world.resource::<LoadedScenes>().active().handle.get();
+        assert_eq!(in_scene("Floor"), active);
+        assert_eq!(in_scene("Lamp"), handle.get());
+        assert_eq!(in_scene("Shade"), handle.get());
+
+        let only = json!({"scene": handle.get()});
+        let extra = call(&mut world, &mut state, "scene_read", only).unwrap();
+        assert_eq!(extra["total"], 2);
     }
 }
