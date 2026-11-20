@@ -55,16 +55,18 @@ const INSTRUCTIONS: &str = "Orrin is a game engine. The live tools read and chan
      Entities are named by EntityId (a UUID), or #slot for one never saved. Scene text is \
      Orrin's scene grammar, the one in the project's .orrin files. Change the open scene only \
      with scene_edit, each call one undo step the developer can take back; edit scripts, shaders \
-     and materials as files and the editor picks the save up.";
+     and materials as files and the editor picks the save up. screenshot shows the scene; quote \
+     frame_stats' banner with any number taken from it.";
 
 /// The editor tools, which are the remote's methods by the same names.
-const LIVE: [&str; 8] = [
+const LIVE: [&str; 9] = [
     "editor_state",
     "scene_read",
     "component_list",
     "asset_find",
     "console_read",
     "frame_stats",
+    "screenshot",
     "scene_edit",
     "editor_command",
 ];
@@ -111,6 +113,8 @@ struct Server {
 struct Answer {
     text: Vec<String>,
     failed: bool,
+    /// A PNG, sent to the client as an image ahead of the text.
+    png: Option<Vec<u8>>,
 }
 
 impl Answer {
@@ -118,6 +122,7 @@ impl Answer {
         Self {
             text: vec![text.into()],
             failed: false,
+            png: None,
         }
     }
 
@@ -125,6 +130,7 @@ impl Answer {
         Self {
             text: vec![text.into()],
             failed: true,
+            png: None,
         }
     }
 }
@@ -205,10 +211,19 @@ impl Server {
             other => return Err((-32602, format!("Unknown tool: {other}"))),
         };
         let answer = answer.unwrap_or_else(Answer::failed);
-        let content: Vec<Value> = answer
-            .text
+        let image = answer.png.map(|png| {
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(png);
+            json!({"type": "image", "data": data, "mimeType": "image/png"})
+        });
+        let content: Vec<Value> = image
             .into_iter()
-            .map(|text| json!({"type": "text", "text": text}))
+            .chain(
+                answer
+                    .text
+                    .into_iter()
+                    .map(|text| json!({"type": "text", "text": text})),
+            )
             .collect();
         Ok(json!({"content": content, "isError": answer.failed}))
     }
@@ -244,11 +259,12 @@ impl Server {
         let mut retried = false;
         loop {
             let client = self.attach(&project)?;
-            match client.call(method, arguments.clone()) {
-                Ok(result) => {
+            match client.call_with_blob(method, arguments.clone()) {
+                Ok((result, png)) => {
                     return Ok(Answer {
                         text: rendered(result),
                         failed: false,
+                        png,
                     });
                 }
                 Err(orrin_remote::Error::Refused(why)) => return Ok(Answer::failed(why)),
@@ -366,6 +382,7 @@ impl Server {
         Ok(Answer {
             text,
             failed: !ran || none,
+            png: None,
         })
     }
 
@@ -431,6 +448,7 @@ impl Server {
                         tail(&log, 40),
                     ],
                     failed: true,
+                    png: None,
                 };
             }
             if let Ok(client) = self.attach(&project) {
@@ -510,6 +528,7 @@ fn built_answer(built: Result<(), String>, captured: Captured, success: &str) ->
             Answer {
                 text,
                 failed: false,
+                png: None,
             }
         }
         Err(why) => {
@@ -519,7 +538,11 @@ fn built_answer(built: Result<(), String>, captured: Captured, success: &str) ->
             } else {
                 text.push(Value::Array(diagnostics).to_string());
             }
-            Answer { text, failed: true }
+            Answer {
+                text,
+                failed: true,
+                png: None,
+            }
         }
     }
 }
@@ -775,6 +798,13 @@ fn tools() -> Vec<Value> {
              and GPU passes slowest first, with the run banner that says how the run was \
              started. A number means little without the banner beside it.",
             json!({"limit": limit("Rows a lane (default 20)")}),
+            Hint::Reads,
+        ),
+        tool(
+            "screenshot",
+            "The scene as the editor's viewport renders it, without the editor drawn over \
+             it, as a PNG no larger than max_size on its longest side.",
+            json!({"max_size": {"type": "integer", "minimum": 16, "maximum": 4096, "description": "Longest side in pixels (default 1024)"}}),
             Hint::Reads,
         ),
         scene_edit(),
