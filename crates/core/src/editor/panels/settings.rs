@@ -93,6 +93,7 @@ pub enum Page {
     Viewport,
     Scripting,
     Blender,
+    Agents,
     Saving,
     Display,
     Startup,
@@ -100,11 +101,12 @@ pub enum Page {
 
 impl Page {
     const PROJECT: [Self; 3] = [Self::General, Self::Scenes, Self::Scripts];
-    const ORRIN: [Self; 7] = [
+    const ORRIN: [Self; 8] = [
         Self::Appearance,
         Self::Viewport,
         Self::Scripting,
         Self::Blender,
+        Self::Agents,
         Self::Saving,
         Self::Display,
         Self::Startup,
@@ -119,6 +121,7 @@ impl Page {
             Self::Viewport => "Viewport",
             Self::Scripting => "Scripting",
             Self::Blender => "Blender",
+            Self::Agents => "Agents",
             Self::Saving => "Saving",
             Self::Display => "Display",
             Self::Startup => "Startup",
@@ -171,6 +174,9 @@ enum Field {
     LinkPort,
     /// Not a setting but an action, found by search like one.
     AddOn,
+    Remote,
+    /// An action too: the client's configuration, to the clipboard.
+    McpConfig,
     Autosave,
     Interval,
     Present,
@@ -392,6 +398,22 @@ const ROWS: &[Row] = &[
         "Add-on",
         "Install the Orrin Live Link add-on into that Blender and enable it",
         "addon install add-on extension plugin live link",
+    ),
+    row(
+        Page::Agents,
+        Field::Remote,
+        "Remote",
+        "Let an AI agent read the open scene, the assets and the console through `orrin mcp`, \
+         over 127.0.0.1 with a token only this project's .orrin/remote holds",
+        "mcp ai agent claude llm assistant tool remote server automation",
+    ),
+    row(
+        Page::Agents,
+        Field::McpConfig,
+        "MCP config",
+        "Copy a .mcp.json entry that runs `orrin mcp` for this project, for an MCP client such \
+         as Claude Code",
+        "mcp json copy clipboard client claude code configure setup",
     ),
     row(
         Page::Saving,
@@ -1134,6 +1156,7 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
     let locked = match field {
         Field::Editor => env.editor_override(),
         Field::BlenderPath => env.blender_override(),
+        Field::Remote => env.remote_override(),
         Field::Backend => env.backend_override(),
         Field::Threads => env.threads_override(),
         Field::Validation => env.validation_override(),
@@ -1156,6 +1179,10 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
                 if locked.is_some() && field.is_startup() {
                     let mut chosen = cx.state.environment.over(&cx.state.settings.startup);
                     startup_control(ui, field, &mut chosen);
+                } else if field == Field::Remote
+                    && let Some(mut on) = locked.and(cx.state.environment.remote())
+                {
+                    ui.checkbox(&mut on, "");
                 } else if let (Some(_), Some(path)) = (locked, cx.state.environment.blender()) {
                     let mut shown = path.to_owned();
                     ui.add(egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
@@ -1215,6 +1242,10 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
     }
     if row.page == Page::Blender {
         blender_note(ui, cx, panel, field, locked.is_some());
+    }
+    if field == Field::Remote {
+        let (line, colour) = remote_line(cx.state);
+        note(ui, &line, colour.unwrap_or(weak));
     }
     if field == Field::Editor
         && let ExternalEditor::Custom(command) = &cx.state.settings.scripting.editor
@@ -1307,6 +1338,46 @@ fn link_line(world: &World, state: &EditorState) -> (String, Option<egui::Color3
         }
     };
     (line, None)
+}
+
+/// The remote's state in a line, and a colour when it is a failure.
+fn remote_line(state: &EditorState) -> (String, Option<egui::Color32>) {
+    match &state.remote {
+        None => ("Off".to_owned(), None),
+        Some(Err(error)) => (sentence(error), Some(theme::ERROR)),
+        Some(Ok(status)) => {
+            let line = match status.peers {
+                0 => format!("Listening on 127.0.0.1:{}", status.port),
+                1 => format!("1 agent connected, on 127.0.0.1:{}", status.port),
+                n => format!("{n} agents connected, on 127.0.0.1:{}", status.port),
+            };
+            (line, None)
+        }
+    }
+}
+
+/// What `.mcp.json` holds to run `orrin mcp` on the project at `root`: the
+/// `orrin` this editor would run an export with when it can find one, the
+/// one on the PATH otherwise.
+fn mcp_config(root: &Path) -> String {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let cli = crate::editor::export::find_cli(
+        std::env::var_os(crate::editor::export::CLI_ENV),
+        beside.as_deref(),
+        std::env::var_os("PATH"),
+    )
+    .map_or_else(|_| "orrin".to_owned(), |cli| cli.display().to_string());
+    let config = serde_json::json!({
+        "mcpServers": {
+            "orrin": {
+                "command": cli,
+                "args": ["mcp", "--project", root.display().to_string()],
+            }
+        }
+    });
+    serde_json::to_string_pretty(&config).unwrap_or_default()
 }
 
 /// A console line as a note on the page: its first letter capitalised.
@@ -1475,6 +1546,20 @@ fn control(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, field: Fie
                 && let Some(blender) = blender
             {
                 cx.state.addon.start(blender);
+            }
+        }
+        Field::Remote => {
+            ui.checkbox(&mut settings.agents.remote, "");
+        }
+        Field::McpConfig => {
+            let root = cx.state.project_root.clone();
+            let button = ui
+                .add_enabled(root.is_some(), egui::Button::new("Copy MCP config"))
+                .on_disabled_hover_text("Open a project first: the config names it");
+            if button.clicked()
+                && let Some(root) = root
+            {
+                ui.ctx().copy_text(mcp_config(&root));
             }
         }
         Field::Autosave => {
@@ -1647,7 +1732,8 @@ fn is_default(field: Field, s: &Settings, d: &Settings) -> bool {
         Field::BlenderPath => s.blender.path == d.blender.path,
         Field::LiveLink => s.blender.live_link == d.blender.live_link,
         Field::LinkPort => s.blender.port == d.blender.port,
-        Field::AddOn => true,
+        Field::AddOn | Field::McpConfig => true,
+        Field::Remote => s.agents.remote == d.agents.remote,
         _ => tint(s.appearance.icons, field) == tint(d.appearance.icons, field),
     }
 }
@@ -1674,7 +1760,8 @@ fn restore(field: Field, s: &mut Settings, d: &Settings) {
         Field::BlenderPath => s.blender.path.clone_from(&d.blender.path),
         Field::LiveLink => s.blender.live_link = d.blender.live_link,
         Field::LinkPort => s.blender.port = d.blender.port,
-        Field::AddOn => {}
+        Field::AddOn | Field::McpConfig => {}
+        Field::Remote => s.agents.remote = d.agents.remote,
         _ => {
             if let (Some(to), Some(from)) = (
                 tint_mut(&mut s.appearance.icons, field),
@@ -1709,7 +1796,8 @@ fn default_text(field: Field, d: &Settings) -> String {
         Field::BlenderPath => "empty, an installed Blender".to_owned(),
         Field::LiveLink => on(d.blender.live_link),
         Field::LinkPort => d.blender.port.to_string(),
-        Field::AddOn => String::new(),
+        Field::AddOn | Field::McpConfig => String::new(),
+        Field::Remote => on(d.agents.remote),
         _ => tint(d.appearance.icons, field)
             .map_or_else(String::new, |[r, g, b]| format!("#{r:02X}{g:02X}{b:02X}")),
     }
@@ -1922,9 +2010,10 @@ mod tests {
             live_link: !defaults.blender.live_link,
             port: 47200,
         };
+        moved.agents.remote = !defaults.agents.remote;
         for row in ROWS.iter().filter(|row| !row.page.is_project()) {
-            // A pick goes through a request, and installing is an action.
-            if matches!(row.field, Field::Theme | Field::AddOn) {
+            // A pick goes through a request; installing and copying are actions.
+            if matches!(row.field, Field::Theme | Field::AddOn | Field::McpConfig) {
                 continue;
             }
             assert!(!is_default(row.field, &moved, &defaults), "{}", row.label);
