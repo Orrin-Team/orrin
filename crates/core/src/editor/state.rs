@@ -318,6 +318,12 @@ pub struct EditorState {
     /// The remote as Settings ▸ Agents shows it: `None` while it is off, and
     /// why it is not listening when it should be.
     pub remote: Option<Result<super::remote::RemoteStatus, String>>,
+    /// Who is connected to the remote, refreshed only when that changes.
+    pub remote_peers: Vec<super::remote::RemotePeer>,
+    /// The remote's change count `remote_peers` was last refreshed at.
+    pub remote_peers_seen: u64,
+    /// A connection Settings ▸ Agents asked to close.
+    pub remote_disconnect: Option<u64>,
     /// How many times [`apply`](Self::apply) has run: the remote waits on it
     /// to see a request it raised carried out.
     applied: u64,
@@ -526,6 +532,9 @@ impl Default for EditorState {
             settings_panel: Default::default(),
             link_error: None,
             remote: None,
+            remote_peers: Vec::new(),
+            remote_peers_seen: 0,
+            remote_disconnect: None,
             applied: 0,
             reloads: (0, None),
             addon: Default::default(),

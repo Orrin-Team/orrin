@@ -6,7 +6,8 @@
 //!
 //! | method | params | result |
 //! | --- | --- | --- |
-//! | `editor_state` | none | project, open scene, unsaved, play state, world read, selection, camera |
+//! | `client_info` | `name`, `version` | nothing: who the client is, for Settings ▸ Agents, answered by its connection's own thread |
+//! | `editor_state` | none | project, agents connected, open scene, unsaved, play state, world read, selection, camera |
 //! | `scene_read` | `ids`, `root`, `name`, `blocks`, `limit`, `offset` | an outline, or entity blocks in the scene grammar |
 //! | `component_list` | `query`, `defaults`, `limit`, `offset` | registered components, each with its default as text |
 //! | `asset_find` | `kind`, `path`, `limit`, `offset` | indexed assets: id, path, kind, load state, import error |
@@ -195,8 +196,22 @@ fn editor_state(world: &World, state: &EditorState) -> Value {
             "target": camera.target.to_array(),
         })
     });
+    let agents: Vec<Value> = state
+        .remote_peers
+        .iter()
+        .map(|peer| {
+            json!({
+                "connection": peer.id,
+                "client": peer.client.as_deref().unwrap_or("unknown client"),
+                "connected_secs": peer.since.elapsed().as_secs(),
+                "requests": peer.requests,
+                "last": peer.last,
+            })
+        })
+        .collect();
     json!({
         "project": state.project_name,
+        "agents": agents,
         "scene": state.scene_path,
         "unsaved": state.scene_dirty(),
         "play": play,

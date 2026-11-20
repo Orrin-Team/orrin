@@ -76,11 +76,11 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orrin_ecs::{FxHashMap, World};
 use orrin_registry::Registry;
@@ -128,6 +128,21 @@ struct Connection {
     reader: Option<JoinHandle<()>>,
     /// Frames for the writer thread; `None` until the handshake is through.
     send: Option<Sender<Vec<u8>>>,
+    /// What Settings ▸ Agents shows of it, kept by its reading thread.
+    seen: RemotePeer,
+}
+
+/// One connection past its handshake, as Settings ▸ Agents and `editor_state`
+/// list it.
+#[derive(Clone, Debug)]
+pub struct RemotePeer {
+    pub id: u64,
+    /// `name version` as the client gave it with `client_info`; `None` for a
+    /// client that has not said.
+    pub client: Option<String>,
+    pub since: Instant,
+    pub requests: u64,
+    pub last: Option<String>,
 }
 
 #[derive(Default)]
@@ -147,6 +162,9 @@ struct Shared {
     queue: Mutex<VecDeque<Waiting>>,
     connections: Mutex<Connections>,
     peers: AtomicUsize,
+    /// Bumped whenever what [`RemotePeer`]s say changes, so a frame that
+    /// shows them reads one atomic to learn nothing did.
+    seen: AtomicU64,
     token: Token,
     hello: Vec<u8>,
 }
@@ -165,8 +183,58 @@ impl Shared {
         }
     }
 
+    /// [`Remote::peers`].
+    fn refresh(&self, seen: &mut u64, into: &mut Vec<RemotePeer>) {
+        let now = self.seen.load(Ordering::Acquire);
+        if now == *seen {
+            return;
+        }
+        *seen = now;
+        into.clear();
+        into.extend(
+            lock(&self.connections)
+                .open
+                .values()
+                .filter(|connection| connection.send.is_some())
+                .map(|connection| connection.seen.clone()),
+        );
+        into.sort_by_key(|peer| peer.id);
+    }
+
+    /// Count a request against its connection, as the Agents page lists it.
+    fn count(&self, peer: Peer, method: &str) {
+        if let Some(connection) = lock(&self.connections).open.get_mut(&peer) {
+            connection.seen.requests += 1;
+            connection.seen.last = Some(method.to_owned());
+        }
+        self.seen.fetch_add(1, Ordering::Release);
+    }
+
+    /// Record who a client says it is: `client_info`, which the reading thread
+    /// answers itself, since it needs nothing of the frame's.
+    fn introduce(&self, peer: Peer, params: &serde_json::Value) -> Result<(), String> {
+        #[derive(serde::Deserialize)]
+        struct ClientInfo {
+            name: String,
+            version: Option<String>,
+        }
+        let info = <ClientInfo as serde::Deserialize>::deserialize(params)
+            .map_err(|error| format!("`client_info`: its params do not read: {error}"))?;
+        let mut said: String = info.name.chars().take(64).collect();
+        if let Some(version) = info.version {
+            said.push(' ');
+            said.extend(version.chars().take(32));
+        }
+        if let Some(connection) = lock(&self.connections).open.get_mut(&peer) {
+            connection.seen.client = Some(said);
+        }
+        self.count(peer, "client_info");
+        Ok(())
+    }
+
     /// Queue a request for the frame, or say why it was not.
     fn post(&self, peer: Peer, request: Request) -> Result<(), Request> {
+        self.count(peer, &request.method);
         let mut queue = lock(&self.queue);
         if queue.len() >= QUEUED {
             return Err(request);
@@ -228,6 +296,7 @@ impl Remote {
             queue: Mutex::new(VecDeque::new()),
             connections: Mutex::new(Connections::default()),
             peers: AtomicUsize::new(0),
+            seen: AtomicU64::new(0),
             token: token.clone(),
             hello,
         });
@@ -322,6 +391,8 @@ impl Remote {
         if !news {
             return false;
         }
+        // Current for `editor_state`, which lists them.
+        shared.refresh(&mut state.remote_peers_seen, &mut state.remote_peers);
         {
             let mut queue = lock(&shared.queue);
             let take = queue.len().min(BUDGET);
@@ -367,6 +438,20 @@ impl Remote {
             shared.send(peer, encoded(request.id, &request.method, answer));
         }
         true
+    }
+
+    /// The connections past their handshake, into `into`, when they changed
+    /// since `seen`: one atomic load otherwise, with no lock and no allocation.
+    pub fn peers(&self, seen: &mut u64, into: &mut Vec<RemotePeer>) {
+        self.shared.refresh(seen, into);
+    }
+
+    /// Close connection `id`, as the Agents page's Disconnect does. Its
+    /// threads end as a client's leaving ends them.
+    pub fn disconnect(&self, id: u64) {
+        if let Some(connection) = lock(&self.shared.connections).open.get(&id) {
+            let _ = connection.socket.shutdown(Shutdown::Both);
+        }
     }
 
     /// Whether a screenshot was asked for since the last call: the renderer is
@@ -489,6 +574,13 @@ fn listen(shared: &Arc<Shared>, listener: &TcpListener) {
                         socket,
                         reader: Some(reader),
                         send: None,
+                        seen: RemotePeer {
+                            id: peer,
+                            client: None,
+                            since: Instant::now(),
+                            requests: 0,
+                            last: None,
+                        },
                     },
                 );
             }
@@ -509,6 +601,7 @@ fn connect(shared: &Shared, peer: Peer, stream: TcpStream) {
         .open
         .remove(&peer)
         .is_some_and(|connection| connection.send.is_some());
+    shared.seen.fetch_add(1, Ordering::Release);
     let from = addr.map_or_else(String::new, |addr| format!(" from {addr}"));
     match outcome {
         Ok(Ok(())) => {}
@@ -577,12 +670,16 @@ fn serve(shared: &Shared, peer: Peer, mut stream: TcpStream) -> Result<(), Strin
     {
         let mut connections = lock(&shared.connections);
         match connections.open.get_mut(&peer) {
-            Some(connection) => connection.send = Some(send),
+            Some(connection) => {
+                connection.send = Some(send);
+                connection.seen.since = Instant::now();
+            }
             // The remote is stopping, and has already shut this socket down.
             None => return Ok(()),
         }
     }
     shared.peers.fetch_add(1, Ordering::AcqRel);
+    shared.seen.fetch_add(1, Ordering::Release);
     match stream.peer_addr() {
         Ok(addr) => tracing::info!("an agent connected to the remote from {addr}"),
         Err(_) => tracing::info!("an agent connected to the remote"),
@@ -610,6 +707,10 @@ fn serve(shared: &Shared, peer: Peer, mut stream: TcpStream) -> Result<(), Strin
             continue;
         }
         let refused = match wire::decode_request(&payload) {
+            Ok(request) if request.method == "client_info" => {
+                let said = shared.introduce(peer, &request.params);
+                Response::answer(Some(request.id), said.map(|()| serde_json::json!({})))
+            }
             Ok(request) => match shared.post(peer, request) {
                 Ok(()) => continue,
                 Err(request) => Response::answer(

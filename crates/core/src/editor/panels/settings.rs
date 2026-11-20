@@ -1248,6 +1248,7 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
     if field == Field::Remote {
         let (line, colour) = remote_line(cx.state);
         note(ui, &line, colour.unwrap_or(weak));
+        connections(ui, cx.state);
     }
     if field == Field::Editor
         && let ExternalEditor::Custom(command) = &cx.state.settings.scripting.editor
@@ -1355,6 +1356,46 @@ fn remote_line(state: &EditorState) -> (String, Option<egui::Color32>) {
             };
             (line, None)
         }
+    }
+}
+
+/// Each agent connected: what client it says it is, for how long, how busy
+/// it has been, and a way to end that one connection.
+fn connections(ui: &mut egui::Ui, state: &mut EditorState) {
+    let weak = ui.visuals().weak_text_color();
+    let mut close = None;
+    for peer in &state.remote_peers {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(peer.client.as_deref().unwrap_or("unknown client")).strong(),
+            );
+            let last = peer
+                .last
+                .as_deref()
+                .map_or_else(String::new, |method| format!(" · last {method}"));
+            let requests = match peer.requests {
+                1 => "1 request".to_owned(),
+                n => format!("{n} requests"),
+            };
+            let line = format!("{} · {requests}{last}", for_how_long(peer.since.elapsed()));
+            ui.add(egui::Label::new(egui::RichText::new(line).small().color(weak)).truncate());
+            if ui.small_button("Disconnect").clicked() {
+                close = Some(peer.id);
+            }
+        });
+    }
+    if close.is_some() {
+        state.remote_disconnect = close;
+    }
+}
+
+/// How long a connection has been open, to the coarsest unit that says it.
+fn for_how_long(open: Duration) -> String {
+    match open.as_secs() {
+        seconds @ 0..60 => format!("{seconds} s"),
+        seconds @ 60..3600 => format!("{} min", seconds / 60),
+        seconds => format!("{} h {} min", seconds / 3600, seconds % 3600 / 60),
     }
 }
 

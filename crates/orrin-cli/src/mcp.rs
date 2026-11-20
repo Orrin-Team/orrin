@@ -83,6 +83,7 @@ pub fn serve(project: Option<PathBuf>) -> Fallible {
     let mut server = Server {
         project,
         editor: None,
+        client: Value::Null,
     };
     let stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
@@ -107,6 +108,9 @@ struct Server {
     project: Option<PathBuf>,
     /// The editor the live tools reach, once one has been found.
     editor: Option<Client>,
+    /// Who the MCP client said it is at `initialize`, passed on to each editor
+    /// this attaches to, for its Settings ▸ Agents.
+    client: Value,
 }
 
 /// What a tool says: text, and whether it failed.
@@ -182,7 +186,10 @@ impl Server {
         let id = id?;
         let params = object.get("params").cloned().unwrap_or(Value::Null);
         let result = match method {
-            "initialize" => Ok(initialize(&params)),
+            "initialize" => {
+                self.client = params.get("clientInfo").cloned().unwrap_or(Value::Null);
+                Ok(initialize(&params))
+            }
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": tools()})),
             "tools/call" => self.call(&params),
@@ -254,6 +261,14 @@ impl Server {
                 }
                 err => no_editor(project, Some(&err.to_string())),
             })?;
+            // An editor older than `client_info` refuses it, and an editor
+            // that has gone is found out by the call that follows; neither
+            // is this call's to report.
+            let mut client = client;
+            if let Some(name) = self.client.get("name").and_then(Value::as_str) {
+                let version = self.client.get("version").and_then(Value::as_str);
+                let _ = client.call("client_info", json!({"name": name, "version": version}));
+            }
             self.editor = Some(client);
         }
         Ok(self.editor.as_mut().expect("just connected"))

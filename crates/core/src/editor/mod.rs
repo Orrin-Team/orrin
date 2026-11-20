@@ -211,6 +211,7 @@ impl Editor {
         if self.remote.take().is_some() {
             tracing::info!("the remote stopped listening");
         }
+        self.state.remote_peers.clear();
     }
 
     /// Answer what an agent asked since the last frame. See `remote`. A
@@ -257,15 +258,23 @@ impl Editor {
         let want = self.state.environment.remote();
         let want = want.unwrap_or(self.state.settings.agents.remote);
         if want == self.remote_wanted {
-            if let (Some(remote), Some(Ok(status))) = (&self.remote, &mut self.state.remote) {
-                *status = remote.status();
+            if let Some(remote) = &self.remote {
+                if let Some(Ok(status)) = &mut self.state.remote {
+                    *status = remote.status();
+                }
+                let state = &mut self.state;
+                remote.peers(&mut state.remote_peers_seen, &mut state.remote_peers);
+                if let Some(id) = state.remote_disconnect.take() {
+                    remote.disconnect(id);
+                }
             }
             return;
         }
         self.remote_wanted = want;
-        if self.remote.take().is_some() {
-            tracing::info!("the remote stopped listening");
-        }
+        self.stop_remote();
+        // A new remote counts its changes from zero; this makes its first
+        // count one the list has not seen.
+        self.state.remote_peers_seen = u64::MAX;
         self.state.remote = want.then(|| {
             let Some((dir, name)) = &self.remote_home else {
                 return Err("the remote needs a project open: its port and token are \
