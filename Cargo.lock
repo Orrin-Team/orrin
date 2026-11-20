@@ -3088,9 +3088,11 @@ version = "0.1.0"
 name = "orrin-cli"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "orrin-build",
  "orrin-project",
+ "orrin-remote",
  "serde",
  "serde_json",
  "tempfile",
@@ -3126,6 +3128,7 @@ dependencies = [
  "orrin-jolt",
  "orrin-project",
  "orrin-registry",
+ "orrin-remote",
  "orrin-script",
  "orrin-shaderc",
  "pollster",
@@ -3136,6 +3139,7 @@ dependencies = [
  "ron",
  "rusty_dds",
  "serde",
+ "serde_json",
  "sysinfo",
  "toml",
  "tracing",
@@ -3216,6 +3220,16 @@ dependencies = [
  "orrin-macros",
  "uuid",
  "xxhash-rust",
+]
+
+[[package]]
+name = "orrin-remote"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
+ "uuid",
 ]
 
 [[package]]

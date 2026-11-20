@@ -174,6 +174,21 @@ pub use outline::OutlineItem;
 pub use overlay::OverlayFrame;
 pub use ui_window::UiSurface;
 
+/// Tightly packed sRGB RGBA8 rows, and the width and height they are rows of.
+pub type Pixels = (Vec<u8>, [u32; 2]);
+
+/// A screenshot between being asked for and being read. See
+/// [`VulkanRenderer::take_screenshot`].
+#[derive(Clone, Copy)]
+enum Screenshot {
+    Asked(frame::ShotView),
+    Drawn {
+        view: TextureViewId,
+        extent: [u32; 2],
+        format: EngineFormat,
+    },
+}
+
 /// What draws over the final swapchain image between the tonemap pass and
 /// present: the editor UI, already laid out and tessellated. See
 /// [`overlay`](self::overlay).
@@ -262,6 +277,10 @@ pub struct VulkanRenderer {
     /// Bumped whenever a material, a texture or the environment changes in
     /// place, which is what the preview's handle and lighting cannot see.
     preview_inputs: u64,
+    /// A screenshot asked of the next frame, or one a frame drew and
+    /// [`take_screenshot`](Self::take_screenshot) has not read yet. `None`
+    /// is every frame nobody asked of, which is then the frame it always was.
+    screenshot: Option<Screenshot>,
     /// Screen-space refraction: the scene pyramid, the sorted draw, and the
     /// composite. Built with a layout of its own — the same five descriptor sets
     /// the forward pass binds, plus a sixth for that pyramid.
@@ -835,6 +854,7 @@ impl VulkanRenderer {
             occlusion_culling,
             wireframe: None,
             material_preview: false,
+            screenshot: None,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -858,6 +878,7 @@ impl VulkanRenderer {
             oit,
             material_preview: None,
             preview_inputs: 0,
+            screenshot: None,
             refraction,
             taa,
             dof,
@@ -923,16 +944,70 @@ impl VulkanRenderer {
     /// [`material_preview::SIZE`]. `None` before any frame has drawn one.
     pub fn read_material_preview(&mut self, viewer: material_preview::Viewer) -> Option<Vec<u8>> {
         let view = self.material_preview.as_ref()?.shown(viewer)?;
+        let side = material_preview::SIZE;
+        Some(self.read_sampled(view, [side, side]))
+    }
+
+    /// The editor UI's pass, once a frame has drawn the editor: the backend's
+    /// own, since each backend records the overlay its own way.
+    fn overlay_pass(&self) -> Option<&overlay::OverlayPass> {
+        match &self.backend {
+            Backend::Vulkan(vk) => vk.overlay.as_ref(),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => self.metal_overlay.as_ref(),
+        }
+    }
+
+    /// Ask the next frame to draw `view` into an image of its own as well,
+    /// for [`take_screenshot`](Self::take_screenshot) once it has drawn: the
+    /// scene, or the scene and the game's UI. Never the editor's marks.
+    pub fn request_screenshot(&mut self, view: frame::ShotView) {
+        self.screenshot.get_or_insert(Screenshot::Asked(view));
+    }
+
+    /// The screenshot the last frame drew, as tightly packed sRGB RGBA8 rows
+    /// at the frame's extent, or why it could not be read; `None` when no
+    /// frame has drawn one since the last call. Waits for that frame, as a
+    /// capture does: the one frame that asked pays a GPU sync, no other does.
+    pub fn take_screenshot(&mut self) -> Option<Result<Pixels, String>> {
+        let Some(Screenshot::Drawn {
+            view,
+            extent,
+            format,
+        }) = self.screenshot
+        else {
+            return None;
+        };
+        self.screenshot = None;
+        let mut pixels = self.read_sampled(view, extent);
+        self.device.destroy_texture(view);
+        Some(match format {
+            EngineFormat::Rgba8Srgb => Ok((pixels, extent)),
+            EngineFormat::Bgra8Srgb => {
+                for texel in pixels.as_chunks_mut::<4>().0 {
+                    texel.swap(0, 2);
+                }
+                Ok((pixels, extent))
+            }
+            other => Err(format!(
+                "the window's format is {other:?}, which a screenshot cannot be read from"
+            )),
+        })
+    }
+
+    /// Tightly packed rows of a 4-byte-a-texel texture the frame left sampled,
+    /// once that frame is done: `ShaderReadOnlyOptimal` to `TransferSrcOptimal`
+    /// for the copy and back, in a command buffer of its own after the frame's.
+    fn read_sampled(&mut self, view: TextureViewId, extent: [u32; 2]) -> Vec<u8> {
         #[cfg(target_os = "macos")]
         if let crate::gfx::rhi::Device::Metal(driver) = &self.device {
-            return Some(driver.read_texture(view));
+            return driver.read_texture(view);
         }
         self.flush_pending_tail();
         self.backend.vk_mut().in_flight.drain();
         self.backend.vk_mut().overlay_present.drain();
 
         let image = self.vk_view(view).image().clone();
-        let side = u64::from(material_preview::SIZE);
         let buffer = Buffer::new_slice::<u8>(
             self.backend.vk().ctx.memory_allocator.clone(),
             BufferCreateInfo {
@@ -944,9 +1019,9 @@ impl VulkanRenderer {
                     | MemoryTypeFilter::HOST_RANDOM_ACCESS,
                 ..Default::default()
             },
-            side * side * 4,
+            u64::from(extent[0]) * u64::from(extent[1]) * 4,
         )
-        .expect("failed to allocate the preview readback buffer");
+        .expect("failed to allocate a readback buffer");
         let transition = |old_layout, new_layout| vulkano::sync::ImageMemoryBarrier {
             src_stages: vulkano::sync::PipelineStages::ALL_COMMANDS,
             src_access: vulkano::sync::AccessFlags::MEMORY_WRITE,
@@ -973,8 +1048,7 @@ impl VulkanRenderer {
                 Layout::ShaderReadOnlyOptimal,
             ));
         builder.submit_and_wait(&self.backend.vk().ctx);
-        let pixels = buffer.read().unwrap().to_vec();
-        Some(pixels)
+        buffer.read().unwrap().to_vec()
     }
 
     pub fn capture(&mut self) -> Option<(Vec<u8>, [u32; 2])> {
@@ -1264,7 +1338,10 @@ impl VulkanRenderer {
         // The cascade map is the one import the table answers for, because it is
         // also an attachment and `rendering_info` resolves attachments there;
         // `reallocate` registered it.
-        if Some(id) == ids.shadows || ids.material_preview.is_some_and(|p| p.output == id) {
+        if Some(id) == ids.shadows
+            || ids.material_preview.is_some_and(|p| p.output == id)
+            || Some(id) == ids.screenshot
+        {
             return Some(record::Target::Image(
                 self.vk_view(self.table.texture(id)).image().clone(),
             ));
@@ -1998,6 +2075,20 @@ impl VulkanRenderer {
             occlusion_culling: self.occlusion_culling,
             wireframe: overlay.as_ref().and_then(|frame| frame.wireframe),
             material_preview: preview_due,
+            // The editor's view waits for a frame whose UI has no textures
+            // still to upload: those are recorded after the frame, and a copy
+            // drawn inside it would sample what is not there yet.
+            screenshot: match self.screenshot {
+                Some(Screenshot::Asked(frame::ShotView::Editor))
+                    if overlay.as_deref().is_some_and(|frame| {
+                        !frame.textures.set.is_empty() || self.overlay_pass().is_none()
+                    }) =>
+                {
+                    None
+                }
+                Some(Screenshot::Asked(view)) => Some(view),
+                _ => None,
+            },
         });
 
         // Each cascade the cache does not redraw this frame is swapped back to
@@ -2403,6 +2494,44 @@ impl VulkanRenderer {
             _ => None,
         };
 
+        // Made here, for the reason the preview's output is named here: past
+        // this point the frame is not abandoned, so an image made for it is
+        // drawn. One the size of the frame, made for this frame alone and
+        // retired once it is read, so nothing is held between screenshots.
+        if let Some(id) = self.frame.ids.screenshot
+            && matches!(self.screenshot, Some(Screenshot::Asked(_)))
+        {
+            let extent = self.backend.extent();
+            let format = self.backend.format();
+            let view = self.device.create_texture(&crate::gfx::rhi::TextureDesc {
+                format,
+                dimension: crate::gfx::rhi::TextureDimension::D2,
+                extent: [extent[0], extent[1], 1],
+                mip_levels: 1,
+                array_layers: 1,
+                samples: crate::gfx::format::SampleCount::Sample1,
+                usage: crate::gfx::graph::ImageUsage::COLOR_ATTACHMENT
+                    | crate::gfx::graph::ImageUsage::SAMPLED
+                    | crate::gfx::graph::ImageUsage::TRANSFER_SRC,
+                memoryless: false,
+            });
+            self.table.import(
+                id,
+                crate::gfx::images::ImageEntry {
+                    whole: view,
+                    levels: Vec::new(),
+                    layers: Vec::new(),
+                    extent,
+                    mip_levels: 1,
+                },
+            );
+            self.screenshot = Some(Screenshot::Drawn {
+                view,
+                extent,
+                format,
+            });
+        }
+
         // Every list a frame draws is an ordering over one shared `RenderItem`
         // array, so any non-empty list carries the whole of it.
         let items = [draws, transparent, refractive]
@@ -2684,6 +2813,37 @@ impl VulkanRenderer {
             objects.indices,
         ));
 
+        // The editor's UI for a screenshot of it, readied while the overlay
+        // pass may still be borrowed mutably; drawn by its node in the walk.
+        let shot_copy = match overlay.as_deref() {
+            Some(frame)
+                if self.frame.ids.screenshot.is_some()
+                    && self.frame.bodies.contains(&PassBody::ScreenshotOverlay) =>
+            {
+                let shot_lent: Vec<_> = self
+                    .material_preview
+                    .as_ref()
+                    .map_or_else(
+                        Default::default,
+                        material_preview::MaterialPreviewPass::lent,
+                    )
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                let pass = match &mut self.backend {
+                    Backend::Vulkan(vk) => vk.overlay.as_mut(),
+                    #[cfg(target_os = "macos")]
+                    Backend::Metal(_) => self.metal_overlay.as_mut(),
+                };
+                pass.and_then(|pass| pass.prepare_copy(&self.device, frame, &shot_lent))
+            }
+            _ => None,
+        };
+        let shot_overlay = shot_copy
+            .as_ref()
+            .and_then(|copy| Some((self.overlay_pass()?, overlay.as_deref()?, copy)));
+
         let record = FrameRecord {
             vk: match &self.backend {
                 Backend::Vulkan(vk) => Some(VkFrame {
@@ -2763,6 +2923,7 @@ impl VulkanRenderer {
                 .map_or(&[], |frame| frame.outline.as_slice()),
             material_preview: self.material_preview.as_ref(),
             preview_frame,
+            shot_overlay,
             surfaces: surface::Surfaces {
                 shaders: &self.surfaces,
                 frame: surface_frame,
@@ -3262,6 +3423,12 @@ struct FrameRecord<'a> {
     outline_items: &'a [OutlineItem],
     material_preview: Option<&'a material_preview::MaterialPreviewPass>,
     preview_frame: Option<material_preview::PreviewFrame>,
+    /// The editor's UI, readied for the screenshot's copy of it.
+    shot_overlay: Option<(
+        &'a overlay::OverlayPass,
+        &'a OverlayFrame,
+        &'a overlay::OverlayCopy,
+    )>,
     /// The twins and parameters of every loaded surface shader, for the passes
     /// that draw a material through one.
     surfaces: surface::Surfaces<'a>,
@@ -3497,7 +3664,10 @@ impl FrameRecord<'_> {
         // The cascade map is the one import the table answers for, because it is
         // also an attachment and `rendering_info` resolves attachments there;
         // `reallocate` registered it.
-        if Some(id) == ids.shadows || ids.material_preview.is_some_and(|p| p.output == id) {
+        if Some(id) == ids.shadows
+            || ids.material_preview.is_some_and(|p| p.output == id)
+            || Some(id) == ids.screenshot
+        {
             return Some(record::Target::Image(
                 self.vk_view(self.table.texture(id)).image().clone(),
             ));
@@ -4279,7 +4449,7 @@ impl FrameRecord<'_> {
                     self.surfaces,
                 );
             }
-            PassBody::Tonemap => {
+            PassBody::Tonemap | PassBody::Screenshot => {
                 // With bloom off the graph has no chain, so the tonemap
                 // pass samples a 1x1 black self.view at a zero strength: "no
                 // bloom" with no second shader path.
@@ -4293,16 +4463,21 @@ impl FrameRecord<'_> {
                 self.hdr
                     .record_tonemap(self.device, encoder, self.extent, hdr, exposure, bloom);
             }
-            PassBody::Ui => {
+            PassBody::ScreenshotOverlay => {
+                if let Some((pass, frame, copy)) = self.shot_overlay {
+                    pass.draw_copy(encoder, frame, copy, self.extent);
+                }
+            }
+            PassBody::Ui | PassBody::ScreenshotUi => {
                 if let Some(frame) = self.ui_frame {
                     self.ui.record(self.device, encoder, frame, self.extent);
                 }
             }
-            PassBody::Gizmo => {
+            PassBody::Gizmo | PassBody::ScreenshotGizmo => {
                 self.gizmo
                     .record(self.device, encoder, self.gizmo_strokes, self.extent);
             }
-            PassBody::Wireframe => {
+            PassBody::Wireframe | PassBody::ScreenshotWireframe => {
                 let (mode, depth) = self
                     .frame
                     .ids
@@ -4328,7 +4503,7 @@ impl FrameRecord<'_> {
                     self.extent,
                 );
             }
-            PassBody::Outline => {
+            PassBody::Outline | PassBody::ScreenshotOutline => {
                 let mask = self
                     .frame
                     .ids

@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 orrin-project.workspace =  true
+# The editor's remote: its wire and discovery file, shared with `orrin mcp`.
+orrin-remote.workspace = true
 orrin-script = { workspace = true, optional = true }
 orrin-build = { workspace = true, optional = true }
 orrin-shaderc = { workspace = true, optional = true }
@@ -24,6 +26,9 @@ pollster.workspace = true
 # SVG image loader for the editor's logo. egui renders no SVG itself.
 egui_extras = { version = "0.31", features = ["svg"] }
 serde.workspace = true
+# The remote's request and response bodies. Already in the tree through
+# orrin-project and gltf.
+serde_json = "1"
 # User themes are hand-authored TOML; editor preferences are machine-written RON
 # (a dock layout is a tree of enums, which TOML cannot express).
 toml.workspace = true

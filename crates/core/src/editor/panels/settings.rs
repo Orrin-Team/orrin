@@ -49,12 +49,25 @@
 //!
 //! **Any width.** Docked into a column the sidebar folds into one page picker.
 //!
+//! **Permissions are the person's, folders the project's.** The switches in
+//! the Agents page's Permissions section are `[agents.allow]` in the user's
+//! settings and its folder rules the project's `.orrin/agent-folders.toml`
+//! (`orrin_remote::permissions` holds both, and is what the editor and `orrin
+//! mcp` check against). They govern what Orrin's tools do for an agent. They do
+//! not confine an agent that can already write the project's files some other
+//! way, and the page does not claim to.
+//!
 //! **Closed, it costs nothing:** the dock does not call [`body`]. Open, it is
 //! a handful of rows a frame and, on a Project page, three file stats a
 //! second: the manifest and the two scenes it names. The Blender page looks
-//! for Blender, which searches the PATH, once a second.
+//! for Blender, which searches the PATH, once a second. The Agents page looks
+//! for the `orrin` its copy rows name and stats it once a second too, and
+//! starts it with `mcp --help`, off the frame's thread, only when that binary
+//! changes.
 
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
 
 use orrin_ecs::World;
@@ -73,6 +86,9 @@ use crate::editor::settings::{
 use crate::editor::state::{DockRequest, EditorState, IconTints};
 use crate::editor::theme::{self, ThemeSet};
 use crate::editor::widgets;
+use orrin_remote::permissions::{
+    Access, Capabilities, Capability, FolderPreset, FolderRule, Folders, Preset,
+};
 
 /// Below this the sidebar folds into a picker: a 168-point sidebar beside a
 /// property row's label column leaves too little for a slider.
@@ -93,6 +109,7 @@ pub enum Page {
     Viewport,
     Scripting,
     Blender,
+    Agents,
     Saving,
     Display,
     Startup,
@@ -100,11 +117,12 @@ pub enum Page {
 
 impl Page {
     const PROJECT: [Self; 3] = [Self::General, Self::Scenes, Self::Scripts];
-    const ORRIN: [Self; 7] = [
+    const ORRIN: [Self; 8] = [
         Self::Appearance,
         Self::Viewport,
         Self::Scripting,
         Self::Blender,
+        Self::Agents,
         Self::Saving,
         Self::Display,
         Self::Startup,
@@ -119,6 +137,7 @@ impl Page {
             Self::Viewport => "Viewport",
             Self::Scripting => "Scripting",
             Self::Blender => "Blender",
+            Self::Agents => "Agents",
             Self::Saving => "Saving",
             Self::Display => "Display",
             Self::Startup => "Startup",
@@ -171,6 +190,16 @@ enum Field {
     LinkPort,
     /// Not a setting but an action, found by search like one.
     AddOn,
+    Remote,
+    /// An action too: the client's configuration, to the clipboard.
+    McpConfig,
+    /// And the `claude mcp add` line, to the clipboard.
+    ClaudeCommand,
+    /// Which of the presets the switches below it are.
+    Preset,
+    Allow(Capability),
+    /// The folder a new folder rule is for, while it is typed.
+    AddFolder,
     Autosave,
     Interval,
     Present,
@@ -187,6 +216,10 @@ impl Field {
             self,
             Self::Backend | Self::Threads | Self::Validation | Self::Log
         )
+    }
+
+    fn is_permission(self) -> bool {
+        matches!(self, Self::Preset | Self::Allow(_))
     }
 }
 
@@ -394,6 +427,135 @@ const ROWS: &[Row] = &[
         "addon install add-on extension plugin live link",
     ),
     row(
+        Page::Agents,
+        Field::Remote,
+        "Remote",
+        "Let an AI agent read the open scene, the assets and the console through `orrin mcp`, \
+         over 127.0.0.1 with a token only this project's .orrin/remote holds",
+        "mcp ai agent claude llm assistant tool remote server automation",
+    ),
+    row(
+        Page::Agents,
+        Field::McpConfig,
+        "MCP config",
+        "Copy a .mcp.json entry that runs `orrin mcp` for this project, for an MCP client such \
+         as Claude Code",
+        "mcp json copy clipboard client claude code configure setup",
+    ),
+    row(
+        Page::Agents,
+        Field::ClaudeCommand,
+        "Claude Code",
+        "Copy a `claude mcp add` command that runs `orrin mcp` for this project; run it in the \
+         folder Claude Code is started in, since it adds the server for that folder only",
+        "claude code mcp add command terminal shell cli copy clipboard install setup register",
+    ),
+    row(
+        Page::Agents,
+        Field::Preset,
+        "Preset",
+        "What an agent may do through Orrin's tools; changing a switch below makes it Custom",
+        "agent permission permissions access preset read only edit full control custom mcp",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::ReadScene),
+        "Read scene and assets",
+        "Read the open scene, the registered components and the asset index",
+        "agent permission allow deny read outline blocks components assets index",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::Console),
+        "Read the console",
+        "Read the editor console's lines",
+        "agent permission allow deny log logs messages errors warnings",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::Screenshot),
+        "Screenshots",
+        "Take a picture of the game or the scene",
+        "agent permission allow deny image picture png view",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::FrameStats),
+        "Frame stats",
+        "Read frame times, the profiler and the run banner",
+        "agent permission allow deny performance profiler fps timings",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::EditScene),
+        "Edit the scene",
+        "Change the open scene through scene_edit, each call one undo step",
+        "agent permission allow deny edit spawn despawn set component reparent modify",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::PlayControl),
+        "Play, pause and stop",
+        "Play, pause, step and stop the game, and load scenes while it plays",
+        "agent permission allow deny play pause stop step run game load unload",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::GameInput),
+        "Send game input",
+        "Press keys, buttons and actions in the playing game, as a playtest",
+        "agent permission allow deny input keyboard mouse gamepad press playtest",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::UndoRedo),
+        "Undo and redo",
+        "Undo and redo the editor's steps, the developer's own included",
+        "agent permission allow deny undo redo history",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::Selection),
+        "Select and frame",
+        "Change the selection and frame it in the camera",
+        "agent permission allow deny select selection frame camera focus",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::Scenes),
+        "Save, open and create scenes",
+        "Save the open scene, open another, or make a new one",
+        "agent permission allow deny save open new scene file write",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::ReloadScripts),
+        "Reload scripts",
+        "Swap in the game's last build",
+        "agent permission allow deny hot reload scripts assembly",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::BuildScripts),
+        "Build scripts",
+        "Compile the project's C# with orrin build",
+        "agent permission allow deny compile dotnet build csharp",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::RunTests),
+        "Run tests",
+        "Run the project's tests with orrin test",
+        "agent permission allow deny test tests unit",
+    ),
+    row(
+        Page::Agents,
+        Field::Allow(Capability::OpenEditor),
+        "Open the editor",
+        "Launch an editor on the project with its remote on",
+        "agent permission allow deny launch start editor_open run",
+    ),
+    row(
         Page::Saving,
         Field::Autosave,
         "Autosave",
@@ -559,6 +721,48 @@ pub struct SettingsPanel {
     manifest: Manifest,
     /// The Blender the Blender page would run, as last looked for.
     found: Option<Found>,
+    /// The `orrin` the Agents page's copy rows name, and what it answered.
+    cli: Option<Cli>,
+    /// Why the last folder typed into Permissions was not added.
+    folder_error: Option<String>,
+}
+
+/// Finding the CLI searches the PATH and asking it starts it, which for a
+/// freshly built unsigned binary on macOS can take well over a frame. So the
+/// page looks at most once a second, asks on a thread of its own, and asks
+/// again only when the path or the file changes: a rebuild clears the note.
+struct Cli {
+    at: Instant,
+    path: Option<PathBuf>,
+    stamp: Option<(SystemTime, u64)>,
+    asking: Option<Receiver<Probe>>,
+    answer: Option<Probe>,
+}
+
+impl Cli {
+    fn ask(path: Option<PathBuf>, stamp: Option<(SystemTime, u64)>) -> Self {
+        let mut cli = Self {
+            at: Instant::now(),
+            path,
+            stamp,
+            asking: None,
+            answer: None,
+        };
+        let Some(path) = cli.path.clone() else {
+            cli.answer = Some(Probe::NotFound);
+            return cli;
+        };
+        let (send, answered) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("orrin-cli-probe".to_owned())
+            .spawn(move || {
+                let _ = send.send(probe(&path));
+            });
+        if spawned.is_ok() {
+            cli.asking = Some(answered);
+        }
+        cli
+    }
 }
 
 /// `blend::locate` searches the PATH, so the page asks it at most once a
@@ -636,6 +840,34 @@ impl SettingsPanel {
         self.found
             .as_ref()
             .map_or((None, false), |found| (found.path.clone(), found.exists))
+    }
+
+    /// The note the copy rows carry about the `orrin` they name, once it has
+    /// answered and only when a client could not use it.
+    fn cli_warning(&mut self) -> Option<String> {
+        if self
+            .cli
+            .as_ref()
+            .is_none_or(|cli| cli.at.elapsed() >= RECHECK)
+        {
+            let path = find_orrin();
+            let stamp = path.as_deref().and_then(stamp);
+            match &mut self.cli {
+                Some(cli) if cli.path == path && cli.stamp == stamp => cli.at = Instant::now(),
+                _ => self.cli = Some(Cli::ask(path, stamp)),
+            }
+        }
+        let cli = self.cli.as_mut()?;
+        if let Some(asking) = &cli.asking {
+            match asking.try_recv() {
+                Ok(answer) => cli.answer = Some(answer),
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {}
+            }
+            cli.asking = None;
+        }
+        let path = cli.path.as_deref().unwrap_or(Path::new("orrin"));
+        cli_note(path, cli.answer.as_ref()?)
     }
 
     fn select(&mut self, page: Page) {
@@ -898,7 +1130,7 @@ fn entry(ui: &mut egui::Ui, panel: &mut SettingsPanel, page: Page) {
 fn picker(ui: &mut egui::Ui, state: &EditorState, panel: &mut SettingsPanel) {
     let mut chosen = None;
     let weak = ui.visuals().weak_text_color();
-    egui::ComboBox::from_id_salt("settings page")
+    egui::ComboBox::from_id_salt("settings page picker")
         .width(ui.available_width())
         .selected_text(panel.page.title())
         .show_ui(ui, |ui| {
@@ -961,7 +1193,17 @@ fn page(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
                             weak,
                         );
                     }
-                    rows_of(ui, cx, panel, |row| row.page == page);
+                    rows_of(ui, cx, panel, |row| {
+                        row.page == page && !row.field.is_permission()
+                    });
+                    if page == Page::Agents {
+                        ui.add_space(14.0);
+                        heading(ui, "Permissions", "what Orrin's tools do for an agent");
+                        rows_of(ui, cx, panel, |row| {
+                            row.page == page && row.field.is_permission()
+                        });
+                        folders(ui, cx.state, panel);
+                    }
                 }
             }
             if !page.is_project() && cx.state.settings_file.is_none() {
@@ -984,11 +1226,20 @@ fn unloadable(ui: &mut egui::Ui, error: &str, state: &EditorState) {
 
 /// The rows `keep` accepts, in the order they are declared.
 fn rows_of(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, keep: impl Fn(&Row) -> bool) {
-    for row in ROWS.iter().filter(|row| keep(row)) {
+    let copies = |row: &Row| matches!(row.field, Field::McpConfig | Field::ClaudeCommand);
+    let mut rows = ROWS.iter().filter(|row| keep(row)).peekable();
+    while let Some(row) = rows.next() {
         if row.page.is_project() {
             project_row(ui, cx, panel, row);
         } else {
             orrin_row(ui, cx, panel, row);
+        }
+        // Once, under whichever of the two copy rows is shown last.
+        if copies(row)
+            && !rows.peek().is_some_and(|next| copies(next))
+            && let Some(warning) = panel.cli_warning()
+        {
+            note(ui, &warning, theme::ERROR);
         }
     }
 }
@@ -1134,6 +1385,7 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
     let locked = match field {
         Field::Editor => env.editor_override(),
         Field::BlenderPath => env.blender_override(),
+        Field::Remote => env.remote_override(),
         Field::Backend => env.backend_override(),
         Field::Threads => env.threads_override(),
         Field::Validation => env.validation_override(),
@@ -1156,7 +1408,13 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
                 if locked.is_some() && field.is_startup() {
                     let mut chosen = cx.state.environment.over(&cx.state.settings.startup);
                     startup_control(ui, field, &mut chosen);
-                } else if let (Some(_), Some(path)) = (locked, cx.state.environment.blender()) {
+                } else if field == Field::Remote
+                    && let Some(mut on) = locked.and(cx.state.environment.remote())
+                {
+                    ui.checkbox(&mut on, "");
+                } else if field == Field::BlenderPath
+                    && let Some(path) = locked.and(cx.state.environment.blender())
+                {
                     let mut shown = path.to_owned();
                     ui.add(egui::TextEdit::singleline(&mut shown).desired_width(f32::INFINITY));
                 } else {
@@ -1215,6 +1473,11 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
     }
     if row.page == Page::Blender {
         blender_note(ui, cx, panel, field, locked.is_some());
+    }
+    if field == Field::Remote {
+        let (line, colour) = remote_line(cx.state);
+        note(ui, &line, colour.unwrap_or(weak));
+        connections(ui, cx.state);
     }
     if field == Field::Editor
         && let ExternalEditor::Custom(command) = &cx.state.settings.scripting.editor
@@ -1307,6 +1570,185 @@ fn link_line(world: &World, state: &EditorState) -> (String, Option<egui::Color3
         }
     };
     (line, None)
+}
+
+/// The remote's state in a line, and a colour when it is a failure.
+fn remote_line(state: &EditorState) -> (String, Option<egui::Color32>) {
+    match &state.remote {
+        None => ("Off".to_owned(), None),
+        Some(Err(error)) => (sentence(error), Some(theme::ERROR)),
+        Some(Ok(status)) => {
+            let line = match status.peers {
+                0 => format!("Listening on 127.0.0.1:{}", status.port),
+                1 => format!("1 agent connected, on 127.0.0.1:{}", status.port),
+                n => format!("{n} agents connected, on 127.0.0.1:{}", status.port),
+            };
+            (line, None)
+        }
+    }
+}
+
+/// Each agent connected: what client it says it is, for how long, how busy
+/// it has been, and a way to end that one connection.
+fn connections(ui: &mut egui::Ui, state: &mut EditorState) {
+    let weak = ui.visuals().weak_text_color();
+    let mut close = None;
+    for peer in &state.remote_peers {
+        let last = peer
+            .last
+            .as_deref()
+            .map_or_else(String::new, |method| format!(" · last {method}"));
+        let requests = match peer.requests {
+            1 => "1 request".to_owned(),
+            n => format!("{n} requests"),
+        };
+        let line = format!("{} · {requests}{last}", for_how_long(peer.since.elapsed()));
+        let client = peer.client.as_deref().unwrap_or("unknown client");
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            // The button first, from the right, so it is whole at any width
+            // and the text gives way to it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Disconnect").clicked() {
+                    close = Some(peer.id);
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(client).strong()).truncate());
+                    let detail = egui::RichText::new(&line).small().color(weak);
+                    ui.add(egui::Label::new(detail).truncate());
+                });
+            });
+        });
+    }
+    if close.is_some() {
+        state.remote_disconnect = close;
+    }
+}
+
+/// How long a connection has been open, to the coarsest unit that says it.
+fn for_how_long(open: Duration) -> String {
+    match open.as_secs() {
+        seconds @ 0..60 => format!("{seconds} s"),
+        seconds @ 60..3600 => format!("{} min", seconds / 60),
+        seconds => format!("{} h {} min", seconds / 3600, seconds % 3600 / 60),
+    }
+}
+
+/// The `orrin` an agent's client should start: the one this editor would run
+/// an export with when it can find one, the one on the PATH otherwise.
+fn orrin_cli() -> String {
+    find_orrin().map_or_else(|| "orrin".to_owned(), |cli| cli.display().to_string())
+}
+
+fn find_orrin() -> Option<PathBuf> {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    crate::editor::export::find_cli(
+        std::env::var_os(crate::editor::export::CLI_ENV),
+        beside.as_deref(),
+        std::env::var_os("PATH"),
+    )
+    .ok()
+}
+
+/// What the `orrin` the copy rows name answered to `mcp --help`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Probe {
+    Serves,
+    /// It ran and refused the subcommand: a build from before `orrin mcp`.
+    NoMcp,
+    /// It would not start, and the OS's reason.
+    WontStart(String),
+    /// No `orrin` was found to ask.
+    NotFound,
+}
+
+/// Run `cli mcp --help` with nothing attached, so it can neither start
+/// serving nor print into the editor's terminal.
+fn probe(cli: &Path) -> Probe {
+    if cfg!(feature = "export") {
+        return Probe::WontStart("an exported game runs no `orrin` CLI".to_owned());
+    }
+    let ran = std::process::Command::new(cli)
+        .args(["mcp", "--help"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match ran {
+        Ok(status) if status.success() => Probe::Serves,
+        Ok(_) => Probe::NoMcp,
+        Err(error) => Probe::WontStart(error.to_string()),
+    }
+}
+
+/// The note under the copy rows when a client could not use `cli`.
+fn cli_note(cli: &Path, probe: &Probe) -> Option<String> {
+    let path = cli.display();
+    // Cargo's release profile writes to a directory of that name.
+    let build = if cli.parent().and_then(Path::file_name) == Some("release".as_ref()) {
+        "`cargo build -p orrin-cli --release`"
+    } else {
+        "`cargo build -p orrin-cli`"
+    };
+    match probe {
+        Probe::Serves => None,
+        Probe::NoMcp => Some(format!(
+            "{path} is an older build with no `mcp` command, so a client that starts it fails \
+             to connect; rebuild it with {build}"
+        )),
+        Probe::WontStart(error) => Some(format!(
+            "{path} would not start ({error}), so what is copied here will not start either; \
+             build it with {build}"
+        )),
+        Probe::NotFound => Some(format!(
+            "No `orrin` was found beside the editor or on the PATH, so what is copied here will \
+             not start; build it with {build}"
+        )),
+    }
+}
+
+/// What `.mcp.json` holds to run `orrin mcp` on the project at `root`.
+fn mcp_config(root: &Path) -> String {
+    let config = serde_json::json!({
+        "mcpServers": {
+            "orrin": {
+                "command": orrin_cli(),
+                "args": ["mcp", "--project", root.display().to_string()],
+            }
+        }
+    });
+    serde_json::to_string_pretty(&config).unwrap_or_default()
+}
+
+/// The shell line that gives Claude Code `orrin mcp` on the project at
+/// `root`. No `--scope`: the default, local, is this person's alone, which is
+/// where a machine-local path belongs.
+fn claude_command(cli: &str, root: &Path) -> String {
+    format!(
+        "claude mcp add orrin -- {} mcp --project {}",
+        shell_word(cli),
+        shell_word(&root.display().to_string())
+    )
+}
+
+/// `word` as a shell reads it back as one word, left bare when nothing in it
+/// needs quoting.
+fn shell_word(word: &str) -> String {
+    if cfg!(windows) {
+        return if word.contains(' ') {
+            format!("\"{word}\"")
+        } else {
+            word.to_owned()
+        };
+    }
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+:,@".contains(c);
+    if !word.is_empty() && word.chars().all(safe) {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
 }
 
 /// A console line as a note on the page: its first letter capitalised.
@@ -1477,6 +1919,31 @@ fn control(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, field: Fie
                 cx.state.addon.start(blender);
             }
         }
+        Field::Remote => {
+            ui.checkbox(&mut settings.agents.remote, "");
+        }
+        Field::McpConfig => {
+            let root = cx.state.project_root.clone();
+            let button = ui
+                .add_enabled(root.is_some(), egui::Button::new("Copy MCP config"))
+                .on_disabled_hover_text("Open a project first: the config names it");
+            if button.clicked()
+                && let Some(root) = root
+            {
+                ui.ctx().copy_text(mcp_config(&root));
+            }
+        }
+        Field::ClaudeCommand => {
+            let root = cx.state.project_root.clone();
+            let button = ui
+                .add_enabled(root.is_some(), egui::Button::new("Copy command"))
+                .on_disabled_hover_text("Open a project first: the command names it");
+            if button.clicked()
+                && let Some(root) = root
+            {
+                ui.ctx().copy_text(claude_command(&orrin_cli(), &root));
+            }
+        }
         Field::Autosave => {
             ui.checkbox(&mut settings.saving.autosave, "");
         }
@@ -1519,8 +1986,152 @@ fn control(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, field: Fie
         | Field::Entry
         | Field::ScriptsFolder
         | Field::AssetsFolder
-        | Field::Command => {}
+        | Field::Command
+        | Field::AddFolder => {}
+        Field::Preset => {
+            let allow = &mut settings.agents.allow;
+            let current = allow.preset();
+            egui::ComboBox::from_id_salt("settings agents preset")
+                .width(width)
+                .selected_text(current.label())
+                .show_ui(ui, |ui| {
+                    for preset in Preset::CHOSEN {
+                        if ui
+                            .selectable_label(current == preset, preset.label())
+                            .clicked()
+                        {
+                            *allow = Capabilities::of(preset);
+                        }
+                    }
+                });
+        }
+        Field::Allow(capability) => {
+            let mut on = settings.agents.allow.allows(capability);
+            if ui.checkbox(&mut on, "").changed() {
+                settings.agents.allow.set(capability, on);
+            }
+        }
     }
+}
+
+/// The project's folder rules for agents, under the switches: a preset, what
+/// every folder no rule names gets, and one rule a folder, the longest that
+/// matches a path deciding it. Kept in the project's `.orrin`, not in
+/// `orrin.toml`: they are this person's rules for their agent, not the
+/// project's.
+fn folders(ui: &mut egui::Ui, state: &mut EditorState, panel: &mut SettingsPanel) {
+    let weak = ui.visuals().weak_text_color();
+    ui.add_space(14.0);
+    heading(ui, "Folders", "this project, kept in .orrin");
+    if state.project_root.is_none() {
+        note(ui, "Open a project to give its folders rules", weak);
+        return;
+    }
+    let assets = state.agent_assets.clone();
+    let folders = match &mut state.agent_folders {
+        Ok(folders) => folders,
+        Err(why) => {
+            note(ui, &sentence(why), theme::ERROR);
+            note(ui, "Agents are refused every folder until it reads", weak);
+            if ui.button("Reset to the whole project").clicked() {
+                state.agent_folders = Ok(Folders::default());
+                state.agent_folders_changed = true;
+            }
+            return;
+        }
+    };
+    let mut changed = false;
+    let current = folders.preset(&assets);
+    widgets::property(ui, "Folder preset", |ui| {
+        egui::ComboBox::from_id_salt("settings agents folders")
+            .width(ui.available_width())
+            .selected_text(current.label())
+            .show_ui(ui, |ui| {
+                for preset in FolderPreset::CHOSEN {
+                    if ui
+                        .selectable_label(current == preset, preset.label())
+                        .clicked()
+                    {
+                        *folders = Folders::of(preset, &assets);
+                        changed = true;
+                    }
+                }
+            });
+    });
+    widgets::property(ui, "Everything else", |ui| {
+        changed |= access_picker(ui, "unlisted", &mut folders.unlisted);
+    });
+    let mut gone = None;
+    for (at, rule) in folders.rules.iter_mut().enumerate() {
+        let shown = if rule.path.is_empty() {
+            "."
+        } else {
+            &rule.path
+        };
+        widgets::property_with(
+            ui,
+            shown,
+            |ui| changed |= access_picker(ui, &rule.path, &mut rule.access),
+            |ui| {
+                if icons::button(ui, icons::x(), 12.0, weak, false)
+                    .on_hover_text("Remove this rule")
+                    .clicked()
+                {
+                    gone = Some(at);
+                }
+            },
+        );
+    }
+    if let Some(at) = gone {
+        folders.rules.remove(at);
+        changed = true;
+    }
+    let typed = widgets::property(ui, "Add folder", |ui| {
+        committed_text(ui, &mut panel.typing, Field::AddFolder, "")
+    });
+    if let Some(typed) = typed.filter(|typed| !typed.trim().is_empty()) {
+        match orrin_remote::permissions::normalise(typed.trim()) {
+            Ok(path) if folders.rules.iter().any(|rule| rule.path == path) => {
+                panel.folder_error = Some(format!("{path} has a rule already"));
+            }
+            Ok(path) => {
+                folders.rules.push(FolderRule {
+                    path,
+                    access: Access::Read,
+                });
+                folders.rules.sort_by(|a, b| a.path.cmp(&b.path));
+                panel.folder_error = None;
+                changed = true;
+            }
+            Err(why) => panel.folder_error = Some(sentence(&why)),
+        }
+    }
+    if let Some(error) = &panel.folder_error {
+        note(ui, error, theme::ERROR);
+    }
+    note(
+        ui,
+        "Relative to the project, longest match first. These govern Orrin's tools only, not a \
+         process that can already write the project's files",
+        weak,
+    );
+    if changed {
+        state.agent_folders_changed = true;
+    }
+}
+
+/// An access level, picked; whether it changed.
+fn access_picker(ui: &mut egui::Ui, salt: &str, access: &mut Access) -> bool {
+    let before = *access;
+    egui::ComboBox::from_id_salt(("settings agents access", salt.to_owned()))
+        .width(ui.available_width())
+        .selected_text(access.label())
+        .show_ui(ui, |ui| {
+            for option in Access::ALL {
+                ui.selectable_value(access, option, option.label());
+            }
+        });
+    *access != before
 }
 
 /// A Startup row's picker over `startup`, which a locked row hands in as a
@@ -1647,7 +2258,12 @@ fn is_default(field: Field, s: &Settings, d: &Settings) -> bool {
         Field::BlenderPath => s.blender.path == d.blender.path,
         Field::LiveLink => s.blender.live_link == d.blender.live_link,
         Field::LinkPort => s.blender.port == d.blender.port,
-        Field::AddOn => true,
+        Field::AddOn | Field::McpConfig | Field::ClaudeCommand => true,
+        Field::Preset => s.agents.allow == d.agents.allow,
+        Field::Allow(capability) => {
+            s.agents.allow.allows(capability) == d.agents.allow.allows(capability)
+        }
+        Field::Remote => s.agents.remote == d.agents.remote,
         _ => tint(s.appearance.icons, field) == tint(d.appearance.icons, field),
     }
 }
@@ -1674,7 +2290,13 @@ fn restore(field: Field, s: &mut Settings, d: &Settings) {
         Field::BlenderPath => s.blender.path.clone_from(&d.blender.path),
         Field::LiveLink => s.blender.live_link = d.blender.live_link,
         Field::LinkPort => s.blender.port = d.blender.port,
-        Field::AddOn => {}
+        Field::AddOn | Field::McpConfig | Field::ClaudeCommand => {}
+        Field::Preset => s.agents.allow = d.agents.allow,
+        Field::Allow(capability) => s
+            .agents
+            .allow
+            .set(capability, d.agents.allow.allows(capability)),
+        Field::Remote => s.agents.remote = d.agents.remote,
         _ => {
             if let (Some(to), Some(from)) = (
                 tint_mut(&mut s.appearance.icons, field),
@@ -1709,7 +2331,10 @@ fn default_text(field: Field, d: &Settings) -> String {
         Field::BlenderPath => "empty, an installed Blender".to_owned(),
         Field::LiveLink => on(d.blender.live_link),
         Field::LinkPort => d.blender.port.to_string(),
-        Field::AddOn => String::new(),
+        Field::AddOn | Field::McpConfig | Field::ClaudeCommand => String::new(),
+        Field::Preset => d.agents.allow.preset().label().to_owned(),
+        Field::Allow(capability) => on(d.agents.allow.allows(capability)),
+        Field::Remote => on(d.agents.remote),
         _ => tint(d.appearance.icons, field)
             .map_or_else(String::new, |[r, g, b]| format!("#{r:02X}{g:02X}{b:02X}")),
     }
@@ -1889,6 +2514,84 @@ mod tests {
         }
     }
 
+    /// The line is pasted into a shell, so a path with a space or a quote in it
+    /// must still arrive as one word, and a plain one is left as typed.
+    #[test]
+    fn the_claude_command_quotes_only_the_words_a_shell_would_split() {
+        if cfg!(windows) {
+            assert_eq!(
+                claude_command(r"C:\Orrin\orrin.exe", Path::new(r"C:\Games\game")),
+                r"claude mcp add orrin -- C:\Orrin\orrin.exe mcp --project C:\Games\game"
+            );
+            assert_eq!(
+                claude_command(
+                    r"C:\Program Files\Orrin\orrin.exe",
+                    Path::new(r"C:\Users\me\My Game's")
+                ),
+                r#"claude mcp add orrin -- "C:\Program Files\Orrin\orrin.exe" mcp --project "C:\Users\me\My Game's""#
+            );
+        } else {
+            assert_eq!(
+                claude_command(
+                    "/usr/local/bin/orrin",
+                    Path::new("/Users/me/games/space-1.0")
+                ),
+                "claude mcp add orrin -- /usr/local/bin/orrin mcp --project /Users/me/games/space-1.0"
+            );
+            assert_eq!(
+                claude_command("/opt/Orrin Engine/orrin", Path::new("/Users/me/My Game's")),
+                r"claude mcp add orrin -- '/opt/Orrin Engine/orrin' mcp --project '/Users/me/My Game'\''s'"
+            );
+        }
+    }
+
+    /// A client starts whatever `orrin` the copy rows name, so the page asks it
+    /// for `mcp` first: one that has it, one built before it, one not there.
+    #[cfg(all(unix, not(feature = "export")))]
+    #[test]
+    fn the_agents_page_warns_when_the_orrin_it_copies_cannot_serve_mcp() {
+        use std::os::unix::fs::PermissionsExt;
+        let tools = Dir::new("settings-cli-probe");
+        let stand_in = |name: &str, body: &str| {
+            let path = tools.write(name, format!("#!/bin/sh\n{body}\n").as_bytes());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let current = stand_in("current/orrin", r#"[ "$*" = "mcp --help" ] || exit 64"#);
+        let old = stand_in(
+            "old/orrin",
+            "echo \"error: unrecognized subcommand 'mcp'\" >&2\nexit 2",
+        );
+        let missing = tools.path().join("gone/orrin");
+
+        assert_eq!(probe(&current), Probe::Serves);
+        assert_eq!(probe(&old), Probe::NoMcp);
+        let gone = probe(&missing);
+        assert!(matches!(gone, Probe::WontStart(_)), "{gone:?}");
+
+        assert_eq!(cli_note(&current, &Probe::Serves), None);
+        let stale = cli_note(&old, &Probe::NoMcp).unwrap();
+        assert!(stale.contains(&old.display().to_string()), "{stale}");
+        assert!(stale.contains("`mcp`"), "{stale}");
+        assert!(stale.contains("`cargo build -p orrin-cli`"), "{stale}");
+        let release = cli_note(Path::new("/src/orrin/target/release/orrin"), &Probe::NoMcp);
+        assert!(
+            release
+                .as_deref()
+                .is_some_and(|note| note.contains("`cargo build -p orrin-cli --release`")),
+            "{release:?}"
+        );
+        let unstarted = cli_note(&missing, &gone).unwrap();
+        assert!(
+            unstarted.contains(&missing.display().to_string()),
+            "{unstarted}"
+        );
+        assert!(unstarted.contains("os error"), "{unstarted}");
+        let none = cli_note(Path::new("orrin"), &Probe::NotFound).unwrap();
+        assert!(none.contains("PATH"), "{none}");
+        assert!(none.contains("`cargo build -p orrin-cli`"), "{none}");
+    }
+
     #[test]
     fn every_orrin_row_resets_to_what_it_calls_its_default() {
         let defaults = Settings::default();
@@ -1922,9 +2625,21 @@ mod tests {
             live_link: !defaults.blender.live_link,
             port: 47200,
         };
+        moved.agents.remote = !defaults.agents.remote;
+        for capability in orrin_remote::permissions::Capability::ALL {
+            moved.agents.allow.set(capability, false);
+        }
         for row in ROWS.iter().filter(|row| !row.page.is_project()) {
-            // A pick goes through a request, and installing is an action.
-            if matches!(row.field, Field::Theme | Field::AddOn) {
+            // A pick goes through a request; installing and copying are
+            // actions; a preset is every switch below it at once.
+            if matches!(
+                row.field,
+                Field::Theme
+                    | Field::AddOn
+                    | Field::McpConfig
+                    | Field::ClaudeCommand
+                    | Field::Preset
+            ) {
                 continue;
             }
             assert!(!is_default(row.field, &moved, &defaults), "{}", row.label);

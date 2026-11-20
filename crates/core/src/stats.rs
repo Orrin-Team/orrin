@@ -22,6 +22,7 @@ pub struct FrameStats {
     vram_used: Option<u64>,
     vram_total: u64,
     device: Option<String>,
+    run_banner: Option<String>,
 }
 
 impl Default for FrameStats {
@@ -45,6 +46,7 @@ impl FrameStats {
             vram_used: None,
             vram_total: 0,
             device: None,
+            run_banner: None,
         }
     }
 
@@ -87,6 +89,16 @@ impl FrameStats {
 
     pub fn device(&self) -> Option<&str> {
         self.device.as_deref()
+    }
+
+    /// The run banner `app.rs` printed at startup, which says how a number
+    /// from this run was taken. Kept for the remote's `frame_stats`.
+    pub fn set_run_banner(&mut self, banner: String) {
+        self.run_banner = Some(banner);
+    }
+
+    pub fn run_banner(&self) -> Option<&str> {
+        self.run_banner.as_deref()
     }
 
     pub fn set_gpu_stats(&mut self, gpu_ms: Option<f32>, vram_used: Option<u64>, vram_total: u64) {

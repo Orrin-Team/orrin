@@ -678,7 +678,7 @@ impl ApplicationHandler for App {
         #[cfg(not(feature = "scripting"))]
         let scripts_dir = None;
 
-        let editor = Editor::new(
+        let mut editor = Editor::new(
             event_loop,
             window.clone(),
             renderer.max_texture_side(),
@@ -687,6 +687,10 @@ impl ApplicationHandler for App {
             settings,
             self.backend,
         );
+        if !self.shipped {
+            // Listens only once Settings ▸ Agents or `ORRIN_REMOTE` asks.
+            editor.offer_remote();
+        }
         self.camera_controller.configure(editor.fly_camera());
 
         if self.shipped {
@@ -821,6 +825,12 @@ impl ApplicationHandler for App {
                         tracing::warn!("{issue}");
                     }
                 }
+
+                // An agent's playtest is a device too, and lands where the
+                // window's events have: before the resolve that reads them.
+                active
+                    .editor
+                    .feed_game_input(&mut self.world, active.renderer.extent());
 
                 // Pads are polled, so their frame starts here — before the
                 // resolve that reads them, and gated on focus so a stick held
@@ -965,6 +975,10 @@ impl ApplicationHandler for App {
                                 outcome.to_string(),
                                 frame,
                             );
+                            active.editor.script_reloaded(
+                                matches!(outcome, crate::scripting::ReloadOutcome::Swapped { .. }),
+                                outcome.to_string(),
+                            );
                             // Only a swap that happened means the session is
                             // running what was built; a rejected one leaves the
                             // compiled code still ahead of the live code.
@@ -987,6 +1001,13 @@ impl ApplicationHandler for App {
                             profile_scope!("script tick");
                             scripting.tick(&mut self.world, &self.registry, game_delta);
                         }
+                    } else if reload_requested {
+                        active.editor.script_reloaded(
+                            false,
+                            "no scripts are running in this session, so there is nothing to \
+                             reload"
+                                .to_owned(),
+                        );
                     }
                 }
 
@@ -1008,6 +1029,11 @@ impl ApplicationHandler for App {
                 // is about to draw.
                 self.console
                     .drain_into(&mut self.world.resource_mut::<LogBuffer>(), frame);
+
+                // An agent's requests, at the one point in the frame the
+                // remote touches the world: after the drain, so `console_read`
+                // finds this frame's lines, and before the UI, overlay or not.
+                active.editor.serve_remote(&mut self.world, &self.registry);
 
                 // Before extraction: the UI may spawn/despawn/edit entities.
                 //
@@ -1215,6 +1241,10 @@ impl ApplicationHandler for App {
                     .renderer
                     .set_present(*self.world.resource::<PresentSettings>());
 
+                if let Some(view) = active.editor.take_screenshot_request() {
+                    active.renderer.request_screenshot(view);
+                }
+
                 let Active {
                     renderer, editor, ..
                 } = active;
@@ -1264,6 +1294,12 @@ impl ApplicationHandler for App {
                         Some(self.ui.frame()),
                         overlay,
                     );
+                }
+                // Only a frame the remote asked of drew one; for any other this
+                // is the check of an `Option`.
+                let reading = Instant::now();
+                if let Some(taken) = renderer.take_screenshot() {
+                    editor.screenshot_taken(taken, reading.elapsed());
                 }
 
                 #[cfg(feature = "scripting")]
@@ -1331,6 +1367,17 @@ impl ApplicationHandler for App {
             active.window.request_redraw();
         }
     }
+
+    /// Every way out of the loop comes through here, including the one that
+    /// never returns from it: on macOS, Quit from the app menu, Cmd+Q and the
+    /// Dock's Quit terminate the process from inside `applicationWillTerminate`,
+    /// so `run_app` does not return and nothing `App` owns is dropped. What
+    /// must not outlive the editor is let go here rather than left to `Drop`.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(active) = self.active.as_mut() {
+            active.editor.stop_remote();
+        }
+    }
 }
 
 fn close(renderer: &mut VulkanRenderer, event_loop: &ActiveEventLoop) {
@@ -1379,7 +1426,7 @@ fn apply_cursor_grab(
     let lock = {
         let mut lock = world.resource_mut::<crate::scene::CursorLock>();
         if !live || (escaped && !shipped) {
-            lock.requested = false;
+            lock.request(false, false);
         }
         *lock
     };
@@ -1596,7 +1643,7 @@ fn print_run_banner(
         .unwrap_or_else(|| "offscreen".to_string());
     let extent = renderer.extent();
 
-    tracing::info!(
+    let banner = format!(
         "run config: {} build | {} | debug assertions {} | validation {} | threads {} | \
          log {} | present {} | {}x{} | MSAA {} | overlay {} | GPU pass timings {} | scene {}",
         if cfg!(debug_assertions) {
@@ -1626,6 +1673,8 @@ fn print_run_banner(
         on_off(crate::profile::is_enabled() && crate::profile::gpu_passes_enabled()),
         scene.label(),
     );
+    tracing::info!("{banner}");
+    world.resource_mut::<FrameStats>().set_run_banner(banner);
 }
 
 fn on_off(value: bool) -> &'static str {

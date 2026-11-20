@@ -479,6 +479,14 @@ impl<'a> SceneEditor<'a> {
         Ok(())
     }
 
+    /// Bring world transforms up to what the edits so far have done. Not an
+    /// edit — they are derived — but [`reparent`](Self::reparent) keeping a
+    /// world position reads them, and a batch that moved something earlier
+    /// in the same frame would otherwise keep the position from before.
+    pub fn propagate(&mut self) {
+        super::propagate_transforms(self.world);
+    }
+
     /// Everything `edits` does, as one step under `label`. Nested batches
     /// join the outermost.
     pub fn batch<R>(&mut self, label: impl Into<String>, edits: impl FnOnce(&mut Self) -> R) -> R {
@@ -494,6 +502,42 @@ impl<'a> SceneEditor<'a> {
             self.history.push(Op::Batch { label, ops });
         }
         result
+    }
+
+    /// [`batch`](Self::batch), applied whole or not at all. `edits` stops at
+    /// its first error and returns it; everything the batch had applied by
+    /// then is put back by its inverse, and nothing reaches the history — not
+    /// a step, and not the redo stack it would have cleared. An entity an
+    /// edit gave an [`EntityId`] keeps it: that is identity, not an edit.
+    pub fn batch_whole<R>(
+        &mut self,
+        label: impl Into<String>,
+        edits: impl FnOnce(&mut Self) -> Result<R, EditError>,
+    ) -> Result<R, EditError> {
+        self.commit();
+        if self.history.batch.is_some() {
+            return edits(self);
+        }
+        self.history.batch = Some((label.into(), Vec::new()));
+        let result = edits(self);
+        self.commit();
+        let (label, ops) = self.history.batch.take().expect("opened above");
+        if ops.is_empty() {
+            return result;
+        }
+        let batch = Op::Batch { label, ops };
+        match result {
+            Ok(done) => {
+                self.history.push(batch);
+                Ok(done)
+            }
+            Err(error) => match batch.invert().apply(self.world, self.registry) {
+                Ok(()) => Err(error),
+                Err(undo) => Err(EditError(format!(
+                    "{error}; putting back what the batch had already done failed too: {undo}"
+                ))),
+            },
+        }
     }
 
     /// Undo the last step and return its label, or `None` when there is

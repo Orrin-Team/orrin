@@ -199,6 +199,26 @@ pub struct FrameConfig {
     /// editor is showing one *and* something it shows changed. See
     /// [`material_preview`](super::material_preview).
     pub material_preview: bool,
+    /// Whether this frame also draws the picture into an image of its own,
+    /// for `VulkanRenderer::take_screenshot` to read back, and which picture:
+    /// the editor's remote asked for one. `None` is the frame exactly as it is
+    /// without the feature — no node, no image, no barrier — and a frame that
+    /// asks recompiles the graph twice, as one that redraws the material
+    /// sphere does.
+    pub screenshot: Option<ShotView>,
+}
+
+/// What a screenshot shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShotView {
+    /// The scene alone, tonemapped.
+    Scene,
+    /// The scene with the game's own UI over it, and none of the editor's
+    /// marks: what a player sees.
+    Game,
+    /// The window as the developer sees it: the game's view with the
+    /// wireframe, the outline, the handles and the editor's own UI over it.
+    Editor,
 }
 
 /// Which piece of engine code a graph node runs.
@@ -300,6 +320,19 @@ pub enum PassBody {
     MaterialPreview,
     /// That sphere supersampled down and tonemapped, for the overlay to sample.
     MaterialPreviewResolve,
+    /// The tonemap again, into the screenshot's own image: the scene with
+    /// nothing drawn over it.
+    Screenshot,
+    /// The game's UI again, over that.
+    ScreenshotUi,
+    /// The editor's marks again, over that, each as its window twin draws.
+    ScreenshotWireframe,
+    ScreenshotOutline,
+    ScreenshotGizmo,
+    /// The editor's UI again, from the primitives the window's overlay draws
+    /// this frame: an inline pass, unlike its `Raw` twin, so the graph orders
+    /// it and derives its barriers.
+    ScreenshotOverlay,
     Overlay,
     ShadowCascade(u32),
     /// Every point and spot light's faces, in one pass over one atlas. A tile is
@@ -368,6 +401,9 @@ pub struct FrameIds {
     /// The wireframe's mode, and the depth it hides edges with when it has one.
     pub wireframe: Option<(super::wireframe::Wireframe, Option<ResourceId>)>,
     pub material_preview: Option<MaterialPreviewIds>,
+    /// The screenshot's image, which the renderer owns for the one frame that
+    /// draws it.
+    pub screenshot: Option<ResourceId>,
 }
 
 /// The inspector's material sphere: shaded into `hdr` against `depth`, then
@@ -1867,6 +1903,71 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         MaterialPreviewIds { hdr, depth, output }
     });
 
+    // The picture a screenshot asks for, drawn a second time into an image of
+    // the window's format so each twin's own pipeline draws it: the tonemap,
+    // then what the view puts over it, in the order the window's writers draw
+    // and reading only what they read, so the frame's other images keep their
+    // usage. It ends sampled because the readback leaves it that way.
+    let screenshot = config.screenshot.map(|view| {
+        let image = builder.import_image(
+            "screenshot",
+            ImageDesc::new(config.color_format),
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let mut pass = builder
+            .pass("screenshot", PassKind::Inline)
+            .access(scene_color, Access::Sampled)
+            .access(exposure, Access::StorageRead);
+        if let Some(bloom) = bloom {
+            pass = pass.access(bloom.result(), Access::Sampled);
+        }
+        let id = pass.access(image, Access::ColorAttachment).build();
+        record(id, PassBody::Screenshot, &mut bodies);
+        let editor = view == ShotView::Editor;
+        let mut over = |name: &'static str, body: PassBody, extra: Option<(ResourceId, Access)>| {
+            let mut pass = builder
+                .pass(name, PassKind::Inline)
+                .access(image, Access::ColorAttachment);
+            if let Some((resource, access)) = extra {
+                pass = pass.access(resource, access);
+            }
+            record(pass.build(), body, &mut bodies);
+        };
+        if editor && let Some((_, depth)) = wireframe {
+            over(
+                "screenshot_wireframe",
+                PassBody::ScreenshotWireframe,
+                depth.map(|depth| (depth, Access::DepthAttachmentRead)),
+            );
+        }
+        if view != ShotView::Scene && config.ui {
+            over("screenshot_ui", PassBody::ScreenshotUi, None);
+        }
+        if editor && let Some(mask) = outline_mask {
+            over(
+                "screenshot_outline",
+                PassBody::ScreenshotOutline,
+                Some((mask, Access::Sampled)),
+            );
+        }
+        if editor && config.overlay && config.gizmo {
+            over("screenshot_gizmo", PassBody::ScreenshotGizmo, None);
+        }
+        // The window's overlay samples the material preview after the frame;
+        // this copy of it samples it inside, after the preview's resolve.
+        if editor && config.overlay && config.presents {
+            over(
+                "screenshot_overlay",
+                PassBody::ScreenshotOverlay,
+                material_preview
+                    .as_ref()
+                    .map(|preview| (preview.output, Access::Sampled)),
+            );
+        }
+        image
+    });
+
     // Only into a window: offscreen there is no egui to draw and the executor
     // skips the node, but its barriers would still name `PresentSrc`.
     if config.overlay && config.presents {
@@ -1906,6 +2007,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             outline_mask,
             wireframe,
             material_preview,
+            screenshot,
         },
         bodies,
     })

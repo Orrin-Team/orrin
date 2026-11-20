@@ -193,6 +193,101 @@ The hub found beside `orrin` is used; otherwise the checkout `orrin` came from
 builds and runs it. Recent projects are kept in `hub.json` in the platform's
 per-user settings directory.
 
+### `orrin mcp [--project DIR]`
+
+An MCP server on stdin and stdout, for an AI agent such as Claude Code:
+newline-delimited JSON-RPC 2.0, tools only. Its client starts it, usually from
+a `.mcp.json` — the editor's Settings ▸ Agents ▸ Copy MCP config writes one
+for the open project:
+
+```json
+{ "mcpServers": { "orrin": { "command": "orrin", "args": ["mcp", "--project", "/path/to/game"] } } }
+```
+
+Claude Code can also be given it from a shell, in the folder it is started in;
+the editor's Settings ▸ Agents ▸ Copy command copies this line for the open
+project:
+
+```sh
+claude mcp add orrin -- orrin mcp --project /path/to/game
+```
+
+stdout carries protocol messages and nothing else; everything a build or a
+test run prints is captured into the tool's result. The tools:
+
+| tool | needs the editor | what |
+| --- | --- | --- |
+| `project_info` | no | the manifest, its scenes, whether an editor is attached |
+| `build_scripts` | no | `orrin build`; the compiler's errors and warnings by file and line |
+| `run_tests` | no | `orrin test [filter]`; the engine's JSON report |
+| `editor_open` | no | `orrin run`, detached, with the remote on; waits until it can be reached |
+| `editor_state` | yes | open scene, unsaved or not, play state, selection, camera |
+| `scene_read` | yes | an outline, or whole entities in the scene grammar, by id, subtree or name |
+| `component_list` | yes | every registered component, with its default in the scene grammar |
+| `asset_find` | yes | the asset index by kind and path: id, load state, import error |
+| `console_read` | yes | console entries from a cursor, at a minimum level |
+| `frame_stats` | yes | the run banner, frame and GPU time, and the profiler's CPU phases and GPU passes |
+| `screenshot` | yes | the game as a player sees it (`view: game`, the default), the scene alone (`view: scene`), or the editor's window as the developer sees it (`view: editor`), as a PNG image no larger than `max_size` (default 1024) |
+| `scene_edit` | yes | a labelled batch of ops — set, add or remove a component, spawn, despawn, reparent — as one undo step, all or none; edit mode only |
+| `editor_command` | yes | play, pause, step, stop, save, open or create a scene, undo, redo, reload scripts, select, frame, and while the game plays load a scene (additively or not) and unload one; answered once the effect is seen |
+| `game_input` | yes | playtest the running game: keys, mouse, gamepad and actions by name, step by step, released when the call ends; answered with frames and game seconds elapsed and the warnings logged |
+| `input_names` | yes | the game's actions and axes and every source name the bindings accept |
+
+The editor tools reach the editor open on the project through its remote: a
+loopback listener that is off unless Settings ▸ Agents turns it on or
+`ORRIN_REMOTE=1` does — `editor_open` sets that — and that writes its port and
+a token to `.orrin/remote` (`crates/orrin-remote` describes the protocol).
+With no editor attached they answer with an error saying so. `editor_open`
+sends the editor's output to `.orrin/editor.log` and leaves it running when
+the server exits.
+
+`scene_edit` is the only way a tool changes the open scene: it goes through the
+editor's edit pipeline, under the label it was given (shown as `Agent: …` in
+the Edit menu), and a batch with one refused op changes nothing and names that
+op. Values are text in the scene grammar, written as `component_list` prints
+them. `editor_command` raises the request the editor's own button raises and
+answers with what happened; it never leaves a dialog open, so opening a scene
+over unsaved work needs `save` or `discard`, and saving one that has never had
+a file needs a `path` inside the project. No tool runs code, and the only file
+a tool writes by name is a scene saved inside the project.
+
+**Scenes.** `editor_state` lists every loaded scene — its handle, file, role
+(active, additive or persistent), entity count, and for the active one whether
+it has unsaved changes — and the project's start and persistent scenes. With
+more than one loaded, `scene_read` says which scene each entity is in, by the
+membership rule (an entity is in its nearest ancestor's scene), and takes a
+`scene` filter. Additive loading is a playing game's: the editor itself has one
+scene open, and `load_scene` and `unload_scene` are refused in edit mode. A
+scene that is not open is a text file, read and edited as one.
+
+**Playtesting.** `game_input` is a virtual input device: its presses enter
+where the keyboard's, the mouse's and a pad's do, so bindings, actions,
+scripts, physics and UI events see ordinary input, and the developer's own
+devices keep working beside it. An action named in a step is pressed through a
+source the project's `input.toml` binds it to; `input_names` lists the
+actions, the axes and every source name. It runs only while the game plays —
+a paused game is advanced one stepped frame per input frame — and with the
+editor window unfocused. A cursor lock the game asks for because of an agent's
+click is the game's to see and never grabs the developer's pointer. One call
+is at most 256 steps and 10 s; everything it pressed is let go when it ends,
+however it ends. The switch is "Send game input" in Settings ▸ Agents.
+
+**Permissions.** Settings ▸ Agents says what an agent may do, and every
+tool is checked against it: a preset (Read only, Edit scene, Full control —
+the default — or Custom once a switch is changed), one switch for each kind of
+thing (reading the scene, the console, screenshots, frame stats, editing,
+play control, game input, undo and redo, selection, saving and opening scenes,
+reloading, building, testing, opening the editor), and per-project folder rules — none,
+read, or read and write, the longest matching folder deciding — which govern
+which assets `asset_find` lists, which scenes may be opened or saved and which
+prefabs placed. The switches are `[agents.allow]` in the user's
+`settings.toml`, the folder rules the project's `.orrin/agent-folders.toml`;
+`orrin mcp` checks its own tools against those files and the editor checks the
+rest, each at the request, so a change applies to the next call. A refused call
+is an `isError` result naming what is off; `project_info` and `editor_state`
+report the permissions in force. They govern Orrin's tools, not an agent that
+can write the project's files by other means.
+
 ## How the engine is found
 
 In order, because a wrong guess here is near-invisible:

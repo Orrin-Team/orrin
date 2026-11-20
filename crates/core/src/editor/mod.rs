@@ -19,6 +19,7 @@ mod prefs;
 mod preview;
 mod previews;
 mod rect_tool;
+mod remote;
 mod selection;
 pub mod settings;
 pub(crate) mod source;
@@ -61,6 +62,16 @@ pub struct Editor {
     cadence: cadence::Cadence,
     /// Kept between frames for its allocations.
     outline: Vec<(glam::Vec3, glam::Vec3)>,
+    /// The remote, while it listens.
+    remote: Option<remote::Remote>,
+    /// The project's editor directory, where the remote's file goes, and the
+    /// name it greets a client with. `None` with no project open.
+    remote_home: Option<(std::path::PathBuf, String)>,
+    /// Whether `app.rs` has offered this editor a remote at all, which it
+    /// does only for the windowed editor and never for an exported game.
+    remote_offered: bool,
+    /// Whether the remote should be listening, as last decided.
+    remote_wanted: bool,
 }
 
 /// The last chance to keep a layout: a drag in the final two seconds of a
@@ -128,6 +139,13 @@ impl Editor {
                 .chain(project.map(|project| project.themes_dir())),
         );
         let mut state = EditorState::new(project);
+        if let Some(project) = project {
+            state.agent_folders = orrin_remote::permissions::Folders::load(&project.editor_dir());
+            let assets = project.assets_dir();
+            let assets = assets.strip_prefix(project.root()).unwrap_or(&assets);
+            state.agent_assets =
+                orrin_remote::permissions::normalise(&assets.to_string_lossy()).unwrap_or_default();
+        }
         state.script_files = source::ScriptFiles::new(scripts_dir);
         state.environment = settings::Environment::of_process();
         state.settings_file = settings.file();
@@ -161,7 +179,149 @@ impl Editor {
             last_layout_check: std::time::Instant::now(),
             cadence: cadence::Cadence::default(),
             outline: Vec::new(),
+            remote: None,
+            remote_home: project.map(|project| (project.editor_dir(), project.name().to_owned())),
+            remote_offered: false,
+            remote_wanted: false,
         }
+    }
+
+    /// Let the remote listen while Settings ▸ Agents or `ORRIN_REMOTE` says
+    /// it should, from now on. The windowed editor's alone, for the reason
+    /// `SettingsStore::drive_blender` is.
+    pub fn offer_remote(&mut self) {
+        self.remote_offered = true;
+        self.sync_remote();
+        // A remote that started has written its own file over any stale one.
+        // Otherwise one a killed editor left is cleared here, off the frame's
+        // thread, since telling whether it is stale means connecting to it.
+        if self.remote.is_none()
+            && let Some((dir, _)) = &self.remote_home
+        {
+            let dir = dir.clone();
+            let swept = std::thread::Builder::new()
+                .name("orrin-remote-sweep".to_owned())
+                .spawn(move || {
+                    if let Some(removed) = orrin_remote::client::sweep(&dir) {
+                        tracing::info!("{removed}");
+                    }
+                });
+            if let Err(error) = swept {
+                tracing::warn!("could not look for a stale remote file: {error}");
+            }
+        }
+    }
+
+    /// Write the folder rules Settings ▸ Agents changed, once the pointer
+    /// lets go. They are read at every request, so the next one is governed.
+    fn save_agent_folders(&mut self) {
+        if !self.state.agent_folders_changed || self.ctx.input(|input| input.pointer.any_down()) {
+            return;
+        }
+        self.state.agent_folders_changed = false;
+        let (Some((dir, _)), Ok(folders)) = (&self.remote_home, &self.state.agent_folders) else {
+            return;
+        };
+        if let Err(error) = folders.save(dir) {
+            tracing::error!("{error}");
+        }
+    }
+
+    /// Stop the remote now and take its file back, for a way out that will
+    /// not reach the editor's `Drop`.
+    pub fn stop_remote(&mut self) {
+        if self.remote.take().is_some() {
+            tracing::info!("the remote stopped listening");
+        }
+        self.state.remote_peers.clear();
+    }
+
+    /// Answer what an agent asked since the last frame. See `remote`. A
+    /// command it raised is carried out by the UI pass, so that pass is made
+    /// due rather than left to its cadence.
+    pub fn serve_remote(&mut self, world: &mut World, registry: &Registry) {
+        if let Some(remote) = &mut self.remote
+            && remote.serve(world, registry, &mut self.state)
+        {
+            self.cadence.touch();
+        }
+    }
+
+    /// This frame of an agent's playtest, fed before the actions resolve; with
+    /// no remote, any sequence it left is dropped and let go of.
+    pub fn feed_game_input(&mut self, world: &mut World, extent: [u32; 2]) {
+        if self.remote.is_none() {
+            self.state.game_input.cancel();
+        }
+        self.state.game_input.feed(world, extent);
+    }
+
+    /// What screenshot the remote wants the next frame to draw too, if any.
+    /// A check of an `Option` with the remote off.
+    pub fn take_screenshot_request(&mut self) -> Option<crate::gfx::vulkan::frame::ShotView> {
+        self.remote.as_mut()?.wants_screenshot()
+    }
+
+    /// The screenshot the renderer was asked for, read back in `readback`.
+    pub fn screenshot_taken(
+        &mut self,
+        taken: Result<(Vec<u8>, [u32; 2]), String>,
+        readback: std::time::Duration,
+    ) {
+        if let Some(remote) = &mut self.remote {
+            remote.screenshot_taken(taken, readback);
+        }
+    }
+
+    /// A script reload landed, for the remote waiting on it.
+    pub fn script_reloaded(&mut self, swapped: bool, message: String) {
+        self.state.script_reloaded(swapped, message);
+    }
+
+    /// Start or stop the remote when what is wanted changed; otherwise
+    /// refresh what the settings page shows of it, which is one atomic load.
+    fn sync_remote(&mut self) {
+        if !self.remote_offered {
+            return;
+        }
+        let want = self.state.environment.remote();
+        let want = want.unwrap_or(self.state.settings.agents.remote);
+        if want == self.remote_wanted {
+            if let Some(remote) = &self.remote {
+                if let Some(Ok(status)) = &mut self.state.remote {
+                    *status = remote.status();
+                }
+                let state = &mut self.state;
+                remote.peers(&mut state.remote_peers_seen, &mut state.remote_peers);
+                if let Some(id) = state.remote_disconnect.take() {
+                    remote.disconnect(id);
+                }
+            }
+            return;
+        }
+        self.remote_wanted = want;
+        self.stop_remote();
+        // A new remote counts its changes from zero; this makes its first
+        // count one the list has not seen.
+        self.state.remote_peers_seen = u64::MAX;
+        self.state.remote = want.then(|| {
+            let Some((dir, name)) = &self.remote_home else {
+                return Err("the remote needs a project open: its port and token are \
+                            written to the project's .orrin/remote"
+                    .to_owned());
+            };
+            let started = remote::Remote::start(dir, name).inspect_err(|error| {
+                tracing::warn!("{error}");
+            })?;
+            let status = started.status();
+            tracing::info!(
+                "the remote is listening on 127.0.0.1:{} for agents, found through {}",
+                status.port,
+                orrin_remote::discovery::path(dir).display()
+            );
+            self.remote = Some(started);
+            Ok(status)
+        });
     }
 
     /// Returns `true` if the editor wants the event, so the caller can withhold
@@ -276,6 +436,8 @@ impl Editor {
             prefs_file.save(prefs);
         }
         settings.settle(ctx, world, state, themes);
+        self.sync_remote();
+        self.save_agent_folders();
 
         self.save_layout_if_settled();
     }

@@ -1,4 +1,9 @@
-use crate::engine::{self, BINDINGS_ENV};
+use std::path::Path;
+use std::process::Command;
+
+use orrin_project::Project;
+
+use crate::engine::{self, BINDINGS_ENV, Engine};
 use crate::{ProjectArgs, display_path, run};
 
 /// How the engine prints the results: `--format` of its `--test` mode.
@@ -29,19 +34,9 @@ pub fn test(
     dev: bool,
     format: Format,
 ) -> Result<i32, String> {
-    let (project, bindings) = run::prepare(args, no_build)?;
+    let (project, bindings) = run::prepare(args, no_build, &mut crate::build::Log::Terminal)?;
     let engine = engine::find(project.root(), !dev)?;
-    let mut command = engine.command();
-    command.current_dir(project.root());
-    if let Some(bindings) = &bindings
-        && std::env::var_os(BINDINGS_ENV).is_none()
-    {
-        command.env(BINDINGS_ENV, bindings);
-    }
-    if let Some(separator) = engine.args_separator() {
-        command.arg(separator);
-    }
-    command.args(engine_args(filter, format));
+    let mut command = command(&project, bindings.as_deref(), &engine, filter, format);
 
     // To stderr, so that stdout under `--format json` is the engine's report.
     eprintln!("orrin: testing `{}` with {}", project.name(), engine.origin);
@@ -55,4 +50,26 @@ pub fn test(
             display_path(project.root())
         )
     })
+}
+
+/// The engine's headless test run on `project`, as `orrin test` starts it.
+pub fn command(
+    project: &Project,
+    bindings: Option<&Path>,
+    engine: &Engine,
+    filter: Option<&str>,
+    format: Format,
+) -> Command {
+    let mut command = engine.command();
+    command.current_dir(project.root());
+    if let Some(bindings) = bindings
+        && std::env::var_os(BINDINGS_ENV).is_none()
+    {
+        command.env(BINDINGS_ENV, bindings);
+    }
+    if let Some(separator) = engine.args_separator() {
+        command.arg(separator);
+    }
+    command.args(engine_args(filter, format));
+    command
 }

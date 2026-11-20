@@ -256,7 +256,12 @@ extern "C" fn set_cursor_locked(locked: bool) {
         if world.get_resource::<crate::scene::CursorLock>().is_none() {
             world.insert_resource(crate::scene::CursorLock::default());
         }
-        world.resource_mut::<crate::scene::CursorLock>().requested = locked;
+        let by_agent = world
+            .get_resource::<InputState>()
+            .is_some_and(|input| input.pressed_by_virtual_only());
+        world
+            .resource_mut::<crate::scene::CursorLock>()
+            .request(locked, by_agent);
     });
 }
 

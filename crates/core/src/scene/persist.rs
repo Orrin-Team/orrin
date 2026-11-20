@@ -48,14 +48,22 @@ pub fn save(world: &mut World, registry: &orrin_registry::Registry) -> String {
 
 pub fn to_document(world: &mut World, registry: &orrin_registry::Registry) -> SceneDocument {
     assign_missing_ids(world);
+    SceneDocument {
+        entities: as_saved(world, registry),
+    }
+}
 
+/// What a save would write for every entity that already has an
+/// [`EntityId`], prefab instances folded, without giving one to any entity
+/// that lacks it — so a reader that must not change the world sees the very
+/// blocks a save writes.
+pub(crate) fn as_saved(world: &World, registry: &orrin_registry::Registry) -> Vec<SceneEntity> {
     let mut entities: Vec<SceneEntity> = save_order(world)
         .into_iter()
-        .map(|entity| scene_entity(world, registry, entity).expect("just assigned"))
+        .filter_map(|entity| scene_entity(world, registry, entity))
         .collect();
     super::prefab::fold(world, &mut entities);
-
-    SceneDocument { entities }
+    entities
 }
 
 /// One entity as a scene file writes it, or `None` if it has no [`EntityId`].
@@ -90,7 +98,7 @@ pub(super) fn scene_entity(
 /// the file, and the order is a function of identities rather than of slots, so
 /// a save after a load is byte-identical even though the second session
 /// allocated its slots in a different order.
-fn save_order(world: &World) -> Vec<Entity> {
+pub(crate) fn save_order(world: &World) -> Vec<Entity> {
     let mut children: FxHashMap<Entity, Vec<Entity>> = FxHashMap::default();
     let mut roots: Vec<Entity> = Vec::new();
     for entity in world.entities() {
@@ -139,7 +147,7 @@ fn parent_ref(world: &World, entity: Entity) -> Option<(ComponentId, Value)> {
     Some((PARENT, Value::Entity(id)))
 }
 
-fn live_parent(world: &World, entity: Entity) -> Option<Entity> {
+pub(crate) fn live_parent(world: &World, entity: Entity) -> Option<Entity> {
     let parent = world.get::<Parent>(entity)?.get();
     world.is_alive(parent).then_some(parent)
 }
@@ -390,7 +398,7 @@ fn wait_for_host(world: &mut World, entity: Entity, id: &ComponentId, value: &Va
 /// [`apply_component`] for an entity already live, where a parent link resolves
 /// against the whole world and an unregistered component replaces its entry in
 /// the [`UnknownComponents`].
-pub(super) fn write_component(
+pub(crate) fn write_component(
     world: &mut World,
     registry: &orrin_registry::Registry,
     entity: Entity,
@@ -420,7 +428,7 @@ pub(super) fn write_component(
 
 /// One component of a live entity in its file form: what [`write_component`]
 /// takes and [`scene_entity`] would write for it.
-pub(super) fn read_component(
+pub(crate) fn read_component(
     world: &World,
     registry: &orrin_registry::Registry,
     entity: Entity,

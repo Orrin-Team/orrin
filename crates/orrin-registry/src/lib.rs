@@ -42,5 +42,5 @@ pub use reflect::{Reflect, Resolve, take, take_or};
 pub use registry::{
     ApplyError, ComponentId, ComponentVtable, FieldInfo, Registry, ScriptBinding, ScriptBridge,
 };
-pub use text::{write_document, write_entity, write_value_document, write_world};
+pub use text::{write_component, write_document, write_entity, write_value_document, write_world};
 pub use value::{FieldPath, PathSegment, Value, ValueError};

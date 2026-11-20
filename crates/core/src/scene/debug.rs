@@ -84,6 +84,9 @@ impl LogEntry {
 pub struct LogBuffer {
     entries: VecDeque<LogEntry>,
     capacity: usize,
+    /// Every entry ever pushed, so a reader can hold its place by number
+    /// across the ring dropping entries and the console being cleared.
+    pushed: u64,
 }
 
 impl Default for LogBuffer {
@@ -97,6 +100,7 @@ impl LogBuffer {
         Self {
             entries: VecDeque::new(),
             capacity: capacity.max(1),
+            pushed: 0,
         }
     }
 
@@ -115,6 +119,20 @@ impl LogBuffer {
             self.entries.pop_front();
         }
         self.entries.push_back(entry);
+        self.pushed += 1;
+    }
+
+    /// The entries numbered `from` onwards, each with its number: the first
+    /// entry ever pushed is 0. One no longer held is skipped.
+    pub fn since(&self, from: u64) -> impl Iterator<Item = (u64, &LogEntry)> {
+        let first = self.pushed - self.entries.len() as u64;
+        let skip = from.saturating_sub(first).min(self.entries.len() as u64) as usize;
+        (first..).zip(&self.entries).skip(skip)
+    }
+
+    /// The number the next entry will be given.
+    pub fn next_number(&self) -> u64 {
+        self.pushed
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &LogEntry> {

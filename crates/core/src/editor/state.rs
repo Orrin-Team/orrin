@@ -315,6 +315,31 @@ pub struct EditorState {
     pub settings_panel: super::panels::settings::SettingsPanel,
     /// Why the live link is not listening, as `SettingsStore` last heard it.
     pub link_error: Option<String>,
+    /// The remote as Settings ▸ Agents shows it: `None` while it is off, and
+    /// why it is not listening when it should be.
+    pub remote: Option<Result<super::remote::RemoteStatus, String>>,
+    /// Who is connected to the remote, refreshed only when that changes.
+    pub remote_peers: Vec<super::remote::RemotePeer>,
+    /// The remote's change count `remote_peers` was last refreshed at.
+    pub remote_peers_seen: u64,
+    /// A connection Settings ▸ Agents asked to close.
+    pub remote_disconnect: Option<u64>,
+    /// The remote's virtual input device: an agent's playtest.
+    pub game_input: super::remote::GameInput,
+    /// The project's folder rules for agents, or why the file did not read —
+    /// which refuses every folder until it is fixed. See Settings ▸ Agents.
+    pub agent_folders: Result<orrin_remote::permissions::Folders, String>,
+    /// The assets folder relative to the project root, as a folder rule names
+    /// it, for the asset index's paths and the folder presets.
+    pub agent_assets: String,
+    /// The folder rules changed on the page and are not yet written.
+    pub agent_folders_changed: bool,
+    /// How many times [`apply`](Self::apply) has run: the remote waits on it
+    /// to see a request it raised carried out.
+    applied: u64,
+    /// How many script reloads have landed, and how the last one went:
+    /// whether it swapped, and what the console was told.
+    reloads: (u64, Option<(bool, String)>),
     /// Settings ▸ Blender's Install add-on, running or as it last ended.
     pub addon: super::blender::Install,
     /// How the viewport draws the scene: shaded, or as its edges. `None` is
@@ -516,6 +541,16 @@ impl Default for EditorState {
             backend: crate::gfx::BackendChoice::DEFAULT,
             settings_panel: Default::default(),
             link_error: None,
+            remote: None,
+            remote_peers: Vec::new(),
+            remote_peers_seen: 0,
+            remote_disconnect: None,
+            game_input: Default::default(),
+            agent_folders: Ok(orrin_remote::permissions::Folders::default()),
+            agent_assets: String::new(),
+            agent_folders_changed: false,
+            applied: 0,
+            reloads: (0, None),
             addon: Default::default(),
             wireframe: None,
             material_previews: Default::default(),
@@ -997,6 +1032,22 @@ impl EditorState {
                 log(world, level, message);
             }
         }
+        self.applied += 1;
+    }
+
+    /// How many times [`apply`](Self::apply) has run.
+    pub fn applied(&self) -> u64 {
+        self.applied
+    }
+
+    /// A script reload landed: whether it swapped, and what it said.
+    pub fn script_reloaded(&mut self, swapped: bool, message: String) {
+        self.reloads = (self.reloads.0 + 1, Some((swapped, message)));
+    }
+
+    /// How many script reloads have landed, and the last one's outcome.
+    pub fn reloads(&self) -> (u64, Option<&(bool, String)>) {
+        (self.reloads.0, self.reloads.1.as_ref())
     }
 
     fn scene(
@@ -1230,7 +1281,7 @@ fn framed(world: &World, selection: &[Entity]) -> Option<scene::Camera> {
 ///
 /// The mesh case lives here rather than in `scene::prefab`, because a script's
 /// `Prefab.Instantiate` reaches that too and places only prefabs.
-fn place(
+pub(super) fn place(
     world: &mut World,
     registry: &Registry,
     asset: AssetId,

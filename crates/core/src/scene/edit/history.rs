@@ -77,6 +77,12 @@ impl History {
         !self.gesture.is_empty() || self.current() != self.saved
     }
 
+    /// Whether a gesture is open: a drag, or a field being typed into, whose
+    /// changes are applied and not yet a step.
+    pub fn in_gesture(&self) -> bool {
+        !self.gesture.is_empty() || !self.assets.is_empty()
+    }
+
     pub fn mark_saved(&mut self) {
         self.saved = self.current();
     }

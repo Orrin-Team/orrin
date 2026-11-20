@@ -189,6 +189,27 @@ impl Actions {
         self.reseed = true;
     }
 
+    /// What `name` is defined as, without interning it: a name an agent's
+    /// playtest got wrong is the agent's to be told, not the game's to warn
+    /// about.
+    pub fn definition(&self, name: &str) -> Option<&Definition> {
+        self.ids.get(name).map(|id| &self.defs[id.0 as usize])
+    }
+
+    /// The name an id was interned under.
+    pub fn name(&self, id: ActionId) -> Option<&str> {
+        self.names.get(id.0 as usize).map(String::as_str)
+    }
+
+    /// Every name the config defines, in the order they were first seen.
+    pub fn defined(&self) -> impl Iterator<Item = (&str, &Definition)> {
+        self.names
+            .iter()
+            .zip(&self.defs)
+            .filter(|(_, def)| **def != Definition::Unbound)
+            .map(|(name, def)| (name.as_str(), def))
+    }
+
     /// Drain the warnings interning has accumulated, for the caller to log.
     /// Kept out of this module so resolution has no opinion about console.
     pub fn take_warnings(&mut self) -> Vec<String> {

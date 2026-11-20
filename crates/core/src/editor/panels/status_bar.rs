@@ -4,6 +4,9 @@
 //!
 //! Nothing here is a control. A status bar that also holds buttons becomes the
 //! place commands go when there is nowhere better, and then it is a toolbar.
+//! The agents indicator is the one item that answers a click, and only by
+//! opening the page that says who it is counting: a way to the setting behind
+//! a status, not a command.
 
 use orrin_ecs::World;
 
@@ -16,7 +19,7 @@ use crate::stats::FrameStats;
 
 pub const HEIGHT: f32 = 24.0;
 
-pub fn show(ctx: &egui::Context, world: &World, state: &EditorState, themes: &ThemeSet) {
+pub fn show(ctx: &egui::Context, world: &World, state: &mut EditorState, themes: &ThemeSet) {
     let frame = egui::Frame::new()
         .fill(themes.active().bar())
         .inner_margin(egui::Margin::symmetric(10, 0));
@@ -29,6 +32,7 @@ pub fn show(ctx: &egui::Context, world: &World, state: &EditorState, themes: &Th
                 build(ui, world);
                 exporting(ui, state.export.status());
                 carried(ui, world);
+                agents(ui, state);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(stats) = world.get_resource::<FrameStats>() {
@@ -59,6 +63,42 @@ fn device(ui: &mut egui::Ui, stats: &FrameStats) {
     ui.label(super::figures(vram).weak());
     if let Some(device) = stats.device() {
         ui.label(super::figures(device).weak());
+    }
+}
+
+/// While the remote listens, how many agents are connected; nothing while it
+/// is off. A click opens Settings ▸ Agents, which lists them.
+fn agents(ui: &mut egui::Ui, state: &mut EditorState) {
+    let Some(Ok(status)) = &state.remote else {
+        return;
+    };
+    let text = match status.peers {
+        0 => "Remote on".to_owned(),
+        1 => "1 agent".to_owned(),
+        n => format!("{n} agents"),
+    };
+    let colour = if status.peers > 0 {
+        theme::OK
+    } else {
+        theme::PENDING
+    };
+    let hint = format!(
+        "Listening on 127.0.0.1:{} for agents · open Settings ▸ Agents",
+        status.port
+    );
+    let response = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let (dot, _) = ui.allocate_exact_size(egui::Vec2::splat(8.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot.center(), 3.5, colour);
+            ui.label(super::figures(text).weak());
+        })
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(hint);
+    if response.clicked() {
+        state.open_settings(Some(super::settings::Page::Agents));
     }
 }
 
