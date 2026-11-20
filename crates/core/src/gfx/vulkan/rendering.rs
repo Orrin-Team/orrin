@@ -324,14 +324,17 @@ pub(super) fn rendering_info(
         // The tonemapped frame, which the game's UI, the outline and the
         // handles are drawn over.
         PassBody::Ui | PassBody::Outline | PassBody::Gizmo => color_only(drawn_over(swapchain)),
-        // Over the frame and behind its depth, or on a cleared one with none.
-        PassBody::Wireframe => {
+        // Over the frame and behind its depth, or on a cleared one with none;
+        // and its screenshot twin the same, into the screenshot.
+        PassBody::Wireframe | PassBody::ScreenshotWireframe => {
             let (mode, depth) = ids.wireframe.expect("a wireframe pass without its mode");
+            let target = match body {
+                PassBody::Wireframe => swapchain,
+                _ => images.texture(ids.screenshot.expect("a screenshot pass without its image")),
+            };
             let color = match mode {
-                super::wireframe::Wireframe::OverShaded => drawn_over(swapchain),
-                super::wireframe::Wireframe::Alone => {
-                    cleared(swapchain, super::wireframe::BACKGROUND)
-                }
+                super::wireframe::Wireframe::OverShaded => drawn_over(target),
+                super::wireframe::Wireframe::Alone => cleared(target, super::wireframe::BACKGROUND),
             };
             RenderTargets {
                 colors: vec![color],
@@ -353,8 +356,11 @@ pub(super) fn rendering_info(
         PassBody::Screenshot => color_only(overwritten(
             images.texture(ids.screenshot.expect("a screenshot pass without its image")),
         )),
-        // Over that, as the game's UI draws over the window's.
-        PassBody::ScreenshotUi => color_only(drawn_over(
+        // Over that, as each twin draws over the window's.
+        PassBody::ScreenshotUi
+        | PassBody::ScreenshotOutline
+        | PassBody::ScreenshotGizmo
+        | PassBody::ScreenshotOverlay => color_only(drawn_over(
             images.texture(ids.screenshot.expect("a screenshot pass without its image")),
         )),
         // Every pixel written by the full-screen resolve.

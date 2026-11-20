@@ -1355,11 +1355,13 @@ fn an_offscreen_frame_ends_ready_to_be_read_back() {
 }
 
 /// A screenshot is one more reader of what the tonemap reads, into an image of
-/// its own that ends sampled, where the readback expects it — and for the
-/// game's view, the game's UI drawn over it after the tonemap. Every other
-/// pass runs in the order it did and every image the graph allocates keeps
-/// its usage, which is what lets the frames that ask for none stay as they
-/// are.
+/// its own that ends sampled, where the readback expects it — for the game's
+/// view with the game's UI drawn over it, and for the editor's with every mark
+/// the window carries, in the window's order. Every other pass runs in the
+/// order it did and every image the graph allocates keeps its usage, which is
+/// what lets the frames that ask for none stay as they are. The editor's copy
+/// is inline, and must come before the window's own overlay, the one `Raw`
+/// pass, and after the material preview it samples.
 #[test]
 fn a_screenshot_adds_one_reader_and_changes_no_image_the_frame_owns() {
     use orrin_core::gfx::graph::FrameGraph;
@@ -1379,15 +1381,30 @@ fn a_screenshot_adds_one_reader_and_changes_no_image_the_frame_owns() {
         usages.sort();
         usages
     };
+    let editor = [
+        "screenshot",
+        "screenshot_wireframe",
+        "screenshot_ui",
+        "screenshot_outline",
+        "screenshot_gizmo",
+        "screenshot_overlay",
+    ];
     for (async_compute, view) in [
         (false, ShotView::Scene),
         (true, ShotView::Scene),
         (false, ShotView::Game),
         (true, ShotView::Game),
+        (false, ShotView::Editor),
+        (true, ShotView::Editor),
     ] {
         let off = FrameConfig {
             async_compute,
             ui: true,
+            overlay: true,
+            outline: true,
+            gizmo: true,
+            wireframe: Some(orrin_core::gfx::vulkan::wireframe::Wireframe::OverShaded),
+            material_preview: true,
             ..reference_config(false, true)
         };
         let without = declare(off).unwrap().graph;
@@ -1406,6 +1423,17 @@ fn a_screenshot_adds_one_reader_and_changes_no_image_the_frame_owns() {
         match view {
             ShotView::Scene => assert_eq!(shots, ["screenshot"]),
             ShotView::Game => assert_eq!(shots, ["screenshot", "screenshot_ui"]),
+            ShotView::Editor => {
+                assert_eq!(shots, editor);
+                let at = |name: &str| {
+                    with.order()
+                        .iter()
+                        .position(|&id| with.pass_name(id) == name)
+                        .unwrap()
+                };
+                assert!(at("screenshot_overlay") < at("overlay"));
+                assert!(at("material_preview_resolve") < at("screenshot_overlay"));
+            }
         }
         assert_eq!(passes(&without), passes(&with));
         assert_eq!(usages(&without), usages(&with));

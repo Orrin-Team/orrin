@@ -104,6 +104,14 @@ impl OverlayVertex {
 /// The frame's meshes, uploaded once: a vertex and an index buffer.
 type Geometry = (BufferId, BufferId);
 
+/// What a second draw of one frame's editor needs, made ahead of the frame
+/// it is recorded in: the frame's meshes uploaded, and the lent images'
+/// bind groups. See [`OverlayPass::prepare_copy`].
+pub(super) struct OverlayCopy {
+    geometry: Option<Geometry>,
+    lent: Vec<(egui::TextureId, BindGroupId)>,
+}
+
 struct Texture {
     view: TextureViewId,
     set: BindGroupId,
@@ -202,6 +210,50 @@ impl OverlayPass {
                 device.destroy_bind_group(texture.set);
                 device.destroy_texture(texture.view);
             }
+        }
+    }
+
+    /// Ready `frame` to be drawn a second time, into a screenshot, by
+    /// [`draw_copy`](Self::draw_copy) inside the frame's own graph — or `None`
+    /// while the frame has texture changes still to upload: those are recorded
+    /// by [`record`](Self::record), after the frame, so a copy drawn before
+    /// them would sample textures that are not there yet.
+    pub(super) fn prepare_copy(
+        &mut self,
+        device: &Device,
+        frame: &OverlayFrame,
+        lent: &[(egui::TextureId, TextureViewId)],
+    ) -> Option<OverlayCopy> {
+        if !frame.textures.set.is_empty() {
+            return None;
+        }
+        let geometry = self.upload_geometry(device, frame);
+        let lent = lent
+            .iter()
+            .map(|&(id, view)| (id, self.lend(device, view)))
+            .collect();
+        Some(OverlayCopy { geometry, lent })
+    }
+
+    /// Draw `frame` as [`prepare_copy`](Self::prepare_copy) readied it, into
+    /// the target a graph pass has open.
+    pub(super) fn draw_copy(
+        &self,
+        encoder: &mut Encoder,
+        frame: &OverlayFrame,
+        copy: &OverlayCopy,
+        extent: [u32; 2],
+    ) {
+        if let Some(geometry) = copy.geometry {
+            let ppp = frame.pixels_per_point;
+            self.draw_meshes(
+                encoder,
+                &frame.primitives,
+                geometry,
+                ppp,
+                extent,
+                &copy.lent,
+            );
         }
     }
 

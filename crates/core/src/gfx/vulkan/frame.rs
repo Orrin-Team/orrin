@@ -216,6 +216,9 @@ pub enum ShotView {
     /// The scene with the game's own UI over it, and none of the editor's
     /// marks: what a player sees.
     Game,
+    /// The window as the developer sees it: the game's view with the
+    /// wireframe, the outline, the handles and the editor's own UI over it.
+    Editor,
 }
 
 /// Which piece of engine code a graph node runs.
@@ -322,6 +325,14 @@ pub enum PassBody {
     Screenshot,
     /// The game's UI again, over that.
     ScreenshotUi,
+    /// The editor's marks again, over that, each as its window twin draws.
+    ScreenshotWireframe,
+    ScreenshotOutline,
+    ScreenshotGizmo,
+    /// The editor's UI again, from the primitives the window's overlay draws
+    /// this frame: an inline pass, unlike its `Raw` twin, so the graph orders
+    /// it and derives its barriers.
+    ScreenshotOverlay,
     Overlay,
     ShadowCascade(u32),
     /// Every point and spot light's faces, in one pass over one atlas. A tile is
@@ -1788,38 +1799,6 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .build();
     record(id, PassBody::Tonemap, &mut bodies);
 
-    // The tonemap's inputs read a second time, into an image of the window's
-    // format so the tonemap's own pipeline draws it. Only reads of what the
-    // tonemap already reads, so the frame's other images keep their usage,
-    // and it ends sampled because the readback leaves it that way.
-    let screenshot = config.screenshot.map(|view| {
-        let image = builder.import_image(
-            "screenshot",
-            ImageDesc::new(config.color_format),
-            ImageLayout::Undefined,
-            ImageLayout::ShaderReadOnlyOptimal,
-        );
-        let mut pass = builder
-            .pass("screenshot", PassKind::Inline)
-            .access(scene_color, Access::Sampled)
-            .access(exposure, Access::StorageRead);
-        if let Some(bloom) = bloom {
-            pass = pass.access(bloom.result(), Access::Sampled);
-        }
-        let id = pass.access(image, Access::ColorAttachment).build();
-        record(id, PassBody::Screenshot, &mut bodies);
-        // The game's UI, drawn the second time from the same frame of it, after
-        // the tonemap by registration — the two write the one image.
-        if view == ShotView::Game && config.ui {
-            let id = builder
-                .pass("screenshot_ui", PassKind::Inline)
-                .access(image, Access::ColorAttachment)
-                .build();
-            record(id, PassBody::ScreenshotUi, &mut bodies);
-        }
-        image
-    });
-
     // First onto the tonemapped image, so the game's UI and every other mark the
     // editor makes stay on top of it. Over the shaded frame it reads the prepass
     // depth to hide covered edges — read-only, so the prepass stays its only
@@ -1922,6 +1901,71 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .build();
         record(id, PassBody::MaterialPreviewResolve, &mut bodies);
         MaterialPreviewIds { hdr, depth, output }
+    });
+
+    // The picture a screenshot asks for, drawn a second time into an image of
+    // the window's format so each twin's own pipeline draws it: the tonemap,
+    // then what the view puts over it, in the order the window's writers draw
+    // and reading only what they read, so the frame's other images keep their
+    // usage. It ends sampled because the readback leaves it that way.
+    let screenshot = config.screenshot.map(|view| {
+        let image = builder.import_image(
+            "screenshot",
+            ImageDesc::new(config.color_format),
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let mut pass = builder
+            .pass("screenshot", PassKind::Inline)
+            .access(scene_color, Access::Sampled)
+            .access(exposure, Access::StorageRead);
+        if let Some(bloom) = bloom {
+            pass = pass.access(bloom.result(), Access::Sampled);
+        }
+        let id = pass.access(image, Access::ColorAttachment).build();
+        record(id, PassBody::Screenshot, &mut bodies);
+        let editor = view == ShotView::Editor;
+        let mut over = |name: &'static str, body: PassBody, extra: Option<(ResourceId, Access)>| {
+            let mut pass = builder
+                .pass(name, PassKind::Inline)
+                .access(image, Access::ColorAttachment);
+            if let Some((resource, access)) = extra {
+                pass = pass.access(resource, access);
+            }
+            record(pass.build(), body, &mut bodies);
+        };
+        if editor && let Some((_, depth)) = wireframe {
+            over(
+                "screenshot_wireframe",
+                PassBody::ScreenshotWireframe,
+                depth.map(|depth| (depth, Access::DepthAttachmentRead)),
+            );
+        }
+        if view != ShotView::Scene && config.ui {
+            over("screenshot_ui", PassBody::ScreenshotUi, None);
+        }
+        if editor && let Some(mask) = outline_mask {
+            over(
+                "screenshot_outline",
+                PassBody::ScreenshotOutline,
+                Some((mask, Access::Sampled)),
+            );
+        }
+        if editor && config.overlay && config.gizmo {
+            over("screenshot_gizmo", PassBody::ScreenshotGizmo, None);
+        }
+        // The window's overlay samples the material preview after the frame;
+        // this copy of it samples it inside, after the preview's resolve.
+        if editor && config.overlay && config.presents {
+            over(
+                "screenshot_overlay",
+                PassBody::ScreenshotOverlay,
+                material_preview
+                    .as_ref()
+                    .map(|preview| (preview.output, Access::Sampled)),
+            );
+        }
+        image
     });
 
     // Only into a window: offscreen there is no egui to draw and the executor

@@ -1,10 +1,12 @@
 //! `screenshot`: what the viewport renders, as a PNG scaled to fit
 //! `max_size` — an image is paid for in the model's context, so it travels no
 //! larger than asked. `view` is `game`, the scene with the game's own UI over
-//! it as a player sees it, or `scene`, the scene alone. `editor`, the window
-//! as the developer sees it, is refused: the egui overlay is drawn by a pass
-//! outside the graph, in a submission of its own, and no route found draws or
-//! reads it for a screenshot without changing every frame.
+//! it as a player sees it; `scene`, the scene alone; or `editor`, the window as
+//! the developer sees it — the wireframe, the outline, the handles and the
+//! editor's UI drawn a second time, each by its window twin's pipeline, the UI
+//! from the primitives the window's overlay draws that frame. The UI's texture
+//! changes are recorded after the frame, so an `editor` shot is drawn on a
+//! frame that has none, within the deadline.
 //!
 //! **On the frame path only when asked.** The request asks the renderer for
 //! one, the next frame draws the picture a second time into an image of its
@@ -43,14 +45,12 @@ pub(super) fn asked(params: &Value) -> Result<(u32, ShotView), String> {
     let view = match params.view.as_deref() {
         None | Some("game") => ShotView::Game,
         Some("scene") => ShotView::Scene,
-        Some("editor") => {
-            return Err(
-                "`editor` is not offered: the editor's own UI cannot be drawn into a \
-                        screenshot without a change to every frame. Ask for `game` or `scene`"
-                    .to_owned(),
-            );
+        Some("editor") => ShotView::Editor,
+        Some(other) => {
+            return Err(format!(
+                "`{other}` is not a view; `game`, `scene` or `editor`"
+            ));
         }
-        Some(other) => return Err(format!("`{other}` is not a view; `game` or `scene`")),
     };
     Ok((
         params.max_size.unwrap_or(DEFAULT_SIZE).clamp(16, 4096),

@@ -948,6 +948,16 @@ impl VulkanRenderer {
         Some(self.read_sampled(view, [side, side]))
     }
 
+    /// The editor UI's pass, once a frame has drawn the editor: the backend's
+    /// own, since each backend records the overlay its own way.
+    fn overlay_pass(&self) -> Option<&overlay::OverlayPass> {
+        match &self.backend {
+            Backend::Vulkan(vk) => vk.overlay.as_ref(),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(_) => self.metal_overlay.as_ref(),
+        }
+    }
+
     /// Ask the next frame to draw `view` into an image of its own as well,
     /// for [`take_screenshot`](Self::take_screenshot) once it has drawn: the
     /// scene, or the scene and the game's UI. Never the editor's marks.
@@ -2065,7 +2075,17 @@ impl VulkanRenderer {
             occlusion_culling: self.occlusion_culling,
             wireframe: overlay.as_ref().and_then(|frame| frame.wireframe),
             material_preview: preview_due,
+            // The editor's view waits for a frame whose UI has no textures
+            // still to upload: those are recorded after the frame, and a copy
+            // drawn inside it would sample what is not there yet.
             screenshot: match self.screenshot {
+                Some(Screenshot::Asked(frame::ShotView::Editor))
+                    if overlay.as_deref().is_some_and(|frame| {
+                        !frame.textures.set.is_empty() || self.overlay_pass().is_none()
+                    }) =>
+                {
+                    None
+                }
                 Some(Screenshot::Asked(view)) => Some(view),
                 _ => None,
             },
@@ -2793,6 +2813,37 @@ impl VulkanRenderer {
             objects.indices,
         ));
 
+        // The editor's UI for a screenshot of it, readied while the overlay
+        // pass may still be borrowed mutably; drawn by its node in the walk.
+        let shot_copy = match overlay.as_deref() {
+            Some(frame)
+                if self.frame.ids.screenshot.is_some()
+                    && self.frame.bodies.contains(&PassBody::ScreenshotOverlay) =>
+            {
+                let shot_lent: Vec<_> = self
+                    .material_preview
+                    .as_ref()
+                    .map_or_else(
+                        Default::default,
+                        material_preview::MaterialPreviewPass::lent,
+                    )
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                let pass = match &mut self.backend {
+                    Backend::Vulkan(vk) => vk.overlay.as_mut(),
+                    #[cfg(target_os = "macos")]
+                    Backend::Metal(_) => self.metal_overlay.as_mut(),
+                };
+                pass.and_then(|pass| pass.prepare_copy(&self.device, frame, &shot_lent))
+            }
+            _ => None,
+        };
+        let shot_overlay = shot_copy
+            .as_ref()
+            .and_then(|copy| Some((self.overlay_pass()?, overlay.as_deref()?, copy)));
+
         let record = FrameRecord {
             vk: match &self.backend {
                 Backend::Vulkan(vk) => Some(VkFrame {
@@ -2872,6 +2923,7 @@ impl VulkanRenderer {
                 .map_or(&[], |frame| frame.outline.as_slice()),
             material_preview: self.material_preview.as_ref(),
             preview_frame,
+            shot_overlay,
             surfaces: surface::Surfaces {
                 shaders: &self.surfaces,
                 frame: surface_frame,
@@ -3371,6 +3423,12 @@ struct FrameRecord<'a> {
     outline_items: &'a [OutlineItem],
     material_preview: Option<&'a material_preview::MaterialPreviewPass>,
     preview_frame: Option<material_preview::PreviewFrame>,
+    /// The editor's UI, readied for the screenshot's copy of it.
+    shot_overlay: Option<(
+        &'a overlay::OverlayPass,
+        &'a OverlayFrame,
+        &'a overlay::OverlayCopy,
+    )>,
     /// The twins and parameters of every loaded surface shader, for the passes
     /// that draw a material through one.
     surfaces: surface::Surfaces<'a>,
@@ -4405,16 +4463,21 @@ impl FrameRecord<'_> {
                 self.hdr
                     .record_tonemap(self.device, encoder, self.extent, hdr, exposure, bloom);
             }
+            PassBody::ScreenshotOverlay => {
+                if let Some((pass, frame, copy)) = self.shot_overlay {
+                    pass.draw_copy(encoder, frame, copy, self.extent);
+                }
+            }
             PassBody::Ui | PassBody::ScreenshotUi => {
                 if let Some(frame) = self.ui_frame {
                     self.ui.record(self.device, encoder, frame, self.extent);
                 }
             }
-            PassBody::Gizmo => {
+            PassBody::Gizmo | PassBody::ScreenshotGizmo => {
                 self.gizmo
                     .record(self.device, encoder, self.gizmo_strokes, self.extent);
             }
-            PassBody::Wireframe => {
+            PassBody::Wireframe | PassBody::ScreenshotWireframe => {
                 let (mode, depth) = self
                     .frame
                     .ids
@@ -4440,7 +4503,7 @@ impl FrameRecord<'_> {
                     self.extent,
                 );
             }
-            PassBody::Outline => {
+            PassBody::Outline | PassBody::ScreenshotOutline => {
                 let mask = self
                     .frame
                     .ids

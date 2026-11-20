@@ -57,7 +57,7 @@ const INSTRUCTIONS: &str = "Orrin is a game engine. The live tools read and chan
      with scene_edit, each call one undo step the developer can take back; edit scripts, shaders \
      and materials as files and the editor picks the save up; a scene that is not open is a text \
      file, read and edit it as one. screenshot shows the game as a \
-     player sees it, or the scene alone; quote frame_stats' banner with any number taken from \
+     player sees it, the scene alone, or the editor's window; quote frame_stats' banner with any number taken from \
      it. What agents may do is the developer's to set in Settings > Permissions: a refusal names \
      the switch or folder rule, and project_info and editor_state report what is allowed.";
 
@@ -863,11 +863,11 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "screenshot",
-            "What the editor's viewport renders, as a PNG no larger than max_size on its \
-             longest side: by default the game as a player sees it, its UI included; or the \
-             scene alone. Never the editor's own panels or marks.",
+            "A PNG no larger than max_size on its longest side: by default the game as a \
+             player sees it, its UI included; or the scene alone; or the editor's window as \
+             the developer sees it, panels and marks included.",
             json!({
-                "view": {"type": "string", "enum": ["game", "scene"], "description": "game: the scene and the game's UI (default); scene: the scene alone"},
+                "view": {"type": "string", "enum": ["game", "scene", "editor"], "description": "game: the scene and the game's UI (default); scene: the scene alone; editor: the window, panels and all"},
                 "max_size": {"type": "integer", "minimum": 16, "maximum": 4096, "description": "Longest side in pixels (default 1024)"},
             }),
             Hint::Reads,
