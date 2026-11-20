@@ -37,7 +37,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use orrin_project::Project;
-use orrin_remote::{Client, Discovery};
+use orrin_remote::{Client, Discovery, permissions};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -57,7 +57,8 @@ const INSTRUCTIONS: &str = "Orrin is a game engine. The live tools read and chan
      with scene_edit, each call one undo step the developer can take back; edit scripts, shaders \
      and materials as files and the editor picks the save up. screenshot shows the game as a \
      player sees it, or the scene alone; quote frame_stats' banner with any number taken from \
-     it.";
+     it. What agents may do is the developer's to set in Settings > Permissions: a refusal names \
+     the switch or folder rule, and project_info and editor_state report what is allowed.";
 
 /// The editor tools, which are the remote's methods by the same names.
 const LIVE: [&str; 9] = [
@@ -210,7 +211,9 @@ impl Server {
             Some(arguments @ Value::Object(_)) => arguments.clone(),
             Some(_) => return Err(invalid("`arguments` is an object")),
         };
+        let offline = matches!(name, "build_scripts" | "run_tests" | "editor_open");
         let answer = match name {
+            _ if offline && let Err(refused) = self.permitted(name, &arguments) => Err(refused),
             "project_info" => self.project_info(&arguments),
             "build_scripts" => self.build_scripts(&arguments),
             "run_tests" => self.run_tests(&arguments),
@@ -234,6 +237,28 @@ impl Server {
             )
             .collect();
         Ok(json!({"content": content, "isError": answer.failed}))
+    }
+
+    /// Whether an offline tool may run, by the permissions the editor keeps:
+    /// the user's capabilities, read now so a change on the page governs this
+    /// call, and the project's folder rules for the scripts folder a build
+    /// writes into. The live tools are the editor's to check.
+    fn permitted(&self, tool: &str, arguments: &Value) -> Result<(), String> {
+        capabilities().check(tool, arguments)?;
+        let builds = tool != "editor_open"
+            || !arguments
+                .get("no_build")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        if !builds {
+            return Ok(());
+        }
+        let project = self.project()?;
+        let scripts = project.scripts_dir();
+        let scripts = scripts.strip_prefix(project.root()).unwrap_or(&scripts);
+        permissions::Folders::load(&project.editor_dir())?
+            .permit(&scripts.to_string_lossy(), permissions::Access::ReadWrite)
+            .map_err(|why| format!("`{tool}` builds the scripts, but {why}"))
     }
 
     fn project(&self) -> Result<Project, String> {
@@ -334,6 +359,10 @@ impl Server {
                 .map(|scene| scene.display().to_string()),
             "scenes": scenes,
             "orrin": env!("CARGO_PKG_VERSION"),
+            "permissions": permissions::summary(
+                &capabilities(),
+                &permissions::Folders::load(&project.editor_dir()),
+            ),
             "editor": editor,
         });
         Ok(Answer::ok(info.to_string()))
@@ -499,6 +528,13 @@ impl Server {
         std::thread::spawn(move || child.wait());
         Ok(outcome)
     }
+}
+
+/// The user's capabilities for agents, as the editor last saved them.
+fn capabilities() -> permissions::Capabilities {
+    orrin_project::user::dir()
+        .map(|dir| permissions::Capabilities::of_user(&dir))
+        .unwrap_or_default()
 }
 
 fn no_editor(project: &Project, why: Option<&str>) -> String {

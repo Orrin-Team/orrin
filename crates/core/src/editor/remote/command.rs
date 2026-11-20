@@ -27,6 +27,7 @@ use serde_json::{Value as Json, json};
 use super::answer;
 use crate::editor::state::{DEFAULT_SCENE_PATH, EditorState, OpenChoice, SceneRequest, plain};
 use crate::scene::{Camera, Diagnostics, LogBuffer, LogLevel, Play, PlayState, Time};
+use orrin_remote::permissions::Access;
 
 /// How long a held command may take before it is answered as timed out. In
 /// time rather than frames, because what makes one late is a frame that stalls
@@ -144,6 +145,7 @@ pub(super) fn editor_command(
         Command::Save { path } => {
             if let Some(path) = path {
                 let file = in_project(state, &path)?;
+                writable(state, &file)?;
                 if file.exists() && plain(file.display().to_string()) != state.scene_path {
                     return Err(format!(
                         "{path} already exists and is not the open scene; open it, or choose \
@@ -157,6 +159,8 @@ pub(super) fn editor_command(
                      to the project, ending .orrin"
                         .to_owned(),
                 );
+            } else {
+                writable(state, Path::new(&state.scene_path))?;
             }
             state.request_scene(SceneRequest::Save);
             hold(Wait::Save, state)
@@ -167,6 +171,12 @@ pub(super) fn editor_command(
             discard,
         } => {
             let file = in_project(state, &path)?;
+            answer::permit(
+                &state.agent_folders,
+                state.project_root.as_deref(),
+                &file,
+                Access::Read,
+            )?;
             if !file.is_file() {
                 return Err(format!("the project has no scene at {path}"));
             }
@@ -191,6 +201,9 @@ pub(super) fn editor_command(
                     // The answers the editor's own dialog gives, chosen here
                     // so it never opens.
                     (save, _) => {
+                        if save {
+                            writable(state, Path::new(&state.scene_path))?;
+                        }
                         state.request_open_scene_checked(file.clone());
                         state.resolve_open(if save {
                             OpenChoice::SaveFirst
@@ -260,6 +273,17 @@ fn reload(state: &mut EditorState) -> Result<u64, String> {
 #[cfg(not(feature = "scripting"))]
 fn reload(_: &mut EditorState) -> Result<u64, String> {
     Err("this editor was built without scripting, so there are no scripts to reload".to_owned())
+}
+
+/// Whether the folder rules let an agent write `file`: what a save of it
+/// needs, the open scene's own included.
+fn writable(state: &EditorState, file: &Path) -> Result<(), String> {
+    answer::permit(
+        &state.agent_folders,
+        state.project_root.as_deref(),
+        file,
+        Access::ReadWrite,
+    )
 }
 
 /// `path`, relative to the project and inside it, as a scene file.

@@ -11,3 +11,7 @@ serde_json = "1"
 # The token's randomness: the OS generator, through the crate `EntityId::new`
 # already draws from.
 uuid.workspace = true
+# The permission files: the user's `settings.toml`, read for its `[agents.allow]`
+# table, and a project's folder rules. Already in the tree through every crate
+# that reads `orrin.toml`.
+toml.workspace = true

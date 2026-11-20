@@ -132,11 +132,15 @@ pub(super) fn scene_edit(
     let label = format!("{PREFIX}{}", edit.label.trim());
     let count = edit.ops.len();
     let mut done = Done::default();
+    let folders = Folders {
+        rules: &state.agent_folders,
+        assets: &state.agent_assets,
+    };
     let mut editor = SceneEditor::new(world, registry, &mut state.history);
     editor
         .batch_whole(label.clone(), |editor| {
             for (index, op) in edit.ops.iter().enumerate() {
-                apply(editor, registry, op, &mut done).map_err(|why| {
+                apply(editor, registry, &folders, op, &mut done).map_err(|why| {
                     EditError(format!(
                         "op {index} ({}) refused, so nothing in the batch was applied: {why}",
                         op.name()
@@ -162,9 +166,18 @@ pub(super) fn scene_edit(
     }))
 }
 
+/// The folder rules, for the one op that reads a project path: placing a
+/// prefab.
+struct Folders<'a> {
+    rules: &'a Result<orrin_remote::permissions::Folders, String>,
+    /// The assets folder relative to the project root.
+    assets: &'a str,
+}
+
 fn apply(
     editor: &mut SceneEditor,
     registry: &Registry,
+    folders: &Folders,
     op: &EditOp,
     done: &mut Done,
 ) -> Result<(), String> {
@@ -247,7 +260,7 @@ fn apply(
                                 .to_owned(),
                         );
                     }
-                    place(editor, prefab, name.as_deref(), parent)?
+                    place(editor, folders, prefab, name.as_deref(), parent)?
                 }
                 None => spawn(
                     editor,
@@ -431,18 +444,33 @@ fn spawn(
 /// Place does.
 fn place(
     editor: &mut SceneEditor,
+    folders: &Folders,
     asset: &str,
     name: Option<&str>,
     parent: Option<Entity>,
 ) -> Result<Entity, String> {
-    let id = match asset.parse::<AssetId>() {
-        Ok(id) => id,
-        Err(_) => editor
+    let (id, path) = {
+        let db = editor
             .world()
             .get_resource::<AssetDatabase>()
-            .and_then(|db| db.find(asset).map(|entry| entry.id))
-            .ok_or_else(|| format!("the project has no asset at `{asset}`"))?,
+            .ok_or_else(|| "no project is open, so there are no prefabs".to_owned())?;
+        let entry = match asset.parse::<AssetId>() {
+            Ok(id) => db.get(id),
+            Err(_) => db.find(asset),
+        }
+        .ok_or_else(|| format!("the project has no asset at `{asset}`"))?;
+        (entry.id, entry.path.clone())
     };
+    let in_project = match folders.assets {
+        "" => path,
+        assets => format!("{assets}/{path}"),
+    };
+    super::answer::permit(
+        folders.rules,
+        None,
+        std::path::Path::new(&in_project),
+        orrin_remote::permissions::Access::Read,
+    )?;
     editor.replace(format!("Place {asset}"), &[], |world, registry| {
         match crate::editor::state::place(world, registry, id, parent, None) {
             Ok(root) => {

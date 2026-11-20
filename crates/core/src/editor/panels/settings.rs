@@ -49,6 +49,14 @@
 //!
 //! **Any width.** Docked into a column the sidebar folds into one page picker.
 //!
+//! **Permissions are the person's, folders the project's.** The Permissions
+//! page's switches are `[agents.allow]` in the user's settings and its folder
+//! rules the project's `.orrin/agent-folders.toml` (`orrin_remote::permissions`
+//! holds both, and is what the editor and `orrin mcp` check against). They
+//! govern what Orrin's tools do for an agent. They do not confine an agent that
+//! can already write the project's files some other way, and the page does not
+//! claim to.
+//!
 //! **Closed, it costs nothing:** the dock does not call [`body`]. Open, it is
 //! a handful of rows a frame and, on a Project page, three file stats a
 //! second: the manifest and the two scenes it names. The Blender page looks
@@ -73,6 +81,9 @@ use crate::editor::settings::{
 use crate::editor::state::{DockRequest, EditorState, IconTints};
 use crate::editor::theme::{self, ThemeSet};
 use crate::editor::widgets;
+use orrin_remote::permissions::{
+    Access, Capabilities, Capability, FolderPreset, FolderRule, Folders, Preset,
+};
 
 /// Below this the sidebar folds into a picker: a 168-point sidebar beside a
 /// property row's label column leaves too little for a slider.
@@ -94,6 +105,7 @@ pub enum Page {
     Scripting,
     Blender,
     Agents,
+    Permissions,
     Saving,
     Display,
     Startup,
@@ -101,12 +113,13 @@ pub enum Page {
 
 impl Page {
     const PROJECT: [Self; 3] = [Self::General, Self::Scenes, Self::Scripts];
-    const ORRIN: [Self; 8] = [
+    const ORRIN: [Self; 9] = [
         Self::Appearance,
         Self::Viewport,
         Self::Scripting,
         Self::Blender,
         Self::Agents,
+        Self::Permissions,
         Self::Saving,
         Self::Display,
         Self::Startup,
@@ -122,6 +135,7 @@ impl Page {
             Self::Scripting => "Scripting",
             Self::Blender => "Blender",
             Self::Agents => "Agents",
+            Self::Permissions => "Permissions",
             Self::Saving => "Saving",
             Self::Display => "Display",
             Self::Startup => "Startup",
@@ -177,6 +191,11 @@ enum Field {
     Remote,
     /// An action too: the client's configuration, to the clipboard.
     McpConfig,
+    /// Which of the presets the switches below it are.
+    Preset,
+    Allow(Capability),
+    /// The folder a new folder rule is for, while it is typed.
+    AddFolder,
     Autosave,
     Interval,
     Present,
@@ -416,6 +435,104 @@ const ROWS: &[Row] = &[
         "mcp json copy clipboard client claude code configure setup",
     ),
     row(
+        Page::Permissions,
+        Field::Preset,
+        "Preset",
+        "What an agent may do through Orrin's tools; changing a switch below makes it Custom",
+        "agent permission permissions access preset read only edit full control custom mcp",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::ReadScene),
+        "Read scene and assets",
+        "Read the open scene, the registered components and the asset index",
+        "agent permission allow deny read outline blocks components assets index",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::Console),
+        "Read the console",
+        "Read the editor console's lines",
+        "agent permission allow deny log logs messages errors warnings",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::Screenshot),
+        "Screenshots",
+        "Take a picture of the game or the scene",
+        "agent permission allow deny image picture png view",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::FrameStats),
+        "Frame stats",
+        "Read frame times, the profiler and the run banner",
+        "agent permission allow deny performance profiler fps timings",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::EditScene),
+        "Edit the scene",
+        "Change the open scene through scene_edit, each call one undo step",
+        "agent permission allow deny edit spawn despawn set component reparent modify",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::PlayControl),
+        "Play, pause and stop",
+        "Play, pause, step and stop the game, and load scenes while it plays",
+        "agent permission allow deny play pause stop step run game load unload",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::UndoRedo),
+        "Undo and redo",
+        "Undo and redo the editor's steps, the developer's own included",
+        "agent permission allow deny undo redo history",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::Selection),
+        "Select and frame",
+        "Change the selection and frame it in the camera",
+        "agent permission allow deny select selection frame camera focus",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::Scenes),
+        "Save, open and create scenes",
+        "Save the open scene, open another, or make a new one",
+        "agent permission allow deny save open new scene file write",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::ReloadScripts),
+        "Reload scripts",
+        "Swap in the game's last build",
+        "agent permission allow deny hot reload scripts assembly",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::BuildScripts),
+        "Build scripts",
+        "Compile the project's C# with orrin build",
+        "agent permission allow deny compile dotnet build csharp",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::RunTests),
+        "Run tests",
+        "Run the project's tests with orrin test",
+        "agent permission allow deny test tests unit",
+    ),
+    row(
+        Page::Permissions,
+        Field::Allow(Capability::OpenEditor),
+        "Open the editor",
+        "Launch an editor on the project with its remote on",
+        "agent permission allow deny launch start editor_open run",
+    ),
+    row(
         Page::Saving,
         Field::Autosave,
         "Autosave",
@@ -581,6 +698,8 @@ pub struct SettingsPanel {
     manifest: Manifest,
     /// The Blender the Blender page would run, as last looked for.
     found: Option<Found>,
+    /// Why the last folder typed into Permissions was not added.
+    folder_error: Option<String>,
 }
 
 /// `blend::locate` searches the PATH, so the page asks it at most once a
@@ -984,6 +1103,9 @@ fn page(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
                         );
                     }
                     rows_of(ui, cx, panel, |row| row.page == page);
+                    if page == Page::Permissions {
+                        folders(ui, cx.state, panel);
+                    }
                 }
             }
             if !page.is_project() && cx.state.settings_file.is_none() {
@@ -1653,8 +1775,152 @@ fn control(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, field: Fie
         | Field::Entry
         | Field::ScriptsFolder
         | Field::AssetsFolder
-        | Field::Command => {}
+        | Field::Command
+        | Field::AddFolder => {}
+        Field::Preset => {
+            let allow = &mut settings.agents.allow;
+            let current = allow.preset();
+            egui::ComboBox::from_id_salt("settings agents preset")
+                .width(width)
+                .selected_text(current.label())
+                .show_ui(ui, |ui| {
+                    for preset in Preset::CHOSEN {
+                        if ui
+                            .selectable_label(current == preset, preset.label())
+                            .clicked()
+                        {
+                            *allow = Capabilities::of(preset);
+                        }
+                    }
+                });
+        }
+        Field::Allow(capability) => {
+            let mut on = settings.agents.allow.allows(capability);
+            if ui.checkbox(&mut on, "").changed() {
+                settings.agents.allow.set(capability, on);
+            }
+        }
     }
+}
+
+/// The project's folder rules for agents, under the switches: a preset, what
+/// every folder no rule names gets, and one rule a folder, the longest that
+/// matches a path deciding it. Kept in the project's `.orrin`, not in
+/// `orrin.toml`: they are this person's rules for their agent, not the
+/// project's.
+fn folders(ui: &mut egui::Ui, state: &mut EditorState, panel: &mut SettingsPanel) {
+    let weak = ui.visuals().weak_text_color();
+    ui.add_space(14.0);
+    heading(ui, "Folders", "this project, kept in .orrin");
+    if state.project_root.is_none() {
+        note(ui, "Open a project to give its folders rules", weak);
+        return;
+    }
+    let assets = state.agent_assets.clone();
+    let folders = match &mut state.agent_folders {
+        Ok(folders) => folders,
+        Err(why) => {
+            note(ui, &sentence(why), theme::ERROR);
+            note(ui, "Agents are refused every folder until it reads", weak);
+            if ui.button("Reset to the whole project").clicked() {
+                state.agent_folders = Ok(Folders::default());
+                state.agent_folders_changed = true;
+            }
+            return;
+        }
+    };
+    let mut changed = false;
+    let current = folders.preset(&assets);
+    widgets::property(ui, "Folder preset", |ui| {
+        egui::ComboBox::from_id_salt("settings agents folders")
+            .width(ui.available_width())
+            .selected_text(current.label())
+            .show_ui(ui, |ui| {
+                for preset in FolderPreset::CHOSEN {
+                    if ui
+                        .selectable_label(current == preset, preset.label())
+                        .clicked()
+                    {
+                        *folders = Folders::of(preset, &assets);
+                        changed = true;
+                    }
+                }
+            });
+    });
+    widgets::property(ui, "Everything else", |ui| {
+        changed |= access_picker(ui, "unlisted", &mut folders.unlisted);
+    });
+    let mut gone = None;
+    for (at, rule) in folders.rules.iter_mut().enumerate() {
+        let shown = if rule.path.is_empty() {
+            "."
+        } else {
+            &rule.path
+        };
+        widgets::property_with(
+            ui,
+            shown,
+            |ui| changed |= access_picker(ui, &rule.path, &mut rule.access),
+            |ui| {
+                if icons::button(ui, icons::x(), 12.0, weak, false)
+                    .on_hover_text("Remove this rule")
+                    .clicked()
+                {
+                    gone = Some(at);
+                }
+            },
+        );
+    }
+    if let Some(at) = gone {
+        folders.rules.remove(at);
+        changed = true;
+    }
+    let typed = widgets::property(ui, "Add folder", |ui| {
+        committed_text(ui, &mut panel.typing, Field::AddFolder, "")
+    });
+    if let Some(typed) = typed.filter(|typed| !typed.trim().is_empty()) {
+        match orrin_remote::permissions::normalise(typed.trim()) {
+            Ok(path) if folders.rules.iter().any(|rule| rule.path == path) => {
+                panel.folder_error = Some(format!("{path} has a rule already"));
+            }
+            Ok(path) => {
+                folders.rules.push(FolderRule {
+                    path,
+                    access: Access::Read,
+                });
+                folders.rules.sort_by(|a, b| a.path.cmp(&b.path));
+                panel.folder_error = None;
+                changed = true;
+            }
+            Err(why) => panel.folder_error = Some(sentence(&why)),
+        }
+    }
+    if let Some(error) = &panel.folder_error {
+        note(ui, error, theme::ERROR);
+    }
+    note(
+        ui,
+        "Relative to the project, longest match first. These govern Orrin's tools only, not a \
+         process that can already write the project's files",
+        weak,
+    );
+    if changed {
+        state.agent_folders_changed = true;
+    }
+}
+
+/// An access level, picked; whether it changed.
+fn access_picker(ui: &mut egui::Ui, salt: &str, access: &mut Access) -> bool {
+    let before = *access;
+    egui::ComboBox::from_id_salt(("settings agents access", salt.to_owned()))
+        .width(ui.available_width())
+        .selected_text(access.label())
+        .show_ui(ui, |ui| {
+            for option in Access::ALL {
+                ui.selectable_value(access, option, option.label());
+            }
+        });
+    *access != before
 }
 
 /// A Startup row's picker over `startup`, which a locked row hands in as a
@@ -1782,6 +2048,10 @@ fn is_default(field: Field, s: &Settings, d: &Settings) -> bool {
         Field::LiveLink => s.blender.live_link == d.blender.live_link,
         Field::LinkPort => s.blender.port == d.blender.port,
         Field::AddOn | Field::McpConfig => true,
+        Field::Preset => s.agents.allow == d.agents.allow,
+        Field::Allow(capability) => {
+            s.agents.allow.allows(capability) == d.agents.allow.allows(capability)
+        }
         Field::Remote => s.agents.remote == d.agents.remote,
         _ => tint(s.appearance.icons, field) == tint(d.appearance.icons, field),
     }
@@ -1810,6 +2080,11 @@ fn restore(field: Field, s: &mut Settings, d: &Settings) {
         Field::LiveLink => s.blender.live_link = d.blender.live_link,
         Field::LinkPort => s.blender.port = d.blender.port,
         Field::AddOn | Field::McpConfig => {}
+        Field::Preset => s.agents.allow = d.agents.allow,
+        Field::Allow(capability) => s
+            .agents
+            .allow
+            .set(capability, d.agents.allow.allows(capability)),
         Field::Remote => s.agents.remote = d.agents.remote,
         _ => {
             if let (Some(to), Some(from)) = (
@@ -1846,6 +2121,8 @@ fn default_text(field: Field, d: &Settings) -> String {
         Field::LiveLink => on(d.blender.live_link),
         Field::LinkPort => d.blender.port.to_string(),
         Field::AddOn | Field::McpConfig => String::new(),
+        Field::Preset => d.agents.allow.preset().label().to_owned(),
+        Field::Allow(capability) => on(d.agents.allow.allows(capability)),
         Field::Remote => on(d.agents.remote),
         _ => tint(d.appearance.icons, field)
             .map_or_else(String::new, |[r, g, b]| format!("#{r:02X}{g:02X}{b:02X}")),
@@ -2060,9 +2337,16 @@ mod tests {
             port: 47200,
         };
         moved.agents.remote = !defaults.agents.remote;
+        for capability in orrin_remote::permissions::Capability::ALL {
+            moved.agents.allow.set(capability, false);
+        }
         for row in ROWS.iter().filter(|row| !row.page.is_project()) {
-            // A pick goes through a request; installing and copying are actions.
-            if matches!(row.field, Field::Theme | Field::AddOn | Field::McpConfig) {
+            // A pick goes through a request; installing and copying are
+            // actions; a preset is every switch below it at once.
+            if matches!(
+                row.field,
+                Field::Theme | Field::AddOn | Field::McpConfig | Field::Preset
+            ) {
                 continue;
             }
             assert!(!is_default(row.field, &moved, &defaults), "{}", row.label);

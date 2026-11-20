@@ -72,6 +72,7 @@
 
 pub mod client;
 pub mod discovery;
+pub mod permissions;
 pub mod token;
 pub mod wire;
 

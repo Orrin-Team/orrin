@@ -241,6 +241,22 @@ over unsaved work needs `save` or `discard`, and saving one that has never had
 a file needs a `path` inside the project. No tool runs code, and the only file
 a tool writes by name is a scene saved inside the project.
 
+**Permissions.** Settings ▸ Permissions says what an agent may do, and every
+tool is checked against it: a preset (Read only, Edit scene, Full control —
+the default — or Custom once a switch is changed), one switch for each kind of
+thing (reading the scene, the console, screenshots, frame stats, editing,
+play control, undo and redo, selection, saving and opening scenes, reloading,
+building, testing, opening the editor), and per-project folder rules — none,
+read, or read and write, the longest matching folder deciding — which govern
+which assets `asset_find` lists, which scenes may be opened or saved and which
+prefabs placed. The switches are `[agents.allow]` in the user's
+`settings.toml`, the folder rules the project's `.orrin/agent-folders.toml`;
+`orrin mcp` checks its own tools against those files and the editor checks the
+rest, each at the request, so a change applies to the next call. A refused call
+is an `isError` result naming what is off; `project_info` and `editor_state`
+report the permissions in force. They govern Orrin's tools, not an agent that
+can write the project's files by other means.
+
 ## How the engine is found
 
 In order, because a wrong guess here is near-invisible:

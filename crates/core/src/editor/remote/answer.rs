@@ -33,6 +33,7 @@ use super::command::Held;
 use crate::asset_db::{AssetDatabase, AssetKind, LoadState, Status};
 use crate::editor::state::EditorState;
 use crate::scene::{Camera, LogBuffer, LogLevel, Name, Play, PlayState, persist};
+use orrin_remote::permissions::Access;
 
 type FxHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
 
@@ -64,6 +65,11 @@ pub(super) fn answer(
 ) -> Reply {
     let params = &request.params;
     let method = request.method.as_str();
+    // The one check of what an agent may do: every method, and every command
+    // by name, passes here before anything reads or changes a thing.
+    if let Err(refused) = state.settings.agents.allow.check(method, params) {
+        return Reply::Now(Err(refused));
+    }
     let answer = match method {
         "screenshot" => match super::shot::asked(params) {
             Ok((size, view)) => return Reply::Screenshot(size, view),
@@ -91,7 +97,7 @@ fn read(
         "editor_state" => params_of::<Nothing>(params).map(|_| editor_state(world, state)),
         "scene_read" => scene_read(world, registry, state, params),
         "component_list" => component_list(registry, params),
-        "asset_find" => asset_find(world, params),
+        "asset_find" => asset_find(world, state, params),
         "console_read" => console_read(world, params),
         "frame_stats" => frame_stats(world, params),
         other => Err(format!(
@@ -130,6 +136,35 @@ fn page<T>(all: Vec<T>, offset: usize, limit: usize) -> (usize, Vec<T>, Option<u
         all.into_iter().skip(offset).take(limit).collect(),
         next,
     )
+}
+
+/// Why every folder is refused: the folder rules did not read.
+fn refused_folders(why: &str) -> String {
+    format!(
+        "{why}; agents are refused every folder until it reads. Fix it, or reset the folder \
+         rules in Settings ▸ Permissions"
+    )
+}
+
+/// Whether the folder rules let an agent go as far as `need` at `path`:
+/// absolute, or relative to the project root.
+pub(super) fn permit(
+    folders: &Result<orrin_remote::permissions::Folders, String>,
+    root: Option<&std::path::Path>,
+    path: &std::path::Path,
+    need: Access,
+) -> Result<(), String> {
+    let folders = folders.as_ref().map_err(|why| refused_folders(why))?;
+    let relative = match root {
+        Some(root) if path.is_absolute() => path.strip_prefix(root).map_err(|_| {
+            format!(
+                "{} is outside the project, where agents have no access",
+                path.display()
+            )
+        })?,
+        _ => path,
+    };
+    folders.permit(&relative.to_string_lossy(), need)
 }
 
 pub(super) fn world_read(state: &EditorState) -> &'static str {
@@ -212,6 +247,10 @@ fn editor_state(world: &World, state: &EditorState) -> Value {
     json!({
         "project": state.project_name,
         "agents": agents,
+        "permissions": orrin_remote::permissions::summary(
+            &state.settings.agents.allow,
+            &state.agent_folders,
+        ),
         "scene": state.scene_path,
         "unsaved": state.scene_dirty(),
         "play": play,
@@ -464,7 +503,7 @@ struct AssetFind {
     offset: usize,
 }
 
-fn asset_find(world: &World, params: &Value) -> Result<Value, String> {
+fn asset_find(world: &World, state: &EditorState, params: &Value) -> Result<Value, String> {
     let find: AssetFind = params_of(params)?;
     let kind = find
         .kind
@@ -484,8 +523,21 @@ fn asset_find(world: &World, params: &Value) -> Result<Value, String> {
         "no project is open, so there is no asset index; open one with `orrin run`".to_owned()
     })?;
     let path = find.path.as_deref().map(str::to_lowercase);
+    // What the folder rules keep from agents is not listed: not even its name.
+    let folders = state
+        .agent_folders
+        .as_ref()
+        .map_err(|why| refused_folders(why))?;
+    let readable = |path: &str| {
+        let in_project = match state.agent_assets.as_str() {
+            "" => path.to_owned(),
+            assets => format!("{assets}/{path}"),
+        };
+        folders.permit(&in_project, Access::Read).is_ok()
+    };
     let mut entries: Vec<_> = db
         .iter()
+        .filter(|entry| readable(&entry.path))
         .filter(|entry| kind.is_none_or(|kind| entry.kind == kind))
         .filter(|entry| {
             path.as_ref()
@@ -664,4 +716,86 @@ fn frame_stats(world: &World, params: &Value) -> Result<Value, String> {
         );
     }
     Ok(answer)
+}
+
+#[cfg(test)]
+mod tests {
+    use orrin_remote::permissions::{Capability, FolderRule, Folders};
+
+    use super::*;
+    use crate::asset_db::tests::Dir;
+
+    fn call(
+        world: &mut World,
+        state: &mut EditorState,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
+        let mut registry = Registry::new();
+        crate::scene::register_components(&mut registry);
+        let request = Request {
+            id: 1,
+            method: method.into(),
+            params,
+        };
+        match answer(&request, world, &registry, state) {
+            Reply::Now(answer) => answer,
+            _ => panic!("{method} was held"),
+        }
+    }
+
+    /// The folder rules govern what the tools do with a project path: an
+    /// asset in a folder agents may not read is not even listed, and a scene
+    /// saved into a folder they may only read is refused before anything is
+    /// asked of the editor. A capability that is off refuses its method by
+    /// name, here, before either.
+    #[test]
+    fn the_folder_rules_hide_what_agents_may_not_read_and_refuse_a_write_outside() {
+        let dir = Dir::new("remote-folders");
+        dir.write("assets/levels/one.orrin", b"orrin-scene 4 min-reader 4\n");
+        dir.write("assets/props/door.oprefab", b"orrin-scene 1\n");
+        let mut world = World::default();
+        let (db, _) = AssetDatabase::open(dir.path().join("assets"), dir.path().join(".cache"));
+        world.insert_resource(db);
+        let mut state = EditorState::default();
+        state.project_root = Some(dir.path().to_owned());
+        state.agent_assets = "assets".to_owned();
+        state.agent_folders = Ok(Folders {
+            unlisted: orrin_remote::permissions::Access::None,
+            rules: vec![
+                FolderRule {
+                    path: "assets/levels".into(),
+                    access: orrin_remote::permissions::Access::Read,
+                },
+                FolderRule {
+                    path: "assets/props".into(),
+                    access: orrin_remote::permissions::Access::None,
+                },
+            ],
+        });
+
+        let found = call(&mut world, &mut state, "asset_find", Value::Null).unwrap();
+        let paths: Vec<&str> = found["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|asset| asset["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["levels/one.orrin"]);
+
+        let save = json!({"command": "save", "path": "assets/levels/two.orrin"});
+        let refused = call(&mut world, &mut state, "editor_command", save).unwrap_err();
+        assert!(
+            refused.contains("may not write to assets/levels/two.orrin"),
+            "{refused}"
+        );
+
+        state
+            .settings
+            .agents
+            .allow
+            .set(Capability::ReadScene, false);
+        let refused = call(&mut world, &mut state, "asset_find", Value::Null).unwrap_err();
+        assert!(refused.contains("Read scene and assets"), "{refused}");
+    }
 }

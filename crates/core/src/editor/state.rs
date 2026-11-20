@@ -324,6 +324,15 @@ pub struct EditorState {
     pub remote_peers_seen: u64,
     /// A connection Settings ▸ Agents asked to close.
     pub remote_disconnect: Option<u64>,
+    /// The project's folder rules for agents, or why the file did not read —
+    /// which refuses every folder until it is fixed. See Settings ▸
+    /// Permissions.
+    pub agent_folders: Result<orrin_remote::permissions::Folders, String>,
+    /// The assets folder relative to the project root, as a folder rule names
+    /// it, for the asset index's paths and the folder presets.
+    pub agent_assets: String,
+    /// The folder rules changed on the page and are not yet written.
+    pub agent_folders_changed: bool,
     /// How many times [`apply`](Self::apply) has run: the remote waits on it
     /// to see a request it raised carried out.
     applied: u64,
@@ -535,6 +544,9 @@ impl Default for EditorState {
             remote_peers: Vec::new(),
             remote_peers_seen: 0,
             remote_disconnect: None,
+            agent_folders: Ok(orrin_remote::permissions::Folders::default()),
+            agent_assets: String::new(),
+            agent_folders_changed: false,
             applied: 0,
             reloads: (0, None),
             addon: Default::default(),

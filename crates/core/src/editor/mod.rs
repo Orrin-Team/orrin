@@ -139,6 +139,13 @@ impl Editor {
                 .chain(project.map(|project| project.themes_dir())),
         );
         let mut state = EditorState::new(project);
+        if let Some(project) = project {
+            state.agent_folders = orrin_remote::permissions::Folders::load(&project.editor_dir());
+            let assets = project.assets_dir();
+            let assets = assets.strip_prefix(project.root()).unwrap_or(&assets);
+            state.agent_assets =
+                orrin_remote::permissions::normalise(&assets.to_string_lossy()).unwrap_or_default();
+        }
         state.script_files = source::ScriptFiles::new(scripts_dir);
         state.environment = settings::Environment::of_process();
         state.settings_file = settings.file();
@@ -202,6 +209,21 @@ impl Editor {
             if let Err(error) = swept {
                 tracing::warn!("could not look for a stale remote file: {error}");
             }
+        }
+    }
+
+    /// Write the folder rules Settings ▸ Permissions changed, once the pointer
+    /// lets go. They are read at every request, so the next one is governed.
+    fn save_agent_folders(&mut self) {
+        if !self.state.agent_folders_changed || self.ctx.input(|input| input.pointer.any_down()) {
+            return;
+        }
+        self.state.agent_folders_changed = false;
+        let (Some((dir, _)), Ok(folders)) = (&self.remote_home, &self.state.agent_folders) else {
+            return;
+        };
+        if let Err(error) = folders.save(dir) {
+            tracing::error!("{error}");
         }
     }
 
@@ -406,6 +428,7 @@ impl Editor {
         }
         settings.settle(ctx, world, state, themes);
         self.sync_remote();
+        self.save_agent_folders();
 
         self.save_layout_if_settled();
     }

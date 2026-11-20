@@ -26,7 +26,7 @@ Rust edition 2024, resolver 3. Cargo workspace, `members = ["crates/*"]`.
 | `crates/orrin-build` | `dotnet build` for a project's C# |
 | `crates/orrin-project` | The `orrin.toml` project manifest |
 | `crates/orrin-shaderc` | Compiling a shader: GLSL to SPIR-V, that SPIR-V to MSL, and the binding layout both agree on. The one way `build.rs` and the editor's runtime compiler compile a shader |
-| `crates/orrin-remote` | The editor's remote: the loopback protocol's wire, the `.orrin/remote` discovery file and a blocking client, read by the editor and by `orrin mcp` |
+| `crates/orrin-remote` | The editor's remote: the loopback protocol's wire, the `.orrin/remote` discovery file, a blocking client, and what agents are permitted, read by the editor and by `orrin mcp` |
 | `crates/orrin-cli` (binary `orrin`) | `orrin new` / `build` / `run` / `export` / `hub` / `mcp` |
 | `crates/orrin-hub` (binary `orrin-hub`) | Orrin Hub: a window over the CLI for creating, opening and exporting projects. eframe lives here and nowhere else |
 | `scripting/Orrin` | The C# bindings assembly. `scripting/DemoGame` is a game assembly like any project's; `scripting/Orrin.Analyzers` is the Roslyn analyzer holding Behaviour fields to the registry-visible / `[Transient]` split |

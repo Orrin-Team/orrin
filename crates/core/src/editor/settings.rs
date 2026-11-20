@@ -96,6 +96,9 @@ pub struct Settings {
 #[serde(default)]
 pub struct Agents {
     pub remote: bool,
+    /// What an agent may do through it, and through `orrin mcp`, which reads
+    /// this very table (`orrin_remote::permissions::USER_TABLE`).
+    pub allow: orrin_remote::permissions::Capabilities,
 }
 
 /// Blender, for `.blend` assets and the live link its add-on streams over.
@@ -944,6 +947,20 @@ mod tests {
     /// Deviations only, as a material's shader values and a Behaviour's
     /// fields across a reload are: a default the engine changes later reaches
     /// everyone who never set it.
+    /// `orrin mcp` reads the switches out of this file by a table name of its
+    /// own; the two disagreeing would leave every switch on for the offline
+    /// tools while the page showed it off.
+    #[test]
+    fn orrin_mcp_reads_the_agents_switches_the_editor_writes() {
+        use orrin_remote::permissions::{Capabilities, Capability};
+        let dir = Scratch::new("agents-allow");
+        let mut settings = Settings::default();
+        settings.agents.allow.set(Capability::BuildScripts, false);
+        settings.agents.allow.set(Capability::EditScene, false);
+        save(&mut dir.store().0, settings.clone());
+        assert_eq!(Capabilities::of_user(&dir.0), settings.agents.allow);
+    }
+
     #[test]
     fn a_value_left_at_its_default_is_not_written() {
         let dir = Scratch::new("deviations");
