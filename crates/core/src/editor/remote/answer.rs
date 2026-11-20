@@ -246,6 +246,17 @@ fn loaded_scenes(world: &World, state: &EditorState) -> Vec<Value> {
             });
             if scene.handle == active {
                 entry["unsaved"] = Value::Bool(state.scene_dirty());
+                // A scene the editor made or opened this session may not be
+                // indexed yet; its file is still the one a save writes.
+                if path.is_none() {
+                    let file = std::path::Path::new(&state.scene_path);
+                    let shown = state
+                        .project_root
+                        .as_deref()
+                        .and_then(|root| file.strip_prefix(root).ok())
+                        .unwrap_or(file);
+                    entry["path"] = Value::String(shown.display().to_string());
+                }
             }
             entry
         })
