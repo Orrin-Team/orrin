@@ -21,6 +21,14 @@
 //! the tail of what it printed. The files are written to a directory of the
 //! install's own, created afresh and readable by its owner alone, because
 //! what is in it is code that Blender then runs.
+//!
+//! **Open in Blender** ([`open`]) is the asset browser's way to the file that
+//! matters: a `.blend` dropped on the browser is copied in, and the copy is
+//! what the engine watches. It is the user's own session, with none of the
+//! flags an export or an install takes, so their add-ons — the live link's
+//! included — load. Its output goes nowhere, and on Unix it leads a process
+//! group of its own, so it shares neither a pipe nor a Ctrl-C with the editor;
+//! a thread reaps it, and the editor quitting neither waits for it nor stops it.
 
 use std::path::{Path, PathBuf};
 #[cfg(not(feature = "export"))]
@@ -130,6 +138,36 @@ impl Install {
         self.last = Some(ended);
         self.last.as_ref()
     }
+}
+
+#[cfg(feature = "export")]
+pub fn open(_: &Path, _: &Path) -> Result<(), String> {
+    Err("an exported game opens nothing in Blender".to_owned())
+}
+
+/// Start `blender` on `file` as the user's own session, and reap it on a
+/// thread of its own once it quits.
+#[cfg(not(feature = "export"))]
+pub fn open(blender: &Path, file: &Path) -> Result<(), String> {
+    let mut command = Command::new(blender);
+    command
+        .arg(file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "Blender would not start from {}: {error}. {}",
+            blender.display(),
+            crate::asset_db::blend::FIX
+        )
+    })?;
+    let _ = std::thread::Builder::new()
+        .name("orrin-blender".to_owned())
+        .spawn(move || child.wait());
+    Ok(())
 }
 
 #[cfg(feature = "export")]

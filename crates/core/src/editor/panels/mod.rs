@@ -2942,6 +2942,71 @@ mod tests {
         );
     }
 
+    /// A `.blend` opens in the configured Blender, given nothing but the
+    /// project's copy, so it is the user's own session; a `.glb` opens nothing.
+    /// The stand-in records each run in a file of its own, and the import
+    /// worker runs it too, to export the `.blend`, which is told apart by its
+    /// `--background`.
+    #[cfg(all(unix, not(feature = "export")))]
+    #[test]
+    fn double_clicking_a_blend_opens_the_projects_copy_in_blender_and_a_glb_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let tools = crate::asset_db::tests::Dir::new("panel-open-blender-tools");
+        let runs = tools.path().join("runs");
+        std::fs::create_dir(&runs).unwrap();
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > '{runs}/.'$$\nmv '{runs}/.'$$ '{runs}/'$$\n",
+            runs = runs.display()
+        );
+        let blender = tools.write("blender", script.as_bytes());
+        std::fs::set_permissions(&blender, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut editor = Harness::new(egui::vec2(1280.0, 800.0));
+        let (dir, _) = mesh_project(&mut editor, "panel-open-blender");
+        {
+            // Configured before the `.blend` is indexed, so its export never
+            // reaches for an installed Blender.
+            let mut db = editor
+                .world
+                .resource_mut::<crate::asset_db::AssetDatabase>();
+            db.set_blender(Some(blender.clone()));
+            dir.write("tree.blend", b"BLENDER");
+            db.rescan();
+        }
+        editor.state.settings.blender.path = Some(blender);
+        editor.dock.activate(Tab::Assets);
+        editor.frames(2);
+
+        editor.input.time = Some(0.0);
+        editor.double_click(row_of(&editor, "rock.glb"));
+        editor.input.time = Some(2.0);
+        editor.double_click(row_of(&editor, "tree.blend"));
+
+        let opens = || -> Vec<Vec<String>> {
+            std::fs::read_dir(&runs)
+                .unwrap()
+                .flatten()
+                .filter(|run| !run.file_name().to_string_lossy().starts_with('.'))
+                .map(|run| {
+                    let args = std::fs::read_to_string(run.path()).unwrap();
+                    args.split_terminator('\0').map(str::to_owned).collect()
+                })
+                .filter(|args: &Vec<String>| {
+                    args.first().is_none_or(|first| first != "--background")
+                })
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + crate::asset_db::tests::WAIT;
+        while opens().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let db = editor.world.resource::<crate::asset_db::AssetDatabase>();
+        assert!(db.wait_idle(crate::asset_db::tests::WAIT));
+        let file = dir.path().join("tree.blend");
+        assert!(file.is_absolute());
+        assert_eq!(opens(), [vec![file.to_string_lossy().into_owned()]]);
+    }
+
     #[test]
     fn a_mesh_dropped_on_a_row_is_placed_under_it() {
         let mut editor = Harness::new(egui::vec2(1280.0, 800.0));

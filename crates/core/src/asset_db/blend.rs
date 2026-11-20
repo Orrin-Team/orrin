@@ -91,7 +91,7 @@ pub const EXPORT: &str = concat!(
 /// thread for no longer than this.
 pub const TIMEOUT: Duration = Duration::from_secs(120);
 
-const FIX: &str = "Set Blender's path in Settings ▸ Blender, or in ORRIN_BLENDER";
+pub(crate) const FIX: &str = "Set Blender's path in Settings ▸ Blender, or in ORRIN_BLENDER";
 
 /// How many of the last lines Blender printed a failure carries.
 const TAIL: usize = 20;
