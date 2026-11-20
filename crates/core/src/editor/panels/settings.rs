@@ -920,7 +920,7 @@ fn entry(ui: &mut egui::Ui, panel: &mut SettingsPanel, page: Page) {
 fn picker(ui: &mut egui::Ui, state: &EditorState, panel: &mut SettingsPanel) {
     let mut chosen = None;
     let weak = ui.visuals().weak_text_color();
-    egui::ComboBox::from_id_salt("settings page")
+    egui::ComboBox::from_id_salt("settings page picker")
         .width(ui.available_width())
         .selected_text(panel.page.title())
         .show_ui(ui, |ui| {
