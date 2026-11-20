@@ -185,6 +185,32 @@ impl Editor {
     pub fn offer_remote(&mut self) {
         self.remote_offered = true;
         self.sync_remote();
+        // A remote that started has written its own file over any stale one.
+        // Otherwise one a killed editor left is cleared here, off the frame's
+        // thread, since telling whether it is stale means connecting to it.
+        if self.remote.is_none()
+            && let Some((dir, _)) = &self.remote_home
+        {
+            let dir = dir.clone();
+            let swept = std::thread::Builder::new()
+                .name("orrin-remote-sweep".to_owned())
+                .spawn(move || {
+                    if let Some(removed) = orrin_remote::client::sweep(&dir) {
+                        tracing::info!("{removed}");
+                    }
+                });
+            if let Err(error) = swept {
+                tracing::warn!("could not look for a stale remote file: {error}");
+            }
+        }
+    }
+
+    /// Stop the remote now and take its file back, for a way out that will
+    /// not reach the editor's `Drop`.
+    pub fn stop_remote(&mut self) {
+        if self.remote.take().is_some() {
+            tracing::info!("the remote stopped listening");
+        }
     }
 
     /// Answer what an agent asked since the last frame. See `remote`. A

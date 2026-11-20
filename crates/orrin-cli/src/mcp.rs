@@ -243,10 +243,17 @@ impl Server {
     /// connection yet.
     fn attach(&mut self, project: &Project) -> Result<&mut Client, String> {
         if self.editor.is_none() {
-            let found =
-                Discovery::read(&project.editor_dir())?.ok_or_else(|| no_editor(project, None))?;
-            let client = Client::connect(&found)
-                .map_err(|err| no_editor(project, Some(&err.to_string())))?;
+            let editor_dir = project.editor_dir();
+            let found = Discovery::read(&editor_dir)?.ok_or_else(|| no_editor(project, None))?;
+            let client = Client::connect(&found).map_err(|err| match err {
+                // Left by an editor that was killed or crashed: whoever notices
+                // first clears it, if it still holds the token read.
+                orrin_remote::Error::Stale(why) => {
+                    found.remove(&editor_dir);
+                    no_editor(project, Some(&format!("{why}; the file was removed")))
+                }
+                err => no_editor(project, Some(&err.to_string())),
+            })?;
             self.editor = Some(client);
         }
         Ok(self.editor.as_mut().expect("just connected"))
@@ -268,7 +275,7 @@ impl Server {
                     });
                 }
                 Err(orrin_remote::Error::Refused(why)) => return Ok(Answer::failed(why)),
-                Err(orrin_remote::Error::Gone(why)) => {
+                Err(orrin_remote::Error::Gone(why) | orrin_remote::Error::Stale(why)) => {
                     self.editor = None;
                     if retried {
                         return Err(no_editor(&project, Some(&why)));

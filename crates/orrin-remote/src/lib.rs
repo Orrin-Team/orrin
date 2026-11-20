@@ -16,7 +16,10 @@
 //! [`Token`] to `<project>/.orrin/remote` ([`Discovery`]), readable by its
 //! owner alone on Unix and removed when the remote stops. A client proves it
 //! read that file. The link to Blender needs no token; this does, because a
-//! connection here will be able to change the open scene.
+//! connection here will be able to change the open scene. A file a killed or
+//! crashed editor left behind is removed by whoever next finds it stale
+//! ([`client::sweep`]): its port refuses, or what listens there hangs up on
+//! its token. A listener that is merely slow to answer is not taken for stale.
 //!
 //! **Its bytes are untrusted.** A length over [`MAX_FRAME`] is refused from the
 //! header, before anything is allocated for it, and ends the connection.

@@ -1,7 +1,9 @@
-//! A blocking client: one connection, one call at a time.
+//! A blocking client: one connection, one call at a time, and the one test of
+//! whether a remote file is stale, which the client and the editor share.
 
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -23,6 +25,11 @@ pub enum Error {
     /// There is no editor at the other end, or it went: connect again, from a
     /// fresh read of the discovery file.
     Gone(String),
+    /// The remote file names an editor that is certainly not there: its port
+    /// refuses the connection, or what listens there closed it without a
+    /// word, which an editor does only to a token that is not its own. A file
+    /// a crash or a kill left behind.
+    Stale(String),
     /// The editor answered, and the answer is a refusal.
     Refused(String),
 }
@@ -30,7 +37,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Gone(why) | Self::Refused(why) => f.write_str(why),
+            Self::Gone(why) | Self::Refused(why) | Self::Stale(why) => f.write_str(why),
         }
     }
 }
@@ -47,10 +54,14 @@ impl Client {
     pub fn connect(discovery: &Discovery) -> Result<Self, Error> {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, discovery.port));
         let mut stream = TcpStream::connect_timeout(&addr, CONNECT).map_err(|error| {
-            Error::Gone(format!(
+            let why = format!(
                 "no editor is listening on {addr} (process {} may have quit): {error}",
                 discovery.pid
-            ))
+            );
+            match error.kind() {
+                ErrorKind::ConnectionRefused => Error::Stale(why),
+                _ => Error::Gone(why),
+            }
         })?;
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(CONNECT));
@@ -58,6 +69,27 @@ impl Client {
         stream
             .write_all(&wire::preamble(&discovery.token))
             .map_err(|error| Error::Gone(format!("the editor at {addr} went: {error}")))?;
+        // Whether anything answers at all, told apart from an answer that is
+        // late: a closed connection is a listener that is not this file's
+        // editor, and a silent one may be an editor stopped in a debugger.
+        let stale = || {
+            Error::Stale(format!(
+                "what listens at {addr} closed the connection without a word: it is not the \
+                 editor whose token the remote file holds, so the file is stale"
+            ))
+        };
+        match stream.peek(&mut [0; 1]) {
+            Ok(0) => return Err(stale()),
+            Ok(_) => {}
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(Error::Gone(format!(
+                    "the editor at {addr} did not greet within {} s; it may be stopped in a \
+                     debugger",
+                    CONNECT.as_secs()
+                )));
+            }
+            Err(_) => return Err(stale()),
+        }
         let mut payload = Vec::new();
         let hello = loop {
             match wire::read_frame(&mut stream, &mut payload) {
@@ -160,5 +192,104 @@ impl Client {
                 _ => continue,
             }
         }
+    }
+}
+
+/// Remove the remote file in `editor_dir` if it is stale, and say what was
+/// removed; `None` when there is no file, or its editor is there, or whether
+/// it is cannot be told. Removed only if it still holds the token it was read
+/// with, because an editor starting meanwhile may have just written its own.
+pub fn sweep(editor_dir: &Path) -> Option<String> {
+    let found = Discovery::read(editor_dir).ok()??;
+    match Client::connect(&found) {
+        Err(Error::Stale(why)) => {
+            found.remove(editor_dir);
+            Some(format!(
+                "removed the remote file process {} left behind: {why}",
+                found.pid
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    use super::*;
+    use crate::token::Token;
+    use crate::wire::Hello;
+
+    struct Dir(std::path::PathBuf);
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn dir(name: &str) -> Dir {
+        let dir = std::env::temp_dir().join(format!("orrin-remote-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Dir(dir)
+    }
+
+    fn file(dir: &Dir, port: u16) -> Discovery {
+        let discovery = Discovery {
+            port,
+            token: Token::generate(),
+            pid: 1,
+        };
+        discovery.write(&dir.0).unwrap();
+        discovery
+    }
+
+    /// A file whose port refuses, or whose listener hangs up unanswered, is
+    /// removed; one whose editor greets is left alone. Removing a live
+    /// editor's file would cut every client off from it with nothing to say so.
+    #[test]
+    fn only_a_file_no_editor_answers_for_is_swept() {
+        let refusing = dir("refused");
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        file(&refusing, port);
+        assert!(sweep(&refusing.0).is_some());
+        assert!(Discovery::read(&refusing.0).unwrap().is_none());
+
+        let stranger = dir("stranger");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        file(&stranger, listener.local_addr().unwrap().port());
+        let hangs_up = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut [0; 44]);
+        });
+        assert!(sweep(&stranger.0).is_some());
+        hangs_up.join().unwrap();
+        assert!(Discovery::read(&stranger.0).unwrap().is_none());
+
+        let live = dir("live");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        file(&live, listener.local_addr().unwrap().port());
+        let greets = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.read_exact(&mut [0; 44]).unwrap();
+            let hello = Hello {
+                version: wire::VERSION,
+                project: "game".into(),
+                pid: 1,
+            };
+            stream
+                .write_all(&wire::encode(wire::HELLO, &hello).unwrap())
+                .unwrap();
+            let _ = stream.read(&mut [0; 1]);
+        });
+        assert!(sweep(&live.0).is_none());
+        greets.join().unwrap();
+        assert!(Discovery::read(&live.0).unwrap().is_some());
     }
 }

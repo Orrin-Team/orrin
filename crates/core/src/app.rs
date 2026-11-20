@@ -1361,6 +1361,17 @@ impl ApplicationHandler for App {
             active.window.request_redraw();
         }
     }
+
+    /// Every way out of the loop comes through here, including the one that
+    /// never returns from it: on macOS, Quit from the app menu, Cmd+Q and the
+    /// Dock's Quit terminate the process from inside `applicationWillTerminate`,
+    /// so `run_app` does not return and nothing `App` owns is dropped. What
+    /// must not outlive the editor is let go here rather than left to `Drop`.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(active) = self.active.as_mut() {
+            active.editor.stop_remote();
+        }
+    }
 }
 
 fn close(renderer: &mut VulkanRenderer, event_loop: &ActiveEventLoop) {

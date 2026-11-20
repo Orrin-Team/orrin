@@ -19,9 +19,12 @@
 //! **Only once asked, and only with the token.** The remote is off unless
 //! Settings ▸ Agents turns it on or `ORRIN_REMOTE=1` does, and it needs a
 //! project: the port and token go to its `.orrin/remote`, owner-readable, and
-//! the file goes when the remote stops. A peer that does not open with the
-//! magic and that token is dropped having been told nothing. A connection's
-//! thread that panicked would end that connection alone.
+//! the file goes when the remote stops — on every way the editor leaves,
+//! macOS's Quit included, which ends the process without returning from the
+//! event loop (`App::exiting`). One a kill left behind is swept by the next
+//! editor to open the project and by `orrin mcp`. A peer that does not open
+//! with the magic and that token is dropped having been told nothing. A
+//! connection's thread that panicked would end that connection alone.
 //!
 //! # Threads
 //!
