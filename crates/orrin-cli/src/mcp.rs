@@ -60,7 +60,7 @@ const INSTRUCTIONS: &str = "Orrin is a game engine. The live tools read and chan
      player sees it, the scene alone, or the editor's window; quote frame_stats' banner with any number taken from \
      it. To playtest: editor_command play, game_input to press keys, actions and the mouse in the \
      running game, then screenshot, scene_read or console_read to see what happened, and \
-     editor_command stop. What agents may do is the developer's to set in Settings > Permissions: a refusal names \
+     editor_command stop. What agents may do is the developer's to set in Settings > Agents: a refusal names \
      the switch or folder rule, and project_info and editor_state report what is allowed.";
 
 /// The editor tools, which are the remote's methods by the same names.

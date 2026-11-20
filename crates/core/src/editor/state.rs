@@ -327,8 +327,7 @@ pub struct EditorState {
     /// The remote's virtual input device: an agent's playtest.
     pub game_input: super::remote::GameInput,
     /// The project's folder rules for agents, or why the file did not read —
-    /// which refuses every folder until it is fixed. See Settings ▸
-    /// Permissions.
+    /// which refuses every folder until it is fixed. See Settings ▸ Agents.
     pub agent_folders: Result<orrin_remote::permissions::Folders, String>,
     /// The assets folder relative to the project root, as a folder rule names
     /// it, for the asset index's paths and the folder presets.

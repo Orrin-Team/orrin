@@ -33,7 +33,7 @@ pub const USER_TABLE: [&str; 2] = ["agents", "allow"];
 pub const FOLDERS: &str = "agent-folders.toml";
 
 /// Where both are changed, as a refusal says.
-const WHERE: &str = "Settings ▸ Permissions";
+const WHERE: &str = "Settings ▸ Agents";
 
 /// One kind of thing an agent may be refused, at the grain a person would
 /// want to deny.
@@ -93,7 +93,7 @@ impl Capability {
         }
     }
 
-    /// What Settings ▸ Permissions calls it.
+    /// What Settings ▸ Agents calls it.
     pub fn label(self) -> &'static str {
         match self {
             Self::ReadScene => "Read scene and assets",

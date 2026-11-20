@@ -262,9 +262,9 @@ a paused game is advanced one stepped frame per input frame — and with the
 editor window unfocused. A cursor lock the game asks for because of an agent's
 click is the game's to see and never grabs the developer's pointer. One call
 is at most 256 steps and 10 s; everything it pressed is let go when it ends,
-however it ends. The switch is "Send game input" in Settings ▸ Permissions.
+however it ends. The switch is "Send game input" in Settings ▸ Agents.
 
-**Permissions.** Settings ▸ Permissions says what an agent may do, and every
+**Permissions.** Settings ▸ Agents says what an agent may do, and every
 tool is checked against it: a preset (Read only, Edit scene, Full control —
 the default — or Custom once a switch is changed), one switch for each kind of
 thing (reading the scene, the console, screenshots, frame stats, editing,

@@ -212,7 +212,7 @@ impl Editor {
         }
     }
 
-    /// Write the folder rules Settings ▸ Permissions changed, once the pointer
+    /// Write the folder rules Settings ▸ Agents changed, once the pointer
     /// lets go. They are read at every request, so the next one is governed.
     fn save_agent_folders(&mut self) {
         if !self.state.agent_folders_changed || self.ctx.input(|input| input.pointer.any_down()) {

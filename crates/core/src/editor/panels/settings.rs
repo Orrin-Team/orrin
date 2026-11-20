@@ -49,13 +49,13 @@
 //!
 //! **Any width.** Docked into a column the sidebar folds into one page picker.
 //!
-//! **Permissions are the person's, folders the project's.** The Permissions
-//! page's switches are `[agents.allow]` in the user's settings and its folder
-//! rules the project's `.orrin/agent-folders.toml` (`orrin_remote::permissions`
-//! holds both, and is what the editor and `orrin mcp` check against). They
-//! govern what Orrin's tools do for an agent. They do not confine an agent that
-//! can already write the project's files some other way, and the page does not
-//! claim to.
+//! **Permissions are the person's, folders the project's.** The switches in
+//! the Agents page's Permissions section are `[agents.allow]` in the user's
+//! settings and its folder rules the project's `.orrin/agent-folders.toml`
+//! (`orrin_remote::permissions` holds both, and is what the editor and `orrin
+//! mcp` check against). They govern what Orrin's tools do for an agent. They do
+//! not confine an agent that can already write the project's files some other
+//! way, and the page does not claim to.
 //!
 //! **Closed, it costs nothing:** the dock does not call [`body`]. Open, it is
 //! a handful of rows a frame and, on a Project page, three file stats a
@@ -105,7 +105,6 @@ pub enum Page {
     Scripting,
     Blender,
     Agents,
-    Permissions,
     Saving,
     Display,
     Startup,
@@ -113,13 +112,12 @@ pub enum Page {
 
 impl Page {
     const PROJECT: [Self; 3] = [Self::General, Self::Scenes, Self::Scripts];
-    const ORRIN: [Self; 9] = [
+    const ORRIN: [Self; 8] = [
         Self::Appearance,
         Self::Viewport,
         Self::Scripting,
         Self::Blender,
         Self::Agents,
-        Self::Permissions,
         Self::Saving,
         Self::Display,
         Self::Startup,
@@ -135,7 +133,6 @@ impl Page {
             Self::Scripting => "Scripting",
             Self::Blender => "Blender",
             Self::Agents => "Agents",
-            Self::Permissions => "Permissions",
             Self::Saving => "Saving",
             Self::Display => "Display",
             Self::Startup => "Startup",
@@ -212,6 +209,10 @@ impl Field {
             self,
             Self::Backend | Self::Threads | Self::Validation | Self::Log
         )
+    }
+
+    fn is_permission(self) -> bool {
+        matches!(self, Self::Preset | Self::Allow(_))
     }
 }
 
@@ -435,105 +436,105 @@ const ROWS: &[Row] = &[
         "mcp json copy clipboard client claude code configure setup",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Preset,
         "Preset",
         "What an agent may do through Orrin's tools; changing a switch below makes it Custom",
         "agent permission permissions access preset read only edit full control custom mcp",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::ReadScene),
         "Read scene and assets",
         "Read the open scene, the registered components and the asset index",
         "agent permission allow deny read outline blocks components assets index",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::Console),
         "Read the console",
         "Read the editor console's lines",
         "agent permission allow deny log logs messages errors warnings",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::Screenshot),
         "Screenshots",
         "Take a picture of the game or the scene",
         "agent permission allow deny image picture png view",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::FrameStats),
         "Frame stats",
         "Read frame times, the profiler and the run banner",
         "agent permission allow deny performance profiler fps timings",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::EditScene),
         "Edit the scene",
         "Change the open scene through scene_edit, each call one undo step",
         "agent permission allow deny edit spawn despawn set component reparent modify",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::PlayControl),
         "Play, pause and stop",
         "Play, pause, step and stop the game, and load scenes while it plays",
         "agent permission allow deny play pause stop step run game load unload",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::GameInput),
         "Send game input",
         "Press keys, buttons and actions in the playing game, as a playtest",
         "agent permission allow deny input keyboard mouse gamepad press playtest",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::UndoRedo),
         "Undo and redo",
         "Undo and redo the editor's steps, the developer's own included",
         "agent permission allow deny undo redo history",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::Selection),
         "Select and frame",
         "Change the selection and frame it in the camera",
         "agent permission allow deny select selection frame camera focus",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::Scenes),
         "Save, open and create scenes",
         "Save the open scene, open another, or make a new one",
         "agent permission allow deny save open new scene file write",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::ReloadScripts),
         "Reload scripts",
         "Swap in the game's last build",
         "agent permission allow deny hot reload scripts assembly",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::BuildScripts),
         "Build scripts",
         "Compile the project's C# with orrin build",
         "agent permission allow deny compile dotnet build csharp",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::RunTests),
         "Run tests",
         "Run the project's tests with orrin test",
         "agent permission allow deny test tests unit",
     ),
     row(
-        Page::Permissions,
+        Page::Agents,
         Field::Allow(Capability::OpenEditor),
         "Open the editor",
         "Launch an editor on the project with its remote on",
@@ -1109,8 +1110,15 @@ fn page(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
                             weak,
                         );
                     }
-                    rows_of(ui, cx, panel, |row| row.page == page);
-                    if page == Page::Permissions {
+                    rows_of(ui, cx, panel, |row| {
+                        row.page == page && !row.field.is_permission()
+                    });
+                    if page == Page::Agents {
+                        ui.add_space(14.0);
+                        heading(ui, "Permissions", "what Orrin's tools do for an agent");
+                        rows_of(ui, cx, panel, |row| {
+                            row.page == page && row.field.is_permission()
+                        });
                         folders(ui, cx.state, panel);
                     }
                 }

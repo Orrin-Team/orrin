@@ -164,7 +164,7 @@ fn page<T>(all: Vec<T>, offset: usize, limit: usize) -> (usize, Vec<T>, Option<u
 fn refused_folders(why: &str) -> String {
     format!(
         "{why}; agents are refused every folder until it reads. Fix it, or reset the folder \
-         rules in Settings ▸ Permissions"
+         rules in Settings ▸ Agents"
     )
 }
 
