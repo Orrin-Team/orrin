@@ -60,9 +60,14 @@
 //! **Closed, it costs nothing:** the dock does not call [`body`]. Open, it is
 //! a handful of rows a frame and, on a Project page, three file stats a
 //! second: the manifest and the two scenes it names. The Blender page looks
-//! for Blender, which searches the PATH, once a second.
+//! for Blender, which searches the PATH, once a second. The Agents page looks
+//! for the `orrin` its copy rows name and stats it once a second too, and
+//! starts it with `mcp --help`, off the frame's thread, only when that binary
+//! changes.
 
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
 
 use orrin_ecs::World;
@@ -716,8 +721,48 @@ pub struct SettingsPanel {
     manifest: Manifest,
     /// The Blender the Blender page would run, as last looked for.
     found: Option<Found>,
+    /// The `orrin` the Agents page's copy rows name, and what it answered.
+    cli: Option<Cli>,
     /// Why the last folder typed into Permissions was not added.
     folder_error: Option<String>,
+}
+
+/// Finding the CLI searches the PATH and asking it starts it, which for a
+/// freshly built unsigned binary on macOS can take well over a frame. So the
+/// page looks at most once a second, asks on a thread of its own, and asks
+/// again only when the path or the file changes: a rebuild clears the note.
+struct Cli {
+    at: Instant,
+    path: Option<PathBuf>,
+    stamp: Option<(SystemTime, u64)>,
+    asking: Option<Receiver<Probe>>,
+    answer: Option<Probe>,
+}
+
+impl Cli {
+    fn ask(path: Option<PathBuf>, stamp: Option<(SystemTime, u64)>) -> Self {
+        let mut cli = Self {
+            at: Instant::now(),
+            path,
+            stamp,
+            asking: None,
+            answer: None,
+        };
+        let Some(path) = cli.path.clone() else {
+            cli.answer = Some(Probe::NotFound);
+            return cli;
+        };
+        let (send, answered) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("orrin-cli-probe".to_owned())
+            .spawn(move || {
+                let _ = send.send(probe(&path));
+            });
+        if spawned.is_ok() {
+            cli.asking = Some(answered);
+        }
+        cli
+    }
 }
 
 /// `blend::locate` searches the PATH, so the page asks it at most once a
@@ -795,6 +840,34 @@ impl SettingsPanel {
         self.found
             .as_ref()
             .map_or((None, false), |found| (found.path.clone(), found.exists))
+    }
+
+    /// The note the copy rows carry about the `orrin` they name, once it has
+    /// answered and only when a client could not use it.
+    fn cli_warning(&mut self) -> Option<String> {
+        if self
+            .cli
+            .as_ref()
+            .is_none_or(|cli| cli.at.elapsed() >= RECHECK)
+        {
+            let path = find_orrin();
+            let stamp = path.as_deref().and_then(stamp);
+            match &mut self.cli {
+                Some(cli) if cli.path == path && cli.stamp == stamp => cli.at = Instant::now(),
+                _ => self.cli = Some(Cli::ask(path, stamp)),
+            }
+        }
+        let cli = self.cli.as_mut()?;
+        if let Some(asking) = &cli.asking {
+            match asking.try_recv() {
+                Ok(answer) => cli.answer = Some(answer),
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {}
+            }
+            cli.asking = None;
+        }
+        let path = cli.path.as_deref().unwrap_or(Path::new("orrin"));
+        cli_note(path, cli.answer.as_ref()?)
     }
 
     fn select(&mut self, page: Page) {
@@ -1153,11 +1226,20 @@ fn unloadable(ui: &mut egui::Ui, error: &str, state: &EditorState) {
 
 /// The rows `keep` accepts, in the order they are declared.
 fn rows_of(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, keep: impl Fn(&Row) -> bool) {
-    for row in ROWS.iter().filter(|row| keep(row)) {
+    let copies = |row: &Row| matches!(row.field, Field::McpConfig | Field::ClaudeCommand);
+    let mut rows = ROWS.iter().filter(|row| keep(row)).peekable();
+    while let Some(row) = rows.next() {
         if row.page.is_project() {
             project_row(ui, cx, panel, row);
         } else {
             orrin_row(ui, cx, panel, row);
+        }
+        // Once, under whichever of the two copy rows is shown last.
+        if copies(row)
+            && !rows.peek().is_some_and(|next| copies(next))
+            && let Some(warning) = panel.cli_warning()
+        {
+            note(ui, &warning, theme::ERROR);
         }
     }
 }
@@ -1555,6 +1637,10 @@ fn for_how_long(open: Duration) -> String {
 /// The `orrin` an agent's client should start: the one this editor would run
 /// an export with when it can find one, the one on the PATH otherwise.
 fn orrin_cli() -> String {
+    find_orrin().map_or_else(|| "orrin".to_owned(), |cli| cli.display().to_string())
+}
+
+fn find_orrin() -> Option<PathBuf> {
     let beside = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
@@ -1563,7 +1649,64 @@ fn orrin_cli() -> String {
         beside.as_deref(),
         std::env::var_os("PATH"),
     )
-    .map_or_else(|_| "orrin".to_owned(), |cli| cli.display().to_string())
+    .ok()
+}
+
+/// What the `orrin` the copy rows name answered to `mcp --help`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Probe {
+    Serves,
+    /// It ran and refused the subcommand: a build from before `orrin mcp`.
+    NoMcp,
+    /// It would not start, and the OS's reason.
+    WontStart(String),
+    /// No `orrin` was found to ask.
+    NotFound,
+}
+
+/// Run `cli mcp --help` with nothing attached, so it can neither start
+/// serving nor print into the editor's terminal.
+fn probe(cli: &Path) -> Probe {
+    if cfg!(feature = "export") {
+        return Probe::WontStart("an exported game runs no `orrin` CLI".to_owned());
+    }
+    let ran = std::process::Command::new(cli)
+        .args(["mcp", "--help"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match ran {
+        Ok(status) if status.success() => Probe::Serves,
+        Ok(_) => Probe::NoMcp,
+        Err(error) => Probe::WontStart(error.to_string()),
+    }
+}
+
+/// The note under the copy rows when a client could not use `cli`.
+fn cli_note(cli: &Path, probe: &Probe) -> Option<String> {
+    let path = cli.display();
+    // Cargo's release profile writes to a directory of that name.
+    let build = if cli.parent().and_then(Path::file_name) == Some("release".as_ref()) {
+        "`cargo build -p orrin-cli --release`"
+    } else {
+        "`cargo build -p orrin-cli`"
+    };
+    match probe {
+        Probe::Serves => None,
+        Probe::NoMcp => Some(format!(
+            "{path} is an older build with no `mcp` command, so a client that starts it fails \
+             to connect; rebuild it with {build}"
+        )),
+        Probe::WontStart(error) => Some(format!(
+            "{path} would not start ({error}), so what is copied here will not start either; \
+             build it with {build}"
+        )),
+        Probe::NotFound => Some(format!(
+            "No `orrin` was found beside the editor or on the PATH, so what is copied here will \
+             not start; build it with {build}"
+        )),
+    }
 }
 
 /// What `.mcp.json` holds to run `orrin mcp` on the project at `root`.
@@ -2400,6 +2543,53 @@ mod tests {
                 r"claude mcp add orrin -- '/opt/Orrin Engine/orrin' mcp --project '/Users/me/My Game'\''s'"
             );
         }
+    }
+
+    /// A client starts whatever `orrin` the copy rows name, so the page asks it
+    /// for `mcp` first: one that has it, one built before it, one not there.
+    #[cfg(all(unix, not(feature = "export")))]
+    #[test]
+    fn the_agents_page_warns_when_the_orrin_it_copies_cannot_serve_mcp() {
+        use std::os::unix::fs::PermissionsExt;
+        let tools = Dir::new("settings-cli-probe");
+        let stand_in = |name: &str, body: &str| {
+            let path = tools.write(name, format!("#!/bin/sh\n{body}\n").as_bytes());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let current = stand_in("current/orrin", r#"[ "$*" = "mcp --help" ] || exit 64"#);
+        let old = stand_in(
+            "old/orrin",
+            "echo \"error: unrecognized subcommand 'mcp'\" >&2\nexit 2",
+        );
+        let missing = tools.path().join("gone/orrin");
+
+        assert_eq!(probe(&current), Probe::Serves);
+        assert_eq!(probe(&old), Probe::NoMcp);
+        let gone = probe(&missing);
+        assert!(matches!(gone, Probe::WontStart(_)), "{gone:?}");
+
+        assert_eq!(cli_note(&current, &Probe::Serves), None);
+        let stale = cli_note(&old, &Probe::NoMcp).unwrap();
+        assert!(stale.contains(&old.display().to_string()), "{stale}");
+        assert!(stale.contains("`mcp`"), "{stale}");
+        assert!(stale.contains("`cargo build -p orrin-cli`"), "{stale}");
+        let release = cli_note(Path::new("/src/orrin/target/release/orrin"), &Probe::NoMcp);
+        assert!(
+            release
+                .as_deref()
+                .is_some_and(|note| note.contains("`cargo build -p orrin-cli --release`")),
+            "{release:?}"
+        );
+        let unstarted = cli_note(&missing, &gone).unwrap();
+        assert!(
+            unstarted.contains(&missing.display().to_string()),
+            "{unstarted}"
+        );
+        assert!(unstarted.contains("os error"), "{unstarted}");
+        let none = cli_note(Path::new("orrin"), &Probe::NotFound).unwrap();
+        assert!(none.contains("PATH"), "{none}");
+        assert!(none.contains("`cargo build -p orrin-cli`"), "{none}");
     }
 
     #[test]
