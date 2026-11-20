@@ -188,6 +188,8 @@ enum Field {
     Remote,
     /// An action too: the client's configuration, to the clipboard.
     McpConfig,
+    /// And the `claude mcp add` line, to the clipboard.
+    ClaudeCommand,
     /// Which of the presets the switches below it are.
     Preset,
     Allow(Capability),
@@ -434,6 +436,14 @@ const ROWS: &[Row] = &[
         "Copy a .mcp.json entry that runs `orrin mcp` for this project, for an MCP client such \
          as Claude Code",
         "mcp json copy clipboard client claude code configure setup",
+    ),
+    row(
+        Page::Agents,
+        Field::ClaudeCommand,
+        "Claude Code",
+        "Copy a `claude mcp add` command that runs `orrin mcp` for this project; run it in the \
+         folder Claude Code is started in, since it adds the server for that folder only",
+        "claude code mcp add command terminal shell cli copy clipboard install setup register",
     ),
     row(
         Page::Agents,
@@ -1542,28 +1552,60 @@ fn for_how_long(open: Duration) -> String {
     }
 }
 
-/// What `.mcp.json` holds to run `orrin mcp` on the project at `root`: the
-/// `orrin` this editor would run an export with when it can find one, the
-/// one on the PATH otherwise.
-fn mcp_config(root: &Path) -> String {
+/// The `orrin` an agent's client should start: the one this editor would run
+/// an export with when it can find one, the one on the PATH otherwise.
+fn orrin_cli() -> String {
     let beside = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let cli = crate::editor::export::find_cli(
+    crate::editor::export::find_cli(
         std::env::var_os(crate::editor::export::CLI_ENV),
         beside.as_deref(),
         std::env::var_os("PATH"),
     )
-    .map_or_else(|_| "orrin".to_owned(), |cli| cli.display().to_string());
+    .map_or_else(|_| "orrin".to_owned(), |cli| cli.display().to_string())
+}
+
+/// What `.mcp.json` holds to run `orrin mcp` on the project at `root`.
+fn mcp_config(root: &Path) -> String {
     let config = serde_json::json!({
         "mcpServers": {
             "orrin": {
-                "command": cli,
+                "command": orrin_cli(),
                 "args": ["mcp", "--project", root.display().to_string()],
             }
         }
     });
     serde_json::to_string_pretty(&config).unwrap_or_default()
+}
+
+/// The shell line that gives Claude Code `orrin mcp` on the project at
+/// `root`. No `--scope`: the default, local, is this person's alone, which is
+/// where a machine-local path belongs.
+fn claude_command(cli: &str, root: &Path) -> String {
+    format!(
+        "claude mcp add orrin -- {} mcp --project {}",
+        shell_word(cli),
+        shell_word(&root.display().to_string())
+    )
+}
+
+/// `word` as a shell reads it back as one word, left bare when nothing in it
+/// needs quoting.
+fn shell_word(word: &str) -> String {
+    if cfg!(windows) {
+        return if word.contains(' ') {
+            format!("\"{word}\"")
+        } else {
+            word.to_owned()
+        };
+    }
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+:,@".contains(c);
+    if !word.is_empty() && word.chars().all(safe) {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
 }
 
 /// A console line as a note on the page: its first letter capitalised.
@@ -1746,6 +1788,17 @@ fn control(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, field: Fie
                 && let Some(root) = root
             {
                 ui.ctx().copy_text(mcp_config(&root));
+            }
+        }
+        Field::ClaudeCommand => {
+            let root = cx.state.project_root.clone();
+            let button = ui
+                .add_enabled(root.is_some(), egui::Button::new("Copy command"))
+                .on_disabled_hover_text("Open a project first: the command names it");
+            if button.clicked()
+                && let Some(root) = root
+            {
+                ui.ctx().copy_text(claude_command(&orrin_cli(), &root));
             }
         }
         Field::Autosave => {
@@ -2062,7 +2115,7 @@ fn is_default(field: Field, s: &Settings, d: &Settings) -> bool {
         Field::BlenderPath => s.blender.path == d.blender.path,
         Field::LiveLink => s.blender.live_link == d.blender.live_link,
         Field::LinkPort => s.blender.port == d.blender.port,
-        Field::AddOn | Field::McpConfig => true,
+        Field::AddOn | Field::McpConfig | Field::ClaudeCommand => true,
         Field::Preset => s.agents.allow == d.agents.allow,
         Field::Allow(capability) => {
             s.agents.allow.allows(capability) == d.agents.allow.allows(capability)
@@ -2094,7 +2147,7 @@ fn restore(field: Field, s: &mut Settings, d: &Settings) {
         Field::BlenderPath => s.blender.path.clone_from(&d.blender.path),
         Field::LiveLink => s.blender.live_link = d.blender.live_link,
         Field::LinkPort => s.blender.port = d.blender.port,
-        Field::AddOn | Field::McpConfig => {}
+        Field::AddOn | Field::McpConfig | Field::ClaudeCommand => {}
         Field::Preset => s.agents.allow = d.agents.allow,
         Field::Allow(capability) => s
             .agents
@@ -2135,7 +2188,7 @@ fn default_text(field: Field, d: &Settings) -> String {
         Field::BlenderPath => "empty, an installed Blender".to_owned(),
         Field::LiveLink => on(d.blender.live_link),
         Field::LinkPort => d.blender.port.to_string(),
-        Field::AddOn | Field::McpConfig => String::new(),
+        Field::AddOn | Field::McpConfig | Field::ClaudeCommand => String::new(),
         Field::Preset => d.agents.allow.preset().label().to_owned(),
         Field::Allow(capability) => on(d.agents.allow.allows(capability)),
         Field::Remote => on(d.agents.remote),
@@ -2318,6 +2371,37 @@ mod tests {
         }
     }
 
+    /// The line is pasted into a shell, so a path with a space or a quote in it
+    /// must still arrive as one word, and a plain one is left as typed.
+    #[test]
+    fn the_claude_command_quotes_only_the_words_a_shell_would_split() {
+        if cfg!(windows) {
+            assert_eq!(
+                claude_command(r"C:\Orrin\orrin.exe", Path::new(r"C:\Games\game")),
+                r"claude mcp add orrin -- C:\Orrin\orrin.exe mcp --project C:\Games\game"
+            );
+            assert_eq!(
+                claude_command(
+                    r"C:\Program Files\Orrin\orrin.exe",
+                    Path::new(r"C:\Users\me\My Game's")
+                ),
+                r#"claude mcp add orrin -- "C:\Program Files\Orrin\orrin.exe" mcp --project "C:\Users\me\My Game's""#
+            );
+        } else {
+            assert_eq!(
+                claude_command(
+                    "/usr/local/bin/orrin",
+                    Path::new("/Users/me/games/space-1.0")
+                ),
+                "claude mcp add orrin -- /usr/local/bin/orrin mcp --project /Users/me/games/space-1.0"
+            );
+            assert_eq!(
+                claude_command("/opt/Orrin Engine/orrin", Path::new("/Users/me/My Game's")),
+                r"claude mcp add orrin -- '/opt/Orrin Engine/orrin' mcp --project '/Users/me/My Game'\''s'"
+            );
+        }
+    }
+
     #[test]
     fn every_orrin_row_resets_to_what_it_calls_its_default() {
         let defaults = Settings::default();
@@ -2360,7 +2444,11 @@ mod tests {
             // actions; a preset is every switch below it at once.
             if matches!(
                 row.field,
-                Field::Theme | Field::AddOn | Field::McpConfig | Field::Preset
+                Field::Theme
+                    | Field::AddOn
+                    | Field::McpConfig
+                    | Field::ClaudeCommand
+                    | Field::Preset
             ) {
                 continue;
             }

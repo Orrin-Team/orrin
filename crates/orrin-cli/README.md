@@ -204,6 +204,14 @@ for the open project:
 { "mcpServers": { "orrin": { "command": "orrin", "args": ["mcp", "--project", "/path/to/game"] } } }
 ```
 
+Claude Code can also be given it from a shell, in the folder it is started in;
+the editor's Settings ▸ Agents ▸ Copy command copies this line for the open
+project:
+
+```sh
+claude mcp add orrin -- orrin mcp --project /path/to/game
+```
+
 stdout carries protocol messages and nothing else; everything a build or a
 test run prints is captured into the tool's result. The tools:
 
