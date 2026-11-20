@@ -1566,6 +1566,390 @@ assert max(v.co.x for v in cube.data.vertices) < 2, "the edit was read, not comm
         from.elapsed()
     }
 
+    /// The windowed Blender's half of the test below. It never ticks the
+    /// session: the add-on's own timer does. It only watches what the add-on
+    /// does, opens the file again once it streams, makes each edit the way a
+    /// user's would be made — operators over the 3D view, in Object Mode and in
+    /// Edit Mode — announces each step on stdout, waits for a `go` on stdin
+    /// without blocking the event loop, and quits. The panel's `status_line` is
+    /// wrapped, so what the sidebar drew can be asserted.
+    #[cfg(not(feature = "export"))]
+    const WINDOWED: &str = r#"
+import bpy, bmesh, os, select, sys, threading, traceback
+sys.dont_write_bytecode = True
+PATH = "models/crate.blend"
+addon = sys.modules["bl_ext.user_default.orrin_link"]
+drawn = set()
+status_line = addon.status_line
+
+def recorded():
+    line = status_line()
+    drawn.add(line)
+    return line
+
+addon.status_line = recorded
+
+def say(name):
+    print("@orrin", name, flush=True)
+
+def go():
+    if not select.select([sys.stdin], [], [], 0)[0]:
+        return False
+    line = sys.stdin.readline()
+    if not line:
+        raise RuntimeError("the test closed stdin")
+    return line.strip() == "go"
+
+def view3d():
+    window = bpy.context.window_manager.windows[0]
+    area = next(a for a in window.screen.areas if a.type == "VIEW_3D")
+    region = next(r for r in area.regions if r.type == "WINDOW")
+    return dict(window=window, area=area, region=region)
+
+def script():
+    assert not bpy.app.background
+    view = view3d()
+    view["area"].spaces.active.show_region_ui = True
+    # Read-only until the sidebar has drawn its tabs once.
+    for tries in range(250):
+        try:
+            sidebar = next(r for r in view["area"].regions if r.type == "UI")
+            sidebar.active_panel_category = "Orrin"
+            break
+        except AttributeError:
+            yield
+    else:
+        raise RuntimeError("the sidebar never offered the Orrin tab")
+    while addon._session is None:
+        yield
+    session = addon._session
+    streaming = f"Streaming {PATH}"
+    while session.status_line() != streaming or streaming not in drawn:
+        yield
+
+    # One session, however many of `register`'s timer and the file's
+    # `load_post` asked for one, and it survives opening the file again:
+    # every edit below reaches the editor only through its handlers.
+    links = lambda: sum(t.name == "orrin-link" for t in threading.enumerate())
+    installed = lambda: [handlers.count(h) for handlers, h in session.handlers]
+    assert links() == 1 and installed() == [1, 1, 1, 1], (links(), installed())
+    sent = session.client.sent
+    with bpy.context.temp_override(window=view["window"]):
+        bpy.ops.wm.open_mainfile(filepath=bpy.data.filepath)
+    view = view3d()
+    while session.client.sent == sent or session.status_line() != streaming:
+        yield
+    assert addon._session is session, "the same session"
+    assert links() == 1 and installed() == [1, 1, 1, 1], (links(), installed())
+    say("live")
+    while not go():
+        yield
+
+    cube = bpy.data.objects["Cube"]
+    sent = session.client.sent
+    with bpy.context.temp_override(**view):
+        bpy.ops.object.select_all(action="DESELECT")
+        cube.select_set(True)
+        bpy.context.view_layer.objects.active = cube
+        bpy.ops.transform.translate(value=(0, 0, 2))
+    while session.client.sent == sent:
+        yield
+    say("moved")
+    while not go():
+        yield
+
+    with bpy.context.temp_override(**view):
+        bpy.ops.object.mode_set(mode="EDIT")
+    edit = bmesh.from_edit_mesh(cube.data)
+    for vertex in edit.verts:
+        vertex.select_set(vertex.co.x > 0)
+    edit.select_flush_mode()
+    bmesh.update_edit_mesh(cube.data)
+    sent = session.client.sent
+    with bpy.context.temp_override(**view):
+        bpy.ops.transform.translate(value=(3, 0, 0))
+    while session.client.sent == sent:
+        yield
+    assert cube.mode == "EDIT", "still in Edit Mode"
+    say("edited")
+    while not go():
+        yield
+    with bpy.context.temp_override(window=view["window"]):
+        bpy.ops.wm.quit_blender()
+
+steps = script()
+
+def drive():
+    try:
+        next(steps)
+    except StopIteration:
+        return None
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.flush()
+        os._exit(3)
+    return 0.02
+
+bpy.app.timers.register(drive, first_interval=0.1, persistent=True)
+"#;
+
+    /// A child process killed if the test ends before it does.
+    #[cfg(not(feature = "export"))]
+    struct Running(std::process::Child);
+
+    #[cfg(not(feature = "export"))]
+    impl Drop for Running {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    /// Every Blender preferences file of this machine's user, with its bytes.
+    #[cfg(not(feature = "export"))]
+    fn owners_preferences() -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Vec::new();
+        };
+        let root = std::path::Path::new(&home).join("Library/Application Support/Blender");
+        let mut found: Vec<_> = std::fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|version| version.path().join("config/userpref.blend"))
+            .filter_map(|path| Some((path.clone(), std::fs::read(&path).ok()?)))
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// The path the owner takes: the add-on installed and enabled as the
+    /// editor's Install button does it, a windowed Blender opening a file in
+    /// the project, `register` starting the session, and its own timer
+    /// streaming an Object Mode move and an Edit Mode edit to the slot, then
+    /// giving the slot back when Blender quits. Everything Blender keeps —
+    /// preferences, extensions, recent files, autosave and `quit.blend` — is in
+    /// a scratch profile and temporary directory, and the add-on is pointed at
+    /// this test's own port, so a Blender the user has open is never touched.
+    #[cfg(not(feature = "export"))]
+    #[test]
+    #[ignore = "needs Blender and opens a window"]
+    fn the_add_on_streams_from_its_own_timer_in_a_windowed_blender() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let started = Instant::now();
+        let blender = crate::asset_db::blend::locate(std::env::var_os("ORRIN_BLENDER"), None)
+            .expect("no Blender found; set ORRIN_BLENDER");
+        let owners = owners_preferences();
+        let profile = Dir::new("link-windowed-profile");
+        let temporary = profile.path().join("tmp");
+        std::fs::create_dir_all(&temporary).unwrap();
+        let scratch = |command: &mut Command| {
+            for overridden in [
+                "BLENDER_USER_CONFIG",
+                "BLENDER_USER_SCRIPTS",
+                "BLENDER_USER_EXTENSIONS",
+                "BLENDER_USER_DATAFILES",
+            ] {
+                command.env_remove(overridden);
+            }
+            command
+                .env("BLENDER_USER_RESOURCES", profile.path())
+                .env("TMPDIR", &temporary)
+                .env("PYTHONDONTWRITEBYTECODE", "1");
+        };
+
+        let dir = Dir::new("link-windowed");
+        let source = dir.path().join("models").join("crate.blend");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let mut command = Command::new(&blender);
+        scratch(&mut command);
+        let made = command
+            .args([
+                "--background",
+                "--factory-startup",
+                "--python-exit-code",
+                "1",
+                "--python-expr",
+                "import bpy, sys\n\
+                 bpy.ops.wm.save_as_mainfile(filepath=sys.argv[sys.argv.index('--') + 1])",
+                "--",
+            ])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+
+        let mut command = Command::new(&blender);
+        scratch(&mut command);
+        let installed = crate::editor::blender::install_with(command, &blender);
+        assert!(installed.is_ok(), "{installed:?}");
+
+        let mut db = open(&dir);
+        db.set_link(Some(0)).unwrap();
+        let port = db.link_status().unwrap().port;
+        let mut command = Command::new(&blender);
+        scratch(&mut command);
+        let pointed = command
+            .args([
+                "--background",
+                "--python-exit-code",
+                "1",
+                "--python-expr",
+                "import bpy, sys\n\
+                 prefs = bpy.context.preferences\n\
+                 link = prefs.addons['bl_ext.user_default.orrin_link'].preferences\n\
+                 link.port = int(sys.argv[sys.argv.index('--') + 1])\n\
+                 prefs.view.show_splash = False\n\
+                 bpy.ops.wm.save_userpref()",
+                "--",
+            ])
+            .arg(port.to_string())
+            .output()
+            .unwrap();
+        assert!(pointed.status.success(), "{pointed:?}");
+
+        let id = db.find("models/crate.blend").unwrap().id;
+        let (world, entity) = drawing(db, id);
+        let mut backend = HeadlessBackend::new();
+        update(&world, &mut backend);
+        assert!(world.resource::<AssetDatabase>().wait_idle(WAIT));
+        let errors = update(&world, &mut backend);
+        assert!(errors.is_empty(), "{errors:?}");
+        let slot = handle(&world, entity);
+        let triangles = |world: &World| {
+            let table = world.resource::<MeshBounds>();
+            table.geometry(slot).map_or(0, |g| g.triangles.len())
+        };
+        let disk = backend.mesh_bounds(slot).unwrap();
+        let disk_triangles = triangles(&world);
+        assert_eq!(disk_triangles, 12);
+
+        let log = profile.path().join("blender.log");
+        let printed = || std::fs::read_to_string(&log).unwrap_or_default();
+        let mut command = Command::new(&blender);
+        scratch(&mut command);
+        let launched = Instant::now();
+        let mut child = Running(
+            command
+                .args(["--window-geometry", "40", "40", "640", "480"])
+                .arg("--no-window-focus")
+                .arg(&source)
+                .arg("--python-expr")
+                .arg(WINDOWED)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(std::fs::File::create(&log).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let (said, heard) = mpsc::channel::<String>();
+        let stdout = child.0.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if said.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut stdin = child.0.stdin.take().unwrap();
+        let deadline = started + Duration::from_secs(90);
+
+        let until = |what: &str,
+                     child: &mut Running,
+                     backend: &mut HeadlessBackend,
+                     done: &dyn Fn(&World, &HeadlessBackend) -> bool| {
+            let from = Instant::now();
+            let mut announced = false;
+            loop {
+                update(&world, backend);
+                while let Ok(line) = heard.try_recv() {
+                    announced |= line == format!("@orrin {what}");
+                }
+                if announced && done(&world, backend) {
+                    return from.elapsed();
+                }
+                let exited = child.0.try_wait().unwrap();
+                assert!(
+                    exited.is_none() && from.elapsed() < WAIT && Instant::now() < deadline,
+                    "{what}: Blender {}; it printed:\n{}",
+                    exited.map_or("timed out".to_owned(), |status| format!(
+                        "exited with {status}"
+                    )),
+                    printed()
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        until("live", &mut child, &mut backend, &|world, _| {
+            let db = world.resource::<AssetDatabase>();
+            db.link_status().unwrap().live == ["models/crate.blend"]
+        });
+        let live = launched.elapsed();
+        let streamed = backend.mesh_bounds(slot).unwrap();
+        assert!(
+            near(streamed, disk),
+            "{streamed:?} against the file's {disk:?}"
+        );
+        assert_eq!(triangles(&world), disk_triangles, "the file's triangles");
+        writeln!(stdin, "go").unwrap();
+
+        let moved = until("moved", &mut child, &mut backend, &|_, backend| {
+            let now = backend.mesh_bounds(slot).unwrap();
+            (now.max.y - (disk.max.y + 2.0)).abs() < 1e-4
+        });
+        writeln!(stdin, "go").unwrap();
+
+        let edited = until("edited", &mut child, &mut backend, &|_, backend| {
+            let now = backend.mesh_bounds(slot).unwrap();
+            (now.max.x - (disk.max.x + 3.0)).abs() < 1e-4
+                && (now.max.y - (disk.max.y + 2.0)).abs() < 1e-4
+        });
+        writeln!(stdin, "go").unwrap();
+        let quit = Instant::now();
+
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Blender did not quit; it printed:\n{}",
+                printed()
+            );
+            update(&world, &mut backend);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success(), "Blender failed:\n{}", printed());
+        until_back(&world, &mut backend);
+        let gone = quit.elapsed();
+        assert!(near(backend.mesh_bounds(slot).unwrap(), disk));
+        assert_eq!(triangles(&world), disk_triangles);
+        assert!(
+            !printed().contains("Traceback"),
+            "the add-on raised:\n{}",
+            printed()
+        );
+        assert!(
+            owners_preferences() == owners,
+            "this machine's own Blender preferences changed: {:?}",
+            owners.iter().map(|(path, _)| path).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "windowed Blender: from starting it to live {live:?}, an Object Mode move to the \
+             slot {moved:?}, an Edit Mode edit {edited:?}, and the file back {gone:?} after it \
+             was told to quit; {} preferences file(s) of the user's checked unchanged",
+            owners.len()
+        );
+    }
+
     /// A grid of `side` x `side` quads in the XZ plane, `2 x side^2`
     /// triangles, with shared vertices as a smooth-shaded grid has them.
     fn grid(path: &str, side: u32, lift: f32) -> Vec<u8> {

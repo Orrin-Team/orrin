@@ -144,7 +144,7 @@ fn install(blender: &Path) -> Result<String, String> {
 
 /// `command` is Blender, with whatever environment it is to run in.
 #[cfg(not(feature = "export"))]
-fn install_with(mut command: Command, blender: &Path) -> Result<String, String> {
+pub(crate) fn install_with(mut command: Command, blender: &Path) -> Result<String, String> {
     let failed = |why: String| format!("the Blender add-on could not be installed: {why}");
     let scratch = Scratch::new().map_err(failed)?;
     let package = scratch.0.join("orrin_link");

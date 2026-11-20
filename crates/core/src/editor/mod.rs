@@ -4,7 +4,7 @@
 //! `gfx/vulkan/overlay.rs`).
 
 mod autosave;
-mod blender;
+pub(crate) mod blender;
 mod cadence;
 pub(crate) mod catalog;
 mod dock;
