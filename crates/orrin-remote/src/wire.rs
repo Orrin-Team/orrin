@@ -36,8 +36,9 @@ pub const ERROR: u8 = 2;
 pub const REQUEST: u8 = 3;
 /// Engine to client: a [`Response`].
 pub const RESPONSE: u8 = 4;
-/// Either way: a `u64` request id, then raw bytes belonging to that request's
-/// response. Reserved; nothing sends one yet.
+/// Engine to client: a `u64` request id, then raw bytes belonging to that
+/// request's response — a screenshot's PNG — sent just before the response,
+/// so a JSON body never carries them as text.
 pub const BLOB: u8 = 5;
 
 /// What a peer opened with.
@@ -130,6 +131,21 @@ pub fn frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
     out.push(kind);
     out.extend_from_slice(payload);
     Ok(out)
+}
+
+/// A blob frame carrying `bytes` for request `id`, or why it cannot be sent.
+pub fn blob(id: u64, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut payload = Vec::with_capacity(8 + bytes.len());
+    payload.extend_from_slice(&id.to_le_bytes());
+    payload.extend_from_slice(bytes);
+    frame(BLOB, &payload)
+}
+
+/// A blob frame's payload as its request id and its bytes; `None` for one too
+/// short to hold an id.
+pub fn decode_blob(payload: &[u8]) -> Option<(u64, &[u8])> {
+    let (id, bytes) = payload.split_first_chunk::<8>()?;
+    Some((u64::from_le_bytes(*id), bytes))
 }
 
 /// The greeting, which says the token was accepted.
@@ -352,6 +368,18 @@ mod tests {
                 let _ = decode_response(body);
                 let _ = decode_hello(body);
             }
+        }
+    }
+
+    #[test]
+    fn a_blob_carries_its_request_id_ahead_of_its_bytes() {
+        let sent = blob(7, b"\x89PNG").unwrap();
+        let mut payload = Vec::new();
+        assert_eq!(read_frame(&mut sent.as_slice(), &mut payload), Ok(BLOB));
+        assert_eq!(decode_blob(&payload), Some((7, &b"\x89PNG"[..])));
+        assert_eq!(decode_blob(&payload[..8]), Some((7, &b""[..])));
+        for short in 0..8 {
+            assert_eq!(decode_blob(&payload[..short]), None);
         }
     }
 

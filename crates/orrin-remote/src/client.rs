@@ -91,6 +91,17 @@ impl Client {
 
     /// Call `method` with `params` and wait for its answer.
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, Error> {
+        self.call_with_blob(method, params)
+            .map(|(result, _)| result)
+    }
+
+    /// [`call`](Self::call), with the bytes the editor sent ahead of the
+    /// answer, for a method that sends any.
+    pub fn call_with_blob(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<(Value, Option<Vec<u8>>), Error> {
         let id = self.next;
         self.next += 1;
         let request = Request {
@@ -102,6 +113,7 @@ impl Client {
         self.stream
             .write_all(&frame)
             .map_err(|error| Error::Gone(format!("the editor went: {error}")))?;
+        let mut blob = None;
         loop {
             let kind = match wire::read_frame(&mut self.stream, &mut self.payload) {
                 Ok(kind) => kind,
@@ -127,7 +139,7 @@ impl Client {
                         continue;
                     }
                     return match (response.result, response.error) {
-                        (Some(result), None) => Ok(result),
+                        (Some(result), None) => Ok((result, blob)),
                         (_, Some(error)) => Err(Error::Refused(error)),
                         (None, None) => Err(Error::Gone("an empty response".into())),
                     };
@@ -136,6 +148,13 @@ impl Client {
                     return Err(Error::Gone(
                         String::from_utf8_lossy(&self.payload).into_owned(),
                     ));
+                }
+                wire::BLOB => {
+                    if let Some((of, bytes)) = wire::decode_blob(&self.payload)
+                        && of == id
+                    {
+                        blob = Some(bytes.to_vec());
+                    }
                 }
                 // A kind added since this client, skipped by its length.
                 _ => continue,

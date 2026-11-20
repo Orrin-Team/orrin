@@ -1235,6 +1235,10 @@ impl ApplicationHandler for App {
                     .renderer
                     .set_present(*self.world.resource::<PresentSettings>());
 
+                if active.editor.take_screenshot_request() {
+                    active.renderer.request_screenshot();
+                }
+
                 let Active {
                     renderer, editor, ..
                 } = active;
@@ -1284,6 +1288,12 @@ impl ApplicationHandler for App {
                         Some(self.ui.frame()),
                         overlay,
                     );
+                }
+                // Only a frame the remote asked of drew one; for any other this
+                // is the check of an `Option`.
+                let reading = Instant::now();
+                if let Some(taken) = renderer.take_screenshot() {
+                    editor.screenshot_taken(taken, reading.elapsed());
                 }
 
                 #[cfg(feature = "scripting")]

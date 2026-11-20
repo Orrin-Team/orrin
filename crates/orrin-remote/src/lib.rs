@@ -47,7 +47,7 @@
 //! | 2 | `error` | editor | UTF-8: why the connection is ending |
 //! | 3 | `request` | client | JSON [`Request`]: `id` (a `u64`), `method`, `params` |
 //! | 4 | `response` | editor | JSON [`Response`]: `id`, and `result` or `error` |
-//! | 5 | `blob` | either | `u64` request id, then bytes belonging to that response (reserved) |
+//! | 5 | `blob` | editor | `u64` request id, then bytes belonging to that request's response, sent just before it |
 //!
 //! A response carries its request's id. Requests that reach the editor's
 //! frame are answered in the order they were sent; one refused before it gets

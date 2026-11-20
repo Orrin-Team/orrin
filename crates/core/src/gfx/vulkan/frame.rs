@@ -199,6 +199,12 @@ pub struct FrameConfig {
     /// editor is showing one *and* something it shows changed. See
     /// [`material_preview`](super::material_preview).
     pub material_preview: bool,
+    /// Whether this frame also tonemaps the scene into an image of its own,
+    /// for `VulkanRenderer::take_screenshot` to read back: the editor's remote
+    /// asked for one. Off is the frame exactly as it is without the feature —
+    /// no node, no image, no barrier — and a frame that asks recompiles the
+    /// graph twice, as one that redraws the material sphere does.
+    pub screenshot: bool,
 }
 
 /// Which piece of engine code a graph node runs.
@@ -300,6 +306,9 @@ pub enum PassBody {
     MaterialPreview,
     /// That sphere supersampled down and tonemapped, for the overlay to sample.
     MaterialPreviewResolve,
+    /// The tonemap again, into the screenshot's own image: the scene with
+    /// nothing drawn over it.
+    Screenshot,
     Overlay,
     ShadowCascade(u32),
     /// Every point and spot light's faces, in one pass over one atlas. A tile is
@@ -368,6 +377,9 @@ pub struct FrameIds {
     /// The wireframe's mode, and the depth it hides edges with when it has one.
     pub wireframe: Option<(super::wireframe::Wireframe, Option<ResourceId>)>,
     pub material_preview: Option<MaterialPreviewIds>,
+    /// The screenshot's image, which the renderer owns for the one frame that
+    /// draws it.
+    pub screenshot: Option<ResourceId>,
 }
 
 /// The inspector's material sphere: shaded into `hdr` against `depth`, then
@@ -1763,6 +1775,29 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .build();
     record(id, PassBody::Tonemap, &mut bodies);
 
+    // The tonemap's inputs read a second time, into an image of the window's
+    // format so the tonemap's own pipeline draws it. Only reads of what the
+    // tonemap already reads, so the frame's other images keep their usage,
+    // and it ends sampled because the readback leaves it that way.
+    let screenshot = config.screenshot.then(|| {
+        let image = builder.import_image(
+            "screenshot",
+            ImageDesc::new(config.color_format),
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let mut pass = builder
+            .pass("screenshot", PassKind::Inline)
+            .access(scene_color, Access::Sampled)
+            .access(exposure, Access::StorageRead);
+        if let Some(bloom) = bloom {
+            pass = pass.access(bloom.result(), Access::Sampled);
+        }
+        let id = pass.access(image, Access::ColorAttachment).build();
+        record(id, PassBody::Screenshot, &mut bodies);
+        image
+    });
+
     // First onto the tonemapped image, so the game's UI and every other mark the
     // editor makes stay on top of it. Over the shaded frame it reads the prepass
     // depth to hide covered edges — read-only, so the prepass stays its only
@@ -1906,6 +1941,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             outline_mask,
             wireframe,
             material_preview,
+            screenshot,
         },
         bodies,
     })

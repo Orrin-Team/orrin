@@ -12,6 +12,7 @@
 //! | `asset_find` | `kind`, `path`, `limit`, `offset` | indexed assets: id, path, kind, load state, import error |
 //! | `console_read` | `cursor`, `level`, `limit` | console entries numbered from `cursor`, and the next cursor |
 //! | `frame_stats` | `limit` | the run banner, frame time, and the profiler's CPU phases and GPU passes |
+//! | `screenshot` | `max_size` | the scene as a PNG in a blob frame, then its size and timings ([`shot`](super::shot)) |
 //! | `scene_edit` | `label`, `ops` | the step's label, the ops applied, ids spawned and given |
 //! | `editor_command` | `command` and its own | what the command did, once it can be seen |
 //!
@@ -34,21 +35,24 @@ use crate::scene::{Camera, LogBuffer, LogLevel, Name, Play, PlayState, persist};
 
 type FxHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
 
-const METHODS: [&str; 8] = [
+const METHODS: [&str; 9] = [
     "editor_state",
     "scene_read",
     "component_list",
     "asset_find",
     "console_read",
     "frame_stats",
+    "screenshot",
     "scene_edit",
     "editor_command",
 ];
 
-/// An answer now, or a command held until its effect can be seen.
+/// An answer now, a command held until its effect can be seen, or a
+/// screenshot to be drawn this size at most.
 pub(super) enum Reply {
     Now(Result<Value, String>),
     Held(Held),
+    Screenshot(u32),
 }
 
 pub(super) fn answer(
@@ -60,6 +64,10 @@ pub(super) fn answer(
     let params = &request.params;
     let method = request.method.as_str();
     let answer = match method {
+        "screenshot" => match super::shot::max_size(params) {
+            Ok(size) => return Reply::Screenshot(size),
+            Err(refused) => Err(refused),
+        },
         "scene_edit" => super::edit::scene_edit(world, registry, state, params),
         "editor_command" => match super::command::editor_command(world, state, params) {
             Ok(Err(held)) => return Reply::Held(held),
@@ -97,7 +105,7 @@ fn read(
 struct Nothing {}
 
 /// Absent params are every default.
-fn params_of<T: DeserializeOwned + Default>(params: &Value) -> Result<T, String> {
+pub(super) fn params_of<T: DeserializeOwned + Default>(params: &Value) -> Result<T, String> {
     if params.is_null() {
         return Ok(T::default());
     }

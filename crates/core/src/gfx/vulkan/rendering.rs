@@ -349,6 +349,10 @@ pub(super) fn rendering_info(
                 depth: Some(depth_scratch(images.texture(ids.depth))),
             }
         }
+        // Every pixel written, as the tonemap writes the window's.
+        PassBody::Screenshot => color_only(overwritten(
+            images.texture(ids.screenshot.expect("a screenshot pass without its image")),
+        )),
         // Every pixel written by the full-screen resolve.
         PassBody::MaterialPreviewResolve => color_only(overwritten(
             images.texture(

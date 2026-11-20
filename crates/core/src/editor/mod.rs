@@ -198,6 +198,25 @@ impl Editor {
         }
     }
 
+    /// Whether the remote wants the next frame drawn into a screenshot too. A
+    /// check of an `Option` with the remote off.
+    pub fn take_screenshot_request(&mut self) -> bool {
+        self.remote
+            .as_mut()
+            .is_some_and(remote::Remote::wants_screenshot)
+    }
+
+    /// The screenshot the renderer was asked for, read back in `readback`.
+    pub fn screenshot_taken(
+        &mut self,
+        taken: Result<(Vec<u8>, [u32; 2]), String>,
+        readback: std::time::Duration,
+    ) {
+        if let Some(remote) = &mut self.remote {
+            remote.screenshot_taken(taken, readback);
+        }
+    }
+
     /// A script reload landed, for the remote waiting on it.
     pub fn script_reloaded(&mut self, swapped: bool, message: String) {
         self.state.script_reloaded(swapped, message);

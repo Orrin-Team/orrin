@@ -67,6 +67,7 @@
 mod answer;
 mod command;
 mod edit;
+mod shot;
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -184,6 +185,8 @@ pub struct Remote {
     batch: Vec<Waiting>,
     /// Commands raised and not yet seen to land, oldest first.
     held: Vec<Holding>,
+    /// Screenshots asked for and not yet read back.
+    shots: Vec<shot::Shot>,
 }
 
 /// A held command, and who is waiting for it.
@@ -242,6 +245,7 @@ impl Remote {
             editor_dir: editor_dir.to_owned(),
             batch: Vec::new(),
             held: Vec::new(),
+            shots: Vec::new(),
         };
         // Written once something is listening, so a client that reads it can
         // connect; a remote nobody can find is no remote.
@@ -269,7 +273,7 @@ impl Remote {
         state: &mut EditorState,
     ) -> bool {
         let news = self.shared.news.load(Ordering::Acquire);
-        if !news && self.held.is_empty() {
+        if !news && self.held.is_empty() && self.shots.is_empty() {
             return false;
         }
         crate::profile_scope!("remote");
@@ -277,8 +281,26 @@ impl Remote {
             shared,
             batch,
             held,
+            shots,
             ..
         } = self;
+        if !shots.is_empty() {
+            let open = |peer: Peer| lock(&shared.connections).open.contains_key(&peer);
+            shots.retain(|shot| {
+                if !open(shot.peer) {
+                    return false;
+                }
+                if shot.raised.elapsed() < command::DEADLINE {
+                    return true;
+                }
+                let why = format!(
+                    "no frame drew the screenshot within {} s; a minimised window draws none",
+                    command::DEADLINE.as_secs()
+                );
+                shared.send(shot.peer, encoded(shot.id, "screenshot", Err(why)));
+                false
+            });
+        }
         if !held.is_empty() {
             let open = |peer: Peer| lock(&shared.connections).open.contains_key(&peer);
             held.retain_mut(|holding| {
@@ -306,6 +328,23 @@ impl Remote {
         for Waiting { peer, request } in batch.drain(..) {
             let answer = match answer::answer(&request, world, registry, state) {
                 answer::Reply::Now(answer) => answer,
+                answer::Reply::Screenshot(max_size) => {
+                    if !shots.iter().any(|shot| shot.peer == peer) {
+                        shots.push(shot::Shot {
+                            peer,
+                            id: request.id,
+                            max_size,
+                            raised: std::time::Instant::now(),
+                            asked: false,
+                        });
+                        continue;
+                    }
+                    Err(
+                        "one screenshot at a time: this connection's last one is still being \
+                         taken"
+                            .to_owned(),
+                    )
+                }
                 answer::Reply::Held(command) => {
                     let mine = held.iter().filter(|holding| holding.peer == peer).count();
                     if mine < HELD {
@@ -325,6 +364,45 @@ impl Remote {
             shared.send(peer, encoded(request.id, &request.method, answer));
         }
         true
+    }
+
+    /// Whether a screenshot was asked for since the last call: the renderer is
+    /// to draw one into the next frame. A check of an empty list otherwise.
+    pub fn wants_screenshot(&mut self) -> bool {
+        let mut wanted = false;
+        for shot in self.shots.iter_mut().filter(|shot| !shot.asked) {
+            shot.asked = true;
+            wanted = true;
+        }
+        wanted
+    }
+
+    /// The frame the renderer was asked for has been read back, in
+    /// `readback`: every screenshot waiting on it is scaled, encoded and
+    /// answered off this thread.
+    pub fn screenshot_taken(
+        &mut self,
+        taken: Result<(Vec<u8>, [u32; 2]), String>,
+        readback: std::time::Duration,
+    ) {
+        let (waiting, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shots)
+            .into_iter()
+            .partition(|shot| shot.asked);
+        self.shots = later;
+        match taken {
+            Ok((pixels, extent)) => {
+                let pixels = Arc::new(pixels);
+                for shot in waiting {
+                    shot::deliver(&self.shared, shot, pixels.clone(), extent, readback);
+                }
+            }
+            Err(why) => {
+                for shot in waiting {
+                    let answer = encoded(shot.id, "screenshot", Err(why.clone()));
+                    self.shared.send(shot.peer, answer);
+                }
+            }
+        }
     }
 
     /// Stop every thread, wait for them, and take the remote file back.
