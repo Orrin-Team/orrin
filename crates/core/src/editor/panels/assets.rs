@@ -396,7 +396,9 @@ fn pick_files() -> Vec<PathBuf> {
         .set_title("Import files into the project")
         .add_filter(
             "Assets",
-            &["png", "jpg", "jpeg", "gltf", "glb", "omat", "oprefab"],
+            &[
+                "png", "jpg", "jpeg", "gltf", "glb", "blend", "omat", "oprefab",
+            ],
         );
     pollster::block_on(dialog.pick_files())
         .unwrap_or_default()
