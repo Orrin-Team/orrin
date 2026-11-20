@@ -318,6 +318,12 @@ pub struct EditorState {
     /// The remote as Settings ▸ Agents shows it: `None` while it is off, and
     /// why it is not listening when it should be.
     pub remote: Option<Result<super::remote::RemoteStatus, String>>,
+    /// How many times [`apply`](Self::apply) has run: the remote waits on it
+    /// to see a request it raised carried out.
+    applied: u64,
+    /// How many script reloads have landed, and how the last one went:
+    /// whether it swapped, and what the console was told.
+    reloads: (u64, Option<(bool, String)>),
     /// Settings ▸ Blender's Install add-on, running or as it last ended.
     pub addon: super::blender::Install,
     /// How the viewport draws the scene: shaded, or as its edges. `None` is
@@ -520,6 +526,8 @@ impl Default for EditorState {
             settings_panel: Default::default(),
             link_error: None,
             remote: None,
+            applied: 0,
+            reloads: (0, None),
             addon: Default::default(),
             wireframe: None,
             material_previews: Default::default(),
@@ -1001,6 +1009,22 @@ impl EditorState {
                 log(world, level, message);
             }
         }
+        self.applied += 1;
+    }
+
+    /// How many times [`apply`](Self::apply) has run.
+    pub fn applied(&self) -> u64 {
+        self.applied
+    }
+
+    /// A script reload landed: whether it swapped, and what it said.
+    pub fn script_reloaded(&mut self, swapped: bool, message: String) {
+        self.reloads = (self.reloads.0 + 1, Some((swapped, message)));
+    }
+
+    /// How many script reloads have landed, and the last one's outcome.
+    pub fn reloads(&self) -> (u64, Option<&(bool, String)>) {
+        (self.reloads.0, self.reloads.1.as_ref())
     }
 
     fn scene(
@@ -1234,7 +1258,7 @@ fn framed(world: &World, selection: &[Entity]) -> Option<scene::Camera> {
 ///
 /// The mesh case lives here rather than in `scene::prefab`, because a script's
 /// `Prefab.Instantiate` reaches that too and places only prefabs.
-fn place(
+pub(super) fn place(
     world: &mut World,
     registry: &Registry,
     asset: AssetId,

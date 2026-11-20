@@ -6,13 +6,15 @@
 //!
 //! # What a connection may do
 //!
-//! **Read, today.** Every method answers from what the frame's thread already
-//! holds and changes nothing, not even an entity's lack of an
-//! [`EntityId`](orrin_registry::EntityId):
-//! an entity that has none is named by its slot, `#12`, which holds for this
-//! session only, rather than given one the way an edit or a save would. Which
-//! world was read — the scene being edited or the fork a playing game runs
-//! on — is in every answer that reads one ([`answer`] lists the methods).
+//! **Read, and change only the way the editor's own controls do.** A read
+//! changes nothing, not even an entity's lack of an
+//! [`EntityId`](orrin_registry::EntityId): an entity that has none is named by
+//! its slot, `#12`, which holds for this session only. Which world was read —
+//! the scene being edited or the fork a playing game runs on — is in every
+//! answer that reads one ([`answer`] lists the methods). A change to the scene
+//! is a `scene_edit`, one labelled batch through the edit pipeline and one
+//! undo step ([`edit`]); anything else is an `editor_command`, the request its
+//! button raises ([`command`]). There is no other way in.
 //!
 //! **Only once asked, and only with the token.** The remote is off unless
 //! Settings ▸ Agents turns it on or `ORRIN_REMOTE=1` does, and it needs a
@@ -45,6 +47,14 @@
 //! first; the rest wait for the next. A flood costs latency, not frame time,
 //! and past [`QUEUED`] waiting a request is refused as busy rather than held.
 //!
+//! **Held commands.** A command is carried out after it is raised — by the
+//! UI pass later in the frame, or a script reload by the next frame's script
+//! phase — so it waits beside the queue, not in it, and is answered on a later
+//! frame once its effect can be seen, or at its deadline. At most [`HELD`] a
+//! connection; they go with the connection, and while any wait the idle frame
+//! also pays a look at their list. A frame that took a request makes the UI
+//! pass due, since that pass is what carries a command out.
+//!
 //! **Nothing wakes the loop, because nothing has to.** The event loop runs on
 //! `ControlFlow::Poll` and asks for a redraw at every `about_to_wait`, and
 //! winit delivers that redraw to an unfocused or covered window too, so a
@@ -55,6 +65,8 @@
 //! app only offers it to the editor.
 
 mod answer;
+mod command;
+mod edit;
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -86,6 +98,10 @@ pub const BUDGET: usize = 8;
 
 /// Requests waiting, across every connection, before another is refused.
 pub const QUEUED: usize = 256;
+
+/// Commands one connection may have held at once. They wait beside the queue
+/// rather than in it, so one that never lands holds up nothing behind it.
+pub const HELD: usize = 4;
 
 /// What the remote is doing, for Settings ▸ Agents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +182,15 @@ pub struct Remote {
     editor_dir: PathBuf,
     /// This frame's requests, kept for its allocation.
     batch: Vec<Waiting>,
+    /// Commands raised and not yet seen to land, oldest first.
+    held: Vec<Holding>,
+}
+
+/// A held command, and who is waiting for it.
+struct Holding {
+    peer: Peer,
+    id: u64,
+    held: command::Held,
 }
 
 impl Remote {
@@ -216,6 +241,7 @@ impl Remote {
             },
             editor_dir: editor_dir.to_owned(),
             batch: Vec::new(),
+            held: Vec::new(),
         };
         // Written once something is listening, so a client that reads it can
         // connect; a remote nobody can find is no remote.
@@ -233,13 +259,47 @@ impl Remote {
         }
     }
 
-    /// Answer up to [`BUDGET`] of the requests waiting, oldest first.
-    pub fn serve(&mut self, world: &mut World, registry: &Registry, state: &mut EditorState) {
-        if !self.shared.news.load(Ordering::Acquire) {
-            return;
+    /// Answer the held commands that have landed, then up to [`BUDGET`] of
+    /// the requests waiting, oldest first. Whether any request was taken: the
+    /// UI pass is what carries a command out.
+    pub fn serve(
+        &mut self,
+        world: &mut World,
+        registry: &Registry,
+        state: &mut EditorState,
+    ) -> bool {
+        let news = self.shared.news.load(Ordering::Acquire);
+        if !news && self.held.is_empty() {
+            return false;
         }
         crate::profile_scope!("remote");
-        let Self { shared, batch, .. } = self;
+        let Self {
+            shared,
+            batch,
+            held,
+            ..
+        } = self;
+        if !held.is_empty() {
+            let open = |peer: Peer| lock(&shared.connections).open.contains_key(&peer);
+            held.retain_mut(|holding| {
+                if !open(holding.peer) {
+                    return false;
+                }
+                holding.held.frames += 1;
+                let answer = match holding.held.poll(world, state) {
+                    Some(answer) => answer,
+                    None if holding.held.frames >= command::DEADLINE => {
+                        Err(holding.held.expired(world))
+                    }
+                    None => return true,
+                };
+                shared.send(holding.peer, encoded(holding.id, "editor_command", answer));
+                false
+            });
+        }
+        if !news {
+            return false;
+        }
         {
             let mut queue = lock(&shared.queue);
             let take = queue.len().min(BUDGET);
@@ -247,21 +307,27 @@ impl Remote {
             shared.news.store(!queue.is_empty(), Ordering::Release);
         }
         for Waiting { peer, request } in batch.drain(..) {
-            let answer = answer::answer(&request, world, registry, state);
-            let response = Response::answer(Some(request.id), answer);
-            let frame = wire::encode(wire::RESPONSE, &response).unwrap_or_else(|why| {
-                let refused = Response::answer(
-                    Some(request.id),
+            let answer = match answer::answer(&request, world, registry, state) {
+                answer::Reply::Now(answer) => answer,
+                answer::Reply::Held(command) => {
+                    let mine = held.iter().filter(|holding| holding.peer == peer).count();
+                    if mine < HELD {
+                        held.push(Holding {
+                            peer,
+                            id: request.id,
+                            held: command,
+                        });
+                        continue;
+                    }
                     Err(format!(
-                        "the answer to `{}` is too large to send ({why}); ask for less, with \
-                         `limit`",
-                        request.method
-                    )),
-                );
-                wire::encode(wire::RESPONSE, &refused).unwrap_or_default()
-            });
-            shared.send(peer, frame);
+                        "the editor is busy: {HELD} of this connection's commands are still \
+                         waiting to land"
+                    ))
+                }
+            };
+            shared.send(peer, encoded(request.id, &request.method, answer));
         }
+        true
     }
 
     /// Stop every thread, wait for them, and take the remote file back.
@@ -296,6 +362,20 @@ impl Drop for Remote {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// The response frame answering request `id`, or one saying why that answer
+/// was too large to send.
+fn encoded(id: u64, method: &str, answer: Result<serde_json::Value, String>) -> Vec<u8> {
+    wire::encode(wire::RESPONSE, &Response::answer(Some(id), answer)).unwrap_or_else(|why| {
+        let refused = Response::answer(
+            Some(id),
+            Err(format!(
+                "the answer to `{method}` is too large to send ({why}); ask for less, with `limit`"
+            )),
+        );
+        wire::encode(wire::RESPONSE, &refused).unwrap_or_default()
+    })
 }
 
 fn listen(shared: &Arc<Shared>, listener: &TcpListener) {

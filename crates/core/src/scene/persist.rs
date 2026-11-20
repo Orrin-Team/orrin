@@ -398,7 +398,7 @@ fn wait_for_host(world: &mut World, entity: Entity, id: &ComponentId, value: &Va
 /// [`apply_component`] for an entity already live, where a parent link resolves
 /// against the whole world and an unregistered component replaces its entry in
 /// the [`UnknownComponents`].
-pub(super) fn write_component(
+pub(crate) fn write_component(
     world: &mut World,
     registry: &orrin_registry::Registry,
     entity: Entity,
@@ -428,7 +428,7 @@ pub(super) fn write_component(
 
 /// One component of a live entity in its file form: what [`write_component`]
 /// takes and [`scene_entity`] would write for it.
-pub(super) fn read_component(
+pub(crate) fn read_component(
     world: &World,
     registry: &orrin_registry::Registry,
     entity: Entity,

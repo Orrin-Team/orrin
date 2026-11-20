@@ -969,6 +969,10 @@ impl ApplicationHandler for App {
                                 outcome.to_string(),
                                 frame,
                             );
+                            active.editor.script_reloaded(
+                                matches!(outcome, crate::scripting::ReloadOutcome::Swapped { .. }),
+                                outcome.to_string(),
+                            );
                             // Only a swap that happened means the session is
                             // running what was built; a rejected one leaves the
                             // compiled code still ahead of the live code.
@@ -991,6 +995,13 @@ impl ApplicationHandler for App {
                             profile_scope!("script tick");
                             scripting.tick(&mut self.world, &self.registry, game_delta);
                         }
+                    } else if reload_requested {
+                        active.editor.script_reloaded(
+                            false,
+                            "no scripts are running in this session, so there is nothing to \
+                             reload"
+                                .to_owned(),
+                        );
                     }
                 }
 

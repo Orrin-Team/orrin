@@ -187,11 +187,20 @@ impl Editor {
         self.sync_remote();
     }
 
-    /// Answer what an agent asked since the last frame. See `remote`.
+    /// Answer what an agent asked since the last frame. See `remote`. A
+    /// command it raised is carried out by the UI pass, so that pass is made
+    /// due rather than left to its cadence.
     pub fn serve_remote(&mut self, world: &mut World, registry: &Registry) {
-        if let Some(remote) = &mut self.remote {
-            remote.serve(world, registry, &mut self.state);
+        if let Some(remote) = &mut self.remote
+            && remote.serve(world, registry, &mut self.state)
+        {
+            self.cadence.touch();
         }
+    }
+
+    /// A script reload landed, for the remote waiting on it.
+    pub fn script_reloaded(&mut self, swapped: bool, message: String) {
+        self.state.script_reloaded(swapped, message);
     }
 
     /// Start or stop the remote when what is wanted changed; otherwise

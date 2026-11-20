@@ -1,6 +1,8 @@
-//! What the remote answers, method by method. Each reads what the frame's
-//! thread holds and changes nothing; each answer that lists things is bounded
-//! by a `limit` with a default, and says where the next page starts.
+//! What the remote answers, method by method. The reads here take what the
+//! frame's thread holds and change nothing; each answer that lists things is
+//! bounded by a `limit` with a default, and says where the next page starts.
+//! The two that change things are in [`edit`](super::edit) and
+//! [`command`](super::command).
 //!
 //! | method | params | result |
 //! | --- | --- | --- |
@@ -9,6 +11,8 @@
 //! | `component_list` | `query`, `defaults`, `limit`, `offset` | registered components, each with its default as text |
 //! | `asset_find` | `kind`, `path`, `limit`, `offset` | indexed assets: id, path, kind, load state, import error |
 //! | `console_read` | `cursor`, `level`, `limit` | console entries numbered from `cursor`, and the next cursor |
+//! | `scene_edit` | `label`, `ops` | the step's label, the ops applied, ids spawned and given |
+//! | `editor_command` | `command` and its own | what the command did, once it can be seen |
 //!
 //! An entity is named by its [`EntityId`], or by `#slot` when it has none —
 //! one a script spawned, or one never saved. A block `scene_read` returns for
@@ -22,42 +26,67 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use super::command::Held;
 use crate::asset_db::{AssetDatabase, AssetKind, LoadState, Status};
 use crate::editor::state::EditorState;
 use crate::scene::{Camera, LogBuffer, LogLevel, Name, Play, PlayState, persist};
 
 type FxHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
 
-const METHODS: [&str; 5] = [
+const METHODS: [&str; 7] = [
     "editor_state",
     "scene_read",
     "component_list",
     "asset_find",
     "console_read",
+    "scene_edit",
+    "editor_command",
 ];
+
+/// An answer now, or a command held until its effect can be seen.
+pub(super) enum Reply {
+    Now(Result<Value, String>),
+    Held(Held),
+}
 
 pub(super) fn answer(
     request: &Request,
     world: &mut World,
     registry: &Registry,
     state: &mut EditorState,
-) -> Result<Value, String> {
-    let (world, state, params) = (&*world, &*state, &request.params);
+) -> Reply {
+    let params = &request.params;
     let method = request.method.as_str();
     let answer = match method {
+        "scene_edit" => super::edit::scene_edit(world, registry, state, params),
+        "editor_command" => match super::command::editor_command(world, state, params) {
+            Ok(Err(held)) => return Reply::Held(held),
+            Ok(Ok(done)) => Ok(done),
+            Err(refused) => Err(refused),
+        },
+        _ => read(method, world, registry, state, params),
+    };
+    Reply::Now(answer.map_err(|why| format!("`{method}`: {why}")))
+}
+
+fn read(
+    method: &str,
+    world: &World,
+    registry: &Registry,
+    state: &EditorState,
+    params: &Value,
+) -> Result<Value, String> {
+    match method {
         "editor_state" => params_of::<Nothing>(params).map(|_| editor_state(world, state)),
         "scene_read" => scene_read(world, registry, state, params),
         "component_list" => component_list(registry, params),
         "asset_find" => asset_find(world, params),
         "console_read" => console_read(world, params),
-        other => {
-            return Err(format!(
-                "the editor has no method `{other}`; it answers {}",
-                METHODS.join(", ")
-            ));
-        }
-    };
-    answer.map_err(|why| format!("`{method}`: {why}"))
+        other => Err(format!(
+            "the editor has no such method; it answers {} (asked for `{other}`)",
+            METHODS.join(", ")
+        )),
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -69,6 +98,10 @@ fn params_of<T: DeserializeOwned + Default>(params: &Value) -> Result<T, String>
     if params.is_null() {
         return Ok(T::default());
     }
+    params_of_required(params)
+}
+
+pub(super) fn params_of_required<T: DeserializeOwned>(params: &Value) -> Result<T, String> {
     T::deserialize(params).map_err(|error| format!("its params do not read: {error}"))
 }
 
@@ -87,7 +120,7 @@ fn page<T>(all: Vec<T>, offset: usize, limit: usize) -> (usize, Vec<T>, Option<u
     )
 }
 
-fn world_read(state: &EditorState) -> &'static str {
+pub(super) fn world_read(state: &EditorState) -> &'static str {
     if state.playing() { "play" } else { "edit" }
 }
 
@@ -98,10 +131,13 @@ fn reference(world: &World, entity: Entity) -> String {
     }
 }
 
-/// The live entity `text` names: an [`EntityId`], or `#slot` for one that has
-/// none.
 fn resolve(world: &World, state: &EditorState, text: &str) -> Result<Entity, String> {
-    let read = world_read(state);
+    find(world, text, world_read(state))
+}
+
+/// The live entity `text` names: an [`EntityId`], or `#slot` for one that has
+/// none. `read` names the world in an error.
+pub(super) fn find(world: &World, text: &str, read: &str) -> Result<Entity, String> {
     if let Some(slot) = text.strip_prefix('#') {
         let slot: u32 = slot
             .parse()
@@ -125,19 +161,23 @@ fn resolve(world: &World, state: &EditorState, text: &str) -> Result<Entity, Str
     found.ok_or_else(|| format!("no entity in the {read} world has id {id}"))
 }
 
+pub(super) fn selection(world: &World, state: &EditorState) -> Vec<String> {
+    state
+        .selection
+        .entities()
+        .iter()
+        .filter(|&&entity| world.is_alive(entity))
+        .map(|&entity| reference(world, entity))
+        .collect()
+}
+
 fn editor_state(world: &World, state: &EditorState) -> Value {
     let play = match world.get_resource::<Play>().map(|play| play.state()) {
         Some(PlayState::Playing) => "playing",
         Some(PlayState::Paused) => "paused",
         Some(PlayState::Editing) | None => "editing",
     };
-    let selection: Vec<String> = state
-        .selection
-        .entities()
-        .iter()
-        .filter(|&&entity| world.is_alive(entity))
-        .map(|&entity| reference(world, entity))
-        .collect();
+    let selection = selection(world, state);
     let camera = world.get_resource::<Camera>().map(|camera| {
         json!({
             "position": camera.position.to_array(),
