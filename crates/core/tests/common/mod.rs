@@ -160,6 +160,35 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 ..CaptureSettings::default()
             },
         ),
+        // Every light's shadow at once, from the rig's own camera: the sun's
+        // cascades across the grid and the three lamps' and the spot's atlas
+        // tiles under it. The whole-frame check that a shadow lands where its
+        // caster stands, for each kind of light.
+        (
+            "shadows",
+            CaptureSettings {
+                shadows: true,
+                punctual_shadows: true,
+                ..CaptureSettings::default()
+            },
+        ),
+        // The same lights from two metres above a gap between four cubes, where
+        // a centimetre of floor is three pixels and the filter is what is on
+        // screen: the width of each penumbra, whether its edge shows the map's
+        // texels, and whether a cube's shadow stays attached at its foot.
+        (
+            "zoom-shadow-edges",
+            CaptureSettings {
+                shadows: true,
+                punctual_shadows: true,
+                camera: Some(Camera {
+                    position: Vec3::new(-4.0, 1.6, 5.2),
+                    target: Vec3::new(-4.0, -0.5, 3.9),
+                    ..Camera::default()
+                }),
+                ..CaptureSettings::default()
+            },
+        ),
         // The two masonry walls, close and at a glancing angle, which is the one
         // vantage point where parallax occlusion mapping is legible: the left
         // wall marches the height field and the right one has the same albedo,

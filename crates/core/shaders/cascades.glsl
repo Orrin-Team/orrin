@@ -19,10 +19,9 @@
 // Keep in sync with MAX_CASCADES in gfx/shadows.rs.
 const int MAX_CASCADES = 4;
 
-// Laid out to match the same four fields in `GpuLighting` and `GpuFog`, in that
-// order. std140 gives a struct of `mat4[4]` and three `vec4`s the same offsets it
-// gives those fields written out flat, which is what lets one Rust struct feed a
-// shader that nests them and another that does not.
+// Laid out to match `GpuCascades`, which `GpuLighting` and `GpuFog` both nest.
+// std140 gives a struct of `mat4[4]` and `vec4`s the same offsets it gives those
+// fields written out flat, which is what lets one Rust struct feed both.
 struct Cascades {
     mat4 view_proj[MAX_CASCADES];
     // Per-cascade far distance, radial from the camera.
@@ -32,6 +31,9 @@ struct Cascades {
     vec4 texel_sizes;
     // x = count, y = blend overlap fraction, z = strength, w = debug tint.
     vec4 params;
+    // x = the sun's penumbra width in metres, y = its sharpness; z and w the
+    // same pair for the punctual lights. See `shadow_filter.glsl`.
+    vec4 filtering;
 };
 
 #endif // ORRIN_CASCADES_GLSL

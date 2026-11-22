@@ -324,9 +324,8 @@ fn to_gpu_lighting(
 /// shader that wants four fields of it. One constructor fills both, so the two
 /// copies are made together or not at all.
 ///
-/// std140 gives a struct of a `mat4` array and three `vec4`s exactly the offsets
-/// it gave these fields written out flat, which is why nesting them changed no
-/// layout.
+/// std140 gives a struct of a `mat4` array and `vec4`s exactly the offsets it
+/// gives these fields written out flat, so the two blocks nest it as it is.
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(super) struct GpuCascades {
@@ -342,6 +341,9 @@ pub(super) struct GpuCascades {
     /// x = cascade count, y = blend overlap fraction, z = strength,
     /// w = 1.0 to tint by cascade index.
     params: [f32; 4],
+    /// x = the sun's penumbra width in metres, y = its sharpness; z and w the
+    /// same pair for the punctual lights.
+    filtering: [f32; 4],
 }
 
 impl GpuCascades {
@@ -374,12 +376,14 @@ impl GpuCascades {
             }
             None => [0.0; 4],
         };
+        let filtering = shadows.map_or([0.0; 4], |shadows| shadows.settings.filtering());
 
         Self {
             view_proj,
             splits,
             texel_sizes,
             params,
+            filtering,
         }
     }
 }

@@ -47,11 +47,13 @@ const FACE_DIRECTIONS: [Vec3; 6] = [
 /// its own tile.
 ///
 /// A face rendered at exactly 90° fills its tile edge to edge, so the outermost
-/// percentage-closer tap of a fragment near a cube seam has nothing of its own
-/// to read and gets clamped back onto the last real texel. Widening the frustum
-/// by a texel and a half puts real geometry under those taps instead. It costs
-/// that fraction of the tile's resolution, which at 512 is under a percent.
-const FACE_BORDER_TEXELS: f32 = 1.5;
+/// filter taps of a fragment near a cube seam have nothing of their own to read
+/// and get clamped back onto the last real texel. Widening the frustum by the
+/// kernel's reach puts real geometry under those taps instead: four texels, the
+/// widest the tent gets (`SHADOW_KERNEL_MAX` in `shadow_filter.glsl`). It costs
+/// that fraction of the tile's resolution, which at 512 is a percent and a
+/// half.
+const FACE_BORDER_TEXELS: f32 = 4.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LightKind {

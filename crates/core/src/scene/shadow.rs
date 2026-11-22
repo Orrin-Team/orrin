@@ -3,6 +3,14 @@ use orrin_registry::Reflect;
 use crate::gfx::punctual::AtlasConfig;
 use crate::gfx::shadows::CascadeConfig;
 
+/// Three centimetres: about what the 3x3 kernel this replaced spread a near
+/// cascade's edge over, so a scene authored before the width was a setting
+/// keeps the contact shadows it had.
+const DEFAULT_SOFTNESS: f32 = 0.03;
+const DEFAULT_SHARPNESS: f32 = 0.0;
+/// Past this the remap is a threshold and the edge shows the map's texels.
+pub const MAX_SHADOW_SHARPNESS: f32 = 0.9;
+
 #[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct ShadowSettings {
     /// When false the cascade passes are never declared and the forward shader
@@ -23,6 +31,20 @@ pub struct ShadowSettings {
     pub pullback: f32,
     pub constant_bias: f32,
     pub slope_bias: f32,
+    /// How wide the sun's penumbra is, in metres. A width rather than a kernel
+    /// size because a kernel counted in texels is a different width in every
+    /// cascade, which shows as a step in softness at each seam. The filter
+    /// holds it wherever a cascade's texels allow: no wider than its kernel
+    /// reaches and no narrower than antialiases, so a far cascade is softer
+    /// than this by as much as its texels are coarse.
+    #[reflect(default = DEFAULT_SOFTNESS)]
+    pub softness: f32,
+    /// How much of the filtered penumbra is visible, 0 to 1. The kernel stays
+    /// as wide as `softness` asks, which is what antialiases the edge, and this
+    /// narrows the gradient around the edge's midpoint — so a soft kernel does
+    /// not read as light leaking under its caster.
+    #[reflect(default = DEFAULT_SHARPNESS)]
+    pub sharpness: f32,
     /// Whether point and spot lights write into the punctual atlas at all. The
     /// per-light `casts_shadows` says which of them ask; this is the master
     /// switch, and turning it off drops the atlas pass and its image.
@@ -43,6 +65,13 @@ pub struct ShadowSettings {
     /// a depth unit — see `ShadowPass::punctual_constant_bias`.
     pub punctual_constant_bias: f32,
     pub punctual_slope_bias: f32,
+    /// `softness` and `sharpness` for the punctual lights. Their own pair for
+    /// the reason the biases are: a lamp is a smaller source than the sky's
+    /// share of the sun, and its texels grow with distance from it.
+    #[reflect(default = DEFAULT_SOFTNESS)]
+    pub punctual_softness: f32,
+    #[reflect(default = DEFAULT_SHARPNESS)]
+    pub punctual_sharpness: f32,
     /// How dark a fully shadowed fragment gets. 1.0 is physically what the
     /// shadow map says; less is an art dial.
     pub strength: f32,
@@ -63,6 +92,8 @@ impl Default for ShadowSettings {
             pullback: 50.0,
             constant_bias: 1.25,
             slope_bias: 2.5,
+            softness: DEFAULT_SOFTNESS,
+            sharpness: DEFAULT_SHARPNESS,
             punctual_enabled: true,
             // 4096 with 512-texel tiles is 64 faces: ten point lights, or a mix
             // of points and spots up to the eight-caster budget. One D16 image
@@ -72,6 +103,8 @@ impl Default for ShadowSettings {
             punctual_near: 0.05,
             punctual_constant_bias: 2.0,
             punctual_slope_bias: 3.0,
+            punctual_softness: DEFAULT_SOFTNESS,
+            punctual_sharpness: DEFAULT_SHARPNESS,
             strength: 1.0,
             debug_cascades: false,
         }
@@ -79,6 +112,18 @@ impl Default for ShadowSettings {
 }
 
 impl ShadowSettings {
+    /// The filter block as the shaders read it: the sun's width and sharpness,
+    /// then the punctual pair. Clamped here because every one of them reaches
+    /// a slider, and a sharpness of one divides by zero.
+    pub fn filtering(&self) -> [f32; 4] {
+        [
+            self.softness.max(0.0),
+            self.sharpness.clamp(0.0, MAX_SHADOW_SHARPNESS),
+            self.punctual_softness.max(0.0),
+            self.punctual_sharpness.clamp(0.0, MAX_SHADOW_SHARPNESS),
+        ]
+    }
+
     pub fn cascade_config(&self) -> CascadeConfig {
         CascadeConfig {
             count: self.cascade_count as usize,

@@ -17,6 +17,8 @@
 #error "define ORRIN_CASCADES as the includer's Cascades block member before including cascade_lookup.glsl"
 #endif
 
+#include "shadow_filter.glsl"
+
 // The cascade a point is routed to: the first whose far distance it is nearer
 // than. Distance is radial rather than view-space depth, which costs a little
 // over-coverage at the frustum corners and buys rotation invariance — the same
@@ -31,10 +33,10 @@ int select_cascade(float view_dist) {
     return count - 1;
 }
 
-// Percentage-closer filtered visibility from one cascade. 1.0 is lit.
+// Filtered visibility from one cascade. 1.0 is lit.
 //
 // `N` is the direction the lookup is biased along, which is the surface normal
-// for a surface and the light direction itself for a point of air — where there
+// for a surface and the light direction itself for a point of air -- where there
 // is no surface to be shadow-acned against, and pushing toward the light is
 // exactly the offset that keeps a froxel out of its own occluder.
 float cascade_shadow(
@@ -45,13 +47,11 @@ float cascade_shadow(
     vec3 N,
     vec3 L
 ) {
-    // Normal-offset bias: move the lookup along `N` by about a texel's worth of
-    // world space, more at grazing angles where a texel covers the most depth.
+    float texel = ORRIN_CASCADES.texel_sizes[cascade];
+    float radius = shadow_kernel_radius(ORRIN_CASCADES.filtering.x, texel);
     // Offsetting in texture space rather than in depth is what removes acne
     // without the peter-panning a depth offset causes.
-    float texel = ORRIN_CASCADES.texel_sizes[cascade];
-    float slope = 1.0 - max(dot(N, L), 0.0);
-    vec3 p = world_pos + N * texel * 1.4142136 * (1.0 + slope);
+    vec3 p = world_pos + N * shadow_normal_offset(radius, texel, dot(N, L));
 
     vec4 clip = ORRIN_CASCADES.view_proj[cascade] * vec4(p, 1.0);
     vec3 ndc = clip.xyz / clip.w;
@@ -60,22 +60,22 @@ float cascade_shadow(
         return 1.0;
     }
 
-    vec2 uv = ndc.xy * 0.5 + 0.5;
-    vec2 step = 1.0 / vec2(textureSize(sampler2DArrayShadow(maps, cmp), 0).xy);
+    vec2 size = vec2(textureSize(sampler2DArrayShadow(maps, cmp), 0).xy);
+    vec2 at = (ndc.xy * 0.5 + 0.5) * size - 0.5;
+    vec2 base = floor(at);
+    vec4 offsets_x, weights_x, offsets_y, weights_y;
+    shadow_tent_axis(at.x - base.x, radius, offsets_x, weights_x);
+    shadow_tent_axis(at.y - base.y, radius, offsets_y, weights_y);
 
-    // 3x3 taps. Each is itself a hardware 2x2 comparison — the compare happens
-    // before the bilinear filter — so this is effectively a 4x4 kernel.
-    float sum = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            vec2 offset = vec2(x, y) * step;
-            sum += texture(
-                sampler2DArrayShadow(maps, cmp),
-                vec4(uv + offset, float(cascade), ndc.z)
-            );
-        }
+#define CASCADE_FETCH(at_texel) \
+    texture(sampler2DArrayShadow(maps, cmp), vec4((at_texel) / size, float(cascade), ndc.z))
+    float sum = SHADOW_TENT_INNER(CASCADE_FETCH);
+    if (radius > SHADOW_KERNEL_INNER) {
+        sum += SHADOW_TENT_OUTER(CASCADE_FETCH);
     }
-    return sum / 9.0;
+#undef CASCADE_FETCH
+    float total = dot(weights_x, vec4(1.0)) * dot(weights_y, vec4(1.0));
+    return shadow_sharpen(sum / total, ORRIN_CASCADES.filtering.y);
 }
 
 // Sun visibility, blended across the cascade seam and scaled by the strength

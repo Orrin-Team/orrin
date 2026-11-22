@@ -73,6 +73,9 @@ pub struct CaptureSettings {
     /// between a leaf-shaped shadow and a quad-shaped one is the only place that
     /// pipeline is visible at all.
     pub shadows: bool,
+    /// Whether the point and spot lights get atlas tiles, in a capture that has
+    /// `shadows` on. Off by default for the reason `shadows` is.
+    pub punctual_shadows: bool,
     /// Screen-space reflections: off by default, because they are the effect
     /// most easily mistaken for a lighting bug when they are wrong.
     pub ssr: bool,
@@ -152,6 +155,7 @@ impl Default for CaptureSettings {
             subsurface: true,
             decals: true,
             shadows: false,
+            punctual_shadows: false,
             ssr: false,
             dof: false,
             motion_blur: false,
@@ -331,10 +335,7 @@ pub fn render(
     let mut lighting = SceneLighting::default();
     let mut geometry = FrameGeometry::default();
     let mut decals = Vec::new();
-    // No punctual atlas either way: the sun is what a cutout's shadow is legible
-    // against, and a tile per face per lamp is a second budget for no extra
-    // evidence. A capture that wants one grows it the way `app.rs` does.
-    let atlas = ShadowAtlas::default();
+    let mut atlas = ShadowAtlas::default();
     let shadow_settings = ShadowSettings::default();
     let aspect = settings.extent[0] as f32 / settings.extent[1] as f32;
     let mut overlay = settings
@@ -365,6 +366,13 @@ pub fn render(
         } else {
             CascadeSet::default()
         };
+        // After the lighting for the reason `app.rs` fits it there: the tiles
+        // go to the lights that extraction just produced.
+        if settings.punctual_shadows
+            && let Some(config) = shadow_settings.atlas_config()
+        {
+            atlas = crate::gfx::punctual::fit(&lighting, camera.position, &config);
+        }
         systems::extract_geometry(world, aspect, &mut geometry);
         systems::extract_decals(world, aspect, &mut decals);
 

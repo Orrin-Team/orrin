@@ -691,8 +691,8 @@ Lobes brdf(Surface s, vec3 L, vec3 radiance, float visibility, float back_visibi
 float sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist) {
     // A surface facing away from the sun is already unlit by it — `brdf`
     // returns zero for n_dot_l <= 0, so whatever the maps say gets multiplied
-    // into nothing. Leaving before the lookup saves the nine taps this cascade
-    // would cost, and the eighteen a fragment in the blend band would.
+    // into nothing. Leaving before the lookup saves the kernel this cascade
+    // would cost, and the second one a fragment in the blend band would.
     if (dot(N, L) <= 0.0) {
         return 1.0;
     }
@@ -780,7 +780,7 @@ int cube_face(vec3 d) {
     return d.z > 0.0 ? 4 : 5;
 }
 
-// Percentage-closer visibility from one atlas face. 1.0 is lit.
+// Filtered visibility from one atlas face. 1.0 is lit.
 //
 // The taps are clamped inside the tile, which the cascades do not have to do:
 // there, a tap past the edge hits the sampler's white border and reads as lit,
@@ -790,15 +790,15 @@ int cube_face(vec3 d) {
 float atlas_shadow(int face_index, vec3 world_pos, vec3 N, vec3 L, float dist) {
     ShadowFace face = shadow_faces[face_index];
 
-    // Normal-offset bias, as the cascades do it, but scaled by how much world
-    // space a texel covers *here*: a perspective face's texel grows with
-    // distance from the light, so a constant offset is either useless near it or
-    // peter-panning far from it. `rect.z` is the tile's share of the atlas, so
-    // the divisor is that tile's texel count along an edge.
+    // A perspective face's texel grows with distance from the light, so the
+    // kernel that is `softness` metres wide is a different number of texels at
+    // every fragment. `rect.z` is the tile's share of the atlas, so the divisor
+    // is that tile's texel count along an edge.
     vec2 atlas_size = vec2(textureSize(sampler2DShadow(u_shadow_atlas, u_shadow_cmp), 0));
     float texel_world = 2.0 * dist / max(face.rect.z * atlas_size.x, 1.0);
-    float slope = 1.0 - max(dot(N, L), 0.0);
-    vec4 clip = face.view_proj * vec4(world_pos + N * texel_world * 1.4142136 * (1.0 + slope), 1.0);
+    float radius = shadow_kernel_radius(lighting.cascades.filtering.z, texel_world);
+    vec3 p = world_pos + N * shadow_normal_offset(radius, texel_world, dot(N, L));
+    vec4 clip = face.view_proj * vec4(p, 1.0);
     if (clip.w <= 0.0) {
         return 1.0;
     }
@@ -810,24 +810,27 @@ float atlas_shadow(int face_index, vec3 world_pos, vec3 N, vec3 L, float dist) {
         return 1.0;
     }
 
-    vec2 tile_uv = ndc.xy * 0.5 + 0.5;
-    vec2 texel = 1.0 / atlas_size;
     // Half a texel in from the tile's edge, so a bilinear fetch cannot reach
     // past it either.
-    vec2 lo = face.rect.xy + texel * 0.5;
-    vec2 hi = face.rect.xy + face.rect.zw - texel * 0.5;
+    vec2 lo = face.rect.xy * atlas_size + 0.5;
+    vec2 hi = (face.rect.xy + face.rect.zw) * atlas_size - 0.5;
 
-    float sum = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            vec2 uv = face.rect.xy + (tile_uv + vec2(x, y) * texel / face.rect.zw) * face.rect.zw;
-            sum += texture(
-                sampler2DShadow(u_shadow_atlas, u_shadow_cmp),
-                vec3(clamp(uv, lo, hi), ndc.z)
-            );
-        }
+    vec2 at = (face.rect.xy + (ndc.xy * 0.5 + 0.5) * face.rect.zw) * atlas_size - 0.5;
+    vec2 base = floor(at);
+    vec4 offsets_x, weights_x, offsets_y, weights_y;
+    shadow_tent_axis(at.x - base.x, radius, offsets_x, weights_x);
+    shadow_tent_axis(at.y - base.y, radius, offsets_y, weights_y);
+
+#define ATLAS_FETCH(at_texel) \
+    textureLod(sampler2DShadow(u_shadow_atlas, u_shadow_cmp), \
+        vec3(clamp(at_texel, lo, hi) / atlas_size, ndc.z), 0.0)
+    float sum = SHADOW_TENT_INNER(ATLAS_FETCH);
+    if (radius > SHADOW_KERNEL_INNER) {
+        sum += SHADOW_TENT_OUTER(ATLAS_FETCH);
     }
-    return sum / 9.0;
+#undef ATLAS_FETCH
+    float total = dot(weights_x, vec4(1.0)) * dot(weights_y, vec4(1.0));
+    return shadow_sharpen(sum / total, lighting.cascades.filtering.w);
 }
 
 // Visibility for a point light: pick the face its direction falls on, then the
@@ -1299,7 +1302,7 @@ Shaded shade_surface() {
         if (atten <= 0.0) continue;
         vec3 L = to_light / max(dist, 1e-4);
         // Before the atlas lookup, not after: a surface facing away is already
-        // unlit by this light, and the nine taps would be multiplied into a
+        // unlit by this light, and the kernel would be multiplied into a
         // zero. The same early-out `sun_shadow` makes for the cascades.
         //
         // Except on a scattering surface, where facing away from the light is not

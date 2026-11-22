@@ -158,6 +158,8 @@ const SHADOWS: &[Section] = &[
             "Pullback",
             "Bias",
             "Slope bias",
+            "Softness",
+            "Sharpness",
             "Strength",
             "Tint cascades",
         ],
@@ -167,7 +169,15 @@ const SHADOWS: &[Section] = &[
         "Point & spot shadows",
         Some("One atlas, a tile per cube face, drawn in a single pass"),
         icons::lightbulb(),
-        &["Enabled", "Atlas", "Near", "Bias", "Slope bias"],
+        &[
+            "Enabled",
+            "Atlas",
+            "Near",
+            "Bias",
+            "Slope bias",
+            "Softness",
+            "Sharpness",
+        ],
         punctual_shadows,
     ),
     section(
@@ -697,6 +707,12 @@ fn shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
             egui::Slider::new(&mut s.slope_bias, 0.0..=8.0),
         );
     }
+    if rows.shows("Softness") {
+        softness(ui, &mut s.softness);
+    }
+    if rows.shows("Sharpness") {
+        sharpness(ui, &mut s.sharpness);
+    }
     if rows.shows("Strength") {
         slider(
             ui,
@@ -768,6 +784,32 @@ fn punctual_shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
             egui::Slider::new(&mut s.punctual_slope_bias, 0.0..=8.0),
         );
     }
+    if rows.shows("Softness") {
+        softness(ui, &mut s.punctual_softness);
+    }
+    if rows.shows("Sharpness") {
+        sharpness(ui, &mut s.punctual_sharpness);
+    }
+}
+
+fn softness(ui: &mut egui::Ui, value: &mut f32) {
+    slider(
+        ui,
+        "Softness",
+        egui::Slider::new(value, 0.0..=0.5)
+            .logarithmic(true)
+            .suffix(" m"),
+    )
+    .on_hover_text("Penumbra width, held wherever a map's texels are fine enough to hold it");
+}
+
+fn sharpness(ui: &mut egui::Ui, value: &mut f32) {
+    slider(
+        ui,
+        "Sharpness",
+        egui::Slider::new(value, 0.0..=crate::scene::MAX_SHADOW_SHARPNESS),
+    )
+    .on_hover_text("Narrows the visible penumbra and keeps the kernel that antialiases it");
 }
 
 fn contact_shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {

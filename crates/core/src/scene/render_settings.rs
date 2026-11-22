@@ -248,6 +248,29 @@ mod tests {
         assert_eq!(*loaded.get::<RenderSettings>(entity).unwrap(), foggy());
     }
 
+    /// A scene saved before the shadow filter had a width carries none of its
+    /// four fields, and has to load as the scene it was rather than fail.
+    #[test]
+    fn settings_saved_before_the_shadow_filter_existed_still_load() {
+        let mut registry = Registry::new();
+        register_components(&mut registry);
+        let mut world = World::new();
+        with_settings(&mut world, foggy());
+
+        let saved = crate::scene::save(&mut world, &registry);
+        let older: String = saved
+            .lines()
+            .filter(|line| !line.contains("softness") && !line.contains("sharpness"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(older.len(), saved.len(), "the fields were never saved");
+
+        let mut loaded = World::new();
+        crate::scene::load(&older, &mut loaded, &registry).unwrap();
+        let entity = source(&loaded).expect("the settings entity came back");
+        assert_eq!(*loaded.get::<RenderSettings>(entity).unwrap(), foggy());
+    }
+
     #[test]
     fn the_scene_drives_the_renderer() {
         let mut world = renderer();
