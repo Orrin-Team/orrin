@@ -415,7 +415,6 @@ fn readable(state: SlotState, recorded: u64, open: u64) -> bool {
 mod tests {
     use super::*;
     use crate::gfx::graph::PassKind;
-    use crate::gfx::shadows::MAX_CASCADES;
     use crate::gfx::vulkan::bloom::{MAX_BLOOM_MIPS, mip_count};
     use crate::gfx::vulkan::frame::{FrameConfig, declare};
 
@@ -494,8 +493,6 @@ mod tests {
             gizmo: true,
             ui: false,
             presents: true,
-            shadow_cascades: MAX_CASCADES as u8,
-            shadow_resolution: 2048,
             shadow_atlas: 4096,
             async_compute,
             occlusion_culling: false,

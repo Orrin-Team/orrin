@@ -10,7 +10,7 @@
 // Nothing here declares a binding. This file is the types; the lookup itself is
 // `cascade_lookup.glsl`, which reads the constants straight out of whichever
 // uniform block the includer owns — the includer names it with `ORRIN_CASCADES`
-// — and takes the maps and their comparison sampler as parameters, so the two
+// — and takes the atlas and its comparison sampler as parameters, so the two
 // callers can keep them at different sets and bindings.
 
 #ifndef ORRIN_CASCADES_GLSL
@@ -24,6 +24,8 @@ const int MAX_CASCADES = 4;
 // fields written out flat, which is what lets one Rust struct feed both.
 struct Cascades {
     mat4 view_proj[MAX_CASCADES];
+    // Where each view's tile is in the atlas: xy = uv offset, zw = uv scale.
+    vec4 rects[MAX_CASCADES];
     // Per-cascade far distance, radial from the camera.
     vec4 splits;
     // World size of one shadow texel, per cascade. It differs per cascade

@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use vulkano::buffer::allocator::SubbufferAllocatorCreateInfo;
 use vulkano::buffer::{Buffer, BufferCreateInfo, Subbuffer};
-use vulkano::command_buffer::{ClearAttachment, ClearRect};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::format::Format as VkFormat;
 use vulkano::image::sampler::{ComponentMapping, ComponentSwizzle};
@@ -60,10 +59,10 @@ use crate::gfx::Vertex;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, BufferId,
-    ComputePipelineDesc, CullMode, DepthCompare, DepthRect, Encoder, Feature, GraphicsPipelineDesc,
-    LoadOp, MeshSpan, PipelineId, Pool, RenderTargets, SamplerDesc, SamplerId, ShaderModuleId,
-    ShaderRef, StoreOp, TextureDesc, TextureDimension, TextureSwizzle, TextureViewId, Topology,
-    VertexFormat, VertexStream, Viewport,
+    ComputePipelineDesc, CullMode, DepthCompare, Encoder, Feature, GraphicsPipelineDesc, LoadOp,
+    MeshSpan, PipelineId, Pool, RenderTargets, SamplerDesc, SamplerId, ShaderModuleId, ShaderRef,
+    StoreOp, TextureDesc, TextureDimension, TextureSwizzle, TextureViewId, Topology, VertexFormat,
+    VertexStream, Viewport,
 };
 use crate::gfx::shaders::{CompiledBindings, CompiledShader};
 
@@ -1448,17 +1447,6 @@ impl<'a> VkEncoder<'a> {
 
     pub fn set_depth_bias(&mut self, constant: f32, clamp: f32, slope: f32) {
         self.recorder.set_depth_bias(constant, clamp, slope);
-    }
-
-    pub fn clear_depth(&mut self, rects: &[DepthRect]) {
-        self.recorder.clear_attachments(
-            [ClearAttachment::Depth(crate::gfx::depth::SHADOW_CLEAR)],
-            rects.iter().map(|rect| ClearRect {
-                offset: rect.offset,
-                extent: rect.extent,
-                array_layers: 0..1,
-            }),
-        );
     }
 
     pub fn bind_pipeline(&mut self, pipeline: PipelineId) {

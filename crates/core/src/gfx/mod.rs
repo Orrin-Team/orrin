@@ -11,6 +11,7 @@ pub mod punctual;
 pub mod rhi;
 pub mod sh;
 pub mod shaders;
+pub mod shadow_views;
 pub mod shadows;
 pub mod surface;
 mod texel;

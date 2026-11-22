@@ -65,14 +65,14 @@ const float PI = 3.14159265359;
 struct PointLight {
     vec4 position; // xyz = world position, w = range
     vec4 color;    // rgb = color,         w = luminous intensity (cd)
-    vec4 shadow;   // x = first atlas face (< 0 = none), y = near plane
+    vec4 shadow;   // x = first shadow view (< 0 = none), y = near plane
 };
 
 struct SpotLight {
     vec4 position;  // xyz = world position, w = range
     vec4 direction; // xyz = cone axis,      w = cos(outer half angle)
     vec4 color;     // rgb = color,          w = luminous intensity (cd)
-    vec4 params;    // x = cos(inner), y = atlas face (< 0 = none), z = near
+    vec4 params;    // x = cos(inner), y = shadow view (< 0 = none), z = near
 };
 
 layout(set = 0, binding = 0) uniform Lighting {
@@ -150,10 +150,11 @@ layout(set = 2, binding = 1) uniform sampler tex_sampler;
 // Screen-space ambient occlusion (blurred), sampled by screen-space UV.
 layout(set = 3, binding = 0) uniform sampler2D u_ao;
 
-// The cascade depth maps, one array layer each, and the comparison sampler
-// they are read through. Separated for the same reason the texture array above
-// is: Metal allows far fewer samplers per stage than sampled images.
-layout(set = 3, binding = 1) uniform texture2DArray u_shadow_maps;
+// The shadow atlas, every light's views as tiles of one depth image, and the
+// comparison sampler it is read through. Separated for the same reason the
+// texture array above is: Metal allows far fewer samplers per stage than
+// sampled images.
+layout(set = 3, binding = 1) uniform texture2D u_shadow_atlas;
 layout(set = 3, binding = 2) uniform samplerShadow u_shadow_cmp;
 
 // Prefiltered specular environment: roughness increases with mip level. When no
@@ -169,17 +170,16 @@ layout(set = 3, binding = 4) uniform sampler u_environment_sampler;
 // so there is one path here rather than two.
 layout(set = 3, binding = 5) uniform sampler2D u_contact_shadow;
 
-// The punctual shadow atlas, and the table saying where in it each light's
-// faces landed. Read through `u_shadow_cmp`, the cascades' comparison sampler:
-// same `Less` against a map cleared to 1.0, so one sampler serves both and the
-// per-stage sampler budget Metal imposes stays untouched.
-layout(set = 3, binding = 6) uniform texture2D u_shadow_atlas;
-
+// The table saying where in the atlas each view landed and what it was drawn
+// with, indexed by the view number a punctual light carries. The sun's views
+// are rows of it too, but are read out of `lighting.cascades`, which the fog
+// shares.
 struct ShadowFace {
     mat4 view_proj;
-    vec4 rect; // xy = atlas uv offset, zw = atlas uv scale
+    vec4 rect;   // xy = atlas uv offset, zw = atlas uv scale
+    vec4 params; // x = world size of a texel where clip w is one
 };
-layout(set = 3, binding = 7, std430) readonly buffer ShadowFaces {
+layout(set = 3, binding = 6, std430) readonly buffer ShadowFaces {
     ShadowFace shadow_faces[];
 };
 
@@ -190,8 +190,8 @@ layout(set = 3, binding = 7, std430) readonly buffer ShadowFaces {
 // `camera_pos.w` is what says which of those a frame is in; the volume is a
 // 1x1x1 stand-in when it is zero, so there is one binding here rather than two
 // pipelines.
-layout(set = 3, binding = 8) uniform sampler3D u_fog_volume;
-layout(set = 3, binding = 9) uniform Fog {
+layout(set = 3, binding = 7) uniform sampler3D u_fog_volume;
+layout(set = 3, binding = 8) uniform Fog {
     GpuFog f;
 } u_fog;
 
@@ -704,7 +704,7 @@ float sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist) {
         return 1.0;
     }
 
-    return cascade_sun_shadow(u_shadow_maps, u_shadow_cmp, world_pos, N, L, view_dist);
+    return cascade_sun_shadow(u_shadow_atlas, u_shadow_cmp, world_pos, N, L, view_dist);
 }
 
 // The sun's visibility at the *far* side of a scattering medium — whether light
@@ -735,7 +735,7 @@ float back_sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist, float thi
     // question rather than `sun_shadow` at an offset — and note the missing
     // `dot(N, L)` early-out, deliberately.
     return cascade_sun_shadow(
-        u_shadow_maps,
+        u_shadow_atlas,
         u_shadow_cmp,
         world_pos - N * thickness,
         -N,
@@ -767,7 +767,7 @@ float attenuate(float dist, float range) {
     return (window * window) / max(dist * dist, 1e-4);
 }
 
-// --- Punctual shadows: one atlas, a tile per face ---
+// --- Punctual shadows: a tile of the atlas per face ---
 
 // Which cube face a direction belongs to, in the order `gfx/punctual.rs` builds
 // them: +X, -X, +Y, -Y, +Z, -Z. That order is the contract between the two — the
@@ -780,70 +780,33 @@ int cube_face(vec3 d) {
     return d.z > 0.0 ? 4 : 5;
 }
 
-// Filtered visibility from one atlas face. 1.0 is lit.
-//
-// The taps are clamped inside the tile, which the cascades do not have to do:
-// there, a tap past the edge hits the sampler's white border and reads as lit,
-// while here it would land in a *neighbouring light's* depth and read as
-// whatever that light happened to see. The border the faces are rendered with
-// is what keeps that clamp reading real geometry rather than a repeated edge.
-float atlas_shadow(int face_index, vec3 world_pos, vec3 N, vec3 L, float dist) {
+// Filtered visibility from one of a punctual light's views. 1.0 is lit.
+float atlas_shadow(int face_index, vec3 world_pos, vec3 N, vec3 L) {
     ShadowFace face = shadow_faces[face_index];
-
-    // A perspective face's texel grows with distance from the light, so the
-    // kernel that is `softness` metres wide is a different number of texels at
-    // every fragment. `rect.z` is the tile's share of the atlas, so the divisor
-    // is that tile's texel count along an edge.
-    vec2 atlas_size = vec2(textureSize(sampler2DShadow(u_shadow_atlas, u_shadow_cmp), 0));
-    float texel_world = 2.0 * dist / max(face.rect.z * atlas_size.x, 1.0);
-    float radius = shadow_kernel_radius(lighting.cascades.filtering.z, texel_world);
-    vec3 p = world_pos + N * shadow_normal_offset(radius, texel_world, dot(N, L));
-    vec4 clip = face.view_proj * vec4(p, 1.0);
-    if (clip.w <= 0.0) {
-        return 1.0;
-    }
-
-    vec3 ndc = clip.xyz / clip.w;
-    // Past the light's own far plane there is nothing recorded to occlude
-    // against, and the attenuation has already taken the light to zero there.
-    if (ndc.z > 1.0) {
-        return 1.0;
-    }
-
-    // Half a texel in from the tile's edge, so a bilinear fetch cannot reach
-    // past it either.
-    vec2 lo = face.rect.xy * atlas_size + 0.5;
-    vec2 hi = (face.rect.xy + face.rect.zw) * atlas_size - 0.5;
-
-    vec2 at = (face.rect.xy + (ndc.xy * 0.5 + 0.5) * face.rect.zw) * atlas_size - 0.5;
-    vec2 base = floor(at);
-    vec4 offsets_x, weights_x, offsets_y, weights_y;
-    shadow_tent_axis(at.x - base.x, radius, offsets_x, weights_x);
-    shadow_tent_axis(at.y - base.y, radius, offsets_y, weights_y);
-
-#define ATLAS_FETCH(at_texel) \
-    textureLod(sampler2DShadow(u_shadow_atlas, u_shadow_cmp), \
-        vec3(clamp(at_texel, lo, hi) / atlas_size, ndc.z), 0.0)
-    float sum = SHADOW_TENT_INNER(ATLAS_FETCH);
-    if (radius > SHADOW_KERNEL_INNER) {
-        sum += SHADOW_TENT_OUTER(ATLAS_FETCH);
-    }
-#undef ATLAS_FETCH
-    float total = dot(weights_x, vec4(1.0)) * dot(weights_y, vec4(1.0));
-    return shadow_sharpen(sum / total, lighting.cascades.filtering.w);
+    return shadow_view_visibility(
+        u_shadow_atlas,
+        u_shadow_cmp,
+        face.view_proj,
+        face.rect,
+        face.params.x,
+        lighting.cascades.filtering.zw,
+        world_pos,
+        N,
+        L
+    );
 }
 
 // Visibility for a point light: pick the face its direction falls on, then the
 // lookup above. `first_face` is negative for a light the atlas had no room for,
 // which is the unshadowed path.
-float point_shadow(PointLight light, vec3 world_pos, vec3 N, vec3 L, float dist) {
+float point_shadow(PointLight light, vec3 world_pos, vec3 N, vec3 L) {
     int first_face = int(light.shadow.x);
     if (first_face < 0) {
         return 1.0;
     }
     // The direction *from* the light, which is what the faces were built around.
     int face = cube_face(world_pos - light.position.xyz);
-    return atlas_shadow(first_face + face, world_pos, N, L, dist);
+    return atlas_shadow(first_face + face, world_pos, N, L);
 }
 
 // The cone's own falloff: full inside the inner angle, out to nothing at the
@@ -1310,9 +1273,9 @@ Shaded shade_surface() {
         // the camera by going *through*.
         if (!scatters && dot(s.N, L) <= 0.0) continue;
         vec3 radiance = light.color.rgb * light.color.w * atten;
-        float shadow = point_shadow(light, v_world_pos, s.N, L, dist);
+        float shadow = point_shadow(light, v_world_pos, s.N, L);
         float back_shadow = scatters
-            ? point_shadow(light, v_world_pos - s.N * s.thickness, -s.N, L, dist)
+            ? point_shadow(light, v_world_pos - s.N * s.thickness, -s.N, L)
             : 1.0;
         Lobes lobes = brdf(s, L, radiance, shadow, back_shadow);
         color += lobes.direct;
@@ -1334,10 +1297,10 @@ Shaded shade_surface() {
 
         vec3 radiance = light.color.rgb * light.color.w * atten;
         int face = int(light.params.y);
-        float shadow = face < 0 ? 1.0 : atlas_shadow(face, v_world_pos, s.N, L, dist);
+        float shadow = face < 0 ? 1.0 : atlas_shadow(face, v_world_pos, s.N, L);
         float back_shadow = (face < 0 || !scatters)
             ? 1.0
-            : atlas_shadow(face, v_world_pos - s.N * s.thickness, -s.N, L, dist);
+            : atlas_shadow(face, v_world_pos - s.N * s.thickness, -s.N, L);
         Lobes lobes = brdf(s, L, radiance, shadow, back_shadow);
         color += lobes.direct;
         diffusible += lobes.diffusible;

@@ -1,9 +1,10 @@
 // The shadow filter, once: a tent-weighted percentage-closer kernel built from
 // bilinear comparison taps, sized in metres rather than in texels.
 //
-// Included by `cascade_lookup.glsl` and by `shading.glsl`'s atlas lookup, for
-// the reason `brdf.glsl` exists: the sun's shadow and a lamp's are one question
-// asked of two maps, and two kernels that drifted would read as two lights of
+// Included by `cascade_lookup.glsl`, which asks it about the sun, and by
+// `shading.glsl`, which asks it about the lamps, for the reason `brdf.glsl`
+// exists: the sun's shadow and a lamp's are one question asked of two tiles of
+// one atlas, and two lookups that drifted would read as two lights of
 // different sizes.
 //
 // A hardware comparison tap placed between two texel centres returns their two
@@ -32,10 +33,20 @@ const float SHADOW_KERNEL_MIN = 1.5;
 // renders that much real depth past a face's edge for these taps to land on.
 const float SHADOW_KERNEL_MAX = 4.0;
 
-// The kernel's radius in texels for a penumbra `softness` metres wide over
-// texels `texel` metres across.
-float shadow_kernel_radius(float softness, float texel) {
-    return clamp(softness / max(texel, 1e-6), SHADOW_KERNEL_MIN, SHADOW_KERNEL_MAX);
+// The narrowest penumbra a view can show, in texels either side of the edge.
+// Narrower than this and the remap below is a threshold, which draws the map's
+// texels as stairs however wide the kernel under it was.
+const float SHADOW_PENUMBRA_MIN = 0.75;
+
+// The radius a penumbra `softness` metres wide asks for, in texels `texel`
+// metres across, before the kernel's limits are applied to it.
+float shadow_asked_radius(float softness, float texel) {
+    return softness / max(texel, 1e-6);
+}
+
+// The kernel's radius in texels for that request.
+float shadow_kernel_radius(float asked) {
+    return clamp(asked, SHADOW_KERNEL_MIN, SHADOW_KERNEL_MAX);
 }
 
 // One axis of the tent. `s` is how far the lookup sits past the texel centre
@@ -57,8 +68,8 @@ void shadow_tent_axis(float s, float radius, out vec4 offsets, out vec4 weights)
 // indexing a local vector by a loop counter is a dynamic index, which the
 // compiler answers by spilling the vector to the stack -- the cost
 // `cascade_lookup.glsl` documents paying once already. `FETCH(texel)` is the
-// caller's comparison at a position in texels; `base`, `offsets_x`,
-// `weights_x`, `offsets_y` and `weights_y` are the names it must have used.
+// comparison at a position in texels; `base`, `offsets_x`, `weights_x`,
+// `offsets_y` and `weights_y` are the locals it is expanded among.
 //
 // Two halves because a radius of two or less reaches only the inner four taps:
 // the outer twelve have a weight of exactly zero and are not fetched.
@@ -96,10 +107,91 @@ float shadow_normal_offset(float radius, float texel, float n_dot_l) {
 // A wide kernel is what antialiases a shadow's edge, and it is also a wide
 // penumbra, which under a caster's foot reads as light leaking beneath it. This
 // stretches the filtered result about its midpoint, so the edge stays where it
-// was and keeps the kernel's gradient while less of it is visible. Zero is the
-// kernel as filtered.
-float shadow_sharpen(float visibility, float sharpness) {
-    return clamp((visibility - 0.5) / max(1.0 - sharpness, 0.05) + 0.5, 0.0, 1.0);
+// was and keeps the kernel's gradient while less of it is visible.
+//
+// Two things ask for it. Where a view's texels are coarser than the penumbra
+// asked for, the kernel is held at `SHADOW_KERNEL_MIN` and is wider than was
+// asked; the stretch takes the visible width back toward the request, down to
+// `SHADOW_PENUMBRA_MIN` -- which is what keeps a far view's shadow from being
+// several times softer than the near view's it meets at a seam. And
+// `sharpness` narrows whatever is left by an authored factor.
+float shadow_sharpen(float visibility, float asked, float radius, float sharpness) {
+    float contrast = radius / clamp(asked, SHADOW_PENUMBRA_MIN, radius);
+    contrast /= max(1.0 - sharpness, 0.05);
+    return clamp((visibility - 0.5) * contrast + 0.5, 0.0, 1.0);
+}
+
+// Filtered visibility of a point from one shadow view. 1.0 is lit.
+//
+// One function for a cascade, a sun level and a face of a lamp, because to a
+// lookup they differ in nothing but numbers: `view_proj` is the matrix the
+// view was drawn with, `rect` its tile of the atlas as a uv offset and scale,
+// and `texel_scale` the world size of one of its texels where clip-space `w`
+// is one. An orthographic view's `w` is one everywhere and a perspective
+// face's is the depth along its axis, so multiplying by it is the texel's size
+// at the lookup either way. `filtering` is the penumbra's width in metres and
+// its sharpness.
+//
+// `N` is the direction the lookup is biased along: the surface normal for a
+// surface, and the light direction itself for a point of air -- where there is
+// no surface to be shadow-acned against, and pushing toward the light is
+// exactly the offset that keeps a froxel out of its own occluder.
+float shadow_view_visibility(
+    texture2D atlas,
+    samplerShadow cmp,
+    mat4 view_proj,
+    vec4 rect,
+    float texel_scale,
+    vec2 filtering,
+    vec3 world_pos,
+    vec3 N,
+    vec3 L
+) {
+    float w = view_proj[0].w * world_pos.x + view_proj[1].w * world_pos.y
+        + view_proj[2].w * world_pos.z + view_proj[3].w;
+    if (w <= 0.0) {
+        return 1.0;
+    }
+    float texel = texel_scale * w;
+    float asked = shadow_asked_radius(filtering.x, texel);
+    float radius = shadow_kernel_radius(asked);
+    // Offsetting in world space rather than in depth is what removes acne
+    // without the peter-panning a depth offset causes.
+    vec4 clip = view_proj
+        * vec4(world_pos + N * shadow_normal_offset(radius, texel, dot(N, L)), 1.0);
+    if (clip.w <= 0.0) {
+        return 1.0;
+    }
+    vec3 ndc = clip.xyz / clip.w;
+    // Outside the view there is nothing recorded to occlude against: past a
+    // sun view's far plane, past a lamp's range, off the side of either.
+    if (ndc.z > 1.0 || any(greaterThan(abs(ndc.xy), vec2(1.0)))) {
+        return 1.0;
+    }
+
+    vec2 atlas_size = vec2(textureSize(sampler2DShadow(atlas, cmp), 0));
+    // Half a texel in from the tile's edge, so that not even a bilinear fetch
+    // reaches past it. The tile next door is another view's depth, and a tap
+    // that landed there would read as whatever that view happened to see.
+    vec2 lo = rect.xy * atlas_size + 0.5;
+    vec2 hi = (rect.xy + rect.zw) * atlas_size - 0.5;
+
+    vec2 at = (rect.xy + (ndc.xy * 0.5 + 0.5) * rect.zw) * atlas_size - 0.5;
+    vec2 base = floor(at);
+    vec4 offsets_x, weights_x, offsets_y, weights_y;
+    shadow_tent_axis(at.x - base.x, radius, offsets_x, weights_x);
+    shadow_tent_axis(at.y - base.y, radius, offsets_y, weights_y);
+
+#define SHADOW_ATLAS_FETCH(at_texel) \
+    textureLod(sampler2DShadow(atlas, cmp), \
+        vec3(clamp(at_texel, lo, hi) / atlas_size, ndc.z), 0.0)
+    float sum = SHADOW_TENT_INNER(SHADOW_ATLAS_FETCH);
+    if (radius > SHADOW_KERNEL_INNER) {
+        sum += SHADOW_TENT_OUTER(SHADOW_ATLAS_FETCH);
+    }
+#undef SHADOW_ATLAS_FETCH
+    float total = dot(weights_x, vec4(1.0)) * dot(weights_y, vec4(1.0));
+    return shadow_sharpen(sum / total, asked, radius, filtering.y);
 }
 
 #endif // ORRIN_SHADOW_FILTER_GLSL

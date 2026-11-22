@@ -31,9 +31,9 @@ use vulkano::VulkanObject;
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, IndexBuffer, Subbuffer};
 use vulkano::command_buffer::{
-    BlitImageInfo, ClearAttachment, ClearDepthStencilImageInfo, ClearRect, CommandBuffer,
-    CommandBufferBeginInfo, CommandBufferInheritanceInfo, CommandBufferLevel, CommandBufferUsage,
-    CopyBufferInfo, CopyBufferToImageInfo, CopyImageToBufferInfo, DrawIndexedIndirectCommand,
+    BlitImageInfo, ClearDepthStencilImageInfo, CommandBuffer, CommandBufferBeginInfo,
+    CommandBufferInheritanceInfo, CommandBufferLevel, CommandBufferUsage, CopyBufferInfo,
+    CopyBufferToImageInfo, CopyImageToBufferInfo, DrawIndexedIndirectCommand,
     RecordingCommandBuffer, RenderingInfo,
 };
 use vulkano::descriptor_set::DescriptorSet;
@@ -657,18 +657,6 @@ impl Recorder {
     pub(super) fn end_rendering(&mut self) -> &mut Self {
         unsafe { self.inner.end_rendering() }
             .expect("ended a rendering instance that was not open");
-        self
-    }
-
-    pub(super) fn clear_attachments(
-        &mut self,
-        attachments: impl IntoIterator<Item = ClearAttachment>,
-        rects: impl IntoIterator<Item = ClearRect>,
-    ) -> &mut Self {
-        let attachments: Vec<_> = attachments.into_iter().collect();
-        let rects: Vec<_> = rects.into_iter().collect();
-        unsafe { self.inner.clear_attachments(&attachments, &rects) }
-            .expect("invalid attachment clear");
         self
     }
 

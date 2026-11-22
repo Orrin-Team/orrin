@@ -17,9 +17,6 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 use crate::camera_controller::CameraController;
 use crate::editor::Editor;
 use crate::gfx::BackendChoice;
-use crate::gfx::punctual::ShadowAtlas;
-use crate::gfx::shadows::{CascadeSet, cascades};
-use crate::gfx::vulkan::ShadowFrame;
 use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::{RenderBackend, SceneLighting};
 use crate::profile::Profiler;
@@ -66,14 +63,6 @@ pub struct App {
     /// a field rather than a local: extraction refills it every frame and the
     /// allocation is reused.
     decals: Vec<crate::gfx::DecalInstance>,
-    /// This frame's cascade matrices. The caster orders live in `geometry`,
-    /// which was culled against exactly these.
-    cascades: CascadeSet,
-    /// Which punctual lights got atlas tiles this frame, where those tiles are,
-    /// and the matrix each face is drawn with. Fitted between extracting the
-    /// lighting and extracting the geometry, because the caster lists are culled
-    /// against the very lights it chose.
-    atlas: ShadowAtlas,
     /// This frame's debug lines, copied out of the `DebugLines` resource so the
     /// renderer borrow doesn't overlap the world borrow.
     debug_lines: Vec<DebugLine>,
@@ -271,8 +260,6 @@ impl App {
             geometry: FrameGeometry::default(),
             lighting: SceneLighting::default(),
             decals: Vec::new(),
-            cascades: CascadeSet::default(),
-            atlas: ShadowAtlas::default(),
             debug_lines: Vec::new(),
             ui: crate::gfx::ui::Painter::new(),
             console,
@@ -1182,32 +1169,6 @@ impl ApplicationHandler for App {
                     // Beside the lighting and for the same reason: a decal is
                     // scene data two existing passes read, not a queue.
                     systems::extract_decals(&self.world, aspect, &mut self.decals);
-                    // Cascades are fitted before extraction because the caster
-                    // lists are culled against them: a shadow pass needs what
-                    // reaches its box, which is not what the camera can see.
-                    let shadow_settings = *self.world.resource::<ShadowSettings>();
-                    self.cascades = if shadow_settings.enabled {
-                        cascades(
-                            &self.world.resource::<Camera>().clone(),
-                            aspect,
-                            self.lighting.sun.direction,
-                            &shadow_settings.cascade_config(),
-                        )
-                    } else {
-                        CascadeSet::default()
-                    };
-                    // Same reason the cascades are fitted first, and it has to
-                    // be after `extract_lighting`: the atlas spends its tiles on
-                    // the lights that frame produced, and the caster lists are
-                    // culled against the reach of exactly those.
-                    self.atlas = match shadow_settings.atlas_config() {
-                        Some(config) => crate::gfx::punctual::fit(
-                            &self.lighting,
-                            self.world.resource::<Camera>().position,
-                            &config,
-                        ),
-                        None => ShadowAtlas::default(),
-                    };
                     systems::extract_geometry(&self.world, aspect, &mut self.geometry);
                     // Copy this frame's debug lines out (they're Copy) so the render
                     // borrow below doesn't overlap the world borrow.
@@ -1295,17 +1256,12 @@ impl ApplicationHandler for App {
                         dt,
                         &self.debug_lines,
                         profiler_frame,
-                        // Either half is reason enough to hand one over: the sun
+                        // Either half is reason enough to hand them over: the sun
                         // and the punctual lights are independent, and a scene
                         // with cascades off and a lamp casting is an ordinary
                         // thing to want.
-                        (self.cascades.count > 0 || !self.atlas.faces.is_empty()).then_some({
-                            ShadowFrame {
-                                cascades: &self.cascades,
-                                atlas: &self.atlas,
-                                settings: &shadow_settings,
-                            }
-                        }),
+                        (shadow_settings.enabled || shadow_settings.punctual_enabled)
+                            .then_some(&shadow_settings),
                         Some(self.ui.frame()),
                         overlay,
                     );

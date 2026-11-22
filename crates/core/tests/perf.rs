@@ -64,9 +64,7 @@ use std::sync::Arc;
 use vulkano::VulkanLibrary;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 
-use orrin_core::gfx::punctual::ShadowAtlas;
-use orrin_core::gfx::shadows::{CascadeSet, cascades};
-use orrin_core::gfx::vulkan::{ShadowFrame, VulkanRenderer};
+use orrin_core::gfx::vulkan::VulkanRenderer;
 use orrin_core::gfx::{DecalInstance, SceneLighting};
 use orrin_core::profile::{self, Lane, Profiler};
 use orrin_core::scene::entities::{SceneChoice, StressSpec, spawn_stress_scene};
@@ -287,8 +285,6 @@ fn frame_cost() {
     let mut lighting = SceneLighting::default();
     let mut geometry = FrameGeometry::default();
     let mut decals: Vec<DecalInstance> = Vec::new();
-    let mut cascade_set;
-    let mut atlas;
     let aspect = extent[0] as f32 / extent[1] as f32;
 
     // Big enough that a GPU readback landing several frames late still finds the
@@ -328,22 +324,6 @@ fn frame_cost() {
                 let _s = profile::scope("decals");
                 systems::extract_decals(&world, aspect, &mut decals);
             }
-            let shadow_settings = *world.resource::<ShadowSettings>();
-            let camera = *world.resource::<Camera>();
-            cascade_set = if shadow_settings.enabled {
-                cascades(
-                    &camera,
-                    aspect,
-                    lighting.sun.direction,
-                    &shadow_settings.cascade_config(),
-                )
-            } else {
-                CascadeSet::default()
-            };
-            atlas = match shadow_settings.atlas_config() {
-                Some(config) => orrin_core::gfx::punctual::fit(&lighting, camera.position, &config),
-                None => ShadowAtlas::default(),
-            };
             {
                 let _s = profile::scope("geometry");
                 systems::extract_geometry(&world, aspect, &mut geometry);
@@ -392,11 +372,7 @@ fn frame_cost() {
                 1.0 / 60.0,
                 &[],
                 profiler.frame_index(),
-                (cascade_set.count > 0).then_some(ShadowFrame {
-                    cascades: &cascade_set,
-                    atlas: &atlas,
-                    settings: &shadow_settings,
-                }),
+                shadow_settings.enabled.then_some(&shadow_settings),
                 None,
                 None,
             );

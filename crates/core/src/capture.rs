@@ -23,9 +23,7 @@ use vulkano::VulkanLibrary;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 
 use crate::gfx::SceneLighting;
-use crate::gfx::punctual::ShadowAtlas;
-use crate::gfx::shadows::{CascadeSet, cascades};
-use crate::gfx::vulkan::{ShadowFrame, VulkanRenderer};
+use crate::gfx::vulkan::VulkanRenderer;
 use crate::scene::entities::SceneChoice;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, DecalSettings, DofSettings, EnvironmentSettings,
@@ -335,8 +333,10 @@ pub fn render(
     let mut lighting = SceneLighting::default();
     let mut geometry = FrameGeometry::default();
     let mut decals = Vec::new();
-    let mut atlas = ShadowAtlas::default();
-    let shadow_settings = ShadowSettings::default();
+    let shadow_settings = ShadowSettings {
+        punctual_enabled: settings.punctual_shadows,
+        ..ShadowSettings::default()
+    };
     let aspect = settings.extent[0] as f32 / settings.extent[1] as f32;
     let mut overlay = settings
         .wireframe
@@ -354,25 +354,6 @@ pub fn render(
         crate::scene::propagate_transforms(world);
         systems::extract_lighting(world, &mut lighting);
         let camera = *world.resource::<Camera>();
-        // Fitted after the lighting, exactly as `app.rs` orders it: the boxes
-        // are built around the sun that extraction just found.
-        let cascade_set = if settings.shadows {
-            cascades(
-                &camera,
-                aspect,
-                lighting.sun.direction,
-                &shadow_settings.cascade_config(),
-            )
-        } else {
-            CascadeSet::default()
-        };
-        // After the lighting for the reason `app.rs` fits it there: the tiles
-        // go to the lights that extraction just produced.
-        if settings.punctual_shadows
-            && let Some(config) = shadow_settings.atlas_config()
-        {
-            atlas = crate::gfx::punctual::fit(&lighting, camera.position, &config);
-        }
         systems::extract_geometry(world, aspect, &mut geometry);
         systems::extract_decals(world, aspect, &mut decals);
 
@@ -407,11 +388,7 @@ pub fn render(
             // existed.
             &[],
             0,
-            (cascade_set.count > 0).then_some(ShadowFrame {
-                cascades: &cascade_set,
-                atlas: &atlas,
-                settings: &shadow_settings,
-            }),
+            settings.shadows.then_some(&shadow_settings),
             None,
             overlay.as_mut(),
         );

@@ -1,23 +1,20 @@
-use glam::Mat4;
-
 use crate::gfx::PositionVertex;
 use crate::gfx::format::SampleCount;
 use crate::gfx::graph::ImageUsage;
-use crate::gfx::images::ImageEntry;
-use crate::gfx::punctual::ShadowAtlas;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BindingResource, Blend, BufferId, CullMode, DepthCompare, DepthRect,
-    DepthTest, Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerId, TextureDesc,
-    TextureDimension, TextureViewId, Topology, Viewport,
+    BindGroupId, Binding, BindingResource, Blend, BufferId, CullMode, DepthCompare, DepthTest,
+    Device, Encoder, GraphicsPipelineDesc, PipelineId, SamplerId, TextureDesc, TextureDimension,
+    TextureViewId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
+use crate::gfx::shadow_views::{ShadowViews, ViewKind};
 
 use super::cull::{CullFrame, Draws};
+use glam::Mat4;
 
-/// The depth format of every shadow map, cascade and punctual alike, and
-/// deliberately not the camera's.
+/// The depth format of the shadow atlas, and deliberately not the camera's.
 ///
-/// Sixteen bits suffice here and not for the camera: a cascade is orthographic,
+/// Sixteen bits suffice here and not for the camera: a sun view is orthographic,
 /// so its depth is linear over `2 * radius + pullback` — about 200 m at the
 /// default distance, a 3 mm step — and a punctual face spends its precision near
 /// the light, where its contacts are. The saving is half of every clear, write
@@ -46,22 +43,11 @@ pub struct ShadowPass {
     /// set 0 is identical in both, which is what lets the object set stay bound
     /// across a switch.
     masked_pipeline: PipelineId,
-    /// 1x1 array depth image cleared to 1.0, bound when shadows are off so the
-    /// forward shader samples "fully lit" with no second code path. Not a graph
-    /// resource: with shadows off the graph has no cascade image at all, so
+    /// A 1x1 depth texture of 1.0, bound as the atlas when there is none, so
+    /// the forward shader samples "fully lit" with no second code path. Not a
+    /// graph resource: with nothing casting the graph has no atlas at all, so
     /// there is nothing for the forward pass to declare a read of.
-    lit_view: TextureViewId,
-    /// A 1x1 non-array depth texture of 1.0, bound as the punctual atlas when
-    /// there is none. The cascades' `lit_view` cannot serve: the forward shader
-    /// declares the atlas as a plain `texture2D` and the cascades as a
-    /// `texture2DArray`, and a view satisfies one or the other.
     lit_atlas_view: TextureViewId,
-    /// The cascade map, kept here rather than by the graph because the far
-    /// cascades are not redrawn every frame (`shadows::CascadeCache`) and a
-    /// graph transient starts each frame `Undefined`. Allocated to the
-    /// description `frame::cascade_map_desc` declares, and replaced only when
-    /// that changes.
-    cascade_map: Option<CascadeMap>,
     pub constant_bias: f32,
     pub slope_bias: f32,
     /// The punctual maps get their own pair. A cascade is orthographic, so one
@@ -117,9 +103,7 @@ impl ShadowPass {
         Self {
             pipeline: plain,
             masked_pipeline,
-            lit_view: build_lit_depth(device, TextureDimension::D2Array),
-            lit_atlas_view: build_lit_depth(device, TextureDimension::D2),
-            cascade_map: None,
+            lit_atlas_view: build_lit_depth(device),
             constant_bias: 1.25,
             slope_bias: 2.5,
             punctual_constant_bias: 2.0,
@@ -127,77 +111,15 @@ impl ShadowPass {
         }
     }
 
-    /// The cascade map for `resolution` and `layers`, and whether it was just
-    /// (re)allocated — in which case every cascade it held is gone and the
-    /// caller's `CascadeCache` has to forget them.
-    ///
-    /// A new map is cleared to the far plane and left `ShaderReadOnlyOptimal`,
-    /// so the layout the graph declares it entering in is true from its first
-    /// frame rather than only from its second.
-    pub(super) fn cascade_map(
-        &mut self,
-        device: &Device,
-        resolution: u32,
-        layers: u8,
-    ) -> (ImageEntry, bool) {
-        if let Some(map) = &self.cascade_map
-            && map.resolution == resolution
-            && map.layers == layers
-        {
-            return (map.entry.clone(), false);
-        }
-        if let Some(old) = self.cascade_map.take() {
-            for view in old.entry.layers {
-                device.destroy_texture(view);
-            }
-            device.destroy_texture(old.entry.whole);
-        }
-        let desc = super::frame::cascade_map_desc(resolution, layers);
-        let whole = device.create_texture(&TextureDesc {
-            format: desc.format,
-            dimension: TextureDimension::D2Array,
-            extent: [resolution, resolution, 1],
-            mip_levels: 1,
-            array_layers: u32::from(layers),
-            samples: SampleCount::Sample1,
-            usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT
-                | ImageUsage::SAMPLED
-                | ImageUsage::TRANSFER_DST,
-            memoryless: false,
-        });
-        device.fill_depth(whole, crate::gfx::depth::SHADOW_CLEAR);
-        let entry = ImageEntry {
-            whole,
-            levels: Vec::new(),
-            layers: (0..u32::from(layers))
-                .map(|layer| device.face_view(whole, layer, 0))
-                .collect(),
-            extent: [resolution, resolution],
-            mip_levels: 1,
-        };
-        self.cascade_map = Some(CascadeMap {
-            entry: entry.clone(),
-            resolution,
-            layers,
-        });
-        (entry, true)
-    }
-
-    /// The "everything is lit" atlas, bound when nothing punctual casts.
+    /// The "everything is lit" atlas, bound when nothing casts.
     pub(super) fn lit_atlas_view(&self) -> TextureViewId {
         self.lit_atlas_view
     }
 
-    /// The "everything is lit" view, bound when shadows are disabled.
-    #[allow(dead_code)]
-    pub(super) fn lit_view(&self) -> TextureViewId {
-        self.lit_view
-    }
-
-    /// The per-object descriptor set every cascade binds.
+    /// The per-object descriptor set every view binds.
     ///
-    /// Built once per frame and handed to each cascade, rather than once per
-    /// cascade: all of them read the same buffer through the same layout.
+    /// Built once per frame and handed to each view, rather than once per
+    /// view: all of them read the same buffer through the same layout.
     pub(super) fn build_object_set(
         &self,
         device: &Device,
@@ -245,107 +167,52 @@ impl ShadowPass {
         )
     }
 
-    /// Record one cascade's depth pass.
+    /// Record every view into the atlas.
     ///
-    /// `resolution` is the shadow map's, not the frame's — every other pass in
-    /// the executor takes the swapchain extent, and using it here would render
-    /// the cascade into a corner of its own map with nothing reporting an error.
+    /// One render pass for all of them, which is the whole reason the atlas
+    /// exists: a tile is a viewport, so four sun views and the faces of eight
+    /// lights are one barrier rather than fifty-two. Each view is one of the
+    /// cull dispatch's own, numbered from `first_view` in the plan's order, so
+    /// what it draws was already tested against that view's volume.
+    ///
+    /// The attachment opens cleared to the far plane (see
+    /// `rendering::rendering_info`), so a view the dispatch culled to nothing
+    /// reads as lit, and so does a tile no view was given.
     pub(super) fn record(
         &self,
         builder: &mut Encoder,
-        casters: Draws<'_>,
-        view_proj: Mat4,
-        resolution: u32,
-        sets: &CasterSets,
-    ) {
-        self.set_tile(builder, [0, 0], resolution);
-        // Position alone: a depth-only pass reads no surface stream. Bound here
-        // rather than in `draw` because vertex bindings are command-buffer
-        // state that outlives a draw, and a secondary starts with none.
-        builder.bind_geometry(true);
-        // Dynamic so the editor's bias sliders tune acne live instead of
-        // rebuilding the pipeline on every drag. `clamp` stays 0.0: a nonzero
-        // one needs the `depth_bias_clamp` device feature. Set before any
-        // pipeline is bound, which is fine and is the point of dynamic state: it
-        // survives the pipeline switches `draw` makes between cutout runs and
-        // the rest.
-        builder.set_depth_bias(self.constant_bias, 0.0, self.slope_bias);
-
-        // A cascade is one view into a map it owns outright, so its guard starts
-        // and ends here.
-        self.draw(builder, casters, view_proj, sets, &mut Bound::default());
-    }
-
-    /// Record every face of every punctual caster into one atlas.
-    ///
-    /// One render pass for all of them, which is the whole reason the atlas
-    /// exists: a tile is a viewport, so the sixteen-light worst case is one
-    /// barrier rather than ninety-six. Each face is a view of the cull
-    /// dispatch's own, numbered from `first_view`, so what it draws was already
-    /// tested against that face's frustum — which is sound for a punctual face
-    /// in a way it is not for a cascade: the frustum's apex is at the light, so
-    /// anything that can occlude light travelling into a face is inside it.
-    pub(super) fn record_atlas(
-        &self,
-        builder: &mut Encoder,
-        atlas: &ShadowAtlas,
+        views: &ShadowViews,
         (frame, commands, first_view): (&CullFrame, BufferId, u32),
         sets: &CasterSets,
     ) {
-        // Every tile this frame assigned, cleared before anything draws — and
-        // *only* those, which is the point: the atlas attachment loads
-        // `DontCare` (see `rendering::rendering_info`), so the 45-odd tiles a
-        // typical scene leaves unassigned cost nothing rather than 67 MB of
-        // blanking.
-        //
-        // Safe only because `atlas_shadow` in `shading.glsl` clamps every one of
-        // its nine taps to half a texel inside the tile it belongs to: nothing
-        // can read a texel outside an assigned tile, so whatever is left there
-        // is unobservable. The cascades cannot make that promise — they
-        // deliberately let a tap fall past the edge onto the sampler's white
-        // border — which is why they clear and this does not.
-        //
-        // Over every assigned face rather than only the ones with something to
-        // draw: a face the dispatch culled to nothing still has its tile
-        // sampled, and it has to read as far, or the light would be shadowed by
-        // whatever the last frame left in that tile.
-        let tiles: Vec<DepthRect> = atlas
-            .casters
-            .iter()
-            .flat_map(|caster| {
-                &atlas.faces[caster.first_face..caster.first_face + caster.face_count]
-            })
-            .map(|face| DepthRect {
-                offset: face.tile.offset,
-                extent: [face.tile.size; 2],
-            })
-            .collect();
-        if tiles.is_empty() {
-            return;
-        }
-        builder.clear_depth(&tiles);
+        // Position alone: a depth-only pass reads no surface stream.
         builder.bind_geometry(true);
 
-        builder.set_depth_bias(self.punctual_constant_bias, 0.0, self.punctual_slope_bias);
-
-        // One guard for every light and every face rather than one per call into
-        // `draw`. The two pipelines and the three descriptor sets are the same
-        // for the whole atlas, so past the first face nothing below rebinds
-        // either — where a guard scoped to one face rebound both on every one of
-        // the nineteen tiles a demo frame assigns.
+        // One guard for every view rather than one per call into `draw`. The
+        // two pipelines and the three descriptor sets are the same for the
+        // whole atlas, so past the first view nothing below rebinds either.
         let mut bound = Bound::default();
-        for caster in &atlas.casters {
-            let faces = caster.first_face..caster.first_face + caster.face_count;
-            for (offset, face) in atlas.faces[faces].iter().enumerate() {
-                let face_index = (caster.first_face + offset) as u32;
-                let draws = Draws {
-                    frame,
-                    view: first_view + face_index,
-                    commands,
+        let mut biased = None;
+        for (index, view) in views.views.iter().enumerate() {
+            // Dynamic so the editor's bias sliders tune acne live instead of
+            // rebuilding the pipeline on every drag, and so the sun's views and
+            // the lamps' can share the pass. `clamp` stays 0.0: a nonzero one
+            // needs the `depth_bias_clamp` device feature.
+            if biased != Some(view.kind) {
+                let (constant, slope) = match view.kind {
+                    ViewKind::Sun => (self.constant_bias, self.slope_bias),
+                    ViewKind::Punctual => (self.punctual_constant_bias, self.punctual_slope_bias),
                 };
-                self.set_tile(builder, face.tile.offset, face.tile.size);
-                self.draw(builder, draws, face.view_proj, sets, &mut bound);
+                builder.set_depth_bias(constant, 0.0, slope);
+                biased = Some(view.kind);
             }
+            let draws = Draws {
+                frame,
+                view: first_view + index as u32,
+                commands,
+            };
+            self.set_tile(builder, view.tile.offset, view.tile.size);
+            self.draw(builder, draws, view.view_proj, sets, &mut bound);
         }
     }
 
@@ -431,11 +298,10 @@ impl ShadowPass {
 /// when the run's material actually changes it.
 ///
 /// Held by the caller rather than by [`ShadowPass::draw`], and that is the whole
-/// point: the atlas calls into that loop once per face, and a guard scoped to
+/// point: the atlas calls into that loop once per view, and a guard scoped to
 /// the call rebound a pipeline and three descriptor sets on every tile. Spans
-/// one render pass instance and never more — each `record` and `record_atlas`
-/// starts a fresh one, so nothing here assumes what a render pass boundary
-/// preserves.
+/// one render pass instance and never more — each `record` starts a fresh one,
+/// so nothing here assumes what a render pass boundary preserves.
 #[derive(Default)]
 struct Bound(Option<bool>);
 
@@ -449,8 +315,8 @@ impl Bound {
 
 /// What a caster draw binds, in the two shapes the two pipelines want.
 ///
-/// One struct rather than three parameters threaded through `record`,
-/// `record_atlas` and `draw`, and it holds the *cutout* sets as an `Option`
+/// One struct rather than three parameters threaded through `record` and
+/// `draw`, and it holds the *cutout* sets as an `Option`
 /// because a frame is entitled to have no material table cached yet — nothing
 /// here forces the alpha-testing pipeline into existence for a scene with no
 /// foliage in it.
@@ -470,23 +336,12 @@ impl CasterSets {
     }
 }
 
-struct CascadeMap {
-    entry: ImageEntry,
-    resolution: u32,
-    layers: u8,
-}
-
-/// A 1x1 single-layer depth texture cleared to 1.0 — "nothing is nearer than
-/// the far plane", which every comparison reads as lit.
-///
-/// Built once per view type rather than one image viewed both ways, because a
-/// view's type is fixed at creation and the cascades' array and the punctual
-/// atlas's plain 2D want different ones. A pair of one-texel images is not worth
-/// avoiding.
-fn build_lit_depth(device: &Device, dimension: TextureDimension) -> TextureViewId {
+/// A 1x1 depth texture cleared to 1.0 — "nothing is nearer than the far
+/// plane", which every comparison reads as lit.
+fn build_lit_depth(device: &Device) -> TextureViewId {
     let texture = device.create_texture(&TextureDesc {
         format: SHADOW_FORMAT,
-        dimension,
+        dimension: TextureDimension::D2,
         extent: [1, 1, 1],
         mip_levels: 1,
         array_layers: 1,

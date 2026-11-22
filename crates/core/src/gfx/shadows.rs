@@ -20,12 +20,37 @@ const NDC_CORNERS: [Vec3; 8] = {
     ]
 };
 
+/// How many of the sun's views are fitted to the view frustum. The rest are
+/// [levels](fit_level): squares centred on the camera.
+pub const NEAR_CASCADES: usize = 2;
+
+/// How far past its split distance a level's square reaches, in its own texels:
+/// the texel the snap may move it by, the filter kernel's reach, and the normal
+/// offset a lookup is moved by before it is projected.
+const LEVEL_MARGIN_TEXELS: f32 = 8.0;
+
 pub struct CascadeConfig {
     pub count: usize,
     pub max_distance: f32,
     pub lambda: f32,
+    /// Edge of a near cascade's tile in texels.
     pub resolution: u32,
+    /// Edge of a level's tile. Its own number because a level covers the whole
+    /// disc around the camera rather than the slice in view, at a distance
+    /// where a texel is fewer pixels.
+    pub far_resolution: u32,
     pub pullback: f32,
+}
+
+impl CascadeConfig {
+    /// Edge of the tile sun view `index` is drawn into.
+    pub fn resolution_of(&self, index: usize) -> u32 {
+        if index < NEAR_CASCADES {
+            self.resolution
+        } else {
+            self.far_resolution
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -183,6 +208,60 @@ pub fn fit_cascade(
     }
 }
 
+/// Fit a level: a square centred on the camera that holds everything within
+/// `radius` of it, snapped to its own texel grid.
+///
+/// Where [`fit_cascade`] bounds the slice of the frustum a cascade answers for,
+/// this bounds the whole disc the shader's radial selection can route to it, in
+/// view or not. That is what makes it independent of where the camera is
+/// looking — turning never moves it, and moving slides it across a grid that
+/// stays put — and it is smaller than the sphere around a wide frustum's far
+/// corners besides.
+pub fn fit_level(
+    camera: Vec3,
+    light_dir: Vec3,
+    radius: f32,
+    resolution: u32,
+    pullback: f32,
+) -> Cascade {
+    let light_dir = light_dir.normalize();
+    let up = light_up(light_dir);
+    let rot = Mat4::look_at_rh(Vec3::ZERO, light_dir, up);
+
+    // Solved so that the square still reaches `radius` once the margin is
+    // taken off it: the texel is a fraction of the extent it is a margin of.
+    let resolution = resolution.max(64) as f32;
+    let half_extent = radius / (1.0 - 2.0 * LEVEL_MARGIN_TEXELS / resolution);
+    let texel = 2.0 * half_extent / resolution;
+
+    let mut c_ls = rot.transform_point3(camera);
+    c_ls.x = (c_ls.x / texel).floor() * texel;
+    c_ls.y = (c_ls.y / texel).floor() * texel;
+    let center = rot.inverse().transform_point3(c_ls);
+
+    let depth_range = 2.0 * half_extent + pullback;
+    let eye = center - light_dir * (half_extent + pullback);
+    let light_view = Mat4::look_at_rh(eye, center, up);
+    let mut ortho = Mat4::orthographic_rh(
+        -half_extent,
+        half_extent,
+        -half_extent,
+        half_extent,
+        0.0,
+        depth_range,
+    );
+    ortho.y_axis.y *= -1.0;
+
+    Cascade {
+        view_proj: ortho * light_view,
+        light_view,
+        half_extent,
+        depth_range,
+        split_distance: radius,
+        texel_world_size: texel,
+    }
+}
+
 /// The corners of the slice of the view cascade `index` answers for: from the
 /// previous split, pulled in by the blend overlap, to its own.
 fn slice_corners(
@@ -215,8 +294,18 @@ pub fn cascades(
 
     let mut cascades = [Cascade::default(); MAX_CASCADES];
     for i in 0..count {
-        let corners = slice_corners(camera, aspect, &splits, i);
-        cascades[i] = fit_cascade(&corners, light_dir, splits[i], config);
+        cascades[i] = if i < NEAR_CASCADES {
+            let corners = slice_corners(camera, aspect, &splits, i);
+            fit_cascade(&corners, light_dir, splits[i], config)
+        } else {
+            fit_level(
+                camera.position,
+                light_dir,
+                splits[i],
+                config.far_resolution,
+                config.pullback,
+            )
+        };
     }
 
     // The sweep culls against a rotation it is told the cascades share. If a
@@ -243,111 +332,6 @@ pub fn cascades(
     }
 }
 
-/// Whether cascade `index` is re-rendered on frame `frame`.
-///
-/// The two near cascades every frame; the far two, which spend the fewest
-/// pixels on the most distance, at half and a quarter of the rate — 2 on odd
-/// frames and 3 on every fourth even one, so no frame pays for both.
-pub fn cascade_due(index: usize, frame: u64) -> bool {
-    match index {
-        0 | 1 => true,
-        2 => frame % 2 == 1,
-        _ => frame % 4 == 0,
-    }
-}
-
-/// Which cascades a frame re-renders, and the matrices every consumer samples
-/// the others with.
-///
-/// A cascade that is not [due](cascade_due) keeps the map it was last rendered
-/// into, so it must also keep being *sampled* with the matrix that map was
-/// rendered with: [`Self::resolve`] puts that cascade back into the set the
-/// lighting block, the fog and the cull dispatch all read, so none of them can
-/// disagree with the texels. It is re-rendered anyway, whatever its turn, when
-/// its old map no longer covers its slice of the view — the camera has moved
-/// or turned past the slack between the slice and the sphere fitted around it
-/// — when the sun has moved, or when the set's shape has changed. What
-/// staggering costs is up to three frames of lag on a moving object's distant
-/// shadow.
-#[derive(Default)]
-pub struct CascadeCache {
-    rendered: [Option<Rendered>; MAX_CASCADES],
-    frame: u64,
-}
-
-#[derive(Clone, Copy)]
-struct Rendered {
-    cascade: Cascade,
-    light_dir: Vec3,
-    resolution: u32,
-    count: usize,
-}
-
-/// How far the sun may turn, as a cosine, before every map is stale: about a
-/// quarter of a degree.
-const SUN_STILL: f32 = 0.99999;
-
-impl CascadeCache {
-    /// Forget every map, because the image behind them was replaced.
-    pub fn invalidate(&mut self) {
-        self.rendered = [None; MAX_CASCADES];
-    }
-
-    /// This frame's `set`, with each cascade that is not re-rendered replaced
-    /// by the one its map holds, and which cascades are re-rendered.
-    pub fn resolve(
-        &mut self,
-        set: &CascadeSet,
-        camera: &Camera,
-        aspect: f32,
-        light_dir: Vec3,
-        config: &CascadeConfig,
-    ) -> ([bool; MAX_CASCADES], CascadeSet) {
-        let frame = self.frame;
-        self.frame += 1;
-        let light_dir = light_dir.try_normalize().unwrap_or(Vec3::NEG_Y);
-
-        let mut resolved = *set;
-        let mut render = [false; MAX_CASCADES];
-        for index in 0..set.count {
-            let reusable = self.rendered[index].filter(|old| {
-                old.count == set.count
-                    && old.resolution == config.resolution
-                    && old.light_dir.dot(light_dir) > SUN_STILL
-                    && covers(
-                        &old.cascade,
-                        &slice_corners(camera, aspect, &set.splits, index),
-                    )
-            });
-            match reusable {
-                Some(old) if !cascade_due(index, frame) => resolved.cascades[index] = old.cascade,
-                _ => {
-                    render[index] = true;
-                    self.rendered[index] = Some(Rendered {
-                        cascade: set.cascades[index],
-                        light_dir,
-                        resolution: config.resolution,
-                        count: set.count,
-                    });
-                }
-            }
-        }
-        for slot in &mut self.rendered[set.count..] {
-            *slot = None;
-        }
-        (render, resolved)
-    }
-}
-
-/// Whether a map rendered with `cascade` holds every point of `corners`' slice:
-/// each corner inside its box, across and in depth.
-fn covers(cascade: &Cascade, corners: &[Vec3; 8]) -> bool {
-    corners.iter().all(|corner| {
-        let ndc = cascade.view_proj.project_point3(*corner);
-        ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0 && (0.0..=1.0).contains(&ndc.z)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,99 +354,9 @@ mod tests {
             max_distance: 100.0,
             lambda: 0.75,
             resolution: 2048,
+            far_resolution: 1024,
             pullback: 50.0,
         }
-    }
-
-    // --- CascadeCache ---
-
-    #[test]
-    fn the_far_cascades_render_at_half_and_a_quarter_rate_and_never_together() {
-        let frames = 0..16u64;
-        assert!(
-            frames
-                .clone()
-                .all(|f| cascade_due(0, f) && cascade_due(1, f))
-        );
-        assert_eq!(frames.clone().filter(|&f| cascade_due(2, f)).count(), 8);
-        assert_eq!(frames.clone().filter(|&f| cascade_due(3, f)).count(), 4);
-        assert!(
-            frames
-                .clone()
-                .all(|f| !(cascade_due(2, f) && cascade_due(3, f))),
-            "a frame that renders both far cascades is the spike staggering exists to remove",
-        );
-    }
-
-    fn resolve(
-        cache: &mut CascadeCache,
-        camera: &Camera,
-        sun: Vec3,
-    ) -> ([bool; MAX_CASCADES], CascadeSet) {
-        let set = cascades(camera, ASPECT, sun, &config());
-        cache.resolve(&set, camera, ASPECT, sun, &config())
-    }
-
-    /// The first frame has nothing to reuse; the next skips cascade 3, whose
-    /// turn is every fourth frame — and samples it with the matrix its map was
-    /// rendered with, not this frame's, even though the camera has crept a
-    /// little since and this frame's fit for it has moved.
-    #[test]
-    fn a_skipped_cascade_is_sampled_with_the_matrix_it_was_rendered_with() {
-        let mut cache = CascadeCache::default();
-        let mut camera = Camera::default();
-        let (first, rendered) = resolve(&mut cache, &camera, sun());
-        assert_eq!(
-            first, [true; MAX_CASCADES],
-            "an empty cache renders everything"
-        );
-
-        camera.position += Vec3::new(0.3, 0.0, 0.0);
-        camera.target += Vec3::new(0.3, 0.0, 0.0);
-        let fresh = cascades(&camera, ASPECT, sun(), &config());
-        assert_ne!(fresh.cascades[3].view_proj, rendered.cascades[3].view_proj);
-
-        let (second, sampled) = resolve(&mut cache, &camera, sun());
-        assert_eq!(second, [true, true, true, false]);
-        assert_eq!(
-            sampled.cascades[3].view_proj,
-            rendered.cascades[3].view_proj
-        );
-        assert_eq!(sampled.cascades[2].view_proj, fresh.cascades[2].view_proj);
-    }
-
-    /// A stale map is only worth keeping while it still covers the slice of
-    /// view it answers for. Turned to face another way, the slice is somewhere
-    /// the old map never saw.
-    #[test]
-    fn a_turned_camera_re_renders_what_its_old_maps_no_longer_cover() {
-        let mut cache = CascadeCache::default();
-        let mut camera = Camera::default();
-        resolve(&mut cache, &camera, sun());
-        let forward = camera.target - camera.position;
-        camera.target = camera.position + Vec3::new(forward.z, forward.y, -forward.x);
-        let (render, _) = resolve(&mut cache, &camera, sun());
-        assert_eq!(render, [true; MAX_CASCADES]);
-    }
-
-    #[test]
-    fn a_moved_sun_re_renders_every_cascade() {
-        let mut cache = CascadeCache::default();
-        let camera = Camera::default();
-        resolve(&mut cache, &camera, sun());
-        let moved = (sun() + Vec3::new(0.05, 0.0, 0.0)).normalize();
-        let (render, _) = resolve(&mut cache, &camera, moved);
-        assert_eq!(render, [true; MAX_CASCADES]);
-    }
-
-    #[test]
-    fn an_invalidated_cache_re_renders_every_cascade() {
-        let mut cache = CascadeCache::default();
-        let camera = Camera::default();
-        resolve(&mut cache, &camera, sun());
-        cache.invalidate();
-        let (render, _) = resolve(&mut cache, &camera, sun());
-        assert_eq!(render, [true; MAX_CASCADES]);
     }
 
     /// The light-space frame the fit snaps against: rotation only, anchored at
@@ -838,6 +732,44 @@ mod tests {
         }
     }
 
+    /// What a level is for: everything within its radius of the camera is
+    /// inside its square, in every direction, so no turn of the camera can
+    /// carry the view out of it.
+    #[test]
+    fn a_level_holds_everything_within_its_radius_of_the_camera() {
+        let camera = Vec3::new(13.7, 2.0, -41.3);
+        let level = fit_level(camera, sun(), 32.0, 1024, 50.0);
+        for direction in [
+            Vec3::X,
+            Vec3::NEG_X,
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::Z,
+            Vec3::NEG_Z,
+            Vec3::new(1.0, 1.0, 1.0).normalize(),
+            Vec3::new(-1.0, 0.3, -1.0).normalize(),
+        ] {
+            let ndc = level.view_proj.project_point3(camera + direction * 32.0);
+            assert!(inside_ndc(ndc, 0.0), "{direction} -> {ndc}");
+        }
+    }
+
+    /// The property scrolling is built on: a level's square sits on a grid of
+    /// its own texels that does not move with the camera.
+    #[test]
+    fn a_level_lands_on_its_texel_grid() {
+        let level = fit_level(Vec3::new(13.7, 2.0, -41.3), sun(), 32.0, 1024, 50.0);
+        let eye = level.light_view.inverse().transform_point3(Vec3::ZERO);
+        let center = light_rot(sun()).transform_point3(eye);
+        for (axis, value) in [("x", center.x), ("y", center.y)] {
+            let texels = value / level.texel_world_size;
+            assert!(
+                (texels - texels.round()).abs() < 1e-2,
+                "{axis} centre is {texels} texels, not a whole number",
+            );
+        }
+    }
+
     #[test]
     fn cascades_grow_outward() {
         let camera = Camera::default();
@@ -861,7 +793,7 @@ mod tests {
         let config = config();
         let set = cascades(&camera, ASPECT, sun(), &config);
         let slack = 2.0 / config.resolution as f32;
-        for i in 0..set.count {
+        for i in 0..set.count.min(NEAR_CASCADES) {
             let near = if i == 0 {
                 camera.near
             } else {

@@ -370,7 +370,7 @@ impl FogPass {
         &self,
         device: &Device,
         builder: &mut Encoder,
-        shadow_maps: TextureViewId,
+        shadow_atlas: TextureViewId,
     ) {
         let target = self.scatter_view();
         // The volume's own extent, which the history was allocated at.
@@ -389,7 +389,7 @@ impl FogPass {
                 // and what writing one would be rejected for.
                 Binding {
                     binding: 1,
-                    resource: BindingResource::Texture(shadow_maps),
+                    resource: BindingResource::Texture(shadow_atlas),
                 },
                 Binding {
                     binding: 3,

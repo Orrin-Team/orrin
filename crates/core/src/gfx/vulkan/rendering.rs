@@ -6,8 +6,9 @@
 //! match the framebuffer's attachment order.
 //!
 //! Two consequences shape what is here. Load and store ops are decided at record
-//! time, so the shadow atlas no longer needs a second render pass differing from
-//! the cascades' only in `load_op`. And attachment layouts are stated per
+//! time, so a pass that keeps what its target held differs from one that clears
+//! it by a field rather than by a render pass object. And attachment layouts are
+//! stated per
 //! attachment, so the read-only prepass depth that `oit.rs`, `refraction.rs` and
 //! the one-sample forward pass borrow is one field rather than three hand-built
 //! `RenderPassCreateInfo`s.
@@ -52,8 +53,7 @@ fn cleared(target: TextureViewId, clear: [f32; 4]) -> ColorAttachment {
 }
 
 /// A colour attachment whose previous contents do not matter and which is
-/// entirely rewritten — the swapchain image, and the shadow atlas whose live
-/// tiles `record_atlas` clears itself.
+/// entirely rewritten — the swapchain image.
 fn overwritten(target: TextureViewId) -> ColorAttachment {
     ColorAttachment {
         target,
@@ -104,7 +104,7 @@ fn depth_scratch(target: TextureViewId) -> DepthAttachment {
 }
 
 /// A depth attachment that is cleared, written, and kept for later passes to
-/// sample — the geometry prepass's, and each shadow cascade's. `clear` is the
+/// sample — the geometry prepass's, and the shadow atlas's. `clear` is the
 /// far plane in that map's own convention, which a camera and a shadow map do
 /// not share; see [`crate::gfx::depth`].
 fn depth_written(target: TextureViewId, clear: f32) -> DepthAttachment {
@@ -278,38 +278,15 @@ pub(super) fn rendering_info(
                 depth: Some(depth_borrowed(images.texture(prepass.depth))),
             }
         }
-        // One layer of the cascade array, not the array view: an attachment is a
-        // single layer, and handing it the whole array would make every cascade
-        // clear and overwrite the same texels without erroring.
-        //
-        // Entirely re-rendered, so clearing it whole is exactly what it wants: a
-        // texel nobody drew into reads as far, and therefore as lit.
-        PassBody::ShadowCascade(cascade) => RenderTargets {
+        // Cleared whole, because every view in it is redrawn: a texel nobody
+        // drew into reads as far, and therefore as lit, and so does a tile no
+        // view was given.
+        PassBody::Shadows => RenderTargets {
             colors: Vec::new(),
             depth: Some(depth_written(
-                images.layer_texture(
-                    ids.shadows.expect("shadow pass without a shadow image"),
-                    cascade,
-                ),
+                images.texture(ids.shadow_atlas.expect("the shadow pass without its atlas")),
                 crate::gfx::depth::SHADOW_CLEAR,
             )),
-        },
-        // Not re-rendered whole: it holds up to 64 tiles of which a frame lights
-        // a fraction, so it loads `DontCare` and `record_atlas` clears the ones
-        // assigned. That difference — one `load_op` — cost a second render pass
-        // object before; here it is this arm.
-        PassBody::PunctualShadows => RenderTargets {
-            colors: Vec::new(),
-            depth: Some(DepthAttachment {
-                target: images.texture(
-                    ids.shadow_atlas
-                        .expect("punctual shadow pass without an atlas"),
-                ),
-                load: LoadOp::DontCare,
-                store: StoreOp::Store,
-                clear: crate::gfx::depth::SHADOW_CLEAR,
-                read_only: false,
-            }),
         },
         // The acquired swapchain image, every pixel of which the tonemap writes.
         PassBody::Tonemap => color_only(overwritten(swapchain)),

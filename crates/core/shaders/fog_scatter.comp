@@ -20,10 +20,10 @@ layout(set = 0, binding = 0) uniform Fog {
     GpuFog f;
 } u;
 
-// The cascades, kept as a separate image and comparison sampler for the reason
-// `shading.glsl` keeps them apart: Metal caps sampler states per stage far below
-// sampled images.
-layout(set = 0, binding = 1) uniform texture2DArray u_shadow_maps;
+// The shadow atlas, kept as a separate image and comparison sampler for the
+// reason `shading.glsl` keeps them apart: Metal caps sampler states per stage
+// far below sampled images.
+layout(set = 0, binding = 1) uniform texture2D u_shadow_atlas;
 layout(set = 0, binding = 2) uniform samplerShadow u_shadow_cmp;
 
 // Last frame's volume, in last frame's froxel space. Linear and clamped: the
@@ -64,7 +64,7 @@ void main() {
     // surface here — see `cascade_shadow`. The `dot(N, L)` early-out a surface
     // takes has no meaning for a point of air, which is exactly why this calls
     // the shared core rather than `shading.glsl`'s `sun_shadow`.
-    float sun_visibility = cascade_sun_shadow(u_shadow_maps, u_shadow_cmp, world_pos, L, L, view_dist);
+    float sun_visibility = cascade_sun_shadow(u_shadow_atlas, u_shadow_cmp, world_pos, L, L, view_dist);
 
     // `rgb` is scattered radiance per metre and `a` is extinction per metre, so
     // the pass below can integrate the two together over a slice's own length.

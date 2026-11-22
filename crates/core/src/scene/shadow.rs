@@ -1,6 +1,6 @@
 use orrin_registry::Reflect;
 
-use crate::gfx::punctual::AtlasConfig;
+use crate::gfx::shadow_views::{AtlasConfig, floor_power_of_two};
 use crate::gfx::shadows::CascadeConfig;
 
 /// Three centimetres: about what the 3x3 kernel this replaced spread a near
@@ -8,6 +8,7 @@ use crate::gfx::shadows::CascadeConfig;
 /// keeps the contact shadows it had.
 const DEFAULT_SOFTNESS: f32 = 0.03;
 const DEFAULT_SHARPNESS: f32 = 0.0;
+const DEFAULT_FAR_RESOLUTION: u32 = 1024;
 /// Past this the remap is a threshold and the edge shows the map's texels.
 pub const MAX_SHADOW_SHARPNESS: f32 = 0.9;
 
@@ -18,8 +19,16 @@ pub struct ShadowSettings {
     pub enabled: bool,
     /// Clamped to `MAX_CASCADES` when the cascades are built.
     pub cascade_count: u32,
-    /// Edge length of one cascade's depth map, in texels.
+    /// Edge of a near cascade's tile of the atlas, in texels: the first two of
+    /// the sun's views, which are fitted to the view. Held to half the atlas.
     pub resolution: u32,
+    /// Edge of the tile each of the sun's remaining views gets. Those are
+    /// squares centred on the camera, a distance away where a texel is fewer
+    /// pixels, so they take a smaller tile by default — which is what leaves
+    /// the lamps their room in an atlas the sun shares. Held to a quarter of
+    /// the atlas.
+    #[reflect(default = DEFAULT_FAR_RESOLUTION)]
+    pub far_resolution: u32,
     /// How far from the camera shadows are cast. Deliberately independent of
     /// the camera's far plane: splitting across a 1000 m view distance would
     /// spend every cascade on geometry nobody can see the shadows of.
@@ -45,14 +54,14 @@ pub struct ShadowSettings {
     /// not read as light leaking under its caster.
     #[reflect(default = DEFAULT_SHARPNESS)]
     pub sharpness: f32,
-    /// Whether point and spot lights write into the punctual atlas at all. The
+    /// Whether point and spot lights get tiles of the atlas at all. The
     /// per-light `casts_shadows` says which of them ask; this is the master
-    /// switch, and turning it off drops the atlas pass and its image.
+    /// switch.
     pub punctual_enabled: bool,
-    /// Edge of the punctual atlas in texels, and of one face's tile within it.
-    /// Both are frame *structure* in the same way the cascade resolution is —
-    /// the first reallocates the image, and the second changes how many lights
-    /// fit in it.
+    /// Edge of the atlas every shadow view is a tile of, the sun's and the
+    /// lamps' alike, and of one punctual face's tile within it. The first is
+    /// frame *structure* — it reallocates the image — and the second changes
+    /// how many lights fit beside the sun.
     pub atlas_resolution: u32,
     pub atlas_tile_size: u32,
     /// Near plane of every punctual frustum. It cannot come from the light's
@@ -87,6 +96,7 @@ impl Default for ShadowSettings {
             enabled: true,
             cascade_count: 4,
             resolution: 2048,
+            far_resolution: DEFAULT_FAR_RESOLUTION,
             max_distance: 100.0,
             lambda: 0.75,
             pullback: 50.0,
@@ -95,9 +105,9 @@ impl Default for ShadowSettings {
             softness: DEFAULT_SOFTNESS,
             sharpness: DEFAULT_SHARPNESS,
             punctual_enabled: true,
-            // 4096 with 512-texel tiles is 64 faces: ten point lights, or a mix
-            // of points and spots up to the eight-caster budget. One D16 image
-            // of 32 MB, the same as four 2048 cascades.
+            // One D16 image of 32 MB. Two 2048 cascades and two 1024 levels
+            // take five eighths of it, and what is left is 24 tiles of 512:
+            // four point lights, or a mix of points and spots.
             atlas_resolution: 4096,
             atlas_tile_size: 512,
             punctual_near: 0.05,
@@ -125,24 +135,40 @@ impl ShadowSettings {
     }
 
     pub fn cascade_config(&self) -> CascadeConfig {
+        let atlas = floor_power_of_two(self.atlas_resolution);
         CascadeConfig {
             count: self.cascade_count as usize,
             max_distance: self.max_distance,
             lambda: self.lambda,
-            resolution: self.resolution,
+            // Powers of two, because a tile is one and a cascade is fitted to
+            // its tile's texel count; and bounded so that four views always
+            // fit, whatever a slider pair says.
+            resolution: floor_power_of_two(self.resolution).min(atlas / 2),
+            far_resolution: floor_power_of_two(self.far_resolution).min(atlas / 4),
             pullback: self.pullback,
         }
     }
 
-    /// How the punctual atlas is cut up, or `None` when nothing punctual casts —
-    /// which is what makes the graph declare no atlas at all.
-    pub fn atlas_config(&self) -> Option<AtlasConfig> {
-        self.punctual_enabled.then(|| AtlasConfig {
+    /// How the atlas is cut up for the punctual lights.
+    pub fn atlas_config(&self) -> AtlasConfig {
+        AtlasConfig {
             resolution: self.atlas_resolution,
-            // A tile larger than the atlas would divide to zero columns, and a
-            // slider pair can express that.
+            punctual: self.punctual_enabled,
             tile_size: self.atlas_tile_size.clamp(1, self.atlas_resolution.max(1)),
             near: self.punctual_near,
-        })
+        }
+    }
+
+    /// How many punctual faces the atlas has room for beside the sun's views.
+    pub fn punctual_tiles(&self) -> u32 {
+        let mut tiles = crate::gfx::shadow_views::TileAllocator::new(self.atlas_resolution);
+        if self.enabled {
+            let config = self.cascade_config();
+            for index in 0..config.count.clamp(1, crate::gfx::shadows::MAX_CASCADES) {
+                tiles.allocate(config.resolution_of(index));
+            }
+        }
+        let size = self.atlas_config().tile_size;
+        std::iter::from_fn(|| tiles.allocate(size)).count() as u32
     }
 }

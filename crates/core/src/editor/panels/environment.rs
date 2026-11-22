@@ -663,13 +663,26 @@ fn shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
     }
     if rows.shows("Resolution") {
         widgets::property(ui, "Resolution", |ui| {
-            egui::ComboBox::from_id_salt("shadow_resolution")
-                .selected_text(format!("{}", s.resolution))
-                .show_ui(ui, |ui| {
-                    for size in [512u32, 1024, 2048, 4096] {
-                        ui.selectable_value(&mut s.resolution, size, format!("{size}"));
-                    }
-                });
+            // The near cascades' tiles, then the tiles of the levels past them.
+            // Both come out of the atlas the lamps share, so the first is held
+            // to half its edge and the second to a quarter.
+            let ShadowSettings {
+                resolution,
+                far_resolution,
+                ..
+            } = &mut *s;
+            for (salt, value) in [
+                ("shadow_resolution", resolution),
+                ("shadow_far_resolution", far_resolution),
+            ] {
+                egui::ComboBox::from_id_salt(salt)
+                    .selected_text(format!("{value}"))
+                    .show_ui(ui, |ui| {
+                        for size in [512u32, 1024, 2048, 4096] {
+                            ui.selectable_value(value, size, format!("{size}"));
+                        }
+                    });
+            }
         });
     }
     if rows.shows("Distance") {
@@ -734,12 +747,10 @@ fn punctual_shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
     }
     if rows.shows("Atlas") {
         widgets::property(ui, "Atlas", |ui| {
-            // 4096 is the ceiling on purpose, twice over. Vulkan guarantees
+            // 4096 is the ceiling on purpose. Vulkan guarantees
             // `maxImageDimension2D` of only 4096, so offering 8192 is offering a
             // startup panic on a conformant device that Metal happens to let this
-            // one get away with. And it would buy nothing if it worked: the budget
-            // is `MAX_SHADOW_LIGHTS` casters, so the most faces anything can ask for
-            // is 48, and 4096 at 512 already holds 64.
+            // one get away with.
             egui::ComboBox::from_id_salt("shadow_atlas_resolution")
                 .selected_text(format!("{}", s.atlas_resolution))
                 .show_ui(ui, |ui| {
@@ -757,8 +768,11 @@ fn punctual_shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
         });
         // Both are structure, so the reader deserves to know what they bought: a
         // point light spends six of these and a spot one.
-        let tiles = s.atlas_config().map_or(0, |config| config.capacity());
-        ui.weak(format!("{tiles} tiles — {} point lights", tiles / 6));
+        let tiles = s.punctual_tiles();
+        ui.weak(format!(
+            "{tiles} tiles beside the sun's — {} point lights",
+            tiles / 6
+        ));
     }
     if rows.shows("Near") {
         slider(

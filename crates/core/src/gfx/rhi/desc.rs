@@ -289,13 +289,6 @@ pub struct Binding {
     pub resource: BindingResource,
 }
 
-/// A rectangle of a depth attachment, in texels.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct DepthRect {
-    pub offset: [u32; 2],
-    pub extent: [u32; 2],
-}
-
 /// What a render pass does with an attachment's contents on the way in.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum LoadOp {

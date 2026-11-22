@@ -33,49 +33,26 @@ int select_cascade(float view_dist) {
     return count - 1;
 }
 
-// Filtered visibility from one cascade. 1.0 is lit.
-//
-// `N` is the direction the lookup is biased along, which is the surface normal
-// for a surface and the light direction itself for a point of air -- where there
-// is no surface to be shadow-acned against, and pushing toward the light is
-// exactly the offset that keeps a froxel out of its own occluder.
+// Filtered visibility from one of the sun's views. 1.0 is lit.
 float cascade_shadow(
-    texture2DArray maps,
+    texture2D atlas,
     samplerShadow cmp,
     int cascade,
     vec3 world_pos,
     vec3 N,
     vec3 L
 ) {
-    float texel = ORRIN_CASCADES.texel_sizes[cascade];
-    float radius = shadow_kernel_radius(ORRIN_CASCADES.filtering.x, texel);
-    // Offsetting in texture space rather than in depth is what removes acne
-    // without the peter-panning a depth offset causes.
-    vec3 p = world_pos + N * shadow_normal_offset(radius, texel, dot(N, L));
-
-    vec4 clip = ORRIN_CASCADES.view_proj[cascade] * vec4(p, 1.0);
-    vec3 ndc = clip.xyz / clip.w;
-    // Past the cascade's far plane there is nothing to occlude against.
-    if (ndc.z > 1.0) {
-        return 1.0;
-    }
-
-    vec2 size = vec2(textureSize(sampler2DArrayShadow(maps, cmp), 0).xy);
-    vec2 at = (ndc.xy * 0.5 + 0.5) * size - 0.5;
-    vec2 base = floor(at);
-    vec4 offsets_x, weights_x, offsets_y, weights_y;
-    shadow_tent_axis(at.x - base.x, radius, offsets_x, weights_x);
-    shadow_tent_axis(at.y - base.y, radius, offsets_y, weights_y);
-
-#define CASCADE_FETCH(at_texel) \
-    texture(sampler2DArrayShadow(maps, cmp), vec4((at_texel) / size, float(cascade), ndc.z))
-    float sum = SHADOW_TENT_INNER(CASCADE_FETCH);
-    if (radius > SHADOW_KERNEL_INNER) {
-        sum += SHADOW_TENT_OUTER(CASCADE_FETCH);
-    }
-#undef CASCADE_FETCH
-    float total = dot(weights_x, vec4(1.0)) * dot(weights_y, vec4(1.0));
-    return shadow_sharpen(sum / total, ORRIN_CASCADES.filtering.y);
+    return shadow_view_visibility(
+        atlas,
+        cmp,
+        ORRIN_CASCADES.view_proj[cascade],
+        ORRIN_CASCADES.rects[cascade],
+        ORRIN_CASCADES.texel_sizes[cascade],
+        ORRIN_CASCADES.filtering.xy,
+        world_pos,
+        N,
+        L
+    );
 }
 
 // Sun visibility, blended across the cascade seam and scaled by the strength
@@ -83,7 +60,7 @@ float cascade_shadow(
 // slider at zero — belong to the caller, because only one of the two callers has
 // a normal to test.
 float cascade_sun_shadow(
-    texture2DArray maps,
+    texture2D atlas,
     samplerShadow cmp,
     vec3 world_pos,
     vec3 N,
@@ -96,7 +73,7 @@ float cascade_sun_shadow(
     }
 
     int cascade = select_cascade(view_dist);
-    float shadow = cascade_shadow(maps, cmp, cascade, world_pos, N, L);
+    float shadow = cascade_shadow(atlas, cmp, cascade, world_pos, N, L);
 
     // The next cascade only has depth slightly before its own near plane, and
     // that overlap is what `cascades()` widened each slice by — so the blend
@@ -105,7 +82,7 @@ float cascade_sun_shadow(
     float band = split * ORRIN_CASCADES.params.y;
     if (cascade + 1 < count && view_dist > split - band) {
         float t = clamp((view_dist - (split - band)) / max(band, 1e-4), 0.0, 1.0);
-        shadow = mix(shadow, cascade_shadow(maps, cmp, cascade + 1, world_pos, N, L), t);
+        shadow = mix(shadow, cascade_shadow(atlas, cmp, cascade + 1, world_pos, N, L), t);
     }
 
     return mix(1.0, shadow, ORRIN_CASCADES.params.z);
