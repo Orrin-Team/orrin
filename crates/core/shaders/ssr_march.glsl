@@ -231,12 +231,28 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
     float surface_depth = texture(u_depth, hit_uv).r;
     float surface_z = view_pos(hit_uv, surface_depth).z;
     float ray_z = view_pos(hit_uv, hit_screen.z).z;
-    if (abs(ray_z - surface_z) > ssr.params.z) {
+    float gap = abs(ray_z - surface_z);
+    if (gap > ssr.params.z) {
         return vec4(0.0);
     }
 
-    // Three things the trace cannot know anything about, faded rather than cut
-    // so a reflection dissolves instead of ending on a line.
+    // The depth buffer vouches for a hit only to within the ray's own depth
+    // across one texel: that is how far apart a real crossing and the texel
+    // the march stopped on can be. Further behind, the ray went behind the
+    // surface rather than into it, and only `thickness` says something is
+    // there — a floating sphere's hidden underside, read in the colour of its
+    // lit top. A mirror shows that guess texel for texel and, where it runs
+    // out, ends on a ragged edge that flickers with the jitter and leaves
+    // slabs of the wrong surface, so a mirror's hit fades across the window
+    // instead. A rough lobe blurs that edge by itself and keeps the plain cut:
+    // its loose hits are most of the contact reflection under an object.
+    vec3 next = hit_screen + dir / max(length(dir.xy * ssr.extent.xy), 1e-4);
+    float slack = min(abs(view_pos(next.xy, next.z).z - ray_z), 0.5 * ssr.params.z);
+    float sharp = 1.0 - smoothstep(MIRROR_ROUGHNESS, GLOSSY_ROUGHNESS, roughness);
+    float behind = mix(1.0, 1.0 - smoothstep(slack, ssr.params.z, gap), sharp);
+
+    // Three more things the trace cannot know anything about, faded rather than
+    // cut so a reflection dissolves instead of ending on a line.
     vec2 border = min(hit_uv, 1.0 - hit_uv);
     float edge = smoothstep(0.0, 0.08, min(border.x, border.y));
     // A ray travelling back toward the camera is reflecting something the screen
@@ -246,7 +262,7 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
     // And the lobe stops being resolvable by one ray long before the cutoff.
     float smoothness = 1.0 - smoothstep(ssr.params.y * 0.6, ssr.params.y, roughness);
 
-    float confidence = edge * facing * smoothness;
+    float confidence = behind * edge * facing * smoothness;
 
     // The ray is really a cone, and this is where that stops being a figure of
     // speech. A lobe of angular width ~alpha covers a patch of the world after
