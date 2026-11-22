@@ -8,6 +8,12 @@
 //! crate that a script moves leaves its shadow where it stood — and a scene
 //! built without one would cache nothing at all.
 //!
+//! A mesh may still say how it casts ([`ShadowCasting`]), and what it says is
+//! about cost, never about whether its shadow is right: `Static` skips the
+//! wait and `Dynamic` never ends it, but a caster told it is static and then
+//! moved is noticed exactly as any other is, and takes its cached depth with
+//! it.
+//!
 //! What this module tracks beyond the flag is what each change *costs*: a
 //! caster entering or leaving the static set has made every cached layer it
 //! stands in out of date, so its bounds are reported for the planner to find

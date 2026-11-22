@@ -42,6 +42,32 @@
 //! live layer. So the cache never decides whether a shadow is right, only what
 //! it costs; `tests/shadow_cache.rs` holds it to that on a GPU.
 //!
+//! # What a light may say about its own views
+//!
+//! A light carries [`LightShadows`], and each field
+//! of it lands on the views here rather than in a pass. The filter width, the
+//! sharpness and the two biases travel with a view, because two lamps in one
+//! atlas are two different answers; `INHERIT` in any of them is the scene's
+//! own ([`ViewDefaults`]).
+//!
+//! A lamp's tile is sized by how much of the screen its reach covers, in
+//! powers of two, and a tier is held until the size wanted has left it by a
+//! margin on either side. Without the margin a lamp at a tier's boundary
+//! changes tile every few frames as the camera breathes, and a new tile is a
+//! cached layer thrown away.
+//!
+//! The update mode is which casters a view takes and when: `Always` keeps what
+//! stands still and draws what moves over it every frame, `OnChange` draws
+//! only what stands still, so a moving caster casts nothing, and `OnDemand`
+//! draws everything in reach once and keeps that picture until the light's
+//! revision is bumped. None of them can leave a light's own movement undrawn:
+//! a new matrix is a new view whatever the mode says.
+//!
+//! A light's channel mask is part of what a view *is*. It decides which
+//! casters the cull takes for the view, so a mask that changes is a cached
+//! layer holding depth from casters that are no longer its own, and the view
+//! is redrawn.
+//!
 //! Nothing here takes a `Device`, for the reason the render graph does not: the
 //! allocation, the matrices and the plan are the part that can be wrong in a
 //! way pixels only hint at, so they are the part CI can assert.

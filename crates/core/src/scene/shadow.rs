@@ -14,7 +14,7 @@ pub const MAX_SHADOW_SHARPNESS: f32 = 0.9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct ShadowSettings {
-    /// When false the cascade passes are never declared and the forward shader
+    /// When false the shadow pass is never declared and the forward shader
     /// samples a 1x1 "fully lit" depth texture instead.
     pub enabled: bool,
     /// Clamped to `MAX_CASCADES` when the cascades are built.
@@ -69,9 +69,11 @@ pub struct ShadowSettings {
     /// switch.
     pub punctual_enabled: bool,
     /// Edge of the atlas every shadow view is a tile of, the sun's and the
-    /// lamps' alike, and of one punctual face's tile within it. The first is
-    /// frame *structure* — it reallocates the image — and the second changes
-    /// how many lights fit beside the sun.
+    /// lamps' alike, and the largest tile one punctual face takes within it: a
+    /// lamp's tile follows how much of the screen its reach covers, up to this
+    /// or to the light's own `LightShadows::resolution`. The first is frame
+    /// *structure* — it reallocates the image — and the second changes how
+    /// many lights fit beside the sun.
     pub atlas_resolution: u32,
     pub atlas_tile_size: u32,
     /// Near plane of every punctual frustum. It cannot come from the light's
@@ -79,14 +81,15 @@ pub struct ShadowSettings {
     /// a contact shadow looks like, and a lamp with a long reach still stands
     /// inches from the table it lights.
     pub punctual_near: f32,
-    /// The punctual maps' own bias pair. Separate from the cascades' because a
-    /// perspective face and an orthographic slice do not mean the same thing by
-    /// a depth unit — see `ShadowPass::punctual_constant_bias`.
+    /// The punctual maps' own bias pair, for a light that sets neither itself.
+    /// Separate from the sun's because a perspective face and an orthographic
+    /// slice do not mean the same thing by a depth unit.
     pub punctual_constant_bias: f32,
     pub punctual_slope_bias: f32,
-    /// `softness` and `sharpness` for the punctual lights. Their own pair for
-    /// the reason the biases are: a lamp is a smaller source than the sky's
-    /// share of the sun, and its texels grow with distance from it.
+    /// `softness` and `sharpness` for a punctual light that sets neither
+    /// itself. Their own pair for the reason the biases are: a lamp is a
+    /// smaller source than the sky's share of the sun, and its texels grow
+    /// with distance from it.
     #[reflect(default = DEFAULT_SOFTNESS)]
     pub punctual_softness: f32,
     #[reflect(default = DEFAULT_SHARPNESS)]

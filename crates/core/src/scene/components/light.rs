@@ -168,8 +168,9 @@ pub enum ShadowUpdate {
     /// casters cast nothing: a shadow of the room, not of who is in it.
     OnChange,
     /// Only when [`LightShadows::revision`] changes, with everything in reach
-    /// at that moment. Until then it is sampled as it was drawn, wherever the
-    /// light and its casters have gone since.
+    /// at that moment. Until then it is sampled as it was drawn, wherever its
+    /// casters have gone since. A light that itself moves is still redrawn: a
+    /// new matrix is a new view.
     OnDemand,
 }
 
