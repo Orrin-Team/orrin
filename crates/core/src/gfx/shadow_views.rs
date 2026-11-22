@@ -46,12 +46,14 @@
 //! allocation, the matrices and the plan are the part that can be wrong in a
 //! way pixels only hint at, so they are the part CI can assert.
 
-use glam::{IVec2, Mat4, Vec3};
+use glam::{IVec2, Mat4, Vec3, Vec4};
 
 use super::SceneLighting;
 use super::punctual::{self, LightKind, MAX_SHADOW_LIGHTS};
 use super::shadow_casters::{CasterTracker, FLAG_DYNAMIC, FLAG_STATIC};
-use super::shadows::{CascadeConfig, LevelWindow, MAX_CASCADES, SweepBounds, sun_views};
+use super::shadows::{
+    CascadeConfig, LevelWindow, MAX_CASCADES, MAX_SWEEP_PLANES, SweepBounds, sun_views, swept_slice,
+};
 use crate::geom::{Aabb, Frustum};
 use crate::scene::Camera;
 
@@ -228,6 +230,10 @@ pub enum CasterVolume {
         light_view: Mat4,
         bounds: SweepBounds,
     },
+    /// The part of a sun view the camera can see, swept toward the light, as
+    /// the planes whose positive side is inside. For what a frame draws and
+    /// throws away; see [`swept_slice`].
+    Hull([Vec4; MAX_SWEEP_PLANES], usize),
 }
 
 impl CasterVolume {
@@ -251,6 +257,16 @@ impl CasterVolume {
                     && lit.min.y <= sweep.max.y
                     && lit.max.y >= sweep.min.y
                     && lit.max.z >= sweep.min.z
+            }
+            CasterVolume::Hull(planes, count) => {
+                if !bounds.is_valid() {
+                    return true;
+                }
+                let (center, extents) = (bounds.center(), bounds.half_extents());
+                planes[..*count].iter().all(|plane| {
+                    let normal = glam::Vec3A::from(plane.truncate());
+                    normal.dot(center) + plane.w + extents.dot(normal.abs()) >= 0.0
+                })
             }
         }
     }
@@ -397,6 +413,11 @@ pub struct CasterDraw {
     pub tile: AtlasTile,
     /// The part of the tile the draw may write.
     pub scissor: AtlasRect,
+    /// The size below which a caster is not worth drawing here: a texel of the
+    /// view, as a length in metres and a further length per metre of depth
+    /// into a perspective one. A caster smaller than a texel shadows nothing
+    /// the filter can resolve.
+    pub cutoff: [f32; 2],
 }
 
 /// A rectangle of the live layer put back to what the cached layer holds.
@@ -552,6 +573,12 @@ const MAX_TOUCHED: usize = 48;
 /// both their cached layers every time.
 const INCUMBENT_BONUS: f32 = 1.5;
 
+/// What a light that reaches nothing in view is worth beside one that does.
+const OUT_OF_VIEW: f32 = 1e-6;
+
+/// How many texels across a caster has to be for a view to draw it.
+const SMALL_CASTER_TEXELS: f32 = 1.0;
+
 /// Plans each frame's shadow views and the work that brings the atlas up to
 /// date with them, and remembers what the atlas holds from the frames before.
 ///
@@ -599,6 +626,16 @@ struct Wanted {
     window: Option<LevelWindow>,
     /// The light's rotation, for a level's strips.
     rotation: Mat4,
+    /// What can cast into the part of the view a frame can see, for the layers
+    /// it draws and throws away. The view's own volume where that is no
+    /// tighter.
+    visible: CasterVolume,
+    /// Corners of the only part of the view the frame can read, where that is
+    /// known to be less than all of it.
+    read: Option<[Vec3; 8]>,
+    /// Whether the light reaches anything in view. One that does not is not
+    /// worked on: nothing reads its tiles until it does.
+    in_view: bool,
 }
 
 impl ShadowPlanner {
@@ -690,18 +727,25 @@ impl ShadowPlanner {
 
         let mut budget = REFRESH_BUDGET;
         for (index, cascade) in set.cascades[..set.count].iter().enumerate() {
+            let volume = CasterVolume::Sweep {
+                light_view: cascade.light_view,
+                bounds: cascade.bounds,
+            };
+            let slice = swept_slice(inputs.camera, inputs.aspect, direction, &set.splits, index);
             let wanted = Wanted {
                 key: ViewKey::Sun(index as u8),
                 size: sizes[index],
                 kind: ViewKind::Sun,
                 view_proj: cascade.view_proj,
-                volume: CasterVolume::Sweep {
-                    light_view: cascade.light_view,
-                    bounds: cascade.bounds,
-                },
+                volume,
                 texel_scale: cascade.texel_world_size,
                 window: cascade.window,
                 rotation,
+                visible: slice.map_or(volume, |slice| {
+                    CasterVolume::Hull(slice.planes, slice.count)
+                }),
+                read: slice.map(|slice| slice.corners),
+                in_view: true,
             };
             // A cascade is fitted to its tile's texel count, so a tile of any
             // other size would shimmer. One that does not fit ends the sun's
@@ -729,6 +773,27 @@ impl ShadowPlanner {
             LightKind::Spot => lighting.spot_lights[light].id,
         };
 
+        // A light whose reach is outside the view lights no pixel of the frame,
+        // so nothing samples its shadow: the clusters that bin it for shading
+        // are cut from this same frustum.
+        let frustum = inputs.camera.frustum(inputs.aspect);
+        let reaches_view = |kind, light: usize| {
+            let (position, range) = match kind {
+                LightKind::Point => {
+                    let light = &lighting.point_lights[light];
+                    (light.position, light.range)
+                }
+                LightKind::Spot => {
+                    let light = &lighting.spot_lights[light];
+                    (light.position, light.range)
+                }
+            };
+            frustum.intersects(&Aabb {
+                min: (position - Vec3::splat(range)).into(),
+                max: (position + Vec3::splat(range)).into(),
+            })
+        };
+
         let mut ranked = std::mem::take(&mut self.ranked);
         punctual::rank(lighting, inputs.camera.position, &mut ranked);
         let holds = |entries: &[Entry], light: u64| {
@@ -737,10 +802,22 @@ impl ShadowPlanner {
             )
         };
         for candidate in &mut ranked {
-            if holds(&self.entries, id(candidate.0, candidate.1)) {
+            let held = holds(&self.entries, id(candidate.0, candidate.1));
+            if held {
                 candidate.2 *= INCUMBENT_BONUS;
             }
+            if !reaches_view(candidate.0, candidate.1) {
+                // Below every light that does, and not worth new tiles: it
+                // keeps the ones it has for as long as nothing in view wants
+                // them, so that turning back to it finds its cached layers.
+                candidate.2 = if held {
+                    candidate.2 * OUT_OF_VIEW
+                } else {
+                    -1.0
+                };
+            }
         }
+        ranked.retain(|candidate| candidate.2 >= 0.0);
         ranked.sort_by(|a, b| b.2.total_cmp(&a.2));
 
         // Which lights the atlas has room for, decided before any of them is
@@ -789,6 +866,7 @@ impl ShadowPlanner {
         for &(kind, light, _) in &ranked {
             let needed = punctual::face_count(kind);
             let first_view = plan.views.views.len();
+            let in_view = reaches_view(kind, light);
             let faces = punctual::faces(
                 lighting,
                 kind,
@@ -810,6 +888,9 @@ impl ShadowPlanner {
                     texel_scale: faces.texel_per_metre,
                     window: None,
                     rotation: Mat4::IDENTITY,
+                    visible: CasterVolume::Frustum(faces.view_proj[face]),
+                    read: None,
+                    in_view,
                 };
                 if !self.plan_view(&wanted, inputs.casters, &mut budget, plan) {
                     break;
@@ -915,15 +996,45 @@ impl ShadowPlanner {
             texel_scale: wanted.texel_scale,
             kind: wanted.kind,
         });
+        let cutoff = match wanted.kind {
+            ViewKind::Sun => [wanted.texel_scale * SMALL_CASTER_TEXELS, 0.0],
+            ViewKind::Punctual => [0.0, wanted.texel_scale * SMALL_CASTER_TEXELS],
+        };
+        // A layer the frame throws away takes only what can shadow what the
+        // camera sees. The cached layer has to be right wherever the camera
+        // turns next, and takes everything that reaches the view.
         let draw = |layer, casters, scissor| CasterDraw {
             view,
             layer,
             casters,
-            volume: wanted.volume,
+            volume: if layer == Layer::Live {
+                wanted.visible
+            } else {
+                wanted.volume
+            },
             view_proj: wanted.view_proj,
             tile,
             scissor,
+            cutoff,
         };
+
+        // Nothing reads a tile whose light reaches nothing in view, so nothing
+        // is done to it. What it holds goes stale meanwhile, and is put right
+        // the frame the light is back.
+        if !wanted.in_view {
+            if entry.cached
+                && casters.changed().is_none_or(|changed| {
+                    changed
+                        .iter()
+                        .any(|bounds| wanted.volume.reached_by(bounds))
+                })
+            {
+                entry.cached = false;
+            }
+            entry.live = Live::Unknown;
+            plan.work.push(ViewWork::Held);
+            return true;
+        }
 
         // What moved between the matrix the tile holds and the one asked for.
         let same = entry.view_proj == wanted.view_proj;
@@ -973,11 +1084,20 @@ impl ShadowPlanner {
                 });
                 plan.work.push(ViewWork::Refreshed);
             } else {
+                // Only as much of the tile as the frame can read. Clearing a
+                // tile is a touch of every texel in it, and a view drawn
+                // directly is cleared every frame it stays so.
+                let read = wanted
+                    .read
+                    .and_then(|corners| {
+                        read_rect(&corners, &wanted.view_proj, tile, wanted.texel_scale)
+                    })
+                    .unwrap_or(whole);
                 entry.window = wanted.window;
                 entry.live = Live::Everything;
                 entry.touched.clear();
-                plan.live_fills.push(whole);
-                plan.draws.push(draw(Layer::Live, Casters::All, whole));
+                plan.live_fills.push(read);
+                plan.draws.push(draw(Layer::Live, Casters::All, read));
                 plan.work.push(ViewWork::Direct);
                 return true;
             }
@@ -999,6 +1119,7 @@ impl ShadowPlanner {
                         view_proj,
                         tile,
                         scissor,
+                        cutoff,
                     });
                 },
             );
@@ -1039,7 +1160,7 @@ impl ShadowPlanner {
         match casters.dynamic() {
             Some(dynamic) => {
                 for bounds in dynamic {
-                    if !wanted.volume.reached_by(bounds) {
+                    if !wanted.visible.reached_by(bounds) {
                         continue;
                     }
                     match footprint(bounds, &wanted.view_proj, tile) {
@@ -1099,6 +1220,40 @@ fn footprint(bounds: &Aabb, view_proj: &Mat4, tile: AtlasTile) -> Option<AtlasRe
         return None;
     }
     Some(AtlasRect {
+        min: [tile.offset[0] + low.x as u32, tile.offset[1] + low.y as u32],
+        max: [
+            tile.offset[0] + high.x as u32,
+            tile.offset[1] + high.y as u32,
+        ],
+    })
+}
+
+/// How far past what the camera can see a lookup reaches: the filter's kernel
+/// and the normal offset in texels, and in metres the thickness a scattering
+/// surface looks behind itself by.
+const READ_MARGIN_TEXELS: f32 = 8.0;
+const READ_MARGIN_METRES: f32 = 0.25;
+
+/// The rectangle of `tile` the frame can read, given the corners of the part
+/// of the view it reads from.
+fn read_rect(
+    corners: &[Vec3; 8],
+    view_proj: &Mat4,
+    tile: AtlasTile,
+    texel: f32,
+) -> Option<AtlasRect> {
+    let margin = READ_MARGIN_TEXELS + READ_MARGIN_METRES / texel.max(1e-6);
+    let mut low = glam::Vec2::splat(f32::INFINITY);
+    let mut high = glam::Vec2::splat(f32::NEG_INFINITY);
+    for corner in corners {
+        let at = view_proj.project_point3(*corner).truncate() * 0.5 + 0.5;
+        low = low.min(at);
+        high = high.max(at);
+    }
+    let size = tile.size as f32;
+    let low = (low * size - margin).floor().max(glam::Vec2::ZERO);
+    let high = (high * size + margin).ceil().min(glam::Vec2::splat(size));
+    (low.x < high.x && low.y < high.y).then(|| AtlasRect {
         min: [tile.offset[0] + low.x as u32, tile.offset[1] + low.y as u32],
         max: [
             tile.offset[0] + high.x as u32,
@@ -1494,7 +1649,7 @@ mod tests {
     #[test]
     fn a_caster_that_starts_moving_uncaches_the_views_it_stood_in_and_no_others() {
         let near = point(1, Vec3::new(0.0, 3.0, 0.0));
-        let far = point(2, Vec3::new(60.0, 3.0, 0.0));
+        let far = point(2, Vec3::new(0.0, 3.0, -40.0));
         let mut rig = Rig::new(vec![near, far], Vec::new());
         rig.sun = None;
         rig.casters = vec![Vec3::ZERO];
@@ -1543,6 +1698,43 @@ mod tests {
         }
         assert_eq!(rig.frame().work, [ViewWork::Refreshed]);
         assert_eq!(rig.frame().work, [ViewWork::Held]);
+    }
+
+    /// A light whose reach is out of view lights nothing on screen, so nothing
+    /// is done for it however much moves around it — and what its tiles hold
+    /// by then is not trusted the frame it comes back.
+    #[test]
+    fn a_light_that_reaches_nothing_in_view_is_left_alone_until_it_does() {
+        // Twenty metres ahead, so that turning round puts all of its reach
+        // behind the camera.
+        let under = Vec3::new(0.0, 0.0, -20.0);
+        let mut rig = Rig::new(Vec::new(), vec![spot(1, under + Vec3::Y * 5.0)]);
+        rig.sun = None;
+        rig.casters = vec![under, under + Vec3::X];
+        rig.settle();
+
+        // Face away, and keep a caster moving under the light.
+        let ahead = rig.camera.target;
+        rig.camera.target = rig.camera.position + (rig.camera.position - ahead);
+        for step in 1..12 {
+            rig.casters[1] = under + Vec3::X * (1.0 + 0.05 * step as f32);
+            let plan = rig.frame();
+            assert_eq!(plan.views.views.len(), 1, "it lost the tile it had");
+            assert!(!plan.draws_static() && !plan.draws_live(), "step {step}");
+        }
+
+        rig.camera.target = ahead;
+        let plan = rig.frame();
+        assert!(
+            plan.draws_live(),
+            "it came back into view and was not redrawn"
+        );
+        let whole = AtlasRect::of(plan.views.views[0].tile);
+        assert!(
+            plan.live_fills.contains(&whole) || plan.restores.iter().any(|r| r.rect == whole),
+            "a tile that sat out {:?} was trusted as it was",
+            plan.work
+        );
     }
 
     /// The budget spreads the cost of starting to cache, and only that: a view

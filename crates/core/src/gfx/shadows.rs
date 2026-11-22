@@ -1,4 +1,4 @@
-use glam::{IVec2, Mat3, Mat4, Vec2, Vec3};
+use glam::{IVec2, Mat3, Mat4, Vec2, Vec3, Vec4};
 
 use crate::scene::Camera;
 
@@ -422,6 +422,107 @@ fn slice_corners(
         splits[index - 1] * (1.0 - OVERLAP)
     };
     sub_frustum_corners(camera, aspect, near, splits[index])
+}
+
+/// The most planes [`swept_slice`] returns: a frustum's outline seen from any
+/// direction has at most six edges, and one more plane closes the far end.
+pub const MAX_SWEEP_PLANES: usize = 8;
+
+/// A slice of the view frustum swept toward the light. See [`swept_slice`].
+#[derive(Clone, Copy, Debug)]
+pub struct SweptSlice {
+    pub planes: [Vec4; MAX_SWEEP_PLANES],
+    /// How many of `planes` are set.
+    pub count: usize,
+    /// The slice's own corners, which bound where in the sun's view the camera
+    /// can be reading.
+    pub corners: [Vec3; 8],
+}
+
+/// What can cast into the part of a sun view the camera can see: the slice of
+/// the view frustum that view `index` answers for, swept toward the light.
+///
+/// As planes whose positive side is inside, in world space: one through each
+/// edge of the slice's outline as the light sees it, and one behind the slice's
+/// farthest point from the light. Open toward the light, like every sun
+/// volume. Tighter than the view's own box wherever the camera is not looking
+/// at all of it — and a level's box is the whole disc around the camera, of
+/// which a frustum is a wedge.
+///
+/// For the layers a frame draws and throws away. What a cached layer holds has
+/// to be right wherever the camera turns next, so it is culled against the box
+/// and never against this.
+///
+/// `None` when the outline does not come out as a polygon, which is a slice
+/// seen exactly end on.
+pub fn swept_slice(
+    camera: &Camera,
+    aspect: f32,
+    light_dir: Vec3,
+    splits: &[f32; MAX_CASCADES],
+    index: usize,
+) -> Option<SweptSlice> {
+    let light_dir = light_dir.try_normalize().unwrap_or(Vec3::NEG_Y);
+    // The view selects by distance from the eye, and a fragment that far along
+    // a ray to the frustum's corner is nearer than that in depth: the slice
+    // starts where the corner ray reaches the previous split.
+    let corner = (camera.fov_y * 0.5).tan() * (1.0 + aspect * aspect).sqrt();
+    let near = if index == 0 {
+        camera.near
+    } else {
+        splits[index - 1] * (1.0 - OVERLAP) / (1.0 + corner * corner).sqrt()
+    };
+    let corners = sub_frustum_corners(camera, aspect, near.max(camera.near), splits[index]);
+    let rotation = Mat4::look_at_rh(Vec3::ZERO, light_dir, light_up(light_dir));
+    let lit = corners.map(|corner| rotation.transform_point3(corner));
+
+    // The outline: the convex hull of the corners as the light sees them, by
+    // Andrew's monotone chain, counter-clockwise.
+    let mut points = lit.map(|point| point.truncate());
+    points.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    let cross = |o: Vec2, a: Vec2, b: Vec2| (a - o).perp_dot(b - o);
+    let mut hull = [Vec2::ZERO; 16];
+    let mut count = 0;
+    for pass in 0..2 {
+        let start = count;
+        for step in 0..points.len() {
+            let point = if pass == 0 {
+                points[step]
+            } else {
+                points[points.len() - 1 - step]
+            };
+            while count >= start + 2 && cross(hull[count - 2], hull[count - 1], point) <= 1e-6 {
+                count -= 1;
+            }
+            hull[count] = point;
+            count += 1;
+        }
+        // Each chain ends on the point the other begins with.
+        count -= 1;
+    }
+    if !(3..MAX_SWEEP_PLANES).contains(&count) {
+        return None;
+    }
+
+    let to_world = Mat3::from_mat4(rotation).transpose();
+    let mut planes = [Vec4::ZERO; MAX_SWEEP_PLANES];
+    for edge in 0..count {
+        let (a, b) = (hull[edge], hull[(edge + 1) % count]);
+        // Inside is to the left of a counter-clockwise edge.
+        let normal = Vec2::new(a.y - b.y, b.x - a.x).normalize_or_zero();
+        planes[edge] = (to_world * normal.extend(0.0)).extend(-normal.dot(a));
+    }
+    // The light looks down -z, so the slice's far end is its least z.
+    let far = lit
+        .iter()
+        .map(|point| point.z)
+        .fold(f32::INFINITY, f32::min);
+    planes[count] = (to_world * Vec3::Z).extend(-far);
+    Some(SweptSlice {
+        planes,
+        count: count + 1,
+        corners,
+    })
 }
 
 pub fn cascades(
@@ -969,6 +1070,48 @@ mod tests {
         let slid = texel(&placed) - texel(&moved);
         let cells = (moved.min_cell - placed.min_cell).as_vec2();
         assert!(slid.abs_diff_eq(cells, 1e-2), "{slid} against {cells}");
+    }
+
+    /// What the sweep is for and what it must never do. A caster standing in
+    /// the slice, or anywhere between it and the sun, is inside every plane;
+    /// one behind the camera is not, though the level's own box holds it.
+    #[test]
+    fn a_swept_slice_keeps_what_shadows_the_view_and_drops_what_is_behind_it() {
+        let camera = Camera::default();
+        let config = config();
+        let splits = split_distances(camera.near, &config);
+        let forward = (camera.target - camera.position).normalize();
+        let inside = |index: usize, point: Vec3| {
+            let slice = swept_slice(&camera, ASPECT, sun(), &splits, index).unwrap();
+            slice.planes[..slice.count]
+                .iter()
+                .all(|plane| plane.truncate().dot(point) + plane.w >= -1e-3)
+        };
+
+        for index in 0..config.count {
+            let near = if index == 0 {
+                camera.near
+            } else {
+                splits[index - 1]
+            };
+            let middle = camera.position + forward * 0.5 * (near + splits[index]);
+            assert!(inside(index, middle), "view {index} lost its own middle");
+            assert!(
+                inside(index, middle - sun().normalize() * 40.0),
+                "view {index} lost a caster between it and the sun"
+            );
+            assert!(
+                !inside(index, camera.position - forward * splits[index]),
+                "view {index} kept a caster behind the camera"
+            );
+        }
+        // Every corner of every slice, which is where a plane facing the wrong
+        // way shows first.
+        for index in 0..config.count {
+            for corner in slice_corners(&camera, ASPECT, &splits, index) {
+                assert!(inside(index, corner), "view {index} lost {corner}");
+            }
+        }
     }
 
     #[test]

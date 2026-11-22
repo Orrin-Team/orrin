@@ -74,6 +74,9 @@ pub(super) enum CullVolume {
     /// The camera, and each face of a punctual light: a closed volume, and a box
     /// outside it cannot be seen from inside it.
     Frustum(Frustum),
+    /// Any other convex volume, as the planes whose positive side is inside:
+    /// the slice of the view a sun view answers for, swept toward the light.
+    Planes([glam::Vec4; MAX_PLANES], usize),
     /// A sun view, or a strip of one, which keeps anything that reaches its box
     /// when swept toward the light — so it has no near plane, and an object
     /// between the sun and the box is exactly what casts into it.
@@ -91,9 +94,18 @@ pub(super) enum CullVolume {
 pub(super) struct CullView {
     pub volume: CullVolume,
     pub casters: u32,
+    /// The size below which an instance is not worth this view drawing: a
+    /// length in metres, and a further length per metre of depth into a
+    /// perspective view. Zero for the camera, whose pixels are not this
+    /// dispatch's to give up.
+    pub cutoff: [f32; 2],
 }
 
-const KIND_FRUSTUM: u32 = 0;
+/// How many planes a view's volume may have. Lock-stepped with `MAX_PLANES` in
+/// `cull.comp`.
+pub(super) const MAX_PLANES: usize = crate::gfx::shadows::MAX_SWEEP_PLANES;
+
+const KIND_PLANES: u32 = 0;
 const KIND_SWEEP: u32 = 1;
 
 /// Layout-frozen against `View` in `cull.comp`.
@@ -101,15 +113,16 @@ const KIND_SWEEP: u32 = 1;
 #[repr(C)]
 struct GpuView {
     light_view: [[f32; 4]; 4],
-    planes: [[f32; 4]; 6],
+    planes: [[f32; 4]; MAX_PLANES],
     /// A sweep's box in `light_view`'s space: least x and y and the far
-    /// plane's z, then greatest x and y.
+    /// plane's z, then greatest x and y. The spare two hold the view's
+    /// [`cutoff`](CullView::cutoff).
     sweep_min: [f32; 4],
     sweep_max: [f32; 4],
     kind: u32,
     casters: u32,
     base: u32,
-    _padding: u32,
+    plane_count: u32,
 }
 
 /// Layout-frozen against `Batch` in both shaders.
@@ -786,31 +799,39 @@ impl CullPass {
             .enumerate()
             .map(|(index, view)| {
                 let base = index as u32 * frame.stride;
-                let (kind, light_view, planes, sweep_min, sweep_max) = match view.volume {
-                    CullVolume::Frustum(frustum) => (
-                        KIND_FRUSTUM,
-                        Mat4::IDENTITY,
-                        frustum.planes().map(|plane| plane.to_array()),
-                        [0.0; 4],
-                        [0.0; 4],
-                    ),
+                let mut planes = [[0.0; 4]; MAX_PLANES];
+                let mut plane_count = 0;
+                let mut fill = |from: &[glam::Vec4]| {
+                    for (slot, plane) in planes.iter_mut().zip(from) {
+                        *slot = plane.to_array();
+                    }
+                    plane_count = from.len() as u32;
+                };
+                let (kind, light_view, sweep_min, sweep_max) = match &view.volume {
+                    CullVolume::Frustum(frustum) => {
+                        fill(frustum.planes());
+                        (KIND_PLANES, Mat4::IDENTITY, [0.0; 3], [0.0; 2])
+                    }
+                    CullVolume::Planes(planes, count) => {
+                        fill(&planes[..*count]);
+                        (KIND_PLANES, Mat4::IDENTITY, [0.0; 3], [0.0; 2])
+                    }
                     CullVolume::Sweep { light_view, bounds } => (
                         KIND_SWEEP,
-                        light_view,
-                        [[0.0; 4]; 6],
-                        bounds.min.extend(0.0).to_array(),
-                        [bounds.max.x, bounds.max.y, 0.0, 0.0],
+                        *light_view,
+                        bounds.min.to_array(),
+                        bounds.max.to_array(),
                     ),
                 };
                 GpuView {
                     light_view: light_view.to_cols_array_2d(),
                     planes,
-                    sweep_min,
-                    sweep_max,
+                    sweep_min: [sweep_min[0], sweep_min[1], sweep_min[2], 0.0],
+                    sweep_max: [sweep_max[0], sweep_max[1], view.cutoff[0], view.cutoff[1]],
                     kind,
                     casters: view.casters,
                     base,
-                    _padding: 0,
+                    plane_count,
                 }
             })
             .collect();

@@ -25,7 +25,7 @@ use orrin_ecs::{Entity, World};
 /// Frames before anything changes: long enough for every caster to have been
 /// baked into the cached layers, so that what the change has to undo is there.
 const WARM: u32 = 24;
-/// Frames after the last change, so that whatever the change started — a
+/// Frames after the last change by which whatever the change started — a
 /// caster settling, a cached layer waiting its turn — has finished.
 const SETTLE: u32 = 16;
 
@@ -128,12 +128,16 @@ fn differing(a: &[u8], b: &[u8]) -> f64 {
 }
 
 /// Render the rig, apply `step` once a frame for `steps` frames, and compare
-/// what is on screen afterwards with a renderer that was shown the result from
-/// its first frame.
-///
-/// Both run the same number of frames, so that the two differ in what they
-/// were shown and in nothing else.
+/// what is on screen with a renderer that was shown the result from its first
+/// frame — twice: on the frame of the last step, while whatever the change
+/// started is still under way, and again once it has all come to rest.
 fn holds(metal: bool, name: &str, steps: u32, step: impl Fn(&mut World, u32)) {
+    for settle in [0, SETTLE] {
+        holds_after(metal, name, steps, settle, &step);
+    }
+}
+
+fn holds_after(metal: bool, name: &str, steps: u32, settle: u32, step: &impl Fn(&mut World, u32)) {
     let settings = settings();
     let frames = |frames| CaptureSettings {
         frames,
@@ -148,9 +152,12 @@ fn holds(metal: bool, name: &str, steps: u32, step: impl Fn(&mut World, u32)) {
     let (before, _) = capture::render(&mut world, &mut watched, &frames(WARM));
     for index in 0..steps {
         step(&mut world, index);
-        capture::render(&mut world, &mut watched, &frames(1));
+        // The last step's own frame is the one compared when nothing settles.
+        if index + 1 < steps || settle > 0 {
+            capture::render(&mut world, &mut watched, &frames(1));
+        }
     }
-    let (after, _) = capture::render(&mut world, &mut watched, &frames(SETTLE));
+    let (after, _) = capture::render(&mut world, &mut watched, &frames(settle.max(1)));
 
     // And one that has only ever seen how it ended.
     let mut fresh = renderer(metal);
@@ -160,6 +167,7 @@ fn holds(metal: bool, name: &str, steps: u32, step: impl Fn(&mut World, u32)) {
         step(&mut world, index);
     }
     let (expected, _) = capture::render(&mut world, &mut fresh, &frames(WARM + steps + SETTLE));
+    let name = &format!("{name}{}", if settle == 0 { "-moving" } else { "" });
 
     for (half, pixels) in [("watched", &after), ("fresh", &expected)] {
         save(
@@ -171,7 +179,7 @@ fn holds(metal: bool, name: &str, steps: u32, step: impl Fn(&mut World, u32)) {
     let changed = differing(&before, &after);
     let stale = differing(&after, &expected);
     println!(
-        "{backend:>6} {name:<8} changed {:5.2}% of the frame; {:.3}% differs from a fresh render",
+        "{backend:>6} {name:<14} changed {:5.2}% of the frame; {:.3}% differs from a fresh render",
         changed * 100.0,
         stale * 100.0
     );
@@ -212,6 +220,33 @@ fn nothing_stays_behind(metal: bool) {
     holds(metal, "light", 20, |world, _| {
         let spot = the_spot(world);
         translate(world, spot, Vec3::new(0.08, 0.0, -0.05));
+    });
+    // A sun that turns: a new matrix for every one of its views every frame,
+    // so each is cleared and drawn whole — and only as much of it as the
+    // camera can see.
+    holds(metal, "sun", 20, |world, _| {
+        let mut sun = None;
+        world.query::<&Light>().for_each(|entity, light| {
+            if matches!(light, Light::Directional { .. }) {
+                sun = Some(entity);
+            }
+        });
+        let sun = sun.expect("the rig has a sun");
+        let mut transform = world.get_mut::<LocalTransform>(sun).expect("it is placed");
+        transform.0.rotation = glam::Quat::from_rotation_y(0.01) * transform.0.rotation;
+    });
+    // A camera that looks away and back while a caster moves behind it: what
+    // is drawn for the frame alone takes only what shadows the view, and a
+    // light with nothing in view is not drawn at all, so both have to be put
+    // right when the view returns.
+    holds(metal, "turn", 40, |world, index| {
+        let cube = cube_at(world, CUBE + Vec3::new(0.03, 0.04, 0.0) * index as f32);
+        translate(world, cube, Vec3::new(0.03, 0.04, 0.0));
+        let ahead = settings().camera.expect("the rig's camera is set");
+        let forward = ahead.target - ahead.position;
+        let turn = std::f32::consts::PI * (std::f32::consts::PI * index as f32 / 39.0).sin();
+        let mut camera = world.resource_mut::<Camera>();
+        camera.target = camera.position + glam::Quat::from_rotation_y(turn) * forward;
     });
     // And a camera that walks, far enough for the sun's nearest views to
     // follow it several times: what they hold is slid, not redrawn.

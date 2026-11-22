@@ -2607,6 +2607,7 @@ impl VulkanRenderer {
                     view.unjittered_view_proj,
                 )),
                 casters: crate::gfx::shadow_views::Casters::All.mask(),
+                cutoff: [0.0; 2],
             }];
             if let Some(shadows) = shadows {
                 views.extend(shadows.plan.draws.iter().map(|draw| CullView {
@@ -2617,8 +2618,10 @@ impl VulkanRenderer {
                         CasterVolume::Sweep { light_view, bounds } => {
                             CullVolume::Sweep { light_view, bounds }
                         }
+                        CasterVolume::Hull(planes, count) => CullVolume::Planes(planes, count),
                     },
                     casters: draw.casters.mask(),
+                    cutoff: draw.cutoff,
                 }));
             }
             views

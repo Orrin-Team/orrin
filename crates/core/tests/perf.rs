@@ -56,6 +56,10 @@
 //!   case anything that keeps work between frames — the instance rows, the
 //!   cached shadow layers — is at its best in, and so the wrong one to quote
 //!   for them alone.
+//! - `ORRIN_PERF_SUN=1` turns the sun a little every frame, as a time of day
+//!   does. A sun that moves is a new matrix for every one of its shadow views
+//!   every frame, so none of them can keep anything: what shadows cost with
+//!   nothing cached.
 //! - `ORRIN_PERF_FITTED` is how many of the sun's views are fitted to the view
 //!   frustum (`ShadowSettings::fitted_cascades`), which with
 //!   `ORRIN_PERF_MOTION` is what a view that cannot be kept between frames
@@ -315,6 +319,7 @@ fn frame_cost() {
     let mut entries = 0usize;
     let (mut extract_allocations, mut render_allocations) = (0u64, 0u64);
     let motion = env_usize("ORRIN_PERF_MOTION", 0) != 0;
+    let turning_sun = env_usize("ORRIN_PERF_SUN", 0) != 0;
     let start = *world.resource::<Camera>();
     for frame in 0..frames + WARMUP {
         if motion {
@@ -325,6 +330,19 @@ fn frame_cost() {
             let mut camera = world.resource_mut::<Camera>();
             camera.position = start.position + offset;
             camera.target = start.target + offset;
+        }
+        if turning_sun {
+            world
+                .query::<(
+                    &mut orrin_core::scene::LocalTransform,
+                    &orrin_core::scene::Light,
+                )>()
+                .for_each(|_, (transform, light)| {
+                    if matches!(light, orrin_core::scene::Light::Directional { .. }) {
+                        transform.0.rotation =
+                            glam::Quat::from_rotation_y(0.002) * transform.0.rotation;
+                    }
+                });
         }
         let before_extract = allocations();
         // The engine throws its numbers away for the first few frames; so does
