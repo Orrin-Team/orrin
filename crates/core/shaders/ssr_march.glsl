@@ -20,6 +20,17 @@
 
 const float PI = 3.14159265359;
 
+// Below the first, a surface is a mirror: its ray is the exact reflection, the
+// same every frame, so it is the answer rather than a sample of it and keeps
+// no history. A lobe of 0.05 is under a fifth of a degree wide, below what the
+// frame resolves at any distance on screen, so drawing from it would add
+// grain and nothing else. From there up a ray is drawn from the lobe, and
+// every drawn ray is accumulated. Up to the second, a pixel still traces its
+// own ray beside the quarter-rate gather, for sharpness; past it, only the
+// gather. Perceptual roughness.
+const float MIRROR_ROUGHNESS = 0.05;
+const float GLOSSY_ROUGHNESS = 0.15;
+
 vec3 view_pos(vec2 uv, float depth) {
     vec4 clip = ssr.inv_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
     return clip.xyz / clip.w;
@@ -100,7 +111,7 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
     vec3 v_local = vec3(dot(v, t1), dot(v, t2), dot(v, n));
 
     float alpha = roughness * roughness;
-    vec3 h = tangent_to_view * sample_vndf(v_local, alpha, u);
+    vec3 h = roughness < MIRROR_ROUGHNESS ? n : tangent_to_view * sample_vndf(v_local, alpha, u);
     vec3 l = reflect(-v, h);
 
     // Below the horizon: the sampled microfacet reflects into the surface.

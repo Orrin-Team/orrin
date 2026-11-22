@@ -6,14 +6,15 @@
 // each pixel, then accumulate the result into a history that holds the
 // reflection alone.
 //
-// Except on a near-mirror. There the lobe is so narrow that one ray is the
-// answer rather than a sample of it, so gathering neighbours could only blur it
-// and accumulating frames could only lag it: the pixel traces its own ray here,
-// at full resolution, and takes it as it is. Between `MIRROR_ROUGHNESS` and
-// `GLOSSY_ROUGHNESS` the two estimates cross-fade, along with the history's
-// length, so a surface whose roughness crosses from one regime to the other
-// shows no line — the same `trace_reflection` produces both, so what changes
-// across the band is only how much the pixel borrows and remembers.
+// Except on a mirror. Below `MIRROR_ROUGHNESS` the ray is the exact
+// reflection, so it is the answer rather than a sample of it: gathering
+// neighbours could only blur it and accumulating frames could only lag it, and
+// the pixel traces its own ray here, at full resolution, and takes it as it
+// is. Every ray drawn from a lobe is accumulated, however narrow the lobe —
+// one that is not leaves grain that never settles. Between `MIRROR_ROUGHNESS`
+// and `GLOSSY_ROUGHNESS` the pixel's own ray and the quarter-rate gather
+// cross-fade, so a surface whose roughness crosses from one regime to the
+// other shows no line — the same `trace_reflection` produces both.
 //
 // Its own history rather than TAA's, because TAA's clip runs on the composited
 // frame, where a reflection's noise cannot be told from texture: it either clips
@@ -71,15 +72,6 @@ layout(set = 0, binding = 10) uniform Ssr {
 } ssr;
 
 #include "ssr_march.glsl"
-
-// Below the first, a pixel's own full-rate ray is all it uses; past the second,
-// only the quarter-rate gather and its history. Perceptual roughness. A lobe
-// of 0.05 is under a fifth of a degree wide, so the ray's own sample spread is
-// below what the frame resolves at any distance on screen; by 0.15 it is
-// about a degree and a half, where one ray's variance starts to show as grain
-// and the gather and the history are what remove it.
-const float MIRROR_ROUGHNESS = 0.05;
-const float GLOSSY_ROUGHNESS = 0.15;
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
@@ -339,9 +331,16 @@ void main() {
         } else {
             own = trace_reflection(uv, depth, n, roughness, stratified(pixel, frame), own_length);
         }
-        // Weighted by confidence on both sides, for the reason the gather is.
+        // Weighted by confidence on both sides, for the reason the gather is,
+        // and held to the gather's firefly rule wherever the gather has a
+        // neighbourhood to measure it against: a drawn ray that found
+        // something far brighter than its neighbours did is the same lucky
+        // sample whichever pass traced it.
+        float own_firefly = mean_weight > 0.0
+            ? 1.0 / (1.0 + max(0.0, dot(own.rgb, LUMA) / max(mean_luma, 1e-4) - 1.0))
+            : 1.0;
         float gathered_weight = (1.0 - mirror) * confidence;
-        float own_weight = mirror * own.a;
+        float own_weight = mirror * own.a * own_firefly;
         float both = gathered_weight + own_weight;
         if (both > 1e-6) {
             traced = (traced * gathered_weight + own.rgb * own_weight) / both;
@@ -421,8 +420,8 @@ void main() {
     // arrive; a settled one stops at a length that is short for a smooth
     // surface, where a stale sharp reflection is the visible error, and long
     // for a rough one, where the noise is — and none at all for a mirror, whose
-    // one ray has no noise for a history to remove.
-    float limit = mix(mix(ssr.history.y, ssr.history.z, rough), 0.0, mirror);
+    // exact ray has no noise for a history to remove.
+    float limit = roughness < MIRROR_ROUGHNESS ? 0.0 : mix(ssr.history.y, ssr.history.z, rough);
     float frames = min(chosen.count * chosen.trust, limit);
     float alpha = 1.0 / (frames + 1.0);
 
