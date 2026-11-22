@@ -167,6 +167,7 @@ fn apply(world: &World, settings: &RenderSettings) {
     let mut live = world.resource_mut::<ShadowSettings>();
     *live = ShadowSettings {
         debug_cascades: live.debug_cascades,
+        debug_view: live.debug_view,
         ..*shadows
     };
 

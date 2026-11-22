@@ -23,7 +23,10 @@ pub use audio::{AudioListener, AudioSource, Rolloff};
 pub use camera::CameraComponent;
 pub use collider::{Collider, ColliderShape};
 pub use folder::Folder;
-pub use light::{AmbientLight, Light, MAX_CONE_ANGLE, MIN_CONE_ANGLE};
+pub use light::{
+    ALL_CHANNELS, AmbientLight, INHERIT, Light, LightShadows, MAX_CONE_ANGLE, MIN_CONE_ANGLE,
+    MeshLighting, ShadowCasting, ShadowUpdate,
+};
 pub use local_transform::LocalTransform;
 pub use locked::Locked;
 pub use material_handle::MaterialHandle;

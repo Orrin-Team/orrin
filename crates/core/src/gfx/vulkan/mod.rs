@@ -64,7 +64,7 @@ use crate::geom::{Aabb, Frustum};
 use crate::gfx::DecalInstance;
 use crate::gfx::shadow_casters::CasterTracker;
 use crate::gfx::shadow_views::{
-    CasterVolume, Layer, ShadowInputs, ShadowPlan, ShadowPlanner, ShadowViews,
+    CasterVolume, Layer, ShadowInputs, ShadowPlan, ShadowPlanner, ShadowViews, ViewDefaults,
 };
 use crate::gfx::ui::UiFrame;
 use crate::scene::{
@@ -945,13 +945,33 @@ impl VulkanRenderer {
             .filter(|settings| settings.enabled)
             .map(|settings| settings.cascade_config());
         let atlas = shadows.map(|settings| settings.atlas_config());
+        let defaults = |settings: &ShadowSettings| {
+            let [softness, sharpness, lamp_softness, lamp_sharpness] = settings.filtering();
+            (
+                ViewDefaults {
+                    filtering: [softness, sharpness],
+                    bias: [settings.constant_bias, settings.slope_bias],
+                },
+                ViewDefaults {
+                    filtering: [lamp_softness, lamp_sharpness],
+                    bias: [
+                        settings.punctual_constant_bias,
+                        settings.punctual_slope_bias,
+                    ],
+                },
+            )
+        };
+        let (sun_defaults, lamp_defaults) = shadows.map(defaults).unwrap_or_default();
         let inputs = atlas.as_ref().map(|atlas| ShadowInputs {
             camera,
             aspect: extent[0] as f32 / extent[1].max(1) as f32,
             lighting,
-            sun: sun.as_ref(),
+            cascades: sun.as_ref(),
             atlas,
             casters: &self.shadow_casters,
+            viewport_height: extent[1] as f32,
+            sun: sun_defaults,
+            lamps: lamp_defaults,
         });
         self.shadow_planner.plan(inputs.as_ref(), plan);
     }
@@ -2363,12 +2383,6 @@ impl VulkanRenderer {
             Some(_) => self.bloom.strength(),
             None => 0.0,
         };
-        if let Some(shadows) = shadows {
-            self.shadow.constant_bias = shadows.settings.constant_bias;
-            self.shadow.slope_bias = shadows.settings.slope_bias;
-            self.shadow.punctual_constant_bias = shadows.settings.punctual_constant_bias;
-            self.shadow.punctual_slope_bias = shadows.settings.punctual_slope_bias;
-        }
 
         // Material table and texture array are static after asset load, so keep
         // their groups and rebuild only when invalidated (set to None).
@@ -2606,8 +2620,9 @@ impl VulkanRenderer {
                 volume: CullVolume::Frustum(Frustum::from_view_projection(
                     view.unjittered_view_proj,
                 )),
-                casters: crate::gfx::shadow_views::Casters::All.mask(),
+                casters: crate::gfx::shadow_casters::FLAG_VISIBLE,
                 cutoff: [0.0; 2],
+                channels: crate::scene::ALL_CHANNELS,
             }];
             if let Some(shadows) = shadows {
                 views.extend(shadows.plan.draws.iter().map(|draw| CullView {
@@ -2622,6 +2637,7 @@ impl VulkanRenderer {
                     },
                     casters: draw.casters.mask(),
                     cutoff: draw.cutoff,
+                    channels: shadows.views.views[draw.view].channels,
                 }));
             }
             views

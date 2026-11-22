@@ -73,6 +73,10 @@ struct View {
     // Where this view's block of `instance_index` begins.
     uint base;
     uint plane_count;
+    // The light channels the view takes casters from: its light's. An object
+    // a light does not light casts nothing into its shadows.
+    uint channels;
+    uint _padding[3];
 };
 
 struct DrawCommand {
@@ -235,6 +239,9 @@ void main() {
         return;
     }
     Object object = objects[instance.row];
+    if ((object.flags.x & view.channels) == 0u) {
+        return;
+    }
     uint batch_slot = slot(instance.batch);
     Batch batch = batches[batch_slot];
 

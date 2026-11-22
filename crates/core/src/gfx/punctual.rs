@@ -18,9 +18,10 @@ use super::{MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, SceneLighting};
 /// How many lights may cast at once, whatever the atlas has room for.
 ///
 /// A second budget above the tile count because the two limit different things:
-/// tiles bound the memory, this bounds the *draws*, and a scene of small lights
-/// in a large atlas would otherwise re-record the caster list forty-eight times.
-pub const MAX_SHADOW_LIGHTS: usize = 8;
+/// tiles bound the memory, and this bounds what a frame can be asked to draw
+/// when none of it is cached yet — the frame a scene loads, when every face of
+/// every light is drawn from nothing.
+pub const MAX_SHADOW_LIGHTS: usize = 32;
 
 /// The most faces those lights can ask for, which is all of them being points.
 pub const MAX_SHADOW_FACES: usize = 6 * MAX_SHADOW_LIGHTS;
@@ -141,7 +142,8 @@ pub fn rank(lighting: &SceneLighting, camera: Vec3, candidates: &mut Vec<(LightK
             candidates.push((
                 LightKind::Point,
                 index,
-                importance(light.position, light.range, light.candela, camera),
+                importance(light.position, light.range, light.candela, camera)
+                    * light.shadows.priority.max(0.0),
             ));
         }
     }
@@ -155,7 +157,8 @@ pub fn rank(lighting: &SceneLighting, camera: Vec3, candidates: &mut Vec<(LightK
             candidates.push((
                 LightKind::Spot,
                 index,
-                importance(light.position, light.range, light.candela, camera),
+                importance(light.position, light.range, light.candela, camera)
+                    * light.shadows.priority.max(0.0),
             ));
         }
     }
@@ -192,19 +195,29 @@ pub fn faces(
     tile_size: u32,
 ) -> Faces {
     let mut view_proj = [Mat4::IDENTITY; 6];
+    // A light may shadow less far than it lights, and never farther.
+    let reach = |range: f32, shadows: f32| {
+        if shadows > 0.0 {
+            shadows.min(range)
+        } else {
+            range
+        }
+    };
     let (extent, near) = match kind {
         LightKind::Point => {
             let light = &lighting.point_lights[index];
-            let near = near.clamp(1e-3, light.range * 0.5);
+            let far = reach(light.range, light.shadows.range);
+            let near = near.clamp(1e-3, far * 0.5);
             let extent = bordered_extent(std::f32::consts::FRAC_PI_4, tile_size);
             for (face, slot) in view_proj.iter_mut().enumerate() {
-                *slot = point_face(light.position, face, near, light.range, extent);
+                *slot = point_face(light.position, face, near, far, extent);
             }
             (extent, near)
         }
         LightKind::Spot => {
             let light = &lighting.spot_lights[index];
-            let near = near.clamp(1e-3, light.range * 0.5);
+            let far = reach(light.range, light.shadows.range);
+            let near = near.clamp(1e-3, far * 0.5);
             // Back from the cosine the shader compares against, so the
             // frustum and the falloff cannot describe different cones.
             let half_angle = light.outer_cos.clamp(-1.0, 1.0).acos();
@@ -215,7 +228,7 @@ pub fn faces(
                 Vec3::Y
             };
             let view = Mat4::look_at_rh(light.position, light.position + light.direction, up);
-            view_proj[0] = perspective(2.0 * extent.atan(), near, light.range) * view;
+            view_proj[0] = perspective(2.0 * extent.atan(), near, far) * view;
             (extent, near)
         }
     };
@@ -240,6 +253,8 @@ mod tests {
             candela,
             range: 10.0,
             casts_shadows: casts,
+            channels: crate::scene::ALL_CHANNELS,
+            shadows: Default::default(),
         }
     }
 
@@ -254,6 +269,8 @@ mod tests {
             inner_cos: 0.9,
             outer_cos: 0.7,
             casts_shadows: casts,
+            channels: crate::scene::ALL_CHANNELS,
+            shadows: Default::default(),
         }
     }
 

@@ -31,11 +31,16 @@ struct Cascades {
     // World size of one shadow texel, per cascade. It differs per cascade
     // because each fits a different-sized box to the same number of texels.
     vec4 texel_sizes;
-    // x = count, y = blend overlap fraction, z = strength, w = debug tint.
+    // x = count, y = blend overlap fraction, z = strength, w = which debug view
+    // to draw: 0 none, 1 which view, 2 the atlas, 3 texel density, 4 what the
+    // frame did to each view.
     vec4 params;
-    // x = the sun's penumbra width in metres, y = its sharpness; z and w the
-    // same pair for the punctual lights. See `shadow_filter.glsl`.
+    // x = the sun's penumbra width in metres, y = its sharpness. A lamp's own
+    // pair travels with its views. See `shadow_filter.glsl`.
     vec4 filtering;
+    // What this frame did to each view: 0 nothing, 1 moving casters redrawn,
+    // 2 a strip scrolled in, 3 its cached layer redrawn, 4 drawn whole.
+    vec4 states;
 };
 
 #endif // ORRIN_CASCADES_GLSL

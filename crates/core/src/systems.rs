@@ -8,9 +8,9 @@ use crate::gfx::{
     RenderItem, SceneLighting, SpotLight,
 };
 use crate::scene::{
-    AmbientLight, Camera, Culling, Decal, DecalSettings, EditorHidden, Light, LocalTransform,
-    MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialBlends, MaterialHandle, MeshBounds, MeshHandle, Spin,
-    WorldTransform,
+    ALL_CHANNELS, AmbientLight, Camera, Culling, Decal, DecalSettings, EditorHidden, Light,
+    LocalTransform, MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialBlends, MaterialHandle, MeshBounds,
+    MeshHandle, MeshLighting, ShadowCasting, Spin, WorldTransform,
 };
 
 /// What the editor has hidden from its view, or `None` when that is nothing —
@@ -151,8 +151,13 @@ pub fn extract_geometry(world: &World, aspect: f32, out: &mut FrameGeometry) {
 
     let sweep = crate::profile::scope("sweep");
     world
-        .query::<(&WorldTransform, &MeshHandle, Option<&MaterialHandle>)>()
-        .for_each(|entity, (transform, mesh, material)| {
+        .query::<(
+            &WorldTransform,
+            &MeshHandle,
+            Option<&MaterialHandle>,
+            Option<&MeshLighting>,
+        )>()
+        .for_each(|entity, (transform, mesh, material, lit)| {
             total += 1;
             if hidden
                 .as_ref()
@@ -212,6 +217,8 @@ pub fn extract_geometry(world: &World, aspect: f32, out: &mut FrameGeometry) {
                 // it is the same number next frame, so a row the GPU already
                 // holds does not have to be written again.
                 instance: entity.index(),
+                channels: lit.map_or(ALL_CHANNELS, |lit| lit.channels),
+                shadows: lit.map_or(ShadowCasting::Auto, |lit| lit.shadows),
             });
 
             match mode {
@@ -330,7 +337,11 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
             _ if hidden
                 .as_ref()
                 .is_some_and(|hidden| hidden.contains(entity)) => {}
-            Light::Directional { color, lux } => {
+            Light::Directional {
+                color,
+                lux,
+                channels,
+            } => {
                 // The shader supports one directional light, so the first wins.
                 if !has_sun {
                     let direction = transform.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
@@ -341,6 +352,7 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
                     // is multiplied by. Only the punctual lights below have a
                     // fixture to divide out.
                     out.sun.illuminance = lux;
+                    out.sun.channels = channels;
                     has_sun = true;
                 }
             }
@@ -349,6 +361,8 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
                 lumens,
                 range,
                 casts_shadows,
+                channels,
+                shadows,
             } => {
                 if out.point_lights.len() < MAX_POINT_LIGHTS {
                     out.point_lights.push(PointLight {
@@ -358,6 +372,8 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
                         candela: Light::point_candela(lumens),
                         range,
                         casts_shadows,
+                        channels,
+                        shadows,
                     });
                 }
             }
@@ -369,6 +385,8 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
                 outer_angle,
                 reflector,
                 casts_shadows,
+                channels,
+                shadows,
             } => {
                 if out.spot_lights.len() < MAX_SPOT_LIGHTS {
                     // Cosines here rather than in the shader, and ordered so the
@@ -390,6 +408,8 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
                         inner_cos: inner.to_radians().cos(),
                         outer_cos: outer.to_radians().cos(),
                         casts_shadows,
+                        channels,
+                        shadows,
                     });
                 }
             }

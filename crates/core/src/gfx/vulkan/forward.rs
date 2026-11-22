@@ -199,9 +199,15 @@ fn gpu_point_lights(lighting: &SceneLighting, views: &ShadowViews, out: &mut Vec
             // A light that asked for tiles and did not get them keeps its -1 and
             // shades unshadowed, which is the whole behaviour of the budget: too
             // many casters costs shadows, never correctness.
-            shadow: match views.caster(LightKind::Point, index) {
-                Some(caster) => [caster.first_view as f32, caster.near, 0.0, 0.0],
-                None => [-1.0, 0.0, 0.0, 0.0],
+            shadow: {
+                // A mask travels as the bits of a float, which a uniform block
+                // carries untouched and the shader reads back with
+                // `floatBitsToUint`.
+                let channels = f32::from_bits(light.channels);
+                match views.caster(LightKind::Point, index) {
+                    Some(caster) => [caster.first_view as f32, caster.near, channels, 0.0],
+                    None => [-1.0, 0.0, channels, 0.0],
+                }
             },
         });
     }
@@ -238,7 +244,12 @@ fn gpu_spot_lights(lighting: &SceneLighting, views: &ShadowViews, out: &mut Vec<
                 light.outer_cos,
             ],
             color: [light.color.x, light.color.y, light.color.z, light.candela],
-            params: [light.inner_cos, face[0], face[1], 0.0],
+            params: [
+                light.inner_cos,
+                face[0],
+                face[1],
+                f32::from_bits(light.channels),
+            ],
         });
     }
     if out.is_empty() {
@@ -289,7 +300,12 @@ fn to_gpu_lighting(
             lighting.ambient_color.z,
             lighting.ambient_nits,
         ],
-        sun_direction: [to_sun.x, to_sun.y, to_sun.z, 0.0],
+        sun_direction: [
+            to_sun.x,
+            to_sun.y,
+            to_sun.z,
+            f32::from_bits(lighting.sun.channels),
+        ],
         sun_color: [
             lighting.sun.color.x,
             lighting.sun.color.y,
@@ -344,9 +360,12 @@ pub(super) struct GpuCascades {
     /// x = view count, y = blend overlap fraction, z = strength,
     /// w = 1.0 to tint by view index.
     params: [f32; 4],
-    /// x = the sun's penumbra width in metres, y = its sharpness; z and w the
-    /// same pair for the punctual lights.
+    /// x = the sun's penumbra width in metres, y = its sharpness. A lamp's own
+    /// pair travels with its views.
     filtering: [f32; 4],
+    /// What this frame did to each view, as [`ViewWork`]'s order, for the
+    /// debug view that tints by it.
+    states: [f32; MAX_CASCADES],
 }
 
 impl GpuCascades {
@@ -354,6 +373,7 @@ impl GpuCascades {
         let mut view_proj = [[[0.0f32; 4]; 4]; MAX_CASCADES];
         let mut rects = [[0.0f32; 4]; MAX_CASCADES];
         let mut texel_sizes = [0.0f32; MAX_CASCADES];
+        let mut states = [0.0f32; MAX_CASCADES];
         let Some(shadows) = shadows else {
             // A zero count is what makes every sun lookup return "lit"; the
             // arrays are then never indexed.
@@ -364,6 +384,7 @@ impl GpuCascades {
             view_proj[index] = view.view_proj.to_cols_array_2d();
             rects[index] = view.tile.uv_rect(views.resolution);
             texel_sizes[index] = view.texel_scale;
+            states[index] = shadows.plan.work[index] as u32 as f32;
         }
         Self {
             view_proj,
@@ -374,13 +395,10 @@ impl GpuCascades {
                 views.sun as f32,
                 crate::gfx::shadows::OVERLAP,
                 shadows.settings.strength,
-                if shadows.settings.debug_cascades {
-                    1.0
-                } else {
-                    0.0
-                },
+                shadows.settings.debug_mode(),
             ],
             filtering: shadows.settings.filtering(),
+            states,
         }
     }
 }
@@ -560,7 +578,8 @@ struct GpuShadowFace {
     view_proj: [[f32; 4]; 4],
     /// xy = atlas UV offset, zw = atlas UV scale.
     rect: [f32; 4],
-    /// x = world size of one texel where the view's clip-space `w` is one.
+    /// x = world size of one texel where the view's clip-space `w` is one,
+    /// y = its penumbra's width in metres, z = its sharpness.
     params: [f32; 4],
 }
 
@@ -1209,7 +1228,7 @@ impl ForwardPass {
             *row = GpuShadowFace {
                 view_proj: view.view_proj.to_cols_array_2d(),
                 rect: view.tile.uv_rect(views.resolution),
-                params: [view.texel_scale, 0.0, 0.0, 0.0],
+                params: [view.texel_scale, view.filtering[0], view.filtering[1], 0.0],
             };
         }
         let shadow_faces =

@@ -55,7 +55,7 @@ use super::shadows::{
     CascadeConfig, LevelWindow, MAX_CASCADES, MAX_SWEEP_PLANES, SweepBounds, sun_views, swept_slice,
 };
 use crate::geom::{Aabb, Frustum};
-use crate::scene::Camera;
+use crate::scene::{Camera, LightShadows, ShadowUpdate};
 
 /// Where one view lives in the atlas, in texels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -294,6 +294,12 @@ pub struct ShadowView {
     /// is what makes one formula serve both.
     pub texel_scale: f32,
     pub kind: ViewKind,
+    /// The light channels it takes casters from: its light's.
+    pub channels: u32,
+    /// The width of its penumbra in metres, and how much of it is visible.
+    pub filtering: [f32; 2],
+    /// The constant and slope depth bias it is drawn with.
+    pub bias: [f32; 2],
 }
 
 /// A punctual light the atlas found room for.
@@ -499,10 +505,24 @@ pub struct ShadowInputs<'a> {
     pub aspect: f32,
     pub lighting: &'a SceneLighting,
     /// The sun's cascades, or `None` when it casts no shadow.
-    pub sun: Option<&'a CascadeConfig>,
+    pub cascades: Option<&'a CascadeConfig>,
     pub atlas: &'a AtlasConfig,
     /// Which casters are standing still, and what changed about that.
     pub casters: &'a CasterTracker,
+    /// Height of the frame in pixels, which is what a light's reach is
+    /// measured against to size its tiles.
+    pub viewport_height: f32,
+    /// The sun's penumbra width and sharpness, and its constant and slope bias.
+    pub sun: ViewDefaults,
+    /// The same for a lamp that does not say otherwise.
+    pub lamps: ViewDefaults,
+}
+
+/// How a view is filtered and biased where nothing more specific says.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ViewDefaults {
+    pub filtering: [f32; 2],
+    pub bias: [f32; 2],
 }
 
 /// Which view a tile belongs to, from one frame to the next.
@@ -530,8 +550,11 @@ struct Entry {
     tile: AtlasTile,
     /// The frame it was last planned.
     seen: u32,
-    /// The matrix its tile was last drawn or kept for.
+    /// The matrix its tile was last drawn or kept for, and the channels and
+    /// the revision it was drawn with.
     view_proj: Mat4,
+    channels: u32,
+    revision: u32,
     /// Whether the cached layer holds the static casters for `view_proj` — or,
     /// for a level, for the cells of `window`.
     cached: bool,
@@ -615,6 +638,101 @@ impl Default for ShadowPlanner {
     }
 }
 
+/// The smallest tile a lamp's face is given.
+const MIN_LAMP_TILE: u32 = 64;
+
+/// How far past the tile it holds a lamp's want has to go before it is given
+/// the next size up, and how far under half before it is given the next down.
+/// Between the two it keeps its tile: a light whose reach sits at a boundary
+/// would otherwise change size, and be redrawn whole, with every step the
+/// camera took.
+const TILE_GROW: f32 = 1.15;
+const TILE_SHRINK: f32 = 0.5 * 0.85;
+
+/// What the planner reads of a point or spot light.
+struct Lamp {
+    id: u64,
+    position: Vec3,
+    /// How far its shadows reach.
+    reach: f32,
+    /// The tangent of half the angle a face spans, at most one.
+    spread: f32,
+    channels: u32,
+    shadows: LightShadows,
+}
+
+impl Lamp {
+    fn of(lighting: &SceneLighting, kind: LightKind, index: usize) -> Self {
+        let reach = |range: f32, shadows: &LightShadows| {
+            if shadows.range > 0.0 {
+                shadows.range.min(range)
+            } else {
+                range
+            }
+        };
+        match kind {
+            LightKind::Point => {
+                let light = &lighting.point_lights[index];
+                Self {
+                    id: light.id,
+                    position: light.position,
+                    reach: reach(light.range, &light.shadows),
+                    spread: 1.0,
+                    channels: light.channels,
+                    shadows: light.shadows,
+                }
+            }
+            LightKind::Spot => {
+                let light = &lighting.spot_lights[index];
+                let cos = light.outer_cos.clamp(1e-3, 1.0);
+                Self {
+                    id: light.id,
+                    position: light.position,
+                    reach: reach(light.range, &light.shadows),
+                    spread: ((1.0 - cos * cos).sqrt() / cos).min(1.0),
+                    channels: light.channels,
+                    shadows: light.shadows,
+                }
+            }
+        }
+    }
+
+    /// The edge of the tile each of its faces gets: a texel for each pixel the
+    /// far end of its reach covers on screen, in powers of two, up to the
+    /// scene's tile or the light's own cap — and `held`, the tile it has, for
+    /// as long as that is near enough.
+    ///
+    /// A face spans `2 * reach * spread` metres at the far end of its reach,
+    /// which from the camera's distance is that many pixels across: more
+    /// texels than that are texels nothing on screen can tell apart.
+    fn tile(&self, inputs: &ShadowInputs<'_>, held: Option<u32>) -> u32 {
+        let largest = if self.shadows.resolution > 0 {
+            self.shadows.resolution
+        } else {
+            inputs.atlas.tile_size
+        };
+        let largest = floor_power_of_two(largest.max(MIN_LAMP_TILE));
+        let distance = self.position.distance(inputs.camera.position);
+        let focal = inputs.viewport_height * 0.5 / (inputs.camera.fov_y * 0.5).tan();
+        // Inside its reach the far end is all around the camera, and no tile
+        // is too large.
+        let wanted = if distance <= self.reach {
+            largest as f32
+        } else {
+            (2.0 * self.reach * self.spread * focal / distance).min(largest as f32)
+        };
+        let size = match held {
+            Some(held)
+                if wanted <= held as f32 * TILE_GROW && wanted > held as f32 * TILE_SHRINK =>
+            {
+                held
+            }
+            _ => (wanted.max(1.0) as u32).next_power_of_two(),
+        };
+        size.clamp(MIN_LAMP_TILE, largest)
+    }
+}
+
 /// What one view asks of the planner this frame.
 struct Wanted {
     key: ViewKey,
@@ -636,6 +754,11 @@ struct Wanted {
     /// Whether the light reaches anything in view. One that does not is not
     /// worked on: nothing reads its tiles until it does.
     in_view: bool,
+    channels: u32,
+    filtering: [f32; 2],
+    bias: [f32; 2],
+    update: ShadowUpdate,
+    revision: u32,
 }
 
 impl ShadowPlanner {
@@ -689,7 +812,7 @@ impl ShadowPlanner {
     }
 
     fn plan_sun(&mut self, inputs: &ShadowInputs<'_>, plan: &mut ShadowPlan) {
-        let Some(config) = inputs.sun else {
+        let Some(config) = inputs.cascades else {
             self.sun = None;
             return;
         };
@@ -746,6 +869,11 @@ impl ShadowPlanner {
                 }),
                 read: slice.map(|slice| slice.corners),
                 in_view: true,
+                channels: inputs.lighting.sun.channels,
+                filtering: inputs.sun.filtering,
+                bias: inputs.sun.bias,
+                update: ShadowUpdate::Always,
+                revision: 0,
             };
             // A cascade is fitted to its tile's texel count, so a tile of any
             // other size would shimmer. One that does not fit ends the sun's
@@ -830,10 +958,25 @@ impl ShadowPlanner {
             .iter()
             .map(|view| AtlasRect::of(view.tile).texels())
             .sum();
-        let tile = u64::from(floor_power_of_two(inputs.atlas.tile_size.max(MIN_TILE)));
+        let entries = &self.entries;
+        let tile_of = |kind, light: usize| {
+            let lamp = Lamp::of(lighting, kind, light);
+            let held = entries
+                .iter()
+                .find(|entry| {
+                    entry.key
+                        == ViewKey::Face {
+                            light: lamp.id,
+                            face: 0,
+                        }
+                })
+                .map(|entry| entry.tile.size);
+            lamp.tile(inputs, held)
+        };
         let mut room = (side * side).saturating_sub(sun);
         let mut casting = 0;
-        ranked.retain(|&(kind, _, _)| {
+        ranked.retain(|&(kind, light, _)| {
+            let tile = u64::from(tile_of(kind, light));
             let needed = punctual::face_count(kind) as u64 * tile * tile;
             // Skipped rather than stopped: a spot still fits in the one tile a
             // point light could not use, and leaving it empty helps nobody.
@@ -867,13 +1010,21 @@ impl ShadowPlanner {
             let needed = punctual::face_count(kind);
             let first_view = plan.views.views.len();
             let in_view = reaches_view(kind, light);
-            let faces = punctual::faces(
-                lighting,
-                kind,
-                light,
-                inputs.atlas.near,
-                inputs.atlas.tile_size,
-            );
+            let lamp = Lamp::of(lighting, kind, light);
+            let held = self
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.key
+                        == ViewKey::Face {
+                            light: lamp.id,
+                            face: 0,
+                        }
+                })
+                .map(|entry| entry.tile.size);
+            let size = lamp.tile(inputs, held);
+            let faces = punctual::faces(lighting, kind, light, inputs.atlas.near, size);
+            let or = |value: f32, default: f32| if value >= 0.0 { value } else { default };
             let mut placed = 0;
             for face in 0..needed {
                 let wanted = Wanted {
@@ -881,7 +1032,7 @@ impl ShadowPlanner {
                         light: id(kind, light),
                         face: face as u8,
                     },
-                    size: floor_power_of_two(inputs.atlas.tile_size.max(MIN_TILE)),
+                    size,
                     kind: ViewKind::Punctual,
                     view_proj: faces.view_proj[face],
                     volume: CasterVolume::Frustum(faces.view_proj[face]),
@@ -891,6 +1042,18 @@ impl ShadowPlanner {
                     visible: CasterVolume::Frustum(faces.view_proj[face]),
                     read: None,
                     in_view,
+                    channels: lamp.channels,
+                    filtering: [
+                        or(lamp.shadows.softness, inputs.lamps.filtering[0]),
+                        or(lamp.shadows.sharpness, inputs.lamps.filtering[1])
+                            .min(crate::scene::MAX_SHADOW_SHARPNESS),
+                    ],
+                    bias: [
+                        or(lamp.shadows.constant_bias, inputs.lamps.bias[0]),
+                        or(lamp.shadows.slope_bias, inputs.lamps.bias[1]),
+                    ],
+                    update: lamp.shadows.update,
+                    revision: lamp.shadows.revision,
                 };
                 if !self.plan_view(&wanted, inputs.casters, &mut budget, plan) {
                     break;
@@ -974,6 +1137,8 @@ impl ShadowPlanner {
                     tile,
                     seen: 0,
                     view_proj: Mat4::ZERO,
+                    channels: 0,
+                    revision: 0,
                     cached: false,
                     live: Live::Unknown,
                     window: None,
@@ -995,7 +1160,18 @@ impl ShadowPlanner {
             volume: wanted.volume,
             texel_scale: wanted.texel_scale,
             kind: wanted.kind,
+            channels: wanted.channels,
+            filtering: wanted.filtering,
+            bias: wanted.bias,
         });
+        // Which casters each kind of draw takes. A light that updates on
+        // demand keeps a picture of everything in reach when it was asked; one
+        // that updates on change never draws what moves at all.
+        let (kept, direct) = match wanted.update {
+            ShadowUpdate::Always => (Casters::Static, Casters::All),
+            ShadowUpdate::OnChange => (Casters::Static, Casters::Static),
+            ShadowUpdate::OnDemand => (Casters::All, Casters::All),
+        };
         let cutoff = match wanted.kind {
             ViewKind::Sun => [wanted.texel_scale * SMALL_CASTER_TEXELS, 0.0],
             ViewKind::Punctual => [0.0, wanted.texel_scale * SMALL_CASTER_TEXELS],
@@ -1037,7 +1213,9 @@ impl ShadowPlanner {
         }
 
         // What moved between the matrix the tile holds and the one asked for.
-        let same = entry.view_proj == wanted.view_proj;
+        // Other channels are other casters, which is another picture as surely
+        // as another matrix is.
+        let same = entry.view_proj == wanted.view_proj && entry.channels == wanted.channels;
         let slid = match (&entry.window, &wanted.window) {
             (Some(old), Some(new)) if !same && entry.cached => {
                 let by = (new.min_cell - old.min_cell).abs();
@@ -1053,9 +1231,15 @@ impl ShadowPlanner {
         if !same && slid.is_none() {
             entry.cached = false;
         }
+        if entry.revision != wanted.revision {
+            entry.cached = false;
+        }
         // A caster that joined or left the static set inside the view has made
-        // its cached layer wrong, wherever in it the caster stands.
+        // its cached layer wrong, wherever in it the caster stands — unless
+        // the layer is a picture taken on demand, which nothing but a demand
+        // retakes.
         if entry.cached
+            && wanted.update != ShadowUpdate::OnDemand
             && casters.changed().is_none_or(|changed| {
                 changed
                     .iter()
@@ -1065,6 +1249,8 @@ impl ShadowPlanner {
             entry.cached = false;
         }
         entry.view_proj = wanted.view_proj;
+        entry.channels = wanted.channels;
+        entry.revision = wanted.revision;
 
         if !entry.cached {
             let cost = whole.texels();
@@ -1076,7 +1262,7 @@ impl ShadowPlanner {
                 entry.window = wanted.window;
                 entry.base = wanted.window.map_or(IVec2::ZERO, |window| window.min_cell);
                 plan.static_fills.push(whole);
-                plan.draws.push(draw(Layer::Static, Casters::Static, whole));
+                plan.draws.push(draw(Layer::Static, kept, whole));
                 plan.restores.push(Restore {
                     rect: whole,
                     tile,
@@ -1097,7 +1283,7 @@ impl ShadowPlanner {
                 entry.live = Live::Everything;
                 entry.touched.clear();
                 plan.live_fills.push(read);
-                plan.draws.push(draw(Layer::Live, Casters::All, read));
+                plan.draws.push(draw(Layer::Live, direct, read));
                 plan.work.push(ViewWork::Direct);
                 return true;
             }
@@ -1114,7 +1300,7 @@ impl ShadowPlanner {
                     plan.draws.push(CasterDraw {
                         view,
                         layer: Layer::Static,
-                        casters: Casters::Static,
+                        casters: kept,
                         volume,
                         view_proj,
                         tile,
@@ -1157,6 +1343,9 @@ impl ShadowPlanner {
         // wherever they are about to draw.
         entry.live = Live::Composite;
         entry.touched.clear();
+        if wanted.update != ShadowUpdate::Always {
+            return true;
+        }
         match casters.dynamic() {
             Some(dynamic) => {
                 for bounds in dynamic {
@@ -1355,6 +1544,8 @@ mod tests {
             candela: 1.0,
             range: 10.0,
             casts_shadows: true,
+            channels: crate::scene::ALL_CHANNELS,
+            shadows: Default::default(),
         }
     }
 
@@ -1369,6 +1560,8 @@ mod tests {
             inner_cos: 0.9,
             outer_cos: 0.7,
             casts_shadows: true,
+            channels: crate::scene::ALL_CHANNELS,
+            shadows: Default::default(),
         }
     }
 
@@ -1392,6 +1585,8 @@ mod tests {
             mesh: MeshHandle(0),
             material: MaterialHandle(0),
             instance,
+            channels: crate::scene::ALL_CHANNELS,
+            shadows: Default::default(),
         }
     }
 
@@ -1448,9 +1643,12 @@ mod tests {
                     camera: &self.camera,
                     aspect: 16.0 / 9.0,
                     lighting: &self.lighting,
-                    sun: self.sun.as_ref(),
+                    cascades: self.sun.as_ref(),
                     atlas: &self.atlas,
                     casters: &self.tracker,
+                    viewport_height: 1080.0,
+                    sun: ViewDefaults::default(),
+                    lamps: ViewDefaults::default(),
                 }),
                 &mut self.plan,
             );
@@ -1735,6 +1933,108 @@ mod tests {
             "a tile that sat out {:?} was trusted as it was",
             plan.work
         );
+    }
+
+    /// A lamp's tile is sized by how much of the screen its reach covers, so a
+    /// light across the level does not hold the texels of one overhead — and it
+    /// keeps the tile it has while the camera hovers at the distance where one
+    /// size gives way to the next, because every change of size is the light
+    /// redrawn whole.
+    #[test]
+    fn a_lamps_tile_follows_its_reach_on_screen_and_holds_at_a_boundary() {
+        let mut rig = Rig::new(Vec::new(), vec![spot(1, Vec3::new(0.0, 5.0, -30.0))]);
+        rig.sun = None;
+        let size = |rig: &mut Rig, distance: f32| {
+            rig.camera.position = Vec3::new(0.0, 5.0, -30.0 + distance);
+            rig.camera.target = Vec3::new(0.0, 5.0, -30.0);
+            rig.frame().views.views[0].tile.size
+        };
+
+        let near = size(&mut rig, 5.0);
+        assert_eq!(
+            near, rig.atlas.tile_size,
+            "inside its reach it takes the largest"
+        );
+        let mut sizes = vec![near];
+        let mut shrank_at = 0.0;
+        for step in 0..200 {
+            let distance = 12.0 + step as f32;
+            let next = size(&mut rig, distance);
+            if next != *sizes.last().unwrap() {
+                sizes.push(next);
+                shrank_at = distance;
+            }
+        }
+        assert!(sizes.len() >= 3, "it never shrank: {sizes:?}");
+        assert!(sizes.windows(2).all(|pair| pair[1] < pair[0]), "{sizes:?}");
+        assert!(sizes.iter().all(|size| size.is_power_of_two()));
+
+        // Back and forth across the distance it last shrank at.
+        let mut last = size(&mut rig, shrank_at);
+        for step in 0..40 {
+            let wobble = if step % 2 == 0 { 0.97 } else { 1.03 };
+            let now = size(&mut rig, shrank_at * wobble);
+            assert_eq!(now, last, "a tile that changes size at a boundary");
+            last = now;
+        }
+    }
+
+    /// The three ways a light can be told to keep its shadow. One that updates
+    /// on change never draws what moves, however it moves; one that updates on
+    /// demand draws nothing at all until it is asked, and then everything.
+    #[test]
+    fn a_light_draws_no_more_often_than_its_update_mode_says() {
+        use crate::scene::ShadowUpdate;
+        for update in [ShadowUpdate::OnChange, ShadowUpdate::OnDemand] {
+            let mut lamp = spot(1, Vec3::new(0.0, 5.0, 0.0));
+            lamp.shadows.update = update;
+            let mut rig = Rig::new(Vec::new(), vec![lamp]);
+            rig.sun = None;
+            rig.casters = vec![Vec3::ZERO, Vec3::X];
+            rig.settle();
+
+            // Something moving under it.
+            for step in 1..12 {
+                rig.casters[1] = Vec3::X * (1.0 + 0.05 * step as f32);
+                let plan = rig.frame();
+                assert!(
+                    plan.draws
+                        .iter()
+                        .all(|draw| draw.casters != Casters::Dynamic),
+                    "{update:?} drew what moves"
+                );
+                if update == ShadowUpdate::OnDemand {
+                    assert!(!plan.draws_static() && !plan.draws_live(), "step {step}");
+                }
+            }
+
+            if update == ShadowUpdate::OnDemand {
+                rig.lighting.spot_lights[0].shadows.revision += 1;
+                let plan = rig.frame();
+                assert!(plan.draws_static(), "it was asked and did not redraw");
+                assert!(
+                    plan.draws.iter().all(|draw| draw.casters == Casters::All),
+                    "a picture on demand is of everything in reach"
+                );
+                assert_eq!(rig.frame().work, [ViewWork::Held]);
+            }
+        }
+    }
+
+    /// A light's channels say whose shadows it takes, so changing them changes
+    /// what its tiles should hold as surely as moving it does.
+    #[test]
+    fn a_light_whose_channels_change_is_redrawn() {
+        let mut rig = Rig::new(Vec::new(), vec![spot(1, Vec3::new(0.0, 5.0, 0.0))]);
+        rig.sun = None;
+        rig.casters = vec![Vec3::ZERO];
+        rig.settle();
+        assert_eq!(rig.frame().work, [ViewWork::Held]);
+
+        rig.lighting.spot_lights[0].channels = 0b10;
+        let plan = rig.frame();
+        assert_eq!(plan.views.views[0].channels, 0b10);
+        assert!(plan.draws_live(), "{:?}", plan.work);
     }
 
     /// The budget spreads the cost of starting to cache, and only that: a view

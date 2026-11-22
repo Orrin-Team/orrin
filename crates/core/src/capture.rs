@@ -27,8 +27,9 @@ use crate::gfx::vulkan::VulkanRenderer;
 use crate::scene::entities::SceneChoice;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, DecalSettings, DofSettings, EnvironmentSettings,
-    FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings, ShadowSettings, SsaoSettings,
-    SsrSettings, SubsurfaceSettings, TaaSettings, TransparencySettings,
+    FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings, ShadowDebugView,
+    ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
+    TransparencySettings,
 };
 use crate::systems::{self, FrameGeometry};
 
@@ -74,6 +75,8 @@ pub struct CaptureSettings {
     /// Whether the point and spot lights get atlas tiles, in a capture that has
     /// `shadows` on. Off by default for the reason `shadows` is.
     pub punctual_shadows: bool,
+    /// Which of the shadows' debug views the frame is drawn through.
+    pub shadow_debug: ShadowDebugView,
     /// Screen-space reflections: off by default, because they are the effect
     /// most easily mistaken for a lighting bug when they are wrong.
     pub ssr: bool,
@@ -154,6 +157,7 @@ impl Default for CaptureSettings {
             decals: true,
             shadows: false,
             punctual_shadows: false,
+            shadow_debug: ShadowDebugView::None,
             ssr: false,
             dof: false,
             motion_blur: false,
@@ -335,6 +339,7 @@ pub fn render(
     let mut decals = Vec::new();
     let shadow_settings = ShadowSettings {
         punctual_enabled: settings.punctual_shadows,
+        debug_view: settings.shadow_debug,
         ..ShadowSettings::default()
     };
     let aspect = settings.extent[0] as f32 / settings.extent[1] as f32;

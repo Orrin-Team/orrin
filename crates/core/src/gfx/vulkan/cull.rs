@@ -99,6 +99,8 @@ pub(super) struct CullView {
     /// perspective view. Zero for the camera, whose pixels are not this
     /// dispatch's to give up.
     pub cutoff: [f32; 2],
+    /// The light channels the view takes instances from.
+    pub channels: u32,
 }
 
 /// How many planes a view's volume may have. Lock-stepped with `MAX_PLANES` in
@@ -123,6 +125,8 @@ struct GpuView {
     casters: u32,
     base: u32,
     plane_count: u32,
+    channels: u32,
+    _padding: [u32; 3],
 }
 
 /// Layout-frozen against `Batch` in both shaders.
@@ -832,6 +836,8 @@ impl CullPass {
                     casters: view.casters,
                     base,
                     plane_count,
+                    channels: view.channels,
+                    _padding: [0; 3],
                 }
             })
             .collect();

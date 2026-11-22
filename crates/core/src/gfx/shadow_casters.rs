@@ -17,6 +17,7 @@ use glam::Mat4;
 
 use crate::geom::Aabb;
 use crate::gfx::DrawList;
+use crate::scene::ShadowCasting;
 
 /// How many frames a caster has to hold still before it is baked into the
 /// cached layers. More than one, because baking is a redraw of every layer the
@@ -26,9 +27,13 @@ use crate::gfx::DrawList;
 pub const STATIC_AFTER: u16 = 8;
 
 /// The bit of an instance's flags that says it is in the cached layers, and the
-/// one that says it is not. One or the other, so a view's filter is a mask.
+/// one that says it is not. One or the other, or neither for an instance that
+/// casts no shadow, so a view's filter is a mask.
 pub const FLAG_STATIC: u32 = 1;
 pub const FLAG_DYNAMIC: u32 = 2;
+/// Set on every instance, which is what the camera's view asks for: whether
+/// something casts has nothing to do with whether it is seen.
+pub const FLAG_VISIBLE: u32 = 4;
 
 /// How many changes of the static set a frame reports one by one. Past it the
 /// frame says only that everything changed, which is what loading a scene is.
@@ -48,6 +53,8 @@ struct Row {
     model: Mat4,
     mesh: u32,
     material: u32,
+    channels: u32,
+    mode: ShadowCasting,
     /// The frame this row was last offered.
     seen: u32,
     /// Frames since anything about it changed.
@@ -63,6 +70,8 @@ impl Default for Row {
             model: Mat4::ZERO,
             mesh: u32::MAX,
             material: u32::MAX,
+            channels: 0,
+            mode: ShadowCasting::Auto,
             seen: 0,
             still: 0,
             is_static: false,
@@ -121,6 +130,10 @@ impl CasterTracker {
             let moved = row.model != item.model
                 || row.mesh != item.mesh.0
                 || row.material != item.material.0
+                // A caster in other channels casts into other lights' views,
+                // and one told to cast differently is another caster.
+                || row.channels != item.channels
+                || row.mode != item.shadows
                 // A row nobody offered last frame is a new caster, whatever the
                 // slot's last occupant was doing.
                 || row.seen != frame - 1;
@@ -128,6 +141,8 @@ impl CasterTracker {
             row.model = item.model;
             row.mesh = item.mesh.0;
             row.material = item.material.0;
+            row.channels = item.channels;
+            row.mode = item.shadows;
 
             if moved {
                 row.still = 0;
@@ -144,12 +159,17 @@ impl CasterTracker {
                 row.still = row.still.saturating_add(1);
             }
 
-            if row.is_static {
+            if row.is_static || row.mode == ShadowCasting::Off {
                 continue;
             }
             let world = bounds(item.mesh.0).map(|bounds| bounds.transformed(&item.model));
+            let settled = match row.mode {
+                ShadowCasting::Static => true,
+                ShadowCasting::Dynamic => false,
+                _ => row.still >= STATIC_AFTER,
+            };
             match world {
-                Some(world) if row.still >= STATIC_AFTER => {
+                Some(world) if settled => {
                     row.is_static = true;
                     row.bounds = world;
                     self.baked.push(item.instance);
@@ -200,10 +220,12 @@ impl CasterTracker {
 
     /// The flags the cull dispatch tests a view's filter against.
     pub fn flags(&self, row: u32) -> u32 {
-        match self.rows.get(row as usize) {
-            Some(row) if row.is_static => FLAG_STATIC,
-            _ => FLAG_DYNAMIC,
-        }
+        FLAG_VISIBLE
+            | match self.rows.get(row as usize) {
+                Some(row) if row.mode == ShadowCasting::Off => 0,
+                Some(row) if row.is_static => FLAG_STATIC,
+                _ => FLAG_DYNAMIC,
+            }
     }
 
     /// World bounds of the casters that joined or left the static set this
@@ -252,6 +274,8 @@ mod tests {
             mesh: MeshHandle(0),
             material: MaterialHandle(0),
             instance,
+            channels: crate::scene::ALL_CHANNELS,
+            shadows: Default::default(),
         }
     }
 
@@ -273,12 +297,16 @@ mod tests {
 
         for frame in 0..STATIC_AFTER {
             update(&mut tracker, &still);
-            assert_eq!(tracker.flags(7), FLAG_DYNAMIC, "frame {frame}");
+            assert_eq!(
+                tracker.flags(7),
+                FLAG_VISIBLE | FLAG_DYNAMIC,
+                "frame {frame}"
+            );
             assert!(tracker.changed().unwrap().is_empty(), "frame {frame}");
             assert_eq!(tracker.dynamic().unwrap().len(), 1);
         }
         update(&mut tracker, &still);
-        assert_eq!(tracker.flags(7), FLAG_STATIC);
+        assert_eq!(tracker.flags(7), FLAG_VISIBLE | FLAG_STATIC);
         assert_eq!(tracker.changed().unwrap().len(), 1, "settling bakes it in");
         assert!(tracker.dynamic().unwrap().is_empty());
 
@@ -287,7 +315,7 @@ mod tests {
 
         let moved = [item(7, rest + Vec3::X)];
         update(&mut tracker, &moved);
-        assert_eq!(tracker.flags(7), FLAG_DYNAMIC);
+        assert_eq!(tracker.flags(7), FLAG_VISIBLE | FLAG_DYNAMIC);
         let changed = tracker.changed().unwrap();
         assert_eq!(changed.len(), 1);
         assert!(
@@ -300,10 +328,42 @@ mod tests {
         for _ in 0..=STATIC_AFTER {
             update(&mut tracker, &settled);
         }
-        assert_eq!(tracker.flags(7), FLAG_STATIC);
+        assert_eq!(tracker.flags(7), FLAG_VISIBLE | FLAG_STATIC);
         update(&mut tracker, &[]);
         assert_eq!(tracker.changed().unwrap().len(), 1, "a despawn un-bakes it");
-        assert_eq!(tracker.flags(7), FLAG_DYNAMIC);
+        assert_eq!(tracker.flags(7), FLAG_VISIBLE | FLAG_DYNAMIC);
+    }
+
+    /// What a mesh says about its own shadow outranks what its movement does.
+    /// Told to be static it is baked the frame it appears; told to be dynamic
+    /// it never is, however long it rests; told to cast nothing it is in no
+    /// shadow view's mask at all — and still in the camera's.
+    #[test]
+    fn a_caster_told_how_to_cast_is_taken_at_its_word() {
+        let mut tracker = CasterTracker::default();
+        let told = |instance, shadows| RenderItem {
+            shadows,
+            ..item(instance, Vec3::ZERO)
+        };
+        let items = [
+            told(0, ShadowCasting::Static),
+            told(1, ShadowCasting::Dynamic),
+            told(2, ShadowCasting::Off),
+        ];
+        update(&mut tracker, &items);
+        assert_eq!(tracker.flags(0), FLAG_VISIBLE | FLAG_STATIC);
+        assert_eq!(tracker.changed().unwrap().len(), 1, "baked on sight");
+
+        for _ in 0..STATIC_AFTER * 2 {
+            update(&mut tracker, &items);
+        }
+        assert_eq!(tracker.flags(1), FLAG_VISIBLE | FLAG_DYNAMIC);
+        assert_eq!(tracker.flags(2), FLAG_VISIBLE);
+        assert_eq!(
+            tracker.dynamic().unwrap().len(),
+            1,
+            "only the dynamic one moves"
+        );
     }
 
     /// A slot reused by another entity standing still must not inherit the
@@ -318,6 +378,6 @@ mod tests {
         update(&mut tracker, &[]);
         update(&mut tracker, &still);
         update(&mut tracker, &still);
-        assert_eq!(tracker.flags(2), FLAG_DYNAMIC);
+        assert_eq!(tracker.flags(2), FLAG_VISIBLE | FLAG_DYNAMIC);
     }
 }

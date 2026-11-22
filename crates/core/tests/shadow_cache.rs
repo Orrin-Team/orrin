@@ -19,7 +19,9 @@
 use glam::Vec3;
 use orrin_core::capture::{self, CaptureSettings};
 use orrin_core::gfx::vulkan::VulkanRenderer;
-use orrin_core::scene::{Camera, HdrSettings, Light, LocalTransform, Spin};
+use orrin_core::scene::{
+    Camera, HdrSettings, Light, LocalTransform, MeshLighting, ShadowCasting, Spin,
+};
 use orrin_ecs::{Entity, World};
 
 /// Frames before anything changes: long enough for every caster to have been
@@ -82,6 +84,14 @@ fn cube_at(world: &World, at: Vec3) -> Entity {
             }
         });
     nearest.expect("the rig has cubes").1
+}
+
+fn cubes(world: &World) -> Vec<Entity> {
+    let mut cubes = Vec::new();
+    world
+        .query::<(&LocalTransform, &Spin)>()
+        .for_each(|entity, _| cubes.push(entity));
+    cubes
 }
 
 fn the_spot(world: &World) -> Entity {
@@ -215,6 +225,41 @@ fn nothing_stays_behind(metal: bool) {
     holds(metal, "despawn", 1, |world, _| {
         let cube = cube_at(world, CUBE);
         world.despawn(cube);
+    });
+    // Every cube told to stop casting, where it stands: nothing moved, and the
+    // cached layers hold their depth all the same.
+    holds(metal, "uncast", 1, |world, _| {
+        for cube in cubes(world) {
+            world.insert(
+                cube,
+                MeshLighting {
+                    shadows: ShadowCasting::Off,
+                    ..MeshLighting::default()
+                },
+            );
+        }
+    });
+    // And taken out of every light's channels: unlit, and out of every view
+    // they were cached in.
+    holds(metal, "channels", 1, |world, _| {
+        for cube in cubes(world) {
+            world.insert(
+                cube,
+                MeshLighting {
+                    channels: 0,
+                    ..MeshLighting::default()
+                },
+            );
+        }
+    });
+    // A light whose channels stop including anything: its tiles leave the atlas
+    // and its light leaves the floor.
+    holds(metal, "light-channels", 1, |world, _| {
+        let spot = the_spot(world);
+        let mut light = world.get_mut::<Light>(spot).expect("it is a light");
+        if let Light::Spot { channels, .. } = &mut *light {
+            *channels = 0;
+        }
     });
     // A light that moves: no cached layer survives a new matrix.
     holds(metal, "light", 20, |world, _| {

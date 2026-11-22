@@ -42,6 +42,10 @@ pub enum Light {
         color: Vec3,
         /// Illuminance on a surface facing the light, in lux.
         lux: f32,
+        /// Which [channels](MeshLighting::channels) it lights. An object in
+        /// none of them is not lit by it and casts nothing into its shadows.
+        #[reflect(default = ALL_CHANNELS)]
+        channels: u32,
     },
     Point {
         color: Vec3,
@@ -55,6 +59,12 @@ pub enum Light {
         /// than fit.
         #[reflect(default = true)]
         casts_shadows: bool,
+        /// Which [channels](MeshLighting::channels) it lights, and so which
+        /// objects cast into its shadows.
+        #[reflect(default = ALL_CHANNELS)]
+        channels: u32,
+        #[reflect(default)]
+        shadows: LightShadows,
     },
     /// A cone. `inner_angle` is where it is still at full brightness and
     /// `outer_angle` where it has fallen to nothing, both as the *half* angle
@@ -89,13 +99,125 @@ pub enum Light {
         /// factor of six.
         #[reflect(default = true)]
         casts_shadows: bool,
+        #[reflect(default = ALL_CHANNELS)]
+        channels: u32,
+        #[reflect(default)]
+        shadows: LightShadows,
     },
+}
+
+/// Every light channel: what a light lights and an object is in until one of
+/// them says otherwise.
+pub const ALL_CHANNELS: u32 = u32::MAX;
+
+/// What stands for "whatever the scene's shadow settings say" in a
+/// [`LightShadows`] field that overrides one of them.
+pub const INHERIT: f32 = -1.0;
+
+/// How a point or spot light's shadow is drawn, where it should differ from the
+/// scene's [`ShadowSettings`](crate::scene::ShadowSettings).
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
+pub struct LightShadows {
+    /// The largest tile a face of this light is given, in texels, or zero for
+    /// the scene's. The tile it gets is sized by how much of the screen the
+    /// light's reach covers, up to this.
+    pub resolution: u32,
+    /// How much this light is worth a tile beside another when the atlas runs
+    /// short, as a factor on what its brightness and distance say.
+    pub priority: f32,
+    /// Width of the penumbra in metres, or [`INHERIT`].
+    pub softness: f32,
+    /// How much of the filtered penumbra is visible, 0 to 1, or [`INHERIT`].
+    pub sharpness: f32,
+    /// How far from the light its shadows reach, in metres, or zero for as far
+    /// as its light does. A long-reaching fill can shadow only what is near it.
+    pub range: f32,
+    pub update: ShadowUpdate,
+    /// Changed to have a light that updates [`OnDemand`](ShadowUpdate::OnDemand)
+    /// drawn again. The value means nothing; a change to it is the request.
+    pub revision: u32,
+    /// The depth bias its faces are drawn with, or [`INHERIT`] for each.
+    pub constant_bias: f32,
+    pub slope_bias: f32,
+}
+
+impl Default for LightShadows {
+    fn default() -> Self {
+        Self {
+            resolution: 0,
+            priority: 1.0,
+            softness: INHERIT,
+            sharpness: INHERIT,
+            range: 0.0,
+            update: ShadowUpdate::Always,
+            revision: 0,
+            constant_bias: INHERIT,
+            slope_bias: INHERIT,
+        }
+    }
+}
+
+/// When a light's shadow is redrawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+pub enum ShadowUpdate {
+    /// Whenever anything in it changes, moving casters included: what stands
+    /// still is kept and what moves is drawn over it every frame.
+    #[default]
+    Always,
+    /// When the light moves or something standing still in it changes. Moving
+    /// casters cast nothing: a shadow of the room, not of who is in it.
+    OnChange,
+    /// Only when [`LightShadows::revision`] changes, with everything in reach
+    /// at that moment. Until then it is sampled as it was drawn, wherever the
+    /// light and its casters have gone since.
+    OnDemand,
+}
+
+/// How a mesh takes part in the lighting: which lights reach it, and what it
+/// does for their shadows. An entity without one is in every channel and casts
+/// by whether it is moving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect)]
+pub struct MeshLighting {
+    /// The channels the mesh is in. A light lights it, and takes it as a
+    /// shadow caster, only if they share one.
+    pub channels: u32,
+    pub shadows: ShadowCasting,
+}
+
+impl Default for MeshLighting {
+    fn default() -> Self {
+        Self {
+            channels: ALL_CHANNELS,
+            shadows: ShadowCasting::Auto,
+        }
+    }
+}
+
+/// What a mesh does for shadows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+pub enum ShadowCasting {
+    /// Kept in the cached shadow layers while it stands still, and drawn each
+    /// frame while it moves.
+    #[default]
+    Auto,
+    /// Always in the cached layers, from the frame it appears. Moving it
+    /// redraws every layer it stands in, each time.
+    Static,
+    /// Never in the cached layers, however long it rests: for what rests
+    /// between moves, so that each rest and each move does not redraw them.
+    Dynamic,
+    /// Casts no shadow.
+    Off,
 }
 
 impl Light {
     #[inline]
     pub fn directional(color: Vec3, lux: f32) -> Self {
-        Self::Directional { color, lux }
+        Self::Directional {
+            color,
+            lux,
+            channels: ALL_CHANNELS,
+        }
     }
 
     #[inline]
@@ -105,6 +227,8 @@ impl Light {
             lumens,
             range,
             casts_shadows: true,
+            channels: ALL_CHANNELS,
+            shadows: LightShadows::default(),
         }
     }
 
@@ -118,6 +242,8 @@ impl Light {
             outer_angle,
             reflector: true,
             casts_shadows: true,
+            channels: ALL_CHANNELS,
+            shadows: LightShadows::default(),
         }
     }
 

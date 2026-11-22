@@ -266,6 +266,8 @@ mod tests {
             candela: 100.0,
             range,
             casts_shadows: false,
+            channels: crate::scene::ALL_CHANNELS,
+            shadows: Default::default(),
         }
     }
 
@@ -332,6 +334,8 @@ mod tests {
             inner_cos: 0.9,
             outer_cos: 0.8,
             casts_shadows: false,
+            channels: crate::scene::ALL_CHANNELS,
+            shadows: Default::default(),
         });
         let clusters = bin(&lighting);
 

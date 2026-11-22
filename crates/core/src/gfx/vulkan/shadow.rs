@@ -8,7 +8,7 @@ use crate::gfx::rhi::{
     TextureDimension, TextureViewId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
-use crate::gfx::shadow_views::{AtlasRect, Layer, ShadowPlan, ViewKind};
+use crate::gfx::shadow_views::{AtlasRect, Layer, ShadowPlan};
 
 use std::ops::Range;
 
@@ -62,15 +62,6 @@ pub struct ShadowPass {
     /// `frame::shadow_atlas_desc` declares, and replaced only when that
     /// changes.
     atlases: Option<Atlases>,
-    pub constant_bias: f32,
-    pub slope_bias: f32,
-    /// The punctual maps get their own pair. A cascade is orthographic, so one
-    /// depth unit is the same world distance everywhere in it and a constant
-    /// bias means one thing; a punctual face is perspective, where the same
-    /// offset is millimetres at the light and metres at its range. They are
-    /// tuned apart because they cannot be tuned together.
-    pub punctual_constant_bias: f32,
-    pub punctual_slope_bias: f32,
 }
 
 impl ShadowPass {
@@ -148,10 +139,6 @@ impl ShadowPass {
             restore_pipeline,
             lit_atlas_view: build_lit_depth(device),
             atlases: None,
-            constant_bias: 1.25,
-            slope_bias: 2.5,
-            punctual_constant_bias: 2.0,
-            punctual_slope_bias: 3.0,
         }
     }
 
@@ -396,19 +383,18 @@ impl ShadowPass {
                 continue;
             }
             // Dynamic so the editor's bias sliders tune acne live instead of
-            // rebuilding the pipeline on every drag, and so the sun's views and
-            // the lamps' can share the pass. `clamp` stays 0.0: a nonzero one
-            // needs the `depth_bias_clamp` device feature. Set after the
-            // rectangles, whose pipelines have no bias of their own and leave
-            // the dynamic one undefined.
-            let kind = plan.views.views[draw.view].kind;
-            if biased != Some(kind) {
-                let (constant, slope) = match kind {
-                    ViewKind::Sun => (self.constant_bias, self.slope_bias),
-                    ViewKind::Punctual => (self.punctual_constant_bias, self.punctual_slope_bias),
-                };
-                builder.set_depth_bias(constant, 0.0, slope);
-                biased = Some(kind);
+            // rebuilding the pipeline on every drag, and so views with
+            // different biases can share the pass: the sun's and the lamps'
+            // are tuned apart, because an orthographic depth unit is the same
+            // distance everywhere and a perspective one is millimetres at the
+            // light and metres at its range, and a light may carry its own.
+            // `clamp` stays 0.0: a nonzero one needs the `depth_bias_clamp`
+            // device feature. Set after the rectangles, whose pipelines have
+            // no bias of their own and leave the dynamic one undefined.
+            let bias = plan.views.views[draw.view].bias;
+            if biased != Some(bias) {
+                builder.set_depth_bias(bias[0], 0.0, bias[1]);
+                biased = Some(bias);
             }
             let draws = Draws {
                 frame,

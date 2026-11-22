@@ -163,6 +163,7 @@ const SHADOWS: &[Section] = &[
             "Sharpness",
             "Strength",
             "Tint cascades",
+            "Debug view",
         ],
         shadows,
     ),
@@ -746,6 +747,30 @@ fn shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
     }
     if rows.shows("Tint cascades") {
         toggle(ui, "Tint cascades", &mut s.debug_cascades);
+    }
+    if rows.shows("Debug view") {
+        use crate::scene::ShadowDebugView;
+        widgets::property(ui, "Debug view", |ui| {
+            let name = |view| match view {
+                ShadowDebugView::None => "None",
+                ShadowDebugView::Atlas => "Atlas",
+                ShadowDebugView::TexelDensity => "Texel density",
+                ShadowDebugView::CacheState => "Cache state",
+            };
+            egui::ComboBox::from_id_salt("shadow_debug_view")
+                .selected_text(name(s.debug_view))
+                .show_ui(ui, |ui| {
+                    for view in [
+                        ShadowDebugView::None,
+                        ShadowDebugView::Atlas,
+                        ShadowDebugView::TexelDensity,
+                        ShadowDebugView::CacheState,
+                    ] {
+                        ui.selectable_value(&mut s.debug_view, view, name(view));
+                    }
+                })
+                .response
+        });
     }
 }
 

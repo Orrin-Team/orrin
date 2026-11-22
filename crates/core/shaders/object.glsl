@@ -8,6 +8,10 @@
 struct Object {
     vec4 model[3];
     vec4 prev_model[3];
+    // x = the light channels the object is in: a light lights it, and takes it
+    // as a shadow caster, only if the two masks share a bit. The rest is the
+    // row's padding to its own alignment.
+    uvec4 flags;
 };
 
 // The matrix three stored rows describe. Mirrored by `shader_affine` in

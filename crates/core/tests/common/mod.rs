@@ -4,7 +4,7 @@
 use glam::Vec3;
 use orrin_core::capture::{CaptureSettings, Floor};
 use orrin_core::scene::entities::SceneChoice;
-use orrin_core::scene::{Camera, FogSettings};
+use orrin_core::scene::{Camera, FogSettings, ShadowDebugView};
 
 /// Where both fog captures stand, shared so the pair differs in one field.
 ///
@@ -186,6 +186,38 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                     target: Vec3::new(-4.0, -0.5, 3.9),
                     ..Camera::default()
                 }),
+                ..CaptureSettings::default()
+            },
+        ),
+        // The three ways of looking at the shadows rather than at the scene, from
+        // the `shadows` capture's own camera so each reads against it: the atlas
+        // in the corner, each surface by how a shadow texel compares with its
+        // pixel, and each by what the last frame did to the view it reads —
+        // which in a scene standing still is nothing, so the whole frame is grey.
+        (
+            "shadow-debug-atlas",
+            CaptureSettings {
+                shadows: true,
+                punctual_shadows: true,
+                shadow_debug: ShadowDebugView::Atlas,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "shadow-debug-density",
+            CaptureSettings {
+                shadows: true,
+                punctual_shadows: true,
+                shadow_debug: ShadowDebugView::TexelDensity,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "shadow-debug-cache",
+            CaptureSettings {
+                shadows: true,
+                punctual_shadows: true,
+                shadow_debug: ShadowDebugView::CacheState,
                 ..CaptureSettings::default()
             },
         ),

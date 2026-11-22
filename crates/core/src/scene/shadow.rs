@@ -98,6 +98,42 @@ pub struct ShadowSettings {
     /// rather than part of it, so never saved with one.
     #[reflect(skip)]
     pub debug_cascades: bool,
+    /// Another way of looking at the shadows, for the same reason never saved.
+    #[reflect(skip)]
+    pub debug_view: ShadowDebugView,
+}
+
+/// A way of looking at the shadows rather than at the scene.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShadowDebugView {
+    #[default]
+    None,
+    /// The atlas itself, as a picture in the corner of the frame: which tiles
+    /// hold what. Drawn by the surfaces under it, so it shows where there is
+    /// one to draw it.
+    Atlas,
+    /// Each surface by how large a texel of the sun's shadow is against the
+    /// pixel it shades: green at one for one, toward red where the shadow is
+    /// coarser than the frame, toward blue where it is finer.
+    TexelDensity,
+    /// Each surface by what this frame did to the sun view it reads: grey for
+    /// nothing, green for its moving casters redrawn, blue for a strip scrolled
+    /// in, yellow for its cached layer redrawn, red for drawn whole.
+    CacheState,
+}
+
+impl ShadowSettings {
+    /// Which debug view the shaders draw, as the number they switch on. Zero
+    /// is none; the cascade tint is one of them.
+    pub fn debug_mode(&self) -> f32 {
+        match (self.debug_cascades, self.debug_view) {
+            (true, _) => 1.0,
+            (_, ShadowDebugView::None) => 0.0,
+            (_, ShadowDebugView::Atlas) => 2.0,
+            (_, ShadowDebugView::TexelDensity) => 3.0,
+            (_, ShadowDebugView::CacheState) => 4.0,
+        }
+    }
 }
 
 impl Default for ShadowSettings {
@@ -129,6 +165,7 @@ impl Default for ShadowSettings {
             punctual_sharpness: DEFAULT_SHARPNESS,
             strength: 1.0,
             debug_cascades: false,
+            debug_view: ShadowDebugView::None,
         }
     }
 }

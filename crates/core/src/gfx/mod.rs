@@ -235,6 +235,10 @@ pub struct RenderItem {
     /// than five, and a row survives the frames in which nothing about it
     /// changed. See `vulkan::instances::InstanceStore`.
     pub instance: u32,
+    /// The light channels it is in, and what it does for shadows. See
+    /// [`MeshLighting`](crate::scene::MeshLighting).
+    pub channels: u32,
+    pub shadows: crate::scene::ShadowCasting,
 }
 
 /// One pass's draw order over a shared item array.
@@ -413,6 +417,8 @@ pub struct DirectionalLight {
     /// distance to fall off over, so the illuminance it lays down is already what
     /// the BRDF wants to be multiplied by.
     pub illuminance: f32,
+    /// Which channels it lights. See [`MeshLighting`](crate::scene::MeshLighting).
+    pub channels: u32,
 }
 
 impl DirectionalLight {
@@ -442,9 +448,12 @@ pub struct PointLight {
     pub range: f32,
     /// Whether this light asks for atlas tiles. Asking is not getting: the atlas
     /// has a fixed number of tiles and a point light spends six, so
-    /// [`fit`](punctual::fit) spends them on the lights that matter most and
-    /// leaves the rest shading unshadowed.
+    /// the planner spends them on the lights that matter most and leaves the
+    /// rest shading unshadowed.
     pub casts_shadows: bool,
+    /// Which channels it lights, and so whose shadows it takes.
+    pub channels: u32,
+    pub shadows: crate::scene::LightShadows,
 }
 
 /// A cone of light. `inner_cos`/`outer_cos` are cosines of the half angles
@@ -467,6 +476,8 @@ pub struct SpotLight {
     pub inner_cos: f32,
     pub outer_cos: f32,
     pub casts_shadows: bool,
+    pub channels: u32,
+    pub shadows: crate::scene::LightShadows,
 }
 
 #[derive(Clone, Debug)]
@@ -825,6 +836,7 @@ impl Default for SceneLighting {
                 direction: Vec3::new(-0.4, -1.0, -0.6).normalize(),
                 color: Vec3::new(1.0, 0.97, 0.92),
                 illuminance: 20_000.0,
+                channels: crate::scene::ALL_CHANNELS,
             },
             point_lights: Vec::new(),
             spot_lights: Vec::new(),
@@ -953,6 +965,8 @@ mod draw_list_tests {
             mesh: MeshHandle(mesh),
             material: MaterialHandle(material),
             instance: 0,
+            channels: crate::scene::ALL_CHANNELS,
+            shadows: Default::default(),
         }
     }
 

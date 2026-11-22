@@ -17,6 +17,8 @@ layout(location = 5) out vec3 v_color;
 // is no per-draw push to put it in. `flat` because it is a number, not a
 // quantity to interpolate.
 layout(location = 6) flat out uint v_material;
+// The light channels this object is in, for the light loops to test.
+layout(location = 7) flat out uint v_channels;
 
 // Declared identically to the fragment shader so the two stages share one
 // push-constant range.
@@ -55,6 +57,7 @@ void main() {
     uvec2 entry = instances[uint(gl_InstanceIndex)];
     uint object = entry.x;
     v_material = entry.y;
+    v_channels = objects[object].flags.x;
     mat4 model = object_model(objects[object]);
 
     vec4 world = model * vec4(position, 1.0);

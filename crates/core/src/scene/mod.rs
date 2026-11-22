@@ -43,9 +43,10 @@ pub use assets::Assets;
 pub use bloom::BloomSettings;
 pub use camera::{ActiveCamera, Camera, active_camera, follow_active_camera};
 pub use components::{
-    AmbientLight, AudioListener, AudioSource, CameraComponent, Collider, ColliderShape, Folder,
-    Light, LocalTransform, Locked, MAX_CONE_ANGLE, MIN_CONE_ANGLE, MaterialHandle, MeshHandle,
-    Name, PHYSICS_LAYERS, Parent, PendingScripts, PhysicsSettings, RigidBody, Rolloff, Spin, Tag,
+    ALL_CHANNELS, AmbientLight, AudioListener, AudioSource, CameraComponent, Collider,
+    ColliderShape, Folder, INHERIT, Light, LightShadows, LocalTransform, Locked, MAX_CONE_ANGLE,
+    MIN_CONE_ANGLE, MaterialHandle, MeshHandle, MeshLighting, Name, PHYSICS_LAYERS, Parent,
+    PendingScripts, PhysicsSettings, RigidBody, Rolloff, ShadowCasting, ShadowUpdate, Spin, Tag,
     UnknownComponents, WorldTransform,
 };
 #[cfg(feature = "scripting")]
@@ -78,7 +79,7 @@ pub use previews::{
 };
 pub use registry::register_components;
 pub use render_settings::RenderSettings;
-pub use shadow::{MAX_SHADOW_SHARPNESS, ShadowSettings};
+pub use shadow::{MAX_SHADOW_SHARPNESS, ShadowDebugView, ShadowSettings};
 pub use ssao::SsaoSettings;
 pub use ssr::SsrSettings;
 pub use subsurface::SubsurfaceSettings;

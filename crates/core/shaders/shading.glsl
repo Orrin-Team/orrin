@@ -43,6 +43,9 @@ layout(location = 4) in vec2 v_uv;
 layout(location = 5) in vec3 v_color;
 // The material row this instance is drawn with. See `forward.vert`.
 layout(location = 6) flat in uint v_material;
+// The light channels this object is in: a light whose own mask shares no bit
+// with it does not light it. See `MeshLighting` in scene/components/light.rs.
+layout(location = 7) flat in uint v_channels;
 
 // Keep in sync with MAX_TEXTURES in forward.rs.
 const int MAX_TEXTURES = 192;
@@ -65,20 +68,20 @@ const float PI = 3.14159265359;
 struct PointLight {
     vec4 position; // xyz = world position, w = range
     vec4 color;    // rgb = color,         w = luminous intensity (cd)
-    vec4 shadow;   // x = first shadow view (< 0 = none), y = near plane
+    vec4 shadow;   // x = first shadow view (< 0 = none), y = near plane, z = channel mask (bits)
 };
 
 struct SpotLight {
     vec4 position;  // xyz = world position, w = range
     vec4 direction; // xyz = cone axis,      w = cos(outer half angle)
     vec4 color;     // rgb = color,          w = luminous intensity (cd)
-    vec4 params;    // x = cos(inner), y = shadow view (< 0 = none), z = near
+    vec4 params;    // x = cos(inner), y = shadow view (< 0 = none), z = near, w = channel mask (bits)
 };
 
 layout(set = 0, binding = 0) uniform Lighting {
     vec4 camera_pos;    // xyz = camera world position
     vec4 ambient;       // rgb = color, w = luminance (cd/m2)
-    vec4 sun_direction; // xyz = direction toward the sun (normalized)
+    vec4 sun_direction; // xyz = direction toward the sun (normalized), w = channel mask (bits)
     vec4 sun_color;     // rgb = color, w = illuminance (lux)
     vec4 params;        // x = point light count, y = surface time (s), z legacy, w = spot count
     vec4 viewport;      // x=w, y=h, z=1/w, w=1/h
@@ -177,7 +180,8 @@ layout(set = 3, binding = 5) uniform sampler2D u_contact_shadow;
 struct ShadowFace {
     mat4 view_proj;
     vec4 rect;   // xy = atlas uv offset, zw = atlas uv scale
-    vec4 params; // x = world size of a texel where clip w is one
+    vec4 params; // x = world size of a texel where clip w is one,
+                 // y = penumbra width (m), z = sharpness
 };
 layout(set = 3, binding = 6, std430) readonly buffer ShadowFaces {
     ShadowFace shadow_faces[];
@@ -752,6 +756,56 @@ vec3 cascade_debug_tint(int cascade) {
     return vec3(1.0, 1.0, 0.4);
 }
 
+// What a frame did to a view, as a colour: grey for nothing, green for its
+// moving casters redrawn, blue for a strip scrolled in, yellow for its cached
+// layer redrawn, red for drawn whole. `ViewWork`'s order, in shadow_views.rs.
+vec3 shadow_state_tint(float state) {
+    if (state < 0.5) return vec3(0.55);
+    if (state < 1.5) return vec3(0.4, 1.0, 0.4);
+    if (state < 2.5) return vec3(0.4, 0.6, 1.0);
+    if (state < 3.5) return vec3(1.0, 1.0, 0.4);
+    return vec3(1.0, 0.4, 0.4);
+}
+
+// How a shadow texel compares with the pixel it shades: green at one for one,
+// toward red at four times coarser, toward blue at four times finer.
+vec3 shadow_density_tint(float ratio) {
+    float stops = clamp(log2(max(ratio, 1e-6)) * 0.5, -1.0, 1.0);
+    vec3 even = vec3(0.4, 1.0, 0.4);
+    return stops > 0.0
+        ? mix(even, vec3(1.0, 0.4, 0.4), stops)
+        : mix(even, vec3(0.4, 0.6, 1.0), -stops);
+}
+
+// The atlas at `uv`: black where nothing was drawn, and where something was, its
+// depth as a grey under the tint of the sun view whose tile it is — a lamp's
+// tiles stay untinted. Depth is read the only way this stage can read it,
+// through the comparison sampler, as how many of a ladder of depths it is
+// nearer than; the ladder crowds both ends, because an orthographic view keeps
+// its casters in a sliver of its range and a perspective face keeps nearly all
+// of its depth at the far plane.
+vec3 shadow_atlas_picture(vec2 uv) {
+    const float ladder[12] = float[12](
+        0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 0.6, 0.9, 0.97, 0.99, 0.997, 0.9995
+    );
+    float nearer = 0.0;
+    for (int i = 0; i < 12; ++i) {
+        nearer += textureLod(sampler2DShadow(u_shadow_atlas, u_shadow_cmp), vec3(uv, ladder[i]), 0.0);
+    }
+    if (nearer > 11.5) return vec3(0.0);
+
+    vec3 tint = vec3(1.0);
+    int count = int(lighting.cascades.params.x);
+    for (int i = 0; i < count; ++i) {
+        vec4 rect = lighting.cascades.rects[i];
+        vec2 local = (uv - rect.xy) / rect.zw;
+        if (all(greaterThanEqual(local, vec2(0.0))) && all(lessThan(local, vec2(1.0)))) {
+            tint = cascade_debug_tint(i);
+        }
+    }
+    return tint * mix(1.0, 0.3, nearer / 12.0);
+}
+
 // Smooth, range-limited falloff (windowed inverse-square). Multiplying a
 // light's candela by this gives the illuminance it lays on a surface facing it,
 // in lux — which is only true because one world unit is one metre.
@@ -789,7 +843,7 @@ float atlas_shadow(int face_index, vec3 world_pos, vec3 N, vec3 L) {
         face.view_proj,
         face.rect,
         face.params.x,
-        lighting.cascades.filtering.zw,
+        face.params.yz,
         world_pos,
         N,
         L
@@ -1227,7 +1281,7 @@ Shaded shade_surface() {
     // The environment term above is what `u_ao` attenuates instead; the
     // punctual lights below carry their own atlas lookups.
     float view_dist = length(v_world_pos - lighting.camera_pos.xyz);
-    {
+    if ((floatBitsToUint(lighting.sun_direction.w) & v_channels) != 0u) {
         vec3 L = normalize(lighting.sun_direction.xyz);
         // Illuminance straight out of the uniform: `brdf` multiplies by n.l,
         // which is what turns light arriving perpendicular to itself into light
@@ -1259,6 +1313,7 @@ Shaded shade_surface() {
     // Point lights.
     for (uint k = 0u; k < cluster.y; ++k) {
         PointLight light = point_lights[cluster_lights[cluster.x + k]];
+        if ((floatBitsToUint(light.shadow.z) & v_channels) == 0u) continue;
         vec3 to_light = light.position.xyz - v_world_pos;
         float dist = length(to_light);
         float atten = attenuate(dist, light.position.w);
@@ -1286,6 +1341,7 @@ Shaded shade_surface() {
     // than six because a cone is a single frustum.
     for (uint k = 0u; k < cluster.w; ++k) {
         SpotLight light = spot_lights[cluster_lights[cluster.z + k]];
+        if ((floatBitsToUint(light.params.w) & v_channels) == 0u) continue;
         vec3 to_light = light.position.xyz - v_world_pos;
         float dist = length(to_light);
         float atten = attenuate(dist, light.position.w);
@@ -1332,10 +1388,35 @@ Shaded shade_surface() {
     color = color * fog.transmittance + fog.inscatter;
     diffusible *= fog.transmittance;
 
-    if (lighting.cascades.params.w > 0.5) {
-        vec3 tint = cascade_debug_tint(select_cascade(view_dist));
+    // Ways of looking at the shadows. The branch is on a uniform, so a frame
+    // that looks at none of them pays one compare.
+    float debug_view = lighting.cascades.params.w;
+    if (debug_view > 0.5) {
+        int cascade = select_cascade(view_dist);
+        vec3 tint = cascade_debug_tint(cascade);
+        if (debug_view > 3.5) {
+            tint = shadow_state_tint(lighting.cascades.states[cascade]);
+        } else if (debug_view > 2.5) {
+            // The world size of a pixel here, against the world size of a texel
+            // of the view it reads.
+            float pixel = length(fwidth(v_world_pos)) * 0.70710678;
+            tint = shadow_density_tint(lighting.cascades.texel_sizes[cascade] / max(pixel, 1e-6));
+        } else if (debug_view > 1.5) {
+            tint = vec3(1.0);
+        }
         color *= tint;
         diffusible *= tint;
+
+        // The atlas, in the corner: a square two fifths of the frame's height.
+        float side = lighting.viewport.y * 0.4;
+        vec2 corner = vec2(gl_FragCoord.x, lighting.viewport.y - gl_FragCoord.y) / side;
+        if (debug_view > 1.5 && debug_view < 2.5 && all(lessThan(corner, vec2(1.0)))) {
+            // An eighth of the sky's luminance: a level the exposure this
+            // frame is already metered for shows as a mid grey.
+            color = shadow_atlas_picture(vec2(corner.x, 1.0 - corner.y))
+                * lighting.ambient.w * 0.12;
+            diffusible = vec3(0.0);
+        }
     }
 
     Shaded shaded;
