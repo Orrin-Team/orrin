@@ -29,6 +29,7 @@ layout(set = 0, binding = 4) uniform sampler2D u_source;   // the lit frame, as 
 layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D u_rays;
 // Metres from the surface to what the ray hit, zero for a miss.
 layout(set = 0, binding = 7, r32f) uniform writeonly image2D u_ray_length;
+layout(set = 0, binding = 8) uniform sampler2D u_blue_noise; // two independent channels
 
 layout(set = 0, binding = 6) uniform Ssr {
     mat4 proj;
@@ -57,31 +58,27 @@ vec3 view_pos(vec2 uv, float depth) {
     return clip.xyz / clip.w;
 }
 
-// A per-pixel offset, fixed for the pixel's lifetime. Neighbouring pixels get
-// unrelated offsets, which is what makes the resolve's spatial gather average
-// over *different* parts of the lobe rather than the same part nine times.
-vec2 hash2(uvec2 pixel) {
-    uvec3 v = uvec3(pixel, 0x9E3779B9u);
-    v = v * 1664525u + 1013904223u;
-    v.x += v.y * v.z;
-    v.y += v.z * v.x;
-    v.z += v.x * v.y;
-    v ^= v >> 16u;
-    v.x += v.y * v.z;
-    v.y += v.z * v.x;
-    return vec2(v.xy & uvec2(0xFFFFu)) / 65535.0;
-}
-
 // The R2 low-discrepancy sequence (Roberts 2018) over the frame index, shifted
-// per pixel by the hash above — a Cranley-Patterson rotation.
+// per pixel by a blue-noise tile — a Cranley-Patterson rotation. Low
+// discrepancy in time, blue in space, and each for its own filter.
 //
-// This is the difference between a pixel drawing twelve *independent* samples
-// across the history's accumulation window and drawing twelve that cover the
-// lobe evenly. Independent samples leave clumps and gaps, and a gap on a bright
-// reflection is exactly the flicker that survives a temporal filter.
-vec2 stratified(uvec2 pixel, uint frame) {
+// In time, it is the difference between a pixel drawing twelve *independent*
+// samples across the history's accumulation window and drawing twelve that
+// cover the lobe evenly. Independent samples leave clumps and gaps, and a gap
+// on a bright reflection is exactly the flicker that survives a temporal
+// filter.
+//
+// In space, it decides what the gather is left with. Neighbouring offsets from
+// the tile are as far apart as the tile allows, so the nine rays a pixel
+// gathers sample nine different parts of the lobe; a white hash would hand some
+// neighbourhoods nine similar offsets, and those survive the gather as blotches
+// the history then has to average away. Shifting every pixel by the same
+// amount each frame keeps the tile blue: it only moves where its values sit
+// on the circle.
+vec2 stratified(ivec2 pixel, uint frame) {
     const vec2 alpha = vec2(0.7548776662, 0.5698402909);
-    return fract(alpha * float(frame) + hash2(pixel));
+    vec2 offset = texelFetch(u_blue_noise, pixel % textureSize(u_blue_noise, 0), 0).rg;
+    return fract(alpha * float(frame) + offset);
 }
 
 // Heitz 2018, sampling the GGX distribution of visible normals. Sampling D
@@ -147,7 +144,7 @@ void main() {
     vec3 v_local = vec3(dot(v, t1), dot(v, t2), dot(v, n));
 
     float alpha = roughness * roughness;
-    vec2 u = stratified(uvec2(pixel), uint(ssr.params.x));
+    vec2 u = stratified(pixel, uint(ssr.params.x));
     vec3 h = tangent_to_view * sample_vndf(v_local, alpha, u);
     vec3 l = reflect(-v, h);
 

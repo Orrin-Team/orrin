@@ -169,6 +169,8 @@ pub struct SsrPass {
     /// a cone that grows smoothly with distance would otherwise step between
     /// blurs, and the step would be visible as a ring on a curved surface.
     linear_mip: SamplerId,
+    /// What each pixel's sample sequence is offset by. See `blue_noise.rs`.
+    blue_noise: TextureViewId,
     settings: SsrSettings,
     /// Advanced every frame the pass runs, and what decorrelates the sample
     /// sequence frame to frame. Without it every frame would trace the same ray
@@ -228,6 +230,12 @@ impl SsrPass {
             max_lod: None,
         });
 
+        let blue_noise = device.create_texture_2d(
+            super::blue_noise::TILE,
+            [super::blue_noise::SIDE; 2],
+            crate::gfx::format::Format::Rg8Unorm,
+        );
+
         Self {
             hiz_pipeline,
             source_pipeline,
@@ -237,6 +245,7 @@ impl SsrPass {
             nearest_clamp,
             linear_clamp,
             linear_mip,
+            blue_noise,
             settings: SsrSettings::default(),
             frame: 0,
             uniforms: None,
@@ -467,6 +476,7 @@ impl SsrPass {
                     binding: 7,
                     resource: BindingResource::StorageTexture(ray_length),
                 },
+                self.sampled(8, self.blue_noise, self.nearest_clamp),
             ],
         );
 

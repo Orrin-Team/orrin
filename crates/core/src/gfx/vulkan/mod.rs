@@ -1,4 +1,5 @@
 mod bloom;
+mod blue_noise;
 mod contact_shadows;
 mod context;
 mod convert;
