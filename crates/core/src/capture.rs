@@ -121,6 +121,11 @@ pub struct CaptureSettings {
     /// ships with. A reflection capture needs a reflective floor to be about
     /// anything: the shipped one is past every roughness the trace accepts.
     pub floor: Option<Floor>,
+    /// Every sphere of the rig's roughness sweep refinished as white metal at
+    /// roughness 0.5, or not at all. A rough metal is
+    /// where a reflection has the fewest rays that hit anything, and the
+    /// sweep's own row has one sphere of it against nine that say nothing.
+    pub rough_metal_sweep: bool,
 }
 
 /// A reflective finish for the rig's ground, all metal so the reflection is
@@ -157,6 +162,7 @@ impl Default for CaptureSettings {
             wireframe: None,
             surface_time: Some(0.0),
             floor: None,
+            rough_metal_sweep: false,
         }
     }
 }
@@ -230,6 +236,9 @@ pub fn prepare(world: &mut World, renderer: &mut VulkanRenderer, settings: &Capt
     if let Some(floor) = settings.floor {
         refinish_floor(world, renderer, floor);
     }
+    if settings.rough_metal_sweep {
+        refinish_sweep(world, renderer);
+    }
     if let Some(camera) = settings.camera {
         world.insert_resource(camera);
     }
@@ -295,6 +304,21 @@ fn refinish_floor(world: &World, renderer: &mut VulkanRenderer, floor: Floor) {
         }
     }
     renderer.update_material(ground, &material);
+}
+
+fn refinish_sweep(world: &World, renderer: &mut VulkanRenderer) {
+    use crate::gfx::{Material, RenderBackend};
+    let material = Material {
+        base_color: glam::Vec3::ONE,
+        metallic: 1.0,
+        roughness: 0.5,
+        ..Material::default()
+    };
+    for (name, handle) in world.resource::<crate::scene::Assets>().materials() {
+        if name.starts_with("metal_") || name.starts_with("dielectric_") {
+            renderer.update_material(handle, &material);
+        }
+    }
 }
 
 /// Render `settings.frames` frames of `world` and read the last one back as

@@ -286,6 +286,16 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
             "ssr-sphere-row",
             reflection_view(None, Vec3::new(2.0, 1.6, 6.0), Vec3::new(0.0, 1.5, 14.0)),
         ),
+        // The sweep's spheres as rough metal, from below and beside the row:
+        // the lower half of each reflects the ground and the glowing cubes,
+        // which few of its rays reach.
+        (
+            "ssr-rough-metal",
+            CaptureSettings {
+                rough_metal_sweep: true,
+                ..reflection_view(None, Vec3::new(-6.0, 1.2, 9.5), Vec3::new(0.0, 3.0, 13.0))
+            },
+        ),
         (
             "dof",
             CaptureSettings {

@@ -2,24 +2,27 @@ use orrin_registry::Reflect;
 
 /// Screen-space reflections: what the frame reflects off itself.
 ///
-/// A stopgap, and worth saying so where the settings live. The trace can only
-/// reflect what the screen already contains, so anything off-frame, behind the
-/// camera, or hidden behind what it reflects has no radiance to give and falls
-/// back to the environment cube. Every field below except `enabled` is about
-/// making that fallback happen gracefully rather than about accuracy.
+/// One exact reflection ray per surface, with the roughness read as a blur of
+/// what it hits, and nothing kept from frame to frame — `gfx/vulkan/ssr.rs` is
+/// the design. The trace can only reflect what the screen already contains, so
+/// anything off-frame, behind the camera, or hidden behind what it reflects
+/// has no radiance to give and falls back to the environment cube; `thickness`,
+/// `max_distance` and `max_steps` are about where that happens, and
+/// `max_roughness` about where the environment is the better answer anyway.
 #[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct SsrSettings {
-    /// Off drops the three passes rather than tracing zero-length rays, which
+    /// Off drops the four passes rather than tracing zero-length rays, which
     /// is why it is part of the frame's structure.
     pub enabled: bool,
     /// How much of the traced reflection to believe, as a multiplier on the
     /// per-ray confidence. One is the physical answer; lower is an art dial for
     /// scenes where the screen-space failure cases are conspicuous.
     pub intensity: f32,
-    /// Past this roughness the surface is left to the environment cube. One ray
-    /// per pixel cannot resolve a wide lobe, and a rough reflection is close to
-    /// the prefiltered environment anyway — which is exactly why the cutoff
-    /// costs so little.
+    /// Past this roughness the surface is left to the environment cube. A lobe
+    /// that wide sees most of the hemisphere, which the prefiltered environment
+    /// integrates and a blur of the screen around one ray's hit does not: the
+    /// one ray still either hits or misses, so a blurred image of whatever it
+    /// hit stays where the lobe would have spread it to nothing.
     pub max_roughness: f32,
     /// How deep a surface is assumed to be, in metres, when deciding whether a
     /// ray landed on it or passed behind it. The depth buffer records a front
@@ -39,9 +42,10 @@ impl Default for SsrSettings {
         Self {
             enabled: false,
             intensity: 1.0,
-            // Wet asphalt and polished concrete sit around 0.3; past 0.6 a
-            // single ray is mostly noise for a result the environment already
-            // approximates well.
+            // Wet asphalt and polished concrete sit around 0.3. By 0.6 a ray of a
+            // few metres asks for a wider blur than the pyramid's top level
+            // holds, and what is left of the reflection is the outline of
+            // whatever that ray happened to hit.
             max_roughness: 0.6,
             thickness: 0.5,
             max_distance: 50.0,
@@ -54,7 +58,7 @@ impl SsrSettings {
     /// How much of the traced reflection survives at `roughness`, before the
     /// per-ray confidence the trace itself computes.
     ///
-    /// Mirrored by the fade in `ssr_trace.comp`, which has to apply it per ray:
+    /// Mirrored by the fade in `ssr_march.glsl`, which has to apply it per ray:
     /// this is here so the cutoff can be reasoned about — and tested — without
     /// a GPU.
     pub fn roughness_fade(&self, roughness: f32) -> f32 {
@@ -76,9 +80,8 @@ mod tests {
     use super::*;
 
     /// A mirror gets the whole reflection and anything past the cutoff gets
-    /// none. The cutoff is what keeps the noise budget bounded, so a fade that
-    /// let anything through past it would be spending rays on a result the
-    /// environment already has.
+    /// none: a fade that let anything through past it would be tracing rays
+    /// for a result the environment already has.
     #[test]
     fn the_fade_spans_the_cutoff() {
         let settings = SsrSettings::default();

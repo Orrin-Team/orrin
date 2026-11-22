@@ -4,14 +4,11 @@
 // reflections reach, returning the radiance it found and how much that radiance
 // should be believed.
 //
-// The ray direction is importance-sampled from the GGX visible-normal
-// distribution, so a rough surface scatters its rays across its lobe and a
-// smooth one concentrates them: the blur of a rough reflection is the spread of
-// the samples, not a filter applied afterwards. One sample per quad per frame
-// is noisy by construction; `ssr_temporal.comp`, a spatial gather and a history
-// of the reflection's own, is what turns the noise back into an image — and
-// traces the rest of the quad itself where the surface is a near-mirror, whose
-// one ray is already the answer.
+// The ray is the exact reflection, and the surface's roughness is the blur
+// `trace_reflection` reads the hit through — so a ray per quad is a sampling
+// rate of a smooth image, not a sample of a noisy one, and `ssr_resolve.comp`
+// gathers these into each pixel as a small spatial blur. A surface smooth
+// enough for that blur to show traces the rest of its quad there instead.
 //
 // The G-buffer is read at exactly the pixel the ray starts from
 // (`ray_texel`): the quad is a sampling rate, not a lower-resolution copy of
@@ -19,9 +16,7 @@
 //
 // What comes out is incoming radiance, not a shaded value. The composite applies
 // the same split-sum weight to it that the forward pass applied to the
-// environment, because its job is to swap one for the other. Beside it goes how
-// far the ray travelled, which is what lets the history follow the reflected
-// object rather than the mirror.
+// environment, because its job is to swap one for the other.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -31,16 +26,11 @@ layout(set = 0, binding = 2) uniform sampler2D u_normal;   // view-space, encode
 layout(set = 0, binding = 3) uniform sampler2D u_material; // rgb = f0, a = roughness
 layout(set = 0, binding = 4) uniform sampler2D u_source;   // the lit frame, as a pyramid
 layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D u_rays;
-// Metres from the surface to what the ray hit, zero for a miss.
-layout(set = 0, binding = 7, r32f) uniform writeonly image2D u_ray_length;
-layout(set = 0, binding = 8) uniform sampler2D u_blue_noise; // two independent channels
-layout(set = 0, binding = 9) uniform sampler2D u_source_full; // the lit frame itself
-
 layout(set = 0, binding = 6) uniform Ssr {
     mat4 proj;
     mat4 inv_proj;
     mat4 inv_view;
-    // x = frame index, y = max roughness, z = thickness (metres), w = intensity
+    // x = max roughness, y = thickness (metres), z = intensity, w unused
     vec4 params;
     // x = max steps, y = max distance (metres), z = pyramid levels above the
     // depth buffer, w unused
@@ -50,12 +40,8 @@ layout(set = 0, binding = 6) uniform Ssr {
     // x = sin(environment yaw), y = cos, z = specular mip count
     vec4 env;
     vec4 env_tint;
-    // The temporal pass's: the history's reprojection, unjittered like TAA's.
-    mat4 inv_view_proj;
-    mat4 prev_view_proj;
-    // x != 0 to ignore the history
-    vec4 history;
 } ssr;
+layout(set = 0, binding = 7) uniform sampler2D u_source_full; // the lit frame itself
 
 #include "ssr_march.glsl"
 
@@ -64,21 +50,18 @@ void main() {
     if (any(greaterThanEqual(quad, imageSize(u_rays)))) {
         return;
     }
-    uint frame = uint(ssr.params.x);
     ivec2 full = textureSize(u_depth, 0);
     ivec2 texel = ray_texel(quad, full);
 
     float roughness = texelFetch(u_material, texel, 0).a;
     float depth = texelFetch(u_depth, texel, 0).r;
-    float ray_length = 0.0;
     vec4 ray = vec4(0.0);
     // The far plane is sky: nothing was rasterised, so there is no surface to
     // reflect off.
-    if (!depth_is_far(depth) && roughness <= ssr.params.y) {
+    if (!depth_is_far(depth) && roughness <= ssr.params.x) {
         vec2 uv = (vec2(texel) + 0.5) / vec2(full);
         vec3 n = normalize(texelFetch(u_normal, texel, 0).xyz * 2.0 - 1.0);
-        ray = trace_reflection(uv, depth, n, roughness, stratified(quad, frame), ray_length);
+        ray = trace_reflection(uv, depth, n, roughness);
     }
     imageStore(u_rays, quad, ray);
-    imageStore(u_ray_length, quad, vec4(ray_length));
 }

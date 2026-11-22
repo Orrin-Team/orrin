@@ -58,7 +58,6 @@ skybox_vert vertex skybox.vert
 ssao_frag fragment ssao.frag
 ssao_blur_frag fragment ssao_blur.frag
 ssr_resolve_comp compute ssr_resolve.comp
-ssr_temporal_comp compute ssr_temporal.comp
 ssr_trace_comp compute ssr_trace.comp
 sss_blur_comp compute sss_blur.comp
 sss_composite_comp compute sss_composite.comp

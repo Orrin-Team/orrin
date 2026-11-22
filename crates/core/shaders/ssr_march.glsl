@@ -1,35 +1,36 @@
-// One reflection ray: its direction drawn from the GGX visible-normal lobe, its
-// march through the depth pyramid, and the radiance it finds.
+// One reflection ray: the exact reflection of the view ray about the surface
+// normal, its march through the depth pyramid, and the radiance it finds —
+// blurred by the surface's roughness at the hit.
 //
 // Shared by the two passes that trace. `ssr_trace.comp` traces one ray per 2x2
-// quad for every surface the reflections reach; `ssr_temporal.comp` traces the
-// other three of a near-mirror's quad itself, at the pixel that needs it, so a
-// mirror's reflection is as sharp as the frame. One function, so the two rates
-// are the same estimator and a roughness gradient that crosses from one to the
-// other changes how often a ray is traced, never what a ray finds.
+// quad for every surface the reflections reach; `ssr_resolve.comp` traces the
+// other three of a smooth surface's quad itself, at the pixel that needs it, so
+// a mirror's reflection is as sharp as the frame. One function, so the two
+// rates find the same thing and a roughness gradient that crosses from one to
+// the other changes how often a ray is traced, never what a ray finds.
+//
+// The ray is the same every frame for the same surface, so nothing here varies
+// from frame to frame but what the frame itself does — see `ssr.rs` for why that
+// is the design, and what it gives up.
 //
 // The including shader declares, by these names: the `Ssr` block as `ssr`,
-// `u_hiz` (the nearest-depth pyramid from level 1 up), `u_depth`, `u_source` (the lit frame's
-// pyramid, based at half resolution), `u_source_full` (the lit frame itself)
-// and `u_blue_noise`.
+// `u_hiz` (the nearest-depth pyramid from level 1 up), `u_depth`, `u_source`
+// (the lit frame's pyramid, based at half resolution) and `u_source_full` (the
+// lit frame itself).
 
 #ifndef ORRIN_SSR_MARCH_GLSL
 #define ORRIN_SSR_MARCH_GLSL
 
 #include "depth.glsl"
 
-const float PI = 3.14159265359;
-
-// Below the first, a surface is a mirror: its ray is the exact reflection, the
-// same every frame, so it is the answer rather than a sample of it and keeps
-// no history. A lobe of 0.05 is under a fifth of a degree wide, below what the
-// frame resolves at any distance on screen, so drawing from it would add
-// grain and nothing else. From there up a ray is drawn from the lobe, and
-// every drawn ray is accumulated. Up to the second, a pixel still traces its
-// own ray beside the quarter-rate gather, for sharpness; past it, only the
-// gather. Perceptual roughness.
-const float MIRROR_ROUGHNESS = 0.05;
-const float GLOSSY_ROUGHNESS = 0.15;
+// Below the first, a pixel's own full-rate ray is all its reflection is; past
+// the second, the quarter-rate rays its neighbours traced, gathered; between
+// them the two cross-fade, so a roughness gradient shows no line. The gather is
+// a blur a quad or two wide, which a mirror cannot afford and a surface at 0.15
+// no longer shows — by then the blur at the hit is wider than a quad.
+// Perceptual roughness.
+const float FULL_RATE_ROUGHNESS = 0.05;
+const float QUARTER_RATE_ROUGHNESS = 0.15;
 
 vec3 view_pos(vec2 uv, float depth) {
     vec4 clip = ssr.inv_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
@@ -37,84 +38,44 @@ vec3 view_pos(vec2 uv, float depth) {
 }
 
 // The pixel a quarter-rate ray starts from: its quad's first, every frame.
-//
-// Not rotated through the four. Rotating lets the history see each pixel's own
-// surface in turn, and measured as more flicker than it bought: the corner
-// that started the ray moves every frame, so every silhouette pixel's estimate
-// does too, and the history has to average that away as well as the noise.
 ivec2 ray_texel(ivec2 quad, ivec2 size) {
     return min(quad * 2, size - 1);
 }
 
-// The R2 low-discrepancy sequence (Roberts 2018) over the frame index, shifted
-// per pixel by a blue-noise tile — a Cranley-Patterson rotation. Low
-// discrepancy in time, blue in space, and each for its own filter.
-//
-// In time, it is the difference between a pixel drawing twelve *independent*
-// samples across the history's accumulation window and drawing twelve that
-// cover the lobe evenly. Independent samples leave clumps and gaps, and a gap
-// on a bright reflection is exactly the flicker that survives a temporal
-// filter.
-//
-// In space, it decides what the gather is left with. Neighbouring offsets from
-// the tile are as far apart as the tile allows, so the nine rays a pixel
-// gathers sample nine different parts of the lobe; a white hash would hand some
-// neighbourhoods nine similar offsets, and those survive the gather as blotches
-// the history then has to average away. Shifting every pixel by the same
-// amount each frame keeps the tile blue: it only moves where its values sit
-// on the circle.
-vec2 stratified(ivec2 pixel, uint frame) {
-    const vec2 alpha = vec2(0.7548776662, 0.5698402909);
-    vec2 offset = texelFetch(u_blue_noise, pixel % textureSize(u_blue_noise, 0), 0).rg;
-    return fract(alpha * float(frame) + offset);
+// The pyramid at fractional `level`, through a cubic B-spline rather than the
+// sampler's tent. A box-reduced level read bilinearly shows its texels as
+// blocks once they are tens of pixels wide, and a reflection that slides
+// across them steps; the B-spline is smooth through each texel boundary.
+// Four bilinear taps placed between texels, as Sigg and Hadwiger do it, each
+// trilinear, with the offsets of the finer of the two levels it blends.
+vec3 pyramid_smooth(vec2 uv, float level) {
+    vec2 size = vec2(textureSize(u_source, int(level)));
+    vec2 position = uv * size - 0.5;
+    vec2 centre = floor(position);
+    vec2 f = position - centre;
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+    vec2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    vec2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    vec2 w3 = f3 / 6.0;
+    vec2 g0 = w0 + w1;
+    vec2 g1 = 1.0 - g0;
+    vec2 at0 = (centre + 0.5 + w1 / g0 - 1.0) / size;
+    vec2 at1 = (centre + 0.5 + w3 / g1 + 1.0) / size;
+    return g0.y * (g0.x * textureLod(u_source, vec2(at0.x, at0.y), level).rgb
+                 + g1.x * textureLod(u_source, vec2(at1.x, at0.y), level).rgb)
+         + g1.y * (g0.x * textureLod(u_source, vec2(at0.x, at1.y), level).rgb
+                 + g1.x * textureLod(u_source, vec2(at1.x, at1.y), level).rgb);
 }
 
-// Heitz 2018, sampling the GGX distribution of visible normals. Sampling D
-// alone would generate half-vectors the viewer cannot see and then throw the
-// samples away; this generates only visible ones, which is what makes a single
-// ray per pixel worth tracing at all.
-vec3 sample_vndf(vec3 v, float alpha, vec2 u) {
-    // Stretch the view direction so the anisotropic lobe becomes a hemisphere.
-    vec3 vh = normalize(vec3(alpha * v.x, alpha * v.y, v.z));
-
-    // An orthonormal basis around vh, built to stay stable as vh.z -> 1.
-    float len2 = vh.x * vh.x + vh.y * vh.y;
-    vec3 t1 = len2 > 0.0 ? vec3(-vh.y, vh.x, 0.0) * inversesqrt(len2) : vec3(1.0, 0.0, 0.0);
-    vec3 t2 = cross(vh, t1);
-
-    // A point on the projected hemisphere: a disc, squashed toward the silhouette.
-    float r = sqrt(u.x);
-    float phi = 2.0 * PI * u.y;
-    float p1 = r * cos(phi);
-    float p2 = r * sin(phi);
-    float s = 0.5 * (1.0 + vh.z);
-    p2 = (1.0 - s) * sqrt(1.0 - p1 * p1) + s * p2;
-
-    vec3 nh = p1 * t1 + p2 * t2 + sqrt(max(0.0, 1.0 - p1 * p1 - p2 * p2)) * vh;
-    // Unstretch back into the original frame.
-    return normalize(vec3(alpha * nh.x, alpha * nh.y, max(nh.z, 1e-6)));
-}
-
-// The ray from the surface at `uv` (view-space normal `n`), with lobe sample
-// `u`: rgb = the radiance it found, a = how much of it to believe. Zero for a
-// miss, with `ray_length` — metres from the surface to the hit — zero too.
-vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out float ray_length) {
-    ray_length = 0.0;
+// The reflection of the surface at `uv` (view-space normal `n`): rgb = the
+// radiance found, a = how much of it to believe, zero for a miss.
+vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness) {
     vec3 p = view_pos(uv, depth);
     vec3 v = normalize(-p); // toward the camera, view space
+    vec3 l = reflect(-v, n);
 
-    // Sample the lobe in a frame where the normal is +Z, which is the frame the
-    // visible-normal derivation is written in.
-    vec3 t1 = abs(n.z) < 0.999 ? normalize(cross(vec3(0.0, 0.0, 1.0), n)) : vec3(1.0, 0.0, 0.0);
-    vec3 t2 = cross(n, t1);
-    mat3 tangent_to_view = mat3(t1, t2, n);
-    vec3 v_local = vec3(dot(v, t1), dot(v, t2), dot(v, n));
-
-    float alpha = roughness * roughness;
-    vec3 h = roughness < MIRROR_ROUGHNESS ? n : tangent_to_view * sample_vndf(v_local, alpha, u);
-    vec3 l = reflect(-v, h);
-
-    // Below the horizon: the sampled microfacet reflects into the surface.
+    // Below the horizon: a normal map tilted past the view ray.
     if (dot(l, n) <= 0.0) {
         return vec4(0.0);
     }
@@ -232,7 +193,7 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
     float surface_z = view_pos(hit_uv, surface_depth).z;
     float ray_z = view_pos(hit_uv, hit_screen.z).z;
     float gap = abs(ray_z - surface_z);
-    if (gap > ssr.params.z) {
+    if (gap > ssr.params.y) {
         return vec4(0.0);
     }
 
@@ -241,15 +202,12 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
     // the march stopped on can be. Further behind, the ray went behind the
     // surface rather than into it, and only `thickness` says something is
     // there — a floating sphere's hidden underside, read in the colour of its
-    // lit top. A mirror shows that guess texel for texel and, where it runs
-    // out, ends on a ragged edge that flickers with the jitter and leaves
-    // slabs of the wrong surface, so a mirror's hit fades across the window
-    // instead. A rough lobe blurs that edge by itself and keeps the plain cut:
-    // its loose hits are most of the contact reflection under an object.
+    // lit top. An exact ray shows that guess texel for texel and, where it
+    // runs out, ends on a ragged edge that flickers with the jitter and leaves
+    // slabs of the wrong surface, so the hit fades across the window instead.
     vec3 next = hit_screen + dir / max(length(dir.xy * ssr.extent.xy), 1e-4);
-    float slack = min(abs(view_pos(next.xy, next.z).z - ray_z), 0.5 * ssr.params.z);
-    float sharp = 1.0 - smoothstep(MIRROR_ROUGHNESS, GLOSSY_ROUGHNESS, roughness);
-    float behind = mix(1.0, 1.0 - smoothstep(slack, ssr.params.z, gap), sharp);
+    float slack = min(abs(view_pos(next.xy, next.z).z - ray_z), 0.5 * ssr.params.y);
+    float behind = 1.0 - smoothstep(slack, ssr.params.y, gap);
 
     // Three more things the trace cannot know anything about, faded rather than
     // cut so a reflection dissolves instead of ending on a line.
@@ -259,25 +217,24 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
     // does not contain — it is behind the viewer, or hidden by the surface doing
     // the reflecting.
     float facing = 1.0 - smoothstep(0.25, 0.75, dot(l, v));
-    // And the lobe stops being resolvable by one ray long before the cutoff.
-    float smoothness = 1.0 - smoothstep(ssr.params.y * 0.6, ssr.params.y, roughness);
+    // And a lobe wide enough to see most of the hemisphere is a reflection the
+    // prefiltered environment approximates better than a blur of the screen.
+    float smoothness = 1.0 - smoothstep(ssr.params.x * 0.6, ssr.params.x, roughness);
 
     float confidence = behind * edge * facing * smoothness;
 
-    // The ray is really a cone, and this is where that stops being a figure of
-    // speech. A lobe of angular width ~alpha covers a patch of the world after
-    // travelling `distance`; reading one texel of that patch is the variance
-    // that shows up as grain on every surface that is not a mirror, and reading
-    // the pyramid level whose texel *is* the patch costs the same fetch.
+    // The roughness is a cone around the exact ray, and it is read as one: the
+    // pyramid level whose texel matches the cone's width at the hit carries the
+    // average of what the lobe would have seen. Short rays stay sharp and long
+    // ones soften, which is a contact reflection hardening toward the contact.
     //
-    // Half the lobe, not all of it: the direction was already sampled *from*
-    // the lobe, so prefiltering over its full width would blur by the roughness
-    // twice. Half puts the effective width about a tenth over the truth and
-    // takes most of the variance with it.
-    const float CONE_SCALE = 0.5;
+    // 2.5 alpha is the reflected lobe's full width at half its peak: GGX puts
+    // its half-maximum at `tan(theta_h) = 0.64 alpha`, and a reflection turns
+    // twice as far as the half-vector does.
+    const float CONE_SCALE = 2.5;
+    float alpha = roughness * roughness;
     vec3 hit_view = view_pos(hit_uv, surface_depth);
-    ray_length = distance(hit_view, p);
-    float cone = ray_length * alpha * CONE_SCALE;
+    float cone = distance(hit_view, p) * alpha * CONE_SCALE;
     // World units to texels of the full-resolution frame: a length at view
     // depth z spans `|proj[1][1]| / |z|` of NDC, and NDC spans two across it.
     // The magnitude, because Vulkan's flipped Y makes `proj[1][1]` negative.
@@ -290,7 +247,7 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
     // never steps from one to the other. A mirror's cone is under a texel for
     // any distance on screen, which is what makes its reflection as sharp as
     // the frame it reflects.
-    vec3 radiance = textureLod(u_source, hit_uv, max(lod - 1.0, 0.0)).rgb;
+    vec3 radiance = pyramid_smooth(hit_uv, max(lod - 1.0, 0.0));
     if (lod < 1.0) {
         radiance = mix(textureLod(u_source_full, hit_uv, 0.0).rgb, radiance, lod);
     }

@@ -3,16 +3,15 @@
 // A mip pyramid of the lit frame, for a *cone* to be sampled out of rather than
 // a single texel.
 //
-// This is what makes a rough reflection affordable. The lobe a ray was sampled
-// from has an angular width, so by the time the ray has travelled any distance
-// it covers a patch of the world rather than a point — and reading one texel of
-// that patch is precisely the variance that shows up as grain on everything
-// that is not a mirror. Reading the level of this pyramid whose texel *is* the
-// patch costs the same fetch and carries the average instead of a sample.
+// This is what makes a rough reflection affordable. A lobe has an angular
+// width, so by the time a ray around it has travelled any distance it covers a
+// patch of the world rather than a point. Reading the level of this pyramid
+// whose texel *is* the patch carries the lobe's average in one fetch, where
+// reading one texel of it would be one point of a blur.
 //
 // Two passes build one of these, from the same source and to the same shape and
-// both at half resolution: the reflection trace, whose rays are stochastic and
-// denoised temporally anyway, and screen-space refraction, whose consumers are
+// both at half resolution: the reflection trace, which reads it as the blur a
+// rough lobe would see, and screen-space refraction, whose consumers are
 // all rough enough to be averaging over a cone. The one thing that genuinely
 // wants the frame sharp — a clear pane of glass — reads the frame itself rather
 // than this chain, which is what lets this stay half. Neither pass owns this

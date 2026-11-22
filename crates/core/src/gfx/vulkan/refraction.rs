@@ -17,9 +17,9 @@
 //! - `refraction_scene` reduces the lit frame into a mip pyramid, so a rough
 //!   surface can refract a cone rather than a texel. It shares
 //!   `shaders/color_pyramid.comp` with the reflection trace, at full resolution
-//!   rather than half: a stochastic ray is denoised temporally afterwards and a
-//!   clear pane of glass is not, so its background has to be as sharp as the
-//!   frame recorded it.
+//!   rather than half: a reflection's half-resolution base is blurred by the
+//!   roughness it is read through, and a clear pane of glass is not, so its
+//!   background has to be as sharp as the frame recorded it.
 //! - `refraction_draw` rasterises the queue back to front into a premultiplied
 //!   target, sampling that pyramid through set 5.
 //! - `refraction_composite` puts that target over the lit frame.
