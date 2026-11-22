@@ -1848,6 +1848,111 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
     assert!(at("oit_composite") < at("taa_resolve"), "{order:?}");
 }
 
+/// The reflection history is ping-ponged like TAA's, and two things about the
+/// plan are what make that sound.
+///
+/// Last frame's accumulation is read by the temporal pass and written by
+/// nothing, and this frame's is written by the temporal pass and read by the
+/// composite after it — the composite before TAA, so the reflection is
+/// antialiased with the frame.
+///
+/// And none of the four images is left to a closing barrier. A split frame
+/// records those in its trailing graphics segment, which is submitted after the
+/// *next* frame's head — so an accumulation moved into its history layout there
+/// would still be in its storage layout when the next frame's temporal pass
+/// samples it. The composite's read is what moves it, inside the frame.
+#[test]
+fn the_reflection_history_is_read_before_it_is_written_and_left_sampled_inside_the_frame() {
+    for async_compute in [false, true] {
+        let frame = declare(FrameConfig {
+            color_format: COLOR_FORMAT,
+            msaa: false,
+            ssao: true,
+            ssao_half_res: false,
+            contact_shadows: false,
+            ssr: true,
+            subsurface: false,
+            transparency: true,
+            refraction: false,
+            taa: true,
+            auto_exposure: true,
+            motion_blur: false,
+            dof: false,
+            volumetric_fog: false,
+            bloom_mips: BLOOM_MIPS,
+            overlay: true,
+            outline: true,
+            gizmo: true,
+            ui: false,
+            presents: true,
+            shadow_cascades: 0,
+            shadow_resolution: SHADOW_RESOLUTION,
+            shadow_atlas: 0,
+            async_compute,
+            occlusion_culling: false,
+            wireframe: None,
+            material_preview: false,
+            screenshot: None,
+        })
+        .unwrap();
+
+        let order: Vec<&str> = frame
+            .graph
+            .order()
+            .iter()
+            .map(|&id| frame.graph.pass_name(id))
+            .collect();
+        let at = |name: &str| {
+            order
+                .iter()
+                .position(|&pass| pass == name)
+                .unwrap_or_else(|| panic!("{name} is not in the frame: {order:?}"))
+        };
+        assert!(at("ssr_trace") < at("ssr_temporal"), "{order:?}");
+        assert!(at("ssr_temporal") < at("ssr_resolve"), "{order:?}");
+        assert!(at("ssr_resolve") < at("taa_resolve"), "{order:?}");
+
+        let plan = format!("{}", frame.graph);
+        for history in ["ssr_history", "ssr_history_depth"] {
+            assert!(
+                pass_block(&plan, "ssr_temporal").contains(&format!(" {history} Sampled\n")),
+                "the temporal pass must read {history}:\n{plan}",
+            );
+            assert_eq!(
+                plan.matches(&format!(" {history} Sampled\n")).count(),
+                1,
+                "only the temporal pass may read {history}:\n{plan}",
+            );
+            assert!(
+                !plan.contains(&format!(" {history} StorageWrite\n")),
+                "last frame's {history} must not be written this frame:\n{plan}",
+            );
+        }
+        for accum in ["ssr_accum", "ssr_accum_depth"] {
+            assert!(
+                pass_block(&plan, "ssr_temporal").contains(&format!(" {accum} StorageWrite\n")),
+                "{plan}",
+            );
+            assert!(
+                pass_block(&plan, "ssr_resolve").contains(&format!(" {accum} Sampled\n")),
+                "the composite must read {accum}, which is what leaves it sampled:\n{plan}",
+            );
+        }
+
+        let closing: Vec<_> = frame
+            .graph
+            .final_barriers()
+            .iter()
+            .map(|barrier| frame.graph.resource_name(barrier.resource))
+            .filter(|name| name.starts_with("ssr_"))
+            .collect();
+        assert!(
+            closing.is_empty(),
+            "async compute {async_compute}: {closing:?}"
+        );
+    }
+}
+
 /// The transform gizmo is editor chrome: drawn over the tonemapped frame, so
 /// its colours are exact and nothing in the scene can stand in front of a
 /// handle, and under the editor's own UI. A frame without the editor has none.

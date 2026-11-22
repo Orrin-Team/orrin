@@ -10,13 +10,14 @@
 // distribution, so a rough surface scatters its rays across its lobe and a
 // smooth one concentrates them: the blur of a rough reflection is the spread of
 // the samples, not a filter applied afterwards. One sample per pixel per frame
-// is noisy by construction; this pass runs before the TAA resolve, whose
-// accumulation over the jitter sequence is what turns the noise back into an
-// image. That ordering is the denoiser.
+// is noisy by construction; `ssr_temporal.comp`, a spatial gather and a history
+// of the reflection's own, is what turns the noise back into an image.
 //
 // What comes out is incoming radiance, not a shaded value. The composite applies
 // the same split-sum weight to it that the forward pass applied to the
-// environment, because its job is to swap one for the other.
+// environment, because its job is to swap one for the other. Beside it goes how
+// far the ray travelled, which is what lets the history follow the reflected
+// object rather than the mirror.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -26,6 +27,8 @@ layout(set = 0, binding = 2) uniform sampler2D u_normal;   // view-space, encode
 layout(set = 0, binding = 3) uniform sampler2D u_material; // rgb = f0, a = roughness
 layout(set = 0, binding = 4) uniform sampler2D u_source;   // the lit frame, as a pyramid
 layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D u_rays;
+// Metres from the surface to what the ray hit, zero for a miss.
+layout(set = 0, binding = 7, r32f) uniform writeonly image2D u_ray_length;
 
 layout(set = 0, binding = 6) uniform Ssr {
     mat4 proj;
@@ -40,6 +43,11 @@ layout(set = 0, binding = 6) uniform Ssr {
     // x = sin(environment yaw), y = cos, z = specular mip count
     vec4 env;
     vec4 env_tint;
+    // The temporal pass's: the history's reprojection, unjittered like TAA's.
+    mat4 inv_view_proj;
+    mat4 prev_view_proj;
+    // x != 0 to ignore the history
+    vec4 history;
 } ssr;
 
 const float PI = 3.14159265359;
@@ -68,8 +76,8 @@ vec2 hash2(uvec2 pixel) {
 // per pixel by the hash above — a Cranley-Patterson rotation.
 //
 // This is the difference between a pixel drawing twelve *independent* samples
-// across TAA's accumulation window and drawing twelve that cover the lobe
-// evenly. Independent samples leave clumps and gaps, and a gap on a bright
+// across the history's accumulation window and drawing twelve that cover the
+// lobe evenly. Independent samples leave clumps and gaps, and a gap on a bright
 // reflection is exactly the flicker that survives a temporal filter.
 vec2 stratified(uvec2 pixel, uint frame) {
     const vec2 alpha = vec2(0.7548776662, 0.5698402909);
@@ -102,6 +110,11 @@ vec3 sample_vndf(vec3 v, float alpha, vec2 u) {
     return normalize(vec3(alpha * nh.x, alpha * nh.y, max(nh.z, 1e-6)));
 }
 
+void miss(ivec2 pixel) {
+    imageStore(u_rays, pixel, vec4(0.0));
+    imageStore(u_ray_length, pixel, vec4(0.0));
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(u_rays);
@@ -118,7 +131,7 @@ void main() {
     // The far plane is sky: nothing was rasterised, so there is no surface to
     // reflect off.
     if (depth_is_far(depth) || roughness > ssr.params.y) {
-        imageStore(u_rays, pixel, vec4(0.0));
+        miss(pixel);
         return;
     }
 
@@ -140,7 +153,7 @@ void main() {
 
     // Below the horizon: the sampled microfacet reflects into the surface.
     if (dot(l, n) <= 0.0) {
-        imageStore(u_rays, pixel, vec4(0.0));
+        miss(pixel);
         return;
     }
 
@@ -158,7 +171,7 @@ void main() {
     vec4 clip0 = ssr.proj * vec4(origin, 1.0);
     vec4 clip1 = ssr.proj * vec4(target, 1.0);
     if (clip0.w <= 0.0 || clip1.w <= 0.0) {
-        imageStore(u_rays, pixel, vec4(0.0));
+        miss(pixel);
         return;
     }
     vec3 s0 = vec3((clip0.xy / clip0.w) * 0.5 + 0.5, clip0.z / clip0.w);
@@ -225,7 +238,7 @@ void main() {
     }
 
     if (!hit) {
-        imageStore(u_rays, pixel, vec4(0.0));
+        miss(pixel);
         return;
     }
 
@@ -239,7 +252,7 @@ void main() {
     float surface_z = view_pos(hit_uv, surface_depth).z;
     float ray_z = view_pos(hit_uv, hit_screen.z).z;
     if (abs(ray_z - surface_z) > ssr.params.z) {
-        imageStore(u_rays, pixel, vec4(0.0));
+        miss(pixel);
         return;
     }
 
@@ -268,7 +281,8 @@ void main() {
     // takes most of the variance with it.
     const float CONE_SCALE = 0.5;
     vec3 hit_view = view_pos(hit_uv, surface_depth);
-    float cone = distance(hit_view, p) * alpha * CONE_SCALE;
+    float ray_length = distance(hit_view, p);
+    float cone = ray_length * alpha * CONE_SCALE;
     // World units to texels of the pyramid: a length at view depth z spans
     // `proj[1][1] / |z|` of NDC, and NDC spans two across the image.
     vec2 source_size = vec2(textureSize(u_source, 0));
@@ -277,4 +291,5 @@ void main() {
 
     vec3 radiance = textureLod(u_source, hit_uv, lod).rgb;
     imageStore(u_rays, pixel, vec4(radiance, confidence));
+    imageStore(u_ray_length, pixel, vec4(ray_length));
 }

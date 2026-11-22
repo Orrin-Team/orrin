@@ -33,7 +33,10 @@ use super::prepass::{MATERIAL_FORMAT, NORMAL_FORMAT, VELOCITY_FORMAT};
 use super::refraction::{ACCUM_FORMAT as REFRACTION_ACCUM_FORMAT, SCENE_LEVELS};
 use super::shadow::SHADOW_FORMAT;
 use super::ssao::AO_FORMAT;
-use super::ssr::{HIZ_FORMAT, HIZ_LEVELS, RAY_FORMAT, SOURCE_LEVELS};
+use super::ssr::{
+    HISTORY_DEPTH_FORMAT, HISTORY_FORMAT, HIZ_FORMAT, HIZ_LEVELS, RAY_FORMAT, RAY_LENGTH_FORMAT,
+    SOURCE_LEVELS,
+};
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
 
@@ -79,7 +82,7 @@ pub struct FrameConfig {
     pub contact_shadows: bool,
     /// Whether the frame reflects off itself. Structural like the rest, and
     /// another consumer that can keep the geometry prepass alive on its own —
-    /// it reads depth, normals and the material target the prepass writes.
+    /// it reads all four targets the prepass writes.
     pub ssr: bool,
     /// Whether the frame diffuses subsurface light across the image. Structural
     /// twice over, and more deeply than the rest: it registers three passes, it is
@@ -258,7 +261,10 @@ pub enum PassBody {
     SsrSource,
     /// One importance-sampled reflection ray per half-resolution pixel.
     SsrTrace,
-    /// Upsamples those rays and swaps the environment's reflection for them.
+    /// Gathers those rays at full resolution and accumulates them into the
+    /// reflection's own history.
+    SsrTemporal,
+    /// Swaps the environment's reflection for that accumulation.
     SsrResolve,
     /// One axis of the subsurface diffusion each, sharing a pipeline and differing
     /// only in the direction they are pushed — the same shape the bloom chain's
@@ -453,7 +459,7 @@ impl BloomIds {
 /// What the one geometry pass in front of shading leaves behind. Written
 /// together because they come off the same rasterisation, and read apart: SSAO
 /// wants depth and normals, TAA and motion blur want depth and motion, depth of
-/// field wants depth alone, reflections want all but the motion.
+/// field wants depth alone, reflections want all four.
 #[derive(Clone, Copy, Debug)]
 pub struct PrepassIds {
     pub normal: ResourceId,
@@ -491,7 +497,14 @@ pub struct SsaoIds {
     pub ao: ResourceId,
 }
 
-/// The reflection trace's three images, and what it was handed.
+/// The reflection trace's images, its history, and what it was handed.
+///
+/// The history is two pairs of **imported** images, ping-ponged by the pass
+/// that owns them for the reason TAA's are: `history` and `history_depth` are
+/// last frame's accumulation, which the temporal pass reads and nothing in
+/// this frame writes, and `accum` and `accum_depth` are this frame's, which it
+/// writes and the composite reads. One resource for each would be a pass
+/// reading and writing one image, which `compile` reports as a cycle.
 #[derive(Clone, Copy, Debug)]
 pub struct SsrIds {
     /// The lit frame the rays sample, recorded rather than re-derived for the
@@ -509,6 +522,15 @@ pub struct SsrIds {
     /// Half the frame: the radiance each ray found, with its confidence in
     /// alpha.
     pub rays: ResourceId,
+    /// Half the frame: how far each ray went, in metres.
+    pub ray_length: ResourceId,
+    /// `rgb` = accumulated radiance, `a` = accumulated confidence.
+    pub history: ResourceId,
+    /// The linear depth `history` was accumulated at, carrying its sample
+    /// count.
+    pub history_depth: ResourceId,
+    pub accum: ResourceId,
+    pub accum_depth: ResourceId,
     pub output: ResourceId,
 }
 
@@ -899,8 +921,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // target's bandwidth at the price of a second render pass to keep in step.
     // Seven readers now want different parts of it: SSAO and contact shadows
     // take depth and normals, TAA and motion blur take depth and motion, depth
-    // of field takes depth alone, reflections take depth, normals and the
-    // material target — and transparency and refraction both attach the depth
+    // of field takes depth alone, reflections take all four — and
+    // transparency and refraction both attach the depth
     // read-only, the two readers that want it as an attachment rather than as a
     // texture.
     //
@@ -1213,10 +1235,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let lit_color = subsurface.map_or(hdr_color, |ids| ids.output);
 
     // Between shading and the temporal resolve, and it has to be both: a ray can
-    // only sample radiance that has been lit, and one ray per pixel is noise
-    // until TAA has accumulated it over the jitter sequence. Putting it after
-    // the resolve instead would mean denoising it separately, with a second
-    // history of its own.
+    // only sample radiance that has been lit, and the reflection has to be
+    // antialiased with the rest of the frame rather than composited over the
+    // top of it. Its noise is the reflection's own history's to remove, not
+    // TAA's — see `ssr.rs` for why TAA's clip cannot.
     let ssr = config.ssr.then(|| {
         let prepass = prepass.expect("screen-space reflections read the geometry prepass");
         let source = lit_color;
@@ -1246,7 +1268,41 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             "ssr_rays",
             ImageDesc::new(RAY_FORMAT).extent(Extent::FrameDiv(1)),
         );
+        let ray_length = builder.create_image(
+            "ssr_ray_length",
+            ImageDesc::new(RAY_LENGTH_FORMAT).extent(Extent::FrameDiv(1)),
+        );
         let output = builder.create_image("ssr_color", ImageDesc::new(HDR_FORMAT));
+
+        // Entered and left the way TAA's pair is, and for its reason: the
+        // allocation written as `ssr_accum` is the one read as `ssr_history`
+        // next frame, so it leaves in the layout the history enters in — moved
+        // there by the composite's read, inside the frame, rather than by a
+        // closing barrier (see `ssr.rs` for why that matters).
+        let history = builder.import_image(
+            "ssr_history",
+            ImageDesc::new(HISTORY_FORMAT),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let history_depth = builder.import_image(
+            "ssr_history_depth",
+            ImageDesc::new(HISTORY_DEPTH_FORMAT),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let accum = builder.import_image(
+            "ssr_accum",
+            ImageDesc::new(HISTORY_FORMAT),
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let accum_depth = builder.import_image(
+            "ssr_accum_depth",
+            ImageDesc::new(HISTORY_DEPTH_FORMAT),
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
 
         let id = builder
             .pass("ssr_hiz", PassKind::Compute)
@@ -1270,8 +1326,24 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(prepass.material, Access::Sampled)
             .access(source_pyramid, Access::Sampled)
             .access(rays, Access::StorageWrite)
+            .access(ray_length, Access::StorageWrite)
             .build();
         record(id, PassBody::SsrTrace, &mut bodies);
+
+        let id = builder
+            .pass("ssr_temporal", PassKind::Compute)
+            .access(rays, Access::Sampled)
+            .access(ray_length, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(prepass.material, Access::Sampled)
+            .access(prepass.velocity, Access::Sampled)
+            .access(history, Access::Sampled)
+            .access(history_depth, Access::Sampled)
+            .access(accum, Access::StorageWrite)
+            .access(accum_depth, Access::StorageWrite)
+            .build();
+        record(id, PassBody::SsrTemporal, &mut bodies);
 
         // Reads `source` again rather than accumulating into it, for the reason
         // the depth-of-field composite does: resources are unversioned, so a
@@ -1281,8 +1353,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let id = builder
             .pass("ssr_resolve", PassKind::Compute)
             .access(source, Access::Sampled)
-            .access(rays, Access::Sampled)
-            .access(prepass.depth, Access::Sampled)
+            .access(accum, Access::Sampled)
+            .access(accum_depth, Access::Sampled)
             .access(prepass.normal, Access::Sampled)
             .access(prepass.material, Access::Sampled)
             .access(output, Access::StorageWrite)
@@ -1294,6 +1366,11 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             hiz,
             source_pyramid,
             rays,
+            ray_length,
+            history,
+            history_depth,
+            accum,
+            accum_depth,
             output,
         }
     });

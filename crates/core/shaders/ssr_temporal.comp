@@ -1,0 +1,389 @@
+#version 460
+
+#include "depth.glsl"
+
+// The reflection's denoiser: gather this frame's half-resolution rays around
+// each pixel, then accumulate the result into a history that holds the
+// reflection alone.
+//
+// Its own history rather than TAA's, because TAA's clip runs on the composited
+// frame, where a reflection's noise cannot be told from texture: it either clips
+// the noise back in every frame, which flickers, or lets it through as grain.
+// Clipped here, the box is the spread of the reflection's own rays.
+//
+// The history is reprojected two ways. A reflection does not move with the
+// surface showing it but with what it reflects, which sits `ray length` further
+// down the camera ray — so a mirror's history is found by reprojecting that
+// virtual point. A rough reflection is a blur that mostly does move with the
+// surface, and a miss has no length at all, so the surface's own motion vector
+// is the other candidate. Whichever sits closer to this frame's neighbourhood
+// is taken, with a thumb on the scale for the virtual point on smooth surfaces.
+//
+// What it writes is still incoming radiance and how much of it to believe; the
+// composite in `ssr_resolve.comp` is what turns that into the frame's colour.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_rays;       // half-res, rgb + confidence
+layout(set = 0, binding = 1) uniform sampler2D u_ray_length; // half-res, metres, 0 = miss
+layout(set = 0, binding = 2) uniform sampler2D u_depth;
+layout(set = 0, binding = 3) uniform sampler2D u_normal;     // view-space, encoded
+layout(set = 0, binding = 4) uniform sampler2D u_material;   // rgb = f0, a = roughness
+layout(set = 0, binding = 5) uniform sampler2D u_velocity;
+// Last frame's accumulation, and the linear depth it was accumulated at with
+// the sample count in its low bits.
+layout(set = 0, binding = 6) uniform sampler2D u_history;
+layout(set = 0, binding = 7) uniform sampler2D u_history_depth;
+layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D u_accum;
+layout(set = 0, binding = 9, r32f) uniform writeonly image2D u_accum_depth;
+
+layout(set = 0, binding = 10) uniform Ssr {
+    mat4 proj;
+    mat4 inv_proj;
+    mat4 inv_view;
+    vec4 params;   // y = max roughness
+    vec4 trace;
+    vec4 extent;
+    vec4 env;
+    vec4 env_tint;
+    // Unjittered, for the reason TAA's are: the motion vectors the history is
+    // also reprojected by carry no jitter.
+    mat4 inv_view_proj;
+    mat4 prev_view_proj;
+    // x != 0 to ignore the history, y = frames a mirror's history may average,
+    // z = frames a surface at the roughness cutoff's may, w = the mask of the
+    // history depth's low bits that carry the sample count (`COUNT_BITS`)
+    vec4 history;
+} ssr;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+float pack_history_depth(float z, uint count) {
+    uint mask = uint(ssr.history.w);
+    return uintBitsToFloat((floatBitsToUint(z) & ~mask) | count);
+}
+
+vec3 view_pos(vec2 uv, float depth) {
+    vec4 clip = ssr.inv_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
+    return clip.xyz / clip.w;
+}
+
+// YCoCg for the clip, for the reason `taa_resolve.comp` gives: a box around
+// samples that differ mostly in brightness is far tighter in it than in RGB.
+vec3 to_ycocg(vec3 c) {
+    return vec3(
+        0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
+        0.5 * c.r - 0.5 * c.b,
+        -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
+}
+
+vec3 from_ycocg(vec3 c) {
+    float t = c.x - c.z;
+    return vec3(t + c.y, c.x + c.z, t - c.y);
+}
+
+// Toward the box's centre until inside, keeping the direction — as TAA does.
+vec3 clip_to_box(vec3 centre, vec3 half_extent, vec3 value) {
+    vec3 offset = value - centre;
+    vec3 units = abs(offset / (half_extent + 1e-5));
+    float longest = max(units.x, max(units.y, units.z));
+    return longest > 1.0 ? centre + offset / longest : value;
+}
+
+// Catmull-Rom as five bilinear taps, as in `taa_resolve.comp`, and for its
+// reason: a history resampled bilinearly every frame blurs geometrically, which
+// on a mirror is a reflection that goes soft whenever the camera moves.
+vec4 sample_history(vec2 uv, vec2 size) {
+    vec2 position = uv * size;
+    vec2 centre = floor(position - 0.5) + 0.5;
+    vec2 f = position - centre;
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+
+    vec2 w0 = f2 - 0.5 * (f3 + f);
+    vec2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+    vec2 w3 = 0.5 * (f3 - f2);
+    vec2 w2 = 1.0 - w0 - w1 - w3;
+    vec2 w12 = w1 + w2;
+    vec2 offset12 = w2 / max(w12, vec2(1e-5));
+
+    vec2 uv0 = (centre - 1.0) / size;
+    vec2 uv12 = (centre + offset12) / size;
+    vec2 uv3 = (centre + 2.0) / size;
+
+    float k0 = w0.x * w12.y;
+    float k1 = w12.x * w0.y;
+    float k2 = w12.x * w12.y;
+    float k3 = w3.x * w12.y;
+    float k4 = w12.x * w3.y;
+
+    vec4 sum = texture(u_history, vec2(uv0.x, uv12.y)) * k0
+             + texture(u_history, vec2(uv12.x, uv0.y)) * k1
+             + texture(u_history, vec2(uv12.x, uv12.y)) * k2
+             + texture(u_history, vec2(uv3.x, uv12.y)) * k3
+             + texture(u_history, vec2(uv12.x, uv3.y)) * k4;
+    // The cubic's lobes overshoot; neither radiance nor confidence may.
+    return clamp(sum / (k0 + k1 + k2 + k3 + k4), vec4(0.0), vec4(vec3(65504.0), 1.0));
+}
+
+struct Candidate {
+    vec4 value;
+    // How far the history there can be believed to be this surface, 0 to 1.
+    float trust;
+    float count;
+};
+
+// The history at `at`, trusted by how well the depth it was accumulated at
+// matches the depth this surface had last frame. A different surface — the
+// background a moving object uncovered — is at a different depth.
+Candidate fetch_history(vec2 at, float expected, float tolerance, vec2 size) {
+    Candidate c = Candidate(vec4(0.0), 0.0, 0.0);
+    if (any(lessThan(at, vec2(0.0))) || any(greaterThan(at, vec2(1.0)))) {
+        return c;
+    }
+    c.value = texture(u_history, at);
+    ivec2 texel = min(ivec2(at * size), ivec2(size) - 1);
+    float packed = texelFetch(u_history_depth, texel, 0).r;
+    float error = abs(packed - expected) / max(expected, 1e-4);
+    c.trust = 1.0 - smoothstep(0.5 * tolerance, tolerance, error);
+    c.count = float(floatBitsToUint(packed) & uint(ssr.history.w));
+    return c;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_accum);
+    if (any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+
+    float depth = texture(u_depth, uv).r;
+    float roughness = texture(u_material, uv).a;
+    if (depth_is_far(depth) || roughness > ssr.params.y) {
+        // A depth of zero is one no surface can match next frame, which is the
+        // history a pixel with nothing to reflect should leave — and what tells
+        // the composite there is nothing here to swap.
+        imageStore(u_accum, pixel, vec4(0.0));
+        imageStore(u_accum_depth, pixel, vec4(0.0));
+        return;
+    }
+
+    vec3 p = view_pos(uv, depth);
+    vec3 n = normalize(texture(u_normal, uv).xyz * 2.0 - 1.0);
+    vec3 v = normalize(-p);
+    float n_dot_v = max(dot(n, v), 1e-4);
+    float rough = clamp(roughness / max(ssr.params.y, 1e-3), 0.0, 1.0);
+
+    // Gather the neighbouring half-resolution rays. This is what decides
+    // whether the image is usable: one importance-sampled ray per pixel is
+    // noise, and a history can only average what a *pixel* has seen over time.
+    // Nine neighbours, each of which sampled a different part of the same lobe,
+    // is a ninefold cut in variance available in the frame the ray was traced.
+    //
+    // The spread follows the roughness it is standing in for. A near-mirror
+    // pixel keeps its own ray and barely borrows, because its neighbours are
+    // reflecting genuinely different directions and averaging them is just
+    // blur; a rough pixel borrows freely, because its lobe is wide enough that
+    // the neighbours' rays are samples of the same integral.
+    vec2 ray_size = vec2(textureSize(u_rays, 0));
+    vec2 ray_coord = uv * ray_size - 0.5;
+    ivec2 centre = ivec2(round(ray_coord));
+    // Gentler than it would need to be alone: the trace already prefilters each
+    // ray over its own cone, so a wide spatial spread here would blur by the
+    // roughness a second time.
+    float sigma = mix(0.45, 1.0, rough);
+
+    // Two sweeps over the same taps: the first finds what a typical sample
+    // looks like, the second weights against it. A firefly has to be measured
+    // relative to its neighbours rather than against a fixed threshold —
+    // exposure is metered downstream of this pass, so there is no absolute
+    // scale here to compare a luminance to.
+    vec4 taps[9];
+    float lengths[9];
+    float spatial[9];
+    float bilateral[9];
+    float mean_luma = 0.0;
+    float mean_weight = 0.0;
+    int count = 0;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            ivec2 tap = centre + ivec2(i, j);
+            if (any(lessThan(tap, ivec2(0))) || any(greaterThanEqual(tap, ivec2(ray_size)))) {
+                continue;
+            }
+            vec2 tap_uv = (vec2(tap) + 0.5) / ray_size;
+            float tap_depth = texture(u_depth, tap_uv).r;
+            vec3 tap_n = normalize(texture(u_normal, tap_uv).xyz * 2.0 - 1.0);
+            float tap_z = view_pos(tap_uv, tap_depth).z;
+
+            // Distance from this pixel's true position in ray space, so the
+            // gather stays centred where the pixel is rather than on whichever
+            // texel it rounded to.
+            vec2 offset = vec2(tap) - ray_coord;
+            float falloff = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+            // A tenth of a metre of depth disagreement halves the tap and a
+            // metre kills it, measured in view space so the tolerance means the
+            // same thing near and far. The normal term catches the creases
+            // depth alone cannot see — two faces of a cube meeting at an edge
+            // sit at the same distance and reflect completely different things.
+            float agreement = exp(-abs(tap_z - p.z) * 10.0)
+                            * smoothstep(0.0, 0.25, dot(tap_n, n));
+            float weight = falloff * agreement;
+            if (weight <= 1e-4) {
+                continue;
+            }
+
+            vec4 ray = texelFetch(u_rays, tap, 0);
+            taps[count] = ray;
+            lengths[count] = texelFetch(u_ray_length, tap, 0).r;
+            spatial[count] = weight;
+            bilateral[count] = agreement;
+            // Weighted by the ray's own confidence, so a neighbourhood of
+            // mostly misses does not report a near-zero mean and then read
+            // every genuine hit in it as a firefly.
+            mean_luma += dot(ray.rgb, LUMA) * weight * ray.a;
+            mean_weight += weight * ray.a;
+            count++;
+        }
+    }
+    mean_luma /= max(mean_weight, 1e-6);
+
+    // Radiance and confidence are averaged over different denominators, and the
+    // difference matters. A ray that missed carries no radiance at all, so
+    // folding its zero into the colour would darken the rays that did hit
+    // instead of merely saying the pixel is less sure — a half-missing
+    // neighbourhood would come out a quarter strength rather than half.
+    // Confidence is what records the misses; the colour is the average of what
+    // was actually found.
+    //
+    // The clip's statistics leave the falloff out: the box has to describe the
+    // neighbourhood, and with a mirror's narrow falloff it would describe one
+    // ray and admit nothing else.
+    vec3 radiance = vec3(0.0);
+    float radiance_weight = 0.0;
+    float length_sum = 0.0;
+    float confidence_sum = 0.0;
+    float total = 0.0;
+    vec3 moment1 = vec3(0.0);
+    vec3 moment2 = vec3(0.0);
+    float moment_weight = 0.0;
+    vec2 confidence_moments = vec2(0.0);
+    float confidence_weight = 0.0;
+    for (int i = 0; i < count; ++i) {
+        // A sample no brighter than the neighbourhood keeps its full weight;
+        // one ten times brighter keeps a tenth of it. That is a biased
+        // estimator on purpose — the alternative is an unbiased mean that
+        // spends a dozen frames showing one ray's lucky hit on an emissive
+        // surface as a bright dot, which is what a firefly is.
+        float luma = dot(taps[i].rgb, LUMA);
+        float firefly = 1.0 / (1.0 + max(0.0, luma / max(mean_luma, 1e-4) - 1.0));
+        float weight = spatial[i] * firefly * taps[i].a;
+
+        radiance += taps[i].rgb * weight;
+        length_sum += lengths[i] * weight;
+        radiance_weight += weight;
+        confidence_sum += taps[i].a * spatial[i];
+        total += spatial[i];
+
+        float moment = bilateral[i] * firefly * taps[i].a;
+        vec3 c = to_ycocg(taps[i].rgb);
+        moment1 += c * moment;
+        moment2 += c * c * moment;
+        moment_weight += moment;
+        confidence_moments += vec2(taps[i].a, taps[i].a * taps[i].a) * bilateral[i];
+        confidence_weight += bilateral[i];
+    }
+    bool found = radiance_weight > 1e-6;
+    vec3 traced = found ? radiance / radiance_weight : vec3(0.0);
+    // By the radiance's own weights: the virtual point below has to be where
+    // the reflection being accumulated comes from.
+    float ray_length = found ? length_sum / radiance_weight : 0.0;
+    float confidence = confidence_sum / max(total, 1e-6);
+
+    vec3 mean = moment1 / max(moment_weight, 1e-6);
+    vec3 deviation = sqrt(max(moment2 / max(moment_weight, 1e-6) - mean * mean, vec3(0.0)));
+
+    // Where this surface was last frame, reconstructed through the unjittered
+    // matrices as TAA reconstructs the sky.
+    vec4 world_h = ssr.inv_view_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec3 world = world_h.xyz / world_h.w;
+    float expected = (ssr.prev_view_proj * vec4(world, 1.0)).w;
+    // A grazing surface's depth changes fastest from one pixel to the next, so
+    // a reprojection a fraction of a pixel out reads as a larger error there.
+    float tolerance = 0.05 / max(n_dot_v, 0.25);
+    vec2 history_size = vec2(size);
+
+    vec2 surface_uv = uv - texelFetch(u_velocity, pixel, 0).rg;
+    vec2 chosen_uv = surface_uv;
+    Candidate chosen = fetch_history(surface_uv, expected, tolerance, history_size);
+
+    if (found) {
+        vec3 eye = ssr.inv_view[3].xyz;
+        vec3 virtual_point = eye + (world - eye) * (1.0 + ray_length / max(distance(world, eye), 1e-4));
+        vec4 previous = ssr.prev_view_proj * vec4(virtual_point, 1.0);
+        vec2 parallax_uv = previous.w > 0.0 ? (previous.xy / previous.w) * 0.5 + 0.5 : vec2(-1.0);
+
+        // A still camera puts both candidates on the same texel, and the
+        // second fetch would be the first one again.
+        if (any(greaterThan(abs(parallax_uv - surface_uv) * history_size, vec2(0.5)))) {
+            // The surface's depth is still what the virtual point's history is
+            // tested against: on the plane of a mirror, where this candidate is
+            // the right one, the texel it lands on is that same plane.
+            Candidate parallax = fetch_history(parallax_uv, expected, tolerance, history_size);
+            // Distance from the neighbourhood in its own standard deviations,
+            // so the comparison has no absolute scale in it.
+            vec3 scale = deviation + 1e-3 * mean.x + 1e-6;
+            float off_surface = length((to_ycocg(chosen.value.rgb) - mean) / scale);
+            float off_parallax = length((to_ycocg(parallax.value.rgb) - mean) / scale);
+            bool take = parallax.trust > 0.0
+                && (chosen.trust <= 0.0 || off_parallax * mix(0.5, 2.0, rough) <= off_surface);
+            if (take) {
+                chosen = parallax;
+                chosen_uv = parallax_uv;
+            }
+        }
+    }
+    if (ssr.history.x != 0.0) {
+        chosen.trust = 0.0;
+    }
+
+    vec4 history = chosen.trust > 0.0 ? sample_history(chosen_uv, history_size) : vec4(0.0);
+
+    // Wider for rougher surfaces, whose rays scatter further from their own
+    // mean and whose history is the better estimate of the two.
+    float gamma = mix(1.25, 2.5, rough);
+    if (moment_weight > 0.0) {
+        history.rgb = max(from_ycocg(clip_to_box(mean, gamma * deviation, to_ycocg(history.rgb))), vec3(0.0));
+    }
+    // Confidence is clipped too, or a reflection whose object has moved away
+    // would fade out over the whole history rather than leave with it.
+    float confidence_mean = confidence_moments.x / max(confidence_weight, 1e-6);
+    float confidence_deviation = sqrt(max(
+        confidence_moments.y / max(confidence_weight, 1e-6) - confidence_mean * confidence_mean, 0.0));
+    history.a = clamp(history.a, confidence_mean - gamma * confidence_deviation,
+                      confidence_mean + gamma * confidence_deviation);
+
+    // A pixel the history has just found converges as fast as its samples
+    // arrive; a settled one stops at a length that is short for a mirror, where
+    // a stale sharp reflection is the visible error, and long for a rough
+    // surface, where the noise is.
+    float limit = mix(ssr.history.y, ssr.history.z, rough);
+    float frames = min(chosen.count * chosen.trust, limit);
+    float alpha = 1.0 / (frames + 1.0);
+
+    // Radiance is weighted by confidence for the reason the gather weights it:
+    // a frame whose rays missed says nothing about what the reflection looks
+    // like, only about how much of it there is.
+    float history_weight = (1.0 - alpha) * history.a;
+    float current_weight = alpha * confidence;
+    float weights = history_weight + current_weight;
+    vec3 accumulated = weights > 1e-6
+        ? (history.rgb * history_weight + traced * current_weight) / weights
+        : traced;
+    float accumulated_confidence = mix(history.a, confidence, alpha);
+    uint next = uint(min(frames + 1.0, limit) + 0.5);
+
+    imageStore(u_accum, pixel, vec4(accumulated, accumulated_confidence));
+    imageStore(u_accum_depth, pixel, vec4(pack_history_depth(-p.z, next)));
+}

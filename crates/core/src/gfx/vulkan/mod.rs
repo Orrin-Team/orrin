@@ -1377,6 +1377,9 @@ impl VulkanRenderer {
                 ));
             }
         }
+        if let Some(view) = ssr_history_view(ids.ssr, &self.ssr, id) {
+            return Some(record::Target::Image(self.vk_view(view).image().clone()));
+        }
 
         self.backend
             .vk()
@@ -2300,6 +2303,8 @@ impl VulkanRenderer {
                 environment::SPECULAR_MIPS,
                 self.environment.specular_tint(ambient, environment),
             );
+        } else {
+            self.ssr.release(&self.device);
         }
         self.motion_blur.begin_frame(motion_blur, camera);
         // Whether or not the two dispatches run, and that is the point: the
@@ -3515,6 +3520,29 @@ fn image_slots(graph: &crate::gfx::graph::FrameGraph) -> usize {
     }
 }
 
+/// Which of the reflection history's four imports `id` is, as the view the
+/// pass that ping-pongs them has bound this frame. One function for both
+/// executors' `barrier_target`, so the two cannot disagree about which half of
+/// the pair is the history.
+fn ssr_history_view(
+    ids: Option<frame::SsrIds>,
+    ssr: &SsrPass,
+    id: ResourceId,
+) -> Option<TextureViewId> {
+    let ids = ids?;
+    let [history, history_depth] = ssr.history_views();
+    let [accum, accum_depth] = ssr.accum_views();
+    [
+        (ids.history, history),
+        (ids.history_depth, history_depth),
+        (ids.accum, accum),
+        (ids.accum_depth, accum_depth),
+    ]
+    .into_iter()
+    .find(|&(import, _)| import == id)
+    .map(|(_, view)| view)
+}
+
 /// How many command buffers one frame's recording is worth splitting into.
 ///
 /// The partition has little left to give beyond this: the punctual shadow atlas
@@ -3702,6 +3730,9 @@ impl FrameRecord<'_> {
                     self.vk_view(self.taa.history_view()).image().clone(),
                 ));
             }
+        }
+        if let Some(view) = ssr_history_view(ids.ssr, self.ssr, id) {
+            return Some(record::Target::Image(self.vk_view(view).image().clone()));
         }
 
         self.vk()
@@ -3897,6 +3928,7 @@ impl FrameRecord<'_> {
                 let material = self.table.texture(prepass.material);
                 let source = self.table.texture(ids.source_pyramid);
                 let target = self.table.texture(ids.rays);
+                let ray_length = self.table.texture(ids.ray_length);
 
                 self.ssr.record_trace(
                     self.device,
@@ -3907,6 +3939,36 @@ impl FrameRecord<'_> {
                     material,
                     source,
                     target,
+                    ray_length,
+                );
+            }
+            PassBody::SsrTemporal => {
+                let ids = self
+                    .frame
+                    .ids
+                    .ssr
+                    .expect("reflections without their images");
+                let prepass = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled reflections with no prepass");
+                let rays = self.table.texture(ids.rays);
+                let ray_length = self.table.texture(ids.ray_length);
+                let depth = self.table.texture(prepass.depth);
+                let normal = self.table.texture(prepass.normal);
+                let material = self.table.texture(prepass.material);
+                let velocity = self.table.texture(prepass.velocity);
+
+                self.ssr.record_temporal(
+                    self.device,
+                    encoder,
+                    rays,
+                    ray_length,
+                    depth,
+                    normal,
+                    material,
+                    velocity,
                 );
             }
             PassBody::SsrResolve => {
@@ -3921,8 +3983,6 @@ impl FrameRecord<'_> {
                     .prepass
                     .expect("the graph scheduled reflections with no prepass");
                 let source = self.texture_of(ids.source);
-                let rays = self.table.texture(ids.rays);
-                let depth = self.table.texture(prepass.depth);
                 let normal = self.table.texture(prepass.normal);
                 let material = self.table.texture(prepass.material);
                 let environment = self.environment.specular_view();
@@ -3932,8 +3992,6 @@ impl FrameRecord<'_> {
                     self.device,
                     encoder,
                     source,
-                    rays,
-                    depth,
                     normal,
                     material,
                     environment,
@@ -4541,6 +4599,7 @@ impl FrameRecord<'_> {
             | PassBody::SsrHiz
             | PassBody::SsrSource
             | PassBody::SsrTrace
+            | PassBody::SsrTemporal
             | PassBody::SsrResolve
             | PassBody::FogScatter
             | PassBody::FogIntegrate
