@@ -3927,7 +3927,8 @@ impl FrameRecord<'_> {
                 let depth = self.table.texture(prepass.depth);
                 let normal = self.table.texture(prepass.normal);
                 let material = self.table.texture(prepass.material);
-                let source = self.table.texture(ids.source_pyramid);
+                let source_pyramid = self.table.texture(ids.source_pyramid);
+                let source = self.texture_of(ids.source);
                 let target = self.table.texture(ids.rays);
                 let ray_length = self.table.texture(ids.ray_length);
 
@@ -3938,6 +3939,7 @@ impl FrameRecord<'_> {
                     depth,
                     normal,
                     material,
+                    source_pyramid,
                     source,
                     target,
                     ray_length,
@@ -3960,6 +3962,9 @@ impl FrameRecord<'_> {
                 let normal = self.table.texture(prepass.normal);
                 let material = self.table.texture(prepass.material);
                 let velocity = self.table.texture(prepass.velocity);
+                let hiz = self.table.texture(ids.hiz);
+                let source_pyramid = self.table.texture(ids.source_pyramid);
+                let source = self.texture_of(ids.source);
 
                 self.ssr.record_temporal(
                     self.device,
@@ -3970,6 +3975,9 @@ impl FrameRecord<'_> {
                     normal,
                     material,
                     velocity,
+                    hiz,
+                    source_pyramid,
+                    source,
                 );
             }
             PassBody::SsrResolve => {

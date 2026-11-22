@@ -1713,6 +1713,7 @@
      prepass_normal Sampled
      prepass_material Sampled
      ssr_source Sampled
+     hdr_color Sampled
      ssr_rays StorageWrite
      ssr_ray_length StorageWrite
 09 pass ssr_temporal [Compute]
@@ -1729,6 +1730,9 @@
      prepass_velocity Sampled
      ssr_history Sampled
      ssr_history_depth Sampled
+     ssr_hiz Sampled
+     ssr_source Sampled
+     hdr_color Sampled
      ssr_accum StorageWrite
      ssr_accum_depth StorageWrite
 10 pass ssr_resolve [Compute]
@@ -1897,6 +1901,7 @@
      prepass_normal Sampled
      prepass_material Sampled
      ssr_source Sampled
+     hdr_color Sampled
      ssr_rays StorageWrite
      ssr_ray_length StorageWrite
 07 pass ssr_temporal [Compute]
@@ -1913,6 +1918,9 @@
      prepass_velocity Sampled
      ssr_history Sampled
      ssr_history_depth Sampled
+     ssr_hiz Sampled
+     ssr_source Sampled
+     hdr_color Sampled
      ssr_accum StorageWrite
      ssr_accum_depth StorageWrite
 08 pass ssr_resolve [Compute]
@@ -2697,6 +2705,7 @@
      prepass_normal Sampled
      prepass_material Sampled
      ssr_source Sampled
+     hdr_color Sampled
      ssr_rays StorageWrite
      ssr_ray_length StorageWrite
 14 pass ssr_temporal [Compute]
@@ -2713,6 +2722,9 @@
      prepass_velocity Sampled
      ssr_history Sampled
      ssr_history_depth Sampled
+     ssr_hiz Sampled
+     ssr_source Sampled
+     hdr_color Sampled
      ssr_accum StorageWrite
      ssr_accum_depth StorageWrite
 15 pass ssr_resolve [Compute]
@@ -3054,6 +3066,7 @@
      prepass_normal Sampled
      prepass_material Sampled
      ssr_source Sampled
+     hdr_color Sampled
      ssr_rays StorageWrite
      ssr_ray_length StorageWrite
 14 pass ssr_temporal [Compute]
@@ -3070,6 +3083,9 @@
      prepass_velocity Sampled
      ssr_history Sampled
      ssr_history_depth Sampled
+     ssr_hiz Sampled
+     ssr_source Sampled
+     hdr_color Sampled
      ssr_accum StorageWrite
      ssr_accum_depth StorageWrite
 15 pass ssr_resolve [Compute]
@@ -3256,7 +3272,7 @@
 -- end of frame
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
 -- aliased ssao_raw_ao [07..08] -> contact_shadow_mask [09..19]
--- aliased ssr_source [12..13] -> refraction_scene [18..19]
+-- aliased ssr_source [12..14] -> refraction_scene [18..19]
 -- aliased ssr_rays [13..14] -> dof_prefiltered [22..24]
 -- aliased ssr_color [15..17] -> refraction_color [20..21] -> dof_color [25..39]
 -- aliased oit_accum [16..17] -> refraction_accum [19..20]
@@ -3460,6 +3476,7 @@
      prepass_normal Sampled
      prepass_material Sampled
      ssr_source Sampled
+     subsurface_color Sampled
      ssr_rays StorageWrite
      ssr_ray_length StorageWrite
 17 pass ssr_temporal [Compute]
@@ -3476,6 +3493,9 @@
      prepass_velocity Sampled
      ssr_history Sampled
      ssr_history_depth Sampled
+     ssr_hiz Sampled
+     ssr_source Sampled
+     subsurface_color Sampled
      ssr_accum StorageWrite
      ssr_accum_depth StorageWrite
 18 pass ssr_resolve [Compute]
@@ -4605,6 +4625,7 @@
      prepass_normal Sampled
      prepass_material Sampled
      ssr_source Sampled
+     subsurface_color Sampled
      ssr_rays StorageWrite
      ssr_ray_length StorageWrite
 20 pass ssr_temporal [Compute]
@@ -4621,6 +4642,9 @@
      prepass_velocity Sampled
      ssr_history Sampled
      ssr_history_depth Sampled
+     ssr_hiz Sampled
+     ssr_source Sampled
+     subsurface_color Sampled
      ssr_accum StorageWrite
      ssr_accum_depth StorageWrite
 21 pass ssr_resolve [Compute]
@@ -4826,7 +4850,7 @@
 -- concurrent bloom_up_0
 -- aliased subsurface_diffusible [13..14] -> oit_accum [22..23]
 -- aliased subsurface_color [16..21] -> refraction_color [26..27] -> dof_color [31..34]
--- aliased ssr_source [18..19] -> refraction_scene [24..25]
+-- aliased ssr_source [18..20] -> refraction_scene [24..25]
 -- aliased ssr_rays [19..20] -> dof_prefiltered [28..30]
 -- aliased oit_color [23..26] -> motion_blur_color [34..48]
 

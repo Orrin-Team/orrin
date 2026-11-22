@@ -1263,7 +1263,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         );
         // Half the frame, for the reason depth of field's gather is: the cost is
         // the ray, and a stochastic ray is denoised temporally either way, so
-        // tracing four times as many buys far less than it costs.
+        // tracing four times as many buys far less than it costs. A near-mirror,
+        // whose one ray is not a sample, traces the rest of its quad in the
+        // temporal pass — which is why that pass reads the pyramids too.
         let rays = builder.create_image(
             "ssr_rays",
             ImageDesc::new(RAY_FORMAT).extent(Extent::FrameDiv(1)),
@@ -1325,6 +1327,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(prepass.normal, Access::Sampled)
             .access(prepass.material, Access::Sampled)
             .access(source_pyramid, Access::Sampled)
+            .access(source, Access::Sampled)
             .access(rays, Access::StorageWrite)
             .access(ray_length, Access::StorageWrite)
             .build();
@@ -1340,6 +1343,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(prepass.velocity, Access::Sampled)
             .access(history, Access::Sampled)
             .access(history_depth, Access::Sampled)
+            .access(hiz, Access::Sampled)
+            .access(source_pyramid, Access::Sampled)
+            .access(source, Access::Sampled)
             .access(accum, Access::StorageWrite)
             .access(accum_depth, Access::StorageWrite)
             .build();

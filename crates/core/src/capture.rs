@@ -117,6 +117,23 @@ pub struct CaptureSettings {
     /// the fixed step below. Pinned by default, so a capture of an animated
     /// surface does not depend on how many frames it warmed up for.
     pub surface_time: Option<f32>,
+    /// What the rig's ground is refinished as, or `None` for the matte floor it
+    /// ships with. A reflection capture needs a reflective floor to be about
+    /// anything: the shipped one is past every roughness the trace accepts.
+    pub floor: Option<Floor>,
+}
+
+/// A reflective finish for the rig's ground, all metal so the reflection is
+/// the whole of what the floor shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Floor {
+    /// Roughness 0.04: a mirror, whose reflection is as sharp as the frame.
+    Mirror,
+    /// Roughness 0.3: glossy, where the reflection is a blur built from noise.
+    Glossy,
+    /// Roughness ramping from 0 at the floor's sides to 0.25 down its middle,
+    /// across every rate and regime the trace switches between.
+    RoughnessRamp,
 }
 
 impl Default for CaptureSettings {
@@ -139,6 +156,7 @@ impl Default for CaptureSettings {
             camera: None,
             wireframe: None,
             surface_time: Some(0.0),
+            floor: None,
         }
     }
 }
@@ -209,6 +227,9 @@ pub fn prepare(world: &mut World, renderer: &mut VulkanRenderer, settings: &Capt
     world.insert_resource(FogSettings::default());
 
     settings.scene.build(world, renderer);
+    if let Some(floor) = settings.floor {
+        refinish_floor(world, renderer, floor);
+    }
     if let Some(camera) = settings.camera {
         world.insert_resource(camera);
     }
@@ -240,6 +261,40 @@ pub fn prepare(world: &mut World, renderer: &mut VulkanRenderer, settings: &Capt
     if let Some(fog) = settings.fog {
         world.insert_resource(fog);
     }
+}
+
+fn refinish_floor(world: &World, renderer: &mut VulkanRenderer, floor: Floor) {
+    use crate::gfx::{Material, RenderBackend};
+    let ground = world
+        .resource::<crate::scene::Assets>()
+        .material("ground")
+        .expect("a floor finish is for the rig, whose ground material is `ground`");
+    let mut material = Material {
+        base_color: glam::Vec3::splat(0.9),
+        metallic: 1.0,
+        roughness: 0.04,
+        ..Material::default()
+    };
+    match floor {
+        Floor::Mirror => {}
+        Floor::Glossy => material.roughness = 0.3,
+        Floor::RoughnessRamp => {
+            // Roughness in green, as glTF's metallic-roughness texture has it,
+            // and a factor of one so the texel is the roughness.
+            const WIDTH: usize = 256;
+            let texels: Vec<u8> = (0..WIDTH)
+                .flat_map(|x| {
+                    let u = x as f32 / (WIDTH - 1) as f32;
+                    let roughness = 0.25 * (1.0 - (2.0 * u - 1.0).abs());
+                    [0, (roughness * 255.0).round() as u8, 255, 255]
+                })
+                .collect();
+            material.roughness = 1.0;
+            material.metallic_roughness_texture =
+                Some(renderer.load_texture(&texels, WIDTH as u32, 1, false));
+        }
+    }
+    renderer.update_material(ground, &material);
 }
 
 /// Render `settings.frames` frames of `world` and read the last one back as

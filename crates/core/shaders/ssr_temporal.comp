@@ -2,9 +2,18 @@
 
 #include "depth.glsl"
 
-// The reflection's denoiser: gather this frame's half-resolution rays around
+// The reflection's denoiser: gather this frame's quarter-rate rays around
 // each pixel, then accumulate the result into a history that holds the
 // reflection alone.
+//
+// Except on a near-mirror. There the lobe is so narrow that one ray is the
+// answer rather than a sample of it, so gathering neighbours could only blur it
+// and accumulating frames could only lag it: the pixel traces its own ray here,
+// at full resolution, and takes it as it is. Between `MIRROR_ROUGHNESS` and
+// `GLOSSY_ROUGHNESS` the two estimates cross-fade, along with the history's
+// length, so a surface whose roughness crosses from one regime to the other
+// shows no line — the same `trace_reflection` produces both, so what changes
+// across the band is only how much the pixel borrows and remembers.
 //
 // Its own history rather than TAA's, because TAA's clip runs on the composited
 // frame, where a reflection's noise cannot be told from texture: it either clips
@@ -24,8 +33,8 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(set = 0, binding = 0) uniform sampler2D u_rays;       // half-res, rgb + confidence
-layout(set = 0, binding = 1) uniform sampler2D u_ray_length; // half-res, metres, 0 = miss
+layout(set = 0, binding = 0) uniform sampler2D u_rays;       // one per quad, rgb + confidence
+layout(set = 0, binding = 1) uniform sampler2D u_ray_length; // one per quad, metres, 0 = miss
 layout(set = 0, binding = 2) uniform sampler2D u_depth;
 layout(set = 0, binding = 3) uniform sampler2D u_normal;     // view-space, encoded
 layout(set = 0, binding = 4) uniform sampler2D u_material;   // rgb = f0, a = roughness
@@ -36,12 +45,17 @@ layout(set = 0, binding = 6) uniform sampler2D u_history;
 layout(set = 0, binding = 7) uniform sampler2D u_history_depth;
 layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D u_accum;
 layout(set = 0, binding = 9, r32f) uniform writeonly image2D u_accum_depth;
+// What a near-mirror's own ray marches and samples; see `ssr_march.glsl`.
+layout(set = 0, binding = 11) uniform sampler2D u_hiz;
+layout(set = 0, binding = 12) uniform sampler2D u_source;
+layout(set = 0, binding = 13) uniform sampler2D u_source_full;
+layout(set = 0, binding = 14) uniform sampler2D u_blue_noise;
 
 layout(set = 0, binding = 10) uniform Ssr {
     mat4 proj;
     mat4 inv_proj;
     mat4 inv_view;
-    vec4 params;   // y = max roughness
+    vec4 params;   // x = frame index, y = max roughness, z = thickness
     vec4 trace;
     vec4 extent;
     vec4 env;
@@ -50,22 +64,28 @@ layout(set = 0, binding = 10) uniform Ssr {
     // also reprojected by carry no jitter.
     mat4 inv_view_proj;
     mat4 prev_view_proj;
-    // x != 0 to ignore the history, y = frames a mirror's history may average,
-    // z = frames a surface at the roughness cutoff's may, w = the mask of the
+    // x != 0 to ignore the history, y = frames a smooth surface's history may
+    // average, z = frames a surface at the roughness cutoff's may, w = the mask of the
     // history depth's low bits that carry the sample count (`COUNT_BITS`)
     vec4 history;
 } ssr;
+
+#include "ssr_march.glsl"
+
+// Below the first, a pixel's own full-rate ray is all it uses; past the second,
+// only the quarter-rate gather and its history. Perceptual roughness. A lobe
+// of 0.05 is under a fifth of a degree wide, so the ray's own sample spread is
+// below what the frame resolves at any distance on screen; by 0.15 it is
+// about a degree and a half, where one ray's variance starts to show as grain
+// and the gather and the history are what remove it.
+const float MIRROR_ROUGHNESS = 0.05;
+const float GLOSSY_ROUGHNESS = 0.15;
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 float pack_history_depth(float z, uint count) {
     uint mask = uint(ssr.history.w);
     return uintBitsToFloat((floatBitsToUint(z) & ~mask) | count);
-}
-
-vec3 view_pos(vec2 uv, float depth) {
-    vec4 clip = ssr.inv_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
-    return clip.xyz / clip.w;
 }
 
 // YCoCg for the clip, for the reason `taa_resolve.comp` gives: a box around
@@ -157,9 +177,10 @@ void main() {
         return;
     }
     vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    uint frame = uint(ssr.params.x);
 
-    float depth = texture(u_depth, uv).r;
-    float roughness = texture(u_material, uv).a;
+    float depth = texelFetch(u_depth, pixel, 0).r;
+    float roughness = texelFetch(u_material, pixel, 0).a;
     if (depth_is_far(depth) || roughness > ssr.params.y) {
         // A depth of zero is one no surface can match next frame, which is the
         // history a pixel with nothing to reflect should leave — and what tells
@@ -170,12 +191,12 @@ void main() {
     }
 
     vec3 p = view_pos(uv, depth);
-    vec3 n = normalize(texture(u_normal, uv).xyz * 2.0 - 1.0);
+    vec3 n = normalize(texelFetch(u_normal, pixel, 0).xyz * 2.0 - 1.0);
     vec3 v = normalize(-p);
     float n_dot_v = max(dot(n, v), 1e-4);
     float rough = clamp(roughness / max(ssr.params.y, 1e-3), 0.0, 1.0);
 
-    // Gather the neighbouring half-resolution rays. This is what decides
+    // Gather the neighbouring quads' rays. This is what decides
     // whether the image is usable: one importance-sampled ray per pixel is
     // noise, and a history can only average what a *pixel* has seen over time.
     // Nine neighbours, each of which sampled a different part of the same lobe,
@@ -186,9 +207,8 @@ void main() {
     // reflecting genuinely different directions and averaging them is just
     // blur; a rough pixel borrows freely, because its lobe is wide enough that
     // the neighbours' rays are samples of the same integral.
-    vec2 ray_size = vec2(textureSize(u_rays, 0));
-    vec2 ray_coord = uv * ray_size - 0.5;
-    ivec2 centre = ivec2(round(ray_coord));
+    ivec2 quads = textureSize(u_rays, 0);
+    ivec2 own_quad = pixel / 2;
     // Gentler than it would need to be alone: the trace already prefilters each
     // ray over its own cone, so a wide spatial spread here would blur by the
     // roughness a second time.
@@ -206,21 +226,24 @@ void main() {
     float mean_luma = 0.0;
     float mean_weight = 0.0;
     int count = 0;
-    for (int j = -1; j <= 1; ++j) {
+    // A mirror takes its own ray alone, so it gathers nothing.
+    float mirror = 1.0 - smoothstep(MIRROR_ROUGHNESS, GLOSSY_ROUGHNESS, roughness);
+    for (int j = -1; j <= 1 && mirror < 1.0; ++j) {
         for (int i = -1; i <= 1; ++i) {
-            ivec2 tap = centre + ivec2(i, j);
-            if (any(lessThan(tap, ivec2(0))) || any(greaterThanEqual(tap, ivec2(ray_size)))) {
+            ivec2 tap = own_quad + ivec2(i, j);
+            if (any(lessThan(tap, ivec2(0))) || any(greaterThanEqual(tap, quads))) {
                 continue;
             }
-            vec2 tap_uv = (vec2(tap) + 0.5) / ray_size;
-            float tap_depth = texture(u_depth, tap_uv).r;
-            vec3 tap_n = normalize(texture(u_normal, tap_uv).xyz * 2.0 - 1.0);
+            ivec2 tap_texel = ray_texel(tap, size);
+            vec2 tap_uv = (vec2(tap_texel) + 0.5) / vec2(size);
+            float tap_depth = texelFetch(u_depth, tap_texel, 0).r;
+            vec3 tap_n = normalize(texelFetch(u_normal, tap_texel, 0).xyz * 2.0 - 1.0);
             float tap_z = view_pos(tap_uv, tap_depth).z;
 
-            // Distance from this pixel's true position in ray space, so the
-            // gather stays centred where the pixel is rather than on whichever
-            // texel it rounded to.
-            vec2 offset = vec2(tap) - ray_coord;
+            // Distance from this pixel to where that ray started, in quads, so
+            // the gather stays centred on the pixel rather than on its quad's
+            // traced corner.
+            vec2 offset = vec2(tap_texel - pixel) * 0.5;
             float falloff = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
             // A tenth of a metre of depth disagreement halves the tap and a
             // metre kills it, measured in view space so the tolerance means the
@@ -301,6 +324,29 @@ void main() {
     float ray_length = found ? length_sum / radiance_weight : 0.0;
     float confidence = confidence_sum / max(total, 1e-6);
 
+    if (mirror > 0.0) {
+        // This pixel's own ray: the quad's, when this pixel is the one the
+        // trace started from, and otherwise traced here.
+        vec4 own;
+        float own_length;
+        if (pixel == ray_texel(own_quad, size)) {
+            own = texelFetch(u_rays, own_quad, 0);
+            own_length = texelFetch(u_ray_length, own_quad, 0).r;
+        } else {
+            own = trace_reflection(uv, depth, n, roughness, stratified(pixel, frame), own_length);
+        }
+        // Weighted by confidence on both sides, for the reason the gather is.
+        float gathered_weight = (1.0 - mirror) * confidence;
+        float own_weight = mirror * own.a;
+        float both = gathered_weight + own_weight;
+        if (both > 1e-6) {
+            traced = (traced * gathered_weight + own.rgb * own_weight) / both;
+            ray_length = (ray_length * gathered_weight + own_length * own_weight) / both;
+            found = true;
+        }
+        confidence = mix(confidence, own.a, mirror);
+    }
+
     vec3 mean = moment1 / max(moment_weight, 1e-6);
     vec3 deviation = sqrt(max(moment2 / max(moment_weight, 1e-6) - mean * mean, vec3(0.0)));
 
@@ -316,9 +362,12 @@ void main() {
 
     vec2 surface_uv = uv - texelFetch(u_velocity, pixel, 0).rg;
     vec2 chosen_uv = surface_uv;
-    Candidate chosen = fetch_history(surface_uv, expected, tolerance, history_size);
+    Candidate chosen = Candidate(vec4(0.0), 0.0, 0.0);
+    if (mirror < 1.0) {
+        chosen = fetch_history(surface_uv, expected, tolerance, history_size);
+    }
 
-    if (found) {
+    if (found && mirror < 1.0) {
         vec3 eye = ssr.inv_view[3].xyz;
         vec3 virtual_point = eye + (world - eye) * (1.0 + ray_length / max(distance(world, eye), 1e-4));
         vec4 previous = ssr.prev_view_proj * vec4(virtual_point, 1.0);
@@ -365,10 +414,11 @@ void main() {
                       confidence_mean + gamma * confidence_deviation);
 
     // A pixel the history has just found converges as fast as its samples
-    // arrive; a settled one stops at a length that is short for a mirror, where
-    // a stale sharp reflection is the visible error, and long for a rough
-    // surface, where the noise is.
-    float limit = mix(ssr.history.y, ssr.history.z, rough);
+    // arrive; a settled one stops at a length that is short for a smooth
+    // surface, where a stale sharp reflection is the visible error, and long
+    // for a rough one, where the noise is — and none at all for a mirror, whose
+    // one ray has no noise for a history to remove.
+    float limit = mix(mix(ssr.history.y, ssr.history.z, rough), 0.0, mirror);
     float frames = min(chosen.count * chosen.trust, limit);
     float alpha = 1.0 / (frames + 1.0);
 

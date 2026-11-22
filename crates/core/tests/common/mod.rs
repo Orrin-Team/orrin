@@ -2,7 +2,7 @@
 //! every A/B pair, with the reasoning for each beside it.
 
 use glam::Vec3;
-use orrin_core::capture::CaptureSettings;
+use orrin_core::capture::{CaptureSettings, Floor};
 use orrin_core::scene::entities::SceneChoice;
 use orrin_core::scene::{Camera, FogSettings};
 
@@ -19,6 +19,22 @@ fn fog_camera() -> Camera {
         position: Vec3::new(-20.0, 1.0, -4.0),
         target: Vec3::new(-11.0, 4.5, 4.0),
         ..Camera::default()
+    }
+}
+
+/// The reflection captures' shared settings: one camera and warm-up, so the
+/// three differ in the floor alone.
+fn reflective_floor(floor: Floor) -> CaptureSettings {
+    CaptureSettings {
+        ssr: true,
+        frames: 64,
+        floor: Some(floor),
+        camera: Some(Camera {
+            position: Vec3::new(12.5, 1.6, 12.5),
+            target: Vec3::new(0.0, 0.2, 0.0),
+            ..Camera::default()
+        }),
+        ..CaptureSettings::default()
     }
 }
 
@@ -213,6 +229,18 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 ..CaptureSettings::default()
             },
         ),
+        // The rig's floor refinished, seen low and across a corner toward the
+        // cube grid, so the reflections of the cubes fill the lower half: a mirror, where what a capture shows is how sharp a
+        // reflected edge is; glossy, where it is how fine the remaining grain
+        // is; and a floor whose roughness ramps across the regimes the trace
+        // switches between, where it is whether the switch shows.
+        //
+        // Sixty-four frames, not the usual dozen. The reflection keeps a
+        // history of up to 32 frames, and a capture taken before it settles is
+        // a picture of the warm-up rather than of the reflection.
+        ("ssr-mirror", reflective_floor(Floor::Mirror)),
+        ("ssr-glossy", reflective_floor(Floor::Glossy)),
+        ("ssr-ramp", reflective_floor(Floor::RoughnessRamp)),
         (
             "dof",
             CaptureSettings {

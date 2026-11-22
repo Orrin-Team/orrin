@@ -1,19 +1,43 @@
-//! Screen-space reflections: a depth pyramid, one importance-sampled ray per
-//! half-resolution pixel, a denoiser with a history of its own, and a composite
-//! that swaps the environment's guess for what the rays found.
+//! Screen-space reflections: a depth pyramid, importance-sampled rays — one
+//! per 2x2 quad, and one per pixel on a near-mirror — a denoiser with a history
+//! of its own, and a composite that swaps the environment's guess for what the
+//! rays found.
 //!
 //! Five dispatches, and each earns its place. The depth pyramid is what makes
 //! the march affordable — a ray crossing an empty room steps over it a cell at a
 //! time instead of sampling every texel it passes. The colour pyramid is what
 //! makes a *rough* reflection affordable: a ray from a wide lobe is a cone, and
 //! the level whose texel matches the cone's footprint carries the average of
-//! what the cone covers instead of one sample of it. The trace is at half
-//! resolution because a stochastic ray is denoised either way, so the resolution
-//! it is traced at buys much less than the rays it pays for. The temporal pass
-//! and the composite are full resolution: the first because a mirror's history
+//! what the cone covers instead of one sample of it. The temporal pass and the
+//! composite are full resolution: the first because a mirror's history
 //! resampled at half resolution goes soft under motion, the second because it
 //! touches the frame's colour and subtracting the environment term wants this
 //! pixel's own material.
+//!
+//! # Two ray rates
+//!
+//! A glossy surface is traced at one ray per quad, because a stochastic ray is
+//! denoised either way: the gather and the history average many rays per
+//! pixel, so tracing four times as many buys much less than it costs. That
+//! argument stops at the near-mirror. Its lobe is so narrow that one ray *is*
+//! the reflection rather than a sample of it, so there is nothing to denoise
+//! and a quarter-rate ray is just a quarter-resolution reflection — the soft,
+//! stair-stepped mirror the eye picks out first. Below `GLOSSY_ROUGHNESS` in
+//! `ssr_temporal.comp` each pixel therefore traces its own ray, takes it
+//! without a gather or a history, and cross-fades to the quarter-rate path as
+//! roughness rises, so a roughness gradient shows no line. A mirror's cone also
+//! reads the frame itself rather than the half-resolution pyramid.
+//!
+//! The full-rate rays are traced inside the temporal pass, where the pixel
+//! that needs one already is, rather than by the trace dispatching over every
+//! pixel: a full-resolution trace would idle three lanes in four on every
+//! glossy pixel and need a full-resolution ray target to hand its rays over,
+//! and the quarter-rate trace keeps its half-resolution targets and its cost.
+//! Rejected too: a classification pass building ray and tile lists for an
+//! indirect dispatch (the FidelityFX shape). The RHI has no indirect
+//! dispatch, and with nothing reflective the three passes measured 0.04 ms
+//! between them, almost all of it the history's invalidating write, which a
+//! tile list would still have to make.
 //!
 //! # The reflection's own history
 //!
@@ -135,11 +159,12 @@ fn count_mask() -> u32 {
     (1 << COUNT_BITS) - 1
 }
 
-/// How many frames a history may average, for a mirror and for a surface at
-/// the roughness cutoff; the temporal pass interpolates between them. Short for a
-/// mirror, whose rays barely vary and where a stale sharp reflection is the
-/// visible error; long where the lobe is wide and the noise is.
-const MIRROR_HISTORY: u32 = 8;
+/// How many frames a history may average, for a smooth surface and for one at
+/// the roughness cutoff; the temporal pass interpolates between them. Short for
+/// a smooth surface, whose rays barely vary and where a stale sharp reflection
+/// is the visible error; long where the lobe is wide and the noise is. A
+/// near-mirror keeps none — see `ssr_temporal.comp`.
+const SMOOTH_HISTORY: u32 = 8;
 const ROUGH_HISTORY: u32 = 32;
 
 /// Shared by the trace and the composite, because they must agree about the
@@ -327,7 +352,7 @@ impl SsrPass {
         ];
         let history = [
             self.reset.load(Ordering::Relaxed) as u32 as f32,
-            MIRROR_HISTORY as f32,
+            SMOOTH_HISTORY as f32,
             ROUGH_HISTORY as f32,
             count_mask() as f32,
         ];
@@ -451,6 +476,7 @@ impl SsrPass {
         depth: TextureViewId,
         normal: TextureViewId,
         material: TextureViewId,
+        source_pyramid: TextureViewId,
         source: TextureViewId,
         target: TextureViewId,
         ray_length: TextureViewId,
@@ -463,7 +489,7 @@ impl SsrPass {
                 self.sampled(1, depth, self.nearest_clamp),
                 self.sampled(2, normal, self.nearest_clamp),
                 self.sampled(3, material, self.nearest_clamp),
-                self.sampled(4, source, self.linear_mip),
+                self.sampled(4, source_pyramid, self.linear_mip),
                 Binding {
                     binding: 5,
                     resource: BindingResource::StorageTexture(target),
@@ -477,6 +503,7 @@ impl SsrPass {
                     resource: BindingResource::StorageTexture(ray_length),
                 },
                 self.sampled(8, self.blue_noise, self.nearest_clamp),
+                self.sampled(9, source, self.linear_clamp),
             ],
         );
 
@@ -496,6 +523,9 @@ impl SsrPass {
         normal: TextureViewId,
         material: TextureViewId,
         velocity: TextureViewId,
+        hiz: TextureViewId,
+        source_pyramid: TextureViewId,
+        source: TextureViewId,
     ) {
         let [history, history_depth] = self.history_views();
         let [accum, accum_depth] = self.accum_views();
@@ -529,6 +559,12 @@ impl SsrPass {
                     binding: 10,
                     resource: BindingResource::UniformBuffer(self.uniforms()),
                 },
+                // A near-mirror's own ray, traced here with the trace's
+                // samplers for the trace's reasons.
+                self.sampled(11, hiz, self.nearest_clamp),
+                self.sampled(12, source_pyramid, self.linear_mip),
+                self.sampled(13, source, self.linear_clamp),
+                self.sampled(14, self.blue_noise, self.nearest_clamp),
             ],
         );
 
@@ -648,7 +684,7 @@ mod tests {
     #[test]
     fn the_sample_count_fits_beside_the_depth_without_moving_it() {
         let mask = count_mask();
-        assert!(MIRROR_HISTORY.max(ROUGH_HISTORY) <= mask);
+        assert!(SMOOTH_HISTORY.max(ROUGH_HISTORY) <= mask);
 
         let pack = |z: f32, count: u32| f32::from_bits((z.to_bits() & !mask) | count);
         for z in [0.05f32, 1.0, 3.7, 250.0, 10_000.0] {
