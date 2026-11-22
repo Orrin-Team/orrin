@@ -24,11 +24,10 @@
 // invocations to keep the memory system busy, and few enough loads each that
 // none waits behind its own. A gather at the frame's edge clamps, duplicating
 // an edge texel that is already in the same cell, so the nearest depth of any
-// cell is exactly that of the texels under it. An odd extent still loses its
-// last column or row at the coarser levels (Vulkan floors each mip's size, and
-// the store is dropped), which makes the pyramid non-conservative in that one
-// strip: a missing reflection at the very edge of the frame, where the trace's
-// edge fade has already taken the contribution to nothing.
+// cell is exactly that of the texels under it. An extent that is not a
+// multiple of a level's cell leaves a strip along the right and bottom edges
+// that level has no texel for (Vulkan floors each mip's size, and the store is
+// dropped); the march knows it, and looks closer there instead of skipping it.
 
 const int MAX_LEVELS = 6;
 

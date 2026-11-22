@@ -148,11 +148,18 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
             break;
         }
 
-        vec2 level_size = level == 0 ? ssr.extent.xy : vec2(textureSize(u_hiz, level - 1));
-        vec2 cell = floor(pos.xy * level_size);
+        // Cells are laid on the depth buffer's own texel grid: a cell at level
+        // `n` is exactly the 2^n x 2^n block `hiz_build.comp` reduced into it.
+        // Not `pos * textureSize(level)`, which is the same grid only when 2^n
+        // divides the extent: Vulkan floors each level's size, so on any other
+        // viewport that grid drifts against the blocks by up to a cell across
+        // the frame, and the march tests a ray against the depth of a block
+        // beside the one it is in — a skipped surface, at cell granularity.
+        float texels = float(1 << level);
+        vec2 cell = floor(pos.xy * ssr.extent.xy / texels);
         // The far edge of this cell along each axis, and how far along the ray
         // that is. A zero component gives an infinity, which `min` discards.
-        vec2 boundary = (cell + max(sign(dir.xy), vec2(0.0))) / level_size;
+        vec2 boundary = (cell + max(sign(dir.xy), vec2(0.0))) * texels * ssr.extent.zw;
         vec2 axis_t = (boundary - pos.xy) / dir.xy;
         float step_t = min(axis_t.x, axis_t.y);
         if (!(step_t > 0.0) || isinf(step_t)) {
@@ -164,9 +171,19 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
         // cell and the march stalls.
         float t_next = min(t + step_t + 1e-5, 1.0);
 
-        float cell_z = level == 0
-            ? texelFetch(u_depth, ivec2(cell), 0).r
-            : texelFetch(u_hiz, ivec2(cell), level - 1).r;
+        float cell_z;
+        if (level == 0) {
+            cell_z = texelFetch(u_depth, min(ivec2(cell), ivec2(ssr.extent.xy) - 1), 0).r;
+        } else {
+            // The strip along the right and bottom edges that no stored texel
+            // covers, where the extent is not a multiple of the cell: nothing
+            // says it is empty, so look closer rather than skip it.
+            if (any(greaterThanEqual(ivec2(cell), textureSize(u_hiz, level - 1)))) {
+                level--;
+                continue;
+            }
+            cell_z = texelFetch(u_hiz, ivec2(cell), level - 1).r;
+        }
         float z_far = s0.z + dir.z * t_next;
         // The deepest the ray gets inside this cell. If that stays in front of
         // everything the cell contains, the cell is empty for this ray.

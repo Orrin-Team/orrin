@@ -38,6 +38,23 @@ fn reflective_floor(floor: Floor) -> CaptureSettings {
     }
 }
 
+/// A reflection capture from `position` toward `target`, at an extent no
+/// power of two divides.
+fn reflection_view(floor: Option<Floor>, position: Vec3, target: Vec3) -> CaptureSettings {
+    CaptureSettings {
+        extent: [1389, 803],
+        ssr: true,
+        frames: 64,
+        floor,
+        camera: Some(Camera {
+            position,
+            target,
+            ..Camera::default()
+        }),
+        ..CaptureSettings::default()
+    }
+}
+
 /// Every capture, by the name its file carries.
 pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
     vec![
@@ -241,6 +258,34 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
         ("ssr-mirror", reflective_floor(Floor::Mirror)),
         ("ssr-glossy", reflective_floor(Floor::Glossy)),
         ("ssr-ramp", reflective_floor(Floor::RoughnessRamp)),
+        // Three more, each where the reflection is hardest to get right, and at
+        // an extent no power of two divides: a viewport is whatever size the
+        // window is, and a pyramid level whose cells do not tile the frame is
+        // what a reflection's edge shows first. From high and steep over the
+        // cube grid, where every reflection ends against its own cube; from
+        // above the floating spheres, where the screen holds the top of each
+        // and the mirror wants the underside; and close along the sphere row,
+        // whose smoother spheres show whether a reflection ever settles.
+        (
+            "ssr-steep",
+            reflection_view(
+                Some(Floor::Mirror),
+                Vec3::new(6.0, 5.5, 10.0),
+                Vec3::new(2.0, 0.0, 3.0),
+            ),
+        ),
+        (
+            "ssr-spheres-above",
+            reflection_view(
+                Some(Floor::Mirror),
+                Vec3::new(1.5, 9.0, 18.0),
+                Vec3::new(0.0, 0.0, 12.5),
+            ),
+        ),
+        (
+            "ssr-sphere-row",
+            reflection_view(None, Vec3::new(2.0, 1.6, 6.0), Vec3::new(0.0, 1.5, 14.0)),
+        ),
         (
             "dof",
             CaptureSettings {
