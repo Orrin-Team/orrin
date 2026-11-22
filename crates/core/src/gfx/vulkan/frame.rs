@@ -333,9 +333,14 @@ pub enum PassBody {
     /// it and derives its barriers.
     ScreenshotOverlay,
     Overlay,
-    /// Every shadow view the frame draws, the sun's and the lamps' alike, in
-    /// one pass over one atlas. A tile is a viewport rather than a node, which
-    /// is what keeps this a single barrier instead of one per view.
+    /// The cached layers of the shadow views that redraw theirs this frame:
+    /// the casters standing still, into an atlas kept from frame to frame.
+    ShadowStatic,
+    /// What the frame is shaded from: every shadow view's live tile, brought up
+    /// to date from the cached layer and this frame's moving casters. One pass
+    /// over one atlas for the sun's views and the lamps' alike — a tile is a
+    /// viewport rather than a node, which is what keeps this a single barrier
+    /// instead of one per view.
     Shadows,
 }
 
@@ -388,10 +393,11 @@ pub struct FrameIds {
     pub taa: Option<TaaIds>,
     pub dof: Option<DofIds>,
     pub motion_blur: Option<MotionBlurIds>,
-    /// The shadow atlas, when anything casts. One image and no struct, like the
-    /// contact-shadow mask: one pass writes it and the shading passes and the
-    /// fog read it.
+    /// The shadow atlas, when anything casts: what the shading passes and the
+    /// fog read.
     pub shadow_atlas: Option<ResourceId>,
+    /// The atlas of cached layers beside it, tile for tile.
+    pub shadow_static: Option<ResourceId>,
     /// Which pixels the selection outline is drawn around: red where a selected
     /// mesh covers, green where the hovered one does. With the editor only.
     pub outline_mask: Option<ResourceId>,
@@ -676,6 +682,11 @@ fn indirect(pass: PassBuilder<'_>, commands: ResourceId) -> PassBuilder<'_> {
     pass.access(commands, Access::IndirectRead)
 }
 
+/// What a shadow atlas is: one square image every view is a tile of.
+pub fn shadow_atlas_desc(resolution: u32) -> ImageDesc {
+    ImageDesc::new(SHADOW_FORMAT).extent(Extent::Fixed([resolution; 2]))
+}
+
 pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let mut builder = GraphBuilder::new();
     if config.async_compute {
@@ -822,11 +833,38 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // anything shades. One node for every view of every light — a tile is a
     // viewport into this attachment, so four sun views and six faces of eight
     // lamps are still one barrier.
-    let shadow_atlas = (config.shadow_atlas > 0).then(|| {
-        let atlas = builder.create_image(
-            "shadow_atlas",
-            ImageDesc::new(SHADOW_FORMAT).extent(Extent::Fixed([config.shadow_atlas; 2])),
-        );
+    // Imported rather than graph-owned, both of them, because a view that is
+    // not redrawn keeps its tile from an earlier frame and a transient is
+    // `Undefined` at the start of each. Entered and left
+    // `ShaderReadOnlyOptimal`, the layout the frame's readers leave them in, so
+    // those texels survive the round trip through the attachment layout. The
+    // shadow pass allocates them to exactly this description.
+    let shadow_atlases = (config.shadow_atlas > 0).then(|| {
+        let mut import = |name| {
+            builder.import_image(
+                name,
+                shadow_atlas_desc(config.shadow_atlas),
+                ImageLayout::ShaderReadOnlyOptimal,
+                ImageLayout::ShaderReadOnlyOptimal,
+            )
+        };
+        let (cached, atlas) = (import("shadow_static"), import("shadow_atlas"));
+
+        // Geometry rasterised from each light's point of view, needed before
+        // anything shades. Two nodes for every view of every light — a tile is
+        // a viewport into an attachment, so four sun views and six faces of
+        // eight lamps are a barrier per layer rather than per view. The cached
+        // layer first, because the live one is brought up to date from it.
+        let id = indirect(
+            builder
+                .pass("shadow_static", PassKind::Inline)
+                .access(object_transforms, Access::StorageRead)
+                .access(instance_index, Access::StorageRead),
+            draw_commands,
+        )
+        .access(cached, Access::DepthAttachment)
+        .build();
+        record(id, PassBody::ShadowStatic, &mut bodies);
 
         let id = indirect(
             builder
@@ -835,12 +873,14 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
                 .access(instance_index, Access::StorageRead),
             draw_commands,
         )
+        .access(cached, Access::Sampled)
         .access(atlas, Access::DepthAttachment)
         .build();
         record(id, PassBody::Shadows, &mut bodies);
 
-        atlas
+        (atlas, cached)
     });
+    let shadow_atlas = shadow_atlases.map(|(atlas, _)| atlas);
 
     // One prepass serves every consumer rather than one each: they need the same
     // rasterisation, and running it twice to hand each part of the result to a
@@ -1957,6 +1997,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             dof,
             motion_blur,
             shadow_atlas,
+            shadow_static: shadow_atlases.map(|(_, cached)| cached),
             outline_mask,
             wireframe,
             material_preview,

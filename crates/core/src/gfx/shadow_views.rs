@@ -14,15 +14,45 @@
 //! array are serialised by write-after-write, which is what four cascades used
 //! to pay. A tile also has its own size, where a layer has the array's.
 //!
+//! # Two layers, and what a frame does to them
+//!
+//! Each view has a cached layer — the casters standing still
+//! ([`shadow_casters`](super::shadow_casters)), kept from frame to frame in an
+//! atlas of its own — and the live layer the frame is shaded from, which is the
+//! cached one with the moving casters drawn over it. So shading samples one
+//! map, as it always did, and what the cache changes is only how that map is
+//! brought up to date.
+//!
+//! What it is brought up to date *by* is the texels that changed, never the
+//! tile. Putting a live tile back whole from its cached layer touches every
+//! texel of it, and on a tiling GPU that costs more than the draws it saves:
+//! about 0.02 ms a megapixel on an M5 Pro, against 0.04 ms to clear a 2048
+//! tile by its load op and draw a hundred casters into it from nothing. So a
+//! view remembers the rectangles its moving casters wrote, and the next frame
+//! puts back those rectangles and no others.
+//!
+//! The same number is why a sun level moves in steps rather than following the
+//! camera texel by texel ([`LevelWindow`]), and why the sun's views are levels
+//! unless a scene asks otherwise: a view fitted to the frustum is a new matrix
+//! every time the camera moves, and a new matrix is a tile cleared and redrawn
+//! whole.
+//!
+//! A view that cannot be kept — a light that is moving, a cached layer waiting
+//! its turn — is drawn the way it always was, every caster straight into the
+//! live layer. So the cache never decides whether a shadow is right, only what
+//! it costs; `tests/shadow_cache.rs` holds it to that on a GPU.
+//!
 //! Nothing here takes a `Device`, for the reason the render graph does not: the
-//! allocation and the matrices are the part that can be wrong in a way pixels
-//! only hint at, so they are the part CI can assert.
+//! allocation, the matrices and the plan are the part that can be wrong in a
+//! way pixels only hint at, so they are the part CI can assert.
 
-use glam::Mat4;
+use glam::{IVec2, Mat4, Vec3};
 
 use super::SceneLighting;
 use super::punctual::{self, LightKind, MAX_SHADOW_LIGHTS};
-use super::shadows::{CascadeConfig, CascadeSet, MAX_CASCADES, cascades};
+use super::shadow_casters::{CasterTracker, FLAG_DYNAMIC, FLAG_STATIC};
+use super::shadows::{CascadeConfig, LevelWindow, MAX_CASCADES, SweepBounds, sun_views};
+use crate::geom::{Aabb, Frustum};
 use crate::scene::Camera;
 
 /// Where one view lives in the atlas, in texels.
@@ -154,6 +184,33 @@ pub fn floor_power_of_two(value: u32) -> u32 {
     1 << (31 - value.max(1).leading_zeros())
 }
 
+/// A rectangle of the atlas, in texels: `min` inclusive, `max` exclusive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AtlasRect {
+    pub min: [u32; 2],
+    pub max: [u32; 2],
+}
+
+impl AtlasRect {
+    fn of(tile: AtlasTile) -> Self {
+        Self {
+            min: tile.offset,
+            max: [tile.offset[0] + tile.size, tile.offset[1] + tile.size],
+        }
+    }
+
+    fn texels(&self) -> u64 {
+        u64::from(self.max[0] - self.min[0]) * u64::from(self.max[1] - self.min[1])
+    }
+
+    fn union(&self, other: &AtlasRect) -> AtlasRect {
+        AtlasRect {
+            min: [self.min[0].min(other.min[0]), self.min[1].min(other.min[1])],
+            max: [self.max[0].max(other.max[0]), self.max[1].max(other.max[1])],
+        }
+    }
+}
+
 /// What can cast into a view, which is what the cull dispatch tests.
 ///
 /// Two shapes rather than six planes for everything, because the sun's views
@@ -163,14 +220,40 @@ pub enum CasterVolume {
     /// A face of a punctual light: a closed frustum with its apex at the light,
     /// so anything that can occlude light travelling into it is inside it.
     Frustum(Mat4),
-    /// A sun view, which keeps anything that reaches its box when swept toward
-    /// the light — so it has no near plane, and an object between the sun and
-    /// the box is exactly what casts into it.
+    /// A sun view, or a strip of one: anything that reaches `bounds`, a box in
+    /// `light_view`'s space, when swept toward the light — so it has no near
+    /// plane, and an object between the sun and the box is exactly what casts
+    /// into it.
     Sweep {
         light_view: Mat4,
-        half_extent: f32,
-        depth_range: f32,
+        bounds: SweepBounds,
     },
+}
+
+impl CasterVolume {
+    /// Whether a caster with these world bounds may reach the view. Conservative
+    /// the way the dispatch's own tests are: true means "may".
+    fn reached_by(&self, bounds: &Aabb) -> bool {
+        match self {
+            CasterVolume::Frustum(view_proj) => {
+                Frustum::from_view_projection(*view_proj).intersects(bounds)
+            }
+            CasterVolume::Sweep {
+                light_view,
+                bounds: sweep,
+            } => {
+                if !bounds.is_valid() {
+                    return true;
+                }
+                let lit = bounds.transformed(light_view);
+                lit.min.x <= sweep.max.x
+                    && lit.max.x >= sweep.min.x
+                    && lit.min.y <= sweep.max.y
+                    && lit.max.y >= sweep.min.y
+                    && lit.max.z >= sweep.min.z
+            }
+        }
+    }
 }
 
 /// Whose view it is, which decides the depth bias it is drawn with and the
@@ -184,7 +267,8 @@ pub enum ViewKind {
 /// One map: a cascade, a sun level, or a face of a point or spot light.
 #[derive(Clone, Copy, Debug)]
 pub struct ShadowView {
-    /// What the view is drawn with and sampled with.
+    /// What the view is sampled with, and drawn with wherever it is drawn
+    /// whole.
     pub view_proj: Mat4,
     pub tile: AtlasTile,
     pub volume: CasterVolume,
@@ -237,10 +321,10 @@ impl Default for AtlasConfig {
     }
 }
 
-/// What one frame's shadows resolved to.
+/// What one frame's shadows are read from.
 ///
 /// No views means nothing casts, which is what makes the graph drop the shadow
-/// pass and its atlas entirely rather than keep an image for no reader.
+/// passes and their atlas entirely rather than keep images for no reader.
 #[derive(Clone, Debug, Default)]
 pub struct ShadowViews {
     /// Edge of the atlas the tiles are cut from.
@@ -269,142 +353,122 @@ impl ShadowViews {
     }
 }
 
-/// What laying a frame out reuses from the frame before, so that it allocates
-/// nothing once the lists have grown to the scene.
-#[derive(Debug)]
-struct Scratch {
-    tiles: TileAllocator,
-    ranked: Vec<(LightKind, usize, f32)>,
+/// Which of a view's two layers a draw lands in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layer {
+    /// The cached layer: the casters that are standing still, kept from frame
+    /// to frame.
+    Static,
+    /// What the frame is shaded from.
+    Live,
 }
 
-impl Default for Scratch {
-    fn default() -> Self {
-        Self {
-            tiles: TileAllocator::new(MIN_TILE),
-            ranked: Vec::new(),
+/// Which casters a draw takes, as the mask the cull dispatch tests an
+/// instance's [flags](super::shadow_casters) against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Casters {
+    All,
+    Static,
+    Dynamic,
+}
+
+impl Casters {
+    pub fn mask(self) -> u32 {
+        match self {
+            Casters::All => FLAG_STATIC | FLAG_DYNAMIC,
+            Casters::Static => FLAG_STATIC,
+            Casters::Dynamic => FLAG_DYNAMIC,
         }
     }
 }
 
-/// Lay a frame's views out in the atlas: the sun's `set` first, then the
-/// punctual lights worth a tile, nearest the camera first.
-///
-/// The sun goes first because it lights every pixel a lamp does not, so a full
-/// atlas costs a lamp its shadow before it costs the sun a cascade.
-pub fn fit(
-    sun: Option<(&CascadeSet, &CascadeConfig)>,
-    lighting: &SceneLighting,
-    camera: glam::Vec3,
-    config: &AtlasConfig,
-) -> ShadowViews {
-    let mut out = ShadowViews::default();
-    fit_into(
-        &mut Scratch::default(),
-        &mut out,
-        sun,
-        lighting,
-        camera,
-        config,
-    );
-    out
+/// One draw of casters into a tile. Each is a view of the cull dispatch's own.
+#[derive(Clone, Copy, Debug)]
+pub struct CasterDraw {
+    /// The shadow view this draws for.
+    pub view: usize,
+    pub layer: Layer,
+    pub casters: Casters,
+    pub volume: CasterVolume,
+    /// What it is drawn with: the view's own matrix, or for a strip of a level
+    /// the matrix that lands the strip where its cells are kept.
+    pub view_proj: Mat4,
+    /// The tile, which the viewport covers whole.
+    pub tile: AtlasTile,
+    /// The part of the tile the draw may write.
+    pub scissor: AtlasRect,
 }
 
-fn fit_into(
-    scratch: &mut Scratch,
-    out: &mut ShadowViews,
-    sun: Option<(&CascadeSet, &CascadeConfig)>,
-    lighting: &SceneLighting,
-    camera: glam::Vec3,
-    config: &AtlasConfig,
-) {
-    let Scratch { tiles, ranked } = scratch;
-    tiles.reset(config.resolution);
-    out.resolution = tiles.resolution();
-    out.views.clear();
-    out.casters.clear();
-    out.sun = 0;
-    out.splits = [0.0; MAX_CASCADES];
+/// A rectangle of the live layer put back to what the cached layer holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Restore {
+    pub rect: AtlasRect,
+    pub tile: AtlasTile,
+    /// Where in the cached tile the live tile's first texel is kept. A level's
+    /// cached texels sit at their cells' places modulo the tile, so its window
+    /// starts wherever the camera has carried it; every other view's is zero.
+    pub wrap: [u32; 2],
+}
 
-    if let Some((set, cascade_config)) = sun {
-        for (index, cascade) in set.cascades[..set.count].iter().enumerate() {
-            // A cascade is fitted to its tile's texel count, so a tile of any
-            // other size would shimmer. One that does not fit ends the sun's
-            // views there, and the views before it answer out to their own
-            // splits.
-            let size = cascade_config.resolution_of(index);
-            let Some(tile) = tiles.allocate(size).filter(|tile| tile.size == size) else {
-                break;
-            };
-            out.views.push(ShadowView {
-                view_proj: cascade.view_proj,
-                tile,
-                volume: CasterVolume::Sweep {
-                    light_view: cascade.light_view,
-                    half_extent: cascade.half_extent,
-                    depth_range: cascade.depth_range,
-                },
-                texel_scale: cascade.texel_world_size,
-                kind: ViewKind::Sun,
-            });
-            out.splits[index] = set.splits[index];
-        }
-        out.sun = out.views.len();
-        let last = out.splits[out.sun.saturating_sub(1)];
-        for split in &mut out.splits[out.sun..] {
-            *split = last;
-        }
+/// What happened to a view this frame, for the debug view and the tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewWork {
+    /// Nothing: no caster moved in it, and the tile holds what it held.
+    Held,
+    /// The rectangles its moving casters touched were put back and the moving
+    /// casters drawn again.
+    Composited,
+    /// A level followed the camera: the strip it moved onto was drawn into the
+    /// cached layer.
+    Scrolled,
+    /// The cached layer was redrawn whole.
+    Refreshed,
+    /// Drawn straight into the live layer with every caster, because its
+    /// matrix moved or its cached layer is waiting its turn to be redrawn.
+    Direct,
+}
+
+/// One frame's shadows: the views to shade from, and the work that brings the
+/// atlas up to date with them.
+#[derive(Clone, Debug, Default)]
+pub struct ShadowPlan {
+    pub views: ShadowViews,
+    /// One per view, in `views`' order.
+    pub work: Vec<ViewWork>,
+    /// Caster draws, the cached layer's first.
+    pub draws: Vec<CasterDraw>,
+    /// Rectangles of the cached layer cleared to the far plane before it is
+    /// drawn into.
+    pub static_fills: Vec<AtlasRect>,
+    /// And of the live layer.
+    pub live_fills: Vec<AtlasRect>,
+    pub restores: Vec<Restore>,
+}
+
+impl ShadowPlan {
+    fn clear(&mut self) {
+        self.views.views.clear();
+        self.views.casters.clear();
+        self.views.sun = 0;
+        self.views.resolution = 0;
+        self.views.splits = [0.0; MAX_CASCADES];
+        self.work.clear();
+        self.draws.clear();
+        self.static_fills.clear();
+        self.live_fills.clear();
+        self.restores.clear();
     }
 
-    if config.punctual {
-        punctual::rank(lighting, camera, ranked);
-        for &(kind, light, _) in ranked.iter() {
-            if out.casters.len() >= MAX_SHADOW_LIGHTS {
-                break;
-            }
-            let needed = punctual::face_count(kind);
-            let first_view = out.views.len();
-            let mut placed = [AtlasTile::default(); 6];
-            let mut count = 0;
-            while count < needed {
-                match tiles.allocate(config.tile_size) {
-                    Some(tile) => {
-                        placed[count] = tile;
-                        count += 1;
-                    }
-                    None => break,
-                }
-            }
-            // Skipped rather than stopped: a spot still fits in the one tile a
-            // point light could not use, and leaving it empty helps nobody.
-            if count < needed {
-                for tile in &placed[..count] {
-                    tiles.release(*tile);
-                }
-                continue;
-            }
-
-            let faces = punctual::faces(lighting, kind, light, config.near, placed[0].size);
-            for (face, tile) in placed[..needed].iter().enumerate() {
-                out.views.push(ShadowView {
-                    view_proj: faces.view_proj[face],
-                    tile: *tile,
-                    volume: CasterVolume::Frustum(faces.view_proj[face]),
-                    texel_scale: faces.texel_per_metre,
-                    kind: ViewKind::Punctual,
-                });
-            }
-            out.casters.push(ShadowCaster {
-                kind,
-                light,
-                first_view,
-                view_count: needed,
-                near: faces.near,
-            });
-        }
+    /// Whether the cached layer has anything drawn into it this frame.
+    pub fn draws_static(&self) -> bool {
+        !self.static_fills.is_empty()
     }
 
-    if out.views.is_empty() {
-        out.resolution = 0;
+    /// Whether the live layer has.
+    pub fn draws_live(&self) -> bool {
+        !self.live_fills.is_empty()
+            || !self.restores.is_empty()
+            || self.draws.iter().any(|draw| draw.layer == Layer::Live)
     }
 }
 
@@ -416,54 +480,721 @@ pub struct ShadowInputs<'a> {
     /// The sun's cascades, or `None` when it casts no shadow.
     pub sun: Option<&'a CascadeConfig>,
     pub atlas: &'a AtlasConfig,
+    /// Which casters are standing still, and what changed about that.
+    pub casters: &'a CasterTracker,
 }
 
-/// Plans each frame's shadow views, keeping the lists it works in so that a
-/// frame allocates nothing for them.
-#[derive(Default)]
+/// Which view a tile belongs to, from one frame to the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewKey {
+    Sun(u8),
+    Face { light: u64, face: u8 },
+}
+
+/// What a view's live tile holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Live {
+    /// Nothing that can be used.
+    Unknown,
+    /// Every caster, drawn straight in.
+    Everything,
+    /// The cached layer, with the moving casters over it.
+    Composite,
+}
+
+/// What the atlas holds for one view.
+#[derive(Debug)]
+struct Entry {
+    key: ViewKey,
+    tile: AtlasTile,
+    /// The frame it was last planned.
+    seen: u32,
+    /// The matrix its tile was last drawn or kept for.
+    view_proj: Mat4,
+    /// Whether the cached layer holds the static casters for `view_proj` — or,
+    /// for a level, for the cells of `window`.
+    cached: bool,
+    live: Live,
+    /// A level's window, and the cell its cached tile's first texel holds: the
+    /// cached layer keeps cell `c` at `(c - base) mod cells`, so a window that
+    /// has moved finds the cells it still shares where it left them.
+    window: Option<LevelWindow>,
+    base: IVec2,
+    /// What the moving casters wrote in the live tile last frame.
+    touched: Vec<AtlasRect>,
+}
+
+impl Entry {
+    fn wrap(&self) -> [u32; 2] {
+        match &self.window {
+            Some(window) => {
+                let n = window.cells as i32;
+                let wrap = (window.min_cell - self.base).rem_euclid(IVec2::splat(n));
+                [wrap.x as u32, wrap.y as u32]
+            }
+            None => [0, 0],
+        }
+    }
+}
+
+/// How many texels of cached layer a frame redraws whole. A view past the
+/// budget waits a frame, drawn directly meanwhile — so what the budget spreads
+/// is the cost of *starting* to cache, never a shadow's correctness. A little
+/// over one 2048 tile, so the largest view always fits.
+const REFRESH_BUDGET: u64 = 5_000_000;
+
+/// How many rectangles a view restores one by one. Past it they are restored as
+/// the one rectangle around them all.
+const MAX_TOUCHED: usize = 48;
+
+/// How much a light that already has tiles outranks one that does not. A light
+/// trading its tiles with a neighbour as the camera drifts between them costs
+/// both their cached layers every time.
+const INCUMBENT_BONUS: f32 = 1.5;
+
+/// Plans each frame's shadow views and the work that brings the atlas up to
+/// date with them, and remembers what the atlas holds from the frames before.
+///
+/// Each view has two layers: a cached one holding the casters that are
+/// standing still, and the live one the frame is shaded from, which is the
+/// cached layer with the moving casters drawn over it. Per frame a view is in
+/// one of the [`ViewWork`] states, and which one is decided here from what
+/// changed — so that a still scene draws nothing, a scene with a few moving
+/// things restores and redraws only what they touched, and anything this
+/// cannot cache is drawn the way it always was.
 pub struct ShadowPlanner {
-    scratch: Scratch,
+    tiles: TileAllocator,
+    entries: Vec<Entry>,
+    frame: u32,
+    /// The sun as the levels were last placed for it. A level's grid is laid
+    /// along the light, so a sun that has turned at all has no windows to keep.
+    sun: Option<(Vec3, [u32; MAX_CASCADES])>,
+    ranked: Vec<(LightKind, usize, f32)>,
+    /// Entries taken out while their view is planned and put back after, so a
+    /// frame allocates no list for them.
+    spare: Vec<Vec<AtlasRect>>,
+}
+
+impl Default for ShadowPlanner {
+    fn default() -> Self {
+        Self {
+            tiles: TileAllocator::new(MIN_TILE),
+            entries: Vec::new(),
+            frame: 0,
+            sun: None,
+            ranked: Vec::new(),
+            spare: Vec::new(),
+        }
+    }
+}
+
+/// What one view asks of the planner this frame.
+struct Wanted {
+    key: ViewKey,
+    size: u32,
+    kind: ViewKind,
+    view_proj: Mat4,
+    volume: CasterVolume,
+    texel_scale: f32,
+    window: Option<LevelWindow>,
+    /// The light's rotation, for a level's strips.
+    rotation: Mat4,
 }
 
 impl ShadowPlanner {
-    /// Plan a frame into `views`, which the caller keeps between frames for the
-    /// reason this keeps its own lists. `None` is a frame in which nothing
-    /// casts.
-    pub fn plan(&mut self, inputs: Option<&ShadowInputs<'_>>, views: &mut ShadowViews) {
+    /// Forget what the atlas holds, because the images behind it were replaced.
+    pub fn invalidate(&mut self) {
+        for entry in self.entries.drain(..) {
+            self.spare.push(entry.touched);
+        }
+        self.tiles.reset(self.tiles.resolution());
+        self.sun = None;
+    }
+
+    /// Plan a frame into `plan`, which the caller keeps between frames so that
+    /// its lists are allocated once. `None` is a frame in which nothing casts.
+    pub fn plan(&mut self, inputs: Option<&ShadowInputs<'_>>, plan: &mut ShadowPlan) {
+        plan.clear();
+        self.frame += 1;
         let Some(inputs) = inputs else {
-            views.views.clear();
-            views.casters.clear();
-            views.sun = 0;
-            views.resolution = 0;
+            self.invalidate();
             return;
         };
-        let set = inputs.sun.map(|config| {
-            cascades(
-                inputs.camera,
-                inputs.aspect,
-                inputs.lighting.sun.direction,
-                config,
-            )
+
+        if self.tiles.resolution() != floor_power_of_two(inputs.atlas.resolution.max(MIN_TILE)) {
+            self.invalidate();
+            self.tiles.reset(inputs.atlas.resolution);
+        }
+        plan.views.resolution = self.tiles.resolution();
+
+        self.plan_sun(inputs, plan);
+        self.plan_lamps(inputs, plan);
+
+        // Whatever was not asked for again gives its tile back.
+        let frame = self.frame;
+        let (tiles, spare) = (&mut self.tiles, &mut self.spare);
+        self.entries.retain_mut(|entry| {
+            if entry.seen == frame {
+                return true;
+            }
+            tiles.release(entry.tile);
+            spare.push(std::mem::take(&mut entry.touched));
+            false
         });
-        fit_into(
-            &mut self.scratch,
-            views,
-            set.as_ref().zip(inputs.sun),
-            inputs.lighting,
-            inputs.camera.position,
-            inputs.atlas,
-        );
+
+        if plan.views.views.is_empty() {
+            plan.views.resolution = 0;
+        }
+        // The cached layer's draws first, so the pass that records them takes a
+        // prefix and the dispatch's numbering is the list's order either way.
+        plan.draws
+            .sort_unstable_by_key(|draw| (draw.layer == Layer::Live, draw.view));
     }
+
+    fn plan_sun(&mut self, inputs: &ShadowInputs<'_>, plan: &mut ShadowPlan) {
+        let Some(config) = inputs.sun else {
+            self.sun = None;
+            return;
+        };
+        let direction = inputs
+            .lighting
+            .sun
+            .direction
+            .try_normalize()
+            .unwrap_or(Vec3::NEG_Y);
+        let count = config.count.clamp(1, MAX_CASCADES);
+        let mut sizes = [0; MAX_CASCADES];
+        for (index, size) in sizes.iter_mut().enumerate().take(count) {
+            *size = config.resolution_of(index);
+        }
+
+        // The sun's tiles are placed before any lamp's, in an empty atlas, so
+        // that a lamp can never be what a cascade does not fit beside. A change
+        // to which tiles the sun wants therefore starts the atlas over.
+        if self.sun.is_none_or(|(_, held)| held != sizes) {
+            self.invalidate();
+        }
+        let turned = self.sun.is_none_or(|(held, _)| held != direction);
+        self.sun = Some((direction, sizes));
+
+        let mut previous = [None; MAX_CASCADES];
+        if !turned {
+            for entry in &self.entries {
+                if let ViewKey::Sun(index) = entry.key {
+                    previous[index as usize] = entry.window;
+                }
+            }
+        }
+        let set = sun_views(inputs.camera, inputs.aspect, direction, config, &previous);
+        let rotation = set.cascades[0].light_view;
+
+        let mut budget = REFRESH_BUDGET;
+        for (index, cascade) in set.cascades[..set.count].iter().enumerate() {
+            let wanted = Wanted {
+                key: ViewKey::Sun(index as u8),
+                size: sizes[index],
+                kind: ViewKind::Sun,
+                view_proj: cascade.view_proj,
+                volume: CasterVolume::Sweep {
+                    light_view: cascade.light_view,
+                    bounds: cascade.bounds,
+                },
+                texel_scale: cascade.texel_world_size,
+                window: cascade.window,
+                rotation,
+            };
+            // A cascade is fitted to its tile's texel count, so a tile of any
+            // other size would shimmer. One that does not fit ends the sun's
+            // views there, and the views before it answer out to their own
+            // splits.
+            if !self.plan_view(&wanted, inputs.casters, &mut budget, plan) {
+                break;
+            }
+            plan.views.splits[index] = set.splits[index];
+        }
+        plan.views.sun = plan.views.views.len();
+        let last = plan.views.splits[plan.views.sun.saturating_sub(1)];
+        for split in &mut plan.views.splits[plan.views.sun..] {
+            *split = last;
+        }
+    }
+
+    fn plan_lamps(&mut self, inputs: &ShadowInputs<'_>, plan: &mut ShadowPlan) {
+        if !inputs.atlas.punctual {
+            return;
+        }
+        let lighting = inputs.lighting;
+        let id = |kind, light: usize| match kind {
+            LightKind::Point => lighting.point_lights[light].id,
+            LightKind::Spot => lighting.spot_lights[light].id,
+        };
+
+        let mut ranked = std::mem::take(&mut self.ranked);
+        punctual::rank(lighting, inputs.camera.position, &mut ranked);
+        let holds = |entries: &[Entry], light: u64| {
+            entries.iter().any(
+                |entry| matches!(entry.key, ViewKey::Face { light: held, .. } if held == light),
+            )
+        };
+        for candidate in &mut ranked {
+            if holds(&self.entries, id(candidate.0, candidate.1)) {
+                candidate.2 *= INCUMBENT_BONUS;
+            }
+        }
+        ranked.sort_by(|a, b| b.2.total_cmp(&a.2));
+
+        // Which lights the atlas has room for, decided before any of them is
+        // placed: a light that ranks below the cut gives its tiles back first,
+        // so that one newly ranked above it finds them free.
+        let side = u64::from(self.tiles.resolution());
+        let sun: u64 = plan
+            .views
+            .views
+            .iter()
+            .map(|view| AtlasRect::of(view.tile).texels())
+            .sum();
+        let tile = u64::from(floor_power_of_two(inputs.atlas.tile_size.max(MIN_TILE)));
+        let mut room = (side * side).saturating_sub(sun);
+        let mut casting = 0;
+        ranked.retain(|&(kind, _, _)| {
+            let needed = punctual::face_count(kind) as u64 * tile * tile;
+            // Skipped rather than stopped: a spot still fits in the one tile a
+            // point light could not use, and leaving it empty helps nobody.
+            let fits = casting < MAX_SHADOW_LIGHTS && needed <= room;
+            if fits {
+                room -= needed;
+                casting += 1;
+            }
+            fits
+        });
+        let (tiles, spare) = (&mut self.tiles, &mut self.spare);
+        self.entries.retain_mut(|entry| {
+            let ViewKey::Face { light, .. } = entry.key else {
+                return true;
+            };
+            let kept = ranked
+                .iter()
+                .any(|&(kind, index, _)| id(kind, index) == light);
+            if !kept {
+                tiles.release(entry.tile);
+                spare.push(std::mem::take(&mut entry.touched));
+            }
+            kept
+        });
+
+        // What the lamps may redraw is their own allowance rather than what the
+        // sun left of its: sharing one would let a sun that scrolls every frame
+        // keep every lamp drawn directly for as long as the camera moved.
+        let mut budget = REFRESH_BUDGET;
+        for &(kind, light, _) in &ranked {
+            let needed = punctual::face_count(kind);
+            let first_view = plan.views.views.len();
+            let faces = punctual::faces(
+                lighting,
+                kind,
+                light,
+                inputs.atlas.near,
+                inputs.atlas.tile_size,
+            );
+            let mut placed = 0;
+            for face in 0..needed {
+                let wanted = Wanted {
+                    key: ViewKey::Face {
+                        light: id(kind, light),
+                        face: face as u8,
+                    },
+                    size: floor_power_of_two(inputs.atlas.tile_size.max(MIN_TILE)),
+                    kind: ViewKind::Punctual,
+                    view_proj: faces.view_proj[face],
+                    volume: CasterVolume::Frustum(faces.view_proj[face]),
+                    texel_scale: faces.texel_per_metre,
+                    window: None,
+                    rotation: Mat4::IDENTITY,
+                };
+                if !self.plan_view(&wanted, inputs.casters, &mut budget, plan) {
+                    break;
+                }
+                placed += 1;
+            }
+            // Room by area is not room by shape. A light whose faces did not
+            // all land gives back the ones that did.
+            if placed < needed {
+                self.unplan(first_view, plan);
+                continue;
+            }
+            plan.views.casters.push(ShadowCaster {
+                kind,
+                light,
+                first_view,
+                view_count: needed,
+                near: faces.near,
+            });
+        }
+        self.ranked = ranked;
+    }
+
+    /// Take back the views planned from `first` on, and their tiles.
+    fn unplan(&mut self, first: usize, plan: &mut ShadowPlan) {
+        for view in plan.views.views.drain(first..) {
+            let tile = AtlasRect::of(view.tile);
+            if let Some(at) = self.entries.iter().position(|e| e.tile == view.tile) {
+                let entry = self.entries.swap_remove(at);
+                self.tiles.release(entry.tile);
+                self.spare.push(entry.touched);
+            }
+            // The fills and restores carry no view, only where they land, and a
+            // tile belongs to one view.
+            let elsewhere = |rect: &AtlasRect| {
+                rect.min[0] < tile.min[0]
+                    || rect.min[1] < tile.min[1]
+                    || rect.max[0] > tile.max[0]
+                    || rect.max[1] > tile.max[1]
+            };
+            plan.static_fills.retain(elsewhere);
+            plan.live_fills.retain(elsewhere);
+            plan.restores.retain(|restore| elsewhere(&restore.rect));
+        }
+        plan.work.truncate(first);
+        plan.draws.retain(|draw| draw.view < first);
+    }
+
+    /// Plan one view: find or make its entry, decide what this frame does to
+    /// it, and append that to the plan. False when the atlas has no tile for
+    /// it.
+    fn plan_view(
+        &mut self,
+        wanted: &Wanted,
+        casters: &CasterTracker,
+        budget: &mut u64,
+        plan: &mut ShadowPlan,
+    ) -> bool {
+        let found = self
+            .entries
+            .iter()
+            .position(|entry| entry.key == wanted.key && entry.tile.size == wanted.size);
+        let index = match found {
+            Some(index) => index,
+            None => {
+                // An entry of another size is this view's old tile.
+                if let Some(old) = self.entries.iter().position(|e| e.key == wanted.key) {
+                    let old = self.entries.swap_remove(old);
+                    self.tiles.release(old.tile);
+                    self.spare.push(old.touched);
+                }
+                let Some(tile) = self
+                    .tiles
+                    .allocate(wanted.size)
+                    .filter(|tile| tile.size == wanted.size)
+                else {
+                    return false;
+                };
+                self.entries.push(Entry {
+                    key: wanted.key,
+                    tile,
+                    seen: 0,
+                    view_proj: Mat4::ZERO,
+                    cached: false,
+                    live: Live::Unknown,
+                    window: None,
+                    base: IVec2::ZERO,
+                    touched: self.spare.pop().unwrap_or_default(),
+                });
+                self.entries.len() - 1
+            }
+        };
+        let frame = self.frame;
+        let entry = &mut self.entries[index];
+        entry.seen = frame;
+        let tile = entry.tile;
+        let whole = AtlasRect::of(tile);
+        let view = plan.views.views.len();
+        plan.views.views.push(ShadowView {
+            view_proj: wanted.view_proj,
+            tile,
+            volume: wanted.volume,
+            texel_scale: wanted.texel_scale,
+            kind: wanted.kind,
+        });
+        let draw = |layer, casters, scissor| CasterDraw {
+            view,
+            layer,
+            casters,
+            volume: wanted.volume,
+            view_proj: wanted.view_proj,
+            tile,
+            scissor,
+        };
+
+        // What moved between the matrix the tile holds and the one asked for.
+        let same = entry.view_proj == wanted.view_proj;
+        let slid = match (&entry.window, &wanted.window) {
+            (Some(old), Some(new)) if !same && entry.cached => {
+                let by = (new.min_cell - old.min_cell).abs();
+                (old.cells == new.cells
+                    && old.texel == new.texel
+                    && old.z_eye == new.z_eye
+                    && old.depth_range == new.depth_range
+                    && by.max_element() < new.cells as i32)
+                    .then_some(*old)
+            }
+            _ => None,
+        };
+        if !same && slid.is_none() {
+            entry.cached = false;
+        }
+        // A caster that joined or left the static set inside the view has made
+        // its cached layer wrong, wherever in it the caster stands.
+        if entry.cached
+            && casters.changed().is_none_or(|changed| {
+                changed
+                    .iter()
+                    .any(|bounds| wanted.volume.reached_by(bounds))
+            })
+        {
+            entry.cached = false;
+        }
+        entry.view_proj = wanted.view_proj;
+
+        if !entry.cached {
+            let cost = whole.texels();
+            // Only once the matrix has held for a frame: a light that moves
+            // every frame would redraw a cached layer it never gets to reuse.
+            if same && cost <= *budget {
+                *budget -= cost;
+                entry.cached = true;
+                entry.window = wanted.window;
+                entry.base = wanted.window.map_or(IVec2::ZERO, |window| window.min_cell);
+                plan.static_fills.push(whole);
+                plan.draws.push(draw(Layer::Static, Casters::Static, whole));
+                plan.restores.push(Restore {
+                    rect: whole,
+                    tile,
+                    wrap: [0, 0],
+                });
+                plan.work.push(ViewWork::Refreshed);
+            } else {
+                entry.window = wanted.window;
+                entry.live = Live::Everything;
+                entry.touched.clear();
+                plan.live_fills.push(whole);
+                plan.draws.push(draw(Layer::Live, Casters::All, whole));
+                plan.work.push(ViewWork::Direct);
+                return true;
+            }
+        } else if let (Some(old), Some(new)) = (slid, wanted.window) {
+            entry.window = Some(new);
+            strips(
+                &old,
+                &new,
+                entry.base,
+                tile,
+                wanted.rotation,
+                |volume, view_proj, scissor| {
+                    plan.static_fills.push(scissor);
+                    plan.draws.push(CasterDraw {
+                        view,
+                        layer: Layer::Static,
+                        casters: Casters::Static,
+                        volume,
+                        view_proj,
+                        tile,
+                        scissor,
+                    });
+                },
+            );
+            // The live tile is laid out by the window, so a window that moved
+            // has moved every texel of it.
+            plan.restores.push(Restore {
+                rect: whole,
+                tile,
+                wrap: entry.wrap(),
+            });
+            plan.work.push(ViewWork::Scrolled);
+        } else if entry.live != Live::Composite {
+            plan.restores.push(Restore {
+                rect: whole,
+                tile,
+                wrap: entry.wrap(),
+            });
+            plan.work.push(ViewWork::Composited);
+        } else {
+            let wrap = entry.wrap();
+            plan.restores.extend(
+                entry
+                    .touched
+                    .iter()
+                    .map(|&rect| Restore { rect, tile, wrap }),
+            );
+            plan.work.push(if entry.touched.is_empty() {
+                ViewWork::Held
+            } else {
+                ViewWork::Composited
+            });
+        }
+
+        // The moving casters, over a live tile that now holds the cached layer
+        // wherever they are about to draw.
+        entry.live = Live::Composite;
+        entry.touched.clear();
+        match casters.dynamic() {
+            Some(dynamic) => {
+                for bounds in dynamic {
+                    if !wanted.volume.reached_by(bounds) {
+                        continue;
+                    }
+                    match footprint(bounds, &wanted.view_proj, tile) {
+                        Some(rect) if entry.touched.len() < MAX_TOUCHED => entry.touched.push(rect),
+                        Some(rect) => {
+                            let around = entry.touched.iter().fold(rect, |a, b| a.union(b));
+                            entry.touched.clear();
+                            entry.touched.push(around);
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => entry.touched.push(whole),
+        }
+        if !entry.touched.is_empty() {
+            plan.draws.push(draw(Layer::Live, Casters::Dynamic, whole));
+            if plan.work[view] == ViewWork::Held {
+                plan.work[view] = ViewWork::Composited;
+            }
+        }
+        true
+    }
+}
+
+/// The rectangle of `tile` a caster with these world bounds can write through
+/// `view_proj`, padded by a texel for the rasteriser's rounding, or `None` when
+/// it misses the tile.
+fn footprint(bounds: &Aabb, view_proj: &Mat4, tile: AtlasTile) -> Option<AtlasRect> {
+    let whole = AtlasRect::of(tile);
+    if !bounds.is_valid() {
+        return Some(whole);
+    }
+    let (min, max) = (Vec3::from(bounds.min), Vec3::from(bounds.max));
+    let mut low = glam::Vec2::splat(f32::INFINITY);
+    let mut high = glam::Vec2::splat(f32::NEG_INFINITY);
+    for corner in 0..8 {
+        let point = Vec3::new(
+            if corner & 1 == 0 { min.x } else { max.x },
+            if corner & 2 == 0 { min.y } else { max.y },
+            if corner & 4 == 0 { min.z } else { max.z },
+        );
+        let clip = *view_proj * point.extend(1.0);
+        // A corner at or behind the eye has no place on the tile, and the box
+        // it belongs to may be anywhere on it.
+        if clip.w <= 1e-6 {
+            return Some(whole);
+        }
+        let at = (clip.truncate().truncate() / clip.w) * 0.5 + 0.5;
+        low = low.min(at);
+        high = high.max(at);
+    }
+    let size = tile.size as f32;
+    let low = (low * size - 1.0).floor().max(glam::Vec2::ZERO);
+    let high = (high * size + 1.0).ceil().min(glam::Vec2::splat(size));
+    if low.x >= high.x || low.y >= high.y {
+        return None;
+    }
+    Some(AtlasRect {
+        min: [tile.offset[0] + low.x as u32, tile.offset[1] + low.y as u32],
+        max: [
+            tile.offset[0] + high.x as u32,
+            tile.offset[1] + high.y as u32,
+        ],
+    })
+}
+
+/// The strips a level's window moved onto, as draws into its cached tile.
+///
+/// The cached tile keeps cell `c` at `(c - base) mod cells`, so the cells the
+/// old and new windows share are already in place and only the new ones are
+/// drawn: a strip the window's whole height where it moved along the first
+/// axis, and one across what is left where it moved along the second. A strip
+/// that crosses the tile's edge is drawn in two pieces, each with the matrix
+/// that lands its cells where they are kept.
+fn strips(
+    old: &LevelWindow,
+    new: &LevelWindow,
+    base: IVec2,
+    tile: AtlasTile,
+    rotation: Mat4,
+    mut emit: impl FnMut(CasterVolume, Mat4, AtlasRect),
+) {
+    let n = new.cells as i32;
+    let (old_min, new_min) = (old.min_cell, new.min_cell);
+    let (old_max, new_max) = (old_min + n, new_min + n);
+    // The columns the window gained, then the rows, the rows only across the
+    // columns it kept so that the corner is drawn once.
+    let gained = |old_min: i32, old_max: i32, new_min: i32, new_max: i32| {
+        if new_min > old_min {
+            old_max.max(new_min)..new_max
+        } else {
+            new_min..old_min.min(new_max)
+        }
+    };
+    let columns = gained(old_min.x, old_max.x, new_min.x, new_max.x);
+    let rows = gained(old_min.y, old_max.y, new_min.y, new_max.y);
+    let kept = old_min.x.max(new_min.x)..old_max.x.min(new_max.x);
+    let rects = [(columns, new_min.y..new_max.y), (kept, rows)];
+    for (xs, ys) in rects {
+        if xs.is_empty() || ys.is_empty() {
+            continue;
+        }
+        // Cut where the cells' kept places wrap round the tile.
+        for (x0, x1) in pieces(xs.clone(), base.x, n) {
+            for (y0, y1) in pieces(ys.clone(), base.y, n) {
+                let page = IVec2::new(
+                    base.x + (x0 - base.x).div_euclid(n) * n,
+                    base.y + (y0 - base.y).div_euclid(n) * n,
+                );
+                let scissor = AtlasRect {
+                    min: [
+                        tile.offset[0] + (x0 - page.x) as u32,
+                        tile.offset[1] + (y0 - page.y) as u32,
+                    ],
+                    max: [
+                        tile.offset[0] + (x1 - page.x) as u32,
+                        tile.offset[1] + (y1 - page.y) as u32,
+                    ],
+                };
+                emit(
+                    CasterVolume::Sweep {
+                        light_view: rotation,
+                        bounds: new.sweep(IVec2::new(x0, y0), IVec2::new(x1, y1)),
+                    },
+                    new.page_view_proj(rotation, page),
+                    scissor,
+                );
+            }
+        }
+    }
+}
+
+/// A run of cells cut at the multiples of `n` from `base`: at most two pieces
+/// for a run shorter than `n`.
+fn pieces(cells: std::ops::Range<i32>, base: i32, n: i32) -> impl Iterator<Item = (i32, i32)> {
+    let cut = base + ((cells.start - base).div_euclid(n) + 1) * n;
+    let first = (cells.start, cells.end.min(cut));
+    let second = (cut < cells.end).then_some((cut, cells.end));
+    std::iter::once(first).chain(second)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gfx::{MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, PointLight, SpotLight};
-    use glam::Vec3;
+    use crate::gfx::shadow_casters::STATIC_AFTER;
+    use crate::gfx::{
+        DrawList, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, PointLight, RenderItem, SpotLight,
+    };
+    use crate::scene::{MaterialHandle, MeshHandle};
+    use glam::Vec3A;
 
-    fn point(position: Vec3) -> PointLight {
+    fn point(id: u64, position: Vec3) -> PointLight {
         PointLight {
+            id,
             position,
             color: Vec3::ONE,
             candela: 1.0,
@@ -472,8 +1203,9 @@ mod tests {
         }
     }
 
-    fn spot(position: Vec3) -> SpotLight {
+    fn spot(id: u64, position: Vec3) -> SpotLight {
         SpotLight {
+            id,
             position,
             direction: Vec3::NEG_Y,
             color: Vec3::ONE,
@@ -485,14 +1217,6 @@ mod tests {
         }
     }
 
-    fn lighting(points: Vec<PointLight>, spots: Vec<SpotLight>) -> SceneLighting {
-        SceneLighting {
-            point_lights: points,
-            spot_lights: spots,
-            ..SceneLighting::default()
-        }
-    }
-
     fn cascade_config() -> CascadeConfig {
         CascadeConfig {
             count: 4,
@@ -501,16 +1225,90 @@ mod tests {
             resolution: 2048,
             far_resolution: 1024,
             pullback: 50.0,
+            fitted: 0,
         }
     }
 
-    fn sun_set() -> CascadeSet {
-        cascades(
-            &Camera::default(),
-            16.0 / 9.0,
-            Vec3::new(-0.4, -1.0, -0.3),
-            &cascade_config(),
-        )
+    fn caster(instance: u32, at: Vec3) -> RenderItem {
+        RenderItem {
+            model: Mat4::from_translation(at),
+            prev_model: Mat4::from_translation(at),
+            bounds: Aabb::EMPTY,
+            mesh: MeshHandle(0),
+            material: MaterialHandle(0),
+            instance,
+        }
+    }
+
+    /// A scene, a planner and the tracker feeding it, stepped a frame at a
+    /// time the way the renderer steps them.
+    struct Rig {
+        planner: ShadowPlanner,
+        tracker: CasterTracker,
+        plan: ShadowPlan,
+        lighting: SceneLighting,
+        camera: Camera,
+        sun: Option<CascadeConfig>,
+        atlas: AtlasConfig,
+        /// Where each caster stands.
+        casters: Vec<Vec3>,
+    }
+
+    impl Rig {
+        fn new(points: Vec<PointLight>, spots: Vec<SpotLight>) -> Self {
+            let mut lighting = SceneLighting {
+                point_lights: points,
+                spot_lights: spots,
+                ..SceneLighting::default()
+            };
+            lighting.sun.direction = Vec3::new(-0.4, -1.0, -0.3);
+            Self {
+                planner: ShadowPlanner::default(),
+                tracker: CasterTracker::default(),
+                plan: ShadowPlan::default(),
+                lighting,
+                camera: Camera::default(),
+                sun: Some(cascade_config()),
+                atlas: AtlasConfig::default(),
+                casters: Vec::new(),
+            }
+        }
+
+        fn frame(&mut self) -> &ShadowPlan {
+            let items: Vec<RenderItem> = self
+                .casters
+                .iter()
+                .enumerate()
+                .map(|(index, at)| caster(index as u32, *at))
+                .collect();
+            let order: Vec<u32> = (0..items.len() as u32).collect();
+            self.tracker.update(DrawList::new(&items, &order), |_| {
+                Some(Aabb {
+                    min: Vec3A::splat(-0.5),
+                    max: Vec3A::splat(0.5),
+                })
+            });
+            self.planner.plan(
+                Some(&ShadowInputs {
+                    camera: &self.camera,
+                    aspect: 16.0 / 9.0,
+                    lighting: &self.lighting,
+                    sun: self.sun.as_ref(),
+                    atlas: &self.atlas,
+                    casters: &self.tracker,
+                }),
+                &mut self.plan,
+            );
+            &self.plan
+        }
+
+        /// Run until every caster has settled and every cached layer has had
+        /// its turn to be drawn.
+        fn settle(&mut self) {
+            for _ in 0..STATIC_AFTER as usize + 16 {
+                self.frame();
+            }
+        }
     }
 
     fn overlap(a: AtlasTile, b: AtlasTile) -> bool {
@@ -527,20 +1325,14 @@ mod tests {
     /// edge is a viewport the driver will happily accept and clip to nothing.
     #[test]
     fn no_two_views_share_a_texel_and_every_tile_is_inside_the_atlas() {
-        let points: Vec<_> = (0..MAX_POINT_LIGHTS)
-            .map(|i| point(Vec3::X * i as f32))
+        let points = (0..MAX_POINT_LIGHTS)
+            .map(|i| point(i as u64, Vec3::X * i as f32))
             .collect();
-        let spots: Vec<_> = (0..MAX_SPOT_LIGHTS)
-            .map(|i| spot(Vec3::Y * i as f32))
+        let spots = (0..MAX_SPOT_LIGHTS)
+            .map(|i| spot(1000 + i as u64, Vec3::Y * i as f32))
             .collect();
-        let set = sun_set();
-        let config = cascade_config();
-        let views = fit(
-            Some((&set, &config)),
-            &lighting(points, spots),
-            Vec3::ZERO,
-            &AtlasConfig::default(),
-        );
+        let mut rig = Rig::new(points, spots);
+        let views = &rig.frame().views;
 
         assert_eq!(views.sun, 4);
         assert!(views.views.len() > views.sun, "no lamp got a tile");
@@ -558,14 +1350,9 @@ mod tests {
     /// slice.
     #[test]
     fn the_suns_views_lead_and_each_light_owns_a_run() {
-        let set = sun_set();
+        let mut rig = Rig::new(vec![point(1, Vec3::ZERO)], vec![spot(2, Vec3::X)]);
         let config = cascade_config();
-        let views = fit(
-            Some((&set, &config)),
-            &lighting(vec![point(Vec3::ZERO)], vec![spot(Vec3::X)]),
-            Vec3::ZERO,
-            &AtlasConfig::default(),
-        );
+        let views = &rig.frame().views;
 
         assert_eq!(views.views.len(), 4 + 7);
         assert!(views.views[..4].iter().all(|v| v.kind == ViewKind::Sun));
@@ -580,19 +1367,19 @@ mod tests {
 
     /// A point light that does not fit must not stop a spot that does. Leaving
     /// the last tile empty because the light in front of it wanted six is a
-    /// shadow nobody gets for no saving — and the tiles it took before it ran
-    /// out have to come back, or the spot finds none either.
+    /// shadow nobody gets for no saving.
     #[test]
     fn a_light_too_big_for_the_gap_is_skipped_not_final() {
+        let mut rig = Rig::new(vec![point(1, Vec3::ZERO)], vec![spot(2, Vec3::ZERO)]);
+        rig.lighting.point_lights[0].candela = 100.0;
+        rig.sun = None;
         // Four tiles. The point light needs six.
-        let config = AtlasConfig {
+        rig.atlas = AtlasConfig {
             resolution: 1024,
             tile_size: 512,
             ..AtlasConfig::default()
         };
-        let mut scene = lighting(vec![point(Vec3::ZERO)], vec![spot(Vec3::ZERO)]);
-        scene.point_lights[0].candela = 100.0;
-        let views = fit(None, &scene, Vec3::ZERO, &config);
+        let views = &rig.frame().views;
 
         assert!(views.caster(LightKind::Point, 0).is_none());
         assert_eq!(
@@ -608,9 +1395,10 @@ mod tests {
     /// empty tiles.
     #[test]
     fn a_scene_with_no_casters_has_no_atlas() {
-        let mut scene = lighting(vec![point(Vec3::ZERO)], Vec::new());
-        scene.point_lights[0].casts_shadows = false;
-        let views = fit(None, &scene, Vec3::ZERO, &AtlasConfig::default());
+        let mut rig = Rig::new(vec![point(1, Vec3::ZERO)], Vec::new());
+        rig.lighting.point_lights[0].casts_shadows = false;
+        rig.sun = None;
+        let views = &rig.frame().views;
         assert!(views.views.is_empty());
         assert_eq!(views.resolution, 0);
     }
@@ -644,5 +1432,245 @@ mod tests {
                 size: 1024
             })
         );
+    }
+
+    /// What the cache is for. Once every caster has settled and every cached
+    /// layer has been drawn, a scene in which nothing moves asks for no shadow
+    /// work at all: no draw, no clear, no restore.
+    #[test]
+    fn a_still_scene_draws_no_shadow_geometry() {
+        let mut rig = Rig::new(vec![point(1, Vec3::new(0.0, 3.0, 0.0))], Vec::new());
+        rig.casters = vec![Vec3::ZERO, Vec3::X * 2.0];
+        rig.settle();
+        let plan = rig.frame();
+
+        assert!(plan.draws.is_empty(), "{:?}", plan.draws);
+        assert!(!plan.draws_static() && !plan.draws_live());
+        assert!(plan.work.iter().all(|work| *work == ViewWork::Held));
+    }
+
+    /// And with something moving, the frame pays for that thing alone: its
+    /// own draw into the views it reaches, and the texels it touched last
+    /// frame put back — never a cached layer redrawn, never a whole tile.
+    #[test]
+    fn a_moving_caster_redraws_only_what_it_touched() {
+        let mut rig = Rig::new(vec![point(1, Vec3::new(0.0, 3.0, 0.0))], Vec::new());
+        rig.casters = vec![Vec3::ZERO, Vec3::X * 2.0];
+        rig.settle();
+        // The first step is the frame the caster leaves the cached layers it
+        // was baked into, which redraws them; that takes its turns. What is
+        // asserted is the frames after.
+        for step in 1..24 {
+            rig.casters[1] = Vec3::X * (2.0 + 0.01 * step as f32);
+            let plan = rig.frame();
+            if step < 16 {
+                continue;
+            }
+
+            assert!(!plan.draws_static(), "a cached layer was redrawn");
+            assert!(plan.live_fills.is_empty(), "a tile was cleared whole");
+            assert!(!plan.draws.is_empty(), "the moving caster was not drawn");
+            assert!(
+                plan.draws
+                    .iter()
+                    .all(|draw| draw.layer == Layer::Live && draw.casters == Casters::Dynamic)
+            );
+            assert!(
+                !plan.restores.is_empty(),
+                "what it touched was not put back"
+            );
+            for restore in &plan.restores {
+                assert!(
+                    restore.rect.texels() < AtlasRect::of(restore.tile).texels() / 4,
+                    "a whole tile was restored for one small caster: {restore:?}",
+                );
+            }
+        }
+    }
+
+    /// A caster leaving the static set makes the cached layers it was baked
+    /// into wrong — and no others. A lamp too far away to reach it keeps every
+    /// tile it has.
+    #[test]
+    fn a_caster_that_starts_moving_uncaches_the_views_it_stood_in_and_no_others() {
+        let near = point(1, Vec3::new(0.0, 3.0, 0.0));
+        let far = point(2, Vec3::new(60.0, 3.0, 0.0));
+        let mut rig = Rig::new(vec![near, far], Vec::new());
+        rig.sun = None;
+        rig.casters = vec![Vec3::ZERO];
+        rig.settle();
+
+        rig.casters[0] = Vec3::X * 0.5;
+        let plan = rig.frame().clone();
+        let views = |light: usize| {
+            let caster = plan.views.caster(LightKind::Point, light).unwrap();
+            caster.first_view..caster.first_view + caster.view_count
+        };
+        assert!(
+            plan.work[views(0)]
+                .iter()
+                .any(|work| matches!(work, ViewWork::Refreshed | ViewWork::Direct)),
+            "{:?}",
+            &plan.work[views(0)]
+        );
+        assert!(
+            plan.work[views(1)]
+                .iter()
+                .all(|work| *work == ViewWork::Held),
+            "{:?}",
+            &plan.work[views(1)]
+        );
+    }
+
+    /// A light that moves has no cached layer worth drawing: every frame is a
+    /// different matrix. It is drawn directly while it moves, and cached the
+    /// frame after it comes to rest.
+    #[test]
+    fn a_moving_light_is_drawn_directly_until_it_rests() {
+        let mut rig = Rig::new(Vec::new(), vec![spot(1, Vec3::new(0.0, 5.0, 0.0))]);
+        rig.sun = None;
+        rig.casters = vec![Vec3::ZERO];
+        rig.settle();
+
+        for step in 1..4 {
+            rig.lighting.spot_lights[0].position.x = 0.1 * step as f32;
+            let plan = rig.frame();
+            assert_eq!(plan.work, [ViewWork::Direct]);
+            assert!(
+                !plan.draws_static(),
+                "a layer was cached for one frame's use"
+            );
+        }
+        assert_eq!(rig.frame().work, [ViewWork::Refreshed]);
+        assert_eq!(rig.frame().work, [ViewWork::Held]);
+    }
+
+    /// The budget spreads the cost of starting to cache, and only that: a view
+    /// still waiting for its cached layer is drawn directly, with every
+    /// caster, so nothing is ever missing a shadow because of it.
+    #[test]
+    fn a_view_waiting_for_its_cached_layer_is_drawn_directly() {
+        let points = (0..4)
+            .map(|i| point(i, Vec3::new(i as f32 * 3.0, 3.0, 0.0)))
+            .collect();
+        let mut rig = Rig::new(points, Vec::new());
+        rig.sun = None;
+        rig.atlas.tile_size = 1024;
+        rig.casters = vec![Vec3::ZERO];
+        // Past the first frame, in which every view is new and drawn directly.
+        rig.frame();
+        let plan = rig.frame();
+        let refreshed = plan
+            .work
+            .iter()
+            .filter(|work| **work == ViewWork::Refreshed)
+            .count();
+        let direct = plan
+            .work
+            .iter()
+            .filter(|work| **work == ViewWork::Direct)
+            .count();
+        assert!(refreshed > 0 && direct > 0, "{:?}", plan.work);
+        assert!(refreshed as u64 * 1024 * 1024 <= REFRESH_BUDGET);
+        assert_eq!(refreshed + direct, plan.work.len());
+        // And they all get there.
+        rig.settle();
+        assert!(rig.frame().work.iter().all(|work| *work == ViewWork::Held));
+    }
+
+    /// Where a draw puts a world point, as a texel of the atlas, if it draws it
+    /// at all.
+    fn drawn_at(draw: &CasterDraw, point: Vec3) -> Option<[u32; 2]> {
+        let ndc = draw.view_proj.project_point3(point);
+        let at = (ndc.truncate() * 0.5 + 0.5) * draw.tile.size as f32;
+        let texel = [
+            draw.tile.offset[0] as i64 + at.x.floor() as i64,
+            draw.tile.offset[1] as i64 + at.y.floor() as i64,
+        ];
+        let inside = (0..2).all(|axis| {
+            texel[axis] >= i64::from(draw.scissor.min[axis])
+                && texel[axis] < i64::from(draw.scissor.max[axis])
+        });
+        inside.then_some([texel[0] as u32, texel[1] as u32])
+    }
+
+    /// The whole of scrolling in one property. As the camera walks, a level's
+    /// cached layer is drawn a strip at a time into wherever those cells are
+    /// kept, and the live tile is restored from it through the wrap. So for
+    /// any point the level covers, the cached texel the restore reads for it
+    /// has to be the texel the last draw that covered it wrote — through
+    /// however many moves, across the tile's edge and back.
+    #[test]
+    fn a_scrolled_level_restores_each_cell_from_where_it_was_drawn() {
+        let mut rig = Rig::new(Vec::new(), Vec::new());
+        rig.casters = vec![Vec3::ZERO];
+        rig.settle();
+        let level = 1;
+
+        // Sample points the level covers throughout, near where the walk goes.
+        let samples: Vec<Vec3> = (0..40)
+            .map(|i| {
+                let t = i as f32;
+                rig.camera.position + Vec3::new((t * 1.7).sin() * 4.0, 0.0, (t * 0.9).cos() * 4.0)
+            })
+            .collect();
+        let mut written: Vec<Option<[u32; 2]>> = vec![None; samples.len()];
+        let mut scrolled = 0;
+        // A cached layer drawn whole writes every sample; start from one.
+        rig.planner.invalidate();
+        let heading = Vec3::new(1.0, 0.0, 0.6).normalize();
+        for step in 0..400 {
+            // Out, back past the start, and out again, so the window crosses
+            // its tile's edge in both directions.
+            let phase = (step as f32 / 400.0 * std::f32::consts::TAU).sin();
+            let moved = heading * phase * 9.0;
+            rig.camera.target += moved - (rig.camera.position - samples_origin(&samples));
+            rig.camera.position = samples_origin(&samples) + moved;
+            let plan = rig.frame().clone();
+            scrolled += usize::from(plan.work[level] == ViewWork::Scrolled);
+            for draw in plan
+                .draws
+                .iter()
+                .filter(|draw| draw.view == level && draw.layer == Layer::Static)
+            {
+                for (sample, texel) in samples.iter().zip(&mut written) {
+                    if let Some(at) = drawn_at(draw, *sample) {
+                        *texel = Some(at);
+                    }
+                }
+            }
+            if plan.work[level] == ViewWork::Direct {
+                written.fill(None);
+                continue;
+            }
+
+            // What the restore reads for each sample's live texel.
+            let view = &plan.views.views[level];
+            let wrap = rig
+                .planner
+                .entries
+                .iter()
+                .find(|entry| entry.key == ViewKey::Sun(level as u8))
+                .unwrap()
+                .wrap();
+            for (sample, texel) in samples.iter().zip(&written) {
+                let ndc = view.view_proj.project_point3(*sample);
+                let live = ((ndc.truncate() * 0.5 + 0.5) * view.tile.size as f32).floor();
+                let size = view.tile.size;
+                let read = [
+                    view.tile.offset[0] + (live.x as u32 + wrap[0]) % size,
+                    view.tile.offset[1] + (live.y as u32 + wrap[1]) % size,
+                ];
+                assert_eq!(Some(read), *texel, "step {step}: {sample}");
+            }
+        }
+        assert!(
+            scrolled >= 4,
+            "the walk only scrolled the level {scrolled} times"
+        );
+    }
+
+    fn samples_origin(samples: &[Vec3]) -> Vec3 {
+        samples.iter().sum::<Vec3>() / samples.len() as f32
     }
 }

@@ -11,6 +11,7 @@ pub mod punctual;
 pub mod rhi;
 pub mod sh;
 pub mod shaders;
+pub mod shadow_casters;
 pub mod shadow_views;
 pub mod shadows;
 pub mod surface;
@@ -429,6 +430,10 @@ impl DirectionalLight {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PointLight {
+    /// Which light this is from one frame to the next, so that what the shadow
+    /// atlas holds for it can be found again: the entity's bits, or anything
+    /// else that is stable and distinct.
+    pub id: u64,
     pub position: Vec3,
     pub color: Vec3,
     /// Luminous intensity in candela, already divided out of the authored lumens
@@ -447,6 +452,8 @@ pub struct PointLight {
 /// converting once here keeps a transcendental out of the per-light loop.
 #[derive(Clone, Copy, Debug)]
 pub struct SpotLight {
+    /// See [`PointLight::id`].
+    pub id: u64,
     pub position: Vec3,
     /// The direction the cone points, normalised.
     pub direction: Vec3,

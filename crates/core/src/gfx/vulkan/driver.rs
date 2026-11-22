@@ -902,6 +902,7 @@ impl VkDriver {
                             DepthCompare::LessOrEqual => CompareOp::LessOrEqual,
                             DepthCompare::Greater => CompareOp::Greater,
                             DepthCompare::GreaterOrEqual => CompareOp::GreaterOrEqual,
+                            DepthCompare::Always => CompareOp::Always,
                         },
                     }),
                     ..Default::default()

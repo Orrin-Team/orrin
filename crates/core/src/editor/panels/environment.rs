@@ -153,6 +153,7 @@ const SHADOWS: &[Section] = &[
             "Enabled",
             "Cascades",
             "Resolution",
+            "Fitted",
             "Distance",
             "Split blend",
             "Pullback",
@@ -684,6 +685,16 @@ fn shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
                     });
             }
         });
+    }
+    if rows.shows("Fitted") {
+        let count = s.cascade_count;
+        widgets::property(ui, "Fitted", |ui| {
+            ui.add(egui::DragValue::new(&mut s.fitted_cascades).range(0..=count))
+        })
+        .on_hover_text(
+            "How many of the sun's views follow the view frustum: sharper through a narrow \
+             lens, and redrawn whole whenever the camera moves",
+        );
     }
     if rows.shows("Distance") {
         slider(

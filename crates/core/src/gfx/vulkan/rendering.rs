@@ -104,7 +104,7 @@ fn depth_scratch(target: TextureViewId) -> DepthAttachment {
 }
 
 /// A depth attachment that is cleared, written, and kept for later passes to
-/// sample — the geometry prepass's, and the shadow atlas's. `clear` is the
+/// sample — the geometry prepass's. `clear` is the
 /// far plane in that map's own convention, which a camera and a shadow map do
 /// not share; see [`crate::gfx::depth`].
 fn depth_written(target: TextureViewId, clear: f32) -> DepthAttachment {
@@ -113,6 +113,18 @@ fn depth_written(target: TextureViewId, clear: f32) -> DepthAttachment {
         load: LoadOp::Clear,
         store: StoreOp::Store,
         clear,
+        read_only: false,
+    }
+}
+
+/// A depth attachment drawn into over what it already holds, and kept: a shadow
+/// atlas, most of whose tiles a frame leaves as they were.
+fn depth_kept(target: TextureViewId) -> DepthAttachment {
+    DepthAttachment {
+        target,
+        load: LoadOp::Load,
+        store: StoreOp::Store,
+        clear: crate::gfx::depth::SHADOW_CLEAR,
         read_only: false,
     }
 }
@@ -278,15 +290,23 @@ pub(super) fn rendering_info(
                 depth: Some(depth_borrowed(images.texture(prepass.depth))),
             }
         }
-        // Cleared whole, because every view in it is redrawn: a texel nobody
-        // drew into reads as far, and therefore as lit, and so does a tile no
-        // view was given.
+        // Loaded rather than cleared, both of them: a view the frame does not
+        // touch is sampled from the texels it already has, and
+        // `ShadowPass::record` clears the tiles it redraws.
+        PassBody::ShadowStatic => RenderTargets {
+            colors: Vec::new(),
+            depth: Some(depth_kept(
+                images.texture(
+                    ids.shadow_static
+                        .expect("the cached shadow pass without its atlas"),
+                ),
+            )),
+        },
         PassBody::Shadows => RenderTargets {
             colors: Vec::new(),
-            depth: Some(depth_written(
-                images.texture(ids.shadow_atlas.expect("the shadow pass without its atlas")),
-                crate::gfx::depth::SHADOW_CLEAR,
-            )),
+            depth: Some(depth_kept(images.texture(
+                ids.shadow_atlas.expect("the shadow pass without its atlas"),
+            ))),
         },
         // The acquired swapchain image, every pixel of which the tonemap writes.
         PassBody::Tonemap => color_only(overwritten(swapchain)),

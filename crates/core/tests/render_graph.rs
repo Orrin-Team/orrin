@@ -1129,33 +1129,75 @@ fn the_reference_frame_culls_nothing() {
     }
 }
 
-/// Every shadow view is a tile of one image and is drawn by one pass, however
-/// many lights cast: a tile is a viewport, so the views cost the frame one
-/// barrier between them. A pass per view over a shared image is serialised by
-/// write-after-write, which is what the atlas exists not to pay.
+/// Every shadow view is a tile of one image, however many lights cast: a tile
+/// is a viewport, so the views cost the frame one barrier between them. A pass
+/// per view over a shared image is serialised by write-after-write, which is
+/// what the atlas exists not to pay. Two passes rather than one because a view
+/// has two layers — the cached one, and the live one that is brought up to
+/// date from it and therefore has to follow it.
 #[test]
-fn every_shadow_view_is_drawn_by_one_pass_into_one_image() {
+fn every_shadow_view_is_drawn_by_one_pass_per_layer() {
     let frame = declare(FrameConfig {
         shadow_atlas: 2048,
         ..reference_config(false, true)
     })
     .unwrap();
 
-    let desc = image_desc(&frame.graph, "shadow_atlas").expect("the frame declared no atlas");
-    assert_eq!(
-        desc.extent,
-        orrin_core::gfx::graph::Extent::Fixed([2048; 2])
-    );
-    assert_eq!(desc.array_layers, None, "an atlas is tiles, not layers");
+    for name in ["shadow_atlas", "shadow_static"] {
+        let desc = image_desc(&frame.graph, name)
+            .unwrap_or_else(|| panic!("the frame declared no {name}"));
+        assert_eq!(
+            desc.extent,
+            orrin_core::gfx::graph::Extent::Fixed([2048; 2])
+        );
+        assert_eq!(desc.array_layers, None, "an atlas is tiles, not layers");
+    }
 
-    let writers: Vec<&str> = frame
+    let passes: Vec<&str> = frame
         .graph
         .order()
         .iter()
         .map(|&pass| frame.graph.pass_name(pass))
         .filter(|name| name.contains("shadow") && *name != "contact_shadows")
         .collect();
-    assert_eq!(writers, ["shadows"]);
+    assert_eq!(passes, ["shadow_static", "shadows"]);
+}
+
+/// A view that is not redrawn keeps its tile from an earlier frame, so both
+/// atlases have to outlive the frame: they are imported from the shadow pass
+/// rather than owned by the graph, whose transients start every frame
+/// `Undefined` and would hand such a view garbage. Each is entered in the
+/// layout the frame's readers leave it in, so those texels survive the
+/// transition into the attachment layout and back.
+#[test]
+fn the_shadow_atlases_leave_the_frame_where_the_next_one_expects_them() {
+    let frame = declare(FrameConfig {
+        shadow_atlas: 4096,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    let plan = format!("{}", frame.graph);
+
+    for name in ["shadow_atlas", "shadow_static"] {
+        let imported = frame
+            .graph
+            .imported_images()
+            .any(|(id, _)| frame.graph.resource_name(id) == name);
+        assert!(imported, "a transient {name} loses the views a frame keeps");
+        assert!(
+            plan.contains(&format!(
+                "{name} ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal"
+            )),
+            "{name} must be entered from the layout it was left in, not Undefined:\n{plan}",
+        );
+        let closing: Vec<_> = frame
+            .graph
+            .final_barriers()
+            .iter()
+            .filter(|barrier| frame.graph.resource_name(barrier.resource) == name)
+            .collect();
+        assert!(closing.is_empty(), "{closing:?}");
+    }
 }
 
 /// A sun view's depth is linear over a bounded range and a punctual face spends

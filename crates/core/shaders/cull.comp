@@ -8,16 +8,19 @@
 //
 // The two view kinds are not the same test and must not be made one. A frustum
 // view -- the camera, and each face of a punctual light -- keeps a box that
-// reaches into the volume it can see. A cascade keeps a box that reaches its
+// reaches into the volume it can see. A sun view keeps a box that reaches its
 // volume *when swept toward the light*, which has no near plane at all: an
-// object between the sun and the cascade is exactly what casts into it. Testing
-// a cascade with its own six planes would drop those shadows, which is the
-// mistake `systems::casts_into` documents on the CPU side.
+// object between the sun and the view is exactly what casts into it. Testing
+// one with six planes of its own would drop those shadows.
+//
+// A view also says which instances it takes at all: a shadow view's cached
+// layer is offered the casters standing still, and the layer drawn over it the
+// ones that are not. See `gfx/shadow_casters.rs`.
 
 layout(local_size_x = 64, local_size_y = 1) in;
 
 const uint VIEW_FRUSTUM = 0;
-const uint VIEW_CASCADE = 1;
+const uint VIEW_SWEEP = 1;
 
 #include "object.glsl"
 
@@ -29,6 +32,8 @@ struct Instance {
     // on the host because the split moves whenever a new plain batch appears.
     // See `BatchIds` in `gfx/vulkan/cull.rs`.
     uint batch;
+    // Tested against the view's `casters` mask: static or dynamic.
+    uint flags;
 };
 
 struct Batch {
@@ -48,14 +53,19 @@ struct Batch {
 };
 
 struct View {
-    // World space into light space, for a cascade. Unused by a frustum view.
+    // World space into light space, for a sweep. Unused by a frustum view.
     mat4 light_view;
     vec4 planes[6];
+    // A sweep's box in that space: xy the least corner and z the far plane,
+    // then the greatest corner's xy.
+    vec4 sweep_min;
+    vec4 sweep_max;
     uint kind;
-    float half_extent;
-    float depth_range;
+    // Which instances the view takes, as a mask over `Instance::flags`.
+    uint casters;
     // Where this view's block of `instance_index` begins.
     uint base;
+    uint _padding;
 };
 
 struct DrawCommand {
@@ -115,17 +125,16 @@ bool inside_frustum(View view, vec3 center, vec3 extents) {
     return true;
 }
 
-// The GPU half of `systems::casts_into`. `light_view` is a right-handed
-// look-at, so the cascade lies at negative z between the eye at 0 and the far
-// plane at -depth_range; the near side is deliberately open.
+// Whether a box reaches a sweep's box when carried toward the light.
+// `light_view` is a right-handed look-at, so the light looks down -z and the
+// near side, the greater z, is deliberately open.
 bool casts_into(View view, vec3 center, vec3 extents) {
     vec3 c = (view.light_view * vec4(center, 1.0)).xyz;
     mat3 rotation = mat3(view.light_view);
     vec3 ls = abs(rotation[0]) * extents.x + abs(rotation[1]) * extents.y + abs(rotation[2]) * extents.z;
-    float half_extent = view.half_extent;
-    return c.x - ls.x <= half_extent && c.x + ls.x >= -half_extent
-        && c.y - ls.y <= half_extent && c.y + ls.y >= -half_extent
-        && c.z + ls.z >= -view.depth_range;
+    return c.x - ls.x <= view.sweep_max.x && c.x + ls.x >= view.sweep_min.x
+        && c.y - ls.y <= view.sweep_max.y && c.y + ls.y >= view.sweep_min.y
+        && c.z + ls.z >= view.sweep_min.z;
 }
 
 // True only when the previous frame's depth covered this box everywhere its
@@ -214,10 +223,13 @@ void main() {
     }
 
     Instance instance = instances[index];
+    View view = views[view_index];
+    if ((instance.flags & view.casters) == 0u) {
+        return;
+    }
     Object object = objects[instance.row];
     uint batch_slot = slot(instance.batch);
     Batch batch = batches[batch_slot];
-    View view = views[view_index];
 
     vec3 bmin = batch.bounds_min.xyz;
     vec3 bmax = batch.bounds_max.xyz;
@@ -237,7 +249,7 @@ void main() {
         vec3 extents = abs(rotation[0]) * half_extents.x
             + abs(rotation[1]) * half_extents.y
             + abs(rotation[2]) * half_extents.z;
-        wanted = view.kind == VIEW_CASCADE
+        wanted = view.kind == VIEW_SWEEP
             ? casts_into(view, center, extents)
             : inside_frustum(view, center, extents);
         // View 0 is the camera, and only the camera has a pyramid. A cascade or

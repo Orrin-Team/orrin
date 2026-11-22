@@ -269,6 +269,7 @@ impl MtlDriver {
                 DepthCompare::LessOrEqual => MTLCompareFunction::LessEqual,
                 DepthCompare::Greater => MTLCompareFunction::Greater,
                 DepthCompare::GreaterOrEqual => MTLCompareFunction::GreaterEqual,
+                DepthCompare::Always => MTLCompareFunction::Always,
             });
             stencil.setDepthWriteEnabled(test.write);
             self.device

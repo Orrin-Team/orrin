@@ -165,6 +165,9 @@ pub enum DepthCompare {
     Greater,
     /// [`crate::gfx::depth::NEARER_OR_EQUAL`].
     GreaterOrEqual,
+    /// Every fragment passes, for a draw whose whole purpose is the depth it
+    /// writes.
+    Always,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

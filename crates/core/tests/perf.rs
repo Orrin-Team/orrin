@@ -50,6 +50,16 @@
 //!   with a parameter and the time in it: what the feature costs in use, from
 //!   the extra classes, the twins and the parameter buffer. Needs the default
 //!   `shader-compiler` feature.
+//! - `ORRIN_PERF_MOTION=1` plays the scene rather than photographing it: every
+//!   `Spin` turns and the camera walks a circle at about walking pace. Without
+//!   it nothing in the frame changes from one to the next, which is the one
+//!   case anything that keeps work between frames — the instance rows, the
+//!   cached shadow layers — is at its best in, and so the wrong one to quote
+//!   for them alone.
+//! - `ORRIN_PERF_FITTED` is how many of the sun's views are fitted to the view
+//!   frustum (`ShadowSettings::fitted_cascades`), which with
+//!   `ORRIN_PERF_MOTION` is what a view that cannot be kept between frames
+//!   costs beside one that can.
 //! - `ORRIN_PERF_MSAA=1` rasterises the forward pass at four samples. The other
 //!   half of the comparison `TaaSettings::msaa` exists for: multisampled, the
 //!   pass writes and resolves its own targets and cannot depth-test `EQUAL`
@@ -279,6 +289,7 @@ fn frame_cost() {
     world.insert_resource(Culling::default());
     world.insert_resource(ShadowSettings {
         enabled: env_usize("ORRIN_PERF_SHADOWS", 1) != 0,
+        fitted_cascades: env_usize("ORRIN_PERF_FITTED", 0) as u32,
         ..ShadowSettings::default()
     });
 
@@ -303,7 +314,18 @@ fn frame_cost() {
     let mut draws = 0usize;
     let mut entries = 0usize;
     let (mut extract_allocations, mut render_allocations) = (0u64, 0u64);
+    let motion = env_usize("ORRIN_PERF_MOTION", 0) != 0;
+    let start = *world.resource::<Camera>();
     for frame in 0..frames + WARMUP {
+        if motion {
+            systems::spin(&world, 1.0 / 60.0);
+            // Six centimetres a frame: a walk, at sixty frames a second.
+            let angle = frame as f32 * 0.01;
+            let offset = glam::Vec3::new(angle.cos() - 1.0, 0.0, angle.sin()) * 6.0;
+            let mut camera = world.resource_mut::<Camera>();
+            camera.position = start.position + offset;
+            camera.target = start.target + offset;
+        }
         let before_extract = allocations();
         // The engine throws its numbers away for the first few frames; so does
         // this, by restarting the profiler once the transient is over.

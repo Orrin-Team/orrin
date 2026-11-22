@@ -234,6 +234,7 @@ mod tests {
 
     fn point(position: Vec3, candela: f32, casts: bool) -> PointLight {
         PointLight {
+            id: 0,
             position,
             color: Vec3::ONE,
             candela,
@@ -244,6 +245,7 @@ mod tests {
 
     fn spot(position: Vec3, candela: f32, casts: bool) -> SpotLight {
         SpotLight {
+            id: 0,
             position,
             direction: Vec3::NEG_Y,
             color: Vec3::ONE,

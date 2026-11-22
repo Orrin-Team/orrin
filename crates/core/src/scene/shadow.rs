@@ -19,16 +19,26 @@ pub struct ShadowSettings {
     pub enabled: bool,
     /// Clamped to `MAX_CASCADES` when the cascades are built.
     pub cascade_count: u32,
-    /// Edge of a near cascade's tile of the atlas, in texels: the first two of
-    /// the sun's views, which are fitted to the view. Held to half the atlas.
+    /// Edge of the tile each of the sun's first two views gets, in texels.
+    /// Held to half the atlas.
     pub resolution: u32,
-    /// Edge of the tile each of the sun's remaining views gets. Those are
-    /// squares centred on the camera, a distance away where a texel is fewer
-    /// pixels, so they take a smaller tile by default — which is what leaves
-    /// the lamps their room in an atlas the sun shares. Held to a quarter of
-    /// the atlas.
+    /// Edge of the tile each of the sun's remaining views gets. Those answer
+    /// for a distance where a texel is fewer pixels, so they take a smaller
+    /// tile by default — which is what leaves the lamps their room in an atlas
+    /// the sun shares. Held to a quarter of the atlas.
     #[reflect(default = DEFAULT_FAR_RESOLUTION)]
     pub far_resolution: u32,
+    /// How many of the sun's views, nearest first, are fitted to the slice of
+    /// the view they answer for rather than placed around the camera.
+    ///
+    /// A fitted view spends its texels on what is in front of the camera, which
+    /// a narrow lens makes a much smaller box than the disc around it. It is
+    /// also a different box every time the camera moves or turns, so what it
+    /// holds cannot be kept from one frame to the next: it is cleared and
+    /// redrawn whole while the camera does either, where a view placed around
+    /// the camera keeps what it has. None by default.
+    #[reflect(default)]
+    pub fitted_cascades: u32,
     /// How far from the camera shadows are cast. Deliberately independent of
     /// the camera's far plane: splitting across a 1000 m view distance would
     /// spend every cascade on geometry nobody can see the shadows of.
@@ -97,6 +107,7 @@ impl Default for ShadowSettings {
             cascade_count: 4,
             resolution: 2048,
             far_resolution: DEFAULT_FAR_RESOLUTION,
+            fitted_cascades: 0,
             max_distance: 100.0,
             lambda: 0.75,
             pullback: 50.0,
@@ -105,9 +116,10 @@ impl Default for ShadowSettings {
             softness: DEFAULT_SOFTNESS,
             sharpness: DEFAULT_SHARPNESS,
             punctual_enabled: true,
-            // One D16 image of 32 MB. Two 2048 cascades and two 1024 levels
-            // take five eighths of it, and what is left is 24 tiles of 512:
-            // four point lights, or a mix of points and spots.
+            // One D16 image of 32 MB, and a second for the cached layers. The
+            // sun's two 2048 views and two 1024 ones take five eighths of it,
+            // and what is left is 24 tiles of 512: four point lights, or a mix
+            // of points and spots.
             atlas_resolution: 4096,
             atlas_tile_size: 512,
             punctual_near: 0.05,
@@ -146,6 +158,7 @@ impl ShadowSettings {
             resolution: floor_power_of_two(self.resolution).min(atlas / 2),
             far_resolution: floor_power_of_two(self.far_resolution).min(atlas / 4),
             pullback: self.pullback,
+            fitted: self.fitted_cascades as usize,
         }
     }
 

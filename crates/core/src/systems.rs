@@ -300,6 +300,12 @@ fn order_runs_front_to_back(items: &[RenderItem], order: &mut Vec<u32>, eye: Vec
     *order = sorted;
 }
 
+/// Which light an entity is, for whatever keeps something per light from one
+/// frame to the next.
+fn light_id(entity: Entity) -> u64 {
+    u64::from(entity.generation()) << 32 | u64::from(entity.index())
+}
+
 pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
     let defaults = SceneLighting::default();
     out.ambient_color = defaults.ambient_color;
@@ -346,6 +352,7 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
             } => {
                 if out.point_lights.len() < MAX_POINT_LIGHTS {
                     out.point_lights.push(PointLight {
+                        id: light_id(entity),
                         position: transform.translation(),
                         color,
                         candela: Light::point_candela(lumens),
@@ -371,6 +378,7 @@ pub fn extract_lighting(world: &World, out: &mut SceneLighting) {
                     let outer = outer_angle.clamp(MIN_CONE_ANGLE, MAX_CONE_ANGLE);
                     let inner = inner_angle.clamp(0.0, outer);
                     out.spot_lights.push(SpotLight {
+                        id: light_id(entity),
                         position: transform.translation(),
                         direction: transform.transform_vector3(Vec3::NEG_Z).normalize_or_zero(),
                         color,

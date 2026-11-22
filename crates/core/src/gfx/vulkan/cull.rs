@@ -45,6 +45,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::geom::{Aabb, Frustum};
+use crate::gfx::shadows::SweepBounds;
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 
@@ -66,25 +67,34 @@ const GROUP: u32 = 64;
 
 /// What one view culls against.
 ///
-/// Two shapes rather than six planes for everything, because a cascade is not a
-/// frustum test. See `casts_into` in `cull.comp` and in `systems.rs`.
+/// Two shapes rather than six planes for everything, because a sun view is not
+/// a frustum test. See `casts_into` in `cull.comp`.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum CullView {
+pub(super) enum CullVolume {
     /// The camera, and each face of a punctual light: a closed volume, and a box
     /// outside it cannot be seen from inside it.
     Frustum(Frustum),
-    /// A cascade, which keeps anything that reaches its box when swept toward
-    /// the light — so it has no near plane, and an object between the sun and
-    /// the cascade is exactly what casts into it.
-    Cascade {
+    /// A sun view, or a strip of one, which keeps anything that reaches its box
+    /// when swept toward the light — so it has no near plane, and an object
+    /// between the sun and the box is exactly what casts into it.
+    Sweep {
         light_view: Mat4,
-        half_extent: f32,
-        depth_range: f32,
+        bounds: SweepBounds,
     },
 }
 
+/// One view of the dispatch: what it culls against, and which instances it
+/// takes at all — a mask over [`shadow_casters`](crate::gfx::shadow_casters)'
+/// flags, which is how a cached shadow layer is offered the casters standing
+/// still and the frame's own layer the ones that are not.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CullView {
+    pub volume: CullVolume,
+    pub casters: u32,
+}
+
 const KIND_FRUSTUM: u32 = 0;
-const KIND_CASCADE: u32 = 1;
+const KIND_SWEEP: u32 = 1;
 
 /// Layout-frozen against `View` in `cull.comp`.
 #[derive(Pod, Zeroable, Clone, Copy)]
@@ -92,10 +102,14 @@ const KIND_CASCADE: u32 = 1;
 struct GpuView {
     light_view: [[f32; 4]; 4],
     planes: [[f32; 4]; 6],
+    /// A sweep's box in `light_view`'s space: least x and y and the far
+    /// plane's z, then greatest x and y.
+    sweep_min: [f32; 4],
+    sweep_max: [f32; 4],
     kind: u32,
-    half_extent: f32,
-    depth_range: f32,
+    casters: u32,
     base: u32,
+    _padding: u32,
 }
 
 /// Layout-frozen against `Batch` in both shaders.
@@ -124,6 +138,8 @@ struct GpuBatch {
 struct GpuInstance {
     row: u32,
     batch: u32,
+    /// What a view's `casters` mask is tested against.
+    flags: u32,
 }
 
 /// One batch as the passes need it: which geometry it draws, beside where its
@@ -540,6 +556,7 @@ impl CullPass {
         items: crate::gfx::DrawList<'_>,
         mesh: impl Fn(u32) -> Option<(MeshSpan, Aabb)>,
         variant: impl Fn(u32) -> Variant,
+        flags: impl Fn(u32) -> u32,
         views: u32,
     ) -> CullFrame {
         self.instances.clear();
@@ -566,6 +583,7 @@ impl CullPass {
             self.instances.push(GpuInstance {
                 row: item.instance,
                 batch: id,
+                flags: flags(item.instance),
             });
         }
 
@@ -768,27 +786,31 @@ impl CullPass {
             .enumerate()
             .map(|(index, view)| {
                 let base = index as u32 * frame.stride;
-                match view {
-                    CullView::Frustum(frustum) => GpuView {
-                        light_view: Mat4::IDENTITY.to_cols_array_2d(),
-                        planes: frustum.planes().map(|plane| plane.to_array()),
-                        kind: KIND_FRUSTUM,
-                        half_extent: 0.0,
-                        depth_range: 0.0,
-                        base,
-                    },
-                    CullView::Cascade {
+                let (kind, light_view, planes, sweep_min, sweep_max) = match view.volume {
+                    CullVolume::Frustum(frustum) => (
+                        KIND_FRUSTUM,
+                        Mat4::IDENTITY,
+                        frustum.planes().map(|plane| plane.to_array()),
+                        [0.0; 4],
+                        [0.0; 4],
+                    ),
+                    CullVolume::Sweep { light_view, bounds } => (
+                        KIND_SWEEP,
                         light_view,
-                        half_extent,
-                        depth_range,
-                    } => GpuView {
-                        light_view: light_view.to_cols_array_2d(),
-                        planes: [[0.0; 4]; 6],
-                        kind: KIND_CASCADE,
-                        half_extent: *half_extent,
-                        depth_range: *depth_range,
-                        base,
-                    },
+                        [[0.0; 4]; 6],
+                        bounds.min.extend(0.0).to_array(),
+                        [bounds.max.x, bounds.max.y, 0.0, 0.0],
+                    ),
+                };
+                GpuView {
+                    light_view: light_view.to_cols_array_2d(),
+                    planes,
+                    sweep_min,
+                    sweep_max,
+                    kind,
+                    casters: view.casters,
+                    base,
+                    _padding: 0,
                 }
             })
             .collect();
