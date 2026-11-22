@@ -2,8 +2,15 @@
 
 #include "depth.glsl"
 
-// Swap the environment's guess at a reflection for the one the trace actually
-// found.
+// Each pixel's reflection, from the rays traced for it, swapped in for the
+// environment's guess at one.
+//
+// The reflection is gathered from the quarter-rate rays `ssr_trace.comp` left
+// around the pixel, or traced here at full rate where the surface is smooth
+// enough that a gather would show as blur, or the two cross-faded between.
+// Every ray is the exact reflection, so the gather is a small spatial blur of a
+// smooth image rather than an average of samples, and what it produces is the
+// same next frame for the same view: there is no history to keep.
 //
 // The forward pass already added a specular environment term to every surface,
 // weighted by the split sum. Adding traced radiance on top of that would count
@@ -13,40 +20,36 @@
 // reflection is what the screen contains, where it is not the environment stays,
 // and in between the two cross-fade. That is why the weight lives in a shared
 // header rather than being restated here.
-//
-// It also upsamples: the trace runs at half resolution, and the four nearest
-// rays are combined by how well their depth agrees with this pixel's, so a
-// reflection does not bleed across a silhouette the half-resolution grid cannot
-// see.
 
 #include "brdf.glsl"
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(set = 0, binding = 0) uniform sampler2D u_source;   // the lit frame
-layout(set = 0, binding = 1) uniform sampler2D u_rays;     // half-res, rgb + confidence
+layout(set = 0, binding = 0) uniform sampler2D u_source_full; // the lit frame
+layout(set = 0, binding = 1) uniform sampler2D u_rays;        // one per quad, rgb + confidence
 layout(set = 0, binding = 2) uniform sampler2D u_depth;
-layout(set = 0, binding = 3) uniform sampler2D u_normal;   // view-space, encoded
-layout(set = 0, binding = 4) uniform sampler2D u_material; // rgb = f0, a = roughness
+layout(set = 0, binding = 3) uniform sampler2D u_normal;      // view-space, encoded
+layout(set = 0, binding = 4) uniform sampler2D u_material;    // rgb = f0, a = roughness
 layout(set = 0, binding = 5, r11f_g11f_b10f) uniform writeonly image2D u_output;
 layout(set = 0, binding = 6) uniform textureCube u_environment;
 layout(set = 0, binding = 7) uniform sampler u_environment_sampler;
-
 layout(set = 0, binding = 8) uniform Ssr {
     mat4 proj;
     mat4 inv_proj;
     mat4 inv_view;
-    vec4 params;   // y = max roughness, w = intensity
+    vec4 params;   // x = max roughness, y = thickness, z = intensity
     vec4 trace;
     vec4 extent;
     vec4 env;      // x = sin(yaw), y = cos(yaw), z = specular mip count
     vec4 env_tint;
 } ssr;
+// What a smooth surface's own ray marches and samples; see `ssr_march.glsl`.
+layout(set = 0, binding = 9) uniform sampler2D u_hiz;
+layout(set = 0, binding = 10) uniform sampler2D u_source;
 
-vec3 view_pos(vec2 uv, float depth) {
-    vec4 clip = ssr.inv_proj * vec4(uv * 2.0 - 1.0, depth, 1.0);
-    return clip.xyz / clip.w;
-}
+#include "ssr_march.glsl"
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 // World space into the environment's own frame — the same rotation the skybox
 // and the forward pass sample through, so the sky and what mirrors it agree.
@@ -63,96 +66,87 @@ void main() {
         return;
     }
     vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
-    vec3 scene = texture(u_source, uv).rgb;
+    vec3 scene = texelFetch(u_source_full, pixel, 0).rgb;
 
-    float depth = texture(u_depth, uv).r;
-    vec4 material = texture(u_material, uv);
+    float depth = texelFetch(u_depth, pixel, 0).r;
+    vec4 material = texelFetch(u_material, pixel, 0);
     float roughness = material.a;
-    if (depth_is_far(depth) || roughness > ssr.params.y) {
+    if (depth_is_far(depth) || roughness > ssr.params.x) {
         imageStore(u_output, pixel, vec4(scene, 1.0));
         return;
     }
 
     vec3 p = view_pos(uv, depth);
-    vec3 n = normalize(texture(u_normal, uv).xyz * 2.0 - 1.0);
+    vec3 n = normalize(texelFetch(u_normal, pixel, 0).xyz * 2.0 - 1.0);
     vec3 v = normalize(-p);
     float n_dot_v = max(dot(n, v), 1e-4);
-    vec3 f0 = material.rgb;
+    float rough = clamp(roughness / max(ssr.params.x, 1e-3), 0.0, 1.0);
 
-    // Gather the neighbouring half-resolution rays. This is the pass's other
-    // job, and the one that decides whether the image is usable: one
-    // importance-sampled ray per pixel is noise, and TAA can only average what
-    // a *pixel* has seen over time. Nine neighbours, each of which sampled a
-    // different part of the same lobe, is a ninefold cut in variance available
-    // in the frame the ray was traced.
-    //
-    // The spread follows the roughness it is standing in for. A near-mirror
-    // pixel keeps its own ray and barely borrows, because its neighbours are
-    // reflecting genuinely different directions and averaging them is just
-    // blur; a rough pixel borrows freely, because its lobe is wide enough that
-    // the neighbours' rays are samples of the same integral.
-    vec2 ray_size = vec2(textureSize(u_rays, 0));
-    vec2 ray_coord = uv * ray_size - 0.5;
-    ivec2 centre = ivec2(round(ray_coord));
-    // Gentler than it would need to be alone: the trace already prefilters each
-    // ray over its own cone, so a wide spatial spread here would blur by the
-    // roughness a second time.
-    float sigma = mix(0.45, 1.0, clamp(roughness / max(ssr.params.y, 1e-3), 0.0, 1.0));
+    // How much of this pixel's reflection is its own full-rate ray; the rest
+    // is the gather.
+    float own_share = 1.0 - smoothstep(FULL_RATE_ROUGHNESS, QUARTER_RATE_ROUGHNESS, roughness);
 
-    // Two sweeps over the same taps: the first finds what a typical sample
-    // looks like, the second weights against it. A firefly has to be measured
-    // relative to its neighbours rather than against a fixed threshold —
-    // exposure is metered downstream of this pass, so there is no absolute
-    // scale here to compare a luminance to.
+    // Gather the neighbouring quads' rays. The spread follows the roughness: a
+    // smoother pixel barely borrows, because its neighbours reflect visibly
+    // different directions and averaging them is a blur its own cone does not
+    // have; a rougher one borrows freely, because the blur at its hit is
+    // already wider than the quads it borrows from.
+    ivec2 quads = textureSize(u_rays, 0);
+    ivec2 own_quad = pixel / 2;
+    float sigma = mix(0.45, 1.0, rough);
+
+    // Two sweeps over the same taps: the first finds what a typical ray found,
+    // the second weights against it. A ray far brighter than its neighbours'
+    // has caught the edge of something bright that theirs missed, and it is a
+    // dot that crawls with the sub-pixel jitter; measured relative to them, as
+    // there is no absolute scale here — exposure is metered downstream.
+    // Indexed by the tap's place in the 3x3, with a rejected tap left at zero
+    // weight, rather than packed: an array written at a running count is one
+    // the compiler cannot keep in registers, and this one would go to memory.
     vec4 taps[9];
     float spatial[9];
     float mean_luma = 0.0;
     float mean_weight = 0.0;
-    int count = 0;
-    for (int j = -1; j <= 1; ++j) {
-        for (int i = -1; i <= 1; ++i) {
-            ivec2 tap = centre + ivec2(i, j);
-            if (any(lessThan(tap, ivec2(0))) || any(greaterThanEqual(tap, ivec2(ray_size)))) {
-                continue;
-            }
-            vec2 tap_uv = (vec2(tap) + 0.5) / ray_size;
-            float tap_depth = texture(u_depth, tap_uv).r;
-            vec3 tap_n = normalize(texture(u_normal, tap_uv).xyz * 2.0 - 1.0);
-            float tap_z = view_pos(tap_uv, tap_depth).z;
-
-            // Distance from this pixel's true position in ray space, so the
-            // gather stays centred where the pixel is rather than on whichever
-            // texel it rounded to.
-            vec2 offset = vec2(tap) - ray_coord;
-            float falloff = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
-            // A tenth of a metre of depth disagreement halves the tap and a
-            // metre kills it, measured in view space so the tolerance means the
-            // same thing near and far. The normal term catches the creases
-            // depth alone cannot see — two faces of a cube meeting at an edge
-            // sit at the same distance and reflect completely different things.
-            float agreement = exp(-abs(tap_z - p.z) * 10.0)
-                            * smoothstep(0.0, 0.25, dot(tap_n, n));
-            float weight = falloff * agreement;
-            if (weight <= 1e-4) {
-                continue;
-            }
-
-            vec4 ray = texelFetch(u_rays, tap, 0);
-            taps[count] = ray;
-            spatial[count] = weight;
-            // Weighted by the ray's own confidence, so a neighbourhood of
-            // mostly misses does not report a near-zero mean and then read
-            // every genuine hit in it as a firefly.
-            mean_luma += dot(ray.rgb, vec3(0.2126, 0.7152, 0.0722)) * weight * ray.a;
-            mean_weight += weight * ray.a;
-            count++;
+    for (int k = 0; k < 9; ++k) {
+        taps[k] = vec4(0.0);
+        spatial[k] = 0.0;
+        ivec2 tap = own_quad + ivec2(k % 3, k / 3) - 1;
+        if (own_share >= 1.0 || any(lessThan(tap, ivec2(0))) || any(greaterThanEqual(tap, quads))) {
+            continue;
         }
+        ivec2 tap_texel = ray_texel(tap, size);
+        vec2 tap_uv = (vec2(tap_texel) + 0.5) / vec2(size);
+        float tap_depth = texelFetch(u_depth, tap_texel, 0).r;
+        vec3 tap_n = normalize(texelFetch(u_normal, tap_texel, 0).xyz * 2.0 - 1.0);
+        float tap_z = view_pos(tap_uv, tap_depth).z;
+
+        // Distance from this pixel to where that ray started, in quads, so
+        // the gather stays centred on the pixel rather than on its quad's
+        // traced corner.
+        vec2 offset = vec2(tap_texel - pixel) * 0.5;
+        float falloff = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+        // A tenth of a metre of depth disagreement halves the tap and a
+        // metre kills it, measured in view space so the tolerance means the
+        // same thing near and far. The normal term catches the creases
+        // depth alone cannot see — two faces of a cube meeting at an edge
+        // sit at the same distance and reflect completely different things.
+        float agreement = exp(-abs(tap_z - p.z) * 10.0)
+                        * smoothstep(0.0, 0.25, dot(tap_n, n));
+        float weight = falloff * agreement;
+        if (weight <= 1e-4) {
+            continue;
+        }
+
+        vec4 ray = texelFetch(u_rays, tap, 0);
+        taps[k] = ray;
+        spatial[k] = weight;
+        // Weighted by the ray's own confidence, so a neighbourhood of
+        // mostly misses does not report a near-zero mean and then read
+        // every genuine hit in it as a firefly.
+        mean_luma += dot(ray.rgb, LUMA) * weight * ray.a;
+        mean_weight += weight * ray.a;
     }
-    if (mean_weight <= 0.0) {
-        imageStore(u_output, pixel, vec4(scene, 1.0));
-        return;
-    }
-    mean_luma /= mean_weight;
+    mean_luma /= max(mean_weight, 1e-6);
 
     // Radiance and confidence are averaged over different denominators, and the
     // difference matters. A ray that missed carries no radiance at all, so
@@ -165,32 +159,49 @@ void main() {
     float radiance_weight = 0.0;
     float confidence_sum = 0.0;
     float total = 0.0;
-    for (int i = 0; i < count; ++i) {
-        // A sample no brighter than the neighbourhood keeps its full weight;
-        // one ten times brighter keeps a tenth of it. That is a biased
-        // estimator on purpose — the alternative is an unbiased mean that
-        // spends a dozen frames showing one ray's lucky hit on an emissive
-        // surface as a bright dot, which is what a firefly is.
-        float luma = dot(taps[i].rgb, vec3(0.2126, 0.7152, 0.0722));
+    for (int i = 0; i < 9; ++i) {
+        float luma = dot(taps[i].rgb, LUMA);
         float firefly = 1.0 / (1.0 + max(0.0, luma / max(mean_luma, 1e-4) - 1.0));
-        float weight = spatial[i] * firefly;
-
-        radiance += taps[i].rgb * weight * taps[i].a;
-        radiance_weight += weight * taps[i].a;
+        float weight = spatial[i] * firefly * taps[i].a;
+        radiance += taps[i].rgb * weight;
+        radiance_weight += weight;
         confidence_sum += taps[i].a * spatial[i];
         total += spatial[i];
     }
-    if (radiance_weight <= 1e-6) {
+    vec3 traced = radiance_weight > 1e-6 ? radiance / radiance_weight : vec3(0.0);
+    float confidence = confidence_sum / max(total, 1e-6);
+
+    if (own_share > 0.0) {
+        // This pixel's own ray: the quad's, when this pixel is the one the
+        // trace started from, and otherwise traced here.
+        vec4 own = pixel == ray_texel(own_quad, size)
+            ? texelFetch(u_rays, own_quad, 0)
+            : trace_reflection(uv, depth, n, roughness);
+        // Weighted by confidence on both sides, for the reason the gather is,
+        // and held to the gather's firefly rule wherever the gather has a
+        // neighbourhood to measure it against.
+        float own_firefly = mean_weight > 0.0
+            ? 1.0 / (1.0 + max(0.0, dot(own.rgb, LUMA) / max(mean_luma, 1e-4) - 1.0))
+            : 1.0;
+        float gathered_weight = (1.0 - own_share) * confidence;
+        float own_weight = own_share * own.a * own_firefly;
+        float both = gathered_weight + own_weight;
+        if (both > 1e-6) {
+            traced = (traced * gathered_weight + own.rgb * own_weight) / both;
+        }
+        confidence = mix(confidence, own.a, own_share);
+    }
+
+    float strength = clamp(confidence * ssr.params.z, 0.0, 1.0);
+    if (strength <= 0.0) {
         imageStore(u_output, pixel, vec4(scene, 1.0));
         return;
     }
 
-    vec3 traced = radiance / radiance_weight;
-    float confidence = clamp(confidence_sum / max(total, 1e-6) * ssr.params.w, 0.0, 1.0);
-
     // The environment term the forward pass applied to this pixel, rebuilt from
     // the same inputs it used. View space into world for the cube lookup, which
     // is the one thing the G-buffer cannot store.
+    vec3 f0 = material.rgb;
     vec3 world_n = normalize(mat3(ssr.inv_view) * n);
     vec3 world_v = normalize(mat3(ssr.inv_view) * v);
     vec3 r = to_environment(reflect(-world_v, world_n));
@@ -201,7 +212,7 @@ void main() {
     vec2 dfg = env_brdf_approx(roughness, n_dot_v);
     vec3 weight = (f0 * dfg.x + dfg.y) * energy_compensation(f0, roughness, n_dot_v);
 
-    vec3 color = scene + confidence * (traced - environment) * weight;
+    vec3 color = scene + strength * (traced - environment) * weight;
     // The subtraction is only as exact as the two estimators agree, and a
     // confident ray into a dark corner under a bright sky can take a pixel
     // below zero. Clamping here rather than letting the tonemap do it keeps a

@@ -1,21 +1,68 @@
-//! Screen-space reflections: a depth pyramid, one importance-sampled ray per
-//! half-resolution pixel, and a composite that swaps the environment's guess for
-//! what the ray found.
+//! Screen-space reflections: a depth pyramid, one exact reflection ray per
+//! 2x2 quad — and one per pixel on a smooth surface — whose roughness is the
+//! blur the hit is read through, and a composite that gathers those rays into
+//! each pixel and swaps the environment's guess for what they found.
 //!
 //! Four dispatches, and each earns its place. The depth pyramid is what makes
 //! the march affordable — a ray crossing an empty room steps over it a cell at a
 //! time instead of sampling every texel it passes. The colour pyramid is what
-//! makes a *rough* reflection affordable: a ray from a wide lobe is a cone, and
-//! the level whose texel matches the cone's footprint carries the average of
-//! what the cone covers instead of one sample of it. The trace is at half
-//! resolution because a stochastic ray is denoised either way, so the resolution
-//! it is traced at buys much less than the rays it pays for. The composite is
-//! full resolution because it is the pass that touches the frame's colour, and
-//! because subtracting the environment term wants this pixel's own material.
+//! makes a *rough* reflection: the level whose texel matches the lobe's width
+//! at the hit is the lobe's blur, read in one fetch. The trace is half
+//! resolution, and the composite full, because it touches the frame's colour and
+//! subtracting the environment term wants this pixel's own material.
 //!
-//! Where it sits in the frame is not a detail: between the forward pass and the
-//! TAA resolve. Before TAA, so the accumulation over the jitter sequence is what
-//! denoises the rays; after shading, so what a ray finds is lit.
+//! # Exact rays, and roughness as blur
+//!
+//! Every ray is the exact reflection of the view ray about the surface normal,
+//! at every roughness, and the same for the same surface every frame. The
+//! roughness is a cone around it: the hit is read from the colour pyramid at
+//! the level whose texel is the cone's width there, so a short ray stays sharp
+//! and a long one softens — a reflection hardening toward its contact, as a
+//! real one does. Nothing in the result varies from frame to frame but what the
+//! frame itself does, so there is no history and nothing to denoise. That is
+//! the requirement this design answers: no technique that dithers, ghosts or
+//! smears, which is what a reflection that leans on accumulating frames to hide
+//! its noise does.
+//!
+//! What it gives up is the lobe's shape. A glossy reflection here is a blurred
+//! mirror image, not a scattered one: it has no stretch toward the viewer at
+//! grazing angles, an object reflected in a rough surface keeps a soft version
+//! of its outline where a real lobe would spread it, because one ray either
+//! hits or misses where a lobe would hit in part, and the blur is of the
+//! screen, so it can take in whatever sits beside the hit in depth.
+//!
+//! Not the stochastic design this replaced, though it is the usual one: a ray
+//! drawn from the GGX lobe per quad per frame, a bilateral gather, and a
+//! history of the reflection's own that averaged the draws into the lobe. A
+//! rough surface sees few hits, and a history of rare bright ones never
+//! settles: on white metal at roughness 0.5 it left a patch of sparkles that
+//! changed every frame, measured at a settled change of 0.257 against 0.186
+//! with reflections off, where this design measures 0.201. It also kept four
+//! full-resolution images between frames and a pass to fill them.
+//!
+//! # Two ray rates
+//!
+//! A glossy surface is traced at one ray per quad, and the composite gathers
+//! the four quads around each pixel: the blur at a glossy hit is wider than a
+//! quad, so a ray per pixel would buy a sharper version of something the
+//! roughness then blurs. That stops at a smooth surface, whose blur is narrower
+//! than the quad, where a quarter-rate ray is a quarter-resolution reflection —
+//! the soft, stair-stepped mirror the eye picks out first. Below
+//! `QUARTER_RATE_ROUGHNESS` in `ssr_march.glsl` each pixel therefore traces its
+//! own ray, cross-fading to the gather as roughness rises, so a roughness
+//! gradient shows no line. Its cone also reads the frame itself rather than the
+//! half-resolution pyramid.
+//!
+//! The full-rate rays are traced inside the composite, where the pixel that
+//! needs one already is, rather than by the trace dispatching over every pixel:
+//! a full-resolution trace would idle three lanes in four on every glossy pixel
+//! and need a full-resolution target to hand its rays over. Rejected too: a
+//! classification pass building ray and tile lists for an indirect dispatch
+//! (the FidelityFX shape). The RHI has no indirect dispatch.
+//!
+//! Where it sits in the frame is not a detail: after shading, so what a ray
+//! finds is lit, and before the TAA resolve, so the reflection is antialiased
+//! with everything else rather than over the top of it.
 
 use glam::Vec3;
 
@@ -32,25 +79,30 @@ use super::taa::FrameView;
 const TILE: u32 = 8;
 
 /// Side of the tile one workgroup of the pyramid build owns, in full-resolution
-/// texels. Fixed by the shader: eight invocations square, each reducing an 8x8
-/// block, is what lets the first four levels come out of registers and the next
-/// three out of one shared array.
+/// texels. Fixed by the shader: sixteen invocations square, each reducing a 4x4
+/// block, is what lets the first two levels come out of registers and the next
+/// four out of one shared array.
 const HIZ_TILE: u32 = 64;
 
-/// How deep the pyramid goes, counting the full-resolution copy at level 0.
+/// How deep the pyramid goes above the depth buffer, which the march reads
+/// directly as level 0: the image is based at half the frame.
 ///
-/// Seven is what a 64-texel tile reduces to on its own, and it is also enough:
+/// Six is what a 64-texel tile reduces to on its own, and it is also enough:
 /// a cell at level 6 is 64 texels across, so a ray crosses a 1080p frame in
 /// about thirty steps. Going deeper would need a second dispatch to combine
 /// tiles, and buy a handful of steps on rays that have already left the screen.
-pub(super) const HIZ_LEVELS: u32 = 7;
-
-/// Levels in the pyramid of the lit frame the trace samples its cones out of.
 ///
-/// The same number as [`HIZ_LEVELS`] and for the same reason — both are what a
-/// 64-texel tile reduces to on its own, since both are built by one dispatch.
-/// Level 6 is a 64-texel blur of a half-resolution image, which is wider than
-/// any lobe under the roughness cutoff has cause to ask for.
+/// Not a copy of the depth buffer at level 0, though that would let the march
+/// read every level from one image: the copy was three quarters of what the
+/// build wrote, and the build cost more than the trace it served.
+pub(super) const HIZ_LEVELS: u32 = 6;
+
+/// Levels in the pyramid of the lit frame the trace reads its blur out of.
+///
+/// Seven for the reason [`HIZ_LEVELS`] is six: what a 64-texel tile reduces to
+/// on its own, counting the base, since both are built by one dispatch.
+/// Level 6 is a 64-texel blur of a half-resolution image, 128 pixels of the
+/// frame: the widest blur a reflection can have.
 pub(super) const SOURCE_LEVELS: u32 = 7;
 
 /// Single-channel float, because a min-depth pyramid stores exactly one number
@@ -82,17 +134,13 @@ pub struct SsrPass {
     /// surface between two that are really there, and the march would stop on
     /// it.
     nearest_clamp: SamplerId,
-    /// Linear, for the lit frame a ray lands in and for the environment cube.
+    /// Linear, for the lit frame's reduction into the pyramid and for a smooth
+    /// surface's cone, which reads the frame itself.
     linear_clamp: SamplerId,
     /// Linear across levels as well, because the trace picks a fractional one:
     /// a cone that grows smoothly with distance would otherwise step between
     /// blurs, and the step would be visible as a ring on a curved surface.
     linear_mip: SamplerId,
-    settings: SsrSettings,
-    /// Advanced every frame the pass runs, and what decorrelates the sample
-    /// sequence frame to frame. Without it every frame would trace the same ray
-    /// per pixel and TAA would average eight copies of one sample.
-    frame: u64,
     uniforms: Option<BufferId>,
 }
 
@@ -144,18 +192,16 @@ impl SsrPass {
             nearest_clamp,
             linear_clamp,
             linear_mip,
-            settings: SsrSettings::default(),
-            frame: 0,
             uniforms: None,
         }
     }
 
-    /// Resolve this frame's camera, settings and environment into the block both
-    /// dispatches read.
+    /// Resolve this frame's camera, settings and environment into the block the
+    /// trace and the composite read.
     ///
     /// Called before anything records, like the other per-frame `begin_frame`s,
-    /// because the two passes are separated in the schedule by whatever the
-    /// graph decided and must not re-derive the camera between them.
+    /// because the passes are separated in the schedule by whatever the graph
+    /// decided and must not re-derive the camera between them.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn begin_frame(
         &mut self,
@@ -168,9 +214,6 @@ impl SsrPass {
         specular_mips: u32,
         env_tint: Vec3,
     ) {
-        self.settings = *settings;
-        self.frame = self.frame.wrapping_add(1);
-
         // The *jittered* projection, because every screen-space position here is
         // read out of targets the frame rasterised with it. Unjittering would
         // put the reconstructed position half a pixel from the depth it came
@@ -183,10 +226,10 @@ impl SsrPass {
         ];
         let vectors = [
             [
-                (self.frame % 64) as f32,
                 settings.max_roughness.clamp(0.01, 1.0),
                 settings.thickness.max(1e-3),
                 settings.intensity.max(0.0),
+                0.0,
             ],
             [
                 settings.max_steps.max(1) as f32,
@@ -300,6 +343,7 @@ impl SsrPass {
         depth: TextureViewId,
         normal: TextureViewId,
         material: TextureViewId,
+        source_pyramid: TextureViewId,
         source: TextureViewId,
         target: TextureViewId,
     ) {
@@ -311,7 +355,7 @@ impl SsrPass {
                 self.sampled(1, depth, self.nearest_clamp),
                 self.sampled(2, normal, self.nearest_clamp),
                 self.sampled(3, material, self.nearest_clamp),
-                self.sampled(4, source, self.linear_mip),
+                self.sampled(4, source_pyramid, self.linear_mip),
                 Binding {
                     binding: 5,
                     resource: BindingResource::StorageTexture(target),
@@ -320,6 +364,7 @@ impl SsrPass {
                     binding: 6,
                     resource: BindingResource::UniformBuffer(self.uniforms()),
                 },
+                self.sampled(7, source, self.linear_clamp),
             ],
         );
 
@@ -338,6 +383,8 @@ impl SsrPass {
         depth: TextureViewId,
         normal: TextureViewId,
         material: TextureViewId,
+        hiz: TextureViewId,
+        source_pyramid: TextureViewId,
         environment: TextureViewId,
         environment_sampler: SamplerId,
         target: TextureViewId,
@@ -346,6 +393,8 @@ impl SsrPass {
             self.resolve_pipeline,
             0,
             &[
+                // Linear, though the composite reads its own pixel by texel, so
+                // a smooth surface's ray samples the frame as the trace does.
                 self.sampled(0, source, self.linear_clamp),
                 // Fetched at exact texels by the bilateral gather, which does its
                 // own interpolation — a linear sampler here would blend across the
@@ -370,6 +419,10 @@ impl SsrPass {
                     binding: 8,
                     resource: BindingResource::UniformBuffer(self.uniforms()),
                 },
+                // A smooth surface's own ray, traced here with the trace's
+                // samplers for the trace's reasons.
+                self.sampled(9, hiz, self.nearest_clamp),
+                self.sampled(10, source_pyramid, self.linear_mip),
             ],
         );
 
@@ -403,9 +456,9 @@ mod tests {
     fn the_pyramid_is_no_deeper_than_one_tile_can_reduce() {
         assert_eq!(
             HIZ_LEVELS,
-            HIZ_TILE.trailing_zeros() + 1,
-            "a {HIZ_TILE}-texel tile reduces to {} levels, not {HIZ_LEVELS}",
-            HIZ_TILE.trailing_zeros() + 1,
+            HIZ_TILE.trailing_zeros(),
+            "a {HIZ_TILE}-texel tile reduces to {} levels above its base, not {HIZ_LEVELS}",
+            HIZ_TILE.trailing_zeros(),
         );
     }
 }

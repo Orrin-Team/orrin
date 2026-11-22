@@ -2,7 +2,7 @@
 //! every A/B pair, with the reasoning for each beside it.
 
 use glam::Vec3;
-use orrin_core::capture::CaptureSettings;
+use orrin_core::capture::{CaptureSettings, Floor};
 use orrin_core::scene::entities::SceneChoice;
 use orrin_core::scene::{Camera, FogSettings};
 
@@ -19,6 +19,39 @@ fn fog_camera() -> Camera {
         position: Vec3::new(-20.0, 1.0, -4.0),
         target: Vec3::new(-11.0, 4.5, 4.0),
         ..Camera::default()
+    }
+}
+
+/// The reflection captures' shared settings: one camera and warm-up, so the
+/// three differ in the floor alone.
+fn reflective_floor(floor: Floor) -> CaptureSettings {
+    CaptureSettings {
+        ssr: true,
+        frames: 64,
+        floor: Some(floor),
+        camera: Some(Camera {
+            position: Vec3::new(12.5, 1.6, 12.5),
+            target: Vec3::new(0.0, 0.2, 0.0),
+            ..Camera::default()
+        }),
+        ..CaptureSettings::default()
+    }
+}
+
+/// A reflection capture from `position` toward `target`, at an extent no
+/// power of two divides.
+fn reflection_view(floor: Option<Floor>, position: Vec3, target: Vec3) -> CaptureSettings {
+    CaptureSettings {
+        extent: [1389, 803],
+        ssr: true,
+        frames: 64,
+        floor,
+        camera: Some(Camera {
+            position,
+            target,
+            ..Camera::default()
+        }),
+        ..CaptureSettings::default()
     }
 }
 
@@ -211,6 +244,56 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
             CaptureSettings {
                 ssr: true,
                 ..CaptureSettings::default()
+            },
+        ),
+        // The rig's floor refinished, seen low and across a corner toward the
+        // cube grid, so the reflections of the cubes fill the lower half: a mirror, where what a capture shows is how sharp a
+        // reflected edge is; glossy, where it is how fine the remaining grain
+        // is; and a floor whose roughness ramps across the regimes the trace
+        // switches between, where it is whether the switch shows.
+        //
+        // Sixty-four frames, not the usual dozen. The reflection keeps a
+        // history of up to 32 frames, and a capture taken before it settles is
+        // a picture of the warm-up rather than of the reflection.
+        ("ssr-mirror", reflective_floor(Floor::Mirror)),
+        ("ssr-glossy", reflective_floor(Floor::Glossy)),
+        ("ssr-ramp", reflective_floor(Floor::RoughnessRamp)),
+        // Three more, each where the reflection is hardest to get right, and at
+        // an extent no power of two divides: a viewport is whatever size the
+        // window is, and a pyramid level whose cells do not tile the frame is
+        // what a reflection's edge shows first. From high and steep over the
+        // cube grid, where every reflection ends against its own cube; from
+        // above the floating spheres, where the screen holds the top of each
+        // and the mirror wants the underside; and close along the sphere row,
+        // whose smoother spheres show whether a reflection ever settles.
+        (
+            "ssr-steep",
+            reflection_view(
+                Some(Floor::Mirror),
+                Vec3::new(6.0, 5.5, 10.0),
+                Vec3::new(2.0, 0.0, 3.0),
+            ),
+        ),
+        (
+            "ssr-spheres-above",
+            reflection_view(
+                Some(Floor::Mirror),
+                Vec3::new(1.5, 9.0, 18.0),
+                Vec3::new(0.0, 0.0, 12.5),
+            ),
+        ),
+        (
+            "ssr-sphere-row",
+            reflection_view(None, Vec3::new(2.0, 1.6, 6.0), Vec3::new(0.0, 1.5, 14.0)),
+        ),
+        // The sweep's spheres as rough metal, from below and beside the row:
+        // the lower half of each reflects the ground and the glowing cubes,
+        // which few of its rays reach.
+        (
+            "ssr-rough-metal",
+            CaptureSettings {
+                rough_metal_sweep: true,
+                ..reflection_view(None, Vec3::new(-6.0, 1.2, 9.5), Vec3::new(0.0, 3.0, 13.0))
             },
         ),
         (

@@ -33,8 +33,8 @@
 //! *cannot* have hit anything yet. A visibility test needs the opposite: the
 //! frontmost surface that is farthest away is the one that decides whether a
 //! box is hidden everywhere its rect lands. Neither pyramid can stand in for the
-//! other, and this one is also half the frame at its base and survives the frame
-//! boundary, which a transient by contract does not.
+//! other, and this one also survives the frame boundary, which a transient by
+//! contract does not.
 
 use crate::gfx::format::SampleCount;
 use crate::gfx::graph::ImageUsage;

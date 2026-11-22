@@ -1712,6 +1712,7 @@
      prepass_normal Sampled
      prepass_material Sampled
      ssr_source Sampled
+     hdr_color Sampled
      ssr_rays StorageWrite
 09 pass ssr_resolve [Compute]
   ! ssr_rays General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
@@ -1721,6 +1722,8 @@
      prepass_depth Sampled
      prepass_normal Sampled
      prepass_material Sampled
+     ssr_hiz Sampled
+     ssr_source Sampled
      ssr_color StorageWrite
 10 pass taa_resolve [Compute]
   ! ssr_color General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
@@ -1878,6 +1881,7 @@
      prepass_normal Sampled
      prepass_material Sampled
      ssr_source Sampled
+     hdr_color Sampled
      ssr_rays StorageWrite
 07 pass ssr_resolve [Compute]
   ! ssr_rays General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
@@ -1887,6 +1891,8 @@
      prepass_depth Sampled
      prepass_normal Sampled
      prepass_material Sampled
+     ssr_hiz Sampled
+     ssr_source Sampled
      ssr_color StorageWrite
 08 pass luminance_histogram [Compute]
   ! ssr_color General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
@@ -2659,6 +2665,7 @@
      prepass_normal Sampled
      prepass_material Sampled
      ssr_source Sampled
+     hdr_color Sampled
      ssr_rays StorageWrite
 14 pass ssr_resolve [Compute]
   ! ssr_rays General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
@@ -2668,6 +2675,8 @@
      prepass_depth Sampled
      prepass_normal Sampled
      prepass_material Sampled
+     ssr_hiz Sampled
+     ssr_source Sampled
      ssr_color StorageWrite
 15 pass oit_accumulate [Inline]
   ! oit_accum Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -2998,6 +3007,7 @@
      prepass_normal Sampled
      prepass_material Sampled
      ssr_source Sampled
+     hdr_color Sampled
      ssr_rays StorageWrite
 14 pass ssr_resolve [Compute]
   ! ssr_rays General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
@@ -3007,6 +3017,8 @@
      prepass_depth Sampled
      prepass_normal Sampled
      prepass_material Sampled
+     ssr_hiz Sampled
+     ssr_source Sampled
      ssr_color StorageWrite
 15 pass oit_accumulate [Inline]
   ! oit_accum Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -3183,7 +3195,7 @@
 -- end of frame
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
 -- aliased ssao_raw_ao [07..08] -> contact_shadow_mask [09..18]
--- aliased ssr_source [12..13] -> refraction_scene [17..18]
+-- aliased ssr_source [12..14] -> refraction_scene [17..18]
 -- aliased ssr_rays [13..14] -> dof_prefiltered [21..23]
 -- aliased ssr_color [14..16] -> refraction_color [19..20] -> dof_color [24..38]
 -- aliased oit_accum [15..16] -> refraction_accum [18..19]
@@ -3386,6 +3398,7 @@
      prepass_normal Sampled
      prepass_material Sampled
      ssr_source Sampled
+     subsurface_color Sampled
      ssr_rays StorageWrite
 17 pass ssr_resolve [Compute]
   ! ssr_rays General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
@@ -3395,6 +3408,8 @@
      prepass_depth Sampled
      prepass_normal Sampled
      prepass_material Sampled
+     ssr_hiz Sampled
+     ssr_source Sampled
      ssr_color StorageWrite
 18 pass taa_resolve [Compute]
   ! ssr_color General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
@@ -4513,6 +4528,7 @@
      prepass_normal Sampled
      prepass_material Sampled
      ssr_source Sampled
+     subsurface_color Sampled
      ssr_rays StorageWrite
 20 pass ssr_resolve [Compute]
   ! ssr_rays General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
@@ -4522,6 +4538,8 @@
      prepass_depth Sampled
      prepass_normal Sampled
      prepass_material Sampled
+     ssr_hiz Sampled
+     ssr_source Sampled
      ssr_color StorageWrite
 21 pass oit_accumulate [Inline]
   ! oit_accum Undefined->ColorAttachmentOptimal src VertexShader|FragmentShader|ColorAttachmentOutput|ComputeShader/ColorAttachmentRead|ColorAttachmentWrite dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
@@ -4717,7 +4735,7 @@
 -- concurrent bloom_up_0
 -- aliased subsurface_diffusible [13..14] -> oit_accum [21..22]
 -- aliased subsurface_color [16..20] -> refraction_color [25..26] -> dof_color [30..33]
--- aliased ssr_source [18..19] -> refraction_scene [23..24]
+-- aliased ssr_source [18..20] -> refraction_scene [23..24]
 -- aliased ssr_rays [19..20] -> dof_prefiltered [27..29]
 -- aliased oit_color [22..25] -> motion_blur_color [33..47]
 

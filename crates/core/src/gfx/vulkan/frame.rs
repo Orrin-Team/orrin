@@ -79,7 +79,7 @@ pub struct FrameConfig {
     pub contact_shadows: bool,
     /// Whether the frame reflects off itself. Structural like the rest, and
     /// another consumer that can keep the geometry prepass alive on its own —
-    /// it reads depth, normals and the material target the prepass writes.
+    /// it reads every target the prepass writes but motion.
     pub ssr: bool,
     /// Whether the frame diffuses subsurface light across the image. Structural
     /// twice over, and more deeply than the rest: it registers three passes, it is
@@ -256,9 +256,10 @@ pub enum PassBody {
     /// Every level of the lit frame's pyramid, likewise — what a ray's cone is
     /// sampled out of.
     SsrSource,
-    /// One importance-sampled reflection ray per half-resolution pixel.
+    /// One exact reflection ray per half-resolution pixel.
     SsrTrace,
-    /// Upsamples those rays and swaps the environment's reflection for them.
+    /// Gathers those rays into each pixel, traces a smooth surface's own, and
+    /// swaps the environment's reflection for what they found.
     SsrResolve,
     /// One axis of the subsurface diffusion each, sharing a pipeline and differing
     /// only in the direction they are pushed — the same shape the bloom chain's
@@ -453,7 +454,7 @@ impl BloomIds {
 /// What the one geometry pass in front of shading leaves behind. Written
 /// together because they come off the same rasterisation, and read apart: SSAO
 /// wants depth and normals, TAA and motion blur want depth and motion, depth of
-/// field wants depth alone, reflections want all but the motion.
+/// field wants depth alone, reflections want all but motion.
 #[derive(Clone, Copy, Debug)]
 pub struct PrepassIds {
     pub normal: ResourceId,
@@ -491,7 +492,8 @@ pub struct SsaoIds {
     pub ao: ResourceId,
 }
 
-/// The reflection trace's three images, and what it was handed.
+/// The reflection trace's images, and what it was handed. All transient: an
+/// exact ray is the same next frame, so nothing is kept between frames.
 #[derive(Clone, Copy, Debug)]
 pub struct SsrIds {
     /// The lit frame the rays sample, recorded rather than re-derived for the
@@ -503,8 +505,7 @@ pub struct SsrIds {
     /// why a single pass has to write all of them.
     pub hiz: ResourceId,
     /// Half the frame with a pyramid over it: the lit colour, prefiltered, so a
-    /// ray from a rough surface reads the average of what its cone covers
-    /// rather than one texel inside it.
+    /// ray from a rough surface reads the blur its lobe would see in one fetch.
     pub source_pyramid: ResourceId,
     /// Half the frame: the radiance each ray found, with its confidence in
     /// alpha.
@@ -899,8 +900,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // target's bandwidth at the price of a second render pass to keep in step.
     // Seven readers now want different parts of it: SSAO and contact shadows
     // take depth and normals, TAA and motion blur take depth and motion, depth
-    // of field takes depth alone, reflections take depth, normals and the
-    // material target — and transparency and refraction both attach the depth
+    // of field takes depth alone, reflections take all but motion — and
+    // transparency and refraction both attach the depth
     // read-only, the two readers that want it as an attachment rather than as a
     // texture.
     //
@@ -1213,26 +1214,29 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let lit_color = subsurface.map_or(hdr_color, |ids| ids.output);
 
     // Between shading and the temporal resolve, and it has to be both: a ray can
-    // only sample radiance that has been lit, and one ray per pixel is noise
-    // until TAA has accumulated it over the jitter sequence. Putting it after
-    // the resolve instead would mean denoising it separately, with a second
-    // history of its own.
+    // only sample radiance that has been lit, and the reflection has to be
+    // antialiased with the rest of the frame rather than composited over the
+    // top of it.
     let ssr = config.ssr.then(|| {
         let prepass = prepass.expect("screen-space reflections read the geometry prepass");
         let source = lit_color;
 
         // One image carrying the whole pyramid rather than one per level, which
-        // is what lets the trace pick a level per step with `textureLod`. The
-        // build writes every level in a single pass because it must: a pass per
+        // is what lets the trace pick a level per step by index. The build
+        // writes every level in a single pass because it must: a pass per
         // level, each reading the level above from the same resource, is a cycle
-        // by the rule that makes readers follow writers.
-        let hiz =
-            builder.create_image("ssr_hiz", ImageDesc::new(HIZ_FORMAT).mip_levels(HIZ_LEVELS));
-        // The same shape over the lit frame, and the reason a rough reflection
-        // is affordable: a ray sampled from a wide lobe is a cone, and the level
-        // whose texel matches the cone's footprint carries the average of what
-        // the cone covers instead of one sample from inside it. Based at half
-        // the frame, which is the resolution the trace works at anyway.
+        // by the rule that makes readers follow writers. Based at half the
+        // frame: its level 0 would be the depth buffer, which the trace reads.
+        let hiz = builder.create_image(
+            "ssr_hiz",
+            ImageDesc::new(HIZ_FORMAT)
+                .extent(Extent::FrameDiv(1))
+                .mip_levels(HIZ_LEVELS),
+        );
+        // The same shape over the lit frame, and what a rough reflection is
+        // made of: the level whose texel matches the lobe's width at the hit
+        // carries the blur the lobe would see, in one fetch. Based at half the
+        // frame, which is the resolution the trace works at anyway.
         let source_pyramid = builder.create_image(
             "ssr_source",
             ImageDesc::new(HDR_FORMAT)
@@ -1240,8 +1244,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
                 .mip_levels(SOURCE_LEVELS),
         );
         // Half the frame, for the reason depth of field's gather is: the cost is
-        // the ray, and a stochastic ray is denoised temporally either way, so
-        // tracing four times as many buys far less than it costs.
+        // the ray, and a glossy surface's blur is wider than a quad, so tracing
+        // four times as many buys a sharper version of something the roughness
+        // then blurs. A smooth surface traces the rest of its quad in the
+        // composite — which is why that pass reads the pyramids too.
         let rays = builder.create_image(
             "ssr_rays",
             ImageDesc::new(RAY_FORMAT).extent(Extent::FrameDiv(1)),
@@ -1269,10 +1275,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(prepass.normal, Access::Sampled)
             .access(prepass.material, Access::Sampled)
             .access(source_pyramid, Access::Sampled)
+            .access(source, Access::Sampled)
             .access(rays, Access::StorageWrite)
             .build();
         record(id, PassBody::SsrTrace, &mut bodies);
 
+        // The gather and the composite in one pass: what the gather makes for a
+        // pixel is read by that pixel alone, so handing it over through a
+        // full-resolution image would be a dispatch and a write for nothing.
+        //
         // Reads `source` again rather than accumulating into it, for the reason
         // the depth-of-field composite does: resources are unversioned, so a
         // pass that both read and wrote the frame's colour would make "readers
@@ -1285,6 +1296,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(prepass.depth, Access::Sampled)
             .access(prepass.normal, Access::Sampled)
             .access(prepass.material, Access::Sampled)
+            .access(hiz, Access::Sampled)
+            .access(source_pyramid, Access::Sampled)
             .access(output, Access::StorageWrite)
             .build();
         record(id, PassBody::SsrResolve, &mut bodies);

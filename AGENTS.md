@@ -161,12 +161,14 @@ you want unsafe somewhere new, that is a design discussion, not a diff.
 
 ## 4. Tests
 
-**Agents write the test first.** Before implementing anything — a feature, a
-fix, a refactor with observable behaviour — write the failing test, run it, see
-it fail for the reason you expect, then implement until it passes. A patch that
-arrives with its tests written afterwards has only proven the code agrees with
-itself. This rule is for AI agents specifically; it exists because an agent's
-implementation is persuasive prose and the test is the only thing that isn't.
+**Few tests, and only where they pay.** Most changes need one test or none, and
+it may be written before or after the code. Write one where a bug would lose
+work, corrupt data, or break an invariant CI can check: save and load, undo,
+the registry, the render graph's barrier plan, ECS storage, the C# ABI. Don't
+write tests for how something looks, for editor layout or wording, or ones that
+restate the code. This rule is for AI agents specifically; it exists because an
+agent left alone writes a test per phrasing of a behaviour, and the suite then
+costs more to read and run than it catches.
 
 Where tests live:
 
@@ -191,9 +193,10 @@ graph tests assert the *barrier sequence*, which is the thing that would be
 wrong. Prefer one test that would catch a real bug over five that restate the
 code.
 
-If a change genuinely cannot be tested (a Vulkan path with no headless
-equivalent, an editor layout), say so explicitly in the PR and describe how you
-verified it by hand instead. Don't quietly skip.
+A change that moves pixels is evidenced by captures rather than assertions:
+before and after PNGs from `tests/offscreen.rs`, compared side by side in
+NVIDIA ICAT. For anything else left untested, say so explicitly in the PR and
+describe how you verified it by hand instead. Don't quietly skip.
 
 ---
 
@@ -283,8 +286,10 @@ An agent finishing a change presents, in the final message:
 
 1. **What changed**, file by file, in one line each.
 2. **Why**, where the reason is not obvious from the diff.
-3. **The tests** — which were written first, what they assert, and the actual
-   output of running them (pasted, not summarised as "tests pass").
+3. **The evidence** — for any test you added, what it asserts and the actual
+   output of running it (pasted, not summarised as "tests pass"); for a
+   rendering change, the before and after capture folders and what to look for
+   in them.
 4. **The numbers**, if anything on the frame path moved: before and after, from
    `tests/perf.rs` or a bench, with the environment stated.
 5. **What was not done**: anything skipped, assumed, or left untested, and why.

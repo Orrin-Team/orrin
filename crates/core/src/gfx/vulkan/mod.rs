@@ -1377,7 +1377,6 @@ impl VulkanRenderer {
                 ));
             }
         }
-
         self.backend
             .vk()
             .images
@@ -2286,7 +2285,7 @@ impl VulkanRenderer {
         // composite subtracts the environment term the forward pass added, so
         // it has to be handed the same rotation and the same tint that pass
         // will be. The pyramid depth comes off the allocated image rather than
-        // the declaration, because a window too small for seven levels gets
+        // the declaration, because a window too small for six levels gets
         // fewer and the march has to stop at the last one that exists.
         if let Some(ids) = self.frame.ids.ssr {
             let ambient = lighting.ambient_color * lighting.ambient_nits;
@@ -3703,7 +3702,6 @@ impl FrameRecord<'_> {
                 ));
             }
         }
-
         self.vk()
             .images
             .try_view(id)
@@ -3895,7 +3893,8 @@ impl FrameRecord<'_> {
                 let depth = self.table.texture(prepass.depth);
                 let normal = self.table.texture(prepass.normal);
                 let material = self.table.texture(prepass.material);
-                let source = self.table.texture(ids.source_pyramid);
+                let source_pyramid = self.table.texture(ids.source_pyramid);
+                let source = self.texture_of(ids.source);
                 let target = self.table.texture(ids.rays);
 
                 self.ssr.record_trace(
@@ -3905,6 +3904,7 @@ impl FrameRecord<'_> {
                     depth,
                     normal,
                     material,
+                    source_pyramid,
                     source,
                     target,
                 );
@@ -3925,6 +3925,8 @@ impl FrameRecord<'_> {
                 let depth = self.table.texture(prepass.depth);
                 let normal = self.table.texture(prepass.normal);
                 let material = self.table.texture(prepass.material);
+                let hiz = self.table.texture(ids.hiz);
+                let source_pyramid = self.table.texture(ids.source_pyramid);
                 let environment = self.environment.specular_view();
                 let target = self.table.texture(ids.output);
 
@@ -3936,6 +3938,8 @@ impl FrameRecord<'_> {
                     depth,
                     normal,
                     material,
+                    hiz,
+                    source_pyramid,
                     environment,
                     self.environment.sampler(),
                     target,
