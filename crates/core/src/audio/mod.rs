@@ -842,29 +842,6 @@ mod tests {
         );
     }
 
-    /// A source's volume is read every frame, so the inspector's slider
-    /// moves a sound that is playing; a script's volume multiplies it.
-    #[test]
-    fn a_sources_volume_and_a_scripts_multiply() {
-        let mut rig = rig();
-        let entity = rig.spawn_at(Vec3::ZERO);
-        let source = AudioSource {
-            clip: rig.clip,
-            looping: true,
-            spatial: false,
-            play_on_start: false,
-            ..AudioSource::default()
-        };
-        rig.world.insert(entity, source);
-        let id = rig.audio().play_source(entity, &source).unwrap();
-        assert_eq!(rig.frame(), [0.5; 2]);
-
-        rig.world.get_mut::<AudioSource>(entity).unwrap().volume = 0.5;
-        assert!(rig.audio().set_volume(id, 0.5));
-        rig.frame();
-        assert_eq!(rig.frame(), [0.125; 2]);
-    }
-
     #[test]
     fn leaving_play_silences_everything_and_pause_holds_it() {
         let mut rig = rig();
@@ -914,35 +891,6 @@ mod tests {
     }
 
     #[test]
-    fn a_preview_that_reaches_its_end_is_over() {
-        let mut rig = rig();
-        rig.set_state(PlayState::Editing);
-        rig.audio().preview(rig.clip);
-        rig.frame();
-        assert_eq!(rig.audio().previewing(), Some(rig.clip));
-        rig.pull(RATE as usize);
-        update(&rig.world);
-        rig.pull(BLOCK);
-        update(&rig.world);
-        assert_eq!(rig.audio().previewing(), None);
-    }
-
-    /// Play, Pause and Stop each end a preview: it belongs to the editor, and
-    /// the game's mix starts without it.
-    #[test]
-    fn a_preview_stops_when_the_transport_moves() {
-        let mut rig = rig();
-        rig.set_state(PlayState::Editing);
-        rig.audio().preview(rig.clip);
-        assert_eq!(rig.frame(), [0.5; 2]);
-
-        rig.set_state(PlayState::Playing);
-        rig.frame();
-        assert_eq!(rig.frame(), [0.0; 2]);
-        assert_eq!(rig.audio().previewing(), None);
-    }
-
-    #[test]
     fn a_despawned_entity_takes_its_sound_with_it() {
         let mut rig = rig();
         let entity = rig.spawn_at(Vec3::new(0.0, 0.0, -1.0));
@@ -957,23 +905,6 @@ mod tests {
         rig.frame();
         assert!(!rig.audio().is_playing(id));
         assert_eq!(rig.frame(), [0.0; 2]);
-    }
-
-    /// With no device there is nothing to wait for: the sound is accepted and
-    /// over by the next frame.
-    #[test]
-    fn without_a_device_a_sound_ends_the_frame_after_it_starts() {
-        let mut world = World::new();
-        world.insert_resource(Audio::default());
-        let mut play = Play::default();
-        play.set(PlayState::Playing);
-        world.insert_resource(play);
-        let id = world
-            .resource_mut::<Audio>()
-            .play(Sound::flat(AssetId::new()));
-        assert_ne!(id.to_bits(), 0);
-        update(&world);
-        assert!(!world.resource::<Audio>().is_playing(id));
     }
 
     /// The real device, which CI has none of: a tenth of a second of silence

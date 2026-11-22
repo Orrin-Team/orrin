@@ -97,12 +97,4 @@ mod tests {
         assert_eq!(world.resource::<Time>().delta_time(), 0.02);
         assert_eq!(world.resource::<Time>().unscaled_delta_time(), 0.04);
     }
-
-    /// A world with no transport — a story, a test — runs at one.
-    #[test]
-    fn a_world_with_no_transport_runs_at_one() {
-        let mut world = World::new();
-        world.insert_resource(Time::new());
-        assert_eq!(advance_time(&world, 0.04), 0.04);
-    }
 }

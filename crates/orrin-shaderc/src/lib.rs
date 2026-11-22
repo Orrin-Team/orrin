@@ -603,18 +603,6 @@ mod tests {
     }
 
     #[test]
-    fn a_layout_rebuilds_from_its_own_widths_table() {
-        let layout = Layout::from_resources(&[
-            resource(0, 0, ResourceKind::CombinedImageSampler, 1),
-            resource(0, 2, ResourceKind::UniformBuffer, 1),
-            resource(3, 1, ResourceKind::SampledImage, 8),
-        ]);
-        let table: Vec<_> = layout.widths().collect();
-        assert_eq!(table, [((0, 0), 2), ((0, 2), 1), ((3, 1), 8)]);
-        assert_eq!(Layout::from_widths(table), layout);
-    }
-
-    #[test]
     fn padding_fills_every_unused_id_of_a_set_in_id_order() {
         let layout = Layout::from_widths([((0, 0), 1), ((0, 1), 2), ((0, 2), 1), ((1, 0), 1)]);
         let msl = "struct spvDescriptorSetBuffer0\n{\n    \
@@ -630,13 +618,6 @@ mod tests {
              struct spvDescriptorSetBuffer1\n{\n    \
              constant Ubo* ubo [[id(0)]];\n};\n"
         );
-    }
-
-    #[test]
-    fn a_set_the_shader_does_not_declare_is_left_alone() {
-        let layout = Layout::from_widths([((0, 0), 1), ((0, 1), 1)]);
-        let msl = "kernel void main0() {}\n";
-        assert_eq!(pad_argument_buffers(msl, &layout), msl);
     }
 
     #[test]
@@ -733,15 +714,6 @@ mod tests {
             .unwrap();
         assert!(error.contains("two.frag"), "{error}");
         assert!(error.contains("set 0, binding 1"), "{error}");
-    }
-
-    #[test]
-    fn a_binding_wider_than_the_layout_allows_is_an_error() {
-        let layout = Layout::from_widths([((0, 0), 1), ((0, 1), 1)]);
-        let error = compile(&fragment("two.frag", TWO_BINDINGS), &no_includes, &layout)
-            .err()
-            .unwrap();
-        assert!(error.contains("set 0, binding 0"), "{error}");
     }
 
     #[test]

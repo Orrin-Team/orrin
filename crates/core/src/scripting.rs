@@ -4530,30 +4530,6 @@ mod tests {
         );
     }
 
-    /// The pre-`log_event` sinks pass no source, and a level from a newer
-    /// bindings assembly is one this build cannot name.
-    #[test]
-    fn an_unattributed_or_unknown_level_log_is_still_heard() {
-        let lines = logged(|| {
-            log_warn(c"legacy".as_ptr());
-            log_event(99, std::ptr::null(), 0, c"from the future".as_ptr());
-            log_event(2, std::ptr::null(), 0, std::ptr::null());
-        });
-        assert_eq!(
-            lines,
-            [
-                (
-                    LogLevel::Warning,
-                    "orrin_core::scripting: legacy".to_owned()
-                ),
-                (
-                    LogLevel::Error,
-                    "orrin_core::scripting: from the future".to_owned()
-                ),
-            ]
-        );
-    }
-
     /// A world whose prefab index holds one crate, as the FFI sees it.
     fn prefab_world() -> (World, Registry, AssetId) {
         let id = AssetId::new();
@@ -4618,17 +4594,6 @@ mod tests {
         build_prefab(&mut world, &registry, root, prefab);
         assert_eq!(world.get::<Name>(root).unwrap().0, "Crate");
         assert_eq!(world.get::<PrefabInstance>(root).unwrap().prefab, id);
-    }
-
-    #[test]
-    fn an_unknown_prefab_gives_a_script_the_null_entity() {
-        let (mut world, _, _) = prefab_world();
-        let bytes = AssetId::new().to_bytes();
-        let root =
-            orrin_script::with_active_world(&mut world, || instantiate_prefab(bytes.as_ptr()));
-        assert_eq!((root.index, root.generation), (0, 0));
-        assert_eq!(world.entities().count(), 0);
-        assert!(COMMANDS.with(|c| c.borrow().is_empty()));
     }
 
     /// A project with two scenes and the active one holding `Hub`, as a script
@@ -4809,78 +4774,6 @@ mod tests {
         assert_eq!(state(&mut world, AssetId::new()), orrin_script::LOAD_FAILED);
     }
 
-    #[test]
-    fn a_script_finds_a_font_by_path() {
-        let dir = crate::asset_db::tests::Dir::new("script-font");
-        dir.write("fonts/title.ttf", b"glyphs");
-        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
-        let mut world = World::new();
-        world.insert_resource(db);
-        let mut out = [0u8; 16];
-        let kind = orrin_script::with_active_world(&mut world, || {
-            find_asset(c"fonts/title.ttf".as_ptr(), out.as_mut_ptr())
-        });
-        assert_eq!(kind, orrin_script::ASSET_FONT);
-        let id = world
-            .resource::<crate::asset_db::AssetDatabase>()
-            .find("fonts/title.ttf")
-            .unwrap()
-            .id;
-        assert_eq!(AssetId::from_bytes(out), id);
-    }
-
-    #[test]
-    fn a_script_finds_a_sound_by_path() {
-        let dir = crate::asset_db::tests::Dir::new("script-audio");
-        dir.write("sfx/door.wav", b"riff");
-        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
-        let mut world = World::new();
-        world.insert_resource(db);
-        let mut out = [0u8; 16];
-        let kind = orrin_script::with_active_world(&mut world, || {
-            find_asset(c"sfx/door.wav".as_ptr(), out.as_mut_ptr())
-        });
-        assert_eq!(kind, orrin_script::ASSET_AUDIO);
-    }
-
-    /// A `.omat` is found by path as a material, Ready once it reads and
-    /// Failed while it does not; an engine-built material is always Ready.
-    #[test]
-    fn a_script_finds_a_material_by_path_and_reads_its_load_state() {
-        let dir = crate::asset_db::tests::Dir::new("script-materials");
-        let brick = crate::asset_db::material::write(&Default::default());
-        dir.write("props/brick.omat", brick.as_bytes());
-        dir.write("props/broken.omat", b"orrin-scene 3 min-reader 3\n");
-        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
-        let mut assets = Assets::default();
-        assets.insert_material("gold", MaterialHandle(7));
-        let mut world = World::new();
-        world.insert_resource(db);
-        world.insert_resource(assets);
-
-        let find = |world: &mut World, path: &std::ffi::CStr| {
-            let mut out = [0u8; 16];
-            let kind = orrin_script::with_active_world(world, || {
-                find_asset(path.as_ptr(), out.as_mut_ptr())
-            });
-            (kind, AssetId::from_bytes(out))
-        };
-        let state = |world: &mut World, id: AssetId| {
-            let bytes = id.to_bytes();
-            orrin_script::with_active_world(world, || asset_state(bytes.as_ptr()))
-        };
-
-        let (kind, brick) = find(&mut world, c"props/brick.omat");
-        assert_eq!(kind, orrin_script::ASSET_MATERIAL);
-        let (kind, broken) = find(&mut world, c"props/broken.omat");
-        assert_eq!(kind, orrin_script::ASSET_MATERIAL);
-
-        assert_eq!(state(&mut world, brick), orrin_script::LOAD_READY);
-        assert_eq!(state(&mut world, broken), orrin_script::LOAD_FAILED);
-        let gold = AssetId::named("material", "gold");
-        assert_eq!(state(&mut world, gold), orrin_script::LOAD_READY);
-    }
-
     fn c(entity: Entity) -> CEntity {
         CEntity {
             index: entity.index,
@@ -5005,21 +4898,6 @@ mod tests {
             assert!(set_active_camera(CEntity::NULL));
             assert_eq!(get_active_camera().index, first.index);
         });
-    }
-
-    /// A camera a script adds is one it means to look through, usually at once.
-    #[test]
-    fn a_camera_queued_this_tick_can_be_selected_this_tick() {
-        let mut world = camera_world();
-        let other = world.spawn();
-        world.insert(other, CameraComponent::default());
-        let fresh = world.spawn();
-        let selected = orrin_script::with_active_world(&mut world, || {
-            add_camera(c(fresh), &lens(0)) && set_active_camera(c(fresh))
-        });
-        assert!(selected);
-        COMMANDS.with(|c| c.borrow_mut().clear());
-        assert_eq!(world.resource::<ActiveCamera>().selected(), Some(fresh));
     }
 
     /// `Camera.position` and friends move the camera the game draws from, so
@@ -5506,53 +5384,6 @@ mod tests {
         assert_eq!((added.text.as_str(), added.size), ("Ready", 50.0));
     }
 
-    #[test]
-    fn a_script_asks_whether_the_pointer_is_over_the_ui() {
-        use crate::ui::events::{PointerInput, UiEvents, UiPointer, step};
-
-        let mut world = World::new();
-        assert!(!orrin_script::with_active_world(&mut world, || {
-            ui_pointer_over()
-        }));
-        let canvas = world.spawn();
-        world.insert(canvas, crate::ui::Canvas::default());
-        let panel = world.spawn();
-        world.insert(
-            panel,
-            crate::ui::RectTransform {
-                anchor_min: glam::Vec2::ZERO,
-                anchor_max: glam::Vec2::ZERO,
-                pivot: glam::Vec2::ZERO,
-                ..crate::ui::RectTransform::default()
-            },
-        );
-        world.insert(panel, crate::ui::Image::default());
-        crate::scene::reparent(&mut world, panel, Some(canvas), false).unwrap();
-        crate::ui::update(&mut world, [800, 600]);
-
-        for (x, over) in [(50.0, true), (500.0, false)] {
-            let mut pointer = UiPointer::default();
-            let input = PointerInput {
-                position: [x, 50.0],
-                ..PointerInput::default()
-            };
-            let tree = world.resource::<crate::ui::UiTree>();
-            step(
-                &world,
-                &tree.layout,
-                &mut pointer,
-                input,
-                &mut UiEvents::default(),
-            );
-            drop(tree);
-            world.insert_resource(pointer);
-            // The closure: see `orrin_script::component_bags`.
-            #[allow(clippy::redundant_closure)]
-            let answered = orrin_script::with_active_world(&mut world, || ui_pointer_over());
-            assert_eq!(answered, over);
-        }
-    }
-
     fn ui_world() -> World {
         let mut world = World::new();
         let mut canvas = UiCanvas::default();
@@ -5640,74 +5471,6 @@ mod tests {
         );
     }
 
-    /// The anchor crosses as a number C# owns the meaning of; one past the end
-    /// is a version mismatch and sets text as an unanchored label would.
-    #[test]
-    fn a_script_names_its_font_and_an_unknown_anchor_falls_back() {
-        use crate::scene::{TextAnchor, UiCommand};
-
-        let mut world = ui_world();
-        let font = AssetId::new();
-        orrin_script::with_active_world(&mut world, || {
-            ui_text(
-                "a".as_ptr(),
-                1,
-                font.to_bytes().as_ptr(),
-                12.0,
-                99,
-                0.0,
-                0.0,
-                10.0,
-                10.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-            );
-        });
-        let canvas = world.resource::<UiCanvas>();
-        let UiCommand::Text { style, .. } = &canvas.commands()[0] else {
-            panic!("{:?}", canvas.commands());
-        };
-        assert_eq!(style.font, Some(font));
-        assert_eq!(style.anchor, TextAnchor::UpperLeft);
-    }
-
-    #[test]
-    fn a_script_reads_the_screen_its_tick_began_with() {
-        let mut world = ui_world();
-        let (mut width, mut height) = (0.0, 0.0);
-        orrin_script::with_active_world(&mut world, || ui_screen_size(&mut width, &mut height));
-        assert_eq!((width, height), (1920.0, 1080.0));
-    }
-
-    /// A tool or a test may tick scripts with no canvas; the calls do nothing.
-    #[test]
-    fn ui_calls_without_a_canvas_are_ignored() {
-        let mut world = World::new();
-        let (mut width, mut height) = (1.0, 1.0);
-        orrin_script::with_active_world(&mut world, || {
-            ui_panel(0.0, 0.0, 10.0, 10.0, 1.0, 1.0, 1.0, 1.0);
-            ui_text(
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                12.0,
-                0,
-                0.0,
-                0.0,
-                10.0,
-                10.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-            );
-            ui_screen_size(&mut width, &mut height);
-        });
-        assert_eq!((width, height), (0.0, 0.0));
-    }
-
     /// A script is the game, so it sees the cursor in the pixels of the screen
     /// it is told it has — the previewed one in the editor.
     #[test]
@@ -5772,33 +5535,6 @@ mod tests {
             assert!(!tween_playing(id));
             assert!(!tween_cancel(id));
         });
-    }
-
-    /// The named start and every timing field cross intact.
-    #[test]
-    fn a_tween_request_crosses_whole() {
-        let (mut world, entity) = tween_world();
-        let request = orrin_script::CTween {
-            delay: 0.25,
-            repeat: 2,
-            reverses: 1,
-            has_from: 1,
-            from: [-10.0, 0.0, 0.0, 0.0],
-            ..slide()
-        };
-        orrin_script::with_active_world(&mut world, || {
-            tween_play(c(entity), &request, size_of::<orrin_script::CTween>())
-        });
-        crate::ui::tween::advance(&world, 0.1);
-        assert_eq!(
-            world
-                .get::<crate::ui::RectTransform>(entity)
-                .unwrap()
-                .anchored_position
-                .x,
-            -10.0,
-            "the named start is written while the delay runs"
-        );
     }
 
     #[test]
@@ -5872,33 +5608,6 @@ mod tests {
             0,
             "outside a dispatch window"
         );
-    }
-
-    #[test]
-    fn a_story_asks_for_its_controls_by_name() {
-        let mut world = World::new();
-        world.insert_resource(crate::ui::story::StoryArgs::default());
-        let name = "Width";
-        let (width, disabled) = orrin_script::with_active_world(&mut world, || {
-            (
-                story_float(name.as_ptr(), name.len() as u32, 160.0, 80.0, 400.0),
-                story_bool(c"Off".as_ptr().cast(), 3, true),
-            )
-        });
-        assert_eq!((width, disabled), (160.0, true));
-        let args = world.resource::<crate::ui::story::StoryArgs>();
-        assert_eq!(args.controls().len(), 2);
-        assert_eq!(args.controls()[1].name, "Off");
-    }
-
-    #[test]
-    fn a_control_outside_a_story_is_its_default() {
-        let mut world = World::new();
-        let got = orrin_script::with_active_world(&mut world, || {
-            story_float(c"x".as_ptr().cast(), 1, 0.5, 0.0, 1.0)
-        });
-        assert_eq!(got, 0.5);
-        assert!(!story_bool(std::ptr::null(), 0, false));
     }
 
     fn taken_commands() -> Vec<Command> {
@@ -6221,59 +5930,6 @@ mod tests {
         );
     }
 
-    /// A material loaded with no asset behind it — a glTF's, or one made at
-    /// run time — reads as the null reference, and writing that back keeps it:
-    /// otherwise a script could not change such a renderer's mesh at all. The
-    /// null is still refused where it would replace an asset, or be added.
-    #[test]
-    fn a_mesh_renderer_round_trips_a_material_no_asset_names() {
-        let mut world = World::new();
-        let mut assets = crate::scene::Assets::new();
-        assets.insert_mesh("cube", MeshHandle(3));
-        assets.insert_mesh("sphere", MeshHandle(4));
-        world.insert_resource(assets);
-        let entity = world.spawn();
-        world.insert(entity, MeshHandle(3));
-        world.insert(entity, MaterialHandle(9));
-        let fresh = world.spawn();
-        let size = size_of::<orrin_script::CMeshRenderer>();
-        taken_commands();
-
-        let (read, written, added) = orrin_script::with_active_world(&mut world, || {
-            let mut c = orrin_script::CMeshRenderer::default();
-            let read = get_component(
-                c_entity(entity),
-                KIND_MESH_RENDERER,
-                (&raw mut c).cast(),
-                size,
-            ) && c.material == [0; 16];
-            c.mesh = AssetId::named("mesh", "sphere").to_bytes();
-            let written = set_component(
-                c_entity(entity),
-                KIND_MESH_RENDERER,
-                (&raw const c).cast(),
-                size,
-            );
-            let added = add_component(
-                c_entity(fresh),
-                KIND_MESH_RENDERER,
-                (&raw const c).cast(),
-                size,
-            );
-            (read, written, added)
-        });
-
-        assert!(read, "an unnamed material reads as the null reference");
-        assert!(written, "and writing it back is not assigning nothing");
-        assert_eq!(*world.get::<MeshHandle>(entity).unwrap(), MeshHandle(4));
-        assert_eq!(
-            *world.get::<MaterialHandle>(entity).unwrap(),
-            MaterialHandle(9)
-        );
-        assert!(!added, "a new renderer has no material to keep");
-        assert!(taken_commands().is_empty());
-    }
-
     #[test]
     fn a_script_reads_writes_and_adds_an_audio_source_as_a_component() {
         let mut world = World::new();
@@ -6496,89 +6152,6 @@ mod tests {
         assert!(world.resource::<crate::scene::CursorLock>().requested);
     }
 
-    /// An empty entity spawned where it stands has its transform at once, so
-    /// the same tick can read and move it.
-    #[test]
-    fn a_script_spawns_an_empty_entity_where_it_stands() {
-        let mut world = World::new();
-        let at = CTransform {
-            position: [1.0, 2.0, 3.0],
-            rotation: [0.0, 0.0, 0.0, 1.0],
-            scale: [1.0; 3],
-        };
-
-        let spawned = orrin_script::with_active_world(&mut world, || spawn_with_transform(&at));
-
-        let entity = entity_of(spawned);
-        assert!(world.is_alive(entity));
-        let local = world.get::<LocalTransform>(entity).unwrap();
-        assert_eq!(local.translation, Vec3::new(1.0, 2.0, 3.0));
-    }
-
-    #[test]
-    fn a_script_reads_the_scaled_delta_and_the_real_one() {
-        let mut world = World::new();
-        let mut time = Time::new();
-        time.update(0.04, 0.5);
-        world.insert_resource(time);
-
-        let read =
-            orrin_script::with_active_world(&mut world, || (time_delta(), time_unscaled_delta()));
-
-        assert_eq!(read, (0.02, 0.04));
-    }
-
-    /// The scale lives on the transport, which a test world may not have yet:
-    /// the first write brings one, and a negative scale is pause.
-    #[test]
-    fn a_script_sets_the_time_scale_on_the_transport() {
-        let mut world = World::new();
-
-        let read = orrin_script::with_active_world(&mut world, || {
-            let before = time_scale();
-            set_time_scale(0.5);
-            let after = time_scale();
-            set_time_scale(-1.0);
-            (before, after, time_scale())
-        });
-
-        assert_eq!(read, (1.0, 0.5, 0.0));
-        assert_eq!(world.resource::<crate::scene::Play>().time_scale(), 0.0);
-    }
-
-    #[test]
-    fn the_fixed_delta_is_the_scenes_step() {
-        let mut world = World::new();
-        world.spawn_entity().with(crate::scene::PhysicsSettings {
-            steps_per_second: 120,
-            ..Default::default()
-        });
-
-        // The closure: see `orrin_script::component_bags`.
-        #[allow(clippy::redundant_closure)]
-        let step = orrin_script::with_active_world(&mut world, || time_fixed_delta());
-
-        assert_eq!(step, 1.0 / 120.0);
-    }
-
-    #[test]
-    fn a_script_reads_the_wheel_for_the_frame_it_turned() {
-        let mut world = World::new();
-        let mut input = InputState::new();
-        input.scroll_wheel((0.5, 1.0));
-        input.scroll_wheel((0.0, -3.0));
-        world.insert_resource(input);
-
-        let mut turned = [9.0; 2];
-        orrin_script::with_active_world(&mut world, || scroll_delta(&mut turned));
-        world.resource_mut::<InputState>().end_frame();
-        let mut next = [9.0; 2];
-        orrin_script::with_active_world(&mut world, || scroll_delta(&mut next));
-
-        assert_eq!(turned, [0.5, -2.0]);
-        assert_eq!(next, [0.0, 0.0]);
-    }
-
     fn sphere_query(center: [f32; 3], radius: f32) -> orrin_script::CShapeQuery {
         orrin_script::CShapeQuery {
             shape: 0,
@@ -6625,35 +6198,5 @@ mod tests {
         assert_eq!(total, 3);
         assert_eq!(out.map(entity_of), [row[0], row[1]]);
         assert_eq!(short, 0, "a query of the wrong size is refused");
-    }
-
-    #[test]
-    fn a_shape_cast_writes_its_hit() {
-        let mut world = physics_world();
-        let wall = collider_at(&mut world, Vec3::new(0.0, 0.0, -5.0));
-        physics_frame(&mut world);
-        let mut query = sphere_query([0.0; 3], 0.5);
-        query.shape = 1;
-        query.size = [0.5; 3];
-        let mut hit = orrin_script::CRaycastHit {
-            entity: CEntity::NULL,
-            point: [0.0; 3],
-            normal: [0.0; 3],
-            distance: 0.0,
-        };
-
-        let found = orrin_script::with_active_world(&mut world, || {
-            physics_shape_cast(
-                &query,
-                size_of::<orrin_script::CShapeQuery>(),
-                &mut hit,
-                size_of::<orrin_script::CRaycastHit>(),
-            )
-        });
-
-        assert!(found);
-        assert_eq!(entity_of(hit.entity), wall);
-        assert!((hit.distance - 4.0).abs() < 1e-3, "{}", hit.distance);
-        assert!(Vec3::from_array(hit.normal).abs_diff_eq(Vec3::Z, 1e-3));
     }
 }

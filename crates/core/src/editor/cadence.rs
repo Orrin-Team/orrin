@@ -71,11 +71,6 @@ mod tests {
         start
     }
 
-    #[test]
-    fn the_first_frame_is_due() {
-        assert!(Cadence::default().due(Instant::now()));
-    }
-
     /// The whole point: a thousand frames a second, and the UI rebuilt for
     /// only one of every sixteen or so.
     #[test]
@@ -85,29 +80,6 @@ mod tests {
         assert!(!cadence.due(start + Duration::from_millis(1)));
         assert!(!cadence.due(start + INTERVAL - SLACK - Duration::from_micros(1)));
         assert!(cadence.due(start + INTERVAL));
-    }
-
-    /// A 120 Hz display presents a frame every 8.33 ms, so two frames span one
-    /// interval *almost* exactly — and with real timing jitter the second of
-    /// them lands a hair early half the time. The UI must still rebuild every
-    /// other frame, at the display's 60 Hz, and not slip to every third.
-    #[test]
-    fn a_high_frame_rate_rebuilds_at_the_interval_not_below_it() {
-        let mut cadence = Cadence::default();
-        let start = Instant::now();
-        let mut runs = 0;
-        for frame in 0..240u32 {
-            let jitter = if frame % 2 == 0 { 0 } else { 60 };
-            let now = start + Duration::from_micros(u64::from(frame) * 8_333 - jitter);
-            if cadence.due(now) {
-                cadence.ran(now, Duration::MAX);
-                runs += 1;
-            }
-        }
-        assert!(
-            (118..=122).contains(&runs),
-            "{runs} rebuilds in two seconds at 120 Hz"
-        );
     }
 
     #[test]

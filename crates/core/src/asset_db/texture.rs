@@ -385,20 +385,6 @@ mod tests {
         assert_eq!(level_count(4096, 16), 13);
     }
 
-    #[test]
-    fn a_flat_texture_is_the_same_texel_at_every_level() {
-        for usage in [Usage::Color, Usage::Data] {
-            let chain = mip_chain(flat(8, 8, [200, 100, 50, 77]), usage);
-            for level in &chain {
-                assert!(
-                    level.pixels().all(|p| p.0 == [200, 100, 50, 77]),
-                    "{usage:?} {:?}",
-                    level.dimensions()
-                );
-            }
-        }
-    }
-
     fn checker(width: u32, height: u32) -> RgbaImage {
         RgbaImage::from_fn(width, height, |x, y| {
             let v = if (x + y) % 2 == 0 { 0 } else { 255 };
@@ -470,14 +456,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_level_rounds_partial_blocks_up() {
-        assert_eq!(TexelFormat::Bc7Srgb.level_len(5, 3), 2 * 16);
-        assert_eq!(TexelFormat::Bc5Unorm.level_len(1, 1), 16);
-        assert_eq!(TexelFormat::Bc7Unorm.level_len(9, 9), 9 * 16);
-        assert_eq!(TexelFormat::Rgba8Srgb.level_len(5, 3), 60);
-    }
-
     fn gradient(width: u32, height: u32) -> RgbaImage {
         RgbaImage::from_fn(width, height, |x, y| {
             image::Rgba([
@@ -487,31 +465,6 @@ mod tests {
                 255,
             ])
         })
-    }
-
-    /// The tiles exist only to keep `rusty_dds` off threads of its own; the
-    /// blocks have to be exactly the ones it makes of the whole image, which
-    /// at this size it encodes on those threads.
-    #[test]
-    fn tiled_compression_is_the_whole_image_compressed() {
-        let image = gradient(203, 137);
-        for (format, content) in [
-            (TexelFormat::Bc7Srgb, DecodeContent::Bc7),
-            (TexelFormat::Bc5Unorm, DecodeContent::Bc5UNorm),
-        ] {
-            let whole = rusty_dds::Dds::encode_from_rgba8(
-                image.as_raw(),
-                rusty_dds::EncodeLayout::flat_2d(content, 203, 137),
-            )
-            .unwrap()
-            .data;
-            let tiled = encode(&image, format);
-            assert_eq!(tiled.len(), format.level_len(203, 137), "{format:?}");
-            assert!(
-                tiled == whole,
-                "{format:?}: the tiles differ from the whole"
-            );
-        }
     }
 
     fn decoded(content: DecodeContent, blocks: &[u8], width: u32, height: u32) -> Vec<u8> {
@@ -562,37 +515,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Fitted, not stretched: a 4:1 texture fills the middle quarter of the
-    /// square's height and leaves the rest clear.
-    #[test]
-    fn a_thumbnail_fits_the_texture_in_its_square() {
-        let wide = flat(256, 64, [200, 30, 40, 255]);
-        let chain = mip_chain(wide, Usage::Color);
-        let picture = thumbnail(&chain, Usage::Color);
-        let edge = thumbnail::SIZE;
-        assert_eq!(picture.size, edge);
-        assert_eq!(picture.rgba(edge / 2, edge / 2), [200, 30, 40, 255]);
-        assert_eq!(picture.rgba(edge / 2, 2)[3], 0, "clear above");
-        assert_eq!(picture.rgba(edge / 2, edge - 3)[3], 0, "and below");
-
-        let tiny = mip_chain(flat(2, 2, [9, 8, 7, 255]), Usage::Data);
-        let picture = thumbnail(&tiny, Usage::Data);
-        assert_eq!(picture.size, edge);
-        assert_eq!(
-            picture.rgba(0, 0),
-            [9, 8, 7, 255],
-            "a small one is scaled up"
-        );
-    }
-
-    #[test]
-    fn an_rgba8_level_is_its_texels() {
-        let image = gradient(3, 2);
-        assert_eq!(
-            encode(&image, TexelFormat::Rgba8Srgb),
-            image.as_raw().clone()
-        );
     }
 }

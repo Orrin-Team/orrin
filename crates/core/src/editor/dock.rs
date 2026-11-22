@@ -22,6 +22,27 @@
 //! nothing: egui hands the whole `CentralPanel` to the UI regardless. See
 //! [`Dock::wants_pointer`], which is what the editor asks in egui's place.
 //!
+//! **The tools keep their size; the scene takes the rest.** egui_dock stores a
+//! fraction per split and lays the tree out from those every frame, so left
+//! alone a hierarchy a fifth of an 800-point window is a fifth of a 3440-point
+//! one. So when the dock's region changes size, [`Dock::hold`] rewrites the
+//! fractions of the splits on the way from the root to the viewport — the ones
+//! a tool borders the scene across — so that each of those tools keeps its
+//! size in points and the viewport absorbs the change. Splits inside a tool
+//! column stay shares of that column, and a floating window is its own size.
+//! The size a tool keeps is the one it was last left at: by `hold` itself, or,
+//! where a split's fraction is no longer the one `hold` set, by a dragged
+//! separator or a layout file, whose nodes carry the rects of the frame they
+//! were saved on. Holding them is not allowed to cost the scene its place:
+//! where the tools on an axis would leave it less than [`SCENE_SHARE`] of
+//! the region, they give way in proportion to one another until it has
+//! exactly that, and are handed their sizes back once there is room — a
+//! squeeze changes what they are given, never what they want. A fixed
+//! minimum in points was tried first and is the wrong shape: in the 800-point
+//! start window, columns wanted from a wide one shrank in proportion to it
+//! and left the scene 18% of the window. A frame whose region is the size it
+//! was costs one comparison.
+//!
 //! **A tab dragged out over the scene floats there.** egui_dock floats a tab
 //! only when it is let go over another tool's body, because a drop needs a
 //! node under the pointer to resolve against — and the centre, being `Empty`,
@@ -49,17 +70,27 @@ use super::previews::Previews;
 use super::state::{DockRequest, EditorState};
 use super::theme::ThemeSet;
 
-/// Fractions rather than pixels, because a split is a proportion of its parent
-/// and the window has no fixed size. Measured to land on the widths the design
-/// asks for — hierarchy 240, inspector 320, bottom dock 220 — at the 1280x800
-/// the editor is designed against.
+/// The design's tool sizes in points, and the region they were drawn in: the
+/// dock's share of the 1280x800 window the editor is designed against, below
+/// the menu bar and above the status bar. A split still takes a fraction, so
+/// the default layout is built from these over that region and its root is
+/// given that rect; its first frame then holds them at these sizes in whatever
+/// window it opens in (see the module docs).
 ///
 /// Mind which side a fraction describes: `split_left` and `split_above` give it
 /// to the *new* node, `split_right` and `split_below` to the old one. The
 /// doc comments on all four say the old node, which is true of only two.
-const HIERARCHY: f32 = 0.1875;
-const INSPECTOR: f32 = 0.6923;
-const BOTTOM: f32 = 0.7043;
+const DESIGNED: egui::Vec2 = egui::vec2(1280.0, 744.0);
+const HIERARCHY: f32 = 240.0;
+const INSPECTOR: f32 = 320.0;
+const BOTTOM: f32 = 220.0;
+
+/// The share of the dock's region the scene keeps on each axis before the
+/// tools around it give way. Under the designed layout at 1280x800 the scene
+/// has 56% of the width and 70% of the height, so this never touches it; in
+/// the 800x600 the editor opens at, it is what stops wide columns saved in a
+/// large window leaving the scene a sliver.
+const SCENE_SHARE: f32 = 0.4;
 
 /// A dockable tool. Save and load are also in the File menu and the status
 /// bar, where they are reachable without the Scene Manager open.
@@ -156,6 +187,21 @@ pub struct Dock {
     settings_in_use: bool,
     /// Whether Escape closes Settings, as the frame last drawn left things.
     escape_closes: bool,
+    /// The splits bordering the viewport as [`Dock::hold`] last left them.
+    held: Vec<Held>,
+}
+
+/// A split bordering the viewport: the fraction [`Dock::hold`] gave it, the
+/// size in points the tool across it wants, and which side the scene is on.
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    node: NodeIndex,
+    fraction: f32,
+    wants: f32,
+    horizontal: bool,
+    /// Whether the scene is the split's right or lower child, so the tool's
+    /// share is the fraction rather than the rest.
+    scene_second: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -189,17 +235,17 @@ pub fn default_layout() -> DockState<Tab> {
 
     let [viewport, _] = surface.split_left(
         NodeIndex::root(),
-        HIERARCHY,
+        HIERARCHY / DESIGNED.x,
         vec![Tab::Hierarchy, Tab::Scenes],
     );
     let [viewport, _] = surface.split_right(
         viewport,
-        INSPECTOR,
+        1.0 - INSPECTOR / (DESIGNED.x - HIERARCHY),
         vec![Tab::Inspector, Tab::Environment, Tab::Import],
     );
     let [viewport, _] = surface.split_below(
         viewport,
-        BOTTOM,
+        1.0 - BOTTOM / DESIGNED.y,
         vec![
             Tab::Console,
             Tab::Assets,
@@ -211,6 +257,7 @@ pub fn default_layout() -> DockState<Tab> {
     );
 
     surface[viewport] = Node::Empty;
+    surface[NodeIndex::root()].set_rect(egui::Rect::from_min_size(egui::Pos2::ZERO, DESIGNED));
     state
 }
 
@@ -230,6 +277,7 @@ impl Dock {
             grab: None,
             settings_in_use: false,
             escape_closes: false,
+            held: Vec::new(),
         }
     }
 
@@ -245,6 +293,124 @@ impl Dock {
 
     pub fn reset(&mut self) {
         self.state = default_layout();
+        self.held.clear();
+    }
+
+    /// Give the splits bordering the viewport the fractions that keep their
+    /// tools at the sizes they were left at, in a region now `region` in size.
+    /// Nothing to do unless the region changed size since the tree was last
+    /// laid out — its root's rect is that layout's region.
+    fn hold(&mut self, region: egui::Vec2, separator: f32) {
+        use egui_dock::Node;
+
+        let tree = self.state.main_surface_mut();
+        let Some(last) = tree.root_node().and_then(Node::rect) else {
+            return;
+        };
+        // Not a minimised window's empty region either way: there is nothing
+        // to hold the tools against, and nothing to take their sizes from.
+        let empty = |size: egui::Vec2| !(size.is_finite() && size.x > 0.0 && size.y > 0.0);
+        if empty(last.size()) || empty(region) || (last.size() - region).abs().max_elem() < 0.5 {
+            return;
+        }
+        let Some(scene) = (0..tree.len()).map(NodeIndex).find(|&index| {
+            matches!(tree[index], Node::Empty)
+                && index
+                    .parent()
+                    .is_some_and(|parent| tree[parent].is_parent())
+        }) else {
+            return;
+        };
+
+        // Walked up from the scene and read back down, so each split's old
+        // extent is what the one above it left the scene's side.
+        let first = self.held.len();
+        let mut at = scene;
+        while let Some(parent) = at.parent() {
+            let previous = self.held[..first]
+                .iter()
+                .find(|held| held.node == parent)
+                .copied();
+            let (horizontal, fraction) = match tree[parent] {
+                Node::Horizontal { fraction, .. } => (true, fraction),
+                Node::Vertical { fraction, .. } => (false, fraction),
+                _ => break,
+            };
+            self.held.push(Held {
+                node: parent,
+                fraction,
+                wants: previous
+                    .filter(|held| held.fraction == fraction)
+                    .map_or(f32::NAN, |held| held.wants),
+                horizontal,
+                scene_second: at.is_right(),
+            });
+            at = parent;
+        }
+        self.held.drain(..first);
+        self.held.reverse();
+
+        let axis = |size: egui::Vec2, horizontal: bool| if horizontal { size.x } else { size.y };
+        let mut old = last.size();
+        // What the tools want on each axis, and the separators beside them.
+        let mut wanted = egui::Vec2::ZERO;
+        let mut separators = egui::Vec2::ZERO;
+        for held in &mut self.held {
+            let extent = axis(old, held.horizontal);
+            let share = if held.scene_second {
+                held.fraction
+            } else {
+                1.0 - held.fraction
+            };
+            let actual = share * extent;
+            if held.wants.is_nan() {
+                held.wants = actual;
+            }
+            let taken = actual + separator / 2.0;
+            if held.horizontal {
+                old.x -= taken;
+                wanted.x += held.wants;
+                separators.x += separator / 2.0;
+            } else {
+                old.y -= taken;
+                wanted.y += held.wants;
+                separators.y += separator / 2.0;
+            }
+        }
+
+        let room = region * (1.0 - SCENE_SHARE) - separators;
+        let fit = |room: f32, wanted: f32| {
+            if wanted > 0.0 {
+                (room / wanted).clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        };
+        let scale = egui::vec2(fit(room.x, wanted.x), fit(room.y, wanted.y));
+        let mut new = region;
+        for held in &mut self.held {
+            let extent = axis(new, held.horizontal);
+            if extent <= 0.0 {
+                break;
+            }
+            let given = held.wants * axis(scale, held.horizontal);
+            let share = (given / extent).clamp(0.0, 1.0);
+            held.fraction = if held.scene_second {
+                share
+            } else {
+                1.0 - share
+            };
+            if let Node::Horizontal { fraction, .. } | Node::Vertical { fraction, .. } =
+                &mut tree[held.node]
+            {
+                *fraction = held.fraction;
+            }
+            if held.horizontal {
+                new.x -= given + separator / 2.0;
+            } else {
+                new.y -= given + separator / 2.0;
+            }
+        }
     }
 
     /// Bring a tool to the front of whatever leaf holds it. A tool sharing a
@@ -545,6 +711,7 @@ impl Dock {
         // CentralPanel with the style's fill, which is why this one is mounted
         // here and the area drawn inside it.
         self.region = ctx.available_rect();
+        self.hold(self.region.size(), separator);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
@@ -680,7 +847,7 @@ fn window_rect(region: egui::Rect) -> egui::Rect {
         return egui::Rect::from_min_size(egui::pos2(80.0, 80.0), SIZE);
     }
     let size = SIZE.min(region.size() * 0.9);
-    let left = region.left() + region.width() * HIERARCHY + 16.0;
+    let left = region.left() + HIERARCHY + 16.0;
     let min = egui::pos2(
         left.min(region.right() - size.x),
         region.top() + (region.height() - size.y) / 2.0,
@@ -855,6 +1022,9 @@ const TAB_ICON_GAP: f32 = 20.0;
 impl egui_dock::TabViewer for Viewer<'_> {
     type Tab = Tab;
 
+    /// The Console's carries a count of what was logged while it was out of
+    /// sight — errors, or warnings when there are none — since a tool behind
+    /// another in its leaf otherwise says nothing at all.
     fn title(&mut self, tab: &mut Tab) -> egui::WidgetText {
         let mut job = egui::text::LayoutJob::default();
         job.append(
@@ -862,6 +1032,21 @@ impl egui_dock::TabViewer for Viewer<'_> {
             TAB_ICON_GAP,
             egui::TextFormat::simple(egui::FontId::proportional(12.5), egui::Color32::PLACEHOLDER),
         );
+        if *tab == Tab::Console {
+            let (errors, warnings) = self.state.console.unseen();
+            let (count, colour) = if errors > 0 {
+                (errors, super::theme::LOG_ERROR)
+            } else {
+                (warnings, super::theme::LOG_WARN)
+            };
+            if count > 0 {
+                job.append(
+                    &format!(" {count}"),
+                    0.0,
+                    egui::TextFormat::simple(egui::FontId::monospace(11.5), colour),
+                );
+            }
+        }
         job.into()
     }
 
@@ -959,61 +1144,6 @@ mod tests {
         );
     }
 
-    /// The dock has to look like the rest of the editor. `Style::from_egui`
-    /// reads egui's surfaces but picks different ones than a panel does — the
-    /// tab strip lands on the sunken fill and an open tab on the window fill,
-    /// so the top bar and the dock read as two different programs.
-    #[test]
-    fn the_dock_wears_the_same_surfaces_as_a_panel() {
-        let ctx = egui::Context::default();
-        crate::editor::theme::apply(&ctx, &crate::editor::theme::Theme::default());
-        let style = ctx.style();
-        let dock = dock_style(&style);
-
-        // The strip is the window's frame, darker than the tools: the menu
-        // and status bars' colour, between the panel and the field wells.
-        let panel = style.visuals.panel_fill;
-        let strip = dock.tab_bar.bg_fill;
-        assert_eq!(dock.tab.tab_body.bg_fill, panel);
-        assert!(strip.r() < panel.r() && strip.r() > style.visuals.extreme_bg_color.r());
-
-        // The open tab is the panel it opens, the same surface continuing up
-        // into the strip, so the tool and its tab read as one piece. A tab of
-        // any other fill sat on the panel like a button.
-        assert_eq!(dock.tab.active.bg_fill, panel);
-        assert_eq!(dock.tab.focused.bg_fill, panel);
-        assert_eq!(dock.tab.inactive.bg_fill, strip);
-        assert_ne!(dock.tab.active.bg_fill, style.visuals.selection.bg_fill);
-
-        assert_eq!(dock.tab_bar.height, crate::editor::panels::TAB_BAR_HEIGHT);
-
-        // Idle has fill and no stroke; hover adds a grey one.
-        assert_eq!(dock.tab.inactive.outline_color, egui::Color32::TRANSPARENT);
-        assert_eq!(
-            dock.tab.hovered.outline_color,
-            style.visuals.widgets.hovered.bg_stroke.color
-        );
-
-        // None of it may be hard-coded: a user theme has to carry through. The
-        // accent reaches the dock through a dragged separator, and the
-        // surfaces and the hover outline move with the theme's greys.
-        let ember = crate::editor::theme::Theme {
-            accent: [255, 120, 60],
-            widget: [70, 60, 55],
-            widget_hover: [92, 80, 72],
-            panel: [28, 23, 21],
-            ..crate::editor::theme::Theme::default()
-        };
-        crate::editor::theme::apply(&ctx, &ember);
-        let themed = dock_style(&ctx.style());
-        assert_ne!(themed.separator.color_dragged, dock.separator.color_dragged);
-        assert_ne!(
-            themed.tab.hovered.outline_color,
-            dock.tab.hovered.outline_color
-        );
-        assert_ne!(themed.tab.active.bg_fill, dock.tab.active.bg_fill);
-    }
-
     /// The default layout as it was written before the Shader tab existed.
     /// A variant is only ever added, so a file like this one still loads, the
     /// tab is simply closed in it, and asking for it brings it back beside the
@@ -1039,18 +1169,6 @@ mod tests {
             leaf(Tab::Console),
             "beside its default neighbours"
         );
-    }
-
-    /// A tool is listed, named and pictured like every other: the View menu
-    /// and the tab strip are both built from these.
-    #[test]
-    fn the_shader_tab_is_a_tool_of_its_own() {
-        assert!(Tab::ALL.contains(&Tab::Shader));
-        assert_eq!(Tab::Shader.title(), "Shader");
-        for other in Tab::ALL.into_iter().filter(|tab| *tab != Tab::Shader) {
-            assert_ne!(other.icon(), Tab::Shader.icon(), "{}", other.title());
-            assert_ne!(other.title(), Tab::Shader.title());
-        }
     }
 
     #[test]

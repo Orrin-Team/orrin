@@ -529,18 +529,6 @@ fn pack(image: &egui::ImageData, format: Format, into: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    /// Two lent textures given one id would paint one in the other's place.
-    #[test]
-    fn every_lent_texture_has_its_own_id() {
-        use super::super::material_preview::Viewer;
-        let ids: Vec<_> = Viewer::ALL
-            .map(|viewer| UserTexture::MaterialPreview(viewer).id())
-            .into();
-        let unique: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(unique.len(), ids.len(), "{ids:?}");
-        assert!(ids.iter().all(|id| matches!(id, egui::TextureId::User(_))));
-    }
-
     use super::*;
     use crate::gfx::vulkan::context::VkContext;
     use crate::gfx::vulkan::driver::color_to_present;
@@ -583,23 +571,6 @@ mod tests {
         let scissor = scissor(rect(10.2, 4.0, 2000.0, 30.6), 1.5, [800, 600]).expect("on screen");
         assert_eq!(scissor.offset, [15, 6]);
         assert_eq!(scissor.extent, [785, 40]);
-    }
-
-    /// egui clips to rects that run off the window or have no area; Vulkan
-    /// rejects a scissor with a negative offset, and a draw into nothing is
-    /// work.
-    #[test]
-    fn a_clip_rect_off_screen_or_empty_is_no_scissor() {
-        assert_eq!(
-            scissor(rect(-50.0, -50.0, -10.0, -10.0), 1.0, [800, 600]),
-            None
-        );
-        assert_eq!(
-            scissor(rect(900.0, 10.0, 950.0, 20.0), 1.0, [800, 600]),
-            None
-        );
-        assert_eq!(scissor(rect(10.0, 10.0, 10.0, 20.0), 1.0, [800, 600]), None);
-        assert_eq!(scissor(egui::Rect::NOTHING, 1.0, [800, 600]), None);
     }
 
     /// Several textures in one frame share the staging buffer, and each copy

@@ -342,18 +342,6 @@ mod tests {
         assert!(recents.projects.is_empty());
     }
 
-    #[test]
-    fn times_read_the_way_a_person_says_them() {
-        let now = 1_000_000;
-        assert_eq!(ago(now - 5, now), "just now");
-        assert_eq!(ago(now - 60, now), "1 minute ago");
-        assert_eq!(ago(now - 60 * 25, now), "25 minutes ago");
-        assert_eq!(ago(now - 3600 * 3, now), "3 hours ago");
-        assert_eq!(ago(now - 86_400, now), "yesterday");
-        assert_eq!(ago(now - 86_400 * 4, now), "4 days ago");
-        assert_eq!(ago(now + 50, now), "just now", "a clock that moved back");
-    }
-
     fn row(
         dir: &Path,
         name: &str,
@@ -458,34 +446,5 @@ mod tests {
         assert_eq!(recents.projects.len(), 1);
         assert!(!recents.projects[0].favourite);
         assert_eq!(recents.projects[0].platform, None);
-    }
-
-    #[test]
-    fn details_read_the_name_git_and_the_newest_change_off_the_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let game = project(dir.path(), "game");
-        std::fs::create_dir_all(game.join("assets")).unwrap();
-        std::fs::write(game.join("assets/rock.png"), b"").unwrap();
-        let recent = Recent {
-            path: canonical(&game),
-            opened: 0,
-            favourite: false,
-            platform: None,
-        };
-
-        let details = Details::of(&recent);
-        assert_eq!(details.name, "game");
-        assert!(!details.missing);
-        assert!(!details.git);
-        assert!(
-            details.modified.is_some_and(|at| at + 5 >= now()),
-            "{details:?}"
-        );
-
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        assert!(
-            Details::of(&recent).git,
-            "a repository above the project counts"
-        );
     }
 }

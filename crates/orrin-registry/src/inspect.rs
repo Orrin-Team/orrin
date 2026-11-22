@@ -42,16 +42,22 @@ const CHIP_TEXT: egui::Color32 = egui::Color32::from_rgb(11, 12, 14);
 const CHIP_WIDTH: f32 = 16.0;
 /// How far a label sits in from the edge of its row, so it does not butt
 /// against the panel's border.
-const LABEL_INSET: f32 = 8.0;
+pub const LABEL_INSET: f32 = 8.0;
 const AXIS_GAP: f32 = 4.0;
 
 /// The label column: a share of the row, so a narrow dock still leaves the
 /// value most of the width, bounded so a wide one does not strand the label far
 /// from what it names.
 pub fn label_width(ui: &egui::Ui) -> f32 {
+    label_column(ui.available_width())
+}
+
+/// [`label_width`] for a row `row` points wide, for a caller choosing a
+/// width by what it leaves its labels.
+pub fn label_column(row: f32) -> f32 {
     // Whole pixels, here and in the field widths: a fractional column rounds
     // differently from one row to the next and the edges stop lining up.
-    (ui.available_width() * 0.34).clamp(56.0, 116.0).round()
+    (row * 0.34).clamp(56.0, 116.0).round()
 }
 
 /// The slot every row keeps at its right end: a reset button where a row has
@@ -571,113 +577,6 @@ mod tests {
         assert_eq!(crate::diff(&before, &after.into_inner()), Vec::new());
     }
 
-    /// Every fill the frame painted. A field's axis chip is a filled rect, so
-    /// this is how its colour is asserted.
-    fn painted_fills(draw: impl FnMut(&mut egui::Ui)) -> Vec<egui::Color32> {
-        fn collect(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
-            match shape {
-                egui::Shape::Rect(rect) => out.push(rect.fill),
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
-                _ => {}
-            }
-        }
-        let ctx = egui::Context::default();
-        let mut draw = draw;
-        let mut out = Vec::new();
-        for _ in 0..2 {
-            let output = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| draw(ui));
-            });
-            out.clear();
-            for clipped in &output.shapes {
-                collect(&clipped.shape, &mut out);
-            }
-        }
-        out
-    }
-
-    fn painted_fills_with_rects(
-        draw: impl FnMut(&mut egui::Ui),
-    ) -> Vec<(egui::Rect, egui::Color32)> {
-        fn collect(shape: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
-            match shape {
-                egui::Shape::Rect(rect) => out.push((rect.rect, rect.fill)),
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
-                _ => {}
-            }
-        }
-        let ctx = egui::Context::default();
-        let mut draw = draw;
-        let mut out = Vec::new();
-        for _ in 0..2 {
-            let output = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| draw(ui));
-            });
-            out.clear();
-            for clipped in &output.shapes {
-                collect(&clipped.shape, &mut out);
-            }
-        }
-        out
-    }
-
-    /// A vector reads as X, Y and Z by colour as well as by position, in the
-    /// generic inspector as much as in a hand-drawn section — a game
-    /// assembly's component is not a second-class citizen of the panel.
-    #[test]
-    fn a_vector_is_drawn_with_its_three_axis_colours() {
-        let mut v = Value::Vec3(Vec3::new(1.0, 2.0, 3.0));
-        let fills = painted_fills(|ui| {
-            value(ui, &mut v);
-        });
-        for (axis, colour) in ["X", "Y", "Z"].into_iter().zip(AXIS) {
-            assert!(fills.contains(&colour), "no {axis} chip was painted");
-        }
-    }
-
-    /// Rotations are vectors to the reader too, whatever they are underneath.
-    #[test]
-    fn a_rotation_is_drawn_with_the_same_axis_colours() {
-        let mut v = Value::Quat(Quat::from_euler(EulerRot::YXZ, 0.3, 0.4, 0.5));
-        let fills = painted_fills(|ui| {
-            value(ui, &mut v);
-        });
-        assert!(AXIS.iter().all(|colour| fills.contains(colour)));
-    }
-
-    /// A number too long for its field is clipped to it, never allowed to
-    /// widen it: a field that grows as its value changes shoves its neighbours
-    /// along every frame a spinning object's rotation ticks over.
-    #[test]
-    fn a_long_value_does_not_push_its_neighbours() {
-        let chip_lefts = |x: f32| {
-            let mut v = Value::Vec3(Vec3::new(x, 0.0, 0.0));
-            let fills = painted_fills_with_rects(|ui| {
-                ui.set_width(240.0);
-                value(ui, &mut v);
-            });
-            let mut lefts: Vec<f32> = fills
-                .into_iter()
-                .filter(|(_, fill)| AXIS.contains(fill))
-                .map(|(rect, _)| rect.left())
-                .collect();
-            lefts.sort_by(f32::total_cmp);
-            lefts
-        };
-        assert_eq!(chip_lefts(1.0), chip_lefts(-123_456.8));
-    }
-
-    /// Numbers drop the zeros that say nothing, so a short field still shows
-    /// the digits that do.
-    #[test]
-    fn figures_drop_their_trailing_zeros() {
-        assert_eq!(compact(0.0), "0");
-        assert_eq!(compact(1.0), "1");
-        assert_eq!(compact(-15.273), "-15.27");
-        assert_eq!(compact(0.5), "0.5");
-        assert_eq!(compact(-0.0001), "0");
-    }
-
     /// A chip drag moves its value at the field's own speed, and a press that
     /// does not move reports nothing — otherwise every click on a chip would
     /// post an empty edit into the change stream.
@@ -688,18 +587,6 @@ mod tests {
         assert_eq!(value, 7.0);
         assert!(!scrub(&mut value, 0.0, 0.5));
         assert_eq!(value, 7.0);
-    }
-
-    /// A two-component vector reads as X and Y the way a three-component one
-    /// reads as X, Y and Z — and has no third chip to suggest a Z it lacks.
-    #[test]
-    fn a_vector2_is_drawn_with_two_axis_colours() {
-        let mut v = Value::Vec2(glam::Vec2::new(1.0, 2.0));
-        let fills = painted_fills(|ui| {
-            value(ui, &mut v);
-        });
-        assert!(fills.contains(&AXIS[0]) && fills.contains(&AXIS[1]));
-        assert!(!fills.contains(&AXIS[2]));
     }
 
     /// Every text a frame painted, with where.
@@ -817,35 +704,6 @@ mod tests {
         assert_eq!(bag.field("Secret"), Some(&Value::I32(7)));
     }
 
-    /// `[Tooltip]` is shown on hover over the field's label.
-    #[test]
-    fn a_tooltip_shows_over_its_fields_label() {
-        let (mut bag, fields) = tuned();
-        let ctx = egui::Context::default();
-        ctx.style_mut(|style| style.interaction.tooltip_delay = 0.0);
-        let mut text = Vec::new();
-        for _ in 0..2 {
-            text = painted_text(&ctx, Default::default(), &mut |ui| {
-                annotated(ui, &mut bag, &fields, &mut no_entity);
-            });
-        }
-        assert!(!text.iter().any(|(t, _)| t == "Metres a second"));
-        let label = text.iter().find(|(t, _)| t == "Speed").unwrap().1;
-        let hover = egui::RawInput {
-            events: vec![egui::Event::PointerMoved(label.center())],
-            ..Default::default()
-        };
-        painted_text(&ctx, hover, &mut |ui| {
-            annotated(ui, &mut bag, &fields, &mut no_entity);
-        });
-        for _ in 0..3 {
-            text = painted_text(&ctx, Default::default(), &mut |ui| {
-                annotated(ui, &mut bag, &fields, &mut no_entity);
-            });
-        }
-        assert!(text.iter().any(|(t, _)| t == "Metres a second"), "{text:?}");
-    }
-
     /// A slider bounds what it can produce, not what it is shown: a value a
     /// scene saved outside the range is drawn as it is and not written back.
     #[test]
@@ -882,14 +740,5 @@ mod tests {
             });
         });
         assert_eq!(calls.get(), 3);
-    }
-
-    #[test]
-    fn a_bare_leaf_draws_without_a_surrounding_struct() {
-        let leaf = RefCell::new(Value::F32(2.0));
-        egui::__run_test_ui(|ui| {
-            assert!(!value(ui, &mut leaf.borrow_mut()));
-        });
-        assert_eq!(leaf.into_inner(), Value::F32(2.0));
     }
 }

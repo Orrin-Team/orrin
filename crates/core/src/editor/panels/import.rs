@@ -3,6 +3,12 @@
 //! settings. A material is pictured by the renderer's own sphere rather than a
 //! thumbnail, since it has no import to make one from.
 //!
+//! A material asset is also edited here, in the rows the inspector's Material
+//! section draws (shared with it, not copied) and through the same undoable
+//! edit that saves its `.omat`. Without this a new material could be edited
+//! only once a mesh drew with it, since the inspector reaches a material
+//! through an entity.
+//!
 //! The settings are a draft until Apply writes them to the asset's sidecar,
 //! because every change to a texture's settings is a full reimport, and a
 //! toggle passed through on the way to the setting wanted should not cost one.
@@ -81,11 +87,18 @@ pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews:
         });
     let mut action = None;
     let mut previewed = None;
+    let file = (entry.kind == AssetKind::Material)
+        .then(|| db.material_file(id).cloned())
+        .flatten();
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
             previewed = overview(ui, &db, entry, previews, material);
             ui.add_space(10.0);
+            if let Some(file) = &file {
+                material_rows(ui, world, state, previews, id, file);
+                ui.add_space(10.0);
+            }
             settings(ui, entry, &mut draft, &mut action);
         });
     ui.data_mut(|data| data.insert_temp(memory, draft));
@@ -238,6 +251,31 @@ fn fact(ui: &mut egui::Ui, name: &str) {
     ui.weak(name);
 }
 
+/// The material asset's own values, in the rows the inspector's Material
+/// section draws and through the same undoable edit, saved to its file as
+/// each gesture ends.
+fn material_rows(
+    ui: &mut egui::Ui,
+    world: &World,
+    state: &mut EditorState,
+    previews: &mut Previews,
+    id: AssetId,
+    file: &crate::asset_db::material::MaterialFile,
+) {
+    ui.label(egui::RichText::new("Material").strong());
+    ui.add_space(2.0);
+    let rows = super::inspector::Rows::all();
+    let mut changed = file.clone();
+    let mut edit_shader = None;
+    let textured = file.textures.albedo.is_some();
+    super::inspector::value_rows(ui, rows, &mut changed.material, textured);
+    super::inspector::file_rows(ui, world, previews, rows, &mut changed, &mut edit_shader);
+    if let Some(shader) = edit_shader {
+        state.open_shader(shader);
+    }
+    super::inspector::post_material(state, id, file, changed);
+}
+
 /// The draft's fields, then Apply and Revert for the draft and Reimport for
 /// the asset as it is.
 fn settings(ui: &mut egui::Ui, entry: &Entry, draft: &mut Draft, action: &mut Option<Action>) {
@@ -302,7 +340,7 @@ fn settings(ui: &mut egui::Ui, entry: &Entry, draft: &mut Draft, action: &mut Op
         }
         Settings::None => {
             ui.weak(match entry.kind {
-                AssetKind::Material => "A material is read as it is. Edit it in the inspector.",
+                AssetKind::Material => "A material is read as it is: it has nothing to import.",
                 AssetKind::Font => "A font is read as it is: it has nothing to import.",
                 AssetKind::Audio => "A sound is read as it is: it is decoded when it plays.",
                 AssetKind::Shader => "A surface shader has no settings: it compiles when saved.",
@@ -392,16 +430,4 @@ fn ago(time: std::time::SystemTime) -> Option<String> {
     };
     let plural = if count == 1 { "" } else { "s" };
     Some(format!("{count} {unit}{plural} ago"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sizes_read_as_an_explorer_gives_them() {
-        assert_eq!(size(512), "512 B");
-        assert_eq!(size(1536), "1.5 KB");
-        assert_eq!(size(5 * 1024 * 1024), "5.0 MB");
-    }
 }

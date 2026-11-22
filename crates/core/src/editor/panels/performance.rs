@@ -6,20 +6,40 @@ use crate::profile::{self, Lane, Profiler, Row};
 use crate::scene::{Culling, Diagnostics, PresentSettings, VsyncMode};
 use crate::stats::FrameStats;
 
+/// The frame rate, in the one wording the status bar, the viewport's readout
+/// and this tab share, so a number read in one is found again in another.
+pub(super) fn fps(stats: &FrameStats) -> String {
+    format!("{:.0} FPS", stats.fps())
+}
+
+pub(super) fn cpu(stats: &FrameStats) -> String {
+    format!("CPU {:.2} ms", stats.frame_ms())
+}
+
+/// `None` before the GPU has been timed, or on a device that cannot be.
+pub(super) fn gpu(stats: &FrameStats) -> Option<String> {
+    stats.gpu_ms().map(|ms| format!("GPU {ms:.2} ms"))
+}
+
+pub(super) fn gpu_or_unknown(stats: &FrameStats) -> String {
+    gpu(stats).unwrap_or_else(|| "GPU n/a".to_owned())
+}
+
+pub(super) fn vram(stats: &FrameStats) -> String {
+    let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    match stats.vram_used() {
+        Some(used) => format!("VRAM {:.1} / {:.1} GB", gib(used), gib(stats.vram_total())),
+        None => format!("VRAM {:.1} GB (usage n/a)", gib(stats.vram_total())),
+    }
+}
+
 pub fn body(ui: &mut egui::Ui, world: &World) {
     let Some(stats) = world.get_resource::<FrameStats>() else {
         return;
     };
-    ui.label(
-        egui::RichText::new(format!("{:.0} FPS", stats.fps()))
-            .size(24.0)
-            .strong(),
-    );
-    ui.label(figures(format!("CPU: {:.2} ms (avg)", stats.frame_ms())).color(theme::CPU));
-    ui.label(match stats.gpu_ms() {
-        Some(ms) => figures(format!("GPU: {ms:.2} ms")).color(theme::GPU),
-        None => figures("GPU: n/a").color(theme::GPU),
-    });
+    ui.label(egui::RichText::new(fps(&stats)).size(24.0).strong());
+    ui.label(figures(cpu(&stats)).color(theme::CPU));
+    ui.label(figures(gpu_or_unknown(&stats)).color(theme::GPU));
 
     if !stats.history().is_empty() {
         let (min, max) = stats.min_max_ms();
@@ -28,16 +48,7 @@ pub fn body(ui: &mut egui::Ui, world: &World) {
 
     let rss_mb = stats.memory_bytes() as f64 / (1024.0 * 1024.0);
     ui.label(figures(format!("Memory (RSS): {rss_mb:.1} MB")));
-    let total_gb = stats.vram_total() as f64 / (1024.0 * 1024.0 * 1024.0);
-    match stats.vram_used() {
-        Some(used) => {
-            let used_mb = used as f64 / (1024.0 * 1024.0);
-            ui.label(figures(format!("VRAM: {used_mb:.0} MB / {total_gb:.1} GB")));
-        }
-        None => {
-            ui.label(figures(format!("VRAM: {total_gb:.1} GB (usage n/a)")));
-        }
-    }
+    ui.label(figures(vram(&stats)));
 
     if let Some(mut culling) = world.get_resource_mut::<Culling>() {
         ui.label(figures(match (culling.visible(), culling.culled()) {

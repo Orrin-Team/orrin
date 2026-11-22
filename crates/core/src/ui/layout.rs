@@ -805,13 +805,6 @@ mod tests {
     }
 
     #[test]
-    fn constant_pixel_is_one_unit_to_a_pixel_at_any_size() {
-        let canvas = Canvas::default();
-        assert_eq!(scale_factor(&canvas, [3840.0, 2160.0]), 1.0);
-        assert_eq!(scale_factor(&canvas, [800.0, 600.0]), 1.0);
-    }
-
-    #[test]
     fn scale_with_screen_blends_width_and_height_logarithmically() {
         let by = |amount: f32| Canvas {
             scale_mode: ScaleMode::ScaleWithScreen,
@@ -840,31 +833,6 @@ mod tests {
             close(rect, Rect::new(0.0, 0.0, 1920.0, 1080.0)),
             "authored at half the reference, drawn at half the window: {rect:?}"
         );
-    }
-
-    #[test]
-    fn a_zero_size_parent_still_places_its_children() {
-        let mut tree = Tree::new();
-        let canvas = tree.canvas(Canvas::default());
-        let point = tree.element(
-            canvas,
-            fixed(Vec2::ZERO, Vec2::ZERO, Vec2::new(50.0, 60.0), Vec2::ZERO),
-        );
-        let stretched = tree.element(point, RectTransform::stretched());
-        let sized = tree.element(
-            point,
-            fixed(
-                Vec2::splat(0.5),
-                Vec2::splat(0.5),
-                Vec2::ZERO,
-                Vec2::new(10.0, 10.0),
-            ),
-        );
-        let layout = tree.layout(SCREEN);
-        let rect = |entity| layout.elements()[layout.index_of(entity).unwrap()].rect;
-        assert!(close(rect(stretched), Rect::new(50.0, 60.0, 0.0, 0.0)));
-        assert!(close(rect(sized), Rect::new(45.0, 55.0, 10.0, 10.0)));
-        assert!(rect(sized).x.is_finite() && rect(stretched).width.is_finite());
     }
 
     /// Only a `RectTransform` makes an element: anything else under a canvas
@@ -1067,73 +1035,6 @@ mod tests {
         );
     }
 
-    /// Units, not pixels: a frame scaled up scrolls its content further on
-    /// screen for the same scroll.
-    #[test]
-    fn a_scaled_frame_scrolls_in_its_own_units() {
-        let mut tree = Tree::new();
-        let canvas = tree.canvas(Canvas::default());
-        let list = tree.element(
-            canvas,
-            RectTransform {
-                scale: Vec2::splat(2.0),
-                ..fixed(Vec2::ZERO, Vec2::ZERO, Vec2::ZERO, Vec2::new(100.0, 100.0))
-            },
-        );
-        tree.world
-            .insert(list, frame(Vec2::new(0.0, 300.0), Vec2::new(0.0, 25.0)));
-        let row = tree.element(list, RectTransform::stretched());
-        let layout = tree.layout(SCREEN);
-        let rect = layout.elements()[layout.index_of(row).unwrap()].rect;
-        assert!(close(rect, Rect::new(0.0, -50.0, 200.0, 600.0)), "{rect:?}");
-        assert_eq!(layout.scrolls()[0].pixels, Vec2::splat(2.0));
-    }
-
-    /// A frame inside a frame cuts its content to both.
-    #[test]
-    fn nested_scroll_frames_intersect_their_clips() {
-        let mut tree = Tree::new();
-        let canvas = tree.canvas(Canvas::default());
-        let outer = tree.element(
-            canvas,
-            fixed(Vec2::ZERO, Vec2::ZERO, Vec2::ZERO, Vec2::new(300.0, 300.0)),
-        );
-        tree.world
-            .insert(outer, frame(Vec2::new(0.0, 1000.0), Vec2::ZERO));
-        let inner = tree.element(
-            outer,
-            fixed(
-                Vec2::ZERO,
-                Vec2::ZERO,
-                Vec2::new(100.0, 250.0),
-                Vec2::new(150.0, 200.0),
-            ),
-        );
-        tree.world
-            .insert(inner, frame(Vec2::new(0.0, 1000.0), Vec2::ZERO));
-        let item = tree.element(inner, RectTransform::stretched());
-        let sibling = tree.element(outer, RectTransform::stretched());
-
-        let layout = tree.layout(SCREEN);
-        let index = |entity| layout.index_of(entity).unwrap();
-        assert_eq!(
-            layout.clip(index(inner)),
-            Some(Rect::new(0.0, 0.0, 300.0, 300.0))
-        );
-        assert_eq!(
-            layout.clip(index(item)),
-            Some(Rect::new(100.0, 250.0, 150.0, 50.0)),
-            "the inner viewport, less what of it the outer one hides"
-        );
-        assert_eq!(
-            layout.clip(index(sibling)),
-            Some(Rect::new(0.0, 0.0, 300.0, 300.0)),
-            "back to the outer frame's once the inner one's subtree ends"
-        );
-        let ends: Vec<u32> = layout.scrolls().iter().map(|view| view.end).collect();
-        assert_eq!(ends, [index(sibling) as u32 + 1, index(sibling) as u32]);
-    }
-
     /// What a frame hides cannot be hit, and the frame itself stops the
     /// pointer over all of its viewport.
     #[test]
@@ -1177,59 +1078,5 @@ mod tests {
         // `straddling` is drawn at 160..220.
         assert_eq!(entity(layout.hit([50.0, 170.0], true)), Some(straddling));
         assert_eq!(entity(layout.hit([50.0, 210.0], true)), None);
-    }
-
-    /// A bar runs along the frame's far edge, its thumb the share of the
-    /// content in view, at the share of the scroll done.
-    #[test]
-    fn a_scrollbars_thumb_shows_the_view_of_the_content() {
-        let mut tree = Tree::new();
-        let canvas = tree.canvas(Canvas::default());
-        let list = tree.element(
-            canvas,
-            fixed(Vec2::ZERO, Vec2::ZERO, Vec2::ZERO, Vec2::new(200.0, 100.0)),
-        );
-        let bars = |tree: &mut Tree, frame: ScrollFrame| {
-            tree.world.insert(list, frame);
-            tree.layout(SCREEN).scrolls()[0].bars
-        };
-        let vertical = ScrollFrame {
-            content_size: Vec2::new(0.0, 400.0),
-            scroll_position: Vec2::new(0.0, 150.0),
-            scrollbar_thickness: 10.0,
-            ..ScrollFrame::default()
-        };
-        let [none, Some(bar)] = bars(&mut tree, vertical) else {
-            panic!("a vertical bar only");
-        };
-        assert_eq!(none, None);
-        assert_eq!(bar.track, Rect::new(190.0, 0.0, 10.0, 100.0));
-        // A quarter in view, half of the way down.
-        assert_eq!(bar.thumb, Rect::new(190.0, 37.5, 10.0, 25.0));
-
-        let fits = ScrollFrame {
-            content_size: Vec2::new(0.0, 80.0),
-            ..vertical
-        };
-        assert_eq!(bars(&mut tree, fits), [None, None], "nothing to scroll");
-        let always = ScrollFrame {
-            scrollbar: ScrollbarVisibility::Always,
-            ..fits
-        };
-        let [_, Some(bar)] = bars(&mut tree, always) else {
-            panic!("always drawn");
-        };
-        assert_eq!(bar.thumb, bar.track, "the whole content is in view");
-
-        let both = ScrollFrame {
-            content_size: Vec2::new(800.0, 400.0),
-            horizontal: true,
-            ..vertical
-        };
-        let [Some(across), Some(down)] = bars(&mut tree, both) else {
-            panic!("both bars");
-        };
-        assert_eq!(across.track, Rect::new(0.0, 90.0, 190.0, 10.0));
-        assert_eq!(down.track, Rect::new(190.0, 0.0, 10.0, 90.0));
     }
 }

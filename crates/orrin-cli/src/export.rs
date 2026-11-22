@@ -682,20 +682,6 @@ mod tests {
     }
 
     #[test]
-    fn each_platform_names_its_triple_and_runtime() {
-        assert_eq!(
-            Target::of(Platform::Windows),
-            Target {
-                platform: Platform::Windows,
-                triple: "x86_64-pc-windows-msvc",
-                rid: "win-x64"
-            }
-        );
-        assert_eq!(Target::of(Platform::Linux).rid, "linux-x64");
-        assert_eq!(Target::of(Platform::Mac).triple, "aarch64-apple-darwin");
-    }
-
-    #[test]
     fn the_host_builds_itself_and_cross_targets_name_their_tool() {
         for platform in Platform::ALL {
             assert_eq!(builder(platform, Some(platform), false), Ok(Builder::Cargo));

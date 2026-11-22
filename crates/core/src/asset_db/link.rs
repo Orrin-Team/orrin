@@ -95,10 +95,15 @@
 //! megabytes, and three meshes arriving within a frame cost one replace.
 //!
 //! **Shutdown** cannot leave a thread parked. Turning the link off, or dropping
-//! the database, shuts every connection's socket down, which returns its
-//! reader's blocking `read` and fails its writer's `write`, and connects once to
-//! the listener, which returns its blocking `accept` to find the flag set. All
-//! of them are then joined, so the port is free once [`set_link`] returns.
+//! the database, sets the stop flag and shuts every connection's socket down,
+//! which fails its writer's `write`, and connects once to the listener, which
+//! returns its blocking `accept` to find the flag set. The shutdown is not what
+//! ends a reader: it returns a blocked `read` on Linux and macOS, but on
+//! Windows the `read` stays blocked until the peer closes or the system gives
+//! the connection up, two minutes later. So a reader reads through
+//! [`Stoppable`], on a timeout of [`POLL`], and ends when it finds the flag
+//! set. All of them are then joined, so the port is free once [`set_link`]
+//! returns.
 //!
 //! # In the database
 //!
@@ -147,13 +152,13 @@
 
 mod wire;
 
-use std::io::Write;
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orrin_ecs::{FxHashMap, World};
 use orrin_registry::AssetId;
@@ -175,6 +180,10 @@ const HANDSHAKE: Duration = Duration::from_secs(5);
 /// How long one frame may take to leave. A client that stops reading holds a
 /// writer thread no longer than this, never the frame's thread.
 const WRITE: Duration = Duration::from_secs(5);
+
+/// How often a reader on a quiet connection looks at the stop flag, and so the
+/// longest a stop waits on it.
+pub(crate) const POLL: Duration = Duration::from_millis(100);
 
 /// What the link is doing, for a settings page and the console.
 #[derive(Clone, Debug, PartialEq)]
@@ -468,12 +477,62 @@ fn connect(shared: &Shared, peer: Peer, stream: TcpStream) {
     }
 }
 
+/// A connection's reading half, which reports the end of the stream once its
+/// server is stopping. The socket reads on a timeout of [`POLL`] to look.
+pub(crate) struct Stoppable<'a> {
+    stream: &'a TcpStream,
+    stop: &'a AtomicBool,
+    /// How long one read may wait for a byte before it fails as timed out;
+    /// `None` waits for as long as the server runs.
+    patience: Option<Duration>,
+}
+
+impl<'a> Stoppable<'a> {
+    pub(crate) fn new(
+        stream: &'a TcpStream,
+        stop: &'a AtomicBool,
+        patience: Option<Duration>,
+    ) -> Self {
+        let _ = stream.set_read_timeout(Some(POLL));
+        Self {
+            stream,
+            stop,
+            patience,
+        }
+    }
+}
+
+impl Read for Stoppable<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let asked = Instant::now();
+        loop {
+            match self.stream.read(buf) {
+                // Windows reports a timeout as `TimedOut`, Unix as `WouldBlock`.
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+                {
+                    if self.stop.load(Ordering::Acquire) {
+                        return Ok(0);
+                    }
+                    if self
+                        .patience
+                        .is_some_and(|patience| asked.elapsed() >= patience)
+                    {
+                        return Err(error);
+                    }
+                }
+                read => return read,
+            }
+        }
+    }
+}
+
 /// The handshake, then every frame until the connection closes. `Err` for a
 /// connection ended on a protocol error, to be warned about.
 fn serve(shared: &Shared, peer: Peer, mut stream: TcpStream) -> Result<(), String> {
-    let _ = stream.set_read_timeout(Some(HANDSHAKE));
     let _ = stream.set_write_timeout(Some(WRITE));
-    match wire::opening(&mut stream) {
+    let opening = wire::opening(&mut Stoppable::new(&stream, &shared.stop, Some(HANDSHAKE)));
+    match opening {
         wire::Opening::Ours => {}
         wire::Opening::Stranger => return Ok(()),
         wire::Opening::Version(theirs) => {
@@ -485,7 +544,6 @@ fn serve(shared: &Shared, peer: Peer, mut stream: TcpStream) -> Result<(), Strin
             return Ok(());
         }
     }
-    let _ = stream.set_read_timeout(None);
 
     let (send, outgoing) = mpsc::channel::<Vec<u8>>();
     let mut out = stream
@@ -517,9 +575,10 @@ fn serve(shared: &Shared, peer: Peer, mut stream: TcpStream) -> Result<(), Strin
     // Counted after it is posted, so whoever sees the count finds the post.
     shared.peers.fetch_add(1, Ordering::AcqRel);
 
+    let mut input = Stoppable::new(&stream, &shared.stop, None);
     let mut payload = Vec::new();
     loop {
-        let kind = match wire::read_frame(&mut stream, &mut payload) {
+        let kind = match wire::read_frame(&mut input, &mut payload) {
             Ok(kind) => kind,
             Err(wire::ReadError::Closed) => return Ok(()),
             Err(wire::ReadError::TooLarge(len)) => {

@@ -37,9 +37,10 @@
 //! that does not decode is answered from the reading thread and never reaches
 //! the frame.
 //!
-//! **Shutdown** is the link's: every socket is shut down, which returns its
-//! reader's `read` and fails its writer's `write`, the listener is connected
-//! to once to return its `accept`, and all of them are joined.
+//! **Shutdown** is the link's: the stop flag is set and every socket shut
+//! down, which fails its writer's `write`; its reader ends at its next look at
+//! the flag ([`Stoppable`]), the listener is connected to once to return its
+//! `accept`, and all of them are joined.
 //!
 //! # In the frame
 //!
@@ -93,6 +94,7 @@ use orrin_remote::wire::{self, Hello, Request, Response};
 use orrin_remote::{Discovery, Token};
 
 use super::state::EditorState;
+use crate::asset_db::link::Stoppable;
 
 /// How long a peer has to send its 44-byte preamble.
 const HANDSHAKE: Duration = Duration::from_secs(5);
@@ -650,9 +652,9 @@ fn connect(shared: &Shared, peer: Peer, stream: TcpStream) {
 /// The handshake, then every frame until the connection closes. `Err` for a
 /// connection ended on a protocol error, to be warned about.
 fn serve(shared: &Shared, peer: Peer, mut stream: TcpStream) -> Result<(), String> {
-    let _ = stream.set_read_timeout(Some(HANDSHAKE));
     let _ = stream.set_write_timeout(Some(WRITE));
-    match wire::opening(&mut stream) {
+    let opening = wire::opening(&mut Stoppable::new(&stream, &shared.stop, Some(HANDSHAKE)));
+    match opening {
         wire::Opening::Ours(token) if token.matches(&shared.token) => {}
         wire::Opening::Ours(_) => {
             tracing::warn!(
@@ -674,7 +676,6 @@ fn serve(shared: &Shared, peer: Peer, mut stream: TcpStream) -> Result<(), Strin
             return Ok(());
         }
     }
-    let _ = stream.set_read_timeout(None);
 
     let (send, outgoing) = mpsc::channel::<Vec<u8>>();
     let mut out = stream
@@ -710,9 +711,10 @@ fn serve(shared: &Shared, peer: Peer, mut stream: TcpStream) -> Result<(), Strin
         Err(_) => tracing::info!("an agent connected to the remote"),
     }
 
+    let mut input = Stoppable::new(&stream, &shared.stop, None);
     let mut payload = Vec::new();
     loop {
-        let kind = match wire::read_frame(&mut stream, &mut payload) {
+        let kind = match wire::read_frame(&mut input, &mut payload) {
             Ok(kind) => kind,
             Err(wire::ReadError::Closed) => return Ok(()),
             Err(wire::ReadError::TooLarge(len)) => {
@@ -820,6 +822,30 @@ mod tests {
         assert!(
             Discovery::read(dir.path()).unwrap().is_none(),
             "the file goes with the remote"
+        );
+    }
+
+    /// Stopping is the editor's alone to do: a client that stays connected,
+    /// greeted or not yet having said a word, does not hold it up.
+    #[test]
+    fn stopping_does_not_wait_for_a_connected_peer() {
+        let dir = Dir::new("remote-stop");
+        let remote = Remote::start(dir.path(), "game").unwrap();
+        let found = Discovery::read(dir.path()).unwrap().expect("a remote file");
+        let mut greeted = raw(found.port, &wire::preamble(&found.token));
+        let mut payload = Vec::new();
+        assert_eq!(
+            wire::read_frame(&mut greeted, &mut payload),
+            Ok(wire::HELLO)
+        );
+        let _silent = raw(found.port, b"");
+
+        let started = Instant::now();
+        drop(remote);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
         );
     }
 }

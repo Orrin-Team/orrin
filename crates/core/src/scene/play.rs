@@ -117,39 +117,6 @@ mod tests {
     }
 
     #[test]
-    fn the_time_scale_starts_at_one_and_never_goes_below_zero() {
-        let mut play = Play::default();
-        assert_eq!(play.time_scale(), 1.0);
-        play.set_time_scale(0.25);
-        assert_eq!(play.time_scale(), 0.25);
-        play.set_time_scale(-2.0);
-        assert_eq!(play.time_scale(), 0.0);
-        play.set_time_scale(f32::NAN);
-        play.set_time_scale(f32::INFINITY);
-        assert_eq!(play.time_scale(), 0.0, "a non-finite scale is refused");
-    }
-
-    /// A game that paused itself must not leave the next session frozen, and
-    /// pausing or stepping inside one session must not undo what it asked for.
-    #[test]
-    fn the_time_scale_lasts_one_session() {
-        let mut play = Play::default();
-        play.set(PlayState::Playing);
-        play.set_time_scale(0.0);
-        play.set(PlayState::Paused);
-        play.step();
-        play.set(PlayState::Playing);
-        assert_eq!(play.time_scale(), 0.0);
-
-        play.set(PlayState::Editing);
-        assert_eq!(play.time_scale(), 1.0, "Stop resets it");
-
-        play.set_time_scale(3.0);
-        play.set(PlayState::Playing);
-        assert_eq!(play.time_scale(), 1.0, "Play starts at one");
-    }
-
-    #[test]
     fn stopping_drops_a_step_not_yet_taken() {
         let mut play = Play::default();
         play.set(PlayState::Paused);

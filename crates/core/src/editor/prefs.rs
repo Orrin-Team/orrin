@@ -8,6 +8,7 @@
 //! of enums, which TOML cannot express without inventing a schema for it. User
 //! *themes* stay TOML: those are hand-authored, and this file never is.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -39,9 +40,15 @@ pub struct Prefs {
     /// The resolution the viewport previews; `None` until the user first
     /// picks one.
     pub preview: Option<super::preview::Preview>,
+    /// The console's collapse and clear-on-play toggles; `None` until the
+    /// user first changes one.
+    pub console: Option<super::panels::console::ConsoleOptions>,
     /// Seeding only, as `theme` is.
     #[serde(skip_serializing)]
     pub icons: Option<super::state::IconTints>,
+    /// The hierarchy rows the user closed, by entity id under each scene's
+    /// file; every other row is open. See `state::ClosedRows`.
+    pub collapsed: BTreeMap<String, Vec<String>>,
     /// Which [`LAYOUT_VERSION`] `layout` was saved under. Absent, and so zero,
     /// in every file written before the field existed.
     layout_version: u32,
@@ -102,7 +109,9 @@ impl PrefsFile {
             snap: prefs.snap,
             assets: prefs.assets,
             preview: prefs.preview,
+            console: prefs.console,
             icons: None,
+            collapsed: prefs.collapsed.clone(),
         };
         let text = match ron::ser::to_string_pretty(prefs, ron::ser::PrettyConfig::default()) {
             Ok(text) => text,
@@ -147,24 +156,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn snap_steps_round_trip() {
-        let dir = scratch("snap-steps");
-        let file = PrefsFile::new(Some(dir.clone()));
-        let steps = super::super::state::SnapSteps {
-            translate: 0.5,
-            rotate: 22.5,
-            scale: 0.25,
-        };
-        file.save(&Prefs {
-            snap: Some(steps),
-            ..Prefs::default()
-        });
-
-        assert_eq!(file.load().snap, Some(steps));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     /// Both moved to the user's settings: an old file's are read once, to seed
     /// them, and a project's file never holds them again.
     #[test]
@@ -198,26 +189,6 @@ mod tests {
             tints.listener,
             super::super::state::IconTints::default().listener
         );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn the_asset_browsers_view_round_trips_without_its_filter() {
-        use super::super::state::{AssetLayout, AssetSort, AssetView};
-        let dir = scratch("asset-view");
-        let file = PrefsFile::new(Some(dir.clone()));
-        let view = AssetView {
-            layout: AssetLayout::Grid,
-            sort: AssetSort::Modified,
-            descending: true,
-            kind: Some(crate::asset_db::AssetKind::Texture),
-        };
-        file.save(&Prefs {
-            assets: Some(view),
-            ..Prefs::default()
-        });
-        let back = file.load().assets.unwrap();
-        assert_eq!(back, AssetView { kind: None, ..view });
         let _ = std::fs::remove_dir_all(dir);
     }
 

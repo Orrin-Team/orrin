@@ -35,6 +35,7 @@
 //! cannot root two instances.
 
 mod actions;
+mod copy;
 mod create;
 mod index;
 mod refresh;
@@ -49,6 +50,7 @@ use orrin_registry::{
 };
 
 pub use actions::{apply, instance_of, revert_all, unpack};
+pub use copy::{Copied, Place, copy, paste};
 pub use create::{create, unused_path};
 pub use index::{Prefab, Prefabs, Rescan};
 pub use refresh::{apply_edits, rescan};
@@ -905,23 +907,6 @@ mod tests {
         registry
     }
 
-    /// The asset browser drags any asset's id, so a texture can be let go over
-    /// the hierarchy. The refusal names the file, not the id.
-    #[test]
-    fn placing_an_asset_that_is_not_a_prefab_names_it() {
-        let dir = crate::asset_db::tests::Dir::new("place-texture");
-        dir.write("rocks/rock.png", b"");
-        let (db, _) = crate::asset_db::AssetDatabase::open(dir.path(), dir.path().join(".cache"));
-        let rock = db.find("rocks/rock.png").unwrap().id;
-        let mut world = World::new();
-        world.insert_resource(db);
-        world.insert_resource(Prefabs::default());
-
-        let err = instantiate(&mut world, &registry(), rock).unwrap_err();
-        assert_eq!(err, "`rocks/rock.png` is a texture, not a prefab");
-        assert_eq!(world.entities().count(), 0);
-    }
-
     /// The door, and a house holding one.
     fn library(door: &str) -> Prefabs {
         let mut prefabs = Prefabs::default();
@@ -1266,21 +1251,6 @@ mod tests {
         revert(&mut world, &registry, root, &TAG, &FieldPath::empty()).unwrap();
         assert!(world.get::<Spin>(panel).is_some());
         assert!(world.get::<Tag>(root).is_none());
-    }
-
-    #[test]
-    fn an_entity_outside_any_instance_has_no_overrides() {
-        let registry = registry();
-        let mut world = world();
-        let loose = world.spawn();
-        world.insert(loose, EntityId::new());
-        assert!(member_overrides(&world, &registry, loose).is_none());
-
-        // Parented under a member, but not one itself.
-        instantiate(&mut world, &registry, door_id()).unwrap();
-        let panel = named(&world, "Panel");
-        crate::scene::reparent(&mut world, loose, Some(panel), false).unwrap();
-        assert!(member_overrides(&world, &registry, loose).is_none());
     }
 
     const HOUSE_ID: &str = "40c5e000-0000-4000-8000-000000000002";

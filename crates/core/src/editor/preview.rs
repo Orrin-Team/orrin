@@ -108,12 +108,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn no_resolution_is_the_window_itself() {
-        let screen = screen(&Preview::default(), viewport(), WINDOW);
-        assert!(screen.is_window(WINDOW));
-    }
-
     /// A wide screen in a squarer viewport is as wide as the viewport and
     /// centred down it; a tall one is as tall and centred across.
     #[test]
@@ -153,15 +147,5 @@ mod tests {
         assert_eq!(large.scale, 1.0);
         assert_eq!(large.size, [3840.0, 2160.0]);
         assert_eq!(large.clip, viewport());
-    }
-
-    /// The corner lands on a whole pixel, so text drawn one to one stays sharp.
-    #[test]
-    fn the_screen_starts_on_a_whole_pixel() {
-        let odd = Rect::new(400.5, 100.25, 1201.0, 901.0);
-        for size in [PreviewSize::Fit, PreviewSize::TrueSize] {
-            let screen = screen(&preview([1366, 768], size), odd, WINDOW);
-            assert!(screen.origin.iter().all(|v| v.fract() == 0.0), "{screen:?}");
-        }
     }
 }

@@ -121,6 +121,17 @@ impl Light {
         }
     }
 
+    /// The bulb a new point light is: a shop light, near enough to show
+    /// beside the default sun.
+    pub fn default_point() -> Self {
+        Self::point(Vec3::ONE, 4000.0, 10.0)
+    }
+
+    /// The same bulb in a housing, cut off where a point light is.
+    pub fn default_spot() -> Self {
+        Self::spot(Vec3::ONE, 4000.0, 10.0, 20.0, 30.0)
+    }
+
     /// Luminous intensity, in candela, of a point light radiating `lumens`
     /// uniformly in every direction.
     ///

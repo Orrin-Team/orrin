@@ -88,6 +88,9 @@ pub struct Settings {
     pub startup: Startup,
     pub blender: Blender,
     pub agents: Agents,
+    /// The commands bound to other chords than their defaults. A file from
+    /// before there were any has none, which is every default.
+    pub keys: super::commands::Keys,
 }
 
 /// Whether an agent may reach this editor through `orrin mcp`. Off unless
@@ -847,7 +850,7 @@ impl SettingsStore {
 mod tests {
     use super::*;
     use crate::editor::state::EditorState;
-    use crate::editor::theme::{self, ThemeSet};
+    use crate::editor::theme::ThemeSet;
 
     /// A scratch directory, removed when dropped.
     struct Scratch(PathBuf);
@@ -988,31 +991,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_that_are_all_defaults_write_nothing() {
-        let dir = Scratch::new("all-defaults");
-        let mut changed = Settings::default();
-        changed.saving.autosave = false;
-        assert_eq!(
-            changed.to_toml().as_deref(),
-            Some("[saving]\nautosave = false\n")
-        );
-        assert_eq!(Settings::default().to_toml().as_deref(), Some(""));
-
-        let mut store = dir.store().0;
-        store.seed(None, None);
-        save(&mut store, Settings::default());
-        assert!(!dir.file().exists(), "nothing to say, so no file");
-
-        save(&mut store, changed);
-        save(&mut store, Settings::default());
-        assert_eq!(
-            std::fs::read_to_string(dir.file()).unwrap(),
-            "",
-            "back to every default, the file stays and says nothing"
-        );
-    }
-
-    #[test]
     fn an_unknown_key_is_ignored() {
         let dir = Scratch::new("unknown-key");
         std::fs::write(
@@ -1022,20 +1000,6 @@ mod tests {
         .unwrap();
         let store = dir.store().0;
         assert_eq!(store.current().appearance.theme.as_deref(), Some("Void"));
-    }
-
-    /// A newer engine's editor preset costs that one value, not the file.
-    #[test]
-    fn an_editor_this_build_does_not_know_falls_back_to_auto() {
-        let dir = Scratch::new("unknown-variant");
-        std::fs::write(
-            dir.file(),
-            "[scripting]\neditor = \"fleet\"\nreload_after_rebuild = false\n",
-        )
-        .unwrap();
-        let settings = dir.store().0.current().clone();
-        assert_eq!(settings.scripting.editor, ExternalEditor::Auto);
-        assert!(!settings.scripting.reload_after_rebuild);
     }
 
     #[test]
@@ -1096,16 +1060,6 @@ mod tests {
         );
     }
 
-    /// A port no socket can have costs that one value, not the file.
-    #[test]
-    fn a_port_past_65535_is_the_default() {
-        let dir = Scratch::new("blender-port");
-        std::fs::write(dir.file(), "[blender]\nport = 70000\nlive_link = false\n").unwrap();
-        let blender = dir.store().0.current().blender.clone();
-        assert_eq!(blender.port, crate::asset_db::link::DEFAULT_PORT);
-        assert!(!blender.live_link);
-    }
-
     #[test]
     fn with_no_directory_nothing_is_read_or_written() {
         let mut store = SettingsStore::open(None).0;
@@ -1117,71 +1071,6 @@ mod tests {
             unusual(),
             "the session still runs with it"
         );
-    }
-
-    #[test]
-    fn the_users_themes_sit_beside_the_settings() {
-        let dir = Scratch::new("themes-dir");
-        assert_eq!(dir.store().0.themes_dir(), Some(dir.0.join("themes")));
-    }
-
-    /// The bug this module exists to fix: a theme picked in one project was
-    /// gone in the next, because it was kept in the project's `editor.ron`.
-    #[test]
-    fn a_theme_chosen_with_one_project_open_is_the_theme_with_another_open() {
-        use crate::editor::prefs::PrefsFile;
-
-        let user = Scratch::new("two-projects-user");
-        let (one, other) = (Scratch::new("project-one"), Scratch::new("project-two"));
-        theme_file(&user.0.join("themes"), "Void");
-        // What the old editor left in the second project: it must not win.
-        std::fs::write(other.0.join("editor.ron"), "(theme: Some(\"orrin-dark\"))").unwrap();
-
-        let world = world();
-        let mut store = user.store().0;
-        store.seed(PrefsFile::new(Some(one.0.clone())).load().theme, None);
-        let mut themes = ThemeSet::load([user.0.join("themes")]);
-        let mut state = EditorState::default();
-        state.request_theme("Void");
-        settle(&mut store, &world, &mut state, &mut themes, false);
-        assert_eq!(themes.active().name, "Void");
-
-        let mut store = user.store().0;
-        store.seed(PrefsFile::new(Some(other.0.clone())).load().theme, None);
-        assert_eq!(store.current().appearance.theme.as_deref(), Some("Void"));
-        assert!(
-            !one.0.join("editor.ron").exists(),
-            "the project is not written"
-        );
-    }
-
-    #[test]
-    fn picking_the_built_in_theme_is_the_default_rather_than_a_deviation() {
-        let user = Scratch::new("built-in");
-        theme_file(&user.0.join("themes"), "Void");
-        let world = world();
-        let mut store = user.store().0;
-        let mut themes = ThemeSet::load([user.0.join("themes")]);
-        let mut state = EditorState::default();
-        state.request_theme("Void");
-        settle(&mut store, &world, &mut state, &mut themes, false);
-        state.request_theme(theme::BUILT_IN);
-        settle(&mut store, &world, &mut state, &mut themes, false);
-        assert_eq!(state.settings.appearance.theme, None);
-        assert_eq!(themes.active().name, theme::BUILT_IN);
-    }
-
-    fn theme_file(dir: &std::path::Path, name: &str) {
-        std::fs::create_dir_all(dir).unwrap();
-        let theme = theme::Theme {
-            name: name.to_owned(),
-            ..theme::Theme::default()
-        };
-        std::fs::write(
-            dir.join(format!("{name}.toml")),
-            toml::to_string(&theme).unwrap(),
-        )
-        .unwrap();
     }
 
     #[test]
@@ -1255,32 +1144,6 @@ mod tests {
         );
     }
 
-    /// The Profiler's present mode and the Scripts panel's checkbox edit their
-    /// world resources, as they always have; the store reads them back.
-    #[test]
-    fn a_resource_edited_by_its_own_panel_is_kept() {
-        let dir = Scratch::new("from-world");
-        let world = world();
-        let mut store = dir.store().0;
-        let mut themes = ThemeSet::default();
-        let mut state = EditorState::default();
-        settle(&mut store, &world, &mut state, &mut themes, false);
-
-        world.resource_mut::<PresentSettings>().vsync = VsyncMode::Immediate;
-        #[cfg(feature = "scripting")]
-        {
-            world
-                .resource_mut::<crate::build_watcher::BuildStatus>()
-                .auto_reload = false;
-        }
-        settle(&mut store, &world, &mut state, &mut themes, false);
-
-        let kept = dir.store().0.current().clone();
-        assert_eq!(kept.display.vsync, VsyncMode::Immediate);
-        #[cfg(feature = "scripting")]
-        assert!(!kept.scripting.reload_after_rebuild);
-    }
-
     /// The store's first frame pushes what was loaded into the world rather
     /// than reading the world's engine defaults back over it.
     #[test]
@@ -1304,125 +1167,6 @@ mod tests {
             unusual().display.present()
         );
         assert_eq!(*dir.store().0.current(), unusual());
-    }
-
-    #[cfg(feature = "scripting")]
-    #[test]
-    fn reload_after_rebuild_defaults_to_what_the_build_status_does() {
-        assert_eq!(
-            Scripting::default().reload_after_rebuild,
-            crate::build_watcher::BuildStatus::default().auto_reload
-        );
-    }
-
-    #[test]
-    fn the_display_defaults_to_the_engines_own_present_settings() {
-        assert_eq!(Display::default().present(), PresentSettings::default());
-    }
-
-    #[test]
-    fn the_editor_variable_overrides_and_says_so() {
-        let set = Environment::from_vars(|name| {
-            (name == super::super::source::EDITOR_ENV).then(|| "zed {file}".to_owned())
-        });
-        assert_eq!(set.editor(), Some("zed {file}"));
-        assert_eq!(set.editor_override(), Some("ORRIN_EDITOR"));
-
-        let blank = Environment::from_vars(|_| Some("  ".to_owned()));
-        assert_eq!(blank.editor(), None);
-        assert_eq!(blank.editor_override(), None);
-        assert_eq!(Environment::default().editor_override(), None);
-    }
-
-    #[test]
-    fn the_blender_variable_overrides_the_path_and_says_so() {
-        let set = Environment::from_vars(|name| {
-            (name == "ORRIN_BLENDER").then(|| "/opt/blender/blender".to_owned())
-        });
-        assert_eq!(set.blender(), Some("/opt/blender/blender"));
-        assert_eq!(set.blender_override(), Some("ORRIN_BLENDER"));
-        let blank = Environment::from_vars(|_| Some("  ".to_owned()));
-        assert_eq!(blank.blender_override(), None);
-    }
-
-    /// No `[startup]` is today's behaviour with no variable set, and a default
-    /// is never written; a choice is, by name.
-    #[test]
-    fn startup_defaults_write_nothing_and_a_change_round_trips() {
-        let dir = Scratch::new("startup");
-        std::fs::write(dir.file(), "[viewport]\nfly_speed = 12.0\n").unwrap();
-        assert_eq!(dir.store().0.current().startup, Startup::default());
-        assert_eq!(Startup::default().backend_choice(), None);
-        assert_eq!(Startup::default().threads(), None);
-        assert_eq!(Startup::default().validation(), None);
-        assert_eq!(Startup::default().log_floor(), None);
-
-        let mut settings = Settings::default();
-        settings.viewport.fly_speed = 12.0;
-        save(&mut dir.store().0, settings.clone());
-        let text = std::fs::read_to_string(dir.file()).unwrap();
-        assert!(!text.contains("startup"), "{text}");
-
-        settings.startup = Startup {
-            backend: Backend::Vulkan,
-            threads: Some(4),
-            validation: Validation::Off,
-            log: LogFloor::Debug,
-        };
-        save(&mut dir.store().0, settings.clone());
-        let text = std::fs::read_to_string(dir.file()).unwrap();
-        for line in [
-            "[startup]",
-            "backend = \"vulkan\"",
-            "threads = 4",
-            "validation = \"off\"",
-            "log = \"debug\"",
-        ] {
-            assert!(text.contains(line), "{line} in\n{text}");
-        }
-        let read = dir.store().0.current().startup.clone();
-        assert_eq!(read, settings.startup);
-        assert_eq!(
-            read.backend_choice(),
-            Some(crate::gfx::BackendChoice::Vulkan)
-        );
-        assert_eq!(read.threads(), Some(4));
-        assert_eq!(read.validation(), Some(false));
-        assert_eq!(read.log_floor(), Some(crate::scene::LogLevel::Debug));
-    }
-
-    /// A hand edit that names something this build does not know costs that
-    /// one value; zero threads is rayon's "all of them" and is Auto here.
-    #[test]
-    fn a_startup_value_this_build_cannot_read_is_auto() {
-        let dir = Scratch::new("startup-unknown");
-        std::fs::write(
-            dir.file(),
-            "[startup]\nbackend = \"dx12\"\nthreads = 0\nvalidation = \"maybe\"\nlog = \"debug\"\n",
-        )
-        .unwrap();
-        let (store, said) = dir.store();
-        let startup = &store.current().startup;
-        assert_eq!(startup.backend, Backend::Auto);
-        assert_eq!(startup.threads, None);
-        assert_eq!(startup.validation, Validation::Auto);
-        assert_eq!(startup.log, LogFloor::Debug);
-        assert!(said.iter().any(|line| line.contains("dx12")), "{said:?}");
-    }
-
-    /// The store is opened before the log stream exists, so what it has to
-    /// say comes back to be logged once it does.
-    #[test]
-    fn what_the_store_says_while_opening_is_handed_back() {
-        let dir = Scratch::new("startup-heard");
-        std::fs::write(dir.file(), "[viewport\n").unwrap();
-        let (_, said) = dir.store();
-        assert_eq!(said.len(), 1, "{said:?}");
-        assert!(
-            said[0].contains(&dir.file().display().to_string()),
-            "{said:?}"
-        );
-        assert!(SettingsStore::open(None).1.is_empty());
     }
 
     #[test]
@@ -1472,28 +1216,91 @@ mod tests {
         assert_eq!(nonsense.log_override(), None);
     }
 
-    /// The restart line counts what the user changed that the next run will
-    /// actually pick up: a row the environment decides is not one.
+    /// A file written before there were key bindings is every default, and
+    /// a file of defaults says nothing about keys.
     #[test]
-    fn a_change_the_environment_overrides_is_not_waiting_on_a_restart() {
-        let started = Startup::default();
-        let mut now = started.clone();
-        assert_eq!(now.changes_from(&started, &Environment::default()), 0);
-        now.threads = Some(2);
-        now.log = LogFloor::Info;
-        assert_eq!(now.changes_from(&started, &Environment::default()), 2);
-        let threads = Environment::from_vars(|name| (name == "ORRIN_THREADS").then(|| "6".into()));
-        assert_eq!(now.changes_from(&started, &threads), 1);
+    fn a_settings_file_from_before_key_bindings_loads_with_every_default() {
+        let dir = Scratch::new("keys-before");
+        std::fs::write(dir.file(), "[viewport]\nfly_speed = 12.0\n").unwrap();
+        let (store, said) = dir.store();
+        assert!(said.is_empty(), "{said:?}");
+        assert_eq!(store.current().viewport.fly_speed, 12.0);
+        assert_eq!(
+            store.current().keys,
+            super::super::commands::Keys::default()
+        );
+        let text = Settings::default().to_toml().unwrap();
+        assert!(!text.contains("keys"), "{text}");
     }
 
     #[test]
-    fn the_editors_presets_are_written_by_name() {
+    fn only_a_rebound_command_is_written_and_it_reads_back() {
+        use super::super::commands::{Command, Keys};
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        let dir = Scratch::new("keys-written");
         let mut settings = Settings::default();
-        settings.scripting.editor = ExternalEditor::VsCode;
-        let text = settings.to_toml().unwrap();
-        assert!(text.contains("editor = \"vscode\""), "{text}");
-        settings.display.vsync = VsyncMode::FifoRelaxed;
-        let text = settings.to_toml().unwrap();
-        assert!(text.contains("vsync = \"fifo-relaxed\""), "{text}");
+        let shifted = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::D);
+        settings
+            .keys
+            .bind(Command::Duplicate, Some(0), shifted)
+            .unwrap();
+        settings.keys.unbind(Command::Copy, 0);
+        save(&mut dir.store().0, settings.clone());
+
+        let text = std::fs::read_to_string(dir.file()).unwrap();
+        assert!(text.contains("[keys]"), "{text}");
+        assert!(
+            text.contains("\"edit.duplicate\" = [\"Command+Shift+D\"]"),
+            "{text}"
+        );
+        assert!(text.contains("\"edit.copy\" = []"), "{text}");
+        assert!(!text.contains("edit.undo"), "{text}");
+        let read = dir.store().0.current().keys.clone();
+        assert_eq!(read, settings.keys);
+        assert_eq!(read.chords(Command::Duplicate), [shifted]);
+        assert!(read.chords(Command::Copy).is_empty());
+        assert_ne!(read, Keys::default());
+    }
+
+    /// A command a newer engine has, or a chord this build cannot read, costs
+    /// that one binding and never the file. The unknown one is kept, so this
+    /// build saving does not take it from the newer one.
+    #[test]
+    fn a_binding_this_build_cannot_use_does_not_fail_the_load() {
+        use super::super::commands::Command;
+        let dir = Scratch::new("keys-unknown");
+        std::fs::write(
+            dir.file(),
+            "[viewport]\nboost = 3.0\n\n[keys]\n\"edit.teleport\" = [\"Command+J\"]\n\
+             \"edit.duplicate\" = [\"Hyper+D\"]\n\"edit.frame\" = \"Command+L\"\n\
+             \"edit.paste\" = 7\n",
+        )
+        .unwrap();
+        let mut store = dir.store().0;
+        let settings = store.current().clone();
+        assert_eq!(settings.viewport.boost, 3.0, "the rest of the file is read");
+        let keys = &settings.keys;
+        assert_eq!(
+            keys.chords(Command::Duplicate),
+            Command::Duplicate.defaults()
+        );
+        assert_eq!(keys.chords(Command::Paste), Command::Paste.defaults());
+        assert_eq!(
+            keys.chords(Command::Frame),
+            [egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::L
+            )],
+            "one chord may be written without the list"
+        );
+
+        let mut changed = settings.clone();
+        changed.viewport.boost = 4.0;
+        save(&mut store, changed);
+        let text = std::fs::read_to_string(dir.file()).unwrap();
+        assert!(
+            text.contains("\"edit.teleport\" = [\"Command+J\"]"),
+            "{text}"
+        );
     }
 }

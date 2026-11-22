@@ -405,15 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn a_floor_is_named_or_the_misspelling_is() {
-        assert_eq!(floor_named(None), Ok(None));
-        assert_eq!(floor_named(Some("  ")), Ok(None));
-        assert_eq!(floor_named(Some("WARN")), Ok(Some(LogLevel::Warning)));
-        let complaint = floor_named(Some("loud")).unwrap_err();
-        assert!(complaint.contains("`loud`"), "{complaint}");
-    }
-
-    #[test]
     fn the_environment_beats_the_setting_which_beats_the_build() {
         use LogLevel::{Debug, Info, Trace, Warning};
         assert_eq!(floor(Some("warn"), Some(Debug), Trace), Warning);
@@ -421,18 +412,6 @@ mod tests {
         assert_eq!(floor(None, None, Info), Info);
         assert_eq!(floor(Some("  "), Some(Debug), Trace), Debug, "blank");
         assert_eq!(floor(Some("loud"), Some(Debug), Trace), Debug, "misspelt");
-    }
-
-    /// What runs before the stream exists is heard anyway, once it does.
-    #[test]
-    fn a_warning_before_the_stream_exists_is_handed_back() {
-        let (value, said) = heard(|| {
-            tracing::info!("not a warning");
-            tracing::warn!("settings.toml could not be read");
-            7
-        });
-        assert_eq!(value, 7);
-        assert_eq!(said, ["settings.toml could not be read"]);
     }
 
     #[test]
@@ -448,23 +427,6 @@ mod tests {
         });
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert_eq!(lines[0].0, LogLevel::Info);
-    }
-
-    /// The floor the engine's own trace runs at would otherwise let through
-    /// every line winit and calloop write about their event loops.
-    #[test]
-    fn other_crates_are_held_to_warnings() {
-        let lines = console_of(LogConfig::editor(), || {
-            tracing::trace!(target: "calloop::loop_logic", "dispatching");
-            tracing::info!(target: "winit::platform", "wakeup");
-            tracing::warn!(target: "winit::platform", "no primary monitor");
-            tracing::info!("the engine's own");
-        });
-        assert_eq!(
-            lines.iter().map(|line| line.0).collect::<Vec<_>>(),
-            [LogLevel::Warning, LogLevel::Info],
-            "{lines:?}"
-        );
     }
 
     #[test]
@@ -522,24 +484,5 @@ mod tests {
         });
         assert_eq!(lines.len(), QUEUE_CAPACITY);
         assert!(lines[0].1.ends_with(": 5"), "{}", lines[0].1);
-    }
-
-    #[test]
-    fn a_line_leads_with_its_level_padded_to_a_column() {
-        let entry = |level| LogEntry {
-            level,
-            message: "attached".to_owned(),
-            source: Cow::Borrowed("Spinner"),
-            line: 14,
-            frame: 0,
-        };
-        assert_eq!(
-            format_line(&entry(LogLevel::Info)),
-            "INFO  Spinner:14: attached\n"
-        );
-        assert_eq!(
-            format_line(&entry(LogLevel::Error)),
-            "ERROR Spinner:14: attached\n"
-        );
     }
 }

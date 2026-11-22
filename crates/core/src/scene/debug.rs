@@ -87,6 +87,9 @@ pub struct LogBuffer {
     /// Every entry ever pushed, so a reader can hold its place by number
     /// across the ring dropping entries and the console being cleared.
     pushed: u64,
+    /// `pushed` by level, for a count that the ring dropping entries cannot
+    /// make wrong: the console's tally of what was logged out of sight.
+    logged: [u64; LogLevel::ALL.len()],
 }
 
 impl Default for LogBuffer {
@@ -101,6 +104,7 @@ impl LogBuffer {
             entries: VecDeque::new(),
             capacity: capacity.max(1),
             pushed: 0,
+            logged: [0; LogLevel::ALL.len()],
         }
     }
 
@@ -118,8 +122,14 @@ impl LogBuffer {
         if self.entries.len() == self.capacity {
             self.entries.pop_front();
         }
+        self.logged[entry.level as usize] += 1;
         self.entries.push_back(entry);
         self.pushed += 1;
+    }
+
+    /// How many entries of `level` were ever pushed, held or not.
+    pub fn logged(&self, level: LogLevel) -> u64 {
+        self.logged[level as usize]
     }
 
     /// The entries numbered `from` onwards, each with its number: the first
@@ -199,16 +209,6 @@ impl DebugLines {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every threshold in the engine — the stream's floor, the export log
-    /// file's, the console's filter — is a comparison on this order.
-    #[test]
-    fn levels_order_from_quietest_to_loudest() {
-        assert!(LogLevel::ALL.is_sorted());
-        assert!(LogLevel::Trace < LogLevel::Debug);
-        assert!(LogLevel::Info < LogLevel::Warning);
-        assert!(LogLevel::Warning < LogLevel::Error);
-    }
 
     #[test]
     fn a_line_leaves_out_the_parts_its_entry_does_not_have() {

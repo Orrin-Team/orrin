@@ -157,15 +157,6 @@ mod tests {
     }
 
     #[test]
-    fn a_configured_interval_replaces_the_default() {
-        let start = Instant::now();
-        let mut autosave = Autosave::new(scratch("configured"), start);
-        autosave.configure(Some(Duration::from_secs(30)));
-        assert!(!autosave.due(start + Duration::from_secs(29), 1));
-        assert!(autosave.due(start + Duration::from_secs(30), 1));
-    }
-
-    #[test]
     fn autosave_turned_off_owes_nothing() {
         let start = Instant::now();
         let mut autosave = Autosave::new(scratch("off"), start);

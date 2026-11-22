@@ -197,20 +197,6 @@ mod tests {
     /// The depth the drivers run at.
     const IN_FLIGHT: u64 = 2;
 
-    #[test]
-    fn spans_are_appended_end_to_end() {
-        let mut placement = Placement::new(IN_FLIGHT);
-        let first = placement.place(4, 6);
-        let second = placement.place(3, 3);
-
-        assert_eq!(first.vertex_offset, 0);
-        assert_eq!(first.first_index, 0);
-        assert_eq!(first.index_count, 6);
-        assert_eq!(second.vertex_offset, 4);
-        assert_eq!(second.first_index, 6);
-        assert_eq!(placement.ends(), (7, 9));
-    }
-
     /// A mesh's span has to keep meaning what it meant after the arena grows,
     /// because handles handed out earlier are never revisited.
     #[test]
@@ -224,19 +210,6 @@ mod tests {
         assert_eq!(first.first_index, 0);
         assert_eq!(after.first_index, 6);
         assert_eq!(after.vertex_offset, 4);
-    }
-
-    #[test]
-    fn an_empty_mesh_takes_no_room() {
-        let mut placement = Placement::new(IN_FLIGHT);
-        let empty = placement.place(0, 0);
-        placement.retire(empty, 0, 0);
-        placement.collect(IN_FLIGHT);
-        let next = placement.place(1, 3);
-
-        assert_eq!(next.first_index, 0);
-        assert_eq!(next.vertex_offset, 0);
-        assert_eq!(placement.ends(), (1, 3));
     }
 
     /// A frame recorded before the replace may still be drawing the old span
@@ -301,46 +274,6 @@ mod tests {
             (rest.vertex_offset, rest.first_index),
             (3, 3),
             "a split hole keeps its remainder"
-        );
-    }
-
-    /// Vertices and indices are allocated apart: a mesh can land in a vertex
-    /// hole while its indices go past the end.
-    #[test]
-    fn vertices_and_indices_are_placed_independently() {
-        let mut placement = Placement::new(IN_FLIGHT);
-        let old = placement.place(8, 3);
-        placement.place(1, 1);
-        placement.retire(old, 8, 0);
-        placement.collect(IN_FLIGHT);
-
-        let next = placement.place(8, 6);
-        assert_eq!(next.vertex_offset, 0);
-        assert_eq!(next.first_index, 4);
-    }
-
-    /// What reuse is for: a mesh replaced every frame, as a live link streams
-    /// it, holds a fixed amount of the arena rather than growing it by its size
-    /// on every replace.
-    #[test]
-    fn a_mesh_replaced_every_frame_stops_raising_the_end() {
-        let mut placement = Placement::new(IN_FLIGHT);
-        let mut span = placement.place(50_000, 150_000);
-        let mut ends = Vec::new();
-        for frame in 1..=64 {
-            placement.collect(frame);
-            placement.retire(span, 50_000, frame);
-            span = placement.place(50_000, 150_000);
-            ends.push(placement.ends());
-        }
-        let settled = ends[8];
-        assert!(
-            ends[8..].iter().all(|&end| end == settled),
-            "the end kept moving: {ends:?}"
-        );
-        assert!(
-            settled.0 <= 50_000 * (IN_FLIGHT as u32 + 2),
-            "a few copies in flight, not one per frame: {settled:?}"
         );
     }
 

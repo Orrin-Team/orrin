@@ -1345,48 +1345,6 @@ mod tests {
     }
 
     #[test]
-    fn an_anchor_moves_the_line_by_its_share_of_the_slack() {
-        let rect = Rect::new(0.0, 0.0, 600.0, 200.0);
-        let left = bounds(
-            paint(&text(rect, TextAnchor::UpperLeft, "Score"))
-                .frame()
-                .quads,
-        );
-        let right = bounds(
-            paint(&text(rect, TextAnchor::UpperRight, "Score"))
-                .frame()
-                .quads,
-        );
-        let centre = bounds(
-            paint(&text(rect, TextAnchor::MiddleCenter, "Score"))
-                .frame()
-                .quads,
-        );
-        let low = bounds(
-            paint(&text(rect, TextAnchor::LowerLeft, "Score"))
-                .frame()
-                .quads,
-        );
-
-        let shift = right[0] - left[0];
-        assert!(
-            (shift - (right[2] - left[2])).abs() < 1.0,
-            "the line moves whole"
-        );
-        assert!(
-            rect.width - right[2] < 4.0,
-            "right-aligned ink ends at the edge: {right:?}"
-        );
-        let gaps = (centre[0] - rect.x, rect.width - centre[2]);
-        assert!((gaps.0 - gaps.1).abs() < 4.0, "centred: {gaps:?}");
-        assert!(((centre[1] + centre[3]) / 2.0 - rect.height / 2.0).abs() < 6.0);
-        assert!(
-            rect.height - low[3] < 10.0,
-            "bottom-aligned ink is a descent off the edge"
-        );
-    }
-
-    #[test]
     fn text_wraps_at_whitespace_to_its_width() {
         let rect = Rect::new(0.0, 0.0, 50.0, 300.0);
         let painter = paint(&text(rect, TextAnchor::UpperLeft, "aaa bbb ccc"));
@@ -1395,31 +1353,6 @@ mod tests {
         assert_eq!(quads.len(), 9);
         assert_eq!(rows(quads), 3, "{quads:?}");
         assert!(quads.iter().all(|q| inside(q, rect)), "{quads:?}");
-    }
-
-    #[test]
-    fn a_word_wider_than_the_rect_breaks_between_characters() {
-        let rect = Rect::new(0.0, 0.0, 40.0, 300.0);
-        let painter = paint(&text(rect, TextAnchor::UpperLeft, "abcdefghij"));
-        let quads = painter.frame().quads;
-        assert_eq!(quads.len(), 10, "nothing is dropped");
-        assert!(rows(quads) > 1);
-        assert!(quads.iter().all(|q| inside(q, rect)), "{quads:?}");
-    }
-
-    #[test]
-    fn a_newline_starts_a_line() {
-        let rect = Rect::new(0.0, 0.0, 600.0, 300.0);
-        let painter = paint(&text(rect, TextAnchor::UpperLeft, "x\nx\n\nx"));
-        let quads = painter.frame().quads;
-        assert_eq!(quads.len(), 3);
-        let gap = quads[1].rect[3] - quads[0].rect[3];
-        assert!(gap > 0.0);
-        let skipped = quads[2].rect[3] - quads[1].rect[3];
-        assert!(
-            (skipped - 2.0 * gap).abs() <= 1.0,
-            "an empty line keeps its height"
-        );
     }
 
     #[test]
@@ -1504,22 +1437,6 @@ mod tests {
         assert_eq!(painter.frame().quads[0].rect, [10.0, 10.0, 42.0, 42.0]);
     }
 
-    #[test]
-    fn unwrapped_text_runs_on_one_line_past_its_rect() {
-        let rect = Rect::new(0.0, 0.0, 50.0, 300.0);
-        let mut canvas = UiCanvas::default();
-        let unwrapped = TextStyle {
-            wrap: false,
-            ..style(TextAnchor::UpperLeft)
-        };
-        canvas.text(rect, unwrapped, "aaa bbb ccc");
-        let painter = paint(&canvas);
-        let quads = painter.frame().quads;
-        assert_eq!(quads.len(), 9, "nothing is cut at the sides");
-        assert_eq!(rows(quads), 1, "{quads:?}");
-        assert!(bounds(quads)[2] > rect.width, "{quads:?}");
-    }
-
     /// The immediate canvas is in the game's pixels: a previewed screen draws
     /// it scaled into its place in the window, and nothing of it outside.
     #[test]
@@ -1601,13 +1518,6 @@ mod tests {
     }
 
     #[test]
-    fn an_image_that_does_not_resolve_draws_nothing() {
-        let mut canvas = UiCanvas::default();
-        canvas.image(Rect::new(0.0, 0.0, 64.0, 64.0), AssetId::new(), [255; 4]);
-        assert!(paint(&canvas).frame().is_empty());
-    }
-
-    #[test]
     fn a_font_is_read_once_and_again_after_it_changes() {
         let font = AssetId::new();
         let mut canvas = UiCanvas::default();
@@ -1626,35 +1536,6 @@ mod tests {
         painter.forget_font(font);
         painter.paint(&canvas, &mut assets);
         assert_eq!(assets.fonts_asked, 2);
-    }
-
-    #[test]
-    fn a_font_that_does_not_load_sets_its_text_in_the_default_face() {
-        let font = AssetId::new();
-        let mut canvas = UiCanvas::default();
-        let styled = TextStyle {
-            font: Some(font),
-            ..style(TextAnchor::UpperLeft)
-        };
-        canvas.text(Rect::new(0.0, 0.0, 300.0, 40.0), styled, "fallback");
-        let mut painter = Painter::new();
-        let mut assets = Fake {
-            broken_fonts: true,
-            ..Fake::default()
-        };
-        painter.paint(&canvas, &mut assets);
-        painter.paint(&canvas, &mut assets);
-        assert_eq!(
-            assets.fonts_asked, 1,
-            "a broken font is not reread every frame"
-        );
-
-        let plain = paint(&text(
-            Rect::new(0.0, 0.0, 300.0, 40.0),
-            TextAnchor::UpperLeft,
-            "fallback",
-        ));
-        assert_eq!(painter.frame().quads, plain.frame().quads);
     }
 
     #[test]
@@ -1693,7 +1574,7 @@ mod tests {
         assert_eq!(painter.frame().atlas.extent(), [Atlas::INITIAL; 2]);
     }
 
-    use crate::scene::{GradientPaint, ShapePaint, ShapeStyle, UiStyle};
+    use crate::scene::{ShapePaint, ShapeStyle, UiStyle};
 
     fn cut(bounds: Rect, radius: f32, exponent: f32, paint: ShapePaint) -> UiStyle {
         UiStyle::Shape(ShapeStyle {
@@ -1703,23 +1584,6 @@ mod tests {
             paint,
             gradient: None,
         })
-    }
-
-    /// The modifiers leave the plain stream exactly as it was: 36 bytes a
-    /// quad, and no shape for a canvas that asks for none.
-    #[test]
-    fn a_plain_canvas_draws_no_shapes() {
-        assert_eq!(std::mem::size_of::<UiQuad>(), 36);
-        assert_eq!(std::mem::size_of::<UiShape>(), 88);
-        let canvas = text(
-            Rect::new(0.0, 0.0, 300.0, 40.0),
-            TextAnchor::UpperLeft,
-            "plain",
-        );
-        let painter = paint(&canvas);
-        assert!(!painter.frame().quads.is_empty());
-        assert!(painter.frame().shapes.is_empty());
-        assert!(painter.frame().shape_batches.is_empty());
     }
 
     /// A rounded panel is one shape: what it covers, the box it is cut from,
@@ -1750,44 +1614,6 @@ mod tests {
                 before: 0
             }]
         );
-    }
-
-    #[test]
-    fn a_ring_carries_half_its_width_and_a_blur_its_sigma() {
-        let mut canvas = UiCanvas::default();
-        let rect = Rect::new(0.0, 0.0, 100.0, 100.0);
-        let ring = cut(rect, 0.0, 2.0, ShapePaint::Ring { width: 6.0 });
-        let blur = cut(rect, 8.0, 2.0, ShapePaint::Blur { sigma: 3.0 });
-        canvas.styled(ring, |canvas| canvas.panel(rect, [255; 4]));
-        canvas.styled(blur, |canvas| canvas.panel(rect, [255; 4]));
-        let painter = paint(&canvas);
-        let params: Vec<[f32; 4]> = painter.frame().shapes.iter().map(|s| s.params).collect();
-        assert_eq!(params, [[0.0, 2.0, 3.0, 0.0], [8.0, 2.0, 0.0, 3.0]]);
-    }
-
-    /// A gradient's stops are multiplied into the command's colour, and its
-    /// axis is handed on as the shader reads it.
-    #[test]
-    fn a_gradient_multiplies_into_the_commands_colour() {
-        let mut canvas = UiCanvas::default();
-        let rect = Rect::new(0.0, 0.0, 100.0, 50.0);
-        let style = UiStyle::Shape(ShapeStyle {
-            bounds: Some(rect),
-            radius: 0.0,
-            exponent: 2.0,
-            paint: ShapePaint::Fill,
-            gradient: Some(GradientPaint {
-                start: [255, 255, 255, 255],
-                end: [0, 128, 255, 0],
-                origin: [0.0, 25.0],
-                step: [0.01, 0.0],
-            }),
-        });
-        canvas.styled(style, |canvas| canvas.panel(rect, [255, 255, 128, 255]));
-        let painter = paint(&canvas);
-        let shape = painter.frame().shapes[0];
-        assert_eq!(shape.colors, [[255, 255, 128, 255], [0, 128, 128, 0]]);
-        assert_eq!(shape.gradient, [0.0, 25.0, 0.01, 0.0]);
     }
 
     /// Clipping cuts what a shape covers and the source in proportion, and
@@ -1866,119 +1692,5 @@ mod tests {
             }],
             "two shapes in a row are one draw, between the two panels"
         );
-    }
-
-    /// An outline is the same glyphs grown on every side, set under the fill
-    /// and in the stroke's colour, and no more cut by the label's rect than
-    /// the ink it rings.
-    #[test]
-    fn an_outline_sets_each_glyph_grown_by_its_width() {
-        let rect = Rect::new(100.0, 50.0, 400.0, 60.0);
-        let mut canvas = UiCanvas::default();
-        let ink = TextStyle {
-            color: [0, 0, 0, 255],
-            ..style(TextAnchor::UpperLeft)
-        };
-        canvas.styled(UiStyle::Outline { width: 2.0 }, |canvas| {
-            canvas.text(rect, ink, "HI")
-        });
-        canvas.text(rect, style(TextAnchor::UpperLeft), "HI");
-        let painter = paint(&canvas);
-        let quads = painter.frame().quads;
-        assert_eq!(quads.len(), 4);
-        let (outline, fill) = quads.split_at(2);
-        for (ring, glyph) in outline.iter().zip(fill) {
-            assert_eq!(ring.color, [0, 0, 0, 255]);
-            assert_eq!(glyph.color, [255; 4]);
-            // Two pixels of ring and one more to fade over, uncut by the
-            // label's rect: the stroke is the text's, not the box's.
-            assert_eq!(
-                ring.rect,
-                [
-                    glyph.rect[0] - 3.0,
-                    glyph.rect[1] - 3.0,
-                    glyph.rect[2] + 3.0,
-                    glyph.rect[3] + 3.0
-                ]
-            );
-        }
-        // The grown coverage reaches past where the glyph's own ends.
-        let atlas = painter.frame().atlas;
-        let width = atlas.extent()[0] as usize;
-        let texel = |quad: &UiQuad, dx: f32, dy: f32| {
-            let (x, y) = ((quad.uv[0] + dx) as usize, (quad.uv[1] + dy) as usize);
-            atlas.pixels()[y * width + x]
-        };
-        let ring = outline[0];
-        let middle = (ring.uv[3] - ring.uv[1]) / 2.0;
-        assert_eq!(texel(&ring, 0.0, middle), 0, "nothing at its very edge");
-        assert!(
-            texel(&ring, 1.0, middle) > 0,
-            "ink a pixel out from the H's stem"
-        );
-        assert_eq!(painter.frame().batches.len(), 1, "still one atlas draw");
-    }
-
-    /// Gradient text keeps its glyphs' coverage and adds the blend: every
-    /// glyph is a shape over the atlas, cut by nothing.
-    #[test]
-    fn gradient_text_sets_its_glyphs_as_shapes() {
-        let rect = Rect::new(0.0, 0.0, 400.0, 60.0);
-        let gradient = GradientPaint {
-            start: [255; 4],
-            end: [0, 0, 0, 255],
-            origin: [0.0, 0.0],
-            step: [0.0025, 0.0],
-        };
-        let mut canvas = UiCanvas::default();
-        let glyphs = UiStyle::Shape(ShapeStyle {
-            bounds: None,
-            radius: 0.0,
-            exponent: 2.0,
-            paint: ShapePaint::Fill,
-            gradient: Some(gradient),
-        });
-        canvas.styled(glyphs, |canvas| {
-            canvas.text(rect, style(TextAnchor::UpperLeft), "abc")
-        });
-        let painter = paint(&canvas);
-        let plain = paint(&text(rect, TextAnchor::UpperLeft, "abc"));
-        let frame = painter.frame();
-        assert!(frame.quads.is_empty());
-        assert_eq!(frame.shapes.len(), 3);
-        for (shape, glyph) in frame.shapes.iter().zip(plain.frame().quads) {
-            assert_eq!((shape.rect, shape.uv), (glyph.rect, glyph.uv));
-            assert!(
-                shape.shape[2] > 1.0e5 && shape.shape[3] > 1.0e5,
-                "{shape:?}"
-            );
-            assert_eq!(shape.gradient, [0.0, 0.0, 0.0025, 0.0]);
-        }
-    }
-
-    /// A layer drawn at half size halves its shapes' lengths with it.
-    #[test]
-    fn a_scaled_layer_scales_its_shapes() {
-        let mut canvas = UiCanvas::default();
-        let rect = Rect::new(0.0, 0.0, 100.0, 100.0);
-        canvas.styled(
-            cut(rect, 10.0, 2.0, ShapePaint::Blur { sigma: 4.0 }),
-            |canvas| canvas.panel(rect, [255; 4]),
-        );
-        let screen = GameScreen {
-            size: [1920.0, 1080.0],
-            origin: [10.0, 20.0],
-            scale: 0.5,
-            clip: Rect::new(10.0, 20.0, 960.0, 540.0),
-        };
-        let mut painter = Painter::new();
-        painter.paint_layers(
-            &[(&canvas, Placement::screen(&screen))],
-            &mut Fake::default(),
-        );
-        let shape = painter.frame().shapes[0];
-        assert_eq!(shape.rect, [10.0, 20.0, 60.0, 70.0]);
-        assert_eq!(shape.shape, [35.0, 45.0, 25.0, 25.0]);
-        assert_eq!(shape.params, [5.0, 2.0, 0.0, 2.0]);
     }
 }

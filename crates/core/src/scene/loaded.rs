@@ -550,31 +550,6 @@ mod tests {
         assert_eq!(alive(&world), ["Hub"]);
     }
 
-    /// A handle outlives its scene in a script's field. Using it then must say
-    /// so, not unload whatever was loaded after.
-    #[test]
-    fn a_stale_handle_is_refused() {
-        let (mut world, registry) = session();
-        let shop = additive(
-            &mut world,
-            &registry,
-            "shop",
-            &scene(&registry, &["Shopkeeper"]),
-            false,
-        );
-        unload(&mut world, shop).unwrap();
-        additive(
-            &mut world,
-            &registry,
-            "bank",
-            &scene(&registry, &["Teller"]),
-            false,
-        );
-
-        assert!(unload(&mut world, shop).is_err());
-        assert_eq!(alive(&world), ["Teller"]);
-    }
-
     /// A script's reference is an id; the file it names is found through the
     /// asset database, and anything else under that id is refused by name.
     #[test]

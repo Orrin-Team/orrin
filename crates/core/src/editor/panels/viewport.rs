@@ -5,6 +5,11 @@
 //! rather than a mesh, and the selected element gets the rect tool (see
 //! `editor::rect_tool`) instead of the transform gizmo.
 //!
+//! With Alt held the left button is the camera's, which orbits on it (see
+//! `camera_controller`): no click selects, no drag draws a rectangle, and no
+//! handle of the gizmo or the rect tool is taken. The camera reads the window's
+//! own events, so the scene only has to stand aside.
+//!
 //! While the game is live — playing or paused — the scene is the game's. The
 //! transform tools and the rect tool are hidden, nothing in it is picked, hovered, outlined or
 //! marked, and a click there reaches the game alone, which is what lets an
@@ -22,6 +27,7 @@
 use glam::{Mat4, Vec3};
 use orrin_ecs::{Entity, World};
 
+use crate::editor::commands::{self, Command};
 use crate::editor::gizmo::{Drag, Emphasis, Gizmo, LENGTH, Target};
 use crate::editor::state::{EditorState, GizmoMode, GizmoSpace};
 use crate::editor::theme::{self, ThemeSet};
@@ -66,8 +72,15 @@ pub fn show(
                         space_and_snap(ui, state);
                     });
                     widgets::toolbar_frame(ui.visuals(), bar).show(ui, |ui| {
-                        let hint = "UI mode (T): pick and lay out UI elements";
-                        if widgets::toggle_icon(ui, icons::image(), state.ui_mode, hint).clicked() {
+                        let mode = commands::hint(
+                            ui.ctx(),
+                            &state.settings.keys,
+                            Command::UiMode,
+                            "UI mode",
+                        );
+                        let hint = format!("{mode}: pick and lay out UI elements");
+                        if widgets::toggle_icon(ui, icons::image(), state.ui_mode, &hint).clicked()
+                        {
                             state.ui_mode = !state.ui_mode;
                         }
                     });
@@ -262,13 +275,28 @@ fn play_frame(ctx: &egui::Context, world: &World, themes: &ThemeSet, viewport: e
 }
 
 fn gizmo_modes(ui: &mut egui::Ui, state: &mut EditorState) {
-    for (mode, name, key, icon) in [
-        (GizmoMode::Select, "Select", 1, icons::pointer()),
-        (GizmoMode::Move, "Move", 2, icons::move_()),
-        (GizmoMode::Rotate, "Rotate", 3, icons::rotate()),
-        (GizmoMode::Scale, "Scale", 4, icons::scaling()),
+    for (mode, name, command, icon) in [
+        (
+            GizmoMode::Select,
+            "Select",
+            Command::SelectTool,
+            icons::pointer(),
+        ),
+        (GizmoMode::Move, "Move", Command::MoveTool, icons::move_()),
+        (
+            GizmoMode::Rotate,
+            "Rotate",
+            Command::RotateTool,
+            icons::rotate(),
+        ),
+        (
+            GizmoMode::Scale,
+            "Scale",
+            Command::ScaleTool,
+            icons::scaling(),
+        ),
     ] {
-        let hint = format!("{name} ({key})");
+        let hint = commands::hint(ui.ctx(), &state.settings.keys, command, name);
         if widgets::toggle_icon(ui, icon, state.gizmo_mode == mode, &hint).clicked() {
             state.gizmo_mode = mode;
         }
@@ -367,16 +395,15 @@ fn snap_steps(ui: &mut egui::Ui, state: &mut EditorState) {
 
 fn stats_readout(ui: &mut egui::Ui, stats: &FrameStats) {
     ui.spacing_mut().item_spacing.y = 2.0;
-    ui.label(super::figures(format!("{:.0} FPS", stats.fps())).strong());
-    ui.label(super::figures(format!("CPU {:.2} ms", stats.frame_ms())).color(theme::CPU));
-    let gpu = stats
-        .gpu_ms()
-        .map_or_else(|| "GPU n/a".to_owned(), |ms| format!("GPU {ms:.2} ms"));
-    ui.label(super::figures(gpu).color(theme::GPU));
+    use super::performance::{cpu, fps, gpu_or_unknown};
+    ui.label(super::figures(fps(stats)).strong());
+    ui.label(super::figures(cpu(stats)).color(theme::CPU));
+    ui.label(super::figures(gpu_or_unknown(stats)).color(theme::GPU));
 }
 
-/// Take a prefab let go over the scene, and place it on the ground under the
-/// pointer — or at the camera's focus when the pointer is above the horizon.
+/// Take a prefab let go over the scene, and place it on what is under the
+/// pointer: the surface its ray meets, else the ground, else the camera's
+/// focus when the pointer is above the horizon.
 ///
 /// Read off the pointer rather than through a widget: the centre claims no
 /// input (see `dock`), and a widget there would take the fly camera's clicks.
@@ -412,7 +439,9 @@ pub fn accept_prefab(
     // The scene is drawn across the whole window, behind the tools.
     let screen = ctx.screen_rect();
     let ndc = (pos - screen.min) / screen.size() * 2.0 - egui::Vec2::splat(1.0);
-    let at = ground_point(&camera, screen.aspect_ratio(), ndc).unwrap_or(camera.target);
+    let at = pick::surface_at(world, &camera, screen, pos)
+        .or_else(|| ground_point(&camera, screen.aspect_ratio(), ndc))
+        .unwrap_or(camera.target);
     state.request_instantiate_at(*prefab, at);
 }
 
@@ -584,7 +613,7 @@ pub fn gizmo(
         (
             input.pointer.latest_pos(),
             input.pointer.primary_down(),
-            input.pointer.primary_pressed(),
+            input.pointer.primary_pressed() && !input.modifiers.alt,
             input.modifiers.command,
         )
     });
@@ -750,7 +779,7 @@ pub fn marquee(
         (
             input.pointer.latest_pos(),
             input.pointer.primary_down(),
-            input.pointer.primary_pressed(),
+            input.pointer.primary_pressed() && !input.modifiers.alt,
             input.modifiers.command,
         )
     });
@@ -834,7 +863,8 @@ pub fn select_on_click(
     let Some((pos, toggle)) = ctx.input(|input| {
         let pos = input.pointer.interact_pos()?;
         let toggle = input.modifiers.command;
-        input.pointer.primary_clicked().then_some((pos, toggle))
+        let ours = input.pointer.primary_clicked() && !input.modifiers.alt;
+        ours.then_some((pos, toggle))
     }) else {
         return;
     };
@@ -896,7 +926,7 @@ pub fn rect_tool(
         (
             input.pointer.latest_pos(),
             input.pointer.primary_down(),
-            input.pointer.primary_pressed(),
+            input.pointer.primary_pressed() && !input.modifiers.alt,
             input.modifiers.command,
         )
     });
@@ -976,7 +1006,8 @@ pub fn select_ui_on_click(
     let Some((pos, toggle)) = ctx.input(|input| {
         let pos = input.pointer.interact_pos()?;
         let toggle = input.modifiers.command;
-        input.pointer.primary_clicked().then_some((pos, toggle))
+        let ours = input.pointer.primary_clicked() && !input.modifiers.alt;
+        ours.then_some((pos, toggle))
     }) else {
         return;
     };

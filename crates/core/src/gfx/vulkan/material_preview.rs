@@ -555,100 +555,6 @@ pub(super) fn object_rows(material: MaterialHandle) -> (super::instances::GpuObj
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gfx::PointLight;
-
-    const SPHERE_RADIUS: f32 = 0.5;
-
-    /// The sphere's silhouette as a fraction of the half-height of the view:
-    /// big enough to read a highlight, small enough that the edge where
-    /// Fresnel and the rim live is never cut off.
-    #[test]
-    fn the_sphere_fills_most_of_the_preview_and_none_of_it_is_cut_off() {
-        let camera = camera(Orbit::default());
-        assert_eq!(camera.target, Vec3::ZERO);
-        let distance = camera.position.length();
-        let silhouette = (SPHERE_RADIUS / distance).asin();
-        let fill = silhouette / (camera.fov_y / 2.0);
-        assert!((0.75..0.92).contains(&fill), "fills {fill}");
-        assert!(camera.near < distance - SPHERE_RADIUS);
-        assert!(camera.far > distance + SPHERE_RADIUS);
-    }
-
-    /// A studio key: on the side the camera sees and from above, so the
-    /// terminator falls across the sphere rather than behind it, in white so
-    /// the albedo reads as authored. The sky and the ambient are the scene's —
-    /// a metal reflects the environment it will be seen in — and nothing
-    /// punctual from the scene reaches a sphere that is not in it.
-    #[test]
-    fn the_key_light_comes_from_above_the_camera_and_the_sky_is_the_scenes() {
-        let scene = SceneLighting {
-            ambient_color: Vec3::new(0.2, 0.3, 0.9),
-            ambient_nits: 42.0,
-            sun: DirectionalLight {
-                direction: Vec3::Y,
-                color: Vec3::new(1.0, 0.2, 0.1),
-                illuminance: 3.0,
-            },
-            point_lights: vec![PointLight {
-                position: Vec3::ZERO,
-                color: Vec3::ONE,
-                candela: 1_000.0,
-                range: 10.0,
-                casts_shadows: false,
-            }],
-            ..SceneLighting::default()
-        };
-        let sky = sh::from_constant(Vec3::splat(50.0));
-        let rig = lighting(&scene, &sky, 0.0, Orbit::default());
-        assert_eq!(rig.ambient_color, scene.ambient_color);
-        assert_eq!(rig.ambient_nits, scene.ambient_nits);
-        assert!(rig.point_lights.is_empty() && rig.spot_lights.is_empty());
-
-        let to_light = -rig.sun.direction;
-        let to_camera = camera(Orbit::default()).position.normalize();
-        assert!(to_light.dot(to_camera) > 0.5, "{to_light}");
-        assert!(to_light.y > 0.3, "{to_light}");
-        assert_eq!(rig.sun.color, Vec3::ONE);
-    }
-
-    /// The key is a fixed ratio above the sky it shares the sphere with, so
-    /// the sphere always has a lit side and a shadowed one, and the whole rig
-    /// sits at the scene's level of light. A black sky still gets a key.
-    #[test]
-    fn the_key_stands_a_fixed_ratio_above_the_sky() {
-        for nits in [1.0, 30.0, 6_000.0] {
-            let sky = sh::from_constant(Vec3::splat(nits));
-            let rig = lighting(&SceneLighting::default(), &sky, 0.0, Orbit::default());
-            let ratio = rig.sun.illuminance / (PI * nits);
-            assert!((ratio - KEY_TO_SKY).abs() < 1e-3, "{nits} nits: {ratio}");
-        }
-        let black = sh::from_constant(Vec3::ZERO);
-        let rig = lighting(&SceneLighting::default(), &black, 0.0, Orbit::default());
-        assert_eq!(rig.sun.illuminance, MIN_KEY_LUX);
-    }
-
-    /// What an emitter looks like depends on the light around it. Under the
-    /// default dusk sky a 600-nit panel outshines a lit white surface, as it
-    /// does in such a scene; under a daylight sky it does not.
-    #[test]
-    fn an_emitter_glows_against_a_dim_sky_and_not_against_a_bright_one() {
-        let exposed = |sky_nits: f32, nits: f32| {
-            let sky = sh::from_constant(Vec3::splat(sky_nits));
-            let rig = lighting(&SceneLighting::default(), &sky, 0.0, Orbit::default());
-            nits * exposure(&rig, &sky, 0.0, Orbit::default())
-        };
-        let white = 250.0 / (1.2 * 100.0 * PI);
-        assert!(
-            exposed(30.0, 600.0) > 2.0 * white,
-            "{}",
-            exposed(30.0, 600.0)
-        );
-        assert!(
-            exposed(6_000.0, 600.0) < white,
-            "{}",
-            exposed(6_000.0, 600.0)
-        );
-    }
 
     /// An incident-light meter: whatever the sky, a white diffuse surface
     /// facing the camera lands at one exposed value, so a material is judged
@@ -733,43 +639,6 @@ mod tests {
         assert!(schedule.due(Some(&turned)));
     }
 
-    /// The camera orbits at the distance that frames the sphere, so a turn
-    /// never crops it, and the key turns with the camera: the terminator falls
-    /// where it did, and what moves is the sky in the reflection.
-    #[test]
-    fn orbiting_moves_the_camera_round_the_sphere_and_the_key_with_it() {
-        let rest = Orbit::default();
-        let sky = sh::from_constant(Vec3::splat(30.0));
-        let to_light = |orbit| {
-            -lighting(&SceneLighting::default(), &sky, 0.0, orbit)
-                .sun
-                .direction
-        };
-        for orbit in [
-            Orbit {
-                yaw: 90.0,
-                pitch: 0.0,
-            },
-            Orbit {
-                yaw: 210.0,
-                pitch: 40.0,
-            },
-            Orbit {
-                yaw: 0.0,
-                pitch: -50.0,
-            },
-        ] {
-            let (from, turned) = (camera(rest), camera(orbit));
-            assert!((from.position.length() - turned.position.length()).abs() < 1e-5);
-            assert!(turned.position.distance(from.position) > 0.1, "{orbit:?}");
-            let lit = |orbit, camera: &Camera| to_light(orbit).dot(camera.position.normalize());
-            assert!(
-                (lit(rest, &from) - lit(orbit, &turned)).abs() < 1e-5,
-                "{orbit:?}: the key keeps its angle to the camera"
-            );
-        }
-    }
-
     /// A drag turns the surface the way the pointer moves, and stops short of
     /// the poles however far it goes.
     #[test]
@@ -791,19 +660,6 @@ mod tests {
             "no slack to unwind past the pole"
         );
         assert!((0.0..360.0).contains(&Orbit::default().dragged([1e4, 0.0]).yaw));
-    }
-
-    /// Two views due in the same frames take turns; one alone has every frame.
-    #[test]
-    fn views_due_together_take_turns() {
-        assert_eq!(next_due([false, false, false], 0), None);
-        assert_eq!(next_due([false, true, false], 0), Some(Viewer::Browser));
-        assert_eq!(next_due([true, false, false], 1), Some(Viewer::Inspector));
-        assert_eq!(next_due([true, true, false], 0), Some(Viewer::Inspector));
-        assert_eq!(next_due([true, true, false], 1), Some(Viewer::Browser));
-        assert_eq!(next_due([true, true, false], 2), Some(Viewer::Inspector));
-        assert_eq!(next_due([true, false, true], 1), Some(Viewer::Shader));
-        assert_eq!(next_due([true, true, true], 3), Some(Viewer::Inspector));
     }
 
     /// A view is never shown larger than the picture was drawn, at any

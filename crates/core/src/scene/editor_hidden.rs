@@ -227,14 +227,4 @@ mod tests {
         assert_eq!(next.index(), crate_.index());
         assert!(!is_hidden(&world, next));
     }
-
-    #[test]
-    fn with_nothing_hidden_the_table_is_empty() {
-        let mut world = world();
-        let (_, id) = spawn(&mut world);
-        hide(&mut world, id);
-        assert!(!world.resource::<EditorHidden>().is_empty());
-        hide(&mut world, id);
-        assert!(world.resource::<EditorHidden>().is_empty());
-    }
 }

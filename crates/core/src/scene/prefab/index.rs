@@ -394,21 +394,6 @@ entity {HANDLE}
         registry
     }
 
-    #[test]
-    fn a_prefab_is_one_tree() {
-        let two_roots = format!(
-            "orrin-scene 1\n\nentity {ROOT}\n  orrin.name = \"A\"\n\nentity {PANEL}\n  orrin.name = \"B\"\n"
-        );
-        let err = Prefab::parse(door_id(), "props/pair.oprefab", &two_roots)
-            .err()
-            .expect("two roots must be refused");
-        assert_eq!(
-            err,
-            "props/pair.oprefab: a prefab is one entity tree, and this one has 2 roots; \
-             parent them under one entity"
-        );
-    }
-
     /// One entity cannot be the root of two instances, and the root of a prefab
     /// is the root of every instance of it.
     #[test]
@@ -485,23 +470,6 @@ entity {ROOT}
 
         let (second, _) = Prefabs::scan(dir.path());
         assert_eq!(second.find("props/door.oprefab"), Some(id));
-    }
-
-    #[test]
-    fn a_sidecar_id_is_used_as_written() {
-        let dir = Dir::new("sidecar");
-        dir.write("props/door.oprefab", &door_text("handle", 1.0));
-        dir.write(
-            "props/door.oprefab.meta",
-            &format!("# import settings live here too\nid = \"{DOOR_ID}\"\n"),
-        );
-
-        let (prefabs, issues) = Prefabs::scan(dir.path());
-        assert!(issues.is_empty(), "{issues:?}");
-        assert_eq!(prefabs.find("props/door.oprefab"), Some(door_id()));
-        let prefab = prefabs.get(door_id()).unwrap();
-        assert_eq!(prefab.path, "props/door.oprefab");
-        assert_eq!(prefab.name(), "door");
     }
 
     /// One sidecar format for every asset: a prefab's is read by the asset

@@ -7,11 +7,12 @@
 //! the same route: it decides whether a green build raises that request, never
 //! whether a swap happens here.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use orrin_ecs::World;
 
-use crate::build_watcher::{BuildState, BuildStatus};
+use crate::build_watcher::{self, BuildState, BuildStatus};
 use crate::editor::icons;
 use crate::editor::state::EditorState;
 use crate::editor::theme::{ERROR, OK, PENDING};
@@ -29,11 +30,16 @@ pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
     if ui.button("Reload scripts").clicked() {
         state.request_script_reload();
     }
+    // How tall what follows the build state was last frame, which a failed
+    // build's list leaves room for.
+    let tail_id = ui.id().with("scripts tail");
+    let tail = ui.data(|data| data.get_temp::<f32>(tail_id)).unwrap_or(0.0);
     if let Some(mut status) = world.get_resource_mut::<BuildStatus>() {
         ui.checkbox(&mut status.auto_reload, "Reload after a successful rebuild");
         ui.separator();
-        show_build_state(ui, &status);
+        show_build_state(ui, &status, state, tail);
     }
+    let tail_top = ui.cursor().top();
     ui.separator();
     ui.label(format!("{live} behaviour(s) attached"));
     if faulted > 0 {
@@ -46,6 +52,8 @@ pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
     }
     ui.separator();
     timings(ui, world);
+    let tail = ui.min_rect().bottom() - tail_top;
+    ui.data_mut(|data| data.insert_temp(tail_id, tail));
 }
 
 fn timings(ui: &mut egui::Ui, world: &World) {
@@ -95,7 +103,33 @@ fn timings(ui: &mut egui::Ui, world: &World) {
         });
 }
 
-fn show_build_state(ui: &mut egui::Ui, status: &BuildStatus) {
+/// The shortest a failed build's list is drawn, however little room is left.
+const LIST_MIN: f32 = 120.0;
+
+/// One compiler line; one naming a file and line opens it there on a click.
+fn diagnostic(ui: &mut egui::Ui, line: &str, state: &mut EditorState) {
+    let text = egui::RichText::new(line).color(ERROR);
+    let Some(at) = build_watcher::locate(line) else {
+        ui.label(text);
+        return;
+    };
+    let name = Path::new(at.path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let clicked = ui
+        .add(egui::Label::new(text).sense(egui::Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!("Open {name} at line {}", at.line))
+        .clicked();
+    if clicked {
+        state.request_open_source(PathBuf::from(at.path), at.line);
+    }
+}
+
+/// `tail` is how tall what follows in the tab is, which a failed build's list
+/// leaves on screen.
+fn show_build_state(ui: &mut egui::Ui, status: &BuildStatus, state: &mut EditorState, tail: f32) {
     match &status.state {
         BuildState::Idle => {
             ui.weak("Watching for script changes.");
@@ -136,12 +170,22 @@ fn show_build_state(ui: &mut egui::Ui, status: &BuildStatus) {
             egui::CollapsingHeader::new("Compiler output")
                 .default_open(true)
                 .show(ui, |ui| {
+                    if ui
+                        .button("Copy")
+                        .on_hover_text("Copy every line of the compiler's output")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(status.diagnostics.join("\n"));
+                    }
+                    // The tab's height rather than a fixed box: a broken build
+                    // is what the tab is open to read.
+                    let height = (ui.available_height() - tail).max(LIST_MIN);
                     egui::ScrollArea::vertical()
-                        .max_height(120.0)
+                        .max_height(height)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             for line in &status.diagnostics {
-                                ui.colored_label(ERROR, line);
+                                diagnostic(ui, line, state);
                             }
                         });
                 });

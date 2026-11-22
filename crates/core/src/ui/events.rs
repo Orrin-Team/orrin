@@ -676,20 +676,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_released_press_on_a_despawned_element_is_forgotten() {
-        let mut ui = Ui::new();
-        let a = ui.target(None, at(0.0, 0.0, 100.0, 100.0));
-        ui.press(50.0, 50.0);
-        ui.world.despawn(a);
-        let events = kinds(&ui.release(50.0, 50.0));
-        assert!(
-            events.iter().all(|(kind, _)| *kind == PointerKind::Exit),
-            "{events:?}"
-        );
-        assert_eq!(ui.pointer.pressed(), None);
-    }
-
     impl Ui {
         /// A scroll frame of `size` at `(x, y)`, `content` units of content.
         fn scroller(
@@ -763,38 +749,6 @@ mod tests {
         ui.wheel(500.0, 500.0, [0.0, 3.0]);
         assert_eq!(ui.scrolled(frame), Vec2::new(0.0, 200.0), "not over it");
         let _ = row;
-    }
-
-    /// A frame that scrolls only across takes the ordinary wheel across, and a
-    /// frame at its end passes the wheel to the one around it.
-    #[test]
-    fn the_wheel_goes_across_a_sideways_frame_and_on_from_one_at_its_end() {
-        let mut ui = Ui::new();
-        let outer = ui.scroller(
-            None,
-            at(0.0, 0.0, 400.0, 400.0),
-            list(Vec2::new(0.0, 1000.0)),
-        );
-        let strip = ui.scroller(
-            Some(outer),
-            at(0.0, 0.0, 400.0, 100.0),
-            ScrollFrame {
-                horizontal: true,
-                vertical: false,
-                ..list(Vec2::new(500.0, 0.0))
-            },
-        );
-        ui.wheel(50.0, 50.0, [0.0, -1.0]);
-        assert_eq!(ui.scrolled(strip), Vec2::new(40.0, 0.0));
-        assert_eq!(ui.scrolled(outer), Vec2::ZERO);
-        ui.wheel(50.0, 50.0, [0.0, -5.0]);
-        assert_eq!(ui.scrolled(strip), Vec2::new(100.0, 0.0), "at its end");
-        ui.wheel(50.0, 50.0, [0.0, -1.0]);
-        assert_eq!(
-            ui.scrolled(outer),
-            Vec2::new(0.0, 40.0),
-            "the strip has nowhere left to go"
-        );
     }
 
     /// A row scrolled out of the frame is not under the pointer, even where

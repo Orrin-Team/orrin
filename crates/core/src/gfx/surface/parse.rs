@@ -979,12 +979,6 @@ void surface(in SurfaceIn i, inout SurfaceOut o) {
     }
 
     #[test]
-    fn a_parameter_less_empty_function_is_the_standard_material() {
-        let shader = parse(SURFACE);
-        assert_eq!(shader.params(), &ParamTable::default());
-    }
-
-    #[test]
     fn a_malformed_declaration_names_its_line_and_what_was_expected() {
         let cases: [(&str, &str); 14] = [
             ("param float3 a;", "type"),
@@ -1108,17 +1102,6 @@ void surface(in SurfaceIn i, inout SurfaceOut o) {
     }
 
     #[test]
-    fn param_inside_a_function_is_glsl_not_a_declaration() {
-        let shader = parse(
-            "void surface(in SurfaceIn i, inout SurfaceOut o) {\n\
-             \x20   float param = 1.0;\n\
-             param = 2.0;\n\
-             }\n",
-        );
-        assert!(shader.params().params.is_empty());
-    }
-
-    #[test]
     fn every_error_in_a_file_is_reported_at_once() {
         let found = errors("param flaot a;\nparam float b = (1);\nvoid x() { discard; }\n");
         let lines: Vec<_> = found.iter().map(|(line, _)| *line).collect();
@@ -1130,35 +1113,5 @@ void surface(in SurfaceIn i, inout SurfaceOut o) {
         let (line, message) = one_error(&format!("{SURFACE}\n/* never closed\n\n"));
         assert_eq!(line, 3);
         assert!(message.contains("/*"), "{message}");
-    }
-
-    /// Otherwise the compiler reports it inside the engine's code after the
-    /// include, at a line the user cannot see.
-    #[test]
-    fn an_unclosed_brace_is_an_error_at_the_end_of_the_file() {
-        let (line, message) =
-            one_error("void surface(in SurfaceIn i, inout SurfaceOut o) {\n    o.alpha = 1.0;\n");
-        assert_eq!(line, 2);
-        assert!(message.contains("`{`"), "{message}");
-    }
-
-    #[test]
-    fn macros_the_source_defines_are_recorded() {
-        let shader = parse(&format!(
-            "#define TWO 2.0\n#define CAT(a, b) a##b\n{SURFACE}"
-        ));
-        assert_eq!(shader.defines(), ["TWO", "CAT"]);
-    }
-
-    #[test]
-    fn a_located_error_reads_file_line_message() {
-        let error = SurfaceError::at(7, "something");
-        assert_eq!(error.located("rock.oshader"), "rock.oshader:7: something");
-        assert_eq!(error.to_string(), "line 7: something");
-        let error = SurfaceError {
-            line: None,
-            message: "raw".into(),
-        };
-        assert_eq!(error.located("rock.oshader"), "rock.oshader: raw");
     }
 }

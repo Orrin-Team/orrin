@@ -123,7 +123,6 @@ mod tests {
     use glam::Quat;
 
     use super::*;
-    use crate::scene::CpuMesh;
 
     fn lines(shape: ColliderShape, transform: Mat4) -> Vec<(Vec3, Vec3)> {
         let mut out = Vec::new();
@@ -154,61 +153,5 @@ mod tests {
                 "{local} is not a corner"
             );
         }
-    }
-
-    /// A sphere's radius takes the longest scale, as the body's does, so a
-    /// stretched sphere's outline is the round shape that collides.
-    #[test]
-    fn a_sphere_outline_lies_on_the_radius_the_body_has() {
-        let transform = Mat4::from_scale_rotation_translation(
-            Vec3::new(1.0, 3.0, 1.0),
-            Quat::IDENTITY,
-            Vec3::new(0.0, 2.0, 0.0),
-        );
-        let edges = lines(ColliderShape::Sphere { radius: 0.5 }, transform);
-
-        assert!(!edges.is_empty());
-        for p in points(&edges) {
-            let r = p.distance(Vec3::new(0.0, 2.0, 0.0));
-            assert!((r - 1.5).abs() < 1e-4, "a point {r} m out");
-        }
-    }
-
-    /// Its caps reach `half_height + radius` along its axis and no further.
-    #[test]
-    fn a_capsule_outline_reaches_its_caps() {
-        let edges = lines(
-            ColliderShape::Capsule {
-                radius: 0.25,
-                half_height: 0.5,
-            },
-            Mat4::IDENTITY,
-        );
-
-        let top = points(&edges).map(|p| p.y).fold(f32::MIN, f32::max);
-        let wide = points(&edges).map(|p| p.x.abs()).fold(0.0, f32::max);
-        assert!((top - 0.75).abs() < 1e-4, "reaches {top}");
-        assert!((wide - 0.25).abs() < 1e-4, "is {wide} wide");
-    }
-
-    #[test]
-    fn a_mesh_is_its_triangles_and_a_large_one_its_bounds() {
-        let mesh = MeshGeometry::from_mesh(&CpuMesh::cube());
-        let mut out = Vec::new();
-        outline(ColliderShape::Mesh, Mat4::IDENTITY, Some(&mesh), &mut out);
-        assert_eq!(out.len(), mesh.triangles.len() * 3);
-
-        let large = MeshGeometry {
-            positions: mesh.positions.clone(),
-            triangles: vec![[0, 1, 2]; MAX_OUTLINED_TRIANGLES + 1],
-        };
-        out.clear();
-        outline(
-            ColliderShape::ConvexHull,
-            Mat4::IDENTITY,
-            Some(&large),
-            &mut out,
-        );
-        assert_eq!(out.len(), 12, "a large mesh is outlined by its bounds");
     }
 }

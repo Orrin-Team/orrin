@@ -15,8 +15,9 @@
 //! the renderer, which is visited once per scene rather than every time.
 //!
 //! The filter has its row to itself and a new scene is named below it, once
-//! asked for with the plus. Sharing the row put two empty wells side by side
-//! at a docked tool's width, too narrow for either and hard to tell apart.
+//! asked for with the plus or File ▸ New scene…. Sharing the row put two
+//! empty wells side by side at a docked tool's width, too narrow for either
+//! and hard to tell apart.
 //!
 //! It shows the renderer's settings rather than drawing every slider again:
 //! the Environment tab already edits them, into the scene when the scene has
@@ -25,9 +26,11 @@
 //! it or lost on the next load — beside the few switches that decide which
 //! passes the frame runs at all.
 //!
-//! Opening another scene over unsaved work asks first, in the list itself
-//! rather than in a modal: the question is about the row just clicked, and
-//! the answer is usually "save it", which is one of the choices.
+//! Opening another scene over unsaved work, or reloading this one, asks
+//! first, in the editor's modal rather than in the list: the same question
+//! comes from the File menu and the Assets tab too, while this tool may be
+//! closed or behind another, and a question that is not seen is a click that
+//! throws the work away. Saving it is one of the answers.
 //!
 //! The list comes from the asset database, which already keeps it current as
 //! files are added and renamed; outside a project there is none, and the
@@ -36,8 +39,9 @@
 use orrin_ecs::World;
 
 use crate::asset_db::{AssetDatabase, AssetKind};
+use crate::editor::commands::{self, Command};
 use crate::editor::icons;
-use crate::editor::state::{DockRequest, EditorState, OpenChoice, SceneRequest};
+use crate::editor::state::{DockRequest, EditorState, SceneRequest};
 use crate::editor::theme;
 use crate::editor::widgets::{self, Tool};
 use crate::scene::loaded::name_of;
@@ -81,8 +85,13 @@ fn header(ui: &mut egui::Ui, world: &World, state: &mut EditorState, floating: b
             ui.add(egui::Label::new(egui::RichText::new(name).size(15.0).strong()).truncate());
         });
         if state.scene_dirty() {
-            pill(ui, theme::PENDING, "Unsaved")
-                .on_hover_text("Changes since the last save; Ctrl+S saves them");
+            let save = commands::text(ui.ctx(), &state.settings.keys, Command::Save);
+            let hint = if save.is_empty() {
+                "Changes since the last save".to_owned()
+            } else {
+                format!("Changes since the last save; {save} saves them")
+            };
+            pill(ui, theme::PENDING, "Unsaved").on_hover_text(hint);
         } else {
             pill(ui, theme::OK, "Saved");
         }
@@ -126,6 +135,16 @@ fn header(ui: &mut egui::Ui, world: &World, state: &mut EditorState, floating: b
         }
     };
     let why = |hint: &'static str| if playing { "Stop the game first" } else { hint };
+    let save = commands::hint(ui.ctx(), &state.settings.keys, Command::Save, "Save");
+    let reload = format!(
+        "{} — read the file again, asking first over unsaved changes",
+        commands::hint(
+            ui.ctx(),
+            &state.settings.keys,
+            Command::Reload,
+            Command::Reload.label()
+        )
+    );
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         let text = |word: &str| Some(egui::RichText::new(word));
@@ -135,7 +154,11 @@ fn header(ui: &mut egui::Ui, world: &World, state: &mut EditorState, floating: b
             None,
             text("Save"),
             live(true),
-            why("Save (Ctrl+S)"),
+            if playing {
+                "Stop the game first"
+            } else {
+                &save
+            },
         )
         .clicked()
         {
@@ -147,11 +170,15 @@ fn header(ui: &mut egui::Ui, world: &World, state: &mut EditorState, floating: b
             None,
             text("Reload"),
             live(true),
-            why("Load the file again, discarding unsaved changes"),
+            if playing {
+                "Stop the game first"
+            } else {
+                &reload
+            },
         )
         .clicked()
         {
-            state.request_scene(SceneRequest::Load);
+            state.request_reload_checked();
         }
         let hint = if recoverable {
             "Load the last autosave in place of the file, as unsaved work"
@@ -247,40 +274,37 @@ fn switches(ui: &mut egui::Ui, world: &World) {
             .spacing(egui::vec2(8.0, 4.0))
             .show(ui, |ui| {
                 let mut cell = 0;
-                let mut check = |ui: &mut egui::Ui, label: &str, value: &mut bool| {
+                each_switch(world, |label, value| {
                     ui.checkbox(value, label);
                     cell += 1;
                     if cell % columns == 0 {
                         ui.end_row();
                     }
-                };
-                check(
-                    ui,
-                    "Ambient occlusion",
-                    &mut world.resource_mut::<SsaoSettings>().enabled,
-                );
-                check(
-                    ui,
-                    "Temporal AA",
-                    &mut world.resource_mut::<TaaSettings>().enabled,
-                );
-                check(
-                    ui,
-                    "Bloom",
-                    &mut world.resource_mut::<BloomSettings>().enabled,
-                );
-                check(
-                    ui,
-                    "Shadows",
-                    &mut world.resource_mut::<ShadowSettings>().enabled,
-                );
-                check(
-                    ui,
-                    "Volumetric fog",
-                    &mut world.resource_mut::<FogSettings>().volumetric,
-                );
+                });
             });
     });
+}
+
+/// Each of those switches with the one name it goes by: the Render menu lists
+/// them from here too, so the two cannot drift into two lists or two names.
+pub(super) fn each_switch(world: &World, mut each: impl FnMut(&str, &mut bool)) {
+    each(
+        "Ambient occlusion",
+        &mut world.resource_mut::<SsaoSettings>().enabled,
+    );
+    each(
+        "Temporal AA",
+        &mut world.resource_mut::<TaaSettings>().enabled,
+    );
+    each("Bloom", &mut world.resource_mut::<BloomSettings>().enabled);
+    each(
+        "Shadows",
+        &mut world.resource_mut::<ShadowSettings>().enabled,
+    );
+    each(
+        "Volumetric fog",
+        &mut world.resource_mut::<FogSettings>().volumetric,
+    );
 }
 
 fn loaded(ui: &mut egui::Ui, world: &World) {
@@ -327,12 +351,6 @@ fn project(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
         None,
         |ui| {
             tools(ui, world, state);
-            // Above the list rather than after it, which in a long list is
-            // off the bottom of the tool from the row that asked.
-            if let Some(path) = state.pending_open().map(str::to_owned) {
-                confirm(ui, state, &path);
-                ui.add_space(4.0);
-            }
             let Some(db) = world.get_resource::<AssetDatabase>() else {
                 empty(
                     ui,
@@ -510,49 +528,15 @@ fn row(
     response
 }
 
-/// What to do with the open scene's unsaved work before `path` replaces it.
-fn confirm(ui: &mut egui::Ui, state: &mut EditorState, path: &str) {
-    let current = name_of(&state.scene_path);
-    let next = name_of(path);
-    egui::Frame::new()
-        .fill(theme::PENDING.gamma_multiply(0.12))
-        .stroke(egui::Stroke::new(
-            1.0_f32,
-            theme::PENDING.gamma_multiply(0.5),
-        ))
-        .corner_radius(ui.visuals().widgets.inactive.corner_radius)
-        .inner_margin(8)
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(icons::text(
-                    icons::warning_circle(),
-                    icons::ROW - 2.0,
-                    theme::PENDING,
-                ));
-                ui.label(format!(
-                    "{current} has unsaved changes. Open {next} anyway?"
-                ));
-            });
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Save and open").clicked() {
-                    state.resolve_open(OpenChoice::SaveFirst);
-                }
-                if ui.button("Open without saving").clicked() {
-                    state.resolve_open(OpenChoice::Discard);
-                }
-                if ui.button("Cancel").clicked() {
-                    state.resolve_open(OpenChoice::Cancel);
-                }
-            });
-        });
-}
-
 /// The filter across the row, and at its end the plus that asks for a new
 /// scene's name below it — or, while it is asked for, the cross that stops.
+/// Whether it is asked for is the editor's (`EditorState::naming_scene`), so
+/// File ▸ New scene… can ask too; whether the field was drawn last frame is
+/// this tool's, and the first frame it is drawn gives it the keyboard.
 fn tools(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
-    let naming_id = ui.id().with("naming a new scene");
-    let mut naming = ui.data(|data| data.get_temp::<bool>(naming_id).unwrap_or(false));
-    let mut opened = false;
+    let shown_id = ui.id().with("naming a new scene");
+    let shown = ui.data(|data| data.get_temp::<bool>(shown_id).unwrap_or(false));
+    let mut naming = state.naming_scene;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         let side = ui.spacing().interact_size.y;
@@ -567,13 +551,13 @@ fn tools(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
         };
         if widgets::squircle(ui, icon, hint).clicked() {
             naming = !naming;
-            opened = naming;
         }
     });
     if naming {
-        naming = new_scene(ui, world, state, opened);
+        naming = new_scene(ui, world, state, !shown);
     }
-    ui.data_mut(|data| data.insert_temp(naming_id, naming));
+    state.naming_scene = naming;
+    ui.data_mut(|data| data.insert_temp(shown_id, naming));
     ui.add_space(4.0);
 }
 
@@ -694,7 +678,7 @@ fn empty(ui: &mut egui::Ui, text: &str) {
 }
 
 /// A word in a rounded tint of `colour`: a state, not a control.
-fn pill(ui: &mut egui::Ui, colour: egui::Color32, word: &str) -> egui::Response {
+pub(super) fn pill(ui: &mut egui::Ui, colour: egui::Color32, word: &str) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(
         word.to_owned(),
         egui::TextStyle::Small.resolve(ui.style()),

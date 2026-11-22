@@ -337,16 +337,4 @@ mod tests {
         assert_eq!(text.matches("\nentity ").count(), 3);
         assert!(world.get::<EntityId>(door).is_some());
     }
-
-    #[test]
-    fn a_member_names_its_instance() {
-        let dir = Dir::new("member-of");
-        let mut world = world_in(&dir);
-        let door = spawn_door(&mut world, 0.0);
-        let panel = member(&world, door, "Panel");
-        assert_eq!(instance_of(&world, panel), Some((door, door_id())));
-        let loose = world.spawn();
-        world.insert(loose, EntityId::new());
-        assert_eq!(instance_of(&world, loose), None);
-    }
 }

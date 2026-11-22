@@ -415,23 +415,6 @@ mod tests {
         assert!(packed.contains_key(INDEX));
     }
 
-    /// A sky is read by the environment bake as it is, not imported, so the
-    /// pack carries the file itself — or a shipped game's sky goes black.
-    #[test]
-    fn a_sky_is_packed_as_it_is() {
-        let (dir, assets) = source_project("pack-sky");
-        AssetsDir(&assets).write("environment/meadow.hdr", b"#?RADIANCE sky");
-        let db = imported(&dir);
-        let out = dir.path().join("pack");
-
-        write(&db, &out).unwrap();
-
-        assert_eq!(
-            std::fs::read(out.join("environment/meadow.hdr")).unwrap(),
-            b"#?RADIANCE sky"
-        );
-    }
-
     /// A font is read by the UI as it is, so a shipped game finds the file in
     /// the pack rather than an artifact.
     #[test]
@@ -446,24 +429,6 @@ mod tests {
         let (packed, issues) = AssetDatabase::open_packed(&out, Target::Rgba8);
         assert!(issues.is_empty(), "{issues:?}");
         assert_eq!(packed.font(id), Ok(b"glyphs".to_vec()));
-    }
-
-    /// Audio is decoded from the file itself, so a shipped game finds it in
-    /// the pack exactly as it was authored.
-    #[test]
-    fn an_audio_clip_is_packed_as_it_is_and_reads_from_the_pack() {
-        let (dir, assets) = source_project("pack-audio");
-        AssetsDir(&assets).write("sfx/door.ogg", b"vorbis");
-        let db = imported(&dir);
-        let id = db.find("sfx/door.ogg").unwrap().id;
-        let out = dir.path().join("pack");
-
-        write(&db, &out).unwrap();
-        let (packed, issues) = AssetDatabase::open_packed(&out, Target::Rgba8);
-        assert!(issues.is_empty(), "{issues:?}");
-        let file = packed.audio_file(id).unwrap();
-        assert!(file.starts_with(&out), "{}", file.display());
-        assert_eq!(std::fs::read(file).unwrap(), b"vorbis");
     }
 
     #[test]

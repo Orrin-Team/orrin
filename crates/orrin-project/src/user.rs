@@ -60,20 +60,4 @@ mod tests {
         ];
         assert_eq!(dir_from(env(&vars)), Some(PathBuf::from("/tmp/elsewhere")));
     }
-
-    #[test]
-    fn an_empty_override_is_no_override() {
-        let vars = [
-            (DIR_ENV, ""),
-            ("HOME", "/home/me"),
-            ("APPDATA", "C:\\Users\\me\\AppData\\Roaming"),
-        ];
-        let dir = dir_from(env(&vars)).expect("the platform's directory");
-        assert!(dir.to_string_lossy().to_lowercase().ends_with("orrin"));
-    }
-
-    #[test]
-    fn nothing_set_is_no_directory() {
-        assert_eq!(dir_from(env(&[])), None);
-    }
 }

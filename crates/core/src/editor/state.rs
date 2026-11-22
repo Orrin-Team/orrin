@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -12,14 +13,15 @@ use super::selection::Selection;
 use crate::asset_db::material::MaterialFile;
 use crate::asset_db::{AssetDatabase, AssetKind};
 use crate::scene::edit::{EditError, History, SceneEditor};
+use crate::scene::prefab::Place;
 use crate::scene::{
     self, Assets, LoadedScenes, LogBuffer, LogLevel, MaterialHandle, MeshHandle, Name, Play,
     PlayState, Prefabs, Time, Transform, entities,
 };
 
-/// Where the editor's Save/Load buttons read and write. Relative to the
-/// process's working directory — a real file picker and a project-relative
-/// `scenes/` directory belong with the asset database.
+/// Where the editor's Save/Load buttons read and write until a scene is
+/// opened, or saved as another file, from the File menu or the Scenes tab.
+/// Relative to the process's working directory.
 pub const DEFAULT_SCENE_PATH: &str = "scene.orrin";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -198,7 +200,21 @@ pub enum DockRequest {
     Open(super::dock::Tab),
 }
 
-/// What becomes of unsaved work when another scene is opened over it.
+/// Which hierarchy rows the user closed, under each scene's file, by entity
+/// id. Open is the default, so only what was closed is kept, and it is kept
+/// with the project's editor preferences, so a scene reopens as it was left —
+/// after a reload or a restart. An entity with no id yet has nothing that
+/// outlives the session, and the hierarchy keeps its row's state for the
+/// session alone.
+#[derive(Default)]
+pub struct ClosedRows {
+    scenes: std::collections::HashMap<String, std::collections::HashSet<EntityId>>,
+    /// Changed since the preferences last took a copy.
+    changed: bool,
+}
+
+/// What becomes of unsaved work when another scene is opened over it, or the
+/// window is closed on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenChoice {
     SaveFirst,
@@ -227,6 +243,7 @@ pub enum SpawnKind {
     Sphere,
     Plane,
     PointLight,
+    SpotLight,
     DirectionalLight,
     Camera,
     Ui(crate::ui::create::UiKind),
@@ -241,6 +258,7 @@ impl SpawnKind {
             SpawnKind::Sphere => "Sphere",
             SpawnKind::Plane => "Plane",
             SpawnKind::PointLight => "Point Light",
+            SpawnKind::SpotLight => "Spot Light",
             SpawnKind::DirectionalLight => "Directional Light",
             SpawnKind::Camera => "Camera",
             SpawnKind::Ui(kind) => kind.name(),
@@ -274,20 +292,36 @@ pub struct EditorState {
     pub console_query: String,
     /// Where the console's script attributions lead.
     pub script_files: super::source::ScriptFiles,
+    /// The console's selection, toggles and unseen count.
+    pub console: super::panels::console::ConsoleView,
     /// The inspector's property filter. Kept across selections, the way a
     /// search in a property panel usually is: looking for one field on several
     /// entities is the case it exists for.
     pub inspector_query: String,
+    /// The Environment tab's filter, the inspector's kind over its settings.
+    pub environment_query: String,
     /// The asset browser's filter, kept for the reason the others are.
     pub assets_query: String,
     /// The Scene Manager's filter over the project's scenes.
     pub scenes_query: String,
+    /// The Scenes tab asks for a new scene's name below its filter: its plus
+    /// and File ▸ New scene… both ask.
+    pub naming_scene: bool,
+    /// The hierarchy rows closed, kept across sessions.
+    closed_rows: ClosedRows,
     pub assets_view: AssetView,
     /// The Shader tab's open shader and its unsaved text.
     pub shader: super::panels::shader::ShaderEditor,
     /// The asset the browser marks, and the Import tab shows: the last one
     /// clicked there, or the prefab "Show in Assets" pointed at.
     pub revealed_asset: Option<AssetId>,
+    /// The pointer was over the asset browser last frame, so Delete there is
+    /// the browser's marked assets rather than the scene's selection.
+    pub assets_hovered: bool,
+    /// File ▸ Import… asked for the asset browser's file dialog: the
+    /// browser's to take, since what is picked goes into the folder it has
+    /// open.
+    pub pick_files: bool,
     pub gizmo_mode: GizmoMode,
     pub gizmo_space: GizmoSpace,
     pub snap: bool,
@@ -313,6 +347,8 @@ pub struct EditorState {
     pub backend: crate::gfx::BackendChoice,
     /// The Settings tab's page, search and unsaved fields.
     pub settings_panel: super::panels::settings::SettingsPanel,
+    /// The command palette: whether it is open, and what is typed in it.
+    pub palette: super::panels::palette::Palette,
     /// Why the live link is not listening, as `SettingsStore` last heard it.
     pub link_error: Option<String>,
     /// The remote as Settings ▸ Agents shows it: `None` while it is off, and
@@ -382,7 +418,7 @@ pub struct EditorState {
     pub history: History,
     /// Component values the panels edited on detached copies this frame,
     /// applied by `apply` as part of the open gesture.
-    edits: Vec<(Entity, orrin_registry::ComponentId, orrin_registry::Value)>,
+    edits: Vec<Edit>,
     /// Material assets the inspector edited this frame, the same way.
     material_edits: Vec<(AssetId, MaterialFile)>,
     /// Whether the pointer is down or a field has focus — while it is, the
@@ -399,7 +435,7 @@ pub struct EditorState {
     /// writes it directly rather than through the pipeline.
     frame_request: bool,
     camera_moved: bool,
-    remove_request: Option<(Entity, orrin_registry::ComponentId)>,
+    remove_request: Vec<(Entity, orrin_registry::ComponentId)>,
     /// Overrides to give back to the prefab: entity, component, path.
     revert_request: Vec<(
         Entity,
@@ -415,23 +451,34 @@ pub struct EditorState {
     /// A change to where a tool sits: the dock's, drained before the next
     /// frame lays it out.
     dock_request: Option<DockRequest>,
-    /// A scene the Scene Manager was asked to open over unsaved work, waiting
-    /// for the user to say what happens to that work.
+    /// A scene asked to be opened over unsaved work, the open one when it is
+    /// to be read again, waiting for the user to say what happens to that work.
     pending_open: Option<String>,
     /// Save the open scene, then open this one — the save-first answer to
     /// `pending_open`.
     open_after_save: Option<String>,
-    /// An asset or folder, relative to the assets directory, waiting for the
-    /// user to confirm it should be deleted.
-    pending_delete: Option<String>,
-    /// One the user confirmed. Serviced by `apply`, after the panels, since a
+    /// Assets and folders, relative to the assets directory, waiting for the
+    /// user to confirm they should be deleted: one question for all of them.
+    pending_delete: Vec<String>,
+    /// Those the user confirmed. Serviced by `apply`, after the panels, since a
     /// deleted prefab rescans the index the asset browser draws from.
-    delete_request: Option<String>,
+    delete_request: Vec<String>,
     despawn_request: Vec<Entity>,
-    /// A registered component to add to an entity, at its default. Deferred
-    /// like the rest: the inspector is mid-way through drawing that entity's
+    /// Registered components to add, each at its default. Deferred like the
+    /// rest: the inspector is mid-way through drawing that entity's
     /// components when the menu is clicked.
-    add_request: Option<(Entity, orrin_registry::ComponentId)>,
+    add_request: Vec<(Entity, orrin_registry::ComponentId)>,
+    /// Copy the selection's trees beside them.
+    duplicate_request: bool,
+    /// Take the selection's trees into `clipboard`.
+    copy_request: bool,
+    /// Spawn what `clipboard` holds beside the primary selection.
+    paste_request: bool,
+    /// What Copy took, for Paste: the session's rather than the scene's, so
+    /// it outlives opening another scene.
+    clipboard: Option<scene::prefab::Copied>,
+    /// Edit the primary selection's name in its row: the hierarchy's to take.
+    rename_request: bool,
     hide_requests: Vec<Entity>,
     /// `(child, new parent)`, with `None` meaning "detach to a root". Requested
     /// rather than applied inline for the same reason as the two above: the
@@ -479,9 +526,36 @@ pub struct EditorState {
     restart_request: bool,
     /// Save the scene, then raise `restart_request` if that worked.
     restart_after_save: bool,
+    /// The window was asked to close over unsaved work, and waits for the
+    /// user to say what happens to that work.
+    pending_close: bool,
+    /// Save the scene, then raise `quit_request` if that worked: the
+    /// save-first answer to `pending_close`.
+    quit_after_save: bool,
+    /// Drained by the app after the UI pass, which closes the window.
+    quit_request: bool,
     /// What Stop goes back to. `Some` exactly while the game is live.
     fork: Option<Fork>,
     pub autosave: Autosave,
+}
+
+/// One component value a panel edited on a detached copy.
+struct Edit {
+    entity: Entity,
+    component: orrin_registry::ComponentId,
+    value: orrin_registry::Value,
+    /// Whether the rest of the selection takes the same change; see
+    /// `editor::spread`.
+    spread: bool,
+}
+
+/// How many edits, additions and removals had been asked for at a moment in
+/// a frame, so the ones asked for after it can be told apart.
+#[derive(Clone, Copy)]
+pub struct Posted {
+    edits: usize,
+    adds: usize,
+    removes: usize,
 }
 
 /// A press of one of the transport's buttons.
@@ -521,12 +595,18 @@ impl Default for EditorState {
             console_levels: LevelFilter::default(),
             console_query: String::new(),
             script_files: Default::default(),
+            console: Default::default(),
             inspector_query: String::new(),
+            environment_query: String::new(),
             assets_query: String::new(),
             scenes_query: String::new(),
+            naming_scene: false,
+            closed_rows: ClosedRows::default(),
             assets_view: AssetView::default(),
             shader: Default::default(),
             revealed_asset: None,
+            assets_hovered: false,
+            pick_files: false,
             gizmo_mode: GizmoMode::Select,
             gizmo_space: GizmoSpace::World,
             snap: false,
@@ -540,6 +620,7 @@ impl Default for EditorState {
             started_with: Default::default(),
             backend: crate::gfx::BackendChoice::DEFAULT,
             settings_panel: Default::default(),
+            palette: Default::default(),
             link_error: None,
             remote: None,
             remote_peers: Vec::new(),
@@ -573,7 +654,7 @@ impl Default for EditorState {
             redo_request: false,
             frame_request: false,
             camera_moved: false,
-            remove_request: None,
+            remove_request: Vec::new(),
             revert_request: Vec::new(),
             spawn_request: None,
             render_settings_request: false,
@@ -581,10 +662,15 @@ impl Default for EditorState {
             dock_request: None,
             pending_open: None,
             open_after_save: None,
-            pending_delete: None,
-            delete_request: None,
+            pending_delete: Vec::new(),
+            delete_request: Vec::new(),
             despawn_request: Vec::new(),
-            add_request: None,
+            add_request: Vec::new(),
+            duplicate_request: false,
+            copy_request: false,
+            paste_request: false,
+            clipboard: None,
+            rename_request: false,
             hide_requests: Vec::new(),
             reparent_request: Vec::new(),
             instantiate_request: None,
@@ -601,6 +687,9 @@ impl Default for EditorState {
             transport_request: None,
             restart_request: false,
             restart_after_save: false,
+            pending_close: false,
+            quit_after_save: false,
+            quit_request: false,
             fork: None,
             autosave: Autosave::new(PathBuf::from(".orrin/autosave"), Instant::now()),
         }
@@ -716,19 +805,35 @@ impl EditorState {
         }
     }
 
+    /// Read the open scene's file again, or, over unsaved work, ask first.
+    pub fn request_reload_checked(&mut self) {
+        self.request_open_scene_checked(self.scene_path.clone());
+    }
+
+    /// Whether the scene waiting on an answer is the open one read again.
+    pub fn pending_is_reload(&self) -> bool {
+        self.pending_open.as_deref() == Some(self.scene_path.as_str())
+    }
+
     /// Ask to delete the asset or folder at `rel`, relative to the assets
     /// directory. Nothing happens until [`resolve_delete`](Self::resolve_delete).
     pub fn request_delete_asset(&mut self, rel: impl Into<String>) {
-        self.pending_delete = Some(rel.into());
+        self.pending_delete = vec![rel.into()];
+    }
+
+    /// [`request_delete_asset`](Self::request_delete_asset) for several at
+    /// once, asked about together.
+    pub fn request_delete_assets(&mut self, rels: Vec<String>) {
+        self.pending_delete = rels;
     }
 
     /// What is waiting to be confirmed for deletion.
-    pub fn pending_delete(&self) -> Option<&str> {
-        self.pending_delete.as_deref()
+    pub fn pending_delete(&self) -> Option<&[String]> {
+        (!self.pending_delete.is_empty()).then_some(self.pending_delete.as_slice())
     }
 
     pub fn resolve_delete(&mut self, confirmed: bool) {
-        let pending = self.pending_delete.take();
+        let pending = std::mem::take(&mut self.pending_delete);
         if confirmed {
             self.delete_request = pending;
         }
@@ -832,7 +937,85 @@ impl EditorState {
         component: orrin_registry::ComponentId,
         value: orrin_registry::Value,
     ) {
-        self.edits.push((entity, component, value));
+        self.edits.push(Edit {
+            entity,
+            component,
+            value,
+            spread: false,
+        });
+    }
+
+    /// Where the edits, additions and removals asked for so far end.
+    pub fn posted(&self) -> Posted {
+        Posted {
+            edits: self.edits.len(),
+            adds: self.add_request.len(),
+            removes: self.remove_request.len(),
+        }
+    }
+
+    /// Make every edit, addition and removal asked for on the primary
+    /// selection since `from` reach the rest of the selection too, as part of
+    /// the same step: an edit as the change it made (see `editor::spread`),
+    /// an addition or removal on each entity it applies to.
+    pub fn spread(&mut self, from: Posted) {
+        let Some(primary) = self.selection.primary() else {
+            return;
+        };
+        for edit in &mut self.edits[from.edits..] {
+            edit.spread |= edit.entity == primary;
+        }
+        let others: Vec<Entity> = self
+            .selection
+            .entities()
+            .iter()
+            .copied()
+            .filter(|&entity| entity != primary)
+            .collect();
+        for (requests, from) in [
+            (&mut self.add_request, from.adds),
+            (&mut self.remove_request, from.removes),
+        ] {
+            let asked: Vec<orrin_registry::ComponentId> = requests[from..]
+                .iter()
+                .filter(|(entity, _)| *entity == primary)
+                .map(|(_, id)| id.clone())
+                .collect();
+            for id in asked {
+                requests.extend(others.iter().map(|&other| (other, id.clone())));
+            }
+        }
+    }
+
+    /// Copy every selected tree beside itself; see `scene::prefab::copy`.
+    pub fn request_duplicate(&mut self) {
+        self.duplicate_request = true;
+    }
+
+    pub fn request_copy(&mut self) {
+        self.copy_request = true;
+    }
+
+    pub fn request_paste(&mut self) {
+        self.paste_request = true;
+    }
+
+    /// Whether Copy has taken anything for Paste to put back.
+    pub fn can_paste(&self) -> bool {
+        self.clipboard
+            .as_ref()
+            .is_some_and(|copied| !copied.is_empty())
+    }
+
+    /// Edit the primary selection's name in the hierarchy, bringing the
+    /// hierarchy forward to do it.
+    pub fn request_rename(&mut self) {
+        self.rename_request = true;
+        self.request_dock(DockRequest::Show(super::dock::Tab::Hierarchy));
+    }
+
+    pub fn take_rename_request(&mut self) -> bool {
+        std::mem::take(&mut self.rename_request)
     }
 
     /// Give material asset `id` the parameters and slots of `file`, saved to
@@ -891,7 +1074,7 @@ impl EditorState {
     }
 
     pub fn request_remove_component(&mut self, entity: Entity, id: orrin_registry::ComponentId) {
-        self.remove_request = Some((entity, id));
+        self.remove_request.push((entity, id));
     }
 
     pub fn request_revert(
@@ -910,7 +1093,7 @@ impl EditorState {
     }
 
     pub fn request_add_component(&mut self, entity: Entity, id: orrin_registry::ComponentId) {
-        self.add_request = Some((entity, id));
+        self.add_request.push((entity, id));
     }
 
     pub fn request_theme(&mut self, name: impl Into<String>) {
@@ -951,6 +1134,111 @@ impl EditorState {
 
     pub fn take_restart_request(&mut self) -> bool {
         std::mem::take(&mut self.restart_request)
+    }
+
+    /// Whether the window may close now. Over unsaved work it may not: the
+    /// question is put instead, and a close asked for again while it is up
+    /// leaves it up rather than answering it.
+    pub fn request_close(&mut self) -> bool {
+        if !self.scene_dirty() {
+            return true;
+        }
+        self.pending_close = true;
+        false
+    }
+
+    /// The hierarchy rows closed in the open scene, by entity id.
+    pub fn closed_rows(&self) -> Option<&std::collections::HashSet<EntityId>> {
+        self.closed_rows.scenes.get(&self.scene_key())
+    }
+
+    pub fn set_row_open(&mut self, id: EntityId, open: bool) {
+        let key = self.scene_key();
+        let rows = &mut self.closed_rows;
+        let closed = rows.scenes.entry(key).or_default();
+        let changed = if open {
+            closed.remove(&id)
+        } else {
+            closed.insert(id)
+        };
+        rows.changed |= changed;
+    }
+
+    /// Start from what an earlier session kept; see [`ClosedRows`].
+    pub fn seed_closed_rows(&mut self, saved: &BTreeMap<String, Vec<String>>) {
+        self.closed_rows.scenes = saved
+            .iter()
+            .map(|(scene, ids)| {
+                let ids = ids.iter().filter_map(|id| id.parse().ok()).collect();
+                (scene.clone(), ids)
+            })
+            .collect();
+    }
+
+    /// Every scene's closed rows as the preferences keep them, when they
+    /// changed since last asked; the open scene's are first cut to the ids
+    /// still in `world`, so the list never outgrows the scenes it describes.
+    pub fn closed_rows_to_save(&mut self, world: &World) -> Option<BTreeMap<String, Vec<String>>> {
+        if !std::mem::take(&mut self.closed_rows.changed) {
+            return None;
+        }
+        let key = self.scene_key();
+        if let Some(closed) = self.closed_rows.scenes.get_mut(&key) {
+            let mut alive = std::collections::HashSet::new();
+            world.query::<&EntityId>().for_each(|_, id| {
+                alive.insert(*id);
+            });
+            closed.retain(|id| alive.contains(id));
+        }
+        self.closed_rows
+            .scenes
+            .retain(|_, closed| !closed.is_empty());
+        Some(
+            self.closed_rows
+                .scenes
+                .iter()
+                .map(|(scene, ids)| {
+                    let mut ids: Vec<String> = ids.iter().map(EntityId::to_string).collect();
+                    ids.sort_unstable();
+                    (scene.clone(), ids)
+                })
+                .collect(),
+        )
+    }
+
+    /// The open scene's file as the preferences name it: relative to the
+    /// project when it is inside it, so the name does not change with how
+    /// the file was reached.
+    fn scene_key(&self) -> String {
+        let path = std::path::Path::new(&self.scene_path);
+        self.project_root
+            .as_deref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// Whether a close is waiting on an answer about the scene's unsaved work.
+    pub fn pending_close(&self) -> bool {
+        self.pending_close
+    }
+
+    pub fn resolve_close(&mut self, choice: OpenChoice) {
+        if !std::mem::take(&mut self.pending_close) {
+            return;
+        }
+        match choice {
+            OpenChoice::SaveFirst => self.quit_after_save = true,
+            OpenChoice::Discard => self.quit_request = true,
+            OpenChoice::Cancel => {}
+        }
+    }
+
+    /// Whether the session should end now; drained by the app after the UI
+    /// pass, as a restart is.
+    pub fn take_quit_request(&mut self) -> bool {
+        std::mem::take(&mut self.quit_request)
     }
 
     pub fn apply(&mut self, world: &mut World, registry: &Registry) {
@@ -1001,7 +1289,7 @@ impl EditorState {
             };
             log(world, level, message);
         }
-        if let Some(rel) = self.delete_request.take() {
+        for rel in std::mem::take(&mut self.delete_request) {
             self.delete_asset(world, &rel);
         }
         if let Some(request) = self.scene_request.take() {
@@ -1019,6 +1307,20 @@ impl EditorState {
                     world,
                     LogLevel::Warning,
                     "restart cancelled: the scene was not saved".to_owned(),
+                );
+            }
+        }
+        if std::mem::take(&mut self.quit_after_save) {
+            let (level, message) = self.scene(world, registry, SceneRequest::Save);
+            let saved = level != LogLevel::Error && !self.playing();
+            log(world, level, message);
+            if saved {
+                self.quit_request = true;
+            } else {
+                log(
+                    world,
+                    LogLevel::Warning,
+                    "quit cancelled: the scene was not saved".to_owned(),
                 );
             }
         }
@@ -1100,11 +1402,60 @@ impl EditorState {
     /// What the panels asked of the scene this frame, through the edit
     /// pipeline.
     fn apply_edits(&mut self, world: &mut World, registry: &Registry) {
+        // Not an edit: what is copied is the session's, and the scene keeps
+        // only the ids a copy gave it.
+        self.selection.retain_alive(world);
+        if std::mem::take(&mut self.copy_request)
+            && let Some(copied) = scene::prefab::copy(world, registry, self.selection.entities())
+        {
+            self.clipboard = Some(copied);
+        }
+        let duplicate = std::mem::take(&mut self.duplicate_request)
+            .then(|| scene::prefab::copy(world, registry, self.selection.entities()))
+            .flatten();
+        let paste_under = std::mem::take(&mut self.paste_request).then(|| {
+            self.selection
+                .primary()
+                .and_then(|primary| scene::persist::live_parent(world, primary))
+        });
         let mut editor = SceneEditor::new(world, registry, &mut self.history);
         let mut failed: Vec<(LogLevel, String)> = Vec::new();
         let fail = |error: EditError| (LogLevel::Error, error.to_string());
 
-        for (entity, component, value) in self.edits.drain(..) {
+        let others: Vec<Entity> = self
+            .selection
+            .entities()
+            .iter()
+            .copied()
+            .filter(|&entity| Some(entity) != self.selection.primary())
+            .collect();
+        for edit in self.edits.drain(..) {
+            let before = (edit.spread && !others.is_empty())
+                .then(|| {
+                    scene::persist::read_component(
+                        editor.world(),
+                        registry,
+                        edit.entity,
+                        &edit.component,
+                    )
+                })
+                .flatten();
+            let Edit {
+                entity,
+                component,
+                value,
+                ..
+            } = edit;
+            if let Some(before) = before {
+                for &other in &others {
+                    let theirs =
+                        scene::persist::read_component(editor.world(), registry, other, &component);
+                    if let Some(theirs) = theirs {
+                        let spread = super::spread::spread(&before, &value, &theirs);
+                        failed.extend(editor.set(other, &component, spread).err().map(fail));
+                    }
+                }
+            }
             failed.extend(editor.set(entity, &component, value).err().map(fail));
         }
         for (id, file) in self.material_edits.drain(..) {
@@ -1151,16 +1502,60 @@ impl EditorState {
             let doomed = std::mem::take(&mut self.despawn_request);
             failed.extend(editor.despawn(&doomed).err().map(fail));
         }
-        if let Some((entity, id)) = self.add_request.take()
-            && editor.world().is_alive(entity)
-            && let Some(vtable) = registry.get(&id)
-            && !vtable.has(editor.world(), entity)
-        {
-            let added = editor.add_component(entity, &id, vtable.default());
-            failed.extend(added.err().map(fail));
+        let adds: Vec<(Entity, orrin_registry::ComponentId)> =
+            std::mem::take(&mut self.add_request)
+                .into_iter()
+                .filter(|(entity, id)| {
+                    editor.world().is_alive(*entity)
+                        && registry
+                            .get(id)
+                            .is_some_and(|vtable| !vtable.has(editor.world(), *entity))
+                })
+                .collect();
+        let mut add_all = |editor: &mut SceneEditor| {
+            for (entity, id) in &adds {
+                let default = registry.get(id).expect("filtered above").default();
+                failed.extend(editor.add_component(*entity, id, default).err().map(fail));
+            }
+        };
+        match &adds[..] {
+            [] => {}
+            [_] => add_all(&mut editor),
+            [(_, id), ..] => {
+                let label = format!(
+                    "Add {} to {} entities",
+                    component_name(registry, id),
+                    adds.len()
+                );
+                editor.batch(label, add_all);
+            }
         }
-        if let Some((entity, id)) = self.remove_request.take() {
-            failed.extend(editor.remove_component(entity, &id).err().map(fail));
+        // A removal spread over the selection reaches only what has one.
+        let removes: Vec<(Entity, orrin_registry::ComponentId)> =
+            std::mem::take(&mut self.remove_request)
+                .into_iter()
+                .filter(|(entity, id)| {
+                    editor.world().is_alive(*entity)
+                        && scene::persist::read_component(editor.world(), registry, *entity, id)
+                            .is_some()
+                })
+                .collect();
+        let mut remove_all = |editor: &mut SceneEditor| {
+            for (entity, id) in &removes {
+                failed.extend(editor.remove_component(*entity, id).err().map(fail));
+            }
+        };
+        match &removes[..] {
+            [] => {}
+            [_] => remove_all(&mut editor),
+            [(_, id), ..] => {
+                let label = format!(
+                    "Remove {} from {} entities",
+                    component_name(registry, id),
+                    removes.len()
+                );
+                editor.batch(label, remove_all);
+            }
         }
         for (entity, component, path) in std::mem::take(&mut self.revert_request) {
             let reverted =
@@ -1224,6 +1619,36 @@ impl EditorState {
             }
         }
 
+        let pastes = [
+            duplicate
+                .as_ref()
+                .map(|copied| ("Duplicate", copied, Place::Beside)),
+            paste_under
+                .zip(self.clipboard.as_ref())
+                .map(|(parent, copied)| ("Paste", copied, Place::Under(parent))),
+        ];
+        for (verb, copied, place) in pastes.into_iter().flatten() {
+            let (copies, issues) = editor.replace(
+                format!("{verb} {}", copied.label()),
+                &[],
+                |world, registry| {
+                    let (roots, issues) = scene::prefab::paste(world, registry, copied, place);
+                    ((roots.clone(), issues), roots)
+                },
+            );
+            failed.extend(
+                issues
+                    .into_iter()
+                    .map(|issue| (LogLevel::Warning, issue.to_string())),
+            );
+            if let Some((first, rest)) = copies.split_first() {
+                self.selection.set(*first);
+                for &copy in rest {
+                    self.selection.toggle(copy);
+                }
+            }
+        }
+
         for (level, message) in failed {
             log(editor.world(), level, message);
         }
@@ -1239,6 +1664,21 @@ impl EditorState {
 /// half-metre of room so a lone light is not framed from a hair's breadth.
 fn framed(world: &World, selection: &[Entity]) -> Option<scene::Camera> {
     let camera = *world.get_resource::<scene::Camera>()?;
+    let (centre, radius) = selection_sphere(world, selection)?;
+    let heading = (camera.target - camera.position).normalize();
+    // The sphere's tangent at the edge of the vertical field of view, and a
+    // little more, so the selection is not drawn touching the frame.
+    let distance = radius / (camera.fov_y * 0.5).sin() * 1.15;
+    Some(scene::Camera {
+        position: centre - heading * distance,
+        target: centre,
+        ..camera
+    })
+}
+
+/// The centre of `selection` and the radius round it that [`framed`] fits
+/// the view to; what the editor camera orbits.
+pub(super) fn selection_sphere(world: &World, selection: &[Entity]) -> Option<(Vec3, f32)> {
     let meshes = world.get_resource::<scene::MeshBounds>();
     let mut bounds = crate::geom::Aabb::EMPTY;
     for &entity in selection {
@@ -1263,16 +1703,7 @@ fn framed(world: &World, selection: &[Entity]) -> Option<scene::Camera> {
         return None;
     }
     let centre = Vec3::from(bounds.center());
-    let radius = bounds.half_extents().length().max(0.5);
-    let heading = (camera.target - camera.position).normalize();
-    // The sphere's tangent at the edge of the vertical field of view, and a
-    // little more, so the selection is not drawn touching the frame.
-    let distance = radius / (camera.fov_y * 0.5).sin() * 1.15;
-    Some(scene::Camera {
-        position: centre - heading * distance,
-        target: centre,
-        ..camera
-    })
+    Some((centre, bounds.half_extents().length().max(0.5)))
 }
 
 /// Spawn an instance of prefab `asset`, or an entity drawing it when it is a
@@ -1406,6 +1837,12 @@ impl EditorState {
         match request {
             Transport::PlayStop if self.playing() => self.stop(world, registry),
             Transport::PlayStop => {
+                if self.console.options.clear_on_play
+                    && let Some(mut log) = world.get_resource_mut::<LogBuffer>()
+                {
+                    log.clear();
+                    self.console.forget(Some(&log));
+                }
                 // The gesture is the scene's, so it is closed into the scene's
                 // history rather than carried into the fork's.
                 SceneEditor::new(world, registry, &mut self.history).commit();
@@ -1728,7 +2165,7 @@ pub fn new_scene_path(world: &World, name: &str) -> Result<PathBuf, String> {
 
 /// Where the project's assets are: the database's directory, or `assets/`
 /// beside the working directory without one, as prefabs resolve.
-fn assets_dir(world: &World) -> PathBuf {
+pub(super) fn assets_dir(world: &World) -> PathBuf {
     if let Some(db) = world.get_resource::<crate::asset_db::AssetDatabase>() {
         return db.dir().to_owned();
     }
@@ -1756,6 +2193,13 @@ fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
+}
+
+/// What a component is called in a step's label.
+fn component_name(registry: &Registry, id: &orrin_registry::ComponentId) -> String {
+    registry
+        .get(id)
+        .map_or_else(|| id.to_string(), |vtable| vtable.name.to_string())
 }
 
 /// Whether `ancestor` is above `entity` in the tree.
@@ -1879,14 +2323,28 @@ fn spawn_object(world: &mut World, kind: SpawnKind) -> Option<Entity> {
         // overcast sun. Both are large numbers and neither is arbitrary — a light
         // spawned at the old unitless 8.0 would now be an 8 lumen indicator lamp,
         // which is a feature that looks broken rather than a light that looks dim.
-        SpawnKind::PointLight => Some(entities::spawn_point_light(
-            world,
-            kind.name(),
-            Vec3::new(0.0, 3.0, 0.0),
-            Vec3::ONE,
-            4000.0,
-            10.0,
-        )),
+        SpawnKind::PointLight | SpawnKind::SpotLight => {
+            let (fixture, rotation) = match kind {
+                // Pointing down, so a new spot lights the floor under it.
+                SpawnKind::SpotLight => (
+                    scene::Light::default_spot(),
+                    glam::Quat::from_rotation_arc(Vec3::NEG_Z, Vec3::NEG_Y),
+                ),
+                _ => (scene::Light::default_point(), glam::Quat::IDENTITY),
+            };
+            let light = world.spawn();
+            world.insert(light, Name::new(kind.name()));
+            world.insert(
+                light,
+                scene::LocalTransform::from(Transform {
+                    translation: Vec3::new(0.0, 3.0, 0.0),
+                    rotation,
+                    ..Default::default()
+                }),
+            );
+            world.insert(light, fixture);
+            Some(light)
+        }
         SpawnKind::DirectionalLight => Some(entities::spawn_directional_light(
             world,
             kind.name(),

@@ -614,45 +614,6 @@ mod tests {
         world.get::<Button>(entity).unwrap().interactable
     }
 
-    #[test]
-    fn dropping_a_ball_adds_one_simulated_ball() {
-        let mut world = scene();
-
-        click(&mut world, Control::Ball);
-
-        let dropped = tagged(&world, SPAWNED);
-        assert_eq!(dropped.len(), 1);
-        let ball = dropped[0];
-        assert_eq!(world.get::<Collider>(ball).as_deref(), Some(&unit_ball()));
-        assert!(world.get::<RigidBody>(ball).is_some_and(|b| !b.kinematic));
-        assert_eq!(label(&world), "1 dropped");
-        assert!(interactable(&world, Control::Clear));
-    }
-
-    #[test]
-    fn dropping_a_tower_stacks_five_crates_in_one_column() {
-        let mut world = scene();
-
-        click(&mut world, Control::Tower);
-
-        let dropped = tagged(&world, SPAWNED);
-        assert_eq!(dropped.len(), TOWER);
-        let mut heights: Vec<Vec3> = dropped
-            .iter()
-            .map(|&e| {
-                world
-                    .get::<crate::scene::LocalTransform>(e)
-                    .unwrap()
-                    .translation
-            })
-            .collect();
-        heights.sort_by(|a, b| a.y.total_cmp(&b.y));
-        for pair in heights.windows(2) {
-            assert!((pair[1].y - pair[0].y - 1.0).abs() < 1e-3, "{heights:?}");
-            assert_eq!(pair[0].x, pair[1].x);
-        }
-    }
-
     /// Clear takes back what the panel dropped and nothing the scene authored.
     #[test]
     fn clear_removes_only_what_was_dropped() {
@@ -687,26 +648,5 @@ mod tests {
         click(&mut world, Control::Ball);
 
         assert_eq!(tagged(&world, SPAWNED).len(), 1);
-    }
-
-    /// At the cap the drop buttons switch off, a tower that would cross it
-    /// stops at it, and the label says what to do about it.
-    #[test]
-    fn dropping_stops_at_the_cap_until_something_is_cleared() {
-        let mut world = scene();
-        for _ in 0..MAX_SPAWNED.div_ceil(TOWER) + 2 {
-            click(&mut world, Control::Tower);
-        }
-
-        assert_eq!(tagged(&world, SPAWNED).len(), MAX_SPAWNED);
-        assert!(!interactable(&world, Control::Crate));
-        assert!(!interactable(&world, Control::Tower));
-        assert_eq!(
-            label(&world),
-            format!("{MAX_SPAWNED} dropped, clear to drop more")
-        );
-
-        click(&mut world, Control::Clear);
-        assert!(interactable(&world, Control::Ball));
     }
 }

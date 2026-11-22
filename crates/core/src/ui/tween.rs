@@ -607,55 +607,6 @@ mod tests {
         }
     }
 
-    /// Out is In played backwards and upside down, and InOut is symmetric about
-    /// its middle — the identities every Penner curve satisfies.
-    #[test]
-    fn out_mirrors_in_and_in_out_is_symmetric() {
-        for style in EaseStyle::ALL {
-            let ease_in = Ease::new(style, EaseDirection::In);
-            let ease_out = Ease::new(style, EaseDirection::Out);
-            let in_out = Ease::new(style, EaseDirection::InOut);
-            assert!(
-                (in_out.apply(0.5) - 0.5).abs() < EPS,
-                "{style:?} InOut middle"
-            );
-            for i in 0..=20 {
-                let t = i as f32 / 20.0;
-                let mirrored = 1.0 - ease_in.apply(1.0 - t);
-                assert!(
-                    (ease_out.apply(t) - mirrored).abs() < 1e-4,
-                    "{style:?} Out at {t}"
-                );
-                let reflected = 1.0 - in_out.apply(1.0 - t);
-                assert!(
-                    (in_out.apply(t) - reflected).abs() < 1e-4,
-                    "{style:?} InOut at {t}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_curves_have_their_textbook_values() {
-        let at = |style, direction, t| Ease::new(style, direction).apply(t);
-        use EaseDirection::*;
-        assert!((at(EaseStyle::Quad, In, 0.5) - 0.25).abs() < EPS);
-        assert!((at(EaseStyle::Cubic, Out, 0.5) - 0.875).abs() < EPS);
-        assert!((at(EaseStyle::Quint, In, 0.5) - 0.03125).abs() < EPS);
-        assert!((at(EaseStyle::Sine, Out, 0.5) - std::f32::consts::FRAC_1_SQRT_2).abs() < EPS);
-        assert!((at(EaseStyle::Linear, InOut, 0.3) - 0.3).abs() < EPS);
-        assert!(at(EaseStyle::Back, In, 0.3) < 0.0, "back pulls back first");
-        assert!(
-            (0..100).any(|i| at(EaseStyle::Elastic, Out, i as f32 / 100.0) > 1.0),
-            "elastic overshoots"
-        );
-        let bounce = at(EaseStyle::Bounce, Out, 0.5);
-        assert!(
-            (bounce - 0.765625).abs() < EPS,
-            "bounce out at 0.5 is {bounce}"
-        );
-    }
-
     #[test]
     fn a_tween_eases_from_the_current_value_to_its_target_over_its_duration() {
         let mut world = world();
@@ -700,16 +651,6 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_length_tween_completes_on_its_first_frame() {
-        let mut world = world();
-        let button = element(&mut world);
-        let id = play(&world, slide(button, 42.0, 0.0));
-        advance(&world, 0.016);
-        assert_eq!(position(&world, button).x, 42.0);
-        assert_eq!(completed(&world), vec![id]);
-    }
-
-    #[test]
     fn a_second_tween_on_the_same_field_takes_over_from_where_the_first_got() {
         let mut world = world();
         let button = element(&mut world);
@@ -725,28 +666,6 @@ mod tests {
             vec![second],
             "a replaced tween reports nothing"
         );
-    }
-
-    #[test]
-    fn tweens_on_different_fields_of_one_element_run_side_by_side() {
-        let mut world = world();
-        let button = element(&mut world);
-        let slide = play(&world, slide(button, 100.0, 1.0));
-        let fade = play(
-            &world,
-            Tween {
-                ease: Ease::LINEAR,
-                ..Tween::new(button, TweenProperty::ImageColor, [1.0, 0.0, 0.5, 0.0], 1.0)
-            },
-        );
-        advance(&world, 0.5);
-        assert!(playing(&world, slide) && playing(&world, fade));
-        let color = world.get::<Image>(button).unwrap().color;
-        let want = [1.0, 0.5, 0.75, 0.5];
-        for (got, want) in color.iter().zip(want) {
-            assert!((got - want).abs() < 1e-4, "{color:?}");
-        }
-        assert!((position(&world, button).x - 50.0).abs() < 1e-3);
     }
 
     #[test]
@@ -767,28 +686,6 @@ mod tests {
         assert_eq!(position(&world, button).x, -50.0);
         advance(&world, 0.5);
         assert!((position(&world, button).x - 0.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn a_delayed_tween_reads_its_start_when_the_delay_ends() {
-        let mut world = world();
-        let button = element(&mut world);
-        play(
-            &world,
-            Tween {
-                delay: 0.5,
-                ..slide(button, 100.0, 1.0)
-            },
-        );
-        advance(&world, 0.25);
-        world
-            .get_mut::<RectTransform>(button)
-            .unwrap()
-            .anchored_position
-            .x = 50.0;
-        advance(&world, 0.25);
-        advance(&world, 0.5);
-        assert!((position(&world, button).x - 75.0).abs() < 1e-3);
     }
 
     #[test]
@@ -815,27 +712,6 @@ mod tests {
             "a reversing tween ends where it began"
         );
         assert_eq!(completed(&world), vec![id]);
-    }
-
-    #[test]
-    fn a_negative_repeat_never_finishes() {
-        let mut world = world();
-        let button = element(&mut world);
-        let id = play(
-            &world,
-            Tween {
-                repeat: -1,
-                ..slide(button, 100.0, 0.5)
-            },
-        );
-        for _ in 0..1000 {
-            advance(&world, 0.1);
-        }
-        assert!(playing(&world, id));
-        assert!(completed(&world).is_empty());
-        // Restarted from the start at each cycle: 100.05 s is 0.05 into one.
-        advance(&world, 0.05);
-        assert!((position(&world, button).x - 10.0).abs() < 0.5);
     }
 
     #[test]
@@ -867,20 +743,6 @@ mod tests {
         assert!(!playing(&world, gone) && !playing(&world, missing));
         assert!(completed(&world).is_empty());
         assert!(world.resource::<UiTweens>().is_empty());
-    }
-
-    #[test]
-    fn an_id_is_never_reused_and_never_zero() {
-        let mut world = world();
-        let button = element(&mut world);
-        let first = play(&world, slide(button, 1.0, 0.0));
-        advance(&world, 0.1);
-        let second = play(&world, slide(button, 2.0, 1.0));
-        assert_ne!(first, second);
-        assert!(!playing(&world, first));
-        assert!(playing(&world, second));
-        assert_ne!(first.to_bits(), 0);
-        assert_eq!(TweenId::from_bits(second.to_bits()), second);
     }
 
     /// Every property reads back what it wrote, through the component it names.

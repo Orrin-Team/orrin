@@ -6,6 +6,17 @@
 //! its own (`scene::Folder`), and a row's eye hides it from the editor's view
 //! and nowhere else (`scene::editor_hidden`).
 //!
+//! The row menu and the Edit menu duplicate, copy and paste the selection's
+//! trees (`scene::prefab::copy`), and Rename's key (F2 unless rebound)
+//! renames the primary in its row. While the pointer is over the tree, or a
+//! press last landed in it, the arrows walk the rows; they are the tree's own
+//! and not commands, so they are not rebound. A selection made anywhere else — in the scene, by an
+//! undo, by a command — opens the rows above it and scrolls to it; one made
+//! by a click here leaves the list where it is, since moving it would move
+//! what was aimed at. A row cannot be dropped between two others: siblings
+//! have no order of their own to change, only their slots in the ECS, and a
+//! scene file writes them sorted by id.
+//!
 //! Rows are laid out flat, one fixed-height rect each, rather than as nested
 //! collapsing headers. That is what lets a row fill the panel edge to edge —
 //! selection and hover both cover the whole line, indent included — and what
@@ -13,9 +24,12 @@
 //! over a row that is already the size it will ever be. It is also what lets
 //! the list draw only the rows on screen, which a tree of nested `Ui`s cannot.
 
-use orrin_ecs::{Entity, World};
-use orrin_registry::AssetId;
+use std::collections::HashSet;
 
+use orrin_ecs::{Entity, World};
+use orrin_registry::{AssetId, EntityId};
+
+use crate::editor::commands::{self, Command};
 use crate::editor::kind::Kind;
 use crate::editor::state::{EditorState, PrefabAction};
 use crate::editor::{icons, theme, widgets};
@@ -28,7 +42,13 @@ use crate::scene::{Hierarchy, Name, PrefabInstance, Prefabs};
 /// tree that is changing underneath it.
 struct Node {
     entity: Entity,
+    /// What the row's open state is kept under across sessions; see
+    /// `state::ClosedRows`.
+    id: Option<EntityId>,
     label: String,
+    /// Whether `label` is a [`Name`] rather than a stand-in for one, and so
+    /// can be renamed in the row.
+    named: bool,
     kind: Kind,
     children: Vec<usize>,
     is_root: bool,
@@ -63,21 +83,88 @@ enum Role {
     Member,
 }
 
-/// A node as it lands on screen: which one, how deep, and whether it has a
-/// disclosure to draw.
+/// A node as it lands on screen: which one, how deep, whether it has a
+/// disclosure to draw, and whether that is open.
 struct Row {
     node: usize,
     depth: u32,
     parent: bool,
+    open: bool,
 }
 
 const ROW: f32 = 24.0;
 const INDENT: f32 = 14.0;
 pub(super) const FOOTER: f32 = 24.0;
 
+/// What the tree keeps between frames, in egui's memory: the panel is drawn
+/// afresh each frame and the rest of its state is the scene's.
+#[derive(Clone, Default)]
+struct Tree {
+    /// The primary selection as the tree last left it. One that differs at
+    /// the start of a frame was chosen somewhere else, and is revealed.
+    seen: Option<Entity>,
+    /// Whether the last press landed in the tree. The arrows are its while
+    /// the pointer is over it or until a press lands elsewhere.
+    clicked: bool,
+    renaming: Option<Renaming>,
+}
+
+/// A name being edited in its row. Enter renames; Escape, or clicking away,
+/// does not.
+#[derive(Clone)]
+struct Renaming {
+    entity: Entity,
+    text: String,
+    started: bool,
+    /// Whether the row was drawn this frame. One scrolled away cannot be
+    /// typed into, so its edit is dropped rather than left waiting.
+    drawn: bool,
+}
+
+fn tree_id() -> egui::Id {
+    egui::Id::new("hierarchy_tree")
+}
+
 pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
+    let ctx = ui.ctx().clone();
+    let panel = ui.max_rect();
+    let mut tree: Tree = ctx
+        .data(|data| data.get_temp(tree_id()))
+        .unwrap_or_default();
+    let press = ui.input(|input| {
+        input
+            .pointer
+            .any_pressed()
+            .then(|| input.pointer.interact_pos())
+            .flatten()
+    });
+    if let Some(at) = press {
+        tree.clicked = panel.contains(at);
+    }
+    let active = (ui.rect_contains_pointer(panel) || tree.clicked) && !ctx.wants_keyboard_input();
+
+    let primary = state.selection.primary().filter(|&e| world.is_alive(e));
+    let reveal = primary.filter(|&primary| Some(primary) != tree.seen);
+    if let Some(entity) = reveal {
+        open_ancestors(&ctx, world, state, entity);
+    }
     let nodes = snapshot(world, &state.hierarchy_query);
     let searching = !state.hierarchy_query.trim().is_empty();
+
+    let rename = state.take_rename_request()
+        || (active && ui.input(|input| state.settings.keys.pressed(input, Command::Rename)));
+    let mut scroll_to = reveal;
+    if rename
+        && let Some(node) = primary.and_then(|p| nodes.iter().find(|n| n.entity == p && n.named))
+    {
+        tree.renaming = Some(Renaming {
+            entity: node.entity,
+            text: node.label.clone(),
+            started: false,
+            drawn: false,
+        });
+        scroll_to = Some(node.entity);
+    }
 
     widgets::padded(ui, |ui| {
         // Right-to-left so the Add button is placed first and the field fills
@@ -99,7 +186,17 @@ pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
     });
     ui.add_space(4.0);
 
-    let rows = flatten(ui.ctx(), &nodes, searching);
+    let mut rows = flatten(&ctx, &nodes, searching, state.closed_rows());
+    if active
+        && tree.renaming.is_none()
+        && let Some(moved) = navigate(&ctx, &nodes, &rows, searching, state)
+    {
+        // A row opened or closed by the keys reshapes the list.
+        rows = flatten(&ctx, &nodes, searching, state.closed_rows());
+        scroll_to = Some(moved);
+    }
+    let scroll_row =
+        scroll_to.and_then(|entity| rows.iter().position(|row| nodes[row.node].entity == entity));
     // Less the spacing the layout puts between the tree and the footer: the
     // panel has to end exactly at the tab's bottom, or the dock's own scroll
     // area takes the overflow and the wheel slides the whole panel.
@@ -128,17 +225,43 @@ pub fn body(ui: &mut egui::Ui, world: &mut World, state: &mut EditorState) {
         // which rows are on screen from the row height plus this spacing, and
         // rows packed tighter than it assumes run out short of the bottom.
         ui.spacing_mut().item_spacing.y = 0.0;
-        egui::ScrollArea::vertical().auto_shrink(false).show_rows(
-            ui,
-            ROW,
-            rows.len(),
-            |ui, range| {
-                for row in &rows[range] {
-                    draw_row(ui, &nodes, &rows, row, state);
-                }
-            },
-        );
+        let mut scroll = egui::ScrollArea::vertical()
+            .id_salt("hierarchy_rows")
+            .auto_shrink(false);
+        // The least scroll that brings the row fully into view. Only for a
+        // row chosen by the keys or from outside the tree: one clicked is
+        // under the pointer already, and moving it would move what was aimed
+        // at.
+        if let Some(index) = scroll_row {
+            let id = ui.make_persistent_id(egui::Id::new("hierarchy_rows"));
+            let offset =
+                egui::scroll_area::State::load(&ctx, id).map_or(0.0, |scrolled| scrolled.offset.y);
+            let (top, bottom) = (index as f32 * ROW, (index + 1) as f32 * ROW);
+            let height = ui.available_height();
+            let wanted = if top < offset {
+                top
+            } else if bottom > offset + height {
+                bottom - height
+            } else {
+                offset
+            };
+            scroll = scroll.vertical_scroll_offset(wanted);
+        }
+        scroll.show_rows(ui, ROW, rows.len(), |ui, range| {
+            for row in &rows[range] {
+                draw_row(ui, &nodes, &rows, row, state, &mut tree.renaming);
+            }
+        });
     });
+    if let Some(renaming) = &mut tree.renaming {
+        if renaming.started && !renaming.drawn {
+            tree.renaming = None;
+        } else {
+            renaming.drawn = false;
+        }
+    }
+    tree.seen = state.selection.primary();
+    ctx.data_mut(|data| data.insert_temp(tree_id(), tree));
     if let Some(dragged) = released::<Vec<Entity>>(&background) {
         for &entity in dragged.iter() {
             state.request_reparent(entity, None);
@@ -184,33 +307,48 @@ fn open_id(entity: Entity) -> egui::Id {
     egui::Id::new(("hierarchy_open", entity.index(), entity.generation()))
 }
 
-fn is_open(ctx: &egui::Context, entity: Entity) -> bool {
-    ctx.data(|data| data.get_temp::<bool>(open_id(entity)))
-        .unwrap_or(true)
+/// A row with an id is open unless the scene's closed rows name it, which
+/// outlive the session; one without is kept in egui's memory, for this
+/// session only.
+fn is_open(ctx: &egui::Context, node: &Node, closed: Option<&HashSet<EntityId>>) -> bool {
+    match node.id {
+        Some(id) => closed.is_none_or(|closed| !closed.contains(&id)),
+        None => ctx
+            .data(|data| data.get_temp::<bool>(open_id(node.entity)))
+            .unwrap_or(true),
+    }
 }
 
 /// The rows on screen, in order. A search opens every branch on the way to a
 /// match, so a match is never hidden inside a closed parent.
-fn flatten(ctx: &egui::Context, nodes: &[Node], searching: bool) -> Vec<Row> {
+fn flatten(
+    ctx: &egui::Context,
+    nodes: &[Node],
+    searching: bool,
+    closed: Option<&HashSet<EntityId>>,
+) -> Vec<Row> {
     fn walk(
         ctx: &egui::Context,
         nodes: &[Node],
         index: usize,
         depth: u32,
         searching: bool,
+        closed: Option<&HashSet<EntityId>>,
         out: &mut Vec<Row>,
     ) {
         let node = &nodes[index];
         let parent = node.children.iter().any(|&child| nodes[child].visible);
+        let open = is_open(ctx, node, closed);
         out.push(Row {
             node: index,
             depth,
             parent,
+            open,
         });
-        if parent && (searching || is_open(ctx, node.entity)) {
+        if parent && (searching || open) {
             for &child in &node.children {
                 if nodes[child].visible {
-                    walk(ctx, nodes, child, depth + 1, searching, out);
+                    walk(ctx, nodes, child, depth + 1, searching, closed, out);
                 }
             }
         }
@@ -218,10 +356,137 @@ fn flatten(ctx: &egui::Context, nodes: &[Node], searching: bool) -> Vec<Row> {
     let mut out = Vec::new();
     for index in 0..nodes.len() {
         if nodes[index].is_root && nodes[index].visible {
-            walk(ctx, nodes, index, 0, searching, &mut out);
+            walk(ctx, nodes, index, 0, searching, closed, &mut out);
         }
     }
     out
+}
+
+fn set_open(ctx: &egui::Context, state: &mut EditorState, node: &Node, open: bool) {
+    match node.id {
+        Some(id) => state.set_row_open(id, open),
+        None => ctx.data_mut(|data| data.insert_temp(open_id(node.entity), open)),
+    }
+}
+
+/// Open every row above `entity`, so its own is in the list.
+fn open_ancestors(ctx: &egui::Context, world: &World, state: &mut EditorState, entity: Entity) {
+    let mut cursor = entity;
+    // Bounded: a cycle the hierarchy has not broken yet would otherwise spin.
+    for _ in 0..4096 {
+        let Some(parent) = crate::scene::persist::live_parent(world, cursor) else {
+            return;
+        };
+        match world.get::<EntityId>(parent).map(|id| *id) {
+            Some(id) => state.set_row_open(id, true),
+            None => ctx.data_mut(|data| data.insert_temp(open_id(parent), true)),
+        }
+        cursor = parent;
+    }
+}
+
+/// The arrows over the rows on screen: Up and Down move the selection, with
+/// Shift extending it; Left closes a row, or climbs to its parent; Right
+/// opens one, or descends to its first child. Returns the row the keys
+/// landed on, for the list to keep in view.
+fn navigate(
+    ctx: &egui::Context,
+    nodes: &[Node],
+    rows: &[Row],
+    searching: bool,
+    state: &mut EditorState,
+) -> Option<Entity> {
+    use egui::{Key, Modifiers};
+    // Shift first: a pattern without it matches a press with it.
+    let arrow = |input: &mut egui::InputState, key| {
+        if input.consume_key(Modifiers::SHIFT, key) {
+            Some(true)
+        } else {
+            input.consume_key(Modifiers::NONE, key).then_some(false)
+        }
+    };
+    let (up, down, left, right) = ctx.input_mut(|input| {
+        (
+            arrow(input, Key::ArrowUp),
+            arrow(input, Key::ArrowDown),
+            input.consume_key(Modifiers::NONE, Key::ArrowLeft),
+            input.consume_key(Modifiers::NONE, Key::ArrowRight),
+        )
+    });
+    if rows.is_empty() {
+        return None;
+    }
+    let order: Vec<Entity> = rows.iter().map(|row| nodes[row.node].entity).collect();
+    let at = state
+        .selection
+        .primary()
+        .and_then(|primary| order.iter().position(|&entity| entity == primary));
+    if let Some(extend) = down.or(up) {
+        let to = match at {
+            None => 0,
+            Some(at) if down.is_some() => (at + 1).min(order.len() - 1),
+            Some(at) => at.saturating_sub(1),
+        };
+        if extend {
+            state.selection.extend_to(order[to], &order);
+        } else {
+            state.selection.set(order[to]);
+        }
+        return Some(order[to]);
+    }
+    let at = at?;
+    let row = &rows[at];
+    let node = &nodes[row.node];
+    // A search shows every branch open whatever is kept, so the keys only
+    // move through it.
+    let open = row.parent && (searching || row.open);
+    if left {
+        if open && !searching {
+            set_open(ctx, state, node, false);
+            return Some(node.entity);
+        }
+        let parent = rows[..at]
+            .iter()
+            .rposition(|above| above.depth < row.depth)?;
+        state.selection.set(order[parent]);
+        return Some(order[parent]);
+    }
+    if right {
+        if row.parent && !open {
+            set_open(ctx, state, node, true);
+            return Some(node.entity);
+        }
+        if open
+            && rows
+                .get(at + 1)
+                .is_some_and(|below| below.depth > row.depth)
+        {
+            state.selection.set(order[at + 1]);
+            return Some(order[at + 1]);
+        }
+    }
+    None
+}
+
+/// Select every row the tree lists: what the filter keeps, inside rows that
+/// are open. The primary stays the primary when it is one of them.
+pub(super) fn select_all(ctx: &egui::Context, world: &mut World, state: &mut EditorState) {
+    let nodes = snapshot(world, &state.hierarchy_query);
+    let searching = !state.hierarchy_query.trim().is_empty();
+    let rows = flatten(ctx, &nodes, searching, state.closed_rows());
+    let primary = state.selection.primary();
+    let mut listed: Vec<Entity> = rows
+        .iter()
+        .map(|row| nodes[row.node].entity)
+        .filter(|&entity| Some(entity) != primary)
+        .collect();
+    if primary.is_some_and(|primary| rows.iter().any(|row| nodes[row.node].entity == primary)) {
+        listed.extend(primary);
+    }
+    state.selection.clear();
+    for entity in listed {
+        state.selection.toggle(entity);
+    }
 }
 
 fn add_menu(ui: &mut egui::Ui, state: &mut EditorState) {
@@ -263,10 +528,12 @@ fn snapshot(world: &mut World, query: &str) -> Vec<Node> {
         .enumerate()
         .map(|(index, (entity, children))| Node {
             entity,
+            id: world.get::<EntityId>(entity).map(|id| *id),
             label: world
                 .get::<Name>(entity)
                 .map(|name| name.0.clone())
                 .unwrap_or_else(|| format!("Entity {}", entity.index())),
+            named: world.has::<Name>(entity),
             kind: Kind::of(world, entity),
             children,
             // Roots come first in the order, by construction.
@@ -400,7 +667,14 @@ fn scroll_gutter(ui: &egui::Ui) -> f32 {
 /// `Response::dnd_set_drag_payload` is the API for this case; it stores the
 /// payload only once a drag has actually started, so a press that never moves
 /// stays a click.
-fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &mut EditorState) {
+fn draw_row(
+    ui: &mut egui::Ui,
+    nodes: &[Node],
+    rows: &[Row],
+    row: &Row,
+    state: &mut EditorState,
+    renaming: &mut Option<Renaming>,
+) {
     let node = &nodes[row.node];
     let selected = state.selection.contains(node.entity);
     let (rect, mut response) = ui.allocate_exact_size(
@@ -453,7 +727,7 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
         );
         let id = open_id(node.entity).with("toggle");
         let toggle = ui.interact(chevron.expand(3.0), id, egui::Sense::click());
-        let open = is_open(ui.ctx(), node.entity);
+        let open = row.open;
         let glyph = if open {
             icons::chevron_down()
         } else {
@@ -466,8 +740,12 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
         };
         icons::paint(ui, glyph, chevron, colour);
         if toggle.clicked() {
-            ui.ctx()
-                .data_mut(|data| data.insert_temp(open_id(node.entity), !open));
+            match node.id {
+                Some(id) => state.set_row_open(id, !open),
+                None => ui
+                    .ctx()
+                    .data_mut(|data| data.insert_temp(open_id(node.entity), !open)),
+            }
         }
     }
     x += 16.0;
@@ -497,13 +775,13 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
         egui::pos2(rect.right() - scroll_gutter(ui) - 10.0, rect.center().y),
         egui::Vec2::splat(18.0),
     );
-    // The lock and the eye keep fixed columns, the eye left of the lock, and
-    // both step left while the row is hovered to make room for the cross —
-    // so what is locked, and what is hidden, each reads down one column.
+    // Every glyph keeps one column whether or not the row is hovered: the
+    // cross's is the rightmost, empty at rest, then the lock's, then the
+    // eye's. So what is locked, and what is hidden, each reads down one
+    // column, and the pointer's arrival moves nothing out from under it.
     let step = |columns: f32| cross.translate(egui::vec2(-20.0 * columns, 0.0));
-    let shift = if hovered { 1.0 } else { 0.0 };
-    let lock_slot = step(shift);
-    let eye_slot = step(shift + 1.0);
+    let lock_slot = step(1.0);
+    let eye_slot = step(2.0);
     let shows_lock = hovered || node.lock != Mark::Off;
     let shows_eye = hovered || node.hidden != Mark::Off;
     let text_right = if shows_eye {
@@ -541,11 +819,20 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
     // name already fully on screen would pop a bubble over every row the
     // pointer crosses.
     let elided = galley.elided;
-    ui.painter().galley(
-        egui::pos2(x, rect.center().y - galley.size().y / 2.0),
-        galley,
-        colour,
-    );
+    if renaming.as_ref().is_some_and(|r| r.entity == node.entity) {
+        let height = ui.spacing().interact_size.y;
+        let field = egui::Rect::from_min_max(
+            egui::pos2(x - 4.0, rect.center().y - height / 2.0),
+            egui::pos2(text_right, rect.center().y + height / 2.0),
+        );
+        name_field(ui, renaming, field, state);
+    } else {
+        ui.painter().galley(
+            egui::pos2(x, rect.center().y - galley.size().y / 2.0),
+            galley,
+            colour,
+        );
+    }
     if !node.children.is_empty() && !hovered {
         ui.painter().text(
             egui::pos2(text_right, rect.center().y),
@@ -652,6 +939,52 @@ fn draw_row(ui: &mut egui::Ui, nodes: &[Node], rows: &[Row], row: &Row, state: &
     accept_drop(&response, node.entity, state);
 }
 
+/// The name being edited, laid over the row's own: the asset browser's
+/// in-place rename (`assets::Cells::name_field`), posted as a name edit.
+fn name_field(
+    ui: &mut egui::Ui,
+    renaming: &mut Option<Renaming>,
+    field: egui::Rect,
+    state: &mut EditorState,
+) {
+    let Some(editing) = renaming.as_mut() else {
+        return;
+    };
+    editing.drawn = true;
+    // Its own id rather than the row's next: rows come and go with the
+    // scroll, and an id that moved would drop the focus.
+    let id = egui::Id::new(("hierarchy_rename", editing.entity));
+    let output = ui
+        .scope_builder(egui::UiBuilder::new().max_rect(field), |ui| {
+            egui::TextEdit::singleline(&mut editing.text)
+                .id(id)
+                .desired_width(field.width())
+                .show(ui)
+        })
+        .inner;
+    let response = output.response;
+    if !editing.started {
+        editing.started = true;
+        response.request_focus();
+        let mut text = output.state;
+        let all = egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(editing.text.chars().count()),
+        );
+        text.cursor.set_char_range(Some(all));
+        text.store(ui.ctx(), response.id);
+    } else if response.lost_focus() {
+        if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            state.edit(
+                editing.entity,
+                crate::scene::registry::NAME,
+                orrin_registry::Reflect::to_value(&Name::new(editing.text.clone())),
+            );
+        }
+        *renaming = None;
+    }
+}
+
 /// One of a row's inherited toggles, the lock or the eye: `glyphs` and
 /// `hints` are its off and on states. Clickable only on a hovered row and only
 /// where the row holds the mark itself, since an inherited one is undone on
@@ -686,13 +1019,11 @@ fn toggle(
     response.on_hover_text(hints[on as usize]).clicked()
 }
 
-/// What a right-click on a row offers: the selection as a new prefab, the
-/// whole-instance actions when the row is part of one, and Delete.
+/// What a right-click on a row offers: the Edit menu's commands for the
+/// selection, the selection as a new prefab, the whole-instance actions when
+/// the row is part of one, and Delete.
 fn row_menu(ui: &mut egui::Ui, node: &Node, state: &mut EditorState) {
-    if ui.button("Save as prefab").clicked() {
-        state.request_save_prefab();
-        ui.close_menu();
-    }
+    selection_commands(ui, state, node.named);
     if let Some(folder) = node.folder {
         tint_menu(ui, node.entity, folder, state);
     }
@@ -713,6 +1044,46 @@ fn row_menu(ui: &mut egui::Ui, node: &Node, state: &mut EditorState) {
     ui.separator();
     if ui.button("Delete").clicked() {
         state.request_despawn_selection();
+        ui.close_menu();
+    }
+}
+
+/// The Edit menu's everyday commands for the selection, then the selection
+/// as a new prefab: what a row's menu and the inspector's `⋯` both lead
+/// with. Rename only for an entity with a name to edit.
+pub(super) fn selection_commands(ui: &mut egui::Ui, state: &mut EditorState, named: bool) {
+    let item = |ui: &mut egui::Ui, label: &str, key: &str, enabled: bool| {
+        let clicked = ui
+            .add_enabled(enabled, egui::Button::new(label).shortcut_text(key))
+            .clicked();
+        if clicked {
+            ui.close_menu();
+        }
+        clicked
+    };
+    let key = |command| commands::text(ui.ctx(), &state.settings.keys, command);
+    let [duplicate, copy, paste, rename] = [
+        Command::Duplicate,
+        Command::Copy,
+        Command::Paste,
+        Command::Rename,
+    ]
+    .map(key);
+    if item(ui, "Duplicate", &duplicate, true) {
+        state.request_duplicate();
+    }
+    if item(ui, "Copy", &copy, true) {
+        state.request_copy();
+    }
+    if item(ui, "Paste", &paste, state.can_paste()) {
+        state.request_paste();
+    }
+    if item(ui, "Rename", &rename, named) {
+        state.request_rename();
+    }
+    ui.separator();
+    if ui.button("Save as prefab").clicked() {
+        state.request_save_prefab();
         ui.close_menu();
     }
 }

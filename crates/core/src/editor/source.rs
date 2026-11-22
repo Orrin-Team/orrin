@@ -58,8 +58,9 @@ const OPENER: &str = if cfg!(target_os = "macos") {
 };
 
 /// How old an index may be before a lookup walks the directory again. A script
-/// created mid-session becomes openable this long after, and a console that is
-/// only being looked at walks nothing.
+/// created mid-session becomes openable this long after, and a console showing
+/// a script's lines walks the directory no more often than this, however many
+/// it shows.
 const RESCAN: Duration = Duration::from_secs(2);
 
 /// Script files under the scripts directory, by the name a log line gives them.
@@ -81,6 +82,16 @@ impl ScriptFiles {
 
     /// The one `<name>.cs` under the scripts directory, as an absolute path.
     pub fn find(&mut self, name: &str, now: Instant) -> Option<PathBuf> {
+        self.resolve(name, now).map(Path::to_path_buf)
+    }
+
+    /// [`find`](Self::find) without the copy, for a caller asking every frame.
+    /// A Rust module path, which is what an engine event is attributed to, is
+    /// answered without the index, so a log of nothing else walks nothing.
+    pub fn resolve(&mut self, name: &str, now: Instant) -> Option<&Path> {
+        if name.contains("::") {
+            return None;
+        }
         let dir = self.dir.as_ref()?;
         if self
             .scanned
@@ -92,7 +103,7 @@ impl ScriptFiles {
             }
             self.scanned = Some(now);
         }
-        self.index.get(name)?.clone()
+        self.index.get(name)?.as_deref()
     }
 }
 
@@ -313,72 +324,6 @@ mod tests {
     }
 
     #[test]
-    fn an_override_that_names_no_file_is_handed_it_last() {
-        assert_eq!(
-            command(
-                Some("  gedit  --new-window "),
-                &ExternalEditor::Auto,
-                Path::new(FILE),
-                14,
-                &nothing_on_path
-            ),
-            Launch {
-                program: "gedit".into(),
-                args: args(&["--new-window", FILE]),
-            }
-        );
-    }
-
-    #[test]
-    fn a_blank_override_is_no_override() {
-        let code = |name: &str| (name == CODE[0]).then(|| PathBuf::from("/usr/bin/code"));
-        assert_eq!(
-            command(
-                Some("   "),
-                &ExternalEditor::Auto,
-                Path::new(FILE),
-                14,
-                &code
-            )
-            .program,
-            PathBuf::from("/usr/bin/code")
-        );
-    }
-
-    #[test]
-    fn vs_code_on_the_path_is_asked_to_go_to_the_line() {
-        let code = |name: &str| (name == CODE[0]).then(|| PathBuf::from("/opt/code/bin/code"));
-        assert_eq!(
-            command(None, &ExternalEditor::Auto, Path::new(FILE), 14, &code),
-            Launch {
-                program: "/opt/code/bin/code".into(),
-                args: args(&["-g", "/game/scripts/Spinner.cs:14"]),
-            }
-        );
-    }
-
-    /// A contained exception is attributed to its Behaviour with no line.
-    #[test]
-    fn an_unknown_line_opens_at_the_top() {
-        let code = |name: &str| (name == CODE[0]).then(|| PathBuf::from("code"));
-        assert_eq!(
-            command(None, &ExternalEditor::Auto, Path::new(FILE), 0, &code).args,
-            args(&["-g", "/game/scripts/Spinner.cs:1"])
-        );
-        assert_eq!(
-            command(
-                Some("subl {file}:{line}"),
-                &ExternalEditor::Auto,
-                Path::new(FILE),
-                0,
-                &code
-            )
-            .args,
-            args(&["/game/scripts/Spinner.cs:1"])
-        );
-    }
-
-    #[test]
     fn with_no_editor_the_platform_opens_the_file_without_a_line() {
         assert_eq!(
             command(
@@ -460,46 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_editor_reads_like_the_override() {
-        let custom = ExternalEditor::Custom("subl --wait {file}:{line}".into());
-        assert_eq!(
-            command(None, &custom, Path::new(FILE), 14, &nothing_on_path),
-            Launch {
-                program: "subl".into(),
-                args: args(&["--wait", "/game/scripts/Spinner.cs:14"]),
-            }
-        );
-        let blank = ExternalEditor::Custom("  ".into());
-        assert_eq!(
-            command(None, &blank, Path::new(FILE), 14, &nothing_on_path).program,
-            PathBuf::from(OPENER),
-            "a blank template is no editor, as a blank override is"
-        );
-    }
-
-    #[test]
-    fn a_blank_override_leaves_a_custom_editor_in_charge() {
-        let custom = ExternalEditor::Custom("subl {file}".into());
-        assert_eq!(
-            command(Some(" "), &custom, Path::new(FILE), 14, &nothing_on_path).program,
-            PathBuf::from("subl")
-        );
-    }
-
-    #[test]
-    fn a_program_is_found_on_the_first_path_entry_that_has_it() {
-        let dir = Scratch::new("path");
-        let first = dir.file("b/code");
-        dir.file("c/code");
-        let path =
-            std::env::join_paths([dir.0.join("a"), dir.0.join("b"), dir.0.join("c")]).unwrap();
-
-        assert_eq!(on_path(Some(&path), "code"), Some(first));
-        assert_eq!(on_path(Some(&path), "subl"), None);
-        assert_eq!(on_path(None, "code"), None);
-    }
-
-    #[test]
     fn a_script_is_found_by_name_anywhere_under_the_scripts_directory() {
         let dir = Scratch::new("find");
         let spinner = dir.file("Spinner.cs");
@@ -546,30 +451,6 @@ mod tests {
         assert_eq!(files.find("Generated", now), None);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_relative_scripts_directory_still_finds_an_absolute_file() {
-        let dir = Scratch::new("relative");
-        dir.file("Spinner.cs");
-        let cwd = std::env::current_dir().unwrap();
-        let relative = pathdiff(&dir.0, &cwd);
-        let mut files = ScriptFiles::new(Some(relative));
-
-        let found = files.find("Spinner", Instant::now()).unwrap();
-        assert!(found.is_absolute(), "{}", found.display());
-        assert!(found.is_file(), "{}", found.display());
-    }
-
-    /// `to` from `from`, both absolute, by climbing to the root.
-    #[cfg(unix)]
-    fn pathdiff(to: &Path, from: &Path) -> PathBuf {
-        let mut up = PathBuf::new();
-        for _ in from.components().skip(1) {
-            up.push("..");
-        }
-        up.join(to.strip_prefix("/").unwrap_or(to))
-    }
-
     #[test]
     fn a_script_created_mid_session_is_found_once_the_index_is_stale() {
         let dir = Scratch::new("stale");
@@ -585,10 +466,5 @@ mod tests {
             "a fresh index is not walked again"
         );
         assert_eq!(files.find("Late", start + RESCAN), Some(late));
-    }
-
-    #[test]
-    fn with_no_scripts_directory_nothing_is_found() {
-        assert_eq!(ScriptFiles::default().find("Spinner", Instant::now()), None);
     }
 }

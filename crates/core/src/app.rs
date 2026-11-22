@@ -784,7 +784,15 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => close(&mut active.renderer, event_loop),
+            // The editor asks first over unsaved work, with the overlay put back
+            // so the question is seen; a game has none to lose.
+            WindowEvent::CloseRequested => {
+                if self.shipped || active.editor.close_requested() {
+                    close(&mut active.renderer, event_loop);
+                } else {
+                    self.world.resource_mut::<Diagnostics>().overlay = true;
+                }
+            }
             WindowEvent::Resized(size) => {
                 active.renderer.resize([size.width, size.height]);
             }
@@ -878,13 +886,14 @@ impl ApplicationHandler for App {
                 // Asked once, here: it consumes a paused game's step. Edit mode
                 // runs no game code — see `scene::play`.
                 let simulate = self.world.resource_mut::<crate::scene::Play>().advance();
-                apply_cursor_grab(
+                let game_cursor = apply_cursor_grab(
                     &self.world,
                     self.shipped,
                     self.camera_controller.looking(),
                     &mut self.cursor_grabbed,
                     &active.window,
                 );
+                self.camera_controller.set_game_cursor(game_cursor);
 
                 if simulate {
                     profile_scope!("spin");
@@ -1062,6 +1071,12 @@ impl ApplicationHandler for App {
                 // baseline the controller builds on.
                 if !self.shipped {
                     let before = *self.world.resource::<Camera>();
+                    self.camera_controller
+                        .set_view_height(active.renderer.extent()[1]);
+                    if self.camera_controller.wants_pivot() {
+                        self.camera_controller
+                            .set_selection_centre(active.editor.selection_centre(&self.world));
+                    }
                     self.camera_controller
                         .update(&mut self.world.resource_mut::<Camera>(), delta);
                     let after = *self.world.resource::<Camera>();
@@ -1338,6 +1353,9 @@ impl ApplicationHandler for App {
                     self.restart = true;
                     close(renderer, event_loop);
                 }
+                if editor.take_quit_request() {
+                    close(renderer, event_loop);
+                }
 
                 // Last, so every scope guard above has dropped and this frame's
                 // CPU spans are complete. Its GPU spans arrive later and are
@@ -1408,14 +1426,15 @@ fn relaunch(launch: Option<Launch>) {
 /// Hold or release the cursor for whichever of the fly camera and the game
 /// wants it — see `scene::input::cursor`. Once a frame, so the two cannot
 /// release each other's grab, and before the scripts tick, so a game that asks
-/// this frame looks from the next.
+/// this frame looks from the next. Returns whether the game holds it, which
+/// the editor camera's orbit, pan and wheel stand aside for.
 fn apply_cursor_grab(
     world: &World,
     shipped: bool,
     fly_camera_looking: bool,
     grabbed: &mut bool,
     window: &Window,
-) {
+) -> bool {
     /// `Escape` in the engine's key numbering; see `scene::input::keys`.
     const ESCAPE: u32 = 46;
     let live = world.resource::<crate::scene::Play>().is_live();
@@ -1430,9 +1449,10 @@ fn apply_cursor_grab(
         }
         *lock
     };
+    let game = crate::scene::input::wants_grab(false, live, focused, lock);
     let grab = crate::scene::input::wants_grab(fly_camera_looking, live, focused, lock);
     if grab == *grabbed {
-        return;
+        return game;
     }
     *grabbed = grab;
     window.set_cursor_visible(!grab);
@@ -1449,6 +1469,7 @@ fn apply_cursor_grab(
             CursorGrabMode::None
         })
     });
+    game
 }
 
 /// Whether this event is the press that toggles the editor overlay.

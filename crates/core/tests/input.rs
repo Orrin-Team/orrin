@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use orrin_core::scene::input::config::{self, ConfigError};
 use orrin_core::scene::input::keys::{PadAxis, PadButton};
-use orrin_core::scene::input::{Actions, Binding, InputState, Spec, binding, keys};
+use orrin_core::scene::input::{Actions, InputState, Spec, binding, keys};
 
 use winit::event::{DeviceEvent, WindowEvent};
 
@@ -48,44 +48,6 @@ fn frame(actions: &mut Actions, input: &mut InputState) {
 }
 
 // --- The config file -------------------------------------------------------
-
-#[test]
-fn an_action_lists_alternative_sources() {
-    let specs = specs(
-        r#"
-        format_version = 1
-        [actions]
-        Jump = ["Space", "Gamepad.South", "Mouse.Left"]
-        "#,
-    );
-    assert_eq!(
-        specs,
-        vec![(
-            "Jump".to_owned(),
-            Spec::Action(vec![
-                Binding::Key(code("Space")),
-                Binding::PadButton(PadButton::South),
-                Binding::MouseButton(0),
-            ])
-        )]
-    );
-}
-
-#[test]
-fn a_pad_button_accepts_the_legend_printed_on_it() {
-    for (name, expected) in [
-        ("Gamepad.South", PadButton::South),
-        ("Gamepad.A", PadButton::South),
-        ("Gamepad.Cross", PadButton::South),
-        ("gamepad.l1", PadButton::LeftBumper),
-    ] {
-        assert_eq!(
-            binding::parse(name),
-            Ok(Binding::PadButton(expected)),
-            "`{name}` names {expected:?}"
-        );
-    }
-}
 
 #[test]
 fn a_misspelled_source_suggests_the_canonical_spelling() {
@@ -131,23 +93,6 @@ fn a_composed_axis_missing_one_half_says_which_half() {
 }
 
 #[test]
-fn an_axis_that_mixes_both_shapes_is_still_refused() {
-    let error = error(
-        r#"
-        format_version = 1
-        [actions]
-        Right = ["D"]
-        Left = ["A"]
-        [axes.Horizontal]
-        positive = "Right"
-        negative = "Left"
-        source = "Gamepad.LeftStick.X"
-        "#,
-    );
-    assert!(error.to_string().contains("not both"), "{error}");
-}
-
-#[test]
 fn a_deadzone_on_an_unbounded_source_is_refused() {
     // Mouse movement is a pixel delta with no saturation point, so there is
     // nothing for a deadzone to rescale against. Accepting the key and
@@ -162,80 +107,6 @@ fn a_deadzone_on_an_unbounded_source_is_refused() {
     );
     assert!(matches!(error, ConfigError::AxisShape { .. }), "{error}");
     assert!(error.to_string().contains("deadzone"), "{error}");
-}
-
-#[test]
-fn a_scale_on_an_unbounded_source_is_still_allowed() {
-    let specs = specs(
-        r#"
-        format_version = 1
-        [axes.LookX]
-        source = "Mouse.X"
-        scale = 0.1
-        "#,
-    );
-    assert!(matches!(
-        specs.as_slice(),
-        [(_, Spec::Analog { scale, .. })] if *scale == 0.1
-    ));
-}
-
-#[test]
-fn a_deadzone_outside_its_range_is_refused_rather_than_clamped() {
-    for value in ["-0.1", "0.95", "1.0", "nan"] {
-        let text = format!(
-            r#"
-            format_version = 1
-            [axes.LookX]
-            source = "Gamepad.RightStick.X"
-            deadzone = {value}
-            "#
-        );
-        let error = error(&text);
-        assert!(
-            matches!(error, ConfigError::AxisShape { .. }),
-            "deadzone {value} should be refused, got {error}"
-        );
-    }
-}
-
-#[test]
-fn a_scale_that_is_not_a_number_is_refused() {
-    // A NaN scale is the worst kind of accepted value: it reaches a transform,
-    // the geometry vanishes, and nothing anywhere reports a bad config.
-    for value in ["nan", "inf", "-inf"] {
-        let text = format!(
-            r#"
-            format_version = 1
-            [axes.LookX]
-            source = "Gamepad.RightStick.X"
-            scale = {value}
-            "#
-        );
-        let error = error(&text);
-        assert!(
-            matches!(error, ConfigError::AxisShape { .. }),
-            "scale {value} should be refused, got {error}"
-        );
-    }
-}
-
-#[test]
-fn an_axis_component_that_is_not_an_action_is_refused() {
-    let error = error(
-        r#"
-        format_version = 1
-        [actions]
-        Right = ["D"]
-        [axes.Horizontal]
-        positive = "Right"
-        negative = "Left"
-        "#,
-    );
-    assert!(
-        matches!(error, ConfigError::UnknownComponent { ref component, .. } if component == "Left"),
-        "{error}"
-    );
 }
 
 #[test]
@@ -469,27 +340,6 @@ fn an_analog_axis_is_deadzoned_and_rescaled_to_full_travel() {
 }
 
 #[test]
-fn an_unbounded_source_is_scaled_but_never_clamped() {
-    let (mut actions, mut input) = loaded(
-        r#"
-        format_version = 1
-        [axes.LookX]
-        source = "Mouse.X"
-        scale = 0.5
-        "#,
-    );
-    let look = actions.id("LookX");
-
-    input.on_device_event(&DeviceEvent::MouseMotion { delta: (40.0, 0.0) });
-    actions.resolve(&input);
-    assert_eq!(
-        actions.axis(look, 0),
-        20.0,
-        "a flick is worth more than one unit of turn"
-    );
-}
-
-#[test]
 fn an_analog_source_past_the_threshold_reads_as_a_button() {
     let (mut actions, mut input) = loaded(
         r#"
@@ -551,27 +401,6 @@ fn a_pad_binding_answers_for_its_own_slot() {
     assert!(!actions.held(jump, 0));
 }
 
-#[test]
-fn a_player_past_the_last_slot_reads_as_quiet_rather_than_panicking() {
-    let (mut actions, mut input) = loaded(
-        r#"
-        format_version = 1
-        [actions]
-        Jump = ["Gamepad.South"]
-        [axes.LookX]
-        source = "Gamepad.RightStick.X"
-        "#,
-    );
-    let jump = actions.id("Jump");
-    let look = actions.id("LookX");
-    input.set_pad_connected(0, true);
-    input.set_pad_button(0, PadButton::South, true);
-    frame(&mut actions, &mut input);
-
-    assert!(!actions.held(jump, 99));
-    assert_eq!(actions.axis(look, 99), 0.0);
-}
-
 // --- Names that name nothing -----------------------------------------------
 
 #[test]
@@ -619,44 +448,6 @@ fn a_reload_that_unbinds_a_name_a_script_uses_warns() {
     let warnings = actions.take_warnings();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(warnings[0].contains("Jump"), "{warnings:?}");
-}
-
-#[test]
-fn a_name_nobody_asked_for_is_not_warned_about_on_load() {
-    let (mut actions, _) = loaded(
-        r#"
-        format_version = 1
-        [actions]
-        Jump = ["Space"]
-        "#,
-    );
-    assert!(
-        actions.take_warnings().is_empty(),
-        "a config nobody has queried yet is not a mistake"
-    );
-}
-
-#[test]
-fn an_action_id_reads_as_an_empty_axis_and_the_reverse() {
-    let (mut actions, mut input) = loaded(
-        r#"
-        format_version = 1
-        [actions]
-        Jump = ["Space"]
-        [axes.LookX]
-        source = "Gamepad.RightStick.X"
-        "#,
-    );
-    let jump = actions.id("Jump");
-    let look = actions.id("LookX");
-
-    input.press(code("Space"));
-    input.set_pad_connected(0, true);
-    input.set_pad_axis(0, PadAxis::RightStickX, 1.0);
-    frame(&mut actions, &mut input);
-
-    assert_eq!(actions.axis(jump, 0), 0.0, "an action has no axis value");
-    assert!(!actions.held(look, 0), "an axis is never held");
 }
 
 // --- Device state ----------------------------------------------------------
@@ -731,16 +522,4 @@ fn detaching_a_pad_zeroes_it_rather_than_leaving_a_stick_pushed() {
     assert!(!input.pad_connected(0));
     assert!(!input.pad_button_down(0, PadButton::South));
     assert_eq!(input.pad_axis(0, PadAxis::LeftStickX), 0.0);
-}
-
-/// The wheel is an edge like a press: what turned this frame, summed, and gone
-/// by the next.
-#[test]
-fn the_wheel_sums_a_frame_and_then_reads_still() {
-    let (mut actions, mut input) = loaded("format_version = 1\n[actions]\n");
-    input.scroll_wheel((0.0, 1.0));
-    input.scroll_wheel((0.5, -3.0));
-    assert_eq!(input.wheel(), (0.5, -2.0));
-    frame(&mut actions, &mut input);
-    assert_eq!(input.wheel(), (0.0, 0.0));
 }

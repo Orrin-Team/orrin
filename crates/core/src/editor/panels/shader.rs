@@ -3,8 +3,8 @@
 //! parameters it declares, and its errors at their lines.
 //!
 //! **The text is the tab's until it is saved.** The buffer lives in the
-//! editor's state and is written only by Save (or Cmd/Ctrl+S while the code has
-//! focus), through [`AssetDatabase::write_shader`], which queues the import as it
+//! editor's state and is written only by Save (or Save scene's key, Cmd/Ctrl+S
+//! unless rebound, while the code has focus), through [`AssetDatabase::write_shader`], which queues the import as it
 //! writes. That is not a scene edit: the text edit has its own undo, and a save
 //! is a file written, as an external editor's would be. The status in the
 //! header reads Compiling from that moment until the import lands, then
@@ -33,7 +33,7 @@
 //! while the code has focus, which keeps every key from the game and the fly
 //! camera and every unmodified shortcut from the editor; the two shortcuts
 //! that ignore focus elsewhere, save and play, stand aside for it in
-//! `panels::shortcuts`, and Cmd/Ctrl+S saves the shader instead.
+//! `panels::shortcuts`, and Save scene's key saves the shader instead.
 //!
 //! **Shape follows the dock.** Wider than [`WIDE`], the preview and parameters
 //! sit in a column beside the code; narrower, below it. Where that region is
@@ -54,6 +54,7 @@ use orrin_registry::AssetId;
 use super::assets::log_error;
 use super::figures;
 use crate::asset_db::{AssetDatabase, AssetKind};
+use crate::editor::commands::{self, Command, Keys};
 use crate::editor::glsl::Highlighter;
 use crate::editor::icons;
 use crate::editor::state::EditorState;
@@ -276,6 +277,7 @@ pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
 
     {
         let db = world.resource::<AssetDatabase>();
+        let keys = &state.settings.keys;
         let editor = &mut state.shader;
         if let Some(id) = editor.open
             && db.iter().all(|entry| entry.id != id)
@@ -287,7 +289,7 @@ pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
             None => empty(ui, &db, &mut action),
             Some(id) => {
                 editor.follow_disk(&db, id);
-                let previewed = open(ui, &db, editor, id, material, &mut action);
+                let previewed = open(ui, &db, editor, keys, id, material, &mut action);
                 if previewed.is_some() {
                     state.material_previews[Viewer::Shader as usize] = previewed;
                 }
@@ -579,6 +581,7 @@ fn open(
     ui: &mut egui::Ui,
     db: &AssetDatabase,
     editor: &mut ShaderEditor,
+    keys: &Keys,
     id: AssetId,
     material: Option<MaterialHandle>,
     action: &mut Option<Action>,
@@ -586,7 +589,7 @@ fn open(
     let status = Status::of(db, id);
     let errors = db.shader_errors(id);
     if ui.memory(|memory| memory.has_focus(code_id()))
-        && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
+        && ui.input_mut(|input| keys.take(input, Command::Save))
         && !editor.changed_on_disk
     {
         *action = Some(Action::Save);
@@ -704,7 +707,9 @@ fn open(
     let builder = egui::UiBuilder::new()
         .max_rect(header_rect)
         .layout(egui::Layout::left_to_right(egui::Align::Center));
-    ui.scope_builder(builder, |ui| header(ui, db, editor, id, status, action));
+    ui.scope_builder(builder, |ui| {
+        header(ui, db, editor, keys, id, status, action)
+    });
     previewed
 }
 
@@ -714,6 +719,7 @@ fn header(
     ui: &mut egui::Ui,
     db: &AssetDatabase,
     editor: &ShaderEditor,
+    keys: &Keys,
     id: AssetId,
     status: Status,
     action: &mut Option<Action>,
@@ -745,16 +751,21 @@ fn header(
         );
     }
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let key = commands::text(ui.ctx(), keys, Command::Save);
         let (save, hint) = match (editor.dirty, editor.changed_on_disk) {
             (_, true) => (
                 Tool::Disabled,
-                "The file changed on disk. Reload it, or keep your text, before saving",
+                "The file changed on disk. Reload it, or keep your text, before saving".to_owned(),
             ),
-            (true, false) => (Tool::Command, "Save and compile (Cmd/Ctrl+S in the code)"),
-            (false, false) => (Tool::Disabled, "Nothing to save"),
+            (true, false) if key.is_empty() => (Tool::Command, "Save and compile".to_owned()),
+            (true, false) => (
+                Tool::Command,
+                format!("Save and compile ({key} in the code)"),
+            ),
+            (false, false) => (Tool::Disabled, "Nothing to save".to_owned()),
         };
         let text = Some(egui::RichText::new("Save"));
-        if widgets::tool_button(ui, icons::floppy_disk(), None, text, save, hint).clicked() {
+        if widgets::tool_button(ui, icons::floppy_disk(), None, text, save, &hint).clicked() {
             *action = Some(Action::Save);
         }
         let revert = if editor.dirty {

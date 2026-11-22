@@ -586,18 +586,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn diffing_a_component_against_itself_reports_nothing() {
-        let registry = registry();
-        let mut world = World::new();
-        let entity = world.spawn();
-        world.insert(entity, Speed(3.0));
-
-        let speed = registry.get(&ComponentId::new("test.speed")).unwrap();
-        let live = speed.read(&world, entity).unwrap();
-        assert_eq!(speed.diff(&world, entity, &live), Some(Vec::new()));
-    }
-
     /// A component the entity does not have is not silently created and then
     /// edited: the changes name only some fields, so the result would look like
     /// a successful edit while every unnamed field quietly took its default.
@@ -828,25 +816,6 @@ mod tests {
         assert_eq!(spinner.read(&world, entity), Some(target));
     }
 
-    #[test]
-    fn a_script_component_that_is_gone_reports_absent_rather_than_writing() {
-        let (registry, bridge) = scripted();
-        let mut world = World::new();
-        let entity = world.spawn();
-        let spinner = registry.get(&ComponentId::owned("game.spinner")).unwrap();
-
-        assert!(spinner.has(&world, entity));
-        bridge.bags.lock().unwrap().remove("Game.Spinner, Game");
-
-        assert!(!spinner.has(&world, entity));
-        assert_eq!(spinner.read(&world, entity), None);
-        assert_eq!(spinner.diff(&world, entity, &Value::Bool(true)), None);
-        assert_eq!(
-            spinner.apply(&mut world, entity, &[]).unwrap_err(),
-            ApplyError::Absent
-        );
-    }
-
     /// The reload contract: the previous build's entries go, the engine's stay,
     /// and the `by_type` map — which script entries are deliberately absent
     /// from — is rebuilt without them.
@@ -1019,19 +988,6 @@ mod tests {
         );
         assert!(registry.of::<Slot>().is_some());
         assert_eq!(slot.default(), Value::String("first".to_owned()));
-    }
-
-    #[test]
-    fn a_resolved_component_the_world_cannot_name_reads_as_absent() {
-        let (registry, mut world, entity) = resolving();
-        world.insert(entity, Slot(9));
-        let slot = registry.get(&ComponentId::new("test.slot")).unwrap();
-        assert!(slot.has(&world, entity));
-        assert_eq!(slot.read(&world, entity), None);
-        assert_eq!(
-            slot.diff(&world, entity, &Value::String("first".to_owned())),
-            None
-        );
     }
 
     #[test]

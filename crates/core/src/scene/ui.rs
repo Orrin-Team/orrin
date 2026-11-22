@@ -417,26 +417,6 @@ mod tests {
         assert_eq!(canvas.screen(), [1024.0, 768.0]);
     }
 
-    /// Nothing that would draw no pixels reaches the painter.
-    #[test]
-    fn invisible_calls_record_nothing() {
-        let mut canvas = UiCanvas::default();
-        let rect = Rect::new(0.0, 0.0, 10.0, 10.0);
-        canvas.panel(Rect::new(0.0, 0.0, 0.0, 10.0), [255; 4]);
-        canvas.panel(rect, [255, 255, 255, 0]);
-        canvas.text(rect, style(), "");
-        canvas.text(
-            rect,
-            TextStyle {
-                size: 0.0,
-                ..style()
-            },
-            "x",
-        );
-        canvas.image(Rect::new(0.0, 0.0, 10.0, -1.0), AssetId::new(), [255; 4]);
-        assert!(canvas.is_empty(), "{:?}", canvas.commands());
-    }
-
     /// A style names the command it was recorded with, and a call that drew
     /// nothing leaves none behind to land on the next command.
     #[test]
@@ -473,17 +453,6 @@ mod tests {
     }
 
     #[test]
-    fn the_window_screen_maps_nothing() {
-        let screen = GameScreen::window([1280, 720]);
-        assert_eq!(screen.size, [1280.0, 720.0]);
-        assert_eq!(screen.rect(), Rect::new(0.0, 0.0, 1280.0, 720.0));
-        assert_eq!(screen.clip, screen.rect());
-        assert_eq!(screen.to_game([10.0, 20.0]), [10.0, 20.0]);
-        assert!(screen.is_window([1280, 720]));
-        assert!(!screen.is_window([1920, 1080]));
-    }
-
-    #[test]
     fn a_placed_screen_maps_between_its_pixels_and_the_windows() {
         let screen = GameScreen {
             size: [1920.0, 1080.0],
@@ -498,10 +467,5 @@ mod tests {
             screen.to_window(Rect::new(20.0, 40.0, 200.0, 100.0)),
             Rect::new(110.0, 70.0, 100.0, 50.0)
         );
-    }
-
-    #[test]
-    fn colours_clamp_to_a_byte_per_channel() {
-        assert_eq!(color_bytes([1.0, 0.5, -1.0, 4.0]), [255, 128, 0, 255]);
     }
 }

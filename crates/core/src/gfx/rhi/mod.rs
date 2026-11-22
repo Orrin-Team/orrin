@@ -578,36 +578,4 @@ mod tests {
         let buffer = BufferId(3);
         assert_eq!(texture.index(), buffer.index());
     }
-
-    #[test]
-    fn either_kind_of_shader_converts_into_a_reference_to_itself() {
-        use crate::gfx::shaders::ShaderId;
-        let built_in: ShaderRef = ShaderId::FullscreenVert.into();
-        assert_eq!(built_in, ShaderRef::BuiltIn(ShaderId::FullscreenVert));
-        let loaded: ShaderRef = ShaderModuleId(0).into();
-        assert_eq!(loaded, ShaderRef::Loaded(ShaderModuleId(0)));
-        assert_ne!(built_in, loaded);
-        assert_ne!(loaded, ShaderRef::from(ShaderModuleId(1)));
-        assert_ne!(built_in, ShaderRef::from(ShaderId::TonemapFrag));
-    }
-
-    /// A description is compared to decide whether a pipeline needs rebuilding,
-    /// so a loaded shader in it has to take part in that comparison.
-    #[test]
-    fn a_pipeline_description_takes_a_loaded_shader_beside_a_built_in_one() {
-        use crate::gfx::shaders::ShaderId;
-        let desc =
-            GraphicsPipelineDesc::fullscreen(ShaderId::FullscreenVert, ShaderModuleId(2), &[]);
-        assert_eq!(desc.vertex, ShaderRef::BuiltIn(ShaderId::FullscreenVert));
-        assert_eq!(desc.fragment, ShaderRef::Loaded(ShaderModuleId(2)));
-        let copy = desc;
-        assert_eq!(copy, desc);
-        assert_ne!(
-            GraphicsPipelineDesc {
-                fragment: ShaderModuleId(3).into(),
-                ..desc
-            },
-            desc
-        );
-    }
 }

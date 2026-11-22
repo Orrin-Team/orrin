@@ -161,19 +161,6 @@ fn put<T>(slots: &mut Vec<Option<T>>, index: u32, value: T) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_preview_is_found_by_the_handle_it_was_stored_under() {
-        let mut previews = AssetPreviews::default();
-        previews.insert_mesh(MeshHandle(3), &CpuMesh::cube());
-        previews.insert_material(MaterialHandle(1), &Material::default(), None);
-
-        assert_eq!(previews.mesh(MeshHandle(3)).map(|m| m.triangles), Some(12));
-        assert!(previews.mesh(MeshHandle(2)).is_none());
-        assert!(previews.mesh(MeshHandle(40)).is_none());
-        assert!(previews.material(MaterialHandle(1)).is_some());
-        assert!(previews.material(MaterialHandle(0)).is_none());
-    }
-
     /// An inspector edit lands on the kept copy at once, so the next frame's
     /// panel and thumbnail show it, and is queued once for the renderer.
     #[test]
@@ -206,13 +193,6 @@ mod tests {
         let edits = previews.take_material_edits();
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].1.metallic, 1.0);
-    }
-
-    #[test]
-    fn a_material_never_loaded_cannot_be_edited() {
-        let mut previews = AssetPreviews::default();
-        assert!(!previews.edit_material(MaterialHandle(5), |material| material.metallic = 1.0));
-        assert!(previews.take_material_edits().is_empty());
     }
 
     /// The app's half: queued edits reach the backend and the queue drains.

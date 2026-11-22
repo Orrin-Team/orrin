@@ -7,6 +7,7 @@ mod autosave;
 pub(crate) mod blender;
 mod cadence;
 pub(crate) mod catalog;
+mod commands;
 mod dock;
 mod export;
 mod gizmo;
@@ -23,6 +24,7 @@ mod remote;
 mod selection;
 pub mod settings;
 pub(crate) mod source;
+mod spread;
 mod state;
 mod theme;
 mod widgets;
@@ -160,6 +162,10 @@ impl Editor {
         if let Some(view) = prefs.assets {
             state.assets_view = view;
         }
+        if let Some(options) = prefs.console {
+            state.console.options = options;
+        }
+        state.seed_closed_rows(&prefs.collapsed);
         icons::install(&ctx);
         theme::install_fonts(&ctx);
         theme::apply(&ctx, themes.active());
@@ -428,11 +434,22 @@ impl Editor {
             prefs.assets = Some(view);
             prefs_file.save(prefs);
         }
+        if prefs.console.unwrap_or_default() != state.console.options {
+            prefs.console = Some(state.console.options);
+            prefs_file.save(prefs);
+        }
         // Kept once a typed size has stopped being dragged.
         if prefs.preview.unwrap_or_default() != state.preview
             && !ctx.input(|input| input.pointer.any_down())
         {
             prefs.preview = Some(state.preview);
+            prefs_file.save(prefs);
+        }
+        // Kept once the pointer lets go, as the snap steps are.
+        if !ctx.input(|input| input.pointer.any_down())
+            && let Some(closed) = state.closed_rows_to_save(world)
+        {
+            prefs.collapsed = closed;
             prefs_file.save(prefs);
         }
         settings.settle(ctx, world, state, themes);
@@ -526,6 +543,12 @@ impl Editor {
         self.state.settings.viewport
     }
 
+    /// The centre of the selection, the point `F` frames, which the camera
+    /// controller orbits.
+    pub fn selection_centre(&self, world: &World) -> Option<glam::Vec3> {
+        state::selection_sphere(world, self.state.selection.entities()).map(|(centre, _)| centre)
+    }
+
     /// Whether the editor moved the camera since the last call — see
     /// `EditorState::take_camera_moved`.
     pub fn take_camera_moved(&mut self) -> bool {
@@ -536,6 +559,20 @@ impl Editor {
     /// `EditorState::request_restart`.
     pub fn take_restart_request(&mut self) -> bool {
         self.state.take_restart_request()
+    }
+
+    /// The window's close button: whether it may close now, or must wait on
+    /// the question about the scene's unsaved work, which the next UI pass
+    /// asks. See `EditorState::request_close`.
+    pub fn close_requested(&mut self) -> bool {
+        self.cadence.touch();
+        self.state.request_close()
+    }
+
+    /// Whether the user answered that question with a way out since the
+    /// last call.
+    pub fn take_quit_request(&mut self) -> bool {
+        self.state.take_quit_request()
     }
 
     /// Whether the user asked for a script reload since the last call. Drained

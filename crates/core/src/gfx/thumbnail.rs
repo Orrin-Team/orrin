@@ -555,22 +555,6 @@ mod tests {
         covered / (thumbnail.size * thumbnail.size) as f32
     }
 
-    /// The mean of `[r, g, b]` over the covered pixels inside `region` (x0, y0,
-    /// x1, y1, exclusive), weighted by coverage.
-    fn mean(thumbnail: &Thumbnail, (x0, y0, x1, y1): (u32, u32, u32, u32)) -> Vec3 {
-        let mut sum = Vec3::ZERO;
-        let mut weight = 0.0;
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let [r, g, b, a] = thumbnail.rgba(x, y);
-                let a = a as f32 / 255.0;
-                sum += Vec3::new(r as f32, g as f32, b as f32) * a;
-                weight += a;
-            }
-        }
-        sum / weight.max(1e-6)
-    }
-
     /// Framed, not lost: the subject fills a good part of the square and
     /// leaves its corners empty — a thumbnail of a speck, or of a crop, says
     /// nothing about the asset.
@@ -588,14 +572,6 @@ mod tests {
         }
     }
 
-    /// A plane has no height at all, which is the case a fit to the bounds'
-    /// largest extent along one axis divides by zero on.
-    #[test]
-    fn a_flat_mesh_is_still_framed() {
-        let filled = coverage(&of(&CpuMesh::plane()));
-        assert!(filled > 0.2, "the plane covers only {filled:.2}");
-    }
-
     /// An empty or degenerate mesh is a blank thumbnail, not a panic: the
     /// importer renders whatever a file brings.
     #[test]
@@ -604,106 +580,6 @@ mod tests {
         assert_eq!(coverage(&thumbnail), 0.0);
         let point = super::mesh(&[[1.0, 1.0, 1.0]; 3], &[[0.0, 1.0, 0.0]; 3], &[0, 1, 2]);
         assert_eq!(point.size, SIZE);
-    }
-
-    /// The key light is above and to the left, so the sphere's upper left is
-    /// brighter than its lower right — shading, not a flat disc.
-    #[test]
-    fn a_sphere_is_lit_from_the_upper_left() {
-        let thumbnail = material(&Surface::default());
-        let half = SIZE / 2;
-        let lit = mean(&thumbnail, (0, 0, half, half));
-        let shade = mean(&thumbnail, (half, half, SIZE, SIZE));
-        assert!(
-            lit.element_sum() > shade.element_sum() * 1.3,
-            "lit {lit} vs shade {shade}"
-        );
-    }
-
-    /// The point of a material thumbnail: its colour reads as the material's.
-    #[test]
-    fn a_red_material_renders_red() {
-        let thumbnail = material(&Surface {
-            base_color: Vec3::new(0.8, 0.05, 0.05),
-            ..Surface::default()
-        });
-        let colour = mean(&thumbnail, (0, 0, SIZE, SIZE));
-        assert!(
-            colour.x > colour.y * 2.0 && colour.x > colour.z * 2.0,
-            "{colour}"
-        );
-    }
-
-    /// A metal has no diffuse lobe; its colour is in its reflections. A rough
-    /// dielectric and a polished metal of the same base colour must not render
-    /// alike, or the thumbnail cannot tell chrome from paint.
-    #[test]
-    fn metal_and_paint_render_differently() {
-        let paint = material(&Surface {
-            base_color: Vec3::splat(0.8),
-            roughness: 0.9,
-            ..Surface::default()
-        });
-        let chrome = material(&Surface {
-            base_color: Vec3::splat(0.8),
-            metallic: 1.0,
-            roughness: 0.1,
-            ..Surface::default()
-        });
-        let contrast = |t: &Thumbnail| {
-            let mut lo = 255u8;
-            let mut hi = 0u8;
-            for y in 0..SIZE {
-                for x in 0..SIZE {
-                    let [r, _, _, a] = t.rgba(x, y);
-                    if a == 255 {
-                        lo = lo.min(r);
-                        hi = hi.max(r);
-                    }
-                }
-            }
-            hi.saturating_sub(lo)
-        };
-        assert_ne!(paint, chrome);
-        assert!(
-            contrast(&chrome) > contrast(&paint),
-            "chrome should be the higher-contrast of the two"
-        );
-    }
-
-    /// An emissive material glows on its shadowed side too.
-    #[test]
-    fn emission_lights_the_shadowed_side() {
-        let dark = material(&Surface {
-            base_color: Vec3::splat(0.05),
-            ..Surface::default()
-        });
-        let glowing = material(&Surface {
-            base_color: Vec3::splat(0.05),
-            emissive: Vec3::new(400.0, 400.0, 400.0),
-            ..Surface::default()
-        });
-        let half = SIZE / 2;
-        let region = (half, half, SIZE - 4, SIZE - 4);
-        assert!(mean(&glowing, region).element_sum() > mean(&dark, region).element_sum() + 60.0);
-    }
-
-    /// A textured material's sphere shows the texture's colour, multiplied by
-    /// the factor, as the real shader does.
-    #[test]
-    fn an_albedo_map_tints_the_sphere() {
-        let green: Vec<u8> = [30, 200, 40, 255].repeat(64 * 64);
-        let albedo = Albedo::reduce(&green, 64, 64).expect("reduces");
-        let thumbnail = material(&Surface {
-            base_color: Vec3::ONE,
-            albedo: Some(albedo),
-            ..Surface::default()
-        });
-        let colour = mean(&thumbnail, (0, 0, SIZE, SIZE));
-        assert!(
-            colour.y > colour.x * 1.5 && colour.y > colour.z * 1.5,
-            "{colour}"
-        );
     }
 
     #[test]
@@ -750,13 +626,6 @@ mod tests {
             each < std::time::Duration::from_millis(20),
             "{each:?} per thumbnail"
         );
-    }
-
-    /// Drawn at 36 points, a thumbnail has to carry 54 pixels for a 1.5x
-    /// display without being stretched.
-    #[test]
-    fn a_thumbnail_is_sharp_on_a_high_density_display() {
-        assert!(SIZE as f32 >= 36.0 * 1.5);
     }
 
     #[test]

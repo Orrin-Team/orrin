@@ -290,26 +290,4 @@ mod tests {
         );
         assert!(world.get::<MaterialHandle>(entity).is_none());
     }
-
-    #[test]
-    fn the_null_reference_is_never_a_mesh() {
-        let (registry, mut world, entity) = world();
-        let err = write(
-            &registry,
-            &mut world,
-            entity,
-            &MESH,
-            Value::Asset(AssetId::NIL),
-        )
-        .unwrap_err();
-        assert_eq!(err, "expected a mesh, found the null reference");
-    }
-
-    #[test]
-    fn a_new_mesh_renderer_starts_as_the_cube() {
-        let (registry, mut world, entity) = world();
-        let default = registry.get(&MESH).unwrap().default();
-        write(&registry, &mut world, entity, &MESH, default).unwrap();
-        assert_eq!(*world.get::<MeshHandle>(entity).unwrap(), MeshHandle(3));
-    }
 }

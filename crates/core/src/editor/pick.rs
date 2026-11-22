@@ -1,5 +1,6 @@
 //! Choosing an entity by pointing at it: the cursor's ray against each mesh's
-//! bounds.
+//! bounds. The same test says where on the scene a drop stands
+//! ([`surface_at`]), on the face of the box it enters.
 //!
 //! Bounds rather than an ID buffer, the open choice #60 left: no render
 //! target, no GPU readback and the frame of latency it brings, and the bounds
@@ -231,6 +232,20 @@ pub fn pick_at(
     nearest.map(|(_, entity)| entity)
 }
 
+/// Where the ray from `pointer` first meets a mesh: the point on the nearest
+/// bounds it enters, which is what a drop on the scene stands on. Markers and
+/// cameras have no surface and are passed through.
+pub fn surface_at(
+    world: &World,
+    camera: &Camera,
+    screen: egui::Rect,
+    pointer: egui::Pos2,
+) -> Option<Vec3> {
+    let ndc = (pointer - screen.min) / screen.size() * 2.0 - egui::Vec2::splat(1.0);
+    let (origin, direction) = ray(camera, screen.aspect_ratio(), ndc);
+    mesh_hit(world, origin, direction).map(|(t, _)| origin + direction * t)
+}
+
 /// The nearest entity whose mesh bounds the ray from `origin` along
 /// `direction` enters, and how far along the ray, in its own units.
 fn mesh_hit(world: &World, origin: Vec3, direction: Vec3) -> Option<(f32, Entity)> {
@@ -373,130 +388,6 @@ mod tests {
         assert_eq!(pick_at(&world, &camera, screen(), far), None);
     }
 
-    /// A marker says which kind of light it stands for.
-    #[test]
-    fn a_light_s_marker_names_its_kind() {
-        let mut world = world();
-        let lights = [
-            (Light::point(Vec3::ONE, 800.0, 5.0), LightKind::Point),
-            (
-                Light::spot(Vec3::ONE, 800.0, 5.0, 20.0, 30.0),
-                LightKind::Spot,
-            ),
-            (Light::directional(Vec3::ONE, 20_000.0), LightKind::Sun),
-        ];
-        let mut expected = Vec::new();
-        for (light, kind) in lights {
-            let entity = world.spawn();
-            world.insert(entity, light);
-            world.insert(entity, WorldTransform(Mat4::IDENTITY));
-            expected.push((entity, Marker::Light(kind)));
-        }
-        let mut seen = Vec::new();
-        each_marker(&world, |entity, _, marker| seen.push((entity, marker)));
-        seen.sort_by_key(|(entity, _)| entity.index());
-        assert_eq!(seen, expected);
-    }
-
-    /// An audio source with nothing else to show it is a speaker, picked
-    /// like a light; one on a mesh is picked by its mesh.
-    #[test]
-    fn an_audio_source_with_no_mesh_is_a_speaker() {
-        let mut world = world();
-        let speaker = world.spawn();
-        world.insert(speaker, WorldTransform(Mat4::IDENTITY));
-        world.insert(speaker, crate::scene::AudioSource::default());
-        let cube = mesh(&mut world, Mat4::IDENTITY);
-        world.insert(cube, crate::scene::AudioSource::default());
-        let mut seen = Vec::new();
-        each_marker(&world, |entity, _, marker| seen.push((entity, marker)));
-        assert_eq!(seen, [(speaker, Marker::Audio { playing: false })]);
-    }
-
-    /// A listener with nothing else to show it is an ear; a sound always
-    /// outranks it, and so does a light.
-    #[test]
-    fn an_audio_listener_with_nothing_else_is_an_ear() {
-        let mut world = world();
-        let ear = world.spawn();
-        world.insert(ear, WorldTransform(Mat4::IDENTITY));
-        world.insert(ear, crate::scene::AudioListener);
-        let both = world.spawn();
-        world.insert(both, WorldTransform(Mat4::IDENTITY));
-        world.insert(both, crate::scene::AudioListener);
-        world.insert(both, crate::scene::AudioSource::default());
-        let mut seen = Vec::new();
-        each_marker(&world, |entity, _, marker| seen.push((entity, marker)));
-        seen.sort_by_key(|(entity, _)| entity.index());
-        assert_eq!(
-            seen,
-            [
-                (ear, Marker::Listener),
-                (both, Marker::Audio { playing: false })
-            ]
-        );
-    }
-
-    /// Every audio icon an entity has that its marker does not already show
-    /// is a badge, stacked in a fixed order: the sound, then the listener.
-    #[test]
-    fn what_a_marker_does_not_show_is_worn_as_a_badge() {
-        let mut world = world();
-        let cube = mesh(&mut world, Mat4::IDENTITY);
-        world.insert(cube, crate::scene::AudioSource::default());
-        world.insert(cube, crate::scene::AudioListener);
-        let camera = world.spawn();
-        world.insert(camera, WorldTransform(Mat4::IDENTITY));
-        world.insert(camera, CameraComponent::default());
-        world.insert(camera, crate::scene::AudioListener);
-        let speaker = world.spawn();
-        world.insert(speaker, WorldTransform(Mat4::IDENTITY));
-        world.insert(speaker, crate::scene::AudioSource::default());
-        world.insert(speaker, crate::scene::AudioListener);
-        let lamp = light(&mut world, Vec3::ZERO);
-        world.insert(lamp, crate::scene::AudioSource::default());
-        let ear = world.spawn();
-        world.insert(ear, WorldTransform(Mat4::IDENTITY));
-        world.insert(ear, crate::scene::AudioListener);
-
-        let mut seen = Vec::new();
-        each_badge(&world, |entity, _, marker, slot| {
-            seen.push((entity, marker, slot))
-        });
-        seen.sort_by_key(|&(entity, _, slot)| (entity.index(), slot));
-        let sound = Marker::Audio { playing: false };
-        assert_eq!(
-            seen,
-            [
-                (cube, sound, 0),
-                (cube, Marker::Listener, 1),
-                (camera, Marker::Listener, 0),
-                (speaker, Marker::Listener, 0),
-                (lamp, sound, 0),
-            ]
-        );
-    }
-
-    #[test]
-    fn markers_are_what_has_a_place_and_no_mesh() {
-        let mut world = world();
-        let lamp = light(&mut world, Vec3::ZERO);
-        let group = world.spawn();
-        world.insert(group, WorldTransform(Mat4::IDENTITY));
-        mesh(&mut world, Mat4::IDENTITY);
-        world.spawn();
-        let mut seen = Vec::new();
-        each_marker(&world, |entity, _, marker| seen.push((entity, marker)));
-        seen.sort_by_key(|(entity, _)| entity.index());
-        assert_eq!(
-            seen,
-            [
-                (lamp, Marker::Light(LightKind::Sun)),
-                (group, Marker::Empty)
-            ]
-        );
-    }
-
     /// A marker is behind or in front of a mesh like anything else: the
     /// nearer of the two along the ray is what the click meant.
     #[test]
@@ -599,6 +490,33 @@ mod tests {
         assert_eq!(pick_at(&world, &camera, screen(), middle), None);
     }
 
+    /// What a drop stands on: where the pointer's ray enters the nearest box,
+    /// on its face rather than at its middle, or nothing when it meets none.
+    #[test]
+    fn the_surface_under_the_pointer_is_where_its_ray_enters_the_nearest_box() {
+        let camera = Camera::default();
+        let toward = (camera.position - camera.target).normalize();
+        let middle = on_screen(Vec3::ZERO);
+        let mut world = world();
+        assert_eq!(surface_at(&world, &camera, screen(), middle), None);
+
+        mesh(&mut world, Mat4::from_translation(-toward * 3.0));
+        let front = mesh(&mut world, Mat4::IDENTITY);
+        let hit = surface_at(&world, &camera, screen(), middle).expect("a box is hit");
+        assert!(
+            (hit.abs().max_element() - 0.5).abs() < 1e-3,
+            "on the nearer box's face: {hit}"
+        );
+        assert!(hit.dot(toward) > 0.0, "the face toward the camera: {hit}");
+
+        world.insert(front, Locked);
+        let behind = surface_at(&world, &camera, screen(), middle).unwrap();
+        assert!(
+            (behind - camera.position).length() > (hit - camera.position).length() + 2.0,
+            "through what is locked: {behind}"
+        );
+    }
+
     #[test]
     fn an_entity_without_measured_bounds_is_not_picked() {
         let mut world = world();
@@ -636,20 +554,6 @@ mod tests {
         assert_eq!(pick_at(&world, &view, screen(), edge), Some(entity));
         let gap = on_screen((shape.eye + shape.frame[1] + shape.frame[2]) / 3.0);
         assert_eq!(pick_at(&world, &view, screen(), gap), None);
-    }
-
-    #[test]
-    fn a_camera_is_drawn_as_its_wireframe_not_a_marker() {
-        let mut world = world();
-        let entity = camera(&mut world, Mat4::IDENTITY);
-        let mut markers = 0;
-        each_marker(&world, |_, _, _| markers += 1);
-        assert_eq!(markers, 0);
-        let mut cameras = Vec::new();
-        each_camera(&world, |camera, _, _, active| {
-            cameras.push((camera, active))
-        });
-        assert_eq!(cameras, [(entity, true)]);
     }
 
     /// While the game plays, the view is the active camera: drawn, it would

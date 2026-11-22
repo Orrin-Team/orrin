@@ -12,6 +12,7 @@ use orrin_registry::{AssetId, ComponentId, Reflect};
 use super::inspector::{Filter, texture_slot};
 use crate::editor::catalog;
 use crate::editor::icons;
+use crate::editor::previews::Previews;
 use crate::editor::state::EditorState;
 use crate::editor::widgets;
 use crate::scene::TextAnchor;
@@ -29,12 +30,13 @@ pub fn sections(
     ui: &mut egui::Ui,
     world: &World,
     state: &mut EditorState,
+    previews: &mut Previews,
     entity: Entity,
     filter: &Filter,
 ) {
     canvas_section(ui, world, state, entity, filter);
     rect_section(ui, world, state, entity, filter);
-    image_section(ui, world, state, entity, filter);
+    image_section(ui, world, state, previews, entity, filter);
     text_section(ui, world, state, entity, filter);
     button_section(ui, world, state, entity, filter);
     scroll_frame_section(ui, world, state, entity, filter);
@@ -296,6 +298,7 @@ fn image_section(
     ui: &mut egui::Ui,
     world: &World,
     state: &mut EditorState,
+    previews: &mut Previews,
     entity: Entity,
     filter: &Filter,
 ) {
@@ -313,7 +316,7 @@ fn image_section(
         filter,
         |ui| {
             widgets::property(ui, "Texture", |ui| {
-                texture_slot(ui, world, &mut image.texture)
+                texture_slot(ui, world, previews, &mut image.texture, "image")
             });
             colour(ui, "Colour", &mut image.color);
             widgets::property(ui, "Slice", |ui| {

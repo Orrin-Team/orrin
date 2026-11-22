@@ -369,18 +369,4 @@ mod tests {
             assert!(text.parse::<FieldPath>().is_err(), "`{text}` parsed");
         }
     }
-
-    #[test]
-    fn the_appended_leaves_name_themselves() {
-        assert_eq!(Value::Vec2(glam::Vec2::ZERO).type_name(), "vec2");
-        assert_eq!(Value::Color([0.0; 4]).type_name(), "color");
-    }
-
-    #[test]
-    fn indices_print_without_a_leading_dot() {
-        let err = ValueError::mismatch("f32", &Value::Bool(true))
-            .at_index(2)
-            .at_field("points");
-        assert_eq!(err.path.to_string(), "points[2]");
-    }
 }

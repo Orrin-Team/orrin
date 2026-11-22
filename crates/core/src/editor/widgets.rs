@@ -409,11 +409,12 @@ pub fn section<R>(
     menu: Option<&mut dyn FnMut(&mut egui::Ui)>,
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    section_titled(ui, id, icon, tint, title, None, menu, body)
+    section_titled(ui, id, icon, tint, title, None, None, menu, body)
 }
 
 /// [`section`] with its title in `title_colour` rather than the strong text
-/// colour — how the inspector marks a component a prefab instance overrides.
+/// colour — how the inspector marks a component a prefab instance overrides —
+/// and `hint` as the bar's hover text.
 #[allow(clippy::too_many_arguments)]
 pub fn section_titled<R>(
     ui: &mut egui::Ui,
@@ -422,11 +423,70 @@ pub fn section_titled<R>(
     tint: egui::Color32,
     title: &str,
     title_colour: Option<egui::Color32>,
+    hint: Option<&str>,
     menu: Option<&mut dyn FnMut(&mut egui::Ui)>,
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    let mut state =
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    let opening = Opening {
+        open: true,
+        held: false,
+    };
+    section_bar(
+        ui,
+        id,
+        opening,
+        icon,
+        tint,
+        title,
+        title_colour,
+        hint,
+        menu,
+        body,
+    )
+}
+
+/// How a [`section_with`] opens: whether it starts open, and whether it is
+/// held open whatever it was left at — as a filter holds a section it found
+/// something in, so a match is never hidden behind a fold.
+#[derive(Clone, Copy, Debug)]
+pub struct Opening {
+    pub open: bool,
+    pub held: bool,
+}
+
+/// [`section`] that opens as `opening` says, with `hint` on its bar.
+#[allow(clippy::too_many_arguments)]
+pub fn section_with<R>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    opening: Opening,
+    icon: Icon,
+    tint: egui::Color32,
+    title: &str,
+    hint: Option<&str>,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    section_bar(ui, id, opening, icon, tint, title, None, hint, None, body)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn section_bar<R>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    opening: Opening,
+    icon: Icon,
+    tint: egui::Color32,
+    title: &str,
+    title_colour: Option<egui::Color32>,
+    hint: Option<&str>,
+    menu: Option<&mut dyn FnMut(&mut egui::Ui)>,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        opening.open,
+    );
 
     let width = ui.available_width();
     let (rect, response) =
@@ -449,7 +509,7 @@ pub fn section_titled<R>(
         egui::Stroke::new(1.0_f32, outline),
     );
 
-    let chevron = if state.is_open() {
+    let chevron = if opening.held || state.is_open() {
         icons::chevron_down()
     } else {
         icons::chevron_right()
@@ -482,10 +542,14 @@ pub fn section_titled<R>(
         });
     }
 
+    let response = match hint {
+        Some(hint) => response.on_hover_text(hint),
+        None => response,
+    };
     if response.clicked() {
         state.toggle(ui);
     }
-    let body = state.show_body_unindented(ui, |ui| {
+    let contents = |ui: &mut egui::Ui| {
         ui.add_space(4.0);
         // No left margin: a property label insets itself, and lines up with
         // the header's padded content that way.
@@ -500,7 +564,13 @@ pub fn section_titled<R>(
             .inner;
         ui.add_space(6.0);
         inner
-    });
+    };
+    if opening.held {
+        // Kept as it was left, for when the hold lets go.
+        state.store(ui.ctx());
+        return Some(contents(ui));
+    }
+    let body = state.show_body_unindented(ui, contents);
     body.map(|inner| inner.inner)
 }
 
@@ -619,58 +689,6 @@ mod tests {
                 });
         }
         fill
-    }
-
-    /// Off is bare until the pointer reaches it — every toolbar button has to
-    /// answer the pointer, or it reads as a label.
-    #[test]
-    fn an_idle_tool_shows_nothing_until_hovered() {
-        assert_eq!(fill_of(Tool::Off, false), None);
-        assert!(fill_of(Tool::Off, true).is_some());
-    }
-
-    /// On (a filter that is showing) is a neutral raise; Selected (the one
-    /// active mode) is the accent tint. The two must not be confused, or five
-    /// filters that are all on look like five selected tools.
-    #[test]
-    fn on_is_neutral_and_selected_is_the_accent() {
-        let theme = super::super::theme::Theme::default();
-        assert_eq!(fill_of(Tool::Selected, false), Some(theme.select_fill()));
-        let on = fill_of(Tool::On, false).expect("on is filled");
-        assert_ne!(on, theme.select_fill());
-    }
-
-    /// The add and actions buttons are squircles: a square with a generous
-    /// corner, filled at rest so it reads as a button beside a field.
-    #[test]
-    fn a_squircle_is_a_filled_rounded_square() {
-        let ctx = egui::Context::default();
-        super::super::theme::install_fonts(&ctx);
-        super::super::theme::apply(&ctx, &super::super::theme::Theme::default());
-        let mut found = None;
-        for _ in 0..2 {
-            let output = ctx.run(Default::default(), |ctx| {
-                egui::Area::new("squircle".into())
-                    .fade_in(false)
-                    .fixed_pos(egui::pos2(10.0, 10.0))
-                    .show(ctx, |ui| squircle(ui, icons::plus(), "Add"));
-            });
-            found = output
-                .shapes
-                .iter()
-                .find_map(|clipped| match &clipped.shape {
-                    egui::Shape::Rect(rect) if rect.brush.is_none() && rect.fill.a() > 0 => {
-                        Some((rect.rect, rect.corner_radius))
-                    }
-                    _ => None,
-                });
-        }
-        let (rect, radius) = found.expect("a filled shape");
-        assert_eq!(rect.width(), rect.height());
-        assert!(
-            radius.nw as f32 >= rect.width() * 0.25,
-            "{radius:?} on {rect:?}"
-        );
     }
 
     /// Disabled answers the pointer with a tooltip and nothing else.

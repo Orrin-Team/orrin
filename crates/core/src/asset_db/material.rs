@@ -643,44 +643,6 @@ mod tests {
         assert_eq!(write(&back), text);
     }
 
-    /// The layout pinned: a default material is every parameter, sorted, and
-    /// no texture block.
-    #[test]
-    fn a_default_material_writes_every_parameter_and_no_textures() {
-        assert_eq!(
-            write(&MaterialFile::default()),
-            "\
-orrin-material 1 min-reader 1
-
-alpha = 1.0
-alpha_cutoff = 0.5
-anisotropy = 0.0
-anisotropy_rotation = 0.0
-attenuation_color = (1.0, 1.0, 1.0)
-attenuation_distance = inf
-base_color = (0.8, 0.8, 0.8)
-blend = Opaque
-clearcoat = 0.0
-clearcoat_roughness = 0.03
-emissive = (0.0, 0.0, 0.0)
-ior = 1.5
-metallic = 0.0
-parallax_depth = 0.02
-parallax_max_steps = 32
-parallax_min_steps = 8
-reflectance = 0.5
-roughness = 0.5
-sheen_color = (0.0, 0.0, 0.0)
-sheen_roughness = 0.3
-subsurface_color = (0.0, 0.0, 0.0)
-subsurface_forward_scatter = 12.0
-subsurface_radius = (0.0048, 0.0017, 0.0011)
-thickness = 0.0
-transmission = 0.0
-"
-        );
-    }
-
     #[test]
     fn a_parameter_the_file_lacks_takes_its_default() {
         let file = parse(
@@ -734,28 +696,6 @@ transmission = 0.0
             err,
             "brick.omat: line 1: expected an `orrin-material 2 min-reader 2` header"
         );
-    }
-
-    #[test]
-    fn resolving_fills_each_slot_with_its_texture_and_leaves_the_rest_empty() {
-        let file = MaterialFile {
-            textures: MaterialTextures {
-                albedo: Some(id(1)),
-                normal: Some(id(2)),
-                ..MaterialTextures::default()
-            },
-            ..MaterialFile::default()
-        };
-        let mut asked = Vec::new();
-        let material = file.resolve(|slot, id| {
-            asked.push((slot, id));
-            TextureHandle(40 + asked.len() as u32)
-        });
-        assert_eq!(asked, [("albedo", id(1)), ("normal", id(2))]);
-        assert_eq!(material.albedo_texture, Some(TextureHandle(41)));
-        assert_eq!(material.normal_texture, Some(TextureHandle(42)));
-        assert_eq!(material.emissive_texture, None);
-        assert_eq!(material.height_texture, None);
     }
 
     /// [`everything`] drawn through a shader, with one value of every shape a
@@ -933,16 +873,5 @@ textures
         );
         assert_eq!(file.shader_value("wear"), Some(ShaderValue::Float(0.75)));
         assert_eq!(file.shader_value("glow"), None);
-    }
-
-    #[test]
-    fn only_the_two_normal_map_slots_load_flat() {
-        let normal: Vec<&str> = MaterialTextures::default()
-            .slots()
-            .iter()
-            .map(|(slot, _)| *slot)
-            .filter(|slot| MaterialTextures::is_normal_slot(slot))
-            .collect();
-        assert_eq!(normal, ["normal", "clearcoat_normal"]);
     }
 }

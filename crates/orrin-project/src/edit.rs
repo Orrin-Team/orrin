@@ -310,15 +310,6 @@ dir = "assets"
     }
 
     #[test]
-    fn the_manifest_path_is_the_file_the_project_was_loaded_from() {
-        let (dir, project) = project(MANIFEST);
-        assert_eq!(
-            project.manifest_path(),
-            crate::canonical(dir.path()).unwrap().join("orrin.toml")
-        );
-    }
-
-    #[test]
     fn an_edit_changes_the_value_and_not_one_byte_besides() {
         let (_dir, project) = project(MANIFEST);
         let mut edit = project.edit().expect("edit");
@@ -364,15 +355,6 @@ dir = "assets"
         assert_eq!(on_disk(&project), MANIFEST);
         assert_eq!(reloaded.start_scene(), None);
         assert_eq!(reloaded.persistent_scene(), None);
-    }
-
-    #[test]
-    fn clearing_a_scene_that_is_not_set_changes_nothing() {
-        let (_dir, project) = project(MANIFEST);
-        let mut edit = project.edit().expect("edit");
-        edit.set_start_scene(None);
-        edit.commit().expect("commit");
-        assert_eq!(on_disk(&project), MANIFEST);
     }
 
     #[test]

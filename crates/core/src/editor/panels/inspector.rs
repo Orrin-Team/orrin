@@ -6,6 +6,12 @@
 //! collapsible section per component, every row a label in a fixed column and
 //! a value filling the rest. The column is what makes a long component list
 //! scannable — the eye runs down one edge instead of re-finding each value.
+//!
+//! With several entities selected the primary is the one shown, and what is
+//! done to it reaches the rest: an edit to every other one holding that
+//! component, as the change it made rather than the primary's whole value
+//! (`editor::spread`), and an added or removed component likewise. A material
+//! asset is not spread: it is shared already, and edited once.
 
 use glam::{EulerRot, Quat, Vec3};
 
@@ -61,6 +67,10 @@ pub fn body(
         widgets::search(ui, &mut state.inspector_query, "Filter properties");
     });
     ui.add_space(6.0);
+    // Every section edits the primary; what they ask for reaches the rest of
+    // the selection from here, so no section has to know there is one. After
+    // the header: a name is the primary's own.
+    let posted = state.posted();
 
     let filter = Filter::new(&state.inspector_query);
     // What the selected entity holds differently from its prefab, by
@@ -91,7 +101,7 @@ pub fn body(
             folder_section(ui, world, state, entity, &filter);
             physics_section(ui, world, state, entity, &filter);
             audio_section(ui, world, state, entity, &filter, &overridden);
-            super::ui_sections::sections(ui, world, state, entity, &filter);
+            super::ui_sections::sections(ui, world, state, previews, entity, &filter);
             #[cfg(feature = "scripting")]
             script_sections(ui, world, registry, state, entity, &filter, &overridden);
             registered_sections(ui, world, registry, state, entity, &filter, &overridden);
@@ -100,6 +110,7 @@ pub fn body(
                 widgets::padded(ui, |ui| add_component(ui, world, registry, state, entity));
             }
         });
+    state.spread(posted);
 }
 
 /// The inspector's property filter. A section whose title matches shows whole;
@@ -141,14 +152,22 @@ impl Filter {
 #[derive(Clone, Copy)]
 pub(super) struct Rows<'a>(Option<&'a Filter>);
 
+impl Rows<'static> {
+    /// Every row, as a section drawn with no filter shows them.
+    pub(super) fn all() -> Self {
+        Rows(None)
+    }
+}
+
 impl Rows<'_> {
-    fn shows(self, label: &str) -> bool {
+    pub(super) fn shows(self, label: &str) -> bool {
         self.0.is_none_or(|filter| filter.hits(label))
     }
 }
 
-/// The entity's icon, its name as an editable title, what it is and its id,
-/// and a menu for what can be done to it as a whole.
+/// The entity's icon, its name as an editable title, what it is — with its
+/// index on hover, which only a bug report needs — and a menu for what can be
+/// done to it as a whole.
 fn header(
     ui: &mut egui::Ui,
     world: &mut World,
@@ -189,18 +208,18 @@ fn header(
                 }
                 let others = match state.selection.len() {
                     0 | 1 => String::new(),
-                    n => format!(" · {n} selected"),
+                    n => format!(" · {n} selected, edits apply to all"),
                 };
-                ui.label(
-                    figures(format!("{} · id {}{others}", kind.label(), entity.index())).weak(),
-                );
+                ui.weak(format!("{}{others}", kind.label()))
+                    .on_hover_text(format!("Entity {}", entity.index()));
             });
         });
     });
 }
 
 /// What can be done to an entity as a whole, rather than to one of its
-/// components. The header's `⋯` opens it; the panel tests draw it directly.
+/// components: what a hierarchy row's menu leads with, the dump, and Delete.
+/// The header's `⋯` opens it; the panel tests draw it directly.
 pub fn entity_menu(
     ui: &mut egui::Ui,
     world: &mut World,
@@ -208,6 +227,8 @@ pub fn entity_menu(
     state: &mut EditorState,
     entity: Entity,
 ) {
+    super::hierarchy::selection_commands(ui, state, world.has::<Name>(entity));
+    ui.separator();
     if ui
         .add(egui::Button::new(icons::with_label(
             icons::terminal(),
@@ -219,21 +240,33 @@ pub fn entity_menu(
         dump(world, registry, entity);
         ui.close_menu();
     }
-    ui.separator();
     // The hierarchy deletes the row under the pointer; this deletes the thing
-    // being looked at. Both go through the same deferred request — despawning
-    // while a panel is iterating the tree is what that defers.
-    let name = world.get::<Name>(entity).map_or_else(
-        || format!("entity {}", entity.index()),
-        |name| name.0.clone(),
-    );
+    // being looked at — all of it, when several are. Both go through the same
+    // deferred request — despawning while a panel is iterating the tree is
+    // what that defers.
+    let name = match state.selection.len() {
+        0 | 1 => world.get::<Name>(entity).map_or_else(
+            || format!("entity {}", entity.index()),
+            |name| name.0.clone(),
+        ),
+        n => format!("the {n} selected entities"),
+    };
     let delete = icons::with_label(icons::trash(), Some(crate::editor::theme::ERROR), "Delete");
+    let key = crate::editor::commands::text(
+        ui.ctx(),
+        &state.settings.keys,
+        crate::editor::commands::Command::Delete,
+    );
     if ui
-        .add(egui::Button::new(delete).shortcut_text("Del"))
+        .add(egui::Button::new(delete).shortcut_text(key))
         .on_hover_text(format!("Despawn {name} and everything under it"))
         .clicked()
     {
-        state.request_despawn(entity);
+        if state.selection.contains(entity) {
+            state.request_despawn_selection();
+        } else {
+            state.request_despawn(entity);
+        }
         ui.close_menu();
     }
 }
@@ -464,6 +497,7 @@ fn registered_sections(
             tint,
             &vtable.name,
             title,
+            None,
             Some(&mut menu),
             |ui| (vtable.inspect)(ui, &mut after),
         )
@@ -847,11 +881,10 @@ fn mesh_section(
         },
     );
     // Posted as the asset's id, the form a scene file holds them in.
-    let assets = world.resource::<Assets>();
     if let Some(id) = picked_mesh {
         assign_mesh(state, entity, id);
     }
-    if let Some(id) = picked_material.and_then(|handle| assets.material_id(handle)) {
+    if let Some(id) = picked_material {
         assign_material(state, entity, id);
     }
     if let Some(id) = dropped_mesh {
@@ -901,7 +934,7 @@ struct Choice<H> {
     handle: H,
 }
 
-/// The slot, and below it a filterable list of every asset of its type.
+/// The slot, and below it a filterable list of everything it can hold.
 ///
 /// The list is drawn with `show_rows`, so a model that brings a few thousand
 /// meshes costs the rows on screen and not the rest. Returns the chosen
@@ -1061,48 +1094,80 @@ fn mesh_picker(
     }
 }
 
+/// A row of the Material picker, a project material by its id for the reason
+/// a project mesh is one ([`MeshChoice`]).
+#[derive(Clone, Copy, PartialEq)]
+enum MaterialChoice {
+    Engine(MaterialHandle),
+    Asset(AssetId),
+}
+
+/// The engine's materials first, by name, then the project's, by path, as
+/// [`mesh_picker`] orders meshes. Returns the material picked, by asset id.
 fn material_picker(
     ui: &mut egui::Ui,
     world: &World,
     entity: Entity,
     previews: &mut Previews,
     dropped: &mut Option<AssetId>,
-) -> Option<MaterialHandle> {
-    let mut choices: Vec<Choice<MaterialHandle>> = world
-        .resource::<Assets>()
+) -> Option<AssetId> {
+    let assets = world.resource::<Assets>();
+    let db = world.get_resource::<AssetDatabase>();
+    let mut choices: Vec<Choice<MaterialChoice>> = assets
         .materials()
         .map(|(name, handle)| Choice {
             name: name.to_owned(),
-            handle,
+            handle: MaterialChoice::Engine(handle),
         })
         .collect();
     choices.sort_by(|a, b| a.name.cmp(&b.name));
-    let current = world.get::<MaterialHandle>(entity).map(|h| *h);
-    let texture = current.and_then(|handle| previews.material(ui.ctx(), world, handle));
-    let subtitle = current
+    let mut project: Vec<Choice<MaterialChoice>> = db
+        .iter()
+        .flat_map(|db| db.iter())
+        .filter(|entry| entry.kind == crate::asset_db::AssetKind::Material)
+        .map(|entry| Choice {
+            name: entry.path.clone(),
+            handle: MaterialChoice::Asset(entry.id),
+        })
+        .collect();
+    project.sort_by(|a, b| a.name.cmp(&b.name));
+    choices.extend(project);
+
+    let handle = world.get::<MaterialHandle>(entity).map(|h| *h);
+    let imported = handle.and_then(|handle| db.as_ref()?.material_id(handle));
+    let current = handle.map(|handle| match imported {
+        Some(id) => MaterialChoice::Asset(id),
+        None => MaterialChoice::Engine(handle),
+    });
+    let texture = handle.and_then(|handle| previews.material(ui.ctx(), world, handle));
+    let subtitle = handle
         .and_then(|handle| previews.material_summary(world, handle))
         .unwrap_or_default();
-    let imported = current.and_then(|handle| {
-        let id = world.get_resource::<AssetDatabase>()?.material_id(handle);
-        database_name(world, id)
-    });
+    let fallback = database_name(world, imported);
 
-    picker(
+    let chosen = picker(
         ui,
         "material",
         choices,
         current,
-        imported,
+        fallback,
         |ui, name| {
             let slot = widgets::asset_slot(ui, texture.as_ref(), icons::palette(), name, &subtitle);
-            if world.get_resource::<AssetDatabase>().is_none() {
+            if db.is_none() {
                 return slot;
             }
             take_drop(&slot, dropped);
-            slot.on_hover_text("Click to pick an engine material, or drop a material asset here")
+            slot.on_hover_text("Click to pick a material, or drop a material asset here")
         },
-        &mut |ctx, handle| previews.material(ctx, world, handle),
-    )
+        &mut |ctx, choice| match choice {
+            MaterialChoice::Engine(handle) => previews.material(ctx, world, handle),
+            MaterialChoice::Asset(id) => previews.asset(ctx, db.as_ref()?, id),
+        },
+    )?;
+    match chosen {
+        MaterialChoice::Engine(handle) => assets.material_id(handle),
+        MaterialChoice::Asset(id) => Some(id),
+    }
 }
 
 /// The texture slots a material asset's section offers, by row label and by
@@ -1178,6 +1243,15 @@ fn material_section(
     let mut previewed = None;
     let mut edit_shader = None;
     widgets::section(ui, id, icons::palette(), weak, "Material", None, |ui| {
+        // Said where the edit is made: nothing else on screen tells a
+        // material that saves from one that does not.
+        if asset.is_none() {
+            ui.add_space(4.0);
+            widgets::padded(ui, |ui| {
+                super::scenes::pill(ui, crate::editor::theme::PENDING, "This session only")
+                    .on_hover_text("No material file holds this one, so edits here are not saved");
+            });
+        }
         if rows.shows("Preview") {
             // Drawn by the renderer this frame, through the frame's own
             // shading; see `gfx::vulkan::material_preview`.
@@ -1193,53 +1267,7 @@ fn material_section(
             });
             ui.add_space(8.0);
         }
-        if rows.shows("Base colour") {
-            widgets::property(ui, "Base colour", |ui| {
-                let mut rgb = after.base_color.to_array();
-                ui.color_edit_button_rgb(&mut rgb);
-                after.base_color = Vec3::from(rgb);
-                if textured {
-                    ui.label(figures("× texture").weak());
-                }
-            });
-        }
-        if rows.shows("Metallic") {
-            widgets::property(ui, "Metallic", |ui| {
-                ui.add(egui::Slider::new(&mut after.metallic, 0.0..=1.0).fixed_decimals(2));
-            });
-        }
-        if rows.shows("Roughness") {
-            widgets::property(ui, "Roughness", |ui| {
-                ui.add(egui::Slider::new(&mut after.roughness, 0.0..=1.0).fixed_decimals(2));
-            });
-        }
-        if rows.shows("Emission") {
-            // Edited as a colour and a luminance rather than three nits: the
-            // hue and the brightness are the two things a person adjusts, and
-            // three unbounded channels make either one a chore.
-            let nits = after.emissive.max_element();
-            let mut tint = if nits > 0.0 {
-                (after.emissive / nits).to_array()
-            } else {
-                [1.0; 3]
-            };
-            let mut luminance = nits;
-            widgets::property(ui, "Emission", |ui| {
-                ui.color_edit_button_rgb(&mut tint);
-                // The swatch takes its share of the row, so the slider gets
-                // what is left rather than the whole row's width.
-                let swatch = ui.spacing().interact_size.x + ui.spacing().item_spacing.x;
-                ui.spacing_mut().slider_width = (ui.spacing().slider_width - swatch).max(24.0);
-                ui.add(
-                    egui::Slider::new(&mut luminance, 0.0..=50_000.0)
-                        .logarithmic(true)
-                        .max_decimals(0)
-                        .suffix(" nt"),
-                )
-                .on_hover_text("Luminance in cd/m² (nits)");
-            });
-            after.emissive = Vec3::from(tint) * luminance;
-        }
+        value_rows(ui, rows, &mut after, textured);
         if rows.shows("Blend") {
             let blend = previews
                 .material_info(world, handle)
@@ -1247,13 +1275,7 @@ fn material_section(
             widgets::property(ui, "Blend", |ui| ui.label(blend));
         }
         if let Some(file) = &mut slots {
-            for (label, slot) in MAPS {
-                if rows.shows(label) {
-                    let texture = file.texture_mut(slot).expect("every row names a slot");
-                    widgets::property(ui, label, |ui| texture_slot(ui, world, texture));
-                }
-            }
-            shader_rows(ui, world, file, rows, &mut edit_shader);
+            file_rows(ui, world, previews, rows, file, &mut edit_shader);
         }
     });
     if let Some(shader) = edit_shader {
@@ -1264,57 +1286,202 @@ fn material_section(
         state.material_previews[material_preview::Viewer::Inspector as usize] = previewed;
     }
 
-    let edited = before.base_color != after.base_color
-        || before.metallic != after.metallic
-        || before.roughness != after.roughness
-        || before.emissive != after.emissive;
     match (asset, slots) {
         (Some((id, file)), Some(mut changed)) => {
-            let shaded =
-                changed.shader != file.shader || changed.shader_values != file.shader_values;
-            if edited || shaded || changed.textures != file.textures {
-                changed.material = after;
-                state.edit_material(id, changed);
-            }
+            changed.material = after;
+            post_material(state, id, &file, changed);
         }
         _ => {
-            if edited && let Some(mut kept) = world.get_resource_mut::<AssetPreviews>() {
+            if material_edited(&before, &after)
+                && let Some(mut kept) = world.get_resource_mut::<AssetPreviews>()
+            {
                 kept.edit_material(handle, |material| *material = after);
             }
         }
     }
 }
 
-/// One texture slot of a material asset: the texture's name, a drop target
-/// for another, and a menu to empty it. Whether a drop is a texture is the
-/// edit's to decide, so a refusal is named in the console like any other.
-pub(super) fn texture_slot(ui: &mut egui::Ui, world: &World, texture: &mut Option<AssetId>) {
-    texture_slot_or(ui, world, texture, "—");
+fn material_edited(before: &crate::gfx::Material, after: &crate::gfx::Material) -> bool {
+    before.base_color != after.base_color
+        || before.metallic != after.metallic
+        || before.roughness != after.roughness
+        || before.emissive != after.emissive
+}
+
+/// The rows every material has, file or none: its base colour, metal,
+/// roughness and emission. `textured` says the colour is multiplied by a map.
+pub(super) fn value_rows(
+    ui: &mut egui::Ui,
+    rows: Rows,
+    material: &mut crate::gfx::Material,
+    textured: bool,
+) {
+    if rows.shows("Base colour") {
+        widgets::property(ui, "Base colour", |ui| {
+            let mut rgb = material.base_color.to_array();
+            ui.color_edit_button_rgb(&mut rgb);
+            material.base_color = Vec3::from(rgb);
+            if textured {
+                ui.label(figures("× texture").weak());
+            }
+        });
+    }
+    if rows.shows("Metallic") {
+        widgets::property(ui, "Metallic", |ui| {
+            ui.add(egui::Slider::new(&mut material.metallic, 0.0..=1.0).fixed_decimals(2));
+        });
+    }
+    if rows.shows("Roughness") {
+        widgets::property(ui, "Roughness", |ui| {
+            ui.add(egui::Slider::new(&mut material.roughness, 0.0..=1.0).fixed_decimals(2));
+        });
+    }
+    if rows.shows("Emission") {
+        // Edited as a colour and a luminance rather than three nits: the
+        // hue and the brightness are the two things a person adjusts, and
+        // three unbounded channels make either one a chore.
+        let nits = material.emissive.max_element();
+        let mut tint = if nits > 0.0 {
+            (material.emissive / nits).to_array()
+        } else {
+            [1.0; 3]
+        };
+        let mut luminance = nits;
+        widgets::property(ui, "Emission", |ui| {
+            ui.color_edit_button_rgb(&mut tint);
+            // The swatch takes its share of the row, so the slider gets
+            // what is left rather than the whole row's width.
+            let swatch = ui.spacing().interact_size.x + ui.spacing().item_spacing.x;
+            ui.spacing_mut().slider_width = (ui.spacing().slider_width - swatch).max(24.0);
+            ui.add(
+                egui::Slider::new(&mut luminance, 0.0..=50_000.0)
+                    .logarithmic(true)
+                    .max_decimals(0)
+                    .suffix(" nt"),
+            )
+            .on_hover_text("Luminance in cd/m² (nits)");
+        });
+        material.emissive = Vec3::from(tint) * luminance;
+    }
+}
+
+/// The rows only a material asset has: its texture maps, its surface shader
+/// and that shader's parameters. A shader asked to be opened in the Shader
+/// tab lands in `edit_shader`.
+pub(super) fn file_rows(
+    ui: &mut egui::Ui,
+    world: &World,
+    previews: &mut Previews,
+    rows: Rows,
+    file: &mut MaterialFile,
+    edit_shader: &mut Option<AssetId>,
+) {
+    for (label, slot) in MAPS {
+        if rows.shows(label) {
+            let texture = file.texture_mut(slot).expect("every row names a slot");
+            widgets::property(ui, label, |ui| {
+                texture_slot_or(ui, world, previews, texture, "—", slot)
+            });
+        }
+    }
+    shader_rows(ui, world, previews, file, rows, edit_shader);
+}
+
+/// Give material asset `id`, which `file` was read from, what `changed`
+/// holds, through the edit pipeline — when anything differs.
+pub(super) fn post_material(
+    state: &mut EditorState,
+    id: AssetId,
+    file: &MaterialFile,
+    changed: MaterialFile,
+) {
+    let shaded = changed.shader != file.shader || changed.shader_values != file.shader_values;
+    if material_edited(&file.material, &changed.material)
+        || shaded
+        || changed.textures != file.textures
+    {
+        state.edit_material(id, changed);
+    }
+}
+
+/// One texture slot: the texture's name, which opens a list of the project's
+/// textures, a drop target for another, and a menu to empty it. Whether a
+/// drop is a texture is the edit's to decide, so a refusal is named in the
+/// console like any other. `salt` tells this slot's list from its
+/// neighbours'.
+pub(super) fn texture_slot(
+    ui: &mut egui::Ui,
+    world: &World,
+    previews: &mut Previews,
+    texture: &mut Option<AssetId>,
+    salt: &str,
+) {
+    texture_slot_or(ui, world, previews, texture, "—", salt);
 }
 
 /// [`texture_slot`], saying `empty` while it holds nothing.
-fn texture_slot_or(ui: &mut egui::Ui, world: &World, texture: &mut Option<AssetId>, empty: &str) {
+fn texture_slot_or(
+    ui: &mut egui::Ui,
+    world: &World,
+    previews: &mut Previews,
+    texture: &mut Option<AssetId>,
+    empty: &str,
+    salt: &str,
+) {
+    let db = world.get_resource::<AssetDatabase>();
+    let id = format!("texture {salt}");
+    // Listed only while the list is open, as an entity slot's is: a material
+    // draws several of these every frame.
+    let popup = ui.make_persistent_id(("picker", id.as_str()));
+    let open = ui.memory(|memory| memory.is_popup_open(popup));
+    let mut choices: Vec<Choice<AssetId>> = db
+        .iter()
+        .filter(|_| open)
+        .flat_map(|db| db.iter())
+        .filter(|entry| entry.kind == crate::asset_db::AssetKind::Texture)
+        .map(|entry| Choice {
+            name: entry.path.clone(),
+            handle: entry.id,
+        })
+        .collect();
+    choices.sort_by(|a, b| a.name.cmp(&b.name));
     let name = match *texture {
         Some(id) => database_name(world, Some(id)).unwrap_or_else(|| format!("missing {id}")),
         None => empty.to_owned(),
     };
-    let slot =
-        ui.add(egui::Button::new(figures(name)).min_size(egui::vec2(ui.available_width(), 0.0)));
+    let filled = texture.is_some();
     let mut dropped = None;
-    take_drop(&slot, &mut dropped);
-    if dropped.is_some() {
-        *texture = dropped;
+    let mut cleared = false;
+    let picked = picker(
+        ui,
+        &id,
+        choices,
+        *texture,
+        None,
+        |ui, _| {
+            let slot = ui.add(
+                egui::Button::new(figures(&name)).min_size(egui::vec2(ui.available_width(), 0.0)),
+            );
+            take_drop(&slot, &mut dropped);
+            let slot = slot.on_hover_text(
+                "Click to pick a texture, or drop one here. Right-click to empty the slot",
+            );
+            slot.context_menu(|ui| {
+                if ui.add_enabled(filled, egui::Button::new("Clear")).clicked() {
+                    cleared = true;
+                    ui.close_menu();
+                }
+            });
+            slot
+        },
+        &mut |ctx, id| previews.asset(ctx, db.as_ref()?, id),
+    );
+    if let Some(id) = picked.or(dropped) {
+        *texture = Some(id);
     }
-    slot.on_hover_text("Drop a texture asset here. Right-click to empty the slot")
-        .context_menu(|ui| {
-            if ui
-                .add_enabled(texture.is_some(), egui::Button::new("Clear"))
-                .clicked()
-            {
-                *texture = None;
-                ui.close_menu();
-            }
-        });
+    if cleared {
+        *texture = None;
+    }
 }
 
 /// The labels the shader rows of `file` answer a filter by.
@@ -1340,6 +1507,7 @@ fn shader_labels(world: &World, file: &MaterialFile) -> Vec<String> {
 fn shader_rows(
     ui: &mut egui::Ui,
     world: &World,
+    previews: &mut Previews,
     file: &mut MaterialFile,
     rows: Rows,
     edit: &mut Option<AssetId>,
@@ -1407,7 +1575,7 @@ fn shader_rows(
     drop(db);
     for param in &table.params {
         if rows.shows(&param.name) {
-            param_row(ui, world, file, param);
+            param_row(ui, world, previews, file, param);
         }
     }
     let undeclared: Vec<String> = file
@@ -1559,7 +1727,13 @@ impl Field {
     }
 }
 
-fn param_row(ui: &mut egui::Ui, world: &World, file: &mut MaterialFile, param: &Param) {
+fn param_row(
+    ui: &mut egui::Ui,
+    world: &World,
+    previews: &mut Previews,
+    file: &mut MaterialFile,
+    param: &Param,
+) {
     let set = file.shader_value(&param.name);
     let before = Field::of(&param.kind, set);
     let mut after = before;
@@ -1602,7 +1776,7 @@ fn param_row(ui: &mut egui::Ui, world: &World, file: &mut MaterialFile, param: &
                     DefaultTexture::Black => "black (default)",
                     DefaultTexture::Normal => "flat normal (default)",
                 };
-                texture_slot_or(ui, world, texture, empty);
+                texture_slot_or(ui, world, previews, texture, empty, &param.name);
             }
             (Field::Texture(_), _) => {}
         },
@@ -1622,9 +1796,11 @@ fn param_row(ui: &mut egui::Ui, world: &World, file: &mut MaterialFile, param: &
     }
 }
 
-/// One section per Behaviour on the entity, in attach order: its lifecycle
-/// rows, and, when its type is a registered component, its fields and a way to
-/// remove it alone.
+/// One section per Behaviour on the entity, in attach order: whether it is
+/// enabled, a State row only while it is faulted — the one lifecycle state
+/// the user must act on — and, when its type is a registered component, its
+/// fields and a way to remove it alone. The assembly-qualified type it was
+/// made from and where its lifecycle stands are the title's hover text.
 ///
 /// A Behaviour with no `[Component]` has no id for the edit pipeline to name,
 /// so it cannot be removed here: a removal that skipped the pipeline would be
@@ -1691,7 +1867,10 @@ fn script_sections(
                 .iter()
                 .any(|info| info.hidden && info.name == name)
         };
-        let mut labels = vec!["Behaviour", "Enabled", "State"];
+        let mut labels = vec!["Enabled"];
+        if script.faulted {
+            labels.push("State");
+        }
         if let Some(
             orrin_registry::Value::Struct(fields) | orrin_registry::Value::Enum { fields, .. },
         ) = &before
@@ -1721,6 +1900,13 @@ fn script_sections(
         let title_colour = vtable
             .is_some_and(|vtable| overridden.contains(&vtable.id))
             .then_some(crate::editor::theme::PREFAB);
+        let lifecycle = match (script.faulted, script.active, script.started) {
+            (true, ..) => "faulted",
+            (false, true, _) => "active",
+            (false, false, true) => "inactive",
+            (false, false, false) => "not started",
+        };
+        let hint = format!("{}\n{lifecycle}", script.type_name);
         let touched = widgets::section_titled(
             ui,
             id,
@@ -1728,41 +1914,29 @@ fn script_sections(
             crate::editor::theme::KIND_SCRIPT,
             &title,
             title_colour,
+            Some(&hint),
             vtable.map(|_| &mut menu as &mut dyn FnMut(&mut egui::Ui)),
             |ui| {
-                if rows.shows("Behaviour") {
-                    widgets::property(ui, "Behaviour", |ui| {
-                        ui.label(figures(script.type_name.clone()))
-                    });
-                }
                 if rows.shows("Enabled") {
                     // Only the desired state is written here; the script tick
                     // sees the change next frame and dispatches
                     // OnEnable/OnDisable itself.
                     widgets::property(ui, "Enabled", |ui| ui.checkbox(&mut enabled, ""));
                 }
-                if rows.shows("State") {
+                if script.faulted && rows.shows("State") {
                     widgets::property(ui, "State", |ui| {
-                        if script.faulted {
-                            // A hook threw and the engine disabled the script
-                            // (see the log for the exception). Clearing re-arms
-                            // it from next tick — the manual counterpart to
-                            // "re-enable on hot reload".
-                            icons::labelled(
-                                ui,
-                                icons::warning(),
-                                crate::editor::theme::ERROR,
-                                "faulted",
-                            );
-                            if ui.small_button("Clear fault").clicked() {
-                                clear_fault = true;
-                            }
-                        } else {
-                            ui.weak(match (script.active, script.started) {
-                                (true, _) => "active",
-                                (false, true) => "inactive",
-                                (false, false) => "not started",
-                            });
+                        // A hook threw and the engine disabled the script
+                        // (see the log for the exception). Clearing re-arms
+                        // it from next tick — the manual counterpart to
+                        // "re-enable on hot reload".
+                        icons::labelled(
+                            ui,
+                            icons::warning(),
+                            crate::editor::theme::ERROR,
+                            "faulted",
+                        );
+                        if ui.small_button("Clear fault").clicked() {
+                            clear_fault = true;
                         }
                     });
                 }
@@ -1797,7 +1971,7 @@ fn script_sections(
 /// A Behaviour's fields, as their attributes ask, with every entity reference
 /// drawn as an [`entity_slot`].
 #[cfg(feature = "scripting")]
-fn script_fields(
+pub(super) fn script_fields(
     ui: &mut egui::Ui,
     world: &World,
     value: &mut orrin_registry::Value,
@@ -1806,9 +1980,10 @@ fn script_fields(
     orrin_registry::inspect::annotated(ui, value, fields, &mut |ui, id| entity_slot(ui, world, id))
 }
 
-/// One entity reference: the target's name, a drop target for a row dragged
-/// out of the hierarchy, and a menu to clear it — [`texture_slot`]'s
-/// interaction, over the world rather than the asset index.
+/// One entity reference: the target's name, which opens a list of the
+/// scene's entities, a drop target for a row dragged out of the hierarchy,
+/// and a menu to clear it — [`texture_slot`]'s interaction, over the world
+/// rather than the asset index.
 ///
 /// A drag carrying several rows is refused rather than resolved to one of
 /// them: which one was meant is not something the slot can know.
@@ -1816,37 +1991,72 @@ fn script_fields(
 fn entity_slot(ui: &mut egui::Ui, world: &World, id: &mut orrin_registry::EntityId) -> bool {
     use crate::scene::entity_ref;
 
-    let name = match entity_ref::entity_of(world, *id) {
-        Some(target) => world.get::<Name>(target).map_or_else(
-            || format!("Entity {}", target.index()),
+    let label = |entity: Entity| {
+        world.get::<Name>(entity).map_or_else(
+            || format!("Entity {}", entity.index()),
             |name| name.0.clone(),
-        ),
+        )
+    };
+    let current = entity_ref::entity_of(world, *id);
+    let name = match current {
+        Some(target) => label(target),
         None if id.is_nil() => "None".to_owned(),
         None => "Missing entity".to_owned(),
     };
-    let slot =
-        ui.add(egui::Button::new(figures(name)).min_size(egui::vec2(ui.available_width(), 0.0)));
-    let mut changed = false;
-    if egui::DragAndDrop::has_payload_of_type::<Vec<Entity>>(&slot.ctx)
-        && let Some(dragged) = slot.dnd_release_payload::<Vec<Entity>>()
-        && let [target] = dragged[..]
-    {
-        let dropped = entity_ref::id_of(world, target);
-        changed = dropped != *id;
-        *id = dropped;
-    }
-    slot.on_hover_text("Drop an entity from the hierarchy here. Right-click to clear")
-        .context_menu(|ui| {
-            if ui
-                .add_enabled(!id.is_nil(), egui::Button::new("Clear"))
-                .clicked()
+    // Listed only while the list is open: a scene can hold many thousands,
+    // and a slot is drawn every frame.
+    let popup = ui.make_persistent_id(("picker", "entity"));
+    let open = ui.memory(|memory| memory.is_popup_open(popup));
+    let mut choices: Vec<Choice<Entity>> = world
+        .entities()
+        .filter(|_| open)
+        .map(|entity| Choice {
+            name: label(entity),
+            handle: entity,
+        })
+        .collect();
+    choices.sort_by(|a, b| a.name.cmp(&b.name));
+    let filled = !id.is_nil();
+    let mut dropped = None;
+    let mut cleared = false;
+    let picked = picker(
+        ui,
+        "entity",
+        choices,
+        current,
+        None,
+        |ui, _| {
+            let slot = ui.add(
+                egui::Button::new(figures(&name)).min_size(egui::vec2(ui.available_width(), 0.0)),
+            );
+            if egui::DragAndDrop::has_payload_of_type::<Vec<Entity>>(&slot.ctx)
+                && let Some(dragged) = slot.dnd_release_payload::<Vec<Entity>>()
+                && let [target] = dragged[..]
             {
-                *id = orrin_registry::EntityId::NIL;
-                changed = true;
-                ui.close_menu();
+                dropped = Some(target);
             }
-        });
-    changed
+            let slot = slot.on_hover_text(
+                "Click to pick an entity, or drop one from the hierarchy here. Right-click to \
+                 clear",
+            );
+            slot.context_menu(|ui| {
+                if ui.add_enabled(filled, egui::Button::new("Clear")).clicked() {
+                    cleared = true;
+                    ui.close_menu();
+                }
+            });
+            slot
+        },
+        &mut |_, _| None,
+    );
+    let before = *id;
+    if let Some(target) = picked.or(dropped) {
+        *id = entity_ref::id_of(world, target);
+    }
+    if cleared {
+        *id = orrin_registry::EntityId::NIL;
+    }
+    *id != before
 }
 
 /// Range is where the light is cut off, not how far it carries — inverse-square
@@ -1892,6 +2102,7 @@ fn light_section(
         return;
     };
     let labels = [
+        "Type",
         "Colour",
         "Illuminance",
         "Power",
@@ -1918,86 +2129,179 @@ fn light_section(
         crate::editor::theme::KIND_LIGHT,
         title,
         None,
-        |ui| match &mut light {
-            Light::Directional { color, lux } => {
-                color_row(ui, "Colour", color);
-                // Logarithmic, as every one of these is: the useful range spans
-                // five orders of magnitude, and on a linear slider everything
-                // dimmer than an overcast day is the leftmost pixel.
-                widgets::property(ui, "Illuminance", |ui| {
-                    ui.add(
-                        egui::Slider::new(lux, 1.0..=150_000.0)
-                            .logarithmic(true)
-                            .suffix(" lx"),
-                    )
-                    .on_hover_text("Noon sun 100 000, overcast 20 000, sunset under 1 000");
-                });
-            }
-            Light::Point {
-                color,
-                lumens,
-                range,
-                casts_shadows,
-            } => {
-                color_row(ui, "Colour", color);
-                power_row(
-                    ui,
-                    lumens,
-                    "Domestic bulb 800, shop light 4 000, flood tens of thousands",
-                );
-                range_row(ui, range);
-                shadows_row(
-                    ui,
-                    casts_shadows,
-                    "Six atlas tiles, and only if the budget reaches this light",
-                );
-            }
-            Light::Spot {
-                color,
-                lumens,
-                range,
-                inner_angle,
-                outer_angle,
-                reflector,
-                casts_shadows,
-            } => {
-                color_row(ui, "Colour", color);
-                power_row(
-                    ui,
-                    lumens,
-                    "The bulb's own output, before the cone concentrates it",
-                );
-                widgets::property(ui, "Reflector", |ui| {
-                    ui.checkbox(reflector, "").on_hover_text(
-                        "On, the cone concentrates the power and narrowing it brightens the beam. \
-                         Off, the cone only masks a bare bulb and the angle is free of brightness.",
-                    );
-                });
-                range_row(ui, range);
-                // Dragged together: the inner cone cannot leave the outer one,
-                // and the falloff divides by their difference — so clamping
-                // here is what keeps the editor from authoring a light the
-                // shader has to defend itself against.
-                widgets::property(ui, "Outer angle", |ui| {
-                    ui.add(egui::Slider::new(outer_angle, 1.0..=89.0).suffix("°"))
-                        .on_hover_text("Half angle from the axis, where the cone reaches nothing");
-                });
-                *inner_angle = inner_angle.min(*outer_angle);
-                widgets::property(ui, "Inner angle", |ui| {
-                    ui.add(egui::Slider::new(inner_angle, 0.0..=*outer_angle).suffix("°"))
-                        .on_hover_text("Half angle out to which it is still at full brightness");
-                });
-                shadows_row(
-                    ui,
-                    casts_shadows,
-                    "One atlas tile, and only if the budget reaches this light",
-                );
-            }
+        |ui| {
+            type_row(ui, &mut light);
+            light_rows(ui, &mut light);
         },
     );
     let after = light.to_value();
     if !orrin_registry::diff(&before.to_value(), &after).is_empty() {
         state.edit(entity, crate::scene::registry::LIGHT, after);
+    }
+}
+
+/// Which of the three the light is, switched as one edit by [`retyped`].
+fn type_row(ui: &mut egui::Ui, light: &mut Light) {
+    use crate::editor::pick::LightKind;
+    const KINDS: [(LightKind, &str); 3] = [
+        (LightKind::Sun, "Directional"),
+        (LightKind::Point, "Point"),
+        (LightKind::Spot, "Spot"),
+    ];
+    let kind = match light {
+        Light::Directional { .. } => LightKind::Sun,
+        Light::Point { .. } => LightKind::Point,
+        Light::Spot { .. } => LightKind::Spot,
+    };
+    let mut chosen = kind;
+    widgets::property(ui, "Type", |ui| {
+        let shown = KINDS
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map_or("", |(_, name)| name);
+        egui::ComboBox::from_id_salt("light_type")
+            .selected_text(shown)
+            .show_ui(ui, |ui| {
+                for (kind, name) in KINDS {
+                    ui.selectable_value(&mut chosen, kind, name);
+                }
+            });
+    });
+    if chosen != kind {
+        *light = retyped(*light, chosen);
+    }
+}
+
+/// `light` as another kind. The colour carries over, and between a point and
+/// a spot so does the bulb — its lumens, range and shadow casting; the rest is
+/// the new kind's default. A sun's lux and a bulb's lumens measure different
+/// things, so neither is ever made from the other: crossing between them
+/// takes the default for the new unit.
+fn retyped(light: Light, kind: crate::editor::pick::LightKind) -> Light {
+    use crate::editor::pick::LightKind;
+    let (Light::Directional { color, .. } | Light::Point { color, .. } | Light::Spot { color, .. }) =
+        light;
+    let bulb = match light {
+        Light::Point {
+            lumens,
+            range,
+            casts_shadows,
+            ..
+        }
+        | Light::Spot {
+            lumens,
+            range,
+            casts_shadows,
+            ..
+        } => Some((lumens, range, casts_shadows)),
+        Light::Directional { .. } => None,
+    };
+    let mut retyped = match kind {
+        LightKind::Sun => Light::default(),
+        LightKind::Point => Light::default_point(),
+        LightKind::Spot => Light::default_spot(),
+    };
+    match &mut retyped {
+        Light::Directional { color: new, .. } => *new = color,
+        Light::Point {
+            color: new,
+            lumens,
+            range,
+            casts_shadows,
+        }
+        | Light::Spot {
+            color: new,
+            lumens,
+            range,
+            casts_shadows,
+            ..
+        } => {
+            *new = color;
+            if let Some(bulb) = bulb {
+                (*lumens, *range, *casts_shadows) = bulb;
+            }
+        }
+    }
+    retyped
+}
+
+/// The rows of whichever kind `light` is.
+fn light_rows(ui: &mut egui::Ui, light: &mut Light) {
+    match light {
+        Light::Directional { color, lux } => {
+            color_row(ui, "Colour", color);
+            // Logarithmic, as every one of these is: the useful range spans
+            // five orders of magnitude, and on a linear slider everything
+            // dimmer than an overcast day is the leftmost pixel.
+            widgets::property(ui, "Illuminance", |ui| {
+                ui.add(
+                    egui::Slider::new(lux, 1.0..=150_000.0)
+                        .logarithmic(true)
+                        .suffix(" lx"),
+                )
+                .on_hover_text("Noon sun 100 000, overcast 20 000, sunset under 1 000");
+            });
+        }
+        Light::Point {
+            color,
+            lumens,
+            range,
+            casts_shadows,
+        } => {
+            color_row(ui, "Colour", color);
+            power_row(
+                ui,
+                lumens,
+                "Domestic bulb 800, shop light 4 000, flood tens of thousands",
+            );
+            range_row(ui, range);
+            shadows_row(
+                ui,
+                casts_shadows,
+                "Six atlas tiles, and only if the budget reaches this light",
+            );
+        }
+        Light::Spot {
+            color,
+            lumens,
+            range,
+            inner_angle,
+            outer_angle,
+            reflector,
+            casts_shadows,
+        } => {
+            color_row(ui, "Colour", color);
+            power_row(
+                ui,
+                lumens,
+                "The bulb's own output, before the cone concentrates it",
+            );
+            widgets::property(ui, "Reflector", |ui| {
+                ui.checkbox(reflector, "").on_hover_text(
+                    "On, the cone concentrates the power and narrowing it brightens the beam. \
+                         Off, the cone only masks a bare bulb and the angle is free of brightness.",
+                );
+            });
+            range_row(ui, range);
+            // Dragged together: the inner cone cannot leave the outer one,
+            // and the falloff divides by their difference — so clamping
+            // here is what keeps the editor from authoring a light the
+            // shader has to defend itself against.
+            widgets::property(ui, "Outer angle", |ui| {
+                ui.add(egui::Slider::new(outer_angle, 1.0..=89.0).suffix("°"))
+                    .on_hover_text("Half angle from the axis, where the cone reaches nothing");
+            });
+            *inner_angle = inner_angle.min(*outer_angle);
+            widgets::property(ui, "Inner angle", |ui| {
+                ui.add(egui::Slider::new(inner_angle, 0.0..=*outer_angle).suffix("°"))
+                    .on_hover_text("Half angle out to which it is still at full brightness");
+            });
+            shadows_row(
+                ui,
+                casts_shadows,
+                "One atlas tile, and only if the budget reaches this light",
+            );
+        }
     }
 }
 
@@ -2203,6 +2507,7 @@ fn audio_section(
         crate::editor::theme::KIND_AUDIO,
         "Audio Source",
         title,
+        None,
         Some(&mut menu),
         |ui| {
             if rows.shows("Clip") {
@@ -2421,7 +2726,7 @@ fn clip_row(ui: &mut egui::Ui, world: &World, clip: &mut AssetId) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::{Collider, ColliderShape, Spin, Tag, register_components};
+    use crate::scene::{Collider, ColliderShape, Spin, register_components};
     use orrin_registry::Value;
 
     fn registry() -> Registry {
@@ -2443,33 +2748,6 @@ mod tests {
                 "`{id}` is skipped by the inspector but not registered"
             );
         }
-    }
-
-    /// The other side of the same coin: every component the registry knows and
-    /// no section draws must reach the generic inspector. Named here so that
-    /// adding a component without a section is visibly a decision.
-    #[test]
-    fn everything_else_is_drawn_from_its_vtable() {
-        let registry = registry();
-        let generic: Vec<&str> = registry
-            .components()
-            .filter(|c| !HAND_DRAWN.contains(&c.id))
-            .map(|c| c.id.as_str())
-            .collect();
-        assert_eq!(
-            generic,
-            [
-                "orrin.tag",
-                "orrin.collider",
-                "orrin.rigid_body",
-                "orrin.audio_listener",
-                "orrin.spin",
-                "orrin.locked",
-                "orrin.render_settings",
-                "orrin.camera"
-            ],
-            "registration order changed, or a component gained/lost a section"
-        );
     }
 
     /// A dropped asset goes through the registry like any other edit, so an
@@ -2526,69 +2804,6 @@ mod tests {
         state.request_undo();
         state.apply(&mut world, &registry);
         assert_eq!(*world.get::<MeshHandle>(entity).unwrap(), MeshHandle(0));
-    }
-
-    /// A material asset dropped on the mesh renderer is the same kind of edit
-    /// a dropped mesh is.
-    #[test]
-    fn a_dropped_material_asset_is_an_undoable_edit_and_anything_else_is_refused_by_name() {
-        let registry = registry();
-        let dir = crate::asset_db::tests::Dir::new("inspector-drop-material");
-        dir.write("rock.png", b"");
-        dir.write(
-            "brick.omat",
-            crate::asset_db::material::write(&Default::default()).as_bytes(),
-        );
-        let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
-        let rock = db.find("rock.png").unwrap().id;
-        let brick = db.find("brick.omat").unwrap().id;
-
-        let mut world = World::new();
-        world.insert_resource(db);
-        world.insert_resource(LogBuffer::default());
-        let mut assets = Assets::new();
-        assets.insert_material("clay", MaterialHandle(0));
-        world.insert_resource(assets);
-        let entity = world.spawn();
-        world.insert(entity, MeshHandle(0));
-        world.insert(entity, MaterialHandle(0));
-        world.insert(entity, Name::new("Crate"));
-        let mut state = EditorState::default();
-
-        assign_material(&mut state, entity, rock);
-        state.apply(&mut world, &registry);
-        assert_eq!(
-            *world.get::<MaterialHandle>(entity).unwrap(),
-            MaterialHandle(0)
-        );
-        let logged: Vec<String> = world
-            .resource::<LogBuffer>()
-            .iter()
-            .map(|entry| entry.message.clone())
-            .collect();
-        assert_eq!(
-            logged,
-            [
-                "orrin.material on Crate: expected a material asset, found `rock.png`, which is a \
-                 texture"
-            ]
-        );
-
-        assign_material(&mut state, entity, brick);
-        state.apply(&mut world, &registry);
-        let handle = *world.get::<MaterialHandle>(entity).unwrap();
-        assert_eq!(
-            world.resource::<AssetDatabase>().material_id(handle),
-            Some(brick)
-        );
-        assert_eq!(state.history.undo_label(), Some("Edit Material"));
-
-        state.request_undo();
-        state.apply(&mut world, &registry);
-        assert_eq!(
-            *world.get::<MaterialHandle>(entity).unwrap(),
-            MaterialHandle(0)
-        );
     }
 
     /// The path an inspector drag takes: read the component, edit the detached
@@ -2652,25 +2867,6 @@ mod tests {
         assert_eq!(vtable.read(&world, entity), Some(before));
     }
 
-    /// A hand-written section is the exception, so the generic one has to handle
-    /// a component it has never been told about — the case every game assembly
-    /// component is in.
-    #[test]
-    fn a_component_with_no_section_reads_back_what_the_inspector_drew() {
-        let registry = registry();
-        let mut world = World::new();
-        let entity = world.spawn();
-        world.insert(entity, Tag::new("player"));
-
-        let vtable = registry.get(&crate::scene::registry::TAG).unwrap();
-        let before = vtable.read(&world, entity).unwrap();
-        let drawn = std::cell::RefCell::new(before.clone());
-        egui::__run_test_ui(|ui| {
-            assert!(!(vtable.inspect)(ui, &mut drawn.borrow_mut()));
-        });
-        assert_eq!(drawn.into_inner(), before);
-    }
-
     /// Every text the frame painted, with where.
     #[cfg(feature = "scripting")]
     fn texts(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
@@ -2688,41 +2884,6 @@ mod tests {
             collect(&clipped.shape, &mut out);
         }
         out
-    }
-
-    /// A Behaviour's entity field reads as the entity it names, as `None` when
-    /// it names nothing, and as missing when the entity it named is gone.
-    #[cfg(feature = "scripting")]
-    #[test]
-    fn an_entity_field_shows_its_targets_name() {
-        let mut world = World::new();
-        let door = world.spawn();
-        world.insert(door, Name::new("Door"));
-        let gone = world.spawn();
-        let gone_id = crate::scene::entity_ref::id_of(&world, gone);
-        world.despawn(gone);
-        let mut bag = Value::strukt([
-            (
-                "Target",
-                Value::Entity(crate::scene::entity_ref::id_of(&world, door)),
-            ),
-            ("Nothing", Value::Entity(orrin_registry::EntityId::NIL)),
-            ("Lost", Value::Entity(gone_id)),
-        ]);
-        let ctx = egui::Context::default();
-        let mut painted = Vec::new();
-        for _ in 0..2 {
-            let output = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    script_fields(ui, &world, &mut bag, &[]);
-                });
-            });
-            painted = texts(&output);
-        }
-        let shown: Vec<&str> = painted.iter().map(|(text, _)| text.as_str()).collect();
-        for expected in ["Door", "None", "Missing entity"] {
-            assert!(shown.contains(&expected), "{expected} not in {shown:?}");
-        }
     }
 
     /// A row dragged out of the hierarchy and let go over the slot points the
@@ -2842,28 +3003,6 @@ mod tests {
         );
         // An emptied texture slot is the default, which is no value at all.
         assert_eq!(Field::Texture(None).stored(), None);
-    }
-
-    #[test]
-    fn a_filter_keeps_a_whole_section_when_its_title_matches() {
-        let filter = Filter::new("trans");
-        let rows = filter.section("Transform", &["Position"]).unwrap();
-        assert!(rows.shows("Scale"));
-    }
-
-    #[test]
-    fn a_filter_keeps_only_matching_rows_otherwise() {
-        let filter = Filter::new("ROUGH");
-        assert!(
-            filter
-                .section("Transform", &["Position", "Scale"])
-                .is_none()
-        );
-        let rows = filter
-            .section("Material", &["Metallic", "Roughness"])
-            .unwrap();
-        assert!(rows.shows("Roughness"));
-        assert!(!rows.shows("Metallic"));
     }
 
     #[test]

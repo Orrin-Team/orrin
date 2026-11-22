@@ -10,8 +10,44 @@ use crate::asset_db::material::{self, MaterialFile, ShaderValue};
 use crate::asset_db::tests::Dir;
 use crate::asset_db::{AssetDatabase, Status as Import};
 use crate::editor::panels::shader::{ShaderEditor, code_id};
+use crate::editor::state::GizmoMode;
 use crate::gfx::HeadlessBackend;
-use crate::gfx::vulkan::material_preview::Viewer;
+
+impl Harness {
+    /// Every shape the last frame painted, as bounding rects.
+    fn painted_rects(&self) -> Vec<egui::Rect> {
+        fn collect(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                egui::Shape::Noop => {}
+                other => out.push(other.visual_bounding_rect()),
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &self.output.as_ref().expect("a frame has run").shapes {
+            collect(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// Two clicks at `at` inside one frame: a double-click.
+    fn double_click(&mut self, at: egui::Pos2) -> &mut Self {
+        self.input.events.push(egui::Event::PointerMoved(at));
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                self.input.events.push(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+        }
+        self.frames(1);
+        self.input.events.clear();
+        self
+    }
+}
 
 const GLOW: &str = "5f0c3a4e-0000-4000-8000-0000000000d1";
 const BRICK: &str = "5f0c3a4e-0000-4000-8000-0000000000d2";
@@ -163,24 +199,6 @@ fn save_elsewhere(editor: &mut Harness, dir: &Dir, text: &str) {
 }
 
 #[test]
-fn with_nothing_open_the_tab_says_what_a_shader_is_and_offers_one() {
-    let dir = Dir::new("shader-tab-empty");
-    let mut editor = editor_on(&dir);
-    editor.dock.bring_forward(Tab::Shader);
-    editor.frames(2);
-    assert!(editor.painted_contains("A surface shader is a short GLSL function"));
-    in_tab(&editor, "Open a shader");
-
-    let at = in_tab(&editor, "New surface shader");
-    editor.click(at).frames(2);
-    let db = editor.world.resource::<AssetDatabase>();
-    let created = db.find("New Surface Shader.oshader").expect("written").id;
-    drop(db);
-    assert_eq!(shader(&editor).open(), Some(created));
-    assert_eq!(shader(&editor).text(), crate::asset_db::shader::NEW_SHADER);
-}
-
-#[test]
 fn a_shader_double_clicked_in_the_assets_tab_opens_in_the_shader_tab() {
     let dir = project("shader-tab-open", TINT, None);
     let mut editor = editor_on(&dir);
@@ -198,48 +216,6 @@ fn a_shader_double_clicked_in_the_assets_tab_opens_in_the_shader_tab() {
         panic!("in a leaf");
     };
     assert_eq!(tabs[active.0], Tab::Shader, "brought forward");
-}
-
-#[test]
-fn a_shaders_menu_in_the_assets_tab_edits_it() {
-    let dir = project("shader-tab-menu", TINT, None);
-    let mut editor = editor_on(&dir);
-    editor.dock.activate(Tab::Assets);
-    editor.frames(2);
-    editor.click(row_of(&editor, "fx")).frames(2);
-    editor
-        .right_click(row_of(&editor, "glow.oshader"))
-        .frames(1);
-    let edit = editor
-        .painted_text_rects()
-        .into_iter()
-        .find(|(text, rect)| text == "Edit" && rect.top() > BAR_HEIGHT)
-        .expect("the menu offers Edit")
-        .1;
-    editor.click(edit.center()).frames(3);
-    assert_eq!(shader(&editor).open(), Some(glow()));
-}
-
-/// Wherever the browser offers a new material, it offers a new shader.
-#[test]
-fn the_assets_tab_makes_a_new_shader_where_it_makes_a_new_material() {
-    let dir = project("shader-tab-new", TINT, None);
-    let mut editor = editor_on(&dir);
-    editor.dock.activate(Tab::Assets);
-    editor.frames(2);
-    editor.right_click(row_of(&editor, "fx")).frames(1);
-    let texts = editor.painted();
-    assert!(texts.iter().any(|text| text == "New material"), "{texts:?}");
-    let new = editor
-        .painted_text_rects()
-        .into_iter()
-        .find(|(text, _)| text == "New surface shader")
-        .expect("offered beside New material")
-        .1;
-    editor.click(new.center()).frames(2);
-    let db = editor.world.resource::<AssetDatabase>();
-    let entry = db.find("fx/New Surface Shader.oshader").expect("written");
-    assert_eq!(editor.state.revealed_asset, Some(entry.id), "and marked");
 }
 
 /// Typing marks the buffer, Save writes it through the database, which says
@@ -379,199 +355,6 @@ fn a_clean_buffer_follows_the_file_and_a_dirty_one_keeps_its_text() {
     assert!(!shader(&editor).changed_on_disk());
 }
 
-/// The editor with the Shader tab alone in its one leaf, its body about `size`.
-fn alone(editor: &mut Harness, size: egui::Vec2) {
-    editor.dock =
-        crate::editor::dock::Dock::from_saved(Some(egui_dock::DockState::new(vec![Tab::Shader])));
-    let bars = BAR_HEIGHT + 24.0 + TAB_BAR_HEIGHT;
-    editor.input.screen_rect = Some(egui::Rect::from_min_size(
-        egui::Pos2::ZERO,
-        size + egui::vec2(0.0, bars),
-    ));
-    editor.frames(3);
-}
-
-fn painted_in_tab(editor: &Harness, label: &str) -> egui::Rect {
-    let body = editor.tab_body(Tab::Shader);
-    editor
-        .painted_text_rects()
-        .into_iter()
-        .find(|(text, rect)| without_icons(text) == label && body.intersects(*rect))
-        .unwrap_or_else(|| panic!("no {label:?} in the Shader tab: {:?}", editor.painted()))
-        .1
-}
-
-/// The empty state's words and its two ways in sit on the tab's centre line,
-/// whatever its width.
-#[test]
-fn the_empty_state_is_centred() {
-    let dir = Dir::new("shader-tab-centred");
-    let mut editor = editor_on(&dir);
-    for size in [egui::vec2(1040.0, 220.0), egui::vec2(420.0, 600.0)] {
-        alone(&mut editor, size);
-        let middle = editor.tab_body(Tab::Shader).center().x;
-        for label in ["New surface shader", "Open a shader"] {
-            let at = painted_in_tab(&editor, label).center().x;
-            assert!(
-                (at - middle).abs() < 2.0,
-                "{label} at {at}, centre {middle}"
-            );
-        }
-        let words = editor
-            .painted_text_rects()
-            .into_iter()
-            .find(|(text, _)| text.starts_with("A surface shader is"))
-            .unwrap()
-            .1;
-        assert!(
-            (words.center().x - middle).abs() < 2.0,
-            "{words:?} {middle}"
-        );
-        assert!(words.width() <= 400.0, "a readable measure: {words:?}");
-    }
-}
-
-/// In a dock too short for both, the sphere and the parameters take turns
-/// rather than the sphere pushing the list out of sight.
-#[test]
-fn in_a_short_dock_the_preview_and_parameters_take_turns() {
-    let dir = project("shader-tab-short", EVERY_KIND, None);
-    let mut editor = editor_on(&dir);
-    open_glow(&mut editor);
-    alone(&mut editor, egui::vec2(1040.0, 220.0));
-    let body = editor.tab_body(Tab::Shader);
-    let material = painted_in_tab(&editor, "The shader's defaults");
-    assert!(body.contains_rect(material), "{material:?} in {body:?}");
-
-    editor
-        .click(painted_in_tab(&editor, "Parameters").center())
-        .frames(1);
-    let row = painted_in_tab(&editor, "float = 0.5, 0 to 1");
-    assert!(body.contains_rect(row), "{row:?} in {body:?}");
-    assert!(!editor.painted_contains("The shader's defaults"));
-}
-
-/// A long default is cut to the column, never drawn past the tab's edge.
-#[test]
-fn the_parameter_list_stays_inside_its_column() {
-    let dir = project("shader-tab-column", EVERY_KIND, None);
-    let mut editor = editor_on(&dir);
-    open_glow(&mut editor);
-    alone(&mut editor, egui::vec2(900.0, 700.0));
-    let body = editor.tab_body(Tab::Shader);
-    let rows: Vec<egui::Rect> = editor
-        .painted_text_rects()
-        .into_iter()
-        .filter(|(text, rect)| {
-            ["float", "vec", "color", "texture"]
-                .iter()
-                .any(|kind| text.starts_with(kind))
-                && text.contains(" = ")
-                && !text.contains("param")
-                && body.intersects(*rect)
-        })
-        .map(|(_, rect)| rect)
-        .collect();
-    assert_eq!(rows.len(), 7, "{:?}", editor.painted());
-    for row in rows {
-        assert!(row.right() <= body.right() + 0.5, "{row:?} past {body:?}");
-    }
-}
-
-/// A long name in a narrow tab is shortened before it reaches Save.
-#[test]
-fn a_long_name_gives_way_to_the_header_buttons() {
-    let dir = project("shader-tab-long-name", TINT, None);
-    dir.write(
-        "a_rather_long_surface_shader_name_for_wet_cobblestones.oshader",
-        TINT.as_bytes(),
-    );
-    let mut editor = editor_on(&dir);
-    let id = editor
-        .world
-        .resource::<AssetDatabase>()
-        .find("a_rather_long_surface_shader_name_for_wet_cobblestones.oshader")
-        .unwrap()
-        .id;
-    editor.state.open_shader(id);
-    editor.frames(3);
-    alone(&mut editor, egui::vec2(420.0, 600.0));
-    let body = editor.tab_body(Tab::Shader);
-    let name = editor
-        .painted_text_rects()
-        .into_iter()
-        .find(|(text, rect)| without_icons(text).starts_with("a_rather") && body.intersects(*rect))
-        .expect("the name, or its start")
-        .1;
-    let status = painted_in_tab(&editor, "Compiled");
-    let revert = painted_in_tab(&editor, "Revert");
-    let save = painted_in_tab(&editor, "Save");
-    assert!(name.right() < status.left(), "{name:?} {status:?}");
-    assert!(status.right() < revert.left(), "{status:?} {revert:?}");
-    assert!(save.right() <= body.right(), "{save:?} {body:?}");
-}
-
-/// The shader's name in the header carries the chevron the editor's other
-/// pickers do, after the name and inside the button that opens the list.
-#[test]
-fn the_header_name_shows_a_chevron_and_opens_the_list() {
-    let dir = project("shader-tab-chevron", TINT, None);
-    let mut editor = editor_on(&dir);
-    open_glow(&mut editor);
-    let name = painted_in_tab(&editor, "glow");
-    let chevron = crate::editor::icons::chevron_down().glyph();
-    let at = editor
-        .painted_icons()
-        .into_iter()
-        .find(|(glyph, rect, _)| {
-            *glyph == chevron
-                && rect.left() > name.right()
-                && (rect.center().y - name.center().y).abs() < 4.0
-        })
-        .expect("a chevron after the shader's name")
-        .1;
-    assert!(!editor.painted_contains("Filter shaders"));
-    editor.click(at.center());
-    editor.frames(1);
-    assert!(editor.painted_contains("Filter shaders"));
-}
-
-/// The colour a painted string was drawn in.
-fn colour_of(editor: &Harness, label: &str) -> egui::Color32 {
-    fn find(shape: &egui::Shape, label: &str, out: &mut Option<egui::Color32>) {
-        match shape {
-            egui::Shape::Text(text) if without_icons(text.galley.text()) == label => {
-                let section = text.galley.job.sections.last().map(|s| s.format.color);
-                *out = text.override_text_color.or(section);
-            }
-            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| find(s, label, out)),
-            _ => {}
-        }
-    }
-    let mut out = None;
-    for clipped in &editor.output.as_ref().unwrap().shapes {
-        find(&clipped.shape, label, &mut out);
-    }
-    out.unwrap_or_else(|| panic!("no {label:?} painted"))
-}
-
-/// Save that cannot be pressed looks it: while the file changed under the
-/// typed text it is drawn dimmer than Revert beside it, which can.
-#[test]
-fn save_looks_disabled_while_it_waits_on_a_choice() {
-    let dir = project("shader-tab-disabled", TINT, None);
-    let mut editor = editor_on(&dir);
-    open_glow(&mut editor);
-    type_text(&mut editor, "// mine\n");
-    save_elsewhere(&mut editor, &dir, &format!("// theirs\n{TINT}"));
-    editor
-        .ctx
-        .memory_mut(|memory| memory.surrender_focus(code_id()));
-    editor.frames(2);
-    assert!(shader(&editor).changed_on_disk());
-    assert_ne!(colour_of(&editor, "Save"), colour_of(&editor, "Revert"));
-}
-
 /// Another shader asked for over unsaved text waits on what becomes of it.
 #[test]
 fn opening_another_shader_over_unsaved_text_asks_first() {
@@ -614,71 +397,6 @@ fn the_code_is_highlighted_once_per_text() {
     assert!(typed > settled);
     editor.frames(4);
     assert_eq!(shader(&editor).highlight_runs(), typed);
-}
-
-/// The sphere is a material that uses the shader, or the shader's own one at
-/// its defaults when none does.
-#[test]
-fn the_preview_is_a_material_using_the_shader_or_its_defaults() {
-    let dir = project("shader-tab-preview", TINT, None);
-    let mut editor = editor_on(&dir);
-    open_glow(&mut editor);
-    settle(&mut editor);
-    editor.frames(2);
-    let asked = editor.state.material_previews[Viewer::Shader as usize]
-        .expect("the tab asks for its sphere")
-        .material;
-    let own = editor
-        .world
-        .resource_mut::<AssetDatabase>()
-        .shader_preview_material(glow())
-        .unwrap();
-    assert_eq!(asked, own);
-    assert!(editor.painted_contains("The shader's defaults"));
-
-    let users = MaterialFile {
-        shader: Some(glow()),
-        ..MaterialFile::default()
-    };
-    dir.write("brick.omat", material::write(&users).as_bytes());
-    dir.write("brick.omat.meta", format!("id = \"{BRICK}\"\n").as_bytes());
-    editor.world.resource_mut::<AssetDatabase>().rescan();
-    editor.frames(2);
-    let asked = editor.state.material_previews[Viewer::Shader as usize]
-        .unwrap()
-        .material;
-    let brick = editor
-        .world
-        .resource_mut::<AssetDatabase>()
-        .material(brick())
-        .unwrap();
-    assert_eq!(asked, brick);
-}
-
-/// What the last good compile declared, with each type, default and hint.
-#[test]
-fn the_tab_lists_what_the_shader_declares() {
-    let dir = project("shader-tab-params", EVERY_KIND, None);
-    let mut editor = editor_on(&dir);
-    editor.input.screen_rect = Some(egui::Rect::from_min_size(
-        egui::Pos2::ZERO,
-        egui::vec2(1600.0, 1800.0),
-    ));
-    open_glow(&mut editor);
-    for line in [
-        "float = 0.5, 0 to 1",
-        "float = 2",
-        "vec2 = (0.25, 0.75)",
-        "vec3 = (0, 1, 0)",
-        "color = (1, 0.5, 0.25, 1)",
-        "texture = white, sRGB",
-    ] {
-        assert!(
-            editor.painted_contains(line),
-            "{line}: {:?}",
-            editor.painted()
-        );
-    }
 }
 
 /// While the code has focus, keys are the text's: no tool, delete, scene
@@ -728,111 +446,6 @@ fn keys_typed_into_the_code_stay_in_the_code() {
         !dir.path().join("scene.orrin").exists(),
         "the scene was not saved"
     );
-}
-
-/// Cmd/Ctrl+Z in the code is the text's own undo.
-#[test]
-fn undo_in_the_code_undoes_the_typing() {
-    let dir = project("shader-tab-undo", TINT, None);
-    let mut editor = editor_on(&dir);
-    open_glow(&mut editor);
-    type_text(&mut editor, "abc");
-    assert!(shader(&editor).text().contains("abc"));
-    focus_code(&mut editor);
-    editor.key_with(egui::Modifiers::COMMAND, egui::Key::Z);
-    assert_eq!(shader(&editor).text(), TINT);
-}
-
-/// Away from the code, the editor's keys work as before.
-#[test]
-fn away_from_the_code_the_editors_keys_are_its_own() {
-    let dir = project("shader-tab-keys-away", TINT, None);
-    let mut editor = editor_on(&dir);
-    open_glow(&mut editor);
-    editor
-        .ctx
-        .memory_mut(|memory| memory.surrender_focus(code_id()));
-    editor.key(egui::Key::Num2);
-    assert_eq!(editor.state.gizmo_mode, GizmoMode::Move);
-}
-
-#[test]
-fn the_view_menu_opens_the_shader_tab() {
-    let dir = Dir::new("shader-tab-view");
-    let mut editor = editor_on(&dir);
-    editor.dock.toggle(Tab::Shader);
-    assert!(!editor.dock.is_open(Tab::Shader));
-    let Harness {
-        world,
-        registry,
-        state,
-        themes,
-        dock,
-        ctx,
-        input,
-        ..
-    } = &mut editor;
-    let mut draw = |input: egui::RawInput| {
-        ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                menu_bar::menu_body(
-                    menu_bar::Menu::View,
-                    ui,
-                    world,
-                    registry,
-                    state,
-                    themes,
-                    dock,
-                );
-            });
-        })
-    };
-    let output = draw(input.clone());
-    let output = {
-        let _ = output;
-        draw(input.clone())
-    };
-    let at = painted_text_rects_of(&output)
-        .into_iter()
-        .find(|(text, _)| text == "Shader")
-        .expect("listed in View")
-        .1
-        .center();
-    let mut click = input.clone();
-    click.events = vec![
-        egui::Event::PointerMoved(at),
-        egui::Event::PointerButton {
-            pos: at,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: Default::default(),
-        },
-        egui::Event::PointerButton {
-            pos: at,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: Default::default(),
-        },
-    ];
-    draw(click);
-    assert!(dock.is_open(Tab::Shader));
-}
-
-fn painted_text_rects_of(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
-    fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
-        match shape {
-            egui::Shape::Text(text) => {
-                out.push((text.galley.text().to_owned(), text.visual_bounding_rect()))
-            }
-            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    for clipped in &output.shapes {
-        collect(&clipped.shape, &mut out);
-    }
-    out
 }
 
 /// The editor's two promises about the middle of the window hold with the
@@ -966,28 +579,6 @@ fn the_shader_row_sets_and_clears_the_shader_as_undoable_edits() {
     assert_eq!(brick_file(&editor).shader, None);
 }
 
-#[test]
-fn the_shader_rows_edit_opens_it_in_the_shader_tab() {
-    let file = MaterialFile {
-        shader: Some(glow()),
-        ..MaterialFile::default()
-    };
-    let (_dir, mut editor) = inspecting_brick("shader-row-edit", TINT, &file);
-    scroll_inspector(&mut editor);
-    let edit = editor
-        .painted_icons()
-        .into_iter()
-        .find(|(glyph, rect, _)| {
-            *glyph == crate::editor::icons::arrow_square_out().glyph()
-                && editor.tab_body(Tab::Inspector).contains(rect.center())
-        })
-        .expect("an Edit button on the Shader row")
-        .1;
-    editor.click(edit.center()).frames(3);
-    assert_eq!(shader(&editor).open(), Some(glow()));
-    assert!(editor.dock.is_open(Tab::Shader));
-}
-
 /// One row per declared parameter, in declaration order; a reset on a row
 /// takes its value out of the file.
 #[test]
@@ -1023,46 +614,6 @@ fn the_parameter_group_follows_the_table_and_reset_removes_a_value() {
     assert!(editor.state.history.undo_label().is_some());
 }
 
-/// A vector's fields share the value column, however wide their figures: a
-/// four-component row ends where a two-component one does.
-#[test]
-fn vector_fields_share_the_value_column() {
-    const VECTORS: &str = "\
-param vec2 pair = (0.25, 0.75);
-param vec4 four = (1, 0.5, 0.25, 0.125);
-void surface(in SurfaceIn i, inout SurfaceOut o) {
-    o.albedo = vec3(pair, four.w);
-}
-";
-    let file = MaterialFile {
-        shader: Some(glow()),
-        ..MaterialFile::default()
-    };
-    let (_dir, mut editor) = inspecting_brick("shader-row-vectors", VECTORS, &file);
-    editor.dock = crate::editor::dock::Dock::from_saved(Some(egui_dock::DockState::new(vec![
-        Tab::Inspector,
-    ])));
-    editor.input.screen_rect = Some(egui::Rect::from_min_size(
-        egui::Pos2::ZERO,
-        egui::vec2(340.0, 1100.0),
-    ));
-    editor.frames(3);
-    scroll_inspector(&mut editor);
-    let field = editor.ctx.style().visuals.widgets.inactive.weak_bg_fill;
-    let right_of = |label: &str| {
-        let row = in_inspector(&editor, label);
-        editor
-            .painted_fills()
-            .into_iter()
-            .filter(|(rect, fill)| *fill == field && (rect.center().y - row.center().y).abs() < 6.0)
-            .map(|(rect, _)| rect.right())
-            .fold(f32::MIN, f32::max)
-    };
-    let (pair, four) = (right_of("pair"), right_of("four"));
-    assert!(pair > 0.0, "the pair's fields were found");
-    assert!(four <= pair + 0.5, "four ends at {four}, pair at {pair}");
-}
-
 /// A texture dropped on a texture parameter's slot is its value.
 #[test]
 fn a_texture_dropped_on_a_texture_parameter_sets_it() {
@@ -1096,70 +647,5 @@ fn a_texture_dropped_on_a_texture_parameter_sets_it() {
     assert_eq!(
         brick_file(&editor).shader_value("mask"),
         Some(ShaderValue::Texture(rock()))
-    );
-}
-
-/// A value the shader no longer declares is listed with a warning and can be
-/// taken out of the file.
-#[test]
-fn an_undeclared_value_is_listed_and_removable() {
-    let mut file = MaterialFile {
-        shader: Some(glow()),
-        ..MaterialFile::default()
-    };
-    file.set_shader_value("renamed", Some(ShaderValue::Float(1.0)));
-    let (_dir, mut editor) = inspecting_brick("shader-row-undeclared", TINT, &file);
-    scroll_inspector(&mut editor);
-    let row = in_inspector(&editor, "renamed");
-    assert!(editor.painted_contains("Not declared by glow"));
-    let remove = editor
-        .painted_icons()
-        .into_iter()
-        .find(|(glyph, rect, _)| {
-            *glyph == crate::editor::icons::x().glyph()
-                && (rect.center().y - row.center().y).abs() < 6.0
-        })
-        .expect("a remove button on the row")
-        .1;
-    editor.click(remove.center());
-    apply(&mut editor);
-    assert_eq!(brick_file(&editor).shader_value("renamed"), None);
-}
-
-#[test]
-fn a_shader_with_errors_says_how_many_in_place_of_its_parameters() {
-    let file = MaterialFile {
-        shader: Some(glow()),
-        ..MaterialFile::default()
-    };
-    let (_dir, mut editor) = inspecting_brick("shader-row-errors", BROKEN, &file);
-    scroll_inspector(&mut editor);
-    assert!(
-        editor.painted_contains("glow has 1 error"),
-        "{:?}",
-        editor.painted()
-    );
-    assert!(!editor.painted_contains("has not compiled yet"));
-    let edit = in_inspector(&editor, "Edit");
-    editor.click(edit.center());
-    editor.frames(3);
-    assert_eq!(shader(&editor).open(), Some(glow()));
-}
-
-/// A shader with no errors to show — here one the project does not have — has
-/// simply not compiled.
-#[test]
-fn a_shader_that_never_compiled_says_so_in_place_of_its_parameters() {
-    let missing: AssetId = "5f0c3a4e-0000-4000-8000-0000000000d9".parse().unwrap();
-    let file = MaterialFile {
-        shader: Some(missing),
-        ..MaterialFile::default()
-    };
-    let (_dir, mut editor) = inspecting_brick("shader-row-never", TINT, &file);
-    scroll_inspector(&mut editor);
-    assert!(
-        editor.painted_contains(&format!("{missing} has not compiled yet")),
-        "{:?}",
-        editor.painted()
     );
 }

@@ -157,7 +157,7 @@ pub fn unused_path(dir: &Path, name: &str) -> String {
 
 /// The selected entities that no other selected entity is an ancestor of, in
 /// selection order.
-fn tops(world: &World, selection: &[Entity]) -> Vec<Entity> {
+pub(super) fn tops(world: &World, selection: &[Entity]) -> Vec<Entity> {
     let selected: FxHashSet<Entity> = selection
         .iter()
         .copied()

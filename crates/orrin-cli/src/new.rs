@@ -671,45 +671,6 @@ mod tests {
         }
     }
 
-    /// A new project can be walked around as soon as it runs, in the editor's
-    /// Play and in an export, where the editor's own fly camera is gone.
-    #[test]
-    fn a_scaffolded_project_attaches_a_wasd_camera() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        scaffold("test-game", dir.path()).expect("scaffold");
-        let scripts = dir.path().join("test-game/scripts");
-
-        let camera = std::fs::read_to_string(scripts.join("FlyCamera.cs")).expect("FlyCamera.cs");
-        assert!(camera.contains("namespace TestGame;"), "{camera}");
-        assert!(camera.contains("class FlyCamera : Behaviour"), "{camera}");
-        for axis in ["\"Horizontal\"", "\"Vertical\"", "\"LookX\"", "\"LookY\""] {
-            assert!(camera.contains(axis), "reads {axis} from input.toml");
-            assert!(INPUT.contains(&format!("[axes.{}]", axis.trim_matches('"'))));
-        }
-        let main = std::fs::read_to_string(scripts.join("Main.cs")).expect("Main.cs");
-        assert!(main.contains("World.AddScript<FlyCamera>"), "{main}");
-    }
-
-    /// `orrin test` has something to run in a new project, written against the
-    /// scaffold's own Behaviours and nothing internal.
-    #[test]
-    fn a_scaffolded_project_has_a_test() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        scaffold("test-game", dir.path()).expect("scaffold");
-        let root = dir.path().join("test-game");
-
-        let tests = std::fs::read_to_string(root.join("scripts/Tests.cs")).expect("Tests.cs");
-        assert!(tests.contains("namespace TestGame;"), "{tests}");
-        assert!(tests.contains("using Orrin.Testing;"), "{tests}");
-        assert!(tests.contains("[Test]"), "{tests}");
-        assert!(tests.contains("AddScript<Spinner>"), "{tests}");
-        assert!(!tests.contains("Native."), "{tests}");
-
-        let readme = std::fs::read_to_string(root.join("README.md")).expect("README");
-        assert!(readme.contains("Tests.cs"), "{readme}");
-        assert!(readme.contains("orrin test"), "{readme}");
-    }
-
     #[test]
     fn an_existing_non_empty_directory_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");

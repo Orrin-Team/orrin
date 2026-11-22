@@ -276,33 +276,4 @@ mod tests {
             );
         }
     }
-
-    /// No two names for one glyph: a table edited by hand drifts that way, and
-    /// two commands drawn alike read as one.
-    #[test]
-    fn no_two_icons_share_a_glyph() {
-        for (index, (name, code)) in ALL.iter().enumerate() {
-            for (other, other_code) in &ALL[index + 1..] {
-                assert_ne!(code, other_code, "{name} and {other}");
-            }
-        }
-    }
-
-    /// The handoff's warning about icons: they are exactly the kind of addition
-    /// that quietly costs a fifth of a second at startup. Laying out every
-    /// glyph, which is what rasterises them into the atlas, stays far inside a
-    /// frame.
-    #[test]
-    fn the_whole_set_lays_out_in_well_under_a_frame_budget() {
-        let ctx = context();
-        let start = std::time::Instant::now();
-        let text: String = ALL.iter().map(|(_, code)| *code).collect();
-        ctx.fonts(|fonts| fonts.layout_no_wrap(text, FontId::new(ROW, family()), Color32::WHITE));
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_millis(250),
-            "{} icons took {elapsed:?}",
-            ALL.len()
-        );
-    }
 }

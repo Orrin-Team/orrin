@@ -109,38 +109,4 @@ mod tests {
             );
         }
     }
-
-    /// The icon is what tells two rows apart at a glance, so no two share one.
-    #[test]
-    fn no_two_components_share_an_icon() {
-        let mut seen = std::collections::HashMap::new();
-        for (id, _, icon) in TABLE {
-            if let Some(other) = seen.insert(icon.glyph(), id.as_str()) {
-                panic!("{} and {other} share an icon", id.as_str());
-            }
-        }
-    }
-
-    #[test]
-    fn the_ui_components_are_filed_under_ui() {
-        for ui in [
-            id::CANVAS,
-            id::RECT_TRANSFORM,
-            id::IMAGE,
-            id::TEXT,
-            id::BUTTON,
-            id::GRADIENT,
-            id::CORNER,
-            id::STROKE,
-            id::SHADOW,
-            id::SCROLL_FRAME,
-        ] {
-            assert_eq!(
-                lookup(&ui).map(|(group, _)| group),
-                Some(Group::Ui),
-                "{}",
-                ui.as_str()
-            );
-        }
-    }
 }

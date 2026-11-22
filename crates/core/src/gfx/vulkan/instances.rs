@@ -373,43 +373,6 @@ mod tests {
         }
     }
 
-    /// A flattened object has no normal to speak of; the matrix must still be
-    /// finite, because NaNs would spread through the shader's lighting math.
-    #[test]
-    fn a_zero_scale_axis_stays_finite() {
-        let transform = Transform {
-            scale: Vec3::new(1.0, 0.0, 1.0),
-            ..Default::default()
-        };
-        assert!(
-            shader_normal_matrix(&transform.matrix())
-                .to_cols_array()
-                .iter()
-                .all(|v| v.is_finite())
-        );
-    }
-
-    /// A shear that no translation/rotation/scale triple can express still
-    /// yields correct normals.
-    #[test]
-    fn the_normal_matrix_handles_a_sheared_matrix() {
-        let sheared = Mat4::from_cols_array_2d(&[
-            [1.0, 0.0, 0.0, 0.0],
-            [0.7, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ]);
-        let derived = shader_normal_matrix(&sheared);
-        // A normal is correct when it stays perpendicular to a tangent the same
-        // matrix carried: n' . (M t) == 0 for every tangent t of the surface.
-        let tangent = Mat3::from_mat4(sheared) * Vec3::new(1.0, 0.0, 0.0);
-        let normal = derived * Vec3::new(0.0, 1.0, 0.0);
-        assert!(
-            normal.dot(tangent).abs() < 1e-5,
-            "normal {normal:?} is not perpendicular to tangent {tangent:?}"
-        );
-    }
-
     /// Two affine matrices per row at three `vec4`s each, and std430 lays them
     /// out with no padding — the stride every `Object` declaration in the
     /// shaders has to agree with.

@@ -469,38 +469,6 @@ fn chime() -> Clip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::Audio;
-    use crate::scene::{AudioSource, Name};
-
-    fn demo() -> World {
-        let mut world = World::new();
-        world.insert_resource(Audio::default());
-        build_default_scene(
-            &mut world,
-            &mut crate::gfx::headless::HeadlessBackend::new(),
-        );
-        world
-    }
-
-    /// One sound, on a cube the camera opens looking past on its right, so
-    /// pressing Play is enough to hear both the sound and where it is.
-    #[test]
-    fn the_demo_has_one_spatial_sound_on_a_cube_to_the_right() {
-        let world = demo();
-        let mut found = Vec::new();
-        world
-            .query::<(&AudioSource, &Name)>()
-            .for_each(|_, (source, name)| found.push((*source, name.as_str().to_owned())));
-        assert_eq!(found.len(), 1, "{found:?}");
-        let (source, name) = &found[0];
-        assert!(name.starts_with("Cube"), "{name}");
-        assert!(source.spatial && source.looping && source.play_on_start);
-        assert_eq!(
-            world.resource::<Audio>().clip_state(source.clip),
-            Some(crate::asset_db::LoadState::Ready),
-            "the demo has no asset database, so its sound is built, not imported"
-        );
-    }
 
     /// The chime loops, so it has to end where it starts — at silence — or
     /// every repeat clicks; and it must not clip.

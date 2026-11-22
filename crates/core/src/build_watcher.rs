@@ -19,7 +19,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use orrin_ecs::World;
 
-use crate::scene::{LogBuffer, LogLevel, Time};
+use crate::scene::{LogBuffer, LogEntry, LogLevel, Time};
 
 /// How long the scripts directory must stay quiet before a rebuild starts.
 /// Long enough to coalesce a "save all" across several files, short enough that
@@ -71,8 +71,35 @@ impl BuildEvent {
                     "script build failed; still running the previous build".to_owned(),
                     frame,
                 );
+                // Attributed as a script's own line is — the file's name and
+                // the line — so the console links it to the file.
                 for line in diagnostics.iter().take(MAX_DIAGNOSTICS) {
-                    log.push(LogLevel::Error, line.clone(), frame);
+                    let entry = match locate(line) {
+                        Some(at) => LogEntry {
+                            level: if at.message.starts_with("warning") {
+                                LogLevel::Warning
+                            } else {
+                                LogLevel::Error
+                            },
+                            message: at.message.to_owned(),
+                            source: Path::new(at.path)
+                                .file_stem()
+                                .map_or_else(String::new, |stem| {
+                                    stem.to_string_lossy().into_owned()
+                                })
+                                .into(),
+                            line: at.line,
+                            frame,
+                        },
+                        None => LogEntry {
+                            level: LogLevel::Error,
+                            message: line.clone(),
+                            source: "".into(),
+                            line: 0,
+                            frame,
+                        },
+                    };
+                    log.push_entry(entry);
                 }
                 if diagnostics.len() > MAX_DIAGNOSTICS {
                     let hidden = diagnostics.len() - MAX_DIAGNOSTICS;
@@ -348,6 +375,37 @@ fn should_build(pending_since: Option<Instant>, building: bool, now: Instant) ->
     !building && pending_since.is_some_and(|since| now.saturating_duration_since(since) >= DEBOUNCE)
 }
 
+/// Where a compiler diagnostic points, and what it says there.
+pub struct Located<'a> {
+    pub path: &'a str,
+    pub line: u32,
+    /// From `error`/`warning` on: `error CS0103: The name 'x' does not exist`.
+    pub message: &'a str,
+}
+
+/// The file and line in MSBuild's `path(line,col): error CS0103: message`.
+/// `None` for a line that names no line in a file — the compiler's own
+/// `CSC : error …`, or MSBuild's about the project — which is still a
+/// diagnostic, just not one to open.
+///
+/// Found from the `: error ` or `: warning ` back, not from the path forward:
+/// a Windows path has a colon of its own.
+pub fn locate(diagnostic: &str) -> Option<Located<'_>> {
+    let at = [": error ", ": warning "]
+        .into_iter()
+        .filter_map(|kind| diagnostic.find(kind))
+        .min()?;
+    let place = diagnostic[..at].strip_suffix(')')?;
+    let open = place.rfind('(')?;
+    let line = place[open + 1..].split(',').next()?.trim().parse().ok()?;
+    let path = place[..open].trim();
+    (!path.is_empty()).then_some(Located {
+        path,
+        line,
+        message: &diagnostic[at + 2..],
+    })
+}
+
 fn failure_lines(report: &orrin_build::Report) -> Vec<String> {
     let diagnostics = report.diagnostics();
     if diagnostics.is_empty() {
@@ -474,6 +532,76 @@ mod tests {
 
         assert!(!is_script_source(root, &root.join("readme.md")));
         assert!(!is_script_source(root, &root.join(".#Player.cs")));
+    }
+
+    #[test]
+    fn a_diagnostic_names_its_file_and_line() {
+        let windows =
+            locate(r"C:\proj\scripts\Player.cs(12,9): error CS0103: The name 'x' does not exist")
+                .expect("parses");
+        assert_eq!(windows.path, r"C:\proj\scripts\Player.cs");
+        assert_eq!(windows.line, 12);
+        assert_eq!(windows.message, "error CS0103: The name 'x' does not exist");
+
+        let unix = locate("/p/Enemies/Brain.Movement.cs(3): warning CS0168: unused").unwrap();
+        assert_eq!(
+            (unix.path, unix.line, unix.message),
+            ("/p/Enemies/Brain.Movement.cs", 3, "warning CS0168: unused")
+        );
+
+        // The compiler's own complaints, and MSBuild's, name no line.
+        assert!(locate("CSC : error CS2001: Source file 'x.cs' could not be found").is_none());
+        assert!(locate("MSB4236: The SDK 'Bogus' was not found.").is_none());
+        assert!(locate("/p/Game.csproj : error MSB4025: not valid XML").is_none());
+    }
+
+    /// Each line once per build, attributed as a script's own message is, so
+    /// the console's link opens it; a line that names no file still goes in.
+    #[test]
+    fn a_failed_build_logs_each_diagnostic_against_its_file() {
+        let mut log = LogBuffer::default();
+        BuildEvent::Failed {
+            diagnostics: vec![
+                "/p/Player.cs(12,9): error CS0103: The name 'x' does not exist".to_owned(),
+                "/p/Enemy.cs(4,1): warning CS0168: unused".to_owned(),
+                "CSC : error CS2001: Source file 'x.cs' could not be found".to_owned(),
+            ],
+        }
+        .log_into(&mut log, 7);
+
+        let entries: Vec<_> = log
+            .iter()
+            .map(|e| (e.level, e.source.to_string(), e.line, e.message.clone()))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                (
+                    LogLevel::Error,
+                    String::new(),
+                    0,
+                    "script build failed; still running the previous build".to_owned()
+                ),
+                (
+                    LogLevel::Error,
+                    "Player".to_owned(),
+                    12,
+                    "error CS0103: The name 'x' does not exist".to_owned()
+                ),
+                (
+                    LogLevel::Warning,
+                    "Enemy".to_owned(),
+                    4,
+                    "warning CS0168: unused".to_owned()
+                ),
+                (
+                    LogLevel::Error,
+                    String::new(),
+                    0,
+                    "CSC : error CS2001: Source file 'x.cs' could not be found".to_owned()
+                ),
+            ]
+        );
     }
 
     #[test]

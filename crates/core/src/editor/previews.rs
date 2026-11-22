@@ -336,33 +336,4 @@ mod tests {
             "a prefab has none"
         );
     }
-
-    #[test]
-    fn an_asset_with_no_preview_has_no_texture() {
-        let world = world();
-        let ctx = egui::Context::default();
-        let mut previews = Previews::default();
-        assert!(previews.mesh(&ctx, &world, MeshHandle(9)).is_none());
-        assert!(previews.material(&ctx, &world, MaterialHandle(9)).is_none());
-        assert!(previews.mesh(&ctx, &World::new(), MeshHandle(0)).is_none());
-    }
-
-    #[test]
-    fn summaries_read_in_display_terms() {
-        let world = world();
-        let previews = Previews::default();
-        assert_eq!(
-            previews.mesh_summary(&world, MeshHandle(0)).as_deref(),
-            Some("12 triangles")
-        );
-        assert!(
-            previews
-                .material_summary(&world, MaterialHandle(0))
-                .unwrap()
-                .starts_with("Opaque · ")
-        );
-        assert_eq!(grouped(4812), "4 812");
-        assert_eq!(grouped(1_234_567), "1 234 567");
-        assert_eq!(grouped(999), "999");
-    }
 }

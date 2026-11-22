@@ -81,8 +81,9 @@ impl FrameStats {
         }
     }
 
-    /// The graphics API and the adapter, as one line for the status bar. Set
-    /// once, when the renderer is created; a headless run has none.
+    /// The graphics API and the adapter, as one line for the status bar's
+    /// hover text. Set once, when the renderer is created; a headless run has
+    /// none.
     pub fn set_device(&mut self, device: String) {
         self.device = Some(device);
     }

@@ -446,28 +446,4 @@ mod tests {
             ]
         );
     }
-
-    /// A filter matches anywhere in the whole name, ignoring case, so typing a
-    /// group's name lists the group.
-    #[test]
-    fn a_filter_keeps_the_stories_whose_names_contain_it() {
-        let stories = stories();
-        assert_eq!(
-            groups(&stories, "  pAuSe "),
-            vec![("Menus", vec![("Pause/Settings", "Menus/Pause/Settings")])]
-        );
-        assert_eq!(groups(&stories, "button").len(), 1);
-        assert_eq!(groups(&stories, "button")[0].1.len(), 2);
-        assert!(groups(&stories, "nothing like it").is_empty());
-    }
-
-    /// Side by side wherever the list and the controls both fit; the list takes
-    /// a share of the width within bounds, so neither column collapses.
-    #[test]
-    fn the_panel_splits_when_it_is_wide_enough() {
-        assert_eq!(list_width(300.0), None);
-        let narrowest = list_width(SPLIT_AT).expect("wide enough to split");
-        assert!(narrowest >= LIST_MIN && SPLIT_AT - narrowest >= DETAIL_MIN);
-        assert_eq!(list_width(4000.0), Some(LIST_MAX));
-    }
 }

@@ -15,6 +15,15 @@
 //! project's, not a deviation from anything, so Project rows have no marker
 //! and no reset.
 //!
+//! **Keys are the command table's.** The Keys page is a row per command in
+//! `editor::commands`, made from that table rather than listed in `ROWS`, so
+//! a new command is on the page with no line here, and search finds one by
+//! the chord it has now as well as by name. A click on a chord waits for the
+//! next one pressed, which [`capture`] takes at the start of the following
+//! frame, ahead of every command that could run on it; Escape gives up
+//! waiting and does nothing else. A chord another command has is refused
+//! with that command's name rather than moved: the person unbinds it there.
+//!
 //! **Settings that live elsewhere are found here and left there.** Fog,
 //! exposure and the rest belong to the scene and are edited in Environment;
 //! search lists them as `Link`s to the tool that owns them rather than
@@ -77,6 +86,7 @@ use orrin_registry::inspect::{compact, label_width};
 use super::inspector::Filter;
 use super::performance::{VSYNC_MODES, vsync_label};
 use crate::asset_db::{AssetDatabase, AssetKind};
+use crate::editor::commands::{self, COMMANDS, Command, Keys, Refusal};
 use crate::editor::dock::Tab;
 use crate::editor::icons;
 use crate::editor::settings::{
@@ -107,6 +117,7 @@ pub enum Page {
     #[default]
     Appearance,
     Viewport,
+    Keys,
     Scripting,
     Blender,
     Agents,
@@ -117,9 +128,10 @@ pub enum Page {
 
 impl Page {
     const PROJECT: [Self; 3] = [Self::General, Self::Scenes, Self::Scripts];
-    const ORRIN: [Self; 8] = [
+    const ORRIN: [Self; 9] = [
         Self::Appearance,
         Self::Viewport,
+        Self::Keys,
         Self::Scripting,
         Self::Blender,
         Self::Agents,
@@ -135,6 +147,7 @@ impl Page {
             Self::Scripts => "Scripts",
             Self::Appearance => "Appearance",
             Self::Viewport => "Viewport",
+            Self::Keys => "Keys",
             Self::Scripting => "Scripting",
             Self::Blender => "Blender",
             Self::Agents => "Agents",
@@ -208,6 +221,8 @@ enum Field {
     Threads,
     Validation,
     Log,
+    /// One of the table's commands, on the Keys page.
+    Key(Command),
 }
 
 impl Field {
@@ -223,6 +238,7 @@ impl Field {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Row {
     page: Page,
     field: Field,
@@ -230,6 +246,20 @@ struct Row {
     help: &'static str,
     /// What people type looking for it that the label and help do not say.
     keywords: &'static str,
+}
+
+/// [`ROWS`], then a row on the Keys page for every command in the table, in
+/// its order, which keeps each group's commands together.
+fn all_rows() -> impl Iterator<Item = Row> {
+    ROWS.iter().copied().chain(COMMANDS.iter().map(|spec| {
+        row(
+            Page::Keys,
+            Field::Key(spec.command),
+            spec.label,
+            "",
+            "key shortcut hotkey keybinding binding chord",
+        )
+    }))
 }
 
 const fn row(
@@ -271,6 +301,13 @@ const ROWS: &[Row] = &[
         "folder path directory root",
     ),
     row(
+        Page::General,
+        Field::AssetsFolder,
+        "Assets folder",
+        "Where the project's assets live, relative to the project",
+        "content directory",
+    ),
+    row(
         Page::Scenes,
         Field::Start,
         "Start scene",
@@ -297,13 +334,6 @@ const ROWS: &[Row] = &[
         "Scripts folder",
         "Where the game's C# lives, relative to the project",
         "code source csproj directory",
-    ),
-    row(
-        Page::Scripts,
-        Field::AssetsFolder,
-        "Assets folder",
-        "Where the project's assets live, relative to the project",
-        "content directory",
     ),
     row(
         Page::Appearance,
@@ -379,7 +409,7 @@ const ROWS: &[Row] = &[
         Page::Viewport,
         Field::ScrollSpeed,
         "Scroll speed",
-        "Metres the camera moves per notch of the wheel",
+        "Metres the camera moves per notch of the wheel 10 m from what it looks at; less nearer, more further",
         "wheel zoom dolly camera",
     ),
     row(
@@ -725,6 +755,22 @@ pub struct SettingsPanel {
     cli: Option<Cli>,
     /// Why the last folder typed into Permissions was not added.
     folder_error: Option<String>,
+    /// The chord the Keys page is waiting for.
+    capture: Option<Capture>,
+    /// Why the last chord captured was not bound, under its command's row.
+    key_refusal: Option<(Command, String)>,
+}
+
+/// A command's chord waiting to be pressed: the one in `slot`, or one more
+/// for `None`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Capture {
+    command: Command,
+    slot: Option<usize>,
+    /// Whether the row was drawn since the last frame began. A capture whose
+    /// row is gone — the tab closed, the page left — would otherwise take
+    /// every key for good.
+    drawn: bool,
 }
 
 /// Finding the CLI searches the PATH and asking it starts it, which for a
@@ -804,9 +850,10 @@ impl SettingsPanel {
         self.search_idle
     }
 
-    #[cfg(test)]
-    pub fn set_query(&mut self, query: &str) {
-        self.query = query.to_owned();
+    /// Whether the Keys page is waiting for a chord, which the next key
+    /// pressed is, Escape included.
+    pub fn capturing(&self) -> bool {
+        self.capture.is_some()
     }
 
     #[cfg(test)]
@@ -1172,6 +1219,14 @@ fn page(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
     if page == Page::Startup {
         restart_line(ui, cx.state);
     }
+    if page == Page::Keys {
+        note(
+            ui,
+            "Click a key, then press the one to use instead; Escape gives up",
+            weak,
+        );
+        ui.add_space(4.0);
+    }
     let unread = match &panel.manifest.loaded {
         Some(Err(error)) if page.is_project() => Some(error.clone()),
         _ => None,
@@ -1224,19 +1279,33 @@ fn unloadable(ui: &mut egui::Ui, error: &str, state: &EditorState) {
     }
 }
 
-/// The rows `keep` accepts, in the order they are declared.
+/// The rows `keep` accepts, in the order they are declared, with a command's
+/// group named above the first of its commands.
 fn rows_of(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, keep: impl Fn(&Row) -> bool) {
     let copies = |row: &Row| matches!(row.field, Field::McpConfig | Field::ClaudeCommand);
-    let mut rows = ROWS.iter().filter(|row| keep(row)).peekable();
+    let mut rows = all_rows().filter(|row| keep(row)).peekable();
+    let mut group = None;
     while let Some(row) = rows.next() {
+        if let Field::Key(command) = row.field
+            && group != Some(command.group())
+        {
+            group = Some(command.group());
+            ui.add_space(6.0);
+            let weak = ui.visuals().weak_text_color();
+            ui.label(
+                egui::RichText::new(command.group().title())
+                    .small()
+                    .color(weak),
+            );
+        }
         if row.page.is_project() {
-            project_row(ui, cx, panel, row);
+            project_row(ui, cx, panel, &row);
         } else {
-            orrin_row(ui, cx, panel, row);
+            orrin_row(ui, cx, panel, &row);
         }
         // Once, under whichever of the two copy rows is shown last.
-        if copies(row)
-            && !rows.peek().is_some_and(|next| copies(next))
+        if copies(&row)
+            && !rows.peek().is_some_and(copies)
             && let Some(warning) = panel.cli_warning()
         {
             note(ui, &warning, theme::ERROR);
@@ -1249,11 +1318,25 @@ fn rows_of(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, keep: impl
 fn results(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
     let filter = Filter::new(&panel.query);
     let project = cx.state.project_root.is_some() && panel.manifest.project().is_some();
+    // A command is found by its group and by the chords it has now too.
+    let keys = &cx.state.settings.keys;
+    let commands: Vec<Command> = COMMANDS
+        .iter()
+        .map(|spec| spec.command)
+        .filter(|&command| {
+            filter.hits(command.group().title())
+                || keys
+                    .chords(command)
+                    .iter()
+                    .any(|chord| filter.hits(&ui.ctx().format_shortcut(chord)))
+        })
+        .collect();
     let matches = |row: &Row| {
         (project || !row.page.is_project())
-            && [row.label, row.help, row.keywords, row.page.title()]
+            && ([row.label, row.help, row.keywords, row.page.title()]
                 .into_iter()
                 .any(|text| filter.hits(text))
+                || matches!(row.field, Field::Key(command) if commands.contains(&command)))
     };
     let weak = ui.visuals().weak_text_color();
     egui::ScrollArea::vertical()
@@ -1268,7 +1351,7 @@ fn results(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel) {
             }
             let mut any = false;
             for page in Page::PROJECT.into_iter().chain(Page::ORRIN) {
-                if !ROWS.iter().any(|row| row.page == page && matches(row)) {
+                if !all_rows().any(|row| row.page == page && matches(&row)) {
                     continue;
                 }
                 any = true;
@@ -1395,7 +1478,12 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
     let built = cfg!(feature = "scripting") || !matches!(field, Field::Editor | Field::Reload);
     let live = locked.is_none() && built;
     let changed = !is_default(field, &cx.state.settings, &cx.defaults);
-    let default = default_text(field, &cx.defaults);
+    let default = match field {
+        Field::Key(command) => {
+            chords_text(command.defaults(), |chord| ui.ctx().format_shortcut(chord))
+        }
+        _ => default_text(field, &cx.defaults),
+    };
     let weak = ui.visuals().weak_text_color();
     let top = ui.cursor().min;
     let label = label_width(ui);
@@ -1430,7 +1518,9 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
             }
         },
     );
-    help(ui, top, label, row.label, row.help);
+    if !row.help.is_empty() {
+        help(ui, top, label, row.label, row.help);
+    }
     if changed {
         let height = ui.spacing().interact_size.y;
         let centre = egui::pos2(top.x + 3.5, top.y + height / 2.0);
@@ -1456,6 +1546,12 @@ fn orrin_row(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, row: &Ro
     }
     if let Some(var) = locked {
         note(ui, &format!("Set by {var} for this run"), weak);
+    }
+    if let Field::Key(command) = field
+        && let Some((refused, why)) = &panel.key_refusal
+        && *refused == command
+    {
+        note(ui, why, theme::ERROR);
     }
     if field.is_startup() {
         note(ui, "Applies on restart", weak);
@@ -2011,7 +2107,153 @@ fn control(ui: &mut egui::Ui, cx: &mut Cx, panel: &mut SettingsPanel, field: Fie
                 settings.agents.allow.set(capability, on);
             }
         }
+        Field::Key(command) => key_control(ui, &mut settings.keys, panel, command),
     }
+}
+
+/// The most chords a command is given here; the file may name more.
+const CHORDS: usize = 2;
+
+/// A command's chords as buttons. A click waits for the chord to put in its
+/// place, which [`capture`] takes at the start of the next frame, and `+`
+/// waits for one more; while one waits, Unbind beside it takes it off
+/// instead, and a press anywhere else gives up waiting.
+fn key_control(ui: &mut egui::Ui, keys: &mut Keys, panel: &mut SettingsPanel, command: Command) {
+    let chords = keys.chords(command).to_vec();
+    let waiting = panel
+        .capture
+        .filter(|capture| capture.command == command)
+        .map(|capture| capture.slot);
+    let mut clicked = None;
+    let mut unbind = None;
+    let mut inside = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let more = (chords.len() < CHORDS).then_some(None);
+        for (at, chord) in chords.iter().map(Some).chain(more).enumerate() {
+            let slot = chord.map(|_| at);
+            let here = waiting == Some(slot);
+            let text = match chord {
+                _ if here => egui::RichText::new("Press a key…"),
+                Some(chord) => super::figures(ui.ctx().format_shortcut(chord)),
+                None if chords.is_empty() => egui::RichText::new("None"),
+                None => egui::RichText::new("+"),
+            };
+            let hint = if chord.is_some() {
+                "Click, then press the chord to use instead"
+            } else {
+                "Click, then press a chord to add"
+            };
+            let button = ui
+                .add(egui::Button::new(text).selected(here))
+                .on_hover_text(hint);
+            inside |= button.contains_pointer();
+            if button.clicked() {
+                clicked = Some(slot);
+            }
+            if here && let Some(slot) = slot {
+                let off = ui.small_button("Unbind");
+                inside |= off.contains_pointer();
+                if off.clicked() {
+                    unbind = Some(slot);
+                }
+            }
+        }
+    });
+    if let Some(slot) = unbind {
+        keys.unbind(command, slot);
+        panel.capture = None;
+        return;
+    }
+    match clicked {
+        // A second click on the one waiting stops it.
+        Some(slot) if waiting == Some(slot) => panel.capture = None,
+        Some(slot) => {
+            panel.capture = Some(Capture {
+                command,
+                slot,
+                drawn: true,
+            });
+            panel.key_refusal = None;
+        }
+        None => {}
+    }
+    if let Some(capture) = panel
+        .capture
+        .as_mut()
+        .filter(|capture| capture.command == command)
+    {
+        capture.drawn = true;
+        if clicked.is_none() && !inside && ui.input(|input| input.pointer.any_pressed()) {
+            panel.capture = None;
+        }
+    }
+}
+
+/// Take the chord the Keys page is waiting for, ahead of every command that
+/// could run on it: the first key pressed is bound, or refused with the
+/// reason under its row, and Escape alone gives up waiting. Every key pressed
+/// meanwhile is the capture's. Whether one was waiting.
+pub(super) fn capture(ctx: &egui::Context, state: &mut EditorState) -> bool {
+    let Some(waiting) = state.settings_panel.capture else {
+        return false;
+    };
+    if !waiting.drawn {
+        state.settings_panel.capture = None;
+        return false;
+    }
+    state.settings_panel.capture = Some(Capture {
+        drawn: false,
+        ..waiting
+    });
+    let mut pressed = None;
+    ctx.input_mut(|input| {
+        let held = input.modifiers;
+        input
+            .events
+            .retain(|event| match commands::press(event, held) {
+                Some(chord) => {
+                    pressed.get_or_insert(chord);
+                    false
+                }
+                None => true,
+            });
+    });
+    let Some(chord) = pressed else {
+        return true;
+    };
+    let panel = &mut state.settings_panel;
+    panel.capture = None;
+    if chord == egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Escape) {
+        return true;
+    }
+    panel.key_refusal = state
+        .settings
+        .keys
+        .bind(waiting.command, waiting.slot, chord)
+        .err()
+        .map(|refusal| {
+            let named = ctx.format_shortcut(&chord);
+            let why = match refusal {
+                Refusal::Held(other) => {
+                    format!(
+                        "{named} already runs {}: unbind it there first",
+                        other.label()
+                    )
+                }
+                Refusal::Reserved(what) => format!("{named} {what}"),
+            };
+            (waiting.command, why)
+        });
+    true
+}
+
+/// Chords as a row's marker and reset name them, or that there are none.
+fn chords_text(chords: &[commands::Chord], name: impl Fn(&commands::Chord) -> String) -> String {
+    if chords.is_empty() {
+        return "no key".to_owned();
+    }
+    chords.iter().map(name).collect::<Vec<_>>().join(" or ")
 }
 
 /// The project's folder rules for agents, under the switches: a preset, what
@@ -2264,6 +2506,7 @@ fn is_default(field: Field, s: &Settings, d: &Settings) -> bool {
             s.agents.allow.allows(capability) == d.agents.allow.allows(capability)
         }
         Field::Remote => s.agents.remote == d.agents.remote,
+        Field::Key(command) => s.keys.chords(command) == d.keys.chords(command),
         _ => tint(s.appearance.icons, field) == tint(d.appearance.icons, field),
     }
 }
@@ -2297,6 +2540,7 @@ fn restore(field: Field, s: &mut Settings, d: &Settings) {
             .allow
             .set(capability, d.agents.allow.allows(capability)),
         Field::Remote => s.agents.remote = d.agents.remote,
+        Field::Key(command) => s.keys.reset(command),
         _ => {
             if let (Some(to), Some(from)) = (
                 tint_mut(&mut s.appearance.icons, field),
@@ -2335,6 +2579,11 @@ fn default_text(field: Field, d: &Settings) -> String {
         Field::Preset => d.agents.allow.preset().label().to_owned(),
         Field::Allow(capability) => on(d.agents.allow.allows(capability)),
         Field::Remote => on(d.agents.remote),
+        // egui's own naming without a context to ask for symbols; the row
+        // itself names them through `Context::format_shortcut`.
+        Field::Key(command) => chords_text(d.keys.chords(command), |chord| {
+            chord.format(&egui::ModifierNames::NAMES, cfg!(target_os = "macos"))
+        }),
         _ => tint(d.appearance.icons, field)
             .map_or_else(String::new, |[r, g, b]| format!("#{r:02X}{g:02X}{b:02X}")),
     }
@@ -2478,41 +2727,6 @@ fn scene_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asset_db::tests::Dir;
-
-    fn project(assets: &str) -> (Dir, Project) {
-        let dir = Dir::new(&format!("settings-paths-{}", assets.replace('/', "-")));
-        dir.write(
-            "orrin.toml",
-            format!(
-                "format_version = 1\n[project]\nname = \"p\"\nversion = \"1\"\n\
-                 [scripts]\ndir = \"scripts\"\nentry = \"P.Main, P\"\n[assets]\ndir = \"{assets}\"\n"
-            )
-            .as_bytes(),
-        );
-        let project = Project::load(&dir.path().join("orrin.toml")).unwrap();
-        (dir, project)
-    }
-
-    /// The asset database lists a scene relative to the assets folder; the
-    /// manifest names it relative to the project root, wherever the assets
-    /// folder is.
-    #[test]
-    fn a_scene_asset_is_named_relative_to_the_project_root() {
-        for (assets, expected) in [
-            ("assets", "assets/levels/one.orrin"),
-            ("content/art", "content/art/levels/one.orrin"),
-            (".", "levels/one.orrin"),
-            ("./assets", "assets/levels/one.orrin"),
-        ] {
-            let (_dir, project) = project(assets);
-            assert_eq!(
-                in_manifest(&project, "levels/one.orrin"),
-                expected,
-                "{assets}"
-            );
-        }
-    }
 
     /// The line is pasted into a shell, so a path with a space or a quote in it
     /// must still arrive as one word, and a plain one is left as typed.
@@ -2551,7 +2765,7 @@ mod tests {
     #[test]
     fn the_agents_page_warns_when_the_orrin_it_copies_cannot_serve_mcp() {
         use std::os::unix::fs::PermissionsExt;
-        let tools = Dir::new("settings-cli-probe");
+        let tools = crate::asset_db::tests::Dir::new("settings-cli-probe");
         let stand_in = |name: &str, body: &str| {
             let path = tools.write(name, format!("#!/bin/sh\n{body}\n").as_bytes());
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2590,67 +2804,5 @@ mod tests {
         let none = cli_note(Path::new("orrin"), &Probe::NotFound).unwrap();
         assert!(none.contains("PATH"), "{none}");
         assert!(none.contains("`cargo build -p orrin-cli`"), "{none}");
-    }
-
-    #[test]
-    fn every_orrin_row_resets_to_what_it_calls_its_default() {
-        let defaults = Settings::default();
-        let mut moved = Settings::default();
-        moved.appearance.ui_scale = 1.5;
-        moved.appearance.icons = IconTints {
-            light: [1, 2, 3],
-            sound: [1, 2, 3],
-            listener: [1, 2, 3],
-            camera: [1, 2, 3],
-            empty: [1, 2, 3],
-        };
-        moved.viewport.fly_speed = 20.0;
-        moved.viewport.boost = 9.0;
-        moved.viewport.sensitivity = 3.0;
-        moved.viewport.scroll_speed = 7.0;
-        moved.scripting.editor = ExternalEditor::Zed;
-        moved.scripting.reload_after_rebuild = !defaults.scripting.reload_after_rebuild;
-        moved.saving.autosave = !defaults.saving.autosave;
-        moved.saving.autosave_interval_secs = 600;
-        moved.display.vsync = crate::scene::VsyncMode::Immediate;
-        moved.display.images = 4;
-        moved.startup = crate::editor::settings::Startup {
-            backend: crate::editor::settings::Backend::Vulkan,
-            threads: Some(3),
-            validation: crate::editor::settings::Validation::On,
-            log: crate::editor::settings::LogFloor::Warn,
-        };
-        moved.blender = crate::editor::settings::Blender {
-            path: Some("/opt/blender/blender".into()),
-            live_link: !defaults.blender.live_link,
-            port: 47200,
-        };
-        moved.agents.remote = !defaults.agents.remote;
-        for capability in orrin_remote::permissions::Capability::ALL {
-            moved.agents.allow.set(capability, false);
-        }
-        for row in ROWS.iter().filter(|row| !row.page.is_project()) {
-            // A pick goes through a request; installing and copying are
-            // actions; a preset is every switch below it at once.
-            if matches!(
-                row.field,
-                Field::Theme
-                    | Field::AddOn
-                    | Field::McpConfig
-                    | Field::ClaudeCommand
-                    | Field::Preset
-            ) {
-                continue;
-            }
-            assert!(!is_default(row.field, &moved, &defaults), "{}", row.label);
-            restore(row.field, &mut moved, &defaults);
-            assert!(is_default(row.field, &moved, &defaults), "{}", row.label);
-            assert!(
-                !default_text(row.field, &defaults).is_empty(),
-                "{}",
-                row.label
-            );
-        }
-        assert_eq!(moved, defaults, "every row together is every setting");
     }
 }

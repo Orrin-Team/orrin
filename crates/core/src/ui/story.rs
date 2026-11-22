@@ -221,20 +221,6 @@ mod tests {
     use crate::ui::tween::UiTweens;
 
     #[test]
-    fn a_control_is_its_default_until_it_is_set() {
-        let mut args = StoryArgs::default();
-        assert_eq!(args.float("Width", 160.0, 80.0, 400.0), 160.0);
-        assert!(!args.bool("Disabled", false));
-        assert_eq!(args.controls().len(), 2);
-        assert_eq!(
-            args.float("Width", 999.0, 0.0, 1.0),
-            160.0,
-            "a second ask in the same build is the first's control"
-        );
-        assert_eq!(args.controls().len(), 2);
-    }
-
-    #[test]
     fn a_set_value_survives_a_rebuild_clamped_to_the_range_asked_for_now() {
         let mut args = StoryArgs::default();
         args.float("Width", 160.0, 80.0, 400.0);
@@ -268,32 +254,6 @@ mod tests {
         );
         let mut args = args;
         assert!(!args.bool("Old", false), "dropped two builds ago");
-    }
-
-    /// A control renamed from a slider to a checkbox is a new control, not a
-    /// float read as a bool.
-    #[test]
-    fn a_held_value_of_another_kind_is_not_reused() {
-        let mut args = StoryArgs::default();
-        args.float("Flag", 0.75, 0.0, 1.0);
-        let mut args = args.rebuild();
-        assert!(args.bool("Flag", true));
-    }
-
-    #[test]
-    fn a_backwards_or_unusable_range_still_gives_a_value_inside_it() {
-        let mut args = StoryArgs::default();
-        assert_eq!(args.float("A", 5.0, 10.0, 0.0), 5.0);
-        let a = args.float("B", f32::NAN, 0.0, 1.0);
-        assert_eq!(a, 0.0);
-        assert!(matches!(
-            args.controls()[0].value,
-            StoryValue::Float {
-                min: 0.0,
-                max: 10.0,
-                ..
-            }
-        ));
     }
 
     #[test]

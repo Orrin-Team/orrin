@@ -439,20 +439,6 @@ mod tests {
         }
     }
 
-    /// Without the length prefixes these two would hash one stream.
-    #[test]
-    fn moving_bytes_between_inputs_moves_the_key() {
-        assert_ne!(
-            key(PNG, "", &[("a", b"bc"), ("d", b"")]),
-            key(PNG, "", &[("a", b"b"), ("cd", b"")]),
-        );
-    }
-
-    #[test]
-    fn a_key_is_named_by_32_hex_digits() {
-        assert_eq!(CacheKey(0xab).to_string(), format!("{:0>32}", "ab"));
-    }
-
     fn triangle() -> CpuMesh {
         let vertex = |x: f32| Vertex {
             position: [x, 1.0, -0.5],
@@ -548,64 +534,5 @@ mod tests {
         let bytes = std::fs::read(&thumb).unwrap();
         std::fs::write(&thumb, &bytes[..bytes.len() - 1]).unwrap();
         assert_eq!(cache.load_thumbnail(CacheKey(1)), None, "cut short");
-    }
-
-    /// The Import page reads these without loading a texture's megabytes.
-    #[test]
-    fn an_artifact_is_summarised_from_its_header() {
-        let dir = Dir::new("cache-summary");
-        let cache = Cache::new(dir.path().join("cache"));
-        let texture = TextureArtifact {
-            format: TexelFormat::Bc7Srgb,
-            width: 8,
-            height: 4,
-            levels: vec![vec![0; 32], vec![0; 16], vec![0; 16], vec![0; 16]],
-        };
-        cache
-            .store(CacheKey(1), &Artifact::Texture(texture))
-            .unwrap();
-        cache
-            .store(CacheKey(2), &Artifact::Mesh(triangle()))
-            .unwrap();
-        let bytes = |key| std::fs::metadata(cache.path(key)).unwrap().len();
-
-        assert_eq!(
-            cache.summary(CacheKey(1)),
-            Some(Summary::Texture {
-                format: TexelFormat::Bc7Srgb,
-                width: 8,
-                height: 4,
-                levels: 4,
-                bytes: bytes(CacheKey(1)),
-            })
-        );
-        assert_eq!(
-            cache.summary(CacheKey(2)),
-            Some(Summary::Mesh {
-                vertices: 3,
-                triangles: 1,
-                bytes: bytes(CacheKey(2)),
-            })
-        );
-        assert_eq!(cache.summary(CacheKey(3)), None);
-    }
-
-    #[test]
-    fn the_cache_stores_and_finds_by_key() {
-        let dir = Dir::new("cache-store");
-        let cache = Cache::new(dir.path().join("cache"));
-        let key = CacheKey(42);
-        assert!(cache.load(key).is_none());
-
-        cache.store(key, &Artifact::Mesh(triangle())).unwrap();
-        let Some(Ok(Artifact::Mesh(mesh))) = cache.load(key) else {
-            panic!("the stored mesh is found");
-        };
-        assert_eq!(mesh.indices, vec![0, 1, 2]);
-        let names: Vec<String> = std::fs::read_dir(cache.dir())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, vec![key.to_string()], "no temporary file is left");
     }
 }

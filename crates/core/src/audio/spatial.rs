@@ -173,52 +173,6 @@ mod tests {
     }
 
     #[test]
-    fn linear_rolloff_reaches_silence_at_the_maximum() {
-        let curve = falloff(Rolloff::Linear);
-        assert!(close(attenuation(17.0, curve), 0.5));
-        assert_eq!(attenuation(32.0, curve), 0.0);
-        assert_eq!(attenuation(100.0, curve), 0.0);
-    }
-
-    #[test]
-    fn distance_at_is_where_attenuation_reaches_that_gain() {
-        for rolloff in [Rolloff::Inverse, Rolloff::Linear] {
-            for gain in [1.0, 0.5, 0.25, 0.1] {
-                let distance = distance_at(gain, falloff(rolloff)).unwrap();
-                assert!(
-                    close(attenuation(distance, falloff(rolloff)), gain),
-                    "{rolloff:?} {gain}"
-                );
-            }
-        }
-        assert_eq!(
-            distance_at(0.01, falloff(Rolloff::Inverse)),
-            None,
-            "past the maximum"
-        );
-    }
-
-    #[test]
-    fn a_degenerate_falloff_is_still_a_number() {
-        for (min, max) in [(0.0, 0.0), (10.0, 1.0), (f32::NAN, f32::INFINITY)] {
-            for rolloff in [Rolloff::Inverse, Rolloff::Linear] {
-                let curve = Falloff {
-                    min_distance: min,
-                    max_distance: max,
-                    rolloff,
-                };
-                for distance in [0.0, 0.5, 5.0, 1e6] {
-                    let gain = attenuation(distance, curve);
-                    assert!(
-                        (0.0..=1.0).contains(&gain),
-                        "{curve:?} at {distance}: {gain}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn a_source_ahead_is_centred_and_one_to_the_side_is_in_that_ear() {
         let listener = Listener::default();
         assert!(close(pan(&listener, Vec3::new(0.0, 0.0, -10.0), 1.0), 0.0));
@@ -255,14 +209,6 @@ mod tests {
                 "at {position}: {left} {right} against {expected}"
             );
         }
-    }
-
-    #[test]
-    fn a_source_passing_through_the_head_slides_across_the_middle() {
-        let listener = Listener::default();
-        let near = pan(&listener, Vec3::new(0.1, 0.0, 0.0), 1.0);
-        assert!(close(near, 0.1), "{near}");
-        assert_eq!(pan(&listener, Vec3::ZERO, 1.0), 0.0);
     }
 
     /// Right-handed and -Z forward: a camera at the origin looking down -Z

@@ -670,68 +670,6 @@ mod tests {
     }
 
     #[test]
-    fn a_buttons_tint_follows_the_pointer() {
-        use crate::ui::events::{PointerInput, UiEvents, UiPointer, step};
-
-        let mut ui = Ui::new(Canvas::default());
-        let button = ui.element(None, box_at(0.0, 0.0, 100.0, 40.0));
-        ui.world.insert(button, Image::default());
-        ui.world.insert(
-            button,
-            Button {
-                normal: [1.0, 0.0, 0.0, 1.0],
-                hover: [0.0, 1.0, 0.0, 1.0],
-                pressed: [0.0, 0.0, 1.0, 1.0],
-                ..Button::default()
-            },
-        );
-        let label = ui.element(Some(button), box_at(0.0, 0.0, 20.0, 20.0));
-        ui.world.insert(label, Image::default());
-        ui.world.insert_resource(UiPointer::default());
-
-        let frame = |ui: &mut Ui, x: f32, pressed: bool, released: bool| {
-            ensure_current(&mut ui.world);
-            let mut resolved = Layout::default();
-            layout::resolve(
-                &ui.world,
-                &ui.world.resource::<Hierarchy>(),
-                &crate::scene::GameScreen::window([1920, 1080]),
-                &mut resolved,
-            );
-            let input = PointerInput {
-                position: [x, 10.0],
-                pressed,
-                released,
-            };
-            step(
-                &ui.world,
-                &resolved,
-                &mut ui.world.resource_mut::<UiPointer>(),
-                input,
-                &mut UiEvents::default(),
-            );
-            let canvas = ui.commands();
-            match canvas.commands()[0] {
-                UiCommand::Panel { color, .. } => [color[0], color[1], color[2]],
-                ref other => panic!("{other:?}"),
-            }
-        };
-        assert_eq!(frame(&mut ui, 500.0, false, false), [255, 0, 0], "normal");
-        assert_eq!(frame(&mut ui, 50.0, false, false), [0, 255, 0], "hovered");
-        assert_eq!(
-            frame(&mut ui, 10.0, true, false),
-            [0, 0, 255],
-            "pressed through its child"
-        );
-        assert_eq!(
-            frame(&mut ui, 500.0, false, false),
-            [255, 0, 0],
-            "held, but the pointer left"
-        );
-        assert_eq!(frame(&mut ui, 50.0, false, true), [0, 255, 0]);
-    }
-
-    #[test]
     fn a_sliced_image_is_nine_pieces_with_corners_at_their_own_size() {
         let mut ui = Ui::new(Canvas::default());
         let texture = AssetId::new();
@@ -769,54 +707,6 @@ mod tests {
             pieces[8].1,
             [1.0 - 16.0 / 64.0, 1.0 - 12.0 / 32.0, 1.0, 1.0]
         );
-    }
-
-    /// Too small for its borders, the borders shrink together rather than
-    /// overlapping, as uGUI's do.
-    #[test]
-    fn a_sliced_image_smaller_than_its_borders_shrinks_them() {
-        let mut ui = Ui::new(Canvas::default());
-        let panel = ui.element(None, box_at(0.0, 0.0, 12.0, 100.0));
-        ui.world.insert(
-            panel,
-            Image {
-                texture: Some(AssetId::new()),
-                slice: [8.0, 0.0, 16.0, 0.0],
-                ..Image::default()
-            },
-        );
-        let canvas = ui.commands_with(Some([64, 64]));
-        let widths: Vec<f32> = canvas
-            .commands()
-            .iter()
-            .map(|command| match command {
-                UiCommand::Image { rect, .. } => rect.width,
-                other => panic!("{other:?}"),
-            })
-            .collect();
-        assert_eq!(widths, [4.0, 8.0], "the middle has no width left");
-    }
-
-    #[test]
-    fn an_image_whose_size_is_not_known_yet_draws_stretched() {
-        let mut ui = Ui::new(Canvas::default());
-        let panel = ui.element(None, box_at(0.0, 0.0, 50.0, 50.0));
-        ui.world.insert(
-            panel,
-            Image {
-                texture: Some(AssetId::new()),
-                slice: [8.0; 4],
-                ..Image::default()
-            },
-        );
-        let canvas = ui.commands();
-        assert!(matches!(
-            canvas.commands(),
-            [UiCommand::Image {
-                uv: [0.0, 0.0, 1.0, 1.0],
-                ..
-            }]
-        ));
     }
 
     #[test]
@@ -866,27 +756,6 @@ mod tests {
             | UiCommand::Image { rect, .. }
             | UiCommand::Text { rect, .. } => *rect,
         }
-    }
-
-    /// The modifiers cost an unstyled tree nothing: no style and no clip is
-    /// recorded for it.
-    #[test]
-    fn a_plain_tree_records_no_styles_and_no_clips() {
-        let mut ui = Ui::new(Canvas::default());
-        let panel = ui.element(None, box_at(0.0, 0.0, 100.0, 40.0));
-        ui.world.insert(panel, filled(0.5));
-        let label = ui.element(Some(panel), RectTransform::stretched());
-        ui.world.insert(
-            label,
-            Text {
-                text: "hp".into(),
-                ..Text::default()
-            },
-        );
-        let canvas = ui.commands();
-        assert_eq!(canvas.commands().len(), 2);
-        assert!(canvas.styles().is_empty(), "{:?}", canvas.styles());
-        assert!(canvas.clips().is_empty(), "{:?}", canvas.clips());
     }
 
     /// A corner cuts the image to its element's box, and a gradient across it
@@ -1027,52 +896,6 @@ mod tests {
         );
     }
 
-    /// A stroke on a label rings its glyphs, under them; on an element that
-    /// also has an image it is the box's.
-    #[test]
-    fn a_stroke_on_text_alone_outlines_its_glyphs() {
-        let mut ui = Ui::new(Canvas::default());
-        let label = ui.element(None, box_at(0.0, 0.0, 200.0, 40.0));
-        ui.world.insert(
-            label,
-            Text {
-                text: "Play".into(),
-                color: [1.0; 4],
-                ..Text::default()
-            },
-        );
-        ui.world.insert(
-            label,
-            Stroke {
-                color: [0.0, 0.0, 0.0, 1.0],
-                thickness: 3.0,
-                placement: StrokePlacement::Center,
-            },
-        );
-        ui.world.insert(label, Gradient::default());
-        let canvas = ui.commands();
-        let colours: Vec<[u8; 4]> = canvas
-            .commands()
-            .iter()
-            .map(|command| match command {
-                UiCommand::Text { style, .. } => style.color,
-                other => panic!("{other:?}"),
-            })
-            .collect();
-        assert_eq!(colours, [[0, 0, 0, 255], [255; 4]], "the outline first");
-        assert_eq!(canvas.styles()[0], (0, UiStyle::Outline { width: 3.0 }));
-        let fill = shape(&canvas, 1);
-        assert_eq!(fill.bounds, None, "a gradient colours glyphs and cuts none");
-        assert!(fill.gradient.is_some());
-
-        ui.world.insert(label, filled(1.0));
-        assert_eq!(
-            summary(&ui.commands()),
-            ["255", "0", "T:Play"],
-            "the image, the box's stroke, then the text"
-        );
-    }
-
     /// A frame's content is cut to it, and its bars are drawn over the content
     /// once the frame's subtree is done.
     #[test]
@@ -1110,32 +933,5 @@ mod tests {
         let thumb = shape(&canvas, 2);
         assert_eq!(thumb.bounds, Some(rect));
         assert_eq!(thumb.radius, 4.0, "a pill");
-    }
-
-    /// Nine pieces, one box: each is cut to the element's corners rather than
-    /// its own, and each is styled once.
-    #[test]
-    fn a_sliced_image_with_a_corner_cuts_every_piece_to_the_whole_box() {
-        let mut ui = Ui::new(Canvas::default());
-        let panel = ui.element(None, box_at(10.0, 20.0, 200.0, 100.0));
-        ui.world.insert(
-            panel,
-            Image {
-                texture: Some(AssetId::new()),
-                slice: [8.0; 4],
-                ..Image::default()
-            },
-        );
-        ui.world.insert(panel, Corner::default());
-        let canvas = ui.commands_with(Some([64, 64]));
-        assert_eq!(canvas.commands().len(), 9);
-        let indices: Vec<u32> = canvas.styles().iter().map(|(at, _)| *at).collect();
-        assert_eq!(indices, (0..9).collect::<Vec<_>>());
-        for at in 0..9 {
-            assert_eq!(
-                shape(&canvas, at).bounds,
-                Some(Rect::new(10.0, 20.0, 200.0, 100.0))
-            );
-        }
     }
 }

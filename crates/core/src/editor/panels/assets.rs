@@ -2,13 +2,24 @@
 //! tint each was given, then its assets with their import status. Every asset
 //! row can be dragged onto whatever takes that kind — a prefab onto the
 //! hierarchy or the scene, a mesh or a material onto a mesh renderer, a
-//! texture onto a material asset's slot. Right-clicking a folder, or the open
-//! folder below its rows, makes a new material there. Double-clicking a sound
-//! plays it through the editor's preview, and again stops it.
+//! texture onto a material asset's slot — and an asset or a folder dragged
+//! onto a folder moves into it. Right-clicking a folder, or the open folder
+//! below its rows, makes a new folder, material or shader there; the open
+//! folder's menu also rescans, which a watched directory seldom needs, so it
+//! is not on the bar. A double-click does what the kind is for: a prefab or a
+//! mesh is placed, a sound plays through the editor's preview (and again
+//! stops), a shader opens in the Shader tab, a scene opens, a `.blend` opens
+//! in Blender, and a material, a texture or a font brings the Import tab
+//! forward on itself.
 //!
 //! A row hands over the asset's [`AssetId`], never its path: the hierarchy
 //! and the inspector take that payload the way everything else takes a
-//! reference to an asset.
+//! reference to an asset. A folder has no id to hand over, so its drag
+//! carries its path, which only the browser reads.
+//!
+//! The bar names the open folder as its path, each folder of which opens
+//! itself and takes a drop as a move into it. A path too long for a docked
+//! bar gives up its middle, never the filter's room.
 //!
 //! The filter is not confined to the open folder: typing searches every
 //! asset's path, and each match says which folder it is in. `.png`-style
@@ -17,9 +28,13 @@
 //! The folder shows as rows or as tiles, each pictured by its import's
 //! thumbnail where it has one ([`Previews::asset`]). Both are drawn only for
 //! what is on screen, so a project of thousands of assets costs a screenful.
-//! A click marks an asset, which the Import tab shows; Rename moves the file
-//! with its sidecar, and files dropped from outside the editor are copied in
-//! (see [`AssetDatabase::bring_in`]).
+//! A click marks an asset, which the Import tab shows; Ctrl adds or takes
+//! away one and Shift marks the run from the last click, and Delete over the
+//! browser, the menu's Delete… and a drag of any of them then act on the
+//! whole set. Rename and a move are file operations: the file goes with its
+//! sidecar, and neither is on the undo stack, as neither is in an explorer.
+//! Files dropped from outside the editor are copied in (see
+//! [`AssetDatabase::bring_in`]).
 //!
 //! Without a project there is no asset database, and the tab lists the
 //! prefabs under `assets/` as it always has.
@@ -30,7 +45,8 @@ use std::sync::{Arc, Mutex};
 use orrin_ecs::{FxHashMap, World};
 use orrin_registry::AssetId;
 
-use crate::asset_db::{AssetDatabase, AssetKind, Entry, Folder, LoadState, Status, Tint};
+use crate::asset_db::{AssetDatabase, AssetKind, Entry, Folder, LoadState, Settings, Status, Tint};
+use crate::editor::commands::Command;
 use crate::editor::previews::Previews;
 use crate::editor::state::{AssetLayout, AssetSort, AssetView, EditorState};
 use crate::editor::theme;
@@ -40,6 +56,11 @@ use crate::scene::{LogBuffer, LogLevel, PrefabInstance, Prefabs, Time};
 /// What the stand-in for the file dialog picks, in tests.
 #[cfg(test)]
 pub(super) static PICKED: Mutex<Option<Vec<PathBuf>>> = Mutex::new(None);
+
+/// Held by a test for as long as it uses [`PICKED`]: tests run in parallel,
+/// and a dialog thread takes whatever any of them put there.
+#[cfg(test)]
+pub(super) static PICKER: Mutex<()> = Mutex::new(());
 
 /// A row of the project-less prefab list.
 const ROW: f32 = 24.0;
@@ -64,8 +85,9 @@ const TINTS: [(&str, Tint); 6] = [
 const PLACE_HINT: &str = "Drag onto the hierarchy or the scene to place it, or double-click";
 
 pub fn body(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: &mut Previews) {
+    let pick = std::mem::take(&mut state.pick_files);
     if world.get_resource::<AssetDatabase>().is_some() {
-        browser(ui, world, state, previews);
+        browser(ui, world, state, previews, pick);
     } else {
         prefabs(ui, world, state);
     }
@@ -81,12 +103,16 @@ enum Action {
     NewMaterial(String),
     /// The surface shader template, in this folder.
     NewShader(String),
+    /// A folder in this one, named in place once it is made.
+    NewFolder(String),
     /// Edit this path's name in place, starting from this text.
     StartRename(String, String),
     Rename(String, String),
     CancelRename,
-    /// Ask whether to delete this asset or folder; see `confirm_delete`.
-    Delete(String),
+    /// Move these assets and folders into this folder.
+    Move(Vec<String>, String),
+    /// Ask whether to delete these assets and folders; see `confirm_delete`.
+    Delete(Vec<String>),
     /// Copy these files from outside the project into this folder.
     BringIn(Vec<PathBuf>, String),
     /// Open a file dialog for files to copy into the open folder.
@@ -100,13 +126,166 @@ enum Action {
 
 /// The browser's place, kept in egui's memory rather than the editor state:
 /// which folder is open, which revealed asset it last opened a folder for,
-/// the name being edited, if one is, and the file dialog, if one is open.
+/// what is marked, the name being edited, if one is, and the file dialog, if
+/// one is open.
 #[derive(Clone, Default)]
 struct Place {
     folder: String,
     revealed: Option<AssetId>,
+    /// The marked assets and folders, by path, sorted so a cell finds itself
+    /// by a binary search. May name what has since gone; each use filters.
+    marked: Vec<String>,
+    /// Where a Shift-click's range runs from: the last plain or Ctrl click.
+    anchor: Option<String>,
     renaming: Option<Renaming>,
     picking: Option<Picking>,
+}
+
+impl Place {
+    /// What was at `from` is now at `to`: the open folder and the marks go
+    /// where it went, and so does whatever was inside it.
+    fn follow(&mut self, from: &str, to: &str) {
+        let inside = format!("{from}/");
+        let moved = |path: &mut String| {
+            if path == from {
+                *path = to.to_owned();
+            } else if let Some(rest) = path.strip_prefix(&inside) {
+                *path = format!("{to}/{rest}");
+            }
+        };
+        moved(&mut self.folder);
+        self.marked.iter_mut().for_each(moved);
+        self.marked.sort();
+        if let Some(anchor) = &mut self.anchor {
+            moved(anchor);
+        }
+    }
+}
+
+/// A folder being dragged. An asset's drag carries its bare [`AssetId`], which
+/// is what every other tool takes; a folder has no id to carry.
+struct CarriedFolder(String);
+
+/// A click on `path` with `modifiers` held: Shift marks the listing from the
+/// anchor to it, Ctrl adds or takes it away, and a plain click marks it alone.
+/// The asset clicked into the set is the one the Import tab shows.
+fn mark(
+    place: &mut Place,
+    state: &mut EditorState,
+    db: &AssetDatabase,
+    items: &[Item],
+    path: String,
+    modifiers: egui::Modifiers,
+) {
+    let at = |wanted: &str| items.iter().position(|item| item.path() == wanted);
+    let range = modifiers
+        .shift
+        .then(|| place.anchor.as_deref().and_then(at).zip(at(&path)))
+        .flatten();
+    if let Some((from, to)) = range {
+        let (first, last) = (from.min(to), from.max(to));
+        place.marked = items[first..=last]
+            .iter()
+            .map(|item| item.path().to_owned())
+            .collect();
+        place.marked.sort();
+    } else if modifiers.command {
+        match place.marked.binary_search(&path) {
+            Ok(at) => {
+                place.marked.remove(at);
+            }
+            Err(at) => place.marked.insert(at, path.clone()),
+        }
+        place.anchor = Some(path.clone());
+    } else {
+        place.marked = vec![path.clone()];
+        place.anchor = Some(path.clone());
+    }
+    let Some(clicked) = db.find(&path).map(|entry| entry.id) else {
+        return;
+    };
+    if place.marked.binary_search(&path).is_ok() {
+        state.revealed_asset = Some(clicked);
+    } else if state.revealed_asset == Some(clicked) {
+        state.revealed_asset = place
+            .marked
+            .iter()
+            .rev()
+            .find_map(|path| db.find(path))
+            .map(|entry| entry.id);
+    }
+}
+
+/// Those of `paths` still in the project.
+fn existing(db: &AssetDatabase, paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| db.find(path).is_some() || db.folders().iter().any(|f| &f.path == *path))
+        .cloned()
+        .collect()
+}
+
+/// `paths` without any that lies inside another of them, which goes with it.
+fn outermost(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| {
+            !paths.iter().any(|other| {
+                path.strip_prefix(other.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// What acting on `path` acts on: the whole marked set when it is one of
+/// them, else it alone.
+fn chosen(db: &AssetDatabase, marked: &[String], path: &str) -> Vec<String> {
+    if marked.len() > 1 && marked.binary_search_by(|m| m.as_str().cmp(path)).is_ok() {
+        outermost(&existing(db, marked))
+    } else {
+        vec![path.to_owned()]
+    }
+}
+
+/// An asset or a folder the browser carries, let go on `response`: a move of
+/// it, or of the marked set it is one of, into `folder`. Also outlines
+/// `response` while one is held over it.
+fn dropped_on(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    db: &AssetDatabase,
+    marked: &[String],
+    folder: &str,
+) -> Option<Action> {
+    if !response.contains_pointer() {
+        return None;
+    }
+    let ctx = ui.ctx();
+    let carried = match egui::DragAndDrop::payload::<AssetId>(ctx) {
+        Some(id) => db.get(*id).map(|entry| entry.path.clone()),
+        None => egui::DragAndDrop::payload::<CarriedFolder>(ctx).map(|folder| folder.0.clone()),
+    }?;
+    // Let go where it was picked up: no move was meant.
+    if carried == folder {
+        return None;
+    }
+    if !ui.input(|input| input.pointer.any_released()) {
+        let visuals = ui.visuals();
+        ui.painter().rect_stroke(
+            response.rect,
+            visuals.widgets.inactive.corner_radius,
+            visuals.selection.stroke,
+            egui::StrokeKind::Inside,
+        );
+        return None;
+    }
+    egui::DragAndDrop::clear_payload(ctx);
+    Some(Action::Move(
+        chosen(db, marked, &carried),
+        folder.to_owned(),
+    ))
 }
 
 /// A file dialog open on a thread of its own, so the editor goes on drawing
@@ -128,7 +307,14 @@ struct Renaming {
     started: bool,
 }
 
-fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: &mut Previews) {
+/// `pick` is File ▸ Import… asking for the dialog the bar's + opens.
+fn browser(
+    ui: &mut egui::Ui,
+    world: &World,
+    state: &mut EditorState,
+    previews: &mut Previews,
+    pick: bool,
+) {
     let area = ui.max_rect();
     let memory = ui.id().with("asset_folder");
     let mut place: Place = ui.data_mut(|data| data.get_temp(memory).unwrap_or_default());
@@ -136,13 +322,21 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
     let previewing = world
         .get_resource::<crate::audio::Audio>()
         .and_then(|audio| audio.previewing());
-    let mut action = None;
+    let mut action = (pick && place.picking.is_none()).then_some(Action::PickFiles);
+    let over = ui.rect_contains_pointer(area);
+    state.assets_hovered = over;
     {
         let db = world.resource::<AssetDatabase>();
         if place.revealed != state.revealed_asset {
             place.revealed = state.revealed_asset;
             if let Some(entry) = state.revealed_asset.and_then(|id| db.get(id)) {
                 place.folder = parent(&entry.path).to_owned();
+                // Revealed by another tool: marked alone, unless a click here
+                // already made it one of the set.
+                if place.marked.binary_search(&entry.path).is_err() {
+                    place.marked = vec![entry.path.clone()];
+                    place.anchor = Some(entry.path.clone());
+                }
             }
         }
         if !place.folder.is_empty() && !db.folders().iter().any(|f| f.path == place.folder) {
@@ -152,6 +346,7 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
             ui,
             &db,
             &place.folder,
+            &place.marked,
             place.picking.is_some(),
             &mut state.assets_query,
             &mut state.assets_view,
@@ -183,14 +378,38 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
             .map(Item::Folder)
             .chain(assets.into_iter().map(Item::Asset))
             .collect();
-        let f2 = ui.rect_contains_pointer(ui.max_rect())
+        let keys = &state.settings.keys;
+        let rename = ui.rect_contains_pointer(ui.max_rect())
             && !ui.ctx().wants_keyboard_input()
-            && ui.input(|input| input.key_pressed(egui::Key::F2));
-        if f2 && let Some(entry) = state.revealed_asset.and_then(|id| db.get(id)) {
+            && ui.input(|input| keys.pressed(input, Command::Rename));
+        if rename && let Some(entry) = state.revealed_asset.and_then(|id| db.get(id)) {
             action = Some(Action::StartRename(
                 entry.path.clone(),
                 entry.name().to_owned(),
             ));
+        }
+        let keys = &state.settings.keys;
+        let delete = over
+            && !ui.ctx().wants_keyboard_input()
+            && ui.input(|input| keys.pressed(input, Command::Delete));
+        if delete {
+            // The marked set, or the revealed asset when the listing shows it
+            // and nothing is marked, as after coming back to its folder.
+            let targets = if place.marked.is_empty() {
+                state
+                    .revealed_asset
+                    .and_then(|id| db.get(id))
+                    .filter(|entry| items.iter().any(|item| item.path() == entry.path))
+                    .map(|entry| vec![entry.path.clone()])
+                    .unwrap_or_default()
+            } else {
+                outermost(&existing(&db, &place.marked))
+            };
+            if !targets.is_empty() {
+                let keys = &state.settings.keys;
+                ui.input_mut(|input| keys.take(input, Command::Delete));
+                action = Some(Action::Delete(targets));
+            }
         }
         let mut cells = Cells {
             db: &db,
@@ -201,6 +420,8 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
             state,
             previews,
             renaming: &mut place.renaming,
+            marked: &place.marked,
+            clicked: None,
             action: &mut action,
             folders: Vec::new(),
         };
@@ -250,7 +471,9 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
                 );
             }
         }
-        let folders = cells.folders;
+        let Cells {
+            folders, clicked, ..
+        } = cells;
         if let Some(folder) = file_drop(ui, area, &folders, open, &mut action) {
             ui.painter().rect_stroke(
                 folder,
@@ -258,6 +481,9 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
                 ui.visuals().selection.stroke,
                 egui::StrokeKind::Inside,
             );
+        }
+        if let Some((path, modifiers)) = clicked {
+            mark(&mut place, state, &db, &items, path, modifiers);
         }
     }
 
@@ -291,7 +517,13 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
                 );
             }
         }
-        Some(Action::Open(path)) => place.folder = path,
+        Some(Action::Open(path)) => {
+            if place.folder != path {
+                place.marked.clear();
+                place.anchor = None;
+            }
+            place.folder = path;
+        }
         Some(Action::Tint(path, tint)) => {
             let result = world
                 .resource_mut::<AssetDatabase>()
@@ -317,6 +549,25 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
                 Err(error) => log_error(world, error),
             }
         }
+        Some(Action::NewFolder(folder)) => {
+            let created = world.resource_mut::<AssetDatabase>().create_folder(&folder);
+            match created {
+                Ok(path) => {
+                    // Opened, so the folder made in it is drawn to be named.
+                    if place.folder != folder {
+                        place.folder = folder;
+                        place.marked.clear();
+                        place.anchor = None;
+                    }
+                    place.renaming = Some(Renaming {
+                        text: file_name(&path).to_owned(),
+                        path,
+                        started: false,
+                    });
+                }
+                Err(error) => log_error(world, error),
+            }
+        }
         Some(Action::StartRename(path, text)) => {
             place.renaming = Some(Renaming {
                 path,
@@ -325,7 +576,26 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
             });
         }
         Some(Action::CancelRename) => place.renaming = None,
-        Some(Action::Delete(path)) => state.request_delete_asset(path),
+        Some(Action::Move(paths, into)) => {
+            let moved = world
+                .resource_mut::<AssetDatabase>()
+                .move_all_into(&paths, &into);
+            let mut prefabs = false;
+            for (from, moved) in paths.iter().zip(moved) {
+                match moved {
+                    Ok(to) => {
+                        // A folder may hold prefabs, and the prefab index is by path.
+                        prefabs |= AssetKind::of_path(&to).is_none_or(|k| k == AssetKind::Prefab);
+                        place.follow(from, &to);
+                    }
+                    Err(error) => log_error(world, error),
+                }
+            }
+            if prefabs {
+                state.request_prefab_rescan();
+            }
+        }
+        Some(Action::Delete(paths)) => state.request_delete_assets(paths),
         Some(Action::BringIn(files, folder)) => bring_in(world, state, &files, &folder),
         Some(Action::PickFiles) => {
             let picked = Arc::new(Mutex::new(None));
@@ -358,11 +628,7 @@ fn browser(ui: &mut egui::Ui, world: &World, state: &mut EditorState, previews: 
                     if AssetKind::of_path(&to).is_none_or(|kind| kind == AssetKind::Prefab) {
                         state.request_prefab_rescan();
                     }
-                    if place.folder == path {
-                        place.folder = to;
-                    } else if let Some(rest) = place.folder.strip_prefix(&format!("{path}/")) {
-                        place.folder = format!("{to}/{rest}");
-                    }
+                    place.follow(&path, &to);
                 }
                 Err(error) => log_error(world, error),
             }
@@ -482,9 +748,20 @@ fn file_drop(
 }
 
 /// Rename has no undo: it moves files, as a rename in an explorer does.
-fn delete_item(ui: &mut egui::Ui, path: &str, action: &mut Option<Action>) {
-    if ui.button("Delete…").clicked() {
-        *action = Some(Action::Delete(path.to_owned()));
+fn delete_item(ui: &mut egui::Ui, paths: Vec<String>, action: &mut Option<Action>) {
+    let label = match paths.len() {
+        1 => "Delete…".to_owned(),
+        n => format!("Delete {n} items…"),
+    };
+    if ui.button(label).clicked() {
+        *action = Some(Action::Delete(paths));
+        ui.close_menu();
+    }
+}
+
+fn new_folder_item(ui: &mut egui::Ui, folder: &str, action: &mut Option<Action>) {
+    if ui.button("New folder").clicked() {
+        *action = Some(Action::NewFolder(folder.to_owned()));
         ui.close_menu();
     }
 }
@@ -511,13 +788,19 @@ fn new_material_item(ui: &mut egui::Ui, folder: &str, action: &mut Option<Action
     }
 }
 
-/// The browser's one bar: rescan and up, and where the browser is; the
-/// filter, in whatever width is left; the view's controls; and how much is
-/// still importing or has failed.
+/// The least the filter is given beside a long path, in points: enough to read
+/// a word or two typed into it.
+const FILTER_MIN: f32 = 100.0;
+
+/// The browser's one bar: up, bringing files in, and where the browser is; the
+/// filter, in whatever width the path leaves; the view's controls; and how
+/// much is still importing or has failed.
+#[allow(clippy::too_many_arguments)]
 fn header(
     ui: &mut egui::Ui,
     db: &AssetDatabase,
     folder: &str,
+    marked: &[String],
     picking: bool,
     query: &mut String,
     view: &mut AssetView,
@@ -525,12 +808,6 @@ fn header(
 ) {
     let weak = ui.visuals().weak_text_color();
     ui.horizontal(|ui| {
-        if icons::button(ui, icons::refresh(), icons::ROW - 2.0, weak, false)
-            .on_hover_text("Scan the assets directory again")
-            .clicked()
-        {
-            *action = Some(Action::Rescan);
-        }
         let up = ui
             .add_enabled_ui(!folder.is_empty(), |ui| {
                 icons::button(ui, icons::arrow_up(), icons::ROW - 2.0, weak, false)
@@ -549,7 +826,6 @@ fn header(
         if import.clicked() {
             *action = Some(Action::PickFiles);
         }
-        ui.label(if folder.is_empty() { "assets" } else { folder });
 
         let queued = db.iter().filter(|e| e.status == Status::Queued).count();
         let failed = db
@@ -574,9 +850,167 @@ fn header(
                 );
             }
             view_controls(ui, view);
-            widgets::search(ui, query, "Filter assets — words, or .png .omat");
+            let crumbs = Crumbs::of(ui, folder);
+            let left = ui.available_width();
+            let filter = (left - crumbs.width - ui.spacing().item_spacing.x)
+                .max(FILTER_MIN)
+                .min(left);
+            let height = ui.spacing().interact_size.y;
+            ui.allocate_ui(egui::vec2(filter, height), |ui| {
+                widgets::search(ui, query, "Filter assets — words, or .png .omat");
+            });
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                crumbs.show(ui, db, marked, action);
+            });
         });
     });
+}
+
+/// Where the browser is, as a row of folders from the assets directory down,
+/// each opening itself and each taking a dropped asset or folder as a move
+/// into it.
+struct Crumbs {
+    /// Each folder's path, `""` being the assets directory.
+    paths: Vec<String>,
+    /// Each one's width, with the chevron before it for all but the first.
+    widths: Vec<f32>,
+    width: f32,
+    /// The ellipsis that stands for the folders left out, with its chevron.
+    ellipsis: f32,
+}
+
+/// The chevron between two folders of the path, in points.
+const CHEVRON: f32 = icons::ROW - 4.0;
+/// The path's folders and chevrons sit closer than the bar's controls: they
+/// read as one path, and a docked bar has little width to give them.
+const CRUMB_GAP: f32 = 2.0;
+const CRUMB_PAD: f32 = 2.0;
+
+impl Crumbs {
+    fn of(ui: &egui::Ui, folder: &str) -> Self {
+        let mut paths = vec![String::new()];
+        let mut end = 0;
+        for part in folder.split('/').filter(|part| !part.is_empty()) {
+            end += part.len();
+            paths.push(folder[..end].to_owned());
+            end += 1;
+        }
+        let spacing = CRUMB_GAP;
+        let pad = CRUMB_PAD * 2.0;
+        let colour = ui.visuals().text_color();
+        let measure = |text: &str, font: egui::FontId| {
+            ui.fonts(|fonts| fonts.layout_no_wrap(text.to_owned(), font, colour))
+                .size()
+                .x
+        };
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let chevron = measure(
+            icons::text(icons::chevron_right(), CHEVRON, colour).text(),
+            egui::FontId::new(CHEVRON, icons::family()),
+        ) + spacing;
+        let widths: Vec<f32> = paths
+            .iter()
+            .enumerate()
+            .map(|(at, path)| {
+                let before = if at > 0 { chevron } else { 0.0 };
+                measure(Self::name(path), font.clone()) + pad + spacing + before
+            })
+            .collect();
+        Self {
+            width: widths.iter().sum(),
+            ellipsis: measure("…", font) + pad + spacing + chevron,
+            paths,
+            widths,
+        }
+    }
+
+    fn name(path: &str) -> &str {
+        if path.is_empty() {
+            "assets"
+        } else {
+            file_name(path)
+        }
+    }
+
+    /// The path in the width the bar leaves it: whole when it fits, else the
+    /// assets directory, an ellipsis and as many of the deepest folders as
+    /// fit. The open folder is always shown, cut short if it must be.
+    fn show(
+        &self,
+        ui: &mut egui::Ui,
+        db: &AssetDatabase,
+        marked: &[String],
+        action: &mut Option<Action>,
+    ) {
+        ui.spacing_mut().item_spacing.x = CRUMB_GAP;
+        ui.spacing_mut().button_padding.x = CRUMB_PAD;
+        let room = ui.available_width();
+        let last = self.paths.len() - 1;
+        // The first folder shown after the root; 1 is all of them.
+        let mut from = 1;
+        if self.width > room && last > 1 {
+            from = last;
+            let mut used = self.widths[0] + self.ellipsis + self.widths[last];
+            while from > 2 && used + self.widths[from - 1] <= room {
+                from -= 1;
+                used += self.widths[from];
+            }
+        }
+        let root = from == 1 || self.widths[0] + self.ellipsis + self.widths[last] <= room;
+        let weak = ui.visuals().weak_text_color();
+        let chevron = |ui: &mut egui::Ui| {
+            ui.label(icons::text(icons::chevron_right(), CHEVRON, weak));
+        };
+        if root {
+            self.crumb(ui, 0, None, db, marked, action);
+        }
+        if from > 1 {
+            if root {
+                chevron(ui);
+            }
+            // The deepest folder left out, standing for all of them.
+            let ellipsis = egui::RichText::new("…").color(weak);
+            self.crumb(ui, from - 1, Some(ellipsis), db, marked, action);
+        }
+        for at in from..=last {
+            chevron(ui);
+            self.crumb(ui, at, None, db, marked, action);
+        }
+    }
+
+    fn crumb(
+        &self,
+        ui: &mut egui::Ui,
+        at: usize,
+        label: Option<egui::RichText>,
+        db: &AssetDatabase,
+        marked: &[String],
+        action: &mut Option<Action>,
+    ) {
+        let path = &self.paths[at];
+        let name = Self::name(path);
+        let text = match label {
+            Some(label) => label,
+            None if at == self.paths.len() - 1 => egui::RichText::new(name).strong(),
+            None => egui::RichText::new(name),
+        };
+        let response = ui
+            .add(
+                egui::Button::new(text)
+                    .frame(false)
+                    .wrap_mode(egui::TextWrapMode::Truncate),
+            )
+            .on_hover_text(format!(
+                "Open {name}. Drop an asset or a folder here to move it in, with its .meta; \
+                 not undoable"
+            ));
+        if let Some(moved) = dropped_on(ui, &response, db, marked, path) {
+            *action = Some(moved);
+        }
+        if response.clicked() {
+            *action = Some(Action::Open(path.clone()));
+        }
+    }
 }
 
 /// What the filter box asks for: words found anywhere in an asset's path, and
@@ -771,6 +1205,15 @@ enum Item<'a> {
     Asset(&'a Entry),
 }
 
+impl Item<'_> {
+    fn path(&self) -> &str {
+        match self {
+            Item::Folder(folder) => &folder.path,
+            Item::Asset(entry) => &entry.path,
+        }
+    }
+}
+
 /// What drawing a row or a tile needs, gathered so each cell takes one
 /// argument.
 struct Cells<'a> {
@@ -785,6 +1228,10 @@ struct Cells<'a> {
     state: &'a mut EditorState,
     previews: &'a mut Previews,
     renaming: &'a mut Option<Renaming>,
+    marked: &'a [String],
+    /// The cell clicked this frame and the modifiers held, for [`mark`], which
+    /// needs the whole listing.
+    clicked: Option<(String, egui::Modifiers)>,
     action: &'a mut Option<Action>,
     /// Each folder drawn, where: what a file dropped from outside lands in.
     folders: Vec<(egui::Rect, String)>,
@@ -803,7 +1250,37 @@ impl Cells<'_> {
         let rest = (ui.clip_rect().bottom() - ui.cursor().top()).max(ROW);
         let size = egui::vec2(ui.available_width(), rest);
         ui.allocate_response(size, egui::Sense::click())
-            .context_menu(|ui| new_material_item(ui, folder, self.action));
+            .context_menu(|ui| {
+                new_folder_item(ui, folder, self.action);
+                new_material_item(ui, folder, self.action);
+                ui.separator();
+                if ui
+                    .button("Rescan assets")
+                    .on_hover_text(
+                        "Read the assets directory again. It is watched, so this is only \
+                         for a change the watcher missed",
+                    )
+                    .clicked()
+                {
+                    *self.action = Some(Action::Rescan);
+                    ui.close_menu();
+                }
+            });
+    }
+
+    fn is_marked(&self, path: &str) -> bool {
+        self.marked
+            .binary_search_by(|marked| marked.as_str().cmp(path))
+            .is_ok()
+    }
+
+    /// What a drag of `path` is labelled with beside the pointer: its name,
+    /// or how many it carries when it is one of the marked.
+    fn carrying(&self, path: &str, name: &str) -> String {
+        match self.marked.len() {
+            n if n > 1 && self.is_marked(path) => format!("{n} items"),
+            _ => name.to_owned(),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -828,28 +1305,44 @@ impl Cells<'_> {
         let tint = folder
             .tint
             .map_or(weak, |Tint([r, g, b])| egui::Color32::from_rgb(r, g, b));
+        let name = file_name(&folder.path);
         let response = self.cell(
             ui,
-            egui::Sense::click(),
+            egui::Sense::click_and_drag(),
             Mark::Glyph(icons::folder(), tint),
-            file_name(&folder.path),
+            name,
             "",
             End::Nothing,
-            false,
+            self.is_marked(&folder.path),
         );
         self.name_field(ui, &folder.path, response.rect);
         self.folders.push((response.rect, folder.path.clone()));
-        let action = &mut *self.action;
-        if response.double_clicked() || response.clicked() {
-            *action = Some(Action::Open(folder.path.clone()));
+        if let Some(moved) = dropped_on(ui, &response, self.db, self.marked, &folder.path) {
+            *self.action = Some(moved);
         }
+        carry(
+            ui,
+            &response,
+            || CarriedFolder(folder.path.clone()),
+            &self.carrying(&folder.path, name),
+        );
+        let modifiers = ui.input(|input| input.modifiers);
+        if response.clicked() && (modifiers.command || modifiers.shift) {
+            self.clicked = Some((folder.path.clone(), modifiers));
+        } else if response.double_clicked() || response.clicked() {
+            *self.action = Some(Action::Open(folder.path.clone()));
+        }
+        let (db, marked) = (self.db, self.marked);
+        let action = &mut *self.action;
         response
             .on_hover_text(format!(
-                "{}\nRight-click to rename, tint, or make a material or shader in it",
+                "{}\nRight-click to rename, tint, or make a folder, material or shader in it. \
+                 Drag onto a folder to move it, with its .meta; not undoable",
                 folder.path
             ))
             .context_menu(|ui| {
-                rename_item(ui, &folder.path, file_name(&folder.path), action);
+                rename_item(ui, &folder.path, name, action);
+                new_folder_item(ui, &folder.path, action);
                 new_material_item(ui, &folder.path, action);
                 ui.separator();
                 ui.label("Tint");
@@ -877,12 +1370,12 @@ impl Cells<'_> {
                     ui.close_menu();
                 }
                 ui.separator();
-                delete_item(ui, &folder.path, action);
+                delete_item(ui, chosen(db, marked, &folder.path), action);
             });
     }
 
-    /// One asset: marked by a click and dragged to wherever takes its kind; a
-    /// prefab is also placed by a double-click, as in the prefab list.
+    /// One asset: marked by a click and dragged to wherever takes its kind;
+    /// a double-click does what its kind is for.
     fn asset(&mut self, ui: &mut egui::Ui, entry: &Entry) {
         let weak = ui.visuals().weak_text_color();
         let blend = crate::asset_db::blend::is_blend(std::path::Path::new(&entry.path));
@@ -896,23 +1389,27 @@ impl Cells<'_> {
             AssetKind::Mesh => (
                 icons::box_(),
                 theme::KIND_MESH,
-                "Drag into the scene to place it, or onto a mesh renderer to draw it",
+                "Drag into the scene to place it, or onto a mesh renderer to draw it. \
+                 Double-click to place it",
             ),
             AssetKind::Texture => (
                 icons::image(),
                 weak,
-                "Drag onto a material asset's texture slot to sample it",
+                "Drag onto a material asset's texture slot to sample it. Double-click for \
+                 its import settings",
             ),
             AssetKind::Material => (
                 icons::palette(),
                 weak,
-                "Drag onto a mesh renderer's material to draw with it. Edit it in the inspector",
+                "Drag onto a mesh renderer's material to draw with it. Double-click to edit \
+                 it in the Import tab",
             ),
             AssetKind::Scene => (icons::globe(), weak, "Double-click to open it"),
             AssetKind::Font => (
                 icons::text_t(),
                 weak,
-                "Drag onto a script's font field to set its UI text in it",
+                "Drag onto a script's font field to set its UI text in it. Double-click to \
+                 show it in the Import tab",
             ),
             AssetKind::Audio if self.previewing == Some(entry.id) => (
                 icons::speaker_high(),
@@ -931,18 +1428,18 @@ impl Cells<'_> {
             ),
             AssetKind::Prefab | AssetKind::Folder => (icons::layers(), weak, PLACE_HINT),
         };
+        // Only a state the user must know about is a line of the hover: an
+        // asset that imported, from the cache or not, is the ordinary case.
         let (status, detail) = match (&entry.status, self.db.state(entry.id)) {
             (Status::Failed(message), _) => (
                 Some((icons::warning(), theme::ERROR)),
-                format!("Failed: {message}"),
+                format!("Failed: {message}\n"),
             ),
             (Status::Queued, _) | (_, LoadState::Loading) => (
                 Some((icons::hourglass(), theme::PENDING)),
-                "Importing".to_owned(),
+                "Importing\n".to_owned(),
             ),
-            (Status::Imported { cached: true, .. }, _) => (None, "Imported (cached)".to_owned()),
-            (Status::Imported { .. }, _) => (None, "Imported".to_owned()),
-            (Status::Indexed, _) => (None, "Indexed".to_owned()),
+            (Status::Imported { .. } | Status::Indexed, _) => (None, String::new()),
         };
         let in_scene = self.in_scene.get(&entry.id).copied().unwrap_or(0);
         let end = match status {
@@ -954,8 +1451,7 @@ impl Cells<'_> {
             Some(picture) => Mark::Picture(picture.id()),
             None => Mark::Glyph(icon, colour),
         };
-        let prefab = entry.kind == AssetKind::Prefab;
-        let marked = self.state.revealed_asset == Some(entry.id);
+        let marked = self.is_marked(&entry.path) || self.state.revealed_asset == Some(entry.id);
         let name = file_name(&entry.path);
         let folder = if self.searching {
             parent(&entry.path)
@@ -965,28 +1461,50 @@ impl Cells<'_> {
         let sense = egui::Sense::click_and_drag();
         let response = self.cell(ui, sense, mark, name, folder, end, marked);
         if response.clicked() {
-            self.state.revealed_asset = Some(entry.id);
+            self.clicked = Some((entry.path.clone(), ui.input(|input| input.modifiers)));
         }
-        if prefab && response.double_clicked() {
-            self.state.request_instantiate(entry.id, None);
-        }
-        if entry.kind == AssetKind::Audio && response.double_clicked() {
-            *self.action = Some(Action::TogglePreview(entry.id));
-        }
-        if entry.kind == AssetKind::Shader && response.double_clicked() {
-            self.state.open_shader(entry.id);
-        }
-        if entry.kind == AssetKind::Scene && response.double_clicked() {
-            let path = self.db.dir().join(&entry.path);
-            self.state.request_open_scene(path.to_string_lossy());
-        }
-        if blend && response.double_clicked() {
-            *self.action = Some(Action::OpenInBlender(entry.path.clone()));
+        if response.double_clicked() {
+            match entry.kind {
+                AssetKind::Prefab => self.state.request_instantiate(entry.id, None),
+                AssetKind::Mesh if blend => {
+                    *self.action = Some(Action::OpenInBlender(entry.path.clone()));
+                }
+                AssetKind::Mesh => self.state.request_instantiate(entry.id, None),
+                AssetKind::Audio => *self.action = Some(Action::TogglePreview(entry.id)),
+                AssetKind::Shader => self.state.open_shader(entry.id),
+                AssetKind::Scene => {
+                    let path = self.db.dir().join(&entry.path);
+                    self.state
+                        .request_open_scene_checked(path.to_string_lossy());
+                }
+                AssetKind::Material | AssetKind::Texture | AssetKind::Font => {
+                    self.state.revealed_asset = Some(entry.id);
+                    self.state.request_import_page();
+                }
+                AssetKind::Folder => {}
+            }
         }
         self.name_field(ui, &entry.path, response.rect);
-        carry(ui, &response, entry.id, name);
+        carry(
+            ui,
+            &response,
+            || entry.id,
+            &self.carrying(&entry.path, name),
+        );
+        let (db, marked) = (self.db, self.marked);
+        // Named for what the Import tab does with it. The id is shown there,
+        // and copied from here, rather than on every hover.
+        let opens = match entry.kind {
+            AssetKind::Material => Some("Edit material"),
+            _ if entry.settings != Settings::None => Some("Import settings"),
+            _ => None,
+        };
         response
-            .on_hover_text(format!("{}\n{}\n{detail}\n{hint}", entry.path, entry.id))
+            .on_hover_text(format!(
+                "{}\n{detail}{hint}\nDrag onto a folder to move it, with its .meta; not \
+                 undoable",
+                entry.path
+            ))
             .context_menu(|ui| {
                 if entry.kind == AssetKind::Shader && ui.button("Edit").clicked() {
                     self.state.open_shader(entry.id);
@@ -997,13 +1515,19 @@ impl Cells<'_> {
                     ui.close_menu();
                 }
                 rename_item(ui, &entry.path, entry.name(), self.action);
-                if ui.button("Import settings").clicked() {
+                if let Some(opens) = opens
+                    && ui.button(opens).clicked()
+                {
                     self.state.revealed_asset = Some(entry.id);
                     self.state.request_import_page();
                     ui.close_menu();
                 }
+                if ui.button("Copy id").clicked() {
+                    ui.ctx().copy_text(entry.id.to_string());
+                    ui.close_menu();
+                }
                 ui.separator();
-                delete_item(ui, &entry.path, self.action);
+                delete_item(ui, chosen(db, marked, &entry.path), self.action);
             });
     }
 
@@ -1054,11 +1578,16 @@ impl Cells<'_> {
     }
 }
 
-/// Start a drag of `id`, and while it lasts draw what is being carried beside
-/// the pointer, since the row itself stays put.
-fn carry(ui: &egui::Ui, response: &egui::Response, id: AssetId, name: &str) {
+/// Start a drag of what `payload` makes, and while it lasts draw what is being
+/// carried beside the pointer, since the row itself stays put.
+fn carry<T: std::any::Any + Send + Sync>(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    payload: impl FnOnce() -> T,
+    name: &str,
+) {
     if response.drag_started() {
-        response.dnd_set_drag_payload(id);
+        response.dnd_set_drag_payload(payload());
     }
     if response.dragged()
         && let Some(pointer) = ui.ctx().pointer_latest_pos()
@@ -1315,7 +1844,7 @@ fn prefabs(ui: &mut egui::Ui, world: &World, state: &mut EditorState) {
                 if response.double_clicked() {
                     state.request_instantiate(prefab.id, None);
                 }
-                carry(ui, &response, prefab.id, prefab.name());
+                carry(ui, &response, || prefab.id, prefab.name());
                 response.on_hover_text(format!("{}\n{PLACE_HINT}", prefab.path));
             }
         });
@@ -1326,31 +1855,6 @@ mod tests {
     use super::*;
     use crate::asset_db::AssetDatabase;
     use crate::asset_db::tests::Dir;
-
-    /// The browser shows one folder at a time: its direct subfolders, then its
-    /// direct assets, each by path. Deeper entries belong to the subfolder.
-    #[test]
-    fn a_folder_lists_its_own_subfolders_and_assets_only() {
-        let dir = Dir::new("browser-listing");
-        dir.write("props/door.oprefab", b"orrin-scene 1\n");
-        dir.write("props/wood/plank.png", b"");
-        dir.write("props/wood/oak/leaf.png", b"");
-        dir.write("rock.png", b"");
-        let (db, _) = AssetDatabase::open(dir.path(), dir.path().join(".cache"));
-
-        let (folders, assets) = listing(&db, "");
-        let folders: Vec<&str> = folders.iter().map(|f| f.path.as_str()).collect();
-        let assets: Vec<&str> = assets.iter().map(|a| a.path.as_str()).collect();
-        assert_eq!((folders, assets), (vec!["props"], vec!["rock.png"]));
-
-        let (folders, assets) = listing(&db, "props");
-        let folders: Vec<&str> = folders.iter().map(|f| f.path.as_str()).collect();
-        let assets: Vec<&str> = assets.iter().map(|a| a.path.as_str()).collect();
-        assert_eq!(
-            (folders, assets),
-            (vec!["props/wood"], vec!["props/door.oprefab"])
-        );
-    }
 
     #[test]
     fn a_query_is_words_and_extensions() {
@@ -1433,12 +1937,5 @@ mod tests {
             ..AssetView::default()
         };
         assert_eq!(names("", textures).1, ["a.jpg", "b.png", "deep/d.png"]);
-    }
-
-    #[test]
-    fn a_folder_goes_up_to_its_parent_and_the_root_stays_put() {
-        assert_eq!(parent("props/wood"), "props");
-        assert_eq!(parent("props"), "");
-        assert_eq!(parent(""), "");
     }
 }

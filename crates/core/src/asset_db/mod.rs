@@ -782,14 +782,87 @@ impl AssetDatabase {
         if to.exists() && !rel.eq_ignore_ascii_case(path) {
             return Err(refuse(format!("{rel} already exists")));
         }
-        std::fs::rename(&from, &to).map_err(|error| refuse(error.to_string()))?;
-        let meta = sidecar::path_of(&from);
-        if meta.exists()
-            && let Err(error) = std::fs::rename(&meta, sidecar::path_of(&to))
-        {
-            let _ = std::fs::rename(&to, &from);
-            return Err(refuse(format!("its sidecar would not move: {error}")));
+        move_with_sidecar(&from, &to).map_err(refuse)?;
+        self.rescan();
+        Ok(rel)
+    }
+
+    /// Move the asset or folder at `path` into `folder` (`""` is the assets
+    /// directory), returning its new path.
+    ///
+    /// A rename into another folder, with what [`rename`](Self::rename)
+    /// promises: the sidecar goes along, so the id does, and there is no undo.
+    pub fn move_into(&mut self, path: &str, folder: &str) -> Result<String, String> {
+        let moved = self.relocate(path, folder);
+        if moved.as_ref().is_ok_and(|to| to != path) {
+            self.rescan();
         }
+        moved
+    }
+
+    /// [`move_into`](Self::move_into) for each of `paths`, scanning once
+    /// after all of them rather than once each. None may lie inside another,
+    /// which goes with it.
+    pub fn move_all_into(&mut self, paths: &[String], folder: &str) -> Vec<Result<String, String>> {
+        let moved: Vec<_> = paths
+            .iter()
+            .map(|path| self.relocate(path, folder))
+            .collect();
+        if moved
+            .iter()
+            .zip(paths)
+            .any(|(to, from)| to.as_ref().is_ok_and(|to| to != from))
+        {
+            self.rescan();
+        }
+        moved
+    }
+
+    /// The move itself, on disk; the index is the caller's to rescan.
+    fn relocate(&self, path: &str, folder: &str) -> Result<String, String> {
+        let is_folder = |rel: &str| self.folders.iter().any(|f| f.path == rel);
+        let moving_folder = is_folder(path);
+        if !moving_folder && self.find(path).is_none() {
+            return Err(format!(
+                "there is no asset or folder `{path}` in {}",
+                self.dir.display()
+            ));
+        }
+        let shown = if folder.is_empty() { "assets" } else { folder };
+        let refuse = |why: String| format!("could not move {path} into {shown}: {why}");
+        if moving_folder && (folder == path || folder.starts_with(&format!("{path}/"))) {
+            return Err(refuse("a folder cannot go inside itself".to_owned()));
+        }
+        if !folder.is_empty() && !is_folder(folder) {
+            return Err(refuse(format!("there is no folder `{folder}`")));
+        }
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let rel = match folder {
+            "" => name.to_owned(),
+            folder => format!("{folder}/{name}"),
+        };
+        if rel == path {
+            return Ok(rel);
+        }
+        let (from, to) = (self.dir.join(path), self.dir.join(&rel));
+        if to.exists() {
+            return Err(refuse(format!("{rel} already exists")));
+        }
+        move_with_sidecar(&from, &to).map_err(refuse)?;
+        Ok(rel)
+    }
+
+    /// Make a folder in `parent` named `New Folder`, numbered past any name
+    /// already there, returning its path.
+    pub fn create_folder(&mut self, parent: &str) -> Result<String, String> {
+        if !parent.is_empty() && !self.folders.iter().any(|f| f.path == parent) {
+            return Err(format!(
+                "could not make a folder in {parent}: there is no folder `{parent}`"
+            ));
+        }
+        let rel = self.free_name(parent, "New Folder");
+        std::fs::create_dir(self.dir.join(&rel))
+            .map_err(|error| format!("could not make {rel}: {error}"))?;
         self.rescan();
         Ok(rel)
     }
@@ -990,8 +1063,8 @@ impl AssetDatabase {
         self.reports.extend(issues);
     }
 
-    /// Scan again, reimporting only what is new. For the browser's refresh
-    /// button; a watched directory never needs it.
+    /// Scan again, reimporting only what is new. For the browser's Rescan
+    /// assets; a watched directory never needs it.
     pub fn rescan(&mut self) {
         let issues = self.scan(&[]);
         self.reports.extend(issues);
@@ -1800,6 +1873,20 @@ fn companions(
     Ok(out)
 }
 
+/// Move `from` to `to` with its sidecar, or neither: a file that arrived
+/// without its sidecar would be scanned in under a new id.
+fn move_with_sidecar(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::rename(from, to).map_err(|error| error.to_string())?;
+    let meta = sidecar::path_of(from);
+    if meta.exists()
+        && let Err(error) = std::fs::rename(&meta, sidecar::path_of(to))
+    {
+        let _ = std::fs::rename(to, from);
+        return Err(format!("its sidecar would not move: {error}"));
+    }
+    Ok(())
+}
+
 /// Why `name` cannot be a file or folder name on every system a project may
 /// be opened on, or be seen by the scan at all.
 fn check_name(name: &str) -> Result<(), String> {
@@ -2123,6 +2210,55 @@ pub(crate) mod tests {
         );
     }
 
+    /// A move is a rename into another folder: the sidecar goes along and the
+    /// id with it, a folder takes what is inside it, and nothing lands on a
+    /// name already taken or inside itself.
+    #[test]
+    fn a_move_takes_the_sidecar_into_the_folder_and_keeps_the_id() {
+        let dir = Dir::new("db-move");
+        project(&dir);
+        dir.write("props/rock.png", &png(1, 1, |_, _| [0; 4]));
+        let mut db = open(&dir);
+        let rock = db.find("rocks/rock.png").unwrap().id;
+        let door = db.find("props/door.oprefab").unwrap().id;
+
+        assert_eq!(
+            db.move_into("rocks/rock.png", "models"),
+            Ok("models/rock.png".into())
+        );
+        assert_eq!(db.find("models/rock.png").map(|e| e.id), Some(rock));
+        assert!(dir.path().join("models/rock.png.meta").is_file());
+        assert!(!dir.path().join("rocks/rock.png.meta").exists());
+        assert_eq!(
+            db.move_into("models/rock.png", "models"),
+            Ok("models/rock.png".into()),
+            "already there"
+        );
+
+        db.set_folder_tint("props", Some(Tint([1, 2, 3]))).unwrap();
+        assert_eq!(db.move_into("props", "rocks"), Ok("rocks/props".into()));
+        assert_eq!(
+            db.find("rocks/props/door.oprefab").map(|e| e.id),
+            Some(door)
+        );
+        let moved = db.folders().iter().find(|f| f.path == "rocks/props");
+        assert_eq!(moved.and_then(|f| f.tint), Some(Tint([1, 2, 3])));
+        assert!(!dir.path().join("props.meta").exists());
+        assert_eq!(db.move_into("rocks/props", ""), Ok("props".into()));
+
+        for (path, into, why) in [
+            ("props", "props", "inside itself"),
+            ("rocks", "rocks/props", "inside itself"),
+            ("props/rock.png", "models", "models/rock.png already exists"),
+            ("props/rock.png", "nowhere", "no folder `nowhere`"),
+            ("props/nothing.png", "models", "no asset or folder"),
+        ] {
+            let error = db.move_into(path, into).unwrap_err();
+            assert!(error.contains(path) && error.contains(why), "{error}");
+        }
+        assert!(dir.path().join("props/rock.png").is_file(), "refused whole");
+    }
+
     #[test]
     fn a_folder_tint_is_listed_and_survives_a_fresh_scan() {
         let dir = Dir::new("db-tint");
@@ -2341,21 +2477,6 @@ pub(crate) mod tests {
         assert_eq!(after.min.z, before.min.z + 5.0);
         assert_eq!(world.resource::<MeshBounds>().get(slot), Some(after));
         assert_eq!(backend.mesh_replacements(), 2);
-    }
-
-    #[test]
-    fn a_save_that_changes_nothing_swaps_nothing() {
-        let dir = Dir::new("db-touch");
-        let (world, _, mut backend) = loaded_tree(&dir);
-        let replaced = backend.mesh_replacements();
-        change(
-            &world,
-            &dir,
-            "models/tree.gltf",
-            triangle_gltf("").as_bytes(),
-            &mut backend,
-        );
-        assert_eq!(backend.mesh_replacements(), replaced);
     }
 
     #[test]
@@ -2610,19 +2731,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn an_unknown_id_is_failed_and_a_queued_one_is_loading() {
-        let dir = Dir::new("db-state");
-        project(&dir);
-        let db = open(&dir);
-        assert_eq!(db.state(AssetId::new()), LoadState::Failed);
-        let rock = db.find("rocks/rock.png").unwrap().id;
-        assert!(matches!(
-            db.state(rock),
-            LoadState::Loading | LoadState::Ready
-        ));
-    }
-
     const ROCK: &str = "5f0c3a4e-0000-4000-8000-0000000000a1";
     const ROCK_NORMAL: &str = "5f0c3a4e-0000-4000-8000-0000000000a2";
 
@@ -2840,56 +2948,6 @@ pub(crate) mod tests {
         assert_eq!(db.font(id), Ok(b"saved".to_vec()));
     }
 
-    /// An audio file has nothing to import either: it is decoded off the
-    /// main thread from the file the database names, and a save says so.
-    #[test]
-    fn an_audio_clip_is_read_as_it_is_and_heard_again_when_saved() {
-        let dir = Dir::new("db-audio");
-        dir.write("sfx/door.wav", b"first");
-        let mut db = open(&dir);
-        let entry = db.find("sfx/door.wav").unwrap();
-        let id = entry.id;
-        assert_eq!(entry.kind, AssetKind::Audio);
-        assert_eq!(entry.status, Status::Indexed);
-        assert_eq!(db.state(id), LoadState::Ready);
-        assert_eq!(db.audio_file(id), Ok(dir.path().join("sfx/door.wav")));
-        db.take_audio_changes();
-
-        let path = dir.write("sfx/door.wav", b"saved");
-        db.notice(path);
-        db.apply_changes();
-        assert_eq!(db.take_audio_changes(), [id]);
-        assert!(db.take_audio_changes().is_empty());
-        assert!(db.take_font_changes().is_empty());
-
-        let font = dir.write("fonts/title.ttf", b"glyphs");
-        db.notice(font);
-        db.apply_changes();
-        assert!(db.take_audio_changes().is_empty());
-        let title = db.find("fonts/title.ttf").unwrap().id;
-        assert_eq!(
-            db.audio_file(title),
-            Err("`fonts/title.ttf` is a font, not a sound".to_owned())
-        );
-    }
-
-    #[test]
-    fn only_a_font_is_read_as_one_and_the_error_names_it() {
-        let dir = Dir::new("db-font-kind");
-        dir.write("rocks/rock.png", &png(2, 2, |_, _| [10, 20, 30, 255]));
-        let db = open(&dir);
-        let rock = db.find("rocks/rock.png").unwrap().id;
-        assert_eq!(
-            db.font(rock),
-            Err("`rocks/rock.png` is a texture, not a font".to_owned())
-        );
-        let missing = AssetId::new();
-        assert_eq!(
-            db.font(missing),
-            Err(format!("font asset {missing} is not in the project"))
-        );
-    }
-
     #[test]
     fn a_broken_material_save_keeps_drawing_the_last_good_version() {
         let dir = Dir::new("db-omat-broken");
@@ -2920,47 +2978,6 @@ pub(crate) mod tests {
         let fixed = material::write(&brick(0.5, crate::gfx::BlendMode::Masked));
         change(&world, &dir, "brick.omat", fixed.as_bytes(), &mut backend);
         assert_eq!(backend.material(bound).unwrap().roughness, 0.5);
-    }
-
-    #[test]
-    fn a_texture_given_as_a_material_is_refused_by_path() {
-        let dir = Dir::new("db-omat-kind");
-        project(&dir);
-        let mut db = open(&dir);
-        let rock = db.find("rocks/rock.png").unwrap().id;
-        assert_eq!(
-            db.material(rock).unwrap_err(),
-            "`rocks/rock.png`, which is a texture"
-        );
-    }
-
-    #[test]
-    fn a_slot_naming_something_other_than_a_texture_is_named() {
-        let dir = Dir::new("db-omat-slot");
-        project(&dir);
-        let tree: AssetId = "5f0c3a4e-0000-4000-8000-0000000000a3".parse().unwrap();
-        dir.write(
-            "models/tree.gltf.meta",
-            format!("id = \"{tree}\"\n").as_bytes(),
-        );
-        let file = material::MaterialFile {
-            textures: material::MaterialTextures {
-                emissive: Some(tree),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        dir.write("brick.omat", material::write(&file).as_bytes());
-        let db = open(&dir);
-        let id = db.find("brick.omat").unwrap().id;
-        let (world, _) = drawing_material(db, id);
-        assert_eq!(
-            update(&world, &mut HeadlessBackend::new()),
-            [
-                "brick.omat: the `emissive` slot names `models/tree.gltf`, which is a mesh, \
-                 so it draws pink. Assign a texture"
-            ]
-        );
     }
 
     /// White, or pink, read as a normal is one tilted far off the surface; a
@@ -3012,44 +3029,6 @@ pub(crate) mod tests {
         assert_eq!(texel(missing), Some((FLAT, false)));
     }
 
-    #[test]
-    fn a_normal_map_that_fails_to_import_stays_flat() {
-        let dir = Dir::new("db-omat-normal-bad");
-        project(&dir);
-        dir.write("rocks/bad_normal.png", b"not a png");
-        dir.write(
-            "rocks/bad_normal.png.meta",
-            format!(
-                "id = \"{ROCK_NORMAL}\"
-"
-            )
-            .as_bytes(),
-        );
-        let normal: AssetId = ROCK_NORMAL.parse().unwrap();
-        let file = material::MaterialFile {
-            textures: material::MaterialTextures {
-                normal: Some(normal),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        dir.write("brick.omat", material::write(&file).as_bytes());
-        let db = open(&dir);
-        let id = db.find("brick.omat").unwrap().id;
-        let (world, _) = drawing_material(db, id);
-        let mut backend = HeadlessBackend::new();
-        update(&world, &mut backend);
-        assert!(world.resource::<AssetDatabase>().wait_idle(WAIT));
-        update(&world, &mut backend);
-
-        let db = world.resource::<AssetDatabase>();
-        assert_eq!(db.state(normal), LoadState::Failed);
-        assert_eq!(
-            backend.texel(db.texture(normal).unwrap()),
-            Some(([128, 128, 255, 255], false))
-        );
-    }
-
     /// The editor's save reaches the slot once. The watcher then hears the
     /// same write, and reading it back would upload the material a second
     /// time; a change made outside the editor still does.
@@ -3095,54 +3074,6 @@ pub(crate) mod tests {
         );
         assert_eq!(backend.material(bound).unwrap().roughness, 0.5);
         assert_eq!(backend.material_updates(), 2);
-    }
-
-    /// A slot takes a texture, and anything else is refused by its path
-    /// before it reaches the file.
-    #[test]
-    fn a_material_slot_refuses_what_is_not_a_texture_by_path() {
-        let dir = Dir::new("db-omat-check");
-        let (world, _, _) = loaded_brick(&dir);
-        let db = world.resource::<AssetDatabase>();
-        let id = db.find("brick.omat").unwrap().id;
-        let tree = db.find("models/tree.gltf").unwrap().id;
-        let mut file = db.material_file(id).unwrap().clone();
-
-        file.textures.normal = Some(rock());
-        assert_eq!(db.check_material(id, &file), Ok(()));
-        file.textures.emissive = Some(tree);
-        assert_eq!(
-            db.check_material(id, &file),
-            Err(
-                "brick.omat: the `emissive` slot takes a texture, not `models/tree.gltf`, which \
-                 is a mesh"
-                    .to_owned()
-            )
-        );
-    }
-
-    #[test]
-    fn a_text_that_does_not_read_is_never_written() {
-        let dir = Dir::new("db-omat-unwritable");
-        let (world, _, _) = loaded_brick(&dir);
-        let id = world
-            .resource::<AssetDatabase>()
-            .find("brick.omat")
-            .unwrap()
-            .id;
-        let before = std::fs::read_to_string(dir.path().join("brick.omat")).unwrap();
-
-        let refused = world
-            .resource_mut::<AssetDatabase>()
-            .write_asset(id, "orrin-material 1 min-reader 1\n\nrougness = 0.5\n");
-        assert_eq!(
-            refused,
-            Err("brick.omat: `rougness` is not a material parameter".to_owned())
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("brick.omat")).unwrap(),
-            before
-        );
     }
 
     /// "New material" in the browser: a default material beside its

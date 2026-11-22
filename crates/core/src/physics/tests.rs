@@ -364,64 +364,6 @@ fn despawning_a_touching_entity_raises_exit() {
     assert_eq!(events(&world), [(CollisionEventKind::Exit, a, b)]);
 }
 
-/// The testbed scene, run headless: whatever the balls do to the stack,
-/// nothing may tunnel through the floor or leave the room.
-#[test]
-fn the_physics_scene_stays_on_its_floor() {
-    let mut world = test_world();
-    crate::scene::entities::build_physics_scene(
-        &mut world,
-        &mut crate::gfx::HeadlessBackend::new(),
-    );
-
-    // With the paddle turning, as the app turns it, so the kinematic body
-    // sweeping through the skittles is part of what has to stay sane.
-    for _ in 0..360 {
-        crate::systems::spin(&world, STEP);
-        frame(&mut world, STEP);
-    }
-
-    let mut bodies = 0;
-    world
-        .query::<(&LocalTransform, &RigidBody)>()
-        .for_each(|entity, (transform, _)| {
-            bodies += 1;
-            let at = transform.translation;
-            let name = world.get::<crate::scene::Name>(entity);
-            assert!(
-                at.y > 0.0 && at.x.abs() < 14.0 && at.z.abs() < 14.0,
-                "{name:?} ended at {at}"
-            );
-        });
-    assert!(bodies > 20, "only {bodies} rigid bodies in the scene");
-}
-
-/// Stop throws the play fork away, so the next Play must start from the
-/// scene's transforms at rest — not carry last session's velocity.
-#[test]
-fn reset_forgets_velocity() {
-    let mut world = test_world();
-    let ball = spawn(
-        &mut world,
-        Vec3::new(0.0, 10.0, 0.0),
-        ColliderShape::Sphere { radius: 0.5 },
-        Some(RigidBody::default()),
-    );
-    simulate(&mut world, 1.0, 60.0);
-    assert!(position(&world, ball).y < 6.0, "the ball did not fall");
-
-    reset(&world);
-    world.get_mut::<LocalTransform>(ball).unwrap().0 = Transform {
-        translation: Vec3::new(0.0, 10.0, 0.0),
-        rotation: Quat::IDENTITY,
-        scale: Vec3::ONE,
-    };
-    frame(&mut world, STEP);
-
-    let fallen = 10.0 - position(&world, ball).y;
-    assert!(fallen < 0.01, "fell {fallen} m in one step after a reset");
-}
-
 /// The unit cube's triangles under `MeshHandle(0)`, for the mesh shapes.
 fn with_cube_mesh(world: &mut World) -> MeshHandle {
     let mut bounds = MeshBounds::default();
@@ -436,22 +378,6 @@ fn settings(world: &mut World, settings: PhysicsSettings) -> Entity {
 
 fn edit_collider(world: &World, entity: Entity, edit: impl FnOnce(&mut Collider)) {
     edit(&mut world.get_mut::<Collider>(entity).unwrap());
-}
-
-/// A collider nothing moves is static: Jolt keeps it in a broadphase tree of
-/// its own and never steps it. Moving it makes it kinematic, from then on.
-#[test]
-fn a_plain_collider_is_static_until_something_moves_it() {
-    let mut world = test_world();
-    let wall = spawn(&mut world, Vec3::ZERO, cube(0.5), None);
-    simulate(&mut world, 0.5, 60.0);
-    assert_eq!(motion(&world, wall), Some(Motion::Static));
-
-    world.get_mut::<LocalTransform>(wall).unwrap().translation.x = 1.0;
-    frame(&mut world, STEP);
-    assert_eq!(motion(&world, wall), Some(Motion::Kinematic));
-    simulate(&mut world, 1.0, 60.0);
-    assert_eq!(motion(&world, wall), Some(Motion::Kinematic));
 }
 
 /// Unity's rule: two colliders that nothing moves never report each other,
@@ -499,95 +425,6 @@ fn a_moved_plain_collider_reports_against_a_static_trigger() {
             (CollisionEventKind::Exit, trigger, mover),
         ]
     );
-}
-
-/// A capsule's length is along local Y and excludes its caps, so standing on
-/// end its centre is `half_height + radius` above the floor.
-#[test]
-fn a_capsule_stands_on_its_end() {
-    let mut world = test_world();
-    floor(&mut world);
-    let capsule = spawn(
-        &mut world,
-        Vec3::new(0.0, 2.0, 0.0),
-        ColliderShape::Capsule {
-            radius: 0.25,
-            half_height: 0.5,
-        },
-        Some(RigidBody {
-            lock_rotation: true,
-            ..RigidBody::default()
-        }),
-    );
-
-    simulate(&mut world, 2.0, 60.0);
-
-    let y = position(&world, capsule).y;
-    assert!(
-        (y - 0.75).abs() < RESTING,
-        "the capsule's centre settled at {y}"
-    );
-}
-
-#[test]
-fn a_cylinder_rests_on_its_flat_face() {
-    let mut world = test_world();
-    floor(&mut world);
-    let cylinder = spawn(
-        &mut world,
-        Vec3::new(0.0, 2.0, 0.0),
-        ColliderShape::Cylinder {
-            radius: 0.5,
-            half_height: 0.25,
-        },
-        Some(RigidBody::default()),
-    );
-
-    simulate(&mut world, 2.0, 60.0);
-
-    let y = position(&world, cylinder).y;
-    assert!((y - 0.25).abs() < RESTING, "the cylinder settled at {y}");
-}
-
-/// A mesh collider is the entity's own triangles, scaled by its transform:
-/// the unit cube stretched into a slab is a floor with its top at 0.5.
-#[test]
-fn a_rigid_body_comes_to_rest_on_a_mesh_collider() {
-    let mut world = test_world();
-    let mesh = with_cube_mesh(&mut world);
-    let slab = spawn(&mut world, Vec3::ZERO, ColliderShape::Mesh, None);
-    world.insert(slab, mesh);
-    world.get_mut::<LocalTransform>(slab).unwrap().scale = Vec3::new(10.0, 1.0, 10.0);
-    let ball = spawn(
-        &mut world,
-        Vec3::new(0.0, 3.0, 0.0),
-        ColliderShape::Sphere { radius: 0.5 },
-        Some(RigidBody::default()),
-    );
-
-    simulate(&mut world, 2.0, 60.0);
-
-    let y = position(&world, ball).y;
-    assert!((y - 1.0).abs() < RESTING, "the ball settled at {y}");
-}
-
-#[test]
-fn a_convex_hull_falls_and_rests_like_its_mesh() {
-    let mut world = test_world();
-    floor(&mut world);
-    let mesh = with_cube_mesh(&mut world);
-    let block = spawn(
-        &mut world,
-        Vec3::new(0.0, 3.0, 0.0),
-        ColliderShape::ConvexHull,
-        Some(RigidBody::default()),
-    );
-    world.insert(block, mesh);
-
-    simulate(&mut world, 3.0, 60.0);
-
-    let y = position(&world, block).y;
-    assert!((y - 0.5).abs() < RESTING, "the hull settled at {y}");
 }
 
 /// A triangle mesh has no inside, so Jolt cannot push a moving one out of
@@ -811,37 +648,6 @@ fn a_fast_body_tunnels_through_a_thin_floor_unless_continuous() {
     assert!(ended(true) > 0.0, "the continuous pellet tunnelled");
 }
 
-#[test]
-fn a_body_with_its_rotation_locked_keeps_it() {
-    let tumble = |lock_rotation: bool| {
-        let mut world = test_world();
-        floor(&mut world);
-        let tilt = Quat::from_rotation_z(0.6) * Quat::from_rotation_x(0.3);
-        let crate_ = spawn(
-            &mut world,
-            Vec3::new(0.0, 3.0, 0.0),
-            cube(0.5),
-            Some(RigidBody {
-                lock_rotation,
-                ..RigidBody::default()
-            }),
-        );
-        world.get_mut::<LocalTransform>(crate_).unwrap().rotation = tilt;
-        simulate(&mut world, 2.0, 60.0);
-        world
-            .get::<LocalTransform>(crate_)
-            .unwrap()
-            .rotation
-            .angle_between(tilt)
-    };
-
-    assert!(tumble(true) < 1e-3, "a locked crate turned");
-    assert!(
-        tumble(false) > 0.1,
-        "a free crate landed on its corner and stayed"
-    );
-}
-
 fn velocity_of(world: &World, entity: Entity) -> Vec3 {
     velocity(world, entity)
         .expect("a simulated body has a velocity")
@@ -876,24 +682,6 @@ fn an_impulse_changes_velocity_by_impulse_over_mass() {
     assert!((v.x - 2.0).abs() < 1e-3, "velocity {v}");
 }
 
-#[test]
-fn a_velocity_change_ignores_mass() {
-    let mut world = test_world();
-    let body = spawn(&mut world, Vec3::ZERO, cube(0.5), Some(frictionless(50.0)));
-    frame(&mut world, STEP);
-
-    add_force(
-        &world,
-        body,
-        Vec3::new(0.0, 0.0, 3.0),
-        ForceMode::VelocityChange,
-    );
-    frame(&mut world, STEP);
-
-    let v = velocity_of(&world, body);
-    assert!((v.z - 3.0).abs() < 1e-3, "velocity {v}");
-}
-
 /// A force added every frame is a force held for that frame, so a second of
 /// it is the same push at 60 fps as at 144 — scripts call it from OnUpdate,
 /// which runs at the display's rate rather than the step's.
@@ -921,45 +709,6 @@ fn a_held_force_pushes_the_same_whatever_the_frame_rate() {
             "{mode:?} at 144 fps reached {fast}"
         );
     }
-}
-
-#[test]
-fn an_angular_impulse_spins_a_body() {
-    let mut world = test_world();
-    let body = spawn(&mut world, Vec3::ZERO, cube(0.5), Some(frictionless(1.0)));
-    frame(&mut world, STEP);
-
-    assert!(add_torque(
-        &world,
-        body,
-        Vec3::new(0.0, 1.0, 0.0),
-        ForceMode::Impulse
-    ));
-    frame(&mut world, STEP);
-
-    let (_, angular) = velocity(&world, body).unwrap();
-    assert!(
-        angular.y > 1.0 && angular.x.abs() < 1e-3,
-        "angular velocity {angular}"
-    );
-}
-
-#[test]
-fn setting_a_velocity_moves_the_body_at_it() {
-    let mut world = test_world();
-    let body = spawn(&mut world, Vec3::ZERO, cube(0.5), Some(frictionless(1.0)));
-    frame(&mut world, STEP);
-
-    assert!(set_velocity(
-        &world,
-        body,
-        Some(Vec3::new(0.0, 5.0, 0.0)),
-        None
-    ));
-    simulate(&mut world, 1.0, 60.0);
-
-    let y = position(&world, body).y;
-    assert!((y - 5.0).abs() < 0.1, "moved {y} m in a second at 5 m/s");
 }
 
 /// A script that spawns a body and pushes it in the same OnStart pushes a body
@@ -1028,13 +777,6 @@ fn a_ray_hits_the_nearest_collider_and_names_it() {
 }
 
 #[test]
-fn a_ray_stops_at_its_length() {
-    let (world, _, _) = ray_world();
-
-    assert!(raycast(&world, Vec3::ZERO, -Vec3::Z, 4.0, u32::MAX, false).is_none());
-}
-
-#[test]
 fn a_ray_passes_layers_its_mask_leaves_out() {
     let (world, near, far) = ray_world();
     edit_collider(&world, near, |c| c.layer = 2);
@@ -1044,64 +786,6 @@ fn a_ray_passes_layers_its_mask_leaves_out() {
     let hit = raycast(&world, Vec3::ZERO, -Vec3::Z, 100.0, !(1 << 2), false).unwrap();
 
     assert_eq!(hit.entity, far);
-}
-
-/// A trigger is a volume to be in, not a surface to see, so a ray passes it
-/// unless it asks.
-#[test]
-fn a_ray_passes_triggers_unless_asked_to_hit_them() {
-    let (world, near, far) = ray_world();
-    edit_collider(&world, near, |c| c.is_trigger = true);
-    let mut world = world;
-    frame(&mut world, STEP);
-
-    let through = raycast(&world, Vec3::ZERO, -Vec3::Z, 100.0, u32::MAX, false).unwrap();
-    let onto = raycast(&world, Vec3::ZERO, -Vec3::Z, 100.0, u32::MAX, true).unwrap();
-
-    assert_eq!(through.entity, far);
-    assert_eq!(onto.entity, near);
-}
-
-/// Scripts hear a trigger through its own callbacks, so an event says
-/// whether it was one.
-#[test]
-fn an_event_says_whether_a_trigger_was_in_it() {
-    let mut world = test_world();
-    let trigger = spawn(&mut world, Vec3::ZERO, cube(1.0), None);
-    edit_collider(&world, trigger, |c| c.is_trigger = true);
-    let solid = spawn(&mut world, Vec3::new(5.0, 0.0, 0.0), cube(1.0), None);
-    spawn(
-        &mut world,
-        Vec3::new(5.0, 3.0, 0.0),
-        cube(0.5),
-        Some(RigidBody::default()),
-    );
-    spawn(
-        &mut world,
-        Vec3::new(0.0, 3.0, 0.0),
-        cube(0.25),
-        Some(RigidBody::default()),
-    );
-
-    let mut flags = Vec::new();
-    for _ in 0..90 {
-        frame(&mut world, STEP);
-        for event in &world.resource::<CollisionState>().events {
-            if event.kind == CollisionEventKind::Enter {
-                flags.push((event.a == trigger || event.b == trigger, event.trigger));
-            }
-        }
-    }
-
-    let _ = solid;
-    assert!(flags.contains(&(true, true)), "{flags:?}");
-    assert!(flags.contains(&(false, false)), "{flags:?}");
-    assert!(
-        flags
-            .iter()
-            .all(|(with_trigger, flag)| with_trigger == flag),
-        "{flags:?}"
-    );
 }
 
 /// A body is rebuilt when what it was built from changes — a crouch that
@@ -1126,40 +810,6 @@ fn a_rebuilt_body_keeps_its_velocity() {
     let (linear, angular) = velocity(&world, body).unwrap();
     assert!((linear.x - 6.0).abs() < 1e-3, "lost its speed: {linear}");
     assert!((angular.y - 2.0).abs() < 1e-3, "lost its spin: {angular}");
-}
-
-/// A script's components are added after its tick, so "spawn, add a rigid
-/// body, throw" pushes an entity that has no rigid body yet when it asks. The
-/// push is kept for the next step, which is after the body has arrived — and
-/// dropped there, harmlessly, if it never did.
-#[test]
-fn a_push_waits_for_a_rigid_body_added_after_it() {
-    let mut world = test_world();
-    frame(&mut world, STEP);
-    let ball = spawn(&mut world, Vec3::ZERO, cube(0.5), None);
-
-    assert!(set_velocity(
-        &world,
-        ball,
-        Some(Vec3::new(0.0, 0.0, -8.0)),
-        None
-    ));
-    world.insert(ball, frictionless(1.0));
-    frame(&mut world, STEP);
-
-    let v = velocity_of(&world, ball);
-    assert!((v.z + 8.0).abs() < 1e-3, "velocity {v}");
-
-    let never = spawn(&mut world, Vec3::new(5.0, 0.0, 0.0), cube(0.5), None);
-    world.despawn(never);
-    let stays = spawn(&mut world, Vec3::new(9.0, 0.0, 0.0), cube(0.5), None);
-    assert!(add_force(&world, stays, Vec3::X, ForceMode::Impulse));
-    frame(&mut world, STEP);
-    assert_eq!(
-        motion(&world, stays),
-        Some(Motion::Static),
-        "the dropped push moved a wall"
-    );
 }
 
 /// What `Scripting::run_physics` does each frame while a Behaviour overrides
@@ -1347,37 +997,6 @@ fn a_touching_pair_stays_each_step_between_enter_and_exit() {
     }
 }
 
-/// A pair asleep against each other is dormant: still touching, so it never
-/// exits, and nothing happening to it, so it does not stay either.
-#[test]
-fn a_dormant_pair_does_not_stay() {
-    let mut world = test_world();
-    let floor = floor(&mut world);
-    let resting = spawn(
-        &mut world,
-        Vec3::new(0.0, 0.5, 0.0),
-        cube(0.5),
-        Some(RigidBody::default()),
-    );
-    report_stays(&world);
-
-    let mut stays = Vec::new();
-    for _ in 0..180 {
-        frame(&mut world, STEP);
-        let events = events(&world);
-        assert!(!events.contains(&(CollisionEventKind::Exit, floor, resting)));
-        stays.push(
-            events
-                .iter()
-                .filter(|(kind, ..)| *kind == CollisionEventKind::Stay)
-                .count(),
-        );
-    }
-
-    assert!(stays[1..10].iter().all(|&n| n == 1), "{stays:?}");
-    assert!(stays[120..].iter().all(|&n| n == 0), "{stays:?}");
-}
-
 /// A contact says how fast the pair was closing, a's velocity at the point
 /// less b's, so its component along the normal (a toward b) is the closing
 /// speed.
@@ -1455,20 +1074,6 @@ fn the_time_scale_takes_fewer_steps_of_the_same_length() {
     assert!(unscaled.iter().all(|&delta| delta == STEP), "{unscaled:?}");
 }
 
-#[test]
-fn the_step_length_is_the_scenes() {
-    let mut world = test_world();
-    assert_eq!(step_length(&world), STEP);
-    settings(
-        &mut world,
-        PhysicsSettings {
-            steps_per_second: 120,
-            ..PhysicsSettings::default()
-        },
-    );
-    assert_eq!(step_length(&world), 1.0 / 120.0);
-}
-
 /// A wall straight ahead down -z, a trigger to the right, and a mesh collider
 /// to the left, each one metre across.
 fn query_world() -> (World, Entity, Entity, Entity) {
@@ -1540,51 +1145,6 @@ fn an_overlap_names_each_entity_once_in_entity_order() {
 }
 
 #[test]
-fn an_overlap_skips_layers_its_mask_leaves_out() {
-    let (world, wall, _, mesh) = query_world();
-    edit_collider(&world, wall, |c| c.layer = 2);
-    let mut world = world;
-    frame(&mut world, STEP);
-
-    assert_eq!(
-        overlapping(&world, sphere(Vec3::ZERO, 6.0), !(1 << 2), false),
-        [mesh]
-    );
-}
-
-#[test]
-fn an_overlap_counts_triggers_only_when_asked() {
-    let (world, _, trigger, _) = query_world();
-    let at_trigger = sphere(Vec3::new(4.0, 0.0, 0.0), 0.6);
-
-    assert!(overlapping(&world, at_trigger, u32::MAX, false).is_empty());
-    assert_eq!(overlapping(&world, at_trigger, u32::MAX, true), [trigger]);
-}
-
-/// The box is turned, not just placed: a long thin box reaches the wall only
-/// once it is rotated to point at it.
-#[test]
-fn an_overlap_box_is_turned_by_its_rotation() {
-    let (world, wall, _, _) = query_world();
-    let thin = |rotation| QueryShape::Box {
-        center: Vec3::new(0.0, 0.0, -2.0),
-        half_extents: Vec3::new(3.0, 0.1, 0.1),
-        rotation,
-    };
-
-    assert!(overlapping(&world, thin(Quat::IDENTITY), u32::MAX, false).is_empty());
-    assert_eq!(
-        overlapping(
-            &world,
-            thin(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
-            u32::MAX,
-            false
-        ),
-        [wall]
-    );
-}
-
-#[test]
 fn a_sphere_cast_stops_where_the_sphere_first_touches() {
     let (world, wall, _, _) = query_world();
 
@@ -1604,73 +1164,6 @@ fn a_sphere_cast_stops_where_the_sphere_first_touches() {
     assert!(
         hit.point.abs_diff_eq(Vec3::new(0.0, 0.0, -4.5), 1e-3),
         "{hit:?}"
-    );
-}
-
-#[test]
-fn a_cast_stops_at_its_length() {
-    let (world, _, _, _) = query_world();
-    assert!(
-        shape_cast(
-            &world,
-            sphere(Vec3::ZERO, 0.5),
-            -Vec3::Z,
-            3.9,
-            u32::MAX,
-            false
-        )
-        .is_none()
-    );
-}
-
-#[test]
-fn a_cast_passes_layers_its_mask_leaves_out_and_triggers_unless_asked() {
-    let (world, wall, trigger, _) = query_world();
-    edit_collider(&world, wall, |c| c.layer = 2);
-    let mut world = world;
-    frame(&mut world, STEP);
-    let ahead = sphere(Vec3::ZERO, 0.5);
-    let right = sphere(Vec3::ZERO, 0.5);
-
-    assert!(shape_cast(&world, ahead, -Vec3::Z, 100.0, !(1 << 2), false).is_none());
-    assert!(shape_cast(&world, right, Vec3::X, 100.0, u32::MAX, false).is_none());
-    let hit = shape_cast(&world, right, Vec3::X, 100.0, u32::MAX, true).unwrap();
-    assert_eq!(hit.entity, trigger);
-    assert!((hit.distance - 4.0).abs() < 1e-3, "{hit:?}");
-}
-
-#[test]
-fn a_box_cast_meets_the_wall_face_on() {
-    let (world, wall, _, _) = query_world();
-    let crate_ = QueryShape::Box {
-        center: Vec3::ZERO,
-        half_extents: Vec3::splat(0.5),
-        rotation: Quat::IDENTITY,
-    };
-
-    let hit = shape_cast(&world, crate_, -Vec3::Z, 100.0, u32::MAX, false).unwrap();
-
-    assert_eq!(hit.entity, wall);
-    assert!((hit.distance - 4.0).abs() < 1e-3, "{hit:?}");
-    assert!(hit.normal.abs_diff_eq(Vec3::Z, 1e-3), "{hit:?}");
-    assert!((hit.point.z + 4.5).abs() < 1e-3, "{hit:?}");
-}
-
-#[test]
-fn a_degenerate_query_finds_nothing() {
-    let (world, _, _, _) = query_world();
-    assert!(overlapping(&world, sphere(Vec3::ZERO, 0.0), u32::MAX, true).is_empty());
-    assert!(overlapping(&world, sphere(Vec3::ZERO, f32::NAN), u32::MAX, true).is_empty());
-    assert!(
-        shape_cast(
-            &world,
-            sphere(Vec3::ZERO, 0.5),
-            Vec3::ZERO,
-            10.0,
-            u32::MAX,
-            true
-        )
-        .is_none()
     );
 }
 

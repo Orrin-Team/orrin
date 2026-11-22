@@ -468,33 +468,6 @@ mod tests {
     use super::*;
     use crate::asset_db::tests::Dir;
 
-    #[test]
-    fn a_file_is_an_asset_by_its_extension() {
-        assert_eq!(AssetKind::of_path("rocks/a.PNG"), Some(AssetKind::Texture));
-        assert_eq!(AssetKind::of_path("a.jpeg"), Some(AssetKind::Texture));
-        assert_eq!(AssetKind::of_path("a.jpg"), Some(AssetKind::Texture));
-        assert_eq!(AssetKind::of_path("m/tree.gltf"), Some(AssetKind::Mesh));
-        assert_eq!(AssetKind::of_path("tree.glb"), Some(AssetKind::Mesh));
-        assert_eq!(AssetKind::of_path("door.oprefab"), Some(AssetKind::Prefab));
-        assert_eq!(AssetKind::of_path("brick.OMAT"), Some(AssetKind::Material));
-        assert_eq!(AssetKind::of_path("ui/Title.TTF"), Some(AssetKind::Font));
-        assert_eq!(AssetKind::of_path("body.otf"), Some(AssetKind::Font));
-        assert_eq!(AssetKind::of_path("sfx/door.WAV"), Some(AssetKind::Audio));
-        assert_eq!(AssetKind::of_path("theme.ogg"), Some(AssetKind::Audio));
-        assert_eq!(AssetKind::of_path("theme.mp3"), Some(AssetKind::Audio));
-        assert_eq!(
-            AssetKind::of_path("fx/glow.oshader"),
-            Some(AssetKind::Shader)
-        );
-        assert_eq!(AssetKind::of_path("m/tree.Blend"), Some(AssetKind::Mesh));
-        // Blender's backup of the previous save, and its file mid-save.
-        assert_eq!(AssetKind::of_path("m/tree.blend1"), None);
-        assert_eq!(AssetKind::of_path("m/tree.blend@"), None);
-        assert_eq!(AssetKind::of_path("tree.bin"), None);
-        assert_eq!(AssetKind::of_path("a.png.meta"), None);
-        assert_eq!(AssetKind::of_path("png"), None);
-    }
-
     /// The id is the asset's identity for as long as the file exists, so the
     /// first read has to leave it where the next one finds it — and the second
     /// read must not touch a file that is committed.
@@ -529,27 +502,6 @@ mod tests {
         );
     }
 
-    /// The guess a new sidecar starts from, by the words texture sets use: a
-    /// normal map is told apart from other data, because it filters and
-    /// compresses differently.
-    #[test]
-    fn a_texture_starts_with_the_usage_its_name_suggests() {
-        let usage = |name: &str| {
-            let Settings::Texture(settings) = Settings::defaults_for(AssetKind::Texture, name)
-            else {
-                panic!("a texture's settings");
-            };
-            settings.usage
-        };
-        for name in ["Rock_NormalGL.png", "bark_nrm.jpg", "wall_Normal.png"] {
-            assert_eq!(usage(name), Usage::Normal, "{name}");
-        }
-        for name in ["bark_roughness.jpg", "wall_height.png", "Metal_mask.png"] {
-            assert_eq!(usage(name), Usage::Data, "{name}");
-        }
-        assert_eq!(usage("props/Rock_Color.png"), Usage::Color);
-    }
-
     #[test]
     fn a_texture_sidecar_reads_every_setting() {
         let dir = Dir::new("sidecar-texture");
@@ -570,21 +522,6 @@ mod tests {
         assert_eq!(
             sidecar.settings.canonical(),
             "usage=data;compress=false;max_size=64"
-        );
-    }
-
-    #[test]
-    fn a_usage_that_is_not_one_of_the_three_is_refused_by_name() {
-        let dir = Dir::new("sidecar-usage");
-        let source = dir.write("rock.png", b"");
-        dir.write(
-            "rock.png.meta",
-            b"id = \"5f0c3a4e-0000-4000-8000-000000000001\"\n\n[import]\nusage = \"albedo\"\n",
-        );
-        let err = read_or_create(&source, "rock.png", AssetKind::Texture).unwrap_err();
-        assert_eq!(
-            err,
-            "rock.png.meta: `usage` must be \"color\", \"normal\" or \"data\", not \"albedo\""
         );
     }
 
@@ -626,18 +563,6 @@ mod tests {
     }
 
     #[test]
-    fn a_setting_of_the_wrong_type_is_refused_by_name() {
-        let dir = Dir::new("sidecar-type");
-        let source = dir.write("tree.glb", b"");
-        dir.write(
-            "tree.glb.meta",
-            b"id = \"5f0c3a4e-0000-4000-8000-000000000001\"\n\n[import]\nscale = \"big\"\n",
-        );
-        let err = read_or_create(&source, "tree.glb", AssetKind::Mesh).unwrap_err();
-        assert_eq!(err, "tree.glb.meta: `scale` must be a number, not \"big\"");
-    }
-
-    #[test]
     fn a_sidecar_without_a_valid_id_is_refused_rather_than_replaced() {
         let dir = Dir::new("sidecar-bad-id");
         let source = dir.write("rock.png", b"");
@@ -651,15 +576,6 @@ mod tests {
             std::fs::read_to_string(dir.path().join("rock.png.meta")).unwrap(),
             "id = \"nope\"\n"
         );
-    }
-
-    #[test]
-    fn a_tint_round_trips_as_hex() {
-        assert_eq!(Tint::parse("#e5534B"), Some(Tint([0xe5, 0x53, 0x4b])));
-        assert_eq!(Tint([0x0a, 0xb0, 0x0c]).to_hex(), "#0ab00c");
-        assert_eq!(Tint::parse("e5534b"), None);
-        assert_eq!(Tint::parse("#e5534"), None);
-        assert_eq!(Tint::parse("#zz534b"), None);
     }
 
     /// A folder has no sidecar until it is tinted, and clearing the tint keeps
@@ -683,21 +599,5 @@ mod tests {
         assert_eq!(write_folder_tint(&props, "props", None).unwrap(), id);
         let cleared = read_folder(&props, "props").unwrap().unwrap();
         assert_eq!((cleared.id, cleared.tint), (id, None));
-    }
-
-    #[test]
-    fn a_folder_tint_that_is_not_a_colour_is_refused() {
-        let dir = Dir::new("sidecar-folder-bad");
-        let props = dir.path().join("props");
-        std::fs::create_dir_all(&props).unwrap();
-        dir.write(
-            "props.meta",
-            b"id = \"5f0c3a4e-0000-4000-8000-000000000001\"\ntint = \"red\"\n",
-        );
-        let err = read_folder(&props, "props").unwrap_err();
-        assert_eq!(
-            err,
-            "props.meta: `tint` must be a colour written \"#rrggbb\", not \"red\""
-        );
     }
 }

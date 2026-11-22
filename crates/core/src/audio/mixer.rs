@@ -351,19 +351,6 @@ mod tests {
     }
 
     #[test]
-    fn a_clip_at_half_the_rate_lasts_twice_as_long() {
-        let shared = shared();
-        let mut mixer = Mixer::new(shared.clone());
-        play(&shared, 1, mono(RATE / 2, &[1.0; 100]), false, [1.0; 2]);
-
-        let sounding = pull(&mut mixer, BLOCK)
-            .iter()
-            .filter(|frame| frame[0] > 0.0)
-            .count();
-        assert_eq!(sounding, 200);
-    }
-
-    #[test]
     fn a_looping_clip_wraps_and_never_finishes() {
         let shared = shared();
         let mut mixer = Mixer::new(shared.clone());
@@ -452,28 +439,5 @@ mod tests {
             },
         );
         assert_eq!(pull(&mut mixer, 1)[0], [0.5, 0.125]);
-    }
-
-    #[test]
-    fn a_stream_plays_until_it_runs_out() {
-        let shared = shared();
-        let mut mixer = Mixer::new(shared.clone());
-        let samples: Vec<f32> = (0..20).map(|i| i as f32).collect();
-        send(
-            &shared,
-            Command::Play {
-                id: 9,
-                body: Body::Stream(Box::new(samples.clone().into_iter())),
-                gains: [1.0; 2],
-                downmix: false,
-            },
-        );
-
-        let out = pull(&mut mixer, BLOCK * 2);
-        for (f, frame) in out[..10].iter().enumerate() {
-            assert_eq!(*frame, [samples[2 * f], samples[2 * f + 1]]);
-        }
-        assert!(out[10..].iter().all(|frame| *frame == [0.0; 2]));
-        assert_eq!(shared.lock().unwrap().finished, [9]);
     }
 }

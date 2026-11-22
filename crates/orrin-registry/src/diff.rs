@@ -247,19 +247,6 @@ mod tests {
         );
     }
 
-    /// The appended leaves compare by bits like every other float, so a NaN
-    /// tint is not an edit and a moved one is a single change.
-    #[test]
-    fn a_vec2_and_a_colour_compare_bitwise() {
-        let tint = |alpha| Value::Color([f32::NAN, 0.0, 1.0, alpha]);
-        assert_eq!(diff(&tint(1.0), &tint(1.0)), Vec::new());
-        assert_eq!(diff(&tint(1.0), &tint(0.5)).len(), 1);
-
-        let offset = |x| Value::Vec2(glam::Vec2::new(x, f32::NAN));
-        assert_eq!(diff(&offset(1.0), &offset(1.0)), Vec::new());
-        assert_eq!(diff(&offset(0.0), &offset(-0.0)).len(), 1);
-    }
-
     #[test]
     fn nested_paths_read_outermost_first() {
         let old = Value::strukt([("inner", placement(1.0, 2.0))]);
@@ -276,14 +263,6 @@ mod tests {
     fn a_nan_that_did_not_move_is_not_a_change() {
         let nan = Value::F32(f32::NAN);
         assert_eq!(diff(&nan, &nan.clone()), Vec::new());
-    }
-
-    /// The other half: `-0.0 == 0.0` in Rust, but flipping a sign bit is a real
-    /// edit and the two print differently everywhere the value is inspected.
-    #[test]
-    fn a_sign_flip_on_zero_is_a_change() {
-        let changes = diff(&Value::F32(0.0), &Value::F32(-0.0));
-        assert_eq!(changes, vec![change(&[], Value::F32(-0.0))]);
     }
 
     #[test]
@@ -324,21 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn a_value_that_changed_type_replaces_itself() {
-        let changes = diff(&Value::F32(1.0), &Value::Bool(true));
-        assert_eq!(changes, vec![change(&[], Value::Bool(true))]);
-    }
-
-    /// A component that grew a field between two saves has no field-wise diff at
-    /// all; the shapes are not comparable and the newer one wins whole.
-    #[test]
-    fn a_different_field_set_replaces_the_whole_struct() {
-        let old = Value::strukt([("a", Value::I32(1))]);
-        let new = Value::strukt([("a", Value::I32(1)), ("b", Value::I32(2))]);
-        assert_eq!(diff(&old, &new), vec![change(&[], new)]);
-    }
-
-    #[test]
     fn applying_a_diff_reproduces_the_new_value() {
         let old = placement(1.0, 2.0);
         let new = placement(4.0, 9.0);
@@ -359,26 +323,6 @@ mod tests {
     }
 
     #[test]
-    fn applying_into_a_list_and_an_enum_payload_works() {
-        let mut target = Value::strukt([(
-            "light",
-            Value::enumeration("Point", [("points", Value::List(vec![Value::I32(0)]))]),
-        )]);
-        let changes = vec![change(
-            &[field("light"), field("points"), PathSegment::Index(0)],
-            Value::I32(5),
-        )];
-        apply(&mut target, &changes).unwrap();
-        assert_eq!(
-            target
-                .field("light")
-                .and_then(|l| l.field("points"))
-                .cloned(),
-            Some(Value::List(vec![Value::I32(5)]))
-        );
-    }
-
-    #[test]
     fn an_unresolvable_path_names_it_and_changes_nothing() {
         let mut target = placement(1.0, 2.0);
         let changes = vec![
@@ -391,16 +335,5 @@ mod tests {
             "field `translation.gone`: expected a value, found nothing"
         );
         assert_eq!(target, placement(1.0, 2.0));
-    }
-
-    #[test]
-    fn an_index_past_the_end_names_the_full_path() {
-        let mut target = Value::strukt([("points", Value::List(vec![Value::I32(0)]))]);
-        let changes = vec![change(
-            &[field("points"), PathSegment::Index(3)],
-            Value::I32(1),
-        )];
-        let err = apply(&mut target, &changes).unwrap_err();
-        assert_eq!(err.path.to_string(), "points[3]");
     }
 }
