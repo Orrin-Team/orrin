@@ -279,8 +279,9 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
     ray_length = distance(hit_view, p);
     float cone = ray_length * alpha * CONE_SCALE;
     // World units to texels of the full-resolution frame: a length at view
-    // depth z spans `proj[1][1] / |z|` of NDC, and NDC spans two across it.
-    float texels = cone * (ssr.proj[1][1] / max(abs(hit_view.z), 1e-4)) * ssr.extent.y * 0.5;
+    // depth z spans `|proj[1][1]| / |z|` of NDC, and NDC spans two across it.
+    // The magnitude, because Vulkan's flipped Y makes `proj[1][1]` negative.
+    float texels = cone * (abs(ssr.proj[1][1]) / max(abs(hit_view.z), 1e-4)) * ssr.extent.y * 0.5;
     float lod = log2(max(texels, 1.0));
 
     // A cone under two texels wide reads the frame itself, and the pyramid —
