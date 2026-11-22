@@ -21,10 +21,14 @@
 // The tile shape is `hiz_build.comp`'s exactly: one workgroup owns a 64x64 tile
 // and reduces it alone, because the render graph's unversioned resources forbid
 // a pass per level. Only the reduction differs — a mean here, a minimum there.
+//
+// 16x16 invocations, each reducing a 4x4 block of level 0, for the reason the
+// depth pyramid has them: with an 8x8 block each, an invocation held so many
+// colours live that it ran out of registers and spilled.
 
 const int MAX_LEVELS = 7;
 
-layout(local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(set = 0, binding = 0) uniform sampler2D u_source;
 layout(set = 0, binding = 1, r11f_g11f_b10f) uniform writeonly image2D u_mips[MAX_LEVELS];
@@ -36,7 +40,7 @@ layout(push_constant) uniform Push {
     int levels;
 } push;
 
-shared vec4 lds[64];
+shared vec4 lds[256];
 
 // One bilinear fetch centred between four full-resolution texels averages them
 // for free, which is exactly the 2:1 reduction level 0 is.
@@ -45,12 +49,11 @@ vec4 load(ivec2 p) {
     return texture(u_source, uv);
 }
 
-#define STORE(level, coord, value)                                \
-    if (push.levels > (level)) {                                  \
-        ivec2 size_ = imageSize(u_mips[level]);                   \
-        if (all(lessThan(coord, size_))) {                        \
-            imageStore(u_mips[level], coord, value);              \
-        }                                                         \
+// `mip` is a literal at every call site; the caller has already tested
+// `push.levels`, once per level.
+#define STORE(mip, coord, value)                                  \
+    if (all(lessThan(coord, imageSize(u_mips[mip])))) {           \
+        imageStore(u_mips[mip], coord, value);                    \
     }
 
 vec4 mean4(vec4 a, vec4 b, vec4 c, vec4 d) {
@@ -58,75 +61,74 @@ vec4 mean4(vec4 a, vec4 b, vec4 c, vec4 d) {
 }
 
 void main() {
-    ivec2 tile = ivec2(gl_WorkGroupID.xy) * 64;
+    ivec2 group = ivec2(gl_WorkGroupID.xy);
     ivec2 lid = ivec2(gl_LocalInvocationID.xy);
-    ivec2 base = tile + lid * 8;
+    ivec2 base = group * 64 + lid * 4;
 
-    // Levels 0 to 3 stream through in 2x2 blocks rather than being gathered
-    // whole, and that shape is the difference between this pass costing what its
-    // memory traffic costs and costing several times more.
-    //
-    // The obvious version keeps the thread's entire 8x8 sub-tile live — 64
-    // `vec4`s, 256 32-bit registers — before reducing any of it. A GPU that
-    // allots a thread around 128 spills the rest to device memory and then
-    // reloads it, so a pass whose real work is one read and one write per texel
-    // does several of each, and occupancy collapses on top of that. Reducing
-    // each block the moment its four texels are in hand keeps at most a dozen
-    // `vec4`s live and never spills.
-    //
-    // The reduction tree is unchanged, so every level is bit-identical to the
-    // gathered version: `bi`/`bj` select the same 4x4 block the old `i`/`j` pair
-    // did, and each level's store lands on the same coordinate.
-    vec4 m2[4];
+    // The reduction tree is the 8x8 version's, so every level is bit-identical
+    // to it: each 2x2 block of level 0 is averaged into level 1 the moment it
+    // is in hand, in the same order, and each level's store lands on the same
+    // coordinate.
+    vec4 m1[4];
     for (int bj = 0; bj < 2; ++bj) {
         for (int bi = 0; bi < 2; ++bi) {
-            vec4 m1[4];
-            for (int j = 0; j < 2; ++j) {
-                for (int i = 0; i < 2; ++i) {
-                    ivec2 p = base + ivec2(bi * 4 + i * 2, bj * 4 + j * 2);
-                    vec4 a = load(p);
-                    vec4 b = load(p + ivec2(1, 0));
-                    vec4 c = load(p + ivec2(0, 1));
-                    vec4 d = load(p + ivec2(1, 1));
-                    STORE(0, p, a)
-                    STORE(0, p + ivec2(1, 0), b)
-                    STORE(0, p + ivec2(0, 1), c)
-                    STORE(0, p + ivec2(1, 1), d)
-
-                    vec4 v = mean4(a, b, c, d);
-                    STORE(1, p >> 1, v)
-                    m1[j * 2 + i] = v;
-                }
+            ivec2 p = base + ivec2(bi * 2, bj * 2);
+            vec4 a = load(p);
+            vec4 b = load(p + ivec2(1, 0));
+            vec4 c = load(p + ivec2(0, 1));
+            vec4 d = load(p + ivec2(1, 1));
+            if (push.levels > 0) {
+                STORE(0, p, a)
+                STORE(0, p + ivec2(1, 0), b)
+                STORE(0, p + ivec2(0, 1), c)
+                STORE(0, p + ivec2(1, 1), d)
             }
-            vec4 v = mean4(m1[0], m1[1], m1[2], m1[3]);
-            STORE(2, (base >> 2) + ivec2(bi, bj), v)
-            m2[bj * 2 + bi] = v;
+            vec4 v = mean4(a, b, c, d);
+            if (push.levels > 1) {
+                STORE(1, p >> 1, v)
+            }
+            m1[bj * 2 + bi] = v;
         }
     }
 
-    vec4 m3 = mean4(m2[0], m2[1], m2[2], m2[3]);
-    STORE(3, (base >> 3) + ivec2(0, 0), m3)
+    vec4 m2 = mean4(m1[0], m1[1], m1[2], m1[3]);
+    if (push.levels > 2) {
+        STORE(2, base >> 2, m2)
+    }
 
-    int slot = lid.y * 8 + lid.x;
-    lds[slot] = m3;
+    int slot = lid.y * 16 + lid.x;
+    lds[slot] = m2;
     barrier();
 
     if ((lid.x & 1) == 0 && (lid.y & 1) == 0) {
-        vec4 v = mean4(lds[slot], lds[slot + 1], lds[slot + 8], lds[slot + 9]);
+        vec4 v = mean4(lds[slot], lds[slot + 1], lds[slot + 16], lds[slot + 17]);
         lds[slot] = v;
-        STORE(4, ivec2(gl_WorkGroupID.xy) * 4 + (lid >> 1), v)
+        if (push.levels > 3) {
+            STORE(3, group * 8 + (lid >> 1), v)
+        }
     }
     barrier();
 
     if ((lid.x & 3) == 0 && (lid.y & 3) == 0) {
-        vec4 v = mean4(lds[slot], lds[slot + 2], lds[slot + 16], lds[slot + 18]);
+        vec4 v = mean4(lds[slot], lds[slot + 2], lds[slot + 32], lds[slot + 34]);
         lds[slot] = v;
-        STORE(5, ivec2(gl_WorkGroupID.xy) * 2 + (lid >> 2), v)
+        if (push.levels > 4) {
+            STORE(4, group * 4 + (lid >> 2), v)
+        }
     }
     barrier();
 
-    if (slot == 0) {
-        vec4 v = mean4(lds[0], lds[4], lds[32], lds[36]);
-        STORE(6, ivec2(gl_WorkGroupID.xy), v)
+    if ((lid.x & 7) == 0 && (lid.y & 7) == 0) {
+        vec4 v = mean4(lds[slot], lds[slot + 4], lds[slot + 64], lds[slot + 68]);
+        lds[slot] = v;
+        if (push.levels > 5) {
+            STORE(5, group * 2 + (lid >> 3), v)
+        }
+    }
+    barrier();
+
+    if (slot == 0 && push.levels > 6) {
+        vec4 v = mean4(lds[0], lds[8], lds[128], lds[136]);
+        STORE(6, group, v)
     }
 }

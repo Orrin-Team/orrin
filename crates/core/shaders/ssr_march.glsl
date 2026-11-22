@@ -9,7 +9,7 @@
 // other changes how often a ray is traced, never what a ray finds.
 //
 // The including shader declares, by these names: the `Ssr` block as `ssr`,
-// `u_hiz` (the nearest-depth pyramid), `u_depth`, `u_source` (the lit frame's
+// `u_hiz` (the nearest-depth pyramid from level 1 up), `u_depth`, `u_source` (the lit frame's
 // pyramid, based at half resolution), `u_source_full` (the lit frame itself)
 // and `u_blue_noise`.
 
@@ -131,7 +131,8 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
     // Marching (uv, z) linearly is exact rather than an approximation: NDC z is
     // affine in 1/view_z, and 1/view_z is itself linear across the screen, so a
     // straight line in the world stays a straight line in this space.
-    int max_level = int(ssr.trace.z) - 1;
+    // The pyramid holds levels 1 and up; level 0 is the depth buffer itself.
+    int max_level = int(ssr.trace.z);
     int level = 0;
     // Start a couple of full-resolution texels along, past the depth values the
     // origin surface itself wrote.
@@ -147,7 +148,7 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
             break;
         }
 
-        vec2 level_size = vec2(textureSize(u_hiz, level));
+        vec2 level_size = level == 0 ? ssr.extent.xy : vec2(textureSize(u_hiz, level - 1));
         vec2 cell = floor(pos.xy * level_size);
         // The far edge of this cell along each axis, and how far along the ray
         // that is. A zero component gives an infinity, which `min` discards.
@@ -163,7 +164,9 @@ vec4 trace_reflection(vec2 uv, float depth, vec3 n, float roughness, vec2 u, out
         // cell and the march stalls.
         float t_next = min(t + step_t + 1e-5, 1.0);
 
-        float cell_z = textureLod(u_hiz, (cell + 0.5) / level_size, float(level)).r;
+        float cell_z = level == 0
+            ? texelFetch(u_depth, ivec2(cell), 0).r
+            : texelFetch(u_hiz, ivec2(cell), level - 1).r;
         float z_far = s0.z + dir.z * t_next;
         // The deepest the ray gets inside this cell. If that stays in front of
         // everything the cell contains, the cell is empty for this ray.

@@ -2290,7 +2290,7 @@ impl VulkanRenderer {
         // composite subtracts the environment term the forward pass added, so
         // it has to be handed the same rotation and the same tint that pass
         // will be. The pyramid depth comes off the allocated image rather than
-        // the declaration, because a window too small for seven levels gets
+        // the declaration, because a window too small for six levels gets
         // fewer and the march has to stop at the last one that exists.
         if let Some(ids) = self.frame.ids.ssr {
             let ambient = lighting.ambient_color * lighting.ambient_nits;

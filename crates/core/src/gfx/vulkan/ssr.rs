@@ -91,23 +91,28 @@ use super::taa::FrameView;
 const TILE: u32 = 8;
 
 /// Side of the tile one workgroup of the pyramid build owns, in full-resolution
-/// texels. Fixed by the shader: eight invocations square, each reducing an 8x8
-/// block, is what lets the first four levels come out of registers and the next
-/// three out of one shared array.
+/// texels. Fixed by the shader: sixteen invocations square, each reducing a 4x4
+/// block, is what lets the first two levels come out of registers and the next
+/// four out of one shared array.
 const HIZ_TILE: u32 = 64;
 
-/// How deep the pyramid goes, counting the full-resolution copy at level 0.
+/// How deep the pyramid goes above the depth buffer, which the march reads
+/// directly as level 0: the image is based at half the frame.
 ///
-/// Seven is what a 64-texel tile reduces to on its own, and it is also enough:
+/// Six is what a 64-texel tile reduces to on its own, and it is also enough:
 /// a cell at level 6 is 64 texels across, so a ray crosses a 1080p frame in
 /// about thirty steps. Going deeper would need a second dispatch to combine
 /// tiles, and buy a handful of steps on rays that have already left the screen.
-pub(super) const HIZ_LEVELS: u32 = 7;
+///
+/// Not a copy of the depth buffer at level 0, though that would let the march
+/// read every level from one image: the copy was three quarters of what the
+/// build wrote, and the build cost more than the trace it served.
+pub(super) const HIZ_LEVELS: u32 = 6;
 
 /// Levels in the pyramid of the lit frame the trace samples its cones out of.
 ///
-/// The same number as [`HIZ_LEVELS`] and for the same reason — both are what a
-/// 64-texel tile reduces to on its own, since both are built by one dispatch.
+/// Seven for the reason [`HIZ_LEVELS`] is six: what a 64-texel tile reduces to
+/// on its own, counting the base, since both are built by one dispatch.
 /// Level 6 is a 64-texel blur of a half-resolution image, which is wider than
 /// any lobe under the roughness cutoff has cause to ask for.
 pub(super) const SOURCE_LEVELS: u32 = 7;
@@ -669,9 +674,9 @@ mod tests {
     fn the_pyramid_is_no_deeper_than_one_tile_can_reduce() {
         assert_eq!(
             HIZ_LEVELS,
-            HIZ_TILE.trailing_zeros() + 1,
-            "a {HIZ_TILE}-texel tile reduces to {} levels, not {HIZ_LEVELS}",
-            HIZ_TILE.trailing_zeros() + 1,
+            HIZ_TILE.trailing_zeros(),
+            "a {HIZ_TILE}-texel tile reduces to {} levels above its base, not {HIZ_LEVELS}",
+            HIZ_TILE.trailing_zeros(),
         );
     }
 

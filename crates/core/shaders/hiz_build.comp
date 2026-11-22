@@ -7,128 +7,127 @@
 // it, so a ray that stays in front of a cell's minimum cannot have hit anything
 // inside that cell and can cross the whole cell in one step.
 //
+// It starts at level 1. Level 0 would be a copy of the depth buffer — three
+// quarters of every texel this pass writes — and the march reads the depth
+// buffer itself at level 0 instead (`ssr_march.glsl`), which costs it one
+// branch and saves this pass most of its traffic.
+//
 // One dispatch writes every level, and that is a property of the render graph
 // rather than a performance choice: resources are unversioned, so a chain of
 // passes each reading level n-1 and writing level n of the same image would make
 // "readers after all writers" point in both directions and `compile` would
 // report a cycle. A workgroup therefore owns a 64x64 tile of the frame and
-// reduces it alone — the first six levels need no data from outside that tile,
-// which is exactly why the tile is 64 wide.
+// reduces it alone — the six levels need no data from outside that tile, which
+// is exactly why the tile is 64 wide.
+//
+// 16x16 invocations, each reducing a 4x4 block with four gathers: enough
+// invocations to keep the memory system busy, and few enough loads each that
+// none waits behind its own. A gather at the frame's edge clamps, duplicating
+// an edge texel that is already in the same cell, so the nearest depth of any
+// cell is exactly that of the texels under it. An odd extent still loses its
+// last column or row at the coarser levels (Vulkan floors each mip's size, and
+// the store is dropped), which makes the pyramid non-conservative in that one
+// strip: a missing reflection at the very edge of the frame, where the trace's
+// edge fade has already taken the contribution to nothing.
 
-const int MAX_LEVELS = 7;
+const int MAX_LEVELS = 6;
 
-// 8x8 invocations, each owning an 8x8 block of the tile.
-layout(local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set = 0, binding = 0) uniform sampler2D u_depth;
+layout(set = 0, binding = 0) uniform sampler2D u_depth; // nearest, clamped to the edge
 // One view per level, because a storage image descriptor takes exactly one mip.
 // Indices are literals below, so this needs no descriptor-indexing feature.
 layout(set = 0, binding = 1, r32f) uniform writeonly image2D u_mips[MAX_LEVELS];
 
 layout(push_constant) uniform Push {
+    // The depth buffer's extent.
     ivec2 extent;
     // How many levels the image was actually allocated with — a small window
     // cannot carry the full pyramid, and the trace clamps to the same number.
     int levels;
 } push;
 
-shared float lds[64];
-
-// Outside the frame reads as the far plane, so an edge tile never claims a
-// surface nearer than anything really there.
-float load(ivec2 p) {
-    if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, push.extent))) {
-        return DEPTH_FAR;
-    }
-    return texelFetch(u_depth, p, 0).r;
-}
-
-// `level` is a literal at every call site. A dynamic index into an array of
-// storage images would need shaderStorageImageArrayDynamicIndexing, which is
-// optional; nothing here asks for it.
-#define STORE(level, coord, value)                                \
-    if (push.levels > (level)) {                                  \
-        ivec2 size_ = imageSize(u_mips[level]);                   \
-        if (all(lessThan(coord, size_))) {                        \
-            imageStore(u_mips[level], coord, vec4(value));        \
-        }                                                         \
-    }
+shared float lds[256];
 
 float nearest4(float a, float b, float c, float d) {
     return depth_nearest(depth_nearest(a, b), depth_nearest(c, d));
 }
 
+float nearest4(vec4 v) {
+    return nearest4(v.x, v.y, v.z, v.w);
+}
+
+// `mip` is a literal at every call site: a dynamic index into an array of
+// storage images would need shaderStorageImageArrayDynamicIndexing, which is
+// optional. The caller has already tested `push.levels`, once per level.
+#define STORE(mip, coord, value)                                  \
+    if (all(lessThan(coord, imageSize(u_mips[mip])))) {           \
+        imageStore(u_mips[mip], coord, vec4(value));              \
+    }
+
 void main() {
-    ivec2 tile = ivec2(gl_WorkGroupID.xy) * 64;
+    ivec2 group = ivec2(gl_WorkGroupID.xy);
     ivec2 lid = ivec2(gl_LocalInvocationID.xy);
-    ivec2 base = tile + lid * 8;
+    ivec2 base = group * 64 + lid * 4;
+    vec2 texel = 1.0 / vec2(push.extent);
 
-    // Level 0 is a copy of the depth buffer rather than an alias of it: the
-    // trace samples one image with `textureLod` across every level, and a
-    // pyramid missing its own base would need a second binding and a special
-    // case for level zero in the marching loop.
-    float d[64];
-    for (int j = 0; j < 8; ++j) {
-        for (int i = 0; i < 8; ++i) {
-            float v = load(base + ivec2(i, j));
-            d[j * 8 + i] = v;
-            STORE(0, base + ivec2(i, j), v)
-        }
-    }
-
-    // Levels 1 to 3 come out of this invocation's own 8x8 block: a level-3 texel
-    // covers exactly it. An odd frame extent loses its last column or row at the
-    // coarse levels (Vulkan floors each mip's size, and the write is dropped by
-    // the bounds check above), which makes the pyramid non-conservative in that
-    // one strip — a ray may skip a surface there. It costs a missing reflection
-    // at the very edge of the frame, where the trace's edge fade has already
-    // taken the contribution to nothing.
-    float m1[16];
-    for (int j = 0; j < 4; ++j) {
-        for (int i = 0; i < 4; ++i) {
-            float v = nearest4(d[(2 * j) * 8 + 2 * i], d[(2 * j) * 8 + 2 * i + 1],
-                           d[(2 * j + 1) * 8 + 2 * i], d[(2 * j + 1) * 8 + 2 * i + 1]);
-            m1[j * 4 + i] = v;
-            STORE(1, (base >> 1) + ivec2(i, j), v)
-        }
-    }
-
-    float m2[4];
+    // Level 1, as four texels: each gather is centred on the corner its 2x2
+    // block shares, which is exactly the block's footprint.
+    float m1[4];
     for (int j = 0; j < 2; ++j) {
         for (int i = 0; i < 2; ++i) {
-            float v = nearest4(m1[(2 * j) * 4 + 2 * i], m1[(2 * j) * 4 + 2 * i + 1],
-                           m1[(2 * j + 1) * 4 + 2 * i], m1[(2 * j + 1) * 4 + 2 * i + 1]);
-            m2[j * 2 + i] = v;
-            STORE(2, (base >> 2) + ivec2(i, j), v)
+            m1[j * 2 + i] = nearest4(textureGather(u_depth, vec2(base + ivec2(i * 2 + 1, j * 2 + 1)) * texel));
         }
     }
+    if (push.levels > 0) {
+        ivec2 at = base >> 1;
+        STORE(0, at, m1[0])
+        STORE(0, at + ivec2(1, 0), m1[1])
+        STORE(0, at + ivec2(0, 1), m1[2])
+        STORE(0, at + ivec2(1, 1), m1[3])
+    }
 
-    float m3 = nearest4(m2[0], m2[1], m2[2], m2[3]);
-    STORE(3, (base >> 3) + ivec2(0, 0), m3)
+    float m2 = nearest4(m1[0], m1[1], m1[2], m1[3]);
+    if (push.levels > 1) {
+        STORE(1, base >> 2, m2)
+    }
 
-    // Past level 3 a texel spans more than one invocation's block, so the
+    // Past level 2 a texel spans more than one invocation's block, so the
     // reduction moves into shared memory. Every barrier is in uniform control
     // flow; only the stores are predicated.
-    int slot = lid.y * 8 + lid.x;
-    lds[slot] = m3;
+    int slot = lid.y * 16 + lid.x;
+    lds[slot] = m2;
     barrier();
 
     if ((lid.x & 1) == 0 && (lid.y & 1) == 0) {
-        float v = nearest4(lds[slot], lds[slot + 1], lds[slot + 8], lds[slot + 9]);
+        float v = nearest4(lds[slot], lds[slot + 1], lds[slot + 16], lds[slot + 17]);
         lds[slot] = v;
-        STORE(4, ivec2(gl_WorkGroupID.xy) * 4 + (lid >> 1), v)
+        if (push.levels > 2) {
+            STORE(2, group * 8 + (lid >> 1), v)
+        }
     }
     barrier();
 
     if ((lid.x & 3) == 0 && (lid.y & 3) == 0) {
-        float v = nearest4(lds[slot], lds[slot + 2], lds[slot + 16], lds[slot + 18]);
+        float v = nearest4(lds[slot], lds[slot + 2], lds[slot + 32], lds[slot + 34]);
         lds[slot] = v;
-        STORE(5, ivec2(gl_WorkGroupID.xy) * 2 + (lid >> 2), v)
+        if (push.levels > 3) {
+            STORE(3, group * 4 + (lid >> 2), v)
+        }
     }
     barrier();
 
-    if (slot == 0) {
-        float v = nearest4(lds[0], lds[4], lds[32], lds[36]);
-        STORE(6, ivec2(gl_WorkGroupID.xy), v)
+    if ((lid.x & 7) == 0 && (lid.y & 7) == 0) {
+        float v = nearest4(lds[slot], lds[slot + 4], lds[slot + 64], lds[slot + 68]);
+        lds[slot] = v;
+        if (push.levels > 4) {
+            STORE(4, group * 2 + (lid >> 3), v)
+        }
+    }
+    barrier();
+
+    if (slot == 0 && push.levels > 5) {
+        float v = nearest4(lds[0], lds[8], lds[128], lds[136]);
+        STORE(5, group, v)
     }
 }

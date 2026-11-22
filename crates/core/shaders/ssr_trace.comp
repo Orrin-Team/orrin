@@ -42,7 +42,8 @@ layout(set = 0, binding = 6) uniform Ssr {
     mat4 inv_view;
     // x = frame index, y = max roughness, z = thickness (metres), w = intensity
     vec4 params;
-    // x = max steps, y = max distance (metres), z = pyramid levels, w unused
+    // x = max steps, y = max distance (metres), z = pyramid levels above the
+    // depth buffer, w unused
     vec4 trace;
     // xy = full-resolution extent, zw = its reciprocal
     vec4 extent;

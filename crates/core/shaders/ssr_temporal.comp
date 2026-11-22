@@ -219,56 +219,60 @@ void main() {
     // relative to its neighbours rather than against a fixed threshold —
     // exposure is metered downstream of this pass, so there is no absolute
     // scale here to compare a luminance to.
+    // Indexed by the tap's place in the 3x3, with a rejected tap left at zero
+    // weight, rather than packed: an array written at a running count is one
+    // the compiler cannot keep in registers, and this one would go to memory.
+    // A zero-weight tap adds exactly nothing to any sum below.
     vec4 taps[9];
     float lengths[9];
     float spatial[9];
     float bilateral[9];
     float mean_luma = 0.0;
     float mean_weight = 0.0;
-    int count = 0;
     // A mirror takes its own ray alone, so it gathers nothing.
     float mirror = 1.0 - smoothstep(MIRROR_ROUGHNESS, GLOSSY_ROUGHNESS, roughness);
-    for (int j = -1; j <= 1 && mirror < 1.0; ++j) {
-        for (int i = -1; i <= 1; ++i) {
-            ivec2 tap = own_quad + ivec2(i, j);
-            if (any(lessThan(tap, ivec2(0))) || any(greaterThanEqual(tap, quads))) {
-                continue;
-            }
-            ivec2 tap_texel = ray_texel(tap, size);
-            vec2 tap_uv = (vec2(tap_texel) + 0.5) / vec2(size);
-            float tap_depth = texelFetch(u_depth, tap_texel, 0).r;
-            vec3 tap_n = normalize(texelFetch(u_normal, tap_texel, 0).xyz * 2.0 - 1.0);
-            float tap_z = view_pos(tap_uv, tap_depth).z;
-
-            // Distance from this pixel to where that ray started, in quads, so
-            // the gather stays centred on the pixel rather than on its quad's
-            // traced corner.
-            vec2 offset = vec2(tap_texel - pixel) * 0.5;
-            float falloff = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
-            // A tenth of a metre of depth disagreement halves the tap and a
-            // metre kills it, measured in view space so the tolerance means the
-            // same thing near and far. The normal term catches the creases
-            // depth alone cannot see — two faces of a cube meeting at an edge
-            // sit at the same distance and reflect completely different things.
-            float agreement = exp(-abs(tap_z - p.z) * 10.0)
-                            * smoothstep(0.0, 0.25, dot(tap_n, n));
-            float weight = falloff * agreement;
-            if (weight <= 1e-4) {
-                continue;
-            }
-
-            vec4 ray = texelFetch(u_rays, tap, 0);
-            taps[count] = ray;
-            lengths[count] = texelFetch(u_ray_length, tap, 0).r;
-            spatial[count] = weight;
-            bilateral[count] = agreement;
-            // Weighted by the ray's own confidence, so a neighbourhood of
-            // mostly misses does not report a near-zero mean and then read
-            // every genuine hit in it as a firefly.
-            mean_luma += dot(ray.rgb, LUMA) * weight * ray.a;
-            mean_weight += weight * ray.a;
-            count++;
+    for (int k = 0; k < 9; ++k) {
+        taps[k] = vec4(0.0);
+        lengths[k] = 0.0;
+        spatial[k] = 0.0;
+        bilateral[k] = 0.0;
+        ivec2 tap = own_quad + ivec2(k % 3, k / 3) - 1;
+        if (mirror >= 1.0 || any(lessThan(tap, ivec2(0))) || any(greaterThanEqual(tap, quads))) {
+            continue;
         }
+        ivec2 tap_texel = ray_texel(tap, size);
+        vec2 tap_uv = (vec2(tap_texel) + 0.5) / vec2(size);
+        float tap_depth = texelFetch(u_depth, tap_texel, 0).r;
+        vec3 tap_n = normalize(texelFetch(u_normal, tap_texel, 0).xyz * 2.0 - 1.0);
+        float tap_z = view_pos(tap_uv, tap_depth).z;
+
+        // Distance from this pixel to where that ray started, in quads, so
+        // the gather stays centred on the pixel rather than on its quad's
+        // traced corner.
+        vec2 offset = vec2(tap_texel - pixel) * 0.5;
+        float falloff = exp(-dot(offset, offset) / (2.0 * sigma * sigma));
+        // A tenth of a metre of depth disagreement halves the tap and a
+        // metre kills it, measured in view space so the tolerance means the
+        // same thing near and far. The normal term catches the creases
+        // depth alone cannot see — two faces of a cube meeting at an edge
+        // sit at the same distance and reflect completely different things.
+        float agreement = exp(-abs(tap_z - p.z) * 10.0)
+                        * smoothstep(0.0, 0.25, dot(tap_n, n));
+        float weight = falloff * agreement;
+        if (weight <= 1e-4) {
+            continue;
+        }
+
+        vec4 ray = texelFetch(u_rays, tap, 0);
+        taps[k] = ray;
+        lengths[k] = texelFetch(u_ray_length, tap, 0).r;
+        spatial[k] = weight;
+        bilateral[k] = agreement;
+        // Weighted by the ray's own confidence, so a neighbourhood of
+        // mostly misses does not report a near-zero mean and then read
+        // every genuine hit in it as a firefly.
+        mean_luma += dot(ray.rgb, LUMA) * weight * ray.a;
+        mean_weight += weight * ray.a;
     }
     mean_luma /= max(mean_weight, 1e-6);
 
@@ -293,7 +297,7 @@ void main() {
     float moment_weight = 0.0;
     vec2 confidence_moments = vec2(0.0);
     float confidence_weight = 0.0;
-    for (int i = 0; i < count; ++i) {
+    for (int i = 0; i < 9; ++i) {
         // A sample no brighter than the neighbourhood keeps its full weight;
         // one ten times brighter keeps a tenth of it. That is a biased
         // estimator on purpose — the alternative is an unbiased mean that

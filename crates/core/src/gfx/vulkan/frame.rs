@@ -1244,12 +1244,17 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let source = lit_color;
 
         // One image carrying the whole pyramid rather than one per level, which
-        // is what lets the trace pick a level per step with `textureLod`. The
-        // build writes every level in a single pass because it must: a pass per
+        // is what lets the trace pick a level per step by index. The build
+        // writes every level in a single pass because it must: a pass per
         // level, each reading the level above from the same resource, is a cycle
-        // by the rule that makes readers follow writers.
-        let hiz =
-            builder.create_image("ssr_hiz", ImageDesc::new(HIZ_FORMAT).mip_levels(HIZ_LEVELS));
+        // by the rule that makes readers follow writers. Based at half the
+        // frame: its level 0 would be the depth buffer, which the trace reads.
+        let hiz = builder.create_image(
+            "ssr_hiz",
+            ImageDesc::new(HIZ_FORMAT)
+                .extent(Extent::FrameDiv(1))
+                .mip_levels(HIZ_LEVELS),
+        );
         // The same shape over the lit frame, and the reason a rough reflection
         // is affordable: a ray sampled from a wide lobe is a cone, and the level
         // whose texel matches the cone's footprint carries the average of what
