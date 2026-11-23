@@ -86,10 +86,19 @@ void main() {
     // show as a contour wherever a slice of froxels crosses the wall's face.
     // Added rather than folded into the line above, which then stays the
     // frame it was where they are off.
+    //
+    // A sample no probe can see has nothing to say rather than darkness to
+    // report, and keeps the froxel's history whole below: the slice that
+    // crosses a wall's face is jittered into the wall on some frames and into
+    // the room on others, and averaging the first as black is a band along
+    // the wall for every slice that meets it.
+    float keep = f.temporal.x;
     if (gi_live() && gi.environment.z > 0.5) {
         vec4 local = gi_mean_radiance(world_pos);
-        vec3 ambient = local.rgb + f.ambient.rgb * (1.0 - gi_reach(world_pos));
+        float reach = gi_reach(world_pos);
+        vec3 ambient = local.rgb + f.ambient.rgb * (1.0 - reach);
         current.rgb += density * f.albedo.rgb * (ambient - f.ambient.rgb);
+        keep = mix(keep, 1.0, reach * (1.0 - local.a));
     }
 
     if (f.temporal.z < 0.5) {
@@ -105,7 +114,7 @@ void main() {
             if (all(greaterThanEqual(prev_uv, vec2(0.0)))
                 && all(lessThanEqual(prev_uv, vec2(1.0)))) {
                 vec4 history = textureLod(u_history, prev, 0.0);
-                current = mix(current, history, f.temporal.x);
+                current = mix(current, history, keep);
             }
         }
     }
