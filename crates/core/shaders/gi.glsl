@@ -213,7 +213,7 @@ float gi_visibility(int level, uvec3 slot, vec3 to_point) {
     float variance = abs(moments.x * moments.x - moments.y);
     float d = r - moments.x;
     float chebyshev = variance / (variance + d * d);
-    return max(chebyshev * chebyshev * chebyshev, 0.05);
+    return chebyshev * chebyshev * chebyshev;
 }
 
 // What one grid says arrives at a surface at `P` facing `N`, seen along `V`,
@@ -244,9 +244,10 @@ vec4 gi_cascade_irradiance(int level, vec3 P, vec3 N, vec3 V) {
         vec3 to_probe = probe - P;
         float facing = dot(to_probe / max(length(to_probe), 1e-5), N) * 0.5 + 0.5;
         float weight = facing * facing + 0.2;
-        weight *= gi_visibility(level, slot, biased - probe);
-        // Crushed rather than kept linear: a probe that barely sees the point
-        // still outweighs none, but should not tint it.
+        // Never quite zero, so a point every probe is cut off from still has
+        // an answer; and crushed rather than kept linear below a fifth, so a
+        // probe that barely sees the point outweighs none but cannot tint it.
+        weight = max(weight * gi_visibility(level, slot, biased - probe), 1e-6);
         const float CRUSH = 0.2;
         if (weight < CRUSH) {
             weight *= weight * weight / (CRUSH * CRUSH);
@@ -278,6 +279,17 @@ vec4 gi_irradiance(vec3 P, vec3 N, vec3 V) {
     return vec4(sum, 1.0 - left);
 }
 
+// How much of a point the grids reach at all, whether or not a probe there
+// can answer yet: what `gi_irradiance` leaves the sky to make up for a point
+// past the last of them.
+float gi_reach(vec3 P) {
+    float beyond = 1.0;
+    for (int level = 0; level < GI_CASCADES; ++level) {
+        beyond *= 1.0 - gi_cascade_weight(level, P);
+    }
+    return 1.0 - beyond;
+}
+
 // The mean radiance arriving at a point of air from every direction, which is
 // what an isotropic medium scatters. The mean of a probe's tile along the six
 // axes, which for anything within the first three spherical-harmonic bands —
@@ -301,7 +313,7 @@ vec4 gi_cascade_mean(int level, vec3 P) {
         }
         vec3 probe = vec3(world) * s + gi_offset(state);
         vec3 trilinear = mix(1.0 - alpha, alpha, vec3(corner));
-        float weight = gi_visibility(level, slot, P - probe)
+        float weight = max(gi_visibility(level, slot, P - probe), 1e-6)
                      * max(trilinear.x * trilinear.y * trilinear.z, 1e-4);
         vec3 mean = gi_irradiance_texel(level, slot, vec3(1.0, 0.0, 0.0))
                   + gi_irradiance_texel(level, slot, vec3(-1.0, 0.0, 0.0))

@@ -92,10 +92,12 @@ void main() {
     uint t = gl_LocalInvocationIndex;
     ivec2 local = ivec2(gl_LocalInvocationID.xy);
     ivec2 texel = ivec2(gi_tile(level, slot)) + local;
-    vec4 held = imageLoad(u_irradiance, texel);
-    vec4 held_distance = imageLoad(u_distance, texel);
+    // What a probe new to its slot holds is whatever the slot's last probe
+    // left, or nothing defined at all: never read, not even weighted by zero.
+    vec3 held = fresh ? vec3(0.0) : imageLoad(u_irradiance, texel).rgb;
+    vec2 held_distance = fresh ? vec2(REACH, REACH * REACH) : imageLoad(u_distance, texel).rg;
     bool interior = all(greaterThanEqual(local, ivec2(1))) && all(lessThanEqual(local, ivec2(GI_TILE)));
-    s_held[t] = interior && !fresh ? dot(held.rgb, LUMA) : 0.0;
+    s_held[t] = interior ? dot(held, LUMA) : 0.0;
 
     if (t < rays) {
         GiRay ray = gi_rays[probe * rays + t];
@@ -226,14 +228,14 @@ void main() {
     }
 
     float keep = count == 0u ? 0.0 : min(gi.params.x, float(count) / float(count + 1u));
-    vec3 result = fresh ? vec3(0.0) : held.rgb;
+    vec3 result = held;
     if (weight > 1e-4) {
         float hold = s_switched != 0u ? min(keep, SWITCHED_KEEP) : keep;
-        result = mix(irradiance / weight, held.rgb, hold);
+        result = mix(irradiance / weight, held, hold);
     }
-    vec2 distance = fresh ? vec2(REACH, REACH * REACH) : held_distance.rg;
+    vec2 distance = held_distance;
     if (moment_weight > 1e-6) {
-        distance = mix(moments / moment_weight, held_distance.rg, keep);
+        distance = mix(moments / moment_weight, held_distance, keep);
     }
     imageStore(u_irradiance, texel, vec4(result, 1.0));
     imageStore(u_distance, texel, vec4(distance, 0.0, 1.0));

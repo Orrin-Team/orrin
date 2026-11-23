@@ -76,6 +76,30 @@ fn sun_penumbra() -> CaptureSettings {
     }
 }
 
+/// Into the rooms scene's closed room, toward the thin wall, and into the
+/// room lit by its panel, from a corner.
+const LEAK: ([f32; 3], [f32; 3]) = ([5.2, 1.5, 2.2], [0.0, 1.3, -0.6]);
+const EMISSIVE: ([f32; 3], [f32; 3]) = ([14.6, 1.6, 2.4], [9.5, 1.0, -1.5]);
+
+/// A rooms capture from `view`, the volumes on or off, with the sun's
+/// shadows: the courtyard's light has to stop at the thin wall for the leak
+/// to mean anything.
+fn rooms((position, target): ([f32; 3], [f32; 3]), gi: bool) -> CaptureSettings {
+    CaptureSettings {
+        scene: SceneChoice::Rooms,
+        shadows: true,
+        punctual_shadows: true,
+        gi,
+        frames: GI_FRAMES,
+        camera: Some(Camera {
+            position: Vec3::from(position),
+            target: Vec3::from(target),
+            ..Camera::default()
+        }),
+        ..CaptureSettings::default()
+    }
+}
+
 /// Every capture, by the name its file carries.
 pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
     vec![
@@ -344,6 +368,37 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 gi_debug: GiDebugView::Irradiance,
                 frames: GI_FRAMES,
                 ..CaptureSettings::default()
+            },
+        ),
+        // The closed room behind the ten-centimetre wall, lit by one small
+        // lamp, with the sunlit courtyard on the wall's other side. Off, the
+        // sky's diffuse light fills the room as if it had no roof; on, what
+        // is left is the lamp and its bounce — and any light on the near face
+        // of the thin wall that the courtyard puts there is the leak the
+        // probes' visibility exists to stop. The reference is the room as it
+        // is, every bounce followed, at the exposure of the frame lit by the
+        // volumes.
+        ("gi-leak-off", rooms(LEAK, false)),
+        ("gi-leak", rooms(LEAK, true)),
+        (
+            "gi-leak-path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                frames: 768,
+                ..rooms(LEAK, true)
+            },
+        ),
+        // The room with no light but its glowing ceiling panel, between a red
+        // wall and a green one. Off, the sky lights it through its roof; on,
+        // the panel does, and the walls bleed their colour onto the floor.
+        ("gi-emissive-off", rooms(EMISSIVE, false)),
+        ("gi-emissive", rooms(EMISSIVE, true)),
+        (
+            "gi-emissive-path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                frames: 768,
+                ..rooms(EMISSIVE, true)
             },
         ),
         (

@@ -63,8 +63,13 @@ void main() {
     float cone = sqrt(4.0 * PI / float(gi.grid.y));
     RaySurface found = ray_surface(hit, direction, cone * landed.hit.w / max(hit.distance, 1e-4));
     Surface s = found.s;
-    float reflection;
-    vec3 irradiance = ray_irradiance(found.position, s.N, s.V, reflection);
+    // The volumes, and the sky only past their reach. Not the sky where the
+    // volumes reach but have no probe ready to answer yet, as a surface the
+    // camera sees takes it: shaded into a cell, light that is not there would
+    // go round a closed room's walls bounce after bounce, and outlast the
+    // probes' own settling by seconds.
+    vec4 local = gi_irradiance(found.position, s.N, s.V);
+    vec3 irradiance = local.rgb + sh_irradiance(s.N) * (1.0 - gi_reach(found.position));
     vec3 radiance = found.emissive + ray_lights(found, true)
                   + irradiance * s.albedo * (1.0 - s.metallic);
     // Into half floats, so held to their range; and a hit whose arithmetic
