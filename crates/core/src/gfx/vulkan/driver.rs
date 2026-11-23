@@ -1816,6 +1816,14 @@ impl<'a> VkEncoder<'a> {
         self.recorder.dispatch(groups);
     }
 
+    pub fn dispatch_indirect(&mut self, command: BufferId) {
+        let size = size_of::<vulkano::command_buffer::DispatchIndirectCommand>() as u64;
+        let command = lookup(&self.driver.buffers, command.0, "buffer")
+            .slice(0..size)
+            .reinterpret::<[vulkano::command_buffer::DispatchIndirectCommand]>();
+        self.recorder.dispatch_indirect(command);
+    }
+
     pub fn draw(&mut self, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
         self.recorder
             .draw(vertices, instances, first_vertex, first_instance);

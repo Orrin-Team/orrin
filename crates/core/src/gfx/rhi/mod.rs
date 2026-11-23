@@ -471,6 +471,17 @@ impl Encoder<'_> {
         encoder_dispatch!(self, encoder => encoder.dispatch(groups))
     }
 
+    /// Dispatch as many groups as the first three words of `command` say,
+    /// which a pass before this one wrote on the device.
+    pub fn dispatch_indirect(&mut self, command: BufferId) {
+        match self {
+            Encoder::Vulkan(encoder) => encoder.dispatch_indirect(command),
+            // Only the irradiance volumes dispatch this way, and they trace.
+            #[cfg(target_os = "macos")]
+            Encoder::Metal(_) => unreachable!("Metal reports no ray tracing"),
+        }
+    }
+
     /// Record the mesh acceleration structures
     /// [`prepare_ray_scene`](Device::prepare_ray_scene) chose for this frame.
     pub fn build_mesh_accel(&mut self) {

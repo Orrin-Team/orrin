@@ -38,8 +38,8 @@ use vulkano::buffer::{BufferContents, IndexBuffer, Subbuffer};
 use vulkano::command_buffer::{
     BlitImageInfo, ClearDepthStencilImageInfo, CommandBuffer, CommandBufferBeginInfo,
     CommandBufferInheritanceInfo, CommandBufferLevel, CommandBufferUsage, CopyBufferInfo,
-    CopyBufferToImageInfo, CopyImageToBufferInfo, DrawIndexedIndirectCommand,
-    RecordingCommandBuffer, RenderingInfo,
+    CopyBufferToImageInfo, CopyImageToBufferInfo, DispatchIndirectCommand,
+    DrawIndexedIndirectCommand, RecordingCommandBuffer, RenderingInfo,
 };
 use vulkano::descriptor_set::DescriptorSet;
 use vulkano::image::{Image, ImageLayout, ImageSubresourceRange};
@@ -831,6 +831,21 @@ impl Recorder {
 
     pub(super) fn dispatch(&mut self, group_counts: [u32; 3]) -> &mut Self {
         unsafe { self.inner.dispatch(group_counts) }.expect("invalid dispatch");
+        self
+    }
+
+    /// A dispatch whose group counts a pass before it wrote into `command`.
+    ///
+    /// The counts come from the device, so nothing on this side has seen them.
+    /// What makes that sound is the writer's contract, not this call: a shader
+    /// that reads its own invocation's index checks it against the count the
+    /// same pass wrote, so a dispatch of more groups than there is work does
+    /// nothing with the surplus. See `gi_cache_compact.comp`.
+    pub(super) fn dispatch_indirect(
+        &mut self,
+        command: Subbuffer<[DispatchIndirectCommand]>,
+    ) -> &mut Self {
+        unsafe { self.inner.dispatch_indirect(&command) }.expect("invalid indirect dispatch");
         self
     }
 
