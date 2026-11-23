@@ -102,6 +102,12 @@ impl GraphBuilder {
         self.push(name, ResourceKind::ImportedBuffer)
     }
 
+    /// What a ray is traced against: the scene's acceleration structure, or
+    /// the set of the meshes' own that it is built over.
+    pub fn import_acceleration_structure(&mut self, name: &'static str) -> ResourceId {
+        self.push(name, ResourceKind::ImportedAccelerationStructure)
+    }
+
     fn push(&mut self, name: &'static str, kind: ResourceKind) -> ResourceId {
         let id = ResourceId(self.resources.len() as u32);
         self.resources.push(ResourceDecl { name, kind });

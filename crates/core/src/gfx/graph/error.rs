@@ -46,6 +46,14 @@ pub enum GraphError {
         resource: &'static str,
         access: Access,
     },
+    /// An acceleration structure declared with an access that is an image's or
+    /// a buffer's, or the reverse. The barrier derived from it would name a
+    /// stage the resource is never touched through.
+    NotAnAccelerationStructureAccess {
+        pass: &'static str,
+        resource: &'static str,
+        access: Access,
+    },
 }
 
 impl fmt::Display for GraphError {
@@ -105,6 +113,18 @@ impl fmt::Display for GraphError {
                  {access:?}, but a dispatch runs outside any render pass and an \
                  attachment only exists inside one. Read it as Sampled or write \
                  it as StorageWrite, or make `{pass}` an inline pass."
+            ),
+            GraphError::NotAnAccelerationStructureAccess {
+                pass,
+                resource,
+                access,
+            } => write!(
+                f,
+                "render graph: pass `{pass}` declares `{resource}` as {access:?}. \
+                 An acceleration structure is built, read by a build, or traced \
+                 (AccelerationStructureBuild, AccelerationStructureInput, \
+                 AccelerationStructureRead) and nothing else is: declare \
+                 `{resource}` with an access that matches what it is."
             ),
         }
     }

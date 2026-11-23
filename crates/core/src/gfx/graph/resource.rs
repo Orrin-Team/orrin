@@ -157,6 +157,10 @@ pub(super) enum ResourceKind {
     /// the graph. There is deliberately no `create_buffer` to leave dead
     /// allocation paths behind.
     ImportedBuffer,
+    /// What a ray is traced against. Imported for the reason a buffer is: the
+    /// renderer owns it across frames, and the graph owns only the order and
+    /// the barriers between the passes that build it and the ones that trace.
+    ImportedAccelerationStructure,
 }
 
 #[derive(Clone, Debug)]
@@ -167,13 +171,22 @@ pub(super) struct ResourceDecl {
 
 impl ResourceDecl {
     pub fn is_image(&self) -> bool {
-        !matches!(self.kind, ResourceKind::ImportedBuffer)
+        matches!(
+            self.kind,
+            ResourceKind::Transient(_) | ResourceKind::Imported(..)
+        )
+    }
+
+    pub fn is_acceleration_structure(&self) -> bool {
+        matches!(self.kind, ResourceKind::ImportedAccelerationStructure)
     }
 
     pub fn is_imported(&self) -> bool {
         matches!(
             self.kind,
-            ResourceKind::Imported(..) | ResourceKind::ImportedBuffer
+            ResourceKind::Imported(..)
+                | ResourceKind::ImportedBuffer
+                | ResourceKind::ImportedAccelerationStructure
         )
     }
 
@@ -188,7 +201,9 @@ impl ResourceDecl {
         match self.kind {
             ResourceKind::Transient(_) => ImageLayout::Undefined,
             ResourceKind::Imported(_, layouts) => layouts.entry,
-            ResourceKind::ImportedBuffer => ImageLayout::Undefined,
+            ResourceKind::ImportedBuffer | ResourceKind::ImportedAccelerationStructure => {
+                ImageLayout::Undefined
+            }
         }
     }
 
@@ -196,7 +211,9 @@ impl ResourceDecl {
     pub fn exit_layout(&self) -> Option<ImageLayout> {
         match self.kind {
             ResourceKind::Imported(_, layouts) => Some(layouts.exit),
-            ResourceKind::Transient(_) | ResourceKind::ImportedBuffer => None,
+            ResourceKind::Transient(_)
+            | ResourceKind::ImportedBuffer
+            | ResourceKind::ImportedAccelerationStructure => None,
         }
     }
 }

@@ -46,6 +46,13 @@ pub enum Access {
     IndirectRead,
     TransferRead,
     TransferWrite,
+    /// An acceleration structure built on the device this frame.
+    AccelerationStructureBuild,
+    /// An acceleration structure read by the build of the one that instances
+    /// it: the meshes' structures, as the scene's is built over them.
+    AccelerationStructureInput,
+    /// An acceleration structure a shader traces a ray query against.
+    AccelerationStructureRead,
 }
 
 impl Access {
@@ -64,10 +71,14 @@ impl Access {
             Access::StorageRead | Access::StorageWrite => ImageLayout::General,
             Access::TransferRead => ImageLayout::TransferSrcOptimal,
             Access::TransferWrite => ImageLayout::TransferDstOptimal,
-            // Buffer-only accesses; never reached for an image.
-            Access::UniformRead | Access::VertexRead | Access::IndirectRead => {
-                ImageLayout::Undefined
-            }
+            // Never reached for an image: a buffer's accesses, and an
+            // acceleration structure's.
+            Access::UniformRead
+            | Access::VertexRead
+            | Access::IndirectRead
+            | Access::AccelerationStructureBuild
+            | Access::AccelerationStructureInput
+            | Access::AccelerationStructureRead => ImageLayout::Undefined,
         }
     }
 
@@ -86,8 +97,13 @@ impl Access {
             Access::DepthAttachment | Access::DepthAttachmentRead => {
                 PipelineStages::EARLY_FRAGMENT_TESTS | PipelineStages::LATE_FRAGMENT_TESTS
             }
-            Access::Sampled | Access::UniformRead | Access::StorageRead | Access::StorageWrite => {
-                shader
+            Access::Sampled
+            | Access::UniformRead
+            | Access::StorageRead
+            | Access::StorageWrite
+            | Access::AccelerationStructureRead => shader,
+            Access::AccelerationStructureBuild | Access::AccelerationStructureInput => {
+                PipelineStages::ACCELERATION_STRUCTURE_BUILD
             }
             Access::VertexRead => PipelineStages::VERTEX_INPUT,
             Access::IndirectRead => PipelineStages::DRAW_INDIRECT,
@@ -118,6 +134,10 @@ impl Access {
             Access::IndirectRead => AccessFlags::INDIRECT_COMMAND_READ,
             Access::TransferRead => AccessFlags::TRANSFER_READ,
             Access::TransferWrite => AccessFlags::TRANSFER_WRITE,
+            Access::AccelerationStructureBuild => AccessFlags::ACCELERATION_STRUCTURE_WRITE,
+            Access::AccelerationStructureInput | Access::AccelerationStructureRead => {
+                AccessFlags::ACCELERATION_STRUCTURE_READ
+            }
         }
     }
 
@@ -129,6 +149,18 @@ impl Access {
                 | Access::DepthAttachment
                 | Access::StorageWrite
                 | Access::TransferWrite
+                | Access::AccelerationStructureBuild
+        )
+    }
+
+    /// True for the accesses only an acceleration structure takes, which are
+    /// also the only ones it takes.
+    pub fn is_acceleration_structure(self) -> bool {
+        matches!(
+            self,
+            Access::AccelerationStructureBuild
+                | Access::AccelerationStructureInput
+                | Access::AccelerationStructureRead
         )
     }
 
@@ -157,7 +189,12 @@ impl Access {
             Access::StorageRead | Access::StorageWrite => ImageUsage::STORAGE,
             Access::TransferRead => ImageUsage::TRANSFER_SRC,
             Access::TransferWrite => ImageUsage::TRANSFER_DST,
-            Access::UniformRead | Access::VertexRead | Access::IndirectRead => ImageUsage::empty(),
+            Access::UniformRead
+            | Access::VertexRead
+            | Access::IndirectRead
+            | Access::AccelerationStructureBuild
+            | Access::AccelerationStructureInput
+            | Access::AccelerationStructureRead => ImageUsage::empty(),
         }
     }
 

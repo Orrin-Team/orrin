@@ -179,6 +179,7 @@ pub fn compile(builder: GraphBuilder) -> Result<FrameGraph, GraphError> {
     for pass in &passes {
         check_single_access_per_resource(pass, &resources)?;
         check_compute_declares_no_attachment(pass, &resources)?;
+        check_acceleration_structure_accesses(pass, &resources)?;
     }
 
     let order = topological_order(&passes)?;
@@ -295,6 +296,26 @@ fn check_compute_declares_no_attachment(
             return Err(GraphError::AttachmentInComputePass {
                 pass: pass.name,
                 resource: resources[resource.index()].name,
+                access,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// An acceleration structure has three accesses of its own and takes no other,
+/// and nothing else takes those: a barrier derived from a mismatch names a stage
+/// the resource is never touched through, which orders nothing.
+fn check_acceleration_structure_accesses(
+    pass: &PassDecl,
+    resources: &[ResourceDecl],
+) -> Result<(), GraphError> {
+    for &(resource, access) in &pass.accesses {
+        let decl = &resources[resource.index()];
+        if decl.is_acceleration_structure() != access.is_acceleration_structure() {
+            return Err(GraphError::NotAnAccelerationStructureAccess {
+                pass: pass.name,
+                resource: decl.name,
                 access,
             });
         }

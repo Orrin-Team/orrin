@@ -174,6 +174,7 @@ fn stages(value: PipelineStages) -> String {
         PipelineStages::COMPUTE_SHADER => "ComputeShader",
         PipelineStages::ALL_TRANSFER => "AllTransfer",
         PipelineStages::BOTTOM_OF_PIPE => "BottomOfPipe",
+        PipelineStages::ACCELERATION_STRUCTURE_BUILD => "AccelerationStructureBuild",
     )
 }
 
@@ -193,5 +194,7 @@ fn access(value: AccessFlags) -> String {
         AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE => "DepthStencilAttachmentWrite",
         AccessFlags::TRANSFER_READ => "TransferRead",
         AccessFlags::TRANSFER_WRITE => "TransferWrite",
+        AccessFlags::ACCELERATION_STRUCTURE_READ => "AccelerationStructureRead",
+        AccessFlags::ACCELERATION_STRUCTURE_WRITE => "AccelerationStructureWrite",
     )
 }

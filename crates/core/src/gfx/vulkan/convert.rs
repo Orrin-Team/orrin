@@ -131,6 +131,7 @@ flag_conversions!(
         BOTTOM_OF_PIPE,
         HOST,
         ALL_COMMANDS,
+        ACCELERATION_STRUCTURE_BUILD,
     ]
 );
 
@@ -153,6 +154,8 @@ flag_conversions!(
         DEPTH_STENCIL_ATTACHMENT_WRITE,
         TRANSFER_READ,
         TRANSFER_WRITE,
+        ACCELERATION_STRUCTURE_READ,
+        ACCELERATION_STRUCTURE_WRITE,
     ]
 );
 
@@ -322,6 +325,7 @@ mod tests {
             BOTTOM_OF_PIPE,
             HOST,
             ALL_COMMANDS,
+            ACCELERATION_STRUCTURE_BUILD,
         ]
     );
 
@@ -345,6 +349,8 @@ mod tests {
             DEPTH_STENCIL_ATTACHMENT_WRITE,
             TRANSFER_READ,
             TRANSFER_WRITE,
+            ACCELERATION_STRUCTURE_READ,
+            ACCELERATION_STRUCTURE_WRITE,
         ]
     );
 
