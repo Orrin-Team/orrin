@@ -60,6 +60,25 @@
 //! classification pass building ray and tile lists for an indirect dispatch
 //! (the FidelityFX shape). The RHI has no indirect dispatch.
 //!
+//! # Past the screen
+//!
+//! Where the device traces rays (`raytrace.rs`), the part of a reflection the
+//! screen cannot vouch for — its ray left the frame, turned back toward the
+//! camera, or passed behind what is in it — is traced against the scene itself
+//! and shaded where it lands, by a second pair of pipelines built from the same
+//! two shaders. The order is id Tech 8's: the screen when it can, a traced ray
+//! next, the environment last. It is the same exact ray, so the traced part is
+//! as steady from frame to frame as the rest, and nothing is added to denoise.
+//!
+//! What a traced hit cannot be is blurred: it is one point's radiance, and
+//! nothing can prefilter what is not on the screen. So it answers in full only
+//! for a surface smooth enough not to want a blur, and hands back to the
+//! environment as roughness rises (`TRACED_FULL_ROUGHNESS` to
+//! `TRACED_NO_ROUGHNESS` in `ssr_march.glsl`). A hit is also shaded more simply
+//! than the screen is — a material's standard reading, no screen-space
+//! occlusion, no air — so where a reflection crosses from one to the other, at
+//! the frame's edge, the two can differ by what those add.
+//!
 //! Where it sits in the frame is not a detail: after shading, so what a ray
 //! finds is lit, and before the TAA resolve, so the reflection is antialiased
 //! with everything else rather than over the top of it.
