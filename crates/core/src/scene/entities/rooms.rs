@@ -9,6 +9,10 @@
 //! - A closed room with no light in it at all, only a glowing panel in its
 //!   ceiling and a red wall and a green one. Everything in it is lit by the
 //!   panel, through what the probes' rays find.
+//! - In the courtyard, in the thin wall's shadow, a white sheet with a small
+//!   red block standing on it: smaller than the probes' spacing, so the
+//!   volumes can give it neither the shadow it casts in the sky's light nor
+//!   the colour it bounces onto the sheet, and the final gather has to.
 //!
 //! The rooms are closed boxes of six slabs, so with the volumes off the sky's
 //! diffuse light reaches into both as if they had no roof — which is the
@@ -51,6 +55,7 @@ pub fn build_rooms_scene(world: &mut World, backend: &mut impl RenderBackend) {
     let red = material("plaster_red", matte(Vec3::new(0.7, 0.08, 0.06)));
     let green = material("plaster_green", matte(Vec3::new(0.08, 0.6, 0.1)));
     let ground = material("paving", matte(Vec3::new(0.55, 0.5, 0.45)));
+    let white = material("white", matte(Vec3::splat(0.85)));
     // A softbox: about what a frosted ceiling panel shows lit from behind.
     let panel = material(
         "panel",
@@ -91,6 +96,22 @@ pub fn build_rooms_scene(world: &mut World, backend: &mut impl RenderBackend) {
         Vec3::new(-6.2, 0.0, -3.0),
         Vec3::new(-6.0, 3.0, 3.0),
         plaster,
+    );
+    // Where the roof beyond the thin wall shades the courtyard's floor from
+    // the sun, so what lights the sheet is the sky and what bounced.
+    slab(
+        world,
+        "Sheet",
+        Vec3::new(-1.55, 0.0, -0.7),
+        Vec3::new(-0.15, 0.01, 0.7),
+        white,
+    );
+    slab(
+        world,
+        "Block",
+        Vec3::new(-1.0, 0.01, -0.15),
+        Vec3::new(-0.7, 0.31, 0.15),
+        red,
     );
 
     // The thin wall, and the closed room behind it: its own walls and a roof

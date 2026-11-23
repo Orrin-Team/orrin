@@ -4,7 +4,9 @@
 use glam::Vec3;
 use orrin_core::capture::{CaptureSettings, Floor};
 use orrin_core::scene::entities::SceneChoice;
-use orrin_core::scene::{Camera, FogSettings, GiDebugView, RayDebugView, ShadowDebugView};
+use orrin_core::scene::{
+    Camera, FogSettings, GiDebugView, GiGatherResolution, RayDebugView, ShadowDebugView,
+};
 
 /// The warm-up of every capture the irradiance volumes light, of the half of
 /// each pair they do not, and of the path-traced reference they are held
@@ -79,9 +81,11 @@ fn sun_penumbra() -> CaptureSettings {
 }
 
 /// Into the rooms scene's closed room, toward the thin wall, and into the
-/// room lit by its panel, from a corner.
+/// room lit by its panel, from a corner; and down onto the red block on its
+/// white sheet in the courtyard, from the sunlit side.
 const LEAK: ([f32; 3], [f32; 3]) = ([5.2, 1.5, 2.2], [0.0, 1.3, -0.6]);
 const EMISSIVE: ([f32; 3], [f32; 3]) = ([14.6, 1.6, 2.4], [9.5, 1.0, -1.5]);
+const BLOCK: ([f32; 3], [f32; 3]) = ([-2.6, 1.2, 1.5], [-0.85, 0.1, 0.0]);
 
 /// Thick enough air indoors that what it scatters is most of the picture.
 fn room_fog() -> FogSettings {
@@ -112,6 +116,14 @@ fn rooms((position, target): ([f32; 3], [f32; 3]), gi: bool) -> CaptureSettings 
             ..Camera::default()
         }),
         ..CaptureSettings::default()
+    }
+}
+
+/// A rooms capture lit by the volumes and the final gather over them.
+fn gathered(view: ([f32; 3], [f32; 3])) -> CaptureSettings {
+    CaptureSettings {
+        gi_gather: Some(GiGatherResolution::Half),
+        ..rooms(view, true)
     }
 }
 
@@ -402,11 +414,58 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 ..rooms(LEAK, true)
             },
         ),
+        // The final gather over the volumes, in the room the lamp lights, and
+        // the reference at the exposure of that frame: a frame the gather
+        // lights is metered apart from one the volumes light.
+        ("gi-leak-gather", gathered(LEAK)),
+        (
+            "gi-leak-gather-path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                ..gathered(LEAK)
+            },
+        ),
+        // The red block on its white sheet, in the sky's light: off, the
+        // volumes, the volumes with the final gather over them, and the
+        // reference. The probes are a metre apart, so the second shows the
+        // sheet lit as if the block were not there; the gather and the
+        // reference darken the sheet round the block's foot and tint it red
+        // beside the block's faces. The fifth is the gather at a quarter of
+        // the frame each way, against the third.
+        ("gi-block-off", rooms(BLOCK, false)),
+        ("gi-block", rooms(BLOCK, true)),
+        ("gi-block-gather", gathered(BLOCK)),
+        (
+            "gi-block-gather-quarter",
+            CaptureSettings {
+                gi_gather: Some(GiGatherResolution::Quarter),
+                ..rooms(BLOCK, true)
+            },
+        ),
+        (
+            "gi-block-path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                ..rooms(BLOCK, true)
+            },
+        ),
+        (
+            "gi-block-gather-path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                ..gathered(BLOCK)
+            },
+        ),
         // The room with no light but its glowing ceiling panel, between a red
         // wall and a green one. Off, the sky lights it through its roof; on,
         // the panel does, and the walls bleed their colour onto the floor.
         ("gi-emissive-off", rooms(EMISSIVE, false)),
         ("gi-emissive", rooms(EMISSIVE, true)),
+        // The final gather over the volumes. Light leaves the panel only by
+        // what bounced, and a ray from the floor that meets the panel reads
+        // what it emits, where the probes a metre apart average it over the
+        // room.
+        ("gi-emissive-gather", gathered(EMISSIVE)),
         // The screen-space occlusion off under the volumes, for the corners:
         // the probes are a metre apart and see none of a corner's last half
         // metre, which is the occlusion's to darken, so the pair should
@@ -441,6 +500,13 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
             CaptureSettings {
                 ray_debug: RayDebugView::PathTraced,
                 ..rooms(EMISSIVE, true)
+            },
+        ),
+        (
+            "gi-emissive-gather-path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                ..gathered(EMISSIVE)
             },
         ),
         (

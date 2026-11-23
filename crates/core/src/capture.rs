@@ -90,6 +90,11 @@ pub struct CaptureSettings {
     /// other half of the A/B for everything they change. Needs `ray_tracing`,
     /// and a device that traces.
     pub gi: bool,
+    /// Whether the final gather lights the opaque surfaces, and at which
+    /// resolution. Off by default, so a capture of the volumes is of the
+    /// volumes alone; on is the other half of the A/B for what the gather
+    /// adds below the probes' spacing. Needs `gi`.
+    pub gi_gather: Option<crate::scene::GiGatherResolution>,
     /// Which of the volumes' debug views the frame is drawn through.
     pub gi_debug: crate::scene::GiDebugView,
     /// Screen-space ambient occlusion. On, as it ships; off is the other half
@@ -183,6 +188,7 @@ impl Default for CaptureSettings {
             ray_debug: crate::scene::RayDebugView::None,
             ray_tracing: true,
             gi: false,
+            gi_gather: None,
             gi_debug: crate::scene::GiDebugView::None,
             ssao: true,
             sun_angle: None,
@@ -391,6 +397,8 @@ pub fn render(
     });
     renderer.set_gi(crate::scene::GiSettings {
         enabled: settings.gi,
+        gather: settings.gi_gather.is_some(),
+        gather_resolution: settings.gi_gather.unwrap_or_default(),
         debug_view: settings.gi_debug,
         ..Default::default()
     });
