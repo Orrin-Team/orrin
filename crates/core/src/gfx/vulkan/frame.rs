@@ -1326,6 +1326,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         if let Some(atlas) = shadow_atlas {
             scatter_pass = scatter_pass.access(atlas, Access::Sampled);
         }
+        scatter_pass = reads_gi(scatter_pass, gi);
         let id = scatter_pass.access(scatter, Access::StorageWrite).build();
         record(id, PassBody::FogScatter, &mut bodies);
 
@@ -1556,11 +1557,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(source_pyramid, Access::Sampled)
             .access(output, Access::StorageWrite);
         if let Some(ray) = traced {
-            resolve = reads_gi(
-                resolve.access(ray.scene, Access::AccelerationStructureRead),
-                gi,
-            );
+            resolve = resolve.access(ray.scene, Access::AccelerationStructureRead);
         }
+        // What the environment's reflection it takes back was scaled by.
+        resolve = reads_gi(resolve, gi);
         record(resolve.build(), PassBody::SsrResolve, &mut bodies);
 
         SsrIds {

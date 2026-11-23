@@ -315,7 +315,7 @@ impl GiPass {
                 camera.z,
                 if settings.reflections { 1.0 } else { 0.0 },
             ],
-            environment: [sin, cos, 0.0, 0.0],
+            environment: [sin, cos, if settings.fog { 1.0 } else { 0.0 }, 0.0],
             rotation: columns.map(|[x, y, z]| [x, y, z, 0.0]),
             cascades: cascades
                 .map(|c| [c.base.x as f32, c.base.y as f32, c.base.z as f32, c.spacing]),

@@ -37,6 +37,17 @@ layout(set = 0, binding = 3) uniform sampler3D u_history;
 
 layout(set = 0, binding = 4, rgba16f) uniform writeonly image3D u_scatter;
 
+// The irradiance volumes, or their inert stand-ins: where they are live, the
+// light the air scatters from everywhere but the sun is what they hold, not
+// the scene's flat ambient — the air in a closed room is as dark as its walls.
+#define ORRIN_GI_SET 0
+#define ORRIN_GI_BLOCK_BINDING 5
+#define ORRIN_GI_PROBES_BINDING 6
+#define ORRIN_GI_IRRADIANCE_BINDING 7
+#define ORRIN_GI_DISTANCE_BINDING 8
+#define ORRIN_GI_SAMPLER_BINDING 9
+#include "gi.glsl"
+
 void main() {
     ivec3 size = imageSize(u_scatter);
     ivec3 coord = ivec3(gl_GlobalInvocationID);
@@ -69,6 +80,17 @@ void main() {
     // `rgb` is scattered radiance per metre and `a` is extinction per metre, so
     // the pass below can integrate the two together over a slice's own length.
     vec4 current = vec4(density * fog_inscattered(f, dir, sun_visibility), density);
+    // The flat ambient taken back out and the volumes' mean radiance put in,
+    // with the ambient again past their reach — and not where they reach but
+    // no probe can see, which is air inside a wall, and whose light would
+    // show as a contour wherever a slice of froxels crosses the wall's face.
+    // Added rather than folded into the line above, which then stays the
+    // frame it was where they are off.
+    if (gi_live() && gi.environment.z > 0.5) {
+        vec4 local = gi_mean_radiance(world_pos);
+        vec3 ambient = local.rgb + f.ambient.rgb * (1.0 - gi_reach(world_pos));
+        current.rgb += density * f.albedo.rgb * (ambient - f.ambient.rgb);
+    }
 
     if (f.temporal.z < 0.5) {
         vec4 clip = f.prev_view_proj * vec4(world_pos, 1.0);

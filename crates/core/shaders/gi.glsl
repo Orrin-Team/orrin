@@ -40,7 +40,8 @@ struct GpuGi {
     // xyz = the camera, w = 1 where the environment's reflection is re-fitted
     // to local light.
     vec4 camera;
-    // The environment's yaw, as `lighting.environment` carries it.
+    // xy = the environment's yaw, as `lighting.environment` carries it; z = 1
+    // where the froxel fog takes its ambient light from the volumes.
     vec4 environment;
     // The rotation this frame's rays are turned by, column by column.
     vec4 rotation[3];
@@ -162,6 +163,27 @@ vec3 gi_sky(vec3 d) {
            + gi.sky[6].rgb * (0.315392 * (3.0 * n.z * n.z - 1.0))
            + gi.sky[7].rgb * (1.092548 * n.x * n.z)
            + gi.sky[8].rgb * (0.546274 * (n.x * n.x - n.y * n.y));
+    return max(e, vec3(0.0));
+}
+
+// The irradiance the sky alone gives a surface facing `n`: `gi_sky` with
+// each band's cosine lobe put back, which is `sh_irradiance` for a pass that
+// has no lighting block.
+vec3 gi_sky_irradiance(vec3 d) {
+    float s = gi.environment.x;
+    float c = gi.environment.y;
+    vec3 n = vec3(c * d.x - s * d.z, d.y, s * d.x + c * d.z);
+    const float BAND1 = 2.0 / 3.0;
+    const float BAND2 = 0.25;
+    vec3 e = gi.sky[0].rgb * 0.282095
+           + gi.sky[1].rgb * (BAND1 * 0.488603 * n.y)
+           + gi.sky[2].rgb * (BAND1 * 0.488603 * n.z)
+           + gi.sky[3].rgb * (BAND1 * 0.488603 * n.x)
+           + gi.sky[4].rgb * (BAND2 * 1.092548 * n.x * n.y)
+           + gi.sky[5].rgb * (BAND2 * 1.092548 * n.y * n.z)
+           + gi.sky[6].rgb * (BAND2 * 0.315392 * (3.0 * n.z * n.z - 1.0))
+           + gi.sky[7].rgb * (BAND2 * 1.092548 * n.x * n.z)
+           + gi.sky[8].rgb * (BAND2 * 0.546274 * (n.x * n.x - n.y * n.y));
     return max(e, vec3(0.0));
 }
 
@@ -313,7 +335,9 @@ vec4 gi_cascade_mean(int level, vec3 P) {
         }
         vec3 probe = vec3(world) * s + gi_offset(state);
         vec3 trilinear = mix(1.0 - alpha, alpha, vec3(corner));
-        float weight = max(gi_visibility(level, slot, P - probe), 1e-6)
+        // No floor under the visibility, unlike a surface's: a point of air no
+        // probe can see is inside something, and is left to the ambient.
+        float weight = gi_visibility(level, slot, P - probe)
                      * max(trilinear.x * trilinear.y * trilinear.z, 1e-4);
         vec3 mean = gi_irradiance_texel(level, slot, vec3(1.0, 0.0, 0.0))
                   + gi_irradiance_texel(level, slot, vec3(-1.0, 0.0, 0.0))
@@ -324,7 +348,7 @@ vec4 gi_cascade_mean(int level, vec3 P) {
         sum += mean * (weight / 6.0);
         total += weight;
     }
-    return total > 1e-8 ? vec4(sum / total, 1.0) : vec4(0.0);
+    return total > 1e-4 ? vec4(sum / total, 1.0) : vec4(0.0);
 }
 
 vec4 gi_mean_radiance(vec3 P) {

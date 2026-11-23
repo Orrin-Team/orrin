@@ -4226,11 +4226,16 @@ impl FrameRecord<'_> {
                     self.environment.sampler(),
                     target,
                     self.ray_frame.as_ref().filter(|_| ids.traced),
+                    self.gi.views(),
                 );
             }
             PassBody::FogScatter => {
-                self.fog
-                    .record_scatter(self.device, encoder, self.shadow_atlas_view);
+                self.fog.record_scatter(
+                    self.device,
+                    encoder,
+                    self.shadow_atlas_view,
+                    self.gi.views(),
+                );
             }
             PassBody::FogIntegrate => {
                 let ids = self

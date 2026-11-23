@@ -2849,6 +2849,7 @@ fn the_irradiance_volumes_are_updated_before_anything_lights_with_them() {
         ray_reflections: true,
         transparency: true,
         refraction: true,
+        volumetric_fog: true,
         ..reference_config(false, true)
     })
     .unwrap();
@@ -2878,6 +2879,7 @@ fn the_irradiance_volumes_are_updated_before_anything_lights_with_them() {
         "refraction_draw",
         "ssr_trace",
         "ssr_resolve",
+        "fog_scatter",
     ] {
         assert!(at("gi_update") < at(reader), "{reader}: {order:?}");
     }

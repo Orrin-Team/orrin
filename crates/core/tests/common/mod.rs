@@ -81,6 +81,19 @@ fn sun_penumbra() -> CaptureSettings {
 const LEAK: ([f32; 3], [f32; 3]) = ([5.2, 1.5, 2.2], [0.0, 1.3, -0.6]);
 const EMISSIVE: ([f32; 3], [f32; 3]) = ([14.6, 1.6, 2.4], [9.5, 1.0, -1.5]);
 
+/// Thick enough air indoors that what it scatters is most of the picture.
+fn room_fog() -> FogSettings {
+    FogSettings {
+        density: 0.15,
+        height_falloff: 0.0,
+        volumetric: true,
+        // The froxels' depth spent on the room rather than on the hundred
+        // metres outside it.
+        distance: 16.0,
+        ..FogSettings::default()
+    }
+}
+
 /// A rooms capture from `view`, the volumes on or off, with the sun's
 /// shadows: the courtyard's light has to stop at the thin wall for the leak
 /// to mean anything.
@@ -393,6 +406,24 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
         // the panel does, and the walls bleed their colour onto the floor.
         ("gi-emissive-off", rooms(EMISSIVE, false)),
         ("gi-emissive", rooms(EMISSIVE, true)),
+        // The same room filled with marched air. Off, the air scatters the
+        // scene's flat ambient whatever is round it; on, it scatters what the
+        // volumes hold — bright under the panel, dim in the corners, and
+        // tinted by the wall it is near.
+        (
+            "gi-emissive-fog-off",
+            CaptureSettings {
+                fog: Some(room_fog()),
+                ..rooms(EMISSIVE, false)
+            },
+        ),
+        (
+            "gi-emissive-fog",
+            CaptureSettings {
+                fog: Some(room_fog()),
+                ..rooms(EMISSIVE, true)
+            },
+        ),
         (
             "gi-emissive-path-traced",
             CaptureSettings {

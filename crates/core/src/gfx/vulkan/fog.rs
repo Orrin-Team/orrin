@@ -37,6 +37,7 @@ use crate::scene::FogSettings;
 
 use super::ShadowFrame;
 use super::forward::GpuCascades;
+use super::gi::GiViews;
 use super::taa::FrameView;
 
 /// How far the froxel grid is reduced from the frame in each screen axis.
@@ -371,8 +372,10 @@ impl FogPass {
         device: &Device,
         builder: &mut Encoder,
         shadow_atlas: TextureViewId,
+        gi: GiViews,
     ) {
         let target = self.scatter_view();
+        let [gi_block, gi_probes, gi_irradiance, gi_distance, gi_sampler] = gi.bindings(5);
         // The volume's own extent, which the history was allocated at.
         let extent = self.extent;
 
@@ -402,6 +405,11 @@ impl FogPass {
                     binding: 4,
                     resource: BindingResource::StorageTexture(target),
                 },
+                gi_block,
+                gi_probes,
+                gi_irradiance,
+                gi_distance,
+                gi_sampler,
             ],
         );
 

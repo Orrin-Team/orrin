@@ -92,6 +92,7 @@ use crate::gfx::rhi::{
 use crate::gfx::shaders::ShaderId;
 use crate::scene::SsrSettings;
 
+use super::gi::GiViews;
 use super::raytrace::{RayFrame, RayReads, TEXTURE_SET};
 use super::taa::FrameView;
 
@@ -496,6 +497,7 @@ impl SsrPass {
         environment_sampler: SamplerId,
         target: TextureViewId,
         traced_rays: Option<&RayFrame<'_>>,
+        gi: GiViews,
     ) {
         let traced = self.traced(traced_rays, true);
         let pipeline = traced.map_or(self.resolve_pipeline, |(pipeline, _)| pipeline);
@@ -538,9 +540,14 @@ impl SsrPass {
 
         builder.bind_pipeline(pipeline);
         builder.bind_group(0, set);
-        if let (Some(rays), Some((_, textures))) = (traced_rays, traced) {
-            rays.bind(device, builder, pipeline, RayReads::SHADING);
-            builder.bind_group(TEXTURE_SET, textures);
+        match (traced_rays, traced) {
+            (Some(rays), Some((_, textures))) => {
+                rays.bind(device, builder, pipeline, RayReads::SHADING);
+                builder.bind_group(TEXTURE_SET, textures);
+            }
+            // The volumes, which the traced composite reads at set 4 with
+            // everything else a hit is shaded from.
+            _ => builder.bind_group(1, gi.group(device, pipeline, 1, 0)),
         }
         dispatch_over(device, builder, target);
     }
