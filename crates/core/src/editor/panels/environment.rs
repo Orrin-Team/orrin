@@ -281,6 +281,9 @@ const RAYS: &[Section] = &[
             "Hysteresis",
             "Reflections",
             "Fog",
+            "Final gather",
+            "Gather resolution",
+            "Gather history",
             "Debug view",
         ],
         global_illumination,
@@ -699,6 +702,42 @@ fn global_illumination(ui: &mut egui::Ui, world: &World, rows: Rows) {
     if rows.shows("Fog") {
         toggle(ui, "Fog", &mut gi.fog)
             .on_hover_text("The volumetric fog scatters the probes' light, not the flat ambient");
+    }
+    if rows.shows("Final gather") {
+        toggle(ui, "Final gather", &mut gi.gather).on_hover_text(
+            "A ray per pixel at reduced resolution, for what is smaller than the probes: \
+             the shadow and colour a small object casts. Opaque surfaces only",
+        );
+    }
+    if rows.shows("Gather resolution") {
+        use crate::scene::GiGatherResolution;
+        widgets::property(ui, "Gather resolution", |ui| {
+            let name = |resolution| match resolution {
+                GiGatherResolution::Half => "Half",
+                GiGatherResolution::Quarter => "Quarter",
+            };
+            egui::ComboBox::from_id_salt("gi_gather_resolution")
+                .selected_text(name(gi.gather_resolution))
+                .show_ui(ui, |ui| {
+                    for resolution in [GiGatherResolution::Half, GiGatherResolution::Quarter] {
+                        ui.selectable_value(
+                            &mut gi.gather_resolution,
+                            resolution,
+                            name(resolution),
+                        );
+                    }
+                })
+                .response
+        })
+        .on_hover_text("Of the frame each way");
+    }
+    if rows.shows("Gather history") {
+        slider(
+            ui,
+            "Gather history",
+            egui::Slider::new(&mut gi.gather_history, 1..=64).suffix(" frames"),
+        )
+        .on_hover_text("The most frames a pixel averages: longer is quieter and lags more");
     }
     if rows.shows("Debug view") {
         use crate::scene::GiDebugView;

@@ -74,7 +74,12 @@
 //!   shade the radiance cache, and every pass that lights a surface reading
 //!   them. Their rows are `gi_trace`, `gi_cache_compact`, `gi_update` and
 //!   `gi_cache_shade`; what reading them costs is the `forward` row against a
-//!   run without. Nothing on a device that cannot trace.
+//!   run without. Nothing on a device that cannot trace. The final gather is
+//!   off under this alone.
+//! - `ORRIN_PERF_GI_GATHER=half` (or `quarter`) adds the final gather to
+//!   `ORRIN_PERF_GI`, at that share of the frame each way: the rows
+//!   `gi_gather`, `gi_gather_temporal`, `gi_gather_blur_x`, `gi_gather_blur_y`
+//!   and `gi_gather_upscale`, and the cells it adds to `gi_cache_shade`.
 //! - `ORRIN_PERF_MSAA=1` rasterises the forward pass at four samples. The other
 //!   half of the comparison `TaaSettings::msaa` exists for: multisampled, the
 //!   pass writes and resolves its own targets and cannot depth-test `EQUAL`
@@ -316,7 +321,17 @@ fn frame_cost() {
     }
 
     if env_usize("ORRIN_PERF_GI", 0) != 0 {
-        renderer.set_gi(orrin_core::scene::GiSettings::default());
+        use orrin_core::scene::{GiGatherResolution, GiSettings};
+        let gather = match std::env::var("ORRIN_PERF_GI_GATHER").as_deref() {
+            Ok("half") => Some(GiGatherResolution::Half),
+            Ok("quarter") => Some(GiGatherResolution::Quarter),
+            _ => None,
+        };
+        renderer.set_gi(GiSettings {
+            gather: gather.is_some(),
+            gather_resolution: gather.unwrap_or_default(),
+            ..GiSettings::default()
+        });
     }
 
     let mut lighting = SceneLighting::default();
