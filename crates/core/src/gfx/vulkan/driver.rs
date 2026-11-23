@@ -49,6 +49,7 @@ use vulkano::pipeline::{
 };
 use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
 
+use super::accel::SceneAccel;
 use super::context::VkContext;
 use super::convert::{vk_buffer_usage, vk_format, vk_image_usage, vk_samples};
 use super::mesh::MeshArena;
@@ -60,9 +61,9 @@ use crate::gfx::format::Format;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, BufferId,
     ComputePipelineDesc, CullMode, DepthCompare, Encoder, Feature, GraphicsPipelineDesc, LoadOp,
-    MeshSpan, PipelineId, Pool, RenderTargets, SamplerDesc, SamplerId, ShaderModuleId, ShaderRef,
-    StoreOp, TextureDesc, TextureDimension, TextureSwizzle, TextureViewId, Topology, VertexFormat,
-    VertexStream, Viewport,
+    MeshSpan, PipelineId, Pool, RayInstance, RenderTargets, SamplerDesc, SamplerId, ShaderModuleId,
+    ShaderRef, StoreOp, TextureDesc, TextureDimension, TextureSwizzle, TextureViewId, Topology,
+    VertexFormat, VertexStream, Viewport,
 };
 use crate::gfx::shaders::{CompiledBindings, CompiledShader};
 
@@ -100,6 +101,8 @@ pub struct VkDriver {
     /// because every pass binds the same buffers; a pass names a mesh by its
     /// span and never holds the arena.
     arena: RwLock<MeshArena>,
+    /// What a ray is traced against, on a device that traces. See `accel`.
+    accel: Option<Mutex<SceneAccel>>,
     bind_groups: Mutex<Pool<Arc<DescriptorSet>>>,
     /// Texture uploads, none of which the CPU waits for. See `upload`.
     uploads: super::upload::Uploads,
@@ -161,11 +164,15 @@ impl VkDriver {
             },
         );
         let arena = RwLock::new(MeshArena::new(&ctx, frames_in_flight));
+        let accel = ctx
+            .ray_tracing
+            .then(|| Mutex::new(SceneAccel::new(&ctx, frames_in_flight)));
         let uploads = super::upload::Uploads::new(&ctx);
         Self {
             ctx,
             frame: AtomicU64::new(0),
             arena,
+            accel,
             views: Mutex::new(Pool::new(frames_in_flight)),
             buffers: Mutex::new(Pool::new(frames_in_flight)),
             samplers: Mutex::new(Pool::new(frames_in_flight)),
@@ -184,10 +191,42 @@ impl VkDriver {
     /// Put a mesh into the shared arena and say where it landed, with its
     /// object-space bounds.
     pub fn upload_mesh(&self, vertices: &[Vertex], indices: &[u32]) -> (MeshSpan, Aabb) {
-        self.arena
+        let placed = self
+            .arena
             .write()
             .expect("a pass panicked while using the device")
-            .upload(&self.ctx, vertices, indices)
+            .upload(&self.ctx, vertices, indices);
+        if let Some(accel) = &self.accel {
+            accel.lock().unwrap().add(placed.0, vertices.len() as u32);
+        }
+        placed
+    }
+
+    fn accel(&self) -> std::sync::MutexGuard<'_, SceneAccel> {
+        self.accel
+            .as_ref()
+            .expect("a pass traced rays on a device that reports no ray tracing")
+            .lock()
+            .expect("a pass panicked while using the device")
+    }
+
+    pub fn prepare_ray_scene(&self, instances: &[RayInstance]) -> u32 {
+        let arena = self
+            .arena
+            .read()
+            .expect("a pass panicked while using the device");
+        self.accel().prepare(
+            &self.ctx,
+            &arena,
+            self.frame.load(Ordering::Relaxed),
+            instances,
+        )
+    }
+
+    pub fn ray_scene_bytes(&self) -> u64 {
+        self.accel
+            .as_ref()
+            .map_or(0, |accel| accel.lock().unwrap().bytes())
     }
 
     pub fn replace_mesh(
@@ -201,8 +240,15 @@ impl VkDriver {
             .arena
             .write()
             .expect("a pass panicked while using the device");
-        arena.retire(old, old_vertices, self.frame.load(Ordering::Relaxed));
-        arena.upload(&self.ctx, vertices, indices)
+        let frame = self.frame.load(Ordering::Relaxed);
+        arena.retire(old, old_vertices, frame);
+        let placed = arena.upload(&self.ctx, vertices, indices);
+        if let Some(accel) = &self.accel {
+            let mut accel = accel.lock().unwrap();
+            accel.retire(old, frame);
+            accel.add(placed.0, vertices.len() as u32);
+        }
+        placed
     }
 
     #[cfg(test)]
@@ -1213,6 +1259,10 @@ impl VkDriver {
                         .expect("a pass panicked while using the device")
                         .storage(stream),
                 ),
+                BindingResource::SceneAccel => WriteDescriptorSet::acceleration_structure(
+                    binding.binding,
+                    self.accel().scene(),
+                ),
             });
             index += 1;
         }
@@ -1731,6 +1781,14 @@ impl<'a> VkEncoder<'a> {
             .reinterpret::<[vulkano::command_buffer::DrawIndexedIndirectCommand]>()
             .slice(range.start as u64..range.end as u64);
         self.recorder.draw_indexed_indirect(commands);
+    }
+
+    pub fn build_mesh_accel(&mut self) {
+        self.driver.accel().record_meshes(self.recorder);
+    }
+
+    pub fn build_scene_accel(&mut self) {
+        self.driver.accel().record_scene(self.recorder);
     }
 
     pub fn dispatch(&mut self, groups: [u32; 3]) {

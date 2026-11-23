@@ -205,6 +205,14 @@ pub struct FrameConfig {
     /// asks recompiles the graph twice, as one that redraws the material
     /// sphere does.
     pub screenshot: Option<ShotView>,
+    /// Whether the frame builds the acceleration structures a ray is traced
+    /// against: the device can, and something in the frame traces. Structural
+    /// because it registers the two builds, and those cost a frame that traces
+    /// nothing the same as one that does.
+    pub ray_tracing: bool,
+    /// Whether the traced scene is drawn in place of the frame. Needs
+    /// `ray_tracing`.
+    pub ray_debug: bool,
 }
 
 /// What a screenshot shows.
@@ -334,6 +342,13 @@ pub enum PassBody {
     /// it and derives its barriers.
     ScreenshotOverlay,
     Overlay,
+    /// The acceleration structures of meshes uploaded since the last frame
+    /// that built any, within the frame's budget, and their compaction.
+    RayMeshes,
+    /// The scene's acceleration structure, over this frame's instances.
+    RayScene,
+    /// The traced scene from one ray per pixel, over the tonemapped frame.
+    RayDebug,
     /// The cached layers of the shadow views that redraw theirs this frame:
     /// the casters standing still, into an atlas kept from frame to frame.
     ShadowStatic,
@@ -408,6 +423,19 @@ pub struct FrameIds {
     /// The screenshot's image, which the renderer owns for the one frame that
     /// draws it.
     pub screenshot: Option<ResourceId>,
+    /// What a ray is traced against, in a frame that traces.
+    pub ray: Option<RayIds>,
+}
+
+/// The two levels of what a ray is traced against, which the device owns.
+#[derive(Clone, Copy, Debug)]
+pub struct RayIds {
+    /// Every mesh's acceleration structure, as one resource: a frame builds
+    /// some of them and the scene's is built over all of them, so one barrier
+    /// orders the two however many there are.
+    pub meshes: ResourceId,
+    /// The scene's, which a tracing shader binds.
+    pub scene: ResourceId,
 }
 
 /// The inspector's material sphere: shaded into `hdr` against `depth`, then
@@ -792,6 +820,30 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
         draw_commands
     };
+
+    // At the head of the frame, so anything after may trace. Two nodes and
+    // not one for the reason the cull is two: the scene's structure is built
+    // over the meshes', some of which this frame built, and the barrier between
+    // a build and a read of what it built is the compiler's to derive.
+    let ray = config.ray_tracing.then(|| {
+        let meshes = builder.import_acceleration_structure("ray_meshes");
+        let scene = builder.import_acceleration_structure("ray_scene");
+
+        let id = builder
+            .pass("ray_meshes", PassKind::Compute)
+            .access(meshes, Access::AccelerationStructureBuild)
+            .build();
+        record(id, PassBody::RayMeshes, &mut bodies);
+
+        let id = builder
+            .pass("ray_scene", PassKind::Compute)
+            .access(meshes, Access::AccelerationStructureInput)
+            .access(scene, Access::AccelerationStructureBuild)
+            .build();
+        record(id, PassBody::RayScene, &mut bodies);
+
+        RayIds { meshes, scene }
+    });
 
     let swapchain_color = builder.import_image(
         "swapchain_color",
@@ -1795,6 +1847,18 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .build();
     record(id, PassBody::Tonemap, &mut bodies);
 
+    // Over every pixel the tonemap wrote, and under everything drawn after it:
+    // the traced scene replaces the picture, not the editor's marks on it.
+    if let (true, Some(ray)) = (config.ray_debug, ray) {
+        let id = builder
+            .pass("ray_debug", PassKind::Inline)
+            .access(ray.scene, Access::AccelerationStructureRead)
+            .access(object_transforms, Access::StorageRead)
+            .access(swapchain_color, Access::ColorAttachment)
+            .build();
+        record(id, PassBody::RayDebug, &mut bodies);
+    }
+
     // First onto the tonemapped image, so the game's UI and every other mark the
     // editor makes stay on top of it. Over the shaded frame it reads the prepass
     // depth to hide covered edges — read-only, so the prepass stays its only
@@ -2004,6 +2068,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             wireframe,
             material_preview,
             screenshot,
+            ray,
         },
         bodies,
     })

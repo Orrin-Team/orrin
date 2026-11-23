@@ -1,3 +1,4 @@
+mod accel;
 mod bloom;
 mod contact_shadows;
 mod context;
@@ -25,6 +26,7 @@ mod overlay;
 mod parallel;
 mod pipeline_cache;
 mod prepass;
+mod raytrace;
 mod record;
 mod refraction;
 mod rendering;
@@ -147,7 +149,7 @@ use crate::gfx::format::Format as EngineFormat;
 use crate::gfx::images::ImageTable;
 use crate::gfx::rhi::{
     BindGroupId, BlockKind, BufferDesc, BufferId, Device, Encoder, Feature, MemoryLocation,
-    TextureViewId,
+    MeshSpan, TextureViewId,
 };
 use crate::profile::Profiler;
 use crate::profile_scope;
@@ -379,6 +381,12 @@ pub struct VulkanRenderer {
     /// Each material's blend mode, by handle: which queue draws it, and so
     /// which twins a surface shader reading it needs.
     blends: Vec<crate::gfx::BlendMode>,
+    /// What the frame traces rays for. `None` on a device that cannot trace,
+    /// where nothing of it is built. See `raytrace`.
+    raytrace: Option<raytrace::RayTracePass>,
+    /// What the next frame traces, as [`set_ray_tracing`](Self::set_ray_tracing)
+    /// last left it.
+    ray_settings: crate::scene::RayTracingSettings,
 }
 
 /// The frame's commands as they are being recorded: a Vulkan command buffer, or
@@ -830,6 +838,9 @@ impl VulkanRenderer {
         let shadow = ShadowPass::new(&device);
         let line = LinePass::new(&device, &forward.targets);
         let environment = EnvironmentPass::new(&device, &forward.targets);
+        let raytrace = device
+            .supports(Feature::RayTracing)
+            .then(|| raytrace::RayTracePass::new(&device, format));
         // Default textures so every material slot resolves to a valid view:
         // index 0 = white (a no-op multiply), index 1 = flat normal (0,0,1).
         let textures = vec![
@@ -867,6 +878,8 @@ impl VulkanRenderer {
             wireframe: None,
             material_preview: false,
             screenshot: None,
+            ray_tracing: false,
+            ray_debug: false,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -927,6 +940,8 @@ impl VulkanRenderer {
             ui_window: None,
             surfaces: surface::SurfaceShaders::new(0, 1),
             blends: vec![crate::gfx::BlendMode::default()],
+            raytrace,
+            ray_settings: Default::default(),
             backend,
         }
     }
@@ -1397,6 +1412,9 @@ impl VulkanRenderer {
             || id == ids.instance_index
             || id == ids.exposure
             || Some(id) == ids.histogram
+            || ids
+                .ray
+                .is_some_and(|ray| id == ray.meshes || id == ray.scene)
         {
             return Some(record::Target::Memory);
         }
@@ -1866,6 +1884,12 @@ impl VulkanRenderer {
     /// takes — a swapchain cannot be replaced while the frame in flight is still
     /// presenting from its images. A call that changes nothing does nothing, so
     /// the app may hand over the resource every frame without recreating one.
+    /// What the frames from here on trace rays for. Inert on a device that
+    /// cannot trace.
+    pub fn set_ray_tracing(&mut self, settings: crate::scene::RayTracingSettings) {
+        self.ray_settings = settings;
+    }
+
     pub fn set_present(&mut self, present: PresentSettings) {
         #[cfg(target_os = "macos")]
         if let Backend::Metal(mtl) = &mut self.backend {
@@ -2160,6 +2184,10 @@ impl VulkanRenderer {
                 Some(Screenshot::Asked(view)) => Some(view),
                 _ => None,
             },
+            ray_tracing: self.raytrace.is_some() && self.ray_settings.traces(),
+            ray_debug: self.raytrace.is_some()
+                && self.ray_settings.enabled
+                && self.ray_settings.debug_view != crate::scene::RayDebugView::None,
         });
 
         // Atlases allocated for this frame hold nothing, whatever the plan
@@ -2604,11 +2632,35 @@ impl VulkanRenderer {
         // ahead of every pass that reads them.
         {
             let mut encoder = commands.encoder(&self.device);
-            self.instances.sync(&self.device, &mut encoder, items);
+            let meshes = &self.meshes;
+            self.instances
+                .sync(&self.device, &mut encoder, items, |mesh| {
+                    meshes
+                        .get(mesh as usize)
+                        .map_or(MeshSpan::default(), |mesh| mesh.span)
+                });
             if let Some(ui) = ui {
                 self.ui
                     .prepare(&self.device, &mut encoder, ui, &self.textures);
             }
+        }
+
+        // After the rows are named and before anything records: the traced
+        // scene is this frame's objects, and the two build passes record what
+        // is decided here.
+        if self.frame.ids.ray.is_some()
+            && let Some(raytrace) = self.raytrace.as_mut()
+        {
+            profile_scope!("ray scene");
+            raytrace.begin_frame(
+                &self.device,
+                &self.ray_settings,
+                draws,
+                &self.meshes,
+                &self.materials,
+                camera.position,
+                view.unjittered_view_proj,
+            );
         }
 
         // The blended queues' draw orders, as row numbers into those rows. Still
@@ -2938,6 +2990,7 @@ impl VulkanRenderer {
             shadow: &self.shadow,
             ssao: &self.ssao,
             ssr: &self.ssr,
+            raytrace: self.raytrace.as_ref(),
             subsurface: &self.subsurface,
             taa: &self.taa,
             view,
@@ -3428,6 +3481,7 @@ struct FrameRecord<'a> {
     shadow: &'a ShadowPass,
     ssao: &'a SsaoPass,
     ssr: &'a SsrPass,
+    raytrace: Option<&'a raytrace::RayTracePass>,
     subsurface: &'a SubsurfacePass,
     taa: &'a TaaPass,
     view: taa::FrameView,
@@ -3696,6 +3750,9 @@ impl FrameRecord<'_> {
             || id == ids.instance_index
             || id == ids.exposure
             || Some(id) == ids.histogram
+            || ids
+                .ray
+                .is_some_and(|ray| id == ray.meshes || id == ray.scene)
         {
             return Some(record::Target::Memory);
         }
@@ -3852,6 +3909,7 @@ impl FrameRecord<'_> {
                     let swapchain = if matches!(
                         body,
                         PassBody::Tonemap
+                            | PassBody::RayDebug
                             | PassBody::Ui
                             | PassBody::Wireframe
                             | PassBody::Outline
@@ -3897,6 +3955,8 @@ impl FrameRecord<'_> {
     /// A compute pass's body: dispatches, with no render pass around them.
     fn record_compute(&self, encoder: &mut Encoder, body: PassBody) {
         match body {
+            PassBody::RayMeshes => encoder.build_mesh_accel(),
+            PassBody::RayScene => encoder.build_scene_accel(),
             PassBody::SsrHiz => {
                 let ids = self
                     .frame
@@ -4488,6 +4548,11 @@ impl FrameRecord<'_> {
                     self.surfaces,
                 );
             }
+            PassBody::RayDebug => {
+                self.raytrace
+                    .expect("the graph scheduled a traced pass on a device that cannot trace")
+                    .record_debug(self.device, encoder, self.extent, self.object_rows);
+            }
             PassBody::Tonemap | PassBody::Screenshot => {
                 // With bloom off the graph has no chain, so the tonemap
                 // pass samples a 1x1 black self.view at a zero strength: "no
@@ -4604,6 +4669,8 @@ impl FrameRecord<'_> {
             | PassBody::BloomUpsample(_)
             | PassBody::CullReset
             | PassBody::Cull
+            | PassBody::RayMeshes
+            | PassBody::RayScene
             | PassBody::OcclusionHiz => unreachable!("handled above"),
         }
     }

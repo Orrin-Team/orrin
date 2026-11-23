@@ -77,6 +77,9 @@ pub struct CaptureSettings {
     pub punctual_shadows: bool,
     /// Which of the shadows' debug views the frame is drawn through.
     pub shadow_debug: ShadowDebugView,
+    /// Which view of the traced scene is drawn in place of the frame. On a
+    /// device that cannot trace, the capture is the frame as it was.
+    pub ray_debug: crate::scene::RayDebugView,
     /// The sun's angular diameter in degrees, or `None` for the default. Zero
     /// is the other half of an A/B: every edge at one width, whatever cast it.
     pub sun_angle: Option<f32>,
@@ -161,6 +164,7 @@ impl Default for CaptureSettings {
             shadows: false,
             punctual_shadows: false,
             shadow_debug: ShadowDebugView::None,
+            ray_debug: crate::scene::RayDebugView::None,
             sun_angle: None,
             ssr: false,
             dof: false,
@@ -357,6 +361,10 @@ pub fn render(
         });
 
     renderer.pin_surface_time(settings.surface_time);
+    renderer.set_ray_tracing(crate::scene::RayTracingSettings {
+        debug_view: settings.ray_debug,
+        ..Default::default()
+    });
     for _ in 0..settings.frames.max(1) {
         // Extraction reads *world* transforms, and a freshly built scene has
         // only local ones — the propagation that derives them is a system, not

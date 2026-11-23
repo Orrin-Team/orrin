@@ -39,7 +39,7 @@ use glam::Mat4;
 use crate::gfx::RenderItem;
 use crate::gfx::graph::BufferUsage;
 use crate::gfx::rhi::{
-    BlockKind, BufferCopy, BufferDesc, BufferId, Device, Encoder, MemoryLocation,
+    BlockKind, BufferCopy, BufferDesc, BufferId, Device, Encoder, MemoryLocation, MeshSpan,
 };
 
 /// Per-object transforms, indexed through [`InstanceLists`] from a storage
@@ -64,15 +64,31 @@ pub(super) struct GpuObject {
     /// `[0]` is the light channels the object is in. A word of its own costs
     /// the row sixteen bytes rather than four, because std430 rounds the
     /// struct up to the alignment of the vectors beside it.
+    ///
+    /// The other three are what a ray that hits the object needs and a draw
+    /// never does, since a draw is handed them: the material, and where the
+    /// mesh's indices and vertices start in the shared geometry. A hit reports
+    /// the row's number and a triangle's, and finds the triangle from here.
     flags: [u32; 4],
 }
 
 impl GpuObject {
-    pub(super) fn new(model: &Mat4, prev_model: &Mat4, channels: u32) -> Self {
+    pub(super) fn new(
+        model: &Mat4,
+        prev_model: &Mat4,
+        channels: u32,
+        material: u32,
+        span: MeshSpan,
+    ) -> Self {
         Self {
             model: affine_rows(model),
             prev_model: affine_rows(prev_model),
-            flags: [channels, 0, 0, 0],
+            flags: [
+                channels,
+                material,
+                span.first_index,
+                span.vertex_offset as u32,
+            ],
         }
     }
 }
@@ -100,13 +116,18 @@ const INITIAL_ROWS: u32 = 1024;
 ///
 /// Deliberately *not* keyed by entity generation. A slot reused by a different
 /// entity that happens to stand exactly where the last one did needs no upload:
-/// the row's contents are fully determined by this pair, so equal pairs mean the
+/// the row's contents are fully determined by these, so equal ones mean the
 /// row on the GPU is already right, whoever put it there.
+///
+/// The span and not the mesh's handle, because a replaced mesh keeps its
+/// handle and moves.
 #[derive(Clone, Copy, PartialEq)]
 struct Resident {
     model: Mat4,
     prev_model: Mat4,
     channels: u32,
+    material: u32,
+    span: MeshSpan,
 }
 
 /// One entry of a draw order: which object row to draw, and which material to
@@ -181,6 +202,7 @@ impl InstanceStore {
         device: &Device,
         encoder: &mut Encoder,
         items: &[RenderItem],
+        span_of: impl Fn(u32) -> MeshSpan,
     ) -> usize {
         // Growth first, because the dirty test below is against the mirror this
         // may have just cleared. `+ 1` since `instance` is an index.
@@ -211,6 +233,8 @@ impl InstanceStore {
                 model: item.model,
                 prev_model: item.prev_model,
                 channels: item.channels,
+                material: item.material.0,
+                span: span_of(item.mesh.0),
             };
             if self.resident[slot] == Some(current) {
                 continue;
@@ -218,7 +242,13 @@ impl InstanceStore {
             self.resident[slot] = Some(current);
             dirty.push((
                 item.instance,
-                GpuObject::new(&item.model, &item.prev_model, item.channels),
+                GpuObject::new(
+                    &item.model,
+                    &item.prev_model,
+                    item.channels,
+                    current.material,
+                    current.span,
+                ),
             ));
         }
 
@@ -419,7 +449,7 @@ mod tests {
             [0.0, 0.0, 1.0, 0.0],
             [-4.0, 0.5, 9.0, 1.0],
         ]);
-        let row = GpuObject::new(&trs, &sheared, 0);
+        let row = GpuObject::new(&trs, &sheared, 0, 0, MeshSpan::default());
         assert_eq!(shader_affine(&row.model), trs);
         assert_eq!(shader_affine(&row.prev_model), sheared);
     }

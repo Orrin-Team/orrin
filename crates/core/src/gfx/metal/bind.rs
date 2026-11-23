@@ -283,6 +283,9 @@ impl MtlDriver {
                         self.write_sampler(writer.encoder(), resource.index, sampler);
                     }
                 }
+                BindingResource::SceneAccel => {
+                    unreachable!("Metal reports no ray tracing, so no pass binds a scene to trace")
+                }
                 BindingResource::Geometry(stream) => {
                     let Some(writer) = writer_of(resource.index) else {
                         continue;

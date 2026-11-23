@@ -311,7 +311,7 @@ pub(super) fn rendering_info(
             ))),
         },
         // The acquired swapchain image, every pixel of which the tonemap writes.
-        PassBody::Tonemap => color_only(overwritten(swapchain)),
+        PassBody::Tonemap | PassBody::RayDebug => color_only(overwritten(swapchain)),
         // Cleared to "nothing outlined".
         PassBody::OutlineMask => color_only(cleared(
             images.texture(
@@ -399,7 +399,9 @@ pub(super) fn rendering_info(
         | PassBody::BloomDownsample(_)
         | PassBody::BloomUpsample(_)
         | PassBody::CullReset
-        | PassBody::Cull => return None,
+        | PassBody::Cull
+        | PassBody::RayMeshes
+        | PassBody::RayScene => return None,
     })
 }
 

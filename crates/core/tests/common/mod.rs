@@ -4,7 +4,7 @@
 use glam::Vec3;
 use orrin_core::capture::{CaptureSettings, Floor};
 use orrin_core::scene::entities::SceneChoice;
-use orrin_core::scene::{Camera, FogSettings, ShadowDebugView};
+use orrin_core::scene::{Camera, FogSettings, RayDebugView, ShadowDebugView};
 
 /// Where both fog captures stand, shared so the pair differs in one field.
 ///
@@ -264,6 +264,34 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 shadows: true,
                 punctual_shadows: true,
                 shadow_debug: ShadowDebugView::TexelDensity,
+                ..CaptureSettings::default()
+            },
+        ),
+        // The traced scene in place of the frame, from the rig's own camera so
+        // each reads against `scene.png`: what stands in the acceleration
+        // structures and where, as one colour per instance, as the distance a
+        // ray travels, and as each hit triangle's own normal. A mesh missing
+        // from the first is one that was never built or never instanced; a
+        // normal that disagrees with the shaded frame is a hit resolved to the
+        // wrong triangle.
+        (
+            "ray-debug-instance",
+            CaptureSettings {
+                ray_debug: RayDebugView::Instance,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "ray-debug-distance",
+            CaptureSettings {
+                ray_debug: RayDebugView::HitDistance,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "ray-debug-normal",
+            CaptureSettings {
+                ray_debug: RayDebugView::GeometricNormal,
                 ..CaptureSettings::default()
             },
         ),

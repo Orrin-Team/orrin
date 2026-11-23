@@ -1,4 +1,4 @@
-use super::{BufferId, PipelineId, SamplerId, ShaderModuleId, TextureViewId};
+use super::{BufferId, MeshSpan, PipelineId, SamplerId, ShaderModuleId, TextureViewId};
 use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::graph::{BufferUsage, ImageUsage};
 use crate::gfx::shaders::ShaderId;
@@ -275,6 +275,24 @@ pub enum BindingResource {
     /// a `BufferId` because the driver owns the arena and replaces its buffers
     /// when they grow: each group resolves whichever one is current.
     Geometry(GeometryStream),
+    /// The scene's acceleration structure as this frame builds it, for a
+    /// shader that traces ray queries. Named for the reason the geometry is:
+    /// the driver owns it, and which one is current changes every frame.
+    SceneAccel,
+}
+
+/// One thing a ray can hit: a mesh, where it stands, and what a hit on it
+/// reports.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RayInstance {
+    pub span: MeshSpan,
+    /// Object to world, as the top three rows of the matrix.
+    pub transform: [[f32; 4]; 3],
+    /// What a shader reads back from a hit. Twenty-four bits.
+    pub id: u32,
+    /// Whether every triangle stops a ray outright. False for a cutout, whose
+    /// hits the tracing shader tests against the material's alpha itself.
+    pub opaque: bool,
 }
 
 /// Which of the shared geometry's buffers a [`BindingResource::Geometry`] is.

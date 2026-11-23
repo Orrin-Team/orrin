@@ -28,6 +28,11 @@ use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use vulkano::VulkanObject;
+use vulkano::acceleration_structure::{
+    AccelerationStructure, AccelerationStructureBuildGeometryInfo,
+    AccelerationStructureBuildRangeInfo, AccelerationStructureCreateInfo,
+    AccelerationStructureType, CopyAccelerationStructureInfo, CopyAccelerationStructureMode,
+};
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, IndexBuffer, Subbuffer};
 use vulkano::command_buffer::{
@@ -595,14 +600,20 @@ impl Recorder {
     /// What a mesh upload that is not waited on ends with: with no fence wait
     /// between it and the next submission, this barrier is the only thing that
     /// orders the two.
-    pub(super) fn transfer_to_geometry_reads(&mut self) -> &mut Self {
+    pub(super) fn transfer_to_geometry_reads(&mut self, ray_tracing: bool) -> &mut Self {
+        let mut dst_stages = PipelineStages::ALL_TRANSFER
+            | PipelineStages::VERTEX_ATTRIBUTE_INPUT
+            | PipelineStages::INDEX_INPUT
+            | PipelineStages::VERTEX_SHADER;
+        // A mesh's acceleration structure is built from the same bytes, read
+        // as storage. The stage only exists on a device that traces.
+        if ray_tracing {
+            dst_stages |= PipelineStages::ACCELERATION_STRUCTURE_BUILD;
+        }
         let barrier = MemoryBarrier {
             src_stages: PipelineStages::ALL_TRANSFER,
             src_access: AccessFlags::TRANSFER_WRITE,
-            dst_stages: PipelineStages::ALL_TRANSFER
-                | PipelineStages::VERTEX_ATTRIBUTE_INPUT
-                | PipelineStages::INDEX_INPUT
-                | PipelineStages::VERTEX_SHADER,
+            dst_stages,
             dst_access: AccessFlags::TRANSFER_READ
                 | AccessFlags::TRANSFER_WRITE
                 | AccessFlags::VERTEX_ATTRIBUTE_READ
@@ -881,6 +892,81 @@ impl Recorder {
         self.keep.hold_arc(pool);
         self
     }
+
+    /// Build one acceleration structure from the buffers `info` names.
+    pub(super) fn build_acceleration_structure(
+        &mut self,
+        info: AccelerationStructureBuildGeometryInfo,
+        range: AccelerationStructureBuildRangeInfo,
+    ) -> &mut Self {
+        // SAFETY: the inputs were written before this command — by the host, or
+        // by a copy the arena ended with a barrier — and the destination and
+        // the scratch are this build's alone until the graph's barrier after
+        // the pass. `info` holds every buffer and is kept until the frame's
+        // fence signals.
+        unsafe { self.inner.build_acceleration_structure(&info, &[range]) }
+            .expect("invalid acceleration structure build");
+        self.keep.hold(info);
+        self
+    }
+
+    /// Copy `src` into `dst` at the size its compaction query reported.
+    pub(super) fn compact_acceleration_structure(
+        &mut self,
+        src: Arc<AccelerationStructure>,
+        dst: Arc<AccelerationStructure>,
+    ) -> &mut Self {
+        let info = CopyAccelerationStructureInfo {
+            mode: CopyAccelerationStructureMode::Compact,
+            ..CopyAccelerationStructureInfo::new(src, dst)
+        };
+        // SAFETY: `src` was built in a frame that has finished executing, which
+        // is what its query having a result means, and `dst` is new.
+        unsafe { self.inner.copy_acceleration_structure(&info) }
+            .expect("invalid acceleration structure copy");
+        self.keep.hold(info);
+        self
+    }
+
+    /// Ask what each structure would compact to, into `pool` from query zero.
+    pub(super) fn write_compacted_sizes(
+        &mut self,
+        structures: &[Arc<AccelerationStructure>],
+        pool: Arc<QueryPool>,
+    ) -> &mut Self {
+        // SAFETY: the pool is this batch's own and nothing else has written it,
+        // and every structure was built by a frame submitted before this one.
+        unsafe {
+            self.inner
+                .reset_query_pool(&pool, 0..structures.len() as u32)
+                .expect("invalid query pool reset")
+                .write_acceleration_structures_properties(structures, &pool, 0)
+        }
+        .expect("invalid compacted size query");
+        self.keep.hold(structures.to_vec());
+        self.keep.hold_arc(pool);
+        self
+    }
+}
+
+/// An acceleration structure over `buffer`, which becomes its storage.
+pub(super) fn create_acceleration_structure(
+    ctx: &VkContext,
+    ty: AccelerationStructureType,
+    buffer: Subbuffer<[u8]>,
+) -> Arc<AccelerationStructure> {
+    // SAFETY: the buffer was allocated for this structure by the caller and is
+    // handed over whole: nothing else holds a handle that reads or writes it.
+    unsafe {
+        AccelerationStructure::new(
+            ctx.device.clone(),
+            AccelerationStructureCreateInfo {
+                ty,
+                ..AccelerationStructureCreateInfo::new(buffer)
+            },
+        )
+    }
+    .expect("failed to create an acceleration structure")
 }
 
 /// One frame's submission, and everything that must outlive it.

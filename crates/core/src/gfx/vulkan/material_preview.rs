@@ -552,6 +552,8 @@ pub(super) fn object_rows(material: MaterialHandle) -> (super::instances::GpuObj
             &Mat4::IDENTITY,
             &Mat4::IDENTITY,
             crate::scene::ALL_CHANNELS,
+            material.0,
+            MeshSpan::default(),
         ),
         [0, material.0],
     )

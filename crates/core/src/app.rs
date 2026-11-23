@@ -346,6 +346,7 @@ impl App {
         world.insert_resource(AmbientLight::default());
         world.insert_resource(SsaoSettings::default());
         world.insert_resource(SsrSettings::default());
+        world.insert_resource(crate::scene::RayTracingSettings::default());
         world.insert_resource(SubsurfaceSettings::default());
         world.insert_resource(TransparencySettings::default());
         world.insert_resource(DecalSettings::default());
@@ -1216,6 +1217,9 @@ impl ApplicationHandler for App {
                 active
                     .renderer
                     .set_present(*self.world.resource::<PresentSettings>());
+                active
+                    .renderer
+                    .set_ray_tracing(*self.world.resource::<crate::scene::RayTracingSettings>());
 
                 if let Some(view) = active.editor.take_screenshot_request() {
                     active.renderer.request_screenshot(view);

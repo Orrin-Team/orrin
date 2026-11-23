@@ -27,6 +27,7 @@ mod play;
 pub mod prefab;
 mod present;
 mod previews;
+mod ray_tracing;
 pub mod registry;
 pub mod render_settings;
 mod shadow;
@@ -77,6 +78,7 @@ pub use present::{PresentSettings, VsyncMode};
 pub use previews::{
     AssetPreviews, MaterialPreview, MeshPreview, apply_material_edits, render_mesh,
 };
+pub use ray_tracing::{RayDebugView, RayTracingSettings};
 pub use registry::register_components;
 pub use render_settings::RenderSettings;
 pub use shadow::{MAX_SHADOW_SHARPNESS, MAX_SUN_ANGLE, ShadowDebugView, ShadowSettings};
