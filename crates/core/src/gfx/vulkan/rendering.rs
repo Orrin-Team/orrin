@@ -53,7 +53,8 @@ fn cleared(target: TextureViewId, clear: [f32; 4]) -> ColorAttachment {
 }
 
 /// A colour attachment whose previous contents do not matter and which is
-/// entirely rewritten — the swapchain image.
+/// entirely rewritten — the swapchain image, and the target of a full-screen
+/// pass whose fragment shader writes its output on every path.
 fn overwritten(target: TextureViewId) -> ColorAttachment {
     ColorAttachment {
         target,
@@ -187,23 +188,24 @@ pub(super) fn rendering_info(
                 )),
             }
         }
-        // 1.0 = fully unoccluded, so an untouched pixel darkens nothing.
+        // Not cleared: each of these three is one triangle over its whole
+        // target, drawn by a fragment shader that writes its output before
+        // every `return` and never discards, so a clear is traffic the draw
+        // then overwrites. `a_target_left_uncleared_is_written_everywhere`
+        // holds the half of that a compiler can see.
         PassBody::SsaoResolve => {
             let ssao = ids.ssao.expect("SSAO pass without SSAO resources");
-            color_only(cleared(images.texture(ssao.raw_ao), [1.0, 0.0, 0.0, 0.0]))
+            color_only(overwritten(images.texture(ssao.raw_ao)))
         }
         PassBody::SsaoBlur => {
             let ssao = ids.ssao.expect("SSAO pass without SSAO resources");
-            color_only(cleared(images.texture(ssao.ao), [1.0, 0.0, 0.0, 0.0]))
+            color_only(overwritten(images.texture(ssao.ao)))
         }
-        // 1.0 = fully lit, for the same reason: the pass writes every pixel, so
-        // this only decides what a pixel would be if it somehow did not.
-        PassBody::ContactShadows => color_only(cleared(
+        PassBody::ContactShadows => color_only(overwritten(
             images.texture(
                 ids.contact_shadows
                     .expect("contact shadow pass without its mask"),
             ),
-            [1.0, 0.0, 0.0, 0.0],
         )),
         // Four render passes and four framebuffers, now two independent
         // questions: does this frame resolve, and does it diffuse.
@@ -399,4 +401,35 @@ pub(super) fn rendering_info(
         | PassBody::CullReset
         | PassBody::Cull => return None,
     })
+}
+
+#[cfg(all(test, feature = "shader-compiler"))]
+mod tests {
+    use crate::gfx::shaders::ShaderId;
+    use crate::gfx::surface::discards;
+
+    /// A target that is not cleared keeps whatever the last frame left in it
+    /// wherever its pass does not write. A full-screen fragment shader stops
+    /// writing in one way a compiler can see, and this is it; a `return` that
+    /// leaves the output unset is the other, and only reading the shader finds
+    /// that one.
+    #[test]
+    fn a_target_left_uncleared_is_written_everywhere() {
+        // The cutout prepass is how this knows the scan sees a discard at all.
+        assert!(discards(ShaderId::PrepassFragMasked.blob().spirv) > 0);
+        for shader in [
+            ShaderId::SsaoFrag,
+            ShaderId::SsaoBlurFrag,
+            ShaderId::ContactShadowsFrag,
+        ] {
+            let blob = shader.blob();
+            assert_eq!(
+                discards(blob.spirv),
+                0,
+                "{} discards, and its target is not cleared: either it stops, or \
+                 `rendering_info` clears that target again",
+                blob.name
+            );
+        }
+    }
 }
