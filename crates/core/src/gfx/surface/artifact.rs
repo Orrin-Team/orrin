@@ -308,6 +308,7 @@ fn put_shader(out: &mut Vec<u8>, shader: &CompiledShader) {
             ResourceKind::Sampler => 3,
             ResourceKind::StorageImage => 4,
             ResourceKind::CombinedImageSampler => 5,
+            ResourceKind::AccelerationStructure => 6,
         });
         put_u32(out, resource.count);
         put_u32(out, resource.index);
@@ -422,6 +423,7 @@ impl<'a> Reader<'a> {
                     3 => ResourceKind::Sampler,
                     4 => ResourceKind::StorageImage,
                     5 => ResourceKind::CombinedImageSampler,
+                    6 => ResourceKind::AccelerationStructure,
                     other => return Err(malformed(format!("resource kind {other}"))),
                 },
                 count: self.u32("a resource")?,

@@ -92,6 +92,14 @@ pub struct VkContext {
     /// draw the opaque queue, and the renderer refuses it at startup — see
     /// `require_gpu_culling`.
     pub multi_draw: bool,
+    /// Whether a shader can trace a ray against the scene: acceleration
+    /// structures, built on the device, and ray queries from any stage.
+    ///
+    /// The one switch everything ray traced is gated on. Without it no
+    /// acceleration structure is built, no pass that traces is registered, and
+    /// the frame is the one this renderer drew before any of it existed — see
+    /// [`probe_ray_tracing`].
+    pub ray_tracing: bool,
 }
 
 impl VkContext {
@@ -248,6 +256,23 @@ impl VkContext {
 
         let samples_bc = physical_device.supported_features().texture_compression_bc;
 
+        let ray_tracing = probe_ray_tracing(&physical_device);
+        if ray_tracing {
+            device_extensions.khr_acceleration_structure = true;
+            device_extensions.khr_ray_query = true;
+            // Never used: the builds are recorded, not deferred to host threads.
+            // `VK_KHR_acceleration_structure` names it as a dependency.
+            device_extensions.khr_deferred_host_operations = true;
+        }
+        tracing::info!(
+            "ray tracing: {}",
+            if ray_tracing {
+                "acceleration structures and ray queries"
+            } else {
+                "off, the frame is rasterised alone"
+            },
+        );
+
         // Graphics first, then the compute-only family, then a transfer family
         // of its own — so `queues` yields them in that order. A transfer queue
         // in the compute family is that family's second queue, and comes out
@@ -286,6 +311,9 @@ impl VkContext {
                     dynamic_rendering: true,
                     synchronization2: true,
                     texture_compression_bc: samples_bc,
+                    acceleration_structure: ray_tracing,
+                    ray_query: ray_tracing,
+                    buffer_device_address: ray_tracing,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()
@@ -353,6 +381,7 @@ impl VkContext {
             pipelines,
             partially_bound,
             multi_draw,
+            ray_tracing,
         }
     }
 
@@ -460,6 +489,35 @@ fn select_compute_family(physical_device: &Arc<PhysicalDevice>) -> Option<u32> {
                 && family.queue_count > 0
         })
         .map(|index| index as u32)
+}
+
+/// Whether the device can build acceleration structures and trace ray queries
+/// against them, or `false` under `ORRIN_RAY_TRACING=0`.
+///
+/// Ray queries and not ray-tracing pipelines: a query is traced inline from the
+/// compute dispatches the frame already is, with no shader binding table and no
+/// recursion, so `VK_KHR_ray_tracing_pipeline` is neither asked for nor enabled.
+///
+/// Vulkan 1.2 is the floor because that is where buffer device addresses are
+/// core, and an acceleration structure is built from addresses rather than from
+/// bound buffers. A device below it, or one missing either extension — MoltenVK,
+/// lavapipe, an integrated part from before 2020 — reports `false` and is drawn
+/// for exactly as it was.
+fn probe_ray_tracing(physical_device: &Arc<PhysicalDevice>) -> bool {
+    // The control every ray-traced feature is measured against, and the way to
+    // run the fallback on a machine that has the hardware.
+    if std::env::var("ORRIN_RAY_TRACING").is_ok_and(|value| value.trim() == "0") {
+        return false;
+    }
+    let extensions = physical_device.supported_extensions();
+    let features = physical_device.supported_features();
+    physical_device.api_version() >= Version::V1_2
+        && extensions.khr_acceleration_structure
+        && extensions.khr_ray_query
+        && extensions.khr_deferred_host_operations
+        && features.acceleration_structure
+        && features.ray_query
+        && features.buffer_device_address
 }
 
 /// The device's queue families, read for [`transfer_slot`].

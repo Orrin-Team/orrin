@@ -85,5 +85,6 @@ fn kind(kind: orrin_shaderc::ResourceKind) -> ResourceKind {
         K::Sampler => ResourceKind::Sampler,
         K::StorageImage => ResourceKind::StorageImage,
         K::CombinedImageSampler => ResourceKind::CombinedImageSampler,
+        K::AccelerationStructure => ResourceKind::AccelerationStructure,
     }
 }

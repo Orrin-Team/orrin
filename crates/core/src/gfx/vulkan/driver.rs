@@ -325,6 +325,7 @@ impl VkDriver {
         };
         match feature {
             Feature::BlockCompression => self.ctx.samples_bc,
+            Feature::RayTracing => self.ctx.ray_tracing,
             Feature::CoverageTexture => {
                 let device = &self.ctx.device;
                 let swizzle = !device.enabled_extensions().khr_portability_subset

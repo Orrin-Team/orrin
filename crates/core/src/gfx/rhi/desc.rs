@@ -346,6 +346,10 @@ pub enum Feature {
     CoverageTexture,
     /// Sampling block-compressed (BC5, BC7) textures.
     BlockCompression,
+    /// Tracing rays against the scene from a shader: acceleration structures
+    /// built on the device and ray queries against them. False on Metal until
+    /// that driver builds acceleration structures of its own.
+    RayTracing,
 }
 
 /// Which kind of buffer a per-frame block is bound as.
