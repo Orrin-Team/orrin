@@ -480,7 +480,7 @@ impl SsrPass {
     ) {
         let traced = self.traced(traced_rays, true);
         let pipeline = traced.map_or(self.resolve_pipeline, |(pipeline, _)| pipeline);
-        let mut bindings = vec![
+        let bindings = [
             // Linear, though the composite reads its own pixel by texel, so
             // a smooth surface's ray samples the frame as the trace does.
             self.sampled(0, source, self.linear_clamp),
@@ -503,22 +503,19 @@ impl SsrPass {
             // samplers for the trace's reasons.
             self.sampled(9, hiz, self.nearest_clamp),
             self.sampled(10, source_pyramid, self.linear_mip),
+            Binding {
+                binding: 6,
+                resource: BindingResource::Texture(environment),
+            },
+            Binding {
+                binding: 7,
+                resource: BindingResource::Sampler(environment_sampler),
+            },
         ];
-        // The traced composite reads the environment through the set every
-        // hit is shaded from, and declares it nowhere else.
-        if traced.is_none() {
-            bindings.extend([
-                Binding {
-                    binding: 6,
-                    resource: BindingResource::Texture(environment),
-                },
-                Binding {
-                    binding: 7,
-                    resource: BindingResource::Sampler(environment_sampler),
-                },
-            ]);
-        }
-        let set = device.create_transient_bind_group(pipeline, 0, &bindings);
+        // The last two are the environment, which the traced composite reads
+        // through the set every hit is shaded from and declares nowhere else.
+        let bindings = &bindings[..bindings.len() - if traced.is_some() { 2 } else { 0 }];
+        let set = device.create_transient_bind_group(pipeline, 0, bindings);
 
         builder.bind_pipeline(pipeline);
         builder.bind_group(0, set);
