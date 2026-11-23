@@ -17,9 +17,9 @@
 // surface has seen, so one bright ray does not stay in the mean for a second.
 // The bound is the history's mean and eight of its deviations, kept beside it
 // as a running deviation from the running mean, or the brightest of the eight
-// rays round this one,
-// whichever is higher: light that is new to the whole neighbourhood, a lamp
-// switched on, passes, and light that only this ray found does not.
+// rays round this one, whichever is higher: light that is new to the whole
+// neighbourhood, a lamp switched on, passes, and light that only this ray
+// found does not.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 

@@ -4183,8 +4183,7 @@ impl FrameRecord<'_> {
             PassBody::GiUpdate => self.gi.record_update(self.device, encoder),
             PassBody::GiGather
             | PassBody::GiGatherTemporal
-            | PassBody::GiGatherBlurHorizontal
-            | PassBody::GiGatherBlurVertical
+            | PassBody::GiGatherBlur { .. }
             | PassBody::GiGatherUpscale => self.record_gather(encoder, body),
             PassBody::SsrHiz => {
                 let ids = self
@@ -4914,14 +4913,13 @@ impl FrameRecord<'_> {
             | PassBody::GiCacheShade
             | PassBody::GiGather
             | PassBody::GiGatherTemporal
-            | PassBody::GiGatherBlurHorizontal
-            | PassBody::GiGatherBlurVertical
+            | PassBody::GiGatherBlur { .. }
             | PassBody::GiGatherUpscale
             | PassBody::OcclusionHiz => unreachable!("handled above"),
         }
     }
 
-    /// One of the final gather's five dispatches, each bound to what
+    /// One of the final gather's dispatches, each bound to what
     /// `declare` said it reads and writes.
     fn record_gather(&self, encoder: &mut Encoder, body: PassBody) {
         let ids = self
@@ -4965,29 +4963,29 @@ impl FrameRecord<'_> {
                 texture(ids.history),
                 texture(ids.accumulated),
             ),
-            PassBody::GiGatherBlurHorizontal => gather.record_blur(
-                self.device,
-                encoder,
-                inputs,
-                texture(ids.accumulated),
-                texture(ids.accumulated),
-                texture(ids.blurred_x),
-                false,
-            ),
-            PassBody::GiGatherBlurVertical => gather.record_blur(
-                self.device,
-                encoder,
-                inputs,
-                texture(ids.blurred_x),
-                texture(ids.accumulated),
-                texture(ids.blurred),
-                true,
-            ),
+            PassBody::GiGatherBlur { vertical, wide } => {
+                let (source, target) = match (vertical, wide) {
+                    (false, false) => (ids.accumulated, ids.blurred_x),
+                    (true, false) => (ids.blurred_x, ids.blurred),
+                    (false, true) => (ids.blurred, ids.wide_x),
+                    (true, true) => (ids.wide_x, ids.wide),
+                };
+                gather.record_blur(
+                    self.device,
+                    encoder,
+                    inputs,
+                    texture(source),
+                    texture(ids.accumulated),
+                    texture(target),
+                    vertical,
+                    wide,
+                );
+            }
             PassBody::GiGatherUpscale => gather.record_upscale(
                 self.device,
                 encoder,
                 inputs,
-                texture(ids.blurred),
+                texture(ids.wide),
                 texture(ids.irradiance),
             ),
             _ => unreachable!("not one of the gather's"),

@@ -385,9 +385,11 @@ pub enum PassBody {
     GiGather,
     /// Those rays into each texel's running mean, reprojected.
     GiGatherTemporal,
-    /// One axis each of the gather's spatial filter.
-    GiGatherBlurHorizontal,
-    GiGatherBlurVertical,
+    /// One axis of one level of the gather's spatial filter.
+    GiGatherBlur {
+        vertical: bool,
+        wide: bool,
+    },
     /// The gather to the frame's resolution, for the forward pass.
     GiGatherUpscale,
     /// The cached layers of the shadow views that redraw theirs this frame:
@@ -538,9 +540,11 @@ pub struct GatherIds {
     pub raw: ResourceId,
     pub history: ResourceId,
     pub accumulated: ResourceId,
-    /// The spatial filter's two axes.
+    /// The spatial filter's two axes, and its second level's.
     pub blurred_x: ResourceId,
     pub blurred: ResourceId,
+    pub wide_x: ResourceId,
+    pub wide: ResourceId,
     /// The harmonics at the frame's resolution: what the forward pass reads.
     pub irradiance: ResourceId,
     /// Last frame's lit colour, which a ray that lands on something the
@@ -1392,6 +1396,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         );
         let blurred_x = builder.create_image("gi_gather_blur_x", low(SH_LAYERS));
         let blurred = builder.create_image("gi_gather_blur_y", low(SH_LAYERS));
+        let wide_x = builder.create_image("gi_gather_blur_wide_x", low(SH_LAYERS));
+        let wide = builder.create_image("gi_gather_blur_wide_y", low(SH_LAYERS));
         let irradiance = builder.create_image(
             "gi_gather_irradiance",
             ImageDesc::new(GATHER_FORMAT).array_layers(SH_LAYERS),
@@ -1436,7 +1442,14 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(accumulated, Access::Sampled)
             .access(blurred_x, Access::StorageWrite)
             .build();
-        record(id, PassBody::GiGatherBlurHorizontal, &mut bodies);
+        record(
+            id,
+            PassBody::GiGatherBlur {
+                vertical: false,
+                wide: false,
+            },
+            &mut bodies,
+        );
 
         let id = builder
             .pass("gi_gather_blur_y", PassKind::Compute)
@@ -1446,13 +1459,56 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(accumulated, Access::Sampled)
             .access(blurred, Access::StorageWrite)
             .build();
-        record(id, PassBody::GiGatherBlurVertical, &mut bodies);
+        record(
+            id,
+            PassBody::GiGatherBlur {
+                vertical: true,
+                wide: false,
+            },
+            &mut bodies,
+        );
+
+        // The second level, into two images more: neither outlives the first
+        // level's, so each takes the other's allocation.
+        let id = builder
+            .pass("gi_gather_blur_wide_x", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(blurred, Access::Sampled)
+            .access(accumulated, Access::Sampled)
+            .access(wide_x, Access::StorageWrite)
+            .build();
+        record(
+            id,
+            PassBody::GiGatherBlur {
+                vertical: false,
+                wide: true,
+            },
+            &mut bodies,
+        );
+
+        let id = builder
+            .pass("gi_gather_blur_wide_y", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(wide_x, Access::Sampled)
+            .access(accumulated, Access::Sampled)
+            .access(wide, Access::StorageWrite)
+            .build();
+        record(
+            id,
+            PassBody::GiGatherBlur {
+                vertical: true,
+                wide: true,
+            },
+            &mut bodies,
+        );
 
         let id = builder
             .pass("gi_gather_upscale", PassKind::Compute)
             .access(prepass.depth, Access::Sampled)
             .access(prepass.normal, Access::Sampled)
-            .access(blurred, Access::Sampled)
+            .access(wide, Access::Sampled)
             .access(irradiance, Access::StorageWrite)
             .build();
         record(id, PassBody::GiGatherUpscale, &mut bodies);
@@ -1463,6 +1519,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             accumulated,
             blurred_x,
             blurred,
+            wide_x,
+            wide,
             irradiance,
             lit: early_taa_history,
         }

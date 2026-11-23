@@ -78,8 +78,8 @@
 //!   off under this alone.
 //! - `ORRIN_PERF_GI_GATHER=half` (or `quarter`) adds the final gather to
 //!   `ORRIN_PERF_GI`, at that share of the frame each way: the rows
-//!   `gi_gather`, `gi_gather_temporal`, `gi_gather_blur_x`, `gi_gather_blur_y`
-//!   and `gi_gather_upscale`, and the cells it adds to `gi_cache_shade`.
+//!   `gi_gather`, `gi_gather_temporal`, the four `gi_gather_blur_*` and
+//!   `gi_gather_upscale`, and the cells it adds to `gi_cache_shade`.
 //! - `ORRIN_PERF_MSAA=1` rasterises the forward pass at four samples. The other
 //!   half of the comparison `TaaSettings::msaa` exists for: multisampled, the
 //!   pass writes and resolves its own targets and cannot depth-test `EQUAL`

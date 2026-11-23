@@ -5,8 +5,8 @@
 //!
 //! # A frame
 //!
-//! Five dispatches between the prepass and the forward pass, the first at
-//! half or a quarter of the frame's resolution each way:
+//! Seven dispatches between the prepass and the forward pass, all but the
+//! last at half or a quarter of the frame's resolution each way:
 //!
 //! 1. `gi_gather`: one ray per texel, cosine-weighted about the prepass's
 //!    normal, from a low-discrepancy sequence with a per-pixel scramble
@@ -24,14 +24,19 @@
 //! 3. and 4. `gi_gather_blur_x` and `_y`: a Gaussian along each axis weighted
 //!    by plane, normal and how far the rays went, wider where the history is
 //!    short.
-//! 5. `gi_gather_upscale`: four texels to each pixel, weighted by plane and
+//! 5. and 6. `gi_gather_blur_wide_x` and `_y`: the same again over what that
+//!    left, its taps [`WIDE_STRIDE`] texels apart (Dammertz et al. 2010).
+//!    One level leaves a room lit by a small bright panel blotched by four
+//!    parts in a hundred, and the two leave it by a half of one.
+//! 7. `gi_gather_upscale`: four texels to each pixel, weighted by plane and
 //!    normal (Sloan et al. 2007), into the image the forward pass reads by
 //!    pixel and evaluates with its own shading normal.
 //!
 //! The order is temporal, then spatial: the history keeps what the rays
 //! found, unblurred, so the blur's error is not fed back into it. SVGF (Schied
-//! et al. 2017) is the step up if the plain filter is not enough; NRD and the
-//! vendor denoisers are a dependency or a vendor each.
+//! et al. 2017), whose second level this already is, adds the variance that
+//! steers it and is the step up if this is not enough; NRD and the vendor
+//! denoisers are a dependency or a vendor each.
 //!
 //! # The cache
 //!
@@ -56,7 +61,8 @@
 //!
 //! At half resolution and 1080p: the raw rays and the two accumulations are
 //! four layers of 960x540 half floats each, 16.6 MB apiece; the two blurs
-//! three, 12.4 MB each; and the upscaled harmonics three layers at the full
+//! three, 12.4 MB each, which the second level's two take over as each is
+//! done with; and the upscaled harmonics three layers at the full
 //! extent, 49.8 MB. A quarter of that at a quarter resolution, bar the last.
 //! The table of hits beside the cache is 8.4 MB, made with the cache.
 
@@ -84,6 +90,10 @@ pub(super) const SH_LAYERS: u32 = 3;
 pub(super) const META_LAYERS: u32 = 4;
 /// Side of every gather pass's workgroup.
 const TILE: u32 = 8;
+/// How many texels apart the blur's second level takes its taps: about the
+/// first level's narrowest deviation and a half, past which what the first
+/// left would alias.
+const WIDE_STRIDE: u32 = 3;
 
 /// `Gather` in `gi_gather.glsl`, as the words of its std140 layout: three
 /// matrices, then `camera`, `previous_camera` and `params`.
@@ -399,7 +409,8 @@ impl GatherPass {
         dispatch_over(device, encoder, accumulated);
     }
 
-    /// One axis of the blur: across where `vertical` is false.
+    /// One axis of one level of the blur: across where `vertical` is false,
+    /// and the second level, its taps `WIDE_STRIDE` apart, where `wide`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_blur(
         &self,
@@ -410,6 +421,7 @@ impl GatherPass {
         meta: TextureViewId,
         target: TextureViewId,
         vertical: bool,
+        wide: bool,
     ) {
         let (pipelines, block) = self.live();
         let set = device.create_transient_bind_group(
@@ -426,7 +438,8 @@ impl GatherPass {
         );
         encoder.bind_pipeline(pipelines.blur);
         encoder.bind_group(0, set);
-        encoder.push_constants(&[u32::from(!vertical), u32::from(vertical)]);
+        let stride = if wide { WIDE_STRIDE } else { 1 };
+        encoder.push_constants(&[u32::from(!vertical) * stride, u32::from(vertical) * stride]);
         dispatch_over(device, encoder, target);
     }
 

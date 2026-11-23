@@ -12,6 +12,12 @@
 // The kernel is widest where the history is shortest: a texel disoccluded this
 // frame has one ray, and is spread over more of its neighbours' than one that
 // has averaged a full history.
+//
+// Run a second time with its taps further apart, over what the first run
+// left (Dammertz et al. 2010): a room lit by one small bright thing, which a
+// few rays in a hundred meet, is still blotched after a history and a kernel
+// a few texels wide, and a kernel wide enough in one run is taps by the
+// dozen.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -25,11 +31,14 @@ layout(set = 0, binding = 4, rgba16f) uniform writeonly image2DArray u_filtered;
 #define ORRIN_GATHER_BLOCK_BINDING 5
 #include "gi_gather.glsl"
 
+// The axis, times how many texels apart this run's taps are.
 layout(push_constant) uniform Axis {
     ivec2 step;
 } axis;
 
 const int WIDEST = 8;
+// The second run's taps either side.
+const float WIDE = 6.0;
 
 void main() {
     ivec2 low = ivec2(gl_GlobalInvocationID.xy);
@@ -52,8 +61,12 @@ void main() {
     vec4 meta = texelFetch(u_meta, ivec3(low, GATHER_META), 0);
     float reach = meta.z;
 
-    // Four texels either side once the history is full, eight for one ray.
-    float radius = mix(4.0, float(WIDEST), clamp(1.0 - (meta.x - 1.0) / 15.0, 0.0, 1.0));
+    // Four texels either side once the history is full, eight for one ray;
+    // the second run's are the same count whatever the history.
+    bool wide = abs(axis.step.x) + abs(axis.step.y) > 1;
+    float radius = wide
+        ? WIDE
+        : mix(4.0, float(WIDEST), clamp(1.0 - (meta.x - 1.0) / 15.0, 0.0, 1.0));
     float sigma = radius * 0.5;
 
     vec4 sum[3] = vec4[3](vec4(0.0), vec4(0.0), vec4(0.0));

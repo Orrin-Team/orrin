@@ -3017,6 +3017,8 @@ fn the_final_gather_runs_between_the_cache_and_the_forward_pass() {
         "gi_gather_temporal",
         "gi_gather_blur_x",
         "gi_gather_blur_y",
+        "gi_gather_blur_wide_x",
+        "gi_gather_blur_wide_y",
         "gi_gather_upscale",
         "forward",
     ];

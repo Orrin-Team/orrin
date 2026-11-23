@@ -409,8 +409,7 @@ pub(super) fn rendering_info(
         | PassBody::GiCacheShade
         | PassBody::GiGather
         | PassBody::GiGatherTemporal
-        | PassBody::GiGatherBlurHorizontal
-        | PassBody::GiGatherBlurVertical
+        | PassBody::GiGatherBlur { .. }
         | PassBody::GiGatherUpscale => return None,
     })
 }
