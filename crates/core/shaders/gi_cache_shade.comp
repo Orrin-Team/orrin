@@ -18,6 +18,16 @@
 // frame: the volumes this reads were written by this frame's update, so the
 // light they hold reaches the probes one update later.
 //
+// Averaged into what the cell held, over about `CELL_HISTORY` frames, or its
+// last `CELL_HISTORY` shadings where it is shaded every frame. Each shading is
+// from wherever this frame's ray landed in the cell, so a cell across the edge
+// of a sunlit patch is lit by one and in shade by the next; shaded afresh,
+// every probe ray that read the cell that frame read the same flip, which no
+// number of rays averages out. Averaged, the cell holds its own mean. By
+// frames and not by shadings alone, because a cell in a closed room may be
+// shaded once in six frames, and a lamp switched there would otherwise reach
+// its probes over seconds.
+//
 // A cell no probe ray used but the final gather asked for is shaded the same
 // way, from the gather ray the gather left in its own table.
 
@@ -33,7 +43,7 @@ layout(set = 0, binding = 0, std430) buffer GiCells {
 layout(set = 0, binding = 1, std430) readonly buffer GiRays {
     GiRay gi_rays[];
 };
-layout(set = 0, binding = 2, std430) writeonly buffer GiRadiance {
+layout(set = 0, binding = 2, std430) buffer GiRadiance {
     uvec2 gi_radiance[];
 };
 layout(set = 0, binding = 3, std430) readonly buffer GiList {
@@ -48,6 +58,8 @@ layout(set = 0, binding = 4, std430) readonly buffer GiGatherHits {
 
 // The point the volumes are looked up from, a hair off its surface.
 vec3 shade_from;
+
+const float CELL_HISTORY = 8.0;
 
 // A ray to the probe rather than the probe's own account of how far it sees,
 // which is too coarse to stop all of what is behind a wall. This pass is
@@ -67,8 +79,8 @@ void main() {
     uint cell = gi_list[at];
     uint ray = gi_cells[cell].representative;
     gi_cells[cell].representative = GI_NO_CELL;
+    uint since = gi.frame.x - gi_cells[cell].shaded;
     gi_cells[cell].shaded = gi.frame.x;
-    gi_radiance[cell] = uvec2(0u);
     if (ray == GI_NO_CELL) {
         return;
     }
@@ -109,5 +121,9 @@ void main() {
     if (any(isnan(radiance))) {
         return;
     }
-    gi_radiance[cell] = uvec2(packHalf2x16(radiance.rg), packHalf2x16(vec2(radiance.b, 1.0)));
+    vec4 held = gi_cell_light(gi_radiance[cell]);
+    float shadings = min(held.a, CELL_HISTORY - 1.0);
+    float take = max(1.0 / (shadings + 1.0), 1.0 - pow(1.0 - 1.0 / CELL_HISTORY, float(since)));
+    radiance = mix(held.rgb, radiance, take);
+    gi_radiance[cell] = uvec2(packHalf2x16(radiance.rg), packHalf2x16(vec2(radiance.b, shadings + 1.0)));
 }

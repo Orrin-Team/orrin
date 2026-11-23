@@ -3,9 +3,9 @@
 // One look at every cell of the world radiance cache. A cell the trace used
 // this frame goes on the list the shading pass is dispatched over; one unused
 // for longer than its lifetime is emptied, which is how the table follows
-// the camera without being rebuilt; and every other live cell carries its
-// light into this frame's half of the pair, which the shading pass then
-// writes only for the cells on the list.
+// the camera without being rebuilt; and every live cell carries its light
+// into this frame's half of the pair, where the shading pass averages a
+// listed cell's new light into it.
 //
 // The dispatch is counted as the list grows, one workgroup for every 64th
 // entry, so the shading pass needs no pass between to size it.
@@ -48,15 +48,16 @@ void main() {
         return;
     }
     uint age = gi.frame.x - held.used;
+    if (age > gi.frame.y) {
+        gi_cells[cell] = GiCell(0u, 0u, GI_NO_CELL, 0u);
+        return;
+    }
     if (age == 0u) {
         uint at = atomicAdd(gi_list_count, 1u);
         gi_list[at] = cell;
         if (at % SHADE_GROUP == 0u) {
             atomicAdd(gi_args.x, 1u);
         }
-    } else if (age > gi.frame.y) {
-        gi_cells[cell] = GiCell(0u, 0u, GI_NO_CELL, 0u);
-    } else {
-        gi_radiance[cell] = gi_radiance_history[cell];
     }
+    gi_radiance[cell] = gi_radiance_history[cell];
 }

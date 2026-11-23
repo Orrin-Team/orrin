@@ -78,8 +78,8 @@ uvec2 gi_cell_key(vec3 P, vec3 N, float reach, vec3 camera, float finest) {
     return uvec2(lo, hi);
 }
 
-// A cell's light as the table holds it: three halves, and a fourth that is
-// one once the cell has been shaded.
+// A cell's light as the table holds it: three halves, and a fourth that
+// counts the shadings averaged into it, zero until it has had one.
 vec4 gi_cell_light(uvec2 packed) {
     vec2 blue = unpackHalf2x16(packed.y);
     return vec4(unpackHalf2x16(packed.x), blue);

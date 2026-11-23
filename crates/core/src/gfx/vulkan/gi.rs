@@ -43,8 +43,10 @@
 //! cell, the cell's level of detail and which of six ways the surface faces
 //! (`gi_cache.glsl`), with a second hash as checksum and linear probing on a
 //! collision. A cell is a quarter of a metre near the camera and doubles with
-//! distance. Each is shaded afresh every frame it is used rather than
-//! accumulated, so a bad value lasts no longer than the frame that made it.
+//! distance. Each is shaded every frame it is used, from wherever a ray landed
+//! in it, and holds the mean of its last few shadings: a cell across a shadow's
+//! edge would otherwise be lit one frame and dark the next, for every probe
+//! ray that reads it at once, and a bad value still lasts only a few frames.
 //!
 //! The final gather (`vulkan::gi_gather`) reads the cache too, and claims the
 //! cells its rays land in that no probe ray has: such a cell is marked used
