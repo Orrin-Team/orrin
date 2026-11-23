@@ -34,8 +34,10 @@ pub struct GiSettings {
     /// what is smaller casts no indirect shadow.
     pub spacing: f32,
     /// How much of what a probe held it keeps at each update, once it has
-    /// averaged its first few. Higher is steadier and slower to follow a
-    /// change of light the probe does not see as sudden.
+    /// averaged its first few, where its updates disagree by about a tenth: a
+    /// probe whose updates agree more keeps less, and one whose updates
+    /// disagree more keeps more, up to all but a 256th. Higher is steadier and
+    /// slower to follow a change of light the probe does not see as sudden.
     pub hysteresis: f32,
     /// Whether the environment's reflections are dimmed where less of the
     /// sky's light reaches than the sky alone would give, so a closed room's

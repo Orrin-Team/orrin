@@ -489,6 +489,9 @@ pub struct GiIds {
     /// sees and its square: what every pass that lights a surface samples.
     pub irradiance: ResourceId,
     pub distance: ResourceId,
+    /// The same irradiance over the last few updates alone, which the cache's
+    /// shading reads for the light that bounced.
+    pub bounce: ResourceId,
     /// Each probe's offset, whether it is inside geometry, and the coordinate
     /// it was last written for.
     pub probes: ResourceId,
@@ -1035,9 +1038,16 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             ImageLayout::ShaderReadOnlyOptimal,
             ImageLayout::ShaderReadOnlyOptimal,
         );
+        let bounce = builder.import_image(
+            "gi_bounce",
+            atlas(),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
         let ids = GiIds {
             irradiance,
             distance,
+            bounce,
             probes: builder.import_buffer("gi_probes"),
             rays: builder.import_buffer("gi_rays"),
             cells: builder.import_buffer("gi_cells"),
@@ -1081,6 +1091,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(ids.radiance_history, Access::StorageRead)
             .access(irradiance, Access::StorageWrite)
             .access(distance, Access::StorageWrite)
+            .access(bounce, Access::StorageWrite)
             .build();
         record(id, PassBody::GiUpdate, &mut bodies);
 
@@ -1092,7 +1103,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(ids.cells, Access::StorageWrite)
             .access(ids.rays, Access::StorageRead)
             .access(ids.probes, Access::StorageRead)
-            .access(irradiance, Access::Sampled)
+            .access(bounce, Access::Sampled)
             .access(distance, Access::Sampled)
             .access(ids.radiance, Access::StorageWrite);
         // Last frame's gather rays, read for the cells they asked for and

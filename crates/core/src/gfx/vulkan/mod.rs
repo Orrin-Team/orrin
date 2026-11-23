@@ -2794,10 +2794,14 @@ impl VulkanRenderer {
                 );
             }
         }
-        if let (Some(ids), Some(([irradiance, distance], extent))) =
+        if let (Some(ids), Some(([irradiance, distance, bounce], extent))) =
             (self.frame.ids.gi, self.gi.atlases())
         {
-            for (id, view) in [(ids.irradiance, irradiance), (ids.distance, distance)] {
+            for (id, view) in [
+                (ids.irradiance, irradiance),
+                (ids.distance, distance),
+                (ids.bounce, bounce),
+            ] {
                 self.table.import(
                     id,
                     crate::gfx::images::ImageEntry {

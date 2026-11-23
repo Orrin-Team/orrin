@@ -30,6 +30,13 @@
 //!    which is how one bounce becomes many — from the probes a ray from the
 //!    cell reaches, since this is the one lookup whose errors are fed back.
 //!
+//! The light a cell bounces is read from a third atlas, each probe's
+//! irradiance over its last few updates alone, not from the one a surface
+//! reads. A probe can average hundreds of updates where its rays disagree,
+//! and light reaches a probe through the cells at the rate it blends, so a
+//! room fed from that atlas would take as many updates to fill with light, or
+//! to go dark, for every bounce it has. A surface reads the steady one.
+//!
 //! The update reads the cache's light and the shading writes it, while the
 //! shading reads the volumes and the update writes them: a cycle within the
 //! frame. So the cache's light is a pair that swaps each frame, like the
@@ -55,9 +62,9 @@
 //!
 //! # Memory
 //!
-//! At sixteen probes a side: the two atlases 39 MB, the rays 8.4 MB, the
+//! At sixteen probes a side: the three atlases 59 MB, the rays 8.4 MB, the
 //! cache 8.4 MB, the gather's hits beside it 8.4 MB and its list 1 MB, the
-//! probes' state 0.4 MB. Twelve a side takes the atlases to 17 MB and the rays
+//! probes' state 0.4 MB. Twelve a side takes the atlases to 25 MB and the rays
 //! to 3.5 MB. All of it is made when the volumes first go live and let go when
 //! they stop.
 //!
@@ -85,7 +92,7 @@ use super::raytrace::{RayFrame, RayReads, TEXTURE_SET};
 
 /// The set a traced shader reads the volumes at. See `ray_shade.glsl`.
 pub(super) const GI_SET: u32 = 4;
-/// Both atlases. Half floats, not the shared exponent id ships irradiance in:
+/// Every atlas. Half floats, not the shared exponent id ships irradiance in:
 /// `E5B9G9R9` is not a format this device family can store to, and a probe's
 /// update reads and writes its own texels.
 pub(super) const ATLAS_FORMAT: Format = Format::Rgba16Float;
@@ -172,6 +179,7 @@ struct Volumes {
     extent: [u32; 2],
     irradiance: TextureViewId,
     distance: TextureViewId,
+    bounce: TextureViewId,
     states: BufferId,
     rays: BufferId,
 }
@@ -370,11 +378,11 @@ impl GiPass {
         self.fallback
     }
 
-    /// The two atlases and their extent, for the graph to be handed.
-    pub(super) fn atlases(&self) -> Option<([TextureViewId; 2], [u32; 2])> {
+    /// The three atlases and their extent, for the graph to be handed.
+    pub(super) fn atlases(&self) -> Option<([TextureViewId; 3], [u32; 2])> {
         self.volumes
             .as_ref()
-            .map(|v| ([v.irradiance, v.distance], v.extent))
+            .map(|v| ([v.irradiance, v.distance, v.bounce], v.extent))
     }
 
     /// Make sure the trace and the shading have the material textures bound,
@@ -418,6 +426,7 @@ impl GiPass {
         if let Some(volumes) = self.volumes.take() {
             device.destroy_texture(volumes.irradiance);
             device.destroy_texture(volumes.distance);
+            device.destroy_texture(volumes.bounce);
             device.destroy_buffer(volumes.states);
             device.destroy_buffer(volumes.rays);
         }
@@ -546,6 +555,10 @@ impl GiPass {
                     binding: 5,
                     resource: BindingResource::StorageTexture(volumes.distance),
                 },
+                Binding {
+                    binding: 6,
+                    resource: BindingResource::StorageTexture(volumes.bounce),
+                },
             ],
         );
         encoder.bind_pipeline(pipelines.update);
@@ -570,6 +583,13 @@ impl GiPass {
         );
         encoder.bind_pipeline(pipeline);
         encoder.bind_group(0, set);
+        let rays = RayFrame {
+            gi: GiViews {
+                irradiance: volumes.bounce,
+                ..rays.gi
+            },
+            ..*rays
+        };
         rays.bind(
             device,
             encoder,
@@ -613,7 +633,7 @@ fn words(device: &Device, usage: BufferUsage, words: &[u32]) -> BufferId {
     )
 }
 
-/// Both atlases, entered sampled as the frame declares them, and every probe
+/// Every atlas, entered sampled as the frame declares them, and every probe
 /// with no state: an update reads a probe's texels only once its state says
 /// it has written them.
 fn allocate_volumes(device: &Device, probes: u32, spacing: f32) -> Volumes {
@@ -639,6 +659,7 @@ fn allocate_volumes(device: &Device, probes: u32, spacing: f32) -> Volumes {
         extent,
         irradiance: atlas(),
         distance: atlas(),
+        bounce: atlas(),
         states: words(
             device,
             BufferUsage::STORAGE_BUFFER,
