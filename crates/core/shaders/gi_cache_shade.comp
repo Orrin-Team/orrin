@@ -20,6 +20,7 @@
 
 layout(local_size_x = 64) in;
 
+#define ORRIN_GI_TRACED_VISIBILITY
 #include "ray_shade.glsl"
 #include "gi_cache.glsl"
 
@@ -36,6 +37,19 @@ layout(set = 0, binding = 3, std430) readonly buffer GiList {
     uint gi_list_count;
     uint gi_list[];
 };
+
+// The point the volumes are looked up from, a hair off its surface.
+vec3 shade_from;
+
+// A ray to the probe rather than the probe's own account of how far it sees,
+// which is too coarse to stop all of what is behind a wall. This pass is
+// where light is fed back to the probes, and what gets into a closed room
+// beside a sunlit yard goes round its walls for seconds before it fades.
+bool gi_probe_hidden(vec3 probe) {
+    vec3 to_probe = probe - shade_from;
+    float far = length(to_probe);
+    return far > 1e-4 && ray_occluded(shade_from, to_probe / far, far);
+}
 
 void main() {
     uint at = gl_GlobalInvocationID.x;
@@ -63,6 +77,7 @@ void main() {
     float cone = sqrt(4.0 * PI / float(gi.grid.y));
     RaySurface found = ray_surface(hit, direction, cone * landed.hit.w / max(hit.distance, 1e-4));
     Surface s = found.s;
+    shade_from = found.lifted;
     // The volumes, and the sky only past their reach. Not the sky where the
     // volumes reach but have no probe ready to answer yet, as a surface the
     // camera sees takes it: shaded into a cell, light that is not there would

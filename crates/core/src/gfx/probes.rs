@@ -15,7 +15,10 @@
 //!
 //! Each grid is snapped to its own spacing and centred on the camera, so it
 //! moves a whole probe at a time and a probe never moves at all: probe `w`
-//! stands at `w * spacing` for as long as the grid holds it. Where its data
+//! stands at `(w + PHASE) * spacing` for as long as the grid holds it — off
+//! the whole multiples by [`PHASE`], because that is where a level built on a
+//! metre grid puts its floors and walls, and a probe that starts exactly in a
+//! wall's face is one the room loses to the far side of it. Where its data
 //! lives is decided by `w` alone — the grid is a torus over the atlas, [`slot`]
 //! is `w` modulo the grid's width — so a grid that scrolls by one probe hands
 //! one slab of slots to the probes that came into it and leaves every other
@@ -34,7 +37,10 @@
 //! octahedron's fold rather than a neighbour's. Tiles are laid out a grid's
 //! `x` and `z` along the atlas's width and its `y` and the cascade down its
 //! height. One atlas of irradiance and one of the mean and mean square of
-//! the distance to whatever each direction hits.
+//! the distance to whatever each direction hits, with the nearest of what
+//! lies round that direction beside them: the mean of a wall's edge and the
+//! open air past it says the probe sees further than the wall, and the
+//! nearest is what says it does not.
 //!
 //! # Which cascade a frame updates
 //!
@@ -61,9 +67,12 @@ pub const MAX_RAYS: u32 = 64;
 /// How many frames a grid may go without an update before it is taken ahead
 /// of one that scrolled.
 pub const OVERDUE: u64 = 2 * CASCADES as u64;
+/// How far off the whole multiples of its spacing a grid stands, in spacings.
+/// Keep in sync with `GI_PHASE` in `gi.glsl`.
+pub const PHASE: f32 = 0.37;
 
 /// One grid of probes: the coordinate of its lowest probe, and the distance
-/// between neighbours in metres. Probe `w` stands at `w * spacing`.
+/// between neighbours in metres. Probe `w` stands at `(w + PHASE) * spacing`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cascade {
     pub base: IVec3,
@@ -75,7 +84,7 @@ impl Cascade {
     /// to its own spacing.
     pub fn around(camera: Vec3, spacing: f32, probes: u32) -> Self {
         Self {
-            base: (camera / spacing).floor().as_ivec3() - IVec3::splat(probes as i32 / 2),
+            base: (camera / spacing - PHASE).floor().as_ivec3() - IVec3::splat(probes as i32 / 2),
             spacing,
         }
     }
@@ -83,7 +92,7 @@ impl Cascade {
     /// The probe at the lowest corner of the cell `point` is in, when all
     /// eight round the point are in this grid.
     pub fn cell_of(&self, point: Vec3, probes: u32) -> Option<IVec3> {
-        let world = (point / self.spacing).floor().as_ivec3();
+        let world = (point / self.spacing - PHASE).floor().as_ivec3();
         let local = world - self.base;
         let inside =
             local.cmpge(IVec3::ZERO).all() && local.cmplt(IVec3::splat(probes as i32 - 1)).all();

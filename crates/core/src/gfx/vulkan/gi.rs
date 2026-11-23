@@ -27,7 +27,8 @@
 //! 4. `gi_cache_shade`: each listed cell shaded once, with the hit shading
 //!    every traced pass runs, from where the lowest-numbered ray that used it
 //!    landed. Its bounce light comes from the volumes the update just wrote,
-//!    which is how one bounce becomes many.
+//!    which is how one bounce becomes many — from the probes a ray from the
+//!    cell reaches, since this is the one lookup whose errors are fed back.
 //!
 //! The update reads the cache's light and the shading writes it, while the
 //! shading reads the volumes and the update writes them: a cycle within the

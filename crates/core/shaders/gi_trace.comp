@@ -78,7 +78,7 @@ void main() {
     uvec3 slot = uvec3(probe % n, (probe / n) % n, probe / (n * n));
     ivec3 world = gi_world_of(level, slot);
     uvec4 state = gi_probes[gi_probe_index(level, slot)];
-    vec3 origin = vec3(world) * gi_spacing(level)
+    vec3 origin = gi_position(level, world)
                 + (gi_owned(state, world) ? gi_offset(state) : vec3(0.0));
     vec3 direction = gi_ray_direction(ray, rays);
 

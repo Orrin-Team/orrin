@@ -7,7 +7,9 @@
 // `ORRIN_GI_PROBES_BINDING`, and `ORRIN_GI_PROBES_WRITE` for the one pass
 // that writes the probes' state. Defining `ORRIN_GI_IRRADIANCE_BINDING`,
 // `ORRIN_GI_DISTANCE_BINDING` and `ORRIN_GI_SAMPLER_BINDING` as well declares
-// the two atlases and the lookup over them.
+// the two atlases and the lookup over them. A shader that can trace may define
+// `ORRIN_GI_TRACED_VISIBILITY` and `gi_probe_hidden`, and the lookup then
+// takes nothing from a probe the point cannot see.
 
 #ifndef ORRIN_GI_GLSL
 #define ORRIN_GI_GLSL
@@ -75,6 +77,18 @@ ivec3 gi_base(int level) {
 
 float gi_spacing(int level) {
     return gi.cascades[level].w;
+}
+
+// Where the probe at a coordinate stands before it is moved, and the
+// coordinate a point falls at. `PHASE` in gfx/probes.rs, which says why.
+const float GI_PHASE = 0.37;
+
+vec3 gi_position(int level, ivec3 world) {
+    return (vec3(world) + GI_PHASE) * gi_spacing(level);
+}
+
+vec3 gi_coordinate(int level, vec3 P) {
+    return P / gi_spacing(level) - GI_PHASE;
 }
 
 // `slot` in gfx/probes.rs. Offset to positive first, because GLSL leaves the
@@ -222,7 +236,7 @@ vec3 gi_irradiance_texel(int level, uvec3 slot, vec3 dir) {
 // How much of a point's answer a grid gives: none at its edge, where the
 // eight probes round the point run out, and all of it two probes in.
 float gi_cascade_weight(int level, vec3 P) {
-    vec3 grid = P / gi_spacing(level) - vec3(gi_base(level));
+    vec3 grid = gi_coordinate(level, P) - vec3(gi_base(level));
     vec3 inside = min(grid, vec3(float(gi.grid.x) - 1.0) - grid);
     return clamp(min(inside.x, min(inside.y, inside.z)) * 0.5, 0.0, 1.0);
 }
@@ -230,19 +244,47 @@ float gi_cascade_weight(int level, vec3 P) {
 // Whether a probe sees a point `to_point` from it: one-sided Chebyshev on the
 // distances it saw in that direction, so a probe behind a wall gives the
 // point next to nothing. The distances are stored in spacings.
+//
+// And nothing at all past twice the nearest thing it saw round that
+// direction. A tile is eight texels a side, so one texel takes in a roof's
+// edge and the open air beyond it, and the mean and variance of those two say
+// the probe may well see a point under the roof. The nearest says a roof is
+// there. A floor seen at a grazing angle has the same shape — near under the
+// probe, far along the texel — and loses its furthest probes to this, which
+// hold the least of its light.
+#ifdef ORRIN_GI_TRACED_VISIBILITY
+// Whether anything stands between the point being looked up and `probe`.
+bool gi_probe_hidden(vec3 probe);
+#endif
+
+const vec2 GI_NEAR = vec2(1.15, 1.6);
+
 float gi_visibility(int level, uvec3 slot, vec3 to_point) {
     float s = gi_spacing(level);
     float r = length(to_point);
-    vec2 moments = textureLod(sampler2D(gi_distance_atlas, gi_sampler),
-                              gi_atlas_uv(level, slot, to_point / max(r, 1e-5)), 0.0).rg
-                 * vec2(s, s * s);
+    vec3 seen = textureLod(sampler2D(gi_distance_atlas, gi_sampler),
+                           gi_atlas_uv(level, slot, to_point / max(r, 1e-5)), 0.0).rgb;
+    vec2 moments = seen.rg * vec2(s, s * s);
+    float near = 1.0 - smoothstep(GI_NEAR.x, GI_NEAR.y, r / max(seen.b * s, 1e-4));
     if (r <= moments.x) {
-        return 1.0;
+        return near;
     }
+
     float variance = abs(moments.x * moments.x - moments.y);
     float d = r - moments.x;
     float chebyshev = variance / (variance + d * d);
-    return chebyshev * chebyshev * chebyshev;
+    return chebyshev * chebyshev * chebyshev * near;
+}
+
+// How much a probe counts for by where it stands against the surface: all of
+// it in front, and next to nothing once it is behind the surface's own plane
+// by more than a shallow angle. The published weight wraps round to the back
+// and keeps a fifth there, for a surface every probe is behind; but a probe
+// behind a wall's plane is as a rule beyond the wall, the distances it holds
+// are too coarse to say so at a grazing angle, and a fifth of a sunlit yard is
+// more light than the room has. What is kept is enough to outweigh nothing.
+float gi_facing(float cosine) {
+    return max(smoothstep(-0.15, 0.3, cosine), 1e-3);
 }
 
 // What one grid says arrives at a surface at `P` facing `N`, seen along `V`,
@@ -255,7 +297,7 @@ vec4 gi_cascade_irradiance(int level, vec3 P, vec3 N, vec3 V) {
     float s = gi_spacing(level);
     vec3 biased = P + (N * 0.2 + V * 0.8) * (0.3 * s);
     ivec3 base = gi_base(level);
-    vec3 grid = biased / s - vec3(base);
+    vec3 grid = gi_coordinate(level, biased) - vec3(base);
     ivec3 lo = clamp(ivec3(floor(grid)), ivec3(0), ivec3(int(gi.grid.x) - 2));
     vec3 alpha = clamp(grid - vec3(lo), 0.0, 1.0);
     uvec3 first = gi_slot(base + lo);
@@ -270,10 +312,16 @@ vec4 gi_cascade_irradiance(int level, vec3 P, vec3 N, vec3 V) {
         if (!gi_usable(state, world)) {
             continue;
         }
-        vec3 probe = vec3(world) * s + gi_offset(state);
+        vec3 probe = gi_position(level, world) + gi_offset(state);
         vec3 to_probe = probe - P;
-        float facing = dot(to_probe / max(length(to_probe), 1e-5), N) * 0.5 + 0.5;
-        float weight = facing * facing + 0.2;
+        float weight = gi_facing(dot(to_probe / max(length(to_probe), 1e-5), N));
+#ifdef ORRIN_GI_TRACED_VISIBILITY
+        // No ray for a probe behind the surface, which counts for nothing
+        // whether or not it can be reached.
+        if (weight <= 1e-3 || gi_probe_hidden(probe)) {
+            continue;
+        }
+#endif
         // Never quite zero, so a point every probe is cut off from still has
         // an answer; and crushed rather than kept linear below a fifth, so a
         // probe that barely sees the point outweighs none but cannot tint it.
@@ -327,7 +375,7 @@ float gi_reach(vec3 P) {
 vec4 gi_cascade_mean(int level, vec3 P) {
     float s = gi_spacing(level);
     ivec3 base = gi_base(level);
-    vec3 grid = P / s - vec3(base);
+    vec3 grid = gi_coordinate(level, P) - vec3(base);
     ivec3 lo = clamp(ivec3(floor(grid)), ivec3(0), ivec3(int(gi.grid.x) - 2));
     vec3 alpha = clamp(grid - vec3(lo), 0.0, 1.0);
     uvec3 first = gi_slot(base + lo);
@@ -342,7 +390,7 @@ vec4 gi_cascade_mean(int level, vec3 P) {
         if (!gi_usable(state, world)) {
             continue;
         }
-        vec3 probe = vec3(world) * s + gi_offset(state);
+        vec3 probe = gi_position(level, world) + gi_offset(state);
         vec3 trilinear = mix(1.0 - alpha, alpha, vec3(corner));
         // No floor under the visibility, unlike a surface's: a point of air no
         // probe can see is inside something, and is left to the ambient.
