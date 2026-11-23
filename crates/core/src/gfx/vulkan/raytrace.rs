@@ -28,8 +28,9 @@
 //! - The scene's structure and a table with a row per instance: its material,
 //!   where its mesh starts in the shared geometry, and its light channels. An
 //!   instance carries its row's number as its id. Uploaded each frame and not
-//!   read out of the per-object rows, which the next frame rewrites while a
-//!   frame split across two queues may still be tracing this one.
+//!   read out of the per-object rows, which persist and are rewritten at the
+//!   head of the next frame: what a hit reads is this frame's, whatever the
+//!   two frames' order on the device.
 //! - The frame's own lighting block and light tables, the material table and
 //!   the environment cube — the buffers the forward pass binds, so a hit is
 //!   lit by what its reflector is — and the world light grid in place of the

@@ -2699,8 +2699,9 @@ fn the_traced_scene_is_built_over_the_meshes_before_anything_traces_it() {
 }
 
 /// The reflections fall back to a traced ray in both of the passes that trace
-/// one, and either may sit in the compute tail of a split frame: each declares
-/// the scene it traces, and the first waits for its build.
+/// one: each declares the scene it traces, and the first waits for its build.
+/// A hit is shaded from the scene's own textures and geometry, which the
+/// graphics queue's family owns, so the frame is not split while they trace.
 #[test]
 fn traced_reflections_wait_for_the_scene_in_both_passes_that_trace() {
     let frame = declare(FrameConfig {
@@ -2712,6 +2713,7 @@ fn traced_reflections_wait_for_the_scene_in_both_passes_that_trace() {
     })
     .unwrap();
     assert!(frame.ids.ssr.unwrap().traced);
+    assert_eq!(frame.graph.segments().len(), 1, "{}", frame.graph);
 
     let plan = format!("{}", frame.graph);
     assert_eq!(

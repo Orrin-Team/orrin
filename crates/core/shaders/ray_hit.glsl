@@ -8,8 +8,8 @@
 //
 // A table of the frame's own and not the per-object rows every draw reads,
 // though those are indexed alike: the rows persist and the next frame rewrites
-// them at its head, which on a frame split across two queues is while this
-// frame's compute tail is still tracing.
+// them at its head, which a pass still tracing this frame must not depend on
+// having happened yet or not.
 //
 // Set 1 of every shader that traces, bound here so they all bind it alike. A
 // shader that includes this reads all four bindings: a pipeline's layout holds

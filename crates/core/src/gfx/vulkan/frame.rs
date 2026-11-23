@@ -745,7 +745,14 @@ pub fn shadow_atlas_desc(resolution: u32) -> ImageDesc {
 
 pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let mut builder = GraphBuilder::new();
-    if config.async_compute {
+    // A pass that shades a ray's hit reads the scene itself: every material's
+    // textures, the shared geometry, the material table. Those belong to the
+    // graphics queue's family alone — the images the two queues share are the
+    // frame's own, which is what the compiler can name and make concurrent —
+    // so a frame with such a pass among its dispatches is not split, or its
+    // tail would read them from a family that does not own them.
+    let shades_hits = config.ray_reflections || config.ray_path_trace;
+    if config.async_compute && !shades_hits {
         builder.request_async_compute();
     }
     let mut bodies = Vec::new();

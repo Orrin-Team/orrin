@@ -33,9 +33,13 @@
 //! instances is cheap enough that there is nothing to trade it for. Built for
 //! build speed, where a mesh's is built for trace speed, for the same reason.
 //!
-//! Two of them, alternating by frame, because a frame split across two queues
-//! has its compute tail still tracing while the next frame's head builds — the
-//! reason `GraphImages` keeps two sets of the graph's images.
+//! Two of them, alternating by frame, so that the one a frame traces is never
+//! the one the next frame is building, whichever order the device takes the two
+//! in: a split frame's compute tail overlaps the next frame's head, which is
+//! why `GraphImages` keeps two sets of the graph's images. No frame that
+//! traces from its tail is split today (`frame::declare` says why), and this
+//! is what keeps that a rule about who owns the scene's textures and not one
+//! this structure's contents depend on.
 //!
 //! What goes in is the caller's list. An instance whose mesh has no structure
 //! yet is left out, and the list's order is the order of the instances, so a
