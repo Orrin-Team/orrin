@@ -46,7 +46,8 @@ struct GpuGi {
     // where the froxel fog takes its ambient light from the volumes; w = 1
     // where the final gather lights the opaque surfaces in their place.
     vec4 environment;
-    // The rotation this frame's rays are turned by, column by column.
+    // The rotation this frame's rays are turned by, column by column; and in
+    // the first column's w, how far along its step each ray's height is.
     vec4 rotation[3];
     // xyz = the coordinate of a grid's lowest probe, w = its spacing.
     vec4 cascades[GI_CASCADES];
@@ -160,10 +161,10 @@ vec2 gi_oct_encode(vec3 n) {
 }
 
 // Ray `ray` of `rays`: a spherical Fibonacci set, as even over the sphere as a
-// set of points gets, turned by this frame's rotation.
+// set of points gets, slid along its axis and turned by this frame's update.
 vec3 gi_ray_direction(uint ray, uint rays) {
     const float GOLDEN_ANGLE = 2.39996323;
-    float z = 1.0 - (2.0 * float(ray) + 1.0) / float(rays);
+    float z = 1.0 - 2.0 * (float(ray) + gi.rotation[0].w) / float(rays);
     float r = sqrt(max(0.0, 1.0 - z * z));
     float phi = float(ray) * GOLDEN_ANGLE;
     vec3 d = vec3(r * cos(phi), r * sin(phi), z);

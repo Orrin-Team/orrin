@@ -47,9 +47,14 @@
 //! One a frame, so the cost is flat: [`Schedule`] picks the grid that scrolled
 //! since its last update, and otherwise the one updated longest ago. A grid
 //! that has been waiting [`OVERDUE`] frames is taken whatever else scrolled,
-//! so one moving fast cannot starve the rest. Each update's rays are turned by
-//! a rotation of their own, so successive updates of a probe look in
-//! different directions and its history averages them.
+//! so one moving fast cannot starve the rest. Each update of a grid slides its
+//! rays along the set's axis and turns them about it by the next step of a
+//! low-discrepancy sequence (Roberts' R2), so a probe's successive updates
+//! look between each other's rays: what its history averages is one ever finer
+//! set of directions, and it converges on the light round it. Rotations drawn
+//! at random each update leave the history wandering about that light by as
+//! much as one update's error over the square root of the updates it holds,
+//! which is a slow, visible pulse where a few rays find a sunlit floor.
 //!
 //! `slot`, `probe_index`, `tile` and `stamp` here and their `gi_` twins in
 //! `gi.glsl` are a lock-step pair, as are the constants.
@@ -142,11 +147,13 @@ pub fn stamp(world: IVec3) -> u32 {
     (world.x & 511) as u32 | ((world.y & 511) as u32) << 9 | ((world.z & 511) as u32) << 18
 }
 
-/// One frame's update: which grid, and how its rays are turned.
+/// One frame's update: which grid, how its rays are turned, and how far along
+/// its step in height each ray is slid, from 0 to 1.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Update {
     pub level: usize,
     pub rotation: Mat3,
+    pub offset: f32,
 }
 
 /// Which grid each frame updates. Kept between frames.
@@ -157,6 +164,8 @@ pub struct Schedule {
     /// The update each grid last had.
     last: [u64; CASCADES],
     updates: u64,
+    /// How many updates each grid has had: where it is in its sequence.
+    steps: [u64; CASCADES],
 }
 
 impl Schedule {
@@ -177,36 +186,29 @@ impl Schedule {
         self.updates += 1;
         self.updated[level] = Some(cascades[level].base);
         self.last[level] = self.updates;
+        self.steps[level] += 1;
+        let (offset, turn) = r2(self.steps[level]);
         Update {
             level,
-            rotation: rotation(self.updates),
+            rotation: Mat3::from_quat(TILT) * Mat3::from_rotation_z(turn * std::f32::consts::TAU),
+            offset,
         }
     }
 }
 
-/// A rotation drawn uniformly from all of them (Shoemake 1992), the same one
-/// for the same `n`: a capture is the same picture however often it is taken.
-fn rotation(n: u64) -> Mat3 {
-    let mut state = n.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    let mut next = || {
-        // SplitMix64, one step.
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32
-    };
-    let (u1, u2, u3) = (next(), next(), next());
-    let tau = std::f32::consts::TAU;
-    let (a, b) = ((1.0 - u1).sqrt(), u1.sqrt());
-    Mat3::from_quat(
-        Quat::from_xyzw(
-            a * (tau * u2).sin(),
-            a * (tau * u2).cos(),
-            b * (tau * u3).sin(),
-            b * (tau * u3).cos(),
-        )
-        .normalize(),
+/// The ray set's axis, off every world axis: a level's walls and floors are
+/// square to those, and a set's pole on one would sample them unlike the rest.
+const TILT: Quat = Quat::from_xyzw(0.2706, 0.2706, 0.0, 0.9239);
+
+/// Step `k` of Roberts' R2 sequence: two numbers in [0, 1) whose first `k`
+/// pairs, for any `k`, spread over the unit square with no clumps or gaps.
+fn r2(k: u64) -> (f32, f32) {
+    // The plastic number, and its powers' reciprocals as the two steps.
+    const G: f64 = 1.324_717_957_244_746;
+    let k = k as f64;
+    (
+        (0.5 + k / G).fract() as f32,
+        (0.5 + k / (G * G)).fract() as f32,
     )
 }
 

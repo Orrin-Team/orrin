@@ -338,7 +338,11 @@ impl GiPass {
                 if settings.fog { 1.0 } else { 0.0 },
                 if gathered { 1.0 } else { 0.0 },
             ],
-            rotation: columns.map(|[x, y, z]| [x, y, z, 0.0]),
+            rotation: [
+                [columns[0][0], columns[0][1], columns[0][2], update.offset],
+                [columns[1][0], columns[1][1], columns[1][2], 0.0],
+                [columns[2][0], columns[2][1], columns[2][2], 0.0],
+            ],
             cascades: cascades
                 .map(|c| [c.base.x as f32, c.base.y as f32, c.base.z as f32, c.spacing]),
             sky: sky.map(|c| [c.x, c.y, c.z, 0.0]),
