@@ -216,6 +216,9 @@ pub struct FrameConfig {
     /// Whether the reflections trace the scene for what the screen cannot
     /// answer. Needs `ray_tracing` and `ssr`.
     pub ray_reflections: bool,
+    /// Whether the frame's colour is replaced by the path-traced reference.
+    /// Needs `ray_tracing`.
+    pub ray_path_trace: bool,
 }
 
 /// What a screenshot shows.
@@ -352,6 +355,8 @@ pub enum PassBody {
     RayScene,
     /// The traced scene from one ray per pixel, over the tonemapped frame.
     RayDebug,
+    /// One more path per pixel of the reference, and its running mean.
+    PathTrace,
     /// The cached layers of the shadow views that redraw theirs this frame:
     /// the casters standing still, into an atlas kept from frame to frame.
     ShadowStatic,
@@ -378,6 +383,13 @@ pub struct FrameIds {
     /// frame it is in, which is what makes inserting a stage a change to one
     /// binding rather than to every consumer.
     pub scene_color: ResourceId,
+    /// What the exposure is metered from: the rasterised frame, which
+    /// `scene_color` is but where the path-traced reference stands in for it.
+    /// The reference is then exposed as the frame it is held against, so a
+    /// difference between them is one of light and not of exposure.
+    pub metered_color: ResourceId,
+    /// The reference's two images, where the frame draws it.
+    pub path: Option<PathIds>,
     /// The multisampled pair, in a frame that rasterises at more than one
     /// sample. `None` on the default path, where the forward pass shades
     /// straight into `hdr_color` and borrows the prepass depth.
@@ -428,6 +440,14 @@ pub struct FrameIds {
     pub screenshot: Option<ResourceId>,
     /// What a ray is traced against, in a frame that traces.
     pub ray: Option<RayIds>,
+}
+
+/// The path-traced reference: every path's radiance so far, which the pass
+/// that owns it keeps between frames, and their mean, which the frame shows.
+#[derive(Clone, Copy, Debug)]
+pub struct PathIds {
+    pub sum: ResourceId,
+    pub mean: ResourceId,
 }
 
 /// The two levels of what a ray is traced against, which the device owns.
@@ -1751,6 +1771,37 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         scene_color = motion_blur.output;
     }
 
+    // The reference, where it is asked for, in place of everything above: the
+    // frame from here on tonemaps the mean of its paths. It declares the frame
+    // it replaces as read, though it reads none of it, so the frame's structure
+    // is the same with the reference on as off — every pass still runs, and no
+    // history is dropped for having looked at the reference — and so the
+    // exposure it is shown at is metered from the frame it is held against.
+    let metered_color = scene_color;
+    let path = ray.filter(|_| config.ray_path_trace).map(|ray| {
+        // Kept between frames, so imported, and entered and left sampled for
+        // the reason every history is. See `occlusion_history`.
+        let sum = builder.import_image(
+            "path_sum",
+            ImageDesc::new(Format::Rgba32Float),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let mean = builder.create_image("path_mean", ImageDesc::new(HDR_WIDE_FORMAT));
+        let id = builder
+            .pass("path_trace", PassKind::Compute)
+            .access(ray.scene, Access::AccelerationStructureRead)
+            .access(scene_color, Access::Sampled)
+            .access(sum, Access::StorageWrite)
+            .access(mean, Access::StorageWrite)
+            .build();
+        record(id, PassBody::PathTrace, &mut bodies);
+        PathIds { sum, mean }
+    });
+    if let Some(path) = path {
+        scene_color = path.mean;
+    }
+
     // Imported, not created: temporal adaptation is a value that has to outlive
     // the frame, and a transient is `Undefined` at every frame's start by
     // contract. The exposure module owns the allocation; the graph only orders
@@ -1762,7 +1813,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
         let id = builder
             .pass("luminance_histogram", PassKind::Compute)
-            .access(scene_color, Access::Sampled)
+            .access(metered_color, Access::Sampled)
             .access(histogram, Access::StorageWrite)
             .build();
         record(id, PassBody::LuminanceHistogram, &mut bodies);
@@ -2060,6 +2111,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             swapchain_color,
             hdr_color,
             scene_color,
+            metered_color,
+            path,
             msaa,
             exposure,
             histogram,

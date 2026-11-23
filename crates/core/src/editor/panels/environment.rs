@@ -606,6 +606,9 @@ fn ray_tracing(ui: &mut egui::Ui, world: &World, rows: Rows) {
                 RayDebugView::HitDistance => "Hit distance",
                 RayDebugView::Instance => "Instance",
                 RayDebugView::GeometricNormal => "Geometric normal",
+                // A capture's, and not offered here: it needs a scene held
+                // still for as long as it is watched.
+                RayDebugView::PathTraced => "Path traced",
             };
             egui::ComboBox::from_id_salt("ray_debug_view")
                 .selected_text(name(rays.debug_view))

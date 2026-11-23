@@ -401,7 +401,8 @@ pub(super) fn rendering_info(
         | PassBody::CullReset
         | PassBody::Cull
         | PassBody::RayMeshes
-        | PassBody::RayScene => return None,
+        | PassBody::RayScene
+        | PassBody::PathTrace => return None,
     })
 }
 

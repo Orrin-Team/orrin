@@ -666,6 +666,9 @@ impl VulkanRenderer {
         self.ui.invalidate_textures(&self.device);
         self.ui_window_invalidate_textures();
         self.ssr.forget_textures(&self.device);
+        if let Some(raytrace) = &mut self.raytrace {
+            raytrace.forget_textures(&self.device);
+        }
     }
 
     pub fn new(
@@ -882,6 +885,7 @@ impl VulkanRenderer {
             ray_tracing: false,
             ray_debug: false,
             ray_reflections: false,
+            ray_path_trace: false,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -1431,6 +1435,7 @@ impl VulkanRenderer {
             || Some(id) == ids.shadow_static
             || ids.material_preview.is_some_and(|p| p.output == id)
             || Some(id) == ids.screenshot
+            || ids.path.is_some_and(|path| path.sum == id)
         {
             return Some(record::Target::Image(
                 self.vk_view(self.table.texture(id)).image().clone(),
@@ -2195,7 +2200,9 @@ impl VulkanRenderer {
             },
             ray_tracing: self.raytrace.is_some()
                 && (self.ray_settings.draws_debug_view()
+                    || self.ray_settings.path_traces()
                     || self.ray_settings.traces_reflections(ssr.enabled)),
+            ray_path_trace: self.raytrace.is_some() && self.ray_settings.path_traces(),
             ray_debug: self.raytrace.is_some() && self.ray_settings.draws_debug_view(),
             ray_reflections: self.raytrace.is_some()
                 && self.ray_settings.traces_reflections(ssr.enabled),
@@ -2668,6 +2675,27 @@ impl VulkanRenderer {
                 view.unjittered_view_proj,
             );
         }
+        if let (Some(ids), Some(raytrace)) = (self.frame.ids.path, self.raytrace.as_mut()) {
+            let extent = self.backend.extent();
+            let sum = raytrace.begin_path(
+                &self.device,
+                extent,
+                camera.position,
+                view.unjittered_view_proj,
+                &self.textures,
+                self.prepass.material_sampler(),
+            );
+            self.table.import(
+                ids.sum,
+                crate::gfx::images::ImageEntry {
+                    whole: sum,
+                    levels: Vec::new(),
+                    layers: Vec::new(),
+                    extent,
+                    mip_levels: 1,
+                },
+            );
+        }
         if self.frame.ids.ssr.is_some_and(|ids| ids.traced) {
             self.ssr.prepare_traced(
                 &self.device,
@@ -2831,6 +2859,7 @@ impl VulkanRenderer {
         // every pass in the chain recorded what it was handed, so nothing here
         // re-derives an order.
         let scene_color = self.texture_of(self.frame.ids.scene_color);
+        let metered_color = self.texture_of(self.frame.ids.metered_color);
 
         // Against the unjittered projection: the bins are conservative by far
         // more than a subpixel, and the lookup reads `gl_FragCoord`, which the
@@ -3042,6 +3071,7 @@ impl VulkanRenderer {
             prepass_texture_set,
             decal_block,
             scene_color,
+            metered_color,
             shadow_atlas_view: atlas_view,
             debug_lines,
             gizmo_strokes: overlay
@@ -3546,6 +3576,8 @@ struct FrameRecord<'a> {
     prepass_texture_set: BindGroupId,
     decal_block: BufferId,
     scene_color: TextureViewId,
+    /// What the exposure is metered from. See `FrameIds::metered_color`.
+    metered_color: TextureViewId,
     shadow_atlas_view: TextureViewId,
     debug_lines: &'a [DebugLine],
     gizmo_strokes: &'a [GizmoVertex],
@@ -3793,6 +3825,7 @@ impl FrameRecord<'_> {
             || Some(id) == ids.shadow_static
             || ids.material_preview.is_some_and(|p| p.output == id)
             || Some(id) == ids.screenshot
+            || ids.path.is_some_and(|path| path.sum == id)
         {
             return Some(record::Target::Image(
                 self.vk_view(self.table.texture(id)).image().clone(),
@@ -3983,6 +4016,24 @@ impl FrameRecord<'_> {
         match body {
             PassBody::RayMeshes => encoder.build_mesh_accel(),
             PassBody::RayScene => encoder.build_scene_accel(),
+            PassBody::PathTrace => {
+                let ids = self
+                    .frame
+                    .ids
+                    .path
+                    .expect("the reference without its images");
+                let rays = self
+                    .ray_frame
+                    .as_ref()
+                    .expect("the graph scheduled the reference in a frame that traces nothing");
+                rays.pass.record_path(
+                    self.device,
+                    encoder,
+                    rays,
+                    self.table.texture(ids.sum),
+                    self.table.texture(ids.mean),
+                );
+            }
             PassBody::SsrHiz => {
                 let ids = self
                     .frame
@@ -4346,7 +4397,7 @@ impl FrameRecord<'_> {
                     .record(self.device, encoder, depth, self.extent);
             }
             PassBody::LuminanceHistogram => {
-                let hdr = self.scene_color;
+                let hdr = self.metered_color;
 
                 self.exposure
                     .record_histogram(self.device, encoder, self.extent, hdr);
@@ -4699,6 +4750,7 @@ impl FrameRecord<'_> {
             | PassBody::Cull
             | PassBody::RayMeshes
             | PassBody::RayScene
+            | PassBody::PathTrace
             | PassBody::OcclusionHiz => unreachable!("handled above"),
         }
     }

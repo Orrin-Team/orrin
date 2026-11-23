@@ -45,6 +45,10 @@ pub enum RayDebugView {
     /// The hit triangle's own normal, from its three corners: what the
     /// structures were built from, with no interpolation over it.
     GeometricNormal,
+    /// The frame path traced, every bounce followed, and summed over the
+    /// frames it is left running: a reference to hold the frame against, noisy
+    /// until it has run a few hundred. Anything that moves smears into it.
+    PathTraced,
 }
 
 impl RayDebugView {
@@ -55,6 +59,8 @@ impl RayDebugView {
             RayDebugView::HitDistance => 1,
             RayDebugView::Instance => 2,
             RayDebugView::GeometricNormal => 3,
+            // Not one of that shader's: a pass of its own.
+            RayDebugView::PathTraced => 0,
         }
     }
 }
@@ -73,7 +79,16 @@ impl Default for RayTracingSettings {
 impl RayTracingSettings {
     /// Whether the traced scene is drawn in place of the frame.
     pub fn draws_debug_view(&self) -> bool {
-        self.enabled && self.debug_view != RayDebugView::None
+        self.enabled
+            && !matches!(
+                self.debug_view,
+                RayDebugView::None | RayDebugView::PathTraced
+            )
+    }
+
+    /// Whether the frame's colour is replaced by the path-traced reference.
+    pub fn path_traces(&self) -> bool {
+        self.enabled && self.debug_view == RayDebugView::PathTraced
     }
 
     /// Whether reflections fall back to a traced ray, in a frame whose

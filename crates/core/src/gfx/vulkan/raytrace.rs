@@ -4,8 +4,9 @@
 //! The acceleration structures are the driver's (`accel.rs`). This module
 //! decides what stands in them each frame, uploads what a hit needs to become a
 //! lit surface, and owns the debug views, which draw the traced scene in place
-//! of the frame. A pass that traces for its own reasons — the reflections, when
-//! the screen runs out — binds what is prepared here through [`RayFrame`].
+//! of the frame, and the path-traced reference (`path_trace.comp`). A pass that
+//! traces for its own reasons — the reflections, when the screen runs out —
+//! binds what is prepared here through [`RayFrame`].
 //!
 //! # What a ray can hit
 //!
@@ -40,13 +41,13 @@
 
 use glam::{Mat4, Vec3};
 
-use crate::gfx::format::Format;
-use crate::gfx::graph::BufferUsage;
+use crate::gfx::format::{Format, SampleCount};
+use crate::gfx::graph::{BufferUsage, ImageUsage};
 use crate::gfx::light_grid::LightGrid;
 use crate::gfx::rhi::{
-    BindGroupId, Binding, BindingResource, BlockKind, BufferDesc, BufferId, Device, Encoder,
-    GeometryStream, GraphicsPipelineDesc, MemoryLocation, PipelineId, RayInstance, SamplerId,
-    TextureViewId, Viewport,
+    BindGroupId, Binding, BindingResource, BlockKind, BufferDesc, BufferId, ComputePipelineDesc,
+    Device, Encoder, GeometryStream, GraphicsPipelineDesc, MemoryLocation, PipelineId, RayInstance,
+    SamplerId, TextureDesc, TextureDimension, TextureViewId, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::gfx::{DrawList, RenderItem, SceneLighting};
@@ -65,8 +66,33 @@ struct GridBuffers {
     lights: BufferId,
 }
 
+/// The set a traced compute pipeline reads the material textures from.
+pub(super) const TEXTURE_SET: u32 = 3;
+
+/// The path block as the words of its std140 layout: `inv_view_proj`, then
+/// `origin` and `frame`.
+const PATH_WORDS: usize = 16 + 4 + 4;
+
+/// The reference path tracer's own state: what it has summed so far, and for
+/// which view.
+struct PathTracer {
+    pipeline: PipelineId,
+    /// The material textures, bound for this pipeline's layout and kept until
+    /// they change.
+    textures: Option<BindGroupId>,
+    /// Every path's radiance so far, and the extent it was made at.
+    sum: Option<(TextureViewId, [u32; 2])>,
+    /// How many paths each pixel of `sum` holds.
+    paths: u32,
+    /// The view those paths were traced through. A different one starts the
+    /// sum again: paths through another camera are of another picture.
+    view: Mat4,
+    uniforms: Option<BufferId>,
+}
+
 pub struct RayTracePass {
     debug_pipeline: PipelineId,
+    path: PathTracer,
     /// Reused each frame, with the table beside it, so a frame that traces
     /// allocates nothing for either once it has seen the scene.
     instances: Vec<RayInstance>,
@@ -154,8 +180,22 @@ impl RayTracePass {
             ShaderId::RayDebugFrag,
             &[swapchain_format],
         ));
+        let path = PathTracer {
+            pipeline: device.create_compute_pipeline_over_textures(
+                &ComputePipelineDesc {
+                    shader: ShaderId::PathTraceComp.into(),
+                },
+                TEXTURE_SET,
+            ),
+            textures: None,
+            sum: None,
+            paths: 0,
+            view: Mat4::ZERO,
+            uniforms: None,
+        };
         Self {
             debug_pipeline,
+            path,
             instances: Vec::new(),
             table: Vec::new(),
             table_buffer: None,
@@ -268,6 +308,117 @@ impl RayTracePass {
         }
         words[20] = settings.debug_view.mode();
         self.debug_uniforms = Some(device.upload_uniform(&words));
+    }
+
+    /// Ready the reference for a frame that draws it: the image its paths are
+    /// summed in, at `extent`, and which path of each pixel this frame traces.
+    /// Returns that image, for the graph to be handed. After
+    /// [`begin_frame`](Self::begin_frame).
+    pub(super) fn begin_path(
+        &mut self,
+        device: &Device,
+        extent: [u32; 2],
+        camera: Vec3,
+        unjittered_view_proj: Mat4,
+        textures: &[TextureViewId],
+        sampler: SamplerId,
+    ) -> TextureViewId {
+        let path = &mut self.path;
+        if path.textures.is_none() {
+            path.textures = Some(device.create_texture_array_group(
+                path.pipeline,
+                TEXTURE_SET,
+                textures,
+                sampler,
+            ));
+        }
+        if path.sum.is_none_or(|(_, made_at)| made_at != extent) {
+            if let Some((old, _)) = path.sum.take() {
+                device.destroy_texture(old);
+            }
+            let sum = device.create_texture(&TextureDesc {
+                format: Format::Rgba32Float,
+                dimension: TextureDimension::D2,
+                extent: [extent[0], extent[1], 1],
+                mip_levels: 1,
+                array_layers: 1,
+                samples: SampleCount::Sample1,
+                usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
+                memoryless: false,
+            });
+            device.initialise_sampled(sum);
+            path.sum = Some((sum, extent));
+            path.paths = 0;
+        }
+        if path.view != unjittered_view_proj {
+            path.view = unjittered_view_proj;
+            path.paths = 0;
+        }
+
+        let mut words = [0u32; PATH_WORDS];
+        let floats = unjittered_view_proj
+            .inverse()
+            .to_cols_array()
+            .into_iter()
+            .chain([camera.x, camera.y, camera.z, 0.0]);
+        for (word, float) in words.iter_mut().zip(floats) {
+            *word = float.to_bits();
+        }
+        words[20] = path.paths;
+        path.uniforms = Some(device.upload_uniform(&words));
+        path.paths = path.paths.saturating_add(1);
+        path.sum.expect("made above").0
+    }
+
+    /// Let go of the reference's texture set, which names textures that have
+    /// changed.
+    pub(super) fn forget_textures(&mut self, device: &Device) {
+        if let Some(group) = self.path.textures.take() {
+            device.destroy_bind_group(group);
+        }
+    }
+
+    /// One more path per pixel, into the sum and out as its mean.
+    pub(super) fn record_path(
+        &self,
+        device: &Device,
+        encoder: &mut Encoder,
+        rays: &RayFrame<'_>,
+        sum: TextureViewId,
+        mean: TextureViewId,
+    ) {
+        let path = &self.path;
+        let targets = device.create_transient_bind_group(
+            path.pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::StorageTexture(sum),
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageTexture(mean),
+                },
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::UniformBuffer(
+                        path.uniforms
+                            .expect("the graph scheduled the reference before begin_path"),
+                    ),
+                },
+            ],
+        );
+        encoder.bind_pipeline(path.pipeline);
+        encoder.bind_group(0, targets);
+        rays.bind(device, encoder, path.pipeline);
+        encoder.bind_group(
+            TEXTURE_SET,
+            path.textures
+                .expect("the graph scheduled the reference before begin_path"),
+        );
+        let extent = device.view_extent(mean);
+        encoder.dispatch([extent[0].div_ceil(8), extent[1].div_ceil(8), 1]);
     }
 
     /// One ray per pixel, drawn over the whole target.

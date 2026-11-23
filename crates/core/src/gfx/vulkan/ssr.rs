@@ -73,7 +73,7 @@ use crate::gfx::rhi::{
 use crate::gfx::shaders::ShaderId;
 use crate::scene::SsrSettings;
 
-use super::raytrace::RayFrame;
+use super::raytrace::{RayFrame, TEXTURE_SET};
 use super::taa::FrameView;
 
 /// Side of the compute workgroup for the trace and the composite.
@@ -156,9 +156,6 @@ struct Traced {
     resolve: PipelineId,
     textures: Option<[BindGroupId; 2]>,
 }
-
-/// The set a traced pipeline reads the material textures from.
-const TEXTURE_SET: u32 = 3;
 
 impl SsrPass {
     pub fn new(device: &Device) -> Self {

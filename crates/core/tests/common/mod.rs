@@ -295,6 +295,21 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 ..CaptureSettings::default()
             },
         ),
+        // The reference: the rig path traced from its own camera, every bounce
+        // followed, summed over this many frames. What `scene.png` is held
+        // against once light bounces in the frame too; until then the
+        // difference between the two is the bounce light the frame does not
+        // have, beside everything a traced ray does not see — nothing blended
+        // or refractive, no air, a material's standard reading. Its noise is
+        // what is left of one path per pixel per frame after this many.
+        (
+            "path-traced",
+            CaptureSettings {
+                ray_debug: RayDebugView::PathTraced,
+                frames: 768,
+                ..CaptureSettings::default()
+            },
+        ),
         (
             "shadow-debug-cache",
             CaptureSettings {

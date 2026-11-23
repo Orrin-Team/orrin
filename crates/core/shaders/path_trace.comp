@@ -1,0 +1,192 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// A reference, not a feature: the scene path traced, one path per pixel per
+// frame, summed over as many frames as it is left running. What the frame
+// would look like if every bounce were followed — the picture the global
+// illumination is held against, and nothing a game ships.
+//
+// It is noisy for its first frames and converges as their mean. That is the one
+// place in the renderer a result is built up over time, and it is here because
+// a reference is allowed to be: nobody plays it, and a capture of it waits for
+// as many frames as it is asked to.
+//
+// A path is the camera's ray and up to `MAX_BOUNCES` more. At every surface it
+// takes what the surface emits and what the lights lay on it directly — each
+// light is a point or a direction, so one shadow ray answers for it exactly and
+// no bounce could ever find it — then leaves in a direction drawn from the
+// surface's own lobes. A path that leaves the scene takes the sky. The surface
+// and the lights are `ray_shade.glsl`'s: this is the same hit shading every
+// traced pass runs, with real bounces where those have the environment's
+// irradiance.
+//
+// So it shares their limits. A material is its standard reading, without the
+// optional lobes or a custom surface function; nothing blended or refractive is
+// in the scene; and there is no air.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// rgb = every path's radiance so far, a = how many paths.
+layout(set = 0, binding = 0, rgba32f) uniform image2D u_sum;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_mean;
+layout(set = 0, binding = 2) uniform PathTrace {
+    // Without the frame's jitter: each path picks its own place in its pixel.
+    mat4 inv_view_proj;
+    // xyz = the camera.
+    vec4 origin;
+    // x = which path of each pixel this is, counted from zero.
+    uvec4 frame;
+} u;
+
+#include "ray_shade.glsl"
+
+const int MAX_BOUNCES = 6;
+// A pixel's own angle, near enough: what the camera's ray is filtered by.
+const float PIXEL_SPREAD = 0.0015;
+// What a ray that has scattered once is filtered by. Its cone is wide, and
+// a map read at its finest level through one is noise the sum then has to
+// average away for nothing.
+const float BOUNCE_SPREAD = 0.05;
+
+uint rng;
+
+// PCG, one step.
+float random() {
+    rng = rng * 747796405u + 2891336453u;
+    uint word = ((rng >> ((rng >> 28u) + 4u)) ^ rng) * 277803737u;
+    return float((word >> 22u) ^ word) / 4294967296.0;
+}
+
+// Any two unit vectors square to `n`.
+void basis(vec3 n, out vec3 t, out vec3 b) {
+    float s = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float c = n.x * n.y * a;
+    t = vec3(1.0 + s * n.x * n.x * a, s * c, -s * n.x);
+    b = vec3(c, s + n.y * n.y * a, -n.y);
+}
+
+// A half-vector drawn from the GGX normals a view direction can see (Heitz
+// 2018), in the frame where the surface normal is +Z.
+vec3 visible_normal(vec3 v, float a, vec2 xi) {
+    vec3 vh = normalize(vec3(a * v.x, a * v.y, v.z));
+    float len2 = vh.x * vh.x + vh.y * vh.y;
+    vec3 t1 = len2 > 0.0 ? vec3(-vh.y, vh.x, 0.0) * inversesqrt(len2) : vec3(1.0, 0.0, 0.0);
+    vec3 t2 = cross(vh, t1);
+    float r = sqrt(xi.x);
+    float phi = 2.0 * PI * xi.y;
+    float p1 = r * cos(phi);
+    float p2 = r * sin(phi);
+    float s = 0.5 * (1.0 + vh.z);
+    p2 = (1.0 - s) * sqrt(1.0 - p1 * p1) + s * p2;
+    vec3 nh = p1 * t1 + p2 * t2 + sqrt(max(0.0, 1.0 - p1 * p1 - p2 * p2)) * vh;
+    return normalize(vec3(a * nh.x, a * nh.y, max(0.0, nh.z)));
+}
+
+float luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// The sky a path leaving the scene reads: the environment as the frame's
+// surfaces are lit by it.
+vec3 sky(vec3 direction) {
+    return textureLod(samplerCube(u_environment, u_environment_sampler),
+                      to_environment(direction), 0.0).rgb * lighting.env_specular.rgb;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_sum);
+    if (any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+    rng = uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + u.frame.x * 26699u + 1u;
+    random();
+
+    vec2 uv = (vec2(pixel) + vec2(random(), random())) / vec2(size);
+    vec4 near = u.inv_view_proj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+    vec3 origin = u.origin.xyz;
+    vec3 direction = normalize(near.xyz / near.w - origin);
+
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    float spread = PIXEL_SPREAD;
+    for (int bounce = 0; bounce <= MAX_BOUNCES; ++bounce) {
+        RayHit hit = ray_closest(origin, direction, 0.0, RAY_FAR);
+        if (!hit.found) {
+            radiance += throughput * sky(direction);
+            break;
+        }
+        RaySurface found = ray_surface(hit, direction, spread);
+        radiance += throughput * (found.emissive + ray_direct(found));
+        if (bounce == MAX_BOUNCES) {
+            break;
+        }
+
+        // Which lobe the path leaves by, in proportion to how much each sends
+        // on. A draw from one lobe carries that lobe's whole energy divided by
+        // the chance of having drawn it.
+        Surface s = found.s;
+        vec3 fresnel = fresnel_schlick(s.n_dot_v, s.f0);
+        vec3 diffuse = s.albedo * (1.0 - s.metallic);
+        float specular_share = luminance(fresnel);
+        float chance = clamp(specular_share / max(specular_share + luminance(diffuse), 1e-6),
+                             0.05, 0.95);
+        vec3 t;
+        vec3 b;
+        basis(s.N, t, b);
+        vec3 next;
+        if (random() < chance) {
+            vec3 v = vec3(dot(s.V, t), dot(s.V, b), s.n_dot_v);
+            vec3 h = visible_normal(v, max(s.a, 1e-3), vec2(random(), random()));
+            vec3 l = reflect(-v, h);
+            if (l.z <= 0.0) {
+                break;
+            }
+            next = t * l.x + b * l.y + s.N * l.z;
+            // Drawn from the visible normals, a direction's weight is its
+            // Fresnel and the shadowing the view did not already account for.
+            float a2 = s.a * s.a;
+            float g1 = 2.0 * l.z / (l.z + sqrt(a2 + (1.0 - a2) * l.z * l.z));
+            throughput *= fresnel_schlick(max(dot(v, h), 0.0), s.f0) * g1 * s.energy / chance;
+        } else {
+            float r = sqrt(random());
+            float phi = 2.0 * PI * random();
+            vec3 l = vec3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - r * r)));
+            next = t * l.x + b * l.y + s.N * l.z;
+            vec3 h = normalize(next + s.V);
+            // A cosine-weighted draw cancels the lobe's own cosine and its pi.
+            throughput *= (1.0 - fresnel_schlick(max(dot(s.V, h), 0.0), s.f0)) * diffuse
+                        / (1.0 - chance);
+        }
+        // Under the triangle itself, which a mapped normal can send a path.
+        if (dot(next, found.face) <= 0.0) {
+            break;
+        }
+
+        // Past the first few bounces a path carries little, and is ended with
+        // the chance its throughput says it deserves; the survivors are scaled
+        // up so the sum's mean is unchanged.
+        if (bounce >= 2) {
+            float survive = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 1.0);
+            if (random() >= survive) {
+                break;
+            }
+            throughput /= survive;
+        }
+
+        origin = found.lifted;
+        direction = next;
+        spread = BOUNCE_SPREAD;
+    }
+
+    // A path whose arithmetic went wrong would poison its pixel's sum for good.
+    if (any(isnan(radiance)) || any(isinf(radiance))) {
+        radiance = vec3(0.0);
+    }
+    vec4 sum = u.frame.x == 0u ? vec4(0.0) : imageLoad(u_sum, pixel);
+    sum += vec4(radiance, 1.0);
+    imageStore(u_sum, pixel, sum);
+    imageStore(u_mean, pixel, vec4(sum.rgb / sum.a, 1.0));
+}

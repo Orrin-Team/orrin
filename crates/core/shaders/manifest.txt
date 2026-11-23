@@ -43,6 +43,7 @@ outline_mask_vert vertex outline_mask.vert
 overlay_frag fragment overlay.frag
 overlay_vert vertex overlay.vert
 ray_debug_frag fragment ray_debug.frag
+path_trace_comp compute path_trace.comp ORRIN_FLAT_SURFACE=1
 prefilter_cube_frag fragment prefilter_cube.frag
 prepass_frag fragment prepass.frag
 prepass_frag_masked fragment prepass.frag ORRIN_MASKED=1
