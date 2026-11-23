@@ -851,11 +851,15 @@ Shaded shade_surface() {
     // instead, sky and all: the volumes are a metre apart, and the gather is
     // what sees the object beside this one. Its rays have already met what
     // the screen-space occlusion would darken, so that darkens only the
-    // reflections here: on both, a block's foot came out a quarter darker
-    // against the sheet round it than the path-traced reference.
+    // reflections here: with both, a block's foot measured a quarter darker
+    // against the sheet round it than in the path-traced reference. The
+    // occlusion is divided back out of the irradiance rather than left out of
+    // the product below, which the compiler then builds as it always did: a
+    // frame without the volumes comes out the same to the bit, and did not
+    // with a second factor in its place.
     vec3 irradiance = sh_irradiance(s.N);
     float reflection = 1.0;
-    float diffuse_ao = ao;
+    float shown_ao = 1.0;
     if (gi_live()) {
         vec3 sky = irradiance;
 #if defined(ORRIN_TRANSPARENT) || defined(ORRIN_REFRACTIVE)
@@ -865,23 +869,29 @@ Shaded shade_surface() {
         vec4 local = gathered
             ? vec4(gathered_irradiance(s.N), 1.0)
             : gi_irradiance(v_world_pos, s.N, s.V);
-        diffuse_ao = gathered ? 1.0 : ao;
 #endif
         irradiance = local.rgb + sky * (1.0 - local.a);
         if (gi.camera.w > 0.5) {
             reflection = gi_reflection_scale(irradiance, sky);
         }
+#if !defined(ORRIN_TRANSPARENT) && !defined(ORRIN_REFRACTIVE)
+        if (gathered) {
+            shown_ao = max(ao, 1e-3);
+            irradiance /= shown_ao;
+        }
+#endif
     }
-    // The volumes' debug view: the irradiance alone, on white.
+    // The debug view of the light that bounced: the irradiance alone, on
+    // white.
     if (gi.frame.z == 1u) {
         Shaded shown;
-        shown.color = irradiance;
+        shown.color = irradiance * shown_ao;
         shown.diffusible = vec3(0.0);
         shown.scatter = 0.0;
         shown.alpha = alpha;
         return shown;
     }
-    vec3 diffuse_ibl = irradiance * s.albedo * (1.0 - s.metallic) * diffuse_ao;
+    vec3 diffuse_ibl = irradiance * s.albedo * (1.0 - s.metallic) * ao;
     vec3 color = scatters ? vec3(0.0) : diffuse_ibl;
     vec3 diffusible = scatters ? diffuse_ibl : vec3(0.0);
     // The scale goes in with the energy term rather than over the result: the

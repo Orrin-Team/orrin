@@ -103,9 +103,9 @@ vec4 cached_light(vec3 p, vec3 face, float reach, vec3 direction) {
         if (held != 0u && held != checksum) {
             continue;
         }
-        // Shaded at frame zero is never shaded: a cell claimed this frame
-        // holds whatever its slot last held, and the probes' update reads
-        // this half next frame, so it is emptied by whoever claimed it.
+        // A cell shaded at frame zero has never been shaded, and its light
+        // is whatever its slot last held. Whoever claimed it empties that,
+        // since the probes' update reads this half next frame.
         uint shaded = gi_cells[cell].shaded;
         if (held == 0u) {
             gi_radiance[cell] = uvec2(0u);
