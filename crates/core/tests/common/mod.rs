@@ -6,12 +6,14 @@ use orrin_core::capture::{CaptureSettings, Floor};
 use orrin_core::scene::entities::SceneChoice;
 use orrin_core::scene::{Camera, FogSettings, GiDebugView, RayDebugView, ShadowDebugView};
 
-/// The warm-up of every capture the irradiance volumes light, and of the
-/// half of each pair they do not. A probe averages its first fifteen updates
-/// before it keeps a fixed share of its history, a grid is updated one frame
-/// in six, and a cell's light reaches the probes an update after it is first
-/// used: this is enough for the coarsest grid to have settled too.
-const GI_FRAMES: u32 = 360;
+/// The warm-up of every capture the irradiance volumes light, of the half of
+/// each pair they do not, and of the path-traced reference they are held
+/// against. A probe averages its first fifteen updates before it keeps a fixed
+/// share of its history, a grid is updated one frame in six, and a cell's
+/// light reaches the probes an update after it is first used; and the
+/// exposure takes longer than any of that to come down to a room lit by one
+/// lamp, so a pair taken at two warm-ups is a pair at two exposures.
+const GI_FRAMES: u32 = 768;
 
 /// Where both fog captures stand, shared so the pair differs in one field.
 ///
@@ -397,7 +399,6 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
             "gi-leak-path-traced",
             CaptureSettings {
                 ray_debug: RayDebugView::PathTraced,
-                frames: 768,
                 ..rooms(LEAK, true)
             },
         ),
@@ -439,7 +440,6 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
             "gi-emissive-path-traced",
             CaptureSettings {
                 ray_debug: RayDebugView::PathTraced,
-                frames: 768,
                 ..rooms(EMISSIVE, true)
             },
         ),
