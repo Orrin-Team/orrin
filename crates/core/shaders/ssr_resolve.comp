@@ -1,4 +1,8 @@
 #version 460
+#ifdef ORRIN_RAY_FALLBACK
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+#endif
 
 #include "depth.glsl"
 
@@ -31,8 +35,12 @@ layout(set = 0, binding = 2) uniform sampler2D u_depth;
 layout(set = 0, binding = 3) uniform sampler2D u_normal;      // view-space, encoded
 layout(set = 0, binding = 4) uniform sampler2D u_material;    // rgb = f0, a = roughness
 layout(set = 0, binding = 5, r11f_g11f_b10f) uniform writeonly image2D u_output;
+// The traced variant shades its hits under the same cube, which
+// `ray_shade.glsl` binds for it by these names.
+#ifndef ORRIN_RAY_FALLBACK
 layout(set = 0, binding = 6) uniform textureCube u_environment;
 layout(set = 0, binding = 7) uniform sampler u_environment_sampler;
+#endif
 layout(set = 0, binding = 8) uniform Ssr {
     mat4 proj;
     mat4 inv_proj;
@@ -47,17 +55,24 @@ layout(set = 0, binding = 8) uniform Ssr {
 layout(set = 0, binding = 9) uniform sampler2D u_hiz;
 layout(set = 0, binding = 10) uniform sampler2D u_source;
 
+#ifdef ORRIN_RAY_FALLBACK
+#include "ray_shade.glsl"
+#endif
 #include "ssr_march.glsl"
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 // World space into the environment's own frame — the same rotation the skybox
 // and the forward pass sample through, so the sky and what mirrors it agree.
+// The traced variant has `ambient.glsl`'s, which is the same rotation read out
+// of the lighting block.
+#ifndef ORRIN_RAY_FALLBACK
 vec3 to_environment(vec3 v) {
     float s = ssr.env.x;
     float c = ssr.env.y;
     return vec3(c * v.x - s * v.z, v.y, s * v.x + c * v.z);
 }
+#endif
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);

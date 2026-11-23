@@ -80,6 +80,11 @@ pub struct CaptureSettings {
     /// Which view of the traced scene is drawn in place of the frame. On a
     /// device that cannot trace, the capture is the frame as it was.
     pub ray_debug: crate::scene::RayDebugView,
+    /// Whether anything traces a ray. On by default, as it is in the engine;
+    /// off is the other half of the A/B for whatever a traced ray adds — a
+    /// reflection of what the screen does not hold — and is the frame every
+    /// device that cannot trace draws.
+    pub ray_tracing: bool,
     /// The sun's angular diameter in degrees, or `None` for the default. Zero
     /// is the other half of an A/B: every edge at one width, whatever cast it.
     pub sun_angle: Option<f32>,
@@ -165,6 +170,7 @@ impl Default for CaptureSettings {
             punctual_shadows: false,
             shadow_debug: ShadowDebugView::None,
             ray_debug: crate::scene::RayDebugView::None,
+            ray_tracing: true,
             sun_angle: None,
             ssr: false,
             dof: false,
@@ -362,6 +368,7 @@ pub fn render(
 
     renderer.pin_surface_time(settings.surface_time);
     renderer.set_ray_tracing(crate::scene::RayTracingSettings {
+        enabled: settings.ray_tracing,
         debug_view: settings.ray_debug,
         ..Default::default()
     });

@@ -213,6 +213,9 @@ pub struct FrameConfig {
     /// Whether the traced scene is drawn in place of the frame. Needs
     /// `ray_tracing`.
     pub ray_debug: bool,
+    /// Whether the reflections trace the scene for what the screen cannot
+    /// answer. Needs `ray_tracing` and `ssr`.
+    pub ray_reflections: bool,
 }
 
 /// What a screenshot shows.
@@ -542,6 +545,9 @@ pub struct SsrIds {
     /// alpha.
     pub rays: ResourceId,
     pub output: ResourceId,
+    /// Whether the trace and the composite also trace the scene itself, which
+    /// is which pair of pipelines the executor binds.
+    pub traced: bool,
 }
 
 /// The forward pass's multisampled targets, declared only when `FrameConfig::msaa`
@@ -1309,7 +1315,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .build();
         record(id, PassBody::SsrSource, &mut bodies);
 
-        let id = builder
+        // Both passes that trace a reflection fall back to the scene's
+        // structure where the screen has no answer, so both wait on its build.
+        let traced = ray.filter(|_| config.ray_reflections);
+        let mut trace = builder
             .pass("ssr_trace", PassKind::Compute)
             .access(hiz, Access::Sampled)
             .access(prepass.depth, Access::Sampled)
@@ -1317,9 +1326,11 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(prepass.material, Access::Sampled)
             .access(source_pyramid, Access::Sampled)
             .access(source, Access::Sampled)
-            .access(rays, Access::StorageWrite)
-            .build();
-        record(id, PassBody::SsrTrace, &mut bodies);
+            .access(rays, Access::StorageWrite);
+        if let Some(ray) = traced {
+            trace = trace.access(ray.scene, Access::AccelerationStructureRead);
+        }
+        record(trace.build(), PassBody::SsrTrace, &mut bodies);
 
         // The gather and the composite in one pass: what the gather makes for a
         // pixel is read by that pixel alone, so handing it over through a
@@ -1330,7 +1341,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // pass that both read and wrote the frame's colour would make "readers
         // after all writers" point in two directions and `compile` would report
         // a cycle.
-        let id = builder
+        let mut resolve = builder
             .pass("ssr_resolve", PassKind::Compute)
             .access(source, Access::Sampled)
             .access(rays, Access::Sampled)
@@ -1339,9 +1350,11 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(prepass.material, Access::Sampled)
             .access(hiz, Access::Sampled)
             .access(source_pyramid, Access::Sampled)
-            .access(output, Access::StorageWrite)
-            .build();
-        record(id, PassBody::SsrResolve, &mut bodies);
+            .access(output, Access::StorageWrite);
+        if let Some(ray) = traced {
+            resolve = resolve.access(ray.scene, Access::AccelerationStructureRead);
+        }
+        record(resolve.build(), PassBody::SsrResolve, &mut bodies);
 
         SsrIds {
             source,
@@ -1349,6 +1362,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             source_pyramid,
             rays,
             output,
+            traced: traced.is_some(),
         }
     });
 

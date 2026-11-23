@@ -1025,6 +1025,23 @@ impl VkDriver {
         desc: &ComputePipelineDesc,
         immutable_samplers: &[(u32, u32, SamplerId)],
     ) -> Result<PipelineId, String> {
+        self.build_compute_pipeline(desc, immutable_samplers, None)
+    }
+
+    pub fn try_create_compute_pipeline_over_textures(
+        &self,
+        desc: &ComputePipelineDesc,
+        texture_set: u32,
+    ) -> Result<PipelineId, String> {
+        self.build_compute_pipeline(desc, &[], Some(texture_set))
+    }
+
+    fn build_compute_pipeline(
+        &self,
+        desc: &ComputePipelineDesc,
+        immutable_samplers: &[(u32, u32, SamplerId)],
+        partial_texture_set: Option<u32>,
+    ) -> Result<PipelineId, String> {
         let device = &self.ctx.device;
         let (entry, name) = self.entry_point(desc.shader)?;
         let named = |e: &dyn std::fmt::Display| format!("{name}: {e}");
@@ -1034,6 +1051,10 @@ impl VkDriver {
             immutable_binding(&mut layout_info, set, binding)
                 .map_err(|e| named(&e))?
                 .immutable_samplers = vec![lookup(&self.samplers, sampler.0, "sampler")];
+        }
+        if let Some(set) = partial_texture_set {
+            self.ctx
+                .mark_texture_array_partial(&mut layout_info, set as usize);
         }
         let info = layout_info
             .into_pipeline_layout_create_info(device.clone())

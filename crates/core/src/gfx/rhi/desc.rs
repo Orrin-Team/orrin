@@ -302,6 +302,8 @@ pub enum GeometryStream {
     Positions,
     /// `u32`s, relative to a mesh's `vertex_offset`.
     Indices,
+    /// `SurfaceVertex`es, beside the positions vertex for vertex.
+    Surfaces,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

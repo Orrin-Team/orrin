@@ -149,7 +149,7 @@ use crate::gfx::format::Format as EngineFormat;
 use crate::gfx::images::ImageTable;
 use crate::gfx::rhi::{
     BindGroupId, BlockKind, BufferDesc, BufferId, Device, Encoder, Feature, MemoryLocation,
-    MeshSpan, TextureViewId,
+    TextureViewId,
 };
 use crate::profile::Profiler;
 use crate::profile_scope;
@@ -665,6 +665,7 @@ impl VulkanRenderer {
         }
         self.ui.invalidate_textures(&self.device);
         self.ui_window_invalidate_textures();
+        self.ssr.forget_textures(&self.device);
     }
 
     pub fn new(
@@ -880,6 +881,7 @@ impl VulkanRenderer {
             screenshot: None,
             ray_tracing: false,
             ray_debug: false,
+            ray_reflections: false,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -2191,10 +2193,12 @@ impl VulkanRenderer {
                 Some(Screenshot::Asked(view)) => Some(view),
                 _ => None,
             },
-            ray_tracing: self.raytrace.is_some() && self.ray_settings.traces(),
-            ray_debug: self.raytrace.is_some()
-                && self.ray_settings.enabled
-                && self.ray_settings.debug_view != crate::scene::RayDebugView::None,
+            ray_tracing: self.raytrace.is_some()
+                && (self.ray_settings.draws_debug_view()
+                    || self.ray_settings.traces_reflections(ssr.enabled)),
+            ray_debug: self.raytrace.is_some() && self.ray_settings.draws_debug_view(),
+            ray_reflections: self.raytrace.is_some()
+                && self.ray_settings.traces_reflections(ssr.enabled),
         });
 
         // Atlases allocated for this frame hold nothing, whatever the plan
@@ -2639,13 +2643,7 @@ impl VulkanRenderer {
         // ahead of every pass that reads them.
         {
             let mut encoder = commands.encoder(&self.device);
-            let meshes = &self.meshes;
-            self.instances
-                .sync(&self.device, &mut encoder, items, |mesh| {
-                    meshes
-                        .get(mesh as usize)
-                        .map_or(MeshSpan::default(), |mesh| mesh.span)
-                });
+            self.instances.sync(&self.device, &mut encoder, items);
             if let Some(ui) = ui {
                 self.ui
                     .prepare(&self.device, &mut encoder, ui, &self.textures);
@@ -2665,8 +2663,16 @@ impl VulkanRenderer {
                 draws,
                 &self.meshes,
                 &self.materials,
+                lighting,
                 camera.position,
                 view.unjittered_view_proj,
+            );
+        }
+        if self.frame.ids.ssr.is_some_and(|ids| ids.traced) {
+            self.ssr.prepare_traced(
+                &self.device,
+                &self.textures,
+                self.prepass.material_sampler(),
             );
         }
 
@@ -2998,6 +3004,17 @@ impl VulkanRenderer {
             ssao: &self.ssao,
             ssr: &self.ssr,
             raytrace: self.raytrace.as_ref(),
+            ray_frame: self
+                .raytrace
+                .as_ref()
+                .filter(|_| self.frame.ids.ray.is_some())
+                .map(|pass| raytrace::RayFrame {
+                    pass,
+                    lights: forward_sets.lights(),
+                    materials,
+                    environment: self.environment.specular_view(),
+                    environment_sampler: self.environment.sampler(),
+                }),
             subsurface: &self.subsurface,
             taa: &self.taa,
             view,
@@ -3489,6 +3506,8 @@ struct FrameRecord<'a> {
     ssao: &'a SsaoPass,
     ssr: &'a SsrPass,
     raytrace: Option<&'a raytrace::RayTracePass>,
+    /// What a pass that shades a ray's hits binds, in a frame that traces.
+    ray_frame: Option<raytrace::RayFrame<'a>>,
     subsurface: &'a SubsurfacePass,
     taa: &'a TaaPass,
     view: taa::FrameView,
@@ -4024,6 +4043,7 @@ impl FrameRecord<'_> {
                     source_pyramid,
                     source,
                     target,
+                    self.ray_frame.as_ref().filter(|_| ids.traced),
                 );
             }
             PassBody::SsrResolve => {
@@ -4060,6 +4080,7 @@ impl FrameRecord<'_> {
                     environment,
                     self.environment.sampler(),
                     target,
+                    self.ray_frame.as_ref().filter(|_| ids.traced),
                 );
             }
             PassBody::FogScatter => {
@@ -4558,7 +4579,7 @@ impl FrameRecord<'_> {
             PassBody::RayDebug => {
                 self.raytrace
                     .expect("the graph scheduled a traced pass on a device that cannot trace")
-                    .record_debug(self.device, encoder, self.extent, self.object_rows);
+                    .record_debug(self.device, encoder, self.extent);
             }
             PassBody::Tonemap | PassBody::Screenshot => {
                 // With bloom off the graph has no chain, so the tonemap

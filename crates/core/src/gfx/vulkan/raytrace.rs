@@ -2,8 +2,10 @@
 //! against.
 //!
 //! The acceleration structures are the driver's (`accel.rs`). This module
-//! decides what stands in them each frame and owns the passes that trace:
-//! today the debug views, which draw the traced scene in place of the frame.
+//! decides what stands in them each frame, uploads what a hit needs to become a
+//! lit surface, and owns the debug views, which draw the traced scene in place
+//! of the frame. A pass that traces for its own reasons — the reflections, when
+//! the screen runs out — binds what is prepared here through [`RayFrame`].
 //!
 //! # What a ray can hit
 //!
@@ -18,33 +20,129 @@
 //! Blended and refractive surfaces are left out. A ray asks what is there, and
 //! for those the honest answer is a fraction this has no way to return.
 //!
-//! An instance carries its row in the per-object buffer as its id, so a hit
-//! names the row and the row names the mesh and the material. See
-//! `ray_hit.glsl`.
+//! # What a hit reads
+//!
+//! Three sets, the same for every shader that shades a hit (`ray_shade.glsl`):
+//!
+//! - The scene's structure and a table with a row per instance: its material,
+//!   where its mesh starts in the shared geometry, and its light channels. An
+//!   instance carries its row's number as its id. Uploaded each frame and not
+//!   read out of the per-object rows, which the next frame rewrites while a
+//!   frame split across two queues may still be tracing this one.
+//! - The frame's own lighting block and light tables, the material table and
+//!   the environment cube — the buffers the forward pass binds, so a hit is
+//!   lit by what its reflector is — and the world light grid in place of the
+//!   view's clusters (`gfx::light_grid`).
+//! - The material texture array.
+//!
+//! A hit reads a material's standard reading, with none of the optional lobes
+//! and no custom surface function: `gfx/surface/mod.rs` says why.
 
 use glam::{Mat4, Vec3};
 
 use crate::gfx::format::Format;
+use crate::gfx::graph::BufferUsage;
+use crate::gfx::light_grid::LightGrid;
 use crate::gfx::rhi::{
-    Binding, BindingResource, BufferId, Device, Encoder, GeometryStream, GraphicsPipelineDesc,
-    PipelineId, RayInstance, Viewport,
+    BindGroupId, Binding, BindingResource, BlockKind, BufferDesc, BufferId, Device, Encoder,
+    GeometryStream, GraphicsPipelineDesc, MemoryLocation, PipelineId, RayInstance, SamplerId,
+    TextureViewId, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
-use crate::gfx::{DrawList, RenderItem};
+use crate::gfx::{DrawList, RenderItem, SceneLighting};
 use crate::scene::RayTracingSettings;
 
-use super::forward::{GpuMaterial, GpuMesh};
+use super::forward::{GpuMaterial, GpuMesh, LightBlocks};
 
 /// The debug block as the words of its std140 layout: `inv_view_proj`, then
 /// `origin` and `mode`.
 const DEBUG_WORDS: usize = 16 + 4 + 4;
 
+/// The world light grid as the device holds it: every cell's range, and the
+/// lists they index.
+struct GridBuffers {
+    cells: BufferId,
+    lights: BufferId,
+}
+
 pub struct RayTracePass {
     debug_pipeline: PipelineId,
-    /// Reused each frame, so a frame that traces allocates nothing for the
-    /// list once it has seen the scene.
+    /// Reused each frame, with the table beside it, so a frame that traces
+    /// allocates nothing for either once it has seen the scene.
     instances: Vec<RayInstance>,
+    /// One row per entry of `instances`: material, first index, vertex offset,
+    /// light channels.
+    table: Vec<[u32; 4]>,
+    table_buffer: Option<BufferId>,
+    grid: LightGrid,
+    /// Kept until the lists change, which is when a light moves or the camera
+    /// leaves a cell of the grid's finest cascade.
+    grid_buffers: Option<GridBuffers>,
+    /// The cascades the lists were binned round, uploaded with the frame.
+    grid_header: Option<BufferId>,
     debug_uniforms: Option<BufferId>,
+}
+
+/// What a pass that shades a ray's hits binds, for the frame being recorded.
+#[derive(Clone, Copy)]
+pub(super) struct RayFrame<'a> {
+    pub pass: &'a RayTracePass,
+    pub lights: LightBlocks,
+    pub materials: BufferId,
+    pub environment: TextureViewId,
+    pub environment_sampler: SamplerId,
+}
+
+impl RayFrame<'_> {
+    /// Bind sets 1 and 2 of `pipeline`, whose shader includes `ray_shade.glsl`.
+    /// Set 3, the textures, is the pipeline's owner's: it is kept between
+    /// frames, and a set belongs to the layout it was made for.
+    pub(super) fn bind(&self, device: &Device, encoder: &mut Encoder, pipeline: PipelineId) {
+        let pass = self.pass;
+        let grid = pass
+            .grid_buffers
+            .as_ref()
+            .expect("a pass shaded a hit before begin_frame");
+        let uniform = |binding, buffer| Binding {
+            binding,
+            resource: BindingResource::UniformBuffer(buffer),
+        };
+        let storage = |binding, buffer| Binding {
+            binding,
+            resource: BindingResource::StorageBuffer(buffer),
+        };
+        let shading = device.create_transient_bind_group(
+            pipeline,
+            2,
+            &[
+                uniform(0, self.lights.lighting),
+                uniform(1, self.lights.points),
+                uniform(2, self.lights.spots),
+                storage(3, self.materials),
+                Binding {
+                    binding: 4,
+                    resource: BindingResource::Texture(self.environment),
+                },
+                Binding {
+                    binding: 5,
+                    resource: BindingResource::Sampler(self.environment_sampler),
+                },
+                uniform(
+                    6,
+                    pass.grid_header
+                        .expect("a pass shaded a hit before begin_frame"),
+                ),
+                storage(7, grid.cells),
+                storage(8, grid.lights),
+                Binding {
+                    binding: 9,
+                    resource: BindingResource::Geometry(GeometryStream::Surfaces),
+                },
+            ],
+        );
+        encoder.bind_group(1, pass.hit_group(device, pipeline));
+        encoder.bind_group(2, shading);
+    }
 }
 
 impl RayTracePass {
@@ -59,13 +157,18 @@ impl RayTracePass {
         Self {
             debug_pipeline,
             instances: Vec::new(),
+            table: Vec::new(),
+            table_buffer: None,
+            grid: LightGrid::default(),
+            grid_buffers: None,
+            grid_header: None,
             debug_uniforms: None,
         }
     }
 
-    /// Hand the device this frame's traced scene, and resolve the debug view's
-    /// camera. Before anything records: the build passes record what this
-    /// decides.
+    /// Hand the device this frame's traced scene, bin the lights round the
+    /// camera, and resolve the debug view's camera. Before anything records:
+    /// the build passes record what this decides.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn begin_frame(
         &mut self,
@@ -74,28 +177,85 @@ impl RayTracePass {
         draws: DrawList<'_>,
         meshes: &[GpuMesh],
         materials: &[GpuMaterial],
+        lighting: &SceneLighting,
         camera: Vec3,
         unjittered_view_proj: Mat4,
     ) {
         let reach = settings.distance.max(0.0);
         self.instances.clear();
-        self.instances.extend((0..draws.len()).filter_map(|i| {
+        self.table.clear();
+        for i in 0..draws.len() {
             let item = draws.item(i);
-            let mesh = meshes.get(item.mesh.0 as usize)?;
-            within(item, mesh, camera, reach).then(|| RayInstance {
+            let Some(mesh) = meshes.get(item.mesh.0 as usize) else {
+                continue;
+            };
+            if !within(item, mesh, camera, reach) {
+                continue;
+            }
+            self.instances.push(RayInstance {
                 span: mesh.span,
                 transform: [
                     item.model.row(0).to_array(),
                     item.model.row(1).to_array(),
                     item.model.row(2).to_array(),
                 ],
-                id: item.instance,
+                id: self.table.len() as u32,
                 opaque: !materials
                     .get(item.material.0 as usize)
                     .is_some_and(GpuMaterial::is_masked),
-            })
-        }));
+            });
+            self.table.push([
+                item.material.0,
+                mesh.span.first_index,
+                mesh.span.vertex_offset as u32,
+                item.channels,
+            ]);
+        }
         device.prepare_ray_scene(&self.instances);
+        // Never empty, for the reason no bound buffer here is: a scene of
+        // nothing still binds a table, which nothing then indexes.
+        if self.table.is_empty() {
+            self.table.push([0; 4]);
+        }
+        self.table_buffer =
+            Some(device.upload_block(BlockKind::Storage, bytemuck::cast_slice(&self.table)));
+
+        if self.grid.bin(lighting, camera) || self.grid_buffers.is_none() {
+            if let Some(old) = self.grid_buffers.take() {
+                device.destroy_buffer(old.cells);
+                device.destroy_buffer(old.lights);
+            }
+            let buffer = |words: &[u32]| {
+                let bytes: &[u8] = bytemuck::cast_slice(words);
+                device.create_buffer_bytes(
+                    BufferDesc {
+                        size: bytes.len() as u64,
+                        usage: BufferUsage::STORAGE_BUFFER,
+                        location: MemoryLocation::GpuOnly,
+                    },
+                    bytes,
+                )
+            };
+            self.grid_buffers = Some(GridBuffers {
+                cells: buffer(bytemuck::cast_slice(&self.grid.ranges)),
+                lights: if self.grid.indices.is_empty() {
+                    buffer(&[0])
+                } else {
+                    buffer(&self.grid.indices)
+                },
+            });
+        }
+        let mut header = [0u32; 4 * crate::gfx::light_grid::CASCADES];
+        for (words, cascade) in header
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(&self.grid.cascades)
+        {
+            let origin = cascade.origin;
+            *words = [origin.x, origin.y, origin.z, cascade.cell].map(f32::to_bits);
+        }
+        self.grid_header = Some(device.upload_uniform(&header));
 
         let mut words = [0u32; DEBUG_WORDS];
         let floats = unjittered_view_proj
@@ -111,31 +271,18 @@ impl RayTracePass {
     }
 
     /// One ray per pixel, drawn over the whole target.
-    pub(super) fn record_debug(
-        &self,
-        device: &Device,
-        encoder: &mut Encoder,
-        extent: [u32; 2],
-        object_rows: BufferId,
-    ) {
+    pub(super) fn record_debug(&self, device: &Device, encoder: &mut Encoder, extent: [u32; 2]) {
         let uniforms = self
             .debug_uniforms
             .expect("the graph scheduled the ray debug view before begin_frame");
-        let scene = device.create_transient_bind_group(
+        let view = device.create_transient_bind_group(
             self.debug_pipeline,
             0,
-            &[
-                Binding {
-                    binding: 0,
-                    resource: BindingResource::SceneAccel,
-                },
-                Binding {
-                    binding: 1,
-                    resource: BindingResource::UniformBuffer(uniforms),
-                },
-            ],
+            &[Binding {
+                binding: 0,
+                resource: BindingResource::UniformBuffer(uniforms),
+            }],
         );
-        let hit = hit_group(device, self.debug_pipeline, object_rows);
 
         encoder.set_viewport(Viewport {
             origin: [0.0, 0.0],
@@ -143,37 +290,40 @@ impl RayTracePass {
             depth_range: [0.0, 1.0],
         });
         encoder.bind_pipeline(self.debug_pipeline);
-        encoder.bind_group(0, scene);
-        encoder.bind_group(1, hit);
+        encoder.bind_group(0, view);
+        encoder.bind_group(1, self.hit_group(device, self.debug_pipeline));
         encoder.draw(3, 1, 0, 0);
     }
-}
 
-/// Set 1 of every shader that includes `ray_hit.glsl`: the rows a hit's id
-/// indexes and the geometry its triangle is in.
-fn hit_group(
-    device: &Device,
-    pipeline: PipelineId,
-    object_rows: BufferId,
-) -> crate::gfx::rhi::BindGroupId {
-    device.create_bind_group(
-        pipeline,
-        1,
-        &[
-            Binding {
-                binding: 0,
-                resource: BindingResource::StorageBuffer(object_rows),
-            },
-            Binding {
-                binding: 1,
-                resource: BindingResource::Geometry(GeometryStream::Positions),
-            },
-            Binding {
-                binding: 2,
-                resource: BindingResource::Geometry(GeometryStream::Indices),
-            },
-        ],
-    )
+    /// Set 1 of every shader that includes `ray_hit.glsl`: the scene, the
+    /// table a hit's id indexes and the geometry its triangle is in.
+    fn hit_group(&self, device: &Device, pipeline: PipelineId) -> BindGroupId {
+        device.create_transient_bind_group(
+            pipeline,
+            1,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::SceneAccel,
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::StorageBuffer(
+                        self.table_buffer
+                            .expect("a pass traced the scene before begin_frame"),
+                    ),
+                },
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::Geometry(GeometryStream::Positions),
+                },
+                Binding {
+                    binding: 3,
+                    resource: BindingResource::Geometry(GeometryStream::Indices),
+                },
+            ],
+        )
+    }
 }
 
 /// Whether any of `item` stands within `reach` of `camera`, by the sphere

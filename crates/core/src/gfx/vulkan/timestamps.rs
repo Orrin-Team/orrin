@@ -501,6 +501,7 @@ mod tests {
             screenshot: None,
             ray_tracing: false,
             ray_debug: false,
+            ray_reflections: false,
         };
         let frame = declare(config).expect("the busiest frame must compile");
 

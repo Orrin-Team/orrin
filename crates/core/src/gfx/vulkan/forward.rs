@@ -206,7 +206,7 @@ fn gpu_point_lights(lighting: &SceneLighting, views: &ShadowViews, out: &mut Vec
                 let channels = f32::from_bits(light.channels);
                 match views.caster(LightKind::Point, index) {
                     Some(caster) => [caster.first_view as f32, caster.near, channels, 0.0],
-                    None => [-1.0, 0.0, channels, 0.0],
+                    None => [no_view(light.casts_shadows), 0.0, channels, 0.0],
                 }
             },
         });
@@ -214,6 +214,14 @@ fn gpu_point_lights(lighting: &SceneLighting, views: &ShadowViews, out: &mut Vec
     if out.is_empty() {
         out.push(GpuPointLight::ZERO);
     }
+}
+
+/// What a light with no shadow view carries in place of one. Both are "none"
+/// to a fragment, which has only the atlas to ask. A ray's hit traces its own
+/// shadow and so needs to know which lights cast none at all:
+/// `LIGHT_CASTS_NONE` in `lights.glsl` is the line between the two.
+fn no_view(casts_shadows: bool) -> f32 {
+    if casts_shadows { -1.0 } else { -2.0 }
 }
 
 /// [`gpu_point_lights`] for the spots.
@@ -227,7 +235,7 @@ fn gpu_spot_lights(lighting: &SceneLighting, views: &ShadowViews, out: &mut Vec<
     {
         let face = views
             .caster(LightKind::Spot, index)
-            .map_or([-1.0, 0.0], |caster| {
+            .map_or([no_view(light.casts_shadows), 0.0], |caster| {
                 [caster.first_view as f32, caster.near]
             });
         out.push(GpuSpotLight {
@@ -680,11 +688,25 @@ impl PreviewLighting {
 /// keeps that from being a comment somebody has to keep true.
 pub(super) struct ForwardSets {
     groups: [BindGroupId; 5],
+    lights: LightBlocks,
+}
+
+/// This frame's lighting block and its two light tables, for a pass that
+/// lights something through a layout of its own: a ray's hit.
+#[derive(Clone, Copy)]
+pub(super) struct LightBlocks {
+    pub lighting: BufferId,
+    pub points: BufferId,
+    pub spots: BufferId,
 }
 
 impl ForwardSets {
     pub(super) fn groups(&self) -> [BindGroupId; 5] {
         self.groups
+    }
+
+    pub(super) fn lights(&self) -> LightBlocks {
+        self.lights
     }
 
     /// The same five with the object set swapped, for a pass that indexes
@@ -697,7 +719,10 @@ impl ForwardSets {
     pub(super) fn with_object_set(&self, object_set: BindGroupId) -> ForwardSets {
         let mut groups = self.groups;
         groups[4] = object_set;
-        ForwardSets { groups }
+        ForwardSets {
+            groups,
+            lights: self.lights,
+        }
     }
 }
 
@@ -1276,6 +1301,11 @@ impl ForwardPass {
         texture_set: BindGroupId,
         object_set: BindGroupId,
     ) -> ForwardSets {
+        let lights = LightBlocks {
+            lighting: set0.lighting,
+            points: set0.points,
+            spots: set0.spots,
+        };
         let lighting_set = device.create_transient_bind_group(
             self.single.plain,
             0,
@@ -1361,6 +1391,7 @@ impl ForwardPass {
 
         ForwardSets {
             groups: [lighting_set, material_set, texture_set, ao_set, object_set],
+            lights,
         }
     }
 

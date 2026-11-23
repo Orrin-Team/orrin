@@ -266,7 +266,7 @@ const RAYS: &[Section] = &[section(
     "Ray tracing",
     Some("Trace rays against a copy of the scene, on a GPU that can"),
     icons::bounding_box(),
-    &["Enabled", "Distance", "Debug view"],
+    &["Enabled", "Distance", "Reflections", "Debug view"],
     ray_tracing,
 )];
 
@@ -591,6 +591,12 @@ fn ray_tracing(ui: &mut egui::Ui, world: &World, rows: Rows) {
                 .suffix(" m"),
         )
         .on_hover_text("How far from the camera an object still stands in the traced scene");
+    }
+    if rows.shows("Reflections") {
+        toggle(ui, "Reflections", &mut rays.reflections).on_hover_text(
+            "Where a screen-space reflection has no answer, trace the scene itself. \
+             Needs Screen-space reflections on",
+        );
     }
     if rows.shows("Debug view") {
         use crate::scene::RayDebugView;

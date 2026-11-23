@@ -314,6 +314,7 @@ impl VkContext {
                     acceleration_structure: ray_tracing,
                     ray_query: ray_tracing,
                     buffer_device_address: ray_tracing,
+                    shader_sampled_image_array_non_uniform_indexing: ray_tracing,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()
@@ -518,6 +519,11 @@ fn probe_ray_tracing(physical_device: &Arc<PhysicalDevice>) -> bool {
         && features.acceleration_structure
         && features.ray_query
         && features.buffer_device_address
+        // A hit reads the maps of whichever material it lands on, which is a
+        // different texture for every ray in a dispatch: the one place in the
+        // renderer an index into the texture array is not uniform across a
+        // draw.
+        && features.shader_sampled_image_array_non_uniform_indexing
 }
 
 /// The device's queue families, read for [`transfer_slot`].

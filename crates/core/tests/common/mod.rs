@@ -430,6 +430,42 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
             "ssr-sphere-row",
             reflection_view(None, Vec3::new(2.0, 1.6, 6.0), Vec3::new(0.0, 1.5, 14.0)),
         ),
+        // Three of the mirrors again with nothing traced, so each pair differs
+        // in exactly what the traced ray adds: the part of a reflection whose
+        // ray left the frame or passed behind what is in it. Low across the
+        // floor, the reflected cubes run off the frame's edge; steep over the
+        // grid, each cube's reflection ends where the screen stops holding the
+        // cube; above the spheres, the mirror wants their undersides, which no
+        // pixel shows. A device that cannot trace draws both halves alike.
+        (
+            "ssr-mirror-screen",
+            CaptureSettings {
+                ray_tracing: false,
+                ..reflective_floor(Floor::Mirror)
+            },
+        ),
+        (
+            "ssr-steep-screen",
+            CaptureSettings {
+                ray_tracing: false,
+                ..reflection_view(
+                    Some(Floor::Mirror),
+                    Vec3::new(6.0, 5.5, 10.0),
+                    Vec3::new(2.0, 0.0, 3.0),
+                )
+            },
+        ),
+        (
+            "ssr-spheres-above-screen",
+            CaptureSettings {
+                ray_tracing: false,
+                ..reflection_view(
+                    Some(Floor::Mirror),
+                    Vec3::new(1.5, 9.0, 18.0),
+                    Vec3::new(0.0, 0.0, 12.5),
+                )
+            },
+        ),
         // The sweep's spheres as rough metal, from below and beside the row:
         // the lower half of each reflects the ground and the glowing cubes,
         // which few of its rays reach.

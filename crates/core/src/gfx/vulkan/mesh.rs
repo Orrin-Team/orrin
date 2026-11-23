@@ -62,6 +62,9 @@ const INITIAL_INDICES: u64 = 1 << 15;
 /// fetches its own vertices so each corner knows which corner it is.
 const POSITION_USAGE: BufferUsage = BufferUsage::VERTEX_BUFFER.union(BufferUsage::STORAGE_BUFFER);
 const INDEX_USAGE: BufferUsage = BufferUsage::INDEX_BUFFER.union(BufferUsage::STORAGE_BUFFER);
+/// And the surfaces, for a ray's hit: it has no vertex shader to hand it a
+/// normal, so it reads the three corners' and blends them itself.
+const SURFACE_USAGE: BufferUsage = BufferUsage::VERTEX_BUFFER.union(BufferUsage::STORAGE_BUFFER);
 
 /// What a buffer an acceleration structure is built from carries besides: the
 /// build names its inputs by address. Only on a device that traces, because
@@ -102,12 +105,7 @@ impl MeshArena {
                 INITIAL_VERTICES,
                 host_visible,
             ),
-            surfaces: allocate(
-                ctx,
-                BufferUsage::VERTEX_BUFFER,
-                INITIAL_VERTICES,
-                host_visible,
-            ),
+            surfaces: allocate(ctx, SURFACE_USAGE, INITIAL_VERTICES, host_visible),
             indices: allocate(ctx, traced(ctx, INDEX_USAGE), INITIAL_INDICES, host_visible),
             placement: Placement::new(frames_in_flight),
             host_visible,
@@ -140,6 +138,7 @@ impl MeshArena {
         match stream {
             crate::gfx::rhi::GeometryStream::Positions => self.positions.clone().into_bytes(),
             crate::gfx::rhi::GeometryStream::Indices => self.indices.clone().into_bytes(),
+            crate::gfx::rhi::GeometryStream::Surfaces => self.surfaces.clone().into_bytes(),
         }
     }
 
@@ -269,7 +268,7 @@ impl MeshArena {
                 ctx,
                 &mut builder,
                 &self.surfaces,
-                BufferUsage::VERTEX_BUFFER,
+                SURFACE_USAGE,
                 capacity,
                 held_vertices,
                 self.host_visible,

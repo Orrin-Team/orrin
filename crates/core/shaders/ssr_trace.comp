@@ -1,4 +1,8 @@
 #version 460
+#ifdef ORRIN_RAY_FALLBACK
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+#endif
 
 // One reflection ray per 2x2 quad of the frame, for every surface the
 // reflections reach, returning the radiance it found and how much that radiance
@@ -43,6 +47,9 @@ layout(set = 0, binding = 6) uniform Ssr {
 } ssr;
 layout(set = 0, binding = 7) uniform sampler2D u_source_full; // the lit frame itself
 
+#ifdef ORRIN_RAY_FALLBACK
+#include "ray_shade.glsl"
+#endif
 #include "ssr_march.glsl"
 
 void main() {

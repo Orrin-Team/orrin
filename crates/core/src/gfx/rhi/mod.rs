@@ -204,6 +204,24 @@ impl Device {
         .unwrap_or_else(|error| panic!("{error}"))
     }
 
+    /// A compute pipeline that reads the material texture array at binding 0
+    /// of `texture_set`, declared partially bound where the device allows it,
+    /// as a graphics pipeline's `partial_texture_set` is.
+    pub fn create_compute_pipeline_over_textures(
+        &self,
+        desc: &ComputePipelineDesc,
+        texture_set: u32,
+    ) -> PipelineId {
+        match self {
+            Device::Vulkan(driver) => {
+                driver.try_create_compute_pipeline_over_textures(desc, texture_set)
+            }
+            #[cfg(target_os = "macos")]
+            Device::Metal(driver) => driver.try_create_compute_pipeline_with_samplers(desc, &[]),
+        }
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
     /// Retire a pipeline once the frames that may have recorded it are done.
     pub fn destroy_pipeline(&self, pipeline: PipelineId) {
         device_dispatch!(self, driver => driver.destroy_pipeline(pipeline))

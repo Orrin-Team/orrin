@@ -41,7 +41,7 @@
 
 use glam::Vec3;
 
-use super::SceneLighting;
+use super::{MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, SceneLighting};
 
 pub const CELLS: u32 = 16;
 pub const CASCADES: usize = 8;
@@ -61,7 +61,7 @@ impl Cascade {
     fn cell_at(&self, point: Vec3) -> Option<[u32; 3]> {
         let local = ((point - self.origin) / self.cell).floor();
         let inside = local.cmpge(Vec3::ZERO).all() && local.cmplt(Vec3::splat(CELLS as f32)).all();
-        inside.then(|| [local.x as u32, local.y as u32, local.z as u32])
+        inside.then_some([local.x as u32, local.y as u32, local.z as u32])
     }
 }
 
@@ -127,14 +127,18 @@ impl LightGrid {
     pub fn bin(&mut self, lighting: &SceneLighting, camera: Vec3) -> bool {
         let cascades = cascades(camera);
         let spheres = || {
+            // No further than the light tables go: an index past the end of
+            // one is a read past the end of a uniform block.
             lighting
                 .point_lights
                 .iter()
+                .take(MAX_POINT_LIGHTS)
                 .map(|light| (false, light.position, light.range))
                 .chain(
                     lighting
                         .spot_lights
                         .iter()
+                        .take(MAX_SPOT_LIGHTS)
                         .map(|light| (true, light.position, light.range)),
                 )
         };

@@ -67,12 +67,13 @@
 use glam::Vec3;
 
 use crate::gfx::rhi::{
-    Binding, BindingResource, BufferId, ComputePipelineDesc, Device, Encoder, PipelineId,
-    SamplerDesc, SamplerId, TextureViewId,
+    BindGroupId, Binding, BindingResource, BufferId, ComputePipelineDesc, Device, Encoder, Feature,
+    PipelineId, SamplerDesc, SamplerId, TextureViewId,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::scene::SsrSettings;
 
+use super::raytrace::RayFrame;
 use super::taa::FrameView;
 
 /// Side of the compute workgroup for the trace and the composite.
@@ -142,7 +143,22 @@ pub struct SsrPass {
     /// blurs, and the step would be visible as a ring on a curved surface.
     linear_mip: SamplerId,
     uniforms: Option<BufferId>,
+    /// The trace and the composite again, falling back to a ray traced
+    /// against the scene. `None` on a device that cannot trace.
+    traced: Option<Traced>,
 }
+
+/// The pipelines of the traced pair, and the material textures a hit reads,
+/// which each binds through a set of its own for the reason every pass that
+/// reads them does: a set belongs to the layout it was made for.
+struct Traced {
+    trace: PipelineId,
+    resolve: PipelineId,
+    textures: Option<[BindGroupId; 2]>,
+}
+
+/// The set a traced pipeline reads the material textures from.
+const TEXTURE_SET: u32 = 3;
 
 impl SsrPass {
     pub fn new(device: &Device) -> Self {
@@ -184,6 +200,22 @@ impl SsrPass {
             max_lod: None,
         });
 
+        let traced = device.supports(Feature::RayTracing).then(|| {
+            let pipeline = |shader: ShaderId| {
+                device.create_compute_pipeline_over_textures(
+                    &ComputePipelineDesc {
+                        shader: shader.into(),
+                    },
+                    TEXTURE_SET,
+                )
+            };
+            Traced {
+                trace: pipeline(ShaderId::SsrTraceCompTraced),
+                resolve: pipeline(ShaderId::SsrResolveCompTraced),
+                textures: None,
+            }
+        });
+
         Self {
             hiz_pipeline,
             source_pipeline,
@@ -193,7 +225,59 @@ impl SsrPass {
             linear_clamp,
             linear_mip,
             uniforms: None,
+            traced,
         }
+    }
+
+    /// Make sure the traced pair has the material textures bound, before a
+    /// frame that traces records. Kept until the textures change.
+    pub(super) fn prepare_traced(
+        &mut self,
+        device: &Device,
+        textures: &[TextureViewId],
+        sampler: SamplerId,
+    ) {
+        if let Some(traced) = &mut self.traced
+            && traced.textures.is_none()
+        {
+            traced.textures = Some([traced.trace, traced.resolve].map(|pipeline| {
+                device.create_texture_array_group(pipeline, TEXTURE_SET, textures, sampler)
+            }));
+        }
+    }
+
+    /// Let go of the texture sets, which name textures that have changed.
+    pub(super) fn forget_textures(&mut self, device: &Device) {
+        if let Some(groups) = self
+            .traced
+            .as_mut()
+            .and_then(|traced| traced.textures.take())
+        {
+            for group in groups {
+                device.destroy_bind_group(group);
+            }
+        }
+    }
+
+    /// The traced pipeline and its textures, for a frame that asked for them.
+    fn traced(
+        &self,
+        rays: Option<&RayFrame<'_>>,
+        resolve: bool,
+    ) -> Option<(PipelineId, BindGroupId)> {
+        rays?;
+        let traced = self
+            .traced
+            .as_ref()
+            .expect("the graph scheduled traced reflections on a device that cannot trace");
+        let textures = traced
+            .textures
+            .expect("traced reflections were recorded before prepare_traced");
+        Some(if resolve {
+            (traced.resolve, textures[1])
+        } else {
+            (traced.trace, textures[0])
+        })
     }
 
     /// Resolve this frame's camera, settings and environment into the block the
@@ -346,9 +430,12 @@ impl SsrPass {
         source_pyramid: TextureViewId,
         source: TextureViewId,
         target: TextureViewId,
+        rays: Option<&RayFrame<'_>>,
     ) {
+        let traced = self.traced(rays, false);
+        let pipeline = traced.map_or(self.trace_pipeline, |(pipeline, _)| pipeline);
         let set = device.create_transient_bind_group(
-            self.trace_pipeline,
+            pipeline,
             0,
             &[
                 self.sampled(0, hiz, self.nearest_clamp),
@@ -368,8 +455,12 @@ impl SsrPass {
             ],
         );
 
-        builder.bind_pipeline(self.trace_pipeline);
+        builder.bind_pipeline(pipeline);
         builder.bind_group(0, set);
+        if let (Some(rays), Some((_, textures))) = (rays, traced) {
+            rays.bind(device, builder, pipeline);
+            builder.bind_group(TEXTURE_SET, textures);
+        }
         dispatch_over(device, builder, target);
     }
 
@@ -388,25 +479,38 @@ impl SsrPass {
         environment: TextureViewId,
         environment_sampler: SamplerId,
         target: TextureViewId,
+        traced_rays: Option<&RayFrame<'_>>,
     ) {
-        let set = device.create_transient_bind_group(
-            self.resolve_pipeline,
-            0,
-            &[
-                // Linear, though the composite reads its own pixel by texel, so
-                // a smooth surface's ray samples the frame as the trace does.
-                self.sampled(0, source, self.linear_clamp),
-                // Fetched at exact texels by the bilateral gather, which does its
-                // own interpolation — a linear sampler here would blend across the
-                // silhouettes that gather exists to respect.
-                self.sampled(1, rays, self.nearest_clamp),
-                self.sampled(2, depth, self.nearest_clamp),
-                self.sampled(3, normal, self.nearest_clamp),
-                self.sampled(4, material, self.nearest_clamp),
-                Binding {
-                    binding: 5,
-                    resource: BindingResource::StorageTexture(target),
-                },
+        let traced = self.traced(traced_rays, true);
+        let pipeline = traced.map_or(self.resolve_pipeline, |(pipeline, _)| pipeline);
+        let mut bindings = vec![
+            // Linear, though the composite reads its own pixel by texel, so
+            // a smooth surface's ray samples the frame as the trace does.
+            self.sampled(0, source, self.linear_clamp),
+            // Fetched at exact texels by the bilateral gather, which does its
+            // own interpolation — a linear sampler here would blend across the
+            // silhouettes that gather exists to respect.
+            self.sampled(1, rays, self.nearest_clamp),
+            self.sampled(2, depth, self.nearest_clamp),
+            self.sampled(3, normal, self.nearest_clamp),
+            self.sampled(4, material, self.nearest_clamp),
+            Binding {
+                binding: 5,
+                resource: BindingResource::StorageTexture(target),
+            },
+            Binding {
+                binding: 8,
+                resource: BindingResource::UniformBuffer(self.uniforms()),
+            },
+            // A smooth surface's own ray, traced here with the trace's
+            // samplers for the trace's reasons.
+            self.sampled(9, hiz, self.nearest_clamp),
+            self.sampled(10, source_pyramid, self.linear_mip),
+        ];
+        // The traced composite reads the environment through the set every
+        // hit is shaded from, and declares it nowhere else.
+        if traced.is_none() {
+            bindings.extend([
                 Binding {
                     binding: 6,
                     resource: BindingResource::Texture(environment),
@@ -415,19 +519,16 @@ impl SsrPass {
                     binding: 7,
                     resource: BindingResource::Sampler(environment_sampler),
                 },
-                Binding {
-                    binding: 8,
-                    resource: BindingResource::UniformBuffer(self.uniforms()),
-                },
-                // A smooth surface's own ray, traced here with the trace's
-                // samplers for the trace's reasons.
-                self.sampled(9, hiz, self.nearest_clamp),
-                self.sampled(10, source_pyramid, self.linear_mip),
-            ],
-        );
+            ]);
+        }
+        let set = device.create_transient_bind_group(pipeline, 0, &bindings);
 
-        builder.bind_pipeline(self.resolve_pipeline);
+        builder.bind_pipeline(pipeline);
         builder.bind_group(0, set);
+        if let (Some(rays), Some((_, textures))) = (traced_rays, traced) {
+            rays.bind(device, builder, pipeline);
+            builder.bind_group(TEXTURE_SET, textures);
+        }
         dispatch_over(device, builder, target);
     }
 

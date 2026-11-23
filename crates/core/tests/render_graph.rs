@@ -79,6 +79,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // MSAA with the diffusion on, which is the five-attachment forward pass:
@@ -117,6 +118,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         (
@@ -150,6 +152,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // Four cascades write four layers of one image, which the graph tracks
@@ -189,6 +192,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // SSAO off is a different graph, not a flag read at record time: the
@@ -227,6 +231,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // The shape that proves the prepass belongs to the frame rather than to
@@ -263,6 +268,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // Metering off is the other shape that ships. Worth baselining for one
@@ -301,6 +307,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // A window too small for a real chain still gets one level, and that
@@ -338,6 +345,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // The froxel fog, with the cascades it exists to read. Worth baselining
@@ -379,6 +387,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // The whole optical chain at once: lens, then shutter, then sensor.
@@ -417,6 +426,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // The other shape that proves the prepass belongs to the frame rather
@@ -455,6 +465,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // Reflections are the first thing to sit *between* shading and the
@@ -493,6 +504,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // And the same without a resolve behind it, which is the shape where
@@ -529,6 +541,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // What actually ships in the editor: the march sits between the prepass
@@ -567,6 +580,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // And the march on its own, which is the shape that proves it keeps the
@@ -603,6 +617,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // The punctual atlas: one pass however many lights cast, because a tile
@@ -640,6 +655,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // And the atlas with no cascades, which is an ordinary scene: an indoor
@@ -677,6 +693,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // What ships: transparency accumulates after the reflections and before
@@ -716,6 +733,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // And transparency on its own, which is the shape that proves it keeps
@@ -753,6 +771,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // Both non-opaque queues at once, which is the shape that pins the
@@ -791,6 +810,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // And refraction on its own, which proves it keeps the geometry prepass
@@ -827,6 +847,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // Subsurface scattering is the first thing to change the *forward pass's
@@ -868,6 +889,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // And on its own, which is the shape that proves the diffusion keeps the
@@ -905,6 +927,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         (
@@ -938,6 +961,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // The split, on the frame the editor actually runs. Every configuration
@@ -983,6 +1007,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // The same frame with the depth test on, because what it adds is a
@@ -1023,6 +1048,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         (
@@ -1056,6 +1082,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // And the frame the split is *for*: every optical stage on, which is
@@ -1094,6 +1121,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 screenshot: None,
                 ray_tracing: false,
                 ray_debug: false,
+                ray_reflections: false,
             },
         ),
         // A frame that traces: the two builds at its head and the traced scene
@@ -1308,6 +1336,7 @@ fn the_shadow_atlas_is_sixteen_bit_and_the_camera_depth_is_not() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     })
     .unwrap();
 
@@ -1351,6 +1380,7 @@ fn reference_config(msaa: bool, presents: bool) -> FrameConfig {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     }
 }
 
@@ -1440,6 +1470,7 @@ fn a_screenshot_adds_one_reader_and_changes_no_image_the_frame_owns() {
             screenshot: Some(view),
             ray_tracing: false,
             ray_debug: false,
+            ray_reflections: false,
             ..off
         })
         .unwrap()
@@ -1538,6 +1569,7 @@ fn an_empty_selection_runs_no_outline_and_no_gizmo() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     };
     let passes = |outline, gizmo| {
         let frame = declare(config(outline, gizmo)).unwrap();
@@ -1604,6 +1636,7 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     })
     .unwrap();
 
@@ -1667,6 +1700,7 @@ fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     })
     .unwrap();
 
@@ -1726,6 +1760,7 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     })
     .unwrap();
 
@@ -1794,6 +1829,7 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     })
     .unwrap();
 
@@ -1849,6 +1885,7 @@ fn the_gizmo_draws_between_the_tonemap_and_the_overlay() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     };
     for async_compute in [false, true] {
         let frame = declare(config(true, async_compute)).unwrap();
@@ -1955,6 +1992,7 @@ fn the_selection_outline_is_masked_then_drawn_under_the_gizmo() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     };
     let frame = declare(config(true)).unwrap();
     let order: Vec<&str> = frame
@@ -2030,6 +2068,7 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     })
     .unwrap();
 
@@ -2097,6 +2136,7 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     };
 
     let plan = format!("{}", declare(base).unwrap().graph);
@@ -2202,6 +2242,7 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     })
     .unwrap();
 
@@ -2270,6 +2311,7 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     })
     .unwrap();
 
@@ -2329,6 +2371,7 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     })
     .unwrap();
 
@@ -2413,6 +2456,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     };
 
     let consumers: [Consumer; 10] = [
@@ -2515,6 +2559,7 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     })
     .unwrap();
 
@@ -2608,6 +2653,45 @@ fn the_traced_scene_is_built_over_the_meshes_before_anything_traces_it() {
     );
 }
 
+/// The reflections fall back to a traced ray in both of the passes that trace
+/// one, and either may sit in the compute tail of a split frame: each declares
+/// the scene it traces, and the first waits for its build.
+#[test]
+fn traced_reflections_wait_for_the_scene_in_both_passes_that_trace() {
+    let frame = declare(FrameConfig {
+        ssr: true,
+        ray_tracing: true,
+        ray_reflections: true,
+        async_compute: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    assert!(frame.ids.ssr.unwrap().traced);
+
+    let plan = format!("{}", frame.graph);
+    assert_eq!(
+        plan.matches("     ray_scene AccelerationStructureRead\n")
+            .count(),
+        2,
+        "the trace and the composite must each declare the scene they trace:\n{plan}",
+    );
+    assert_eq!(
+        plan.matches("  ! ray_scene src ").count(),
+        1,
+        "the first pass to trace must wait for the scene's build, once:\n{plan}",
+    );
+
+    // Without the setting the same frame binds the screen-only pair and
+    // touches no acceleration structure.
+    let frame = declare(FrameConfig {
+        ssr: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    assert!(!frame.ids.ssr.unwrap().traced);
+    assert!(!format!("{}", frame.graph).contains("ray_"));
+}
+
 /// A device that cannot trace, or a frame in which nothing does, declares
 /// neither build: the structures cost a frame that traces nothing as much as
 /// one that does.
@@ -2640,6 +2724,7 @@ fn the_occlusion_pyramid_the_cull_reads_is_not_the_one_the_frame_builds() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
         ..occlusion_base()
     })
     .unwrap();
@@ -2712,6 +2797,7 @@ fn occlusion_culling_keeps_the_prepass_alive_on_its_own() {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
         ..occlusion_base()
     })
     .unwrap();
@@ -2757,6 +2843,7 @@ fn occlusion_base() -> FrameConfig {
         screenshot: None,
         ray_tracing: false,
         ray_debug: false,
+        ray_reflections: false,
     }
 }
 

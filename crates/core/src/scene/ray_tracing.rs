@@ -21,6 +21,11 @@ pub struct RayTracingSettings {
     /// metres, measured to the nearest point of its bounds. By distance and
     /// not by the view: a ray is traced toward what the camera does not see.
     pub distance: f32,
+    /// Whether a reflection the screen cannot answer — its ray leaves the
+    /// frame, or passes behind what is in it — is traced against the scene
+    /// instead, and shaded where it lands. Only where screen-space reflections
+    /// are on: this is what they fall back to, before the environment.
+    pub reflections: bool,
     /// A way of looking at the traced scene rather than at the frame, so never
     /// saved with one.
     #[reflect(skip)]
@@ -59,14 +64,21 @@ impl Default for RayTracingSettings {
         Self {
             enabled: true,
             distance: 200.0,
+            reflections: true,
             debug_view: RayDebugView::None,
         }
     }
 }
 
 impl RayTracingSettings {
-    /// Whether this frame traces anything, and so builds anything.
-    pub fn traces(&self) -> bool {
+    /// Whether the traced scene is drawn in place of the frame.
+    pub fn draws_debug_view(&self) -> bool {
         self.enabled && self.debug_view != RayDebugView::None
+    }
+
+    /// Whether reflections fall back to a traced ray, in a frame whose
+    /// screen-space reflections are `ssr`.
+    pub fn traces_reflections(&self, ssr: bool) -> bool {
+        self.enabled && self.reflections && ssr
     }
 }

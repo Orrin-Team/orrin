@@ -9,16 +9,14 @@
 // The normal is the triangle's own, from its three corners in the shared
 // geometry, and that is the point of it: it proves the path every traced pass
 // takes from a hit to a mesh — the instance's row, the mesh's first index, the
-// three positions — and shows a structure built from the wrong span as wrong.
+// three corners — and shows a structure built from the wrong span as wrong.
 
 #include "ray_hit.glsl"
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 out_color;
 
-layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
-
-layout(set = 0, binding = 1) uniform RayDebug {
+layout(set = 0, binding = 0) uniform RayDebug {
     // Without the frame's jitter: this is drawn after the temporal resolve,
     // and nothing would average the jitter back out.
     mat4 inv_view_proj;
@@ -52,8 +50,8 @@ void main() {
     // Every triangle as built: a cutout is its whole quad here, since what
     // this draws is the geometry and not the surface.
     rayQueryEXT query;
-    rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, 0xffu, u.origin.xyz, 0.0, direction,
-                          u.origin.w);
+    rayQueryInitializeEXT(query, ray_scene, gl_RayFlagsOpaqueEXT, 0xffu, u.origin.xyz, 0.0,
+                          direction, u.origin.w);
     while (rayQueryProceedEXT(query)) {
     }
 
@@ -71,13 +69,13 @@ void main() {
     } else if (u.mode.x == VIEW_INSTANCE) {
         color = id_color(uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)));
     } else {
-        vec3 corners[3] = hit_corners(
-            uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)),
+        RayTriangle triangle = ray_triangle(
+            ray_instances[rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)],
             uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true)));
         mat4x3 to_world = rayQueryGetIntersectionObjectToWorldEXT(query, true);
-        vec3 a = to_world * vec4(corners[0], 1.0);
-        vec3 b = to_world * vec4(corners[1], 1.0);
-        vec3 c = to_world * vec4(corners[2], 1.0);
+        vec3 a = to_world * vec4(triangle.position[0], 1.0);
+        vec3 b = to_world * vec4(triangle.position[1], 1.0);
+        vec3 c = to_world * vec4(triangle.position[2], 1.0);
         vec3 normal = normalize(cross(b - a, c - a));
         // Toward the ray, as a surface seen from either side is drawn.
         normal = faceforward(normal, direction, normal);

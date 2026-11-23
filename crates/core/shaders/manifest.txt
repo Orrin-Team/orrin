@@ -62,7 +62,9 @@ skybox_vert vertex skybox.vert
 ssao_frag fragment ssao.frag
 ssao_blur_frag fragment ssao_blur.frag
 ssr_resolve_comp compute ssr_resolve.comp
+ssr_resolve_comp_traced compute ssr_resolve.comp ORRIN_RAY_FALLBACK=1 ORRIN_FLAT_SURFACE=1
 ssr_trace_comp compute ssr_trace.comp
+ssr_trace_comp_traced compute ssr_trace.comp ORRIN_RAY_FALLBACK=1 ORRIN_FLAT_SURFACE=1
 sss_blur_comp compute sss_blur.comp
 sss_composite_comp compute sss_composite.comp
 taa_resolve_comp compute taa_resolve.comp

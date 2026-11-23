@@ -9,9 +9,8 @@ struct Object {
     vec4 model[3];
     vec4 prev_model[3];
     // x = the light channels the object is in: a light lights it, and takes it
-    // as a shadow caster, only if the two masks share a bit. y = its material,
-    // z = its mesh's first index and w = its vertex offset in the shared
-    // geometry, which a ray that hits it reads and a draw is handed.
+    // as a shadow caster, only if the two masks share a bit. The rest is the
+    // row's padding to its own alignment.
     uvec4 flags;
 };
 
