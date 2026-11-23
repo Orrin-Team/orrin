@@ -55,6 +55,7 @@ use crate::gfx::{DrawList, RenderItem, SceneLighting};
 use crate::scene::RayTracingSettings;
 
 use super::forward::{GpuMaterial, GpuMesh, LightBlocks};
+use super::gi::{GI_SET, GiViews};
 
 /// The debug block as the words of its std140 layout: `inv_view_proj`, then
 /// `origin` and `mode`.
@@ -118,13 +119,48 @@ pub(super) struct RayFrame<'a> {
     pub materials: BufferId,
     pub environment: TextureViewId,
     pub environment_sampler: SamplerId,
+    /// The irradiance volumes, or their inert stand-ins.
+    pub gi: GiViews,
+}
+
+/// Which parts of sets 2 and 4 a traced shader reads. A pipeline's layout
+/// holds only the bindings its shader reads, and a set is written for its
+/// layout, so each pass names its part rather than every pass binding all.
+#[derive(Clone, Copy)]
+pub(super) struct RayReads {
+    /// The lighting block, the light tables and the world light grid.
+    pub lights: bool,
+    pub materials: bool,
+    pub environment: bool,
+    /// The vertex stream a hit's normals, tangents and colours are read from.
+    pub surfaces: bool,
+    /// The irradiance volumes, set 4.
+    pub gi: bool,
+}
+
+impl RayReads {
+    /// A shader that runs the whole of `ray_shade`.
+    pub(super) const SHADING: Self = Self {
+        lights: true,
+        materials: true,
+        environment: true,
+        surfaces: true,
+        gi: true,
+    };
 }
 
 impl RayFrame<'_> {
-    /// Bind sets 1 and 2 of `pipeline`, whose shader includes `ray_shade.glsl`.
+    /// Bind sets 1 and 2 of `pipeline`, whose shader includes `ray_shade.glsl`,
+    /// with what `reads` says of set 2, and set 4 where it reads the volumes.
     /// Set 3, the textures, is the pipeline's owner's: it is kept between
     /// frames, and a set belongs to the layout it was made for.
-    pub(super) fn bind(&self, device: &Device, encoder: &mut Encoder, pipeline: PipelineId) {
+    pub(super) fn bind(
+        &self,
+        device: &Device,
+        encoder: &mut Encoder,
+        pipeline: PipelineId,
+        reads: RayReads,
+    ) {
         let pass = self.pass;
         let grid = pass
             .grid_buffers
@@ -138,37 +174,55 @@ impl RayFrame<'_> {
             binding,
             resource: BindingResource::StorageBuffer(buffer),
         };
-        let shading = device.create_transient_bind_group(
-            pipeline,
-            2,
-            &[
-                uniform(0, self.lights.lighting),
-                uniform(1, self.lights.points),
-                uniform(2, self.lights.spots),
-                storage(3, self.materials),
-                Binding {
-                    binding: 4,
-                    resource: BindingResource::Texture(self.environment),
-                },
-                Binding {
-                    binding: 5,
-                    resource: BindingResource::Sampler(self.environment_sampler),
-                },
-                uniform(
-                    6,
-                    pass.grid_header
-                        .expect("a pass shaded a hit before begin_frame"),
-                ),
-                storage(7, grid.cells),
-                storage(8, grid.lights),
-                Binding {
-                    binding: 9,
-                    resource: BindingResource::Geometry(GeometryStream::Surfaces),
-                },
-            ],
-        );
+        let lights = [
+            uniform(0, self.lights.lighting),
+            uniform(1, self.lights.points),
+            uniform(2, self.lights.spots),
+            uniform(
+                6,
+                pass.grid_header
+                    .expect("a pass shaded a hit before begin_frame"),
+            ),
+            storage(7, grid.cells),
+            storage(8, grid.lights),
+        ];
+        let environment = [
+            Binding {
+                binding: 4,
+                resource: BindingResource::Texture(self.environment),
+            },
+            Binding {
+                binding: 5,
+                resource: BindingResource::Sampler(self.environment_sampler),
+            },
+        ];
+        let materials = [storage(3, self.materials)];
+        let surfaces = [Binding {
+            binding: 9,
+            resource: BindingResource::Geometry(GeometryStream::Surfaces),
+        }];
+        let mut bindings = [lights[0]; 10];
+        let mut count = 0;
+        let parts: [(bool, &[Binding]); 4] = [
+            (reads.lights, &lights),
+            (reads.materials, &materials),
+            (reads.environment, &environment),
+            (reads.surfaces, &surfaces),
+        ];
+        for binding in parts
+            .iter()
+            .filter(|(read, _)| *read)
+            .flat_map(|(_, part)| part.iter())
+        {
+            bindings[count] = *binding;
+            count += 1;
+        }
+        let shading = device.create_transient_bind_group(pipeline, 2, &bindings[..count]);
         encoder.bind_group(1, pass.hit_group(device, pipeline));
         encoder.bind_group(2, shading);
+        if reads.gi {
+            encoder.bind_group(GI_SET, self.gi.group(device, pipeline, GI_SET, 0));
+        }
     }
 }
 
@@ -412,7 +466,16 @@ impl RayTracePass {
         );
         encoder.bind_pipeline(path.pipeline);
         encoder.bind_group(0, targets);
-        rays.bind(device, encoder, path.pipeline);
+        // Every bounce is followed, so no hit reads the volumes.
+        rays.bind(
+            device,
+            encoder,
+            path.pipeline,
+            RayReads {
+                gi: false,
+                ..RayReads::SHADING
+            },
+        );
         encoder.bind_group(
             TEXTURE_SET,
             path.textures

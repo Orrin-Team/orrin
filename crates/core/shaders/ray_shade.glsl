@@ -18,6 +18,8 @@
 // - A light's shadow is one ray to it, not a lookup in a map fitted to the
 //   camera's view. To the light's centre, so it is exact and the same every
 //   frame.
+// - The light that bounced to the hit is the irradiance volumes' where they
+//   are live (`gi.glsl`, set 4), and the sky's where they are not.
 //
 // A material is read as its standard reading. The optional lobes — clear coat,
 // sheen, anisotropy, subsurface — fold away, as they do for a flat forward
@@ -26,7 +28,8 @@
 // decals are the rasteriser's alone.
 //
 // The includer enables `GL_EXT_ray_query` and `GL_EXT_nonuniform_qualifier`.
-// Sets 1 to 3 are bound here, alike for every shader that shades a hit.
+// Sets 1 to 4 are bound here, alike for every shader that shades a hit; a
+// shader binds the part of each it reads.
 
 #ifndef ORRIN_RAY_SHADE_GLSL
 #define ORRIN_RAY_SHADE_GLSL
@@ -84,6 +87,14 @@ vec4 sample_tex(uint index, vec2 uv) {
 #include "lobes.glsl"
 #include "brdf.glsl"
 #include "ambient.glsl"
+
+#define ORRIN_GI_SET 4
+#define ORRIN_GI_BLOCK_BINDING 0
+#define ORRIN_GI_PROBES_BINDING 1
+#define ORRIN_GI_IRRADIANCE_BINDING 2
+#define ORRIN_GI_DISTANCE_BINDING 3
+#define ORRIN_GI_SAMPLER_BINDING 4
+#include "gi.glsl"
 
 // How far a ray goes when nothing says otherwise: past everything the scene's
 // structure holds.
@@ -293,9 +304,37 @@ RaySurface ray_surface(RayHit hit, vec3 direction, float spread) {
     return found;
 }
 
+// Whether a ray met the back of what it hit: the side the triangle's vertex
+// normals turn away from, which for a closed mesh is its inside. A cutout is
+// a sheet with no inside, so never.
+bool ray_back_face(RayHit hit, vec3 direction) {
+    uvec4 instance = ray_instances[hit.instance];
+    if ((ray_materials[instance.x].tex_flags.y & MATERIAL_MASKED) != 0u) {
+        return false;
+    }
+    RayTriangle triangle = ray_triangle(instance, hit.primitive);
+    vec3 w = ray_weights(hit.barycentrics);
+    vec3 normal = vec3(0.0);
+    for (int i = 0; i < 3; ++i) {
+        uint n = ray_surface_words[triangle.vertex[i] * SURFACE_WORDS];
+        normal += oct_decode(vec2(snorm16_low(n), snorm16_high(n))) * w[i];
+    }
+    return dot(normal * mat3(hit.from_world), direction) > 0.0;
+}
+
+// One light's contribution: the whole of the material's response, or only
+// its diffuse lobe — what a surface sends every way alike, which is all a
+// cache of radiance shared between directions can hold.
+vec3 ray_light(Surface s, vec3 L, vec3 radiance, bool diffuse_only) {
+    if (diffuse_only) {
+        return s.albedo * (1.0 - s.metallic) / PI * radiance * max(dot(s.N, L), 0.0);
+    }
+    return brdf(s, L, radiance, 1.0, 0.0).direct;
+}
+
 // What the sun and the punctual lights lay on a surface and it sends back
 // along the ray, each light shadowed by one ray to it.
-vec3 ray_direct(RaySurface found) {
+vec3 ray_lights(RaySurface found, bool diffuse_only) {
     Surface s = found.s;
     vec3 position = found.position;
     vec3 face = found.face;
@@ -306,7 +345,7 @@ vec3 ray_direct(RaySurface found) {
     if (lighting.sun_color.w > 0.0 && (floatBitsToUint(lighting.sun_direction.w) & channels) != 0u) {
         vec3 L = lighting.sun_direction.xyz;
         if (dot(s.N, L) > 0.0 && dot(face, L) > 0.0 && !ray_occluded(lifted, L, RAY_FAR)) {
-            radiance += brdf(s, L, lighting.sun_color.rgb * lighting.sun_color.w, 1.0, 0.0).direct;
+            radiance += ray_light(s, L, lighting.sun_color.rgb * lighting.sun_color.w, diffuse_only);
         }
     }
 
@@ -329,7 +368,7 @@ vec3 ray_direct(RaySurface found) {
         if (light.shadow.x > LIGHT_CASTS_NONE && ray_occluded(lifted, L, dist)) {
             continue;
         }
-        radiance += brdf(s, L, light.color.rgb * light.color.w * falloff, 1.0, 0.0).direct;
+        radiance += ray_light(s, L, light.color.rgb * light.color.w * falloff, diffuse_only);
     }
     for (uint k = 0u; k < cell.z; ++k) {
         SpotLight light = spot_lights[light_grid_lights[cell.x + cell.y + k]];
@@ -346,17 +385,41 @@ vec3 ray_direct(RaySurface found) {
         if (light.params.y > LIGHT_CASTS_NONE && ray_occluded(lifted, L, dist)) {
             continue;
         }
-        radiance += brdf(s, L, light.color.rgb * light.color.w * falloff, 1.0, 0.0).direct;
+        radiance += ray_light(s, L, light.color.rgb * light.color.w * falloff, diffuse_only);
     }
     return radiance;
 }
 
-// The sky on a surface, as a fragment takes it but for the screen-space
-// occlusion a hit has none of.
+vec3 ray_direct(RaySurface found) {
+    return ray_lights(found, false);
+}
+
+// What reaches a surface from everything but the lights, in the unit
+// `sh_irradiance` returns: the irradiance volumes where they are live, the
+// sky where they are not or run out. `reflection` is what the environment's
+// reflection is scaled by for it — see `gi_reflection_scale`.
+vec3 ray_irradiance(vec3 P, vec3 N, vec3 V, out float reflection) {
+    vec3 sky = sh_irradiance(N);
+    reflection = 1.0;
+    if (!gi_live()) {
+        return sky;
+    }
+    vec4 local = gi_irradiance(P, N, V);
+    vec3 irradiance = local.rgb + sky * (1.0 - local.a);
+    if (gi.camera.w > 0.5) {
+        reflection = gi_reflection_scale(irradiance, sky);
+    }
+    return irradiance;
+}
+
+// The light that bounced to a surface, as a fragment takes it but for the
+// screen-space occlusion a hit has none of.
 vec3 ray_ambient(RaySurface found) {
     Surface s = found.s;
-    return sh_irradiance(s.N) * s.albedo * (1.0 - s.metallic)
-         + specular_ibl(s.N, s.V, s.f0, s.perceptual_roughness, s.energy);
+    float reflection;
+    vec3 irradiance = ray_irradiance(found.position, s.N, s.V, reflection);
+    return irradiance * s.albedo * (1.0 - s.metallic)
+         + specular_ibl(s.N, s.V, s.f0, s.perceptual_roughness, s.energy * reflection);
 }
 
 // Radiance leaving `hit` back along the ray, in cd/m2: what it emits, what

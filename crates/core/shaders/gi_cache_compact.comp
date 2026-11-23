@@ -1,0 +1,62 @@
+#version 460
+
+// One look at every cell of the world radiance cache. A cell the trace used
+// this frame goes on the list the shading pass is dispatched over; one unused
+// for longer than its lifetime is emptied, which is how the table follows
+// the camera without being rebuilt; and every other live cell carries its
+// light into this frame's half of the pair, which the shading pass then
+// writes only for the cells on the list.
+//
+// The dispatch is counted as the list grows, one workgroup for every 64th
+// entry, so the shading pass needs no pass between to size it.
+
+layout(local_size_x = 64) in;
+
+#define ORRIN_GI_SET 0
+#define ORRIN_GI_BLOCK_BINDING 0
+#define ORRIN_GI_PROBES_BINDING 6
+#include "gi.glsl"
+#include "gi_cache.glsl"
+
+layout(set = 0, binding = 1, std430) buffer GiCells {
+    GiCell gi_cells[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer GiRadianceHistory {
+    uvec2 gi_radiance_history[];
+};
+layout(set = 0, binding = 3, std430) writeonly buffer GiRadiance {
+    uvec2 gi_radiance[];
+};
+layout(set = 0, binding = 4, std430) buffer GiList {
+    uint gi_list_count;
+    uint gi_list[];
+};
+layout(set = 0, binding = 5, std430) buffer GiArgs {
+    uvec4 gi_args;
+};
+
+// Keep in sync with SHADE_GROUP in gfx/vulkan/gi.rs.
+const uint SHADE_GROUP = 64u;
+
+void main() {
+    uint cell = gl_GlobalInvocationID.x;
+    if (cell > gi.frame.w) {
+        return;
+    }
+    GiCell held = gi_cells[cell];
+    if (held.checksum == 0u) {
+        return;
+    }
+    uint age = gi.frame.x - held.used;
+    if (age == 0u) {
+        uint at = atomicAdd(gi_list_count, 1u);
+        gi_list[at] = cell;
+        if (at % SHADE_GROUP == 0u) {
+            atomicAdd(gi_args.x, 1u);
+        }
+    } else if (age > gi.frame.y) {
+        gi_cells[cell] = GiCell(0u, 0u, GI_NO_CELL, 0u);
+    } else {
+        gi_radiance[cell] = gi_radiance_history[cell];
+    }
+}

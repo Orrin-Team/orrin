@@ -23,6 +23,10 @@ forward_frag_alpha_test_flat fragment forward.frag ORRIN_ALPHA_TEST=1 ORRIN_FLAT
 forward_sss_frag_flat fragment forward_sss.frag ORRIN_FLAT_SURFACE=1
 forward_sss_frag_alpha_test_flat fragment forward_sss.frag ORRIN_ALPHA_TEST=1 ORRIN_FLAT_SURFACE=1
 fullscreen_vert vertex fullscreen.vert
+gi_cache_compact_comp compute gi_cache_compact.comp
+gi_cache_shade_comp compute gi_cache_shade.comp ORRIN_FLAT_SURFACE=1
+gi_trace_comp compute gi_trace.comp ORRIN_FLAT_SURFACE=1
+gi_update_comp compute gi_update.comp
 gizmo_frag fragment gizmo.frag
 gizmo_vert vertex gizmo.vert
 hiz_build_comp compute hiz_build.comp

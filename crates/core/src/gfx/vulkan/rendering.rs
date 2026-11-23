@@ -402,7 +402,11 @@ pub(super) fn rendering_info(
         | PassBody::Cull
         | PassBody::RayMeshes
         | PassBody::RayScene
-        | PassBody::PathTrace => return None,
+        | PassBody::PathTrace
+        | PassBody::GiTrace
+        | PassBody::GiCacheCompact
+        | PassBody::GiUpdate
+        | PassBody::GiCacheShade => return None,
     })
 }
 

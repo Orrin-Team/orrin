@@ -30,7 +30,7 @@ use orrin_registry::Reflect;
 
 use super::{
     AmbientLight, BloomSettings, ContactShadowSettings, DecalSettings, DofSettings,
-    EnvironmentSettings, FogSettings, HdrSettings, LoadedScenes, MotionBlurSettings,
+    EnvironmentSettings, FogSettings, GiSettings, HdrSettings, LoadedScenes, MotionBlurSettings,
     RayTracingSettings, RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings,
     SubsurfaceSettings, TaaSettings, TransparencySettings,
 };
@@ -58,6 +58,8 @@ pub struct RenderSettings {
     pub fog: FogSettings,
     #[reflect(default)]
     pub ray_tracing: RayTracingSettings,
+    #[reflect(default)]
+    pub gi: GiSettings,
 }
 
 /// What the resources held before a scene's settings replaced them. Present
@@ -128,6 +130,7 @@ pub fn capture(world: &World) -> RenderSettings {
         dof: *world.resource(),
         fog: *world.resource(),
         ray_tracing: *world.resource(),
+        gi: *world.resource(),
     }
 }
 
@@ -152,6 +155,7 @@ fn apply(world: &World, settings: &RenderSettings) {
         dof,
         fog,
         ray_tracing,
+        gi,
     } = settings;
     *world.resource_mut() = *ambient;
     *world.resource_mut() = *exposure;
@@ -172,6 +176,12 @@ fn apply(world: &World, settings: &RenderSettings) {
     *live = RayTracingSettings {
         debug_view: live.debug_view,
         ..*ray_tracing
+    };
+
+    let mut live = world.resource_mut::<GiSettings>();
+    *live = GiSettings {
+        debug_view: live.debug_view,
+        ..*gi
     };
 
     let mut live = world.resource_mut::<ShadowSettings>();

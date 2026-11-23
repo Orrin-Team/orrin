@@ -1,0 +1,244 @@
+#version 460
+
+// One workgroup per probe of the grid this frame updates, one invocation per
+// texel of its tile, border included. The probe's rays are read once into
+// shared memory — a hit's light out of the world radiance cache, a miss's out
+// of the sky — and each texel sums them by how far each faces it: the cosine
+// for the irradiance, a much sharper lobe for the distance and its square, so
+// a texel's distance is what lies along its own direction (Majercik et al.
+// 2019). A border texel stands for the interior texel across the octahedron's
+// fold and computes exactly what that one does, so the bilinear fetch at a
+// tile's edge needs no second pass to copy them.
+//
+// The new value is blended into the probe's history: for its first updates as
+// a plain running mean, so a probe that has just come into a grid is usable
+// at once and grows exact as the updates come in; after that with a fixed
+// fraction kept, and much less kept when this update's rays say something
+// sharply different from what the probe holds, so a light switched on or off
+// arrives in a few updates rather than over seconds.
+//
+// A probe that sees the backs of surfaces is inside something. It is moved
+// through the nearest back it saw, within its own cell, and left out of the
+// lookup until an update finds it outside (Majercik et al. 2021).
+
+layout(local_size_x = 10, local_size_y = 10) in;
+
+#define ORRIN_GI_SET 0
+#define ORRIN_GI_BLOCK_BINDING 0
+#define ORRIN_GI_PROBES_BINDING 1
+#define ORRIN_GI_PROBES_WRITE
+#include "gi.glsl"
+#include "gi_cache.glsl"
+
+layout(set = 0, binding = 2, std430) readonly buffer GiRays {
+    GiRay gi_rays[];
+};
+layout(set = 0, binding = 3, std430) readonly buffer GiRadianceHistory {
+    uvec2 gi_radiance_history[];
+};
+layout(set = 0, binding = 4, rgba16f) uniform image2D u_irradiance;
+layout(set = 0, binding = 5, rgba16f) uniform image2D u_distance;
+
+// Keep in sync with MAX_RAYS in gfx/probes.rs.
+const uint MAX_RAYS = 64u;
+const uint TEXELS = uint(GI_TILE_BORDER * GI_TILE_BORDER);
+// How far a probe's distances reach, in its own spacings: past the far
+// corner of every cell it shares with a neighbour, so a ray that leaves the
+// scene counts as seeing that far and no further.
+const float REACH = 2.6;
+// How sharply a texel's distance follows the rays nearest its direction.
+const float SHARPNESS = 50.0;
+// A back is recorded at a fifth of its distance, so a probe inside a wall
+// reads as seeing nothing in that direction rather than the wall's far side.
+const float BACK_DISTANCE = 0.2;
+// A probe is inside something when more than this share of its rays see backs.
+const float INSIDE = 0.25;
+// The nearest a probe may stand to a surface it sees the front of, and the
+// furthest from its grid position, in spacings: inside its own cell, so the
+// trilinear weights it is read with still mean something.
+const float NEAREST = 0.1;
+const float MAX_OFFSET = 0.45;
+// How much of its history a probe keeps when its rays say something sharply
+// different — a change of more than `SWITCHED` of the brighter of the two
+// means — and how many updates it averages before keeping a fixed fraction.
+const float SWITCHED_KEEP = 0.2;
+const float SWITCHED = 0.4;
+const uint MAX_COUNT = 15u;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+// xyz = the ray's direction, w = how far it saw, in spacings.
+shared vec4 s_ray[MAX_RAYS];
+// rgb = the light it brought back, a = 1 where that is known.
+shared vec4 s_light[MAX_RAYS];
+shared uint s_kind[MAX_RAYS];
+// Each texel's luminance as the probe held it, for the switch test.
+shared float s_held[TEXELS];
+shared uint s_switched;
+shared uvec4 s_state;
+
+void main() {
+    uint probe = gl_WorkGroupID.x;
+    uint n = gi.grid.x;
+    uint rays = gi.grid.y;
+    int level = int(gi.grid.w);
+    uvec3 slot = uvec3(probe % n, (probe / n) % n, probe / (n * n));
+    ivec3 world = gi_world_of(level, slot);
+    uint row = gi_probe_index(level, slot);
+    uvec4 state = gi_probes[row];
+    bool fresh = !gi_owned(state, world) || gi_count(state) == 0u;
+    uint count = fresh ? 0u : gi_count(state);
+
+    uint t = gl_LocalInvocationIndex;
+    ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    ivec2 texel = ivec2(gi_tile(level, slot)) + local;
+    vec4 held = imageLoad(u_irradiance, texel);
+    vec4 held_distance = imageLoad(u_distance, texel);
+    bool interior = all(greaterThanEqual(local, ivec2(1))) && all(lessThanEqual(local, ivec2(GI_TILE)));
+    s_held[t] = interior && !fresh ? dot(held.rgb, LUMA) : 0.0;
+
+    if (t < rays) {
+        GiRay ray = gi_rays[probe * rays + t];
+        vec3 direction = gi_ray_direction(t, rays);
+        vec3 light = vec3(0.0);
+        float known = 1.0;
+        float seen = REACH;
+        if (ray.meta.y == GI_MISS) {
+            light = gi_sky(direction);
+        } else {
+            seen = min(ray.hit.w / gi_spacing(level), REACH);
+            if (ray.meta.y == GI_FRONT) {
+                uvec2 packed = ray.meta.x == GI_NO_CELL ? uvec2(0u) : gi_radiance_history[ray.meta.x];
+                vec2 blue = unpackHalf2x16(packed.y);
+                if (blue.y > 0.0) {
+                    light = vec3(unpackHalf2x16(packed.x), blue.x);
+                } else {
+                    known = 0.0;
+                }
+            }
+        }
+        s_ray[t] = vec4(direction, seen);
+        s_light[t] = vec4(light, known);
+        s_kind[t] = ray.meta.y;
+    }
+    barrier();
+
+    if (t == 0u) {
+        float now = 0.0;
+        uint known = 0u;
+        uint backs = 0u;
+        float nearest_back = REACH;
+        vec3 back_direction = vec3(0.0);
+        float nearest_front = REACH;
+        vec3 front_direction = vec3(0.0);
+        float farthest_front = 0.0;
+        vec3 far_direction = vec3(0.0);
+        for (uint i = 0u; i < rays; ++i) {
+            if (s_light[i].a > 0.0) {
+                now += dot(s_light[i].rgb, LUMA);
+                known += 1u;
+            }
+            float seen = s_ray[i].w;
+            if (s_kind[i] == GI_BACK) {
+                backs += 1u;
+                if (seen < nearest_back) {
+                    nearest_back = seen;
+                    back_direction = s_ray[i].xyz;
+                }
+            } else if (s_kind[i] == GI_FRONT) {
+                if (seen < nearest_front) {
+                    nearest_front = seen;
+                    front_direction = s_ray[i].xyz;
+                }
+                if (seen > farthest_front) {
+                    farthest_front = seen;
+                    far_direction = s_ray[i].xyz;
+                }
+            }
+        }
+        float before = 0.0;
+        for (uint i = 0u; i < TEXELS; ++i) {
+            before += s_held[i];
+        }
+        before /= float(GI_TILE * GI_TILE);
+        now = known > 0u ? now / float(known) : 0.0;
+        s_switched = count > 0u && known > 0u
+                && abs(now - before) > SWITCHED * max(max(now, before), 1e-4) ? 1u : 0u;
+
+        // In spacings until it is stored.
+        float s = gi_spacing(level);
+        vec3 offset = fresh ? vec3(0.0) : gi_offset(state) / s;
+        vec3 moved = offset;
+        bool inside = float(backs) > INSIDE * float(rays);
+        if (inside) {
+            moved += back_direction * (nearest_back + NEAREST * 0.5);
+        } else if (nearest_front < NEAREST) {
+            // Away from the nearest front, toward the most open direction,
+            // unless that would be through the front itself.
+            if (dot(front_direction, far_direction) <= 0.0) {
+                moved += far_direction * min(farthest_front, 1.0) * 0.5;
+            }
+        } else if (dot(offset, offset) > 0.0) {
+            // Clear of everything, so back toward the grid position as far
+            // as the nearest front allows.
+            float back = min(nearest_front - NEAREST, length(offset));
+            moved -= normalize(offset) * back;
+        }
+        if (all(lessThanEqual(abs(moved), vec3(MAX_OFFSET)))) {
+            offset = moved;
+        }
+        uint updates = min(count + (known > 0u ? 1u : 0u), MAX_COUNT);
+        s_state = uvec4(floatBitsToUint(offset * s),
+                        gi_stamp(world) | (inside ? 0u : GI_ACTIVE) | (updates << GI_COUNT_SHIFT));
+    }
+    barrier();
+
+    // The direction this texel stands for. A border texel is folded across
+    // the octahedron's edge onto the interior texel it borders, so it comes
+    // out to exactly that texel's value.
+    vec2 oct = (vec2(local) - 0.5) / float(GI_TILE) * 2.0 - 1.0;
+    if (abs(oct.x) > 1.0) {
+        oct.x = sign(oct.x) * 2.0 - oct.x;
+        oct.y = -oct.y;
+    }
+    if (abs(oct.y) > 1.0) {
+        oct.y = sign(oct.y) * 2.0 - oct.y;
+        oct.x = -oct.x;
+    }
+    vec3 facing = oct_decode(oct);
+
+    vec3 irradiance = vec3(0.0);
+    float weight = 0.0;
+    vec2 moments = vec2(0.0);
+    float moment_weight = 0.0;
+    for (uint i = 0u; i < rays; ++i) {
+        vec4 ray = s_ray[i];
+        vec4 light = s_light[i];
+        float cosine = max(dot(facing, ray.xyz), 0.0);
+        if (light.a > 0.0) {
+            irradiance += light.rgb * cosine;
+            weight += cosine;
+        }
+        float seen = s_kind[i] == GI_BACK ? ray.w * BACK_DISTANCE : ray.w;
+        float w = pow(cosine, SHARPNESS);
+        moments += vec2(seen, seen * seen) * w;
+        moment_weight += w;
+    }
+
+    float keep = count == 0u ? 0.0 : min(gi.params.x, float(count) / float(count + 1u));
+    vec3 result = fresh ? vec3(0.0) : held.rgb;
+    if (weight > 1e-4) {
+        float hold = s_switched != 0u ? min(keep, SWITCHED_KEEP) : keep;
+        result = mix(irradiance / weight, held.rgb, hold);
+    }
+    vec2 distance = fresh ? vec2(REACH, REACH * REACH) : held_distance.rg;
+    if (moment_weight > 1e-6) {
+        distance = mix(moments / moment_weight, held_distance.rg, keep);
+    }
+    imageStore(u_irradiance, texel, vec4(result, 1.0));
+    imageStore(u_distance, texel, vec4(distance, 0.0, 1.0));
+
+    if (t == 0u) {
+        gi_probes[row] = s_state;
+    }
+}

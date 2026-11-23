@@ -14,6 +14,7 @@ pub mod entities;
 pub mod entity_ref;
 mod environment;
 mod fog;
+mod gi;
 mod hdr;
 mod hierarchy;
 pub mod input;
@@ -61,6 +62,7 @@ pub use dof::DofSettings;
 pub use editor_hidden::EditorHidden;
 pub use environment::{EnvironmentSettings, Hdri, HdriError, load_hdri, sky_pixels};
 pub use fog::FogSettings;
+pub use gi::{GiDebugView, GiSettings};
 pub use hdr::HdrSettings;
 pub use hierarchy::{
     Hierarchy, HierarchyError, can_reparent, despawn_recursive, ensure_current, is_transform_root,

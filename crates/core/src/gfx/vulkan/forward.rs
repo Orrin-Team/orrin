@@ -13,6 +13,7 @@ use crate::gfx::{
 use crate::scene::{Camera, EnvironmentSettings};
 
 use super::cull::{Draws, Surface};
+use super::gi::GiViews;
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::surface::{Surfaces, Twin};
 use super::swapchain::DEPTH_FORMAT;
@@ -623,6 +624,7 @@ struct SurfaceSet {
     fog_volume: TextureViewId,
     fog_sampler: SamplerId,
     fog: BufferId,
+    gi: GiViews,
 }
 
 /// The views a frame binds when a term has nothing to say — white occlusion,
@@ -635,6 +637,7 @@ pub(super) struct NeutralViews {
     pub env_sampler: SamplerId,
     pub fog_volume: TextureViewId,
     pub fog_sampler: SamplerId,
+    pub gi: GiViews,
 }
 
 /// The blocks a frame binds when there is nothing to light with — no punctual
@@ -1203,6 +1206,7 @@ impl ForwardPass {
         fog: BufferId,
         fog_volume: TextureViewId,
         fog_sampler: SamplerId,
+        gi: GiViews,
         surface_time: f32,
     ) -> ForwardSets {
         // Both halves fall back to the scene's flat ambient when nothing is
@@ -1282,6 +1286,7 @@ impl ForwardPass {
                 fog_volume,
                 fog_sampler,
                 fog,
+                gi,
             },
             material_set,
             texture_set,
@@ -1354,6 +1359,7 @@ impl ForwardPass {
             binding,
             resource: BindingResource::Texture(view),
         };
+        let [gi_block, gi_probes, gi_irradiance, gi_distance, gi_sampler] = set3.gi.bindings(9);
         let ao_set = device.create_transient_bind_group(
             self.single.plain,
             3,
@@ -1386,6 +1392,13 @@ impl ForwardPass {
                     binding: 8,
                     resource: BindingResource::UniformBuffer(set3.fog),
                 },
+                // The irradiance volumes, or their inert stand-ins, for the
+                // reason the fog is bound either way.
+                gi_block,
+                gi_probes,
+                gi_irradiance,
+                gi_distance,
+                gi_sampler,
             ],
         );
 
@@ -1467,6 +1480,7 @@ impl ForwardPass {
                 fog_volume: neutral.fog_volume,
                 fog_sampler: neutral.fog_sampler,
                 fog: blocks.fog,
+                gi: neutral.gi,
             },
             material_set,
             texture_set,

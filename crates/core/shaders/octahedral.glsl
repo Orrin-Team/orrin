@@ -2,6 +2,8 @@
 // in: the sphere folded onto the octahedron, then the octahedron's lower half
 // folded out onto the corners of the square. The inverse of `oct_encode` in
 // `gfx/mod.rs`, and mirrored there by `shader_oct_decode`.
+#ifndef ORRIN_OCTAHEDRAL_GLSL
+#define ORRIN_OCTAHEDRAL_GLSL
 vec3 oct_decode(vec2 e) {
     vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
     float t = max(-n.z, 0.0);
@@ -9,3 +11,4 @@ vec3 oct_decode(vec2 e) {
     n.y += n.y >= 0.0 ? -t : t;
     return normalize(n);
 }
+#endif

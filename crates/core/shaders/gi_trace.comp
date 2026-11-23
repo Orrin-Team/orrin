@@ -1,0 +1,106 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// Every probe of the grid this frame updates traces its fixed set of rays,
+// turned by this frame's rotation, and asks only what each one met and how
+// far away. Nothing is shaded here: a ray that lands on a surface files the
+// hit in the world radiance cache and leaves the cell's number for the update,
+// which reads the light there once the cache has it.
+//
+// A hit on the back of a surface is told apart, because a probe that sees
+// backs is inside something and the update moves it or switches it off.
+
+layout(local_size_x = 64) in;
+
+#include "ray_shade.glsl"
+#include "gi_cache.glsl"
+
+layout(set = 0, binding = 0, std430) writeonly buffer GiRays {
+    GiRay gi_rays[];
+};
+layout(set = 0, binding = 1, std430) buffer GiCells {
+    GiCell gi_cells[];
+};
+// Last frame's light in each cell, as the update reads it: the trace marks
+// a cell it has just claimed as holding none yet.
+layout(set = 0, binding = 2, std430) writeonly buffer GiRadianceHistory {
+    uvec2 gi_radiance_history[];
+};
+// The list of cells to shade, and its dispatch: emptied here, before the pass
+// that fills them.
+layout(set = 0, binding = 3, std430) buffer GiList {
+    uint gi_list_count;
+    uint gi_list[];
+};
+layout(set = 0, binding = 4, std430) buffer GiArgs {
+    uvec4 gi_args;
+};
+
+// The cell a front-facing hit is filed under, claimed if it is new, and
+// marked used this frame by `ray` — the lowest-numbered ray that used it is
+// what the cache shades it from, so which ray that is does not depend on the
+// order the rays ran in.
+uint gi_cache_insert(vec3 P, vec3 N, float reach, uint ray) {
+    uvec2 key = gi_cell_key(P, N, reach, gi.camera.xyz, gi.params.y);
+    uint checksum = gi_cell_checksum(key);
+    uint mask = gi.frame.w;
+    uint home = gi_cell_home(key, mask);
+    for (uint i = 0u; i < GI_CACHE_PROBES; ++i) {
+        uint cell = (home + i) & mask;
+        uint held = atomicCompSwap(gi_cells[cell].checksum, 0u, checksum);
+        if (held == 0u || held == checksum) {
+            if (held == 0u) {
+                gi_radiance_history[cell] = uvec2(0u);
+            }
+            gi_cells[cell].used = gi.frame.x;
+            atomicMin(gi_cells[cell].representative, ray);
+            return cell;
+        }
+    }
+    return GI_NO_CELL;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index == 0u) {
+        gi_list_count = 0u;
+        gi_args = uvec4(0u, 1u, 1u, 0u);
+    }
+    uint n = gi.grid.x;
+    uint rays = gi.grid.y;
+    if (index >= n * n * n * rays) {
+        return;
+    }
+    uint probe = index / rays;
+    uint ray = index - probe * rays;
+    int level = int(gi.grid.w);
+    uvec3 slot = uvec3(probe % n, (probe / n) % n, probe / (n * n));
+    ivec3 world = gi_world_of(level, slot);
+    uvec4 state = gi_probes[gi_probe_index(level, slot)];
+    vec3 origin = vec3(world) * gi_spacing(level)
+                + (gi_owned(state, world) ? gi_offset(state) : vec3(0.0));
+    vec3 direction = gi_ray_direction(ray, rays);
+
+    GiRay record;
+    record.hit = vec4(0.0);
+    record.meta = uvec4(GI_NO_CELL, GI_MISS, 0u, 0u);
+    RayHit hit = ray_closest(origin, direction, 0.0, RAY_FAR);
+    if (hit.found) {
+        vec3 P = origin + direction * hit.distance;
+        record.hit = vec4(P, hit.distance);
+        if (ray_back_face(hit, direction)) {
+            record.meta.y = GI_BACK;
+        } else {
+            uvec4 instance = ray_instances[hit.instance];
+            RayTriangle triangle = ray_triangle(instance, hit.primitive);
+            vec3 a = hit.to_world * vec4(triangle.position[0], 1.0);
+            vec3 b = hit.to_world * vec4(triangle.position[1], 1.0);
+            vec3 c = hit.to_world * vec4(triangle.position[2], 1.0);
+            vec3 face = normalize(cross(b - a, c - a));
+            face *= dot(face, direction) > 0.0 ? -1.0 : 1.0;
+            record.meta = uvec4(gi_cache_insert(P, face, hit.distance, index), GI_FRONT, 0u, 0u);
+        }
+    }
+    gi_rays[index] = record;
+}

@@ -212,6 +212,17 @@ layout(push_constant) uniform Push {
 const float SPEC_AA_SIGMA2 = 0.25;
 #include "ambient.glsl"
 
+// The irradiance volumes, which stand in for the environment's diffuse
+// series wherever they are live. Bound in every frame, as inert stand-ins
+// where they are not, so there is one pipeline rather than two.
+#define ORRIN_GI_SET 3
+#define ORRIN_GI_BLOCK_BINDING 9
+#define ORRIN_GI_PROBES_BINDING 10
+#define ORRIN_GI_IRRADIANCE_BINDING 11
+#define ORRIN_GI_DISTANCE_BINDING 12
+#define ORRIN_GI_SAMPLER_BINDING 13
+#include "gi.glsl"
+
 // Clamping threshold, from Kaplanyan et al. 2016.
 const float SPEC_AA_KAPPA = 0.18;
 
@@ -814,11 +825,39 @@ Shaded shade_surface() {
     // back out of it by the same physics a lamp's does, and leaving it behind
     // here would diffuse a face under a lamp and not the same face under an
     // overcast sky.
-    vec3 diffuse_ibl = sh_irradiance(s.N) * s.albedo * (1.0 - s.metallic) * ao;
+    //
+    // The irradiance is the volumes' where they are live, which is light that
+    // bounced as well as the sky's, and where they run out the sky's alone.
+    // The volumes then also say how much less of the sky's light arrives here
+    // than the sky alone would give, and the environment's reflections are
+    // scaled by that, so a dark room's speculars stop glowing with sky.
+    vec3 irradiance = sh_irradiance(s.N);
+    float reflection = 1.0;
+    if (gi_live()) {
+        vec3 sky = irradiance;
+        vec4 local = gi_irradiance(v_world_pos, s.N, s.V);
+        irradiance = local.rgb + sky * (1.0 - local.a);
+        if (gi.camera.w > 0.5) {
+            reflection = gi_reflection_scale(irradiance, sky);
+        }
+    }
+    // The volumes' debug view: the irradiance alone, on white.
+    if (gi.frame.z == 1u) {
+        Shaded shown;
+        shown.color = irradiance;
+        shown.diffusible = vec3(0.0);
+        shown.scatter = 0.0;
+        shown.alpha = alpha;
+        return shown;
+    }
+    vec3 diffuse_ibl = irradiance * s.albedo * (1.0 - s.metallic) * ao;
     vec3 color = scatters ? vec3(0.0) : diffuse_ibl;
     vec3 diffusible = scatters ? diffuse_ibl : vec3(0.0);
+    // The scale goes in with the energy term rather than over the result: the
+    // compiler then builds the product it always did, and a frame with the
+    // volumes off comes out the same to the bit.
     color += specular_ibl_along(
-        ibl_reflection(s), s.n_dot_v, s.f0, s.perceptual_roughness, s.energy
+        ibl_reflection(s), s.n_dot_v, s.f0, s.perceptual_roughness, s.energy * reflection
     ) * ao;
 
     // The fibres' own environment response. Sampled through the same split-sum
@@ -828,7 +867,7 @@ Shaded shade_surface() {
     if ((s.flags & MATERIAL_SHEEN) != 0u) {
         color += specular_ibl_along(
             reflect(-s.V, s.N), s.n_dot_v, s.sheen_color, s.sheen_a, vec3(1.0)
-        ) * ao;
+        ) * reflection * ao;
     }
 
     // The coat's environment reflection, and the same `1 - Fc` attenuation of
@@ -848,7 +887,7 @@ Shaded shade_surface() {
         diffusible *= 1.0 - Fc;
         color += specular_ibl_along(
             reflect(-s.V, s.coat_N), coat_n_dot_v, vec3(0.04), s.coat_roughness, vec3(1.0)
-        ) * s.coat * ao;
+        ) * s.coat * reflection * ao;
     }
 
     // Directional sun, shadowed by the cascades and the screen-space march.

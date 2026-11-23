@@ -85,6 +85,13 @@ pub struct CaptureSettings {
     /// reflection of what the screen does not hold — and is the frame every
     /// device that cannot trace draws.
     pub ray_tracing: bool,
+    /// Whether the irradiance volumes light the frame. Off by default, so
+    /// every capture taken before they existed is the frame it was; on is the
+    /// other half of the A/B for everything they change. Needs `ray_tracing`,
+    /// and a device that traces.
+    pub gi: bool,
+    /// Which of the volumes' debug views the frame is drawn through.
+    pub gi_debug: crate::scene::GiDebugView,
     /// The sun's angular diameter in degrees, or `None` for the default. Zero
     /// is the other half of an A/B: every edge at one width, whatever cast it.
     pub sun_angle: Option<f32>,
@@ -171,6 +178,8 @@ impl Default for CaptureSettings {
             shadow_debug: ShadowDebugView::None,
             ray_debug: crate::scene::RayDebugView::None,
             ray_tracing: true,
+            gi: false,
+            gi_debug: crate::scene::GiDebugView::None,
             sun_angle: None,
             ssr: false,
             dof: false,
@@ -370,6 +379,11 @@ pub fn render(
     renderer.set_ray_tracing(crate::scene::RayTracingSettings {
         enabled: settings.ray_tracing,
         debug_view: settings.ray_debug,
+        ..Default::default()
+    });
+    renderer.set_gi(crate::scene::GiSettings {
+        enabled: settings.gi,
+        debug_view: settings.gi_debug,
         ..Default::default()
     });
     for _ in 0..settings.frames.max(1) {

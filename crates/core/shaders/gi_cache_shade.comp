@@ -1,0 +1,77 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// The cells of the world radiance cache the probe rays used this frame, each
+// shaded once by the hit shading every traced pass runs, however many rays
+// landed in it. Dispatched over the list the compaction counted.
+//
+// A cell is shaded where the lowest-numbered ray that used it landed: that
+// ray is traced again over the last few centimetres to recover the surface,
+// and the radiance it sends every way alike is stored — what it emits, the
+// diffuse lobe of what each light lays on it, and the light that bounced to
+// it out of the irradiance volumes, which is how one bounce becomes many.
+// Only the diffuse lobe, because a cell is read by rays arriving from every
+// direction and a reflection belongs to one of them.
+//
+// Written into this frame's half of the pair, which the update reads next
+// frame: the volumes this reads were written by this frame's update, so the
+// light they hold reaches the probes one update later.
+
+layout(local_size_x = 64) in;
+
+#include "ray_shade.glsl"
+#include "gi_cache.glsl"
+
+layout(set = 0, binding = 0, std430) buffer GiCells {
+    GiCell gi_cells[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer GiRays {
+    GiRay gi_rays[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer GiRadiance {
+    uvec2 gi_radiance[];
+};
+layout(set = 0, binding = 3, std430) readonly buffer GiList {
+    uint gi_list_count;
+    uint gi_list[];
+};
+
+void main() {
+    uint at = gl_GlobalInvocationID.x;
+    if (at >= gi_list_count) {
+        return;
+    }
+    uint cell = gi_list[at];
+    uint ray = gi_cells[cell].representative;
+    gi_cells[cell].representative = GI_NO_CELL;
+    gi_radiance[cell] = uvec2(0u);
+    if (ray == GI_NO_CELL) {
+        return;
+    }
+
+    GiRay landed = gi_rays[ray];
+    vec3 direction = gi_ray_direction(ray % gi.grid.y, gi.grid.y);
+    float back = max(0.02, landed.hit.w * 1e-3);
+    RayHit hit = ray_closest(landed.hit.xyz - direction * back, direction, 0.0, back * 2.0);
+    if (!hit.found) {
+        return;
+    }
+    // The cone a probe's ray stands for — the probe's sphere shared between
+    // its rays — at the distance the ray went, not the few centimetres it was
+    // traced again: what a map is filtered by is what one ray sees of it.
+    float cone = sqrt(4.0 * PI / float(gi.grid.y));
+    RaySurface found = ray_surface(hit, direction, cone * landed.hit.w / max(hit.distance, 1e-4));
+    Surface s = found.s;
+    float reflection;
+    vec3 irradiance = ray_irradiance(found.position, s.N, s.V, reflection);
+    vec3 radiance = found.emissive + ray_lights(found, true)
+                  + irradiance * s.albedo * (1.0 - s.metallic);
+    // Into half floats, so held to their range; and a hit whose arithmetic
+    // went wrong would light every probe that reads the cell.
+    radiance = min(radiance, vec3(65000.0));
+    if (any(isnan(radiance))) {
+        return;
+    }
+    gi_radiance[cell] = uvec2(packHalf2x16(radiance.rg), packHalf2x16(vec2(radiance.b, 1.0)));
+}

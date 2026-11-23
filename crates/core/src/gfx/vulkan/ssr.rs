@@ -92,7 +92,7 @@ use crate::gfx::rhi::{
 use crate::gfx::shaders::ShaderId;
 use crate::scene::SsrSettings;
 
-use super::raytrace::{RayFrame, TEXTURE_SET};
+use super::raytrace::{RayFrame, RayReads, TEXTURE_SET};
 use super::taa::FrameView;
 
 /// Side of the compute workgroup for the trace and the composite.
@@ -474,7 +474,7 @@ impl SsrPass {
         builder.bind_pipeline(pipeline);
         builder.bind_group(0, set);
         if let (Some(rays), Some((_, textures))) = (rays, traced) {
-            rays.bind(device, builder, pipeline);
+            rays.bind(device, builder, pipeline, RayReads::SHADING);
             builder.bind_group(TEXTURE_SET, textures);
         }
         dispatch_over(device, builder, target);
@@ -539,7 +539,7 @@ impl SsrPass {
         builder.bind_pipeline(pipeline);
         builder.bind_group(0, set);
         if let (Some(rays), Some((_, textures))) = (traced_rays, traced) {
-            rays.bind(device, builder, pipeline);
+            rays.bind(device, builder, pipeline, RayReads::SHADING);
             builder.bind_group(TEXTURE_SET, textures);
         }
         dispatch_over(device, builder, target);

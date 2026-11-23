@@ -4,7 +4,14 @@
 use glam::Vec3;
 use orrin_core::capture::{CaptureSettings, Floor};
 use orrin_core::scene::entities::SceneChoice;
-use orrin_core::scene::{Camera, FogSettings, RayDebugView, ShadowDebugView};
+use orrin_core::scene::{Camera, FogSettings, GiDebugView, RayDebugView, ShadowDebugView};
+
+/// The warm-up of every capture the irradiance volumes light, and of the
+/// half of each pair they do not. A probe averages its first fifteen updates
+/// before it keeps a fixed share of its history, a grid is updated one frame
+/// in six, and a cell's light reaches the probes an update after it is first
+/// used: this is enough for the coarsest grid to have settled too.
+const GI_FRAMES: u32 = 360;
 
 /// Where both fog captures stand, shared so the pair differs in one field.
 ///
@@ -307,6 +314,35 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
             CaptureSettings {
                 ray_debug: RayDebugView::PathTraced,
                 frames: 768,
+                ..CaptureSettings::default()
+            },
+        ),
+        // The irradiance volumes off and on over the rig, from its own camera
+        // and with the same long warm-up, so the pair differs in the volumes
+        // alone: the ground and the cubes' undersides lit by what bounced
+        // off each other rather than by the whole sky, and the floor's
+        // colour on the cubes. The third is the volumes alone, on white.
+        (
+            "gi-rig-off",
+            CaptureSettings {
+                frames: GI_FRAMES,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "gi-rig",
+            CaptureSettings {
+                gi: true,
+                frames: GI_FRAMES,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "gi-rig-irradiance",
+            CaptureSettings {
+                gi: true,
+                gi_debug: GiDebugView::Irradiance,
+                frames: GI_FRAMES,
                 ..CaptureSettings::default()
             },
         ),

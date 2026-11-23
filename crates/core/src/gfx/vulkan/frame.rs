@@ -219,6 +219,13 @@ pub struct FrameConfig {
     /// Whether the frame's colour is replaced by the path-traced reference.
     /// Needs `ray_tracing`.
     pub ray_path_trace: bool,
+    /// Probes along each side of an irradiance volume's cascade, zero where
+    /// the volumes are off. Live, they are four dispatches at the head of the
+    /// frame and every pass that lights a surface reads what they leave; a
+    /// size rather than a flag, because it is the atlases' extent. Needs
+    /// `ray_tracing`. Zero is the frame exactly as it was, lit by the
+    /// environment's diffuse series alone.
+    pub gi_probes: u32,
 }
 
 /// What a screenshot shows.
@@ -357,6 +364,16 @@ pub enum PassBody {
     RayDebug,
     /// One more path per pixel of the reference, and its running mean.
     PathTrace,
+    /// Every ray of every probe of the grid this frame updates, each hit
+    /// filed in the world radiance cache.
+    GiTrace,
+    /// The cache's cells the rays used, listed for shading; the ones nothing
+    /// has used for long enough, emptied.
+    GiCacheCompact,
+    /// Each probe's tile brought up to date from its rays.
+    GiUpdate,
+    /// Each listed cell shaded once, for the probes' next update.
+    GiCacheShade,
     /// The cached layers of the shadow views that redraw theirs this frame:
     /// the casters standing still, into an atlas kept from frame to frame.
     ShadowStatic,
@@ -440,6 +457,50 @@ pub struct FrameIds {
     pub screenshot: Option<ResourceId>,
     /// What a ray is traced against, in a frame that traces.
     pub ray: Option<RayIds>,
+    /// The irradiance volumes and the radiance cache, where they are live.
+    pub gi: Option<GiIds>,
+}
+
+/// The irradiance volumes and the world radiance cache: every one kept from
+/// frame to frame by the pass that owns it, so imported. See `vulkan::gi`.
+#[derive(Clone, Copy, Debug)]
+pub struct GiIds {
+    /// Every probe's octahedral tile of irradiance, and of the distance it
+    /// sees and its square: what every pass that lights a surface samples.
+    pub irradiance: ResourceId,
+    pub distance: ResourceId,
+    /// Each probe's offset, whether it is inside geometry, and the coordinate
+    /// it was last written for.
+    pub probes: ResourceId,
+    /// What each ray of this frame's update met.
+    pub rays: ResourceId,
+    /// The cache's table, and the list of its cells to shade with the
+    /// dispatch that covers them.
+    pub cells: ResourceId,
+    pub list: ResourceId,
+    pub args: ResourceId,
+    /// Each cell's light as the update reads it — last frame's shading — and
+    /// as this frame's shading writes it. The two swap every frame, for the
+    /// reason the occlusion pyramids do: see [`OcclusionIds`].
+    pub radiance_history: ResourceId,
+    pub radiance: ResourceId,
+}
+
+impl GiIds {
+    /// Whether `id` is one of the buffers here, which a barrier covers with a
+    /// memory barrier rather than by name.
+    pub fn holds_buffer(&self, id: ResourceId) -> bool {
+        [
+            self.probes,
+            self.rays,
+            self.cells,
+            self.list,
+            self.args,
+            self.radiance_history,
+            self.radiance,
+        ]
+        .contains(&id)
+    }
 }
 
 /// The path-traced reference: every path's radiance so far, which the pass
@@ -737,6 +798,19 @@ fn indirect(pass: PassBuilder<'_>, commands: ResourceId) -> PassBuilder<'_> {
     pass.access(commands, Access::IndirectRead)
 }
 
+/// Declares what a pass that lights a surface reads of the irradiance
+/// volumes, where they are live: one function for every such pass, so none
+/// can read them without being ordered after their update.
+fn reads_gi(pass: PassBuilder<'_>, gi: Option<GiIds>) -> PassBuilder<'_> {
+    match gi {
+        Some(ids) => pass
+            .access(ids.irradiance, Access::Sampled)
+            .access(ids.distance, Access::Sampled)
+            .access(ids.probes, Access::StorageRead),
+        None => pass,
+    }
+}
+
 /// What a shadow atlas is: one image every view is a tile of, its pages side
 /// by side.
 pub fn shadow_atlas_desc(resolution: u32) -> ImageDesc {
@@ -751,7 +825,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // frame's own, which is what the compiler can name and make concurrent —
     // so a frame with such a pass among its dispatches is not split, or its
     // tail would read them from a family that does not own them.
-    let shades_hits = config.ray_reflections || config.ray_path_trace;
+    let shades_hits = config.ray_reflections || config.ray_path_trace || config.gi_probes > 0;
     if config.async_compute && !shades_hits {
         builder.request_async_compute();
     }
@@ -876,6 +950,104 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         record(id, PassBody::RayScene, &mut bodies);
 
         RayIds { meshes, scene }
+    });
+
+    // Right behind the scene's build, because nothing here reads anything the
+    // frame rasterises: the volumes are the world's, not the view's, and every
+    // pass that lights a surface reads them. Four nodes for four steps that
+    // each need the last finished on the device: the rays, the cache's list
+    // of what they hit, the probes, and the cells shaded for the next update.
+    //
+    // The order the cache imposes is the one place this frame reads before it
+    // writes. The shading reads the volumes, for the light that bounced, and
+    // the update writes them; the update reads the cache's light, and the
+    // shading writes it. So the shading runs last and writes the other half of
+    // a pair the update read from — the cycle the occlusion pyramids break the
+    // same way — and the light a cell is shaded with this frame reaches the
+    // probes at their next update.
+    let gi = ray.filter(|_| config.gi_probes > 0).map(|ray| {
+        let atlas = || {
+            ImageDesc::new(super::gi::ATLAS_FORMAT).extent(Extent::Fixed(
+                crate::gfx::probes::atlas_extent(config.gi_probes),
+            ))
+        };
+        // Entered and left sampled, for the reason every history is: the
+        // update reads each texel it writes, and everything after samples.
+        let irradiance = builder.import_image(
+            "gi_irradiance",
+            atlas(),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let distance = builder.import_image(
+            "gi_distance",
+            atlas(),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let ids = GiIds {
+            irradiance,
+            distance,
+            probes: builder.import_buffer("gi_probes"),
+            rays: builder.import_buffer("gi_rays"),
+            cells: builder.import_buffer("gi_cells"),
+            list: builder.import_buffer("gi_list"),
+            args: builder.import_buffer("gi_args"),
+            radiance_history: builder.import_buffer("gi_radiance_history"),
+            radiance: builder.import_buffer("gi_radiance"),
+        };
+
+        // The probes' state is only read here, for where each stands, but
+        // declared written: the update writes it after this pass reads it,
+        // and a read would be ordered after every write. The list and its
+        // dispatch are emptied here, ahead of the pass that fills them.
+        let id = builder
+            .pass("gi_trace", PassKind::Compute)
+            .access(ray.scene, Access::AccelerationStructureRead)
+            .access(ids.probes, Access::StorageWrite)
+            .access(ids.rays, Access::StorageWrite)
+            .access(ids.cells, Access::StorageWrite)
+            .access(ids.radiance_history, Access::StorageWrite)
+            .access(ids.list, Access::StorageWrite)
+            .access(ids.args, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiTrace, &mut bodies);
+
+        let id = builder
+            .pass("gi_cache_compact", PassKind::Compute)
+            .access(ids.cells, Access::StorageWrite)
+            .access(ids.radiance_history, Access::StorageRead)
+            .access(ids.radiance, Access::StorageWrite)
+            .access(ids.list, Access::StorageWrite)
+            .access(ids.args, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiCacheCompact, &mut bodies);
+
+        let id = builder
+            .pass("gi_update", PassKind::Compute)
+            .access(ids.probes, Access::StorageWrite)
+            .access(ids.rays, Access::StorageRead)
+            .access(ids.radiance_history, Access::StorageRead)
+            .access(irradiance, Access::StorageWrite)
+            .access(distance, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiUpdate, &mut bodies);
+
+        let id = builder
+            .pass("gi_cache_shade", PassKind::Compute)
+            .access(ray.scene, Access::AccelerationStructureRead)
+            .access(ids.args, Access::IndirectRead)
+            .access(ids.list, Access::StorageRead)
+            .access(ids.cells, Access::StorageWrite)
+            .access(ids.rays, Access::StorageRead)
+            .access(ids.probes, Access::StorageRead)
+            .access(irradiance, Access::Sampled)
+            .access(distance, Access::Sampled)
+            .access(ids.radiance, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiCacheShade, &mut bodies);
+
+        ids
     });
 
     let swapchain_color = builder.import_image(
@@ -1201,6 +1373,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     if let Some(fog) = fog {
         forward = forward.access(fog.volume, Access::Sampled);
     }
+    forward = reads_gi(forward, gi);
     forward = match msaa {
         Some(msaa) => forward
             .access(msaa.hdr, Access::ColorAttachment)
@@ -1355,7 +1528,11 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(source, Access::Sampled)
             .access(rays, Access::StorageWrite);
         if let Some(ray) = traced {
-            trace = trace.access(ray.scene, Access::AccelerationStructureRead);
+            // A hit's bounce light is the volumes'.
+            trace = reads_gi(
+                trace.access(ray.scene, Access::AccelerationStructureRead),
+                gi,
+            );
         }
         record(trace.build(), PassBody::SsrTrace, &mut bodies);
 
@@ -1379,7 +1556,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(source_pyramid, Access::Sampled)
             .access(output, Access::StorageWrite);
         if let Some(ray) = traced {
-            resolve = resolve.access(ray.scene, Access::AccelerationStructureRead);
+            resolve = reads_gi(
+                resolve.access(ray.scene, Access::AccelerationStructureRead),
+                gi,
+            );
         }
         record(resolve.build(), PassBody::SsrResolve, &mut bodies);
 
@@ -1444,6 +1624,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         if let Some(fog) = fog {
             accumulate = accumulate.access(fog.volume, Access::Sampled);
         }
+        accumulate = reads_gi(accumulate, gi);
         let id = accumulate
             .access(accum, Access::ColorAttachment)
             .access(reveal, Access::ColorAttachment)
@@ -1537,6 +1718,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         if let Some(fog) = fog {
             draw = draw.access(fog.volume, Access::Sampled);
         }
+        draw = reads_gi(draw, gi);
         let id = draw
             .access(accum, Access::ColorAttachment)
             .access(prepass.depth, Access::DepthAttachmentRead)
@@ -2143,6 +2325,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             material_preview,
             screenshot,
             ray,
+            gi,
         },
         bodies,
     })

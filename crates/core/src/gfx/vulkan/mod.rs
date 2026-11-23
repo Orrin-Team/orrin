@@ -12,6 +12,7 @@ mod exposure;
 mod fog;
 mod forward;
 pub mod frame;
+mod gi;
 pub(crate) mod gizmo;
 pub(crate) mod hdr;
 mod instances;
@@ -387,6 +388,13 @@ pub struct VulkanRenderer {
     /// What the next frame traces, as [`set_ray_tracing`](Self::set_ray_tracing)
     /// last left it.
     ray_settings: crate::scene::RayTracingSettings,
+    /// The irradiance volumes, or on a device that cannot trace their inert
+    /// stand-ins alone. See `gi`.
+    gi: gi::GiPass,
+    /// What the next frame's volumes are, as [`set_gi`](Self::set_gi) last left
+    /// them. Off until then, so a harness that never asks draws the frame it
+    /// always did.
+    gi_settings: crate::scene::GiSettings,
 }
 
 /// The frame's commands as they are being recorded: a Vulkan command buffer, or
@@ -669,6 +677,7 @@ impl VulkanRenderer {
         if let Some(raytrace) = &mut self.raytrace {
             raytrace.forget_textures(&self.device);
         }
+        self.gi.forget_textures(&self.device);
     }
 
     pub fn new(
@@ -845,6 +854,7 @@ impl VulkanRenderer {
         let raytrace = device
             .supports(Feature::RayTracing)
             .then(|| raytrace::RayTracePass::new(&device, format));
+        let gi = gi::GiPass::new(&device, raytrace.is_some());
         // Default textures so every material slot resolves to a valid view:
         // index 0 = white (a no-op multiply), index 1 = flat normal (0,0,1).
         let textures = vec![
@@ -886,6 +896,7 @@ impl VulkanRenderer {
             ray_debug: false,
             ray_reflections: false,
             ray_path_trace: false,
+            gi_probes: 0,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -948,6 +959,11 @@ impl VulkanRenderer {
             blends: vec![crate::gfx::BlendMode::default()],
             raytrace,
             ray_settings: Default::default(),
+            gi,
+            gi_settings: crate::scene::GiSettings {
+                enabled: false,
+                ..Default::default()
+            },
             backend,
         }
     }
@@ -1421,6 +1437,7 @@ impl VulkanRenderer {
             || ids
                 .ray
                 .is_some_and(|ray| id == ray.meshes || id == ray.scene)
+            || ids.gi.is_some_and(|gi| gi.holds_buffer(id))
         {
             return Some(record::Target::Memory);
         }
@@ -1436,6 +1453,9 @@ impl VulkanRenderer {
             || ids.material_preview.is_some_and(|p| p.output == id)
             || Some(id) == ids.screenshot
             || ids.path.is_some_and(|path| path.sum == id)
+            || ids
+                .gi
+                .is_some_and(|gi| id == gi.irradiance || id == gi.distance)
         {
             return Some(record::Target::Image(
                 self.vk_view(self.table.texture(id)).image().clone(),
@@ -1897,6 +1917,17 @@ impl VulkanRenderer {
         self.ray_settings = settings;
     }
 
+    /// What the frames from here on light with the irradiance volumes. Inert
+    /// on a device that cannot trace, and where ray tracing is off.
+    pub fn set_gi(&mut self, settings: crate::scene::GiSettings) {
+        self.gi_settings = settings;
+    }
+
+    /// Whether the next frame traces and reads the irradiance volumes.
+    fn gi_live(&self) -> bool {
+        self.raytrace.is_some() && self.ray_settings.enabled && self.gi_settings.enabled
+    }
+
     pub fn set_present(&mut self, present: PresentSettings) {
         #[cfg(target_os = "macos")]
         if let Backend::Metal(mtl) = &mut self.backend {
@@ -2201,11 +2232,17 @@ impl VulkanRenderer {
             ray_tracing: self.raytrace.is_some()
                 && (self.ray_settings.draws_debug_view()
                     || self.ray_settings.path_traces()
-                    || self.ray_settings.traces_reflections(ssr.enabled)),
+                    || self.ray_settings.traces_reflections(ssr.enabled)
+                    || self.gi_live()),
             ray_path_trace: self.raytrace.is_some() && self.ray_settings.path_traces(),
             ray_debug: self.raytrace.is_some() && self.ray_settings.draws_debug_view(),
             ray_reflections: self.raytrace.is_some()
                 && self.ray_settings.traces_reflections(ssr.enabled),
+            gi_probes: if self.gi_live() {
+                self.gi_settings.held().probes
+            } else {
+                0
+            },
         });
 
         // Atlases allocated for this frame hold nothing, whatever the plan
@@ -2569,6 +2606,7 @@ impl VulkanRenderer {
                         env_sampler: self.environment.sampler(),
                         fog_volume: self.fog.volume_or_fallback(None),
                         fog_sampler: self.fog.sampler(),
+                        gi: self.gi.fallback(),
                     },
                     pass.neutral(),
                     material_set,
@@ -2694,6 +2732,41 @@ impl VulkanRenderer {
                     extent,
                     mip_levels: 1,
                 },
+            );
+        }
+        // Beside the traced scene and for the same reason: the four passes
+        // record what is decided here, and every pass that lights a surface
+        // binds what it leaves.
+        {
+            let ambient = lighting.ambient_color * lighting.ambient_nits;
+            self.gi.begin_frame(
+                &self.device,
+                &self.gi_settings,
+                self.frame.ids.gi.is_some(),
+                camera.position,
+                self.environment.irradiance(ambient, environment),
+                environment.yaw,
+            );
+        }
+        if let (Some(ids), Some(([irradiance, distance], extent))) =
+            (self.frame.ids.gi, self.gi.atlases())
+        {
+            for (id, view) in [(ids.irradiance, irradiance), (ids.distance, distance)] {
+                self.table.import(
+                    id,
+                    crate::gfx::images::ImageEntry {
+                        whole: view,
+                        levels: Vec::new(),
+                        layers: Vec::new(),
+                        extent,
+                        mip_levels: 1,
+                    },
+                );
+            }
+            self.gi.prepare(
+                &self.device,
+                &self.textures,
+                self.prepass.material_sampler(),
             );
         }
         if self.frame.ids.ssr.is_some_and(|ids| ids.traced) {
@@ -2906,6 +2979,7 @@ impl VulkanRenderer {
             self.fog
                 .volume_or_fallback(self.frame.ids.fog.map(|ids| self.table.texture(ids.volume))),
             self.fog.sampler(),
+            self.gi.views(),
             surface_time,
         );
 
@@ -3043,7 +3117,9 @@ impl VulkanRenderer {
                     materials,
                     environment: self.environment.specular_view(),
                     environment_sampler: self.environment.sampler(),
+                    gi: self.gi.views(),
                 }),
+            gi: &self.gi,
             subsurface: &self.subsurface,
             taa: &self.taa,
             view,
@@ -3538,6 +3614,7 @@ struct FrameRecord<'a> {
     raytrace: Option<&'a raytrace::RayTracePass>,
     /// What a pass that shades a ray's hits binds, in a frame that traces.
     ray_frame: Option<raytrace::RayFrame<'a>>,
+    gi: &'a gi::GiPass,
     subsurface: &'a SubsurfacePass,
     taa: &'a TaaPass,
     view: taa::FrameView,
@@ -3811,6 +3888,7 @@ impl FrameRecord<'_> {
             || ids
                 .ray
                 .is_some_and(|ray| id == ray.meshes || id == ray.scene)
+            || ids.gi.is_some_and(|gi| gi.holds_buffer(id))
         {
             return Some(record::Target::Memory);
         }
@@ -3826,6 +3904,9 @@ impl FrameRecord<'_> {
             || ids.material_preview.is_some_and(|p| p.output == id)
             || Some(id) == ids.screenshot
             || ids.path.is_some_and(|path| path.sum == id)
+            || ids
+                .gi
+                .is_some_and(|gi| id == gi.irradiance || id == gi.distance)
         {
             return Some(record::Target::Image(
                 self.vk_view(self.table.texture(id)).image().clone(),
@@ -4034,6 +4115,19 @@ impl FrameRecord<'_> {
                     self.table.texture(ids.mean),
                 );
             }
+            PassBody::GiTrace | PassBody::GiCacheShade => {
+                let rays = self
+                    .ray_frame
+                    .as_ref()
+                    .expect("the graph scheduled the volumes in a frame that traces nothing");
+                if body == PassBody::GiTrace {
+                    self.gi.record_trace(self.device, encoder, rays);
+                } else {
+                    self.gi.record_shade(self.device, encoder, rays);
+                }
+            }
+            PassBody::GiCacheCompact => self.gi.record_compact(self.device, encoder),
+            PassBody::GiUpdate => self.gi.record_update(self.device, encoder),
             PassBody::SsrHiz => {
                 let ids = self
                     .frame
@@ -4751,6 +4845,10 @@ impl FrameRecord<'_> {
             | PassBody::RayMeshes
             | PassBody::RayScene
             | PassBody::PathTrace
+            | PassBody::GiTrace
+            | PassBody::GiCacheCompact
+            | PassBody::GiUpdate
+            | PassBody::GiCacheShade
             | PassBody::OcclusionHiz => unreachable!("handled above"),
         }
     }
