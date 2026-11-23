@@ -360,8 +360,9 @@ pub(super) struct GpuCascades {
     /// x = view count, y = blend overlap fraction, z = strength,
     /// w = 1.0 to tint by view index.
     params: [f32; 4],
-    /// x = the sun's penumbra width in metres, y = its sharpness. A lamp's own
-    /// pair travels with its views.
+    /// x = the sun's penumbra width in metres where a caster touches what it
+    /// shadows, y = its sharpness, z = how much wider the penumbra gets a metre
+    /// of caster distance. A lamp's own pair travels with its views.
     filtering: [f32; 4],
     /// What this frame did to each view, as [`ViewWork`]'s order, for the
     /// debug view that tints by it.
@@ -397,7 +398,10 @@ impl GpuCascades {
                 shadows.settings.strength,
                 shadows.settings.debug_mode(),
             ],
-            filtering: shadows.settings.filtering(),
+            filtering: {
+                let [softness, sharpness, ..] = shadows.settings.filtering();
+                [softness, sharpness, shadows.settings.sun_spread(), 0.0]
+            },
             states,
         }
     }

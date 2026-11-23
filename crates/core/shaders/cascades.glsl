@@ -35,8 +35,9 @@ struct Cascades {
     // to draw: 0 none, 1 which view, 2 the atlas, 3 texel density, 4 what the
     // frame did to each view.
     vec4 params;
-    // x = the sun's penumbra width in metres, y = its sharpness. A lamp's own
-    // pair travels with its views. See `shadow_filter.glsl`.
+    // x = the sun's penumbra width in metres where a caster touches what it
+    // shadows, y = its sharpness, z = the width a metre of caster distance
+    // adds. A lamp's own pair travels with its views. See `shadow_filter.glsl`.
     vec4 filtering;
     // What this frame did to each view: 0 nothing, 1 moving casters redrawn,
     // 2 a strip scrolled in, 3 its cached layer redrawn, 4 drawn whole.

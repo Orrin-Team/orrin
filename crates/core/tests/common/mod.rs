@@ -55,6 +55,20 @@ fn reflection_view(floor: Option<Floor>, position: Vec3, target: Vec3) -> Captur
     }
 }
 
+/// Where the `sun-penumbra` captures stand.
+fn sun_penumbra() -> CaptureSettings {
+    CaptureSettings {
+        extent: [1920, 1080],
+        shadows: true,
+        camera: Some(Camera {
+            position: Vec3::new(-2.0, 1.2, 12.5),
+            target: Vec3::new(-3.5, -0.5, 8.5),
+            ..Camera::default()
+        }),
+        ..CaptureSettings::default()
+    }
+}
+
 /// Every capture, by the name its file carries.
 pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
     vec![
@@ -205,6 +219,29 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                     ..Camera::default()
                 }),
                 ..CaptureSettings::default()
+            },
+        ),
+        // The sun's penumbra following the distance to what casts it, from a
+        // metre above the ground between the cube grid and the sphere rows:
+        // the cubes stand on the ground and the spheres hang three and six
+        // metres over it, so one frame holds an edge at its caster's foot and
+        // edges a long way under theirs. The three differ in the sun's angle
+        // alone. At zero every edge is one width; at the sun's own half degree
+        // the spheres' are softer than the cubes'; at two degrees, a hazy sky,
+        // a cube's shadow visibly widens from its foot to its far corner.
+        (
+            "sun-penumbra-off",
+            CaptureSettings {
+                sun_angle: Some(0.0),
+                ..sun_penumbra()
+            },
+        ),
+        ("sun-penumbra", sun_penumbra()),
+        (
+            "sun-penumbra-wide",
+            CaptureSettings {
+                sun_angle: Some(2.0),
+                ..sun_penumbra()
             },
         ),
         // The three ways of looking at the shadows rather than at the scene, from

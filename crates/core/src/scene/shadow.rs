@@ -3,14 +3,18 @@ use orrin_registry::Reflect;
 use crate::gfx::shadow_views::{AtlasConfig, floor_power_of_two};
 use crate::gfx::shadows::CascadeConfig;
 
-/// Three centimetres: about what the 3x3 kernel this replaced spread a near
-/// cascade's edge over, so a scene authored before the width was a setting
-/// keeps the contact shadows it had.
-const DEFAULT_SOFTNESS: f32 = 0.03;
+/// Twelve millimetres: under the nearest view's narrowest kernel, so a shadow
+/// is as sharp where it meets its caster as that view's texels allow.
+const DEFAULT_SOFTNESS: f32 = 0.012;
+/// What the sun covers of the sky, seen from the ground.
+const DEFAULT_SUN_ANGLE: f32 = 0.53;
 const DEFAULT_SHARPNESS: f32 = 0.0;
 const DEFAULT_FAR_RESOLUTION: u32 = 2048;
 /// Past this the remap is a threshold and the edge shows the map's texels.
 pub const MAX_SHADOW_SHARPNESS: f32 = 0.9;
+/// The widest sun the slider offers, in degrees: a sky hazy enough that
+/// nothing casts an edge at all is the ambient term's, not a shadow map's.
+pub const MAX_SUN_ANGLE: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct ShadowSettings {
@@ -51,14 +55,22 @@ pub struct ShadowSettings {
     pub pullback: f32,
     pub constant_bias: f32,
     pub slope_bias: f32,
-    /// How wide the sun's penumbra is, in metres. A width rather than a kernel
-    /// size because a kernel counted in texels is a different width in every
-    /// cascade, which shows as a step in softness at each seam. The filter
-    /// holds it wherever a cascade's texels allow: no wider than its kernel
-    /// reaches and no narrower than antialiases, so a far cascade is softer
-    /// than this by as much as its texels are coarse.
+    /// How wide the sun's penumbra is where a caster touches what it shadows,
+    /// in metres; `sun_angle` is what widens it from there. A width rather
+    /// than a kernel size because a kernel counted in texels is a different
+    /// width in every cascade, which shows as a step in softness at each seam.
+    /// The filter holds it wherever a cascade's texels allow: no wider than
+    /// its kernel reaches and no narrower than antialiases, so a far cascade
+    /// is softer than this by as much as its texels are coarse.
     #[reflect(default = DEFAULT_SOFTNESS)]
     pub softness: f32,
+    /// The sun's angular diameter in degrees, which is how fast its penumbra
+    /// widens with the distance between a caster and what it shadows:
+    /// `softness` is the width where they touch, and a caster ten metres up
+    /// adds nine centimetres at the sun's real half degree. A wider sun is a
+    /// hazier sky. Zero holds every edge at `softness`.
+    #[reflect(default = DEFAULT_SUN_ANGLE)]
+    pub sun_angle: f32,
     /// How much of the filtered penumbra is visible, 0 to 1. The kernel stays
     /// as wide as `softness` asks, which is what antialiases the edge, and this
     /// narrows the gradient around the edge's midpoint — so a soft kernel does
@@ -155,6 +167,7 @@ impl Default for ShadowSettings {
             constant_bias: 1.25,
             slope_bias: 2.5,
             softness: DEFAULT_SOFTNESS,
+            sun_angle: DEFAULT_SUN_ANGLE,
             sharpness: DEFAULT_SHARPNESS,
             punctual_enabled: true,
             // Two pages of D16, 64 MB, and the same again for the cached
@@ -186,6 +199,14 @@ impl ShadowSettings {
             self.punctual_softness.max(0.0),
             self.punctual_sharpness.clamp(0.0, MAX_SHADOW_SHARPNESS),
         ]
+    }
+
+    /// How much wider the sun's penumbra gets for each metre between a caster
+    /// and what it shadows: the tangent of half the angle the sun covers.
+    pub fn sun_spread(&self) -> f32 {
+        (0.5 * self.sun_angle.clamp(0.0, MAX_SUN_ANGLE))
+            .to_radians()
+            .tan()
     }
 
     pub fn cascade_config(&self) -> CascadeConfig {

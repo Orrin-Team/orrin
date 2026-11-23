@@ -77,6 +77,9 @@ pub struct CaptureSettings {
     pub punctual_shadows: bool,
     /// Which of the shadows' debug views the frame is drawn through.
     pub shadow_debug: ShadowDebugView,
+    /// The sun's angular diameter in degrees, or `None` for the default. Zero
+    /// is the other half of an A/B: every edge at one width, whatever cast it.
+    pub sun_angle: Option<f32>,
     /// Screen-space reflections: off by default, because they are the effect
     /// most easily mistaken for a lighting bug when they are wrong.
     pub ssr: bool,
@@ -158,6 +161,7 @@ impl Default for CaptureSettings {
             shadows: false,
             punctual_shadows: false,
             shadow_debug: ShadowDebugView::None,
+            sun_angle: None,
             ssr: false,
             dof: false,
             motion_blur: false,
@@ -337,10 +341,12 @@ pub fn render(
     let mut lighting = SceneLighting::default();
     let mut geometry = FrameGeometry::default();
     let mut decals = Vec::new();
+    let defaults = ShadowSettings::default();
     let shadow_settings = ShadowSettings {
         punctual_enabled: settings.punctual_shadows,
         debug_view: settings.shadow_debug,
-        ..ShadowSettings::default()
+        sun_angle: settings.sun_angle.unwrap_or(defaults.sun_angle),
+        ..defaults
     };
     let aspect = settings.extent[0] as f32 / settings.extent[1] as f32;
     let mut overlay = settings

@@ -160,6 +160,7 @@ const SHADOWS: &[Section] = &[
             "Bias",
             "Slope bias",
             "Softness",
+            "Sun angle",
             "Sharpness",
             "Strength",
             "Tint cascades",
@@ -735,6 +736,18 @@ fn shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
     if rows.shows("Softness") {
         softness(ui, &mut s.softness);
     }
+    if rows.shows("Sun angle") {
+        slider(
+            ui,
+            "Sun angle",
+            egui::Slider::new(&mut s.sun_angle, 0.0..=crate::scene::MAX_SUN_ANGLE)
+                .logarithmic(true)
+                .suffix("°"),
+        )
+        .on_hover_text(
+            "How fast a shadow's edge widens with the distance to what casts it: the sun's              real disc is 0.53°, and 0 keeps every edge at Softness",
+        );
+    }
     if rows.shows("Sharpness") {
         sharpness(ui, &mut s.sharpness);
     }
@@ -850,7 +863,10 @@ fn softness(ui: &mut egui::Ui, value: &mut f32) {
             .logarithmic(true)
             .suffix(" m"),
     )
-    .on_hover_text("Penumbra width, held wherever a map's texels are fine enough to hold it");
+    .on_hover_text(
+        "Penumbra width where a shadow meets its caster, held wherever a map's texels are \
+         fine enough to hold it",
+    );
 }
 
 fn sharpness(ui: &mut egui::Ui, value: &mut f32) {

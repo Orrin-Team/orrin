@@ -34,6 +34,13 @@ const float SHADOW_KERNEL_MIN = 2.0;
 // next one. Lock-stepped with `FACE_BORDER_TEXELS` in gfx/punctual.rs, which
 // renders that much real depth past a face's edge for these taps to land on.
 const float SHADOW_KERNEL_MAX = 4.0;
+// The narrowest kernel a surface reads the sun through. Wider than
+// `SHADOW_KERNEL_MIN` because a texel is tens of pixels across where the
+// camera stands close to a shadow, or where a wide penumbra is read from a
+// coarse view: under two texels of tent their corners show along the edge, and
+// under three they do not. The width asked for is put back by the remap. The
+// fog and the lamps keep the narrower one, at a quarter of the taps.
+const float SHADOW_KERNEL_SMOOTH = 3.0;
 
 // The narrowest penumbra a view can show, in texels either side of the edge.
 // The remap below turns into a threshold as this falls, and a threshold draws
@@ -47,9 +54,9 @@ float shadow_asked_radius(float softness, float texel) {
     return softness / max(texel, 1e-6);
 }
 
-// The kernel's radius in texels for that request.
-float shadow_kernel_radius(float asked) {
-    return clamp(asked, SHADOW_KERNEL_MIN, SHADOW_KERNEL_MAX);
+// The kernel's radius in texels for that request, no narrower than `narrowest`.
+float shadow_kernel_radius(float asked, float narrowest) {
+    return clamp(asked, narrowest, SHADOW_KERNEL_MAX);
 }
 
 // One axis of the tent. `s` is how far the lookup sits past the texel centre
@@ -132,8 +139,8 @@ float shadow_sharpen(float visibility, float asked, float radius, float sharpnes
 // and `texel_scale` the world size of one of its texels where clip-space `w`
 // is one. An orthographic view's `w` is one everywhere and a perspective
 // face's is the depth along its axis, so multiplying by it is the texel's size
-// at the lookup either way. `filtering` is the penumbra's width in metres and
-// its sharpness.
+// at the lookup either way. `filtering` is the penumbra's width in metres, its
+// sharpness, and the narrowest kernel to read it through, in texels.
 //
 // `N` is the direction the lookup is biased along: the surface normal for a
 // surface, and the light direction itself for a point of air -- where there is
@@ -145,7 +152,7 @@ float shadow_view_visibility(
     mat4 view_proj,
     vec4 rect,
     float texel_scale,
-    vec2 filtering,
+    vec3 filtering,
     vec3 world_pos,
     vec3 N,
     vec3 L
@@ -157,7 +164,7 @@ float shadow_view_visibility(
     }
     float texel = texel_scale * w;
     float asked = shadow_asked_radius(filtering.x, texel);
-    float radius = shadow_kernel_radius(asked);
+    float radius = shadow_kernel_radius(asked, filtering.z);
     // Offsetting in world space rather than in depth is what removes acne
     // without the peter-panning a depth offset causes.
     vec4 clip = view_proj
@@ -196,5 +203,133 @@ float shadow_view_visibility(
     float total = dot(weights_x, vec4(1.0)) * dot(weights_y, vec4(1.0));
     return shadow_sharpen(sum / total, asked, radius, filtering.y);
 }
+
+#ifdef ORRIN_CONTACT_HARDENING
+
+// Contact hardening's other half: how far above a surface its casters are.
+//
+// A penumbra is as wide as its caster is far, times the angle the sun covers,
+// and the filter above takes a width. So a lookup first asks each view two
+// things about the texels round it. Whether anything is over the surface
+// there, which is a comparison; and, where something is, how much of them and
+// how far over, which is a read of the depths themselves -- the question is
+// how far, not whether. Nothing here picks a tap at random. Every texel of a
+// window is read and weighed by how near it is, which brings one in from
+// nothing as the lookup moves, so the answer has no noise to hide and no step
+// to see.
+//
+// Texels are held against the receiver's own plane rather than against its
+// depth at the lookup. A window is several texels wide, and across it a
+// surface tilted from the light spans a range of depths: the lit side of a
+// slope would read as casting onto the rest of it. The plane's normal is the
+// geometric one for that reason, not the shaded one a normal map has bent.
+//
+// For an orthographic view only: one texel is one distance everywhere in it.
+
+// Where a lookup's window sits in one view, and the plane it is held to. The
+// caller fills it in: how a point reaches a view's texels is the view's own
+// business, and the sun's views share enough of it to do most of it once.
+struct ShadowWindow {
+    // The window's centre and the point on the plane, as texel indices.
+    vec2 at;
+    vec2 on_plane;
+    // The plane's depth at `on_plane`, and what a texel along each axis adds.
+    float depth;
+    vec2 slope;
+    // Metres along the light for one unit of the view's depth.
+    float span;
+    // The tile, as the first and last texel in it.
+    vec2 lo;
+    vec2 hi;
+    vec2 atlas_size;
+};
+
+// The depth one quarter of a window, a block of four texels, is held to: the
+// nearest the plane comes under the block, less a quarter texel and two steps
+// of what sixteen bits resolve. `block` is its first texel.
+//
+// One depth for the four, where the plane is a different depth under each, so
+// that a comparison can ask it. A surface then never reads as its own caster
+// -- held to the plane's deepest instead, every slope in the frame did, and
+// went on to the sixteen reads to learn it had none -- at the price of missing
+// a caster that stands lower over the surface than the plane climbs in a
+// texel, which the filter's own bias would have lost too.
+float shadow_block_reference(ShadowWindow window, vec2 block, float texel) {
+    return window.depth + dot(window.slope, block + 0.5 - window.on_plane)
+        - 0.5 * (abs(window.slope.x) + abs(window.slope.y))
+        - 0.25 * texel / window.span - 2.0 / 65535.0;
+}
+
+// Whether a window has any caster over it at all: four comparisons, a block
+// each, and what most of a sunlit frame stops at.
+bool shadow_window_covered(texture2D atlas, samplerShadow cmp, ShadowWindow window, float texel) {
+    vec2 base = floor(window.at);
+    float open = 0.0;
+    for (int y = -1; y <= 1; y += 2) {
+        for (int x = -1; x <= 1; x += 2) {
+            vec2 block = base + vec2(x, y);
+            // Between the block's four texels, so each weighs the same.
+            open += textureLod(
+                sampler2DShadow(atlas, cmp),
+                vec3(
+                    (clamp(block + 0.5, window.lo, window.hi) + 0.5) / window.atlas_size,
+                    shadow_block_reference(window, block, texel)
+                ),
+                0.0
+            );
+        }
+    }
+    return open < 3.999;
+}
+
+// How much of a window has a caster over it, 0 to 1, and how far over the
+// plane those casters are, in metres.
+//
+// The same sixteen texels, read one by one: a caster is a texel its block's
+// comparison would have counted, so the two agree about where there is none.
+// Each is weighed by how near it is, on a curve that is level where a texel
+// enters the window and level at its middle. A straight tent turns a corner at
+// every texel's edge, and with a coarse view's texels tens of pixels across a
+// penumbra whose width followed it showed each corner as a crease.
+//
+// Two texels each way and no fewer. The filter this sizes reaches four of a
+// view's texels, and what it reaches has to have been seen by this view's
+// window or the next coarser view's, which is two of texels twice the size. A
+// window one texel each way left that to a view two coarser, whose own idea of
+// where an edge is was off by more than the penumbra was wide: the penumbra
+// ended in notches.
+vec2 shadow_window_casters(texture2D atlas, ShadowWindow window, float texel) {
+    vec2 base = floor(window.at);
+    vec2 s = window.at - base;
+    float total = 0.0;
+    float cover = 0.0;
+    float height = 0.0;
+    for (int by = -1; by <= 1; by += 2) {
+        for (int bx = -1; bx <= 1; bx += 2) {
+            vec2 block = base + vec2(bx, by);
+            float reference = shadow_block_reference(window, block, texel);
+            for (int y = 0; y <= 1; ++y) {
+                for (int x = 0; x <= 1; ++x) {
+                    vec2 texel_at = block + vec2(x, y);
+                    vec2 near = smoothstep(
+                        0.0, 1.0, 1.0 - abs(texel_at - window.at) / SHADOW_KERNEL_MIN
+                    );
+                    float w = near.x * near.y;
+                    float held =
+                        texelFetch(atlas, ivec2(clamp(texel_at, window.lo, window.hi)), 0).r;
+                    total += w;
+                    if (held < reference) {
+                        cover += w;
+                        height += w
+                            * (window.depth + dot(window.slope, texel_at - window.on_plane) - held);
+                    }
+                }
+            }
+        }
+    }
+    return vec2(cover / total, cover > 0.0 ? height * window.span / cover : 0.0);
+}
+
+#endif // ORRIN_CONTACT_HARDENING
 
 #endif // ORRIN_SHADOW_FILTER_GLSL

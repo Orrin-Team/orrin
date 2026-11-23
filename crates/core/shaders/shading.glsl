@@ -1,3 +1,6 @@
+// The blocker search reads the shadow atlas by texel, which takes no sampler.
+#extension GL_EXT_samplerless_texture_functions : require
+
 // What a surface looks like, once. Included by `forward.frag`, which writes the
 // result into the opaque target, and by `oit.frag`, which weights it and
 // accumulates it — so a sheet of glass and the wall behind it are lit by the
@@ -683,6 +686,10 @@ Lobes brdf(Surface s, vec3 L, vec3 radiance, float visibility, float back_visibi
 }
 
 #define ORRIN_CASCADES lighting.cascades
+// A surface's sun shadow widens with its caster's distance. The fog's does
+// not, and does not compile the search: a point of air has no plane to measure
+// a caster from.
+#define ORRIN_CONTACT_HARDENING
 #include "cascade_lookup.glsl"
 
 // --- Cascaded shadow maps ---
@@ -708,7 +715,15 @@ float sun_shadow(vec3 world_pos, vec3 N, vec3 L, float view_dist) {
         return 1.0;
     }
 
-    return cascade_sun_shadow(u_shadow_atlas, u_shadow_cmp, world_pos, N, L, view_dist);
+    return cascade_sun_shadow_hardened(
+        u_shadow_atlas,
+        u_shadow_cmp,
+        world_pos,
+        N,
+        normalize(v_normal),
+        L,
+        view_dist
+    );
 }
 
 // The sun's visibility at the *far* side of a scattering medium — whether light
@@ -843,7 +858,7 @@ float atlas_shadow(int face_index, vec3 world_pos, vec3 N, vec3 L) {
         face.view_proj,
         face.rect,
         face.params.x,
-        face.params.yz,
+        vec3(face.params.yz, SHADOW_KERNEL_MIN),
         world_pos,
         N,
         L

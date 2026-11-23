@@ -79,7 +79,7 @@ pub use previews::{
 };
 pub use registry::register_components;
 pub use render_settings::RenderSettings;
-pub use shadow::{MAX_SHADOW_SHARPNESS, ShadowDebugView, ShadowSettings};
+pub use shadow::{MAX_SHADOW_SHARPNESS, MAX_SUN_ANGLE, ShadowDebugView, ShadowSettings};
 pub use ssao::SsaoSettings;
 pub use ssr::SsrSettings;
 pub use subsurface::SubsurfaceSettings;
