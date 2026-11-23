@@ -406,6 +406,17 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
         // the panel does, and the walls bleed their colour onto the floor.
         ("gi-emissive-off", rooms(EMISSIVE, false)),
         ("gi-emissive", rooms(EMISSIVE, true)),
+        // The screen-space occlusion off under the volumes, for the corners:
+        // the probes are a metre apart and see none of a corner's last half
+        // metre, which is the occlusion's to darken, so the pair should
+        // differ there and not across the walls.
+        (
+            "gi-emissive-no-ssao",
+            CaptureSettings {
+                ssao: false,
+                ..rooms(EMISSIVE, true)
+            },
+        ),
         // The same room filled with marched air. Off, the air scatters the
         // scene's flat ambient whatever is round it; on, it scatters what the
         // volumes hold — bright under the panel, dim in the corners, and

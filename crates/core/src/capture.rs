@@ -92,6 +92,10 @@ pub struct CaptureSettings {
     pub gi: bool,
     /// Which of the volumes' debug views the frame is drawn through.
     pub gi_debug: crate::scene::GiDebugView,
+    /// Screen-space ambient occlusion. On, as it ships; off is the other half
+    /// of the A/B that says whether it and the volumes darken one corner
+    /// twice.
+    pub ssao: bool,
     /// The sun's angular diameter in degrees, or `None` for the default. Zero
     /// is the other half of an A/B: every edge at one width, whatever cast it.
     pub sun_angle: Option<f32>,
@@ -180,6 +184,7 @@ impl Default for CaptureSettings {
             ray_tracing: true,
             gi: false,
             gi_debug: crate::scene::GiDebugView::None,
+            ssao: true,
             sun_angle: None,
             ssr: false,
             dof: false,
@@ -272,7 +277,10 @@ pub fn prepare(world: &mut World, renderer: &mut VulkanRenderer, settings: &Capt
         world.insert_resource(camera);
     }
 
-    world.insert_resource(SsaoSettings::default());
+    world.insert_resource(SsaoSettings {
+        enabled: settings.ssao,
+        ..SsaoSettings::default()
+    });
     world.insert_resource(ContactShadowSettings::default());
     world.insert_resource(SsrSettings {
         enabled: settings.ssr,

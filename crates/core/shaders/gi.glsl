@@ -84,6 +84,13 @@ uvec3 gi_slot(ivec3 world) {
     return uvec3(world + ivec3(int(n) << 20)) % n;
 }
 
+// The slot one step on from `slot` along each axis `step` is set on: the
+// remainder `gi_slot` takes, without taking it eight times over.
+uvec3 gi_next_slot(uvec3 slot, ivec3 step) {
+    uvec3 next = slot + uvec3(step);
+    return mix(next, next - gi.grid.x, greaterThanEqual(next, uvec3(gi.grid.x)));
+}
+
 // The probe a grid holds at a slot: the one coordinate in the grid with that
 // remainder.
 ivec3 gi_world_of(int level, uvec3 slot) {
@@ -251,13 +258,14 @@ vec4 gi_cascade_irradiance(int level, vec3 P, vec3 N, vec3 V) {
     vec3 grid = biased / s - vec3(base);
     ivec3 lo = clamp(ivec3(floor(grid)), ivec3(0), ivec3(int(gi.grid.x) - 2));
     vec3 alpha = clamp(grid - vec3(lo), 0.0, 1.0);
+    uvec3 first = gi_slot(base + lo);
 
     vec3 sum = vec3(0.0);
     float total = 0.0;
     for (int i = 0; i < 8; ++i) {
         ivec3 corner = ivec3(i, i >> 1, i >> 2) & 1;
         ivec3 world = base + lo + corner;
-        uvec3 slot = gi_slot(world);
+        uvec3 slot = gi_next_slot(first, corner);
         uvec4 state = gi_probes[gi_probe_index(level, slot)];
         if (!gi_usable(state, world)) {
             continue;
@@ -322,13 +330,14 @@ vec4 gi_cascade_mean(int level, vec3 P) {
     vec3 grid = P / s - vec3(base);
     ivec3 lo = clamp(ivec3(floor(grid)), ivec3(0), ivec3(int(gi.grid.x) - 2));
     vec3 alpha = clamp(grid - vec3(lo), 0.0, 1.0);
+    uvec3 first = gi_slot(base + lo);
 
     vec3 sum = vec3(0.0);
     float total = 0.0;
     for (int i = 0; i < 8; ++i) {
         ivec3 corner = ivec3(i, i >> 1, i >> 2) & 1;
         ivec3 world = base + lo + corner;
-        uvec3 slot = gi_slot(world);
+        uvec3 slot = gi_next_slot(first, corner);
         uvec4 state = gi_probes[gi_probe_index(level, slot)];
         if (!gi_usable(state, world)) {
             continue;
