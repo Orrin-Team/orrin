@@ -51,6 +51,9 @@ refraction_frag fragment refraction.frag
 refraction_composite_comp compute refraction_composite.comp
 shadow_frag fragment shadow.frag
 shadow_frag_masked fragment shadow.frag ORRIN_MASKED=1
+shadow_rect_vert vertex shadow_rect.vert
+shadow_rect_vert_restore vertex shadow_rect.vert ORRIN_RESTORE=1
+shadow_restore_frag fragment shadow_restore.frag
 shadow_vert vertex shadow.vert
 shadow_vert_masked vertex shadow.vert ORRIN_MASKED=1
 skybox_frag fragment skybox.frag

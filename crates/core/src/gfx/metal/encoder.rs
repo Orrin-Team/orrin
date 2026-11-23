@@ -19,8 +19,8 @@ use objc2_metal::{
 use super::pipeline::Pipe;
 use super::{MtlDriver, MtlEncoder};
 use crate::gfx::rhi::{
-    BindGroupId, BufferCopy, BufferId, DepthRect, LoadOp, PipelineId, RenderTargets, StoreOp,
-    TextureViewId, Viewport,
+    BindGroupId, BufferCopy, BufferId, LoadOp, PipelineId, RenderTargets, StoreOp, TextureViewId,
+    Viewport,
 };
 use crate::gfx::shaders::PUSH_CONSTANT_BUFFER;
 
@@ -367,9 +367,7 @@ impl<'a> MtlEncoder<'a> {
         if let Some(depth) = targets.depth {
             let attachment = pass.depthAttachment();
             attachment.setTexture(Some(&self.driver.texture(depth.target)));
-            // A depth that need not be kept is cleared, which is what the one
-            // pass that loads `DontCare` (the shadow atlas) relies on to have
-            // every tile it does not light read as far.
+            // A depth that need not be kept is cleared.
             attachment.setLoadAction(load(match depth.load {
                 LoadOp::DontCare => LoadOp::Clear,
                 other => other,
@@ -722,11 +720,6 @@ impl<'a> MtlEncoder<'a> {
             }
         }
     }
-
-    /// The pass that asks for this opened its depth as `DontCare`, which this
-    /// driver turns into a whole-attachment clear, so there is nothing left to
-    /// clear.
-    pub fn clear_depth(&mut self, _rects: &[DepthRect]) {}
 
     /// A drawable needs no transition into rendering: hazards are Metal's own.
     pub fn open_swapchain(&mut self, _target: TextureViewId) {}

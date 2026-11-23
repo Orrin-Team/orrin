@@ -260,11 +260,14 @@ mod tests {
 
     fn point(position: Vec3, range: f32) -> PointLight {
         PointLight {
+            id: 0,
             position,
             color: Vec3::ONE,
             candela: 100.0,
             range,
             casts_shadows: false,
+            channels: crate::scene::ALL_CHANNELS,
+            shadows: Default::default(),
         }
     }
 
@@ -322,6 +325,7 @@ mod tests {
                 .push(point(position, rng.range(0.5, 12.0)));
         }
         lighting.spot_lights.push(SpotLight {
+            id: 0,
             position: Vec3::new(1.0, 3.0, 2.0),
             direction: Vec3::NEG_Y,
             color: Vec3::ONE,
@@ -330,6 +334,8 @@ mod tests {
             inner_cos: 0.9,
             outer_cos: 0.8,
             casts_shadows: false,
+            channels: crate::scene::ALL_CHANNELS,
+            shadows: Default::default(),
         });
         let clusters = bin(&lighting);
 

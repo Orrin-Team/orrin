@@ -165,6 +165,9 @@ pub enum DepthCompare {
     Greater,
     /// [`crate::gfx::depth::NEARER_OR_EQUAL`].
     GreaterOrEqual,
+    /// Every fragment passes, for a draw whose whole purpose is the depth it
+    /// writes.
+    Always,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -287,13 +290,6 @@ pub enum GeometryStream {
 pub struct Binding {
     pub binding: u32,
     pub resource: BindingResource,
-}
-
-/// A rectangle of a depth attachment, in texels.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct DepthRect {
-    pub offset: [u32; 2],
-    pub extent: [u32; 2],
 }
 
 /// What a render pass does with an attachment's contents on the way in.

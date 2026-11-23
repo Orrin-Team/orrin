@@ -50,6 +50,20 @@
 //!   with a parameter and the time in it: what the feature costs in use, from
 //!   the extra classes, the twins and the parameter buffer. Needs the default
 //!   `shader-compiler` feature.
+//! - `ORRIN_PERF_MOTION=1` plays the scene rather than photographing it: every
+//!   `Spin` turns and the camera walks a circle at about walking pace. Without
+//!   it nothing in the frame changes from one to the next, which is the one
+//!   case anything that keeps work between frames — the instance rows, the
+//!   cached shadow layers — is at its best in, and so the wrong one to quote
+//!   for them alone.
+//! - `ORRIN_PERF_SUN=1` turns the sun a little every frame, as a time of day
+//!   does. A sun that moves is a new matrix for every one of its shadow views
+//!   every frame, so none of them can keep anything: what shadows cost with
+//!   nothing cached.
+//! - `ORRIN_PERF_FITTED` is how many of the sun's views are fitted to the view
+//!   frustum (`ShadowSettings::fitted_cascades`), which with
+//!   `ORRIN_PERF_MOTION` is what a view that cannot be kept between frames
+//!   costs beside one that can.
 //! - `ORRIN_PERF_MSAA=1` rasterises the forward pass at four samples. The other
 //!   half of the comparison `TaaSettings::msaa` exists for: multisampled, the
 //!   pass writes and resolves its own targets and cannot depth-test `EQUAL`
@@ -64,9 +78,7 @@ use std::sync::Arc;
 use vulkano::VulkanLibrary;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 
-use orrin_core::gfx::punctual::ShadowAtlas;
-use orrin_core::gfx::shadows::{CascadeSet, cascades};
-use orrin_core::gfx::vulkan::{ShadowFrame, VulkanRenderer};
+use orrin_core::gfx::vulkan::VulkanRenderer;
 use orrin_core::gfx::{DecalInstance, SceneLighting};
 use orrin_core::profile::{self, Lane, Profiler};
 use orrin_core::scene::entities::{SceneChoice, StressSpec, spawn_stress_scene};
@@ -281,14 +293,13 @@ fn frame_cost() {
     world.insert_resource(Culling::default());
     world.insert_resource(ShadowSettings {
         enabled: env_usize("ORRIN_PERF_SHADOWS", 1) != 0,
+        fitted_cascades: env_usize("ORRIN_PERF_FITTED", 0) as u32,
         ..ShadowSettings::default()
     });
 
     let mut lighting = SceneLighting::default();
     let mut geometry = FrameGeometry::default();
     let mut decals: Vec<DecalInstance> = Vec::new();
-    let mut cascade_set;
-    let mut atlas;
     let aspect = extent[0] as f32 / extent[1] as f32;
 
     // Big enough that a GPU readback landing several frames late still finds the
@@ -307,7 +318,32 @@ fn frame_cost() {
     let mut draws = 0usize;
     let mut entries = 0usize;
     let (mut extract_allocations, mut render_allocations) = (0u64, 0u64);
+    let motion = env_usize("ORRIN_PERF_MOTION", 0) != 0;
+    let turning_sun = env_usize("ORRIN_PERF_SUN", 0) != 0;
+    let start = *world.resource::<Camera>();
     for frame in 0..frames + WARMUP {
+        if motion {
+            systems::spin(&world, 1.0 / 60.0);
+            // Six centimetres a frame: a walk, at sixty frames a second.
+            let angle = frame as f32 * 0.01;
+            let offset = glam::Vec3::new(angle.cos() - 1.0, 0.0, angle.sin()) * 6.0;
+            let mut camera = world.resource_mut::<Camera>();
+            camera.position = start.position + offset;
+            camera.target = start.target + offset;
+        }
+        if turning_sun {
+            world
+                .query::<(
+                    &mut orrin_core::scene::LocalTransform,
+                    &orrin_core::scene::Light,
+                )>()
+                .for_each(|_, (transform, light)| {
+                    if matches!(light, orrin_core::scene::Light::Directional { .. }) {
+                        transform.0.rotation =
+                            glam::Quat::from_rotation_y(0.002) * transform.0.rotation;
+                    }
+                });
+        }
         let before_extract = allocations();
         // The engine throws its numbers away for the first few frames; so does
         // this, by restarting the profiler once the transient is over.
@@ -328,22 +364,6 @@ fn frame_cost() {
                 let _s = profile::scope("decals");
                 systems::extract_decals(&world, aspect, &mut decals);
             }
-            let shadow_settings = *world.resource::<ShadowSettings>();
-            let camera = *world.resource::<Camera>();
-            cascade_set = if shadow_settings.enabled {
-                cascades(
-                    &camera,
-                    aspect,
-                    lighting.sun.direction,
-                    &shadow_settings.cascade_config(),
-                )
-            } else {
-                CascadeSet::default()
-            };
-            atlas = match shadow_settings.atlas_config() {
-                Some(config) => orrin_core::gfx::punctual::fit(&lighting, camera.position, &config),
-                None => ShadowAtlas::default(),
-            };
             {
                 let _s = profile::scope("geometry");
                 systems::extract_geometry(&world, aspect, &mut geometry);
@@ -392,11 +412,7 @@ fn frame_cost() {
                 1.0 / 60.0,
                 &[],
                 profiler.frame_index(),
-                (cascade_set.count > 0).then_some(ShadowFrame {
-                    cascades: &cascade_set,
-                    atlas: &atlas,
-                    settings: &shadow_settings,
-                }),
+                shadow_settings.enabled.then_some(&shadow_settings),
                 None,
                 None,
             );

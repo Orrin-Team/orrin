@@ -23,14 +23,13 @@ use vulkano::VulkanLibrary;
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 
 use crate::gfx::SceneLighting;
-use crate::gfx::punctual::ShadowAtlas;
-use crate::gfx::shadows::{CascadeSet, cascades};
-use crate::gfx::vulkan::{ShadowFrame, VulkanRenderer};
+use crate::gfx::vulkan::VulkanRenderer;
 use crate::scene::entities::SceneChoice;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, DecalSettings, DofSettings, EnvironmentSettings,
-    FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings, ShadowSettings, SsaoSettings,
-    SsrSettings, SubsurfaceSettings, TaaSettings, TransparencySettings,
+    FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings, ShadowDebugView,
+    ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
+    TransparencySettings,
 };
 use crate::systems::{self, FrameGeometry};
 
@@ -73,6 +72,14 @@ pub struct CaptureSettings {
     /// between a leaf-shaped shadow and a quad-shaped one is the only place that
     /// pipeline is visible at all.
     pub shadows: bool,
+    /// Whether the point and spot lights get atlas tiles, in a capture that has
+    /// `shadows` on. Off by default for the reason `shadows` is.
+    pub punctual_shadows: bool,
+    /// Which of the shadows' debug views the frame is drawn through.
+    pub shadow_debug: ShadowDebugView,
+    /// The sun's angular diameter in degrees, or `None` for the default. Zero
+    /// is the other half of an A/B: every edge at one width, whatever cast it.
+    pub sun_angle: Option<f32>,
     /// Screen-space reflections: off by default, because they are the effect
     /// most easily mistaken for a lighting bug when they are wrong.
     pub ssr: bool,
@@ -152,6 +159,9 @@ impl Default for CaptureSettings {
             subsurface: true,
             decals: true,
             shadows: false,
+            punctual_shadows: false,
+            shadow_debug: ShadowDebugView::None,
+            sun_angle: None,
             ssr: false,
             dof: false,
             motion_blur: false,
@@ -331,11 +341,13 @@ pub fn render(
     let mut lighting = SceneLighting::default();
     let mut geometry = FrameGeometry::default();
     let mut decals = Vec::new();
-    // No punctual atlas either way: the sun is what a cutout's shadow is legible
-    // against, and a tile per face per lamp is a second budget for no extra
-    // evidence. A capture that wants one grows it the way `app.rs` does.
-    let atlas = ShadowAtlas::default();
-    let shadow_settings = ShadowSettings::default();
+    let defaults = ShadowSettings::default();
+    let shadow_settings = ShadowSettings {
+        punctual_enabled: settings.punctual_shadows,
+        debug_view: settings.shadow_debug,
+        sun_angle: settings.sun_angle.unwrap_or(defaults.sun_angle),
+        ..defaults
+    };
     let aspect = settings.extent[0] as f32 / settings.extent[1] as f32;
     let mut overlay = settings
         .wireframe
@@ -353,18 +365,6 @@ pub fn render(
         crate::scene::propagate_transforms(world);
         systems::extract_lighting(world, &mut lighting);
         let camera = *world.resource::<Camera>();
-        // Fitted after the lighting, exactly as `app.rs` orders it: the boxes
-        // are built around the sun that extraction just found.
-        let cascade_set = if settings.shadows {
-            cascades(
-                &camera,
-                aspect,
-                lighting.sun.direction,
-                &shadow_settings.cascade_config(),
-            )
-        } else {
-            CascadeSet::default()
-        };
         systems::extract_geometry(world, aspect, &mut geometry);
         systems::extract_decals(world, aspect, &mut decals);
 
@@ -399,11 +399,7 @@ pub fn render(
             // existed.
             &[],
             0,
-            (cascade_set.count > 0).then_some(ShadowFrame {
-                cascades: &cascade_set,
-                atlas: &atlas,
-                settings: &shadow_settings,
-            }),
+            settings.shadows.then_some(&shadow_settings),
             None,
             overlay.as_mut(),
         );

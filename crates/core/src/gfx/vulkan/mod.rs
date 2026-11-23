@@ -62,8 +62,11 @@ use vulkano::{Validated, VulkanError};
 
 use crate::geom::{Aabb, Frustum};
 use crate::gfx::DecalInstance;
-use crate::gfx::punctual::ShadowAtlas;
-use crate::gfx::shadows::{CascadeCache, CascadeSet, MAX_CASCADES};
+use crate::gfx::shadow_casters::CasterTracker;
+use crate::gfx::shadow_views::{
+    ATLAS_PAGES, CasterVolume, Layer, ShadowInputs, ShadowPlan, ShadowPlanner, ShadowViews,
+    ViewDefaults,
+};
 use crate::gfx::ui::UiFrame;
 use crate::scene::{
     BloomSettings, Camera, ContactShadowSettings, CpuMesh, DofSettings, EnvironmentSettings,
@@ -74,7 +77,7 @@ use crate::scene::{
 
 use self::contact_shadows::ContactShadowPass;
 use self::context::VkContext;
-use self::cull::{CullPass, CullView, Draws};
+use self::cull::{CullPass, CullView, CullVolume, Draws};
 use self::environment::EnvironmentPass;
 use self::forward::{ForwardPass, GpuMaterial, GpuMesh};
 use self::instances::InstanceStore;
@@ -198,19 +201,18 @@ enum Screenshot {
 /// them for the next, and the egui textures stay whole.
 pub type Overlay<'a> = &'a mut OverlayFrame;
 
-/// Everything the cascade passes need for one frame.
+/// Everything the shadow pass and its readers need for one frame.
 ///
 /// Bundled because the three travel together and are meaningless apart: the
-/// matrices decide what each pass draws with and what the cull dispatch tests
-/// against, and the settings supply the bias the maps are rendered with. `None`
-/// means shadows are off, which is what makes the graph drop the passes
-/// entirely rather than run them over an empty list.
+/// views decide what the pass draws with and what the cull dispatch tests
+/// against, and the settings supply the bias the maps are rendered with and
+/// the width they are filtered to. `None` means nothing casts, which is what
+/// makes the graph drop the pass entirely rather than run it over no views.
 #[derive(Clone, Copy)]
-pub struct ShadowFrame<'a> {
-    pub cascades: &'a CascadeSet,
-    /// The punctual lights that got atlas tiles. What each face draws is the
-    /// cull dispatch's to decide, against the face's own frustum.
-    pub atlas: &'a ShadowAtlas,
+pub(super) struct ShadowFrame<'a> {
+    pub views: &'a ShadowViews,
+    /// The work that brings the atlas up to date with them.
+    pub plan: &'a ShadowPlan,
     pub settings: &'a ShadowSettings,
 }
 
@@ -294,8 +296,20 @@ pub struct VulkanRenderer {
     /// The shutter's reconstruction, and the velocity pyramid it reads.
     motion_blur: MotionBlurPass,
     shadow: ShadowPass,
-    /// Which cascades this frame redraws. See `shadows::CascadeCache`.
-    cascade_cache: CascadeCache,
+    /// Lays each frame's shadow views out in the atlas, and knows what the
+    /// atlas still holds from the frames before.
+    shadow_planner: ShadowPlanner,
+    /// Which casters are standing still, which is what a cached shadow layer
+    /// holds.
+    shadow_casters: CasterTracker,
+    /// This frame's plan, replanned in place each frame so its lists are
+    /// allocated once. Shared so that a frame can read it while the renderer
+    /// is borrowed mutably around it; only the frame holds the other handle,
+    /// and it has let go by the time the next one plans.
+    shadow_plan: Arc<ShadowPlan>,
+    /// Set when the atlases were (re)allocated and hold nothing, until the
+    /// frame is planned again knowing so.
+    shadow_atlas_fresh: bool,
     /// Which punctual lights can reach each cluster of this frame's view, binned
     /// before the forward pass uploads them. See `gfx::clusters`.
     light_clusters: crate::gfx::clusters::LightClusters,
@@ -847,8 +861,6 @@ impl VulkanRenderer {
             gizmo: true,
             ui: false,
             presents: true,
-            shadow_cascades: 0,
-            shadow_resolution: 1,
             shadow_atlas: 0,
             async_compute,
             occlusion_culling,
@@ -884,7 +896,10 @@ impl VulkanRenderer {
             dof,
             motion_blur,
             shadow,
-            cascade_cache: CascadeCache::default(),
+            shadow_planner: ShadowPlanner::default(),
+            shadow_casters: CasterTracker::default(),
+            shadow_plan: Arc::new(ShadowPlan::default()),
+            shadow_atlas_fresh: false,
             light_clusters: Default::default(),
             line,
             gizmo,
@@ -914,6 +929,60 @@ impl VulkanRenderer {
             blends: vec![crate::gfx::BlendMode::default()],
             backend,
         }
+    }
+
+    /// Plan this frame's shadows into `shadow_plan`, from what the tracker has
+    /// just been told of the frame's casters.
+    fn plan_shadows(
+        &mut self,
+        shadows: Option<&ShadowSettings>,
+        camera: &Camera,
+        lighting: &SceneLighting,
+    ) {
+        let extent = self.backend.extent();
+        // The atlas is its pages side by side, and Vulkan promises an image no
+        // wider than 4096: a page is held to what this device takes of them.
+        let page = self.max_texture_side() as u32 / ATLAS_PAGES;
+        let held = shadows.map(|settings| ShadowSettings {
+            atlas_resolution: settings.atlas_resolution.min(page),
+            ..*settings
+        });
+        let shadows = held.as_ref();
+        let plan = Arc::get_mut(&mut self.shadow_plan)
+            .expect("the last frame still holds its shadow plan");
+        let sun = shadows
+            .filter(|settings| settings.enabled)
+            .map(|settings| settings.cascade_config());
+        let atlas = shadows.map(|settings| settings.atlas_config());
+        let defaults = |settings: &ShadowSettings| {
+            let [softness, sharpness, lamp_softness, lamp_sharpness] = settings.filtering();
+            (
+                ViewDefaults {
+                    filtering: [softness, sharpness],
+                    bias: [settings.constant_bias, settings.slope_bias],
+                },
+                ViewDefaults {
+                    filtering: [lamp_softness, lamp_sharpness],
+                    bias: [
+                        settings.punctual_constant_bias,
+                        settings.punctual_slope_bias,
+                    ],
+                },
+            )
+        };
+        let (sun_defaults, lamp_defaults) = shadows.map(defaults).unwrap_or_default();
+        let inputs = atlas.as_ref().map(|atlas| ShadowInputs {
+            camera,
+            aspect: extent[0] as f32 / extent[1].max(1) as f32,
+            lighting,
+            cascades: sun.as_ref(),
+            atlas,
+            casters: &self.shadow_casters,
+            viewport_height: extent[1] as f32,
+            sun: sun_defaults,
+            lamps: lamp_defaults,
+        });
+        self.shadow_planner.plan(inputs.as_ref(), plan);
     }
 
     /// Recompile the graph if the frame's structure changed, then (re)allocate
@@ -1335,10 +1404,11 @@ impl VulkanRenderer {
         // transient by contract does not, so the pass that ping-pongs it owns
         // the allocation.
         //
-        // The cascade map is the one import the table answers for, because it is
-        // also an attachment and `rendering_info` resolves attachments there;
-        // `reallocate` registered it.
-        if Some(id) == ids.shadows
+        // The shadow atlases are imports the table answers for, because they
+        // are also attachments and `rendering_info` resolves attachments there;
+        // `reallocate` registered them.
+        if Some(id) == ids.shadow_atlas
+            || Some(id) == ids.shadow_static
             || ids.material_preview.is_some_and(|p| p.output == id)
             || Some(id) == ids.screenshot
         {
@@ -1466,16 +1536,14 @@ impl VulkanRenderer {
                 self.table = mtl.rebuild(driver, &self.frame.graph);
             }
         }
-        if let Some(id) = self.frame.ids.shadows {
-            let (map, fresh) = self.shadow.cascade_map(
-                &self.device,
-                self.config.shadow_resolution,
-                self.config.shadow_cascades,
-            );
-            if fresh {
-                self.cascade_cache.invalidate();
-            }
-            self.table.import(id, map);
+        if let (Some(live), Some(cached)) =
+            (self.frame.ids.shadow_atlas, self.frame.ids.shadow_static)
+        {
+            let (atlas, layers, fresh) =
+                self.shadow.atlases(&self.device, self.config.shadow_atlas);
+            self.shadow_atlas_fresh |= fresh;
+            self.table.import(live, atlas);
+            self.table.import(cached, layers);
         }
     }
 }
@@ -1511,6 +1579,9 @@ impl RenderBackend for VulkanRenderer {
             bounds,
             vertices: mesh.vertices.len() as u32,
         };
+        // The same mesh handle is other geometry now, which every cached
+        // shadow layer it was drawn into still holds the old shape of.
+        self.shadow_casters.reset();
     }
 
     fn mesh_bounds(&self, mesh: MeshHandle) -> Option<Aabb> {
@@ -1544,6 +1615,9 @@ impl RenderBackend for VulkanRenderer {
         // bind it are rebuilt on the next frame. An edit costs a rebuild per
         // frame while a slider is dragged, and nothing once it is let go.
         self.invalidate_material_sets();
+        // A cutout's alpha is part of the depth it casts, and a material that
+        // stops being opaque stops casting at all.
+        self.shadow_casters.reset();
     }
 
     fn load_texture(
@@ -1893,7 +1967,7 @@ impl VulkanRenderer {
         dt: f32,
         debug_lines: &[DebugLine],
         profiler_frame: u64,
-        shadows: Option<ShadowFrame<'_>>,
+        shadows: Option<&ShadowSettings>,
         ui: Option<UiFrame<'_>>,
         overlay: Option<Overlay<'_>>,
     ) {
@@ -1953,7 +2027,7 @@ impl VulkanRenderer {
         dt: f32,
         debug_lines: &[DebugLine],
         profiler_frame: Option<u64>,
-        shadows: Option<ShadowFrame<'_>>,
+        shadows: Option<&ShadowSettings>,
         ui: Option<UiFrame<'_>>,
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))] mut overlay: Option<Overlay<'_>>,
     ) {
@@ -2003,6 +2077,16 @@ impl VulkanRenderer {
         let preview = self.preview_request(overlay.as_deref(), lighting, environment);
         let preview_due = preview.is_some();
 
+        // Laid out before the graph is declared, because whether anything casts
+        // is part of the frame's structure.
+        {
+            let meshes = &self.meshes;
+            self.shadow_casters.update(draws, |mesh| {
+                meshes.get(mesh as usize).map(|mesh| mesh.bounds)
+            });
+        }
+        self.plan_shadows(shadows, camera, lighting);
+
         // The frame's structure, and the only thing that recompiles the graph.
         // Everything else about this call — how many objects, which camera, what
         // exposure — flows through the same compiled schedule.
@@ -2050,22 +2134,10 @@ impl VulkanRenderer {
                 .is_some_and(|frame| !frame.gizmo.is_empty()),
             ui: ui.is_some_and(|frame| !frame.is_empty()),
             presents: self.backend.presents(),
-            // Sourced from the cascade set rather than the setting, so the
-            // number of passes the graph declares cannot disagree with the
-            // number of matrices there are to draw them with.
-            shadow_cascades: shadows.map_or(0, |s| s.cascades.count as u8),
-            shadow_resolution: shadows.map_or(1, |s| s.settings.resolution),
-            // Sourced from the fitted atlas for the reason the cascade count is
-            // sourced from the cascade set: a frame where every punctual light
-            // opted out, or where none reached the budget, declares no atlas
-            // rather than clearing one nothing reads.
-            shadow_atlas: shadows.map_or(0, |s| {
-                if s.atlas.faces.is_empty() {
-                    0
-                } else {
-                    s.atlas.resolution
-                }
-            }),
+            // Sourced from the fitted views rather than from the setting: a
+            // frame with the sun's shadows off and every lamp opted out
+            // declares no atlas rather than keeping one nothing reads.
+            shadow_atlas: self.shadow_plan.views.resolution,
             // What the device turned out to have, not a preference. Whether the
             // frame is actually split is then the compiler's call — a
             // configuration with no compute tail to move gets the plan it always
@@ -2090,27 +2162,19 @@ impl VulkanRenderer {
             },
         });
 
-        // Each cascade the cache does not redraw this frame is swapped back to
-        // the one its map holds, here and before anything reads the set, so the
-        // cull views, the lighting block and the fog all use the matrices those
-        // texels were rendered with. See `shadows::CascadeCache`.
-        let staggered = shadows.map(|frame| {
-            let extent = self.backend.extent();
-            let aspect = extent[0] as f32 / extent[1].max(1) as f32;
-            self.cascade_cache.resolve(
-                frame.cascades,
-                camera,
-                aspect,
-                lighting.sun.direction,
-                &frame.settings.cascade_config(),
-            )
-        });
-        let cascades_due = staggered.map_or([true; MAX_CASCADES], |(due, _)| due);
+        // Atlases allocated for this frame hold nothing, whatever the plan
+        // expected to find in them.
+        if std::mem::take(&mut self.shadow_atlas_fresh) {
+            self.shadow_planner.invalidate();
+            self.plan_shadows(shadows, camera, lighting);
+        }
+        let shadow_plan = self.shadow_plan.clone();
         let shadows = shadows
-            .zip(staggered.as_ref())
-            .map(|(frame, (_, set))| ShadowFrame {
-                cascades: set,
-                ..frame
+            .filter(|_| !shadow_plan.views.views.is_empty())
+            .map(|settings| ShadowFrame {
+                views: &shadow_plan.views,
+                plan: &shadow_plan,
+                settings,
             });
 
         // Release what the GPU has already finished and block only if the CPU
@@ -2155,6 +2219,8 @@ impl VulkanRenderer {
                             ),
                             Err(VulkanError::OutOfDate) => {
                                 self.backend.vk_mut().recreate_swapchain = true;
+                                // The plan made for this frame is never drawn.
+                                self.shadow_planner.invalidate();
                                 return;
                             }
                             Err(e) => panic!("failed to acquire next image: {e}"),
@@ -2326,12 +2392,6 @@ impl VulkanRenderer {
             Some(_) => self.bloom.strength(),
             None => 0.0,
         };
-        if let Some(shadows) = shadows {
-            self.shadow.constant_bias = shadows.settings.constant_bias;
-            self.shadow.slope_bias = shadows.settings.slope_bias;
-            self.shadow.punctual_constant_bias = shadows.settings.punctual_constant_bias;
-            self.shadow.punctual_slope_bias = shadows.settings.punctual_slope_bias;
-        }
 
         // Material table and texture array are static after asset load, so keep
         // their groups and rebuild only when invalidated (set to None).
@@ -2458,7 +2518,6 @@ impl VulkanRenderer {
                     forward::NeutralViews {
                         ao: self.ssao.white_view(),
                         contact_shadow: self.contact_shadows.lit_view(),
-                        shadow: self.shadow.lit_view(),
                         atlas: self.shadow.lit_atlas_view(),
                         env_cube: self.environment.specular_view(),
                         env_sampler: self.environment.sampler(),
@@ -2562,35 +2621,41 @@ impl VulkanRenderer {
         let object_rows = self.instances.rows();
 
         // The views the compute path culls against, in the numbering `cull.rs`
-        // documents: the camera, then each cascade, then each punctual face.
-        // Faces individually rather than one view per light — a face frustum
-        // has its apex at the light, so nothing outside one can occlude light
-        // entering it. See `ShadowPass::record_atlas`.
-        let cull_views: Vec<CullView> =
-            {
-                let mut views = vec![CullView::Frustum(Frustum::from_view_projection(
+        // documents: the camera, then each caster draw of the shadow plan in
+        // the plan's order. A shadow view the plan leaves alone offers the
+        // dispatch nothing, so it has no block and no number.
+        let cull_views: Vec<CullView> = {
+            let mut views = vec![CullView {
+                volume: CullVolume::Frustum(Frustum::from_view_projection(
                     view.unjittered_view_proj,
-                ))];
-                if let Some(shadows) = shadows {
-                    views.extend(
-                        shadows.cascades.cascades[..shadows.cascades.count]
-                            .iter()
-                            .map(|cascade| CullView::Cascade {
-                                light_view: cascade.light_view,
-                                half_extent: cascade.half_extent,
-                                depth_range: cascade.depth_range,
-                            }),
-                    );
-                    views.extend(shadows.atlas.faces.iter().map(|face| {
-                        CullView::Frustum(Frustum::from_view_projection(face.view_proj))
-                    }));
-                }
-                views
-            };
+                )),
+                casters: crate::gfx::shadow_casters::FLAG_VISIBLE,
+                cutoff: [0.0; 2],
+                channels: crate::scene::ALL_CHANNELS,
+            }];
+            if let Some(shadows) = shadows {
+                views.extend(shadows.plan.draws.iter().map(|draw| CullView {
+                    volume: match draw.volume {
+                        CasterVolume::Frustum(view_proj) => {
+                            CullVolume::Frustum(Frustum::from_view_projection(view_proj))
+                        }
+                        CasterVolume::Sweep { light_view, bounds } => {
+                            CullVolume::Sweep { light_view, bounds }
+                        }
+                        CasterVolume::Hull(planes, count) => CullVolume::Planes(planes, count),
+                    },
+                    casters: draw.casters.mask(),
+                    cutoff: draw.cutoff,
+                    channels: shadows.views.views[draw.view].channels,
+                }));
+            }
+            views
+        };
         let cull_frame = {
             let meshes = &self.meshes;
             let materials = &self.materials;
             let surfaces = &self.surfaces;
+            let casters = &self.shadow_casters;
             self.cull.prepare(
                 &self.device,
                 draws,
@@ -2605,6 +2670,7 @@ impl VulkanRenderer {
                         .map_or(cull::Variant::STANDARD, GpuMaterial::built_in_variant);
                     surfaces.variant(material, built_in)
                 },
+                |row| casters.flags(row),
                 cull_views.len() as u32,
             )
         };
@@ -2627,6 +2693,8 @@ impl VulkanRenderer {
         // One block for the whole frame, bound by the forward pass's set 0 and
         // the prepass's alike. See `ForwardPass::upload_decals`.
         let decal_block = self.forward.upload_decals(&self.device, decals);
+        let shadow_rects =
+            shadows.and_then(|shadows| self.shadow.upload_rects(&self.device, shadows.plan));
         let caster_sets = shadows.is_some().then(|| shadow::CasterSets {
             objects: self
                 .shadow
@@ -2685,25 +2753,13 @@ impl VulkanRenderer {
             None => self.contact_shadows.lit_view(),
         };
 
-        // Same trick for shadows: with them off there is no cascade image to
+        // Same trick for shadows: with nothing casting there is no atlas to
         // read, so the forward pass samples a 1x1 depth texture of 1.0 and every
         // comparison reports "lit".
-        let shadow_id = match self.frame.ids.shadows {
-            Some(id) => self.table.texture(id),
-            None => self.shadow.lit_view(),
-        };
-
-        // And the same for the punctual atlas, which is a plain 2D image: with
-        // nothing casting there is no atlas to read, so the forward pass samples
-        // a 1x1 depth texture of 1.0 and every lookup reports "lit".
         let atlas_view = match self.frame.ids.shadow_atlas {
             Some(id) => self.table.texture(id),
             None => self.shadow.lit_atlas_view(),
         };
-        // What the forward pass indexes the face table by. Empty when nothing
-        // casts, which is the frame where every light's face index is -1.
-        let empty_atlas = ShadowAtlas::default();
-        let atlas = shadows.map_or(&empty_atlas, |s| s.atlas);
 
         // What everything past shading composites: whichever image the optical
         // chain left the frame's colour in. `declare` already decided that, and
@@ -2740,12 +2796,10 @@ impl VulkanRenderer {
             self.backend.extent(),
             ao_view,
             contact_shadow_view,
-            shadow_id,
             atlas_view,
             self.environment.specular_view(),
             self.environment.sampler(),
             shadows,
-            atlas,
             material_set,
             texture_set,
             forward_object_set,
@@ -2862,8 +2916,6 @@ impl VulkanRenderer {
             frame: &self.frame,
             table: &self.table,
             swapchain_id,
-            shadow_resolution: self.config.shadow_resolution,
-            cascades_due,
             extent,
             bloom: &self.bloom,
             contact_shadows: &self.contact_shadows,
@@ -2902,6 +2954,7 @@ impl VulkanRenderer {
             occlusion_test: self.occlusion.test(occlusion_live),
             occlusion: &self.occlusion,
             caster_sets,
+            shadow_rects,
             blended_sets,
             forward_sets,
             frame_uniforms,
@@ -2912,7 +2965,7 @@ impl VulkanRenderer {
             prepass_texture_set,
             decal_block,
             scene_color,
-            shadow_view: shadow_id,
+            shadow_atlas_view: atlas_view,
             debug_lines,
             gizmo_strokes: overlay
                 .as_deref()
@@ -3353,10 +3406,6 @@ struct FrameRecord<'a> {
     table: &'a ImageTable,
     /// The same image as the device names it, which is what a pass binds.
     swapchain_id: TextureViewId,
-    shadow_resolution: u32,
-    /// Which cascade passes draw; the rest keep last frame's texels and record
-    /// nothing, not even the clear their render pass would open with.
-    cascades_due: [bool; MAX_CASCADES],
     extent: [u32; 2],
     bloom: &'a BloomPass,
     contact_shadows: &'a ContactShadowPass,
@@ -3405,6 +3454,7 @@ struct FrameRecord<'a> {
     occlusion_test: occlusion::OcclusionTest,
     occlusion: &'a OcclusionPass,
     caster_sets: Option<shadow::CasterSets>,
+    shadow_rects: Option<shadow::ShadowRects>,
     forward_sets: forward::ForwardSets,
     /// The same sets with the blended queues' own instance buffer bound.
     blended_sets: forward::ForwardSets,
@@ -3416,7 +3466,7 @@ struct FrameRecord<'a> {
     prepass_texture_set: BindGroupId,
     decal_block: BufferId,
     scene_color: TextureViewId,
-    shadow_view: TextureViewId,
+    shadow_atlas_view: TextureViewId,
     debug_lines: &'a [DebugLine],
     gizmo_strokes: &'a [GizmoVertex],
     outline_items: &'a [OutlineItem],
@@ -3585,7 +3635,7 @@ impl FrameRecord<'_> {
     /// culled for it.
     ///
     /// The view numbering is `cull.rs`'s and is stated once here — the camera,
-    /// then each cascade, then each punctual face — because the dispatch wrote
+    /// then each shadow view in the plan's order — because the dispatch wrote
     /// its blocks in that order and a pass reading the wrong one draws another
     /// view's visible set without anything failing.
     fn opaque_draws(&self, view: u32) -> Draws<'_> {
@@ -3594,13 +3644,6 @@ impl FrameRecord<'_> {
             view,
             commands: self.cull.commands(),
         }
-    }
-
-    /// Where the punctual faces begin in that numbering.
-    fn first_face_view(&self) -> u32 {
-        1 + self
-            .shadows
-            .map_or(0, |shadows| shadows.cascades.count as u32)
     }
 
     fn pass_ctx(&self) -> PassCtx<'_> {
@@ -3660,10 +3703,11 @@ impl FrameRecord<'_> {
         // transient by contract does not, so the pass that ping-pongs it owns
         // the allocation.
         //
-        // The cascade map is the one import the table answers for, because it is
-        // also an attachment and `rendering_info` resolves attachments there;
-        // `reallocate` registered it.
-        if Some(id) == ids.shadows
+        // The shadow atlases are imports the table answers for, because they
+        // are also attachments and `rendering_info` resolves attachments there;
+        // `reallocate` registered them.
+        if Some(id) == ids.shadow_atlas
+            || Some(id) == ids.shadow_static
             || ids.material_preview.is_some_and(|p| p.output == id)
             || Some(id) == ids.screenshot
         {
@@ -3751,8 +3795,9 @@ impl FrameRecord<'_> {
             }
             return;
         }
-        // The barriers above still ran: they carry the map through the
-        // attachment layout and back, which leaves the texels where they were.
+
+        // The barriers above still ran: they carry an atlas through the
+        // attachment layout and back, which leaves its texels where they were.
         if self.skipped(body) {
             if let Some(timestamps) = self.vk().timestamps {
                 timestamps.close(builder, timed);
@@ -3832,10 +3877,15 @@ impl FrameRecord<'_> {
         }
     }
 
-    /// A cascade the cache kept from an earlier frame: no render pass, so no
-    /// clear, and no draws.
+    /// A shadow pass with nothing to draw this frame, every view of its layer
+    /// keeping the texels it has: no render pass at all.
     fn skipped(&self, body: PassBody) -> bool {
-        matches!(body, PassBody::ShadowCascade(cascade) if !self.cascades_due[cascade as usize])
+        let plan = self.shadows.map(|shadows| shadows.plan);
+        match body {
+            PassBody::ShadowStatic => plan.is_none_or(|plan| !plan.draws_static()),
+            PassBody::Shadows => plan.is_none_or(|plan| !plan.draws_live()),
+            _ => false,
+        }
     }
 
     fn vk(&self) -> &VkFrame<'_> {
@@ -3946,9 +3996,8 @@ impl FrameRecord<'_> {
                 );
             }
             PassBody::FogScatter => {
-                let shadow_maps = self.shadow_view;
-
-                self.fog.record_scatter(self.device, encoder, shadow_maps);
+                self.fog
+                    .record_scatter(self.device, encoder, self.shadow_atlas_view);
             }
             PassBody::FogIntegrate => {
                 let ids = self
@@ -4265,37 +4314,23 @@ impl FrameRecord<'_> {
     /// A graphics pass's body, inside the render pass its targets opened.
     fn record_graphics(&self, encoder: &mut Encoder, body: PassBody) {
         match body {
-            PassBody::ShadowCascade(cascade) => {
+            PassBody::ShadowStatic | PassBody::Shadows => {
                 let shadows = self
                     .shadows
-                    .expect("the graph scheduled a cascade with no shadows");
-                let cascade_index = cascade as usize;
-
+                    .expect("the graph scheduled a shadow pass with no shadow frame");
                 self.shadow.record(
                     encoder,
-                    self.opaque_draws(1 + cascade),
-                    shadows.cascades.cascades[cascade_index].view_proj,
-                    self.shadow_resolution,
+                    shadows.plan,
+                    if body == PassBody::ShadowStatic {
+                        Layer::Static
+                    } else {
+                        Layer::Live
+                    },
+                    self.shadow_rects.as_ref(),
+                    (&self.cull_frame, self.cull.commands(), 1),
                     self.caster_sets
                         .as_ref()
-                        .expect("the graph scheduled a cascade with no shadows"),
-                );
-            }
-            PassBody::PunctualShadows => {
-                let shadows = self
-                    .shadows
-                    .expect("the graph scheduled the atlas with no shadow frame");
-                self.shadow.record_atlas(
-                    encoder,
-                    shadows.atlas,
-                    (
-                        &self.cull_frame,
-                        self.cull.commands(),
-                        self.first_face_view(),
-                    ),
-                    self.caster_sets
-                        .as_ref()
-                        .expect("the graph scheduled the atlas with no shadow frame"),
+                        .expect("the graph scheduled a shadow pass with no shadow frame"),
                 );
             }
             PassBody::GeometryPrepass => {

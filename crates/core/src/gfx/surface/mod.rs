@@ -130,6 +130,8 @@ pub use buffer::{
     DRAWN_VARIANTS, ParamBuffer, SurfaceClock, SurfaceShaderError, SurfaceShaderHandle,
     check_artifact,
 };
+#[cfg(all(test, feature = "shader-compiler"))]
+pub(crate) use compile::discards;
 #[cfg(feature = "shader-compiler")]
 pub use compile::{compile, variants};
 pub use params::{

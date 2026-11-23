@@ -7,8 +7,8 @@
 //!
 //! Adding a pass is a registration here plus a [`PassBody`] arm in `execute`.
 //! Nothing computes an execution order, a layout, or a barrier by hand, which is
-//! what makes the shadow cascades of Part 1 a loop over `declare` rather than
-//! surgery on a fixed pipeline.
+//! what makes a new pass a registration in `declare` rather than surgery on a
+//! fixed pipeline.
 
 use crate::gfx::format::Format;
 use crate::gfx::graph::ImageLayout;
@@ -17,7 +17,6 @@ use crate::gfx::graph::{
     Access, Extent, FrameGraph, GraphBuilder, GraphError, ImageDesc, PassBuilder, PassId, PassKind,
     ResourceId, compile,
 };
-use crate::gfx::shadows::MAX_CASCADES;
 
 use super::MSAA_SAMPLES;
 use super::bloom::MAX_BLOOM_MIPS;
@@ -36,6 +35,7 @@ use super::ssao::AO_FORMAT;
 use super::ssr::{HIZ_FORMAT, HIZ_LEVELS, RAY_FORMAT, SOURCE_LEVELS};
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
+use crate::gfx::shadow_views::atlas_extent;
 
 /// What a frame's structure depends on. A change to any of these recompiles the
 /// graph; nothing else does, which is the "recompiled on structure change, not
@@ -127,7 +127,7 @@ pub struct FrameConfig {
     /// Levels in the bloom chain, zero for none. Derived from the frame's extent
     /// rather than set, so the number of passes registered cannot disagree with
     /// the number of levels there is room for — the same reason
-    /// `shadow_cascades` is sourced from the cascade set.
+    /// `shadow_atlas` is sourced from the fitted views.
     /// Whether the frame marches the air in front of the camera as a froxel
     /// volume. Structural like the rest: it registers two dispatches and the
     /// volumes they write, and it is the one effect here that changes what the
@@ -160,15 +160,14 @@ pub struct FrameConfig {
     /// in: `PresentSrc` needs the swapchain extension, which an offscreen device
     /// does not enable, and the readback copies from `TransferSrcOptimal`.
     pub presents: bool,
-    pub shadow_cascades: u8,
-    pub shadow_resolution: u32,
-    /// Edge of the punctual shadow atlas in texels, zero for a frame where
-    /// nothing punctual casts. Sourced from the fitted atlas rather than from
-    /// the setting, for the reason `shadow_cascades` is: a frame whose lights
-    /// all opted out declares no atlas rather than clearing one nobody reads.
+    /// Edge of the shadow atlas in texels, zero for a frame where nothing
+    /// casts. Sourced from the fitted views rather than from the setting, so a
+    /// frame with the sun's shadows off and every lamp opted out declares no
+    /// atlas rather than keeping one nobody reads.
     ///
-    /// One number and one pass however many lights cast — the tile count varies
-    /// frame to frame *inside* the pass, which is exactly why it is not here.
+    /// One number and one pass however many views there are — which of them a
+    /// frame draws varies *inside* the pass, which is exactly why it is not
+    /// here.
     pub shadow_atlas: u32,
     /// Whether the frame's compute tail may be submitted to a second queue, so
     /// that the *next* frame's graphics head can start before this frame's post
@@ -335,11 +334,15 @@ pub enum PassBody {
     /// it and derives its barriers.
     ScreenshotOverlay,
     Overlay,
-    ShadowCascade(u32),
-    /// Every point and spot light's faces, in one pass over one atlas. A tile is
-    /// a viewport rather than a node, which is what keeps this a single barrier
-    /// instead of one per face.
-    PunctualShadows,
+    /// The cached layers of the shadow views that redraw theirs this frame:
+    /// the casters standing still, into an atlas kept from frame to frame.
+    ShadowStatic,
+    /// What the frame is shaded from: every shadow view's live tile, brought up
+    /// to date from the cached layer and this frame's moving casters. One pass
+    /// over one atlas for the sun's views and the lamps' alike — a tile is a
+    /// viewport rather than a node, which is what keeps this a single barrier
+    /// instead of one per view.
+    Shadows,
 }
 
 /// Handles the executor needs to bind per-frame resources and to find the
@@ -391,11 +394,11 @@ pub struct FrameIds {
     pub taa: Option<TaaIds>,
     pub dof: Option<DofIds>,
     pub motion_blur: Option<MotionBlurIds>,
-    pub shadows: Option<ResourceId>,
-    /// The punctual atlas, when anything punctual casts. One image and no
-    /// struct, like the contact-shadow mask: one pass writes it and the forward
-    /// pass reads it.
+    /// The shadow atlas, when anything casts: what the shading passes and the
+    /// fog read.
     pub shadow_atlas: Option<ResourceId>,
+    /// The atlas of cached layers beside it, tile for tile.
+    pub shadow_static: Option<ResourceId>,
     /// Which pixels the selection outline is drawn around: red where a selected
     /// mesh covers, green where the hovered one does. With the editor only.
     pub outline_mask: Option<ResourceId>,
@@ -680,12 +683,10 @@ fn indirect(pass: PassBuilder<'_>, commands: ResourceId) -> PassBuilder<'_> {
     pass.access(commands, Access::IndirectRead)
 }
 
-/// What the cascade map is: one layer per cascade, always an array so a single
-/// cascade is sampled through the same `sampler2DArrayShadow` as four.
-pub fn cascade_map_desc(resolution: u32, cascades: u8) -> ImageDesc {
-    ImageDesc::new(SHADOW_FORMAT)
-        .extent(Extent::Fixed([resolution; 2]))
-        .array_layers(cascades as u32)
+/// What a shadow atlas is: one image every view is a tile of, its pages side
+/// by side.
+pub fn shadow_atlas_desc(resolution: u32) -> ImageDesc {
+    ImageDesc::new(SHADOW_FORMAT).extent(Extent::Fixed(atlas_extent(resolution)))
 }
 
 pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
@@ -806,21 +807,6 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         },
     );
 
-    // Imported rather than graph-owned, because a far cascade is not redrawn
-    // every frame (`shadows::CascadeCache`) and a transient is `Undefined` at the
-    // start of each. Entered and left `ShaderReadOnlyOptimal`, the layout the
-    // frame's samplers leave it in, so a skipped cascade's texels survive the
-    // round trip through the attachment layout. The shadow pass allocates it to
-    // exactly this description.
-    let shadows = (config.shadow_cascades > 0).then(|| {
-        builder.import_image(
-            "shadow_cascades",
-            cascade_map_desc(config.shadow_resolution, config.shadow_cascades),
-            ImageLayout::ShaderReadOnlyOptimal,
-            ImageLayout::ShaderReadOnlyOptimal,
-        )
-    });
-
     // Resource and pass names live in separate namespaces, so a level's image
     // and the pass that writes it can share a name — and it reads well in the
     // plan, where `bloom_down_2` writes `bloom_down_2`.
@@ -845,52 +831,58 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     const BLOOM_DOWN_PASS_NAMES: [&str; MAX_BLOOM_MIPS] = BLOOM_DOWN_NAMES;
     const BLOOM_UP_PASS_NAMES: [&str; MAX_BLOOM_MIPS] = BLOOM_UP_NAMES;
 
-    const CASCADE_PASS_NAMES: [&str; MAX_CASCADES] = [
-        "shadow_cascade_0",
-        "shadow_cascade_1",
-        "shadow_cascade_2",
-        "shadow_cascade_3",
-    ];
-
-    if let Some(shadows) = shadows {
-        for cascade in 0..config.shadow_cascades as u32 {
-            let id = indirect(
-                builder
-                    .pass(CASCADE_PASS_NAMES[cascade as usize], PassKind::Inline)
-                    .access(object_transforms, Access::StorageRead)
-                    .access(instance_index, Access::StorageRead),
-                draw_commands,
+    // Geometry rasterised from each light's point of view, needed before
+    // anything shades. One node for every view of every light — a tile is a
+    // viewport into this attachment, so four sun views and six faces of eight
+    // lamps are still one barrier.
+    // Imported rather than graph-owned, both of them, because a view that is
+    // not redrawn keeps its tile from an earlier frame and a transient is
+    // `Undefined` at the start of each. Entered and left
+    // `ShaderReadOnlyOptimal`, the layout the frame's readers leave them in, so
+    // those texels survive the round trip through the attachment layout. The
+    // shadow pass allocates them to exactly this description.
+    let shadow_atlases = (config.shadow_atlas > 0).then(|| {
+        let mut import = |name| {
+            builder.import_image(
+                name,
+                shadow_atlas_desc(config.shadow_atlas),
+                ImageLayout::ShaderReadOnlyOptimal,
+                ImageLayout::ShaderReadOnlyOptimal,
             )
-            .access(shadows, Access::DepthAttachment)
-            .build();
-            record(id, PassBody::ShadowCascade(cascade), &mut bodies);
-        }
-    }
+        };
+        let (cached, atlas) = (import("shadow_static"), import("shadow_atlas"));
 
-    // Beside the cascades rather than after the prepass, because it is the same
-    // kind of thing: geometry rasterised from a light's point of view, needed
-    // before anything shades. One node for every face of every light — a tile is
-    // a viewport into this attachment, so six faces of sixteen lights would
-    // still be one barrier.
-    let shadow_atlas = (config.shadow_atlas > 0).then(|| {
-        let atlas = builder.create_image(
-            "shadow_atlas",
-            ImageDesc::new(SHADOW_FORMAT).extent(Extent::Fixed([config.shadow_atlas; 2])),
-        );
-
+        // Geometry rasterised from each light's point of view, needed before
+        // anything shades. Two nodes for every view of every light — a tile is
+        // a viewport into an attachment, so four sun views and six faces of
+        // eight lamps are a barrier per layer rather than per view. The cached
+        // layer first, because the live one is brought up to date from it.
         let id = indirect(
             builder
-                .pass("punctual_shadows", PassKind::Inline)
+                .pass("shadow_static", PassKind::Inline)
                 .access(object_transforms, Access::StorageRead)
                 .access(instance_index, Access::StorageRead),
             draw_commands,
         )
+        .access(cached, Access::DepthAttachment)
+        .build();
+        record(id, PassBody::ShadowStatic, &mut bodies);
+
+        let id = indirect(
+            builder
+                .pass("shadows", PassKind::Inline)
+                .access(object_transforms, Access::StorageRead)
+                .access(instance_index, Access::StorageRead),
+            draw_commands,
+        )
+        .access(cached, Access::Sampled)
         .access(atlas, Access::DepthAttachment)
         .build();
-        record(id, PassBody::PunctualShadows, &mut bodies);
+        record(id, PassBody::Shadows, &mut bodies);
 
-        atlas
+        (atlas, cached)
     });
+    let shadow_atlas = shadow_atlases.map(|(atlas, _)| atlas);
 
     // One prepass serves every consumer rather than one each: they need the same
     // rasterisation, and running it twice to hand each part of the result to a
@@ -1074,8 +1066,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // cannot see and does not need to: the executor binds it, and a resource
         // read and written by one pass is one point in the schedule either way.
         let mut scatter_pass = builder.pass("fog_scatter", PassKind::Compute);
-        if let Some(shadows) = shadows {
-            scatter_pass = scatter_pass.access(shadows, Access::Sampled);
+        if let Some(atlas) = shadow_atlas {
+            scatter_pass = scatter_pass.access(atlas, Access::Sampled);
         }
         let id = scatter_pass.access(scatter, Access::StorageWrite).build();
         record(id, PassBody::FogScatter, &mut bodies);
@@ -1117,9 +1109,6 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     }
     if let Some(mask) = contact_shadows {
         forward = forward.access(mask, Access::Sampled);
-    }
-    if let Some(shadows) = shadows {
-        forward = forward.access(shadows, Access::Sampled);
     }
     if let Some(atlas) = shadow_atlas {
         forward = forward.access(atlas, Access::Sampled);
@@ -1356,9 +1345,6 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         if let Some(mask) = contact_shadows {
             accumulate = accumulate.access(mask, Access::Sampled);
         }
-        if let Some(shadows) = shadows {
-            accumulate = accumulate.access(shadows, Access::Sampled);
-        }
         if let Some(atlas) = shadow_atlas {
             accumulate = accumulate.access(atlas, Access::Sampled);
         }
@@ -1451,9 +1437,6 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         }
         if let Some(mask) = contact_shadows {
             draw = draw.access(mask, Access::Sampled);
-        }
-        if let Some(shadows) = shadows {
-            draw = draw.access(shadows, Access::Sampled);
         }
         if let Some(atlas) = shadow_atlas {
             draw = draw.access(atlas, Access::Sampled);
@@ -2015,8 +1998,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             taa,
             dof,
             motion_blur,
-            shadows,
             shadow_atlas,
+            shadow_static: shadow_atlases.map(|(_, cached)| cached),
             outline_mask,
             wireframe,
             material_preview,

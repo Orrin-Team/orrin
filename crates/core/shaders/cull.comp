@@ -8,16 +8,19 @@
 //
 // The two view kinds are not the same test and must not be made one. A frustum
 // view -- the camera, and each face of a punctual light -- keeps a box that
-// reaches into the volume it can see. A cascade keeps a box that reaches its
+// reaches into the volume it can see. A sun view keeps a box that reaches its
 // volume *when swept toward the light*, which has no near plane at all: an
-// object between the sun and the cascade is exactly what casts into it. Testing
-// a cascade with its own six planes would drop those shadows, which is the
-// mistake `systems::casts_into` documents on the CPU side.
+// object between the sun and the view is exactly what casts into it. Testing
+// one with six planes of its own would drop those shadows.
+//
+// A view also says which instances it takes at all: a shadow view's cached
+// layer is offered the casters standing still, and the layer drawn over it the
+// ones that are not. See `gfx/shadow_casters.rs`.
 
 layout(local_size_x = 64, local_size_y = 1) in;
 
-const uint VIEW_FRUSTUM = 0;
-const uint VIEW_CASCADE = 1;
+const uint VIEW_PLANES = 0;
+const uint VIEW_SWEEP = 1;
 
 #include "object.glsl"
 
@@ -29,6 +32,8 @@ struct Instance {
     // on the host because the split moves whenever a new plain batch appears.
     // See `BatchIds` in `gfx/vulkan/cull.rs`.
     uint batch;
+    // Tested against the view's `casters` mask: static or dynamic.
+    uint flags;
 };
 
 struct Batch {
@@ -47,15 +52,31 @@ struct Batch {
     vec4 bounds_max;
 };
 
+// Lock-stepped with `MAX_PLANES` in cull.rs.
+const uint MAX_PLANES = 8u;
+
 struct View {
-    // World space into light space, for a cascade. Unused by a frustum view.
+    // World space into light space, for a sweep. Unused by a view of planes.
     mat4 light_view;
-    vec4 planes[6];
+    // The view's volume as the planes whose positive side is inside: a
+    // frustum's six, or the edges of a slice of the view swept toward the sun.
+    vec4 planes[MAX_PLANES];
+    // A sweep's box in `light_view`'s space: xy the least corner and z the far
+    // plane, then the greatest corner's xy. `sweep_max.zw` is the size below
+    // which an instance is not worth drawing here: a length, and a further
+    // length per metre of depth into a perspective view.
+    vec4 sweep_min;
+    vec4 sweep_max;
     uint kind;
-    float half_extent;
-    float depth_range;
+    // Which instances the view takes, as a mask over `Instance::flags`.
+    uint casters;
     // Where this view's block of `instance_index` begins.
     uint base;
+    uint plane_count;
+    // The light channels the view takes casters from: its light's. An object
+    // a light does not light casts nothing into its shadows.
+    uint channels;
+    uint _padding[3];
 };
 
 struct DrawCommand {
@@ -105,8 +126,8 @@ uint slot(uint packed) {
 // Conservative, exactly as `Frustum::intersects` is: true means "may be
 // visible". `extents . |n|` is the box's support along the plane normal, so the
 // box is rejected only when even its most inside corner is behind.
-bool inside_frustum(View view, vec3 center, vec3 extents) {
-    for (uint i = 0; i < 6; ++i) {
+bool inside_planes(View view, vec3 center, vec3 extents) {
+    for (uint i = 0; i < view.plane_count; ++i) {
         vec4 plane = view.planes[i];
         if (dot(plane.xyz, center) + plane.w + dot(extents, abs(plane.xyz)) < 0.0) {
             return false;
@@ -115,17 +136,16 @@ bool inside_frustum(View view, vec3 center, vec3 extents) {
     return true;
 }
 
-// The GPU half of `systems::casts_into`. `light_view` is a right-handed
-// look-at, so the cascade lies at negative z between the eye at 0 and the far
-// plane at -depth_range; the near side is deliberately open.
+// Whether a box reaches a sweep's box when carried toward the light.
+// `light_view` is a right-handed look-at, so the light looks down -z and the
+// near side, the greater z, is deliberately open.
 bool casts_into(View view, vec3 center, vec3 extents) {
     vec3 c = (view.light_view * vec4(center, 1.0)).xyz;
     mat3 rotation = mat3(view.light_view);
     vec3 ls = abs(rotation[0]) * extents.x + abs(rotation[1]) * extents.y + abs(rotation[2]) * extents.z;
-    float half_extent = view.half_extent;
-    return c.x - ls.x <= half_extent && c.x + ls.x >= -half_extent
-        && c.y - ls.y <= half_extent && c.y + ls.y >= -half_extent
-        && c.z + ls.z >= -view.depth_range;
+    return c.x - ls.x <= view.sweep_max.x && c.x + ls.x >= view.sweep_min.x
+        && c.y - ls.y <= view.sweep_max.y && c.y + ls.y >= view.sweep_min.y
+        && c.z + ls.z >= view.sweep_min.z;
 }
 
 // True only when the previous frame's depth covered this box everywhere its
@@ -214,10 +234,16 @@ void main() {
     }
 
     Instance instance = instances[index];
+    View view = views[view_index];
+    if ((instance.flags & view.casters) == 0u) {
+        return;
+    }
     Object object = objects[instance.row];
+    if ((object.flags.x & view.channels) == 0u) {
+        return;
+    }
     uint batch_slot = slot(instance.batch);
     Batch batch = batches[batch_slot];
-    View view = views[view_index];
 
     vec3 bmin = batch.bounds_min.xyz;
     vec3 bmax = batch.bounds_max.xyz;
@@ -237,9 +263,16 @@ void main() {
         vec3 extents = abs(rotation[0]) * half_extents.x
             + abs(rotation[1]) * half_extents.y
             + abs(rotation[2]) * half_extents.z;
-        wanted = view.kind == VIEW_CASCADE
+        wanted = view.kind == VIEW_SWEEP
             ? casts_into(view, center, extents)
-            : inside_frustum(view, center, extents);
+            : inside_planes(view, center, extents);
+        // A caster smaller than a texel of the view it would be drawn into
+        // shadows nothing the filter can resolve. By its longest side, so that
+        // a pole is not judged by its width; and for a perspective view by how
+        // deep into it the caster stands, which its near plane measures.
+        float depth = dot(view.planes[4].xyz, center) + view.planes[4].w;
+        float cutoff = view.sweep_max.z + view.sweep_max.w * max(depth, 0.0);
+        wanted = wanted && 2.0 * max(extents.x, max(extents.y, extents.z)) >= cutoff;
         // View 0 is the camera, and only the camera has a pyramid. A cascade or
         // a light face keeps what the frustum kept: an object the eye cannot see
         // still casts a shadow the eye can.

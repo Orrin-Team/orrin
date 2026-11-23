@@ -1,4 +1,4 @@
-use glam::{Mat3, Mat4, Vec3};
+use glam::{IVec2, Mat3, Mat4, Vec2, Vec3, Vec4};
 
 use crate::scene::Camera;
 
@@ -20,12 +20,209 @@ const NDC_CORNERS: [Vec3; 8] = {
     ]
 };
 
+/// How far past its split distance a level's square reaches, in its own texels:
+/// the filter kernel's reach and the normal offset a lookup is moved by before
+/// it is projected.
+const LEVEL_MARGIN_TEXELS: f32 = 8.0;
+
+/// How far a level's square moves when it moves, as a fraction of its edge.
+///
+/// A level does not follow the camera texel by texel. Every move slides what
+/// its tile holds, and sliding a tile is a touch of every texel in it, which on
+/// a tiling GPU costs more than drawing the casters does — so it moves rarely
+/// and by a strip at a time, and is that much larger than the disc it answers
+/// for to leave the camera room to walk about inside it.
+const LEVEL_STEP: f32 = 1.0 / 16.0;
+
+/// How far from the middle of its square the camera gets, in steps, before the
+/// square follows. Past half a step, so a camera pacing across one boundary
+/// does not move the square on every crossing.
+const LEVEL_SLACK_STEPS: f32 = 0.75;
+
+/// The least a level's depth range is padded by at each end, in metres. The
+/// range is anchored rather than centred on the camera for the reason the
+/// square is: depth already drawn is only reusable while the plane it was
+/// measured from stays put.
+const LEVEL_DEPTH_STEP: f32 = 16.0;
+
 pub struct CascadeConfig {
     pub count: usize,
     pub max_distance: f32,
     pub lambda: f32,
+    /// Edge of the tiles of the sun's first two views, in texels.
     pub resolution: u32,
+    /// Edge of the tiles of the views past those, which answer for a distance
+    /// where a texel is fewer pixels.
+    pub far_resolution: u32,
     pub pullback: f32,
+    /// How many of the sun's views, nearest first, are [fitted to the view
+    /// frustum](fit_cascade) rather than [placed around the camera](LevelWindow).
+    pub fitted: usize,
+}
+
+/// How many of the sun's views take the larger tile.
+const NEAR_VIEWS: usize = 2;
+
+impl CascadeConfig {
+    /// Edge of the tile sun view `index` is drawn into.
+    pub fn resolution_of(&self, index: usize) -> u32 {
+        if index < NEAR_VIEWS {
+            self.resolution
+        } else {
+            self.far_resolution
+        }
+    }
+}
+
+/// What can cast into one of the sun's views, as a box in the space of its
+/// `light_view`: anything that reaches the box when swept toward the light. No
+/// upper `z`, because an object between the sun and the box is exactly what
+/// casts into it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SweepBounds {
+    /// Least `x` and `y`, and the far plane's `z`.
+    pub min: Vec3,
+    /// Greatest `x` and `y`.
+    pub max: Vec2,
+}
+
+/// A level: a square of the sun's view centred near the camera, on a grid that
+/// does not move.
+///
+/// Where [`fit_cascade`] bounds the slice of the frustum a cascade answers for,
+/// a level bounds the whole disc the shader's radial selection can route to it,
+/// in view or not. That makes it independent of where the camera is looking —
+/// turning never moves it — and it is smaller than the sphere around a wide
+/// frustum's far corners besides.
+///
+/// The grid is the level's own texels, counted from the light-space origin:
+/// cell `(i, j)` covers `x` in `[i, i + 1) * texel` and `y` in
+/// `(-(j + 1), -j] * texel`, the second axis running down because a tile's rows
+/// do. A window is `cells` of them each way from `min_cell`, and a depth range
+/// hung from `z_eye`. Because the grid is fixed, a window that has moved shares
+/// most of its cells with where it was, and what was drawn for them is still
+/// right: only the strip it moved onto is new.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LevelWindow {
+    pub min_cell: IVec2,
+    pub cells: u32,
+    /// World size of one cell.
+    pub texel: f32,
+    /// Light-space `z` of the plane depth is measured from, the end of the
+    /// range nearest the light.
+    pub z_eye: f32,
+    pub depth_range: f32,
+}
+
+impl LevelWindow {
+    /// Where a level answering for everything within `radius` of the camera
+    /// sits, given where it sat. `camera` is in light space.
+    ///
+    /// `previous` is kept while it still covers the disc, with room to spare:
+    /// that is what makes a level's matrix the same frame after frame while the
+    /// camera moves about inside it.
+    pub fn place(
+        camera: Vec3,
+        radius: f32,
+        resolution: u32,
+        pullback: f32,
+        previous: Option<&LevelWindow>,
+    ) -> Self {
+        let cells = resolution.max(64);
+        let n = cells as f32;
+        let step = (n * LEVEL_STEP).round().max(1.0);
+        let slack = step * LEVEL_SLACK_STEPS;
+        // Solved so that the square still reaches `radius` with the camera a
+        // slack off centre and the margin taken off it: the texel is a fraction
+        // of the extent it is a margin of.
+        let half_extent = radius / (1.0 - 2.0 * (slack + LEVEL_MARGIN_TEXELS) / n);
+        let texel = 2.0 * half_extent / n;
+        let depth_step = radius.max(LEVEL_DEPTH_STEP);
+        let depth_range = 2.0 * (radius + depth_step) + pullback;
+
+        let previous = previous.filter(|old| {
+            old.cells == cells && old.texel == texel && old.depth_range == depth_range
+        });
+
+        let at = Vec2::new(camera.x, -camera.y) / texel;
+        let half = (cells / 2) as i32;
+        let min_cell = previous
+            .map(|old| old.min_cell)
+            .filter(|min| {
+                let off = at - (min.as_vec2() + Vec2::splat(half as f32));
+                off.abs().max_element() <= slack
+            })
+            .unwrap_or_else(|| ((at / step).round() * step).as_ivec2() - IVec2::splat(half));
+
+        // The light looks down -z, so the end nearest it is the greatest `z`.
+        let needed = camera.z + radius + pullback;
+        let z_eye = previous
+            .map(|old| old.z_eye)
+            .filter(|eye| *eye >= needed && *eye - depth_range <= camera.z - radius)
+            .unwrap_or(needed + depth_step);
+
+        Self {
+            min_cell,
+            cells,
+            texel,
+            z_eye,
+            depth_range,
+        }
+    }
+
+    /// Half the square's edge, in metres.
+    pub fn half_extent(&self) -> f32 {
+        0.5 * self.cells as f32 * self.texel
+    }
+
+    /// The projection that lands the `cells`-wide square of cells from `min`
+    /// on a whole tile, cell for texel. Light space in, so it goes after the
+    /// light's rotation.
+    fn projection(&self, min: IVec2) -> Mat4 {
+        let size = self.cells as f32 * self.texel;
+        let left = min.x as f32 * self.texel;
+        let top = -(min.y as f32) * self.texel;
+        let mut ortho = Mat4::orthographic_rh(
+            left,
+            left + size,
+            top - size,
+            top,
+            -self.z_eye,
+            -self.z_eye + self.depth_range,
+        );
+        // The flip the camera's projection has, which is what makes a
+        // triangle's winding come out the same here as in the forward pass —
+        // and what makes a tile's rows run down the grid's second axis. Both
+        // terms of the row, because this box is not centred on the origin.
+        ortho.y_axis.y *= -1.0;
+        ortho.w_axis.y *= -1.0;
+        ortho
+    }
+
+    /// What the level is sampled with: the window on its tile.
+    pub fn view_proj(&self, rotation: Mat4) -> Mat4 {
+        self.projection(self.min_cell) * rotation
+    }
+
+    /// What a strip of the level is drawn with into its cached layer, whose
+    /// texels are kept at their cells' places modulo the tile rather than the
+    /// window's: the square of cells from `page`, which is the window slid by
+    /// whole tiles so the strip lands where its cells are kept.
+    pub fn page_view_proj(&self, rotation: Mat4, page: IVec2) -> Mat4 {
+        self.projection(page) * rotation
+    }
+
+    /// What can cast into the cells from `min` up to `max`.
+    pub fn sweep(&self, min: IVec2, max: IVec2) -> SweepBounds {
+        SweepBounds {
+            min: Vec3::new(
+                min.x as f32 * self.texel,
+                -(max.y as f32) * self.texel,
+                self.z_eye - self.depth_range,
+            ),
+            max: Vec2::new(max.x as f32 * self.texel, -(min.y as f32) * self.texel),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -36,6 +233,11 @@ pub struct Cascade {
     pub depth_range: f32, // 0 .. 2r + pullback
     pub split_distance: f32,
     pub texel_world_size: f32,
+    /// What casts into it, in `light_view`'s space.
+    pub bounds: SweepBounds,
+    /// The window, for a view that is a level rather than fitted to the
+    /// frustum.
+    pub window: Option<LevelWindow>,
 }
 
 /// A `count` of zero means shadows are off — every other field is then inert,
@@ -180,6 +382,29 @@ pub fn fit_cascade(
         depth_range,
         split_distance,
         texel_world_size: texel,
+        bounds: SweepBounds {
+            min: Vec3::new(-half_extent, -half_extent, -depth_range),
+            max: Vec2::splat(half_extent),
+        },
+        window: None,
+    }
+}
+
+/// The sun's view for a level's window.
+fn level(window: LevelWindow, light_dir: Vec3, split_distance: f32) -> Cascade {
+    let rotation = Mat4::look_at_rh(Vec3::ZERO, light_dir, light_up(light_dir));
+    Cascade {
+        view_proj: window.view_proj(rotation),
+        light_view: rotation,
+        half_extent: window.half_extent(),
+        depth_range: window.depth_range,
+        split_distance,
+        texel_world_size: window.texel,
+        bounds: window.sweep(
+            window.min_cell,
+            window.min_cell + IVec2::splat(window.cells as i32),
+        ),
+        window: Some(window),
     }
 }
 
@@ -199,11 +424,128 @@ fn slice_corners(
     sub_frustum_corners(camera, aspect, near, splits[index])
 }
 
+/// The most planes [`swept_slice`] returns: a frustum's outline seen from any
+/// direction has at most six edges, and one more plane closes the far end.
+pub const MAX_SWEEP_PLANES: usize = 8;
+
+/// A slice of the view frustum swept toward the light. See [`swept_slice`].
+#[derive(Clone, Copy, Debug)]
+pub struct SweptSlice {
+    pub planes: [Vec4; MAX_SWEEP_PLANES],
+    /// How many of `planes` are set.
+    pub count: usize,
+    /// The slice's own corners, which bound where in the sun's view the camera
+    /// can be reading.
+    pub corners: [Vec3; 8],
+}
+
+/// What can cast into the part of a sun view the camera can see: the slice of
+/// the view frustum that view `index` answers for, swept toward the light.
+///
+/// As planes whose positive side is inside, in world space: one through each
+/// edge of the slice's outline as the light sees it, and one behind the slice's
+/// farthest point from the light. Open toward the light, like every sun
+/// volume. Tighter than the view's own box wherever the camera is not looking
+/// at all of it — and a level's box is the whole disc around the camera, of
+/// which a frustum is a wedge.
+///
+/// For the layers a frame draws and throws away. What a cached layer holds has
+/// to be right wherever the camera turns next, so it is culled against the box
+/// and never against this.
+///
+/// `None` when the outline does not come out as a polygon, which is a slice
+/// seen exactly end on.
+pub fn swept_slice(
+    camera: &Camera,
+    aspect: f32,
+    light_dir: Vec3,
+    splits: &[f32; MAX_CASCADES],
+    index: usize,
+) -> Option<SweptSlice> {
+    let light_dir = light_dir.try_normalize().unwrap_or(Vec3::NEG_Y);
+    // The view selects by distance from the eye, and a fragment that far along
+    // a ray to the frustum's corner is nearer than that in depth: the slice
+    // starts where the corner ray reaches the previous split.
+    let corner = (camera.fov_y * 0.5).tan() * (1.0 + aspect * aspect).sqrt();
+    let near = if index == 0 {
+        camera.near
+    } else {
+        splits[index - 1] * (1.0 - OVERLAP) / (1.0 + corner * corner).sqrt()
+    };
+    let corners = sub_frustum_corners(camera, aspect, near.max(camera.near), splits[index]);
+    let rotation = Mat4::look_at_rh(Vec3::ZERO, light_dir, light_up(light_dir));
+    let lit = corners.map(|corner| rotation.transform_point3(corner));
+
+    // The outline: the convex hull of the corners as the light sees them, by
+    // Andrew's monotone chain, counter-clockwise.
+    let mut points = lit.map(|point| point.truncate());
+    points.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    let cross = |o: Vec2, a: Vec2, b: Vec2| (a - o).perp_dot(b - o);
+    let mut hull = [Vec2::ZERO; 16];
+    let mut count = 0;
+    for pass in 0..2 {
+        let start = count;
+        for step in 0..points.len() {
+            let point = if pass == 0 {
+                points[step]
+            } else {
+                points[points.len() - 1 - step]
+            };
+            while count >= start + 2 && cross(hull[count - 2], hull[count - 1], point) <= 1e-6 {
+                count -= 1;
+            }
+            hull[count] = point;
+            count += 1;
+        }
+        // Each chain ends on the point the other begins with.
+        count -= 1;
+    }
+    if !(3..MAX_SWEEP_PLANES).contains(&count) {
+        return None;
+    }
+
+    let to_world = Mat3::from_mat4(rotation).transpose();
+    let mut planes = [Vec4::ZERO; MAX_SWEEP_PLANES];
+    for edge in 0..count {
+        let (a, b) = (hull[edge], hull[(edge + 1) % count]);
+        // Inside is to the left of a counter-clockwise edge.
+        let normal = Vec2::new(a.y - b.y, b.x - a.x).normalize_or_zero();
+        planes[edge] = (to_world * normal.extend(0.0)).extend(-normal.dot(a));
+    }
+    // The light looks down -z, so the slice's far end is its least z.
+    let far = lit
+        .iter()
+        .map(|point| point.z)
+        .fold(f32::INFINITY, f32::min);
+    planes[count] = (to_world * Vec3::Z).extend(-far);
+    Some(SweptSlice {
+        planes,
+        count: count + 1,
+        corners,
+    })
+}
+
 pub fn cascades(
     camera: &Camera,
     aspect: f32,
     light_dir: Vec3,
     config: &CascadeConfig,
+) -> CascadeSet {
+    sun_views(camera, aspect, light_dir, config, &[None; MAX_CASCADES])
+}
+
+/// The sun's views for a frame: the first [`CascadeConfig::fitted`] fitted to
+/// their slices of the view, the rest placed around the camera as levels.
+///
+/// `previous` is where each level's window sat last frame, which it keeps while
+/// it can — see [`LevelWindow::place`]. A caller that passes none gets every
+/// level centred afresh.
+pub fn sun_views(
+    camera: &Camera,
+    aspect: f32,
+    light_dir: Vec3,
+    config: &CascadeConfig,
+    previous: &[Option<LevelWindow>; MAX_CASCADES],
 ) -> CascadeSet {
     let count = config.count.clamp(1, MAX_CASCADES);
     // Unit length is not cosmetic here: `fit_cascade` scales the near-plane
@@ -212,11 +554,24 @@ pub fn cascades(
     // `look_at_rh` as NaNs, so it falls back to straight down.
     let light_dir = light_dir.try_normalize().unwrap_or(Vec3::NEG_Y);
     let splits = split_distances(camera.near, config);
+    let rotation = Mat4::look_at_rh(Vec3::ZERO, light_dir, light_up(light_dir));
+    let camera_ls = rotation.transform_point3(camera.position);
 
     let mut cascades = [Cascade::default(); MAX_CASCADES];
     for i in 0..count {
-        let corners = slice_corners(camera, aspect, &splits, i);
-        cascades[i] = fit_cascade(&corners, light_dir, splits[i], config);
+        cascades[i] = if i < config.fitted {
+            let corners = slice_corners(camera, aspect, &splits, i);
+            fit_cascade(&corners, light_dir, splits[i], config)
+        } else {
+            let window = LevelWindow::place(
+                camera_ls,
+                splits[i],
+                config.resolution_of(i),
+                config.pullback,
+                previous[i].as_ref(),
+            );
+            level(window, light_dir, splits[i])
+        };
     }
 
     // The sweep culls against a rotation it is told the cascades share. If a
@@ -243,111 +598,6 @@ pub fn cascades(
     }
 }
 
-/// Whether cascade `index` is re-rendered on frame `frame`.
-///
-/// The two near cascades every frame; the far two, which spend the fewest
-/// pixels on the most distance, at half and a quarter of the rate — 2 on odd
-/// frames and 3 on every fourth even one, so no frame pays for both.
-pub fn cascade_due(index: usize, frame: u64) -> bool {
-    match index {
-        0 | 1 => true,
-        2 => frame % 2 == 1,
-        _ => frame % 4 == 0,
-    }
-}
-
-/// Which cascades a frame re-renders, and the matrices every consumer samples
-/// the others with.
-///
-/// A cascade that is not [due](cascade_due) keeps the map it was last rendered
-/// into, so it must also keep being *sampled* with the matrix that map was
-/// rendered with: [`Self::resolve`] puts that cascade back into the set the
-/// lighting block, the fog and the cull dispatch all read, so none of them can
-/// disagree with the texels. It is re-rendered anyway, whatever its turn, when
-/// its old map no longer covers its slice of the view — the camera has moved
-/// or turned past the slack between the slice and the sphere fitted around it
-/// — when the sun has moved, or when the set's shape has changed. What
-/// staggering costs is up to three frames of lag on a moving object's distant
-/// shadow.
-#[derive(Default)]
-pub struct CascadeCache {
-    rendered: [Option<Rendered>; MAX_CASCADES],
-    frame: u64,
-}
-
-#[derive(Clone, Copy)]
-struct Rendered {
-    cascade: Cascade,
-    light_dir: Vec3,
-    resolution: u32,
-    count: usize,
-}
-
-/// How far the sun may turn, as a cosine, before every map is stale: about a
-/// quarter of a degree.
-const SUN_STILL: f32 = 0.99999;
-
-impl CascadeCache {
-    /// Forget every map, because the image behind them was replaced.
-    pub fn invalidate(&mut self) {
-        self.rendered = [None; MAX_CASCADES];
-    }
-
-    /// This frame's `set`, with each cascade that is not re-rendered replaced
-    /// by the one its map holds, and which cascades are re-rendered.
-    pub fn resolve(
-        &mut self,
-        set: &CascadeSet,
-        camera: &Camera,
-        aspect: f32,
-        light_dir: Vec3,
-        config: &CascadeConfig,
-    ) -> ([bool; MAX_CASCADES], CascadeSet) {
-        let frame = self.frame;
-        self.frame += 1;
-        let light_dir = light_dir.try_normalize().unwrap_or(Vec3::NEG_Y);
-
-        let mut resolved = *set;
-        let mut render = [false; MAX_CASCADES];
-        for index in 0..set.count {
-            let reusable = self.rendered[index].filter(|old| {
-                old.count == set.count
-                    && old.resolution == config.resolution
-                    && old.light_dir.dot(light_dir) > SUN_STILL
-                    && covers(
-                        &old.cascade,
-                        &slice_corners(camera, aspect, &set.splits, index),
-                    )
-            });
-            match reusable {
-                Some(old) if !cascade_due(index, frame) => resolved.cascades[index] = old.cascade,
-                _ => {
-                    render[index] = true;
-                    self.rendered[index] = Some(Rendered {
-                        cascade: set.cascades[index],
-                        light_dir,
-                        resolution: config.resolution,
-                        count: set.count,
-                    });
-                }
-            }
-        }
-        for slot in &mut self.rendered[set.count..] {
-            *slot = None;
-        }
-        (render, resolved)
-    }
-}
-
-/// Whether a map rendered with `cascade` holds every point of `corners`' slice:
-/// each corner inside its box, across and in depth.
-fn covers(cascade: &Cascade, corners: &[Vec3; 8]) -> bool {
-    corners.iter().all(|corner| {
-        let ndc = cascade.view_proj.project_point3(*corner);
-        ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0 && (0.0..=1.0).contains(&ndc.z)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,99 +620,10 @@ mod tests {
             max_distance: 100.0,
             lambda: 0.75,
             resolution: 2048,
+            far_resolution: 1024,
             pullback: 50.0,
+            fitted: 2,
         }
-    }
-
-    // --- CascadeCache ---
-
-    #[test]
-    fn the_far_cascades_render_at_half_and_a_quarter_rate_and_never_together() {
-        let frames = 0..16u64;
-        assert!(
-            frames
-                .clone()
-                .all(|f| cascade_due(0, f) && cascade_due(1, f))
-        );
-        assert_eq!(frames.clone().filter(|&f| cascade_due(2, f)).count(), 8);
-        assert_eq!(frames.clone().filter(|&f| cascade_due(3, f)).count(), 4);
-        assert!(
-            frames
-                .clone()
-                .all(|f| !(cascade_due(2, f) && cascade_due(3, f))),
-            "a frame that renders both far cascades is the spike staggering exists to remove",
-        );
-    }
-
-    fn resolve(
-        cache: &mut CascadeCache,
-        camera: &Camera,
-        sun: Vec3,
-    ) -> ([bool; MAX_CASCADES], CascadeSet) {
-        let set = cascades(camera, ASPECT, sun, &config());
-        cache.resolve(&set, camera, ASPECT, sun, &config())
-    }
-
-    /// The first frame has nothing to reuse; the next skips cascade 3, whose
-    /// turn is every fourth frame — and samples it with the matrix its map was
-    /// rendered with, not this frame's, even though the camera has crept a
-    /// little since and this frame's fit for it has moved.
-    #[test]
-    fn a_skipped_cascade_is_sampled_with_the_matrix_it_was_rendered_with() {
-        let mut cache = CascadeCache::default();
-        let mut camera = Camera::default();
-        let (first, rendered) = resolve(&mut cache, &camera, sun());
-        assert_eq!(
-            first, [true; MAX_CASCADES],
-            "an empty cache renders everything"
-        );
-
-        camera.position += Vec3::new(0.3, 0.0, 0.0);
-        camera.target += Vec3::new(0.3, 0.0, 0.0);
-        let fresh = cascades(&camera, ASPECT, sun(), &config());
-        assert_ne!(fresh.cascades[3].view_proj, rendered.cascades[3].view_proj);
-
-        let (second, sampled) = resolve(&mut cache, &camera, sun());
-        assert_eq!(second, [true, true, true, false]);
-        assert_eq!(
-            sampled.cascades[3].view_proj,
-            rendered.cascades[3].view_proj
-        );
-        assert_eq!(sampled.cascades[2].view_proj, fresh.cascades[2].view_proj);
-    }
-
-    /// A stale map is only worth keeping while it still covers the slice of
-    /// view it answers for. Turned to face another way, the slice is somewhere
-    /// the old map never saw.
-    #[test]
-    fn a_turned_camera_re_renders_what_its_old_maps_no_longer_cover() {
-        let mut cache = CascadeCache::default();
-        let mut camera = Camera::default();
-        resolve(&mut cache, &camera, sun());
-        let forward = camera.target - camera.position;
-        camera.target = camera.position + Vec3::new(forward.z, forward.y, -forward.x);
-        let (render, _) = resolve(&mut cache, &camera, sun());
-        assert_eq!(render, [true; MAX_CASCADES]);
-    }
-
-    #[test]
-    fn a_moved_sun_re_renders_every_cascade() {
-        let mut cache = CascadeCache::default();
-        let camera = Camera::default();
-        resolve(&mut cache, &camera, sun());
-        let moved = (sun() + Vec3::new(0.05, 0.0, 0.0)).normalize();
-        let (render, _) = resolve(&mut cache, &camera, moved);
-        assert_eq!(render, [true; MAX_CASCADES]);
-    }
-
-    #[test]
-    fn an_invalidated_cache_re_renders_every_cascade() {
-        let mut cache = CascadeCache::default();
-        let camera = Camera::default();
-        resolve(&mut cache, &camera, sun());
-        cache.invalidate();
-        let (render, _) = resolve(&mut cache, &camera, sun());
-        assert_eq!(render, [true; MAX_CASCADES]);
     }
 
     /// The light-space frame the fit snaps against: rotation only, anchored at
@@ -838,6 +999,121 @@ mod tests {
         }
     }
 
+    /// The light-space position of a world point, as the level grid counts it.
+    fn in_light_space(point: Vec3) -> Vec3 {
+        light_rot(sun()).transform_point3(point)
+    }
+
+    /// What a level is for: everything within its radius of the camera is
+    /// inside its square, in every direction, so no turn of the camera can
+    /// carry the view out of it — and it stays so while the camera walks about
+    /// inside the slack the window was placed with, without the window moving.
+    #[test]
+    fn a_level_holds_its_disc_while_the_camera_moves_inside_its_slack() {
+        let start = Vec3::new(13.7, 2.0, -41.3);
+        let placed = LevelWindow::place(in_light_space(start), 32.0, 1024, 50.0, None);
+        let rotation = light_rot(sun());
+        let step = placed.cells as f32 * LEVEL_STEP * placed.texel;
+
+        for travelled in [
+            Vec3::ZERO,
+            Vec3::X * step * 0.2,
+            Vec3::new(-0.2, 0.3, 0.2) * step,
+        ] {
+            let camera = start + travelled;
+            let window =
+                LevelWindow::place(in_light_space(camera), 32.0, 1024, 50.0, Some(&placed));
+            assert_eq!(window, placed, "the window moved after {travelled}");
+            for direction in [
+                Vec3::X,
+                Vec3::NEG_X,
+                Vec3::Y,
+                Vec3::NEG_Y,
+                Vec3::Z,
+                Vec3::NEG_Z,
+                Vec3::new(1.0, 1.0, 1.0).normalize(),
+                Vec3::new(-1.0, 0.3, -1.0).normalize(),
+            ] {
+                let ndc = window
+                    .view_proj(rotation)
+                    .project_point3(camera + direction * 32.0);
+                assert!(inside_ndc(ndc, 0.0), "{travelled}: {direction} -> {ndc}");
+            }
+        }
+    }
+
+    /// And when the camera does leave the slack, the window follows by whole
+    /// cells of a grid that has not moved: the cells the two windows share are
+    /// the same cells, which is what lets their texels be kept.
+    #[test]
+    fn a_level_that_moves_stays_on_its_grid() {
+        let start = Vec3::new(13.7, 2.0, -41.3);
+        let placed = LevelWindow::place(in_light_space(start), 32.0, 1024, 50.0, None);
+        let rotation = light_rot(sun());
+        let across = rotation.inverse().transform_vector3(Vec3::X);
+        let far = start + across * placed.half_extent() * 0.5;
+        let moved = LevelWindow::place(in_light_space(far), 32.0, 1024, 50.0, Some(&placed));
+
+        assert_ne!(moved.min_cell, placed.min_cell, "the window never followed");
+        assert_eq!(moved.texel, placed.texel);
+        assert_eq!(
+            moved.z_eye, placed.z_eye,
+            "a sideways move re-anchored depth"
+        );
+        // A point's texel under each window differs by exactly the cells the
+        // window moved, so it is the same cell of the same grid.
+        let point = start + Vec3::new(3.0, 0.0, -2.0);
+        let texel = |window: &LevelWindow| {
+            let ndc = window.view_proj(rotation).project_point3(point);
+            (ndc.truncate() * 0.5 + 0.5) * window.cells as f32
+        };
+        let slid = texel(&placed) - texel(&moved);
+        let cells = (moved.min_cell - placed.min_cell).as_vec2();
+        assert!(slid.abs_diff_eq(cells, 1e-2), "{slid} against {cells}");
+    }
+
+    /// What the sweep is for and what it must never do. A caster standing in
+    /// the slice, or anywhere between it and the sun, is inside every plane;
+    /// one behind the camera is not, though the level's own box holds it.
+    #[test]
+    fn a_swept_slice_keeps_what_shadows_the_view_and_drops_what_is_behind_it() {
+        let camera = Camera::default();
+        let config = config();
+        let splits = split_distances(camera.near, &config);
+        let forward = (camera.target - camera.position).normalize();
+        let inside = |index: usize, point: Vec3| {
+            let slice = swept_slice(&camera, ASPECT, sun(), &splits, index).unwrap();
+            slice.planes[..slice.count]
+                .iter()
+                .all(|plane| plane.truncate().dot(point) + plane.w >= -1e-3)
+        };
+
+        for index in 0..config.count {
+            let near = if index == 0 {
+                camera.near
+            } else {
+                splits[index - 1]
+            };
+            let middle = camera.position + forward * 0.5 * (near + splits[index]);
+            assert!(inside(index, middle), "view {index} lost its own middle");
+            assert!(
+                inside(index, middle - sun().normalize() * 40.0),
+                "view {index} lost a caster between it and the sun"
+            );
+            assert!(
+                !inside(index, camera.position - forward * splits[index]),
+                "view {index} kept a caster behind the camera"
+            );
+        }
+        // Every corner of every slice, which is where a plane facing the wrong
+        // way shows first.
+        for index in 0..config.count {
+            for corner in slice_corners(&camera, ASPECT, &splits, index) {
+                assert!(inside(index, corner), "view {index} lost {corner}");
+            }
+        }
+    }
+
     #[test]
     fn cascades_grow_outward() {
         let camera = Camera::default();
@@ -861,7 +1137,7 @@ mod tests {
         let config = config();
         let set = cascades(&camera, ASPECT, sun(), &config);
         let slack = 2.0 / config.resolution as f32;
-        for i in 0..set.count {
+        for i in 0..set.count.min(config.fitted) {
             let near = if i == 0 {
                 camera.near
             } else {

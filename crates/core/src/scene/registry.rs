@@ -2,13 +2,15 @@ use orrin_registry::{ComponentId, Registry};
 
 use super::{
     AudioListener, AudioSource, CameraComponent, Collider, Folder, Light, LocalTransform, Locked,
-    MaterialHandle, MeshHandle, Name, PhysicsSettings, RenderSettings, RigidBody, Spin, Tag,
+    MaterialHandle, MeshHandle, MeshLighting, Name, PhysicsSettings, RenderSettings, RigidBody,
+    Spin, Tag,
 };
 
 pub const TRANSFORM: ComponentId = ComponentId::new("orrin.transform");
 pub const NAME: ComponentId = orrin_registry::NAME_COMPONENT;
 pub const TAG: ComponentId = ComponentId::new("orrin.tag");
 pub const LIGHT: ComponentId = ComponentId::new("orrin.light");
+pub const MESH_LIGHTING: ComponentId = ComponentId::new("orrin.mesh_lighting");
 pub const COLLIDER: ComponentId = ComponentId::new("orrin.collider");
 pub const RIGID_BODY: ComponentId = ComponentId::new("orrin.rigid_body");
 pub const PHYSICS_SETTINGS: ComponentId = ComponentId::new("orrin.physics_settings");
@@ -79,6 +81,7 @@ pub fn register_components(registry: &mut Registry) {
     registry.register::<Name>(NAME, "Name");
     registry.register::<Tag>(TAG, "Tag");
     registry.register::<Light>(LIGHT, "Light");
+    registry.register::<MeshLighting>(MESH_LIGHTING, "Mesh Lighting");
     registry.register::<Collider>(COLLIDER, "Collider");
     registry.register::<RigidBody>(RIGID_BODY, "Rigid Body");
     registry.register::<AudioSource>(AUDIO_SOURCE, "Audio Source");
@@ -256,9 +259,20 @@ entity #1 \"Cube\"
 entity #1
   orrin.light = Point
     casts_shadows = true
+    channels = 4294967295
     color = (1.0, 1.0, 1.0)
     lumens = 800.0
     range = 10.0
+    shadows
+      constant_bias = -1.0
+      priority = 1.0
+      range = 0.0
+      resolution = 0
+      revision = 0
+      sharpness = -1.0
+      slope_bias = -1.0
+      softness = -1.0
+      update = Always
 "
         );
     }
@@ -296,6 +310,16 @@ entity #1
                 ..
             }
         ));
+        // And as the light it was in every way that has been added since: in
+        // every channel, with nothing about its shadow overridden.
+        let Light::Point {
+            channels, shadows, ..
+        } = light
+        else {
+            unreachable!()
+        };
+        assert_eq!(channels, crate::scene::ALL_CHANNELS);
+        assert_eq!(shadows, crate::scene::LightShadows::default());
     }
 
     /// The other half of the bargain in `Light`'s doc comment: a light authored

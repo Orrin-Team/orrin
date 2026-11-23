@@ -6,8 +6,9 @@
 //! match the framebuffer's attachment order.
 //!
 //! Two consequences shape what is here. Load and store ops are decided at record
-//! time, so the shadow atlas no longer needs a second render pass differing from
-//! the cascades' only in `load_op`. And attachment layouts are stated per
+//! time, so a pass that keeps what its target held differs from one that clears
+//! it by a field rather than by a render pass object. And attachment layouts are
+//! stated per
 //! attachment, so the read-only prepass depth that `oit.rs`, `refraction.rs` and
 //! the one-sample forward pass borrow is one field rather than three hand-built
 //! `RenderPassCreateInfo`s.
@@ -52,8 +53,8 @@ fn cleared(target: TextureViewId, clear: [f32; 4]) -> ColorAttachment {
 }
 
 /// A colour attachment whose previous contents do not matter and which is
-/// entirely rewritten — the swapchain image, and the shadow atlas whose live
-/// tiles `record_atlas` clears itself.
+/// entirely rewritten — the swapchain image, and the target of a full-screen
+/// pass whose fragment shader writes its output on every path.
 fn overwritten(target: TextureViewId) -> ColorAttachment {
     ColorAttachment {
         target,
@@ -104,7 +105,7 @@ fn depth_scratch(target: TextureViewId) -> DepthAttachment {
 }
 
 /// A depth attachment that is cleared, written, and kept for later passes to
-/// sample — the geometry prepass's, and each shadow cascade's. `clear` is the
+/// sample — the geometry prepass's. `clear` is the
 /// far plane in that map's own convention, which a camera and a shadow map do
 /// not share; see [`crate::gfx::depth`].
 fn depth_written(target: TextureViewId, clear: f32) -> DepthAttachment {
@@ -113,6 +114,18 @@ fn depth_written(target: TextureViewId, clear: f32) -> DepthAttachment {
         load: LoadOp::Clear,
         store: StoreOp::Store,
         clear,
+        read_only: false,
+    }
+}
+
+/// A depth attachment drawn into over what it already holds, and kept: a shadow
+/// atlas, most of whose tiles a frame leaves as they were.
+fn depth_kept(target: TextureViewId) -> DepthAttachment {
+    DepthAttachment {
+        target,
+        load: LoadOp::Load,
+        store: StoreOp::Store,
+        clear: crate::gfx::depth::SHADOW_CLEAR,
         read_only: false,
     }
 }
@@ -175,23 +188,24 @@ pub(super) fn rendering_info(
                 )),
             }
         }
-        // 1.0 = fully unoccluded, so an untouched pixel darkens nothing.
+        // Not cleared: each of these three is one triangle over its whole
+        // target, drawn by a fragment shader that writes its output before
+        // every `return` and never discards, so a clear is traffic the draw
+        // then overwrites. `a_target_left_uncleared_is_written_everywhere`
+        // holds the half of that a compiler can see.
         PassBody::SsaoResolve => {
             let ssao = ids.ssao.expect("SSAO pass without SSAO resources");
-            color_only(cleared(images.texture(ssao.raw_ao), [1.0, 0.0, 0.0, 0.0]))
+            color_only(overwritten(images.texture(ssao.raw_ao)))
         }
         PassBody::SsaoBlur => {
             let ssao = ids.ssao.expect("SSAO pass without SSAO resources");
-            color_only(cleared(images.texture(ssao.ao), [1.0, 0.0, 0.0, 0.0]))
+            color_only(overwritten(images.texture(ssao.ao)))
         }
-        // 1.0 = fully lit, for the same reason: the pass writes every pixel, so
-        // this only decides what a pixel would be if it somehow did not.
-        PassBody::ContactShadows => color_only(cleared(
+        PassBody::ContactShadows => color_only(overwritten(
             images.texture(
                 ids.contact_shadows
                     .expect("contact shadow pass without its mask"),
             ),
-            [1.0, 0.0, 0.0, 0.0],
         )),
         // Four render passes and four framebuffers, now two independent
         // questions: does this frame resolve, and does it diffuse.
@@ -278,38 +292,23 @@ pub(super) fn rendering_info(
                 depth: Some(depth_borrowed(images.texture(prepass.depth))),
             }
         }
-        // One layer of the cascade array, not the array view: an attachment is a
-        // single layer, and handing it the whole array would make every cascade
-        // clear and overwrite the same texels without erroring.
-        //
-        // Entirely re-rendered, so clearing it whole is exactly what it wants: a
-        // texel nobody drew into reads as far, and therefore as lit.
-        PassBody::ShadowCascade(cascade) => RenderTargets {
+        // Loaded rather than cleared, both of them: a view the frame does not
+        // touch is sampled from the texels it already has, and
+        // `ShadowPass::record` clears the tiles it redraws.
+        PassBody::ShadowStatic => RenderTargets {
             colors: Vec::new(),
-            depth: Some(depth_written(
-                images.layer_texture(
-                    ids.shadows.expect("shadow pass without a shadow image"),
-                    cascade,
+            depth: Some(depth_kept(
+                images.texture(
+                    ids.shadow_static
+                        .expect("the cached shadow pass without its atlas"),
                 ),
-                crate::gfx::depth::SHADOW_CLEAR,
             )),
         },
-        // Not re-rendered whole: it holds up to 64 tiles of which a frame lights
-        // a fraction, so it loads `DontCare` and `record_atlas` clears the ones
-        // assigned. That difference — one `load_op` — cost a second render pass
-        // object before; here it is this arm.
-        PassBody::PunctualShadows => RenderTargets {
+        PassBody::Shadows => RenderTargets {
             colors: Vec::new(),
-            depth: Some(DepthAttachment {
-                target: images.texture(
-                    ids.shadow_atlas
-                        .expect("punctual shadow pass without an atlas"),
-                ),
-                load: LoadOp::DontCare,
-                store: StoreOp::Store,
-                clear: crate::gfx::depth::SHADOW_CLEAR,
-                read_only: false,
-            }),
+            depth: Some(depth_kept(images.texture(
+                ids.shadow_atlas.expect("the shadow pass without its atlas"),
+            ))),
         },
         // The acquired swapchain image, every pixel of which the tonemap writes.
         PassBody::Tonemap => color_only(overwritten(swapchain)),
@@ -402,4 +401,35 @@ pub(super) fn rendering_info(
         | PassBody::CullReset
         | PassBody::Cull => return None,
     })
+}
+
+#[cfg(all(test, feature = "shader-compiler"))]
+mod tests {
+    use crate::gfx::shaders::ShaderId;
+    use crate::gfx::surface::discards;
+
+    /// A target that is not cleared keeps whatever the last frame left in it
+    /// wherever its pass does not write. A full-screen fragment shader stops
+    /// writing in one way a compiler can see, and this is it; a `return` that
+    /// leaves the output unset is the other, and only reading the shader finds
+    /// that one.
+    #[test]
+    fn a_target_left_uncleared_is_written_everywhere() {
+        // The cutout prepass is how this knows the scan sees a discard at all.
+        assert!(discards(ShaderId::PrepassFragMasked.blob().spirv) > 0);
+        for shader in [
+            ShaderId::SsaoFrag,
+            ShaderId::SsaoBlurFrag,
+            ShaderId::ContactShadowsFrag,
+        ] {
+            let blob = shader.blob();
+            assert_eq!(
+                discards(blob.spirv),
+                0,
+                "{} discards, and its target is not cleared: either it stops, or \
+                 `rendering_info` clears that target again",
+                blob.name
+            );
+        }
+    }
 }

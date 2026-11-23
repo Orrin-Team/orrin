@@ -32,15 +32,10 @@ use orrin_core::gfx::vulkan::wireframe::Wireframe;
 /// depending on whoever regenerated it.
 const COLOR_FORMAT: Format = Format::Bgra8Srgb;
 
-/// The cascade resolution the baseline is written against. It changes what the
-/// images are sized to, not what the plan says, so pinning it keeps the file
-/// from depending on whoever regenerated it.
-const SHADOW_RESOLUTION: u32 = 2048;
-
 /// The bloom chain length the baseline is written against — what
 /// `bloom::mip_count` yields for any frame from 1080p up. Pinned for the same
-/// reason as the cascade resolution: the plan should not depend on the window
-/// whoever regenerated it happened to have open.
+/// reason as the format: the plan should not depend on the window whoever
+/// regenerated it happened to have open.
 const BLOOM_MIPS: u8 = 6;
 
 fn configs() -> Vec<(&'static str, FrameConfig)> {
@@ -76,8 +71,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -114,8 +107,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -147,8 +138,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -186,9 +175,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 4,
-                shadow_resolution: SHADOW_RESOLUTION,
-                shadow_atlas: 0,
+                shadow_atlas: 4096,
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
@@ -224,8 +211,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -260,8 +245,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -298,8 +281,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -335,8 +316,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -376,9 +355,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 4,
-                shadow_resolution: SHADOW_RESOLUTION,
-                shadow_atlas: 0,
+                shadow_atlas: 4096,
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
@@ -414,8 +391,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -452,8 +427,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -490,8 +463,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -526,8 +497,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -564,9 +533,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 4,
-                shadow_resolution: SHADOW_RESOLUTION,
-                shadow_atlas: 0,
+                shadow_atlas: 4096,
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
@@ -600,8 +567,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -637,8 +602,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 4,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 4096,
                 async_compute: false,
                 occlusion_culling: false,
@@ -674,8 +637,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 2048,
                 async_compute: false,
                 occlusion_culling: false,
@@ -713,9 +674,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 4,
-                shadow_resolution: SHADOW_RESOLUTION,
-                shadow_atlas: 0,
+                shadow_atlas: 4096,
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
@@ -750,8 +709,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -788,9 +745,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 4,
-                shadow_resolution: SHADOW_RESOLUTION,
-                shadow_atlas: 0,
+                shadow_atlas: 4096,
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
@@ -824,8 +779,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -865,9 +818,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 4,
-                shadow_resolution: SHADOW_RESOLUTION,
-                shadow_atlas: 0,
+                shadow_atlas: 4096,
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
@@ -902,8 +853,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 0,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 0,
                 async_compute: false,
                 occlusion_culling: false,
@@ -935,9 +884,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: false,
                 ui: false,
                 presents: true,
-                shadow_cascades: 2,
-                shadow_resolution: SHADOW_RESOLUTION,
-                shadow_atlas: 0,
+                shadow_atlas: 2048,
                 async_compute: false,
                 occlusion_culling: false,
                 wireframe: None,
@@ -980,8 +927,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 4,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 4096,
                 async_compute: false,
                 occlusion_culling: false,
@@ -1020,8 +965,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 4,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 4096,
                 async_compute: false,
                 occlusion_culling: true,
@@ -1053,9 +996,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: true,
                 ui: false,
                 presents: true,
-                shadow_cascades: 4,
-                shadow_resolution: SHADOW_RESOLUTION,
-                shadow_atlas: 0,
+                shadow_atlas: 4096,
                 async_compute: true,
                 occlusion_culling: false,
                 wireframe: None,
@@ -1091,8 +1032,6 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 gizmo: false,
                 ui: false,
                 presents: true,
-                shadow_cascades: 4,
-                shadow_resolution: SHADOW_RESOLUTION,
                 shadow_atlas: 2048,
                 async_compute: true,
                 occlusion_culling: false,
@@ -1190,66 +1129,87 @@ fn the_reference_frame_culls_nothing() {
     }
 }
 
-/// A one-cascade frame is the case that catches a view type derived from the
-/// layer count rather than from the declaration: an image of exactly one array
-/// layer looks like a plain 2D image to that heuristic, while the forward
-/// pipeline's sampler is compiled as a `texture2DArray` regardless. It renders
-/// on four cascades and fails on one, so the setting that provokes it is the
-/// one nobody drags to on purpose.
+/// Every shadow view is a tile of one image, however many lights cast: a tile
+/// is a viewport, so the views cost the frame one barrier between them. A pass
+/// per view over a shared image is serialised by write-after-write, which is
+/// what the atlas exists not to pay. Two passes rather than one because a view
+/// has two layers — the cached one, and the live one that is brought up to
+/// date from it and therefore has to follow it.
 #[test]
-fn a_single_cascade_map_is_still_declared_as_an_array() {
-    for count in 1..=4u8 {
-        let frame = declare(FrameConfig {
-            color_format: COLOR_FORMAT,
-            msaa: false,
-            ssao: true,
-            ssao_half_res: false,
-            contact_shadows: false,
-            ssr: false,
-            subsurface: false,
-            transparency: false,
-            refraction: false,
-            taa: false,
-            auto_exposure: true,
-            motion_blur: false,
-            dof: false,
-            volumetric_fog: false,
-            bloom_mips: BLOOM_MIPS,
-            overlay: true,
-            outline: true,
-            gizmo: true,
-            ui: false,
-            presents: true,
-            shadow_cascades: count,
-            shadow_resolution: SHADOW_RESOLUTION,
-            shadow_atlas: 0,
-            async_compute: false,
-            occlusion_culling: false,
-            wireframe: None,
-            material_preview: false,
-            screenshot: None,
-        })
-        .unwrap();
+fn every_shadow_view_is_drawn_by_one_pass_per_layer() {
+    let frame = declare(FrameConfig {
+        shadow_atlas: 2048,
+        ..reference_config(false, true)
+    })
+    .unwrap();
 
-        let desc = image_desc(&frame.graph, "shadow_cascades")
-            .unwrap_or_else(|| panic!("{count} cascades declared no shadow map"));
-
+    for name in ["shadow_atlas", "shadow_static"] {
+        let desc = image_desc(&frame.graph, name)
+            .unwrap_or_else(|| panic!("the frame declared no {name}"));
         assert_eq!(
-            desc.array_layers,
-            Some(u32::from(count)),
-            "{count} cascades must declare a {count}-layer array, not a plain image",
+            desc.extent,
+            orrin_core::gfx::graph::Extent::Fixed(orrin_core::gfx::shadow_views::atlas_extent(
+                2048
+            ))
         );
+        assert_eq!(desc.array_layers, None, "an atlas is tiles, not layers");
+    }
+
+    let passes: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&pass| frame.graph.pass_name(pass))
+        .filter(|name| name.contains("shadow") && *name != "contact_shadows")
+        .collect();
+    assert_eq!(passes, ["shadow_static", "shadows"]);
+}
+
+/// A view that is not redrawn keeps its tile from an earlier frame, so both
+/// atlases have to outlive the frame: they are imported from the shadow pass
+/// rather than owned by the graph, whose transients start every frame
+/// `Undefined` and would hand such a view garbage. Each is entered in the
+/// layout the frame's readers leave it in, so those texels survive the
+/// transition into the attachment layout and back.
+#[test]
+fn the_shadow_atlases_leave_the_frame_where_the_next_one_expects_them() {
+    let frame = declare(FrameConfig {
+        shadow_atlas: 4096,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    let plan = format!("{}", frame.graph);
+
+    for name in ["shadow_atlas", "shadow_static"] {
+        let imported = frame
+            .graph
+            .imported_images()
+            .any(|(id, _)| frame.graph.resource_name(id) == name);
+        assert!(imported, "a transient {name} loses the views a frame keeps");
+        assert!(
+            plan.contains(&format!(
+                "{name} ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal"
+            )),
+            "{name} must be entered from the layout it was left in, not Undefined:\n{plan}",
+        );
+        let closing: Vec<_> = frame
+            .graph
+            .final_barriers()
+            .iter()
+            .filter(|barrier| frame.graph.resource_name(barrier.resource) == name)
+            .collect();
+        assert!(closing.is_empty(), "{closing:?}");
     }
 }
 
-/// A cascade's depth is linear over a bounded range and a punctual face spends
+/// A sun view's depth is linear over a bounded range and a punctual face spends
 /// its precision near the light, so sixteen bits resolve millimetres where the
 /// shadows are and the other sixteen are pure bandwidth. The camera's depth is a
 /// reversed perspective projection, which only works *because* it is a float —
 /// the exponent is what spends precision on distance (see `gfx::depth`) — so it
 /// must not be narrowed alongside them.
 #[test]
-fn the_shadow_maps_are_sixteen_bit_and_the_camera_depth_is_not() {
+fn the_shadow_atlas_is_sixteen_bit_and_the_camera_depth_is_not() {
     let frame = declare(FrameConfig {
         color_format: COLOR_FORMAT,
         msaa: false,
@@ -1271,8 +1231,6 @@ fn the_shadow_maps_are_sixteen_bit_and_the_camera_depth_is_not() {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 4,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 4096,
         async_compute: false,
         occlusion_culling: false,
@@ -1288,7 +1246,6 @@ fn the_shadow_maps_are_sixteen_bit_and_the_camera_depth_is_not() {
             .unwrap_or_else(|| panic!("the frame declared no {name}"))
     };
 
-    assert_eq!(format_of("shadow_cascades"), Format::D16Unorm);
     assert_eq!(format_of("shadow_atlas"), Format::D16Unorm);
     assert_eq!(format_of("prepass_depth"), Format::D32Float);
 }
@@ -1315,8 +1272,6 @@ fn reference_config(msaa: bool, presents: bool) -> FrameConfig {
         gizmo: false,
         ui: false,
         presents,
-        shadow_cascades: 0,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
         occlusion_culling: false,
@@ -1500,8 +1455,6 @@ fn an_empty_selection_runs_no_outline_and_no_gizmo() {
         gizmo,
         ui: false,
         presents: true,
-        shadow_cascades: 0,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
         occlusion_culling: false,
@@ -1532,69 +1485,6 @@ fn an_empty_selection_runs_no_outline_and_no_gizmo() {
     for name in ["outline_mask", "outline", "gizmo", "overlay"] {
         assert!(selected.contains(&name), "{name} missing: {selected:?}");
     }
-}
-
-/// The far cascades are not re-rendered every frame (`shadows::CascadeCache`),
-/// so the cascade map has to outlive the frame: it is imported from the shadow
-/// pass rather than owned by the graph, whose transients start every frame
-/// `Undefined` and would hand a skipped cascade garbage. It is entered in the
-/// layout the frame's samplers leave it in, so a cascade that is skipped keeps
-/// its texels across the transition into the attachment layout and back.
-#[test]
-fn the_shadow_cascades_leave_the_frame_where_the_next_one_expects_them() {
-    let frame = declare(FrameConfig {
-        color_format: COLOR_FORMAT,
-        msaa: false,
-        ssao: true,
-        ssao_half_res: false,
-        contact_shadows: false,
-        ssr: false,
-        subsurface: false,
-        transparency: false,
-        refraction: false,
-        taa: true,
-        auto_exposure: true,
-        motion_blur: false,
-        dof: false,
-        volumetric_fog: false,
-        bloom_mips: BLOOM_MIPS,
-        overlay: true,
-        outline: true,
-        gizmo: true,
-        ui: false,
-        presents: true,
-        shadow_cascades: 4,
-        shadow_resolution: SHADOW_RESOLUTION,
-        shadow_atlas: 0,
-        async_compute: false,
-        occlusion_culling: false,
-        wireframe: None,
-        material_preview: false,
-        screenshot: None,
-    })
-    .unwrap();
-
-    let imported = frame
-        .graph
-        .imported_images()
-        .any(|(id, _)| frame.graph.resource_name(id) == "shadow_cascades");
-    assert!(
-        imported,
-        "a transient cascade map loses the cascades a frame skips"
-    );
-
-    let plan = format!("{}", frame.graph);
-    assert!(
-        plan.contains("shadow_cascades ShaderReadOnlyOptimal->DepthStencilAttachmentOptimal"),
-        "the map must be entered from the layout it was left in, not Undefined:\n{plan}",
-    );
-    let closing: Vec<_> = frame
-        .graph
-        .final_barriers()
-        .iter()
-        .filter(|barrier| frame.graph.resource_name(barrier.resource) == "shadow_cascades")
-        .collect();
-    assert!(closing.is_empty(), "{closing:?}");
 }
 
 /// TAA ping-pongs two allocations, so the image this frame writes as `taa_color`
@@ -1629,8 +1519,6 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 0,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
         occlusion_culling: false,
@@ -1692,9 +1580,7 @@ fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 4,
-        shadow_resolution: SHADOW_RESOLUTION,
-        shadow_atlas: 0,
+        shadow_atlas: 4096,
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
@@ -1751,9 +1637,7 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 4,
-        shadow_resolution: SHADOW_RESOLUTION,
-        shadow_atlas: 0,
+        shadow_atlas: 4096,
         async_compute: false,
         occlusion_culling: false,
         wireframe: None,
@@ -1775,7 +1659,7 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
             .unwrap_or_else(|| panic!("{name} was not scheduled:\n{order:?}"))
     };
 
-    assert!(at("shadow_cascade_3") < at("fog_scatter"), "{order:?}");
+    assert!(at("shadows") < at("fog_scatter"), "{order:?}");
     assert!(at("fog_scatter") < at("fog_integrate"), "{order:?}");
     for shading in ["forward", "oit_accumulate", "refraction_draw"] {
         assert!(at("fog_integrate") < at(shading), "{shading}: {order:?}");
@@ -1819,8 +1703,6 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 0,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
         occlusion_culling: false,
@@ -1874,8 +1756,6 @@ fn the_gizmo_draws_between_the_tonemap_and_the_overlay() {
         gizmo: overlay,
         ui: false,
         presents: true,
-        shadow_cascades: 0,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute,
         occlusion_culling: false,
@@ -1980,8 +1860,6 @@ fn the_selection_outline_is_masked_then_drawn_under_the_gizmo() {
         gizmo: overlay,
         ui: false,
         presents: true,
-        shadow_cascades: 0,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
         occlusion_culling: false,
@@ -2055,8 +1933,6 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 0,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
         occlusion_culling: false,
@@ -2122,8 +1998,6 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 0,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
         occlusion_culling: false,
@@ -2227,8 +2101,6 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 0,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
         occlusion_culling: false,
@@ -2295,8 +2167,6 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 0,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
         occlusion_culling: false,
@@ -2354,8 +2224,6 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 0,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
         occlusion_culling: false,
@@ -2438,8 +2306,6 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 0,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 0,
         async_compute: false,
         occlusion_culling: false,
@@ -2540,8 +2406,6 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 4,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 4096,
         async_compute: false,
         occlusion_culling: false,
@@ -2565,13 +2429,7 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
     };
 
     assert!(at("cull_reset") < at("cull"), "{order:?}");
-    for geometry in [
-        "shadow_cascade_0",
-        "shadow_cascade_3",
-        "punctual_shadows",
-        "geometry_prepass",
-        "forward",
-    ] {
+    for geometry in ["shadows", "geometry_prepass", "forward"] {
         assert!(at("cull") < at(geometry), "{geometry}: {order:?}");
     }
 
@@ -2726,8 +2584,6 @@ fn occlusion_base() -> FrameConfig {
         gizmo: true,
         ui: false,
         presents: true,
-        shadow_cascades: 4,
-        shadow_resolution: SHADOW_RESOLUTION,
         shadow_atlas: 4096,
         async_compute: false,
         occlusion_culling: false,

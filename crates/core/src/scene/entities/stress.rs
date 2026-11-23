@@ -219,6 +219,8 @@ pub fn spawn_stress_scene(world: &mut World, spec: &StressSpec) {
                 lumens: 800.0,
                 range: 3.0,
                 casts_shadows: false,
+                channels: crate::scene::ALL_CHANNELS,
+                shadows: Default::default(),
             });
     }
 

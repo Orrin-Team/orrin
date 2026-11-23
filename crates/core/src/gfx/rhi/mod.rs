@@ -28,7 +28,7 @@ pub(crate) use pool::Pool;
 
 pub use desc::{
     Binding, BindingResource, Blend, BlockKind, BufferCopy, BufferDesc, ColorAttachment,
-    ComputePipelineDesc, CullMode, DepthAttachment, DepthCompare, DepthRect, DepthTest, Feature,
+    ComputePipelineDesc, CullMode, DepthAttachment, DepthCompare, DepthTest, Feature,
     GeometryStream, GraphicsPipelineDesc, LoadOp, MemoryLocation, RenderTargets, SamplerDesc,
     ShaderRef, StoreOp, TextureDesc, TextureDimension, TextureSwizzle, Topology, VertexAttribute,
     VertexFormat, VertexStream, Viewport,
@@ -402,11 +402,6 @@ impl Encoder<'_> {
 
     pub fn set_depth_bias(&mut self, constant: f32, clamp: f32, slope: f32) {
         encoder_dispatch!(self, encoder => encoder.set_depth_bias(constant, clamp, slope))
-    }
-
-    /// Clear depth to 1.0 over `rects` of the attachment being rendered into.
-    pub fn clear_depth(&mut self, rects: &[DepthRect]) {
-        encoder_dispatch!(self, encoder => encoder.clear_depth(rects))
     }
 
     pub fn bind_pipeline(&mut self, pipeline: PipelineId) {

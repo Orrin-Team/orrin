@@ -2,8 +2,9 @@ use glam::Vec3;
 
 use crate::geom::Aabb;
 use crate::gfx::clusters::{CLUSTERS, DepthSlicing, LightClusters};
-use crate::gfx::punctual::{LightKind, MAX_ATLAS_FACES, ShadowAtlas};
+use crate::gfx::punctual::LightKind;
 use crate::gfx::sh::SH9;
+use crate::gfx::shadow_views::ShadowViews;
 use crate::gfx::shadows::MAX_CASCADES;
 use crate::gfx::{
     BlendMode, DecalInstance, MAX_DECALS, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS, Material,
@@ -179,7 +180,7 @@ impl GpuMaterial {
 /// The point lights as the shader's storage buffer holds them, into `out`.
 /// Never empty: a buffer binding of zero bytes is invalid, and a frame with no
 /// lights still binds one, whose row no cluster ever names.
-fn gpu_point_lights(lighting: &SceneLighting, atlas: &ShadowAtlas, out: &mut Vec<GpuPointLight>) {
+fn gpu_point_lights(lighting: &SceneLighting, views: &ShadowViews, out: &mut Vec<GpuPointLight>) {
     out.clear();
     for (index, light) in lighting
         .point_lights
@@ -198,9 +199,15 @@ fn gpu_point_lights(lighting: &SceneLighting, atlas: &ShadowAtlas, out: &mut Vec
             // A light that asked for tiles and did not get them keeps its -1 and
             // shades unshadowed, which is the whole behaviour of the budget: too
             // many casters costs shadows, never correctness.
-            shadow: match atlas.caster(LightKind::Point, index) {
-                Some(caster) => [caster.first_face as f32, caster.near, 0.0, 0.0],
-                None => [-1.0, 0.0, 0.0, 0.0],
+            shadow: {
+                // A mask travels as the bits of a float, which a uniform block
+                // carries untouched and the shader reads back with
+                // `floatBitsToUint`.
+                let channels = f32::from_bits(light.channels);
+                match views.caster(LightKind::Point, index) {
+                    Some(caster) => [caster.first_view as f32, caster.near, channels, 0.0],
+                    None => [-1.0, 0.0, channels, 0.0],
+                }
             },
         });
     }
@@ -210,7 +217,7 @@ fn gpu_point_lights(lighting: &SceneLighting, atlas: &ShadowAtlas, out: &mut Vec
 }
 
 /// [`gpu_point_lights`] for the spots.
-fn gpu_spot_lights(lighting: &SceneLighting, atlas: &ShadowAtlas, out: &mut Vec<GpuSpotLight>) {
+fn gpu_spot_lights(lighting: &SceneLighting, views: &ShadowViews, out: &mut Vec<GpuSpotLight>) {
     out.clear();
     for (index, light) in lighting
         .spot_lights
@@ -218,10 +225,10 @@ fn gpu_spot_lights(lighting: &SceneLighting, atlas: &ShadowAtlas, out: &mut Vec<
         .take(MAX_SPOT_LIGHTS)
         .enumerate()
     {
-        let face = atlas
+        let face = views
             .caster(LightKind::Spot, index)
             .map_or([-1.0, 0.0], |caster| {
-                [caster.first_face as f32, caster.near]
+                [caster.first_view as f32, caster.near]
             });
         out.push(GpuSpotLight {
             position: [
@@ -237,7 +244,12 @@ fn gpu_spot_lights(lighting: &SceneLighting, atlas: &ShadowAtlas, out: &mut Vec<
                 light.outer_cos,
             ],
             color: [light.color.x, light.color.y, light.color.z, light.candela],
-            params: [light.inner_cos, face[0], face[1], 0.0],
+            params: [
+                light.inner_cos,
+                face[0],
+                face[1],
+                f32::from_bits(light.channels),
+            ],
         });
     }
     if out.is_empty() {
@@ -288,7 +300,12 @@ fn to_gpu_lighting(
             lighting.ambient_color.z,
             lighting.ambient_nits,
         ],
-        sun_direction: [to_sun.x, to_sun.y, to_sun.z, 0.0],
+        sun_direction: [
+            to_sun.x,
+            to_sun.y,
+            to_sun.z,
+            f32::from_bits(lighting.sun.channels),
+        ],
         sun_color: [
             lighting.sun.color.x,
             lighting.sun.color.y,
@@ -314,72 +331,78 @@ fn to_gpu_lighting(
     }
 }
 
-/// Everything it takes to read the cascaded shadow maps, mirroring `Cascades` in
+/// Everything it takes to read the sun's shadow views, mirroring `Cascades` in
 /// `shaders/cascades.glsl`.
 ///
 /// Its own struct because two uniform blocks carry it: the lighting block every
 /// surface shades from, and the fog block the froxel scatter pass dispatches
 /// with. A dispatch has no lighting set bound and the alternative was declaring
 /// the whole `Lighting` block — point lights, spot lights, irradiance — in a
-/// shader that wants four fields of it. One constructor fills both, so the two
+/// shader that wants a few fields of it. One constructor fills both, so the two
 /// copies are made together or not at all.
 ///
-/// std140 gives a struct of a `mat4` array and three `vec4`s exactly the offsets
-/// it gave these fields written out flat, which is why nesting them changed no
-/// layout.
+/// std140 gives a struct of `mat4` and `vec4` arrays exactly the offsets it
+/// gives these fields written out flat, so the two blocks nest it as it is.
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 #[repr(C)]
 pub(super) struct GpuCascades {
-    /// Per-cascade light view-projection. std140 lays a `mat4` out as four
+    /// Per-view light view-projection. std140 lays a `mat4` out as four
     /// `vec4`s with no padding between them, which is exactly what this is.
     view_proj: [[[f32; 4]; 4]; MAX_CASCADES],
+    /// Where each view's tile is in the atlas: xy = UV offset, zw = UV scale.
+    rects: [[f32; 4]; MAX_CASCADES],
     /// Split distances, as radial distance from the camera.
     splits: [f32; MAX_CASCADES],
-    /// World size of one shadow texel in each cascade, for the normal-offset
-    /// bias. It differs per cascade because each fits a different-sized box to
-    /// the same number of texels.
+    /// World size of one shadow texel in each view, which the filter sizes its
+    /// kernel and its bias by. It differs per view because each fits a
+    /// different-sized box to its own tile.
     texel_sizes: [f32; MAX_CASCADES],
-    /// x = cascade count, y = blend overlap fraction, z = strength,
-    /// w = 1.0 to tint by cascade index.
+    /// x = view count, y = blend overlap fraction, z = strength,
+    /// w = 1.0 to tint by view index.
     params: [f32; 4],
+    /// x = the sun's penumbra width in metres where a caster touches what it
+    /// shadows, y = its sharpness, z = how much wider the penumbra gets a metre
+    /// of caster distance. A lamp's own pair travels with its views.
+    filtering: [f32; 4],
+    /// What this frame did to each view, as [`ViewWork`]'s order, for the
+    /// debug view that tints by it.
+    states: [f32; MAX_CASCADES],
 }
 
 impl GpuCascades {
     pub(super) fn new(shadows: Option<ShadowFrame<'_>>) -> Self {
         let mut view_proj = [[[0.0f32; 4]; 4]; MAX_CASCADES];
-        let mut splits = [0.0f32; MAX_CASCADES];
+        let mut rects = [[0.0f32; 4]; MAX_CASCADES];
         let mut texel_sizes = [0.0f32; MAX_CASCADES];
-        // A zero count is what makes every shadow lookup return "lit"; the
-        // arrays above are then never indexed.
-        let params = match shadows {
-            Some(shadows) => {
-                let live = &shadows.cascades.cascades[..shadows.cascades.count];
-                for (slot, cascade) in view_proj.iter_mut().zip(live) {
-                    *slot = cascade.view_proj.to_cols_array_2d();
-                }
-                for (index, cascade) in live.iter().enumerate() {
-                    splits[index] = cascade.split_distance;
-                    texel_sizes[index] = cascade.texel_world_size;
-                }
-                [
-                    shadows.cascades.count as f32,
-                    crate::gfx::shadows::OVERLAP,
-                    shadows.settings.strength,
-                    if shadows.settings.debug_cascades {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                ]
-            }
-            None => [0.0; 4],
+        let mut states = [0.0f32; MAX_CASCADES];
+        let Some(shadows) = shadows else {
+            // A zero count is what makes every sun lookup return "lit"; the
+            // arrays are then never indexed.
+            return bytemuck::Zeroable::zeroed();
         };
-
+        let views = shadows.views;
+        for (index, view) in views.views[..views.sun].iter().enumerate() {
+            view_proj[index] = view.view_proj.to_cols_array_2d();
+            rects[index] = view.tile.uv_rect(views.resolution);
+            texel_sizes[index] = view.texel_scale;
+            states[index] = shadows.plan.work[index] as u32 as f32;
+        }
         Self {
             view_proj,
-            splits,
+            rects,
+            splits: views.splits,
             texel_sizes,
-            params,
+            params: [
+                views.sun as f32,
+                crate::gfx::shadows::OVERLAP,
+                shadows.settings.strength,
+                shadows.settings.debug_mode(),
+            ],
+            filtering: {
+                let [softness, sharpness, ..] = shadows.settings.filtering();
+                [softness, sharpness, shadows.settings.sun_spread(), 0.0]
+            },
+            states,
         }
     }
 }
@@ -545,8 +568,8 @@ pub(crate) struct GpuDecals {
     decals: [GpuDecal; MAX_DECALS],
 }
 
-/// One atlas face as the shader reads it: the matrix that rendered it, and the
-/// slice of the atlas it landed in.
+/// One shadow view as the shader reads it: the matrix that rendered it, the
+/// slice of the atlas it landed in, and the size of its texels.
 ///
 /// The matrix is stored rather than rebuilt from the light's position and a face
 /// convention, which the `vector_to_depth` trick would allow. Storing it means
@@ -559,12 +582,16 @@ struct GpuShadowFace {
     view_proj: [[f32; 4]; 4],
     /// xy = atlas UV offset, zw = atlas UV scale.
     rect: [f32; 4],
+    /// x = world size of one texel where the view's clip-space `w` is one,
+    /// y = its penumbra's width in metres, z = its sharpness.
+    params: [f32; 4],
 }
 
 impl GpuShadowFace {
     const ZERO: Self = Self {
         view_proj: [[0.0; 4]; 4],
         rect: [0.0; 4],
+        params: [0.0; 4],
     };
 }
 
@@ -580,7 +607,6 @@ struct LightingSet {
 /// What set 3 binds.
 struct SurfaceSet {
     ao: TextureViewId,
-    shadow: TextureViewId,
     env_cube: TextureViewId,
     env_sampler: SamplerId,
     contact_shadow: TextureViewId,
@@ -596,7 +622,6 @@ struct SurfaceSet {
 pub(super) struct NeutralViews {
     pub ao: TextureViewId,
     pub contact_shadow: TextureViewId,
-    pub shadow: TextureViewId,
     pub atlas: TextureViewId,
     pub env_cube: TextureViewId,
     pub env_sampler: SamplerId,
@@ -1141,12 +1166,10 @@ impl ForwardPass {
         extent: [u32; 2],
         ao_view: TextureViewId,
         contact_shadow_view: TextureViewId,
-        shadow_view: TextureViewId,
         atlas_view: TextureViewId,
         env_cube: TextureViewId,
         env_cube_sampler: SamplerId,
         shadows: Option<ShadowFrame<'_>>,
-        atlas: &ShadowAtlas,
         material_set: BindGroupId,
         texture_set: BindGroupId,
         object_set: BindGroupId,
@@ -1176,6 +1199,10 @@ impl ForwardPass {
         );
         let lighting_buffer =
             device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&lighting_block));
+        // What the lights index the view table by. Empty when nothing casts,
+        // which is the frame where every light's view index is -1.
+        let no_views = ShadowViews::default();
+        let views = shadows.map_or(&no_views, |shadows| shadows.views);
         let (point_buffer, spot_buffer, cluster_buffer) = {
             let mut scratch = self.light_scratch.lock().expect("light scratch poisoned");
             let LightScratch {
@@ -1183,8 +1210,8 @@ impl ForwardPass {
                 spots,
                 clusters,
             } = &mut *scratch;
-            gpu_point_lights(lighting, atlas, points);
-            gpu_spot_lights(lighting, atlas, spots);
+            gpu_point_lights(lighting, views, points);
+            gpu_spot_lights(lighting, views, spots);
             points.resize(MAX_POINT_LIGHTS, GpuPointLight::ZERO);
             spots.resize(MAX_SPOT_LIGHTS, GpuSpotLight::ZERO);
             gpu_clusters(&renderer.light_clusters, clusters);
@@ -1195,15 +1222,17 @@ impl ForwardPass {
             )
         };
 
-        // Always at least one entry: a frame where nothing punctual casts still
-        // has to bind something for the descriptor. Every light's face index is
-        // -1 in that frame, so the row is never read.
-        let face_count = atlas.faces.len().clamp(1, MAX_ATLAS_FACES);
-        let mut shadow_faces = vec![GpuShadowFace::ZERO; face_count];
-        for (row, face) in shadow_faces.iter_mut().zip(&atlas.faces) {
+        // Always at least one entry: a frame where nothing casts still has to
+        // bind something for the descriptor. Every light's view index is -1 in
+        // that frame, so the row is never read. The sun's views are rows too,
+        // so that a light's index is its view's index; the shaders read those
+        // out of the lighting block instead.
+        let mut shadow_faces = vec![GpuShadowFace::ZERO; views.views.len().max(1)];
+        for (row, view) in shadow_faces.iter_mut().zip(&views.views) {
             *row = GpuShadowFace {
-                view_proj: face.view_proj.to_cols_array_2d(),
-                rect: face.tile.uv_rect(atlas.resolution),
+                view_proj: view.view_proj.to_cols_array_2d(),
+                rect: view.tile.uv_rect(views.resolution),
+                params: [view.texel_scale, view.filtering[0], view.filtering[1], 0.0],
             };
         }
         let shadow_faces =
@@ -1220,7 +1249,6 @@ impl ForwardPass {
             },
             SurfaceSet {
                 ao: ao_view,
-                shadow: shadow_view,
                 env_cube,
                 env_sampler: env_cube_sampler,
                 contact_shadow: contact_shadow_view,
@@ -1281,7 +1309,7 @@ impl ForwardPass {
             ],
         );
 
-        // Set 3 is the screen-space and shadow inputs. The cascades are kept as a
+        // Set 3 is the screen-space and shadow inputs. The atlas is kept as a
         // separate image and comparison sampler rather than a combined one, for
         // the same reason the texture array is: Metal caps samplers per stage far
         // lower than sampled images.
@@ -1301,21 +1329,15 @@ impl ForwardPass {
             3,
             &[
                 sampled(0, set3.ao),
-                texture(1, set3.shadow),
+                texture(1, set3.atlas),
                 texture(3, set3.env_cube),
                 Binding {
                     binding: 4,
                     resource: BindingResource::Sampler(set3.env_sampler),
                 },
                 sampled(5, set3.contact_shadow),
-                // The atlas reads through the cascades' comparison sampler at
-                // binding 2 — same conventions, same `Less` against a map
-                // cleared to 1.0 — so it needs no sampler of its own. Which
-                // matters: Metal caps samplers per stage far below sampled
-                // images, and this shader is already at five.
-                texture(6, set3.atlas),
                 Binding {
-                    binding: 7,
+                    binding: 6,
                     resource: BindingResource::StorageBuffer(set3.shadow_faces),
                 },
                 // The fog volume and the medium that produced it. Both are bound
@@ -1324,14 +1346,14 @@ impl ForwardPass {
                 // froxels reads the same block, so there is one path in the
                 // shader rather than a second pipeline.
                 Binding {
-                    binding: 8,
+                    binding: 7,
                     resource: BindingResource::SampledTexture {
                         view: set3.fog_volume,
                         sampler: set3.fog_sampler,
                     },
                 },
                 Binding {
-                    binding: 9,
+                    binding: 8,
                     resource: BindingResource::UniformBuffer(set3.fog),
                 },
             ],
@@ -1406,7 +1428,6 @@ impl ForwardPass {
             },
             SurfaceSet {
                 ao: neutral.ao,
-                shadow: neutral.shadow,
                 env_cube: neutral.env_cube,
                 env_sampler: neutral.env_sampler,
                 contact_shadow: neutral.contact_shadow,

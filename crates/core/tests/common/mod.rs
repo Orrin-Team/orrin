@@ -4,7 +4,7 @@
 use glam::Vec3;
 use orrin_core::capture::{CaptureSettings, Floor};
 use orrin_core::scene::entities::SceneChoice;
-use orrin_core::scene::{Camera, FogSettings};
+use orrin_core::scene::{Camera, FogSettings, ShadowDebugView};
 
 /// Where both fog captures stand, shared so the pair differs in one field.
 ///
@@ -49,6 +49,20 @@ fn reflection_view(floor: Option<Floor>, position: Vec3, target: Vec3) -> Captur
         camera: Some(Camera {
             position,
             target,
+            ..Camera::default()
+        }),
+        ..CaptureSettings::default()
+    }
+}
+
+/// Where the `sun-penumbra` captures stand.
+fn sun_penumbra() -> CaptureSettings {
+    CaptureSettings {
+        extent: [1920, 1080],
+        shadows: true,
+        camera: Some(Camera {
+            position: Vec3::new(-2.0, 1.2, 12.5),
+            target: Vec3::new(-3.5, -0.5, 8.5),
             ..Camera::default()
         }),
         ..CaptureSettings::default()
@@ -157,6 +171,108 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                     target: Vec3::new(-12.0, 0.0, 1.5),
                     ..Camera::default()
                 }),
+                ..CaptureSettings::default()
+            },
+        ),
+        // Every light's shadow at once, from the rig's own camera: the sun's
+        // cascades across the grid and the three lamps' and the spot's atlas
+        // tiles under it. The whole-frame check that a shadow lands where its
+        // caster stands, for each kind of light.
+        (
+            "shadows",
+            CaptureSettings {
+                shadows: true,
+                punctual_shadows: true,
+                ..CaptureSettings::default()
+            },
+        ),
+        // The same lights from two metres above a gap between four cubes, where
+        // a centimetre of floor is three pixels and the filter is what is on
+        // screen: the width of each penumbra, whether its edge shows the map's
+        // texels, and whether a cube's shadow stays attached at its foot.
+        (
+            "zoom-shadow-edges",
+            CaptureSettings {
+                shadows: true,
+                punctual_shadows: true,
+                camera: Some(Camera {
+                    position: Vec3::new(-4.0, 1.6, 5.2),
+                    target: Vec3::new(-4.0, -0.5, 3.9),
+                    ..Camera::default()
+                }),
+                ..CaptureSettings::default()
+            },
+        ),
+        // The sun alone from twenty metres up and back, over the sphere rows:
+        // the distance an editor camera sits at, where a shadow's edge is read
+        // from the sun's third view and its texels are several pixels each.
+        // What to look for is the outline of each sphere's shadow on the
+        // ground, which is an ellipse and should look like one.
+        (
+            "mid-shadow-edges",
+            CaptureSettings {
+                extent: [1920, 1080],
+                shadows: true,
+                camera: Some(Camera {
+                    position: Vec3::new(1.0, 17.0, 22.0),
+                    target: Vec3::new(0.0, -0.5, 10.5),
+                    ..Camera::default()
+                }),
+                ..CaptureSettings::default()
+            },
+        ),
+        // The sun's penumbra following the distance to what casts it, from a
+        // metre above the ground between the cube grid and the sphere rows:
+        // the cubes stand on the ground and the spheres hang three and six
+        // metres over it, so one frame holds an edge at its caster's foot and
+        // edges a long way under theirs. The three differ in the sun's angle
+        // alone. At zero every edge is one width; at the sun's own half degree
+        // the spheres' are softer than the cubes'; at two degrees, a hazy sky,
+        // a cube's shadow visibly widens from its foot to its far corner.
+        (
+            "sun-penumbra-off",
+            CaptureSettings {
+                sun_angle: Some(0.0),
+                ..sun_penumbra()
+            },
+        ),
+        ("sun-penumbra", sun_penumbra()),
+        (
+            "sun-penumbra-wide",
+            CaptureSettings {
+                sun_angle: Some(2.0),
+                ..sun_penumbra()
+            },
+        ),
+        // The three ways of looking at the shadows rather than at the scene, from
+        // the `shadows` capture's own camera so each reads against it: the atlas
+        // in the corner, each surface by how a shadow texel compares with its
+        // pixel, and each by what the last frame did to the view it reads —
+        // which in a scene standing still is nothing, so the whole frame is grey.
+        (
+            "shadow-debug-atlas",
+            CaptureSettings {
+                shadows: true,
+                punctual_shadows: true,
+                shadow_debug: ShadowDebugView::Atlas,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "shadow-debug-density",
+            CaptureSettings {
+                shadows: true,
+                punctual_shadows: true,
+                shadow_debug: ShadowDebugView::TexelDensity,
+                ..CaptureSettings::default()
+            },
+        ),
+        (
+            "shadow-debug-cache",
+            CaptureSettings {
+                shadows: true,
+                punctual_shadows: true,
+                shadow_debug: ShadowDebugView::CacheState,
                 ..CaptureSettings::default()
             },
         ),

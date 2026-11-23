@@ -2085,6 +2085,125 @@ fn power_row(ui: &mut egui::Ui, lumens: &mut f32, hint: &str) {
     });
 }
 
+/// A channel mask as its first eight bits, which is as many as a scene is
+/// likely to name; the rest stay as they are.
+fn channels_row(ui: &mut egui::Ui, channels: &mut u32) {
+    widgets::property(ui, "Channels", |ui| {
+        ui.horizontal(|ui| {
+            for bit in 0..8 {
+                let mut on = *channels & (1 << bit) != 0;
+                if ui
+                    .toggle_value(&mut on, format!("{}", bit + 1))
+                    .on_hover_text("Lights and meshes that share a channel see each other")
+                    .changed()
+                {
+                    *channels ^= 1 << bit;
+                }
+            }
+        })
+        .response
+    });
+}
+
+/// One of a light's overrides of the scene's shadow settings: a switch for
+/// whether it overrides at all, and the value while it does.
+fn override_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    start: f32,
+    slider: impl FnOnce(&mut f32) -> egui::Slider<'_>,
+) {
+    widgets::property(ui, label, |ui| {
+        ui.horizontal(|ui| {
+            let mut overrides = *value >= 0.0;
+            if ui
+                .checkbox(&mut overrides, "")
+                .on_hover_text("Off takes the scene's setting")
+                .changed()
+            {
+                *value = if overrides {
+                    start
+                } else {
+                    crate::scene::INHERIT
+                };
+            }
+            if overrides {
+                ui.add(slider(value));
+            }
+        })
+        .response
+    });
+}
+
+/// How one light's shadow differs from the scene's.
+fn light_shadow_rows(ui: &mut egui::Ui, shadows: &mut crate::scene::LightShadows) {
+    use crate::scene::ShadowUpdate;
+    widgets::property(ui, "Shadow tile", |ui| {
+        egui::ComboBox::from_id_salt("light_shadow_resolution")
+            .selected_text(match shadows.resolution {
+                0 => "Scene".to_owned(),
+                size => format!("{size}"),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut shadows.resolution, 0, "Scene");
+                for size in [128u32, 256, 512, 1024] {
+                    ui.selectable_value(&mut shadows.resolution, size, format!("{size}"));
+                }
+            })
+            .response
+            .on_hover_text("The largest tile a face gets; smaller as the light covers less screen")
+    });
+    widgets::property(ui, "Shadow priority", |ui| {
+        ui.add(egui::Slider::new(&mut shadows.priority, 0.1..=10.0).logarithmic(true))
+            .on_hover_text("Worth this much more of a tile than another light when they run short")
+    });
+    widgets::property(ui, "Shadow range", |ui| {
+        ui.add(egui::Slider::new(&mut shadows.range, 0.0..=100.0).suffix(" m"))
+            .on_hover_text("How far its shadows reach; zero is as far as its light")
+    });
+    widgets::property(ui, "Shadow update", |ui| {
+        egui::ComboBox::from_id_salt("light_shadow_update")
+            .selected_text(match shadows.update {
+                ShadowUpdate::Always => "Always",
+                ShadowUpdate::OnChange => "On change",
+                ShadowUpdate::OnDemand => "On demand",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut shadows.update, ShadowUpdate::Always, "Always");
+                ui.selectable_value(&mut shadows.update, ShadowUpdate::OnChange, "On change")
+                    .on_hover_text("What stands still casts; what moves does not");
+                ui.selectable_value(&mut shadows.update, ShadowUpdate::OnDemand, "On demand")
+                    .on_hover_text("Drawn once, and again when its revision changes");
+            })
+            .response
+    });
+    if shadows.update == ShadowUpdate::OnDemand {
+        widgets::property(ui, "Shadow revision", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Redraw").clicked() {
+                    shadows.revision = shadows.revision.wrapping_add(1);
+                }
+            })
+            .response
+        });
+    }
+    override_row(ui, "Softness", &mut shadows.softness, 0.03, |value| {
+        egui::Slider::new(value, 0.0..=0.5)
+            .logarithmic(true)
+            .suffix(" m")
+    });
+    override_row(ui, "Sharpness", &mut shadows.sharpness, 0.0, |value| {
+        egui::Slider::new(value, 0.0..=crate::scene::MAX_SHADOW_SHARPNESS)
+    });
+    override_row(ui, "Bias", &mut shadows.constant_bias, 2.0, |value| {
+        egui::Slider::new(value, 0.0..=8.0)
+    });
+    override_row(ui, "Slope bias", &mut shadows.slope_bias, 3.0, |value| {
+        egui::Slider::new(value, 0.0..=8.0)
+    });
+}
+
 fn shadows_row(ui: &mut egui::Ui, casts_shadows: &mut bool, hint: &str) {
     widgets::property(ui, "Shadows", |ui| {
         ui.checkbox(casts_shadows, "Cast").on_hover_text(hint);
@@ -2181,19 +2300,24 @@ fn retyped(light: Light, kind: crate::editor::pick::LightKind) -> Light {
     use crate::editor::pick::LightKind;
     let (Light::Directional { color, .. } | Light::Point { color, .. } | Light::Spot { color, .. }) =
         light;
+    let (Light::Directional { channels, .. }
+    | Light::Point { channels, .. }
+    | Light::Spot { channels, .. }) = light;
     let bulb = match light {
         Light::Point {
             lumens,
             range,
             casts_shadows,
+            shadows,
             ..
         }
         | Light::Spot {
             lumens,
             range,
             casts_shadows,
+            shadows,
             ..
-        } => Some((lumens, range, casts_shadows)),
+        } => Some((lumens, range, casts_shadows, shadows)),
         Light::Directional { .. } => None,
     };
     let mut retyped = match kind {
@@ -2202,23 +2326,31 @@ fn retyped(light: Light, kind: crate::editor::pick::LightKind) -> Light {
         LightKind::Spot => Light::default_spot(),
     };
     match &mut retyped {
-        Light::Directional { color: new, .. } => *new = color,
+        Light::Directional {
+            color: new,
+            channels: lit,
+            ..
+        } => (*new, *lit) = (color, channels),
         Light::Point {
             color: new,
             lumens,
             range,
             casts_shadows,
+            channels: lit,
+            shadows,
         }
         | Light::Spot {
             color: new,
             lumens,
             range,
             casts_shadows,
+            channels: lit,
+            shadows,
             ..
         } => {
-            *new = color;
+            (*new, *lit) = (color, channels);
             if let Some(bulb) = bulb {
-                (*lumens, *range, *casts_shadows) = bulb;
+                (*lumens, *range, *casts_shadows, *shadows) = bulb;
             }
         }
     }
@@ -2228,7 +2360,11 @@ fn retyped(light: Light, kind: crate::editor::pick::LightKind) -> Light {
 /// The rows of whichever kind `light` is.
 fn light_rows(ui: &mut egui::Ui, light: &mut Light) {
     match light {
-        Light::Directional { color, lux } => {
+        Light::Directional {
+            color,
+            lux,
+            channels,
+        } => {
             color_row(ui, "Colour", color);
             // Logarithmic, as every one of these is: the useful range spans
             // five orders of magnitude, and on a linear slider everything
@@ -2241,12 +2377,15 @@ fn light_rows(ui: &mut egui::Ui, light: &mut Light) {
                 )
                 .on_hover_text("Noon sun 100 000, overcast 20 000, sunset under 1 000");
             });
+            channels_row(ui, channels);
         }
         Light::Point {
             color,
             lumens,
             range,
             casts_shadows,
+            channels,
+            shadows,
         } => {
             color_row(ui, "Colour", color);
             power_row(
@@ -2255,11 +2394,15 @@ fn light_rows(ui: &mut egui::Ui, light: &mut Light) {
                 "Domestic bulb 800, shop light 4 000, flood tens of thousands",
             );
             range_row(ui, range);
+            channels_row(ui, channels);
             shadows_row(
                 ui,
                 casts_shadows,
                 "Six atlas tiles, and only if the budget reaches this light",
             );
+            if *casts_shadows {
+                light_shadow_rows(ui, shadows);
+            }
         }
         Light::Spot {
             color,
@@ -2269,6 +2412,8 @@ fn light_rows(ui: &mut egui::Ui, light: &mut Light) {
             outer_angle,
             reflector,
             casts_shadows,
+            channels,
+            shadows,
         } => {
             color_row(ui, "Colour", color);
             power_row(
@@ -2296,11 +2441,15 @@ fn light_rows(ui: &mut egui::Ui, light: &mut Light) {
                 ui.add(egui::Slider::new(inner_angle, 0.0..=*outer_angle).suffix("°"))
                     .on_hover_text("Half angle out to which it is still at full brightness");
             });
+            channels_row(ui, channels);
             shadows_row(
                 ui,
                 casts_shadows,
                 "One atlas tile, and only if the budget reaches this light",
             );
+            if *casts_shadows {
+                light_shadow_rows(ui, shadows);
+            }
         }
     }
 }

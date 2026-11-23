@@ -179,13 +179,7 @@ mod tests {
         let bulb = world.spawn();
         world.insert(bulb, Light::default());
         let sun = world.spawn();
-        world.insert(
-            sun,
-            Light::Directional {
-                color: Vec3::ONE,
-                lux: 20_000.0,
-            },
-        );
+        world.insert(sun, Light::directional(Vec3::ONE, 20_000.0));
 
         assert_eq!(Kind::of(&world, group), Kind::Group);
         assert_eq!(Kind::of(&world, mesh), Kind::Mesh);
@@ -200,15 +194,7 @@ mod tests {
         let mut world = World::new();
         let lamp = world.spawn();
         world.insert(lamp, MeshHandle(0));
-        world.insert(
-            lamp,
-            Light::Point {
-                color: Vec3::ONE,
-                lumens: 800.0,
-                range: 10.0,
-                casts_shadows: false,
-            },
-        );
+        world.insert(lamp, Light::point(Vec3::ONE, 800.0, 10.0));
         assert_eq!(Kind::of(&world, lamp), Kind::Light);
     }
 }

@@ -561,6 +561,8 @@ fn the_light_type_row_switches_kind_keeping_what_the_kinds_share() {
             lumens: 1234.0,
             range: 7.0,
             casts_shadows: false,
+            channels: 0b101,
+            shadows: Default::default(),
         },
     );
     editor.state.selection.set(lamp);
@@ -575,13 +577,15 @@ fn the_light_type_row_switches_kind_keeping_what_the_kinds_share() {
         inner_angle,
         outer_angle,
         reflector,
+        channels,
+        ..
     }) = editor.world.get::<Light>(lamp).map(|l| *l)
     else {
         panic!("it is a spot now");
     };
     assert_eq!(
-        (color, lumens, range, casts_shadows),
-        (colour, 1234.0, 7.0, false)
+        (color, lumens, range, casts_shadows, channels),
+        (colour, 1234.0, 7.0, false, 0b101)
     );
     let Light::Spot {
         inner_angle: inner,
@@ -598,7 +602,7 @@ fn the_light_type_row_switches_kind_keeping_what_the_kinds_share() {
     );
 
     retype(&mut editor, "Spot", "Directional");
-    let Some(Light::Directional { color, lux }) = editor.world.get::<Light>(lamp).map(|l| *l)
+    let Some(Light::Directional { color, lux, .. }) = editor.world.get::<Light>(lamp).map(|l| *l)
     else {
         panic!("it is a sun now");
     };

@@ -61,13 +61,18 @@ pub(super) struct GpuObject {
     /// passes that ignore this field would be two ways for one object row to be
     /// wrong.
     prev_model: [[f32; 4]; 3],
+    /// `[0]` is the light channels the object is in. A word of its own costs
+    /// the row sixteen bytes rather than four, because std430 rounds the
+    /// struct up to the alignment of the vectors beside it.
+    flags: [u32; 4],
 }
 
 impl GpuObject {
-    pub(super) fn new(model: &Mat4, prev_model: &Mat4) -> Self {
+    pub(super) fn new(model: &Mat4, prev_model: &Mat4, channels: u32) -> Self {
         Self {
             model: affine_rows(model),
             prev_model: affine_rows(prev_model),
+            flags: [channels, 0, 0, 0],
         }
     }
 }
@@ -101,6 +106,7 @@ const INITIAL_ROWS: u32 = 1024;
 struct Resident {
     model: Mat4,
     prev_model: Mat4,
+    channels: u32,
 }
 
 /// One entry of a draw order: which object row to draw, and which material to
@@ -204,12 +210,16 @@ impl InstanceStore {
             let current = Resident {
                 model: item.model,
                 prev_model: item.prev_model,
+                channels: item.channels,
             };
             if self.resident[slot] == Some(current) {
                 continue;
             }
             self.resident[slot] = Some(current);
-            dirty.push((item.instance, GpuObject::new(&item.model, &item.prev_model)));
+            dirty.push((
+                item.instance,
+                GpuObject::new(&item.model, &item.prev_model, item.channels),
+            ));
         }
 
         if dirty.is_empty() {
@@ -377,8 +387,8 @@ mod tests {
     /// out with no padding — the stride every `Object` declaration in the
     /// shaders has to agree with.
     #[test]
-    fn an_object_row_is_two_affine_matrices() {
-        assert_eq!(std::mem::size_of::<GpuObject>(), 96);
+    fn an_object_row_is_two_affine_matrices_and_a_word_of_flags() {
+        assert_eq!(std::mem::size_of::<GpuObject>(), 112);
     }
 
     /// `affine` in `object.glsl`, here so the packing can be asserted without a
@@ -409,7 +419,7 @@ mod tests {
             [0.0, 0.0, 1.0, 0.0],
             [-4.0, 0.5, 9.0, 1.0],
         ]);
-        let row = GpuObject::new(&trs, &sheared);
+        let row = GpuObject::new(&trs, &sheared, 0);
         assert_eq!(shader_affine(&row.model), trs);
         assert_eq!(shader_affine(&row.prev_model), sheared);
     }

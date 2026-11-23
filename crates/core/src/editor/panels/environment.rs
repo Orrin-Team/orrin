@@ -153,13 +153,18 @@ const SHADOWS: &[Section] = &[
             "Enabled",
             "Cascades",
             "Resolution",
+            "Fitted",
             "Distance",
             "Split blend",
             "Pullback",
             "Bias",
             "Slope bias",
+            "Softness",
+            "Sun angle",
+            "Sharpness",
             "Strength",
             "Tint cascades",
+            "Debug view",
         ],
         shadows,
     ),
@@ -167,7 +172,15 @@ const SHADOWS: &[Section] = &[
         "Point & spot shadows",
         Some("One atlas, a tile per cube face, drawn in a single pass"),
         icons::lightbulb(),
-        &["Enabled", "Atlas", "Near", "Bias", "Slope bias"],
+        &[
+            "Enabled",
+            "Atlas",
+            "Near",
+            "Bias",
+            "Slope bias",
+            "Softness",
+            "Sharpness",
+        ],
         punctual_shadows,
     ),
     section(
@@ -653,14 +666,37 @@ fn shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
     }
     if rows.shows("Resolution") {
         widgets::property(ui, "Resolution", |ui| {
-            egui::ComboBox::from_id_salt("shadow_resolution")
-                .selected_text(format!("{}", s.resolution))
-                .show_ui(ui, |ui| {
-                    for size in [512u32, 1024, 2048, 4096] {
-                        ui.selectable_value(&mut s.resolution, size, format!("{size}"));
-                    }
-                });
+            // The near cascades' tiles, then the tiles of the levels past them.
+            // Each is held to half a page of the atlas, so the sun's four are
+            // one page between them at most.
+            let ShadowSettings {
+                resolution,
+                far_resolution,
+                ..
+            } = &mut *s;
+            for (salt, value) in [
+                ("shadow_resolution", resolution),
+                ("shadow_far_resolution", far_resolution),
+            ] {
+                egui::ComboBox::from_id_salt(salt)
+                    .selected_text(format!("{value}"))
+                    .show_ui(ui, |ui| {
+                        for size in [512u32, 1024, 2048, 4096] {
+                            ui.selectable_value(value, size, format!("{size}"));
+                        }
+                    });
+            }
         });
+    }
+    if rows.shows("Fitted") {
+        let count = s.cascade_count;
+        widgets::property(ui, "Fitted", |ui| {
+            ui.add(egui::DragValue::new(&mut s.fitted_cascades).range(0..=count))
+        })
+        .on_hover_text(
+            "How many of the sun's views follow the view frustum: sharper through a narrow \
+             lens, and redrawn whole whenever the camera moves",
+        );
     }
     if rows.shows("Distance") {
         slider(
@@ -697,6 +733,24 @@ fn shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
             egui::Slider::new(&mut s.slope_bias, 0.0..=8.0),
         );
     }
+    if rows.shows("Softness") {
+        softness(ui, &mut s.softness);
+    }
+    if rows.shows("Sun angle") {
+        slider(
+            ui,
+            "Sun angle",
+            egui::Slider::new(&mut s.sun_angle, 0.0..=crate::scene::MAX_SUN_ANGLE)
+                .logarithmic(true)
+                .suffix("°"),
+        )
+        .on_hover_text(
+            "How fast a shadow's edge widens with the distance to what casts it: the sun's              real disc is 0.53°, and 0 keeps every edge at Softness",
+        );
+    }
+    if rows.shows("Sharpness") {
+        sharpness(ui, &mut s.sharpness);
+    }
     if rows.shows("Strength") {
         slider(
             ui,
@@ -706,6 +760,30 @@ fn shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
     }
     if rows.shows("Tint cascades") {
         toggle(ui, "Tint cascades", &mut s.debug_cascades);
+    }
+    if rows.shows("Debug view") {
+        use crate::scene::ShadowDebugView;
+        widgets::property(ui, "Debug view", |ui| {
+            let name = |view| match view {
+                ShadowDebugView::None => "None",
+                ShadowDebugView::Atlas => "Atlas",
+                ShadowDebugView::TexelDensity => "Texel density",
+                ShadowDebugView::CacheState => "Cache state",
+            };
+            egui::ComboBox::from_id_salt("shadow_debug_view")
+                .selected_text(name(s.debug_view))
+                .show_ui(ui, |ui| {
+                    for view in [
+                        ShadowDebugView::None,
+                        ShadowDebugView::Atlas,
+                        ShadowDebugView::TexelDensity,
+                        ShadowDebugView::CacheState,
+                    ] {
+                        ui.selectable_value(&mut s.debug_view, view, name(view));
+                    }
+                })
+                .response
+        });
     }
 }
 
@@ -718,12 +796,10 @@ fn punctual_shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
     }
     if rows.shows("Atlas") {
         widgets::property(ui, "Atlas", |ui| {
-            // 4096 is the ceiling on purpose, twice over. Vulkan guarantees
-            // `maxImageDimension2D` of only 4096, so offering 8192 is offering a
-            // startup panic on a conformant device that Metal happens to let this
-            // one get away with. And it would buy nothing if it worked: the budget
-            // is `MAX_SHADOW_LIGHTS` casters, so the most faces anything can ask for
-            // is 48, and 4096 at 512 already holds 64.
+            // One page of the atlas, and 4096 is the ceiling on purpose. The
+            // atlas is its pages side by side and Vulkan guarantees
+            // `maxImageDimension2D` of only 4096; the renderer holds a page to
+            // what the device takes, and a larger one here would be held too.
             egui::ComboBox::from_id_salt("shadow_atlas_resolution")
                 .selected_text(format!("{}", s.atlas_resolution))
                 .show_ui(ui, |ui| {
@@ -741,8 +817,11 @@ fn punctual_shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
         });
         // Both are structure, so the reader deserves to know what they bought: a
         // point light spends six of these and a spot one.
-        let tiles = s.atlas_config().map_or(0, |config| config.capacity());
-        ui.weak(format!("{tiles} tiles — {} point lights", tiles / 6));
+        let tiles = s.punctual_tiles();
+        ui.weak(format!(
+            "{tiles} tiles beside the sun's — {} point lights",
+            tiles / 6
+        ));
     }
     if rows.shows("Near") {
         slider(
@@ -768,6 +847,35 @@ fn punctual_shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
             egui::Slider::new(&mut s.punctual_slope_bias, 0.0..=8.0),
         );
     }
+    if rows.shows("Softness") {
+        softness(ui, &mut s.punctual_softness);
+    }
+    if rows.shows("Sharpness") {
+        sharpness(ui, &mut s.punctual_sharpness);
+    }
+}
+
+fn softness(ui: &mut egui::Ui, value: &mut f32) {
+    slider(
+        ui,
+        "Softness",
+        egui::Slider::new(value, 0.0..=0.5)
+            .logarithmic(true)
+            .suffix(" m"),
+    )
+    .on_hover_text(
+        "Penumbra width where a shadow meets its caster, held wherever a map's texels are \
+         fine enough to hold it",
+    );
+}
+
+fn sharpness(ui: &mut egui::Ui, value: &mut f32) {
+    slider(
+        ui,
+        "Sharpness",
+        egui::Slider::new(value, 0.0..=crate::scene::MAX_SHADOW_SHARPNESS),
+    )
+    .on_hover_text("Narrows the visible penumbra and keeps the kernel that antialiases it");
 }
 
 fn contact_shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {

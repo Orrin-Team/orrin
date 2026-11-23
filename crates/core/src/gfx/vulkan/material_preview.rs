@@ -234,6 +234,7 @@ pub(super) fn lighting(
             direction: -to_key,
             color: Vec3::ONE,
             illuminance: key.max(MIN_KEY_LUX),
+            channels: crate::scene::ALL_CHANNELS,
         },
         point_lights: Vec::new(),
         spot_lights: Vec::new(),
@@ -547,7 +548,11 @@ impl MaterialPreviewPass {
 /// The sphere's one object row, at the origin, and its one draw-order entry.
 pub(super) fn object_rows(material: MaterialHandle) -> (super::instances::GpuObject, [u32; 2]) {
     (
-        super::instances::GpuObject::new(&Mat4::IDENTITY, &Mat4::IDENTITY),
+        super::instances::GpuObject::new(
+            &Mat4::IDENTITY,
+            &Mat4::IDENTITY,
+            crate::scene::ALL_CHANNELS,
+        ),
         [0, material.0],
     )
 }

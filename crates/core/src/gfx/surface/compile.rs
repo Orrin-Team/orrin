@@ -362,6 +362,12 @@ fn surface_params() -> Resource {
         .expect("the custom-surface manifest row binds SurfaceParams")
 }
 
+/// How many times a module can end a fragment without writing it.
+#[cfg(test)]
+pub(crate) fn discards(spirv: &[u8]) -> usize {
+    Spirv::scan(spirv).kills
+}
+
 /// What `validate` asks of a module's instructions.
 struct Spirv {
     kills: usize,
