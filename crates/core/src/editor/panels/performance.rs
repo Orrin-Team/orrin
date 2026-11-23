@@ -49,6 +49,12 @@ pub fn body(ui: &mut egui::Ui, world: &World) {
     let rss_mb = stats.memory_bytes() as f64 / (1024.0 * 1024.0);
     ui.label(figures(format!("Memory (RSS): {rss_mb:.1} MB")));
     ui.label(figures(vram(&stats)));
+    if stats.traced_scene_bytes() > 0 {
+        ui.label(figures(format!(
+            "Traced scene: {:.1} MB",
+            stats.traced_scene_bytes() as f64 / (1024.0 * 1024.0)
+        )));
+    }
 
     if let Some(mut culling) = world.get_resource_mut::<Culling>() {
         ui.label(figures(match (culling.visible(), culling.culled()) {

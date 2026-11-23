@@ -64,6 +64,11 @@
 //!   frustum (`ShadowSettings::fitted_cascades`), which with
 //!   `ORRIN_PERF_MOTION` is what a view that cannot be kept between frames
 //!   costs beside one that can.
+//! - `ORRIN_PERF_RAYS=1` traces the scene: the acceleration structures are
+//!   built — the scene's every frame — and the instance view is drawn from one
+//!   ray per pixel. What keeping a traceable scene costs, and one full-screen
+//!   trace of it. Nothing on a device that cannot trace, or under
+//!   `ORRIN_RAY_TRACING=0`.
 //! - `ORRIN_PERF_MSAA=1` rasterises the forward pass at four samples. The other
 //!   half of the comparison `TaaSettings::msaa` exists for: multisampled, the
 //!   pass writes and resolves its own targets and cannot depth-test `EQUAL`
@@ -297,6 +302,13 @@ fn frame_cost() {
         ..ShadowSettings::default()
     });
 
+    if env_usize("ORRIN_PERF_RAYS", 0) != 0 {
+        renderer.set_ray_tracing(orrin_core::scene::RayTracingSettings {
+            debug_view: orrin_core::scene::RayDebugView::Instance,
+            ..Default::default()
+        });
+    }
+
     let mut lighting = SceneLighting::default();
     let mut geometry = FrameGeometry::default();
     let mut decals: Vec<DecalInstance> = Vec::new();
@@ -460,6 +472,14 @@ fn frame_cost() {
             "     {:<28} not reported by this driver",
             "device-local memory"
         ),
+    }
+    let traced = renderer.traced_scene_bytes();
+    if traced > 0 {
+        println!(
+            "     {:<28} {:>9.1} MB",
+            "acceleration structures",
+            traced as f64 / 1e6,
+        );
     }
     for lane in [Lane::Cpu, Lane::Gpu] {
         let mut rows = profiler.aggregate(lane);

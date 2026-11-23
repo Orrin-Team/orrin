@@ -136,6 +136,9 @@ pub(super) struct SceneAccel {
     /// Which of `scenes` the frame being recorded builds and traces.
     current: usize,
     instances: Arena,
+    /// This frame's instances as the build reads them, kept for its
+    /// allocation.
+    resolved: Vec<AccelerationStructureInstance>,
     retired: Vec<(u64, Arc<AccelerationStructure>)>,
     scratch_alignment: DeviceSize,
     frames_in_flight: u64,
@@ -167,6 +170,7 @@ impl SceneAccel {
                     ..Default::default()
                 },
             ),
+            resolved: Vec::new(),
             retired: Vec::new(),
             scratch_alignment,
             frames_in_flight,
@@ -279,6 +283,7 @@ impl SceneAccel {
             if !ready {
                 continue;
             }
+            let (mut before, mut after) = (0, 0);
             for ((key, built), size) in batch.entries.into_iter().zip(sizes) {
                 let current = self
                     .meshes
@@ -292,11 +297,17 @@ impl SceneAccel {
                     AccelerationStructureType::BottomLevel,
                     storage(ctx, size),
                 );
+                before += built.size();
+                after += compact.size();
                 self.mesh_bytes = self.mesh_bytes - built.size() + compact.size();
                 self.meshes.insert(key, compact.clone());
                 self.retired.push((frame, built.clone()));
                 self.work.compactions.push((built, compact));
             }
+            tracing::debug!(
+                "compacting {} mesh acceleration structures, {before} to {after} bytes",
+                self.work.compactions.len(),
+            );
         }
 
         // Asked a frame after the build, never in it. See the module docs.
@@ -414,10 +425,11 @@ impl SceneAccel {
     }
 
     fn build_scene(&mut self, ctx: &VkContext, instances: &[RayInstance]) -> u32 {
-        let resolved: Vec<AccelerationStructureInstance> = instances
-            .iter()
-            .filter_map(|instance| {
-                let structure = self.meshes.get(&key(instance.span))?;
+        let meshes = &self.meshes;
+        self.resolved.clear();
+        self.resolved
+            .extend(instances.iter().filter_map(|instance| {
+                let structure = meshes.get(&key(instance.span))?;
                 let flags = if instance.opaque {
                     GeometryInstanceFlags::FORCE_OPAQUE
                 } else {
@@ -432,8 +444,8 @@ impl SceneAccel {
                     ),
                     acceleration_structure_reference: structure.device_address().get(),
                 })
-            })
-            .collect();
+            }));
+        let resolved = &self.resolved;
         let count = resolved.len() as u32;
 
         // Never empty: a buffer of no bytes has no address to build from, and
@@ -448,7 +460,7 @@ impl SceneAccel {
         if !resolved.is_empty() {
             data.write()
                 .expect("the instance buffer is host-visible")
-                .copy_from_slice(bytemuck::cast_slice(&resolved));
+                .copy_from_slice(bytemuck::cast_slice(resolved));
         }
 
         let geometry = |data| {

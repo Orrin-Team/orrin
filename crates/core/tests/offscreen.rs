@@ -41,7 +41,13 @@ fn captures_the_built_in_scenes() {
     orrin_core::logging::init(orrin_core::logging::LogConfig::for_this_build());
     let dir = output_dir();
 
+    // `ORRIN_CAPTURE=ssr` takes only the captures with `ssr` in their names:
+    // the loop for one feature, without the two minutes the whole set takes.
+    let only = std::env::var("ORRIN_CAPTURE").ok();
     for (name, settings) in common::captures() {
+        if only.as_deref().is_some_and(|only| !name.contains(only)) {
+            continue;
+        }
         let path = dir.join(format!("{name}.png"));
         capture_scene(&path, &settings);
 

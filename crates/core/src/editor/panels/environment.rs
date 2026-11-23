@@ -41,8 +41,8 @@ use crate::scene::registry::RENDER_SETTINGS;
 use crate::scene::render_settings;
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, ContactShadowSettings, DecalSettings, DofSettings,
-    EnvironmentSettings, FogSettings, HdrSettings, MotionBlurSettings, RefractionSettings,
-    ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
+    EnvironmentSettings, FogSettings, HdrSettings, MotionBlurSettings, RayTracingSettings,
+    RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
     TransparencySettings,
 };
 
@@ -262,6 +262,14 @@ const LIGHTING: &[Section] = &[
     ),
 ];
 
+const RAYS: &[Section] = &[section(
+    "Ray tracing",
+    Some("Trace rays against a copy of the scene, on a GPU that can"),
+    icons::bounding_box(),
+    &["Enabled", "Distance", "Debug view"],
+    ray_tracing,
+)];
+
 const LENS: &[Section] = &[
     section(
         "Lens",
@@ -280,7 +288,7 @@ const LENS: &[Section] = &[
 ];
 
 /// The groups the columns are dealt, in reading order.
-const COLUMNS: [&[Section]; 4] = [SCREEN_SPACE, SHADOWS, LIGHTING, LENS];
+const COLUMNS: [&[Section]; 5] = [SCREEN_SPACE, SHADOWS, LIGHTING, RAYS, LENS];
 
 const EDITOR_CAMERA: Section = Section {
     title: "Editor camera",
@@ -563,6 +571,50 @@ fn reflections(ui: &mut egui::Ui, world: &World, rows: Rows) {
     if rows.shows("Steps") {
         slider(ui, "Steps", egui::Slider::new(&mut ssr.max_steps, 8..=128))
             .on_hover_text("A step crosses a whole cell of the depth pyramid, not a texel");
+    }
+}
+
+fn ray_tracing(ui: &mut egui::Ui, world: &World, rows: Rows) {
+    let mut rays = world.resource_mut::<RayTracingSettings>();
+    if rows.shows("Enabled") {
+        toggle(ui, "Enabled", &mut rays.enabled).on_hover_text(
+            "Nothing is built until something traces, so this alone costs nothing. \
+             Ignored on a GPU without ray queries",
+        );
+    }
+    if rows.shows("Distance") {
+        slider(
+            ui,
+            "Distance",
+            egui::Slider::new(&mut rays.distance, 10.0..=2000.0)
+                .logarithmic(true)
+                .suffix(" m"),
+        )
+        .on_hover_text("How far from the camera an object still stands in the traced scene");
+    }
+    if rows.shows("Debug view") {
+        use crate::scene::RayDebugView;
+        widgets::property(ui, "Debug view", |ui| {
+            let name = |view| match view {
+                RayDebugView::None => "None",
+                RayDebugView::HitDistance => "Hit distance",
+                RayDebugView::Instance => "Instance",
+                RayDebugView::GeometricNormal => "Geometric normal",
+            };
+            egui::ComboBox::from_id_salt("ray_debug_view")
+                .selected_text(name(rays.debug_view))
+                .show_ui(ui, |ui| {
+                    for view in [
+                        RayDebugView::None,
+                        RayDebugView::HitDistance,
+                        RayDebugView::Instance,
+                        RayDebugView::GeometricNormal,
+                    ] {
+                        ui.selectable_value(&mut rays.debug_view, view, name(view));
+                    }
+                })
+                .response
+        });
     }
 }
 

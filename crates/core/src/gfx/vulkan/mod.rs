@@ -1941,6 +1941,13 @@ impl VulkanRenderer {
         }
     }
 
+    /// Bytes of that memory the acceleration structures hold: every mesh's,
+    /// and the scene's. Zero on a device that cannot trace, and until a frame
+    /// does.
+    pub fn traced_scene_bytes(&self) -> u64 {
+        self.device.ray_scene_bytes()
+    }
+
     /// The API version the device supports and its name, for the editor's
     /// status bar: `Vulkan 1.3 · AMD Radeon RX 9070 XT`.
     pub fn device_label(&self) -> String {

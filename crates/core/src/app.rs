@@ -1291,9 +1291,11 @@ impl ApplicationHandler for App {
 
                 let gpu_ms = renderer.gpu_frame_ms();
                 let (vram_used, vram_total) = renderer.gpu_memory();
-                self.world
-                    .resource_mut::<FrameStats>()
-                    .set_gpu_stats(gpu_ms, vram_used, vram_total);
+                let traced = renderer.traced_scene_bytes();
+                let mut stats = self.world.resource_mut::<FrameStats>();
+                stats.set_gpu_stats(gpu_ms, vram_used, vram_total);
+                stats.set_traced_scene_bytes(traced);
+                drop(stats);
 
                 // Expire debug lines now that this frame has drawn them: a
                 // one-frame line (expiry == its spawn time) is dropped, a timed
