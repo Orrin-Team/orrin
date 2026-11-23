@@ -41,9 +41,9 @@ use crate::scene::registry::RENDER_SETTINGS;
 use crate::scene::render_settings;
 use crate::scene::{
     AmbientLight, BloomSettings, Camera, ContactShadowSettings, DecalSettings, DofSettings,
-    EnvironmentSettings, FogSettings, HdrSettings, MotionBlurSettings, RayTracingSettings,
-    RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
-    TransparencySettings,
+    EnvironmentSettings, FogSettings, GiSettings, HdrSettings, MotionBlurSettings,
+    RayTracingSettings, RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings,
+    SubsurfaceSettings, TaaSettings, TransparencySettings,
 };
 
 /// What the stand-in for the HDRI file dialog picks, in tests: `None` inside
@@ -262,13 +262,30 @@ const LIGHTING: &[Section] = &[
     ),
 ];
 
-const RAYS: &[Section] = &[section(
-    "Ray tracing",
-    Some("Trace rays against a copy of the scene, on a GPU that can"),
-    icons::bounding_box(),
-    &["Enabled", "Distance", "Reflections", "Debug view"],
-    ray_tracing,
-)];
+const RAYS: &[Section] = &[
+    section(
+        "Ray tracing",
+        Some("Trace rays against a copy of the scene, on a GPU that can"),
+        icons::bounding_box(),
+        &["Enabled", "Distance", "Reflections", "Debug view"],
+        ray_tracing,
+    ),
+    section(
+        "Global illumination",
+        Some("Light that bounced, from probes traced round the camera"),
+        icons::lightbulb(),
+        &[
+            "Enabled",
+            "Quality",
+            "Spacing",
+            "Hysteresis",
+            "Reflections",
+            "Fog",
+            "Debug view",
+        ],
+        global_illumination,
+    ),
+];
 
 const LENS: &[Section] = &[
     section(
@@ -620,6 +637,81 @@ fn ray_tracing(ui: &mut egui::Ui, world: &World, rows: Rows) {
                         RayDebugView::GeometricNormal,
                     ] {
                         ui.selectable_value(&mut rays.debug_view, view, name(view));
+                    }
+                })
+                .response
+        });
+    }
+}
+
+fn global_illumination(ui: &mut egui::Ui, world: &World, rows: Rows) {
+    let mut gi = world.resource_mut::<GiSettings>();
+    if rows.shows("Enabled") {
+        toggle(ui, "Enabled", &mut gi.enabled).on_hover_text(
+            "Needs Ray tracing on, and a GPU with ray queries. Off, the sky lights \
+             everything as if nothing stood in its way",
+        );
+    }
+    if rows.shows("Quality") {
+        // The issue's three tiers, as the two numbers they set.
+        let tiers = [("High", 16, 64), ("Medium", 16, 32), ("Low", 12, 16)];
+        let current = tiers
+            .iter()
+            .find(|(_, probes, rays)| gi.probes == *probes && gi.rays == *rays)
+            .map_or("Custom", |(name, ..)| *name);
+        widgets::property(ui, "Quality", |ui| {
+            egui::ComboBox::from_id_salt("gi_quality")
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (name, probes, rays) in tiers {
+                        if ui.selectable_label(current == name, name).clicked() {
+                            gi.probes = probes;
+                            gi.rays = rays;
+                        }
+                    }
+                })
+                .response
+        })
+        .on_hover_text("Probes a side of each of the six cascades, and rays a probe traces");
+    }
+    if rows.shows("Spacing") {
+        slider(
+            ui,
+            "Spacing",
+            egui::Slider::new(&mut gi.spacing, 0.25..=4.0)
+                .logarithmic(true)
+                .suffix(" m"),
+        )
+        .on_hover_text("Between the finest cascade's probes. Light leaks through anything thinner");
+    }
+    if rows.shows("Hysteresis") {
+        slider(
+            ui,
+            "Hysteresis",
+            egui::Slider::new(&mut gi.hysteresis, 0.8..=0.99),
+        )
+        .on_hover_text("How much a probe keeps of what it held at each update: steadier, slower");
+    }
+    if rows.shows("Reflections") {
+        toggle(ui, "Reflections", &mut gi.reflections)
+            .on_hover_text("Dim the sky's reflection where less of its light reaches");
+    }
+    if rows.shows("Fog") {
+        toggle(ui, "Fog", &mut gi.fog)
+            .on_hover_text("The volumetric fog scatters the probes' light, not the flat ambient");
+    }
+    if rows.shows("Debug view") {
+        use crate::scene::GiDebugView;
+        widgets::property(ui, "Debug view", |ui| {
+            let name = |view| match view {
+                GiDebugView::None => "None",
+                GiDebugView::Irradiance => "Irradiance",
+            };
+            egui::ComboBox::from_id_salt("gi_debug_view")
+                .selected_text(name(gi.debug_view))
+                .show_ui(ui, |ui| {
+                    for view in [GiDebugView::None, GiDebugView::Irradiance] {
+                        ui.selectable_value(&mut gi.debug_view, view, name(view));
                     }
                 })
                 .response

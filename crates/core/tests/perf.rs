@@ -69,6 +69,12 @@
 //!   ray per pixel. What keeping a traceable scene costs, and one full-screen
 //!   trace of it. Nothing on a device that cannot trace, or under
 //!   `ORRIN_RAY_TRACING=0`.
+//! - `ORRIN_PERF_GI=1` lights the frame with the irradiance volumes at their
+//!   defaults: the four dispatches that trace and update a cascade a frame and
+//!   shade the radiance cache, and every pass that lights a surface reading
+//!   them. Their rows are `gi_trace`, `gi_cache_compact`, `gi_update` and
+//!   `gi_cache_shade`; what reading them costs is the `forward` row against a
+//!   run without. Nothing on a device that cannot trace.
 //! - `ORRIN_PERF_MSAA=1` rasterises the forward pass at four samples. The other
 //!   half of the comparison `TaaSettings::msaa` exists for: multisampled, the
 //!   pass writes and resolves its own targets and cannot depth-test `EQUAL`
@@ -307,6 +313,10 @@ fn frame_cost() {
             debug_view: orrin_core::scene::RayDebugView::Instance,
             ..Default::default()
         });
+    }
+
+    if env_usize("ORRIN_PERF_GI", 0) != 0 {
+        renderer.set_gi(orrin_core::scene::GiSettings::default());
     }
 
     let mut lighting = SceneLighting::default();
