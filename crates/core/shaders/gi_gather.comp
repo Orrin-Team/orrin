@@ -1,0 +1,197 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+// One ray per texel at the gather's resolution, drawn in proportion to the
+// cosine about the prepass's normal, and the light it brings back as a small
+// irradiance probe: two bands of spherical harmonics per colour. The ray
+// shades nothing. What it found is read, in this order:
+//
+// - a surface the camera sees, from last frame's lit colour where that
+//   surface was;
+// - anything else, from the world radiance cache's cell there, claimed for
+//   the gather where no probe ray has claimed it and shaded next frame, and
+//   asked to be shaded again once its light is a few frames old;
+// - a cell with no light yet, from what the irradiance volumes say reaches
+//   the surface, with what it emits — light the lights lay on it directly
+//   comes back a frame later, from the cache;
+// - the sky, along a ray that met nothing, as the probes take it.
+//
+// The harmonics are fitted to light that is a constant and a gradient over
+// the hemisphere the rays were drawn from, the gradient across the normal
+// only: at the gather's own normal they give back exactly the mean of what
+// the rays found, and a normal tilted toward the brighter side reads more.
+// That is what lets the full-resolution normal shape a result taken at a
+// quarter of the pixels. Each layer is `(a, g)` for its colour, and the
+// irradiance at `n` is `a + dot(g, n)`, in the unit `sh_irradiance` returns.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "ray_shade.glsl"
+#include "gi_cache.glsl"
+#include "low_discrepancy.glsl"
+
+layout(set = 0, binding = 0) uniform texture2D u_depth;
+layout(set = 0, binding = 1) uniform texture2D u_normal;
+layout(set = 0, binding = 2) uniform texture2D u_velocity;
+// Last frame's lit colour: the temporal resolve's history.
+layout(set = 0, binding = 3) uniform sampler2D u_lit;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2DArray u_raw;
+#define ORRIN_GATHER_BLOCK_BINDING 5
+#include "gi_gather.glsl"
+layout(set = 0, binding = 6, std430) buffer GiCells {
+    GiCell gi_cells[];
+};
+// This frame's light in each cell, as the cache's shading left it.
+layout(set = 0, binding = 7, std430) buffer GiRadiance {
+    uvec2 gi_radiance[];
+};
+layout(set = 0, binding = 8, std430) writeonly buffer GiGatherHits {
+    GiRay gi_gather_hits[];
+};
+
+// How old a cell's light may be, in frames, before the gather asks for it to
+// be shaded again. A cell only the gather reads would otherwise keep the
+// light it was first shaded with for as long as the camera looks at it.
+const uint RESHADE = 8u;
+
+// Whether the hit at `p`, on a face turned toward the ray, is what the camera
+// sees there, and if so its lit colour last frame.
+bool screen_light(vec3 p, vec3 face, ivec2 full, out vec3 light) {
+    light = vec3(0.0);
+    if ((gather.params.z & GATHER_LIT) == 0u || dot(face, gather.camera.xyz - p) <= 0.0) {
+        return false;
+    }
+    vec4 clip = gather.view_proj * vec4(p, 1.0);
+    if (clip.w <= 0.0) {
+        return false;
+    }
+    vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0)))) {
+        return false;
+    }
+    ivec2 texel = ivec2(uv * vec2(full));
+    float depth = texelFetch(u_depth, texel, 0).r;
+    if (depth_is_far(depth)) {
+        return false;
+    }
+    vec3 seen = gather_position(texel, depth, full);
+    if (distance(seen, p) > 0.02 + 0.02 * distance(p, gather.camera.xyz)) {
+        return false;
+    }
+    vec2 previous = (vec2(texel) + 0.5) / vec2(full) - texelFetch(u_velocity, texel, 0).rg;
+    if (any(lessThan(previous, vec2(0.0))) || any(greaterThan(previous, vec2(1.0)))) {
+        return false;
+    }
+    light = textureLod(u_lit, previous, 0.0).rgb;
+    return true;
+}
+
+// The cache's light for a hit, `a` one where the cell has any. The cell is
+// claimed if it is new, kept from being emptied while the gather reads it,
+// and asked to be shaded from this ray if its light is new or old.
+vec4 cached_light(vec3 p, vec3 face, float reach, vec3 direction) {
+    uvec2 key = gi_cell_key(p, face, reach, gi.camera.xyz, gi.params.y);
+    uint checksum = gi_cell_checksum(key);
+    uint mask = gi.frame.w;
+    uint home = gi_cell_home(key, mask);
+    uint now = gi.frame.x;
+    for (uint i = 0u; i < GI_CACHE_PROBES; ++i) {
+        uint cell = (home + i) & mask;
+        uint held = atomicCompSwap(gi_cells[cell].checksum, 0u, checksum);
+        if (held != 0u && held != checksum) {
+            continue;
+        }
+        // Shaded at frame zero is never shaded: a cell claimed this frame
+        // holds whatever its slot last held, and the probes' update reads
+        // this half next frame, so it is emptied by whoever claimed it.
+        uint shaded = gi_cells[cell].shaded;
+        if (held == 0u) {
+            gi_radiance[cell] = uvec2(0u);
+        }
+        bool stale = shaded == 0u || now - shaded >= RESHADE;
+        // Used next frame is listed for shading next frame; used this frame
+        // is only kept.
+        atomicMax(gi_cells[cell].used, stale ? now + 1u : now);
+        if (stale && atomicCompSwap(gi_cells[cell].representative, GI_NO_CELL, GI_GATHERED)
+                         == GI_NO_CELL) {
+            gi_gather_hits[cell] = GiRay(vec4(p, reach), uvec4(floatBitsToUint(direction), 0u));
+        }
+        return shaded == 0u ? vec4(0.0) : gi_cell_light(gi_radiance[cell]);
+    }
+    return vec4(0.0);
+}
+
+void store(ivec2 low, vec3 light, vec3 across, float reach) {
+    imageStore(u_raw, ivec3(low, 0), vec4(light.r, across * light.r));
+    imageStore(u_raw, ivec3(low, 1), vec4(light.g, across * light.g));
+    imageStore(u_raw, ivec3(low, 2), vec4(light.b, across * light.b));
+    imageStore(u_raw, ivec3(low, GATHER_META), vec4(1.0, 0.0, reach, 0.0));
+}
+
+void main() {
+    ivec2 low = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(low, imageSize(u_raw).xy))) {
+        return;
+    }
+    ivec2 full = textureSize(u_depth, 0);
+    ivec2 texel = gather_texel(low, full);
+    float depth = texelFetch(u_depth, texel, 0).r;
+    if (depth_is_far(depth)) {
+        store(low, vec3(0.0), vec3(0.0), GATHER_REACH);
+        return;
+    }
+    vec3 position = gather_position(texel, depth, full);
+    vec3 normal = gather_normal(texel);
+    float far = distance(position, gather.camera.xyz);
+    vec3 direction = ld_cosine_direction(normal, ld_sample(uvec2(low), gather.params.y));
+    // Off the surface by more the further it is, since that is how the
+    // position read back out of the depth goes wrong.
+    vec3 origin = position + normal * (0.01 + 0.002 * far);
+
+    vec3 light = vec3(0.0);
+    float reach = GATHER_REACH;
+    RayHit hit = ray_closest(origin, direction, 0.0, RAY_FAR);
+    if (!hit.found) {
+        light = gi_sky(direction);
+    } else if (!ray_back_face(hit, direction)) {
+        // A back is the inside of something, and sends nothing.
+        reach = min(hit.distance, GATHER_REACH);
+        vec3 p = origin + direction * hit.distance;
+        uvec4 instance = ray_instances[hit.instance];
+        RayTriangle triangle = ray_triangle(instance, hit.primitive);
+        vec3 a = hit.to_world * vec4(triangle.position[0], 1.0);
+        vec3 b = hit.to_world * vec4(triangle.position[1], 1.0);
+        vec3 c = hit.to_world * vec4(triangle.position[2], 1.0);
+        vec3 face = normalize(cross(b - a, c - a));
+        face *= dot(face, direction) > 0.0 ? -1.0 : 1.0;
+        if (!screen_light(p, face, full, light)) {
+            vec4 cached = cached_light(p, face, hit.distance, direction);
+            if (cached.a > 0.0) {
+                light = cached.rgb;
+            } else {
+                // The cone a ray stands for, as the cache's shading reads a
+                // map through it.
+                float cone = sqrt(4.0 * PI / float(gi.grid.y));
+                RaySurface found = ray_surface(hit, direction, cone);
+                Surface s = found.s;
+                vec4 local = gi_irradiance(found.position, s.N, s.V);
+                vec3 irradiance = local.rgb
+                                + gi_sky_irradiance(s.N) * (1.0 - gi_reach(found.position));
+                light = found.emissive + irradiance * s.albedo * (1.0 - s.metallic);
+            }
+        }
+    }
+    // Into half floats; and one hit whose arithmetic went wrong would
+    // otherwise stay in the history for as long as it lasts.
+    light = min(light, vec3(65000.0));
+    if (any(isnan(light))) {
+        light = vec3(0.0);
+    }
+    // The gradient across the normal, from the cosine-weighted first moment
+    // the ray is one sample of: 8/3 of it, which is the light's own gradient
+    // (4x the moment) under the irradiance's band-one weight (2/3).
+    vec3 across = (direction - normal * dot(direction, normal)) * (8.0 / 3.0);
+    store(low, light, across, reach);
+}

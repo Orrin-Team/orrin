@@ -43,7 +43,8 @@ struct GpuGi {
     // to local light.
     vec4 camera;
     // xy = the environment's yaw, as `lighting.environment` carries it; z = 1
-    // where the froxel fog takes its ambient light from the volumes.
+    // where the froxel fog takes its ambient light from the volumes; w = 1
+    // where the final gather lights the opaque surfaces in their place.
     vec4 environment;
     // The rotation this frame's rays are turned by, column by column.
     vec4 rotation[3];
@@ -69,6 +70,10 @@ layout(set = ORRIN_GI_SET, binding = ORRIN_GI_PROBES_BINDING, std430) readonly b
 
 bool gi_live() {
     return gi.grid.z != 0u;
+}
+
+bool gi_gathered() {
+    return gi.environment.w > 0.5;
 }
 
 ivec3 gi_base(int level) {

@@ -46,12 +46,18 @@
 //! distance. Each is shaded afresh every frame it is used rather than
 //! accumulated, so a bad value lasts no longer than the frame that made it.
 //!
+//! The final gather (`vulkan::gi_gather`) reads the cache too, and claims the
+//! cells its rays land in that no probe ray has: such a cell is marked used
+//! for the next frame, so that frame's list holds it, and is shaded from the
+//! gather's ray, left in a table of hits beside the cache.
+//!
 //! # Memory
 //!
 //! At sixteen probes a side: the two atlases 39 MB, the rays 8.4 MB, the
-//! cache 8.4 MB and its list 1 MB, the probes' state 0.4 MB. Twelve a side
-//! takes the atlases to 17 MB and the rays to 3.5 MB. All of it is made when
-//! the volumes first go live and let go when they stop.
+//! cache 8.4 MB, the gather's hits beside it 8.4 MB and its list 1 MB, the
+//! probes' state 0.4 MB. Twelve a side takes the atlases to 17 MB and the rays
+//! to 3.5 MB. All of it is made when the volumes first go live and let go when
+//! they stop.
 //!
 //! Off — on a device that cannot trace, or with the setting off — every pass
 //! that reads the volumes binds inert stand-ins whose block says so, and
@@ -72,6 +78,7 @@ use crate::gfx::sh::{self, SH9};
 use crate::gfx::shaders::ShaderId;
 use crate::scene::GiSettings;
 
+use super::gi_gather::{GatherCache, GatherPass};
 use super::raytrace::{RayFrame, RayReads, TEXTURE_SET};
 
 /// The set a traced shader reads the volumes at. See `ray_shade.glsl`.
@@ -175,6 +182,8 @@ struct Cache {
     radiance: [BufferId; 2],
     list: BufferId,
     args: BufferId,
+    /// The final gather's ray each cell it asked for is shaded from.
+    hits: BufferId,
 }
 
 struct Pipelines {
@@ -202,6 +211,8 @@ pub struct GiPass {
     rays: u32,
     /// This frame's block, while the volumes are live.
     block: Option<BufferId>,
+    /// The final gather, which reads and claims the cache.
+    pub(super) gather: GatherPass,
 }
 
 impl GiPass {
@@ -260,12 +271,14 @@ impl GiPass {
             frame: 0,
             rays: 0,
             block: None,
+            gather: GatherPass::new(device),
         }
     }
 
     /// Bring the volumes up to this frame's settings and camera, and pick the
     /// grid it updates. `live` is whether the frame runs the four passes;
     /// where it does not, everything is let go and the stand-ins are bound.
+    /// `gathered` is whether the final gather lights the opaque surfaces.
     /// Before anything records.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn begin_frame(
@@ -273,6 +286,7 @@ impl GiPass {
         device: &Device,
         settings: &GiSettings,
         live: bool,
+        gathered: bool,
         camera: Vec3,
         irradiance: [Vec3; SH9],
         environment_yaw: f32,
@@ -316,7 +330,12 @@ impl GiPass {
                 camera.z,
                 if settings.reflections { 1.0 } else { 0.0 },
             ],
-            environment: [sin, cos, if settings.fog { 1.0 } else { 0.0 }, 0.0],
+            environment: [
+                sin,
+                cos,
+                if settings.fog { 1.0 } else { 0.0 },
+                if gathered { 1.0 } else { 0.0 },
+            ],
             rotation: columns.map(|[x, y, z]| [x, y, z, 0.0]),
             cascades: cascades
                 .map(|c| [c.base.x as f32, c.base.y as f32, c.base.z as f32, c.spacing]),
@@ -374,6 +393,18 @@ impl GiPass {
         for group in self.textures.take().into_iter().flatten() {
             device.destroy_bind_group(group);
         }
+        self.gather.forget_textures(device);
+    }
+
+    /// The cache as the final gather reads and claims it, this frame.
+    pub(super) fn gather_cache(&self) -> GatherCache {
+        let (_, _, cache, _) = self.live();
+        let (_, radiance) = self.radiance(cache);
+        GatherCache {
+            cells: cache.cells,
+            radiance,
+            hits: cache.hits,
+        }
     }
 
     fn release(&mut self, device: &Device) {
@@ -385,7 +416,7 @@ impl GiPass {
             device.destroy_buffer(volumes.rays);
         }
         if let Some(cache) = self.cache.take() {
-            for buffer in [cache.cells, cache.list, cache.args]
+            for buffer in [cache.cells, cache.list, cache.args, cache.hits]
                 .into_iter()
                 .chain(cache.radiance)
             {
@@ -528,6 +559,7 @@ impl GiPass {
                 storage(1, volumes.rays),
                 storage(2, radiance),
                 storage(3, cache.list),
+                storage(4, cache.hits),
             ],
         );
         encoder.bind_pipeline(pipeline);
@@ -636,5 +668,12 @@ fn allocate_cache(device: &Device) -> Cache {
             BufferUsage::STORAGE_BUFFER | BufferUsage::INDIRECT_BUFFER,
             &[0, 1, 1, 0],
         ),
+        // A ray is a `vec4` and a `uvec4`, as the probes' are. Read only for
+        // a cell the gather has just written its ray for.
+        hits: device.create_buffer(BufferDesc {
+            size: u64::from(CELLS) * 32,
+            usage: BufferUsage::STORAGE_BUFFER,
+            location: MemoryLocation::GpuOnly,
+        }),
     }
 }

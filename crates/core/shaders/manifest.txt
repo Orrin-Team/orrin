@@ -25,6 +25,10 @@ forward_sss_frag_alpha_test_flat fragment forward_sss.frag ORRIN_ALPHA_TEST=1 OR
 fullscreen_vert vertex fullscreen.vert
 gi_cache_compact_comp compute gi_cache_compact.comp
 gi_cache_shade_comp compute gi_cache_shade.comp ORRIN_FLAT_SURFACE=1
+gi_gather_comp compute gi_gather.comp ORRIN_FLAT_SURFACE=1
+gi_gather_blur_comp compute gi_gather_blur.comp
+gi_gather_temporal_comp compute gi_gather_temporal.comp
+gi_gather_upscale_comp compute gi_gather_upscale.comp
 gi_trace_comp compute gi_trace.comp ORRIN_FLAT_SURFACE=1
 gi_update_comp compute gi_update.comp
 gizmo_frag fragment gizmo.frag

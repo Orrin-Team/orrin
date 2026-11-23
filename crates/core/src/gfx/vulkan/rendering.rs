@@ -406,7 +406,12 @@ pub(super) fn rendering_info(
         | PassBody::GiTrace
         | PassBody::GiCacheCompact
         | PassBody::GiUpdate
-        | PassBody::GiCacheShade => return None,
+        | PassBody::GiCacheShade
+        | PassBody::GiGather
+        | PassBody::GiGatherTemporal
+        | PassBody::GiGatherBlurHorizontal
+        | PassBody::GiGatherBlurVertical
+        | PassBody::GiGatherUpscale => return None,
     })
 }
 

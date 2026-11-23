@@ -625,6 +625,7 @@ struct SurfaceSet {
     fog_sampler: SamplerId,
     fog: BufferId,
     gi: GiViews,
+    gathered: TextureViewId,
 }
 
 /// The views a frame binds when a term has nothing to say — white occlusion,
@@ -638,6 +639,7 @@ pub(super) struct NeutralViews {
     pub fog_volume: TextureViewId,
     pub fog_sampler: SamplerId,
     pub gi: GiViews,
+    pub gathered: TextureViewId,
 }
 
 /// The blocks a frame binds when there is nothing to light with — no punctual
@@ -1207,6 +1209,7 @@ impl ForwardPass {
         fog_volume: TextureViewId,
         fog_sampler: SamplerId,
         gi: GiViews,
+        gathered: TextureViewId,
         surface_time: f32,
     ) -> ForwardSets {
         // Both halves fall back to the scene's flat ambient when nothing is
@@ -1287,6 +1290,7 @@ impl ForwardPass {
                 fog_sampler,
                 fog,
                 gi,
+                gathered,
             },
             material_set,
             texture_set,
@@ -1399,6 +1403,9 @@ impl ForwardPass {
                 gi_irradiance,
                 gi_distance,
                 gi_sampler,
+                // The final gather's irradiance, or a stand-in the volumes'
+                // block says not to read.
+                texture(14, set3.gathered),
             ],
         );
 
@@ -1481,6 +1488,7 @@ impl ForwardPass {
                 fog_sampler: neutral.fog_sampler,
                 fog: blocks.fog,
                 gi: neutral.gi,
+                gathered: neutral.gathered,
             },
             material_set,
             texture_set,

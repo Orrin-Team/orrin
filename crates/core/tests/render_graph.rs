@@ -82,6 +82,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // MSAA with the diffusion on, which is the five-attachment forward pass:
@@ -123,6 +124,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         (
@@ -159,6 +161,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // Four cascades write four layers of one image, which the graph tracks
@@ -201,6 +204,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // SSAO off is a different graph, not a flag read at record time: the
@@ -242,6 +246,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // The shape that proves the prepass belongs to the frame rather than to
@@ -281,6 +286,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // Metering off is the other shape that ships. Worth baselining for one
@@ -322,6 +328,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // A window too small for a real chain still gets one level, and that
@@ -362,6 +369,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // The froxel fog, with the cascades it exists to read. Worth baselining
@@ -406,6 +414,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // The whole optical chain at once: lens, then shutter, then sensor.
@@ -447,6 +456,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // The other shape that proves the prepass belongs to the frame rather
@@ -488,6 +498,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // Reflections are the first thing to sit *between* shading and the
@@ -529,6 +540,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // And the same without a resolve behind it, which is the shape where
@@ -568,6 +580,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // What actually ships in the editor: the march sits between the prepass
@@ -609,6 +622,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // And the march on its own, which is the shape that proves it keeps the
@@ -648,6 +662,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // The punctual atlas: one pass however many lights cast, because a tile
@@ -688,6 +703,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // And the atlas with no cascades, which is an ordinary scene: an indoor
@@ -728,6 +744,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // What ships: transparency accumulates after the reflections and before
@@ -770,6 +787,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // And transparency on its own, which is the shape that proves it keeps
@@ -810,6 +828,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // Both non-opaque queues at once, which is the shape that pins the
@@ -851,6 +870,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // And refraction on its own, which proves it keeps the geometry prepass
@@ -890,6 +910,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // Subsurface scattering is the first thing to change the *forward pass's
@@ -934,6 +955,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // And on its own, which is the shape that proves the diffusion keeps the
@@ -974,6 +996,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         (
@@ -1010,6 +1033,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // The split, on the frame the editor actually runs. Every configuration
@@ -1058,6 +1082,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // The same frame with the depth test on, because what it adds is a
@@ -1101,6 +1126,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         (
@@ -1137,6 +1163,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // And the frame the split is *for*: every optical stage on, which is
@@ -1178,6 +1205,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_reflections: false,
                 ray_path_trace: false,
                 gi_probes: 0,
+                gi_gather: 0,
             },
         ),
         // A frame that traces: the two builds at its head and the traced scene
@@ -1202,6 +1230,22 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
             FrameConfig {
                 ray_tracing: true,
                 gi_probes: 16,
+                gi_gather: 0,
+                async_compute: true,
+                transparency: true,
+                refraction: true,
+                ..reference_config(false, true)
+            },
+        ),
+        // The final gather's five dispatches between the prepass and the
+        // forward pass, its rays reading TAA's history and claiming the
+        // cache's cells after the cache is shaded.
+        (
+            "editor frame, lit by the volumes and the final gather",
+            FrameConfig {
+                ray_tracing: true,
+                gi_probes: 16,
+                gi_gather: 1,
                 async_compute: true,
                 transparency: true,
                 refraction: true,
@@ -1410,6 +1454,7 @@ fn the_shadow_atlas_is_sixteen_bit_and_the_camera_depth_is_not() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     })
     .unwrap();
 
@@ -1456,6 +1501,7 @@ fn reference_config(msaa: bool, presents: bool) -> FrameConfig {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     }
 }
 
@@ -1548,6 +1594,7 @@ fn a_screenshot_adds_one_reader_and_changes_no_image_the_frame_owns() {
             ray_reflections: false,
             ray_path_trace: false,
             gi_probes: 0,
+            gi_gather: 0,
             ..off
         })
         .unwrap()
@@ -1649,6 +1696,7 @@ fn an_empty_selection_runs_no_outline_and_no_gizmo() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     };
     let passes = |outline, gizmo| {
         let frame = declare(config(outline, gizmo)).unwrap();
@@ -1718,6 +1766,7 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     })
     .unwrap();
 
@@ -1784,6 +1833,7 @@ fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     })
     .unwrap();
 
@@ -1846,6 +1896,7 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     })
     .unwrap();
 
@@ -1917,6 +1968,7 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     })
     .unwrap();
 
@@ -1975,6 +2027,7 @@ fn the_gizmo_draws_between_the_tonemap_and_the_overlay() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     };
     for async_compute in [false, true] {
         let frame = declare(config(true, async_compute)).unwrap();
@@ -2084,6 +2137,7 @@ fn the_selection_outline_is_masked_then_drawn_under_the_gizmo() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     };
     let frame = declare(config(true)).unwrap();
     let order: Vec<&str> = frame
@@ -2162,6 +2216,7 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     })
     .unwrap();
 
@@ -2232,6 +2287,7 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     };
 
     let plan = format!("{}", declare(base).unwrap().graph);
@@ -2340,6 +2396,7 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     })
     .unwrap();
 
@@ -2411,6 +2468,7 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     })
     .unwrap();
 
@@ -2473,6 +2531,7 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     })
     .unwrap();
 
@@ -2560,6 +2619,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     };
 
     let consumers: [Consumer; 10] = [
@@ -2665,6 +2725,7 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     })
     .unwrap();
 
@@ -2809,6 +2870,7 @@ fn the_path_traced_reference_is_shown_at_the_exposure_of_the_frame_it_replaces()
         ray_tracing: true,
         ray_path_trace: true,
         gi_probes: 0,
+        gi_gather: 0,
         ..reference_config(false, true)
     })
     .unwrap();
@@ -2844,6 +2906,7 @@ fn the_irradiance_volumes_are_updated_before_anything_lights_with_them() {
     let frame = declare(FrameConfig {
         ray_tracing: true,
         gi_probes: 16,
+        gi_gather: 0,
         async_compute: true,
         ssr: true,
         ray_reflections: true,
@@ -2904,6 +2967,132 @@ fn the_irradiance_volumes_are_updated_before_anything_lights_with_them() {
     assert!(!format!("{}", off.graph).contains("gi_"));
 }
 
+/// The final gather runs after the cache is shaded, whose light its rays read
+/// and whose cells they claim, and before the forward pass that reads what it
+/// leaves; its accumulation is a history, so the temporal pass reads one
+/// allocation and writes the other, and the cache's shading reads last
+/// frame's gather rays before this frame's are written. Blended and
+/// refractive surfaces keep the volumes and never wait for it.
+#[test]
+fn the_final_gather_runs_between_the_cache_and_the_forward_pass() {
+    use orrin_core::gfx::graph::Extent;
+    let frame = declare(FrameConfig {
+        ray_tracing: true,
+        gi_probes: 16,
+        gi_gather: 2,
+        async_compute: true,
+        transparency: true,
+        refraction: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    let ids = frame.ids.gather.expect("the gather was asked for");
+    assert!(
+        ids.lit.is_some(),
+        "TAA is on, so its history is the lit colour"
+    );
+    assert_eq!(frame.graph.segments().len(), 1, "{}", frame.graph);
+    assert!(frame.graph.culled().is_empty(), "{}", frame.graph);
+
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&pass| frame.graph.pass_name(pass))
+        .collect();
+    let at = |name: &str| {
+        order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} was not scheduled:
+{order:?}"
+                )
+            })
+    };
+    let chain = [
+        "geometry_prepass",
+        "gi_gather",
+        "gi_gather_temporal",
+        "gi_gather_blur_x",
+        "gi_gather_blur_y",
+        "gi_gather_upscale",
+        "forward",
+    ];
+    for pair in chain.windows(2) {
+        assert!(at(pair[0]) < at(pair[1]), "{pair:?}: {order:?}");
+    }
+    assert!(at("gi_cache_shade") < at("gi_gather"), "{order:?}");
+    assert!(at("gi_gather") < at("taa_resolve"), "{order:?}");
+
+    let desc = image_desc(&frame.graph, "gi_gather_raw").unwrap();
+    assert_eq!(desc.extent, Extent::FrameDiv(2));
+    assert_eq!(desc.array_layers, Some(4));
+    let desc = image_desc(&frame.graph, "gi_gather_irradiance").unwrap();
+    assert_eq!(desc.extent, Extent::Frame);
+    assert_eq!(desc.array_layers, Some(3));
+
+    let plan = format!("{}", frame.graph);
+    let reads = |pass: &str, line: &str| {
+        let from = plan.find(&format!(" pass {pass} [")).unwrap_or_else(|| {
+            panic!(
+                "{pass} was not scheduled:
+{plan}"
+            )
+        });
+        let rest = &plan[from + 1..];
+        rest[..rest.find(" pass ").unwrap_or(rest.len())].contains(line)
+    };
+    assert!(
+        reads(
+            "forward",
+            "     gi_gather_irradiance Sampled
+"
+        ),
+        "{plan}"
+    );
+    assert!(
+        reads(
+            "gi_gather",
+            "     taa_history Sampled
+"
+        ),
+        "{plan}"
+    );
+    assert!(
+        reads(
+            "gi_gather_temporal",
+            "     gi_gather_history Sampled
+"
+        ),
+        "{plan}"
+    );
+    assert!(
+        reads(
+            "gi_gather_temporal",
+            "     gi_gather_accumulated StorageWrite
+"
+        ),
+        "{plan}"
+    );
+    for pass in ["oit_accumulate", "refraction_draw"] {
+        assert!(!reads(pass, "gi_gather"), "{pass}: {plan}");
+    }
+
+    // Off, nothing of it is declared, and the volumes' frame is the one it
+    // was.
+    let off = declare(FrameConfig {
+        ray_tracing: true,
+        gi_probes: 16,
+        gi_gather: 0,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    assert!(off.ids.gather.is_none());
+    assert!(!format!("{}", off.graph).contains("gi_gather"));
+}
+
 /// A device that cannot trace, or a frame in which nothing does, declares
 /// neither build: the structures cost a frame that traces nothing as much as
 /// one that does.
@@ -2939,6 +3128,7 @@ fn the_occlusion_pyramid_the_cull_reads_is_not_the_one_the_frame_builds() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
         ..occlusion_base()
     })
     .unwrap();
@@ -3014,6 +3204,7 @@ fn occlusion_culling_keeps_the_prepass_alive_on_its_own() {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
         ..occlusion_base()
     })
     .unwrap();
@@ -3062,6 +3253,7 @@ fn occlusion_base() -> FrameConfig {
         ray_reflections: false,
         ray_path_trace: false,
         gi_probes: 0,
+        gi_gather: 0,
     }
 }
 

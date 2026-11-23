@@ -1,0 +1,156 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+
+// The final gather's temporal filter: this frame's ray added into a running
+// mean of the rays this texel's surface has had, with a count of how many
+// frames that is (Mattausch et al. 2010). The mean is a plain one until the
+// count reaches the cap, which is the control that trades lag for noise, and
+// keeps a fixed share after.
+//
+// The history is found where the prepass's motion says this texel's surface
+// was, as a bilinear blend of the four texels round that point, each taken
+// only where it was written for a surface at the distance this one would have
+// stood from last frame's camera. None is a disocclusion: the count starts
+// again, and the spatial filter after this widens to cover the one sample.
+//
+// Before it goes in, the ray's light is held to what the history says this
+// surface has seen, so one bright ray does not stay in the mean for a second.
+// The bound is the history's mean and eight of its deviations, kept beside it
+// as a running deviation from the running mean, or the brightest of the eight
+// rays round this one,
+// whichever is higher: light that is new to the whole neighbourhood, a lamp
+// switched on, passes, and light that only this ray found does not.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D u_depth;
+layout(set = 0, binding = 1) uniform texture2D u_normal;
+layout(set = 0, binding = 2) uniform texture2D u_velocity;
+layout(set = 0, binding = 3) uniform texture2DArray u_raw;
+layout(set = 0, binding = 4) uniform texture2DArray u_history;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2DArray u_accumulated;
+#define ORRIN_GATHER_BLOCK_BINDING 6
+#include "gi_gather.glsl"
+
+// How many of the history's deviations above its mean a ray's light may be.
+const float DEVIATIONS = 8.0;
+
+float mean_of(vec4 sh[3]) {
+    return dot(vec3(sh[0].x, sh[1].x, sh[2].x), GATHER_LUMA);
+}
+
+float raw_luminance(ivec2 low) {
+    return dot(vec3(texelFetch(u_raw, ivec3(low, 0), 0).x,
+                    texelFetch(u_raw, ivec3(low, 1), 0).x,
+                    texelFetch(u_raw, ivec3(low, 2), 0).x), GATHER_LUMA);
+}
+
+void main() {
+    ivec2 low = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_accumulated).xy;
+    if (any(greaterThanEqual(low, size))) {
+        return;
+    }
+    ivec2 full = textureSize(u_depth, 0);
+    ivec2 texel = gather_texel(low, full);
+    float depth = texelFetch(u_depth, texel, 0).r;
+    if (depth_is_far(depth)) {
+        for (int layer = 0; layer < GATHER_META; ++layer) {
+            imageStore(u_accumulated, ivec3(low, layer), vec4(0.0));
+        }
+        imageStore(u_accumulated, ivec3(low, GATHER_META), vec4(0.0, 0.0, GATHER_REACH, 0.0));
+        return;
+    }
+    vec3 position = gather_position(texel, depth, full);
+    vec3 normal = gather_normal(texel);
+    float far = distance(position, gather.camera.xyz);
+
+    vec4 sample_sh[3];
+    for (int layer = 0; layer < 3; ++layer) {
+        sample_sh[layer] = texelFetch(u_raw, ivec3(low, layer), 0);
+    }
+    vec4 sample_meta = texelFetch(u_raw, ivec3(low, GATHER_META), 0);
+
+    vec4 history[3] = vec4[3](vec4(0.0), vec4(0.0), vec4(0.0));
+    vec4 held = vec4(0.0);
+    float total = 0.0;
+    vec2 previous = (vec2(texel) + 0.5) / vec2(full) - texelFetch(u_velocity, texel, 0).rg;
+    if ((gather.params.z & GATHER_HISTORY) != 0u
+            && all(greaterThanEqual(previous, vec2(0.0)))
+            && all(lessThanEqual(previous, vec2(1.0)))) {
+        // Where this surface stood from last frame's camera, if it stood
+        // still; and a tolerance that widens as the surface turns edge-on,
+        // where one texel spans more depth.
+        float expected = distance(position, gather.previous_camera.xyz);
+        vec3 view = normalize(gather.camera.xyz - position);
+        float tolerance = 0.02 + expected * 0.03 / max(abs(dot(normal, view)), 0.2);
+        vec2 at = gather_coordinate(previous * vec2(full));
+        ivec2 base = ivec2(floor(at));
+        vec2 f = at - vec2(base);
+        for (int i = 0; i < 4; ++i) {
+            ivec2 corner = ivec2(i & 1, i >> 1);
+            ivec2 q = base + corner;
+            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size))) {
+                continue;
+            }
+            vec4 meta = texelFetch(u_history, ivec3(q, GATHER_META), 0);
+            if (meta.x < 0.5 || abs(meta.y - expected) > tolerance) {
+                continue;
+            }
+            vec2 w2 = mix(1.0 - f, f, vec2(corner));
+            float w = w2.x * w2.y;
+            for (int layer = 0; layer < 3; ++layer) {
+                history[layer] += texelFetch(u_history, ivec3(q, layer), 0) * w;
+            }
+            held += meta * w;
+            total += w;
+        }
+    }
+    float count = 0.0;
+    if (total > 1e-3) {
+        for (int layer = 0; layer < 3; ++layer) {
+            history[layer] /= total;
+        }
+        held /= total;
+        count = floor(held.x + 0.5);
+    }
+
+    float luminance = dot(vec3(sample_sh[0].x, sample_sh[1].x, sample_sh[2].x), GATHER_LUMA);
+    // Before the clamp: a deviation learned from clamped rays would shrink
+    // under its own bound, until it held back the light a rare but real
+    // bright thing — a panel a few rays meet — sends every texel.
+    float mean = mean_of(history);
+    float spread = luminance - mean;
+    if (count >= 2.0) {
+        float neighbours = 0.0;
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                ivec2 q = clamp(low + ivec2(x, y), ivec2(0), size - 1);
+                if (x != 0 || y != 0) {
+                    neighbours = max(neighbours, raw_luminance(q));
+                }
+            }
+        }
+        float bound = max(mean + DEVIATIONS * held.w, neighbours);
+        if (luminance > bound) {
+            float scale = bound / luminance;
+            for (int layer = 0; layer < 3; ++layer) {
+                sample_sh[layer] *= scale;
+            }
+        }
+    }
+
+    float frames = min(count + 1.0, gather.camera.w);
+    float keep = 1.0 - 1.0 / frames;
+    if (count < 0.5) {
+        keep = 0.0;
+    }
+    for (int layer = 0; layer < 3; ++layer) {
+        imageStore(u_accumulated, ivec3(low, layer), mix(sample_sh[layer], history[layer], keep));
+    }
+    // The deviation as a deviation rather than a mean square, which in a
+    // physical unit is past what a half float holds.
+    float deviation = sqrt(mix(spread * spread, held.w * held.w, keep));
+    imageStore(u_accumulated, ivec3(low, GATHER_META),
+               vec4(frames, far, mix(sample_meta.z, held.z, keep), deviation));
+}

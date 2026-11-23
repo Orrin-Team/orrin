@@ -23,13 +23,18 @@ struct GiRay {
 
 // One cell of the table: the key's checksum, zero for an empty cell; the
 // frame it was last used; the lowest-numbered ray that used it this frame,
-// which is the one the cache shades it from.
+// which is the one the cache shades it from; and the frame it was last shaded.
 struct GiCell {
     uint checksum;
     uint used;
     uint representative;
-    uint unused;
+    uint shaded;
 };
+
+// The representative of a cell only the final gather asked to be shaded: its
+// hit is in the gather's own table, under the cell's number. Above every probe
+// ray's number, so a probe ray that also used the cell is shaded from instead.
+const uint GI_GATHERED = 0xfffffffeu;
 
 // How many cells a key may look along from where it hashes to before it
 // gives up and the ray goes uncached.
@@ -71,6 +76,13 @@ uvec2 gi_cell_key(vec3 P, vec3 N, float reach, vec3 camera, float finest) {
     uint hi = ((uint(q.y) >> 13u) & 0x3fu) | ((uint(q.z) & 0x7ffffu) << 6u) | (uint(lod) << 25u)
             | (face << 28u);
     return uvec2(lo, hi);
+}
+
+// A cell's light as the table holds it: three halves, and a fourth that is
+// one once the cell has been shaded.
+vec4 gi_cell_light(uvec2 packed) {
+    vec2 blue = unpackHalf2x16(packed.y);
+    return vec4(unpackHalf2x16(packed.x), blue);
 }
 
 // Where a key starts looking in a table of `mask + 1` cells.

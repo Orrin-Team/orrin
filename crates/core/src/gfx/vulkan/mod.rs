@@ -13,6 +13,7 @@ mod fog;
 mod forward;
 pub mod frame;
 mod gi;
+mod gi_gather;
 pub(crate) mod gizmo;
 pub(crate) mod hdr;
 mod instances;
@@ -897,6 +898,7 @@ impl VulkanRenderer {
             ray_reflections: false,
             ray_path_trace: false,
             gi_probes: 0,
+            gi_gather: 0,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -1456,6 +1458,9 @@ impl VulkanRenderer {
             || ids
                 .gi
                 .is_some_and(|gi| id == gi.irradiance || id == gi.distance)
+            || ids
+                .gather
+                .is_some_and(|gather| id == gather.history || id == gather.accumulated)
         {
             return Some(record::Target::Image(
                 self.vk_view(self.table.texture(id)).image().clone(),
@@ -2243,6 +2248,11 @@ impl VulkanRenderer {
             } else {
                 0
             },
+            gi_gather: if self.gi_live() && self.gi_settings.gather {
+                self.gi_settings.gather_resolution.shift()
+            } else {
+                0
+            },
         });
 
         // Atlases allocated for this frame hold nothing, whatever the plan
@@ -2607,6 +2617,7 @@ impl VulkanRenderer {
                         fog_volume: self.fog.volume_or_fallback(None),
                         fog_sampler: self.fog.sampler(),
                         gi: self.gi.fallback(),
+                        gathered: self.gi.gather.stand_in(),
                     },
                     pass.neutral(),
                     material_set,
@@ -2743,10 +2754,45 @@ impl VulkanRenderer {
                 &self.device,
                 &self.gi_settings,
                 self.frame.ids.gi.is_some(),
+                self.frame.ids.gather.is_some(),
                 camera.position,
                 self.environment.irradiance(ambient, environment),
                 environment.yaw,
             );
+        }
+        // The final gather beside them, and for the same reason. Last frame's
+        // lit colour is TAA's history, and is read only once the resolve has
+        // written one.
+        {
+            let gather = self.frame.ids.gather;
+            let accumulations = self.gi.gather.begin_frame(
+                &self.device,
+                &self.gi_settings,
+                gather.map(|_| self.gi_settings.gather_resolution.shift()),
+                &view,
+                camera.position,
+                self.backend.extent(),
+                gather.is_some_and(|ids| ids.lit.is_some()) && self.taa.history_trusted(),
+            );
+            if let (Some(ids), Some((views, extent))) = (gather, accumulations) {
+                for (id, view) in [(ids.history, views[0]), (ids.accumulated, views[1])] {
+                    self.table.import(
+                        id,
+                        crate::gfx::images::ImageEntry {
+                            whole: view,
+                            levels: Vec::new(),
+                            layers: Vec::new(),
+                            extent,
+                            mip_levels: 1,
+                        },
+                    );
+                }
+                self.gi.gather.prepare(
+                    &self.device,
+                    &self.textures,
+                    self.prepass.material_sampler(),
+                );
+            }
         }
         if let (Some(ids), Some(([irradiance, distance], extent))) =
             (self.frame.ids.gi, self.gi.atlases())
@@ -2980,6 +3026,10 @@ impl VulkanRenderer {
                 .volume_or_fallback(self.frame.ids.fog.map(|ids| self.table.texture(ids.volume))),
             self.fog.sampler(),
             self.gi.views(),
+            match self.frame.ids.gather {
+                Some(ids) => self.table.texture(ids.irradiance),
+                None => self.gi.gather.stand_in(),
+            },
             surface_time,
         );
 
@@ -3907,6 +3957,9 @@ impl FrameRecord<'_> {
             || ids
                 .gi
                 .is_some_and(|gi| id == gi.irradiance || id == gi.distance)
+            || ids
+                .gather
+                .is_some_and(|gather| id == gather.history || id == gather.accumulated)
         {
             return Some(record::Target::Image(
                 self.vk_view(self.table.texture(id)).image().clone(),
@@ -4128,6 +4181,11 @@ impl FrameRecord<'_> {
             }
             PassBody::GiCacheCompact => self.gi.record_compact(self.device, encoder),
             PassBody::GiUpdate => self.gi.record_update(self.device, encoder),
+            PassBody::GiGather
+            | PassBody::GiGatherTemporal
+            | PassBody::GiGatherBlurHorizontal
+            | PassBody::GiGatherBlurVertical
+            | PassBody::GiGatherUpscale => self.record_gather(encoder, body),
             PassBody::SsrHiz => {
                 let ids = self
                     .frame
@@ -4854,7 +4912,85 @@ impl FrameRecord<'_> {
             | PassBody::GiCacheCompact
             | PassBody::GiUpdate
             | PassBody::GiCacheShade
+            | PassBody::GiGather
+            | PassBody::GiGatherTemporal
+            | PassBody::GiGatherBlurHorizontal
+            | PassBody::GiGatherBlurVertical
+            | PassBody::GiGatherUpscale
             | PassBody::OcclusionHiz => unreachable!("handled above"),
+        }
+    }
+
+    /// One of the final gather's five dispatches, each bound to what
+    /// `declare` said it reads and writes.
+    fn record_gather(&self, encoder: &mut Encoder, body: PassBody) {
+        let ids = self
+            .frame
+            .ids
+            .gather
+            .expect("the final gather without its images");
+        let prepass = self
+            .frame
+            .ids
+            .prepass
+            .expect("the graph scheduled the final gather with no prepass");
+        let inputs = gi_gather::Prepass {
+            depth: self.table.texture(prepass.depth),
+            normal: self.table.texture(prepass.normal),
+            velocity: self.table.texture(prepass.velocity),
+        };
+        let gather = &self.gi.gather;
+        let texture = |id| self.table.texture(id);
+        match body {
+            PassBody::GiGather => {
+                let rays = self
+                    .ray_frame
+                    .as_ref()
+                    .expect("the graph scheduled the final gather in a frame that traces nothing");
+                gather.record_gather(
+                    self.device,
+                    encoder,
+                    rays,
+                    inputs,
+                    ids.lit.map(|_| self.taa.history_view()),
+                    self.gi.gather_cache(),
+                    texture(ids.raw),
+                );
+            }
+            PassBody::GiGatherTemporal => gather.record_temporal(
+                self.device,
+                encoder,
+                inputs,
+                texture(ids.raw),
+                texture(ids.history),
+                texture(ids.accumulated),
+            ),
+            PassBody::GiGatherBlurHorizontal => gather.record_blur(
+                self.device,
+                encoder,
+                inputs,
+                texture(ids.accumulated),
+                texture(ids.accumulated),
+                texture(ids.blurred_x),
+                false,
+            ),
+            PassBody::GiGatherBlurVertical => gather.record_blur(
+                self.device,
+                encoder,
+                inputs,
+                texture(ids.blurred_x),
+                texture(ids.accumulated),
+                texture(ids.blurred),
+                true,
+            ),
+            PassBody::GiGatherUpscale => gather.record_upscale(
+                self.device,
+                encoder,
+                inputs,
+                texture(ids.blurred),
+                texture(ids.irradiance),
+            ),
+            _ => unreachable!("not one of the gather's"),
         }
     }
 

@@ -1,0 +1,84 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+
+// The final gather to the frame's resolution: each pixel blends the four
+// texels round it by their bilinear share and by whether they are its own
+// surface — the same plane, a like normal (Sloan et al. 2007). Where none of
+// the four is, the one nearest its plane stands in, rather than nothing.
+//
+// What it blends is harmonics, not a colour: the forward pass evaluates them
+// with its own shading normal, which is how a normal map finer than the
+// gather still shapes what it receives. Each texel's gradient is held to what
+// keeps the irradiance from going negative facing away from it.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D u_depth;
+layout(set = 0, binding = 1) uniform texture2D u_normal;
+layout(set = 0, binding = 2) uniform texture2DArray u_gathered;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2DArray u_irradiance;
+#define ORRIN_GATHER_BLOCK_BINDING 4
+#include "gi_gather.glsl"
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 full = imageSize(u_irradiance).xy;
+    if (any(greaterThanEqual(texel, full))) {
+        return;
+    }
+    float depth = texelFetch(u_depth, texel, 0).r;
+    if (depth_is_far(depth)) {
+        for (int layer = 0; layer < 3; ++layer) {
+            imageStore(u_irradiance, ivec3(texel, layer), vec4(0.0));
+        }
+        return;
+    }
+    vec3 position = gather_position(texel, depth, full);
+    vec3 normal = gather_normal(texel);
+    float far = distance(position, gather.camera.xyz);
+
+    ivec2 size = textureSize(u_gathered, 0).xy;
+    vec2 at = gather_coordinate(vec2(texel) + 0.5);
+    ivec2 base = ivec2(floor(at));
+    vec2 f = at - vec2(base);
+    vec4 sum[3] = vec4[3](vec4(0.0), vec4(0.0), vec4(0.0));
+    float total = 0.0;
+    ivec2 nearest = clamp(base, ivec2(0), size - 1);
+    float nearest_plane = 1e30;
+    for (int i = 0; i < 4; ++i) {
+        ivec2 corner = ivec2(i & 1, i >> 1);
+        ivec2 q = clamp(base + corner, ivec2(0), size - 1);
+        ivec2 t = gather_texel(q, full);
+        float d = texelFetch(u_depth, t, 0).r;
+        if (depth_is_far(d)) {
+            continue;
+        }
+        float plane = gather_plane(position, normal, gather_position(t, d, full), far);
+        if (plane < nearest_plane) {
+            nearest_plane = plane;
+            nearest = q;
+        }
+        vec2 w2 = mix(1.0 - f, f, vec2(corner));
+        float w = w2.x * w2.y * exp(-plane * plane)
+                * pow(max(dot(normal, gather_normal(t)), 0.0), 8.0);
+        for (int layer = 0; layer < 3; ++layer) {
+            sum[layer] += texelFetch(u_gathered, ivec3(q, layer), 0) * w;
+        }
+        total += w;
+    }
+    if (total < 1e-4) {
+        for (int layer = 0; layer < 3; ++layer) {
+            sum[layer] = texelFetch(u_gathered, ivec3(nearest, layer), 0);
+        }
+        total = 1.0;
+    }
+    for (int layer = 0; layer < 3; ++layer) {
+        vec4 c = sum[layer] / total;
+        c.x = max(c.x, 0.0);
+        float g = length(c.yzw);
+        if (g > c.x) {
+            c.yzw *= c.x / g;
+        }
+        imageStore(u_irradiance, ivec3(texel, layer), c);
+    }
+}

@@ -62,7 +62,7 @@ pub use dof::DofSettings;
 pub use editor_hidden::EditorHidden;
 pub use environment::{EnvironmentSettings, Hdri, HdriError, load_hdri, sky_pixels};
 pub use fog::FogSettings;
-pub use gi::{GiDebugView, GiSettings};
+pub use gi::{GiDebugView, GiGatherResolution, GiSettings};
 pub use hdr::HdrSettings;
 pub use hierarchy::{
     Hierarchy, HierarchyError, can_reparent, despawn_recursive, ensure_current, is_transform_root,

@@ -1,0 +1,91 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+
+// One axis of the final gather's spatial filter, at the gather's resolution:
+// a Gaussian whose taps are weighted by whether they are the same surface —
+// the same plane and a like normal — and by how alike the distances their rays
+// went are, so a contact's short rays are not averaged with the open floor's
+// long ones and the indirect shadow under a small object keeps its edge (id
+// Tech 8). Run once along each axis. Not separable, strictly, since the
+// weights differ from one row to the next; that is accepted for the cost.
+//
+// The kernel is widest where the history is shortest: a texel disoccluded this
+// frame has one ray, and is spread over more of its neighbours' than one that
+// has averaged a full history.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D u_depth;
+layout(set = 0, binding = 1) uniform texture2D u_normal;
+// The three layers of harmonics to filter, and the accumulation's fourth
+// beside them for each texel's count and its rays' distance.
+layout(set = 0, binding = 2) uniform texture2DArray u_source;
+layout(set = 0, binding = 3) uniform texture2DArray u_meta;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2DArray u_filtered;
+#define ORRIN_GATHER_BLOCK_BINDING 5
+#include "gi_gather.glsl"
+
+layout(push_constant) uniform Axis {
+    ivec2 step;
+} axis;
+
+const int WIDEST = 8;
+
+void main() {
+    ivec2 low = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_filtered).xy;
+    if (any(greaterThanEqual(low, size))) {
+        return;
+    }
+    ivec2 full = textureSize(u_depth, 0);
+    ivec2 texel = gather_texel(low, full);
+    float depth = texelFetch(u_depth, texel, 0).r;
+    if (depth_is_far(depth)) {
+        for (int layer = 0; layer < 3; ++layer) {
+            imageStore(u_filtered, ivec3(low, layer), vec4(0.0));
+        }
+        return;
+    }
+    vec3 position = gather_position(texel, depth, full);
+    vec3 normal = gather_normal(texel);
+    float far = distance(position, gather.camera.xyz);
+    vec4 meta = texelFetch(u_meta, ivec3(low, GATHER_META), 0);
+    float reach = meta.z;
+
+    // Four texels either side once the history is full, eight for one ray.
+    float radius = mix(4.0, float(WIDEST), clamp(1.0 - (meta.x - 1.0) / 15.0, 0.0, 1.0));
+    float sigma = radius * 0.5;
+
+    vec4 sum[3] = vec4[3](vec4(0.0), vec4(0.0), vec4(0.0));
+    float total = 0.0;
+    for (int k = -WIDEST; k <= WIDEST; ++k) {
+        if (float(abs(k)) > radius) {
+            continue;
+        }
+        ivec2 q = low + axis.step * k;
+        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size))) {
+            continue;
+        }
+        ivec2 t = gather_texel(q, full);
+        float d = texelFetch(u_depth, t, 0).r;
+        if (depth_is_far(d)) {
+            continue;
+        }
+        vec3 p = gather_position(t, d, full);
+        float plane = gather_plane(position, normal, p, far);
+        float facing = max(dot(normal, gather_normal(t)), 0.0);
+        float other = texelFetch(u_meta, ivec3(q, GATHER_META), 0).z;
+        float w = exp(-float(k * k) / (2.0 * sigma * sigma))
+                * exp(-plane * plane)
+                * pow(facing, 8.0)
+                / (1.0 + 4.0 * abs(other - reach) / (other + reach + 0.1));
+        for (int layer = 0; layer < 3; ++layer) {
+            sum[layer] += texelFetch(u_source, ivec3(q, layer), 0) * w;
+        }
+        total += w;
+    }
+    // The centre always weighs one, so the total is never nothing.
+    for (int layer = 0; layer < 3; ++layer) {
+        imageStore(u_filtered, ivec3(low, layer), sum[layer] / total);
+    }
+}

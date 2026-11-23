@@ -226,6 +226,13 @@ pub struct FrameConfig {
     /// `ray_tracing`. Zero is the frame exactly as it was, lit by the
     /// environment's diffuse series alone.
     pub gi_probes: u32,
+    /// How many times the final gather's resolution halves the frame's each
+    /// way, zero where it does not run. Live, it is five dispatches between
+    /// the prepass and the forward pass, and the forward pass reads what they
+    /// leave in place of the volumes; a shift rather than a flag, because it
+    /// is the extent of their images. Needs `gi_probes`, and keeps the prepass
+    /// alive on its own.
+    pub gi_gather: u32,
 }
 
 /// What a screenshot shows.
@@ -374,6 +381,15 @@ pub enum PassBody {
     GiUpdate,
     /// Each listed cell shaded once, for the probes' next update.
     GiCacheShade,
+    /// One ray per texel of the final gather, kept as harmonics.
+    GiGather,
+    /// Those rays into each texel's running mean, reprojected.
+    GiGatherTemporal,
+    /// One axis each of the gather's spatial filter.
+    GiGatherBlurHorizontal,
+    GiGatherBlurVertical,
+    /// The gather to the frame's resolution, for the forward pass.
+    GiGatherUpscale,
     /// The cached layers of the shadow views that redraw theirs this frame:
     /// the casters standing still, into an atlas kept from frame to frame.
     ShadowStatic,
@@ -459,6 +475,8 @@ pub struct FrameIds {
     pub ray: Option<RayIds>,
     /// The irradiance volumes and the radiance cache, where they are live.
     pub gi: Option<GiIds>,
+    /// The final gather's images, where it runs.
+    pub gather: Option<GatherIds>,
 }
 
 /// The irradiance volumes and the world radiance cache: every one kept from
@@ -484,6 +502,9 @@ pub struct GiIds {
     /// reason the occlusion pyramids do: see [`OcclusionIds`].
     pub radiance_history: ResourceId,
     pub radiance: ResourceId,
+    /// The final gather's ray for each cell it asked to be shaded, where the
+    /// gather runs.
+    pub gather_hits: Option<ResourceId>,
 }
 
 impl GiIds {
@@ -500,7 +521,31 @@ impl GiIds {
             self.radiance,
         ]
         .contains(&id)
+            || self.gather_hits == Some(id)
     }
+}
+
+/// The final gather's images. See `vulkan::gi_gather`.
+///
+/// The accumulation is **imported** and ping-ponged, for the reason the TAA
+/// history is: `accumulated` is this frame's allocation and next frame's
+/// `history`, so it leaves in the layout `history` enters in. Everything else
+/// is made and spent within the frame.
+#[derive(Clone, Copy, Debug)]
+pub struct GatherIds {
+    /// The rays as they came back: three layers of harmonics and a fourth
+    /// for how far they went.
+    pub raw: ResourceId,
+    pub history: ResourceId,
+    pub accumulated: ResourceId,
+    /// The spatial filter's two axes.
+    pub blurred_x: ResourceId,
+    pub blurred: ResourceId,
+    /// The harmonics at the frame's resolution: what the forward pass reads.
+    pub irradiance: ResourceId,
+    /// Last frame's lit colour, which a ray that lands on something the
+    /// camera sees reads: TAA's history, where the frame has one.
+    pub lit: Option<ResourceId>,
 }
 
 /// The path-traced reference: every path's radiance so far, which the pass
@@ -826,6 +871,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // so a frame with such a pass among its dispatches is not split, or its
     // tail would read them from a family that does not own them.
     let shades_hits = config.ray_reflections || config.ray_path_trace || config.gi_probes > 0;
+    let gathers = config.ray_tracing && config.gi_probes > 0 && config.gi_gather > 0;
     if config.async_compute && !shades_hits {
         builder.request_async_compute();
     }
@@ -995,6 +1041,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             args: builder.import_buffer("gi_args"),
             radiance_history: builder.import_buffer("gi_radiance_history"),
             radiance: builder.import_buffer("gi_radiance"),
+            gather_hits: gathers.then(|| builder.import_buffer("gi_gather_hits")),
         };
 
         // The probes' state is only read here, for where each stands, but
@@ -1033,7 +1080,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .build();
         record(id, PassBody::GiUpdate, &mut bodies);
 
-        let id = builder
+        let mut shade = builder
             .pass("gi_cache_shade", PassKind::Compute)
             .access(ray.scene, Access::AccelerationStructureRead)
             .access(ids.args, Access::IndirectRead)
@@ -1043,9 +1090,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(ids.probes, Access::StorageRead)
             .access(irradiance, Access::Sampled)
             .access(distance, Access::Sampled)
-            .access(ids.radiance, Access::StorageWrite)
-            .build();
-        record(id, PassBody::GiCacheShade, &mut bodies);
+            .access(ids.radiance, Access::StorageWrite);
+        // Last frame's gather rays, read for the cells they asked for and
+        // declared written, for the reason the trace declares the probes'
+        // state: the gather writes this frame's after, and a read would be
+        // ordered after every write.
+        if let Some(hits) = ids.gather_hits {
+            shade = shade.access(hits, Access::StorageWrite);
+        }
+        record(shade.build(), PassBody::GiCacheShade, &mut bodies);
 
         ids
     });
@@ -1170,6 +1223,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         || config.transparency
         || config.refraction
         || config.occlusion_culling
+        || gathers
         // What the wireframe hides covered edges with.
         || (config.overlay && config.wireframe == Some(super::wireframe::Wireframe::OverShaded)))
     .then(|| PrepassIds {
@@ -1292,6 +1346,128 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         mask
     });
 
+    // Between the prepass and shading, where SSAO is, and for its reasons: it
+    // reads the prepass and nothing the forward pass draws, and the forward
+    // pass reads what it leaves by pixel. After the volumes and the cache's
+    // shading, whose light its rays read and whose cells they claim.
+    //
+    // TAA's history is imported here rather than with the resolve, where the
+    // gather runs: a ray that lands on something the camera sees reads last
+    // frame's lit colour out of it, and a resource is declared before its
+    // first reader.
+    let early_taa_history = (gathers && config.taa).then(|| {
+        builder.import_image(
+            "taa_history",
+            ImageDesc::new(HDR_FORMAT),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        )
+    });
+    let gather = gi.filter(|_| gathers).map(|gi| {
+        use super::gi_gather::{GATHER_FORMAT, META_LAYERS, SH_LAYERS};
+        let prepass = prepass.expect("the final gather reads the geometry prepass");
+        let ray = ray.expect("the final gather traces");
+        let hits = gi.gather_hits.expect("declared with the volumes");
+        let low = |layers| {
+            ImageDesc::new(GATHER_FORMAT)
+                .extent(Extent::FrameDiv(config.gi_gather))
+                .array_layers(layers)
+        };
+        let raw = builder.create_image("gi_gather_raw", low(META_LAYERS));
+        // Entered and left sampled, for the reason every history is; and the
+        // allocation `accumulated` names this frame is `history` next frame,
+        // so it leaves where `history` enters. Entered `Undefined` because
+        // every texel is written.
+        let history = builder.import_image(
+            "gi_gather_history",
+            low(META_LAYERS),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let accumulated = builder.import_image(
+            "gi_gather_accumulated",
+            low(META_LAYERS),
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let blurred_x = builder.create_image("gi_gather_blur_x", low(SH_LAYERS));
+        let blurred = builder.create_image("gi_gather_blur_y", low(SH_LAYERS));
+        let irradiance = builder.create_image(
+            "gi_gather_irradiance",
+            ImageDesc::new(GATHER_FORMAT).array_layers(SH_LAYERS),
+        );
+
+        // The cache's cells and this frame's light are written: a cell a ray
+        // lands in is claimed, and a claimed cell's light emptied.
+        let mut pass = builder
+            .pass("gi_gather", PassKind::Compute)
+            .access(ray.scene, Access::AccelerationStructureRead)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(prepass.velocity, Access::Sampled);
+        if let Some(lit) = early_taa_history {
+            pass = pass.access(lit, Access::Sampled);
+        }
+        let id = reads_gi(pass, Some(gi))
+            .access(gi.cells, Access::StorageWrite)
+            .access(gi.radiance, Access::StorageWrite)
+            .access(hits, Access::StorageWrite)
+            .access(raw, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiGather, &mut bodies);
+
+        let id = builder
+            .pass("gi_gather_temporal", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(prepass.velocity, Access::Sampled)
+            .access(raw, Access::Sampled)
+            .access(history, Access::Sampled)
+            .access(accumulated, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiGatherTemporal, &mut bodies);
+
+        // Two images and not one, for the reason the subsurface blur has two:
+        // a pass that read and wrote one would be a cycle.
+        let id = builder
+            .pass("gi_gather_blur_x", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(accumulated, Access::Sampled)
+            .access(blurred_x, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiGatherBlurHorizontal, &mut bodies);
+
+        let id = builder
+            .pass("gi_gather_blur_y", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(blurred_x, Access::Sampled)
+            .access(accumulated, Access::Sampled)
+            .access(blurred, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiGatherBlurVertical, &mut bodies);
+
+        let id = builder
+            .pass("gi_gather_upscale", PassKind::Compute)
+            .access(prepass.depth, Access::Sampled)
+            .access(prepass.normal, Access::Sampled)
+            .access(blurred, Access::Sampled)
+            .access(irradiance, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiGatherUpscale, &mut bodies);
+
+        GatherIds {
+            raw,
+            history,
+            accumulated,
+            blurred_x,
+            blurred,
+            irradiance,
+            lit: early_taa_history,
+        }
+    });
+
     // After the cascades, because it reads them, and before every geometry pass,
     // because all three sample the result. It needs no prepass and takes no
     // screen-space input at all — a froxel is a point in the world, not a pixel —
@@ -1375,6 +1551,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         forward = forward.access(fog.volume, Access::Sampled);
     }
     forward = reads_gi(forward, gi);
+    if let Some(gather) = gather {
+        forward = forward.access(gather.irradiance, Access::Sampled);
+    }
     forward = match msaa {
         Some(msaa) => forward
             .access(msaa.hdr, Access::ColorAttachment)
@@ -1756,12 +1935,14 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // that layout, and it is the allocation `history` names next frame. On
         // the first frame after an allocation the layout is still true — the
         // allocation put it there — and its contents are what `reset` ignores.
-        let history = builder.import_image(
-            "taa_history",
-            ImageDesc::new(HDR_FORMAT),
-            ImageLayout::ShaderReadOnlyOptimal,
-            ImageLayout::ShaderReadOnlyOptimal,
-        );
+        let history = early_taa_history.unwrap_or_else(|| {
+            builder.import_image(
+                "taa_history",
+                ImageDesc::new(HDR_FORMAT),
+                ImageLayout::ShaderReadOnlyOptimal,
+                ImageLayout::ShaderReadOnlyOptimal,
+            )
+        });
         // Entered `Undefined` because every texel is written, and left where the
         // next frame wants to find it.
         let output = builder.import_image(
@@ -2326,6 +2507,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             screenshot,
             ray,
             gi,
+            gather,
         },
         bodies,
     })

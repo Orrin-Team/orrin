@@ -223,6 +223,21 @@ const float SPEC_AA_SIGMA2 = 0.25;
 #define ORRIN_GI_SAMPLER_BINDING 13
 #include "gi.glsl"
 
+// The final gather's irradiance at this pixel, as two bands of spherical
+// harmonics a layer per colour (`gi_gather.comp`). Read by the opaque pass
+// alone, by pixel: a blended or refractive surface is not the one the prepass
+// saw here, and keeps the volumes. Bound in every frame, as a stand-in where
+// the gather did not run, for the reason the volumes are.
+layout(set = 3, binding = 14) uniform texture2DArray u_gathered;
+
+vec3 gathered_irradiance(vec3 n) {
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    vec4 r = texelFetch(u_gathered, ivec3(pixel, 0), 0);
+    vec4 g = texelFetch(u_gathered, ivec3(pixel, 1), 0);
+    vec4 b = texelFetch(u_gathered, ivec3(pixel, 2), 0);
+    return max(vec3(r.x + dot(r.yzw, n), g.x + dot(g.yzw, n), b.x + dot(b.yzw, n)), vec3(0.0));
+}
+
 // Clamping threshold, from Kaplanyan et al. 2016.
 const float SPEC_AA_KAPPA = 0.18;
 
@@ -831,11 +846,27 @@ Shaded shade_surface() {
     // The volumes then also say how much less of the sky's light arrives here
     // than the sky alone would give, and the environment's reflections are
     // scaled by that, so a dark room's speculars stop glowing with sky.
+    //
+    // Where the final gather ran, an opaque surface takes what its rays found
+    // instead, sky and all: the volumes are a metre apart, and the gather is
+    // what sees the object beside this one. Its rays have already met what
+    // the screen-space occlusion would darken, so that darkens only the
+    // reflections here: on both, a block's foot came out a quarter darker
+    // against the sheet round it than the path-traced reference.
     vec3 irradiance = sh_irradiance(s.N);
     float reflection = 1.0;
+    float diffuse_ao = ao;
     if (gi_live()) {
         vec3 sky = irradiance;
+#if defined(ORRIN_TRANSPARENT) || defined(ORRIN_REFRACTIVE)
         vec4 local = gi_irradiance(v_world_pos, s.N, s.V);
+#else
+        bool gathered = gi_gathered();
+        vec4 local = gathered
+            ? vec4(gathered_irradiance(s.N), 1.0)
+            : gi_irradiance(v_world_pos, s.N, s.V);
+        diffuse_ao = gathered ? 1.0 : ao;
+#endif
         irradiance = local.rgb + sky * (1.0 - local.a);
         if (gi.camera.w > 0.5) {
             reflection = gi_reflection_scale(irradiance, sky);
@@ -850,7 +881,7 @@ Shaded shade_surface() {
         shown.alpha = alpha;
         return shown;
     }
-    vec3 diffuse_ibl = irradiance * s.albedo * (1.0 - s.metallic) * ao;
+    vec3 diffuse_ibl = irradiance * s.albedo * (1.0 - s.metallic) * diffuse_ao;
     vec3 color = scatters ? vec3(0.0) : diffuse_ibl;
     vec3 diffusible = scatters ? diffuse_ibl : vec3(0.0);
     // The scale goes in with the energy term rather than over the result: the

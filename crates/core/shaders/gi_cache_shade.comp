@@ -17,6 +17,9 @@
 // Written into this frame's half of the pair, which the update reads next
 // frame: the volumes this reads were written by this frame's update, so the
 // light they hold reaches the probes one update later.
+//
+// A cell no probe ray used but the final gather asked for is shaded the same
+// way, from the gather ray the gather left in its own table.
 
 layout(local_size_x = 64) in;
 
@@ -36,6 +39,11 @@ layout(set = 0, binding = 2, std430) writeonly buffer GiRadiance {
 layout(set = 0, binding = 3, std430) readonly buffer GiList {
     uint gi_list_count;
     uint gi_list[];
+};
+// What the gather's ray that asked for a cell met, by the cell's number:
+// where it landed and how far it went, and its direction in `meta.xyz`.
+layout(set = 0, binding = 4, std430) readonly buffer GiGatherHits {
+    GiRay gi_gather_hits[];
 };
 
 // The point the volumes are looked up from, a hair off its surface.
@@ -59,13 +67,21 @@ void main() {
     uint cell = gi_list[at];
     uint ray = gi_cells[cell].representative;
     gi_cells[cell].representative = GI_NO_CELL;
+    gi_cells[cell].shaded = gi.frame.x;
     gi_radiance[cell] = uvec2(0u);
     if (ray == GI_NO_CELL) {
         return;
     }
 
-    GiRay landed = gi_rays[ray];
-    vec3 direction = gi_ray_direction(ray % gi.grid.y, gi.grid.y);
+    GiRay landed;
+    vec3 direction;
+    if (ray == GI_GATHERED) {
+        landed = gi_gather_hits[cell];
+        direction = uintBitsToFloat(landed.meta.xyz);
+    } else {
+        landed = gi_rays[ray];
+        direction = gi_ray_direction(ray % gi.grid.y, gi.grid.y);
+    }
     float back = max(0.02, landed.hit.w * 1e-3);
     RayHit hit = ray_closest(landed.hit.xyz - direction * back, direction, 0.0, back * 2.0);
     if (!hit.found) {
