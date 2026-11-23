@@ -20,6 +20,12 @@
 //! and a volume that survives a frame boundary is precisely what the depth
 //! jitter needs to be averaged by. Two allocations, ping-ponged, so the scatter
 //! pass never reads the volume it is writing.
+//!
+//! Where the irradiance volumes are live, the light a froxel scatters from
+//! everywhere but the sun is their mean radiance at it rather than the scene's
+//! flat ambient (`gi_mean_radiance` in `gi.glsl`), so the air in a closed room
+//! is as dark as its walls. Past the froxels the analytic term keeps the flat
+//! ambient: it has no point to look the volumes up at.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -23,7 +23,8 @@
 //!
 //! # What a hit reads
 //!
-//! Three sets, the same for every shader that shades a hit (`ray_shade.glsl`):
+//! Four sets, the same for every shader that shades a hit (`ray_shade.glsl`),
+//! each bound with only the part of it that shader reads ([`RayReads`]):
 //!
 //! - The scene's structure and a table with a row per instance: its material,
 //!   where its mesh starts in the shared geometry, and its light channels. An
@@ -36,6 +37,8 @@
 //!   lit by what its reflector is — and the world light grid in place of the
 //!   view's clusters (`gfx::light_grid`).
 //! - The material texture array.
+//! - The irradiance volumes, for the light that bounced to the hit, or their
+//!   inert stand-ins where they are off (`vulkan::gi`).
 //!
 //! A hit reads a material's standard reading, with none of the optional lobes
 //! and no custom surface function: `gfx/surface/mod.rs` says why.
