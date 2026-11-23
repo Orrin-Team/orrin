@@ -8,7 +8,7 @@ use crate::gfx::rhi::{
     TextureDimension, TextureViewId, Topology, Viewport,
 };
 use crate::gfx::shaders::ShaderId;
-use crate::gfx::shadow_views::{AtlasRect, Layer, ShadowPlan};
+use crate::gfx::shadow_views::{AtlasRect, Layer, ShadowPlan, atlas_extent};
 
 use std::ops::Range;
 
@@ -165,10 +165,11 @@ impl ShadowPass {
         }
         let allocate = || {
             let desc = super::frame::shadow_atlas_desc(resolution);
+            let [width, height] = atlas_extent(resolution);
             let whole = device.create_texture(&TextureDesc {
                 format: desc.format,
                 dimension: TextureDimension::D2,
-                extent: [resolution, resolution, 1],
+                extent: [width, height, 1],
                 mip_levels: 1,
                 array_layers: 1,
                 samples: SampleCount::Sample1,
@@ -245,7 +246,7 @@ impl ShadowPass {
             static_fills: 0..static_fills,
             live_fills: static_fills..live_fills,
             restores: live_fills..count as u32,
-            atlas: atlases.resolution,
+            atlas: atlas_extent(atlases.resolution),
         })
     }
 
@@ -329,7 +330,7 @@ impl ShadowPass {
         if let Some(rects) = rects {
             let whole = AtlasRect {
                 min: [0, 0],
-                max: [rects.atlas; 2],
+                max: rects.atlas,
             };
             let mut aimed = false;
             let mut draw = |builder: &mut Encoder, pipeline, set, range: &Range<u32>| {
@@ -341,7 +342,7 @@ impl ShadowPass {
                 }
                 builder.bind_pipeline(pipeline);
                 builder.bind_group(0, set);
-                builder.push_constants(&[(rects.atlas as f32).to_bits()]);
+                builder.push_constants(&rects.atlas.map(|edge| (edge as f32).to_bits()));
                 builder.draw(6, range.len() as u32, 0, range.start);
             };
             match layer {
@@ -401,7 +402,7 @@ impl ShadowPass {
                 view: first_view + index as u32,
                 commands,
             };
-            self.set_target(builder, draw.tile.offset, draw.tile.size, draw.scissor);
+            self.set_target(builder, draw.tile.offset, [draw.tile.size; 2], draw.scissor);
             self.draw(builder, draws, draw.view_proj, sets, &mut bound);
         }
     }
@@ -414,10 +415,16 @@ impl ShadowPass {
     /// may write a fragment into the neighbour, which is another light's depth.
     /// And a strip of a sun level is drawn through its whole tile's viewport
     /// with the scissor cut down to the strip.
-    fn set_target(&self, builder: &mut Encoder, offset: [u32; 2], size: u32, scissor: AtlasRect) {
+    fn set_target(
+        &self,
+        builder: &mut Encoder,
+        offset: [u32; 2],
+        size: [u32; 2],
+        scissor: AtlasRect,
+    ) {
         builder.set_viewport(Viewport {
             origin: [offset[0] as f32, offset[1] as f32],
-            extent: [size as f32, size as f32],
+            extent: [size[0] as f32, size[1] as f32],
             depth_range: [0.0, 1.0],
         });
         builder.set_scissor(
@@ -567,8 +574,9 @@ pub(super) struct ShadowRects {
     static_fills: Range<u32>,
     live_fills: Range<u32>,
     restores: Range<u32>,
-    /// Edge of the atlas, which is what turns a texel into clip space.
-    atlas: u32,
+    /// Width and height of the atlas, which is what turns a texel into clip
+    /// space.
+    atlas: [u32; 2],
 }
 
 /// A 1x1 depth texture cleared to 1.0 — "nothing is nearer than the far

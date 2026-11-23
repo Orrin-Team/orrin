@@ -96,26 +96,41 @@ impl AtlasTile {
     /// What the shader multiplies a view's NDC into, and the reason a view needs
     /// no knowledge of the atlas beyond these four numbers.
     pub fn uv_rect(&self, resolution: u32) -> [f32; 4] {
-        let resolution = resolution.max(1) as f32;
+        let [width, height] = atlas_extent(resolution.max(1)).map(|edge| edge as f32);
         [
-            self.offset[0] as f32 / resolution,
-            self.offset[1] as f32 / resolution,
-            self.size as f32 / resolution,
-            self.size as f32 / resolution,
+            self.offset[0] as f32 / width,
+            self.offset[1] as f32 / height,
+            self.size as f32 / width,
+            self.size as f32 / height,
         ]
     }
 }
 
-/// Hands out square power-of-two tiles of a square power-of-two atlas.
+/// How many squares the atlas is, side by side.
 ///
-/// A buddy allocator over the atlas's quadtree: a block is either whole, or
+/// Two, because the sun's four views at full size are one square between them
+/// and the lamps need somewhere that is not what is left of it. In one square
+/// the sun's far two views took a quarter of the texels each to leave the
+/// lamps room, and a shadow twenty metres from the camera was drawn from
+/// texels three pixels across: an outline that wobbled where it was round.
+pub const ATLAS_PAGES: u32 = 2;
+
+/// The atlas's width and height for a page `resolution` texels across.
+pub fn atlas_extent(resolution: u32) -> [u32; 2] {
+    [resolution * ATLAS_PAGES, resolution]
+}
+
+/// Hands out square power-of-two tiles of an atlas of square power-of-two
+/// pages.
+///
+/// A buddy allocator over each page's quadtree: a block is either whole, or
 /// split into its four quarters. That is what lets views of different sizes
 /// share the image without a packing problem — a tile of any size lands on a
 /// boundary of its own size, so no two can overlap by part.
 #[derive(Clone, Debug)]
 pub struct TileAllocator {
     resolution: u32,
-    /// Free blocks by level: level 0 is the whole atlas and each level below
+    /// Free blocks by level: level 0 is a whole page and each level below
     /// halves the edge.
     free: Vec<Vec<[u32; 2]>>,
 }
@@ -124,14 +139,15 @@ pub struct TileAllocator {
 const MIN_TILE: u32 = 16;
 
 impl TileAllocator {
-    /// An empty atlas `resolution` texels across, rounded down to a power of
-    /// two.
+    /// An empty atlas of pages `resolution` texels across, rounded down to a
+    /// power of two.
     pub fn new(resolution: u32) -> Self {
-        let resolution = floor_power_of_two(resolution.max(MIN_TILE));
-        let levels = (resolution / MIN_TILE).trailing_zeros() as usize + 1;
-        let mut free = vec![Vec::new(); levels];
-        free[0].push([0, 0]);
-        Self { resolution, free }
+        let mut tiles = Self {
+            resolution: 0,
+            free: Vec::new(),
+        };
+        tiles.reset(resolution);
+        tiles
     }
 
     /// Empty the atlas again, at `resolution`, keeping what was allocated to
@@ -142,9 +158,10 @@ impl TileAllocator {
         self.resolution = resolution;
         self.free.iter_mut().for_each(Vec::clear);
         self.free.resize_with(levels, Vec::new);
-        self.free[0].push([0, 0]);
+        self.free[0].extend((0..ATLAS_PAGES).map(|page| [page * resolution, 0]));
     }
 
+    /// Edge of one page.
     pub fn resolution(&self) -> u32 {
         self.resolution
     }
@@ -347,7 +364,7 @@ pub struct ShadowCaster {
 /// clipped to.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AtlasConfig {
-    /// Edge of the whole atlas in texels. Frame *structure*: changing it
+    /// Edge of one page of the atlas in texels. Frame *structure*: changing it
     /// recompiles the graph and reallocates the image.
     pub resolution: u32,
     /// Whether point and spot lights get tiles at all.
@@ -375,7 +392,7 @@ impl Default for AtlasConfig {
 /// passes and their atlas entirely rather than keep images for no reader.
 #[derive(Clone, Debug, Default)]
 pub struct ShadowViews {
-    /// Edge of the atlas the tiles are cut from.
+    /// Edge of one page of the atlas the tiles are cut from.
     pub resolution: u32,
     /// The sun's views first, nearest first, then each punctual caster's.
     pub views: Vec<ShadowView>,
@@ -999,7 +1016,7 @@ impl ShadowPlanner {
                 .map(|entry| entry.tile.size);
             lamp.tile(inputs, held)
         };
-        let mut room = (side * side).saturating_sub(sun);
+        let mut room = (u64::from(ATLAS_PAGES) * side * side).saturating_sub(sun);
         let mut casting = 0;
         ranked.retain(|&(kind, light, _)| {
             let tile = u64::from(tile_of(kind, light));
@@ -1715,9 +1732,10 @@ mod tests {
 
         assert_eq!(views.sun, 4);
         assert!(views.views.len() > views.sun, "no lamp got a tile");
+        let [width, height] = atlas_extent(views.resolution);
         for (i, a) in views.views.iter().enumerate() {
-            assert!(a.tile.offset[0] + a.tile.size <= views.resolution);
-            assert!(a.tile.offset[1] + a.tile.size <= views.resolution);
+            assert!(a.tile.offset[0] + a.tile.size <= width);
+            assert!(a.tile.offset[1] + a.tile.size <= height);
             for b in &views.views[i + 1..] {
                 assert!(!overlap(a.tile, b.tile), "{:?} and {:?}", a.tile, b.tile);
             }
@@ -1752,9 +1770,9 @@ mod tests {
         let mut rig = Rig::new(vec![point(1, Vec3::ZERO)], vec![spot(2, Vec3::ZERO)]);
         rig.lighting.point_lights[0].candela = 100.0;
         rig.sun = None;
-        // Four tiles. The point light needs six.
+        // A tile a page. The point light needs six.
         rig.atlas = AtlasConfig {
-            resolution: 1024,
+            resolution: 512,
             tile_size: 512,
             ..AtlasConfig::default()
         };
@@ -1790,8 +1808,10 @@ mod tests {
             offset: [512, 1024],
             size: 512,
         };
+        // Of an atlas that is as many pages wide as it has, and one high.
         let [x, y, w, h] = tile.uv_rect(2048);
-        assert_eq!((x, y, w, h), (0.25, 0.5, 0.25, 0.25));
+        let pages = ATLAS_PAGES as f32;
+        assert_eq!((x, y, w, h), (0.25 / pages, 0.5, 0.25 / pages, 0.25));
     }
 
     /// A released tile is whole again: an atlas filled with small tiles and
@@ -1799,8 +1819,10 @@ mod tests {
     #[test]
     fn released_tiles_join_back_into_the_block_they_were_split_from() {
         let mut tiles = TileAllocator::new(1024);
-        let small: Vec<_> = (0..16).map(|_| tiles.allocate(256).unwrap()).collect();
-        assert!(tiles.allocate(256).is_none(), "the atlas holds sixteen");
+        let small: Vec<_> = (0..16 * ATLAS_PAGES)
+            .map(|_| tiles.allocate(256).unwrap())
+            .collect();
+        assert!(tiles.allocate(256).is_none(), "a page holds sixteen");
         for tile in small {
             tiles.release(tile);
         }

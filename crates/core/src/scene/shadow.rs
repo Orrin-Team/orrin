@@ -8,7 +8,7 @@ use crate::gfx::shadows::CascadeConfig;
 /// keeps the contact shadows it had.
 const DEFAULT_SOFTNESS: f32 = 0.03;
 const DEFAULT_SHARPNESS: f32 = 0.0;
-const DEFAULT_FAR_RESOLUTION: u32 = 1024;
+const DEFAULT_FAR_RESOLUTION: u32 = 2048;
 /// Past this the remap is a threshold and the edge shows the map's texels.
 pub const MAX_SHADOW_SHARPNESS: f32 = 0.9;
 
@@ -20,12 +20,13 @@ pub struct ShadowSettings {
     /// Clamped to `MAX_CASCADES` when the cascades are built.
     pub cascade_count: u32,
     /// Edge of the tile each of the sun's first two views gets, in texels.
-    /// Held to half the atlas.
+    /// Held to half a page of the atlas.
     pub resolution: u32,
-    /// Edge of the tile each of the sun's remaining views gets. Those answer
-    /// for a distance where a texel is fewer pixels, so they take a smaller
-    /// tile by default — which is what leaves the lamps their room in an atlas
-    /// the sun shares. Held to a quarter of the atlas.
+    /// Edge of the tile each of the sun's remaining views gets, held to half a
+    /// page as well. The same as the first two by default: a far view's texels
+    /// are already the largest against the pixels they shade, and at half the
+    /// edge the outline of a shadow twenty metres off shows them. Lowering it
+    /// hands the lamps the difference.
     #[reflect(default = DEFAULT_FAR_RESOLUTION)]
     pub far_resolution: u32,
     /// How many of the sun's views, nearest first, are fitted to the slice of
@@ -68,8 +69,9 @@ pub struct ShadowSettings {
     /// per-light `casts_shadows` says which of them ask; this is the master
     /// switch.
     pub punctual_enabled: bool,
-    /// Edge of the atlas every shadow view is a tile of, the sun's and the
-    /// lamps' alike, and the largest tile one punctual face takes within it: a
+    /// Edge of one page of the atlas every shadow view is a tile of, the sun's
+    /// and the lamps' alike — the atlas is `ATLAS_PAGES` of them side by side —
+    /// and the largest tile one punctual face takes within it: a
     /// lamp's tile follows how much of the screen its reach covers, up to this
     /// or to the light's own `LightShadows::resolution`. The first is frame
     /// *structure* — it reallocates the image — and the second changes how
@@ -155,10 +157,10 @@ impl Default for ShadowSettings {
             softness: DEFAULT_SOFTNESS,
             sharpness: DEFAULT_SHARPNESS,
             punctual_enabled: true,
-            // One D16 image of 32 MB, and a second for the cached layers. The
-            // sun's two 2048 views and two 1024 ones take five eighths of it,
-            // and what is left is 24 tiles of 512: four point lights, or a mix
-            // of points and spots.
+            // Two pages of D16, 64 MB, and the same again for the cached
+            // layers. The sun's four 2048 views are one page between them and
+            // the other is 64 tiles of 512: ten point lights, or a mix of
+            // points and spots.
             atlas_resolution: 4096,
             atlas_tile_size: 512,
             punctual_near: 0.05,
@@ -196,7 +198,7 @@ impl ShadowSettings {
             // its tile's texel count; and bounded so that four views always
             // fit, whatever a slider pair says.
             resolution: floor_power_of_two(self.resolution).min(atlas / 2),
-            far_resolution: floor_power_of_two(self.far_resolution).min(atlas / 4),
+            far_resolution: floor_power_of_two(self.far_resolution).min(atlas / 2),
             pullback: self.pullback,
             fitted: self.fitted_cascades as usize,
         }

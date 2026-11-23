@@ -666,8 +666,8 @@ fn shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
     if rows.shows("Resolution") {
         widgets::property(ui, "Resolution", |ui| {
             // The near cascades' tiles, then the tiles of the levels past them.
-            // Both come out of the atlas the lamps share, so the first is held
-            // to half its edge and the second to a quarter.
+            // Each is held to half a page of the atlas, so the sun's four are
+            // one page between them at most.
             let ShadowSettings {
                 resolution,
                 far_resolution,
@@ -783,10 +783,10 @@ fn punctual_shadows(ui: &mut egui::Ui, world: &World, rows: Rows) {
     }
     if rows.shows("Atlas") {
         widgets::property(ui, "Atlas", |ui| {
-            // 4096 is the ceiling on purpose. Vulkan guarantees
-            // `maxImageDimension2D` of only 4096, so offering 8192 is offering a
-            // startup panic on a conformant device that Metal happens to let this
-            // one get away with.
+            // One page of the atlas, and 4096 is the ceiling on purpose. The
+            // atlas is its pages side by side and Vulkan guarantees
+            // `maxImageDimension2D` of only 4096; the renderer holds a page to
+            // what the device takes, and a larger one here would be held too.
             egui::ComboBox::from_id_salt("shadow_atlas_resolution")
                 .selected_text(format!("{}", s.atlas_resolution))
                 .show_ui(ui, |ui| {

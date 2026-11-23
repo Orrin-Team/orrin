@@ -1148,7 +1148,9 @@ fn every_shadow_view_is_drawn_by_one_pass_per_layer() {
             .unwrap_or_else(|| panic!("the frame declared no {name}"));
         assert_eq!(
             desc.extent,
-            orrin_core::gfx::graph::Extent::Fixed([2048; 2])
+            orrin_core::gfx::graph::Extent::Fixed(orrin_core::gfx::shadow_views::atlas_extent(
+                2048
+            ))
         );
         assert_eq!(desc.array_layers, None, "an atlas is tiles, not layers");
     }

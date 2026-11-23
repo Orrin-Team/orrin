@@ -1407,9 +1407,12 @@ Shaded shade_surface() {
         color *= tint;
         diffusible *= tint;
 
-        // The atlas, in the corner: a square two fifths of the frame's height.
+        // The atlas, in the corner: two fifths of the frame's height, and as
+        // wide as its pages make it.
+        vec2 atlas = vec2(textureSize(sampler2DShadow(u_shadow_atlas, u_shadow_cmp), 0));
         float side = lighting.viewport.y * 0.4;
-        vec2 corner = vec2(gl_FragCoord.x, lighting.viewport.y - gl_FragCoord.y) / side;
+        vec2 corner = vec2(gl_FragCoord.x * atlas.y / atlas.x, lighting.viewport.y - gl_FragCoord.y)
+            / side;
         if (debug_view > 1.5 && debug_view < 2.5 && all(lessThan(corner, vec2(1.0)))) {
             // An eighth of the sky's luminance: a level the exposure this
             // frame is already metered for shows as a mid grey.

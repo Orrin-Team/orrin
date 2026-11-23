@@ -23,10 +23,12 @@
 #ifndef ORRIN_SHADOW_FILTER_GLSL
 #define ORRIN_SHADOW_FILTER_GLSL
 
-// The narrowest the kernel gets, in texels. Under this the tent is a bilinear
-// fetch and a shadow's edge shows the map's texels as stairs, so a far cascade
-// is as sharp as this and no sharper, whatever width was asked for.
-const float SHADOW_KERNEL_MIN = 1.5;
+// The narrowest the kernel gets, in texels: the widest the inner four taps
+// hold, and what the 3x3 kernel this replaced covered. A far view is as sharp
+// as this and no sharper, whatever width was asked for. At one and a half the
+// outline of a round shadow read from texels a few pixels across wobbled, each
+// run of texels along it a lump.
+const float SHADOW_KERNEL_MIN = 2.0;
 // The widest, which is what eight texels an axis can hold: at this radius the
 // outermost texel's weight reaches zero exactly as the kernel steps onto the
 // next one. Lock-stepped with `FACE_BORDER_TEXELS` in gfx/punctual.rs, which
@@ -34,9 +36,10 @@ const float SHADOW_KERNEL_MIN = 1.5;
 const float SHADOW_KERNEL_MAX = 4.0;
 
 // The narrowest penumbra a view can show, in texels either side of the edge.
-// Narrower than this and the remap below is a threshold, which draws the map's
-// texels as stairs however wide the kernel under it was.
-const float SHADOW_PENUMBRA_MIN = 0.75;
+// The remap below turns into a threshold as this falls, and a threshold draws
+// the map's texels as stairs however wide the kernel under it was: at three
+// quarters of a texel it already did.
+const float SHADOW_PENUMBRA_MIN = 1.5;
 
 // The radius a penumbra `softness` metres wide asks for, in texels `texel`
 // metres across, before the kernel's limits are applied to it.
@@ -112,8 +115,8 @@ float shadow_normal_offset(float radius, float texel, float n_dot_l) {
 // Two things ask for it. Where a view's texels are coarser than the penumbra
 // asked for, the kernel is held at `SHADOW_KERNEL_MIN` and is wider than was
 // asked; the stretch takes the visible width back toward the request, down to
-// `SHADOW_PENUMBRA_MIN` -- which is what keeps a far view's shadow from being
-// several times softer than the near view's it meets at a seam. And
+// `SHADOW_PENUMBRA_MIN` -- a far view's shadow is still softer than the near
+// view's it meets at a seam, by less than its texels are coarser. And
 // `sharpness` narrows whatever is left by an authored factor.
 float shadow_sharpen(float visibility, float asked, float radius, float sharpness) {
     float contrast = radius / clamp(asked, SHADOW_PENUMBRA_MIN, radius);

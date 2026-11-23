@@ -64,7 +64,8 @@ use crate::geom::{Aabb, Frustum};
 use crate::gfx::DecalInstance;
 use crate::gfx::shadow_casters::CasterTracker;
 use crate::gfx::shadow_views::{
-    CasterVolume, Layer, ShadowInputs, ShadowPlan, ShadowPlanner, ShadowViews, ViewDefaults,
+    ATLAS_PAGES, CasterVolume, Layer, ShadowInputs, ShadowPlan, ShadowPlanner, ShadowViews,
+    ViewDefaults,
 };
 use crate::gfx::ui::UiFrame;
 use crate::scene::{
@@ -939,6 +940,14 @@ impl VulkanRenderer {
         lighting: &SceneLighting,
     ) {
         let extent = self.backend.extent();
+        // The atlas is its pages side by side, and Vulkan promises an image no
+        // wider than 4096: a page is held to what this device takes of them.
+        let page = self.max_texture_side() as u32 / ATLAS_PAGES;
+        let held = shadows.map(|settings| ShadowSettings {
+            atlas_resolution: settings.atlas_resolution.min(page),
+            ..*settings
+        });
+        let shadows = held.as_ref();
         let plan = Arc::get_mut(&mut self.shadow_plan)
             .expect("the last frame still holds its shadow plan");
         let sun = shadows

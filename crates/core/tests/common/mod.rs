@@ -189,6 +189,24 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 ..CaptureSettings::default()
             },
         ),
+        // The sun alone from twenty metres up and back, over the sphere rows:
+        // the distance an editor camera sits at, where a shadow's edge is read
+        // from the sun's third view and its texels are several pixels each.
+        // What to look for is the outline of each sphere's shadow on the
+        // ground, which is an ellipse and should look like one.
+        (
+            "mid-shadow-edges",
+            CaptureSettings {
+                extent: [1920, 1080],
+                shadows: true,
+                camera: Some(Camera {
+                    position: Vec3::new(1.0, 17.0, 22.0),
+                    target: Vec3::new(0.0, -0.5, 10.5),
+                    ..Camera::default()
+                }),
+                ..CaptureSettings::default()
+            },
+        ),
         // The three ways of looking at the shadows rather than at the scene, from
         // the `shadows` capture's own camera so each reads against it: the atlas
         // in the corner, each surface by how a shadow texel compares with its

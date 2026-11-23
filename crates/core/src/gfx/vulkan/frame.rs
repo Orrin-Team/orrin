@@ -35,6 +35,7 @@ use super::ssao::AO_FORMAT;
 use super::ssr::{HIZ_FORMAT, HIZ_LEVELS, RAY_FORMAT, SOURCE_LEVELS};
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
+use crate::gfx::shadow_views::atlas_extent;
 
 /// What a frame's structure depends on. A change to any of these recompiles the
 /// graph; nothing else does, which is the "recompiled on structure change, not
@@ -682,9 +683,10 @@ fn indirect(pass: PassBuilder<'_>, commands: ResourceId) -> PassBuilder<'_> {
     pass.access(commands, Access::IndirectRead)
 }
 
-/// What a shadow atlas is: one square image every view is a tile of.
+/// What a shadow atlas is: one image every view is a tile of, its pages side
+/// by side.
 pub fn shadow_atlas_desc(resolution: u32) -> ImageDesc {
-    ImageDesc::new(SHADOW_FORMAT).extent(Extent::Fixed([resolution; 2]))
+    ImageDesc::new(SHADOW_FORMAT).extent(Extent::Fixed(atlas_extent(resolution)))
 }
 
 pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {

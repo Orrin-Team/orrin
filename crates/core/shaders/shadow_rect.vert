@@ -26,8 +26,8 @@ layout(set = 0, binding = 0, std430) readonly buffer Rects {
 };
 
 layout(push_constant) uniform Push {
-    // Edge of the atlas, in texels.
-    float atlas_size;
+    // Width and height of the atlas, in texels.
+    vec2 atlas_size;
 } push;
 
 #ifdef ORRIN_RESTORE
