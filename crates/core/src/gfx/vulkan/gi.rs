@@ -37,6 +37,21 @@
 //! room fed from that atlas would take as many updates to fill with light, or
 //! to go dark, for every bounce it has. A surface reads the steady one.
 //!
+//! Not all of it over the last few updates, though. In an aisle lit through
+//! its arches nearly all of a probe's light is the one ray in a few dozen
+//! updates that meets a sunlit floor, a hundred times the rest; over two
+//! updates that ray lit every cell round the probe for a few frames, the final
+//! gather read those cells, and a dark urn's light swung by a third and its
+//! wall's by a tenth every hundred frames. So an update's brightest ray, where
+//! it is `OUTLYING` times the update's mean, has its part kept in a fourth
+//! atlas and blended as long as the irradiance, and the bounce tile is the
+//! rest over the last few updates plus that. Each part is a mean of its own
+//! with weights fixed before it is seen, so the sum is the light's whole mean;
+//! a lamp's brightest ray is a few times the rest of a room it lights, and its
+//! light comes and goes at the pace it did. Not the whole irradiance for the
+//! bounce, which steadies the aisle as well but leaves a switched lamp's light
+//! in a closed room for seconds.
+//!
 //! The update reads the cache's light and the shading writes it, while the
 //! shading reads the volumes and the update writes them: a cycle within the
 //! frame. So the cache's light is a pair that swaps each frame, like the
@@ -67,9 +82,9 @@
 //!
 //! # Memory
 //!
-//! At sixteen probes a side: the three atlases 59 MB, the two frames' rays
+//! At sixteen probes a side: the four atlases 79 MB, the two frames' rays
 //! 16.8 MB, the cache 8.4 MB, the gather's hits beside it 8.4 MB and its list
-//! 1 MB, the probes' state 0.4 MB. Twelve a side takes the atlases to 25 MB
+//! 1 MB, the probes' state 0.4 MB. Twelve a side takes the atlases to 33 MB
 //! and the rays to 7.1 MB. All of it is made when the volumes first go live
 //! and let go when they stop.
 //!
@@ -185,6 +200,7 @@ struct Volumes {
     irradiance: TextureViewId,
     distance: TextureViewId,
     bounce: TextureViewId,
+    outlier: TextureViewId,
     states: BufferId,
     /// What each probe ray met, ping-ponged: the update reads last frame's
     /// while the trace writes this frame's.
@@ -396,11 +412,11 @@ impl GiPass {
         self.fallback
     }
 
-    /// The three atlases and their extent, for the graph to be handed.
-    pub(super) fn atlases(&self) -> Option<([TextureViewId; 3], [u32; 2])> {
+    /// The four atlases and their extent, for the graph to be handed.
+    pub(super) fn atlases(&self) -> Option<([TextureViewId; 4], [u32; 2])> {
         self.volumes
             .as_ref()
-            .map(|v| ([v.irradiance, v.distance, v.bounce], v.extent))
+            .map(|v| ([v.irradiance, v.distance, v.bounce, v.outlier], v.extent))
     }
 
     /// Make sure the trace and the shading have the material textures bound,
@@ -447,6 +463,7 @@ impl GiPass {
             device.destroy_texture(volumes.irradiance);
             device.destroy_texture(volumes.distance);
             device.destroy_texture(volumes.bounce);
+            device.destroy_texture(volumes.outlier);
             device.destroy_buffer(volumes.states);
             for buffer in volumes.rays {
                 device.destroy_buffer(buffer);
@@ -592,6 +609,10 @@ impl GiPass {
                     binding: 6,
                     resource: BindingResource::StorageTexture(volumes.bounce),
                 },
+                Binding {
+                    binding: 7,
+                    resource: BindingResource::StorageTexture(volumes.outlier),
+                },
             ],
         );
         encoder.bind_pipeline(pipelines.update);
@@ -694,6 +715,7 @@ fn allocate_volumes(device: &Device, probes: u32, spacing: f32) -> Volumes {
         irradiance: atlas(),
         distance: atlas(),
         bounce: atlas(),
+        outlier: atlas(),
         states: words(
             device,
             BufferUsage::STORAGE_BUFFER,

@@ -2826,13 +2826,14 @@ impl VulkanRenderer {
                 );
             }
         }
-        if let (Some(ids), Some(([irradiance, distance, bounce], extent))) =
+        if let (Some(ids), Some(([irradiance, distance, bounce, outlier], extent))) =
             (self.frame.ids.gi, self.gi.atlases())
         {
             for (id, view) in [
                 (ids.irradiance, irradiance),
                 (ids.distance, distance),
                 (ids.bounce, bounce),
+                (ids.outlier, outlier),
             ] {
                 self.table.import(
                     id,

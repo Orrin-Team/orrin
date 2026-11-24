@@ -4782,12 +4782,14 @@
   ! gi_irradiance ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
   ! gi_distance ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
   ! gi_bounce ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! gi_outlier ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      gi_probes StorageWrite
      gi_rays_previous StorageRead
      gi_radiance_history StorageRead
      gi_irradiance StorageWrite
      gi_distance StorageWrite
      gi_bounce StorageWrite
+     gi_outlier StorageWrite
 05 pass gi_trace [Compute]
   ! ray_scene src AccelerationStructureBuild/AccelerationStructureWrite dst VertexShader|FragmentShader|ComputeShader/AccelerationStructureRead
   ! gi_probes src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
@@ -4996,6 +4998,7 @@
      bloom_up_0 Sampled
      swapchain_color ColorAttachment
 -- end of frame
+  ! gi_outlier General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst BottomOfPipe/-
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
 -- aliased ssao_raw_ao [09..10] -> oit_reveal [12..13]
 -- aliased oit_accum [12..13] -> refraction_accum [15..16]
@@ -5021,12 +5024,14 @@
   ! gi_irradiance ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
   ! gi_distance ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
   ! gi_bounce ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! gi_outlier ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      gi_probes StorageWrite
      gi_rays_previous StorageRead
      gi_radiance_history StorageRead
      gi_irradiance StorageWrite
      gi_distance StorageWrite
      gi_bounce StorageWrite
+     gi_outlier StorageWrite
 05 pass gi_trace [Compute]
   ! ray_scene src AccelerationStructureBuild/AccelerationStructureWrite dst VertexShader|FragmentShader|ComputeShader/AccelerationStructureRead
   ! gi_probes src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
@@ -5302,6 +5307,7 @@
      bloom_up_0 Sampled
      swapchain_color ColorAttachment
 -- end of frame
+  ! gi_outlier General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst BottomOfPipe/-
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
 -- aliased ssao_raw_ao [09..10] -> oit_reveal [19..20]
 -- aliased gi_gather_blur_x [13..14] -> gi_gather_blur_wide_x [15..16]

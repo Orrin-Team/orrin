@@ -2956,6 +2956,9 @@ fn the_irradiance_volumes_are_updated_before_anything_lights_with_them() {
         ),
         "the shading's dispatch must wait for the count the compaction wrote:\n{plan}",
     );
+    // The outlying rays' part of the bounce tile is the update's alone.
+    assert_eq!(plan.matches("     gi_outlier ").count(), 1, "{plan}");
+    assert!(plan.contains("     gi_outlier StorageWrite\n"), "{plan}");
 
     // Off, nothing of them is declared, and the frame is the one it was.
     let off = declare(FrameConfig {

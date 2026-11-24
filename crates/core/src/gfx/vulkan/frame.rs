@@ -495,6 +495,9 @@ pub struct GiIds {
     /// The same irradiance over the last few updates alone, which the cache's
     /// shading reads for the light that bounced.
     pub bounce: ResourceId,
+    /// The part of that which came by each update's brightest rays, over as
+    /// many updates as `irradiance`: only the update reads it.
+    pub outlier: ResourceId,
     /// Each probe's offset, whether it is inside geometry, and the coordinate
     /// it was last written for.
     pub probes: ResourceId,
@@ -1054,10 +1057,17 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             ImageLayout::ShaderReadOnlyOptimal,
             ImageLayout::ShaderReadOnlyOptimal,
         );
+        let outlier = builder.import_image(
+            "gi_outlier",
+            atlas(),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
         let ids = GiIds {
             irradiance,
             distance,
             bounce,
+            outlier,
             probes: builder.import_buffer("gi_probes"),
             rays: builder.import_buffer("gi_rays"),
             rays_previous: builder.import_buffer("gi_rays_previous"),
@@ -1077,6 +1087,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(irradiance, Access::StorageWrite)
             .access(distance, Access::StorageWrite)
             .access(bounce, Access::StorageWrite)
+            .access(outlier, Access::StorageWrite)
             .build();
         record(id, PassBody::GiUpdate, &mut bodies);
 
