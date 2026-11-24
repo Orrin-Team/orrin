@@ -4,8 +4,7 @@
 // The final gather's temporal filter: this frame's ray added into a running
 // mean of the rays this texel's surface has had, with a count of how many
 // frames that is (Mattausch et al. 2010). The mean is a plain one until the
-// count reaches the cap, which is the control that trades lag for noise, and
-// keeps a fixed share after.
+// count reaches the cap, and keeps a fixed share after.
 //
 // The history is found where the prepass's motion says this texel's surface
 // was, as a bilinear blend of the four texels round that point, each taken
@@ -13,13 +12,30 @@
 // stood from last frame's camera. None is a disocclusion: the count starts
 // again, and the spatial filter after this widens to cover the one sample.
 //
-// Before it goes in, the ray's light is held to what the history says this
-// surface has seen, so one bright ray does not stay in the mean for a second.
-// The bound is the history's mean and eight of its deviations, kept beside it
-// as a running deviation from the running mean, or the brightest of the eight
-// rays round this one, whichever is higher: light that is new to the whole
-// neighbourhood, a lamp switched on, passes, and light that only this ray
-// found does not.
+// The cap is led by how far the rays disagree, as a probe's history is
+// (`gi_update.comp`): the history setting where a ray strays from the mean by
+// about twice the mean, and longer by the square of how much further, up to
+// `LONGEST`. A room lit through an arch by a sunlit floor takes most of its
+// light from the few rays in ten thousand that meet the floor, and a mean of
+// a few dozen frames either flickers with them or, held to its own spread,
+// leaves them out: a bound on each ray's light at eight deviations above the
+// mean cost an aisle nearly half its light, so nothing is held back. The
+// disagreement is the change of the mean of the nine rays round the texel
+// from one frame to the next, pooled over the twenty-five texels round it:
+// one texel meets such a floor too seldom to know it is there, and a change
+// between successive frames, unlike a spread about a lagging mean, does not
+// grow while the light is rising or falling.
+//
+// A light switched on would take as long as that cap to arrive, so the
+// probes' test of a short mean against the long one, in its standard errors,
+// on one frame and the next, restarts the count where the light has risen.
+// Only risen, and only where the mean of the nine rays less their two
+// brightest has risen too: where a few rays carry the light, the short mean
+// sits under the long one between them and jumps over it on each, which is
+// no switch either way. A texel that has restarted averages half the history
+// setting for a few seconds, while the light goes on arriving bounce after
+// bounce. Light that falls is left to the cap, which is short where a lamp
+// lights a room, since its rays agree.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -32,8 +48,27 @@ layout(set = 0, binding = 5, rgba16f) uniform writeonly image2DArray u_accumulat
 #define ORRIN_GATHER_BLOCK_BINDING 6
 #include "gi_gather.glsl"
 
-// How many of the history's deviations above its mean a ray's light may be.
-const float DEVIATIONS = 8.0;
+// The relative variance of one ray at which the history is the setting.
+const float AGREE = 4.0;
+const float LONGEST = 1024.0;
+// Texels either side the disagreement is pooled over.
+const int POOL = 2;
+// The switch test, as `gi_update.comp` has it: the short mean's share of each
+// frame, the spread's, the standard errors over the line, and the share of
+// the larger mean the two must be apart by as well; and how many times the
+// long mean the short one must be, unless the count is young.
+const float SHORT = 0.25;
+const float SPREAD = 1.0 / 16.0;
+const float STRIKE = 2.5;
+const float CHANGED = 3.5;
+const float CHANGED_LEAST = 0.25;
+const float SETTLED = 4.0;
+const float SWITCHED = 3.0;
+const float YOUNG = 16.0;
+// The count a restart leaves, and the frames after it the history is held to
+// half the setting.
+const float RESTARTED = 4.0;
+const float SETTLING = 256.0;
 
 float mean_of(vec4 sh[3]) {
     return dot(vec3(sh[0].x, sh[1].x, sh[2].x), GATHER_LUMA);
@@ -59,6 +94,7 @@ void main() {
             imageStore(u_accumulated, ivec3(low, layer), vec4(0.0));
         }
         imageStore(u_accumulated, ivec3(low, GATHER_META), vec4(0.0, 0.0, GATHER_REACH, 0.0));
+        imageStore(u_accumulated, ivec3(low, GATHER_STATS), vec4(0.0));
         return;
     }
     vec3 position = gather_position(texel, depth, full);
@@ -73,7 +109,10 @@ void main() {
 
     vec4 history[3] = vec4[3](vec4(0.0), vec4(0.0), vec4(0.0));
     vec4 held = vec4(0.0);
+    vec4 held_stats = vec4(0.0);
     float total = 0.0;
+    float pooled = 0.0;
+    float pooled_count = 0.0;
     vec2 previous = (vec2(texel) + 0.5) / vec2(full) - texelFetch(u_velocity, texel, 0).rg;
     if ((gather.params.z & GATHER_HISTORY) != 0u
             && all(greaterThanEqual(previous, vec2(0.0)))
@@ -103,7 +142,18 @@ void main() {
                 history[layer] += texelFetch(u_history, ivec3(q, layer), 0) * w;
             }
             held += meta * w;
+            held_stats += texelFetch(u_history, ivec3(q, GATHER_STATS), 0) * w;
             total += w;
+        }
+        for (int y = -POOL; y <= POOL; ++y) {
+            for (int x = -POOL; x <= POOL; ++x) {
+                ivec2 q = clamp(base + ivec2(x, y), ivec2(0), size - 1);
+                vec4 meta = texelFetch(u_history, ivec3(q, GATHER_META), 0);
+                if (meta.x > 0.5) {
+                    pooled += meta.w * meta.w;
+                    pooled_count += 1.0;
+                }
+            }
         }
     }
     float count = 0.0;
@@ -112,46 +162,76 @@ void main() {
             history[layer] /= total;
         }
         held /= total;
+        held_stats /= total;
         count = floor(held.x + 0.5);
     }
 
-    float luminance = dot(vec3(sample_sh[0].x, sample_sh[1].x, sample_sh[2].x), GATHER_LUMA);
-    // Before the clamp: a deviation learned from clamped rays would shrink
-    // under its own bound, until it held back the light a rare but real
-    // bright thing — a panel a few rays meet — sends every texel.
+    // The mean of the nine rays round this one, and the same less the two
+    // brightest.
+    float rays[9];
+    float around = 0.0;
+    for (int i = 0; i < 9; ++i) {
+        rays[i] = raw_luminance(clamp(low + ivec2(i % 3 - 1, i / 3 - 1), ivec2(0), size - 1));
+        around += rays[i];
+    }
+    around /= 9.0;
+    float first = 0.0;
+    float second = 0.0;
+    for (int i = 0; i < 9; ++i) {
+        second = max(second, min(first, rays[i]));
+        first = max(first, rays[i]);
+    }
+    float middle = (around * 9.0 - first - second) / 7.0;
     float mean = mean_of(history);
-    float spread = luminance - mean;
-    if (count >= 2.0) {
-        float neighbours = 0.0;
-        for (int y = -1; y <= 1; ++y) {
-            for (int x = -1; x <= 1; ++x) {
-                ivec2 q = clamp(low + ivec2(x, y), ivec2(0), size - 1);
-                if (x != 0 || y != 0) {
-                    neighbours = max(neighbours, raw_luminance(q));
-                }
-            }
-        }
-        float bound = max(mean + DEVIATIONS * held.w, neighbours);
-        if (luminance > bound) {
-            float scale = bound / luminance;
-            for (int layer = 0; layer < 3; ++layer) {
-                sample_sh[layer] *= scale;
-            }
+    float recent = held_stats.x;
+    float disagreement = abs(held_stats.y);
+    bool struck = held_stats.y < 0.0;
+    float since = held_stats.z + 1.0;
+    bool over = false;
+    if (count < 0.5) {
+        recent = around;
+        disagreement = 0.0;
+        since = SETTLING;
+    } else {
+        float delta = around - recent;
+        recent += SHORT * delta;
+        disagreement = sqrt(mix(disagreement * disagreement, delta * (around - recent), SPREAD));
+        float apart = abs(recent - mean);
+        float error = disagreement * sqrt(SHORT / (2.0 - SHORT));
+        bool far_off = count >= SETTLED && apart > CHANGED_LEAST * max(mean, recent);
+        over = far_off && apart > STRIKE * error;
+        bool switched = recent > mean && middle > mean && (count < YOUNG || recent > SWITCHED * mean);
+        if (struck && far_off && switched && apart > CHANGED * error) {
+            count = min(count, RESTARTED);
+            since = 0.0;
+            over = false;
         }
     }
 
-    float frames = min(count + 1.0, gather.camera.w);
+    // One ray's variance from that of the nine rays' mean between frames:
+    // nine times, and half, for the two frames a change is the difference of.
+    float variance = pooled_count > 0.0 ? 4.5 * pooled / pooled_count / max(mean * mean, 1e-12) : 0.0;
+    float cap = clamp(gather.camera.w * variance / AGREE, gather.camera.w, max(LONGEST, gather.camera.w));
+    if (since < SETTLING) {
+        cap = max(gather.camera.w * 0.5, 1.0);
+    }
+    float frames = min(count + 1.0, cap);
     float keep = 1.0 - 1.0 / frames;
     if (count < 0.5) {
         keep = 0.0;
     }
+    vec4 mixed[3];
     for (int layer = 0; layer < 3; ++layer) {
-        imageStore(u_accumulated, ivec3(low, layer),
-                   gather_half(mix(sample_sh[layer], history[layer], keep)));
+        mixed[layer] = mix(sample_sh[layer], history[layer], keep);
+        imageStore(u_accumulated, ivec3(low, layer), gather_half(mixed[layer]));
     }
-    // The deviation as a deviation rather than a mean square, which in a
-    // physical unit is past what a half float holds.
-    float deviation = sqrt(mix(spread * spread, held.w * held.w, keep));
+    // How far the nine rays' mean moved since last frame, as a running root
+    // mean square over as many frames as the light is averaged over.
+    float step = count < 0.5 ? 0.0 : around - held_stats.w;
+    float noise = sqrt(mix(step * step, held.w * held.w, keep));
     imageStore(u_accumulated, ivec3(low, GATHER_META),
-               gather_half(vec4(frames, far, mix(sample_meta.z, held.z, keep), deviation)));
+               gather_half(vec4(frames, far, mix(sample_meta.z, held.z, keep), min(noise, 65000.0))));
+    imageStore(u_accumulated, ivec3(low, GATHER_STATS),
+               gather_half(vec4(recent, (over ? -1.0 : 1.0) * (min(disagreement, 65000.0) + 1e-6),
+                                min(since, SETTLING), around)));
 }

@@ -737,7 +737,9 @@ fn global_illumination(ui: &mut egui::Ui, world: &World, rows: Rows) {
             "Gather history",
             egui::Slider::new(&mut gi.gather_history, 1..=64).suffix(" frames"),
         )
-        .on_hover_text("The most frames a pixel averages: longer is quieter and lags more");
+        .on_hover_text(
+            "The frames a pixel averages where its rays agree: longer is quieter and lags more",
+        );
     }
     if rows.shows("Debug view") {
         use crate::scene::GiDebugView;

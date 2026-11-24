@@ -53,8 +53,10 @@ pub struct GiSettings {
     /// The share of the frame's pixels the gather traces a ray for.
     #[reflect(default)]
     pub gather_resolution: GiGatherResolution,
-    /// The most frames the gather averages a pixel over: the lag a change of
-    /// light shows against the noise it leaves. 1 to 64.
+    /// The frames the gather averages a pixel over where its rays agree: the
+    /// lag a change of light shows against the noise it leaves. Where they
+    /// disagree it averages more, up to 1024, and a light switched on starts
+    /// it again. 1 to 64.
     #[reflect(default = DEFAULT_GATHER_HISTORY)]
     pub gather_history: u32,
     /// A way of looking at the light that bounced rather than at the frame,

@@ -31,9 +31,15 @@ const uint GATHER_HISTORY = 2u;
 
 // Layer 3 of the raw and accumulated images, beside the three of spherical
 // harmonics: x = frames averaged, y = metres to the camera when written,
-// z = how far the rays went, w = how far the light's luminance strays from
-// its mean.
+// z = how far the rays went, w = how far the luminance of the nine rays round
+// the texel moves from one frame to the next.
 const int GATHER_META = 3;
+
+// Layer 4 of the accumulation, for the test of whether a light was switched:
+// x = a short mean of the nine rays' luminance, y = how far it strays, negative
+// where it was over the line last frame, z = frames since the count last
+// restarted, w = the nine rays' luminance last frame.
+const int GATHER_STATS = 4;
 
 // The longest a ray's distance counts for, in metres: past this one open
 // view is as open as another.

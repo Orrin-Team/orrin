@@ -19,8 +19,10 @@
 //! 2. `gi_gather_temporal`: the ray added to a running mean of its surface's,
 //!    found by the prepass's motion and dropped on a disocclusion, with a
 //!    count of the frames in it (Mattausch et al. 2010) capped at
-//!    [`GiSettings::gather_history`]. The ray's light is held to what the
-//!    history says first, so one bright ray does not last a second.
+//!    [`GiSettings::gather_history`] where the rays agree and at up to 1024
+//!    where they do not, and restarted where a light is switched on. No ray's
+//!    light is held back: in a room lit by a patch of sun a few rays meet,
+//!    those few are most of its light.
 //! 3. and 4. `gi_gather_blur_x` and `_y`: a Gaussian along each axis weighted
 //!    by plane, normal and how far the rays went, wider where the history is
 //!    short.
@@ -59,8 +61,8 @@
 //!
 //! # Memory
 //!
-//! At half resolution and 1080p: the raw rays and the two accumulations are
-//! four layers of 960x540 half floats each, 16.6 MB apiece; the two blurs
+//! At half resolution and 1080p: the raw rays are four layers of 960x540 half
+//! floats, 16.6 MB, and the two accumulations five, 20.7 MB apiece; the two blurs
 //! three, 12.4 MB each, which the second level's two take over as each is
 //! done with; and the upscaled harmonics three layers at the full
 //! extent, 49.8 MB. A quarter of that at a quarter resolution, bar the last.
@@ -88,6 +90,9 @@ pub(super) const GATHER_FORMAT: Format = Format::Rgba16Float;
 pub(super) const SH_LAYERS: u32 = 3;
 /// The harmonics' and the fourth.
 pub(super) const META_LAYERS: u32 = 4;
+/// The accumulation's: those four and a fifth, for the test of whether a light
+/// was switched.
+pub(super) const HISTORY_LAYERS: u32 = 5;
 /// Side of every gather pass's workgroup.
 const TILE: u32 = 8;
 /// How many texels apart the blur's second level takes its taps: about the
@@ -482,7 +487,7 @@ fn allocate(device: &Device, extent: [u32; 2]) -> TextureViewId {
         dimension: TextureDimension::D2Array,
         extent: [extent[0], extent[1], 1],
         mip_levels: 1,
-        array_layers: META_LAYERS,
+        array_layers: HISTORY_LAYERS,
         samples: SampleCount::Sample1,
         usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
         memoryless: false,

@@ -1379,7 +1379,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         )
     });
     let gather = gi.filter(|_| gathers).map(|gi| {
-        use super::gi_gather::{GATHER_FORMAT, META_LAYERS, SH_LAYERS};
+        use super::gi_gather::{GATHER_FORMAT, HISTORY_LAYERS, META_LAYERS, SH_LAYERS};
         let prepass = prepass.expect("the final gather reads the geometry prepass");
         let ray = ray.expect("the final gather traces");
         let hits = gi.gather_hits.expect("declared with the volumes");
@@ -1395,13 +1395,13 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // every texel is written.
         let history = builder.import_image(
             "gi_gather_history",
-            low(META_LAYERS),
+            low(HISTORY_LAYERS),
             ImageLayout::ShaderReadOnlyOptimal,
             ImageLayout::ShaderReadOnlyOptimal,
         );
         let accumulated = builder.import_image(
             "gi_gather_accumulated",
-            low(META_LAYERS),
+            low(HISTORY_LAYERS),
             ImageLayout::Undefined,
             ImageLayout::ShaderReadOnlyOptimal,
         );
