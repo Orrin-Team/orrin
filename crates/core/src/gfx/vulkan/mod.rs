@@ -2726,11 +2726,28 @@ impl VulkanRenderer {
         }
         if let (Some(ids), Some(raytrace)) = (self.frame.ids.path, self.raytrace.as_mut()) {
             let extent = self.backend.extent();
+            // The froxel fog's medium, whether or not it is marched: the
+            // analytic tail draws the same air where it is not.
+            let air = if fog.density > 0.0 {
+                [
+                    fog.density,
+                    fog.height_falloff,
+                    fog.height,
+                    fog.anisotropy.clamp(-0.95, 0.95),
+                    fog.albedo.x,
+                    fog.albedo.y,
+                    fog.albedo.z,
+                    0.0,
+                ]
+            } else {
+                [0.0; 8]
+            };
             let sum = raytrace.begin_path(
                 &self.device,
                 extent,
                 camera.position,
                 view.unjittered_view_proj,
+                air,
                 &self.textures,
                 self.prepass.material_sampler(),
             );

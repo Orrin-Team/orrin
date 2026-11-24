@@ -75,8 +75,8 @@ struct GridBuffers {
 pub(super) const TEXTURE_SET: u32 = 3;
 
 /// The path block as the words of its std140 layout: `inv_view_proj`, then
-/// `origin` and `frame`.
-const PATH_WORDS: usize = 16 + 4 + 4;
+/// `origin`, `frame`, `air` and `air_albedo`.
+const PATH_WORDS: usize = 16 + 4 + 4 + 4 + 4;
 
 /// The reference path tracer's own state: what it has summed so far, and for
 /// which view.
@@ -92,6 +92,8 @@ struct PathTracer {
     /// The view those paths were traced through. A different one starts the
     /// sum again: paths through another camera are of another picture.
     view: Mat4,
+    /// The air they crossed, which starts it again for the same reason.
+    air: [f32; 8],
     uniforms: Option<BufferId>,
 }
 
@@ -249,6 +251,7 @@ impl RayTracePass {
             sum: None,
             paths: 0,
             view: Mat4::ZERO,
+            air: [0.0; 8],
             uniforms: None,
         };
         Self {
@@ -371,13 +374,17 @@ impl RayTracePass {
     /// Ready the reference for a frame that draws it: the image its paths are
     /// summed in, at `extent`, and which path of each pixel this frame traces.
     /// Returns that image, for the graph to be handed. After
-    /// [`begin_frame`](Self::begin_frame).
+    /// [`begin_frame`](Self::begin_frame). `air` is the fog's medium the
+    /// camera's rays cross, as `path_trace.comp` lays it out: all zeros for
+    /// none.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn begin_path(
         &mut self,
         device: &Device,
         extent: [u32; 2],
         camera: Vec3,
         unjittered_view_proj: Mat4,
+        air: [f32; 8],
         textures: &[TextureViewId],
         sampler: SamplerId,
     ) -> TextureViewId {
@@ -408,8 +415,9 @@ impl RayTracePass {
             path.sum = Some((sum, extent));
             path.paths = 0;
         }
-        if path.view != unjittered_view_proj {
+        if path.view != unjittered_view_proj || path.air != air {
             path.view = unjittered_view_proj;
+            path.air = air;
             path.paths = 0;
         }
 
@@ -423,6 +431,9 @@ impl RayTracePass {
             *word = float.to_bits();
         }
         words[20] = path.paths;
+        for (word, float) in words[24..].iter_mut().zip(air) {
+            *word = float.to_bits();
+        }
         path.uniforms = Some(device.upload_uniform(&words));
         path.paths = path.paths.saturating_add(1);
         path.sum.expect("made above").0
