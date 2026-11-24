@@ -146,11 +146,12 @@ void main() {
         keep = 0.0;
     }
     for (int layer = 0; layer < 3; ++layer) {
-        imageStore(u_accumulated, ivec3(low, layer), mix(sample_sh[layer], history[layer], keep));
+        imageStore(u_accumulated, ivec3(low, layer),
+                   gather_half(mix(sample_sh[layer], history[layer], keep)));
     }
     // The deviation as a deviation rather than a mean square, which in a
     // physical unit is past what a half float holds.
     float deviation = sqrt(mix(spread * spread, held.w * held.w, keep));
     imageStore(u_accumulated, ivec3(low, GATHER_META),
-               vec4(frames, far, mix(sample_meta.z, held.z, keep), deviation));
+               gather_half(vec4(frames, far, mix(sample_meta.z, held.z, keep), deviation)));
 }
