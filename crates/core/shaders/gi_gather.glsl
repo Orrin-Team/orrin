@@ -9,6 +9,7 @@
 #define ORRIN_GI_GATHER_GLSL
 
 #include "depth.glsl"
+#include "half_float.glsl"
 
 layout(set = 0, binding = ORRIN_GATHER_BLOCK_BINDING, std140) uniform Gather {
     // This frame's, jittered: what the prepass rasterised with.
@@ -69,18 +70,6 @@ vec3 gather_position(ivec2 texel, float depth, ivec2 full) {
 vec3 gather_normal(ivec2 texel) {
     vec3 n = texelFetch(u_normal, texel, 0).xyz * 2.0 - 1.0;
     return normalize(mat3(gather.inv_view) * n);
-}
-
-// The half float nearest `v`, as a float the store converts exactly. A store
-// to a half-float image may truncate (RDNA packs with round-toward-zero), and
-// a running mean truncated every frame settles below its true mean by about
-// as many half units in the last place as it averages frames: three parts in
-// a hundred at a 32-frame history, and seven at 256.
-vec4 gather_half(vec4 v) {
-    ivec4 e;
-    frexp(v, e);
-    vec4 unit = exp2(vec4(max(e, ivec4(-13)) - 11));
-    return clamp(roundEven(v / unit) * unit, vec4(-65504.0), vec4(65504.0));
 }
 
 // How far `other` lies off the plane of the surface at `p` facing `n`, against

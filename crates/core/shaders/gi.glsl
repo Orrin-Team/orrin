@@ -160,13 +160,19 @@ vec2 gi_oct_encode(vec3 n) {
     return e;
 }
 
-// Ray `ray` of `rays`: a spherical Fibonacci set, as even over the sphere as a
-// set of points gets, slid along its axis and turned by this frame's update.
-vec3 gi_ray_direction(uint ray, uint rays) {
+// Ray `ray` of `rays` of the probe in slot `probe` of the grid this frame
+// updates: a spherical Fibonacci set, as even over the sphere as a set of
+// points gets, slid along its axis and turned by this frame's update, and by
+// the probe's own constant share of a step more. `gfx/probes.rs` says why.
+vec3 gi_ray_direction(uint ray, uint rays, uint probe) {
     const float GOLDEN_ANGLE = 2.39996323;
-    float z = 1.0 - 2.0 * (float(ray) + gi.rotation[0].w) / float(rays);
+    uint h = (probe + gi.grid.w * 0x9e3779b9u) * 747796405u + 2891336453u;
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    h ^= h >> 22u;
+    vec2 own = vec2(h & 0xffffu, h >> 16u) * (1.0 / 65536.0);
+    float z = 1.0 - 2.0 * (float(ray) + fract(gi.rotation[0].w + own.x)) / float(rays);
     float r = sqrt(max(0.0, 1.0 - z * z));
-    float phi = float(ray) * GOLDEN_ANGLE;
+    float phi = float(ray) * GOLDEN_ANGLE + own.y * 6.28318531;
     vec3 d = vec3(r * cos(phi), r * sin(phi), z);
     return mat3(gi.rotation[0].xyz, gi.rotation[1].xyz, gi.rotation[2].xyz) * d;
 }

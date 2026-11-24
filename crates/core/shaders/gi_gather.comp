@@ -44,7 +44,7 @@ layout(set = 0, binding = 6, std430) buffer GiCells {
     GiCell gi_cells[];
 };
 // This frame's light in each cell, as the cache's shading left it.
-layout(set = 0, binding = 7, std430) buffer GiRadiance {
+layout(set = 0, binding = 7, std430) readonly buffer GiRadiance {
     uvec2 gi_radiance[];
 };
 layout(set = 0, binding = 8, std430) writeonly buffer GiGatherHits {
@@ -104,12 +104,8 @@ vec4 cached_light(vec3 p, vec3 face, float reach, vec3 direction) {
             continue;
         }
         // A cell shaded at frame zero has never been shaded, and its light
-        // is whatever its slot last held. Whoever claimed it empties that,
-        // since the probes' update reads this half next frame.
+        // is whatever its slot last held until the compaction empties it.
         uint shaded = gi_cells[cell].shaded;
-        if (held == 0u) {
-            gi_radiance[cell] = uvec2(0u);
-        }
         bool stale = shaded == 0u || now - shaded >= RESHADE;
         // Used next frame is listed for shading next frame; used this frame
         // is only kept.

@@ -1,9 +1,10 @@
 #version 460
 
-// One workgroup per probe of the grid this frame updates, one invocation per
+// One workgroup per probe of the grid last frame traced, one invocation per
 // texel of its tile, border included. The probe's rays are read once into
-// shared memory — a hit's light out of the world radiance cache, a miss's out
-// of the sky — and each texel sums them by how far each faces it: the cosine
+// shared memory — a hit's light out of the world radiance cache, as last
+// frame's shading left the cell it landed in, a miss's out of the sky — and
+// each texel sums them by how far each faces it: the cosine
 // for the irradiance, a much sharper lobe for the distance and its square, so
 // a texel's distance is what lies along its own direction (Majercik et al.
 // 2019). A border texel stands for the interior texel across the octahedron's
@@ -23,7 +24,13 @@
 // tile for its history. One bright update cannot: the disagreement takes it
 // in before the test does. Not a test of one update against the mean, which
 // is what a small bright source fails on every update, and the probe then
-// holds whichever update came last — most often the darker.
+// holds whichever update came last — most often the darker. Nor a test of the
+// whole update alone: a sunlit patch one ray in a few thousand meets, on two
+// updates running after a long run without, passes it, and a probe that took
+// those two for its history lit its wall twice over for seconds. A switched
+// light moves the bulk of a probe's rays, and such a patch two of them, so the
+// update less its two brightest rays keeps a long and a short mean of its own,
+// and the light has changed only where those have moved as far, the same way.
 //
 // A probe that sees the backs of surfaces is inside something. It is moved
 // through the nearest back it saw, within its own cell, and left out of the
@@ -39,7 +46,10 @@ layout(local_size_x = 10, local_size_y = 10) in;
 #define ORRIN_GI_PROBES_WRITE
 #include "gi.glsl"
 #include "gi_cache.glsl"
+#include "half_float.glsl"
 
+// Last frame's rays, and its cells as its shading left them: every cell they
+// landed in was shaded before this reads it.
 layout(set = 0, binding = 2, std430) readonly buffer GiRays {
     GiRay gi_rays[];
 };
@@ -112,8 +122,11 @@ const float SETTLED = 4.0;
 // arriving, bounce after bounce, for some updates after. A smaller change to
 // an older probe is left to the blend. Not a shorter history for those: what
 // sets one off is a run of dark updates more often than a run of bright ones,
-// and the probe it shortens follows the dark run.
+// and the probe it shortens follows the dark run. The bulk of the rays, an
+// update less its `OUTLIERS` brightest, must have moved by the same rule and
+// the same way.
 const float SWITCHED = 3.0;
+const uint OUTLIERS = 2u;
 const float RESTARTED = 4.0;
 const float YOUNG = 16.0;
 // A probe's statistics, in the alpha of the first texels of its irradiance
@@ -121,7 +134,8 @@ const float YOUNG = 16.0;
 // last was over the first line; the long and the short mean of an update's
 // luminance; the spread of an update's luminance about the short mean; the
 // noise the blend is chosen by; the last update's luminance, and how far it
-// was from the one before; and the bounce tile's luminance.
+// was from the one before; the bounce tile's luminance; and the long and the
+// short mean of the bulk's.
 //
 // The noise is the largest of late, decaying by `NOISE_DECAY` an update, of
 // the lesser of the last two differences between successive updates. Not the
@@ -132,14 +146,15 @@ const float YOUNG = 16.0;
 // spread's own decay: it falls in a run of updates that miss that source, and
 // a probe that averaged less for it would take the next update that finds it
 // at nearly full weight.
-const uint STATS = 8u;
+const uint STATS = 10u;
 const float STRUCK = 512.0;
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 // xyz = the ray's direction, w = how far it saw, in spacings.
 shared vec4 s_ray[MAX_RAYS];
-// rgb = the light it brought back, a = 1 where that is known.
+// rgb = the light it brought back, a = 1 where that is known, 0 where it
+// counts for nothing and -1 for a front the cache had no light for.
 shared vec4 s_light[MAX_RAYS];
 shared uint s_kind[MAX_RAYS];
 shared float s_stats[STATS];
@@ -175,7 +190,7 @@ void main() {
 
     if (t < rays) {
         GiRay ray = gi_rays[probe * rays + t];
-        vec3 direction = gi_ray_direction(t, rays);
+        vec3 direction = gi_ray_direction(t, rays, probe);
         vec3 light = vec3(0.0);
         float known = 1.0;
         float seen = REACH;
@@ -189,7 +204,7 @@ void main() {
                 if (blue.y > 0.0) {
                     light = vec3(unpackHalf2x16(packed.x), blue.x);
                 } else {
-                    known = 0.0;
+                    known = -1.0;
                 }
             }
         }
@@ -209,10 +224,45 @@ void main() {
         vec3 front_direction = vec3(0.0);
         float farthest_front = 0.0;
         vec3 far_direction = vec3(0.0);
+
+        // A front the cache had no light for — its cell could not be filed,
+        // or its ray not found again — takes the mean of the fronts it had
+        // light for. Left out, the rest would be renormalised over it, and a
+        // probe in a room whose walls are unlit would be lit by its windows'
+        // sky alone; counted dark, the room would lose light it has. A probe
+        // with no front the cache can answer for has nothing to take, and
+        // skips the update.
+        vec3 fronts = vec3(0.0);
+        uint answered = 0u;
+        uint unanswered = 0u;
+        for (uint i = 0u; i < rays; ++i) {
+            if (s_light[i].a < 0.0) {
+                unanswered += 1u;
+            } else if (s_kind[i] == GI_FRONT) {
+                fronts += s_light[i].rgb;
+                answered += 1u;
+            }
+        }
+        if (unanswered > 0u) {
+            vec4 stand_in = answered > 0u ? vec4(fronts / float(answered), 1.0) : vec4(0.0);
+            for (uint i = 0u; i < rays; ++i) {
+                if (s_light[i].a < 0.0) {
+                    s_light[i] = stand_in;
+                } else if (answered == 0u) {
+                    s_light[i].a = 0.0;
+                }
+            }
+        }
+
+        float first = 0.0;
+        float second = 0.0;
         for (uint i = 0u; i < rays; ++i) {
             if (s_light[i].a > 0.0) {
-                now += dot(s_light[i].rgb, LUMA);
+                float l = dot(s_light[i].rgb, LUMA);
+                now += l;
                 known += 1u;
+                second = max(second, min(first, l));
+                first = max(first, l);
             }
             float seen = s_ray[i].w;
             if (s_kind[i] == GI_BACK) {
@@ -232,7 +282,9 @@ void main() {
                 }
             }
         }
+        float bulk = known > OUTLIERS ? (now - first - second) / float(known - OUTLIERS) : 0.0;
         now = known > 0u ? now / float(known) : 0.0;
+        bulk = known > OUTLIERS ? bulk : now;
 
         // In spacings until it is stored.
         float s = gi_spacing(level);
@@ -269,6 +321,8 @@ void main() {
         float last = s_stats[5];
         float step = s_stats[6];
         float quick = s_stats[7];
+        float bulk_mean = s_stats[8];
+        float bulk_recent = s_stats[9];
         float capped = min(averaged, float(MAX_COUNT));
         float keep_distance = min(gi.params.x, capped / (capped + 1.0));
         float keep = keep_distance;
@@ -280,6 +334,8 @@ void main() {
                 mean = now;
                 recent = now;
                 quick = now;
+                bulk_mean = bulk;
+                bulk_recent = bulk;
                 spread = 0.0;
                 noise = 0.0;
                 step = 0.0;
@@ -292,6 +348,7 @@ void main() {
                 least = clamp(least, 1.0 / LONGEST, FASTEST);
                 float delta = now - recent;
                 recent += SHORT * delta;
+                bulk_recent += SHORT * (bulk - bulk_recent);
                 quick = mix(now, quick, keep_bounce);
                 spread = sqrt(mix(spread * spread, delta * (now - recent), SPREAD));
                 noise = max(min(abs(now - last), step), noise * NOISE_DECAY);
@@ -301,14 +358,21 @@ void main() {
                 bool far = averaged >= SETTLED && apart > CHANGED_LEAST * max(mean, recent);
                 over = far && apart > STRIKE * error;
                 bool switched = averaged < YOUNG || recent > SWITCHED * mean || SWITCHED * recent < mean;
-                copy = struck && far && switched && apart > CHANGED * error;
+                float bulk_apart = bulk_recent - bulk_mean;
+                bool bulk_moved = bulk_apart * (recent - mean) > 0.0
+                               && abs(bulk_apart) > CHANGED_LEAST * max(bulk_mean, bulk_recent)
+                               && (averaged < YOUNG || bulk_recent > SWITCHED * bulk_mean
+                                   || SWITCHED * bulk_recent < bulk_mean);
+                copy = struck && far && switched && bulk_moved && apart > CHANGED * error;
                 if (copy) {
                     mean = quick;
+                    bulk_mean = bulk_recent;
                     averaged = RESTARTED;
                     over = false;
                 } else {
                     keep = 1.0 - max(1.0 / (averaged + 1.0), least);
                     mean = mix(now, mean, keep);
+                    bulk_mean = mix(bulk, bulk_mean, keep);
                 }
             }
             averaged = min(averaged + 1.0, LONGEST);
@@ -328,6 +392,8 @@ void main() {
         s_stats[5] = known > 0u ? now : last;
         s_stats[6] = min(step, 65000.0);
         s_stats[7] = quick;
+        s_stats[8] = bulk_mean;
+        s_stats[9] = bulk_recent;
         s_keep = vec3(keep, keep_distance, keep_bounce);
         s_restart = copy;
         s_state = uvec4(floatBitsToUint(offset * s),
@@ -385,9 +451,9 @@ void main() {
         vec3 now = vec3(moments / moment_weight, pow(nearest / moment_weight, -0.25));
         distance = mix(now, held_distance, s_keep.y);
     }
-    imageStore(u_irradiance, texel, vec4(result, t < STATS ? s_stats[t] : 0.0));
-    imageStore(u_distance, texel, vec4(distance, 1.0));
-    imageStore(u_bounce, texel, vec4(bounce, 1.0));
+    imageStore(u_irradiance, texel, half_nearest(vec4(result, t < STATS ? s_stats[t] : 0.0)));
+    imageStore(u_distance, texel, half_nearest(vec4(distance, 1.0)));
+    imageStore(u_bounce, texel, half_nearest(vec4(bounce, 1.0)));
 
     if (t == 0u) {
         gi_probes[row] = s_state;

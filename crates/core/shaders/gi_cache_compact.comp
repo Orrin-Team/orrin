@@ -5,7 +5,8 @@
 // for longer than its lifetime is emptied, which is how the table follows
 // the camera without being rebuilt; and every live cell carries its light
 // into this frame's half of the pair, where the shading pass averages a
-// listed cell's new light into it.
+// listed cell's new light into it. A cell never shaded carries none: what its
+// slot holds is whatever the cell that last had the slot left.
 //
 // The dispatch is counted as the list grows, one workgroup for every 64th
 // entry, so the shading pass needs no pass between to size it.
@@ -59,5 +60,5 @@ void main() {
             atomicAdd(gi_args.x, 1u);
         }
     }
-    gi_radiance[cell] = gi_radiance_history[cell];
+    gi_radiance[cell] = held.shaded == 0u ? uvec2(0u) : gi_radiance_history[cell];
 }

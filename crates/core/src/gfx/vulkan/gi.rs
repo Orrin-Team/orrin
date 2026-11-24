@@ -13,17 +13,17 @@
 //!
 //! Four dispatches, at the head of the frame, behind the scene's build:
 //!
-//! 1. `gi_trace`: every probe of the grid this frame updates traces its rays.
+//! 1. `gi_update`: each probe of the grid last frame traced has its tile
+//!    blended toward what its rays brought back — a hit's light read out of
+//!    the cache by the cell the trace filed it under, a miss's from the sky.
+//! 2. `gi_trace`: every probe of the grid this frame updates traces its rays.
 //!    Only what each ray met is recorded — where, how far, front or back — and
 //!    a front hit is filed in the cache under the cell it landed in, marking
 //!    the cell used.
-//! 2. `gi_cache_compact`: one look at every cell. Used this frame, it goes on
+//! 3. `gi_cache_compact`: one look at every cell. Used this frame, it goes on
 //!    a list, counted into the next dispatch's arguments as it grows; unused
 //!    for [`LIFETIME`] frames, it is emptied, which is how the table follows
 //!    the camera with no rebuild; otherwise its light is carried forward.
-//! 3. `gi_update`: each probe's tile blended toward what its rays brought
-//!    back — a hit's light read out of the cache by the cell the trace filed
-//!    it under, a miss's from the sky.
 //! 4. `gi_cache_shade`: each listed cell shaded once, with the hit shading
 //!    every traced pass runs, from where the lowest-numbered ray that used it
 //!    landed. Its bounce light comes from the volumes the update just wrote,
@@ -40,9 +40,14 @@
 //! The update reads the cache's light and the shading writes it, while the
 //! shading reads the volumes and the update writes them: a cycle within the
 //! frame. So the cache's light is a pair that swaps each frame, like the
-//! occlusion pyramids, and the shading comes last: a cell shaded this frame
-//! reaches the probes at their next update. A cell first used this frame has
-//! no light yet, and its rays are left out of that update.
+//! occlusion pyramids, and so are the rays: the update takes in last frame's
+//! rays from the half last frame's shading wrote, in which every cell they
+//! landed in has been shaded. Not this frame's rays from last frame's cells:
+//! a cell first used this frame has no light yet, and a probe in a room whose
+//! walls are new to the cache would be lit by its windows' sky alone, until a
+//! history of hundreds of updates forgot it. A ray the cache could not answer
+//! even so — no room in the table, or its hit not found again — takes the
+//! mean of its probe's others.
 //!
 //! # The cache
 //!
@@ -62,11 +67,11 @@
 //!
 //! # Memory
 //!
-//! At sixteen probes a side: the three atlases 59 MB, the rays 8.4 MB, the
-//! cache 8.4 MB, the gather's hits beside it 8.4 MB and its list 1 MB, the
-//! probes' state 0.4 MB. Twelve a side takes the atlases to 25 MB and the rays
-//! to 3.5 MB. All of it is made when the volumes first go live and let go when
-//! they stop.
+//! At sixteen probes a side: the three atlases 59 MB, the two frames' rays
+//! 16.8 MB, the cache 8.4 MB, the gather's hits beside it 8.4 MB and its list
+//! 1 MB, the probes' state 0.4 MB. Twelve a side takes the atlases to 25 MB
+//! and the rays to 7.1 MB. All of it is made when the volumes first go live
+//! and let go when they stop.
 //!
 //! Off — on a device that cannot trace, or with the setting off — every pass
 //! that reads the volumes binds inert stand-ins whose block says so, and
@@ -181,7 +186,9 @@ struct Volumes {
     distance: TextureViewId,
     bounce: TextureViewId,
     states: BufferId,
-    rays: BufferId,
+    /// What each probe ray met, ping-ponged: the update reads last frame's
+    /// while the trace writes this frame's.
+    rays: [BufferId; 2],
 }
 
 /// The radiance cache.
@@ -221,6 +228,11 @@ pub struct GiPass {
     rays: u32,
     /// This frame's block, while the volumes are live.
     block: Option<BufferId>,
+    /// This frame's block as it was, for next frame's update of its rays.
+    traced: Option<GpuGi>,
+    /// Last frame's block, uploaded again for this frame's update; `None`
+    /// on the first frame the volumes are live, which has no rays to take in.
+    previous: Option<BufferId>,
     /// The final gather, which reads and claims the cache.
     pub(super) gather: GatherPass,
 }
@@ -281,6 +293,8 @@ impl GiPass {
             frame: 0,
             rays: 0,
             block: None,
+            traced: None,
+            previous: None,
             gather: GatherPass::new(device),
         }
     }
@@ -356,6 +370,10 @@ impl GiPass {
             sky: sky.map(|c| [c.x, c.y, c.z, 0.0]),
         };
         self.block = Some(device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&block)));
+        self.previous = self
+            .traced
+            .replace(block)
+            .map(|last| device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&last)));
     }
 
     /// What a shader that reads the volumes binds this frame: the volumes
@@ -423,12 +441,16 @@ impl GiPass {
 
     fn release(&mut self, device: &Device) {
         self.block = None;
+        self.traced = None;
+        self.previous = None;
         if let Some(volumes) = self.volumes.take() {
             device.destroy_texture(volumes.irradiance);
             device.destroy_texture(volumes.distance);
             device.destroy_texture(volumes.bounce);
             device.destroy_buffer(volumes.states);
-            device.destroy_buffer(volumes.rays);
+            for buffer in volumes.rays {
+                device.destroy_buffer(buffer);
+            }
         }
         if let Some(cache) = self.cache.take() {
             for buffer in [cache.cells, cache.list, cache.args, cache.hits]
@@ -458,6 +480,12 @@ impl GiPass {
         (cache.radiance[1 - this], cache.radiance[this])
     }
 
+    /// Last frame's rays, and this frame's.
+    fn rays(&self, volumes: &Volumes) -> (BufferId, BufferId) {
+        let this = (self.frame & 1) as usize;
+        (volumes.rays[1 - this], volumes.rays[this])
+    }
+
     fn textures(&self) -> [BindGroupId; 2] {
         self.textures
             .expect("the volumes were recorded before prepare")
@@ -465,17 +493,16 @@ impl GiPass {
 
     pub(super) fn record_trace(&self, device: &Device, encoder: &mut Encoder, rays: &RayFrame<'_>) {
         let (pipelines, volumes, cache, block) = self.live();
-        let (history, _) = self.radiance(cache);
+        let (_, traced) = self.rays(volumes);
         let pipeline = pipelines.trace;
         let set = device.create_transient_bind_group(
             pipeline,
             0,
             &[
-                storage(0, volumes.rays),
+                storage(0, traced),
                 storage(1, cache.cells),
-                storage(2, history),
-                storage(3, cache.list),
-                storage(4, cache.args),
+                storage(2, cache.list),
+                storage(3, cache.args),
             ],
         );
         // Where each probe stands, and nothing else of the volumes.
@@ -533,9 +560,15 @@ impl GiPass {
         encoder.dispatch([CELLS / GROUP, 1, 1]);
     }
 
+    /// Last frame's rays taken into the probes it traced them for, by last
+    /// frame's block: nothing on the first frame the volumes are live.
     pub(super) fn record_update(&self, device: &Device, encoder: &mut Encoder) {
-        let (pipelines, volumes, cache, block) = self.live();
+        let (pipelines, volumes, cache, _) = self.live();
+        let Some(block) = self.previous else {
+            return;
+        };
         let (history, _) = self.radiance(cache);
+        let (traced, _) = self.rays(volumes);
         let set = device.create_transient_bind_group(
             pipelines.update,
             0,
@@ -545,7 +578,7 @@ impl GiPass {
                     resource: BindingResource::UniformBuffer(block),
                 },
                 storage(1, volumes.states),
-                storage(2, volumes.rays),
+                storage(2, traced),
                 storage(3, history),
                 Binding {
                     binding: 4,
@@ -569,13 +602,14 @@ impl GiPass {
     pub(super) fn record_shade(&self, device: &Device, encoder: &mut Encoder, rays: &RayFrame<'_>) {
         let (pipelines, volumes, cache, _) = self.live();
         let (_, radiance) = self.radiance(cache);
+        let (_, traced) = self.rays(volumes);
         let pipeline = pipelines.shade;
         let set = device.create_transient_bind_group(
             pipeline,
             0,
             &[
                 storage(0, cache.cells),
-                storage(1, volumes.rays),
+                storage(1, traced),
                 storage(2, radiance),
                 storage(3, cache.list),
                 storage(4, cache.hits),
@@ -666,10 +700,12 @@ fn allocate_volumes(device: &Device, probes: u32, spacing: f32) -> Volumes {
             &vec![0; (count * CASCADES as u32 * 4) as usize],
         ),
         // A ray is a `vec4` and a `uvec4`.
-        rays: device.create_buffer(BufferDesc {
-            size: u64::from(count * MAX_RAYS) * 32,
-            usage: BufferUsage::STORAGE_BUFFER,
-            location: MemoryLocation::GpuOnly,
+        rays: [(); 2].map(|_| {
+            device.create_buffer(BufferDesc {
+                size: u64::from(count * MAX_RAYS) * 32,
+                usage: BufferUsage::STORAGE_BUFFER,
+                location: MemoryLocation::GpuOnly,
+            })
         }),
     }
 }

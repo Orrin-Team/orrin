@@ -104,6 +104,13 @@ const WIDE_STRIDE: u32 = 3;
 /// matrices, then `camera`, `previous_camera` and `params`.
 const BLOCK_WORDS: usize = 3 * 16 + 3 * 4;
 const LIT: u32 = 1;
+/// Frames the gather runs before it reads last frame's lit colour. The first
+/// frames of a scene, or of the gather, are lit before what the gather
+/// settles on — a shadow map not yet drawn, a bloom or fog not yet warmed,
+/// the flat sky — and the light a texel's history starts from lasts as long
+/// as its history does: in an aisle lit through its arches, a thousand
+/// frames. Read from the cache instead, which starts dark and is risen from.
+const LIT_AFTER: u32 = 8;
 const HISTORY: u32 = 2;
 
 /// The world radiance cache as the gather reads and claims it.
@@ -150,6 +157,8 @@ pub struct GatherPass {
     previous_camera: Option<Vec3>,
     /// Whether the accumulation holds a frame to build on.
     trusted: bool,
+    /// Frames the gather has run in a row, up to [`LIT_AFTER`].
+    running: u32,
     block: Option<BufferId>,
     linear: SamplerId,
     /// What the forward pass binds where the gather did not run, and the
@@ -187,6 +196,7 @@ impl GatherPass {
             frame: 0,
             previous_camera: None,
             trusted: false,
+            running: 0,
             block: None,
             linear,
             stand_in,
@@ -196,7 +206,8 @@ impl GatherPass {
 
     /// Ready this frame's gather, at `1 >> shift` of `extent` each way, or let
     /// its history go where `shift` is `None`. `lit` is whether last frame's
-    /// lit colour can be read. Before anything records. Returns the two
+    /// lit colour can be read, which the gather does once it has run
+    /// [`LIT_AFTER`] frames in a row. Before anything records. Returns the two
     /// accumulations, last frame's then this frame's, for the graph to be
     /// handed.
     #[allow(clippy::too_many_arguments)]
@@ -237,6 +248,7 @@ impl GatherPass {
             });
         }
         let trusted = std::mem::replace(&mut self.trusted, true);
+        self.running = (self.running + 1).min(LIT_AFTER);
         self.frame = self.frame.wrapping_add(1);
 
         let settings = settings.held();
@@ -268,7 +280,11 @@ impl GatherPass {
         words[BLOCK_WORDS - 4..].copy_from_slice(&[
             shift,
             self.frame,
-            if lit { LIT } else { 0 } | history_flag,
+            if lit && self.running >= LIT_AFTER {
+                LIT
+            } else {
+                0
+            } | history_flag,
             0,
         ]);
         self.block = Some(device.upload_uniform(&words));
@@ -319,6 +335,7 @@ impl GatherPass {
             }
         }
         self.trusted = false;
+        self.running = 0;
     }
 
     fn live(&self) -> (&Pipelines, BufferId) {

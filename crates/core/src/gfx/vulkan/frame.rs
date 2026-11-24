@@ -495,8 +495,10 @@ pub struct GiIds {
     /// Each probe's offset, whether it is inside geometry, and the coordinate
     /// it was last written for.
     pub probes: ResourceId,
-    /// What each ray of this frame's update met.
+    /// What each ray this frame traces met, and what each ray last frame
+    /// traced met, which this frame's update takes in.
     pub rays: ResourceId,
+    pub rays_previous: ResourceId,
     /// The cache's table, and the list of its cells to shade with the
     /// dispatch that covers them.
     pub cells: ResourceId,
@@ -519,6 +521,7 @@ impl GiIds {
         [
             self.probes,
             self.rays,
+            self.rays_previous,
             self.cells,
             self.list,
             self.args,
@@ -1008,16 +1011,16 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // Right behind the scene's build, because nothing here reads anything the
     // frame rasterises: the volumes are the world's, not the view's, and every
     // pass that lights a surface reads them. Four nodes for four steps that
-    // each need the last finished on the device: the rays, the cache's list
-    // of what they hit, the probes, and the cells shaded for the next update.
+    // each need the last finished on the device: the probes, the rays, the
+    // cache's list of what they hit, and those cells shaded.
     //
     // The order the cache imposes is the one place this frame reads before it
     // writes. The shading reads the volumes, for the light that bounced, and
     // the update writes them; the update reads the cache's light, and the
-    // shading writes it. So the shading runs last and writes the other half of
-    // a pair the update read from — the cycle the occlusion pyramids break the
-    // same way — and the light a cell is shaded with this frame reaches the
-    // probes at their next update.
+    // shading writes it. The update reads it for every cell its rays landed in
+    // shaded, so it takes in last frame's rays, from the half of the pair last
+    // frame's shading wrote, and runs first — the cycle the occlusion pyramids
+    // break the same way, with the rays as a pair as well.
     let gi = ray.filter(|_| config.gi_probes > 0).map(|ray| {
         let atlas = || {
             ImageDesc::new(super::gi::ATLAS_FORMAT).extent(Extent::Fixed(
@@ -1050,6 +1053,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             bounce,
             probes: builder.import_buffer("gi_probes"),
             rays: builder.import_buffer("gi_rays"),
+            rays_previous: builder.import_buffer("gi_rays_previous"),
             cells: builder.import_buffer("gi_cells"),
             list: builder.import_buffer("gi_list"),
             args: builder.import_buffer("gi_args"),
@@ -1058,17 +1062,25 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             gather_hits: gathers.then(|| builder.import_buffer("gi_gather_hits")),
         };
 
-        // The probes' state is only read here, for where each stands, but
-        // declared written: the update writes it after this pass reads it,
-        // and a read would be ordered after every write. The list and its
-        // dispatch are emptied here, ahead of the pass that fills them.
+        let id = builder
+            .pass("gi_update", PassKind::Compute)
+            .access(ids.probes, Access::StorageWrite)
+            .access(ids.rays_previous, Access::StorageRead)
+            .access(ids.radiance_history, Access::StorageRead)
+            .access(irradiance, Access::StorageWrite)
+            .access(distance, Access::StorageWrite)
+            .access(bounce, Access::StorageWrite)
+            .build();
+        record(id, PassBody::GiUpdate, &mut bodies);
+
+        // The list and its dispatch are emptied here, ahead of the pass that
+        // fills them.
         let id = builder
             .pass("gi_trace", PassKind::Compute)
             .access(ray.scene, Access::AccelerationStructureRead)
-            .access(ids.probes, Access::StorageWrite)
+            .access(ids.probes, Access::StorageRead)
             .access(ids.rays, Access::StorageWrite)
             .access(ids.cells, Access::StorageWrite)
-            .access(ids.radiance_history, Access::StorageWrite)
             .access(ids.list, Access::StorageWrite)
             .access(ids.args, Access::StorageWrite)
             .build();
@@ -1083,17 +1095,6 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(ids.args, Access::StorageWrite)
             .build();
         record(id, PassBody::GiCacheCompact, &mut bodies);
-
-        let id = builder
-            .pass("gi_update", PassKind::Compute)
-            .access(ids.probes, Access::StorageWrite)
-            .access(ids.rays, Access::StorageRead)
-            .access(ids.radiance_history, Access::StorageRead)
-            .access(irradiance, Access::StorageWrite)
-            .access(distance, Access::StorageWrite)
-            .access(bounce, Access::StorageWrite)
-            .build();
-        record(id, PassBody::GiUpdate, &mut bodies);
 
         let mut shade = builder
             .pass("gi_cache_shade", PassKind::Compute)
@@ -1414,8 +1415,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             ImageDesc::new(GATHER_FORMAT).array_layers(SH_LAYERS),
         );
 
-        // The cache's cells and this frame's light are written: a cell a ray
-        // lands in is claimed, and a claimed cell's light emptied.
+        // The cache's cells are written: a cell a ray lands in is claimed.
         let mut pass = builder
             .pass("gi_gather", PassKind::Compute)
             .access(ray.scene, Access::AccelerationStructureRead)
@@ -1427,7 +1427,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         }
         let id = reads_gi(pass, Some(gi))
             .access(gi.cells, Access::StorageWrite)
-            .access(gi.radiance, Access::StorageWrite)
+            .access(gi.radiance, Access::StorageRead)
             .access(hits, Access::StorageWrite)
             .access(raw, Access::StorageWrite)
             .build();

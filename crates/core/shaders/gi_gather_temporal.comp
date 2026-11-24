@@ -223,15 +223,15 @@ void main() {
     vec4 mixed[3];
     for (int layer = 0; layer < 3; ++layer) {
         mixed[layer] = mix(sample_sh[layer], history[layer], keep);
-        imageStore(u_accumulated, ivec3(low, layer), gather_half(mixed[layer]));
+        imageStore(u_accumulated, ivec3(low, layer), half_nearest(mixed[layer]));
     }
     // How far the nine rays' mean moved since last frame, as a running root
     // mean square over as many frames as the light is averaged over.
     float step = count < 0.5 ? 0.0 : around - held_stats.w;
     float noise = sqrt(mix(step * step, held.w * held.w, keep));
     imageStore(u_accumulated, ivec3(low, GATHER_META),
-               gather_half(vec4(frames, far, mix(sample_meta.z, held.z, keep), min(noise, 65000.0))));
+               half_nearest(vec4(frames, far, mix(sample_meta.z, held.z, keep), min(noise, 65000.0))));
     imageStore(u_accumulated, ivec3(low, GATHER_STATS),
-               gather_half(vec4(recent, (over ? -1.0 : 1.0) * (min(disagreement, 65000.0) + 1e-6),
+               half_nearest(vec4(recent, (over ? -1.0 : 1.0) * (min(disagreement, 65000.0) + 1e-6),
                                 min(since, SETTLING), around)));
 }

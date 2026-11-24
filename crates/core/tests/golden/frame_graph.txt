@@ -4778,18 +4778,27 @@
   ! ray_meshes src AccelerationStructureBuild/AccelerationStructureWrite dst AccelerationStructureBuild/AccelerationStructureRead
      ray_meshes AccelerationStructureInput
      ray_scene AccelerationStructureBuild
-04 pass gi_trace [Compute]
-  ! ray_scene src AccelerationStructureBuild/AccelerationStructureWrite dst VertexShader|FragmentShader|ComputeShader/AccelerationStructureRead
-     ray_scene AccelerationStructureRead
+04 pass gi_update [Compute]
+  ! gi_irradiance ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! gi_distance ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! gi_bounce ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      gi_probes StorageWrite
+     gi_rays_previous StorageRead
+     gi_radiance_history StorageRead
+     gi_irradiance StorageWrite
+     gi_distance StorageWrite
+     gi_bounce StorageWrite
+05 pass gi_trace [Compute]
+  ! ray_scene src AccelerationStructureBuild/AccelerationStructureWrite dst VertexShader|FragmentShader|ComputeShader/AccelerationStructureRead
+  ! gi_probes src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
+     ray_scene AccelerationStructureRead
+     gi_probes StorageRead
      gi_rays StorageWrite
      gi_cells StorageWrite
-     gi_radiance_history StorageWrite
      gi_list StorageWrite
      gi_args StorageWrite
-05 pass gi_cache_compact [Compute]
+06 pass gi_cache_compact [Compute]
   ! gi_cells src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-  ! gi_radiance_history src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! gi_list src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
   ! gi_args src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      gi_cells StorageWrite
@@ -4797,23 +4806,11 @@
      gi_radiance StorageWrite
      gi_list StorageWrite
      gi_args StorageWrite
-06 pass gi_update [Compute]
-  ! gi_probes src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-  ! gi_rays src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
-  ! gi_irradiance ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-  ! gi_distance ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-  ! gi_bounce ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-     gi_probes StorageWrite
-     gi_rays StorageRead
-     gi_radiance_history StorageRead
-     gi_irradiance StorageWrite
-     gi_distance StorageWrite
-     gi_bounce StorageWrite
 07 pass gi_cache_shade [Compute]
   ! gi_args src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
   ! gi_list src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! gi_cells src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-  ! gi_probes src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
+  ! gi_rays src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! gi_bounce General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! gi_distance General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! gi_radiance src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
@@ -5020,18 +5017,27 @@
   ! ray_meshes src AccelerationStructureBuild/AccelerationStructureWrite dst AccelerationStructureBuild/AccelerationStructureRead
      ray_meshes AccelerationStructureInput
      ray_scene AccelerationStructureBuild
-04 pass gi_trace [Compute]
-  ! ray_scene src AccelerationStructureBuild/AccelerationStructureWrite dst VertexShader|FragmentShader|ComputeShader/AccelerationStructureRead
-     ray_scene AccelerationStructureRead
+04 pass gi_update [Compute]
+  ! gi_irradiance ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! gi_distance ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! gi_bounce ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      gi_probes StorageWrite
+     gi_rays_previous StorageRead
+     gi_radiance_history StorageRead
+     gi_irradiance StorageWrite
+     gi_distance StorageWrite
+     gi_bounce StorageWrite
+05 pass gi_trace [Compute]
+  ! ray_scene src AccelerationStructureBuild/AccelerationStructureWrite dst VertexShader|FragmentShader|ComputeShader/AccelerationStructureRead
+  ! gi_probes src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
+     ray_scene AccelerationStructureRead
+     gi_probes StorageRead
      gi_rays StorageWrite
      gi_cells StorageWrite
-     gi_radiance_history StorageWrite
      gi_list StorageWrite
      gi_args StorageWrite
-05 pass gi_cache_compact [Compute]
+06 pass gi_cache_compact [Compute]
   ! gi_cells src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-  ! gi_radiance_history src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! gi_list src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
   ! gi_args src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      gi_cells StorageWrite
@@ -5039,23 +5045,11 @@
      gi_radiance StorageWrite
      gi_list StorageWrite
      gi_args StorageWrite
-06 pass gi_update [Compute]
-  ! gi_probes src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-  ! gi_rays src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
-  ! gi_irradiance ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-  ! gi_distance ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-  ! gi_bounce ShaderReadOnlyOptimal->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-     gi_probes StorageWrite
-     gi_rays StorageRead
-     gi_radiance_history StorageRead
-     gi_irradiance StorageWrite
-     gi_distance StorageWrite
-     gi_bounce StorageWrite
 07 pass gi_cache_shade [Compute]
   ! gi_args src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst DrawIndirect/IndirectCommandRead
   ! gi_list src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! gi_cells src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-  ! gi_probes src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
+  ! gi_rays src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! gi_bounce General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! gi_distance General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! gi_radiance src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
@@ -5100,7 +5094,7 @@
   ! prepass_velocity ColorAttachmentOptimal->ShaderReadOnlyOptimal src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! gi_irradiance General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! gi_cells src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
-  ! gi_radiance src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+  ! gi_radiance src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
   ! gi_gather_hits src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
   ! gi_gather_raw Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      ray_scene AccelerationStructureRead
@@ -5112,7 +5106,7 @@
      gi_distance Sampled
      gi_probes StorageRead
      gi_cells StorageWrite
-     gi_radiance StorageWrite
+     gi_radiance StorageRead
      gi_gather_hits StorageWrite
      gi_gather_raw StorageWrite
 12 pass gi_gather_temporal [Compute]

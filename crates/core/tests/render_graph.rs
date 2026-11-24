@@ -2896,11 +2896,12 @@ fn the_path_traced_reference_is_shown_at_the_exposure_of_the_frame_it_replaces()
 }
 
 /// The irradiance volumes' four passes run in the one order the cache
-/// allows — the rays, the cache's list, the probes, then the cells shaded for
-/// the next update — and each waits for the last on the device: the update
-/// for the trace's rays, the shading's dispatch for the list's count. Every
-/// pass that lights a surface reads the volumes after their update, and the
-/// frame is not split, since the shading reads the scene's own textures.
+/// allows — the probes, from last frame's rays and cells, then this frame's
+/// rays, the cache's list, and the cells shaded — and each waits for the last
+/// on the device: the shading for the update's volumes, its dispatch for the
+/// list's count. Every pass that lights a surface reads the volumes after
+/// their update, and the frame is not split, since the shading reads the
+/// scene's own textures.
 #[test]
 fn the_irradiance_volumes_are_updated_before_anything_lights_with_them() {
     let frame = declare(FrameConfig {
@@ -2933,9 +2934,9 @@ fn the_irradiance_volumes_are_updated_before_anything_lights_with_them() {
             .unwrap_or_else(|| panic!("{name} was not scheduled:\n{order:?}"))
     };
     assert!(at("ray_scene") < at("gi_trace"), "{order:?}");
+    assert!(at("gi_update") < at("gi_trace"), "{order:?}");
     assert!(at("gi_trace") < at("gi_cache_compact"), "{order:?}");
-    assert!(at("gi_cache_compact") < at("gi_update"), "{order:?}");
-    assert!(at("gi_update") < at("gi_cache_shade"), "{order:?}");
+    assert!(at("gi_cache_compact") < at("gi_cache_shade"), "{order:?}");
     for reader in [
         "forward",
         "oit_accumulate",

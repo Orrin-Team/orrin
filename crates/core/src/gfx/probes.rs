@@ -54,7 +54,11 @@
 //! set of directions, and it converges on the light round it. Rotations drawn
 //! at random each update leave the history wandering about that light by as
 //! much as one update's error over the square root of the updates it holds,
-//! which is a slow, visible pulse where a few rays find a sunlit floor.
+//! which is a slow, visible pulse where a few rays find a sunlit floor. Each
+//! probe starts the sequence at a place of its own (`gi_ray_direction`), a
+//! constant offset that keeps its updates as evenly spread: with one set of
+//! directions for the whole grid, the probes along a wall meet the same
+//! sunlit patches on the same update, and the wall's light jumps with them.
 //!
 //! `slot`, `probe_index`, `tile` and `stamp` here and their `gi_` twins in
 //! `gi.glsl` are a lock-step pair, as are the constants.

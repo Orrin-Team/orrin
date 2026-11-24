@@ -3,10 +3,10 @@
 #extension GL_EXT_nonuniform_qualifier : require
 
 // Every probe of the grid this frame updates traces its fixed set of rays,
-// turned by this frame's rotation, and asks only what each one met and how
+// turned by this frame's rotation and its own offset, and asks only what each one met and how
 // far away. Nothing is shaded here: a ray that lands on a surface files the
-// hit in the world radiance cache and leaves the cell's number for the update,
-// which reads the light there once the cache has it.
+// hit in the world radiance cache and leaves the cell's number for next
+// frame's update, which reads the light this frame's shading gives the cell.
 //
 // A hit on the back of a surface is told apart, because a probe that sees
 // backs is inside something and the update moves it or switches it off.
@@ -22,18 +22,13 @@ layout(set = 0, binding = 0, std430) writeonly buffer GiRays {
 layout(set = 0, binding = 1, std430) buffer GiCells {
     GiCell gi_cells[];
 };
-// Last frame's light in each cell, as the update reads it: the trace marks
-// a cell it has just claimed as holding none yet.
-layout(set = 0, binding = 2, std430) writeonly buffer GiRadianceHistory {
-    uvec2 gi_radiance_history[];
-};
 // The list of cells to shade, and its dispatch: emptied here, before the pass
 // that fills them.
-layout(set = 0, binding = 3, std430) buffer GiList {
+layout(set = 0, binding = 2, std430) buffer GiList {
     uint gi_list_count;
     uint gi_list[];
 };
-layout(set = 0, binding = 4, std430) buffer GiArgs {
+layout(set = 0, binding = 3, std430) buffer GiArgs {
     uvec4 gi_args;
 };
 
@@ -50,9 +45,6 @@ uint gi_cache_insert(vec3 P, vec3 N, float reach, uint ray) {
         uint cell = (home + i) & mask;
         uint held = atomicCompSwap(gi_cells[cell].checksum, 0u, checksum);
         if (held == 0u || held == checksum) {
-            if (held == 0u) {
-                gi_radiance_history[cell] = uvec2(0u);
-            }
             gi_cells[cell].used = gi.frame.x;
             atomicMin(gi_cells[cell].representative, ray);
             return cell;
@@ -80,7 +72,7 @@ void main() {
     uvec4 state = gi_probes[gi_probe_index(level, slot)];
     vec3 origin = gi_position(level, world)
                 + (gi_owned(state, world) ? gi_offset(state) : vec3(0.0));
-    vec3 direction = gi_ray_direction(ray, rays);
+    vec3 direction = gi_ray_direction(ray, rays, probe);
 
     GiRay record;
     record.hit = vec4(0.0);

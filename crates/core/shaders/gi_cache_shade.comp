@@ -14,9 +14,9 @@
 // Only the diffuse lobe, because a cell is read by rays arriving from every
 // direction and a reflection belongs to one of them.
 //
-// Written into this frame's half of the pair, which the update reads next
-// frame: the volumes this reads were written by this frame's update, so the
-// light they hold reaches the probes one update later.
+// Written into this frame's half of the pair, which next frame's update reads
+// for this frame's rays: the volumes this reads were written by this frame's
+// update, so the light they hold reaches the probes one update later.
 //
 // Averaged into what the cell held, over about `CELL_HISTORY` frames, or its
 // last `CELL_HISTORY` shadings where it is shaded every frame. Each shading is
@@ -92,7 +92,7 @@ void main() {
         direction = uintBitsToFloat(landed.meta.xyz);
     } else {
         landed = gi_rays[ray];
-        direction = gi_ray_direction(ray % gi.grid.y, gi.grid.y);
+        direction = gi_ray_direction(ray % gi.grid.y, gi.grid.y, ray / gi.grid.y);
     }
     float back = max(0.02, landed.hit.w * 1e-3);
     RayHit hit = ray_closest(landed.hit.xyz - direction * back, direction, 0.0, back * 2.0);
