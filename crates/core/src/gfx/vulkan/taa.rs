@@ -190,12 +190,6 @@ impl TaaPass {
         self.pair()[((self.frame + 1) & 1) as usize]
     }
 
-    /// Whether the history holds a frame the resolve wrote: read before this
-    /// frame records, while `reset` still says what the last frame left.
-    pub(super) fn history_trusted(&self) -> bool {
-        !self.reset.load(Ordering::Relaxed)
-    }
-
     fn pair(&self) -> &[TextureViewId; 2] {
         self.history
             .as_ref()

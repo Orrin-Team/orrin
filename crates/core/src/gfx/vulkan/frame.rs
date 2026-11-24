@@ -559,9 +559,6 @@ pub struct GatherIds {
     pub wide: ResourceId,
     /// The harmonics at the frame's resolution: what the forward pass reads.
     pub irradiance: ResourceId,
-    /// Last frame's lit colour, which a ray that lands on something the
-    /// camera sees reads: TAA's history, where the frame has one.
-    pub lit: Option<ResourceId>,
 }
 
 /// The path-traced reference: every path's radiance so far, which the pass
@@ -1384,19 +1381,6 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // reads the prepass and nothing the forward pass draws, and the forward
     // pass reads what it leaves by pixel. After the volumes and the cache's
     // shading, whose light its rays read and whose cells they claim.
-    //
-    // TAA's history is imported here rather than with the resolve, where the
-    // gather runs: a ray that lands on something the camera sees reads last
-    // frame's lit colour out of it, and a resource is declared before its
-    // first reader.
-    let early_taa_history = (gathers && config.taa).then(|| {
-        builder.import_image(
-            "taa_history",
-            ImageDesc::new(HDR_FORMAT),
-            ImageLayout::ShaderReadOnlyOptimal,
-            ImageLayout::ShaderReadOnlyOptimal,
-        )
-    });
     let gather = gi.filter(|_| gathers).map(|gi| {
         use super::gi_gather::{GATHER_FORMAT, HISTORY_LAYERS, META_LAYERS, SH_LAYERS};
         let prepass = prepass.expect("the final gather reads the geometry prepass");
@@ -1434,15 +1418,11 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         );
 
         // The cache's cells are written: a cell a ray lands in is claimed.
-        let mut pass = builder
+        let pass = builder
             .pass("gi_gather", PassKind::Compute)
             .access(ray.scene, Access::AccelerationStructureRead)
             .access(prepass.depth, Access::Sampled)
-            .access(prepass.normal, Access::Sampled)
-            .access(prepass.velocity, Access::Sampled);
-        if let Some(lit) = early_taa_history {
-            pass = pass.access(lit, Access::Sampled);
-        }
+            .access(prepass.normal, Access::Sampled);
         let id = reads_gi(pass, Some(gi))
             .access(gi.cells, Access::StorageWrite)
             .access(gi.radiance, Access::StorageRead)
@@ -1551,7 +1531,6 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             wide_x,
             wide,
             irradiance,
-            lit: early_taa_history,
         }
     });
 
@@ -2053,14 +2032,12 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // that layout, and it is the allocation `history` names next frame. On
         // the first frame after an allocation the layout is still true — the
         // allocation put it there — and its contents are what `reset` ignores.
-        let history = early_taa_history.unwrap_or_else(|| {
-            builder.import_image(
-                "taa_history",
-                ImageDesc::new(HDR_FORMAT),
-                ImageLayout::ShaderReadOnlyOptimal,
-                ImageLayout::ShaderReadOnlyOptimal,
-            )
-        });
+        let history = builder.import_image(
+            "taa_history",
+            ImageDesc::new(HDR_FORMAT),
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
         // Entered `Undefined` because every texel is written, and left where the
         // next frame wants to find it.
         let output = builder.import_image(

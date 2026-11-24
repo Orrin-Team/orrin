@@ -2990,11 +2990,7 @@ fn the_final_gather_runs_between_the_cache_and_the_forward_pass() {
         ..reference_config(false, true)
     })
     .unwrap();
-    let ids = frame.ids.gather.expect("the gather was asked for");
-    assert!(
-        ids.lit.is_some(),
-        "TAA is on, so its history is the lit colour"
-    );
+    assert!(frame.ids.gather.is_some(), "the gather was asked for");
     assert_eq!(frame.graph.segments().len(), 1, "{}", frame.graph);
     assert!(frame.graph.culled().is_empty(), "{}", frame.graph);
 
@@ -3058,14 +3054,7 @@ fn the_final_gather_runs_between_the_cache_and_the_forward_pass() {
         ),
         "{plan}"
     );
-    assert!(
-        reads(
-            "gi_gather",
-            "     taa_history Sampled
-"
-        ),
-        "{plan}"
-    );
+    assert!(!reads("gi_gather", "taa_history"), "{plan}");
     assert!(
         reads(
             "gi_gather_temporal",

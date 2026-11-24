@@ -26,9 +26,8 @@ layout(set = 0, binding = ORRIN_GATHER_BLOCK_BINDING, std140) uniform Gather {
     uvec4 params;
 } gather;
 
-// Last frame's lit colour can be read, and so can the history.
-const uint GATHER_LIT = 1u;
-const uint GATHER_HISTORY = 2u;
+// The history can be read.
+const uint GATHER_HISTORY = 1u;
 
 // Layer 3 of the raw and accumulated images, beside the three of spherical
 // harmonics: x = frames averaged, y = metres to the camera when written,

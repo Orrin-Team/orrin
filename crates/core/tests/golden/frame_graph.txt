@@ -5096,7 +5096,6 @@
      prepass_depth Sampled
      ssao_ao ColorAttachment
 11 pass gi_gather [Compute]
-  ! prepass_velocity ColorAttachmentOptimal->ShaderReadOnlyOptimal src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! gi_irradiance General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! gi_cells src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
   ! gi_radiance src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
@@ -5105,8 +5104,6 @@
      ray_scene AccelerationStructureRead
      prepass_depth Sampled
      prepass_normal Sampled
-     prepass_velocity Sampled
-     taa_history Sampled
      gi_irradiance Sampled
      gi_distance Sampled
      gi_probes StorageRead
@@ -5115,6 +5112,7 @@
      gi_gather_hits StorageWrite
      gi_gather_raw StorageWrite
 12 pass gi_gather_temporal [Compute]
+  ! prepass_velocity ColorAttachmentOptimal->ShaderReadOnlyOptimal src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! gi_gather_raw General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! gi_gather_accumulated Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      prepass_depth Sampled

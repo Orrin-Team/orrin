@@ -2792,9 +2792,7 @@ impl VulkanRenderer {
                 environment.yaw,
             );
         }
-        // The final gather beside them, and for the same reason. Last frame's
-        // lit colour is TAA's history, and is read only once the resolve has
-        // written one.
+        // The final gather beside them, and for the same reason.
         {
             let gather = self.frame.ids.gather;
             let accumulations = self.gi.gather.begin_frame(
@@ -2804,7 +2802,6 @@ impl VulkanRenderer {
                 &view,
                 camera.position,
                 self.backend.extent(),
-                gather.is_some_and(|ids| ids.lit.is_some()) && self.taa.history_trusted(),
             );
             if let (Some(ids), Some((views, extent))) = (gather, accumulations) {
                 for (id, view) in [(ids.history, views[0]), (ids.accumulated, views[1])] {
@@ -5012,7 +5009,6 @@ impl FrameRecord<'_> {
                     encoder,
                     rays,
                     inputs,
-                    ids.lit.map(|_| self.taa.history_view()),
                     self.gi.gather_cache(),
                     texture(ids.raw),
                 );

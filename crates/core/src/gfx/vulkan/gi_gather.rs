@@ -11,8 +11,7 @@
 //! 1. `gi_gather`: one ray per texel, cosine-weighted about the prepass's
 //!    normal, from a low-discrepancy sequence with a per-pixel scramble
 //!    (`low_discrepancy.glsl`). It shades nothing: what it met is read from
-//!    last frame's lit colour where the camera sees it, from the world radiance
-//!    cache where it does not, from the volumes where the cache has nothing
+//!    the world radiance cache, from the volumes where the cache has nothing
 //!    yet, and from the sky where it met nothing. Each texel keeps what it
 //!    found as two bands of spherical harmonics a colour, so it is a small
 //!    irradiance probe the full-resolution normal is read through later.
@@ -42,14 +41,27 @@
 //!
 //! # The cache
 //!
-//! A ray the camera cannot vouch for reads the world radiance cache
-//! (`vulkan::gi`), and a cell the probes' rays never reach — under a small
-//! object, in an alcove narrower than the probes — would never be shaded. So
-//! the gather claims the cells it reads: a new cell, or one whose light is a
-//! few frames old (`RESHADE` in `gi_gather.comp`), is listed for next frame's
-//! shading and shaded from the gather ray that asked, which the gather
-//! leaves in a table of its own beside the cache. Until then the ray reads the
-//! volumes at its hit. One frame of that, for a cell new to the view.
+//! A ray that meets a surface reads the world radiance cache (`vulkan::gi`),
+//! and a cell the probes' rays never reach — under a small object, in an
+//! alcove narrower than the probes — would never be shaded. So the gather
+//! claims the cells it reads: a new cell, or one whose light is a few frames
+//! old (`RESHADE` in `gi_gather.comp`), is listed for next frame's shading and
+//! shaded from the gather ray that asked, which the gather leaves in a table
+//! of its own beside the cache. Until then the ray reads the volumes at its
+//! hit. One frame of that, for a cell new to the view.
+//!
+//! # Not the screen
+//!
+//! A ray that lands on something the camera sees reads the cache there too,
+//! not last frame's lit colour. That colour holds the specular the surface
+//! sends toward the camera, which no other direction receives: read as light
+//! leaving every way alike, it was 7 to 19 % of what the gather found in
+//! Sponza's aisle and gallery. And it lights a surface by what the camera has
+//! lately seen lit, so a level depends on where the camera has been: walked
+//! into, the aisle's vault arrived 30 % dark and climbed for ten seconds.
+//! Without it, against a path-traced reference of the diffuse light alone,
+//! the aisle is nearer and the gallery about 5 % darker, and the noise
+//! standing still is the same.
 //!
 //! # What reads it
 //!
@@ -74,7 +86,7 @@ use crate::gfx::format::{Format, SampleCount};
 use crate::gfx::graph::ImageUsage;
 use crate::gfx::rhi::{
     BindGroupId, Binding, BindingResource, BufferId, ComputePipelineDesc, Device, Encoder,
-    PipelineId, SamplerDesc, SamplerId, TextureDesc, TextureDimension, TextureViewId,
+    PipelineId, SamplerId, TextureDesc, TextureDimension, TextureViewId,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::scene::GiSettings;
@@ -103,15 +115,7 @@ const WIDE_STRIDE: u32 = 3;
 /// `Gather` in `gi_gather.glsl`, as the words of its std140 layout: three
 /// matrices, then `camera`, `previous_camera` and `params`.
 const BLOCK_WORDS: usize = 3 * 16 + 3 * 4;
-const LIT: u32 = 1;
-/// Frames the gather runs before it reads last frame's lit colour. The first
-/// frames of a scene, or of the gather, are lit before what the gather
-/// settles on — a shadow map not yet drawn, a bloom or fog not yet warmed,
-/// the flat sky — and the light a texel's history starts from lasts as long
-/// as its history does: in an aisle lit through its arches, a thousand
-/// frames. Read from the cache instead, which starts dark and is risen from.
-const LIT_AFTER: u32 = 8;
-const HISTORY: u32 = 2;
+const HISTORY: u32 = 1;
 
 /// The world radiance cache as the gather reads and claims it.
 #[derive(Clone, Copy)]
@@ -157,26 +161,13 @@ pub struct GatherPass {
     previous_camera: Option<Vec3>,
     /// Whether the accumulation holds a frame to build on.
     trusted: bool,
-    /// Frames the gather has run in a row, up to [`LIT_AFTER`].
-    running: u32,
     block: Option<BufferId>,
-    linear: SamplerId,
-    /// What the forward pass binds where the gather did not run, and the
-    /// gather binds for last frame's colour where there is none.
+    /// What the forward pass binds where the gather did not run.
     stand_in: TextureViewId,
-    unlit: TextureViewId,
 }
 
 impl GatherPass {
     pub(super) fn new(device: &Device) -> Self {
-        let linear = device.create_sampler(SamplerDesc {
-            linear: true,
-            mipmap_linear: false,
-            repeat: false,
-            compare: false,
-            anisotropy: None,
-            max_lod: Some(0.0),
-        });
         let stand_in = device.create_texture(&TextureDesc {
             format: GATHER_FORMAT,
             dimension: TextureDimension::D2Array,
@@ -188,7 +179,6 @@ impl GatherPass {
             memoryless: false,
         });
         device.initialise_sampled(stand_in);
-        let unlit = device.create_texture_2d(&[0; 4], [1, 1], Format::Rgba8Unorm);
         Self {
             pipelines: None,
             textures: None,
@@ -196,21 +186,15 @@ impl GatherPass {
             frame: 0,
             previous_camera: None,
             trusted: false,
-            running: 0,
             block: None,
-            linear,
             stand_in,
-            unlit,
         }
     }
 
     /// Ready this frame's gather, at `1 >> shift` of `extent` each way, or let
-    /// its history go where `shift` is `None`. `lit` is whether last frame's
-    /// lit colour can be read, which the gather does once it has run
-    /// [`LIT_AFTER`] frames in a row. Before anything records. Returns the two
-    /// accumulations, last frame's then this frame's, for the graph to be
-    /// handed.
-    #[allow(clippy::too_many_arguments)]
+    /// its history go where `shift` is `None`. Before anything records. Returns
+    /// the two accumulations, last frame's then this frame's, for the graph to
+    /// be handed.
     pub(super) fn begin_frame(
         &mut self,
         device: &Device,
@@ -219,7 +203,6 @@ impl GatherPass {
         view: &FrameView,
         camera: Vec3,
         extent: [u32; 2],
-        lit: bool,
     ) -> Option<([TextureViewId; 2], [u32; 2])> {
         let previous_camera = self.previous_camera.replace(camera);
         let Some(shift) = shift else {
@@ -248,7 +231,6 @@ impl GatherPass {
             });
         }
         let trusted = std::mem::replace(&mut self.trusted, true);
-        self.running = (self.running + 1).min(LIT_AFTER);
         self.frame = self.frame.wrapping_add(1);
 
         let settings = settings.held();
@@ -277,16 +259,7 @@ impl GatherPass {
         } else {
             0
         };
-        words[BLOCK_WORDS - 4..].copy_from_slice(&[
-            shift,
-            self.frame,
-            if lit && self.running >= LIT_AFTER {
-                LIT
-            } else {
-                0
-            } | history_flag,
-            0,
-        ]);
+        words[BLOCK_WORDS - 4..].copy_from_slice(&[shift, self.frame, history_flag, 0]);
         self.block = Some(device.upload_uniform(&words));
 
         let history = self.history.as_ref().expect("made above");
@@ -335,7 +308,6 @@ impl GatherPass {
             }
         }
         self.trusted = false;
-        self.running = 0;
     }
 
     fn live(&self) -> (&Pipelines, BufferId) {
@@ -346,14 +318,12 @@ impl GatherPass {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn record_gather(
         &self,
         device: &Device,
         encoder: &mut Encoder,
         rays: &RayFrame<'_>,
         prepass: Prepass,
-        lit: Option<TextureViewId>,
         cache: GatherCache,
         raw: TextureViewId,
     ) {
@@ -365,19 +335,11 @@ impl GatherPass {
             &[
                 texture(0, prepass.depth),
                 texture(1, prepass.normal),
-                texture(2, prepass.velocity),
-                Binding {
-                    binding: 3,
-                    resource: BindingResource::SampledTexture {
-                        view: lit.unwrap_or(self.unlit),
-                        sampler: self.linear,
-                    },
-                },
-                storage_texture(4, raw),
-                uniform(5, block),
-                storage(6, cache.cells),
-                storage(7, cache.radiance),
-                storage(8, cache.hits),
+                storage_texture(2, raw),
+                uniform(3, block),
+                storage(4, cache.cells),
+                storage(5, cache.radiance),
+                storage(6, cache.hits),
             ],
         );
         encoder.bind_pipeline(pipeline);
