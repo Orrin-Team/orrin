@@ -32,8 +32,9 @@
 //! Not the volumes' mean radiance at the froxel. Past the finest cascades a
 //! probe is four metres from the next, an aisle three metres wide has none of
 //! its own, and its air is lit by the probes in the sunlit court beside it:
-//! Sponza's aisle, read that way, ends 2.6 times as bright as a path-traced
-//! reference through the same air, and within a tenth of it traced. Nor one
+//! the far end of Sponza's aisle, read that way, measured 2.6 times as bright
+//! in linear light as a path-traced reference through the same air (2.2 in
+//! the sRGB-decoded image), and 1.07 times traced (1.1 to 1.2). Nor one
 //! ray per froxel at the froxels' own rate: what lights such an aisle's air
 //! is a sunlit patch or the sky a ray meets one time in many, and the froxels
 //! average ten frames. Past the froxels the analytic term keeps the flat

@@ -3,10 +3,11 @@
 #extension GL_EXT_nonuniform_qualifier : require
 
 // Every probe of the grid this frame updates traces its fixed set of rays,
-// turned by this frame's rotation and its own offset, and asks only what each one met and how
-// far away. Nothing is shaded here: a ray that lands on a surface files the
-// hit in the world radiance cache and leaves the cell's number for next
-// frame's update, which reads the light this frame's shading gives the cell.
+// turned by this frame's rotation and its own offset, and asks only what each
+// one met and how far away. Nothing is shaded here: a ray that lands on a
+// surface files the hit in the world radiance cache and leaves the cell's
+// number for next frame's update, which reads the light this frame's shading
+// gives the cell.
 //
 // A hit on the back of a surface is told apart, because a probe that sees
 // backs is inside something and the update moves it or switches it off.

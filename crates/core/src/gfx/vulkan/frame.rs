@@ -269,10 +269,12 @@ pub enum PassBody {
     SsaoBlur,
     /// The sun's visibility over the short range a cascade texel cannot resolve.
     ContactShadows,
+    /// The light the air scatters from everything but the sun, traced from the
+    /// air into the world radiance cache where the irradiance volumes are live.
+    FogLight,
     /// What every froxel of air scatters and blocks — one cascade lookup apiece,
     /// which is the whole cost of the effect and the whole reason a shaft has an
     /// edge.
-    FogLight,
     FogScatter,
     /// Each froxel column marched front to back into the running radiance and
     /// transmittance a fragment applies. One invocation per column rather than
