@@ -19,20 +19,21 @@
 // find a sunlit floor and the rest find shade. Beside it the probe keeps a
 // bounce tile, the same blend over the last few updates alone, which the
 // cache's shading reads — but for an update's brightest ray where it is far
-// above the rest, whose part is blended over as many updates as the
-// irradiance is; and how far its updates disagree, with a short mean of the last few (Halén et al.
-// 2021). A light switched on or off moves the short mean further from the
-// long one than that disagreement explains, and the probe takes its bounce
-// tile for its history. One bright update cannot: the disagreement takes it
-// in before the test does. Not a test of one update against the mean, which
-// is what a small bright source fails on every update, and the probe then
-// holds whichever update came last — most often the darker. Nor a test of the
-// whole update alone: a sunlit patch one ray in a few thousand meets, on two
-// updates running after a long run without, passes it, and a probe that took
-// those two for its history lit its wall twice over for seconds. A switched
-// light moves the bulk of a probe's rays, and such a patch two of them, so the
-// update less its two brightest rays keeps a long and a short mean of its own,
-// and the light has changed only where those have moved as far, the same way.
+// above the rest, whose part is blended over as many updates as the irradiance
+// is; and how far its updates disagree, with a short mean of the last few
+// (Halén et al. 2021). A light switched on or off moves the short mean further
+// from the long one than that disagreement explains, and the probe takes its
+// bounce tile for its history. One bright update cannot: the disagreement
+// takes it in before the test does. Not a test of one update against the mean,
+// which is what a small bright source fails on every update, and the probe
+// then holds whichever update came last — most often the darker. Nor a test of
+// the whole update alone: a sunlit patch one ray in a few thousand meets, on
+// two updates running after a long run without, passes it, and a probe that
+// took those two for its history lit its wall twice over for seconds. A
+// switched light moves the bulk of a probe's rays, and such a patch two of
+// them, so the update less its two brightest rays keeps a long and a short
+// mean of its own, and the light has changed only where those have moved as
+// far, the same way.
 //
 // A probe that sees the backs of surfaces is inside something. It is moved
 // through the nearest back it saw, within its own cell, and left out of the
