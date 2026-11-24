@@ -203,4 +203,31 @@ FogTerm fog_term(FogParams f, sampler3D volume, vec3 world_pos, vec2 screen_uv) 
     return term;
 }
 
+// For the two passes that define `ORRIN_FOG_LIGHT`, which read the grid.
+#ifdef ORRIN_FOG_LIGHT
+// The traced light of the air (`fog_light.comp`) at `coord`, in the grid's
+// texture coordinates: a trilinear blend of the cells that hold any. A cell
+// whose point the camera cannot see holds none, and is left out rather than
+// blended in as dark or as what it saw: the cell behind a wall is outside, in
+// the sky's light, and the froxels in front of the wall would take it through
+// the wall. `a` is zero where no cell round the point holds light.
+vec4 fog_light_at(sampler3D grid, vec3 coord) {
+    ivec3 size = textureSize(grid, 0);
+    vec3 at = coord * vec3(size) - 0.5;
+    ivec3 base = ivec3(floor(at));
+    vec3 f = at - vec3(base);
+    vec4 sum = vec4(0.0);
+    float total = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        ivec3 corner = ivec3(i, i >> 1, i >> 2) & 1;
+        vec4 cell = texelFetch(grid, clamp(base + corner, ivec3(0), size - 1), 0);
+        vec3 w = mix(1.0 - f, f, vec3(corner));
+        float weight = cell.a > 0.0 ? w.x * w.y * w.z : 0.0;
+        sum += cell * weight;
+        total += weight;
+    }
+    return total > 1e-4 ? sum / total : vec4(0.0);
+}
+#endif
+
 #endif // ORRIN_FOG_GLSL

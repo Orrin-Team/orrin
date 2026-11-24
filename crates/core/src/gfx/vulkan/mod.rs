@@ -679,6 +679,7 @@ impl VulkanRenderer {
             raytrace.forget_textures(&self.device);
         }
         self.gi.forget_textures(&self.device);
+        self.fog.forget_textures(&self.device);
     }
 
     pub fn new(
@@ -841,7 +842,7 @@ impl VulkanRenderer {
         let prepass = GeometryPrepass::new(&device);
         let ssao = SsaoPass::new(&device);
         let contact_shadows = ContactShadowPass::new(&device);
-        let fog = FogPass::new(&device);
+        let fog = FogPass::new(&device, device.supports(Feature::RayTracing));
         let ssr = SsrPass::new(&device);
         let subsurface = SubsurfacePass::new(&device);
         let oit = OitPass::new(&device, forward.layout_source());
@@ -1405,6 +1406,11 @@ impl VulkanRenderer {
         {
             return self.fog.scatter_view();
         }
+        if let Some(fog) = self.frame.ids.fog
+            && fog.light == Some(id)
+        {
+            return self.fog.light_view();
+        }
         if let Some(ids) = self.frame.ids.occlusion {
             if id == ids.hiz {
                 return self.occlusion.hiz_view();
@@ -1471,6 +1477,13 @@ impl VulkanRenderer {
         {
             return Some(record::Target::Image(
                 self.vk_view(self.fog.scatter_view()).image().clone(),
+            ));
+        }
+        if let Some(fog) = ids.fog
+            && fog.light == Some(id)
+        {
+            return Some(record::Target::Image(
+                self.vk_view(self.fog.light_view()).image().clone(),
             ));
         }
         if let Some(occlusion) = ids.occlusion {
@@ -2469,6 +2482,8 @@ impl VulkanRenderer {
         self.fog.begin_frame(
             &self.device,
             fog,
+            self.frame.ids.fog.is_some_and(|ids| ids.light.is_some()),
+            self.gi_settings.fog,
             lighting,
             shadows,
             &view,
@@ -2831,6 +2846,11 @@ impl VulkanRenderer {
                 );
             }
             self.gi.prepare(
+                &self.device,
+                &self.textures,
+                self.prepass.material_sampler(),
+            );
+            self.fog.prepare(
                 &self.device,
                 &self.textures,
                 self.prepass.material_sampler(),
@@ -3931,6 +3951,11 @@ impl FrameRecord<'_> {
         {
             return self.fog.scatter_view();
         }
+        if let Some(fog) = self.frame.ids.fog
+            && fog.light == Some(id)
+        {
+            return self.fog.light_view();
+        }
         match self.frame.ids.taa {
             Some(taa) if id == taa.output => self.taa.output_view(),
             _ => self.table.texture(id),
@@ -3991,6 +4016,13 @@ impl FrameRecord<'_> {
         {
             return Some(record::Target::Image(
                 self.vk_view(self.fog.scatter_view()).image().clone(),
+            ));
+        }
+        if let Some(fog) = ids.fog
+            && fog.light == Some(id)
+        {
+            return Some(record::Target::Image(
+                self.vk_view(self.fog.light_view()).image().clone(),
             ));
         }
         if let Some(occlusion) = ids.occlusion {
@@ -4306,6 +4338,13 @@ impl FrameRecord<'_> {
                     self.ray_frame.as_ref().filter(|_| ids.traced),
                     self.gi.views(),
                 );
+            }
+            PassBody::FogLight => {
+                let rays = self.ray_frame.as_ref().expect(
+                    "the graph scheduled the fog's traced light in a frame that traces nothing",
+                );
+                self.fog
+                    .record_light(self.device, encoder, rays, self.gi.gather_cache());
             }
             PassBody::FogScatter => {
                 self.fog.record_scatter(
@@ -4902,6 +4941,7 @@ impl FrameRecord<'_> {
             | PassBody::SsrSource
             | PassBody::SsrTrace
             | PassBody::SsrResolve
+            | PassBody::FogLight
             | PassBody::FogScatter
             | PassBody::FogIntegrate
             | PassBody::SubsurfaceBlurHorizontal

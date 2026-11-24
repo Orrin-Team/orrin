@@ -1,0 +1,170 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// The light the air scatters toward the camera from everything but the sun,
+// traced from the air itself. One invocation per cell of a grid half the
+// froxels' a side and in depth; each cell's point sends its rays in
+// directions drawn from the phase about the view, so their mean is the light
+// it scatters, and reads what they meet as the final gather does: the world
+// radiance cache where the hit has a cell with light, the irradiance volumes
+// at the hit where it has none yet, the sky where the ray leaves. A back is
+// the inside of something and counts for nothing. Nothing is claimed in the
+// cache: the probes' and the gather's rays keep the cells round the camera.
+//
+// The mean is added into a running mean of its cell's, reprojected from last
+// frame's grid as the froxels' history is, with a count of the frames in it
+// up to `LONGEST`. A ray from the air meets a sunlit patch or the sky through
+// an arch as seldom as a probe's does, and those few rays carry most of the
+// light, so the mean is a long one.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#include "ray_shade.glsl"
+#include "gi_cache.glsl"
+
+#define ORRIN_FOG_LIGHT
+#include "fog.glsl"
+#include "half_float.glsl"
+
+layout(set = 0, binding = 0) uniform Fog {
+    GpuFog f;
+} u;
+// Last frame's grid, in last frame's froxel space: linear and clamped, as the
+// froxels' history is read.
+layout(set = 0, binding = 1) uniform sampler3D u_history;
+// rgb = the light scattered toward the camera per unit of scattering, a = the
+// frames averaged.
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image3D u_light;
+layout(set = 0, binding = 3, std430) readonly buffer GiCells {
+    GiCell gi_cells[];
+};
+layout(set = 0, binding = 4, std430) readonly buffer GiRadiance {
+    uvec2 gi_radiance[];
+};
+
+const uint RAYS = 4u;
+const float LONGEST = 64.0;
+
+uint rng;
+
+float random() {
+    rng = rng * 747796405u + 2891336453u;
+    uint word = ((rng >> ((rng >> 28u) + 4u)) ^ rng) * 277803737u;
+    return float(((word >> 22u) ^ word) >> 8u) * (1.0 / 16777216.0);
+}
+
+// A direction drawn in proportion to the Henyey-Greenstein phase of
+// asymmetry `g` about `axis`, toward where the light it weighs comes from,
+// with `xi` the draw of its cosine.
+vec3 phase_direction(vec3 axis, float g, float xi) {
+    float c = 1.0 - 2.0 * xi;
+    if (abs(g) > 1e-3) {
+        float s = (1.0 - g * g) / (1.0 - g + 2.0 * g * xi);
+        c = clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
+    }
+    float r = sqrt(max(0.0, 1.0 - c * c));
+    float phi = 2.0 * PI * random();
+    vec3 up = abs(axis.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t = normalize(cross(up, axis));
+    vec3 b = cross(axis, t);
+    return t * (r * cos(phi)) + b * (r * sin(phi)) + axis * c;
+}
+
+// The cache's light for a hit, `a` one where its cell has any. Every slot the
+// key may have been filed in is looked at, since a cell emptied before it
+// leaves a hole the key's run goes on past.
+vec4 cached_light(vec3 p, vec3 face, float reach) {
+    uvec2 key = gi_cell_key(p, face, reach, gi.camera.xyz, gi.params.y);
+    uint checksum = gi_cell_checksum(key);
+    uint mask = gi.frame.w;
+    uint home = gi_cell_home(key, mask);
+    for (uint i = 0u; i < GI_CACHE_PROBES; ++i) {
+        uint cell = (home + i) & mask;
+        if (gi_cells[cell].checksum == checksum) {
+            return gi_cells[cell].shaded == 0u ? vec4(0.0) : gi_cell_light(gi_radiance[cell]);
+        }
+    }
+    return vec4(0.0);
+}
+
+void main() {
+    ivec3 size = imageSize(u_light);
+    ivec3 coord = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(coord, size))) {
+        return;
+    }
+    FogParams f = u.f.fog;
+    rng = uint(coord.x) * 1973u + uint(coord.y) * 9277u + uint(coord.z) * 26699u
+        + gi.frame.x * 7919u + 1u;
+    random();
+
+    vec2 uv = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+    float t = (float(coord.z) + f.temporal.y) / float(size.z);
+    vec3 dir = fog_ray_direction(f, uv);
+    float view_dist = fog_slice_depth(f, t);
+    vec3 P = f.camera_pos.xyz + dir * view_dist;
+    // Air the camera cannot see lights none of what it sees, and a cell
+    // there holds nothing: `fog_light_at` leaves it out.
+    if (ray_occluded(f.camera_pos.xyz, dir, view_dist)) {
+        imageStore(u_light, coord, vec4(0.0));
+        return;
+    }
+
+    vec3 sum = vec3(0.0);
+    float seen = 0.0;
+    for (uint k = 0u; k < RAYS; ++k) {
+        vec3 d = phase_direction(dir, f.params.w, (float(k) + random()) / float(RAYS));
+        RayHit hit = ray_closest(P, d, 0.0, RAY_FAR);
+        if (!hit.found) {
+            sum += gi_sky(d);
+            seen += 1.0;
+            continue;
+        }
+        if (ray_back_face(hit, d)) {
+            continue;
+        }
+        vec3 p = P + d * hit.distance;
+        uvec4 instance = ray_instances[hit.instance];
+        RayTriangle triangle = ray_triangle(instance, hit.primitive);
+        vec3 a = hit.to_world * vec4(triangle.position[0], 1.0);
+        vec3 b = hit.to_world * vec4(triangle.position[1], 1.0);
+        vec3 c = hit.to_world * vec4(triangle.position[2], 1.0);
+        vec3 face = normalize(cross(b - a, c - a));
+        face *= dot(face, d) > 0.0 ? -1.0 : 1.0;
+        vec4 cached = cached_light(p, face, hit.distance);
+        vec3 light = cached.rgb;
+        if (cached.a <= 0.0) {
+            RaySurface found = ray_surface(hit, d, sqrt(4.0 * PI / float(RAYS)));
+            Surface s = found.s;
+            vec3 irradiance = gi_irradiance(found.position, s.N, s.V).rgb
+                            + gi_sky_irradiance(s.N) * (1.0 - gi_reach(found.position));
+            light = found.emissive + irradiance * s.albedo * (1.0 - s.metallic);
+        }
+        light = min(light, vec3(65000.0));
+        if (!any(isnan(light))) {
+            sum += light;
+            seen += 1.0;
+        }
+    }
+
+    vec4 held = vec4(0.0);
+    if (f.temporal.z < 0.5) {
+        vec4 clip = f.prev_view_proj * vec4(P, 1.0);
+        if (clip.w > 0.0) {
+            vec2 prev_uv = (clip.xy / clip.w) * 0.5 + 0.5;
+            if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
+                float prev_dist = length(P - f.prev_camera_pos.xyz);
+                held = fog_light_at(u_history, vec3(prev_uv, fog_depth_slice(f, prev_dist)));
+            }
+        }
+    }
+    // A point inside something sees only backs, and keeps what it held.
+    if (seen <= 0.0) {
+        imageStore(u_light, coord, held);
+        return;
+    }
+    float count = min(floor(held.a + 0.5) + 1.0, LONGEST);
+    vec3 light = mix(held.rgb, sum / seen, 1.0 / count);
+    imageStore(u_light, coord, half_nearest(vec4(light, count)));
+}

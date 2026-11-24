@@ -377,6 +377,7 @@ pub(super) fn rendering_info(
         | PassBody::SsrSource
         | PassBody::SsrTrace
         | PassBody::SsrResolve
+        | PassBody::FogLight
         | PassBody::FogScatter
         | PassBody::FogIntegrate
         | PassBody::SubsurfaceBlurHorizontal

@@ -22,10 +22,22 @@
 //! pass never reads the volume it is writing.
 //!
 //! Where the irradiance volumes are live, the light a froxel scatters from
-//! everywhere but the sun is their mean radiance at it rather than the scene's
-//! flat ambient (`gi_mean_radiance` in `gi.glsl`), so the air in a closed room
-//! is as dark as its walls. Past the froxels the analytic term keeps the flat
-//! ambient: it has no point to look the volumes up at.
+//! everywhere but the sun is traced from the air rather than the scene's flat
+//! ambient, so the air in a closed room is as dark as its walls: a third
+//! dispatch ahead of the two, `fog_light`, on a grid half the froxels' each
+//! way, whose rays read what they meet out of the world radiance cache
+//! (`vulkan::gi`) and whose mean is kept over as many as sixty-four frames
+//! (`LONGEST` in `fog_light.comp`), reprojected the way the froxels' is.
+//!
+//! Not the volumes' mean radiance at the froxel. Past the finest cascades a
+//! probe is four metres from the next, an aisle three metres wide has none of
+//! its own, and its air is lit by the probes in the sunlit court beside it:
+//! Sponza's aisle, read that way, ends 2.6 times as bright as a path-traced
+//! reference through the same air, and within a tenth of it traced. Nor one
+//! ray per froxel at the froxels' own rate: what lights such an aisle's air
+//! is a sunlit patch or the sky a ray meets one time in many, and the froxels
+//! average ten frames. Past the froxels the analytic term keeps the flat
+//! ambient: it has no point to trace from.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -35,8 +47,8 @@ use crate::gfx::SceneLighting;
 use crate::gfx::format::SampleCount;
 use crate::gfx::graph::ImageUsage;
 use crate::gfx::rhi::{
-    Binding, BindingResource, BlockKind, BufferId, ComputePipelineDesc, Device, Encoder,
-    PipelineId, SamplerDesc, SamplerId, TextureDesc, TextureDimension, TextureViewId,
+    BindGroupId, Binding, BindingResource, BlockKind, BufferId, ComputePipelineDesc, Device,
+    Encoder, PipelineId, SamplerDesc, SamplerId, TextureDesc, TextureDimension, TextureViewId,
 };
 use crate::gfx::shaders::ShaderId;
 use crate::scene::FogSettings;
@@ -44,6 +56,8 @@ use crate::scene::FogSettings;
 use super::ShadowFrame;
 use super::forward::GpuCascades;
 use super::gi::GiViews;
+use super::gi_gather::GatherCache;
+use super::raytrace::{RayFrame, RayReads, TEXTURE_SET};
 use super::taa::FrameView;
 
 /// How far the froxel grid is reduced from the frame in each screen axis.
@@ -70,8 +84,15 @@ pub(super) const FROXEL_SLICES: u32 = 64;
 /// exactly the gradient the effect exists to draw.
 pub(super) const FOG_FORMAT: crate::gfx::format::Format = crate::gfx::format::Format::Rgba16Float;
 
-/// Side of the scatter dispatch's workgroup, matching `fog_scatter.comp`.
+/// Side of the scatter dispatch's workgroup, matching `fog_scatter.comp`, and
+/// of the traced light's, matching `fog_light.comp`.
 const SCATTER_TILE: u32 = 4;
+
+/// How many times the traced light's grid halves the froxels' along each axis.
+/// The light the air scatters from everything round it changes over a metre,
+/// not over a froxel, and a cell four times the size takes four rays a frame
+/// for the price of one each.
+pub(super) const LIGHT_SHIFT: u32 = 1;
 
 /// Side of the integration's workgroup, matching `fog_integrate.comp`. Two
 /// dimensions, because that pass runs one invocation per froxel *column*.
@@ -119,9 +140,27 @@ pub(super) struct GpuFog {
     cascades: GpuCascades,
 }
 
+/// The light the air scatters from everything but the sun, traced: on a device
+/// that can trace, and allocated while the volumes are live.
+struct AirLight {
+    pipeline: PipelineId,
+    /// The material textures, for a ray that lands where the cache has no
+    /// light yet. Kept until they change.
+    textures: Option<BindGroupId>,
+    /// Ping-ponged as the scatter volume is: `frame & 1` is this frame's.
+    /// Allocated while the frame declares it.
+    grids: Option<[TextureViewId; 2]>,
+    extent: [u32; 3],
+    /// Whether the frame declares it, and whether the fog takes its light
+    /// from it: the volumes' setting can leave the fog the flat ambient.
+    live: bool,
+    used: bool,
+}
+
 pub struct FogPass {
     scatter_pipeline: PipelineId,
     integrate_pipeline: PipelineId,
+    air: Option<AirLight>,
     /// Linear and clamped: the reprojection lands between froxels in all three
     /// axes, and the clamp is what makes a froxel that has just entered the
     /// frustum fall back to its own measurement rather than a neighbour's.
@@ -159,7 +198,7 @@ pub struct FogPass {
 }
 
 impl FogPass {
-    pub fn new(device: &Device) -> Self {
+    pub fn new(device: &Device, traces: bool) -> Self {
         // The comparison sampler has to be *immutable* — part of the layout
         // rather than something written into a descriptor set — because MoltenVK
         // is a portability-subset device and rejects a written one outright. The
@@ -196,9 +235,24 @@ impl FogPass {
         let linear_clamp = sampler(true);
         let nearest_clamp = sampler(false);
 
+        let air = traces.then(|| AirLight {
+            pipeline: device.create_compute_pipeline_over_textures(
+                &ComputePipelineDesc {
+                    shader: ShaderId::FogLightComp.into(),
+                },
+                TEXTURE_SET,
+            ),
+            textures: None,
+            grids: None,
+            extent: [0; 3],
+            live: false,
+            used: false,
+        });
+
         Self {
             scatter_pipeline,
             integrate_pipeline,
+            air,
             linear_clamp,
             nearest_clamp,
             shading_sampler: device.create_sampler(SamplerDesc {
@@ -230,18 +284,31 @@ impl FogPass {
         ]
     }
 
+    /// The traced light's grid, as the graph declares it too.
+    pub(super) fn light_extent(extent: [u32; 2]) -> [u32; 3] {
+        [
+            (extent[0] >> (FROXEL_SHIFT + LIGHT_SHIFT)).max(1),
+            (extent[1] >> (FROXEL_SHIFT + LIGHT_SHIFT)).max(1),
+            FROXEL_SLICES >> LIGHT_SHIFT,
+        ]
+    }
+
     /// Resolve this frame's medium into the block everything binds, and advance
     /// the jitter.
     ///
     /// Called before anything records, like the other per-frame `begin_frame`s,
     /// and called whether or not the effect is on: the shading path binds this
     /// block either way, because the analytic fog past the volume's far plane is
-    /// described by the very same numbers.
+    /// described by the very same numbers. `traced` is whether the frame
+    /// declares the air's traced light, which it does where the volumes are
+    /// live, and `lights_fog` whether the fog is to take it.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn begin_frame(
         &mut self,
         device: &Device,
         settings: &FogSettings,
+        traced: bool,
+        lights_fog: bool,
         lighting: &SceneLighting,
         shadows: Option<ShadowFrame<'_>>,
         view: &FrameView,
@@ -251,6 +318,7 @@ impl FogPass {
     ) {
         let live = self.enabled(settings);
         let froxels = Self::froxel_extent(extent);
+        let cells = Self::light_extent(extent);
 
         if live {
             if self.history.is_none() || self.extent != froxels {
@@ -265,6 +333,25 @@ impl FogPass {
             // hold is stale the moment a frame renders without them.
             self.release(device);
             self.reset.store(true, Ordering::Relaxed);
+        }
+        let traced = live && traced;
+        if let Some(air) = &mut self.air {
+            air.live = traced;
+            air.used = traced && lights_fog;
+            if !traced {
+                for view in air.grids.take().into_iter().flatten() {
+                    device.destroy_texture(view);
+                }
+            } else if air.grids.is_none() || air.extent != cells {
+                for view in air.grids.take().into_iter().flatten() {
+                    device.destroy_texture(view);
+                }
+                air.grids = Some(allocate_history(device, cells));
+                air.extent = cells;
+                // What the new grid holds is no frame's, and the flag that says
+                // so is the one both histories read.
+                self.reset.store(true, Ordering::Relaxed);
+            }
         }
 
         // The shader wants the direction *toward* the sun, matching the lighting
@@ -352,6 +439,131 @@ impl FogPass {
         for view in self.history.take().into_iter().flatten() {
             device.destroy_texture(view);
         }
+        if let Some(air) = &mut self.air {
+            for view in air.grids.take().into_iter().flatten() {
+                device.destroy_texture(view);
+            }
+        }
+    }
+
+    /// Make sure the traced light has the material textures bound, before a
+    /// frame that traces it records. Kept until the textures change.
+    pub(super) fn prepare(
+        &mut self,
+        device: &Device,
+        textures: &[TextureViewId],
+        sampler: SamplerId,
+    ) {
+        if let Some(air) = &mut self.air
+            && air.used
+            && air.textures.is_none()
+        {
+            air.textures = Some(device.create_texture_array_group(
+                air.pipeline,
+                TEXTURE_SET,
+                textures,
+                sampler,
+            ));
+        }
+    }
+
+    pub(super) fn forget_textures(&mut self, device: &Device) {
+        if let Some(group) = self.air.as_mut().and_then(|air| air.textures.take()) {
+            device.destroy_bind_group(group);
+        }
+    }
+
+    /// This frame's grid of traced light, which is next frame's history.
+    pub(super) fn light_view(&self) -> TextureViewId {
+        self.light_pair()[(self.frame & 1) as usize]
+    }
+
+    fn light_pair(&self) -> &[TextureViewId; 2] {
+        self.air
+            .as_ref()
+            .and_then(|air| air.grids.as_ref())
+            .expect("the graph scheduled the fog's traced light with no grid allocated")
+    }
+
+    /// What the scatter pass reads the traced light from: this frame's grid,
+    /// or the stand-in where it is not traced.
+    fn light_or_fallback(&self) -> TextureViewId {
+        match &self.air {
+            Some(air) if air.used => self.light_view(),
+            _ => self.fallback,
+        }
+    }
+
+    pub(super) fn record_light(
+        &self,
+        device: &Device,
+        encoder: &mut Encoder,
+        rays: &RayFrame<'_>,
+        cache: GatherCache,
+    ) {
+        let air =
+            self.air.as_ref().filter(|air| air.live).expect(
+                "the graph scheduled the fog's traced light in a frame that does not trace it",
+            );
+        if !air.used {
+            return;
+        }
+        let pair = self.light_pair();
+        let this = (self.frame & 1) as usize;
+        let set = device.create_transient_bind_group(
+            air.pipeline,
+            0,
+            &[
+                Binding {
+                    binding: 0,
+                    resource: BindingResource::UniformBuffer(self.uniforms()),
+                },
+                Binding {
+                    binding: 1,
+                    resource: BindingResource::SampledTexture {
+                        view: pair[1 - this],
+                        sampler: self.linear_clamp,
+                    },
+                },
+                Binding {
+                    binding: 2,
+                    resource: BindingResource::StorageTexture(pair[this]),
+                },
+                Binding {
+                    binding: 3,
+                    resource: BindingResource::StorageBuffer(cache.cells),
+                },
+                Binding {
+                    binding: 4,
+                    resource: BindingResource::StorageBuffer(cache.radiance),
+                },
+            ],
+        );
+        encoder.bind_pipeline(air.pipeline);
+        encoder.bind_group(0, set);
+        rays.bind(
+            device,
+            encoder,
+            air.pipeline,
+            RayReads {
+                lights: false,
+                materials: true,
+                environment: false,
+                surfaces: true,
+                gi: true,
+            },
+        );
+        encoder.bind_group(
+            TEXTURE_SET,
+            air.textures
+                .expect("the fog's traced light was recorded before prepare"),
+        );
+        let extent = air.extent;
+        encoder.dispatch([
+            extent[0].div_ceil(SCATTER_TILE),
+            extent[1].div_ceil(SCATTER_TILE),
+            extent[2].div_ceil(SCATTER_TILE),
+        ]);
     }
 
     pub(super) fn sampler(&self) -> SamplerId {
@@ -381,7 +593,9 @@ impl FogPass {
         gi: GiViews,
     ) {
         let target = self.scatter_view();
-        let [gi_block, gi_probes, gi_irradiance, gi_distance, gi_sampler] = gi.bindings(5);
+        // The volumes' block alone, for whether they are live and asked to
+        // light the fog.
+        let [gi_block, ..] = gi.bindings(5);
         // The volume's own extent, which the history was allocated at.
         let extent = self.extent;
 
@@ -412,10 +626,13 @@ impl FogPass {
                     resource: BindingResource::StorageTexture(target),
                 },
                 gi_block,
-                gi_probes,
-                gi_irradiance,
-                gi_distance,
-                gi_sampler,
+                Binding {
+                    binding: 10,
+                    resource: BindingResource::SampledTexture {
+                        view: self.light_or_fallback(),
+                        sampler: self.linear_clamp,
+                    },
+                },
             ],
         );
 

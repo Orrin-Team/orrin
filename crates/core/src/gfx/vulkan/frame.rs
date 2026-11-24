@@ -22,7 +22,7 @@ use super::MSAA_SAMPLES;
 use super::bloom::MAX_BLOOM_MIPS;
 use super::contact_shadows::MASK_FORMAT;
 use super::dof::COC_TILE_SHIFT;
-use super::fog::{FOG_FORMAT, FROXEL_SHIFT, FROXEL_SLICES};
+use super::fog::{FOG_FORMAT, FROXEL_SHIFT, FROXEL_SLICES, LIGHT_SHIFT};
 use super::hdr::{HDR_FORMAT, HDR_WIDE_FORMAT};
 use super::motion_blur::TILE_SHIFT;
 use super::occlusion::{OCCLUSION_FORMAT, OCCLUSION_LEVELS};
@@ -272,6 +272,7 @@ pub enum PassBody {
     /// What every froxel of air scatters and blocks — one cascade lookup apiece,
     /// which is the whole cost of the effect and the whole reason a shaft has an
     /// edge.
+    FogLight,
     FogScatter,
     /// Each froxel column marched front to back into the running radiance and
     /// transmittance a fragment applies. One invocation per column rather than
@@ -649,6 +650,10 @@ pub struct PrepassIds {
 /// frame, and nothing wants last frame's integral.
 #[derive(Clone, Copy, Debug)]
 pub struct FogIds {
+    /// The light the air scatters from everything but the sun, traced, where
+    /// the irradiance volumes are live: imported and ping-ponged as `scatter`
+    /// is, for the same reason.
+    pub light: Option<ResourceId>,
     /// `rgb` = scattered radiance per metre, `a` = extinction per metre.
     pub scatter: ResourceId,
     /// `rgb` = in-scattered radiance up to this slice, `a` = the transmittance
@@ -1564,6 +1569,31 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
                 .depth(FROXEL_SLICES),
         );
 
+        // The light the air scatters from everything round it, traced where
+        // the volumes are live: after the cache's shading and the gather's
+        // claims, whose cells its rays read, and with the volumes beside it for
+        // a ray that lands where the cache has no light yet.
+        let light = ray.zip(gi).map(|(ray, gi)| {
+            let light = builder.import_image(
+                "fog_light",
+                ImageDesc::new(FOG_FORMAT)
+                    .extent(Extent::FrameDiv(FROXEL_SHIFT + LIGHT_SHIFT))
+                    .depth(FROXEL_SLICES >> LIGHT_SHIFT),
+                ImageLayout::ShaderReadOnlyOptimal,
+                ImageLayout::ShaderReadOnlyOptimal,
+            );
+            let pass = builder
+                .pass("fog_light", PassKind::Compute)
+                .access(ray.scene, Access::AccelerationStructureRead)
+                .access(gi.cells, Access::StorageRead)
+                .access(gi.radiance, Access::StorageRead);
+            let id = reads_gi(pass, Some(gi))
+                .access(light, Access::StorageWrite)
+                .build();
+            record(id, PassBody::FogLight, &mut bodies);
+            light
+        });
+
         // The history is the *other* allocation of `scatter`, which the graph
         // cannot see and does not need to: the executor binds it, and a resource
         // read and written by one pass is one point in the schedule either way.
@@ -1571,7 +1601,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         if let Some(atlas) = shadow_atlas {
             scatter_pass = scatter_pass.access(atlas, Access::Sampled);
         }
-        scatter_pass = reads_gi(scatter_pass, gi);
+        if let Some(light) = light {
+            scatter_pass = scatter_pass.access(light, Access::Sampled);
+        }
         let id = scatter_pass.access(scatter, Access::StorageWrite).build();
         record(id, PassBody::FogScatter, &mut bodies);
 
@@ -1582,7 +1614,11 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .build();
         record(id, PassBody::FogIntegrate, &mut bodies);
 
-        FogIds { scatter, volume }
+        FogIds {
+            light,
+            scatter,
+            volume,
+        }
     });
 
     // Declared before the pass that writes them, because the forward pass has to

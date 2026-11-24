@@ -3096,6 +3096,51 @@ fn the_final_gather_runs_between_the_cache_and_the_forward_pass() {
     assert!(!format!("{}", off.graph).contains("gi_gather"));
 }
 
+/// The fog's traced light reads the cache after it is shaded and after the
+/// gather has claimed its cells, and the froxels read it after it is traced.
+/// Without the volumes it is not declared, and the fog is the frame it was.
+#[test]
+fn the_fogs_traced_light_runs_between_the_cache_and_the_froxels() {
+    let frame = declare(FrameConfig {
+        ray_tracing: true,
+        gi_probes: 16,
+        gi_gather: 1,
+        volumetric_fog: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    let light = frame
+        .ids
+        .fog
+        .and_then(|fog| fog.light)
+        .expect("the volumes are live, so the fog traces its light");
+    assert!(frame.graph.culled().is_empty(), "{}", frame.graph);
+    let order: Vec<&str> = frame
+        .graph
+        .order()
+        .iter()
+        .map(|&pass| frame.graph.pass_name(pass))
+        .collect();
+    let at = |name: &str| {
+        order
+            .iter()
+            .position(|&pass| pass == name)
+            .unwrap_or_else(|| panic!("{name} was not scheduled:\n{order:?}"))
+    };
+    assert!(at("gi_cache_shade") < at("fog_light"), "{order:?}");
+    assert!(at("gi_gather") < at("fog_light"), "{order:?}");
+    assert!(at("fog_light") < at("fog_scatter"), "{order:?}");
+    assert_eq!(frame.graph.resource_name(light), "fog_light");
+
+    let off = declare(FrameConfig {
+        volumetric_fog: true,
+        ..reference_config(false, true)
+    })
+    .unwrap();
+    assert!(off.ids.fog.expect("the fog was asked for").light.is_none());
+    assert!(!format!("{}", off.graph).contains("fog_light"));
+}
+
 /// A device that cannot trace, or a frame in which nothing does, declares
 /// neither build: the structures cost a frame that traces nothing as much as
 /// one that does.

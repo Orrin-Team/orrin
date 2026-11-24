@@ -12,6 +12,7 @@ dof_prefilter_comp compute dof_prefilter.comp
 dof_tile_max_comp compute dof_tile_max.comp
 equirect_to_cube_frag fragment equirect_to_cube.frag
 fog_integrate_comp compute fog_integrate.comp
+fog_light_comp compute fog_light.comp ORRIN_FLAT_SURFACE=1
 fog_scatter_comp compute fog_scatter.comp
 forward_frag fragment forward.frag
 forward_frag_alpha_test fragment forward.frag ORRIN_ALPHA_TEST=1

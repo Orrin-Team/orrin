@@ -12,6 +12,7 @@
 // sixty-four planes; with it the volume resolves finer than its own slice count,
 // for the reason TAA resolves finer than its own pixel grid.
 
+#define ORRIN_FOG_LIGHT
 #include "fog.glsl"
 
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
@@ -37,16 +38,16 @@ layout(set = 0, binding = 3) uniform sampler3D u_history;
 
 layout(set = 0, binding = 4, rgba16f) uniform writeonly image3D u_scatter;
 
-// The irradiance volumes, or their inert stand-ins: where they are live, the
-// light the air scatters from everywhere but the sun is what they hold, not
-// the scene's flat ambient — the air in a closed room is as dark as its walls.
+// The irradiance volumes' block, or its inert stand-in, for whether they are
+// live and asked to light the fog; and where they are, the light the air
+// scatters from everything but the sun, traced from the air itself
+// (`fog_light.comp`) on a grid half the froxels' a side and in depth, or a
+// texel of nothing where it is not.
 #define ORRIN_GI_SET 0
 #define ORRIN_GI_BLOCK_BINDING 5
 #define ORRIN_GI_PROBES_BINDING 6
-#define ORRIN_GI_IRRADIANCE_BINDING 7
-#define ORRIN_GI_DISTANCE_BINDING 8
-#define ORRIN_GI_SAMPLER_BINDING 9
 #include "gi.glsl"
+layout(set = 0, binding = 10) uniform sampler3D u_air;
 
 void main() {
     ivec3 size = imageSize(u_scatter);
@@ -80,25 +81,23 @@ void main() {
     // `rgb` is scattered radiance per metre and `a` is extinction per metre, so
     // the pass below can integrate the two together over a slice's own length.
     vec4 current = vec4(density * fog_inscattered(f, dir, sun_visibility), density);
-    // The flat ambient taken back out and the volumes' mean radiance put in,
-    // with the ambient again past their reach — and not where they reach but
-    // no probe can see, which is air inside a wall, and whose light would
-    // show as a contour wherever a slice of froxels crosses the wall's face.
-    // Added rather than folded into the line above, which then stays the
-    // frame it was where they are off.
+    // The flat ambient taken back out and the traced light put in: the air in
+    // a closed room is as dark as its walls, and the air of an aisle beside a
+    // sunlit court is lit by what it sees of the court. Added rather than
+    // folded into the line above, which then stays the frame it was where the
+    // volumes are off.
     //
-    // A sample no probe can see has nothing to say rather than darkness to
-    // report, and keeps the froxel's history whole below: the slice that
-    // crosses a wall's face is jittered into the wall on some frames and into
-    // the room on others, and averaging the first as black is a band along
-    // the wall for every slice that meets it.
+    // Not the volumes' mean radiance at the point: their probes are a metre
+    // apart near the camera and four at twenty metres, where an aisle three
+    // metres wide has none of its own, and the air there was lit by probes
+    // in the court through the arches. `gfx/vulkan/fog.rs` has the numbers.
+    // Where no cell round the point holds light — air the camera sees only
+    // at a wall's face, jittered into it — the froxel keeps its history.
     float keep = f.temporal.x;
     if (gi_live() && gi.environment.z > 0.5) {
-        vec4 local = gi_mean_radiance(world_pos);
-        float reach = gi_reach(world_pos);
-        vec3 ambient = local.rgb + f.ambient.rgb * (1.0 - reach);
-        current.rgb += density * f.albedo.rgb * (ambient - f.ambient.rgb);
-        keep = mix(keep, 1.0, reach * (1.0 - local.a));
+        vec4 light = fog_light_at(u_air, vec3(uv, t));
+        current.rgb += density * f.albedo.rgb * (light.rgb - f.ambient.rgb);
+        keep = light.a > 0.0 ? keep : 1.0;
     }
 
     if (f.temporal.z < 0.5) {

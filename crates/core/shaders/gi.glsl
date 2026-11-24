@@ -379,62 +379,6 @@ float gi_reach(vec3 P) {
     }
     return 1.0 - beyond;
 }
-
-// The mean radiance arriving at a point of air from every direction, which is
-// what an isotropic medium scatters. The mean of a probe's tile along the six
-// axes, which for anything within the first three spherical-harmonic bands —
-// as irradiance is, to within a percent — is its mean over the sphere.
-vec4 gi_cascade_mean(int level, vec3 P) {
-    float s = gi_spacing(level);
-    ivec3 base = gi_base(level);
-    vec3 grid = gi_coordinate(level, P) - vec3(base);
-    ivec3 lo = clamp(ivec3(floor(grid)), ivec3(0), ivec3(int(gi.grid.x) - 2));
-    vec3 alpha = clamp(grid - vec3(lo), 0.0, 1.0);
-    uvec3 first = gi_slot(base + lo);
-
-    vec3 sum = vec3(0.0);
-    float total = 0.0;
-    for (int i = 0; i < 8; ++i) {
-        ivec3 corner = ivec3(i, i >> 1, i >> 2) & 1;
-        ivec3 world = base + lo + corner;
-        uvec3 slot = gi_next_slot(first, corner);
-        uvec4 state = gi_probes[gi_probe_index(level, slot)];
-        if (!gi_usable(state, world)) {
-            continue;
-        }
-        vec3 probe = gi_position(level, world) + gi_offset(state);
-        vec3 trilinear = mix(1.0 - alpha, alpha, vec3(corner));
-        // No floor under the visibility, unlike a surface's: a point of air no
-        // probe can see is inside something, and is left to the ambient.
-        float weight = gi_visibility(level, slot, P - probe)
-                     * max(trilinear.x * trilinear.y * trilinear.z, 1e-4);
-        vec3 mean = gi_irradiance_texel(level, slot, vec3(1.0, 0.0, 0.0))
-                  + gi_irradiance_texel(level, slot, vec3(-1.0, 0.0, 0.0))
-                  + gi_irradiance_texel(level, slot, vec3(0.0, 1.0, 0.0))
-                  + gi_irradiance_texel(level, slot, vec3(0.0, -1.0, 0.0))
-                  + gi_irradiance_texel(level, slot, vec3(0.0, 0.0, 1.0))
-                  + gi_irradiance_texel(level, slot, vec3(0.0, 0.0, -1.0));
-        sum += mean * (weight / 6.0);
-        total += weight;
-    }
-    return total > 1e-4 ? vec4(sum / total, 1.0) : vec4(0.0);
-}
-
-vec4 gi_mean_radiance(vec3 P) {
-    vec3 sum = vec3(0.0);
-    float left = 1.0;
-    for (int level = 0; level < GI_CASCADES && left > 1e-3; ++level) {
-        float weight = gi_cascade_weight(level, P);
-        if (weight <= 0.0) {
-            continue;
-        }
-        vec4 e = gi_cascade_mean(level, P);
-        float take = left * weight * e.a;
-        sum += e.rgb * take;
-        left -= take;
-    }
-    return vec4(sum, 1.0 - left);
-}
 #endif
 
 #endif
