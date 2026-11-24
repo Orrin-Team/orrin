@@ -24,7 +24,10 @@
 // from one frame to the next, pooled over the twenty-five texels round it:
 // one texel meets such a floor too seldom to know it is there, and a change
 // between successive frames, unlike a spread about a lagging mean, does not
-// grow while the light is rising or falling.
+// grow while the light is rising or falling. It is taken against the mean of
+// the histories of the eight texels two away, not this texel's own: a window
+// that lengthens where its own mean has fallen and shortens where it has risen
+// settles below the light it averages, a tenth below in Sponza's gallery.
 //
 // A light switched on would take as long as that cap to arrive, so the
 // probes' test of a short mean against the long one, in its standard errors,
@@ -113,6 +116,8 @@ void main() {
     float total = 0.0;
     float pooled = 0.0;
     float pooled_count = 0.0;
+    float pooled_level = 0.0;
+    float levels = 0.0;
     vec2 previous = (vec2(texel) + 0.5) / vec2(full) - texelFetch(u_velocity, texel, 0).rg;
     if ((gather.params.z & GATHER_HISTORY) != 0u
             && all(greaterThanEqual(previous, vec2(0.0)))
@@ -152,6 +157,12 @@ void main() {
                 if (meta.x > 0.5) {
                     pooled += meta.w * meta.w;
                     pooled_count += 1.0;
+                    if (((x | y) & 1) == 0 && (x != 0 || y != 0)) {
+                        pooled_level += dot(vec3(texelFetch(u_history, ivec3(q, 0), 0).x,
+                                                 texelFetch(u_history, ivec3(q, 1), 0).x,
+                                                 texelFetch(u_history, ivec3(q, 2), 0).x), GATHER_LUMA);
+                        levels += 1.0;
+                    }
                 }
             }
         }
@@ -210,7 +221,8 @@ void main() {
 
     // One ray's variance from that of the nine rays' mean between frames:
     // nine times, and half, for the two frames a change is the difference of.
-    float variance = pooled_count > 0.0 ? 4.5 * pooled / pooled_count / max(mean * mean, 1e-12) : 0.0;
+    float level = levels > 0.0 ? pooled_level / levels : mean;
+    float variance = pooled_count > 0.0 ? 4.5 * pooled / pooled_count / max(level * level, 1e-12) : 0.0;
     float cap = clamp(gather.camera.w * variance / AGREE, gather.camera.w, max(LONGEST, gather.camera.w));
     if (since < SETTLING) {
         cap = max(gather.camera.w * 0.5, 1.0);
