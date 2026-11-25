@@ -506,6 +506,7 @@ mod tests {
             gi_probes: 0,
             gi_gather: 0,
             upscaling: crate::scene::Upscaling::Native,
+            vendor_resolve: false,
         };
         let frame = declare(config).expect("the busiest frame must compile");
 

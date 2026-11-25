@@ -908,6 +908,7 @@ impl VulkanRenderer {
             gi_probes: 0,
             gi_gather: 0,
             upscaling: crate::scene::Upscaling::Native,
+            vendor_resolve: false,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -2285,6 +2286,7 @@ impl VulkanRenderer {
             // and never resolved would simply be small.
             taa: taa.resolves(),
             upscaling: taa.upscaling,
+            vendor_resolve: false,
             auto_exposure: hdr.auto_exposure,
             motion_blur: motion_blur.enabled,
             dof: dof.enabled,
@@ -4558,6 +4560,9 @@ impl FrameRecord<'_> {
                 self.taa
                     .record(self.device, encoder, &self.view, color, velocity, depth);
             }
+            PassBody::VendorResolve => {
+                unreachable!("a vendor resolve was scheduled with no vendor upscaler bound")
+            }
             PassBody::DofPrefilter => {
                 let ids = self
                     .frame
@@ -5070,6 +5075,7 @@ impl FrameRecord<'_> {
             | PassBody::RefractionScene
             | PassBody::RefractionComposite
             | PassBody::TaaResolve
+            | PassBody::VendorResolve
             | PassBody::DofPrefilter
             | PassBody::DofTileMax
             | PassBody::DofGather

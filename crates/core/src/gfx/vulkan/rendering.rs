@@ -392,6 +392,7 @@ pub(super) fn rendering_info(
         | PassBody::RefractionScene
         | PassBody::RefractionComposite
         | PassBody::TaaResolve
+        | PassBody::VendorResolve
         | PassBody::DofPrefilter
         | PassBody::DofTileMax
         | PassBody::DofGather

@@ -240,6 +240,11 @@ pub struct FrameConfig {
     /// one size and so which may share an allocation, how the wireframe tests
     /// its edges, and the resolve's history format. Needs `taa`.
     pub upscaling: crate::scene::Upscaling,
+    /// Whether a vendor's upscaler resolves the frame in place of the
+    /// engine's own. The node keeps its place and its inputs; what changes is
+    /// its body, that it keeps no history of the engine's, and that the frame
+    /// stays on one queue. Needs `taa`.
+    pub vendor_resolve: bool,
     /// How many times the final gather's resolution halves the frame's each
     /// way, zero where it does not run. Live, it is five dispatches between
     /// the prepass and the forward pass, and the forward pass reads what they
@@ -327,6 +332,9 @@ pub enum PassBody {
     RefractionComposite,
     /// Reprojects the history onto this frame and accumulates into it.
     TaaResolve,
+    /// The same node's inputs and output, resolved by a vendor's upscaler,
+    /// which keeps its history itself.
+    VendorResolve,
     /// Half the frame, carrying its own circle of confusion.
     DofPrefilter,
     /// The widest near and far circle per tile, which sizes the gather's kernel.
@@ -474,6 +482,9 @@ pub struct FrameIds {
     pub transparency: Option<TransparencyIds>,
     pub refraction: Option<RefractionIds>,
     pub taa: Option<TaaIds>,
+    /// The resolve's images where a vendor's upscaler runs it, in place of
+    /// `taa`.
+    pub vendor_resolve: Option<VendorResolveIds>,
     pub dof: Option<DofIds>,
     pub motion_blur: Option<MotionBlurIds>,
     /// The shadow atlas, when anything casts: what the shading passes and the
@@ -848,6 +859,17 @@ pub struct TaaIds {
     pub output: ResourceId,
 }
 
+/// What a vendor's upscaler reads and writes in the resolve's place.
+///
+/// No history: the upscaler keeps its own on the device, so the frame's
+/// output is an ordinary transient, written once and read by what follows.
+#[derive(Clone, Copy, Debug)]
+pub struct VendorResolveIds {
+    /// What [`TaaIds::source`] would be.
+    pub source: ResourceId,
+    pub output: ResourceId,
+}
+
 /// Depth of field's three images, and what it was handed.
 ///
 /// `source` is recorded rather than re-derived because this pass sits in a
@@ -931,7 +953,11 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // tail would read them from a family that does not own them.
     let shades_hits = config.ray_reflections || config.ray_path_trace || config.gi_probes > 0;
     let gathers = config.ray_tracing && config.gi_probes > 0 && config.gi_gather > 0;
-    if config.async_compute && !shades_hits {
+    // Nor is a frame a vendor resolves: the upscaler's own images are made
+    // exclusive to whichever family first runs it, and the resolve sits in the
+    // compute tail, which would move it between families as the frame's shape
+    // changed.
+    if config.async_compute && !shades_hits && !config.vendor_resolve {
         builder.request_async_compute();
     }
     let mut bodies = Vec::new();
@@ -2078,7 +2104,30 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         shaded = refraction.output;
     }
 
-    let taa = config.taa.then(|| {
+    let vendor_resolve = (config.taa && config.vendor_resolve).then(|| {
+        let prepass = prepass.expect("the resolve reads the geometry prepass");
+        let output = builder.create_image(
+            "taa_color",
+            ImageDesc::new(HDR_FORMAT).extent(Extent::Output),
+        );
+        // The states the upscaler is handed say these layouts, and it puts
+        // each image back in them before it returns.
+        let id = builder
+            .pass("taa_resolve", PassKind::Compute)
+            .access(shaded, Access::Sampled)
+            .access(prepass.velocity, Access::Sampled)
+            .access(prepass.depth, Access::Sampled)
+            .access(output, Access::StorageWrite)
+            .build();
+        record(id, PassBody::VendorResolve, &mut bodies);
+
+        VendorResolveIds {
+            source: shaded,
+            output,
+        }
+    });
+
+    let taa = (config.taa && !config.vendor_resolve).then(|| {
         let prepass = prepass.expect("TAA reads the geometry prepass");
         // Entry `ShaderReadOnlyOptimal` states the steady state, which the
         // ping-pong guarantees: `output` below leaves every frame in exactly
@@ -2122,7 +2171,11 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // the resolve is a change to one binding rather than to every consumer.
     // Each optical stage below rebinds it in turn, which is what makes the
     // chain's order a property of this function alone.
-    let mut scene_color = taa.map_or(shaded, |taa| taa.output);
+    let mut scene_color = match (taa, vendor_resolve) {
+        (Some(taa), _) => taa.output,
+        (None, Some(vendor)) => vendor.output,
+        (None, None) => shaded,
+    };
 
     // Lens before shutter before sensor, which is the order light actually
     // meets them and the order Unity and Unreal both settled on. Defocus first,
@@ -2664,6 +2717,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             transparency,
             refraction,
             taa,
+            vendor_resolve,
             dof,
             motion_blur,
             shadow_atlas,
