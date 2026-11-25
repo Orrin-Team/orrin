@@ -49,6 +49,14 @@ pub struct TaaSettings {
     /// resolved would simply be small. Structural, like `enabled`.
     #[reflect(default)]
     pub upscaling: Upscaling,
+    /// What does the resolving. A request rather than a guarantee: a vendor's
+    /// upscaler runs only where its runtime does, and the engine's own resolve
+    /// stands in wherever it does not, so a scene asks for the same thing on
+    /// every machine and loads the same on each. [`UpscalerStatus`] says what
+    /// actually ran. At [`Native`](Upscaling::Native) a vendor's upscaler runs
+    /// as its antialiasing alone.
+    #[reflect(default)]
+    pub upscaler: Upscaler,
 }
 
 impl Default for TaaSettings {
@@ -59,6 +67,7 @@ impl Default for TaaSettings {
             jitter_scale: 1.0,
             msaa: false,
             upscaling: Upscaling::Native,
+            upscaler: Upscaler::BuiltIn,
         }
     }
 }
@@ -152,6 +161,48 @@ impl Upscaling {
             Upscaling::UltraPerformance => "Ultra performance (3x)",
         }
     }
+}
+
+/// Which temporal upscaler resolves the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
+pub enum Upscaler {
+    /// The engine's own resolve, which runs everywhere.
+    #[default]
+    BuiltIn,
+    /// AMD FSR, through its signed runtime: Vulkan on Windows, in a build
+    /// with the `fsr` feature, with the DLLs found.
+    Fsr,
+    /// NVIDIA DLSS. Not bound yet, so the engine's resolve stands in.
+    Dlss,
+}
+
+impl Upscaler {
+    pub const ALL: [Upscaler; 3] = [Upscaler::BuiltIn, Upscaler::Fsr, Upscaler::Dlss];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Upscaler::BuiltIn => "Built-in",
+            Upscaler::Fsr => "AMD FSR",
+            Upscaler::Dlss => "NVIDIA DLSS",
+        }
+    }
+}
+
+/// What the renderer resolved the last frame with, against what
+/// [`TaaSettings::upscaler`] asked for: a world resource the renderer's owner
+/// refreshes, for the editor to show.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UpscalerStatus {
+    pub asked: Upscaler,
+    /// `None` where the frame resolves nothing at all.
+    pub running: Option<Upscaler>,
+    /// Why `running` is not `asked`, where it is not.
+    pub reason: Option<std::sync::Arc<str>>,
+    /// The vendor's own name for the implementation it picked, which says
+    /// which generation of it runs on this device.
+    pub provider: Option<std::sync::Arc<str>>,
+    /// What the vendor's context holds on the device, by its own account.
+    pub memory_bytes: Option<u64>,
 }
 
 #[cfg(test)]

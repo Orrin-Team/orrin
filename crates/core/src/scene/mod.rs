@@ -87,7 +87,7 @@ pub use shadow::{MAX_SHADOW_SHARPNESS, MAX_SUN_ANGLE, ShadowDebugView, ShadowSet
 pub use ssao::SsaoSettings;
 pub use ssr::SsrSettings;
 pub use subsurface::SubsurfaceSettings;
-pub use taa::{TaaSettings, Upscaling};
+pub use taa::{TaaSettings, Upscaler, UpscalerStatus, Upscaling};
 pub use time::{Time, advance_time};
 pub use transform::Transform;
 pub use transparency::{RefractionSettings, TransparencySettings};
