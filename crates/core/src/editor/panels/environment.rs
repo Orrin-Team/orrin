@@ -91,7 +91,15 @@ const SCREEN_SPACE: &[Section] = &[
         "Temporal AA",
         Some("Jitter the camera each frame and accumulate the results"),
         icons::frame_corners(),
-        &["Enabled", "Feedback", "Jitter", "4x MSAA", "Upscaling"],
+        &[
+            "Enabled",
+            "Feedback",
+            "Jitter",
+            "4x MSAA",
+            "Upscaling",
+            "Upscaler",
+            "Running",
+        ],
         temporal_aa,
     ),
     section(
@@ -558,6 +566,40 @@ fn temporal_aa(ui: &mut egui::Ui, world: &World, rows: Rows) {
             "Render the scene below the window's resolution and let the temporal \
              resolve bring it up. Any mode but native turns the resolve on",
         );
+    }
+    if rows.shows("Upscaler") {
+        use crate::scene::Upscaler;
+        widgets::property(ui, "Upscaler", |ui| {
+            egui::ComboBox::from_id_salt("taa_upscaler")
+                .selected_text(taa.upscaler.label())
+                .show_ui(ui, |ui| {
+                    for upscaler in Upscaler::ALL {
+                        ui.selectable_value(&mut taa.upscaler, upscaler, upscaler.label());
+                    }
+                })
+                .response
+        })
+        .on_hover_text(
+            "What resolves the frame. A vendor's upscaler runs where its runtime \
+             does, and the built-in resolve stands in everywhere else",
+        );
+    }
+    // What the renderer did with the request, which only it can know: whether
+    // the vendor's runtime was found and took this device.
+    if rows.shows("Running")
+        && let Some(status) = world.get_resource::<crate::scene::UpscalerStatus>()
+    {
+        widgets::property(ui, "Running", |ui| {
+            let running = status.running.map_or("Nothing", |running| running.label());
+            let response = match (&status.provider, &status.reason) {
+                (Some(provider), _) => ui.label(format!("{running} {provider}")),
+                (None, Some(_)) => ui.label(format!("{running}, not {}", status.asked.label())),
+                (None, None) => ui.label(running),
+            };
+            if let Some(reason) = &status.reason {
+                response.on_hover_text(reason.as_ref());
+            }
+        });
     }
 }
 

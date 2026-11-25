@@ -357,6 +357,7 @@ impl App {
         world.insert_resource(HdrSettings::default());
         world.insert_resource(BloomSettings::default());
         world.insert_resource(TaaSettings::default());
+        world.insert_resource(crate::scene::UpscalerStatus::default());
         world.insert_resource(MotionBlurSettings::default());
         world.insert_resource(DofSettings::default());
         world.insert_resource(FogSettings::default());
@@ -1300,6 +1301,9 @@ impl ApplicationHandler for App {
                 stats.set_gpu_stats(gpu_ms, vram_used, vram_total);
                 stats.set_traced_scene_bytes(traced);
                 drop(stats);
+                // Its strings are shared, so this copies counts, not text.
+                *self.world.resource_mut::<crate::scene::UpscalerStatus>() =
+                    renderer.upscaler_status().clone();
 
                 // Expire debug lines now that this frame has drawn them: a
                 // one-frame line (expiry == its spawn time) is dropped, a timed
