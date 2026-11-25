@@ -2305,6 +2305,7 @@ impl VulkanRenderer {
                 taa,
                 self.backend.extent(),
                 hdr.manual_exposure(),
+                dt,
             )
         };
 

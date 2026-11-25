@@ -9,10 +9,19 @@
 //! an [`UpscalerStatus`], never a failure: the engine's resolve runs
 //! everywhere, which is what lets a scene ask for a vendor on every machine.
 //!
-//! **The context's life.** Made when the vendor first runs; made again when
-//! the extents it was made for or its flags change, which is also how a
-//! resize or a change of mode drops its history; and dropped when the vendor
-//! stops running, so a frame resolved by the engine holds none of the vendor's
+//! **The context's life.** Made when the vendor first runs, for the output's
+//! extent and a render extent as large, so that every mode fits it and a
+//! change of mode needs none. A frame dispatches at its own two extents, and
+//! one whose extents differ from the last dispatch's drops the history, as
+//! a resize or a change of mode drops the engine's. Making one takes a third
+//! of a second, so a resize does not make one per frame: an output that
+//! still fits the context is resolved in it, and one that has outgrown it,
+//! or left it more than twice its area, is given a new one only once it has
+//! been asked for unchanged for [`SETTLE_SECONDS`] of frame time, the
+//! engine's resolve standing in meanwhile where the old one cannot serve. A
+//! drag of the editor's viewport therefore costs one creation when it stops,
+//! or none if it only shrank. The context is dropped when the vendor stops
+//! running, so a frame resolved by the engine holds none of the vendor's
 //! memory, as one the vendor resolves holds none of the engine's history.
 //! Dropping it waits for the graphics queue, which is the only one a vendor's
 //! dispatch is ever submitted to (see `frame::declare`).
@@ -51,6 +60,13 @@ use vulkano::image::Image;
 use crate::gfx::format::Format;
 use crate::gfx::rhi::{BufferId, Device, Encoder, TextureViewId};
 use crate::scene::{TaaSettings, Upscaler, UpscalerStatus};
+
+/// How long an output that has outgrown the vendor's context must be asked
+/// for, unchanged, before one is made for it: long enough that a drag pausing
+/// under the hand does not make one, short beside the third of a second the
+/// making takes.
+#[cfg_attr(not(all(feature = "fsr", windows)), allow(dead_code))]
+pub(super) const SETTLE_SECONDS: f32 = 0.25;
 
 /// The exposure a vendor reads: one float, as AMD's `exposure` input is.
 pub(super) const EXPOSURE_FORMAT: Format = Format::R32Float;
@@ -129,7 +145,8 @@ impl VendorUpscaler {
     /// Decide what resolves the next frame, and make ready what it needs.
     /// `true` when a vendor's upscaler does, and the frame is to declare its
     /// node; `queue` is `None` off Vulkan. `manual_exposure` is what a fresh
-    /// exposure pair is seeded with.
+    /// exposure pair is seeded with, and `dt` the frame's step in seconds, by
+    /// which a resize settles.
     #[cfg_attr(not(all(feature = "fsr", windows)), allow(unused_variables))]
     pub(super) fn prepare(
         &mut self,
@@ -138,6 +155,7 @@ impl VendorUpscaler {
         settings: &TaaSettings,
         output: [u32; 2],
         manual_exposure: f32,
+        dt: f32,
     ) -> bool {
         let asked = settings.upscaler;
         let mut status = UpscalerStatus {
@@ -154,7 +172,7 @@ impl VendorUpscaler {
                     status.reason = Some(DLSS_UNBOUND.clone());
                     false
                 }
-                Upscaler::Fsr => self.prepare_fsr(queue, settings, output, &mut status),
+                Upscaler::Fsr => self.prepare_fsr(queue, settings, output, dt, &mut status),
             }
         };
         if settings.resolves() && !vendor {
@@ -197,6 +215,7 @@ impl VendorUpscaler {
         _queue: Option<&Arc<Queue>>,
         _settings: &TaaSettings,
         _output: [u32; 2],
+        _dt: f32,
         status: &mut UpscalerStatus,
     ) -> bool {
         status.reason = Some(NO_FSR.clone());
@@ -209,6 +228,7 @@ impl VendorUpscaler {
         queue: Option<&Arc<Queue>>,
         settings: &TaaSettings,
         output: [u32; 2],
+        dt: f32,
         status: &mut UpscalerStatus,
     ) -> bool {
         let Some(queue) = queue else {
@@ -217,7 +237,7 @@ impl VendorUpscaler {
         };
         match self
             .fsr
-            .prepare(queue, settings.upscaling, output, self.debug_view)
+            .prepare(queue, settings.upscaling, output, self.debug_view, dt)
         {
             Ok(live) => {
                 status.running = Some(Upscaler::Fsr);
@@ -301,14 +321,14 @@ impl VendorUpscaler {
 #[cfg(all(feature = "fsr", windows))]
 mod amd {
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
     use std::time::Instant;
 
     use vulkano::device::Queue;
 
     use super::super::fsr::{self, ContextDesc, Runtime, UpscaleContext};
     use super::super::record::Recorder;
-    use super::{EXPOSURE_FORMAT, FrameInputs, Images, REACTIVE_FORMAT};
+    use super::{EXPOSURE_FORMAT, FrameInputs, Images, REACTIVE_FORMAT, SETTLE_SECONDS};
     use crate::gfx::format::SampleCount;
     use crate::gfx::graph::ImageUsage;
     use crate::gfx::rhi::{
@@ -319,10 +339,16 @@ mod amd {
     use crate::gfx::shaders::ShaderId;
     use crate::scene::Upscaling;
 
+    /// Why the engine's resolve stands in while an outgrown context waits.
+    static SETTLING: LazyLock<Arc<str>> =
+        LazyLock::new(|| Arc::from("FSR waits for the output's extent to settle"));
+
     /// The context, and what was learnt of it when it was made.
     pub(super) struct Live {
         context: UpscaleContext,
         desc: ContextDesc,
+        /// The render and output extents of the last dispatch.
+        dispatched: Option<([u32; 2], [u32; 2])>,
         pub provider: Arc<str>,
         pub memory: Option<u64>,
     }
@@ -342,9 +368,27 @@ mod amd {
         /// The exposure images, while FSR resolves: `frame & 1` is written
         /// this frame and the other read.
         exposure: Option<([TextureViewId; 2], u64)>,
-        /// Made with the first pair and kept, as are the two below.
+        /// An output the context does not suit, and for how many seconds of
+        /// frames it has been asked for.
+        settling: Option<([u32; 2], f32)>,
+        /// Made with the first pair and kept, as is the reactive mask's.
         exposure_pipeline: Option<PipelineId>,
         reactive_pipeline: Option<(PipelineId, SamplerId)>,
+    }
+
+    /// Whether `output` has been asked for, unchanged, for long enough to
+    /// make a context for it; counts this frame's `dt` towards it.
+    fn settled(settling: &mut Option<([u32; 2], f32)>, output: [u32; 2], dt: f32) -> bool {
+        match settling {
+            Some((asked, waited)) if *asked == output => {
+                *waited += dt;
+                *waited >= SETTLE_SECONDS
+            }
+            _ => {
+                *settling = Some((output, 0.0));
+                false
+            }
+        }
     }
 
     /// `FfxApiUpscaleQualityMode`, `ffx_upscale.h`, in the engine's terms.
@@ -388,6 +432,7 @@ mod amd {
             }
             if forget {
                 self.failed = None;
+                self.settling = None;
                 *self
                     .dispatch_failed
                     .get_mut()
@@ -528,6 +573,7 @@ mod amd {
             upscaling: Upscaling,
             output: [u32; 2],
             debug_view: bool,
+            dt: f32,
         ) -> Result<&Live, Arc<str>> {
             if let Some(reason) = self
                 .dispatch_failed
@@ -560,16 +606,39 @@ mod amd {
             if debug_view {
                 flags |= fsr::ENABLE_DEBUG_VISUALIZATION;
             }
+            let render = upscaling.render_extent(output);
             let desc = ContextDesc {
-                max_render: upscaling.render_extent(output),
+                max_render: output,
                 output,
                 flags,
             };
 
             let live = self.live.get_mut().expect("the FSR context was poisoned");
-            if live.as_ref().is_some_and(|live| live.desc == desc) {
-                return Ok(live.as_ref().unwrap());
+            let area = |[width, height]: [u32; 2]| width as u64 * height as u64;
+            match live.as_ref().map(|live| live.desc) {
+                Some(made) if made.flags == flags => {
+                    let fits = output[0] <= made.output[0] && output[1] <= made.output[1];
+                    let roomy = area(made.output) > 2 * area(output);
+                    if fits && !roomy {
+                        self.settling = None;
+                        return Ok(live.as_ref().unwrap());
+                    }
+                    if !settled(&mut self.settling, output, dt) {
+                        if fits {
+                            return Ok(live.as_ref().unwrap());
+                        }
+                        *live = None;
+                        return Err(SETTLING.clone());
+                    }
+                }
+                None if self.settling.is_some() => {
+                    if !settled(&mut self.settling, output, dt) {
+                        return Err(SETTLING.clone());
+                    }
+                }
+                _ => {}
             }
+            self.settling = None;
             if let Some((failed, reason)) = &self.failed
                 && *failed == desc
             {
@@ -600,23 +669,22 @@ mod amd {
             let mode = quality_mode(upscaling);
             let theirs = context.render_extent(output, mode);
             debug_assert!(
-                theirs.is_none_or(|theirs| theirs == desc.max_render),
-                "FSR renders {output:?} in mode {mode} at {theirs:?}, the engine at {:?}",
-                desc.max_render,
+                theirs.is_none_or(|theirs| theirs == render),
+                "FSR renders {output:?} in mode {mode} at {theirs:?}, the engine at {render:?}",
             );
-            let phases = context.jitter_phases(desc.max_render[0], output[0]);
+            let phases = context.jitter_phases(render[0], output[0]);
             if phases.is_some_and(|phases| phases != upscaling.jitter_phases()) {
                 tracing::warn!(
                     "FSR: a jitter sequence {phases:?} long from {} to {} pixels, the \
                      engine's is {}",
-                    desc.max_render[0],
+                    render[0],
                     output[0],
                     upscaling.jitter_phases(),
                 );
             }
 
             tracing::info!(
-                "FSR: {provider}, {:?} to {:?}, {} MiB, created in {:.0} ms",
+                "FSR: {provider}, up to {:?} to {:?}, {} MiB, created in {:.0} ms",
                 desc.max_render,
                 output,
                 memory.map_or("?".to_string(), |bytes| format!(
@@ -629,6 +697,7 @@ mod amd {
             Ok(live.insert(Live {
                 context,
                 desc,
+                dispatched: None,
                 provider,
                 memory,
             }))
@@ -646,6 +715,11 @@ mod amd {
             let live = live
                 .as_mut()
                 .expect("the graph scheduled FSR with no context made for it");
+            let extents = (inputs.render, inputs.output);
+            let resized = live
+                .dispatched
+                .replace(extents)
+                .is_some_and(|last| last != extents);
             let dispatch = fsr::Dispatch {
                 color: &images.color,
                 depth: &images.depth,
@@ -666,7 +740,7 @@ mod amd {
                 render: inputs.render,
                 upscale: inputs.output,
                 frame_ms: inputs.frame_ms,
-                reset,
+                reset: reset || resized,
                 near: inputs.near,
                 far: inputs.far,
                 fov_y: inputs.fov_y,
