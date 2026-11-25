@@ -40,7 +40,8 @@
 // bounce. Light that falls is left to the cap, which is short where a lamp
 // lights a room, since its rays agree.
 
-layout(local_size_x = 8, local_size_y = 8) in;
+const int TILE = 8;
+layout(local_size_x = TILE, local_size_y = TILE) in;
 
 layout(set = 0, binding = 0) uniform texture2D u_depth;
 layout(set = 0, binding = 1) uniform texture2D u_normal;
@@ -83,9 +84,19 @@ float raw_luminance(ivec2 low) {
                     texelFetch(u_raw, ivec3(low, 2), 0).x), GATHER_LUMA);
 }
 
+// The rays' luminance over the workgroup's tile and a texel round it, read
+// once rather than by each of the nine texels it is round.
+const int RIM = TILE + 2;
+shared float s_rays[RIM * RIM];
+
 void main() {
     ivec2 low = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(u_accumulated).xy;
+    ivec2 corner_of_tile = ivec2(gl_WorkGroupID.xy) * TILE - 1;
+    for (int i = int(gl_LocalInvocationIndex); i < RIM * RIM; i += TILE * TILE) {
+        s_rays[i] = raw_luminance(clamp(corner_of_tile + ivec2(i % RIM, i / RIM), ivec2(0), size - 1));
+    }
+    barrier();
     if (any(greaterThanEqual(low, size))) {
         return;
     }
@@ -182,7 +193,8 @@ void main() {
     float rays[9];
     float around = 0.0;
     for (int i = 0; i < 9; ++i) {
-        rays[i] = raw_luminance(clamp(low + ivec2(i % 3 - 1, i / 3 - 1), ivec2(0), size - 1));
+        ivec2 at = ivec2(gl_LocalInvocationID.xy) + ivec2(i % 3, i / 3);
+        rays[i] = s_rays[at.y * RIM + at.x];
         around += rays[i];
     }
     around /= 9.0;
