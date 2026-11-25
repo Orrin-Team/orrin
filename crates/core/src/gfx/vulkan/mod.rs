@@ -1515,6 +1515,12 @@ impl VulkanRenderer {
                 return self.occlusion.history_view();
             }
         }
+        if let Some(vendor) = self.frame.ids.vendor_resolve
+            && (id == vendor.exposure || id == vendor.exposure_history)
+        {
+            let (written, read) = self.upscaler.exposure_views();
+            return if id == vendor.exposure { written } else { read };
+        }
         match self.frame.ids.taa {
             Some(taa) if id == taa.output => self.taa.output_view(),
             _ => self.table.texture(id),
@@ -1600,6 +1606,13 @@ impl VulkanRenderer {
                     self.vk_view(self.occlusion.history_view()).image().clone(),
                 ));
             }
+        }
+        if let Some(vendor) = ids.vendor_resolve
+            && (id == vendor.exposure || id == vendor.exposure_history)
+        {
+            return Some(record::Target::Image(
+                self.vk_view(self.texture_of(id)).image().clone(),
+            ));
         }
         if let Some(taa) = ids.taa {
             if id == taa.output {
@@ -2286,7 +2299,13 @@ impl VulkanRenderer {
                 #[cfg(target_os = "macos")]
                 Backend::Metal(_) => None,
             };
-            self.upscaler.prepare(queue, taa, self.backend.extent())
+            self.upscaler.prepare(
+                &self.device,
+                queue,
+                taa,
+                self.backend.extent(),
+                hdr.manual_exposure(),
+            )
         };
 
         // The frame's structure, and the only thing that recompiles the graph.
@@ -4100,6 +4119,12 @@ impl FrameRecord<'_> {
         {
             return self.fog.light_state_view();
         }
+        if let Some(vendor) = self.frame.ids.vendor_resolve
+            && (id == vendor.exposure || id == vendor.exposure_history)
+        {
+            let (written, read) = self.upscaler.exposure_views();
+            return if id == vendor.exposure { written } else { read };
+        }
         match self.frame.ids.taa {
             Some(taa) if id == taa.output => self.taa.output_view(),
             _ => self.table.texture(id),
@@ -4187,6 +4212,13 @@ impl FrameRecord<'_> {
                     self.vk_view(self.occlusion.history_view()).image().clone(),
                 ));
             }
+        }
+        if let Some(vendor) = ids.vendor_resolve
+            && (id == vendor.exposure || id == vendor.exposure_history)
+        {
+            return Some(record::Target::Image(
+                self.vk_view(self.texture_of(id)).image().clone(),
+            ));
         }
         if let Some(taa) = ids.taa {
             if id == taa.output {
@@ -4623,6 +4655,7 @@ impl FrameRecord<'_> {
                     color: image(ids.source),
                     depth: image(prepass.depth),
                     motion: image(prepass.velocity),
+                    exposure: image(ids.exposure_history),
                     output: image(ids.output),
                 };
                 self.upscaler
@@ -4793,6 +4826,15 @@ impl FrameRecord<'_> {
             PassBody::LuminanceAverage => {
                 self.exposure
                     .record_average(self.device, encoder, self.output_extent);
+            }
+            PassBody::UpscalerExposure => {
+                self.upscaler.record_exposure(
+                    self.device,
+                    encoder,
+                    self.exposure.exposure_buffer(),
+                    self.hdr.manual_exposure,
+                    self.hdr.auto_exposure,
+                );
             }
             PassBody::BloomPrefilter => {
                 let ids = self.frame.ids.bloom.expect("bloom pass without levels");
@@ -5150,6 +5192,7 @@ impl FrameRecord<'_> {
             | PassBody::MotionBlurGather
             | PassBody::LuminanceHistogram
             | PassBody::LuminanceAverage
+            | PassBody::UpscalerExposure
             | PassBody::BloomPrefilter
             | PassBody::BloomDownsample(_)
             | PassBody::BloomUpsample(_)

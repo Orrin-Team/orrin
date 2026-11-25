@@ -402,6 +402,7 @@ pub(super) fn rendering_info(
         | PassBody::MotionBlurGather
         | PassBody::LuminanceHistogram
         | PassBody::LuminanceAverage
+        | PassBody::UpscalerExposure
         | PassBody::BloomPrefilter
         | PassBody::BloomDownsample(_)
         | PassBody::BloomUpsample(_)

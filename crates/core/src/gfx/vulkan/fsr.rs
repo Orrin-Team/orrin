@@ -77,7 +77,6 @@ const DEBUG_LEVEL_WARNINGS: u32 = 2;
 /// `FfxApiCreateContextUpscaleFlags`, `ffx_upscale.h`.
 pub(super) const ENABLE_HIGH_DYNAMIC_RANGE: u32 = 1 << 0;
 pub(super) const ENABLE_DEPTH_INVERTED: u32 = 1 << 3;
-pub(super) const ENABLE_AUTO_EXPOSURE: u32 = 1 << 5;
 pub(super) const ENABLE_DEBUG_CHECKING: u32 = 1 << 7;
 pub(super) const ENABLE_DEBUG_VISUALIZATION: u32 = 1 << 9;
 
@@ -445,6 +444,8 @@ pub(super) struct Dispatch<'a> {
     pub color: &'a Arc<Image>,
     pub depth: &'a Arc<Image>,
     pub motion: &'a Arc<Image>,
+    /// 1x1, the exposure the tonemap applies.
+    pub exposure: &'a Arc<Image>,
     pub output: &'a Arc<Image>,
     /// In render pixels, as `ffxDispatchDescUpscale::jitterOffset` takes it.
     pub jitter: [f32; 2],
@@ -611,7 +612,7 @@ impl UpscaleContext {
             color: Resource::image(frame.color, STATE_COMPUTE_READ),
             depth: Resource::image(frame.depth, STATE_COMPUTE_READ),
             motion_vectors: Resource::image(frame.motion, STATE_COMPUTE_READ),
-            exposure: Resource::NONE,
+            exposure: Resource::image(frame.exposure, STATE_COMPUTE_READ),
             reactive: Resource::NONE,
             transparency_and_composition: Resource::NONE,
             output: Resource::image(frame.output, STATE_UNORDERED_ACCESS),
@@ -634,6 +635,8 @@ impl UpscaleContext {
             enable_sharpening: false,
             sharpness: 0.0,
             frame_time_delta: frame.frame_ms,
+            // The frame's colour is the light as lit: nothing scaled it on the
+            // way into its format for this to undo.
             pre_exposure: 1.0,
             reset: frame.reset,
             camera_near: frame.near,
@@ -646,7 +649,13 @@ impl UpscaleContext {
                 0
             },
         };
-        let images = [frame.color, frame.depth, frame.motion, frame.output];
+        let images = [
+            frame.color,
+            frame.depth,
+            frame.motion,
+            frame.exposure,
+            frame.output,
+        ];
         let code = recorder.record_foreign(&images, |command_buffer| {
             desc.command_list = command_buffer.as_raw() as *mut c_void;
             // SAFETY: the command buffer is recording — the recorder owns it

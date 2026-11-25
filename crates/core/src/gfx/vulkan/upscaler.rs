@@ -22,20 +22,30 @@
 //! dropped here on the thread that drives the frame, before anything records,
 //! and entered by the one dispatch a frame has.
 //!
-//! **Exposure.** FSR meters its own (`ENABLE_AUTO_EXPOSURE`). The engine's
-//! adapted value is a buffer that the metering after the resolve writes, and
-//! the graph orders every reader of a resource after its writers, so the
-//! resolve cannot read last frame's value from it without a cycle; handing it
-//! over needs a copy into a ping-ponged 1x1 image after the metering, which
-//! the next frame's resolve then reads.
+//! **Exposure.** The vendor is handed the engine's: the multiplier the tonemap
+//! applies, which is what AMD's `exposure` input asks for ("the value the
+//! application uses during any subsequent tonemapping"), with a pre-exposure
+//! of one, since the frame's colour is the light as lit and not pre-scaled.
+//! The metering runs after the resolve, and the graph orders every reader of
+//! a resource after its writers, so the resolve cannot read this frame's
+//! value: `upscaler_exposure` copies it after the metering into one of two
+//! 1x1 images, and the next frame's resolve reads the other, which holds the
+//! exposure the last frame was shown at. The pair exists while a vendor
+//! resolves and only then. It is seeded with the manual exposure, which the
+//! first frame reads; that frame is also its context's first, with no history
+//! for the exposure to weigh.
 
 use std::sync::{Arc, LazyLock};
 
 use vulkano::device::Queue;
 use vulkano::image::Image;
 
-use crate::gfx::rhi::Encoder;
+use crate::gfx::format::Format;
+use crate::gfx::rhi::{BufferId, Device, Encoder, TextureViewId};
 use crate::scene::{TaaSettings, Upscaler, UpscalerStatus};
+
+/// The exposure a vendor reads: one float, as AMD's `exposure` input is.
+pub(super) const EXPOSURE_FORMAT: Format = Format::R32Float;
 
 /// What one frame's upscale is handed besides its images. Read only where a
 /// vendor's upscaler is built in.
@@ -60,6 +70,7 @@ pub(super) struct Images {
     pub color: Arc<Image>,
     pub depth: Arc<Image>,
     pub motion: Arc<Image>,
+    pub exposure: Arc<Image>,
     pub output: Arc<Image>,
 }
 
@@ -105,12 +116,16 @@ impl VendorUpscaler {
 
     /// Decide what resolves the next frame, and make ready what it needs.
     /// `true` when a vendor's upscaler does, and the frame is to declare its
-    /// node; `queue` is `None` off Vulkan.
+    /// node; `queue` is `None` off Vulkan. `manual_exposure` is what a fresh
+    /// exposure pair is seeded with.
+    #[cfg_attr(not(all(feature = "fsr", windows)), allow(unused_variables))]
     pub(super) fn prepare(
         &mut self,
+        device: &Device,
         queue: Option<&Arc<Queue>>,
         settings: &TaaSettings,
         output: [u32; 2],
+        manual_exposure: f32,
     ) -> bool {
         let asked = settings.upscaler;
         let mut status = UpscalerStatus {
@@ -136,9 +151,11 @@ impl VendorUpscaler {
         // A failure is remembered while FSR is still asked for, so it is not
         // retried every frame, and forgotten once it is not.
         #[cfg(all(feature = "fsr", windows))]
-        if !vendor {
+        if vendor {
+            self.fsr.advance_exposure(device, manual_exposure);
+        } else {
             self.fsr
-                .release(!settings.resolves() || asked != Upscaler::Fsr);
+                .release(device, !settings.resolves() || asked != Upscaler::Fsr);
         }
         if status != self.status {
             match (&status.running, &status.reason) {
@@ -203,6 +220,33 @@ impl VendorUpscaler {
         }
     }
 
+    /// The exposure images of a frame a vendor resolves: the one
+    /// `upscaler_exposure` writes, and the one the resolve reads.
+    pub(super) fn exposure_views(&self) -> (TextureViewId, TextureViewId) {
+        #[cfg(all(feature = "fsr", windows))]
+        return self.fsr.exposure_views();
+        #[cfg(not(all(feature = "fsr", windows)))]
+        unreachable!("a vendor resolve was scheduled in a build with no vendor upscaler");
+    }
+
+    /// Record `upscaler_exposure`: what the tonemap applies, from the metered
+    /// buffer or the manual value as `tonemap.frag` chooses.
+    #[cfg_attr(not(all(feature = "fsr", windows)), allow(unused_variables))]
+    pub(super) fn record_exposure(
+        &self,
+        device: &Device,
+        encoder: &mut Encoder,
+        metered: BufferId,
+        manual: f32,
+        auto: bool,
+    ) {
+        #[cfg(all(feature = "fsr", windows))]
+        self.fsr
+            .record_exposure(device, encoder, metered, manual, auto);
+        #[cfg(not(all(feature = "fsr", windows)))]
+        unreachable!("a vendor resolve was scheduled in a build with no vendor upscaler");
+    }
+
     /// Record the vendor's resolve, the body of the node `prepare` said the
     /// frame should declare. `reset` drops the history it accumulated.
     #[cfg_attr(not(all(feature = "fsr", windows)), allow(unused_variables))]
@@ -234,7 +278,14 @@ mod amd {
 
     use super::super::fsr::{self, ContextDesc, Runtime, UpscaleContext};
     use super::super::record::Recorder;
-    use super::{FrameInputs, Images};
+    use super::{EXPOSURE_FORMAT, FrameInputs, Images};
+    use crate::gfx::format::SampleCount;
+    use crate::gfx::graph::ImageUsage;
+    use crate::gfx::rhi::{
+        Binding, BindingResource, BufferId, ComputePipelineDesc, Device, Encoder, PipelineId,
+        TextureDesc, TextureDimension, TextureViewId,
+    };
+    use crate::gfx::shaders::ShaderId;
     use crate::scene::Upscaling;
 
     /// The context, and what was learnt of it when it was made.
@@ -257,6 +308,11 @@ mod amd {
         /// What a dispatch last failed with. Its frame resolved nothing, so
         /// the next falls back.
         dispatch_failed: Mutex<Option<Arc<str>>>,
+        /// The exposure images, while FSR resolves: `frame & 1` is written
+        /// this frame and the other read.
+        exposure: Option<([TextureViewId; 2], u64)>,
+        /// Made with the first pair and kept.
+        exposure_pipeline: Option<PipelineId>,
     }
 
     /// `FfxApiUpscaleQualityMode`, `ffx_upscale.h`, in the engine's terms.
@@ -283,11 +339,20 @@ mod amd {
     }
 
     impl Fsr {
-        /// Drop the context, and with `forget` what failed.
-        pub(super) fn release(&mut self, forget: bool) {
+        /// Drop the context and the exposure pair, and with `forget` what
+        /// failed.
+        pub(super) fn release(&mut self, device: &Device, forget: bool) {
             let live = self.live.get_mut().expect("the FSR context was poisoned");
             if live.take().is_some() {
                 tracing::info!("FSR: context released");
+            }
+            for view in self
+                .exposure
+                .take()
+                .into_iter()
+                .flat_map(|(views, _)| views)
+            {
+                device.destroy_texture(view);
             }
             if forget {
                 self.failed = None;
@@ -296,6 +361,79 @@ mod amd {
                     .get_mut()
                     .expect("the FSR context was poisoned") = None;
             }
+        }
+
+        /// Turn the exposure pair over for a frame FSR resolves, making it
+        /// if this is the first, seeded with `seed`.
+        pub(super) fn advance_exposure(&mut self, device: &Device, seed: f32) {
+            if let Some((_, frame)) = &mut self.exposure {
+                *frame = frame.wrapping_add(1);
+                return;
+            }
+            let Device::Vulkan(driver) = device;
+            let views = std::array::from_fn(|_| {
+                let view = device.create_texture(&TextureDesc {
+                    format: EXPOSURE_FORMAT,
+                    dimension: TextureDimension::D2,
+                    extent: [1, 1, 1],
+                    mip_levels: 1,
+                    array_layers: 1,
+                    samples: SampleCount::Sample1,
+                    usage: ImageUsage::STORAGE | ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
+                    memoryless: false,
+                });
+                driver.fill_color(view, [seed; 4]);
+                view
+            });
+            self.exposure = Some((views, 0));
+            self.exposure_pipeline.get_or_insert_with(|| {
+                device.create_compute_pipeline(&ComputePipelineDesc {
+                    shader: ShaderId::UpscalerExposureComp.into(),
+                })
+            });
+        }
+
+        /// This frame's exposure image and last frame's.
+        pub(super) fn exposure_views(&self) -> (TextureViewId, TextureViewId) {
+            let (views, frame) = self
+                .exposure
+                .expect("the graph scheduled FSR with no exposure made for it");
+            (
+                views[(frame & 1) as usize],
+                views[((frame + 1) & 1) as usize],
+            )
+        }
+
+        pub(super) fn record_exposure(
+            &self,
+            device: &Device,
+            encoder: &mut Encoder,
+            metered: BufferId,
+            manual: f32,
+            auto: bool,
+        ) {
+            let pipeline = self
+                .exposure_pipeline
+                .expect("the exposure pipeline is made with the pair");
+            let (target, _) = self.exposure_views();
+            let set = device.create_bind_group(
+                pipeline,
+                0,
+                &[
+                    Binding {
+                        binding: 0,
+                        resource: BindingResource::StorageBuffer(metered),
+                    },
+                    Binding {
+                        binding: 1,
+                        resource: BindingResource::StorageTexture(target),
+                    },
+                ],
+            );
+            encoder.bind_pipeline(pipeline);
+            encoder.bind_group(0, set);
+            encoder.push_constants(&[manual.to_bits(), auto as u32]);
+            encoder.dispatch([1, 1, 1]);
         }
 
         pub(super) fn prepare(
@@ -329,9 +467,7 @@ mod amd {
                 Err(reason) => return Err(reason.clone()),
             };
 
-            let mut flags = fsr::ENABLE_HIGH_DYNAMIC_RANGE
-                | fsr::ENABLE_DEPTH_INVERTED
-                | fsr::ENABLE_AUTO_EXPOSURE;
+            let mut flags = fsr::ENABLE_HIGH_DYNAMIC_RANGE | fsr::ENABLE_DEPTH_INVERTED;
             if cfg!(debug_assertions) {
                 flags |= fsr::ENABLE_DEBUG_CHECKING;
             }
@@ -428,6 +564,7 @@ mod amd {
                 color: &images.color,
                 depth: &images.depth,
                 motion: &images.motion,
+                exposure: &images.exposure,
                 output: &images.output,
                 // FSR's sign: the offset the projection moves the image by, in
                 // render pixels, y down, which is the engine's. The opposite

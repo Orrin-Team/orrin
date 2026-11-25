@@ -498,6 +498,31 @@ impl VkDriver {
         builder.submit_and_wait(&self.ctx);
     }
 
+    /// [`fill_depth`](Self::fill_depth) for a colour texture: for one read
+    /// before anything has written it, which has to hold a value meanwhile.
+    #[cfg(all(feature = "fsr", windows))]
+    pub fn fill_color(&self, texture: TextureViewId, color: [f32; 4]) {
+        let view = lookup(&self.views, texture.0, "texture view");
+        let image = view.image().clone();
+        let mut builder = Recorder::new(&self.ctx);
+        builder
+            .image_barrier(super::record::to_transfer_dst(
+                image.clone(),
+                super::record::whole_image(&image),
+                vulkano::image::ImageLayout::Undefined,
+            ))
+            .clear_color_image(vulkano::command_buffer::ClearColorImageInfo {
+                clear_value: vulkano::format::ClearColorValue::Float(color),
+                ..vulkano::command_buffer::ClearColorImageInfo::image(image.clone())
+            })
+            .image_barrier(super::record::to_shader_read(
+                image.clone(),
+                super::record::whole_image(&image),
+                vulkano::image::ImageLayout::TransferDstOptimal,
+            ));
+        builder.submit_and_wait(&self.ctx);
+    }
+
     pub fn initialise_sampled(&self, texture: TextureViewId) {
         let view = lookup(&self.views, texture.0, "texture view");
         let image = view.image().clone();

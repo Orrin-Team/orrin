@@ -5559,6 +5559,7 @@
      hdr_color Sampled
      prepass_velocity Sampled
      prepass_depth Sampled
+     upscaler_exposure_history Sampled
      taa_color StorageWrite
 07 pass dof_prefilter [Compute]
   ! taa_color General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
@@ -5615,82 +5616,87 @@
   ! luminance_histogram src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      luminance_histogram StorageWrite
      exposure StorageWrite
-16 pass bloom_prefilter [Compute]
+16 pass upscaler_exposure [Compute]
   ! exposure src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead
+  ! upscaler_exposure Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
+     exposure StorageRead
+     upscaler_exposure StorageWrite
+17 pass bloom_prefilter [Compute]
   ! bloom_down_0 Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      motion_blur_color Sampled
      exposure StorageRead
      bloom_down_0 StorageWrite
-17 pass bloom_down_1 [Compute]
+18 pass bloom_down_1 [Compute]
   ! bloom_down_0 General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! bloom_down_1 Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      bloom_down_0 Sampled
      bloom_down_1 StorageWrite
-18 pass bloom_down_2 [Compute]
+19 pass bloom_down_2 [Compute]
   ! bloom_down_1 General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! bloom_down_2 Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      bloom_down_1 Sampled
      bloom_down_2 StorageWrite
-19 pass bloom_down_3 [Compute]
+20 pass bloom_down_3 [Compute]
   ! bloom_down_2 General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! bloom_down_3 Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      bloom_down_2 Sampled
      bloom_down_3 StorageWrite
-20 pass bloom_down_4 [Compute]
+21 pass bloom_down_4 [Compute]
   ! bloom_down_3 General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! bloom_down_4 Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      bloom_down_3 Sampled
      bloom_down_4 StorageWrite
-21 pass bloom_down_5 [Compute]
+22 pass bloom_down_5 [Compute]
   ! bloom_down_4 General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! bloom_down_5 Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      bloom_down_4 Sampled
      bloom_down_5 StorageWrite
-22 pass bloom_up_4 [Compute]
+23 pass bloom_up_4 [Compute]
   ! bloom_down_5 General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! bloom_up_4 Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      bloom_down_5 Sampled
      bloom_down_4 Sampled
      bloom_up_4 StorageWrite
-23 pass bloom_up_3 [Compute]
+24 pass bloom_up_3 [Compute]
   ! bloom_up_4 General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! bloom_up_3 Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      bloom_up_4 Sampled
      bloom_down_3 Sampled
      bloom_up_3 StorageWrite
-24 pass bloom_up_2 [Compute]
+25 pass bloom_up_2 [Compute]
   ! bloom_up_3 General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! bloom_up_2 Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      bloom_up_3 Sampled
      bloom_down_2 Sampled
      bloom_up_2 StorageWrite
-25 pass bloom_up_1 [Compute]
+26 pass bloom_up_1 [Compute]
   ! bloom_up_2 General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! bloom_up_1 Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      bloom_up_2 Sampled
      bloom_down_1 Sampled
      bloom_up_1 StorageWrite
-26 pass bloom_up_0 [Compute]
+27 pass bloom_up_0 [Compute]
   ! bloom_up_1 General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! bloom_up_0 Undefined->General src TopOfPipe/- dst VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite
      bloom_up_1 Sampled
      bloom_down_0 Sampled
      bloom_up_0 StorageWrite
-27 pass tonemap [Inline]
+28 pass tonemap [Inline]
   ! bloom_up_0 General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst VertexShader|FragmentShader|ComputeShader/ShaderSampledRead
   ! swapchain_color Undefined->ColorAttachmentOptimal src TopOfPipe/- dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      motion_blur_color Sampled
      exposure StorageRead
      bloom_up_0 Sampled
      swapchain_color ColorAttachment
-28 pass wireframe [Inline]
+29 pass wireframe [Inline]
   ! swapchain_color src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      swapchain_color ColorAttachment
      prepass_depth Sampled
-29 pass overlay [Raw]
+30 pass overlay [Raw]
   ! swapchain_color src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite
      swapchain_color ColorAttachment
 -- end of frame
   ! swapchain_color ColorAttachmentOptimal->PresentSrc src ColorAttachmentOutput/ColorAttachmentRead|ColorAttachmentWrite dst BottomOfPipe/-
--- aliased taa_color [06..10] -> motion_blur_color [13..27]
+  ! upscaler_exposure General->ShaderReadOnlyOptimal src VertexShader|FragmentShader|ComputeShader/ShaderStorageRead|ShaderStorageWrite dst BottomOfPipe/-
+-- aliased taa_color [06..10] -> motion_blur_color [13..28]
 

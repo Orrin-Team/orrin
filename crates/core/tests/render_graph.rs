@@ -3559,6 +3559,7 @@ fn a_vendor_resolve_reads_the_resolves_inputs_and_keeps_no_history_of_the_engine
             ("prepass_velocity", Access::Sampled),
             ("refraction_color", Access::Sampled),
             ("taa_color", Access::StorageWrite),
+            ("upscaler_exposure_history", Access::Sampled),
         ]
     );
     assert_eq!(
@@ -3574,6 +3575,90 @@ fn a_vendor_resolve_reads_the_resolves_inputs_and_keeps_no_history_of_the_engine
     assert!(image_desc(graph, "taa_history").is_none());
     assert_eq!(graph.segments().len(), 1, "{:?}", graph.segments());
     assert!(frame.ids.taa.is_none());
+}
+
+/// The exposure a vendor resolve reads is last frame's, copied after that
+/// frame's metering into the other image of a pair: so the copy follows the
+/// metering, writes the image the resolve does not read, and leaves it in the
+/// layout the resolve reads it in next frame. A frame the engine resolves
+/// carries neither the copy nor the pair.
+#[test]
+fn a_vendor_resolve_reads_the_exposure_the_last_frame_copied_after_its_metering() {
+    use orrin_core::gfx::graph::{Access, Extent, ImageLayout};
+    let vendor = |on| {
+        declare(FrameConfig {
+            vendor_resolve: on,
+            async_compute: true,
+            ..upscaled_config(Upscaling::Quality)
+        })
+        .unwrap()
+    };
+    let frame = vendor(true);
+    let graph = &frame.graph;
+    let slot = |name: &str| {
+        graph
+            .order()
+            .iter()
+            .position(|&pass| graph.pass_name(pass) == name)
+            .unwrap_or_else(|| panic!("the frame has no {name}"))
+    };
+    let copy = graph.order()[slot("upscaler_exposure")];
+    let declared: Vec<_> = graph
+        .accesses(copy)
+        .iter()
+        .map(|&(id, access)| (graph.resource_name(id), access))
+        .collect();
+    assert_eq!(
+        declared,
+        [
+            ("exposure", Access::StorageRead),
+            ("upscaler_exposure", Access::StorageWrite),
+        ]
+    );
+    assert!(slot("luminance_average") < slot("upscaler_exposure"));
+    for name in ["upscaler_exposure", "upscaler_exposure_history"] {
+        assert!(
+            graph
+                .imported_images()
+                .any(|(id, desc)| graph.resource_name(id) == name
+                    && desc.extent == Extent::Fixed([1, 1])),
+            "{name} is a 1x1 import, carried across the frame boundary"
+        );
+    }
+    let closing: Vec<_> = graph
+        .final_barriers()
+        .iter()
+        .filter(|barrier| {
+            graph
+                .resource_name(barrier.resource)
+                .starts_with("upscaler_exposure")
+        })
+        .map(|barrier| (graph.resource_name(barrier.resource), barrier.new_layout))
+        .collect();
+    assert_eq!(
+        closing,
+        [("upscaler_exposure", ImageLayout::ShaderReadOnlyOptimal)],
+        "the written image ends the frame where the next one reads it, the read one where it began"
+    );
+
+    let engine = vendor(false);
+    let named = |name: &str| {
+        (0..engine.graph.order().len()).any(|slot| {
+            engine
+                .graph
+                .accesses(engine.graph.order()[slot])
+                .iter()
+                .any(|&(id, _)| engine.graph.resource_name(id).starts_with(name))
+        })
+    };
+    assert!(!named("upscaler_exposure"));
+    assert!(
+        !engine
+            .graph
+            .order()
+            .iter()
+            .any(|&pass| engine.graph.pass_name(pass) == "upscaler_exposure")
+    );
 }
 
 /// Upscaled, a render-extent and an output-extent image are different sizes,

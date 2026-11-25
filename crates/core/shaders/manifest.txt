@@ -84,6 +84,7 @@ ui_frag fragment ui.frag
 ui_vert vertex ui.vert
 ui_shape_frag fragment ui_shape.frag
 ui_shape_vert vertex ui_shape.vert
+upscaler_exposure_comp compute upscaler_exposure.comp
 wireframe_frag fragment wireframe.frag
 wireframe_frag_sampled fragment wireframe.frag ORRIN_WIREFRAME_SAMPLED_DEPTH=1
 wireframe_vert vertex wireframe.vert

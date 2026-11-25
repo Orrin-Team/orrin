@@ -44,6 +44,7 @@ use super::ssao::AO_FORMAT;
 use super::ssr::{HIZ_FORMAT, HIZ_LEVELS, RAY_FORMAT, SOURCE_LEVELS};
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
+use super::upscaler::EXPOSURE_FORMAT;
 use crate::gfx::shadow_views::atlas_extent;
 
 /// What a frame's structure depends on. A change to any of these recompiles the
@@ -352,6 +353,9 @@ pub enum PassBody {
     MotionBlurGather,
     LuminanceHistogram,
     LuminanceAverage,
+    /// The exposure the tonemap applies, for a vendor's upscaler to read next
+    /// frame.
+    UpscalerExposure,
     /// Half the frame, exposed and firefly-weighted: the chain's first level.
     BloomPrefilter,
     /// Writes down-chain level `n`, reading level `n - 1`.
@@ -863,11 +867,17 @@ pub struct TaaIds {
 ///
 /// No history: the upscaler keeps its own on the device, so the frame's
 /// output is an ordinary transient, written once and read by what follows.
+/// The exposure is the one thing carried across frames, a ping-ponged pair
+/// imported for the reason [`TaaIds`] is.
 #[derive(Clone, Copy, Debug)]
 pub struct VendorResolveIds {
     /// What [`TaaIds::source`] would be.
     pub source: ResourceId,
     pub output: ResourceId,
+    /// Last frame's exposure, which the resolve reads.
+    pub exposure_history: ResourceId,
+    /// This frame's, written after the metering: next frame's history.
+    pub exposure: ResourceId,
 }
 
 /// Depth of field's three images, and what it was handed.
@@ -2110,6 +2120,22 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             "taa_color",
             ImageDesc::new(HDR_FORMAT).extent(Extent::Output),
         );
+        // Entered and left sampled, as `taa_history` is, and its writer's twin
+        // entered `Undefined` and left where this one is read: one texel, all
+        // of it written.
+        let exposure_desc = ImageDesc::new(EXPOSURE_FORMAT).extent(Extent::Fixed([1, 1]));
+        let exposure_history = builder.import_image(
+            "upscaler_exposure_history",
+            exposure_desc,
+            ImageLayout::ShaderReadOnlyOptimal,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
+        let exposure = builder.import_image(
+            "upscaler_exposure",
+            exposure_desc,
+            ImageLayout::Undefined,
+            ImageLayout::ShaderReadOnlyOptimal,
+        );
         // The states the upscaler is handed say these layouts, and it puts
         // each image back in them before it returns.
         let id = builder
@@ -2117,6 +2143,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             .access(shaded, Access::Sampled)
             .access(prepass.velocity, Access::Sampled)
             .access(prepass.depth, Access::Sampled)
+            .access(exposure_history, Access::Sampled)
             .access(output, Access::StorageWrite)
             .build();
         record(id, PassBody::VendorResolve, &mut bodies);
@@ -2124,6 +2151,8 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         VendorResolveIds {
             source: shaded,
             output,
+            exposure_history,
+            exposure,
         }
     });
 
@@ -2413,6 +2442,18 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
         histogram
     });
+
+    // After the metering, so what it copies is what the tonemap applies to
+    // this frame; the next frame's resolve reads it. See `upscaler` for why
+    // the resolve cannot read this frame's.
+    if let Some(vendor) = vendor_resolve {
+        let id = builder
+            .pass("upscaler_exposure", PassKind::Compute)
+            .access(exposure, Access::StorageRead)
+            .access(vendor.exposure, Access::StorageWrite)
+            .build();
+        record(id, PassBody::UpscalerExposure, &mut bodies);
+    }
 
     let bloom = (config.bloom_mips > 0).then(|| {
         let mips = config.bloom_mips as usize;

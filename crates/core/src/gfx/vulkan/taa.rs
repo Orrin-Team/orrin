@@ -29,8 +29,8 @@
 //! finite far plane) and motion (`now - before` in UV, unjittered, at the
 //! render extent), [`FrameView::jitter_pixels`], the reset flag, and the
 //! output target. Exposure is the one input the resolve does not read: the
-//! frame meters after it, and `upscaler` says why a vendor's node cannot
-//! simply declare a read of last frame's adapted value. While a vendor
+//! frame meters after it, so a vendor's node reads last frame's from a pair
+//! of images `upscaler` keeps for it. While a vendor
 //! resolves, the jitter and the reset flag here are all of this module the
 //! frame uses: no history is allocated, since the vendor keeps its own.
 

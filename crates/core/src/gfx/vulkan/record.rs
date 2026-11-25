@@ -35,6 +35,8 @@ use vulkano::acceleration_structure::{
 };
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, IndexBuffer, Subbuffer};
+#[cfg(all(feature = "fsr", windows))]
+use vulkano::command_buffer::ClearColorImageInfo;
 use vulkano::command_buffer::{
     BlitImageInfo, ClearDepthStencilImageInfo, CommandBuffer, CommandBufferBeginInfo,
     CommandBufferInheritanceInfo, CommandBufferLevel, CommandBufferUsage, CopyBufferInfo,
@@ -883,6 +885,13 @@ impl Recorder {
 
     pub(super) fn copy_image_to_buffer(&mut self, info: CopyImageToBufferInfo) -> &mut Self {
         unsafe { self.inner.copy_image_to_buffer(&info) }.expect("invalid image-to-buffer copy");
+        self.keep.hold(info);
+        self
+    }
+
+    #[cfg(all(feature = "fsr", windows))]
+    pub(super) fn clear_color_image(&mut self, info: ClearColorImageInfo) -> &mut Self {
+        unsafe { self.inner.clear_color_image(&info) }.expect("invalid colour clear");
         self.keep.hold(info);
         self
     }
