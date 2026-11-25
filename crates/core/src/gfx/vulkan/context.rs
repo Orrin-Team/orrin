@@ -273,6 +273,15 @@ impl VkContext {
             },
         );
 
+        #[cfg(all(feature = "fsr", windows))]
+        let vendor_features = {
+            let (extensions, features) = upscaler_features(&physical_device);
+            device_extensions = device_extensions.union(&extensions);
+            features
+        };
+        #[cfg(not(all(feature = "fsr", windows)))]
+        let vendor_features = DeviceFeatures::empty();
+
         // Graphics first, then the compute-only family, then a transfer family
         // of its own — so `queues` yields them in that order. A transfer queue
         // in the compute family is that family's second queue, and comes out
@@ -316,7 +325,8 @@ impl VkContext {
                     buffer_device_address: ray_tracing,
                     shader_sampled_image_array_non_uniform_indexing: ray_tracing,
                     ..DeviceFeatures::empty()
-                },
+                }
+                .union(&vendor_features),
                 ..Default::default()
             },
         )
@@ -490,6 +500,48 @@ fn select_compute_family(physical_device: &Arc<PhysicalDevice>) -> Option<u32> {
                 && family.queue_count > 0
         })
         .map(|index| index as u32)
+}
+
+/// What FSR's shaders declare, as far as the device has it: the runtime
+/// builds its pipelines on the engine's device, so the device has to have been
+/// made with what they use. Half and byte arithmetic, sixteen-bit storage, a
+/// fixed subgroup size, cooperative matrices and the Vulkan memory model; none
+/// of the engine's own shaders uses any of them.
+///
+/// Not all of it: FSR 4's shaders also declare `SPV_EXT_float8` and
+/// `SPV_NV_cooperative_matrix2`, whose extensions vulkano 0.35 cannot name,
+/// so a device made through it cannot enable them.
+#[cfg(all(feature = "fsr", windows))]
+fn upscaler_features(physical_device: &PhysicalDevice) -> (DeviceExtensions, DeviceFeatures) {
+    let supported = physical_device.supported_extensions();
+    let extensions = DeviceExtensions {
+        khr_cooperative_matrix: supported.khr_cooperative_matrix,
+        ..DeviceExtensions::empty()
+    };
+    let wanted = DeviceFeatures {
+        shader_float16: true,
+        shader_int8: true,
+        shader_int16: true,
+        storage_buffer16_bit_access: true,
+        uniform_and_storage_buffer16_bit_access: true,
+        storage_buffer8_bit_access: true,
+        variable_pointers: true,
+        variable_pointers_storage_buffer: true,
+        vulkan_memory_model: true,
+        vulkan_memory_model_device_scope: true,
+        subgroup_size_control: true,
+        compute_full_subgroups: true,
+        shader_integer_dot_product: true,
+        shader_demote_to_helper_invocation: true,
+        shader_storage_image_write_without_format: true,
+        shader_storage_image_read_without_format: true,
+        cooperative_matrix: supported.khr_cooperative_matrix,
+        ..DeviceFeatures::empty()
+    };
+    (
+        extensions,
+        wanted.intersection(physical_device.supported_features()),
+    )
 }
 
 /// Whether the device can build acceleration structures and trace ray queries

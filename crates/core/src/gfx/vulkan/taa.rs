@@ -29,8 +29,10 @@
 //! finite far plane) and motion (`now - before` in UV, unjittered, at the
 //! render extent), [`FrameView::jitter_pixels`], the reset flag, and the
 //! output target. Exposure is the one input the resolve does not read: the
-//! frame meters after it, so a vendor node would take last frame's adapted
-//! value out of `ExposurePass::exposure_buffer` and declare that read.
+//! frame meters after it, and `upscaler` says why a vendor's node cannot
+//! simply declare a read of last frame's adapted value. While a vendor
+//! resolves, the jitter and the reset flag here are all of this module the
+//! frame uses: no history is allocated, since the vendor keeps its own.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -163,18 +165,26 @@ impl TaaPass {
     /// Called whether or not TAA is enabled, because `prev_view_proj` has to
     /// track the camera regardless — otherwise the first frame after it is
     /// switched on reprojects against wherever the camera was when it was
-    /// switched off.
+    /// switched off. `vendor` is a frame a vendor's upscaler resolves: it
+    /// jitters as any resolved frame does, and holds no history here.
     pub(super) fn begin_frame(
         &mut self,
         device: &Device,
         settings: &TaaSettings,
         camera: &Camera,
         extents: Extents,
+        vendor: bool,
     ) -> FrameView {
         self.settings = *settings;
         let extent = extents.output;
 
-        if settings.resolves() {
+        if settings.resolves() && vendor {
+            if self.history.is_some() {
+                self.release(device);
+                self.reset.store(true, Ordering::Relaxed);
+            }
+            self.frame = self.frame.wrapping_add(1);
+        } else if settings.resolves() {
             if self.history.is_none()
                 || self.extent != extent
                 || self.upscaling != settings.upscaling
@@ -233,6 +243,13 @@ impl TaaPass {
     /// ghost the last shot over the first frames of the next.
     pub(super) fn reset(&self) {
         self.reset.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the resolve recording now is to drop its history, for a
+    /// vendor's resolve, which keeps that history itself; clears it, as the
+    /// engine's own resolve does once it has run.
+    pub(super) fn take_reset(&self) -> bool {
+        self.reset.swap(false, Ordering::Relaxed)
     }
 
     fn release(&mut self, device: &Device) {
@@ -425,7 +442,7 @@ mod tests {
             ..TaaSettings::default()
         };
         let camera = Camera::default();
-        let view = pass.begin_frame(&device, &settings, &camera, Extents::native([8, 8]));
+        let view = pass.begin_frame(&device, &settings, &camera, Extents::native([8, 8]), false);
 
         let floats = |values: &[f32]| -> Vec<u8> { bytemuck::cast_slice(values).to_vec() };
         let color = device.create_texture_2d(

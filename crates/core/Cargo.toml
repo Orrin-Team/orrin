@@ -122,6 +122,11 @@ shader-compiler = ["dep:orrin-shaderc"]
 # directory, its assets open from the pack, and it starts playing with the
 # editor out of the frame (`App::shipped_project`).
 export = ["tracing/max_level_info"]
+# AMD FSR as the temporal upscaler, through AMD's signed runtime loaded at run
+# time on Vulkan on Windows (`gfx/vulkan/fsr.rs`). Off by default: it does
+# nothing without AMD's DLLs beside the executable or in `ORRIN_FSR_DIR`, and
+# the engine's own resolve stands in wherever it cannot run.
+fsr = ["dep:libloading"]
 
 [[bench]]
 name = "startup"
@@ -153,6 +158,11 @@ required-features = ["scripting"]
 # through the crate that is the one way to compile an Orrin shader. It is linked
 # into the engine only with `shader-compiler`.
 orrin-shaderc.workspace = true
+
+# What loads FSR's runtime, with the `fsr` feature. The version ash and vulkano
+# already pull in, so naming it compiles no crate that was not built before.
+[target.'cfg(windows)'.dependencies]
+libloading = { version = "0.8", optional = true }
 
 # Native Metal beside Vulkan, on macOS only: the driver in `gfx/metal`. The
 # bindings are generated per class and default to all of them, which is the

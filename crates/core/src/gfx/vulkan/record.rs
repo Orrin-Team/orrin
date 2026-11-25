@@ -594,6 +594,25 @@ impl Recorder {
         self
     }
 
+    /// Hand the raw buffer to a library that records into it itself, as a
+    /// vendor's upscaler does. `images` are what its commands name, held for
+    /// the frame like anything bound here.
+    ///
+    /// What it leaves bound is undefined afterwards, and nothing recorded
+    /// later depends on it: an encoder is made per pass and refuses a set or
+    /// a push before its pass has bound a pipeline of its own.
+    #[cfg(all(feature = "fsr", windows))]
+    pub(super) fn record_foreign<R>(
+        &mut self,
+        images: &[&Arc<Image>],
+        record: impl FnOnce(vk::CommandBuffer) -> R,
+    ) -> R {
+        for image in images {
+            self.keep.hold_arc(Arc::clone(image));
+        }
+        record(self.inner.handle())
+    }
+
     /// Make every transfer write recorded so far visible to whatever later work
     /// on this queue reads geometry with — another arena copy, a vertex fetch,
     /// an index fetch, or the wireframe's vertex shader reading both as storage.

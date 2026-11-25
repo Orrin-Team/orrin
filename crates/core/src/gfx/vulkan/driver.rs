@@ -1501,6 +1501,15 @@ impl<'a> VkEncoder<'a> {
         self.bound.as_ref().expect("no pipeline is bound").layout()
     }
 
+    /// The recording itself, for a pass whose body a vendor's library
+    /// records. Forgets the bound pipeline, since what the library binds
+    /// replaces it.
+    #[cfg(all(feature = "fsr", windows))]
+    pub(super) fn recorder(&mut self) -> &mut Recorder {
+        self.bound = None;
+        self.recorder
+    }
+
     /// The viewport, and a scissor covering exactly it — every pipeline
     /// declares scissor dynamic, so a draw needs one set. A pass that wants a
     /// narrower one sets it after this.

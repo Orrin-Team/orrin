@@ -12,6 +12,8 @@ mod exposure;
 mod fog;
 mod forward;
 pub mod frame;
+#[cfg(all(feature = "fsr", windows))]
+mod fsr;
 mod gi;
 mod gi_gather;
 pub(crate) mod gizmo;
@@ -45,6 +47,7 @@ mod timestamps;
 mod ui;
 mod ui_window;
 mod upload;
+mod upscaler;
 mod vendor;
 pub mod wireframe;
 
@@ -402,6 +405,9 @@ pub struct VulkanRenderer {
     /// the RHI frees.
     texture_bias: crate::scene::Upscaling,
     biased_samplers: Vec<(crate::scene::Upscaling, crate::gfx::rhi::SamplerId)>,
+    /// What resolves the frame where a vendor's upscaler is asked for, and
+    /// whether it can. See `upscaler`.
+    upscaler: upscaler::VendorUpscaler,
 }
 
 /// The frame's commands as they are being recorded: a Vulkan command buffer, or
@@ -978,6 +984,7 @@ impl VulkanRenderer {
             },
             texture_bias: crate::scene::Upscaling::Native,
             biased_samplers: Vec::new(),
+            upscaler: upscaler::VendorUpscaler::new(),
             backend,
         }
     }
@@ -1106,6 +1113,20 @@ impl VulkanRenderer {
     /// of the next. Nothing here detects a cut; the caller knows it made one.
     pub fn reset_temporal_history(&self) {
         self.taa.reset();
+    }
+
+    /// What resolved the last frame, against what was asked for, and why the
+    /// two differ where they do.
+    pub fn upscaler_status(&self) -> &crate::scene::UpscalerStatus {
+        self.upscaler.status()
+    }
+
+    /// Whether a vendor's upscaler draws its debug view over what it
+    /// resolves: FSR's shows the motion it was handed and where it judged the
+    /// history stale. Remakes the vendor's context, which has to be made
+    /// able to draw it.
+    pub fn set_upscaler_debug_view(&mut self, on: bool) {
+        self.upscaler.set_debug_view(on);
     }
 
     /// Copy the last rendered frame back to host memory as tightly packed
@@ -2257,6 +2278,17 @@ impl VulkanRenderer {
         }
         self.plan_shadows(shadows, camera, lighting);
 
+        // Whether a vendor's upscaler can resolve this frame is part of its
+        // structure, so it is settled first.
+        let vendor_resolve = {
+            let queue = match &self.backend {
+                Backend::Vulkan(vk) => Some(&vk.ctx.queue),
+                #[cfg(target_os = "macos")]
+                Backend::Metal(_) => None,
+            };
+            self.upscaler.prepare(queue, taa, self.backend.extent())
+        };
+
         // The frame's structure, and the only thing that recompiles the graph.
         // Everything else about this call — how many objects, which camera, what
         // exposure — flows through the same compiled schedule.
@@ -2286,7 +2318,7 @@ impl VulkanRenderer {
             // and never resolved would simply be small.
             taa: taa.resolves(),
             upscaling: taa.upscaling,
-            vendor_resolve: false,
+            vendor_resolve,
             auto_exposure: hdr.auto_exposure,
             motion_blur: motion_blur.enabled,
             dof: dof.enabled,
@@ -2526,7 +2558,18 @@ impl VulkanRenderer {
         // Before anything records: this is where the frame's subpixel jitter is
         // chosen, and every pass that rasterises geometry has to be drawn with
         // the matrices it returns rather than deriving its own from `camera`.
-        let view = self.taa.begin_frame(&self.device, taa, camera, extents);
+        let view = self
+            .taa
+            .begin_frame(&self.device, taa, camera, extents, vendor_resolve);
+        let upscale = upscaler::FrameInputs {
+            jitter: view.jitter_pixels.to_array(),
+            render,
+            output: extents.output,
+            near: camera.near,
+            far: camera.far,
+            fov_y: camera.fov_y,
+            frame_ms: dt * 1e3,
+        };
         // Both resolve their optics against this frame's camera: the lens takes
         // its focal length from the field of view, and the shutter takes the
         // depth range it linearises with.
@@ -3303,6 +3346,8 @@ impl VulkanRenderer {
             subsurface: &self.subsurface,
             taa: &self.taa,
             view,
+            upscaler: &self.upscaler,
+            upscale,
             env: environment,
             draws,
             transparent,
@@ -3801,6 +3846,8 @@ struct FrameRecord<'a> {
     subsurface: &'a SubsurfacePass,
     taa: &'a TaaPass,
     view: taa::FrameView,
+    upscaler: &'a upscaler::VendorUpscaler,
+    upscale: upscaler::FrameInputs,
     /// The environment *settings*; `environment` above is the pass that draws
     /// them.
     env: &'a EnvironmentSettings,
@@ -4561,7 +4608,25 @@ impl FrameRecord<'_> {
                     .record(self.device, encoder, &self.view, color, velocity, depth);
             }
             PassBody::VendorResolve => {
-                unreachable!("a vendor resolve was scheduled with no vendor upscaler bound")
+                let prepass = self
+                    .frame
+                    .ids
+                    .prepass
+                    .expect("the graph scheduled the resolve with no prepass");
+                let ids = self
+                    .frame
+                    .ids
+                    .vendor_resolve
+                    .expect("a vendor resolve without its images");
+                let image = |id| self.vk_view(self.texture_of(id)).image().clone();
+                let images = upscaler::Images {
+                    color: image(ids.source),
+                    depth: image(prepass.depth),
+                    motion: image(prepass.velocity),
+                    output: image(ids.output),
+                };
+                self.upscaler
+                    .record(encoder, &images, &self.upscale, self.taa.take_reset());
             }
             PassBody::DofPrefilter => {
                 let ids = self
