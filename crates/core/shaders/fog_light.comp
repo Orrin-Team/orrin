@@ -148,13 +148,19 @@ void main() {
         }
     }
 
+    // Reprojected from where the cell is, not from the point this frame drew
+    // in its depth: read through that point, each frame blended the history
+    // with the cell beside it in depth, a little more of it the longer the
+    // history, and the far arch of Sponza's aisle came out a fifteenth lighter
+    // at sixty-four frames and as much darker at two hundred and fifty-six.
+    vec3 centre = f.camera_pos.xyz + dir * fog_slice_depth(f, (float(coord.z) + 0.5) / float(size.z));
     vec4 held = vec4(0.0);
     if (f.temporal.z < 0.5) {
-        vec4 clip = f.prev_view_proj * vec4(P, 1.0);
+        vec4 clip = f.prev_view_proj * vec4(centre, 1.0);
         if (clip.w > 0.0) {
             vec2 prev_uv = (clip.xy / clip.w) * 0.5 + 0.5;
             if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
-                float prev_dist = length(P - f.prev_camera_pos.xyz);
+                float prev_dist = length(centre - f.prev_camera_pos.xyz);
                 held = fog_light_at(u_history, vec3(prev_uv, fog_depth_slice(f, prev_dist)));
             }
         }
