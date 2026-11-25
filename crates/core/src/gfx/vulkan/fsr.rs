@@ -446,6 +446,9 @@ pub(super) struct Dispatch<'a> {
     pub motion: &'a Arc<Image>,
     /// 1x1, the exposure the tonemap applies.
     pub exposure: &'a Arc<Image>,
+    /// How much each pixel is of what the blended queues drew, where the
+    /// frame drew either.
+    pub reactive: Option<&'a Arc<Image>>,
     pub output: &'a Arc<Image>,
     /// In render pixels, as `ffxDispatchDescUpscale::jitterOffset` takes it.
     pub jitter: [f32; 2],
@@ -613,7 +616,9 @@ impl UpscaleContext {
             depth: Resource::image(frame.depth, STATE_COMPUTE_READ),
             motion_vectors: Resource::image(frame.motion, STATE_COMPUTE_READ),
             exposure: Resource::image(frame.exposure, STATE_COMPUTE_READ),
-            reactive: Resource::NONE,
+            reactive: frame.reactive.map_or(Resource::NONE, |mask| {
+                Resource::image(mask, STATE_COMPUTE_READ)
+            }),
             transparency_and_composition: Resource::NONE,
             output: Resource::image(frame.output, STATE_UNORDERED_ACCESS),
             jitter_offset: Coords {
@@ -655,8 +660,10 @@ impl UpscaleContext {
             frame.motion,
             frame.exposure,
             frame.output,
+            frame.reactive.unwrap_or(frame.output),
         ];
-        let code = recorder.record_foreign(&images, |command_buffer| {
+        let named = if frame.reactive.is_some() { 6 } else { 5 };
+        let code = recorder.record_foreign(&images[..named], |command_buffer| {
             desc.command_list = command_buffer.as_raw() as *mut c_void;
             // SAFETY: the command buffer is recording — the recorder owns it
             // and is borrowed for the call — and is in no rendering instance,

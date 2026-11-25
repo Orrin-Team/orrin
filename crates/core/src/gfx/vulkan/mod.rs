@@ -4656,6 +4656,7 @@ impl FrameRecord<'_> {
                     depth: image(prepass.depth),
                     motion: image(prepass.velocity),
                     exposure: image(ids.exposure_history),
+                    reactive: ids.reactive.map(image),
                     output: image(ids.output),
                 };
                 self.upscaler
@@ -4950,6 +4951,17 @@ impl FrameRecord<'_> {
                     raw_ao,
                     depth,
                     self.ssao_uniforms.as_ref().unwrap(),
+                );
+            }
+            PassBody::ReactiveMask => {
+                let reveal = self.frame.ids.transparency.map(|ids| ids.reveal);
+                let refraction = self.frame.ids.refraction.map(|ids| ids.accum);
+                self.upscaler.record_reactive(
+                    self.device,
+                    encoder,
+                    reveal.map(|id| self.table.texture(id)),
+                    refraction.map(|id| self.table.texture(id)),
+                    self.render_extent,
                 );
             }
             PassBody::ContactShadows => {

@@ -1342,6 +1342,19 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ..reference_config(false, true)
             },
         ),
+        // And with the blended queues in it: the reactive mask is drawn from
+        // what both composites blended by, between them and the resolve.
+        (
+            "editor frame with glass, upscaled by a vendor's upscaler",
+            FrameConfig {
+                transparency: true,
+                refraction: true,
+                overlay: true,
+                upscaling: Upscaling::Quality,
+                vendor_resolve: true,
+                ..reference_config(false, true)
+            },
+        ),
     ]
 }
 
@@ -3557,6 +3570,7 @@ fn a_vendor_resolve_reads_the_resolves_inputs_and_keeps_no_history_of_the_engine
         [
             ("prepass_depth", Access::Sampled),
             ("prepass_velocity", Access::Sampled),
+            ("reactive_mask", Access::Sampled),
             ("refraction_color", Access::Sampled),
             ("taa_color", Access::StorageWrite),
             ("upscaler_exposure_history", Access::Sampled),
@@ -3575,6 +3589,68 @@ fn a_vendor_resolve_reads_the_resolves_inputs_and_keeps_no_history_of_the_engine
     assert!(image_desc(graph, "taa_history").is_none());
     assert_eq!(graph.segments().len(), 1, "{:?}", graph.segments());
     assert!(frame.ids.taa.is_none());
+}
+
+/// A vendor resolve is told how much of each pixel the blended queues drew,
+/// from what each of the two composites present blended by, at the render
+/// extent and before the resolve reads it; a frame with neither queue, or
+/// one the engine resolves, draws no mask.
+#[test]
+fn the_reactive_mask_is_drawn_from_whichever_blended_queues_the_frame_has() {
+    use orrin_core::gfx::graph::{Access, Extent};
+    let frame = |transparency, refraction, vendor_resolve| {
+        declare(FrameConfig {
+            transparency,
+            refraction,
+            vendor_resolve,
+            ..upscaled_config(Upscaling::Quality)
+        })
+        .unwrap()
+    };
+    for (transparency, refraction) in [(true, false), (false, true), (true, true)] {
+        let frame = frame(transparency, refraction, true);
+        let graph = &frame.graph;
+        let slot = |name: &str| {
+            graph
+                .order()
+                .iter()
+                .position(|&pass| graph.pass_name(pass) == name)
+                .unwrap_or_else(|| panic!("the frame has no {name}"))
+        };
+        let mask = graph.order()[slot("reactive_mask")];
+        let mut declared: Vec<_> = graph
+            .accesses(mask)
+            .iter()
+            .map(|&(id, access)| (graph.resource_name(id), access))
+            .collect();
+        declared.sort_by_key(|&(name, _)| name);
+        let mut expected = vec![("reactive_mask", Access::ColorAttachment)];
+        if refraction {
+            expected.push(("refraction_accum", Access::Sampled));
+            assert!(slot("refraction_draw") < slot("reactive_mask"));
+        }
+        if transparency {
+            expected.push(("oit_reveal", Access::Sampled));
+            assert!(slot("oit_accumulate") < slot("reactive_mask"));
+        }
+        expected.sort_by_key(|&(name, _)| name);
+        assert_eq!(declared, expected, "{transparency} {refraction}");
+        let resolve = graph.order()[slot("taa_resolve")];
+        assert!(
+            graph
+                .accesses(resolve)
+                .iter()
+                .any(|&(id, access)| graph.resource_name(id) == "reactive_mask"
+                    && access == Access::Sampled)
+        );
+        assert_eq!(
+            image_desc(graph, "reactive_mask").map(|desc| (desc.extent, desc.format)),
+            Some((Extent::Render, orrin_core::gfx::format::Format::R8Unorm))
+        );
+    }
+    for frame in [frame(false, false, true), frame(true, true, false)] {
+        assert!(image_desc(&frame.graph, "reactive_mask").is_none());
+    }
 }
 
 /// The exposure a vendor resolve reads is last frame's, copied after that

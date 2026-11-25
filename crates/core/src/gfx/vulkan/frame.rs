@@ -44,7 +44,7 @@ use super::ssao::AO_FORMAT;
 use super::ssr::{HIZ_FORMAT, HIZ_LEVELS, RAY_FORMAT, SOURCE_LEVELS};
 use super::subsurface::SUBSURFACE_FORMAT;
 use super::swapchain::DEPTH_FORMAT;
-use super::upscaler::EXPOSURE_FORMAT;
+use super::upscaler::{EXPOSURE_FORMAT, REACTIVE_FORMAT};
 use crate::gfx::shadow_views::atlas_extent;
 
 /// What a frame's structure depends on. A change to any of these recompiles the
@@ -336,6 +336,9 @@ pub enum PassBody {
     /// The same node's inputs and output, resolved by a vendor's upscaler,
     /// which keeps its history itself.
     VendorResolve,
+    /// How much of each pixel the blended queues drew over the opaque frame,
+    /// for a vendor's upscaler to trust its history less there.
+    ReactiveMask,
     /// Half the frame, carrying its own circle of confusion.
     DofPrefilter,
     /// The widest near and far circle per tile, which sizes the gather's kernel.
@@ -878,6 +881,9 @@ pub struct VendorResolveIds {
     pub exposure_history: ResourceId,
     /// This frame's, written after the metering: next frame's history.
     pub exposure: ResourceId,
+    /// How much of each pixel the blended queues drew, where the frame has
+    /// either.
+    pub reactive: Option<ResourceId>,
 }
 
 /// Depth of field's three images, and what it was handed.
@@ -2136,16 +2142,34 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             ImageLayout::Undefined,
             ImageLayout::ShaderReadOnlyOptimal,
         );
+        // From what the two composites blended by, which they leave behind
+        // them; neither writes depth or motion, which is what makes their
+        // pixels ghost through a history.
+        let reactive = (transparency.is_some() || refraction.is_some()).then(|| {
+            let mask = builder.create_image("reactive_mask", ImageDesc::new(REACTIVE_FORMAT));
+            let mut pass = builder.pass("reactive_mask", PassKind::Inline);
+            if let Some(transparency) = transparency {
+                pass = pass.access(transparency.reveal, Access::Sampled);
+            }
+            if let Some(refraction) = refraction {
+                pass = pass.access(refraction.accum, Access::Sampled);
+            }
+            let id = pass.access(mask, Access::ColorAttachment).build();
+            record(id, PassBody::ReactiveMask, &mut bodies);
+            mask
+        });
         // The states the upscaler is handed say these layouts, and it puts
         // each image back in them before it returns.
-        let id = builder
+        let mut resolve = builder
             .pass("taa_resolve", PassKind::Compute)
             .access(shaded, Access::Sampled)
             .access(prepass.velocity, Access::Sampled)
             .access(prepass.depth, Access::Sampled)
-            .access(exposure_history, Access::Sampled)
-            .access(output, Access::StorageWrite)
-            .build();
+            .access(exposure_history, Access::Sampled);
+        if let Some(mask) = reactive {
+            resolve = resolve.access(mask, Access::Sampled);
+        }
+        let id = resolve.access(output, Access::StorageWrite).build();
         record(id, PassBody::VendorResolve, &mut bodies);
 
         VendorResolveIds {
@@ -2153,6 +2177,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             output,
             exposure_history,
             exposure,
+            reactive,
         }
     });
 

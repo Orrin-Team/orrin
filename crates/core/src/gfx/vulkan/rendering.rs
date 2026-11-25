@@ -201,6 +201,13 @@ pub(super) fn rendering_info(
             let ssao = ids.ssao.expect("SSAO pass without SSAO resources");
             color_only(overwritten(images.texture(ssao.ao)))
         }
+        PassBody::ReactiveMask => color_only(overwritten(
+            images.texture(
+                ids.vendor_resolve
+                    .and_then(|vendor| vendor.reactive)
+                    .expect("a reactive mask pass without its mask"),
+            ),
+        )),
         PassBody::ContactShadows => color_only(overwritten(
             images.texture(
                 ids.contact_shadows

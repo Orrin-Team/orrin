@@ -34,6 +34,14 @@
 //! resolves and only then. It is seeded with the manual exposure, which the
 //! first frame reads; that frame is also its context's first, with no history
 //! for the exposure to weigh.
+//!
+//! **The reactive mask.** The transparency and refraction composites write no
+//! depth or motion, so a history reprojects what they drew as though it were
+//! the surface behind. Where the frame has either, `reactive_mask` draws how
+//! much of each pixel they blended over the opaque frame, which is AMD's
+//! `reactive` input. FSR 4.1.2 leaves its output unchanged by it, byte for
+//! byte; it is drawn for FSR 3.1, which the same runtime falls back to where
+//! FSR 4 does not run, and whose guide asks for it.
 
 use std::sync::{Arc, LazyLock};
 
@@ -46,6 +54,9 @@ use crate::scene::{TaaSettings, Upscaler, UpscalerStatus};
 
 /// The exposure a vendor reads: one float, as AMD's `exposure` input is.
 pub(super) const EXPOSURE_FORMAT: Format = Format::R32Float;
+
+/// The reactive mask: AMD's `reactive` input is an R8 unorm image.
+pub(super) const REACTIVE_FORMAT: Format = Format::R8Unorm;
 
 /// What one frame's upscale is handed besides its images. Read only where a
 /// vendor's upscaler is built in.
@@ -71,6 +82,7 @@ pub(super) struct Images {
     pub depth: Arc<Image>,
     pub motion: Arc<Image>,
     pub exposure: Arc<Image>,
+    pub reactive: Option<Arc<Image>>,
     pub output: Arc<Image>,
 }
 
@@ -247,6 +259,24 @@ impl VendorUpscaler {
         unreachable!("a vendor resolve was scheduled in a build with no vendor upscaler");
     }
 
+    /// Record `reactive_mask` over `extent`, from the transparency's
+    /// revealage and the refraction's coverage, whichever the frame has.
+    #[cfg_attr(not(all(feature = "fsr", windows)), allow(unused_variables))]
+    pub(super) fn record_reactive(
+        &self,
+        device: &Device,
+        encoder: &mut Encoder,
+        reveal: Option<TextureViewId>,
+        refraction: Option<TextureViewId>,
+        extent: [u32; 2],
+    ) {
+        #[cfg(all(feature = "fsr", windows))]
+        self.fsr
+            .record_reactive(device, encoder, reveal, refraction, extent);
+        #[cfg(not(all(feature = "fsr", windows)))]
+        unreachable!("a vendor resolve was scheduled in a build with no vendor upscaler");
+    }
+
     /// Record the vendor's resolve, the body of the node `prepare` said the
     /// frame should declare. `reset` drops the history it accumulated.
     #[cfg_attr(not(all(feature = "fsr", windows)), allow(unused_variables))]
@@ -278,12 +308,13 @@ mod amd {
 
     use super::super::fsr::{self, ContextDesc, Runtime, UpscaleContext};
     use super::super::record::Recorder;
-    use super::{EXPOSURE_FORMAT, FrameInputs, Images};
+    use super::{EXPOSURE_FORMAT, FrameInputs, Images, REACTIVE_FORMAT};
     use crate::gfx::format::SampleCount;
     use crate::gfx::graph::ImageUsage;
     use crate::gfx::rhi::{
-        Binding, BindingResource, BufferId, ComputePipelineDesc, Device, Encoder, PipelineId,
-        TextureDesc, TextureDimension, TextureViewId,
+        Binding, BindingResource, BufferId, ComputePipelineDesc, Device, Encoder,
+        GraphicsPipelineDesc, PipelineId, SamplerDesc, SamplerId, TextureDesc, TextureDimension,
+        TextureViewId, Viewport,
     };
     use crate::gfx::shaders::ShaderId;
     use crate::scene::Upscaling;
@@ -311,8 +342,9 @@ mod amd {
         /// The exposure images, while FSR resolves: `frame & 1` is written
         /// this frame and the other read.
         exposure: Option<([TextureViewId; 2], u64)>,
-        /// Made with the first pair and kept.
+        /// Made with the first pair and kept, as are the two below.
         exposure_pipeline: Option<PipelineId>,
+        reactive_pipeline: Option<(PipelineId, SamplerId)>,
     }
 
     /// `FfxApiUpscaleQualityMode`, `ffx_upscale.h`, in the engine's terms.
@@ -391,6 +423,60 @@ mod amd {
                     shader: ShaderId::UpscalerExposureComp.into(),
                 })
             });
+            self.reactive_pipeline.get_or_insert_with(|| {
+                let pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc::fullscreen(
+                    ShaderId::FullscreenVert,
+                    ShaderId::ReactiveMaskFrag,
+                    &[REACTIVE_FORMAT],
+                ));
+                let nearest = device.create_sampler(SamplerDesc {
+                    linear: false,
+                    mipmap_linear: false,
+                    repeat: false,
+                    compare: false,
+                    anisotropy: None,
+                    max_lod: Some(0.0),
+                    lod_bias: 0.0,
+                });
+                (pipeline, nearest)
+            });
+        }
+
+        pub(super) fn record_reactive(
+            &self,
+            device: &Device,
+            encoder: &mut Encoder,
+            reveal: Option<TextureViewId>,
+            refraction: Option<TextureViewId>,
+            extent: [u32; 2],
+        ) {
+            let (pipeline, sampler) = self
+                .reactive_pipeline
+                .expect("the reactive pipeline is made with the exposure pair");
+            let either = reveal
+                .or(refraction)
+                .expect("the graph declares the mask only over a blended queue");
+            let sampled = |binding, view| Binding {
+                binding,
+                resource: BindingResource::SampledTexture { view, sampler },
+            };
+            let set = device.create_transient_bind_group(
+                pipeline,
+                0,
+                &[
+                    sampled(0, reveal.unwrap_or(either)),
+                    sampled(1, refraction.unwrap_or(either)),
+                ],
+            );
+            encoder.set_viewport(Viewport {
+                origin: [0.0, 0.0],
+                extent: [extent[0] as f32, extent[1] as f32],
+                depth_range: [0.0, 1.0],
+            });
+            encoder.bind_pipeline(pipeline);
+            encoder.bind_group(0, set);
+            encoder.push_constants(&[reveal.is_some() as u32, refraction.is_some() as u32]);
+            encoder.draw(3, 1, 0, 0);
         }
 
         /// This frame's exposure image and last frame's.
@@ -565,6 +651,7 @@ mod amd {
                 depth: &images.depth,
                 motion: &images.motion,
                 exposure: &images.exposure,
+                reactive: images.reactive.as_ref(),
                 output: &images.output,
                 // FSR's sign: the offset the projection moves the image by, in
                 // render pixels, y down, which is the engine's. The opposite
