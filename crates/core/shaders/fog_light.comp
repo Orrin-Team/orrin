@@ -24,7 +24,8 @@
 // takes the light up and down, a lamp switched takes it one way. A room a
 // lamp lights, whose rays agree, keeps the shortest; and where the short mean
 // of the rays less the brightest stands well over the history, a lamp
-// switched on, the history starts again, as the gather's does.
+// switched on, the history starts again, as the gather's does. While the
+// camera moves, the cells move through the grid and keep the shortest.
 
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
@@ -74,6 +75,9 @@ const float SWITCHED = 2.0;
 const float RESTARTED = 4.0;
 // And how many of the noise's moves it must stand over the history by.
 const float CHANGED = 4.0;
+// How far a cell's centre may have moved in the grid since last frame, in
+// cells, for its history to grow past the shortest.
+const float MOVING = 0.01;
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 uint rng;
@@ -192,6 +196,7 @@ void main() {
     vec4 held = vec4(0.0);
     vec4 record = vec4(0.0);
     ivec3 was = coord;
+    float shift = 0.0;
     if (f.temporal.z < 0.5) {
         vec4 clip = f.prev_view_proj * vec4(centre, 1.0);
         if (clip.w > 0.0) {
@@ -201,6 +206,7 @@ void main() {
                 vec3 at = vec3(prev_uv, fog_depth_slice(f, prev_dist));
                 held = fog_light_at(u_history, at);
                 was = clamp(ivec3(floor(at * vec3(size))), ivec3(0), size - 1);
+                shift = distance(at * vec3(size), vec3(coord) + 0.5);
                 record = held.a > 0.0 ? texelFetch(u_state_history, was, 0) : vec4(0.0);
             }
         }
@@ -241,7 +247,10 @@ void main() {
         }
     }
     float cap = SHORTEST;
-    if (round_it > 0.0 && level > 0.0) {
+    // Held at the shortest while the cell moves in the grid, the camera
+    // walking or turning: a longer history carried the light of the way there,
+    // and a walk arrived lighter than it did with sixty-four frames.
+    if (round_it > 0.0 && level > 0.0 && shift < MOVING) {
         // One frame's variance from that of the difference of two.
         float variance = 0.5 * pooled * round_it / (level * level);
         cap = clamp(SHORTEST * variance / AGREE, SHORTEST, LONGEST);
