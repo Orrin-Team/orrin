@@ -98,7 +98,7 @@ const SCATTER_TILE: u32 = 4;
 pub(super) const LIGHT_SHIFT: u32 = 1;
 
 /// What each cell of the traced light keeps of its rays' disagreement, beside
-/// its light: three numbers, so the narrowest storage format that holds them.
+/// its light: four numbers, so the narrowest storage format that holds them.
 pub(super) const LIGHT_STATE_FORMAT: crate::gfx::format::Format =
     crate::gfx::format::Format::Rgba16Float;
 
