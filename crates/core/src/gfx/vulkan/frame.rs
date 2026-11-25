@@ -22,7 +22,7 @@ use super::MSAA_SAMPLES;
 use super::bloom::MAX_BLOOM_MIPS;
 use super::contact_shadows::MASK_FORMAT;
 use super::dof::COC_TILE_SHIFT;
-use super::fog::{FOG_FORMAT, FROXEL_SHIFT, FROXEL_SLICES, LIGHT_SHIFT};
+use super::fog::{FOG_FORMAT, FROXEL_SHIFT, FROXEL_SLICES, LIGHT_SHIFT, LIGHT_STATE_FORMAT};
 use super::hdr::{HDR_FORMAT, HDR_WIDE_FORMAT};
 use super::motion_blur::TILE_SHIFT;
 use super::occlusion::{OCCLUSION_FORMAT, OCCLUSION_LEVELS};
@@ -656,6 +656,9 @@ pub struct FogIds {
     /// the irradiance volumes are live: imported and ping-ponged as `scatter`
     /// is, for the same reason.
     pub light: Option<ResourceId>,
+    /// How far each cell's rays disagree from one frame to the next, which
+    /// sets how long its light is averaged: ping-ponged with `light`.
+    pub light_state: Option<ResourceId>,
     /// `rgb` = scattered radiance per metre, `a` = extinction per metre.
     pub scatter: ResourceId,
     /// `rgb` = in-scattered radiance up to this slice, `a` = the transmittance
@@ -1565,10 +1568,18 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // the volumes are live: after the cache's shading and the gather's
         // claims, whose cells its rays read, and with the volumes beside it for
         // a ray that lands where the cache has no light yet.
-        let light = ray.zip(gi).map(|(ray, gi)| {
+        let traced = ray.zip(gi).map(|(ray, gi)| {
             let light = builder.import_image(
                 "fog_light",
                 ImageDesc::new(FOG_FORMAT)
+                    .extent(Extent::FrameDiv(FROXEL_SHIFT + LIGHT_SHIFT))
+                    .depth(FROXEL_SLICES >> LIGHT_SHIFT),
+                ImageLayout::ShaderReadOnlyOptimal,
+                ImageLayout::ShaderReadOnlyOptimal,
+            );
+            let state = builder.import_image(
+                "fog_light_state",
+                ImageDesc::new(LIGHT_STATE_FORMAT)
                     .extent(Extent::FrameDiv(FROXEL_SHIFT + LIGHT_SHIFT))
                     .depth(FROXEL_SLICES >> LIGHT_SHIFT),
                 ImageLayout::ShaderReadOnlyOptimal,
@@ -1581,10 +1592,12 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
                 .access(gi.radiance, Access::StorageRead);
             let id = reads_gi(pass, Some(gi))
                 .access(light, Access::StorageWrite)
+                .access(state, Access::StorageWrite)
                 .build();
             record(id, PassBody::FogLight, &mut bodies);
-            light
+            (light, state)
         });
+        let light = traced.map(|(light, _)| light);
 
         // The history is the *other* allocation of `scatter`, which the graph
         // cannot see and does not need to: the executor binds it, and a resource
@@ -1608,6 +1621,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
         FogIds {
             light,
+            light_state: traced.map(|(_, state)| state),
             scatter,
             volume,
         }

@@ -1411,6 +1411,11 @@ impl VulkanRenderer {
         {
             return self.fog.light_view();
         }
+        if let Some(fog) = self.frame.ids.fog
+            && fog.light_state == Some(id)
+        {
+            return self.fog.light_state_view();
+        }
         if let Some(ids) = self.frame.ids.occlusion {
             if id == ids.hiz {
                 return self.occlusion.hiz_view();
@@ -1484,6 +1489,13 @@ impl VulkanRenderer {
         {
             return Some(record::Target::Image(
                 self.vk_view(self.fog.light_view()).image().clone(),
+            ));
+        }
+        if let Some(fog) = ids.fog
+            && fog.light_state == Some(id)
+        {
+            return Some(record::Target::Image(
+                self.vk_view(self.fog.light_state_view()).image().clone(),
             ));
         }
         if let Some(occlusion) = ids.occlusion {
@@ -3954,6 +3966,11 @@ impl FrameRecord<'_> {
         {
             return self.fog.light_view();
         }
+        if let Some(fog) = self.frame.ids.fog
+            && fog.light_state == Some(id)
+        {
+            return self.fog.light_state_view();
+        }
         match self.frame.ids.taa {
             Some(taa) if id == taa.output => self.taa.output_view(),
             _ => self.table.texture(id),
@@ -4021,6 +4038,13 @@ impl FrameRecord<'_> {
         {
             return Some(record::Target::Image(
                 self.vk_view(self.fog.light_view()).image().clone(),
+            ));
+        }
+        if let Some(fog) = ids.fog
+            && fog.light_state == Some(id)
+        {
+            return Some(record::Target::Image(
+                self.vk_view(self.fog.light_state_view()).image().clone(),
             ));
         }
         if let Some(occlusion) = ids.occlusion {

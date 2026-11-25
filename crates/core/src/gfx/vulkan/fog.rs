@@ -26,8 +26,10 @@
 //! ambient, so the air in a closed room is as dark as its walls: a third
 //! dispatch ahead of the two, `fog_light`, on a grid half the froxels' each
 //! way, whose rays read what they meet out of the world radiance cache
-//! (`vulkan::gi`) and whose mean is kept over as many as sixty-four frames
-//! (`LONGEST` in `fog_light.comp`), reprojected the way the froxels' is.
+//! (`vulkan::gi`) and whose mean is kept over sixty-four frames, and up to two
+//! hundred and fifty-six where its rays disagree (`fog_light.comp`): a second
+//! grid beside it, ping-ponged with it, keeps how far they do, 1 MB the pair
+//! at 1080p.
 //!
 //! Not the volumes' mean radiance at the froxel. Past the finest cascades a
 //! probe is four metres from the next, an aisle three metres wide has none of
@@ -95,6 +97,11 @@ const SCATTER_TILE: u32 = 4;
 /// for the price of one each.
 pub(super) const LIGHT_SHIFT: u32 = 1;
 
+/// What each cell of the traced light keeps of its rays' disagreement, beside
+/// its light: three numbers, so the narrowest storage format that holds them.
+pub(super) const LIGHT_STATE_FORMAT: crate::gfx::format::Format =
+    crate::gfx::format::Format::Rgba16Float;
+
 /// Side of the integration's workgroup, matching `fog_integrate.comp`. Two
 /// dimensions, because that pass runs one invocation per froxel *column*.
 const INTEGRATE_TILE: u32 = 8;
@@ -151,6 +158,9 @@ struct AirLight {
     /// Ping-ponged as the scatter volume is: `frame & 1` is this frame's.
     /// Allocated while the frame declares it.
     grids: Option<[TextureViewId; 2]>,
+    /// Each cell's record of how far its rays disagree, ping-ponged with the
+    /// grids.
+    states: Option<[TextureViewId; 2]>,
     extent: [u32; 3],
     /// Whether the frame declares it, and whether the fog takes its light
     /// from it: the volumes' setting can leave the fog the flat ambient.
@@ -245,6 +255,7 @@ impl FogPass {
             ),
             textures: None,
             grids: None,
+            states: None,
             extent: [0; 3],
             live: false,
             used: false,
@@ -340,14 +351,27 @@ impl FogPass {
             air.live = traced;
             air.used = traced && lights_fog;
             if !traced {
-                for view in air.grids.take().into_iter().flatten() {
+                for view in air
+                    .grids
+                    .take()
+                    .into_iter()
+                    .chain(air.states.take())
+                    .flatten()
+                {
                     device.destroy_texture(view);
                 }
             } else if air.grids.is_none() || air.extent != cells {
-                for view in air.grids.take().into_iter().flatten() {
+                for view in air
+                    .grids
+                    .take()
+                    .into_iter()
+                    .chain(air.states.take())
+                    .flatten()
+                {
                     device.destroy_texture(view);
                 }
                 air.grids = Some(allocate_history(device, cells));
+                air.states = Some(allocate_state(device, cells));
                 air.extent = cells;
                 // What the new grid holds is no frame's, and the flag that says
                 // so is the one both histories read.
@@ -441,7 +465,13 @@ impl FogPass {
             device.destroy_texture(view);
         }
         if let Some(air) = &mut self.air {
-            for view in air.grids.take().into_iter().flatten() {
+            for view in air
+                .grids
+                .take()
+                .into_iter()
+                .chain(air.states.take())
+                .flatten()
+            {
                 device.destroy_texture(view);
             }
         }
@@ -479,6 +509,17 @@ impl FogPass {
         self.light_pair()[(self.frame & 1) as usize]
     }
 
+    pub(super) fn light_state_view(&self) -> TextureViewId {
+        self.state_pair()[(self.frame & 1) as usize]
+    }
+
+    fn state_pair(&self) -> &[TextureViewId; 2] {
+        self.air
+            .as_ref()
+            .and_then(|air| air.states.as_ref())
+            .expect("the graph scheduled the fog's traced light with no state allocated")
+    }
+
     fn light_pair(&self) -> &[TextureViewId; 2] {
         self.air
             .as_ref()
@@ -510,6 +551,7 @@ impl FogPass {
             return;
         }
         let pair = self.light_pair();
+        let states = self.state_pair();
         let this = (self.frame & 1) as usize;
         let set = device.create_transient_bind_group(
             air.pipeline,
@@ -537,6 +579,17 @@ impl FogPass {
                 Binding {
                     binding: 4,
                     resource: BindingResource::StorageBuffer(cache.radiance),
+                },
+                Binding {
+                    binding: 5,
+                    resource: BindingResource::SampledTexture {
+                        view: states[1 - this],
+                        sampler: self.nearest_clamp,
+                    },
+                },
+                Binding {
+                    binding: 6,
+                    resource: BindingResource::StorageTexture(states[this]),
                 },
             ],
         );
@@ -716,6 +769,23 @@ fn jitter(index: u64) -> f32 {
         i /= 2;
     }
     result
+}
+
+fn allocate_state(device: &Device, extent: [u32; 3]) -> [TextureViewId; 2] {
+    std::array::from_fn(|_| {
+        let texture = device.create_texture(&TextureDesc {
+            format: LIGHT_STATE_FORMAT,
+            dimension: TextureDimension::D3,
+            extent,
+            mip_levels: 1,
+            array_layers: 1,
+            samples: SampleCount::Sample1,
+            usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
+            memoryless: false,
+        });
+        device.initialise_sampled(texture);
+        texture
+    })
 }
 
 fn allocate_history(device: &Device, extent: [u32; 3]) -> [TextureViewId; 2] {

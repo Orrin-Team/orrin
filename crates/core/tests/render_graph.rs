@@ -3123,13 +3123,26 @@ fn the_fogs_traced_light_runs_between_the_cache_and_the_froxels() {
     assert!(at("gi_gather") < at("fog_light"), "{order:?}");
     assert!(at("fog_light") < at("fog_scatter"), "{order:?}");
     assert_eq!(frame.graph.resource_name(light), "fog_light");
+    let state = frame
+        .ids
+        .fog
+        .and_then(|fog| fog.light_state)
+        .expect("a traced light keeps its rays' disagreement");
+    assert_eq!(frame.graph.resource_name(state), "fog_light_state");
+    let plan = format!("{}", frame.graph);
+    assert_eq!(
+        plan.matches("     fog_light_state ").count(),
+        1,
+        "only the traced light touches its state: {plan}"
+    );
 
     let off = declare(FrameConfig {
         volumetric_fog: true,
         ..reference_config(false, true)
     })
     .unwrap();
-    assert!(off.ids.fog.expect("the fog was asked for").light.is_none());
+    let ids = off.ids.fog.expect("the fog was asked for");
+    assert!(ids.light.is_none() && ids.light_state.is_none());
     assert!(!format!("{}", off.graph).contains("fog_light"));
 }
 
