@@ -5,7 +5,7 @@ use glam::Vec3;
 use orrin_core::capture::{CaptureSettings, Floor};
 use orrin_core::scene::entities::SceneChoice;
 use orrin_core::scene::{
-    Camera, FogSettings, GiDebugView, GiGatherResolution, RayDebugView, ShadowDebugView,
+    Camera, FogSettings, GiDebugView, GiGatherResolution, RayDebugView, ShadowDebugView, Upscaling,
 };
 
 /// The warm-up of every capture the irradiance volumes light, of the half of
@@ -74,6 +74,26 @@ fn sun_penumbra() -> CaptureSettings {
         camera: Some(Camera {
             position: Vec3::new(-2.0, 1.2, 12.5),
             target: Vec3::new(-3.5, -0.5, 8.5),
+            ..Camera::default()
+        }),
+        ..CaptureSettings::default()
+    }
+}
+
+/// The upscaling set's shared settings, so the five differ in the mode alone:
+/// close on the leaf cards, whose cut-out edges are the thinnest in the rig,
+/// the decals at their feet, and the rows of checkered cubes behind them, whose
+/// texture is finer than a pixel at the back of the grid. 1080p, and long
+/// enough for the three-times mode's accumulation to fill: an output pixel
+/// there is sampled closely about one frame in nine.
+fn upscaled(upscaling: Upscaling) -> CaptureSettings {
+    CaptureSettings {
+        extent: [1920, 1080],
+        frames: 192,
+        upscaling,
+        camera: Some(Camera {
+            position: Vec3::new(-16.5, 3.2, 15.5),
+            target: Vec3::new(-10.5, 0.4, 5.5),
             ..Camera::default()
         }),
         ..CaptureSettings::default()
@@ -703,6 +723,19 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 motion_blur: true,
                 ..CaptureSettings::default()
             },
+        ),
+        // The scene rendered below the output and the temporal resolve bringing
+        // it up, at each mode and at native, from one camera at one extent: what
+        // each pair differs in is the upscaling alone. Look at the leaf cards'
+        // edges for stair-steps, the far cubes' checker for moire, and the
+        // decals for softness against `upscale-native`.
+        ("upscale-native", upscaled(Upscaling::Native)),
+        ("upscale-quality", upscaled(Upscaling::Quality)),
+        ("upscale-balanced", upscaled(Upscaling::Balanced)),
+        ("upscale-performance", upscaled(Upscaling::Performance)),
+        (
+            "upscale-ultra-performance",
+            upscaled(Upscaling::UltraPerformance),
         ),
         // Four samples instead of the temporal resolve: the other forward render
         // pass shape, with a resolve attachment and a depth that is scratch
