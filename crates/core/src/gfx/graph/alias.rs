@@ -45,7 +45,7 @@
 
 use std::ops::Range;
 
-use super::{PassDecl, PassId, ResourceId, TransientImage};
+use super::{ImageDesc, PassDecl, PassId, ResourceId, TransientImage};
 
 /// The slots of `order` each resource is live across, `None` for one no live
 /// pass touches.
@@ -81,6 +81,7 @@ pub(super) fn lifetimes(
 pub(super) fn groups(
     images: &[Option<TransientImage>],
     lifetimes: &[Option<Range<usize>>],
+    upscaled: bool,
 ) -> Vec<Vec<ResourceId>> {
     let mut candidates: Vec<(ResourceId, &TransientImage, Range<usize>)> = images
         .iter()
@@ -96,10 +97,9 @@ pub(super) fn groups(
 
     let mut groups: Vec<(&TransientImage, usize, Vec<ResourceId>)> = Vec::new();
     for (id, image, lifetime) in candidates {
-        match groups
-            .iter_mut()
-            .find(|(shape, end, _)| *end <= lifetime.start && interchangeable(shape, image))
-        {
+        match groups.iter_mut().find(|(shape, end, _)| {
+            *end <= lifetime.start && interchangeable(shape, image, upscaled)
+        }) {
             Some((_, end, members)) => {
                 *end = lifetime.end;
                 members.push(id);
@@ -117,6 +117,12 @@ pub(super) fn groups(
 
 /// Whether two images would be allocated identically, which is how this module
 /// establishes that their memory requirements match without a `Device` to ask.
-fn interchangeable(one: &TransientImage, two: &TransientImage) -> bool {
-    one.desc == two.desc && one.usage == two.usage && one.concurrent == two.concurrent
+/// Their extents are compared as the frame will size them: in a frame that does
+/// not upscale, a render-extent and an output-extent image are one size.
+fn interchangeable(one: &TransientImage, two: &TransientImage, upscaled: bool) -> bool {
+    let folded = |image: &TransientImage| ImageDesc {
+        extent: image.desc.extent.folded(upscaled),
+        ..image.desc
+    };
+    folded(one) == folded(two) && one.usage == two.usage && one.concurrent == two.concurrent
 }

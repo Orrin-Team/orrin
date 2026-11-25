@@ -938,7 +938,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let history = builder.import_image(
             "occlusion_history",
             ImageDesc::new(OCCLUSION_FORMAT)
-                .extent(Extent::FrameDiv(1))
+                .extent(Extent::RenderDiv(1))
                 .mip_levels(OCCLUSION_LEVELS),
             ImageLayout::ShaderReadOnlyOptimal,
             ImageLayout::ShaderReadOnlyOptimal,
@@ -948,7 +948,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let hiz = builder.import_image(
             "occlusion_hiz",
             ImageDesc::new(OCCLUSION_FORMAT)
-                .extent(Extent::FrameDiv(1))
+                .extent(Extent::RenderDiv(1))
                 .mip_levels(OCCLUSION_LEVELS),
             ImageLayout::Undefined,
             ImageLayout::ShaderReadOnlyOptimal,
@@ -1139,7 +1139,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
 
     let swapchain_color = builder.import_image(
         "swapchain_color",
-        ImageDesc::new(config.color_format),
+        ImageDesc::new(config.color_format).extent(Extent::Output),
         // An acquired image's contents are not ours to keep, and the
         // presentation engine wants it back in `PresentSrc` — or, offscreen,
         // the readback wants it in the layout it copies from.
@@ -1272,9 +1272,9 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     // screen UV through a linear sampler, so the only pass that has to know
     // which extent this is is the one setting the viewport.
     let ao_extent = if config.ssao_half_res {
-        Extent::FrameDiv(1)
+        Extent::RenderDiv(1)
     } else {
-        Extent::Frame
+        Extent::Render
     };
     let ssao = config.ssao.then(|| SsaoIds {
         raw_ao: builder.create_image("ssao_raw_ao", ImageDesc::new(AO_FORMAT).extent(ao_extent)),
@@ -1391,7 +1391,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let hits = gi.gather_hits.expect("declared with the volumes");
         let low = |layers| {
             ImageDesc::new(GATHER_FORMAT)
-                .extent(Extent::FrameDiv(config.gi_gather))
+                .extent(Extent::RenderDiv(config.gi_gather))
                 .array_layers(layers)
         };
         let raw = builder.create_image("gi_gather_raw", low(META_LAYERS));
@@ -1552,7 +1552,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let scatter = builder.import_image(
             "fog_scatter",
             ImageDesc::new(FOG_FORMAT)
-                .extent(Extent::FrameDiv(FROXEL_SHIFT))
+                .extent(Extent::RenderDiv(FROXEL_SHIFT))
                 .depth(FROXEL_SLICES),
             ImageLayout::ShaderReadOnlyOptimal,
             ImageLayout::ShaderReadOnlyOptimal,
@@ -1560,7 +1560,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let volume = builder.create_image(
             "fog_volume",
             ImageDesc::new(FOG_FORMAT)
-                .extent(Extent::FrameDiv(FROXEL_SHIFT))
+                .extent(Extent::RenderDiv(FROXEL_SHIFT))
                 .depth(FROXEL_SLICES),
         );
 
@@ -1572,7 +1572,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             let light = builder.import_image(
                 "fog_light",
                 ImageDesc::new(FOG_FORMAT)
-                    .extent(Extent::FrameDiv(FROXEL_SHIFT + LIGHT_SHIFT))
+                    .extent(Extent::RenderDiv(FROXEL_SHIFT + LIGHT_SHIFT))
                     .depth(FROXEL_SLICES >> LIGHT_SHIFT),
                 ImageLayout::ShaderReadOnlyOptimal,
                 ImageLayout::ShaderReadOnlyOptimal,
@@ -1580,7 +1580,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             let state = builder.import_image(
                 "fog_light_state",
                 ImageDesc::new(LIGHT_STATE_FORMAT)
-                    .extent(Extent::FrameDiv(FROXEL_SHIFT + LIGHT_SHIFT))
+                    .extent(Extent::RenderDiv(FROXEL_SHIFT + LIGHT_SHIFT))
                     .depth(FROXEL_SLICES >> LIGHT_SHIFT),
                 ImageLayout::ShaderReadOnlyOptimal,
                 ImageLayout::ShaderReadOnlyOptimal,
@@ -1768,7 +1768,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let hiz = builder.create_image(
             "ssr_hiz",
             ImageDesc::new(HIZ_FORMAT)
-                .extent(Extent::FrameDiv(1))
+                .extent(Extent::RenderDiv(1))
                 .mip_levels(HIZ_LEVELS),
         );
         // The same shape over the lit frame, and what a rough reflection is
@@ -1778,7 +1778,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let source_pyramid = builder.create_image(
             "ssr_source",
             ImageDesc::new(HDR_FORMAT)
-                .extent(Extent::FrameDiv(1))
+                .extent(Extent::RenderDiv(1))
                 .mip_levels(SOURCE_LEVELS),
         );
         // Half the frame, for the reason depth of field's gather is: the cost is
@@ -1788,7 +1788,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // composite — which is why that pass reads the pyramids too.
         let rays = builder.create_image(
             "ssr_rays",
-            ImageDesc::new(RAY_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(RAY_FORMAT).extent(Extent::RenderDiv(1)),
         );
         let output = builder.create_image("ssr_color", ImageDesc::new(HDR_FORMAT));
 
@@ -1968,7 +1968,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         let scene = builder.create_image(
             "refraction_scene",
             ImageDesc::new(HDR_FORMAT)
-                .extent(Extent::FrameDiv(1))
+                .extent(Extent::RenderDiv(1))
                 .mip_levels(SCENE_LEVELS),
         );
         let accum =
@@ -2048,7 +2048,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // allocation put it there — and its contents are what `reset` ignores.
         let history = builder.import_image(
             "taa_history",
-            ImageDesc::new(HDR_FORMAT),
+            ImageDesc::new(HDR_FORMAT).extent(Extent::Output),
             ImageLayout::ShaderReadOnlyOptimal,
             ImageLayout::ShaderReadOnlyOptimal,
         );
@@ -2056,7 +2056,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // next frame wants to find it.
         let output = builder.import_image(
             "taa_color",
-            ImageDesc::new(HDR_FORMAT),
+            ImageDesc::new(HDR_FORMAT).extent(Extent::Output),
             ImageLayout::Undefined,
             ImageLayout::ShaderReadOnlyOptimal,
         );
@@ -2107,15 +2107,15 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // survives a format with no alpha and no negatives.
         let prefiltered = builder.create_image(
             "dof_prefiltered",
-            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::OutputDiv(1)),
         );
         let near = builder.create_image(
             "dof_near",
-            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::OutputDiv(1)),
         );
         let far = builder.create_image(
             "dof_far",
-            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(1)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::OutputDiv(1)),
         );
         // Two channels of maxima, for the reason the motion blur tiles are:
         // `R16G16_SFLOAT` is only a guaranteed storage format behind an optional
@@ -2123,9 +2123,12 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // a feature flag.
         let tile = builder.create_image(
             "dof_tile",
-            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(COC_TILE_SHIFT)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::OutputDiv(COC_TILE_SHIFT)),
         );
-        let output = builder.create_image("dof_color", ImageDesc::new(HDR_FORMAT));
+        let output = builder.create_image(
+            "dof_color",
+            ImageDesc::new(HDR_FORMAT).extent(Extent::Output),
+        );
 
         let id = builder
             .pass("dof_prefilter", PassKind::Compute)
@@ -2202,13 +2205,16 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // flag on the device.
         let tile = builder.create_image(
             "motion_blur_tile",
-            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::OutputDiv(TILE_SHIFT)),
         );
         let neighbour = builder.create_image(
             "motion_blur_neighbour",
-            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::FrameDiv(TILE_SHIFT)),
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::OutputDiv(TILE_SHIFT)),
         );
-        let output = builder.create_image("motion_blur_color", ImageDesc::new(HDR_FORMAT));
+        let output = builder.create_image(
+            "motion_blur_color",
+            ImageDesc::new(HDR_FORMAT).extent(Extent::Output),
+        );
 
         // Depth as well as velocity, because where nothing was rasterised the
         // prepass wrote no motion and the sky still sweeps when the camera
@@ -2262,11 +2268,14 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // the reason every history is. See `occlusion_history`.
         let sum = builder.import_image(
             "path_sum",
-            ImageDesc::new(Format::Rgba32Float),
+            ImageDesc::new(Format::Rgba32Float).extent(Extent::Output),
             ImageLayout::ShaderReadOnlyOptimal,
             ImageLayout::ShaderReadOnlyOptimal,
         );
-        let mean = builder.create_image("path_mean", ImageDesc::new(HDR_WIDE_FORMAT));
+        let mean = builder.create_image(
+            "path_mean",
+            ImageDesc::new(HDR_WIDE_FORMAT).extent(Extent::Output),
+        );
         let id = builder
             .pass("path_trace", PassKind::Compute)
             .access(ray.scene, Access::AccelerationStructureRead)
@@ -2324,12 +2333,12 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             let shift = level as u32 + 1;
             down[level] = Some(builder.create_image(
                 BLOOM_DOWN_NAMES[level],
-                ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(shift)),
+                ImageDesc::new(HDR_FORMAT).extent(Extent::OutputDiv(shift)),
             ));
             if level + 1 < mips {
                 up[level] = Some(builder.create_image(
                     BLOOM_UP_NAMES[level],
-                    ImageDesc::new(HDR_FORMAT).extent(Extent::FrameDiv(shift)),
+                    ImageDesc::new(HDR_FORMAT).extent(Extent::OutputDiv(shift)),
                 ));
             }
         }
@@ -2443,7 +2452,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // Its own target rather than the depth or stencil of the scene: the
         // outline is the editor's, drawn after the frame is finished, and the
         // frame's targets are resolved and gone by then. See `vulkan::outline`.
-        let mask = builder.create_image("outline_mask", ImageDesc::new(OUTLINE_MASK_FORMAT));
+        let mask = builder.create_image(
+            "outline_mask",
+            ImageDesc::new(OUTLINE_MASK_FORMAT).extent(Extent::Output),
+        );
         let id = builder
             .pass("outline_mask", PassKind::Inline)
             .access(mask, Access::ColorAttachment)
@@ -2515,7 +2527,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let screenshot = config.screenshot.map(|view| {
         let image = builder.import_image(
             "screenshot",
-            ImageDesc::new(config.color_format),
+            ImageDesc::new(config.color_format).extent(Extent::Output),
             ImageLayout::Undefined,
             ImageLayout::ShaderReadOnlyOptimal,
         );

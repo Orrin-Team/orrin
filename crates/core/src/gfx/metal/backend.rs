@@ -17,7 +17,7 @@ use super::encoder::Timing;
 use super::window::MtlWindow;
 use super::{FRAME_SLOTS, MtlDriver};
 use crate::gfx::format::{Format, SampleCount};
-use crate::gfx::graph::{FrameGraph, ImageUsage};
+use crate::gfx::graph::{Extents, FrameGraph, ImageUsage};
 use crate::gfx::images::{ImageEntry, ImageTable};
 use crate::gfx::rhi::{TextureDesc, TextureDimension, TextureViewId};
 use crate::scene::PresentSettings;
@@ -68,7 +68,8 @@ pub(crate) struct MtlBackend {
     pub(crate) format: Format,
     /// The image the frame ends in, which a capture reads back.
     pub(crate) target: TextureViewId,
-    images: [u32; 2],
+    /// The frame's extents when the graph's images were last allocated.
+    images: Extents,
     cache: HashMap<Key, ImageEntry>,
     pub(crate) windowed: Option<Windowed>,
     /// Trails the displayed frame by the pacing depth, as the Vulkan reading does.
@@ -111,7 +112,7 @@ impl MtlBackend {
             extent,
             format,
             target,
-            images: extent,
+            images: Extents::native(extent),
             cache: HashMap::new(),
             windowed: None,
             gpu_ms: 0.0,
@@ -119,7 +120,7 @@ impl MtlBackend {
             spare_timing: Vec::new(),
             untimeable: false,
         };
-        let table = backend.rebuild(driver, graph);
+        let table = backend.rebuild(driver, graph, extent);
         (backend, table)
     }
 
@@ -279,19 +280,27 @@ impl MtlBackend {
         }
     }
 
-    pub(crate) fn is_stale(&self) -> bool {
-        self.images != self.extent
+    pub(crate) fn is_stale(&self, extents: Extents) -> bool {
+        self.images != extents
     }
 
     /// Point a table at the images `graph` declares, allocating only the ones
     /// the cache does not already hold and freeing the ones `graph` no longer
     /// declares. A resize changes every key, so it frees everything.
-    pub(crate) fn rebuild(&mut self, driver: &MtlDriver, graph: &FrameGraph) -> ImageTable {
-        self.images = self.extent;
+    pub(crate) fn rebuild(
+        &mut self,
+        driver: &MtlDriver,
+        graph: &FrameGraph,
+        render: [u32; 2],
+    ) -> ImageTable {
+        self.images = Extents {
+            render,
+            output: self.extent,
+        };
         let mut previous = std::mem::take(&mut self.cache);
         let mut entries: Vec<Option<ImageEntry>> = vec![None; graph.resource_count()];
         for (id, image) in graph.transient_images() {
-            let extent = image.desc.extent.resolve(self.extent);
+            let extent = image.desc.extent.resolve(self.images);
             let depth = image.desc.depth.unwrap_or(1);
             let largest = extent[0].max(extent[1]).max(depth).max(1);
             let mip_levels = image.desc.mip_levels.min(largest.ilog2() + 1).max(1);
@@ -419,11 +428,11 @@ mod tests {
         let (mut backend, _) = MtlBackend::new(&driver, Format::Rgba8Unorm, [16, 16], &graph(true));
         let with_extra = live_textures(&driver);
 
-        backend.rebuild(&driver, &graph(false));
+        backend.rebuild(&driver, &graph(false), [16, 16]);
         driver.begin_frame(FRAME_SLOTS);
         assert_eq!(live_textures(&driver), with_extra - 1);
 
-        backend.rebuild(&driver, &graph(false));
+        backend.rebuild(&driver, &graph(false), [16, 16]);
         driver.begin_frame(2 * FRAME_SLOTS);
         assert_eq!(
             live_textures(&driver),

@@ -3029,10 +3029,10 @@ fn the_final_gather_runs_between_the_cache_and_the_forward_pass() {
     assert!(at("gi_gather") < at("taa_resolve"), "{order:?}");
 
     let desc = image_desc(&frame.graph, "gi_gather_raw").unwrap();
-    assert_eq!(desc.extent, Extent::FrameDiv(2));
+    assert_eq!(desc.extent, Extent::RenderDiv(2));
     assert_eq!(desc.array_layers, Some(4));
     let desc = image_desc(&frame.graph, "gi_gather_irradiance").unwrap();
-    assert_eq!(desc.extent, Extent::Frame);
+    assert_eq!(desc.extent, Extent::Render);
     assert_eq!(desc.array_layers, Some(3));
 
     let plan = format!("{}", frame.graph);
@@ -3356,14 +3356,20 @@ fn everything_sharing_a_block_would_have_been_allocated_alike() {
                 .unwrap_or_else(|| panic!("{label}: an aliased resource is a transient image"))
                 .1
         };
+        // As the frame sizes them: a render-extent and an output-extent image
+        // are one size in a frame that does not upscale.
+        let sized = |desc: ImageDesc| ImageDesc {
+            extent: desc.extent.folded(graph.upscaled()),
+            ..desc
+        };
         for group in graph.alias_groups() {
             let first = image(group[0]);
             for &member in &group[1..] {
                 let member_image = image(member);
                 assert_eq!(
-                    (first.desc, first.usage, first.concurrent),
+                    (sized(first.desc), first.usage, first.concurrent),
                     (
-                        member_image.desc,
+                        sized(member_image.desc),
                         member_image.usage,
                         member_image.concurrent
                     ),

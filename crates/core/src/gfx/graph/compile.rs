@@ -56,6 +56,7 @@ pub struct FrameGraph {
     /// Sets of transients that share one allocation, each in the order the
     /// memory changes hands in.
     alias_groups: Vec<Vec<ResourceId>>,
+    upscaled: bool,
 }
 
 impl FrameGraph {
@@ -145,6 +146,12 @@ impl FrameGraph {
         &self.alias_groups
     }
 
+    /// Whether the frame renders below its output extent. See
+    /// [`GraphBuilder::upscale`].
+    pub fn upscaled(&self) -> bool {
+        self.upscaled
+    }
+
     /// The images the executor must allocate, in declaration order.
     /// The images supplied from outside the graph, as they were declared. Their
     /// owners allocate them, so this is what an owner — or a test — checks a
@@ -174,11 +181,13 @@ pub fn compile(builder: GraphBuilder) -> Result<FrameGraph, GraphError> {
         resources,
         passes,
         async_compute,
+        upscaled,
     } = builder;
 
     for pass in &passes {
         check_single_access_per_resource(pass, &resources)?;
         check_compute_declares_no_attachment(pass, &resources)?;
+        check_attachments_share_an_extent(pass, &resources, upscaled)?;
         check_acceleration_structure_accesses(pass, &resources)?;
     }
 
@@ -200,7 +209,7 @@ pub fn compile(builder: GraphBuilder) -> Result<FrameGraph, GraphError> {
     // Before the barriers, because sharing an allocation is a dependency
     // between the resources that share it and the plan has to carry it.
     let lifetimes = alias::lifetimes(&order, &passes, resources.len());
-    let alias_groups = alias::groups(&images, &lifetimes);
+    let alias_groups = alias::groups(&images, &lifetimes, upscaled);
     let mut previous_in_group = vec![None; resources.len()];
     for (index, group) in alias_groups.iter().enumerate() {
         for (position, &member) in group.iter().enumerate() {
@@ -227,6 +236,7 @@ pub fn compile(builder: GraphBuilder) -> Result<FrameGraph, GraphError> {
         concurrent,
         lifetimes,
         alias_groups,
+        upscaled,
     })
 }
 
@@ -298,6 +308,38 @@ fn check_compute_declares_no_attachment(
                 resource: resources[resource.index()].name,
                 access,
             });
+        }
+    }
+    Ok(())
+}
+
+/// A render pass draws over one area, and every attachment has to cover it: an
+/// attachment at the render extent beside one at the output extent clips the
+/// pass to the smaller, which reads as a frame drawn into its own corner.
+/// Compared as the frame sizes them, so a frame that does not upscale is held
+/// to nothing it was not held to before.
+fn check_attachments_share_an_extent(
+    pass: &PassDecl,
+    resources: &[ResourceDecl],
+    upscaled: bool,
+) -> Result<(), GraphError> {
+    let mut first: Option<(&'static str, super::Extent)> = None;
+    for &(resource, access) in &pass.accesses {
+        let decl = &resources[resource.index()];
+        let Some(desc) = decl.image_desc().filter(|_| access.is_attachment()) else {
+            continue;
+        };
+        let extent = desc.extent.folded(upscaled);
+        match first {
+            None => first = Some((decl.name, extent)),
+            Some((name, other)) if other != extent => {
+                return Err(GraphError::AttachmentExtents {
+                    pass: pass.name,
+                    first: name,
+                    second: decl.name,
+                });
+            }
+            Some(_) => {}
         }
     }
     Ok(())

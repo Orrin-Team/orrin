@@ -70,6 +70,9 @@ pub struct GraphBuilder {
     /// cannot ask, and a plan that split a frame the device cannot split would
     /// be a plan nothing could execute.
     pub(super) async_compute: bool,
+    /// Whether the frame renders below its output extent. See
+    /// [`upscale`](Self::upscale).
+    pub(super) upscaled: bool,
 }
 
 impl GraphBuilder {
@@ -121,6 +124,18 @@ impl GraphBuilder {
     /// [`schedule`](super::schedule).
     pub fn request_async_compute(&mut self) {
         self.async_compute = true;
+    }
+
+    /// Declare that this frame renders below its output extent, so the
+    /// [`Extent::Render`](super::Extent::Render) and
+    /// [`Extent::Output`](super::Extent::Output) images are different sizes.
+    ///
+    /// Left alone, the compiler takes the two for one size, and an image of
+    /// one may share an allocation with an image of the other exactly as two
+    /// images of one extent do — which is what keeps a frame that does not
+    /// upscale planned as it was before the two had names.
+    pub fn upscale(&mut self) {
+        self.upscaled = true;
     }
 
     pub fn pass(&mut self, name: &'static str, kind: PassKind) -> PassBuilder<'_> {

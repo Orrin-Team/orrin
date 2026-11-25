@@ -88,7 +88,7 @@ use self::instances::InstanceStore;
 use self::occlusion::OcclusionPass;
 use self::oit::OitPass;
 use self::refraction::RefractionPass;
-use crate::gfx::graph::{PassKind, Queue as GraphQueue, ResourceId};
+use crate::gfx::graph::{Extents, PassKind, Queue as GraphQueue, ResourceId};
 
 use self::bloom::BloomPass;
 use self::dof::DofPass;
@@ -472,15 +472,16 @@ impl Backend {
         }
     }
 
-    fn is_stale(&self) -> bool {
+    /// Whether the images were allocated at other extents than `extents`.
+    fn is_stale(&self, extents: Extents) -> bool {
         match self {
-            Backend::Vulkan(vk) => vk.images.is_stale(vk.swapchain.extent),
+            Backend::Vulkan(vk) => vk.images.is_stale(extents),
             #[cfg(target_os = "macos")]
-            Backend::Metal(mtl) => mtl.is_stale(),
+            Backend::Metal(mtl) => mtl.is_stale(extents),
         }
     }
 
-    /// The extent the frame renders at.
+    /// The extent the frame is presented at: the window's, or the capture's.
     fn extent(&self) -> [u32; 2] {
         match self {
             Backend::Vulkan(vk) => vk.swapchain.extent,
@@ -795,7 +796,7 @@ impl VulkanRenderer {
                     &ctx,
                     device.vulkan(),
                     &frame.graph,
-                    extent,
+                    Extents::native(extent),
                     slots,
                 );
                 let table = images.table();
@@ -1032,10 +1033,16 @@ impl VulkanRenderer {
         if self.config != config {
             self.frame = frame::declare(config).expect("the engine's frame must compile");
             self.config = config;
-        } else if !self.backend.is_stale() {
+        } else if !self.backend.is_stale(self.extents()) {
             return;
         }
         self.reallocate();
+    }
+
+    /// The frame's two extents: the output's, which is the window's, and the
+    /// render's the scene is drawn at below it.
+    fn extents(&self) -> Extents {
+        Extents::native(self.backend.extent())
     }
 
     /// Copy the last rendered frame back to host memory as tightly packed
@@ -1587,6 +1594,7 @@ impl VulkanRenderer {
     }
 
     fn reallocate(&mut self) {
+        let extents = self.extents();
         // Rebuilt rather than replaced, so the image cache survives: a
         // structural toggle re-points `views` at allocations that already exist
         // instead of recreating every image in the frame. See `GraphImages`.
@@ -1598,7 +1606,7 @@ impl VulkanRenderer {
                     &vk.ctx,
                     driver,
                     &self.frame.graph,
-                    vk.swapchain.extent,
+                    extents,
                     image_slots(&self.frame.graph),
                 );
                 self.table = vk.images.table();
@@ -1608,7 +1616,7 @@ impl VulkanRenderer {
                 let crate::gfx::rhi::Device::Metal(driver) = &self.device else {
                     unreachable!("the Metal backend runs on the Metal device");
                 };
-                self.table = mtl.rebuild(driver, &self.frame.graph);
+                self.table = mtl.rebuild(driver, &self.frame.graph, extents.render);
             }
         }
         if let (Some(live), Some(cached)) =
