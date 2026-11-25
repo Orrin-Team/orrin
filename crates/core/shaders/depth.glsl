@@ -31,6 +31,16 @@ float depth_farthest(float a, float b) {
     return min(a, b);
 }
 
+// The texel of an image `source` texels across that lies under pixel `at` of
+// one `size` across: how a pass after the temporal resolve, at the output
+// extent, reads the depth and motion left at the render extent below it. The
+// texel whose centre is nearest, not a filtered one — interpolating depth or
+// motion across a silhouette invents a surface. Multiplied before it divides,
+// so where the two extents are one it is `at` exactly.
+ivec2 texel_under(ivec2 at, ivec2 size, ivec2 source) {
+    return ivec2((vec2(at) + 0.5) * vec2(source) / vec2(size));
+}
+
 // Metres in front of the camera from a depth-buffer value, given the near and
 // far planes it was projected with. Mirrored by
 // `linear_depth_inverts_the_projection` in `scene/camera.rs`.

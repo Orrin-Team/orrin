@@ -60,7 +60,8 @@ void main() {
             // texels, and averaging its CoC against three background ones drops
             // it out of the near field entirely at half resolution, which reads
             // as the object snapping in and out of focus as it moves.
-            float candidate = circle_of_confusion(texelFetch(u_depth, at, 0).r);
+            ivec2 under = texel_under(at, full_size, textureSize(u_depth, 0));
+            float candidate = circle_of_confusion(texelFetch(u_depth, under, 0).r);
             if (abs(candidate) > abs(coc)) {
                 coc = candidate;
             }

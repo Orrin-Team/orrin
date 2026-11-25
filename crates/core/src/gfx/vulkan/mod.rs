@@ -2492,7 +2492,8 @@ impl VulkanRenderer {
                 self.environment.specular_tint(ambient, environment),
             );
         }
-        self.motion_blur.begin_frame(motion_blur, camera);
+        self.motion_blur
+            .begin_frame(motion_blur, camera, self.backend.extent());
         // Whether or not the two dispatches run, and that is the point: the
         // block resolved here is what every shading pass applies the fog out of,
         // and past the volume's far plane — or in a frame with no volume at all —

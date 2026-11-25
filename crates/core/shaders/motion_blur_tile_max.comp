@@ -32,6 +32,9 @@ layout(set = 0, binding = 3) uniform Params {
     mat4 prev_view_proj;
     // x = shutter fraction, y = max blur radius in pixels.
     vec4 params;
+    // xy = the output extent, which the blur is measured across. The motion
+    // and the depth are read from the render extent below it.
+    vec4 extent;
 } mb;
 
 // Side of a tile, in pixels. Must equal the shift the graph sizes this image by,
@@ -46,7 +49,8 @@ const int TILE = 16;
 // history exists. TAA reads that as "reproject off-screen and reject"; here it
 // would be a blur streak across the whole frame, so it saturates instead.
 vec2 blur_vector(ivec2 at, ivec2 size) {
-    float depth = texelFetch(u_depth, at, 0).r;
+    ivec2 under = texel_under(at, size, textureSize(u_depth, 0));
+    float depth = texelFetch(u_depth, under, 0).r;
     vec2 uv = (vec2(at) + 0.5) / vec2(size);
 
     vec2 velocity;
@@ -60,7 +64,7 @@ vec2 blur_vector(ivec2 at, ivec2 size) {
         vec4 previous = mb.prev_view_proj * vec4(world.xyz / world.w, 1.0);
         velocity = uv - ((previous.xy / previous.w) * 0.5 + 0.5);
     } else {
-        velocity = texelFetch(u_velocity, at, 0).rg;
+        velocity = texelFetch(u_velocity, under, 0).rg;
     }
 
     vec2 pixels = velocity * vec2(size) * mb.params.x;
@@ -79,7 +83,7 @@ shared uint s_index[TILE * TILE];
 void main() {
     ivec2 tile = ivec2(gl_WorkGroupID.xy);
     ivec2 size = imageSize(u_target);
-    ivec2 full_size = textureSize(u_velocity, 0);
+    ivec2 full_size = ivec2(mb.extent.xy);
     uint index = gl_LocalInvocationIndex;
     ivec2 at = tile * TILE + ivec2(gl_LocalInvocationID.xy);
 

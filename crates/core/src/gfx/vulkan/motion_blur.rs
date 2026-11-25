@@ -49,7 +49,7 @@ const MAX_BLUR_PIXELS: f32 = (2 << TILE_SHIFT) as f32;
 /// fraction, y = max blur radius in pixels, z = near, w = far. A buffer rather
 /// than push constants because two mat4s alone fill the guaranteed 128-byte push
 /// range.
-const UBO_WORDS: usize = 36;
+const UBO_WORDS: usize = 40;
 
 pub struct MotionBlurPass {
     tile_max_pipeline: PipelineId,
@@ -62,6 +62,7 @@ pub struct MotionBlurPass {
     settings: MotionBlurSettings,
     near: f32,
     far: f32,
+    extent: [u32; 2],
 }
 
 impl MotionBlurPass {
@@ -93,11 +94,20 @@ impl MotionBlurPass {
             settings: MotionBlurSettings::default(),
             near: 0.1,
             far: 1000.0,
+            extent: [1, 1],
         }
     }
 
-    pub fn begin_frame(&mut self, settings: &MotionBlurSettings, camera: &Camera) {
+    /// `extent` is the output's, which the blur is measured across whatever
+    /// extent the motion vectors were drawn at.
+    pub fn begin_frame(
+        &mut self,
+        settings: &MotionBlurSettings,
+        camera: &Camera,
+        extent: [u32; 2],
+    ) {
         self.settings = *settings;
+        self.extent = extent;
         self.near = camera.near;
         self.far = camera.far;
     }
@@ -120,6 +130,10 @@ impl MotionBlurPass {
             MAX_BLUR_PIXELS,
             self.near,
             self.far,
+            self.extent[0] as f32,
+            self.extent[1] as f32,
+            0.0,
+            0.0,
         ];
         let mut words = [0u32; UBO_WORDS];
         for (word, float) in words
