@@ -149,7 +149,8 @@ fn gathered(view: ([f32; 3], [f32; 3])) -> CaptureSettings {
 
 /// Every capture, by the name its file carries.
 pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
-    vec![
+    #[cfg_attr(not(feature = "fsr"), allow(unused_mut))]
+    let mut captures = vec![
         ("scene", CaptureSettings::default()),
         // The editor's two wireframe draw modes over the same frame: edges
         // hidden by the scene's depth, and every edge alone. Against
@@ -792,5 +793,36 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                 ..CaptureSettings::default()
             },
         ),
-    ]
+    ];
+    // The upscaling set again through AMD FSR, each named to pair with the
+    // engine's own in ICAT, its native-AA mode against `upscale-native`, and
+    // FSR's debug view over the quality mode: the motion it was handed top
+    // left, and where it judged its history stale top right. Skipped where
+    // FSR does not run.
+    #[cfg(feature = "fsr")]
+    {
+        use orrin_core::scene::Upscaler;
+        let fsr = |upscaling| CaptureSettings {
+            upscaler: Upscaler::Fsr,
+            ..upscaled(upscaling)
+        };
+        captures.extend([
+            ("upscale-fsr-native", fsr(Upscaling::Native)),
+            ("upscale-fsr-quality", fsr(Upscaling::Quality)),
+            ("upscale-fsr-balanced", fsr(Upscaling::Balanced)),
+            ("upscale-fsr-performance", fsr(Upscaling::Performance)),
+            (
+                "upscale-fsr-ultra-performance",
+                fsr(Upscaling::UltraPerformance),
+            ),
+            (
+                "upscale-fsr-debug-view",
+                CaptureSettings {
+                    upscaler_debug_view: true,
+                    ..fsr(Upscaling::Quality)
+                },
+            ),
+        ]);
+    }
+    captures
 }

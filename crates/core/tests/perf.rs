@@ -88,6 +88,9 @@
 //!   the scene rendered at that fraction of `ORRIN_PERF_EXTENT` and the
 //!   temporal resolve bringing it up. Every pass up to the resolve is then
 //!   that much smaller, and the resolve and everything after it are not.
+//! - `ORRIN_PERF_UPSCALER=fsr` resolves through AMD FSR, in a build with the
+//!   `fsr` feature and its runtime found (see `gfx/vulkan/upscaler.rs`); the
+//!   `taa_resolve` row is then FSR's. What ran is printed with the memory.
 //!
 //! Per-pass GPU timing serialises adjacent nodes that would otherwise overlap
 //! (see `profile::gpu_passes_enabled`), so the GPU rows are a breakdown, not a
@@ -318,6 +321,11 @@ fn frame_cost() {
             ),
             Err(_) => Upscaling::Native,
         },
+        upscaler: match std::env::var("ORRIN_PERF_UPSCALER").as_deref() {
+            Ok("fsr") => orrin_core::scene::Upscaler::Fsr,
+            Ok("builtin") | Err(_) => orrin_core::scene::Upscaler::BuiltIn,
+            Ok(other) => panic!("ORRIN_PERF_UPSCALER is fsr or builtin, not `{other}`"),
+        },
         ..TaaSettings::default()
     });
     world.insert_resource(Culling::default());
@@ -511,6 +519,23 @@ fn frame_cost() {
             "     {:<28} not reported by this driver",
             "device-local memory"
         ),
+    }
+    let upscaler = renderer.upscaler_status();
+    println!(
+        "     {:<28} {:?}{}{}",
+        "temporal resolve",
+        upscaler.running,
+        upscaler
+            .provider
+            .as_ref()
+            .map_or(String::new(), |provider| format!(", {provider}")),
+        upscaler.memory_bytes.map_or(String::new(), |bytes| format!(
+            ", {:.1} MB",
+            bytes as f64 / 1e6
+        )),
+    );
+    if let Some(reason) = &upscaler.reason {
+        println!("     {:<28} {reason}", "");
     }
     let traced = renderer.traced_scene_bytes();
     if traced > 0 {

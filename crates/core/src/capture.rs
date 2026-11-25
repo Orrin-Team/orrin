@@ -119,6 +119,12 @@ pub struct CaptureSettings {
     /// to bring back up. `extent` is the output's whatever this is, so a set
     /// taken at every mode pairs pixel for pixel.
     pub upscaling: crate::scene::Upscaling,
+    /// What resolves the frame. Where the one asked for cannot run, the
+    /// engine's resolve does, and [`render`]'s renderer says so through
+    /// `upscaler_status`.
+    pub upscaler: crate::scene::Upscaler,
+    /// Whether a vendor's upscaler draws its debug view over the frame.
+    pub upscaler_debug_view: bool,
     /// The air, or `None` for whatever the scene asked for.
     ///
     /// Overridden whole rather than by a flag, because the A/B the fog captures
@@ -201,6 +207,8 @@ impl Default for CaptureSettings {
             motion_blur: false,
             msaa: false,
             upscaling: crate::scene::Upscaling::Native,
+            upscaler: crate::scene::Upscaler::BuiltIn,
+            upscaler_debug_view: false,
             fog: None,
             scene: SceneChoice::default(),
             camera: None,
@@ -235,12 +243,24 @@ pub fn scene_pixels_metal(settings: &CaptureSettings) -> (Vec<u8>, [u32; 2]) {
 ///
 /// Panics rather than returning an error on a device that cannot be reached: it
 /// is a developer tool driven from a test, and a `Result` nobody can act on
-/// would only push the same panic one frame up the stack.
-pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
+/// would only push the same panic one frame up the stack. The one `Err` is a
+/// capture of an upscaler this machine cannot run, which writes nothing and
+/// says why: its frame would be the engine's resolve under the vendor's name.
+pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) -> Result<(), String> {
     let mut renderer = offscreen_renderer(settings.extent);
     let mut world = World::new();
     prepare(&mut world, &mut renderer, settings);
     let (pixels, extent) = render(&mut world, &mut renderer, settings);
+    let status = renderer.upscaler_status();
+    if settings.upscaler != crate::scene::Upscaler::BuiltIn
+        && status.running != Some(settings.upscaler)
+    {
+        return Err(status
+            .reason
+            .as_deref()
+            .unwrap_or("it did not run")
+            .to_string());
+    }
     image::save_buffer(
         path.as_ref(),
         &pixels,
@@ -249,6 +269,7 @@ pub fn capture_scene(path: impl AsRef<Path>, settings: &CaptureSettings) {
         image::ColorType::Rgba8,
     )
     .expect("failed to write the capture");
+    Ok(())
 }
 
 /// A renderer drawing into an image of `extent` rather than a window.
@@ -314,6 +335,7 @@ pub fn prepare(world: &mut World, renderer: &mut VulkanRenderer, settings: &Capt
         enabled: settings.taa && !settings.msaa,
         msaa: settings.msaa,
         upscaling: settings.upscaling,
+        upscaler: settings.upscaler,
         ..TaaSettings::default()
     });
     if let Some(fog) = settings.fog {
@@ -396,6 +418,7 @@ pub fn render(
         });
 
     renderer.pin_surface_time(settings.surface_time);
+    renderer.set_upscaler_debug_view(settings.upscaler_debug_view);
     renderer.set_ray_tracing(crate::scene::RayTracingSettings {
         enabled: settings.ray_tracing,
         debug_view: settings.ray_debug,

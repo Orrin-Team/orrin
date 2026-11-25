@@ -49,7 +49,10 @@ fn captures_the_built_in_scenes() {
             continue;
         }
         let path = dir.join(format!("{name}.png"));
-        capture_scene(&path, &settings);
+        if let Err(reason) = capture_scene(&path, &settings) {
+            println!("skipped {name}: {reason}");
+            continue;
+        }
 
         let written = std::fs::metadata(&path)
             .unwrap_or_else(|e| panic!("{} was not written: {e}", path.display()))
