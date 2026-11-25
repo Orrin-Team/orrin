@@ -396,6 +396,12 @@ pub struct VulkanRenderer {
     /// them. Off until then, so a harness that never asks draws the frame it
     /// always did.
     gi_settings: crate::scene::GiSettings,
+    /// The mode the material texture sets were last built for, and a sampler
+    /// per mode that has been used, each with that mode's level-of-detail
+    /// bias. A handful at most, and kept: a device sampler is not something
+    /// the RHI frees.
+    texture_bias: crate::scene::Upscaling,
+    biased_samplers: Vec<(crate::scene::Upscaling, crate::gfx::rhi::SamplerId)>,
 }
 
 /// The frame's commands as they are being recorded: a Vulkan command buffer, or
@@ -901,6 +907,7 @@ impl VulkanRenderer {
             ray_path_trace: false,
             gi_probes: 0,
             gi_gather: 0,
+            upscaling: crate::scene::Upscaling::Native,
         };
         let frame = frame::declare(config).expect("the engine's frame must compile");
         let slots = image_slots(&frame.graph);
@@ -968,8 +975,50 @@ impl VulkanRenderer {
                 enabled: false,
                 ..Default::default()
             },
+            texture_bias: crate::scene::Upscaling::Native,
+            biased_samplers: Vec::new(),
             backend,
         }
+    }
+
+    /// Point the geometry passes' material textures at the sampler the
+    /// compiled frame's upscaling mode wants: below the output's extent a
+    /// texture is sampled at a finer level, by [`Upscaling::texture_lod_bias`],
+    /// so it is as sharp in the resolved frame as at native. Native samples
+    /// through each pass's own sampler, exactly as it did.
+    ///
+    /// [`Upscaling::texture_lod_bias`]: crate::scene::Upscaling::texture_lod_bias
+    fn follow_texture_bias(&mut self) {
+        let mode = self.config.upscaling;
+        if mode == self.texture_bias {
+            return;
+        }
+        let biased = (mode != crate::scene::Upscaling::Native).then(|| {
+            match self
+                .biased_samplers
+                .iter()
+                .find(|(other, _)| *other == mode)
+            {
+                Some(&(_, sampler)) => sampler,
+                None => {
+                    let sampler = self.device.create_sampler(crate::gfx::rhi::SamplerDesc {
+                        linear: true,
+                        mipmap_linear: true,
+                        repeat: true,
+                        compare: false,
+                        anisotropy: self.device.max_anisotropy(),
+                        max_lod: None,
+                        lod_bias: mode.texture_lod_bias(),
+                    });
+                    self.biased_samplers.push((mode, sampler));
+                    sampler
+                }
+            }
+        });
+        self.forward.set_texture_sampler(biased);
+        self.prepass.set_texture_sampler(biased);
+        self.texture_bias = mode;
+        self.invalidate_texture_sets();
     }
 
     /// Plan this frame's shadows into `shadow_plan`, from what the tracker has
@@ -1040,9 +1089,22 @@ impl VulkanRenderer {
     }
 
     /// The frame's two extents: the output's, which is the window's, and the
-    /// render's the scene is drawn at below it.
+    /// render's the scene is drawn at below it, which follows the compiled
+    /// frame's upscaling mode.
     fn extents(&self) -> Extents {
-        Extents::native(self.backend.extent())
+        let output = self.backend.extent();
+        Extents {
+            render: self.config.upscaling.render_extent(output),
+            output,
+        }
+    }
+
+    /// Drop the temporal resolve's history at the next frame, for a camera cut:
+    /// the frame after it shares nothing with the frames before, and the
+    /// resolve would otherwise reproject the last shot over the first frames
+    /// of the next. Nothing here detects a cut; the caller knows it made one.
+    pub fn reset_temporal_history(&self) {
+        self.taa.reset();
     }
 
     /// Copy the last rendered frame back to host memory as tightly packed
@@ -2219,7 +2281,10 @@ impl VulkanRenderer {
             // recreate every image in the frame.
             transparency: transparency.enabled && !transparent.is_empty(),
             refraction: refraction.enabled && !refractive.is_empty(),
-            taa: taa.enabled,
+            // An upscaling mode implies the resolve: a frame rendered small
+            // and never resolved would simply be small.
+            taa: taa.resolves(),
+            upscaling: taa.upscaling,
             auto_exposure: hdr.auto_exposure,
             motion_blur: motion_blur.enabled,
             dof: dof.enabled,
@@ -2287,6 +2352,8 @@ impl VulkanRenderer {
                 0
             },
         });
+
+        self.follow_texture_bias();
 
         // Atlases allocated for this frame hold nothing, whatever the plan
         // expected to find in them.
@@ -2450,12 +2517,14 @@ impl VulkanRenderer {
         self.hdr.auto_exposure = hdr.auto_exposure;
         self.exposure.begin_frame(hdr, dt);
         self.bloom.begin_frame(bloom, hdr);
+        // The scene's passes are sized to `render`, and those after the
+        // resolve to the output's; see `frame` for which are which.
+        let extents = self.extents();
+        let render = extents.render;
         // Before anything records: this is where the frame's subpixel jitter is
         // chosen, and every pass that rasterises geometry has to be drawn with
         // the matrices it returns rather than deriving its own from `camera`.
-        let view = self
-            .taa
-            .begin_frame(&self.device, taa, camera, self.backend.extent());
+        let view = self.taa.begin_frame(&self.device, taa, camera, extents);
         // Both resolve their optics against this frame's camera: the lens takes
         // its focal length from the field of view, and the shutter takes the
         // depth range it linearises with.
@@ -2466,13 +2535,12 @@ impl VulkanRenderer {
         // and the cull is told to test nothing that frame.
         let occlusion_live =
             self.occlusion
-                .begin_frame(&self.device, self.occlusion_culling, self.backend.extent());
+                .begin_frame(&self.device, self.occlusion_culling, render);
         self.dof.begin_frame(dof, camera, self.backend.extent());
         // Resolved against the camera for the reason the lens is: the kernel's
         // width in pixels is a world length divided by a view depth, so both
         // dispatches have to be handed one projection and one depth range.
-        self.subsurface
-            .begin_frame(subsurface, camera, self.backend.extent());
+        self.subsurface.begin_frame(subsurface, camera, render);
         // Reflections resolve against the camera *and* the environment: the
         // composite subtracts the environment term the forward pass added, so
         // it has to be handed the same rotation and the same tint that pass
@@ -2485,7 +2553,7 @@ impl VulkanRenderer {
                 &self.device,
                 ssr,
                 &view,
-                self.backend.extent(),
+                render,
                 self.table.mip_levels(ids.hiz),
                 environment.yaw,
                 environment::SPECULAR_MIPS,
@@ -2510,7 +2578,7 @@ impl VulkanRenderer {
             &view,
             camera.position,
             lighting.ambient_color * lighting.ambient_nits,
-            self.backend.extent(),
+            render,
         );
         // Sourced from the compiled frame, not from the setting: a window too
         // small for a chain leaves bloom enabled but unbuilt, and a non-zero
@@ -2822,7 +2890,7 @@ impl VulkanRenderer {
                 gather.map(|_| self.gi_settings.gather_resolution.shift()),
                 &view,
                 camera.position,
-                self.backend.extent(),
+                render,
             );
             if let (Some(ids), Some((views, extent))) = (gather, accumulations) {
                 for (id, view) in [(ids.history, views[0]), (ids.accumulated, views[1])] {
@@ -3066,7 +3134,7 @@ impl VulkanRenderer {
             &self.device,
             lighting,
             camera,
-            self.backend.extent(),
+            render,
             ao_view,
             contact_shadow_view,
             atlas_view,
@@ -3097,7 +3165,6 @@ impl VulkanRenderer {
         // decides what runs next, what an image's layout is, or what has to
         // finish before what — a pass that needs a different place in the frame
         // gets there by changing its declarations, not by being moved here.
-        let extent = self.backend.extent();
         let (swapchain_view, swapchain_id) = match &self.backend {
             Backend::Vulkan(vk) => {
                 let view = vk.swapchain.image_views[image_index as usize].clone();
@@ -3194,7 +3261,8 @@ impl VulkanRenderer {
             frame: &self.frame,
             table: &self.table,
             swapchain_id,
-            extent,
+            render_extent: render,
+            output_extent: extents.output,
             bloom: &self.bloom,
             contact_shadows: &self.contact_shadows,
             dof: &self.dof,
@@ -3699,7 +3767,10 @@ struct FrameRecord<'a> {
     table: &'a ImageTable,
     /// The same image as the device names it, which is what a pass binds.
     swapchain_id: TextureViewId,
-    extent: [u32; 2],
+    /// What the scene's passes are drawn at, up to the temporal resolve.
+    render_extent: [u32; 2],
+    /// What the resolve and every pass after it are drawn at.
+    output_extent: [u32; 2],
     bloom: &'a BloomPass,
     contact_shadows: &'a ContactShadowPass,
     dof: &'a DofPass,
@@ -4287,7 +4358,7 @@ impl FrameRecord<'_> {
                 let mips = self.table.mip_textures(ids.hiz);
 
                 self.ssr
-                    .record_hiz(self.device, encoder, depth, mips, self.extent);
+                    .record_hiz(self.device, encoder, depth, mips, self.render_extent);
             }
             PassBody::SsrSource => {
                 let ids = self
@@ -4641,17 +4712,17 @@ impl FrameRecord<'_> {
                 let depth = self.table.texture(prepass.depth);
 
                 self.occlusion
-                    .record(self.device, encoder, depth, self.extent);
+                    .record(self.device, encoder, depth, self.render_extent);
             }
             PassBody::LuminanceHistogram => {
                 let hdr = self.metered_color;
 
                 self.exposure
-                    .record_histogram(self.device, encoder, self.extent, hdr);
+                    .record_histogram(self.device, encoder, self.output_extent, hdr);
             }
             PassBody::LuminanceAverage => {
                 self.exposure
-                    .record_average(self.device, encoder, self.extent);
+                    .record_average(self.device, encoder, self.output_extent);
             }
             PassBody::BloomPrefilter => {
                 let ids = self.frame.ids.bloom.expect("bloom pass without levels");
@@ -4724,7 +4795,7 @@ impl FrameRecord<'_> {
                     self.device,
                     encoder,
                     self.opaque_draws(0),
-                    self.extent,
+                    self.render_extent,
                     self.frame_uniforms.unwrap(),
                     self.decal_block,
                     self.prepass_object_set.unwrap(),
@@ -4781,7 +4852,7 @@ impl FrameRecord<'_> {
                 self.contact_shadows.record(
                     self.device,
                     encoder,
-                    self.extent,
+                    self.render_extent,
                     self.contact_shadow_uniforms
                         .as_ref()
                         .expect("contact shadows without their uniforms"),
@@ -4800,7 +4871,7 @@ impl FrameRecord<'_> {
                     encoder,
                     self.opaque_draws(0),
                     &self.view,
-                    self.extent,
+                    self.render_extent,
                     &self.forward_sets,
                     subsurface,
                     msaa,
@@ -4816,7 +4887,7 @@ impl FrameRecord<'_> {
                     self.device,
                     encoder,
                     &self.view,
-                    self.extent,
+                    self.render_extent,
                     self.env,
                     subsurface,
                     msaa,
@@ -4834,7 +4905,7 @@ impl FrameRecord<'_> {
                     encoder,
                     self.debug_lines,
                     &self.view,
-                    self.extent,
+                    self.render_extent,
                     subsurface,
                     msaa,
                 );
@@ -4846,7 +4917,7 @@ impl FrameRecord<'_> {
                     self.transparent,
                     &self.blended_sets,
                     &self.view,
-                    self.extent,
+                    self.render_extent,
                     self.objects.transparent_base,
                     self.surfaces,
                 );
@@ -4869,7 +4940,7 @@ impl FrameRecord<'_> {
                     blur,
                     sharp,
                     &self.view,
-                    self.extent,
+                    self.render_extent,
                     self.objects.refractive_base,
                     self.surfaces,
                 );
@@ -4877,7 +4948,7 @@ impl FrameRecord<'_> {
             PassBody::RayDebug => {
                 self.raytrace
                     .expect("the graph scheduled a traced pass on a device that cannot trace")
-                    .record_debug(self.device, encoder, self.extent);
+                    .record_debug(self.device, encoder, self.output_extent);
             }
             PassBody::Tonemap | PassBody::Screenshot => {
                 // With bloom off the graph has no chain, so the tonemap
@@ -4890,22 +4961,29 @@ impl FrameRecord<'_> {
                 let hdr = self.scene_color;
                 let exposure = self.exposure.exposure_buffer();
 
-                self.hdr
-                    .record_tonemap(self.device, encoder, self.extent, hdr, exposure, bloom);
+                self.hdr.record_tonemap(
+                    self.device,
+                    encoder,
+                    self.output_extent,
+                    hdr,
+                    exposure,
+                    bloom,
+                );
             }
             PassBody::ScreenshotOverlay => {
                 if let Some((pass, frame, copy)) = self.shot_overlay {
-                    pass.draw_copy(encoder, frame, copy, self.extent);
+                    pass.draw_copy(encoder, frame, copy, self.output_extent);
                 }
             }
             PassBody::Ui | PassBody::ScreenshotUi => {
                 if let Some(frame) = self.ui_frame {
-                    self.ui.record(self.device, encoder, frame, self.extent);
+                    self.ui
+                        .record(self.device, encoder, frame, self.output_extent);
                 }
             }
             PassBody::Gizmo | PassBody::ScreenshotGizmo => {
                 self.gizmo
-                    .record(self.device, encoder, self.gizmo_strokes, self.extent);
+                    .record(self.device, encoder, self.gizmo_strokes, self.output_extent);
             }
             PassBody::Wireframe | PassBody::ScreenshotWireframe => {
                 let (mode, depth) = self
@@ -4913,15 +4991,25 @@ impl FrameRecord<'_> {
                     .ids
                     .wireframe
                     .expect("a wireframe pass without its mode");
+                let hidden = match depth {
+                    None => wireframe::Hidden::No,
+                    Some(frame::EdgeDepth::Attached(_)) => wireframe::Hidden::Attached,
+                    Some(frame::EdgeDepth::Sampled(depth)) => wireframe::Hidden::Sampled(
+                        self.table.texture(depth),
+                        [0, 1].map(|axis| {
+                            self.render_extent[axis] as f32 / self.output_extent[axis] as f32
+                        }),
+                    ),
+                };
                 self.wireframe.record(
                     self.device,
                     encoder,
                     mode,
-                    depth.is_some(),
+                    hidden,
                     &[self.draws, self.transparent, self.refractive],
                     self.meshes,
                     self.view.unjittered_view_proj,
-                    self.extent,
+                    self.output_extent,
                 );
             }
             PassBody::OutlineMask => {
@@ -4930,7 +5018,7 @@ impl FrameRecord<'_> {
                     self.outline_items,
                     self.meshes,
                     self.view.unjittered_view_proj,
-                    self.extent,
+                    self.output_extent,
                 );
             }
             PassBody::Outline | PassBody::ScreenshotOutline => {
@@ -4945,7 +5033,7 @@ impl FrameRecord<'_> {
                     self.device,
                     encoder,
                     mask,
-                    self.extent,
+                    self.output_extent,
                     !self.outline_items.is_empty(),
                 );
             }

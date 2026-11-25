@@ -25,6 +25,9 @@
 // It runs in HDR, before metering and bloom, so what those two see is already
 // resolved — a bloom chain fed the unresolved frame pulses at the jitter's
 // frequency.
+//
+// With ORRIN_TAA_UPSCALE it is also the upscaler: this frame is at the render
+// extent and the history at the output's. See the second `main` below.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -32,7 +35,12 @@ layout(set = 0, binding = 0) uniform sampler2D u_color;
 layout(set = 0, binding = 1) uniform sampler2D u_history;
 layout(set = 0, binding = 2) uniform sampler2D u_velocity;
 layout(set = 0, binding = 3) uniform sampler2D u_depth;
+#ifdef ORRIN_TAA_UPSCALE
+// Alpha is how much each pixel has accumulated.
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D u_target;
+#else
 layout(set = 0, binding = 4, r11f_g11f_b10f) uniform writeonly image2D u_target;
+#endif
 layout(set = 0, binding = 5) uniform Params {
     // Unjittered, so background reprojection agrees with the motion vectors the
     // prepass wrote — those are unjittered too.
@@ -40,6 +48,11 @@ layout(set = 0, binding = 5) uniform Params {
     mat4 prev_view_proj;
     // xy = 1 / extent, z = history weight, w != 0 to ignore the history.
     vec4 params;
+#ifdef ORRIN_TAA_UPSCALE
+    // xy = where this frame sampled inside each render pixel, in render pixels
+    // from its centre.
+    vec4 jitter;
+#endif
 } taa;
 
 // How many standard deviations of the neighbourhood the history may sit outside
@@ -167,6 +180,8 @@ shared vec3 s_color[APRON * APRON];
 shared float s_luminance[APRON * APRON];
 shared float s_depth[APRON * APRON];
 
+#ifndef ORRIN_TAA_UPSCALE
+
 void main() {
     ivec2 size = imageSize(u_target);
     ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
@@ -261,3 +276,160 @@ void main() {
 
     imageStore(u_target, texel, vec4(restore(resolved, k), 1.0));
 }
+
+#else
+
+// The upscaling resolve. The history is at the output extent and this frame at
+// the render extent below it, so an output pixel is no longer handed a sample
+// of its own: it reconstructs one from the render samples round it, and takes
+// in as much of that as those samples cover it. Both halves are the temporal
+// upsampling of Yang, Liu and Salvi's survey (2020) as AMD's FSR 2 documents
+// it: a Lanczos kernel over where each sample actually landed — its texel's
+// centre less this frame's jitter — and a per-pixel count of the weight the
+// history holds, kept in its alpha, so a pixel the samples rarely land near
+// takes them in fully when they do and keeps its history when they do not.
+//
+// Everything the native resolve does to the history is kept: the dilated
+// motion, the variance clip in YCoCg, the relative tone weighting and the
+// bicubic fetch. The neighbourhood is the 3x3 of render texels round the pixel.
+
+const float PI = 3.14159265;
+
+// Lanczos 2: one at the sample, zero a texel away and a negative lobe out to
+// two, which is what keeps the reconstruction from being a blur. The ringing
+// the lobe can leave at an edge is clamped to the neighbourhood below.
+float lanczos2(float x) {
+    if (x < 1e-4) {
+        return 1.0;
+    }
+    if (x >= 2.0) {
+        return 0.0;
+    }
+    float t = PI * x;
+    return 2.0 * sin(t) * sin(0.5 * t) / (t * t);
+}
+
+void main() {
+    ivec2 size = imageSize(u_target);
+    ivec2 render = textureSize(u_color, 0);
+    // Render pixels per output pixel, under one at every ratio this runs at.
+    vec2 scale = vec2(render) / vec2(size);
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+
+    // The render texels this group's pixels reach with their 3x3, loaded once
+    // for the group as the native resolve loads its apron. At a ratio of 1.5
+    // eight output pixels span under six render texels, so the apron's ten a
+    // side holds them with a ring to spare.
+    ivec2 origin = ivec2(floor((vec2(gl_WorkGroupID.xy * uint(TILE)) + 0.5) * scale)) - 1;
+    for (int i = int(gl_LocalInvocationIndex); i < APRON * APRON; i += TILE * TILE) {
+        ivec2 at = clamp(origin + ivec2(i % APRON, i / APRON), ivec2(0), render - 1);
+        vec3 color = texelFetch(u_color, at, 0).rgb;
+        s_color[i] = to_ycocg(color);
+        s_luminance[i] = luminance(color);
+        s_depth[i] = texelFetch(u_depth, at, 0).r;
+    }
+    barrier();
+
+    if (any(greaterThanEqual(texel, size))) {
+        return;
+    }
+
+    // This pixel's centre among the render texels, the texel it falls in, and
+    // that texel's slot in the apron.
+    vec2 position = (vec2(texel) + 0.5) * scale;
+    ivec2 base = ivec2(floor(position));
+    ivec2 local = clamp(base - origin, ivec2(1), ivec2(APRON - 2));
+    int centre = local.y * APRON + local.x;
+
+    float k = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            k += s_luminance[centre + y * APRON + x];
+        }
+    }
+    k = max(k / 9.0, 1e-6);
+
+    vec3 sum = vec3(0.0);
+    vec3 sum_squared = vec3(0.0);
+    vec3 lowest = vec3(1e9);
+    vec3 highest = vec3(-1e9);
+    ivec2 nearest = base;
+    float nearest_depth = DEPTH_FAR;
+    vec3 reconstructed = vec3(0.0);
+    float kernel = 0.0;
+    float coverage = 0.0;
+
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 at = base + ivec2(x, y);
+            int slot = centre + y * APRON + x;
+            vec3 c = s_color[slot] / (k + s_luminance[slot]);
+            sum += c;
+            sum_squared += c * c;
+            lowest = min(lowest, c);
+            highest = max(highest, c);
+
+            // Where this texel was sampled, from this pixel's centre: in
+            // render pixels for the reconstruction, and in output pixels for
+            // how much of this pixel it covers — only a sample within a pixel
+            // of the centre counts, and the nearer the more.
+            vec2 offset = vec2(at) + 0.5 - taa.jitter.xy - position;
+            float weight = lanczos2(length(offset));
+            reconstructed += c * weight;
+            kernel += weight;
+            coverage += max(lanczos2(length(offset / scale)), 0.0);
+
+            float depth = s_depth[slot];
+            if (depth_nearer(depth, nearest_depth)) {
+                nearest_depth = depth;
+                nearest = clamp(at, ivec2(0), render - 1);
+            }
+        }
+    }
+
+    vec3 current = kernel > 1e-3 ? reconstructed / kernel : s_color[centre] / (k + s_luminance[centre]);
+    current = clamp(current, lowest, highest);
+    coverage = min(coverage, 1.0);
+
+    // A history that cannot be trusted is replaced by the reconstruction,
+    // counted as one sample's worth so the next frames' still weigh in.
+    if (taa.params.w != 0.0) {
+        imageStore(u_target, texel, vec4(restore(current, k), 1.0));
+        return;
+    }
+
+    vec2 uv = (vec2(texel) + 0.5) * taa.params.xy;
+    vec2 previous_uv;
+    if (depth_is_far(nearest_depth)) {
+        vec4 world = taa.inv_view_proj * vec4(uv * 2.0 - 1.0, DEPTH_FAR, 1.0);
+        vec4 previous = taa.prev_view_proj * vec4(world.xyz / world.w, 1.0);
+        previous_uv = (previous.xy / previous.w) * 0.5 + 0.5;
+    } else {
+        previous_uv = uv - texelFetch(u_velocity, nearest, 0).rg;
+    }
+
+    if (any(lessThan(previous_uv, vec2(0.0))) || any(greaterThan(previous_uv, vec2(1.0)))) {
+        imageStore(u_target, texel, vec4(restore(current, k), 1.0));
+        return;
+    }
+
+    vec3 mean = sum / 9.0;
+    vec3 deviation = sqrt(max(sum_squared / 9.0 - mean * mean, vec3(0.0)));
+    vec3 lo = max(mean - VARIANCE_GAMMA * deviation, lowest);
+    vec3 hi = min(mean + VARIANCE_GAMMA * deviation, highest);
+
+    vec3 history = clip_to_box(lo, hi, prepare(sample_history(previous_uv, vec2(size)), k));
+    // Bilinear, not the bicubic the colour takes: a count has no edge to keep,
+    // and the bicubic's lobes would take it below zero.
+    //
+    // Held to what the history weight allows, which at full coverage every
+    // frame is exactly the native resolve's blend.
+    float limit = taa.params.z / (1.0 - taa.params.z);
+    float accumulated = clamp(texture(u_history, previous_uv).a, 0.0, limit);
+    float total = accumulated + coverage;
+    vec3 resolved = total > 1e-4 ? mix(history, current, coverage / total) : history;
+
+    imageStore(u_target, texel, vec4(restore(resolved, k), min(total, limit)));
+}
+
+#endif

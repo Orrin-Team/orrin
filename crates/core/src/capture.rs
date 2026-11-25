@@ -115,6 +115,10 @@ pub struct CaptureSettings {
     /// Rasterise the forward pass at four samples. The alternative to `taa`, which
     /// the capture turns off when this is on: the two are not companions.
     pub msaa: bool,
+    /// How far below `extent` the scene is rendered, for the temporal resolve
+    /// to bring back up. `extent` is the output's whatever this is, so a set
+    /// taken at every mode pairs pixel for pixel.
+    pub upscaling: crate::scene::Upscaling,
     /// The air, or `None` for whatever the scene asked for.
     ///
     /// Overridden whole rather than by a flag, because the A/B the fog captures
@@ -196,6 +200,7 @@ impl Default for CaptureSettings {
             dof: false,
             motion_blur: false,
             msaa: false,
+            upscaling: crate::scene::Upscaling::Native,
             fog: None,
             scene: SceneChoice::default(),
             camera: None,
@@ -308,6 +313,7 @@ pub fn prepare(world: &mut World, renderer: &mut VulkanRenderer, settings: &Capt
     world.insert_resource(TaaSettings {
         enabled: settings.taa && !settings.msaa,
         msaa: settings.msaa,
+        upscaling: settings.upscaling,
         ..TaaSettings::default()
     });
     if let Some(fog) = settings.fog {

@@ -26,6 +26,7 @@ use orrin_core::gfx::format::Format;
 use orrin_core::gfx::graph::ImageDesc;
 use orrin_core::gfx::vulkan::frame::{FrameConfig, ShotView, declare};
 use orrin_core::gfx::vulkan::wireframe::Wireframe;
+use orrin_core::scene::Upscaling;
 
 /// The swapchain format the baseline is written against. Real ones vary by
 /// surface; the plan does not depend on it, and pinning it keeps the file from
@@ -83,6 +84,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // MSAA with the diffusion on, which is the five-attachment forward pass:
@@ -125,6 +127,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         (
@@ -162,6 +165,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // Four cascades write four layers of one image, which the graph tracks
@@ -205,6 +209,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // SSAO off is a different graph, not a flag read at record time: the
@@ -247,6 +252,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // The shape that proves the prepass belongs to the frame rather than to
@@ -287,6 +293,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // Metering off is the other shape that ships. Worth baselining for one
@@ -329,6 +336,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // A window too small for a real chain still gets one level, and that
@@ -370,6 +378,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // The froxel fog, with the cascades it exists to read. Worth baselining
@@ -415,6 +424,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // The whole optical chain at once: lens, then shutter, then sensor.
@@ -457,6 +467,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // The other shape that proves the prepass belongs to the frame rather
@@ -499,6 +510,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // Reflections are the first thing to sit *between* shading and the
@@ -541,6 +553,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // And the same without a resolve behind it, which is the shape where
@@ -581,6 +594,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // What actually ships in the editor: the march sits between the prepass
@@ -623,6 +637,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // And the march on its own, which is the shape that proves it keeps the
@@ -663,6 +678,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // The punctual atlas: one pass however many lights cast, because a tile
@@ -704,6 +720,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // And the atlas with no cascades, which is an ordinary scene: an indoor
@@ -745,6 +762,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // What ships: transparency accumulates after the reflections and before
@@ -788,6 +806,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // And transparency on its own, which is the shape that proves it keeps
@@ -829,6 +848,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // Both non-opaque queues at once, which is the shape that pins the
@@ -871,6 +891,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // And refraction on its own, which proves it keeps the geometry prepass
@@ -911,6 +932,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // Subsurface scattering is the first thing to change the *forward pass's
@@ -956,6 +978,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // And on its own, which is the shape that proves the diffusion keeps the
@@ -997,6 +1020,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         (
@@ -1034,6 +1058,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // The split, on the frame the editor actually runs. Every configuration
@@ -1083,6 +1108,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // The same frame with the depth test on, because what it adds is a
@@ -1127,6 +1153,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         (
@@ -1164,6 +1191,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // And the frame the split is *for*: every optical stage on, which is
@@ -1206,6 +1234,7 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ray_path_trace: false,
                 gi_probes: 0,
                 gi_gather: 0,
+                upscaling: Upscaling::Native,
             },
         ),
         // A frame that traces: the two builds at its head and the traced scene
@@ -1455,6 +1484,7 @@ fn the_shadow_atlas_is_sixteen_bit_and_the_camera_depth_is_not() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     })
     .unwrap();
 
@@ -1502,6 +1532,7 @@ fn reference_config(msaa: bool, presents: bool) -> FrameConfig {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     }
 }
 
@@ -1697,6 +1728,7 @@ fn an_empty_selection_runs_no_outline_and_no_gizmo() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     };
     let passes = |outline, gizmo| {
         let frame = declare(config(outline, gizmo)).unwrap();
@@ -1767,6 +1799,7 @@ fn the_taa_history_leaves_the_frame_where_the_next_one_expects_it() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     })
     .unwrap();
 
@@ -1834,6 +1867,7 @@ fn the_fog_history_leaves_the_frame_where_the_next_one_expects_it() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     })
     .unwrap();
 
@@ -1897,6 +1931,7 @@ fn the_fog_volume_is_built_after_the_cascades_and_before_anything_shades() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     })
     .unwrap();
 
@@ -1969,6 +2004,7 @@ fn transparency_composites_after_the_reflections_and_before_the_resolve() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     })
     .unwrap();
 
@@ -2028,6 +2064,7 @@ fn the_gizmo_draws_between_the_tonemap_and_the_overlay() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     };
     for async_compute in [false, true] {
         let frame = declare(config(true, async_compute)).unwrap();
@@ -2138,6 +2175,7 @@ fn the_selection_outline_is_masked_then_drawn_under_the_gizmo() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     };
     let frame = declare(config(true)).unwrap();
     let order: Vec<&str> = frame
@@ -2217,6 +2255,7 @@ fn transparency_attaches_the_prepass_depth_read_only() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     })
     .unwrap();
 
@@ -2288,6 +2327,7 @@ fn the_diffusion_replaces_the_frame_the_forward_pass_withheld_light_from() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     };
 
     let plan = format!("{}", declare(base).unwrap().graph);
@@ -2397,6 +2437,7 @@ fn refraction_composites_after_the_transparency_and_before_the_resolve() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     })
     .unwrap();
 
@@ -2469,6 +2510,7 @@ fn refraction_attaches_the_prepass_depth_read_only() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     })
     .unwrap();
 
@@ -2532,6 +2574,7 @@ fn the_optical_chain_runs_lens_then_shutter_then_sensor() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     })
     .unwrap();
 
@@ -2620,6 +2663,7 @@ fn any_single_consumer_keeps_the_geometry_prepass() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     };
 
     let consumers: [Consumer; 10] = [
@@ -2726,6 +2770,7 @@ fn nothing_draws_before_the_cull_pass_has_filled_the_commands() {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     })
     .unwrap();
 
@@ -3307,6 +3352,7 @@ fn occlusion_base() -> FrameConfig {
         ray_path_trace: false,
         gi_probes: 0,
         gi_gather: 0,
+        upscaling: Upscaling::Native,
     }
 }
 

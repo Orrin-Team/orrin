@@ -9,6 +9,15 @@
 //! Nothing computes an execution order, a layout, or a barrier by hand, which is
 //! what makes a new pass a registration in `declare` rather than surgery on a
 //! fixed pipeline.
+//!
+//! It is also where the frame's two extents are assigned. Everything up to and
+//! including what the temporal resolve reads is at the render extent — the
+//! geometry passes, every screen-space effect, the final gather and the fog's
+//! froxels, all of which read `gl_FragCoord` against a scene target or are read
+//! by one that does — and the resolve writes at the output extent, where the
+//! lens, the shutter, bloom, metering, the tonemap and everything the editor
+//! draws stay. A pass after the resolve that needs the prepass reads it under
+//! its own pixel rather than attaching it.
 
 use crate::gfx::format::Format;
 use crate::gfx::graph::ImageLayout;
@@ -226,6 +235,11 @@ pub struct FrameConfig {
     /// `ray_tracing`. Zero is the frame exactly as it was, lit by the
     /// environment's diffuse series alone.
     pub gi_probes: u32,
+    /// How far below the output's extent the scene is rendered. Structural
+    /// although the passes are the same, because it decides which images are
+    /// one size and so which may share an allocation, how the wireframe tests
+    /// its edges, and the resolve's history format. Needs `taa`.
+    pub upscaling: crate::scene::Upscaling,
     /// How many times the final gather's resolution halves the frame's each
     /// way, zero where it does not run. Live, it is five dispatches between
     /// the prepass and the forward pass, and the forward pass reads what they
@@ -471,7 +485,7 @@ pub struct FrameIds {
     /// mesh covers, green where the hovered one does. With the editor only.
     pub outline_mask: Option<ResourceId>,
     /// The wireframe's mode, and the depth it hides edges with when it has one.
-    pub wireframe: Option<(super::wireframe::Wireframe, Option<ResourceId>)>,
+    pub wireframe: Option<(super::wireframe::Wireframe, Option<EdgeDepth>)>,
     pub material_preview: Option<MaterialPreviewIds>,
     /// The screenshot's image, which the renderer owns for the one frame that
     /// draws it.
@@ -482,6 +496,26 @@ pub struct FrameIds {
     pub gi: Option<GiIds>,
     /// The final gather's images, where it runs.
     pub gather: Option<GatherIds>,
+}
+
+/// What hides the wireframe's covered edges over the shaded frame: the prepass
+/// depth, attached where it is at the extent the edges are drawn at, and
+/// sampled where it is at the render extent below the output's, since a pass
+/// cannot attach an image of another extent than its target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeDepth {
+    Attached(ResourceId),
+    Sampled(ResourceId),
+}
+
+impl EdgeDepth {
+    /// The access a pass drawing edges over the frame declares on it.
+    pub fn access(self) -> (ResourceId, Access) {
+        match self {
+            EdgeDepth::Attached(depth) => (depth, Access::DepthAttachmentRead),
+            EdgeDepth::Sampled(depth) => (depth, Access::Sampled),
+        }
+    }
 }
 
 /// The irradiance volumes and the world radiance cache: every one kept from
@@ -884,6 +918,11 @@ pub fn shadow_atlas_desc(resolution: u32) -> ImageDesc {
 
 pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
     let mut builder = GraphBuilder::new();
+    let upscaled = config.upscaling != crate::scene::Upscaling::Native;
+    if upscaled {
+        assert!(config.taa, "upscaling is the temporal resolve's to do");
+        builder.upscale();
+    }
     // A pass that shades a ray's hit reads the scene itself: every material's
     // textures, the shared geometry, the material table. Those belong to the
     // graphics queue's family alone — the images the two queues share are the
@@ -2046,9 +2085,10 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // that layout, and it is the allocation `history` names next frame. On
         // the first frame after an allocation the layout is still true — the
         // allocation put it there — and its contents are what `reset` ignores.
+        let format = super::taa::history_format(config.upscaling);
         let history = builder.import_image(
             "taa_history",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::Output),
+            ImageDesc::new(format).extent(Extent::Output),
             ImageLayout::ShaderReadOnlyOptimal,
             ImageLayout::ShaderReadOnlyOptimal,
         );
@@ -2056,7 +2096,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         // next frame wants to find it.
         let output = builder.import_image(
             "taa_color",
-            ImageDesc::new(HDR_FORMAT).extent(Extent::Output),
+            ImageDesc::new(format).extent(Extent::Output),
             ImageLayout::Undefined,
             ImageLayout::ShaderReadOnlyOptimal,
         );
@@ -2423,14 +2463,20 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
         .flatten()
         .map(|mode| {
             let depth = match mode {
-                super::wireframe::Wireframe::OverShaded => prepass.as_ref().map(|p| p.depth),
+                super::wireframe::Wireframe::OverShaded => prepass.as_ref().map(|p| {
+                    if upscaled {
+                        EdgeDepth::Sampled(p.depth)
+                    } else {
+                        EdgeDepth::Attached(p.depth)
+                    }
+                }),
                 super::wireframe::Wireframe::Alone => None,
             };
             let mut pass = builder
                 .pass("wireframe", PassKind::Inline)
                 .access(swapchain_color, Access::ColorAttachment);
-            if let Some(depth) = depth {
-                pass = pass.access(depth, Access::DepthAttachmentRead);
+            if let Some((depth, access)) = depth.map(EdgeDepth::access) {
+                pass = pass.access(depth, access);
             }
             record(pass.build(), PassBody::Wireframe, &mut bodies);
             (mode, depth)
@@ -2554,7 +2600,7 @@ pub fn declare(config: FrameConfig) -> Result<Frame, GraphError> {
             over(
                 "screenshot_wireframe",
                 PassBody::ScreenshotWireframe,
-                depth.map(|depth| (depth, Access::DepthAttachmentRead)),
+                depth.map(EdgeDepth::access),
             );
         }
         if view != ShotView::Scene && config.ui {

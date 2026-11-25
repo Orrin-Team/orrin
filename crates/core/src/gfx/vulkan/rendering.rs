@@ -337,7 +337,12 @@ pub(super) fn rendering_info(
             };
             RenderTargets {
                 colors: vec![color],
-                depth: depth.map(|depth| depth_borrowed(images.texture(depth))),
+                depth: match depth {
+                    Some(super::frame::EdgeDepth::Attached(depth)) => {
+                        Some(depth_borrowed(images.texture(depth)))
+                    }
+                    Some(super::frame::EdgeDepth::Sampled(_)) | None => None,
+                },
             }
         }
         // Cleared to nothing drawn, which the resolve reads as no coverage, and

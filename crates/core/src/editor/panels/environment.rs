@@ -91,7 +91,7 @@ const SCREEN_SPACE: &[Section] = &[
         "Temporal AA",
         Some("Jitter the camera each frame and accumulate the results"),
         icons::frame_corners(),
-        &["Enabled", "Feedback", "Jitter", "4x MSAA"],
+        &["Enabled", "Feedback", "Jitter", "4x MSAA", "Upscaling"],
         temporal_aa,
     ),
     section(
@@ -540,6 +540,23 @@ fn temporal_aa(ui: &mut egui::Ui, world: &World, rows: Rows) {
              alternative to the temporal resolve above, not a companion to it: \
              it costs roughly a quarter of the frame, and at one sample the \
              forward pass borrows the prepass depth and shades each pixel once",
+        );
+    }
+    if rows.shows("Upscaling") {
+        use crate::scene::Upscaling;
+        widgets::property(ui, "Upscaling", |ui| {
+            egui::ComboBox::from_id_salt("taa_upscaling")
+                .selected_text(taa.upscaling.label())
+                .show_ui(ui, |ui| {
+                    for mode in Upscaling::ALL {
+                        ui.selectable_value(&mut taa.upscaling, mode, mode.label());
+                    }
+                })
+                .response
+        })
+        .on_hover_text(
+            "Render the scene below the window's resolution and let the temporal \
+             resolve bring it up. Any mode but native turns the resolve on",
         );
     }
 }

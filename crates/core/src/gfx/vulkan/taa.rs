@@ -12,30 +12,55 @@
 //! contract, and a history that survives a frame boundary is precisely what this
 //! needs. Two allocations, ping-ponged, so the resolve never reads the image it
 //! is writing.
+//!
+//! **The resolve is also the upscaler.** With an [`Upscaling`] mode on, the
+//! scene is rendered at the render extent and the history is at the output's;
+//! the jitter then walks a longer sequence in render pixels, and the resolve
+//! reconstructs each output pixel from the samples round it before it
+//! accumulates, keeping in the history's alpha how much it has accumulated
+//! (see `taa_resolve.comp`). At native the resolve is the one it always was,
+//! down to its format and its shader, which is a second pipeline rather than
+//! a branch so that it stays so. The history is dropped on a resize, on a
+//! change of mode, and when [`TaaPass::reset`] is asked for at a camera cut.
+//!
+//! **Where a vendor upscaler goes.** It replaces the resolve node and nothing
+//! else, and what it needs at that point is all here: the colour the resolve
+//! reads (linear HDR at the render extent), the prepass depth (reversed, a
+//! finite far plane) and motion (`now - before` in UV, unjittered, at the
+//! render extent), [`FrameView::jitter_pixels`], the reset flag, and the
+//! output target. Exposure is the one input the resolve does not read: the
+//! frame meters after it, so a vendor node would take last frame's adapted
+//! value out of `ExposurePass::exposure_buffer` and declare that read.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use glam::{Mat4, Vec2};
 
+use crate::gfx::format::Format;
 use crate::gfx::format::SampleCount;
+use crate::gfx::graph::Extents;
 use crate::gfx::graph::ImageUsage;
 use crate::gfx::rhi::{
     Binding, BindingResource, ComputePipelineDesc, Device, Encoder, PipelineId, SamplerDesc,
     SamplerId, TextureDesc, TextureDimension, TextureViewId,
 };
 use crate::gfx::shaders::ShaderId;
-use crate::scene::{Camera, TaaSettings};
+use crate::scene::{Camera, TaaSettings, Upscaling};
 
-use super::hdr::HDR_FORMAT;
+use super::hdr::{HDR_FORMAT, HDR_WIDE_FORMAT};
 
 /// Side of the resolve's compute workgroup.
 const TILE: u32 = 8;
 
-/// Length of the jitter sequence. Halton is not periodic, but the accumulation
-/// is: eight frames is long enough to cover a pixel evenly and short enough that
-/// a slowly panning camera revisits offsets before the history has forgotten
-/// them.
-const JITTER_PHASES: u32 = 8;
+/// What the history is kept in: the packed format at native, and with an
+/// upscaling mode the one with an alpha, which holds how much each pixel has
+/// accumulated.
+pub(super) fn history_format(upscaling: Upscaling) -> Format {
+    match upscaling {
+        Upscaling::Native => HDR_FORMAT,
+        _ => HDR_WIDE_FORMAT,
+    }
+}
 
 /// The camera matrices the whole frame is drawn with.
 ///
@@ -58,10 +83,15 @@ pub(super) struct FrameView {
     pub prev_view_proj: Mat4,
     /// The NDC offset baked into `proj`, so a shader can remove it.
     pub jitter: Vec2,
+    /// The same offset in render pixels: where inside its pixel this frame
+    /// sampled, which is the jitter as an upscaler takes it.
+    pub jitter_pixels: Vec2,
 }
 
 pub struct TaaPass {
     pipeline: PipelineId,
+    /// The resolve that also upscales, for a frame with an upscaling mode.
+    upscale_pipeline: PipelineId,
     /// Linear and clamped: the history is resampled at a reprojected coordinate
     /// that almost never lands on a texel centre, and the bicubic fetch in the
     /// shader is built out of bilinear taps.
@@ -73,6 +103,9 @@ pub struct TaaPass {
     /// history. Empty until the first frame TAA is enabled for.
     history: Option<[TextureViewId; 2]>,
     extent: [u32; 2],
+    /// What the history was accumulated under: a history of another mode is
+    /// of other samples, and may not even be of the same format.
+    upscaling: Upscaling,
     frame: u64,
     /// Set whenever the history cannot be trusted — first frame, a resize, or
     /// TAA having been off. The resolve then passes the current frame straight
@@ -92,6 +125,9 @@ impl TaaPass {
         let pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
             shader: ShaderId::TaaResolveComp.into(),
         });
+        let upscale_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
+            shader: ShaderId::TaaResolveCompUpscale.into(),
+        });
         let sampler = |linear: bool| {
             device.create_sampler(SamplerDesc {
                 linear,
@@ -108,10 +144,12 @@ impl TaaPass {
 
         Self {
             pipeline,
+            upscale_pipeline,
             linear_clamp,
             nearest_clamp,
             history: None,
             extent: [0, 0],
+            upscaling: Upscaling::Native,
             frame: 0,
             reset: AtomicBool::new(true),
             previous_view_proj: None,
@@ -131,15 +169,24 @@ impl TaaPass {
         device: &Device,
         settings: &TaaSettings,
         camera: &Camera,
-        extent: [u32; 2],
+        extents: Extents,
     ) -> FrameView {
         self.settings = *settings;
+        let extent = extents.output;
 
-        if settings.enabled {
-            if self.history.is_none() || self.extent != extent {
+        if settings.resolves() {
+            if self.history.is_none()
+                || self.extent != extent
+                || self.upscaling != settings.upscaling
+            {
                 self.release(device);
-                self.history = Some(allocate_history(device, extent));
+                self.history = Some(allocate_history(
+                    device,
+                    extent,
+                    history_format(settings.upscaling),
+                ));
                 self.extent = extent;
+                self.upscaling = settings.upscaling;
                 self.reset.store(true, Ordering::Relaxed);
             }
             self.frame = self.frame.wrapping_add(1);
@@ -156,10 +203,14 @@ impl TaaPass {
         let projection = camera.projection(aspect);
         let unjittered_view_proj = projection * view;
 
-        let jitter = if settings.enabled {
-            jitter_offset(self.frame, extent) * settings.jitter_scale
+        let phases = settings.upscaling.jitter_phases();
+        let (jitter, jitter_pixels) = if settings.resolves() {
+            (
+                jitter_offset(self.frame, phases, extents.render) * settings.jitter_scale,
+                halton_offset(self.frame, phases) * settings.jitter_scale,
+            )
         } else {
-            Vec2::ZERO
+            (Vec2::ZERO, Vec2::ZERO)
         };
         let proj = jittered(projection, jitter);
 
@@ -173,7 +224,15 @@ impl TaaPass {
             unjittered_view_proj,
             prev_view_proj,
             jitter,
+            jitter_pixels,
         }
+    }
+
+    /// Drop the history at the next resolve, for a camera cut: the frame after
+    /// it shares nothing with the frames before, and reprojecting them would
+    /// ghost the last shot over the first frames of the next.
+    pub(super) fn reset(&self) {
+        self.reset.store(true, Ordering::Relaxed);
     }
 
     fn release(&mut self, device: &Device) {
@@ -208,18 +267,27 @@ impl TaaPass {
     ) {
         let target = self.output_view();
         let extent = device.view_extent(target);
+        let pipeline = match self.upscaling {
+            Upscaling::Native => self.pipeline,
+            _ => self.upscale_pipeline,
+        };
 
         // The resolve's uniforms: a buffer rather than push constants because
         // two mat4s already fill the guaranteed 128-byte push range on their own.
         // `params`: xy = 1/extent, z = history weight, w != 0 to ignore the
-        // history.
+        // history; then the jitter in render pixels, which only the upscaling
+        // resolve reads.
         let params = [
             1.0 / extent[0] as f32,
             1.0 / extent[1] as f32,
             self.settings.feedback.clamp(0.0, 0.99),
             self.reset.load(Ordering::Relaxed) as u32 as f32,
+            view.jitter_pixels.x,
+            view.jitter_pixels.y,
+            0.0,
+            0.0,
         ];
-        let mut words = [0u32; 36];
+        let mut words = [0u32; 40];
         let matrices = [
             view.unjittered_view_proj.inverse().to_cols_array_2d(),
             view.prev_view_proj.to_cols_array_2d(),
@@ -237,7 +305,7 @@ impl TaaPass {
             resource: BindingResource::SampledTexture { view, sampler },
         };
         let set = device.create_transient_bind_group(
-            self.pipeline,
+            pipeline,
             0,
             &[
                 sampled(0, color, self.nearest_clamp),
@@ -255,7 +323,7 @@ impl TaaPass {
             ],
         );
 
-        builder.bind_pipeline(self.pipeline);
+        builder.bind_pipeline(pipeline);
         builder.bind_group(0, set);
 
         // The dispatch covers exactly the target's extent and the shader discards
@@ -268,18 +336,24 @@ impl TaaPass {
     }
 }
 
-/// Where inside the pixel frame `index` samples, as an NDC offset.
+/// Where inside the pixel frame `index` samples, in pixels from its centre, of
+/// a sequence `phases` long: [`Upscaling::jitter_phases`], so that at a ratio
+/// each output pixel is still visited about as often as at native.
 ///
 /// Halton (2,3) rather than a fixed rotated grid: the sequence is
 /// low-discrepancy at *every* prefix length, so a history only four frames deep
 /// — all a moving camera ever keeps — is still evenly distributed.
-fn jitter_offset(index: u64, extent: [u32; 2]) -> Vec2 {
+fn halton_offset(index: u64, phases: u32) -> Vec2 {
     // From one, because Halton's zeroth element is the origin and a frame with
     // no offset contributes nothing the unjittered image would not have.
-    let phase = (index % JITTER_PHASES as u64) as u32 + 1;
-    let offset = Vec2::new(halton(phase, 2) - 0.5, halton(phase, 3) - 0.5);
+    let phase = (index % phases as u64) as u32 + 1;
+    Vec2::new(halton(phase, 2) - 0.5, halton(phase, 3) - 0.5)
+}
+
+/// [`halton_offset`] as an NDC offset, for a frame rendered at `extent`.
+fn jitter_offset(index: u64, phases: u32, extent: [u32; 2]) -> Vec2 {
     // NDC spans [-1, 1] across the frame, so one pixel is 2 / extent of it.
-    offset * 2.0 / Vec2::new(extent[0].max(1) as f32, extent[1].max(1) as f32)
+    halton_offset(index, phases) * 2.0 / Vec2::new(extent[0].max(1) as f32, extent[1].max(1) as f32)
 }
 
 fn halton(mut index: u32, base: u32) -> f32 {
@@ -305,10 +379,10 @@ fn jittered(mut projection: Mat4, jitter: Vec2) -> Mat4 {
     projection
 }
 
-fn allocate_history(device: &Device, extent: [u32; 2]) -> [TextureViewId; 2] {
+fn allocate_history(device: &Device, extent: [u32; 2], format: Format) -> [TextureViewId; 2] {
     std::array::from_fn(|_| {
         let texture = device.create_texture(&TextureDesc {
-            format: HDR_FORMAT,
+            format,
             dimension: TextureDimension::D2,
             extent: [extent[0], extent[1], 1],
             mip_levels: 1,
@@ -331,6 +405,8 @@ fn allocate_history(device: &Device, extent: [u32; 2]) -> [TextureViewId; 2] {
 mod tests {
     use super::*;
 
+    const NATIVE_PHASES: u32 = 8;
+
     /// The first resolve after the history is allocated passes the frame
     /// through untouched, which is the simplest thing a compute pass can be
     /// held to on a real device: whatever went in comes out.
@@ -349,7 +425,7 @@ mod tests {
             ..TaaSettings::default()
         };
         let camera = Camera::default();
-        let view = pass.begin_frame(&device, &settings, &camera, [8, 8]);
+        let view = pass.begin_frame(&device, &settings, &camera, Extents::native([8, 8]));
 
         let floats = |values: &[f32]| -> Vec<u8> { bytemuck::cast_slice(values).to_vec() };
         let color = device.create_texture_2d(
@@ -390,7 +466,7 @@ mod tests {
         let extent = [1920, 1080];
         let half = Vec2::new(1.0 / extent[0] as f32, 1.0 / extent[1] as f32);
         for frame in 0..64u64 {
-            let offset = jitter_offset(frame, extent);
+            let offset = jitter_offset(frame, NATIVE_PHASES, extent);
             assert!(
                 offset.x.abs() <= half.x && offset.y.abs() <= half.y,
                 "frame {frame} jittered {offset:?} past half a pixel {half:?}",
@@ -403,10 +479,10 @@ mod tests {
     #[test]
     fn consecutive_frames_sample_different_points() {
         let extent = [1920, 1080];
-        for frame in 0..JITTER_PHASES as u64 {
+        for frame in 0..NATIVE_PHASES as u64 {
             assert_ne!(
-                jitter_offset(frame, extent),
-                jitter_offset(frame + 1, extent),
+                jitter_offset(frame, NATIVE_PHASES, extent),
+                jitter_offset(frame + 1, NATIVE_PHASES, extent),
                 "frame {frame} and the next sampled the same point",
             );
         }
@@ -417,10 +493,10 @@ mod tests {
     #[test]
     fn a_full_cycle_is_centred() {
         let extent = [1920, 1080];
-        let total: Vec2 = (0..JITTER_PHASES as u64)
-            .map(|frame| jitter_offset(frame, extent))
+        let total: Vec2 = (0..NATIVE_PHASES as u64)
+            .map(|frame| jitter_offset(frame, NATIVE_PHASES, extent))
             .sum();
-        let mean = total / JITTER_PHASES as f32;
+        let mean = total / NATIVE_PHASES as f32;
         assert!(mean.length() < 1e-4, "the cycle is biased by {mean:?}");
     }
 

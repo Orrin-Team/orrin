@@ -880,6 +880,10 @@ pub struct ForwardPass {
     /// data that two existing passes read, which is exactly what the shadow face
     /// table above is.
     sampler: SamplerId,
+    /// What the material textures are sampled through in a frame rendered
+    /// below its output's extent, and `None` at native. See
+    /// [`set_texture_sampler`](Self::set_texture_sampler).
+    biased: Option<SamplerId>,
     ao_sampler: SamplerId,
     light_scratch: std::sync::Mutex<LightScratch>,
 }
@@ -1006,9 +1010,17 @@ impl ForwardPass {
             multisampled,
             single,
             sampler,
+            biased: None,
             ao_sampler,
             light_scratch: std::sync::Mutex::new(LightScratch::default()),
         }
+    }
+
+    /// Sample the material textures through `biased`, or through the
+    /// unbiased sampler with `None`. Takes effect on the texture set built
+    /// next, so the caller drops the one it has.
+    pub(super) fn set_texture_sampler(&mut self, biased: Option<SamplerId>) {
+        self.biased = biased;
     }
 
     /// The quartet a frame draws with, given whether it rasterises multisampled.
@@ -1110,7 +1122,7 @@ impl ForwardPass {
             self.single.plain,
             TEXTURE_SET as u32,
             textures,
-            self.sampler,
+            self.biased.unwrap_or(self.sampler),
         )
     }
 

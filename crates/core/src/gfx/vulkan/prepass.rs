@@ -136,6 +136,8 @@ pub struct GeometryPrepass {
     /// same mip selection the forward pass uses, so the two rasterisations
     /// cannot disagree about what a surface is.
     sampler: SamplerId,
+    /// The forward pass's biased sampler, when it has one, for the same reason.
+    biased: Option<SamplerId>,
 }
 
 impl GeometryPrepass {
@@ -162,6 +164,7 @@ impl GeometryPrepass {
             pipeline: pipeline_plain,
             masked_pipeline,
             sampler,
+            biased: None,
         }
     }
 
@@ -203,8 +206,15 @@ impl GeometryPrepass {
         device.upload_block(BlockKind::Uniform, bytemuck::bytes_of(&frame))
     }
 
+    /// The unbiased sampler, for what samples a material away from the
+    /// screen: a shadow caster, a ray's hit.
     pub(super) fn material_sampler(&self) -> SamplerId {
         self.sampler
+    }
+
+    /// See [`ForwardPass::set_texture_sampler`](super::forward::ForwardPass::set_texture_sampler).
+    pub(super) fn set_texture_sampler(&mut self, biased: Option<SamplerId>) {
+        self.biased = biased;
     }
 
     /// The set-1 per-object descriptor set this pass binds.
@@ -249,7 +259,12 @@ impl GeometryPrepass {
         device: &Device,
         textures: &[TextureViewId],
     ) -> BindGroupId {
-        device.create_texture_array_group(self.pipeline, TEXTURE_SET as u32, textures, self.sampler)
+        device.create_texture_array_group(
+            self.pipeline,
+            TEXTURE_SET as u32,
+            textures,
+            self.biased.unwrap_or(self.sampler),
+        )
     }
 
     #[allow(

@@ -505,6 +505,7 @@ mod tests {
             ray_path_trace: false,
             gi_probes: 0,
             gi_gather: 0,
+            upscaling: crate::scene::Upscaling::Native,
         };
         let frame = declare(config).expect("the busiest frame must compile");
 

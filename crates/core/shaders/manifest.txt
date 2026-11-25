@@ -78,10 +78,12 @@ ssr_trace_comp_traced compute ssr_trace.comp ORRIN_RAY_FALLBACK=1 ORRIN_FLAT_SUR
 sss_blur_comp compute sss_blur.comp
 sss_composite_comp compute sss_composite.comp
 taa_resolve_comp compute taa_resolve.comp
+taa_resolve_comp_upscale compute taa_resolve.comp ORRIN_TAA_UPSCALE=1
 tonemap_frag fragment tonemap.frag
 ui_frag fragment ui.frag
 ui_vert vertex ui.vert
 ui_shape_frag fragment ui_shape.frag
 ui_shape_vert vertex ui_shape.vert
 wireframe_frag fragment wireframe.frag
+wireframe_frag_sampled fragment wireframe.frag ORRIN_WIREFRAME_SAMPLED_DEPTH=1
 wireframe_vert vertex wireframe.vert

@@ -84,6 +84,10 @@
 //!   half of the comparison `TaaSettings::msaa` exists for: multisampled, the
 //!   pass writes and resolves its own targets and cannot depth-test `EQUAL`
 //!   against the prepass, so it rasterises every triangle a second time.
+//! - `ORRIN_PERF_UPSCALE` is `quality`, `balanced`, `performance` or `ultra`:
+//!   the scene rendered at that fraction of `ORRIN_PERF_EXTENT` and the
+//!   temporal resolve bringing it up. Every pass up to the resolve is then
+//!   that much smaller, and the resolve and everything after it are not.
 //!
 //! Per-pass GPU timing serialises adjacent nodes that would otherwise overlap
 //! (see `profile::gpu_passes_enabled`), so the GPU rows are a breakdown, not a
@@ -103,7 +107,7 @@ use orrin_core::scene::{
     BloomSettings, Camera, ContactShadowSettings, Culling, DecalSettings, DofSettings,
     EnvironmentSettings, FogSettings, HdrSettings, MeshHandle, MotionBlurSettings,
     RefractionSettings, ShadowSettings, SsaoSettings, SsrSettings, SubsurfaceSettings, TaaSettings,
-    TransparencySettings,
+    TransparencySettings, Upscaling,
 };
 use orrin_core::systems::{self, FrameGeometry};
 use orrin_ecs::World;
@@ -304,6 +308,16 @@ fn frame_cost() {
     world.insert_resource(RefractionSettings::default());
     world.insert_resource(TaaSettings {
         msaa: env_usize("ORRIN_PERF_MSAA", 0) != 0,
+        upscaling: match std::env::var("ORRIN_PERF_UPSCALE").as_deref() {
+            Ok("quality") => Upscaling::Quality,
+            Ok("balanced") => Upscaling::Balanced,
+            Ok("performance") => Upscaling::Performance,
+            Ok("ultra") => Upscaling::UltraPerformance,
+            Ok(other) => panic!(
+                "ORRIN_PERF_UPSCALE is quality, balanced, performance or ultra, not `{other}`"
+            ),
+            Err(_) => Upscaling::Native,
+        },
         ..TaaSettings::default()
     });
     world.insert_resource(Culling::default());
