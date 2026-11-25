@@ -123,6 +123,11 @@ impl FrameGraph {
         self.resources[resource.index()].name
     }
 
+    /// What `pass` declared it touches, and how.
+    pub fn accesses(&self, pass: PassId) -> &[(ResourceId, Access)] {
+        &self.passes[pass.index()].accesses
+    }
+
     pub(super) fn pass(&self, pass: PassId) -> &PassDecl {
         &self.passes[pass.index()]
     }

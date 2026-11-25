@@ -1281,6 +1281,21 @@ fn configs() -> Vec<(&'static str, FrameConfig)> {
                 ..reference_config(false, true)
             },
         ),
+        // Rendered at half the output each way and resolved up to it. The
+        // passes are the frame's own; what moves is which images share memory
+        // — none across the two extents — and the wireframe, which samples the
+        // prepass depth under its pixels rather than attaching it.
+        (
+            "editor frame, upscaled, with the lens, the shutter and the wireframe",
+            FrameConfig {
+                dof: true,
+                motion_blur: true,
+                overlay: true,
+                wireframe: Some(Wireframe::OverShaded),
+                upscaling: Upscaling::Performance,
+                ..reference_config(false, true)
+            },
+        ),
     ]
 }
 
@@ -3353,6 +3368,130 @@ fn occlusion_base() -> FrameConfig {
         gi_probes: 0,
         gi_gather: 0,
         upscaling: Upscaling::Native,
+    }
+}
+
+/// A frame that renders below its output, with every pass that can read across
+/// the two extents: the whole optical chain, the blended queues, the froxels,
+/// and the editor's wireframe and screenshot over it.
+fn upscaled_config(upscaling: Upscaling) -> FrameConfig {
+    FrameConfig {
+        ssr: true,
+        subsurface: true,
+        transparency: true,
+        refraction: true,
+        volumetric_fog: true,
+        motion_blur: true,
+        dof: true,
+        contact_shadows: true,
+        overlay: true,
+        outline: true,
+        gizmo: true,
+        wireframe: Some(Wireframe::OverShaded),
+        screenshot: Some(ShotView::Editor),
+        shadow_atlas: 2048,
+        upscaling,
+        ..reference_config(false, true)
+    }
+}
+
+/// The two extents meet at the temporal resolve and nowhere else. A pass that
+/// writes at the output extent reads nothing at the render extent but what the
+/// resolve reads, or the prepass's depth and motion under its own pixel; a pass
+/// that writes at the render extent reads nothing at the output's. An image
+/// declared at the wrong one is a scene pass paying the output's cost, or a post
+/// pass reading a fraction of the frame as though it were all of it.
+#[test]
+fn an_upscaled_frame_meets_its_two_extents_at_the_resolve() {
+    use orrin_core::gfx::graph::Extent;
+    let graph = declare(upscaled_config(Upscaling::Performance))
+        .unwrap()
+        .graph;
+    assert!(graph.upscaled());
+    let at_output = |id| {
+        let desc = image_desc(&graph, graph.resource_name(id))?;
+        Some(matches!(desc.extent, Extent::Output | Extent::OutputDiv(_)))
+    };
+    assert_eq!(
+        at_output(
+            graph
+                .imported_images()
+                .find(|(id, _)| graph.resource_name(*id) == "swapchain_color")
+                .unwrap()
+                .0
+        ),
+        Some(true)
+    );
+    let mut resolves = 0;
+    for &pass in graph.order() {
+        let name = graph.pass_name(pass);
+        let accesses = graph.accesses(pass);
+        let writes = |output: bool| {
+            accesses
+                .iter()
+                .any(|&(id, access)| access.is_write() && at_output(id) == Some(output))
+        };
+        let reads = |output: bool| {
+            accesses
+                .iter()
+                .filter(move |&&(id, access)| !access.is_write() && at_output(id) == Some(output))
+                .map(|&(id, _)| graph.resource_name(id))
+        };
+        if writes(true) {
+            for read in reads(false) {
+                if name == "taa_resolve" {
+                    continue;
+                }
+                assert!(
+                    ["prepass_depth", "prepass_velocity"].contains(&read),
+                    "`{name}` writes at the output extent and reads `{read}` at the render extent",
+                );
+            }
+        }
+        if writes(false) {
+            let read: Vec<_> = reads(true).collect();
+            assert!(
+                read.is_empty(),
+                "`{name}` writes at the render extent and reads {read:?} at the output extent",
+            );
+        }
+        resolves += usize::from(name == "taa_resolve" && writes(true) && reads(false).count() > 0);
+    }
+    assert_eq!(
+        resolves, 1,
+        "the resolve is where the frame crosses to the output extent"
+    );
+}
+
+/// Upscaled, a render-extent and an output-extent image are different sizes,
+/// so none may share an allocation; at native they are one size, and the frame
+/// keeps the sharing it had. Both halves are what a wrong fold would break: the
+/// first as two images of different sizes in one block, the second as a native
+/// frame quietly needing more memory than it did.
+#[test]
+fn only_a_native_frame_shares_memory_across_the_two_extents() {
+    use orrin_core::gfx::graph::Extent;
+    let crosses = |upscaling| {
+        let graph = declare(upscaled_config(upscaling)).unwrap().graph;
+        graph.alias_groups().iter().any(|group| {
+            let output = |id| {
+                let desc = image_desc(&graph, graph.resource_name(id)).unwrap();
+                matches!(desc.extent, Extent::Output | Extent::OutputDiv(_))
+            };
+            group.iter().any(|&id| output(id)) && group.iter().any(|&id| !output(id))
+        })
+    };
+    assert!(crosses(Upscaling::Native));
+    for upscaling in [
+        Upscaling::Quality,
+        Upscaling::Balanced,
+        Upscaling::Performance,
+        Upscaling::UltraPerformance,
+    ] {
+        assert!(
+            !crosses(upscaling),
+            "{upscaling:?} shares memory across the extents"
+        );
     }
 }
 
