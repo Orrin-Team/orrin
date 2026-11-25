@@ -8,6 +8,7 @@
 //!   dotnet/              a private .NET runtime: no SDK needed to play
 //!   compiled-assets/     artifacts, sidecars and text assets; no sources
 //!   orrin.json           what the engine reads to know which game it is
+//!   amd_fidelityfx_*.dll AMD's FSR runtime and its notice, where asked for
 //! ```
 //!
 //! **Every step runs for the target, from the host.** The engine is
@@ -29,6 +30,15 @@
 //! `Microsoft.NETCore.App.deps.json`, and hostfxr lists a framework only where
 //! it finds one, so [`assemble_runtime`] writes it: every managed file under
 //! `runtime`, every native one under `native`.
+//!
+//! **FSR ships only where it is asked for.** A Windows export with
+//! `ORRIN_FSR_DIR` naming the folder that holds AMD's runtime builds the engine
+//! with its `fsr` feature and puts the loader and the upscaler beside the
+//! executable, which is where the engine looks for them on a player's machine,
+//! with the notice AMD's licence asks to go with every copy. They are AMD's
+//! signed builds, copied whole: nothing here is compiled from the SDK, and the
+//! SDK is never part of the checkout. Without the variable an export holds
+//! nothing of AMD's and the engine's own resolve upscales.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -301,6 +311,43 @@ pub fn prepare_out(dir: &Path) -> Fallible {
 /// The pack's directory inside an export.
 const PACK: &str = "compiled-assets";
 
+/// AMD's FSR runtime: the loader the engine opens, and the upscaler the loader
+/// finds beside itself.
+const FSR_RUNTIME: [&str; 2] = [
+    "amd_fidelityfx_loader_vk.dll",
+    "amd_fidelityfx_upscaler_vk.dll",
+];
+
+/// What AMD's licence asks to go with every copy of them.
+const FSR_NOTICE: &str = "amd-fsr-license.txt";
+
+/// The folder a game's FSR runtime is copied from: `dir`, which is what
+/// `ORRIN_FSR_DIR` names, for a Windows game, the only one FSR runs in. A
+/// folder without the whole runtime is refused, since the engine would be
+/// built to load what the game then lacks.
+pub fn fsr_runtime(platform: Platform, dir: Option<&Path>) -> Result<Option<&Path>, String> {
+    let Some(dir) = dir.filter(|_| platform == Platform::Windows) else {
+        return Ok(None);
+    };
+    match FSR_RUNTIME.iter().find(|name| !dir.join(name).is_file()) {
+        Some(missing) => Err(format!(
+            "ORRIN_FSR_DIR is {}, which has no {missing}; point it at the FidelityFX SDK's \
+             `signedbin` folder, or unset it to export without FSR",
+            display_path(dir)
+        )),
+        None => Ok(Some(dir)),
+    }
+}
+
+/// Put AMD's runtime beside the executable, byte for byte — the DLLs are
+/// signed — with its notice.
+fn ship_fsr(dir: &Path, out: &Path) -> Fallible {
+    for name in FSR_RUNTIME {
+        copy(&dir.join(name), &out.join(name))?;
+    }
+    write(&out.join(FSR_NOTICE), include_str!("notices/amd-fsr.txt"))
+}
+
 pub struct Options {
     pub platform: Option<Platform>,
     pub out: Option<PathBuf>,
@@ -346,6 +393,10 @@ pub fn export(project: &Project, options: &Options) -> Fallible {
     });
 
     // Everything that can fail in a second, before anything that takes minutes.
+    let fsr_dir = std::env::var_os("ORRIN_FSR_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    let fsr = fsr_runtime(platform, fsr_dir.as_deref())?;
     preflight(&checkout, builder, target)?;
     let staging = project.editor_dir().join("export").join(platform.name());
     let _ = std::fs::remove_dir_all(&staging);
@@ -380,7 +431,7 @@ pub fn export(project: &Project, options: &Options) -> Fallible {
     )?;
 
     step(2, "building the engine", &target);
-    let engine_exe = build_engine(&checkout, builder, target)?;
+    let engine_exe = build_engine(&checkout, builder, target, fsr.is_some())?;
 
     step(3, "packing the assets", &target);
     prepare_out(&out)?;
@@ -389,6 +440,10 @@ pub fn export(project: &Project, options: &Options) -> Fallible {
     step(4, "assembling the game", &target);
     let exe = out.join(format!("{}{}", project.name(), platform.exe_suffix()));
     copy(&engine_exe, &exe)?;
+    if let Some(dir) = fsr {
+        println!("orrin: shipping AMD FSR from {}", display_path(dir));
+        ship_fsr(dir, &out)?;
+    }
     copy_published(&bindings, &out, |_| true)?;
     copy_published(&game, &out, |name| !name.starts_with("Orrin."))?;
     assemble_runtime(&runtime, &bindings, target.rid, &out.join(RUNTIME))?;
@@ -507,14 +562,20 @@ fn publish(
 /// measured against it with `tests/perf.rs` at `ORRIN_STRESS=4000` and made no
 /// difference to any CPU phase, so a slower link buys nothing here. Default
 /// features are off so the editor's shader compiler stays out of a game, which
-/// ships its shaders compiled; scripting is named back in.
-fn engine_args(builder: Builder, target: Target) -> Vec<String> {
+/// ships its shaders compiled; scripting is named back in, and `fsr` with it
+/// for a game that ships AMD's runtime.
+fn engine_args(builder: Builder, target: Target, fsr: bool) -> Vec<String> {
+    let features = if fsr {
+        "scripting,export,fsr"
+    } else {
+        "scripting,export"
+    };
     builder
         .build_args()
         .iter()
         .copied()
         .chain(["--release", "-p", "orrin-core", "--no-default-features"])
-        .chain(["--features", "scripting,export"])
+        .chain(["--features", features])
         .chain(["--target", target.triple])
         .map(str::to_owned)
         .collect()
@@ -529,13 +590,18 @@ fn engine_exe(checkout: &Path, target: Target) -> PathBuf {
         .join(format!("orrin-core{}", target.platform.exe_suffix()))
 }
 
-fn build_engine(checkout: &Path, builder: Builder, target: Target) -> Result<PathBuf, String> {
+fn build_engine(
+    checkout: &Path,
+    builder: Builder,
+    target: Target,
+    fsr: bool,
+) -> Result<PathBuf, String> {
     let mut command = Command::new("cargo");
     // From the checkout, so its `rust-toolchain.toml` picks the compiler and
     // the target `preflight` installed is the one this build looks for.
     command
         .current_dir(checkout)
-        .args(engine_args(builder, target))
+        .args(engine_args(builder, target, fsr))
         .arg("--manifest-path")
         .arg(checkout.join("Cargo.toml"))
         .env("CARGO_PROFILE_RELEASE_STRIP", "symbols")
@@ -725,7 +791,7 @@ mod tests {
     #[test]
     fn the_engine_is_built_for_release_with_the_export_feature() {
         let windows = Target::of(Platform::Windows);
-        let args = engine_args(Builder::Xwin, windows);
+        let args = engine_args(Builder::Xwin, windows, false);
         assert_eq!(&args[..2], ["xwin", "build"]);
         let after = |flag: &str| {
             let at = args
@@ -749,6 +815,44 @@ mod tests {
         assert_eq!(
             engine_exe(Path::new("/orrin"), Target::of(Platform::Mac)),
             Path::new("/orrin/target/aarch64-apple-darwin/release/orrin-core")
+        );
+    }
+
+    /// A game built to load FSR without the runtime beside it would fall back
+    /// on every machine, and AMD's DLLs are signed, so what ships has to be
+    /// both of them and exactly them.
+    #[test]
+    fn fsr_ships_whole_and_unaltered_beside_a_windows_game_that_names_its_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sdk, out) = (dir.path().join("signedbin"), dir.path().join("out"));
+        assert_eq!(fsr_runtime(Platform::Windows, None), Ok(None));
+        assert_eq!(fsr_runtime(Platform::Linux, Some(&sdk)), Ok(None));
+
+        std::fs::create_dir_all(&sdk).unwrap();
+        std::fs::write(sdk.join(FSR_RUNTIME[0]), b"loader\0\xff").unwrap();
+        let error = fsr_runtime(Platform::Windows, Some(&sdk)).unwrap_err();
+        assert!(error.contains(FSR_RUNTIME[1]), "{error}");
+
+        std::fs::write(sdk.join(FSR_RUNTIME[1]), b"upscaler\r\n\0").unwrap();
+        assert_eq!(
+            fsr_runtime(Platform::Windows, Some(&sdk)),
+            Ok(Some(sdk.as_path()))
+        );
+        ship_fsr(&sdk, &out).unwrap();
+        for name in FSR_RUNTIME {
+            assert_eq!(
+                std::fs::read(out.join(name)).unwrap(),
+                std::fs::read(sdk.join(name)).unwrap(),
+                "{name}"
+            );
+        }
+        let notice = std::fs::read_to_string(out.join(FSR_NOTICE)).unwrap();
+        assert!(notice.contains("Advanced Micro Devices"), "{notice}");
+
+        let args = engine_args(Builder::Cargo, Target::of(Platform::Windows), true);
+        assert!(
+            args.iter().any(|arg| arg == "scripting,export,fsr"),
+            "{args:?}"
         );
     }
 
