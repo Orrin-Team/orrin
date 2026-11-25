@@ -105,11 +105,15 @@ pub(super) const META_LAYERS: u32 = 4;
 /// The accumulation's: those four and a fifth, for the test of whether a light
 /// was switched.
 pub(super) const HISTORY_LAYERS: u32 = 5;
-/// Side of every gather pass's workgroup.
+/// Side of every gather pass's workgroup but the blur's.
 const TILE: u32 = 8;
+/// The blur's workgroup: a line of texels along its axis, `LINE` in
+/// `gi_gather_blur.comp`.
+const LINE: u32 = 64;
 /// How many texels apart the blur's second level takes its taps: about the
 /// first level's narrowest deviation and a half, past which what the first
-/// left would alias.
+/// left would alias. `WIDE_STRIDE` in `gi_gather_blur.comp`, whose shared
+/// memory holds as far as it reaches.
 const WIDE_STRIDE: u32 = 3;
 
 /// `Gather` in `gi_gather.glsl`, as the words of its std140 layout: three
@@ -424,7 +428,13 @@ impl GatherPass {
         encoder.bind_group(0, set);
         let stride = if wide { WIDE_STRIDE } else { 1 };
         encoder.push_constants(&[u32::from(!vertical) * stride, u32::from(vertical) * stride]);
-        dispatch_over(device, encoder, target);
+        let [width, height] = device.view_extent(target);
+        let (along, across) = if vertical {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        encoder.dispatch([along.div_ceil(LINE), across, 1]);
     }
 
     pub(super) fn record_upscale(
