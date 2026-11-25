@@ -638,6 +638,15 @@ impl VkDriver {
                 .max_lod
                 .unwrap_or(vulkano::image::sampler::LOD_CLAMP_NONE),
             anisotropy: desc.anisotropy,
+            mip_lod_bias: {
+                let limit = self
+                    .ctx
+                    .device
+                    .physical_device()
+                    .properties()
+                    .max_sampler_lod_bias;
+                desc.lod_bias.clamp(-limit, limit)
+            },
             ..Default::default()
         };
         let sampler =
@@ -2171,6 +2180,7 @@ pub(crate) mod tests {
             compare: false,
             anisotropy: None,
             max_lod: None,
+            lod_bias: 0.0,
         });
         (mask, sampler)
     }

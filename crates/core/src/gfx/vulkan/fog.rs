@@ -222,6 +222,7 @@ impl FogPass {
             compare: true,
             anisotropy: None,
             max_lod: None,
+            lod_bias: 0.0,
         });
         let scatter_pipeline = device.create_compute_pipeline_with_samplers(
             &ComputePipelineDesc {
@@ -241,6 +242,7 @@ impl FogPass {
                 compare: false,
                 anisotropy: None,
                 max_lod: Some(if linear { 1.0 } else { 0.0 }),
+                lod_bias: 0.0,
             })
         };
         let linear_clamp = sampler(true);
@@ -274,6 +276,7 @@ impl FogPass {
                 compare: false,
                 anisotropy: None,
                 max_lod: Some(0.0),
+                lod_bias: 0.0,
             }),
             history: None,
             fallback: allocate_fallback(device),

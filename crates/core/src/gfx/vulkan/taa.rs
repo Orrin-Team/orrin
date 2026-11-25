@@ -100,6 +100,7 @@ impl TaaPass {
                 compare: false,
                 anisotropy: None,
                 max_lod: Some(if linear { 1.0 } else { 0.0 }),
+                lod_bias: 0.0,
             })
         };
         let linear_clamp = sampler(true);

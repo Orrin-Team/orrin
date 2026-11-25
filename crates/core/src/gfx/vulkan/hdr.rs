@@ -70,6 +70,7 @@ impl HdrPass {
             compare: false,
             anisotropy: None,
             max_lod: Some(1.0),
+            lod_bias: 0.0,
         });
 
         Self {

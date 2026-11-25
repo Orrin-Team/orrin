@@ -199,6 +199,7 @@ impl SsrPass {
             compare: false,
             anisotropy: None,
             max_lod: None,
+            lod_bias: 0.0,
         });
         let linear_clamp = device.create_sampler(SamplerDesc {
             linear: true,
@@ -207,6 +208,7 @@ impl SsrPass {
             compare: false,
             anisotropy: None,
             max_lod: Some(1.0),
+            lod_bias: 0.0,
         });
         let linear_mip = device.create_sampler(SamplerDesc {
             linear: true,
@@ -215,6 +217,7 @@ impl SsrPass {
             compare: false,
             anisotropy: None,
             max_lod: None,
+            lod_bias: 0.0,
         });
 
         let traced = device.supports(Feature::RayTracing).then(|| {

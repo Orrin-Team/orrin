@@ -285,6 +285,7 @@ impl GiPass {
             compare: false,
             anisotropy: None,
             max_lod: Some(0.0),
+            lod_bias: 0.0,
         });
         let nothing = device.create_texture_2d(&[0; 4], [1, 1], Format::Rgba8Unorm);
         let fallback = GiViews {

@@ -84,6 +84,7 @@ impl SubsurfacePass {
             compare: false,
             anisotropy: None,
             max_lod: Some(0.0),
+            lod_bias: 0.0,
         });
 
         Self {

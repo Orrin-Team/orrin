@@ -162,6 +162,7 @@ impl OverlayPass {
                 compare: false,
                 anisotropy: None,
                 max_lod: Some(0.0),
+                lod_bias: 0.0,
             }),
             font_format,
             textures: HashMap::new(),

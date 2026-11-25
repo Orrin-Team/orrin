@@ -155,6 +155,7 @@ impl GeometryPrepass {
             compare: false,
             anisotropy: device_rhi.max_anisotropy(),
             max_lod: None,
+            lod_bias: 0.0,
         });
 
         Self {

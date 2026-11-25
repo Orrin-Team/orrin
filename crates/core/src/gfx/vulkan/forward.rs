@@ -905,6 +905,7 @@ impl ForwardPass {
             compare: true,
             anisotropy: None,
             max_lod: None,
+            lod_bias: 0.0,
         });
         let samplers = [(SHADOW_SET as u32, SHADOW_SAMPLER_BINDING, shadow_sampler)];
         let pipeline = |colors: &[Format], fragment: ShaderId, cull_back: bool, samples| {
@@ -987,6 +988,7 @@ impl ForwardPass {
             compare: false,
             anisotropy: rhi.max_anisotropy(),
             max_lod: None,
+            lod_bias: 0.0,
         });
 
         let ao_sampler = rhi.create_sampler(SamplerDesc {
@@ -996,6 +998,7 @@ impl ForwardPass {
             compare: false,
             anisotropy: None,
             max_lod: Some(1.0),
+            lod_bias: 0.0,
         });
 
         Self {

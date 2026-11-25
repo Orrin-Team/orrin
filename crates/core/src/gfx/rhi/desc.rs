@@ -73,6 +73,11 @@ pub struct SamplerDesc {
     pub anisotropy: Option<f32>,
     /// Upper end of the sampled mip range; `None` is unclamped.
     pub max_lod: Option<f32>,
+    /// Added to every level of detail the sampler computes, held to what the
+    /// device allows: negative samples finer mips. What a material sampled
+    /// at the render extent is given so it is as sharp as it would be at the
+    /// output's. Metal has no such state on a sampler, so there it is zero.
+    pub lod_bias: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
