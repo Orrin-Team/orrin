@@ -9,6 +9,7 @@
 //!   compiled-assets/     artifacts, sidecars and text assets; no sources
 //!   orrin.json           what the engine reads to know which game it is
 //!   amd_fidelityfx_*.dll AMD's FSR runtime and its notice, where asked for
+//!   nvngx_dlss.dll       NVIDIA's DLSS library, where asked for
 //! ```
 //!
 //! **Every step runs for the target, from the host.** The engine is
@@ -39,6 +40,12 @@
 //! signed builds, copied whole: nothing here is compiled from the SDK, and the
 //! SDK is never part of the checkout. Without the variable an export holds
 //! nothing of AMD's and the engine's own resolve upscales.
+//!
+//! **DLSS likewise**, with `ORRIN_DLSS_DIR` naming NVIDIA's SDK: the engine is
+//! built with its `dlss` feature, which links NGX from there, and the SDK's
+//! release `nvngx_dlss.dll` goes beside the executable. No notice is written
+//! for it: NVIDIA's are in its programming guide, and with its marks and its
+//! sign-off they are the game's to carry, which the export says as it copies.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -339,6 +346,30 @@ pub fn fsr_runtime(platform: Platform, dir: Option<&Path>) -> Result<Option<&Pat
     }
 }
 
+/// NVIDIA's DLSS library, and where its SDK keeps the build a game ships: the
+/// development one beside it draws a watermark over every frame.
+const DLSS_RUNTIME: &str = "nvngx_dlss.dll";
+const DLSS_RELEASE: &str = "lib/Windows_x86_64/rel";
+
+/// The DLSS library a game ships: the release one in `sdk`, which is what
+/// `ORRIN_DLSS_DIR` names, for a Windows game. An SDK without it is refused
+/// for the reason a folder without FSR's is.
+pub fn dlss_runtime(platform: Platform, sdk: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let Some(sdk) = sdk.filter(|_| platform == Platform::Windows) else {
+        return Ok(None);
+    };
+    let dll = sdk.join(DLSS_RELEASE).join(DLSS_RUNTIME);
+    if dll.is_file() {
+        Ok(Some(dll))
+    } else {
+        Err(format!(
+            "ORRIN_DLSS_DIR is {}, which has no {DLSS_RELEASE}/{DLSS_RUNTIME}; point it at the \
+             DLSS SDK's root, or unset it to export without DLSS",
+            display_path(sdk)
+        ))
+    }
+}
+
 /// Put AMD's runtime beside the executable, byte for byte — the DLLs are
 /// signed — with its notice.
 fn ship_fsr(dir: &Path, out: &Path) -> Fallible {
@@ -393,10 +424,18 @@ pub fn export(project: &Project, options: &Options) -> Fallible {
     });
 
     // Everything that can fail in a second, before anything that takes minutes.
-    let fsr_dir = std::env::var_os("ORRIN_FSR_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from);
+    let named = |variable: &str| {
+        std::env::var_os(variable)
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+    };
+    let (fsr_dir, dlss_sdk) = (named("ORRIN_FSR_DIR"), named("ORRIN_DLSS_DIR"));
     let fsr = fsr_runtime(platform, fsr_dir.as_deref())?;
+    let dlss = dlss_runtime(platform, dlss_sdk.as_deref())?;
+    let upscalers: Vec<&str> = [fsr.map(|_| "fsr"), dlss.as_ref().map(|_| "dlss")]
+        .into_iter()
+        .flatten()
+        .collect();
     preflight(&checkout, builder, target)?;
     let staging = project.editor_dir().join("export").join(platform.name());
     let _ = std::fs::remove_dir_all(&staging);
@@ -431,7 +470,7 @@ pub fn export(project: &Project, options: &Options) -> Fallible {
     )?;
 
     step(2, "building the engine", &target);
-    let engine_exe = build_engine(&checkout, builder, target, fsr.is_some())?;
+    let engine_exe = build_engine(&checkout, builder, target, &upscalers)?;
 
     step(3, "packing the assets", &target);
     prepare_out(&out)?;
@@ -443,6 +482,15 @@ pub fn export(project: &Project, options: &Options) -> Fallible {
     if let Some(dir) = fsr {
         println!("orrin: shipping AMD FSR from {}", display_path(dir));
         ship_fsr(dir, &out)?;
+    }
+    if let Some(dll) = &dlss {
+        println!(
+            "orrin: shipping NVIDIA DLSS from {}; NVIDIA's licence asks for the notices in its \
+             programming guide (section 9.5) in the game's documentation and its marks in the \
+             credits",
+            display_path(dll)
+        );
+        copy(dll, &out.join(DLSS_RUNTIME))?;
     }
     copy_published(&bindings, &out, |_| true)?;
     copy_published(&game, &out, |name| !name.starts_with("Orrin."))?;
@@ -562,20 +610,16 @@ fn publish(
 /// measured against it with `tests/perf.rs` at `ORRIN_STRESS=4000` and made no
 /// difference to any CPU phase, so a slower link buys nothing here. Default
 /// features are off so the editor's shader compiler stays out of a game, which
-/// ships its shaders compiled; scripting is named back in, and `fsr` with it
-/// for a game that ships AMD's runtime.
-fn engine_args(builder: Builder, target: Target, fsr: bool) -> Vec<String> {
-    let features = if fsr {
-        "scripting,export,fsr"
-    } else {
-        "scripting,export"
-    };
+/// ships its shaders compiled; scripting is named back in, and with it each of
+/// `upscalers`, the vendors whose runtime the game ships.
+fn engine_args(builder: Builder, target: Target, upscalers: &[&str]) -> Vec<String> {
+    let features = [&["scripting", "export"], upscalers].concat().join(",");
     builder
         .build_args()
         .iter()
         .copied()
         .chain(["--release", "-p", "orrin-core", "--no-default-features"])
-        .chain(["--features", features])
+        .chain(["--features", features.as_str()])
         .chain(["--target", target.triple])
         .map(str::to_owned)
         .collect()
@@ -594,14 +638,14 @@ fn build_engine(
     checkout: &Path,
     builder: Builder,
     target: Target,
-    fsr: bool,
+    upscalers: &[&str],
 ) -> Result<PathBuf, String> {
     let mut command = Command::new("cargo");
     // From the checkout, so its `rust-toolchain.toml` picks the compiler and
     // the target `preflight` installed is the one this build looks for.
     command
         .current_dir(checkout)
-        .args(engine_args(builder, target, fsr))
+        .args(engine_args(builder, target, upscalers))
         .arg("--manifest-path")
         .arg(checkout.join("Cargo.toml"))
         .env("CARGO_PROFILE_RELEASE_STRIP", "symbols")
@@ -791,7 +835,7 @@ mod tests {
     #[test]
     fn the_engine_is_built_for_release_with_the_export_feature() {
         let windows = Target::of(Platform::Windows);
-        let args = engine_args(Builder::Xwin, windows, false);
+        let args = engine_args(Builder::Xwin, windows, &[]);
         assert_eq!(&args[..2], ["xwin", "build"]);
         let after = |flag: &str| {
             let at = args
@@ -849,11 +893,39 @@ mod tests {
         let notice = std::fs::read_to_string(out.join(FSR_NOTICE)).unwrap();
         assert!(notice.contains("Advanced Micro Devices"), "{notice}");
 
-        let args = engine_args(Builder::Cargo, Target::of(Platform::Windows), true);
+        let args = engine_args(
+            Builder::Cargo,
+            Target::of(Platform::Windows),
+            &["fsr", "dlss"],
+        );
         assert!(
-            args.iter().any(|arg| arg == "scripting,export,fsr"),
+            args.iter().any(|arg| arg == "scripting,export,fsr,dlss"),
             "{args:?}"
         );
+    }
+
+    /// NVIDIA's SDK holds two builds of the library under one name, and the
+    /// development one watermarks every frame of a game that ships it.
+    #[test]
+    fn dlss_ships_the_sdks_release_library_and_never_its_development_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let sdk = dir.path().join("DLSS");
+        assert_eq!(dlss_runtime(Platform::Windows, None), Ok(None));
+        assert_eq!(dlss_runtime(Platform::Mac, Some(&sdk)), Ok(None));
+
+        let dev = sdk.join("lib/Windows_x86_64/dev").join(DLSS_RUNTIME);
+        std::fs::create_dir_all(dev.parent().unwrap()).unwrap();
+        std::fs::write(&dev, b"dev").unwrap();
+        let error = dlss_runtime(Platform::Windows, Some(&sdk)).unwrap_err();
+        assert!(error.contains("rel"), "{error}");
+
+        let rel = sdk.join(DLSS_RELEASE).join(DLSS_RUNTIME);
+        std::fs::create_dir_all(rel.parent().unwrap()).unwrap();
+        std::fs::write(&rel, b"rel").unwrap();
+        let chosen = dlss_runtime(Platform::Windows, Some(&sdk))
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(chosen).unwrap(), b"rel");
     }
 
     #[test]
