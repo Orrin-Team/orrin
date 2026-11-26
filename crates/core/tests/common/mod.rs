@@ -149,7 +149,7 @@ fn gathered(view: ([f32; 3], [f32; 3])) -> CaptureSettings {
 
 /// Every capture, by the name its file carries.
 pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
-    #[cfg_attr(not(feature = "fsr"), allow(unused_mut))]
+    #[cfg_attr(not(any(feature = "fsr", feature = "dlss")), allow(unused_mut))]
     let mut captures = vec![
         ("scene", CaptureSettings::default()),
         // The editor's two wireframe draw modes over the same frame: edges
@@ -821,6 +821,26 @@ pub fn captures() -> Vec<(&'static str, CaptureSettings)> {
                     upscaler_debug_view: true,
                     ..fsr(Upscaling::Quality)
                 },
+            ),
+        ]);
+    }
+    // And through NVIDIA DLSS, its native mode being DLAA. Skipped where DLSS
+    // does not run, which is anywhere without an RTX GPU.
+    #[cfg(feature = "dlss")]
+    {
+        use orrin_core::scene::Upscaler;
+        let dlss = |upscaling| CaptureSettings {
+            upscaler: Upscaler::Dlss,
+            ..upscaled(upscaling)
+        };
+        captures.extend([
+            ("upscale-dlss-native", dlss(Upscaling::Native)),
+            ("upscale-dlss-quality", dlss(Upscaling::Quality)),
+            ("upscale-dlss-balanced", dlss(Upscaling::Balanced)),
+            ("upscale-dlss-performance", dlss(Upscaling::Performance)),
+            (
+                "upscale-dlss-ultra-performance",
+                dlss(Upscaling::UltraPerformance),
             ),
         ]);
     }
