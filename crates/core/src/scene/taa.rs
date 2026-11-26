@@ -172,7 +172,8 @@ pub enum Upscaler {
     /// AMD FSR, through its signed runtime: Vulkan on Windows, in a build
     /// with the `fsr` feature, with the DLLs found.
     Fsr,
-    /// NVIDIA DLSS. Not bound yet, so the engine's resolve stands in.
+    /// NVIDIA DLSS, through NGX: Vulkan on Windows, an NVIDIA RTX GPU, in a
+    /// build with the `dlss` feature, with NVIDIA's DLL found.
     Dlss,
 }
 

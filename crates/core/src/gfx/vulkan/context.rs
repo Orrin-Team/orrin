@@ -10,13 +10,13 @@ use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags,
 };
-use vulkano::instance::Instance;
+use vulkano::instance::{Instance, InstanceExtensions};
 use vulkano::memory::MemoryHeapFlags;
 use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::cache::PipelineCache;
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::swapchain::Surface;
-use vulkano::{Version, VulkanObject};
+use vulkano::{Version, VulkanLibrary, VulkanObject};
 
 use super::convert::vk_format;
 use super::descriptors::DescriptorCache;
@@ -100,6 +100,10 @@ pub struct VkContext {
     /// the frame is the one this renderer drew before any of it existed — see
     /// [`probe_ray_tracing`].
     pub ray_tracing: bool,
+    /// Whether the device was made with what NGX asks of it, and why not:
+    /// see [`dlss_requirements`].
+    #[cfg(all(feature = "dlss", windows))]
+    pub(super) dlss: Result<(), Arc<str>>,
 }
 
 impl VkContext {
@@ -281,6 +285,12 @@ impl VkContext {
         };
         #[cfg(not(all(feature = "fsr", windows)))]
         let vendor_features = DeviceFeatures::empty();
+        #[cfg(all(feature = "dlss", windows))]
+        let mut dlss = dlss_requirements(&physical_device);
+        #[cfg(all(feature = "dlss", windows))]
+        let ngx_extensions = dlss.as_ref().copied().unwrap_or_default();
+        #[cfg(not(all(feature = "dlss", windows)))]
+        let ngx_extensions = DeviceExtensions::empty();
 
         // Graphics first, then the compute-only family, then a transfer family
         // of its own — so `queues` yields them in that order. A transfer queue
@@ -296,7 +306,7 @@ impl VkContext {
                 None => families.push((family, 1)),
             }
         }
-        let queue_create_infos = families
+        let queue_create_infos: Vec<QueueCreateInfo> = families
             .iter()
             .map(|&(queue_family_index, count)| QueueCreateInfo {
                 queue_family_index,
@@ -305,32 +315,49 @@ impl VkContext {
             })
             .collect();
 
-        let (device, mut queues) = Device::new(
-            physical_device,
-            DeviceCreateInfo {
-                queue_create_infos,
-                enabled_extensions: device_extensions,
-                enabled_features: DeviceFeatures {
-                    image_view_format_swizzle: swizzle,
-                    sampler_anisotropy: anisotropy,
-                    independent_blend: true,
-                    descriptor_binding_partially_bound: partially_bound,
-                    multi_draw_indirect: multi_draw,
-                    draw_indirect_first_instance: multi_draw,
-                    dynamic_rendering: true,
-                    synchronization2: true,
-                    texture_compression_bc: samples_bc,
-                    acceleration_structure: ray_tracing,
-                    ray_query: ray_tracing,
-                    buffer_device_address: ray_tracing,
-                    shader_sampled_image_array_non_uniform_indexing: ray_tracing,
-                    ..DeviceFeatures::empty()
+        let enabled_features = DeviceFeatures {
+            image_view_format_swizzle: swizzle,
+            sampler_anisotropy: anisotropy,
+            independent_blend: true,
+            descriptor_binding_partially_bound: partially_bound,
+            multi_draw_indirect: multi_draw,
+            draw_indirect_first_instance: multi_draw,
+            dynamic_rendering: true,
+            synchronization2: true,
+            texture_compression_bc: samples_bc,
+            acceleration_structure: ray_tracing,
+            ray_query: ray_tracing,
+            buffer_device_address: ray_tracing,
+            shader_sampled_image_array_non_uniform_indexing: ray_tracing,
+            ..DeviceFeatures::empty()
+        }
+        .union(&vendor_features);
+        let create = |enabled_extensions| {
+            Device::new(
+                physical_device.clone(),
+                DeviceCreateInfo {
+                    queue_create_infos: queue_create_infos.clone(),
+                    enabled_extensions,
+                    enabled_features,
+                    ..Default::default()
+                },
+            )
+        };
+        // NGX's extensions are not the engine's to vouch for, so a device that
+        // cannot be made with them is made without, and DLSS says why.
+        let (device, mut queues) = match create(device_extensions.union(&ngx_extensions)) {
+            Ok(made) => made,
+            Err(e) if ngx_extensions != DeviceExtensions::empty() => {
+                let reason = format!("the device could not be made with NGX's extensions: {e}");
+                tracing::warn!("DLSS: {reason}");
+                #[cfg(all(feature = "dlss", windows))]
+                {
+                    dlss = Err(Arc::from(reason));
                 }
-                .union(&vendor_features),
-                ..Default::default()
-            },
-        )
-        .expect("failed to create device");
+                create(device_extensions).expect("failed to create device")
+            }
+            Err(e) => panic!("failed to create device: {e:?}"),
+        };
 
         let queue = queues.next().unwrap();
         let compute_queue = compute_family.map(|_| {
@@ -393,6 +420,8 @@ impl VkContext {
             partially_bound,
             multi_draw,
             ray_tracing,
+            #[cfg(all(feature = "dlss", windows))]
+            dlss: dlss.map(|_| ()),
         }
     }
 
@@ -542,6 +571,81 @@ fn upscaler_features(physical_device: &PhysicalDevice) -> (DeviceExtensions, Dev
         extensions,
         wanted.intersection(physical_device.supported_features()),
     )
+}
+
+/// The instance extensions a vendor's upscaler asks for, as far as the Vulkan
+/// library has them: what every instance the engine draws through is made
+/// with.
+///
+/// Only DLSS asks, and NGX has to be asked before there is an instance, so
+/// before the device's vendor can be known; the query needs neither (DLSS
+/// programming guide §2.3.1). What the library lacks is left out here, and
+/// [`dlss_requirements`] names it when the device is made.
+#[cfg_attr(not(all(feature = "dlss", windows)), allow(unused_variables))]
+pub fn upscaler_instance_extensions(library: &VulkanLibrary) -> InstanceExtensions {
+    #[cfg(all(feature = "dlss", windows))]
+    match super::dlss::instance_extensions() {
+        Ok(names) => {
+            tracing::info!("DLSS: NGX asks the instance for {names:?}");
+            return InstanceExtensions::from_iter(names.iter().map(String::as_str))
+                .intersection(library.supported_extensions());
+        }
+        Err(reason) => tracing::info!("DLSS: NGX's instance query failed: {reason}"),
+    }
+    InstanceExtensions::empty()
+}
+
+/// The device extensions NGX asks of `physical_device` for DLSS, or why DLSS
+/// cannot run on it.
+///
+/// NGX is asked only of an NVIDIA device; of any other the reason is the
+/// vendor. The device is made through vulkano 0.35, so an extension it cannot
+/// name cannot be enabled, and DLSS reports it rather than the device being
+/// made some other way. The instance's half is checked here too, against what
+/// the instance was made with, since an instance made without
+/// [`upscaler_instance_extensions`] never asked.
+#[cfg(all(feature = "dlss", windows))]
+fn dlss_requirements(physical_device: &Arc<PhysicalDevice>) -> Result<DeviceExtensions, Arc<str>> {
+    use super::dlss;
+
+    let properties = physical_device.properties();
+    if properties.vendor_id != dlss::NVIDIA {
+        return Err(Arc::from(format!(
+            "DLSS runs on NVIDIA RTX GPUs only, and this is {}",
+            properties.device_name
+        )));
+    }
+    let made_with = physical_device.instance().enabled_extensions();
+    let names = dlss::instance_extensions()
+        .map_err(|reason| Arc::from(format!("NGX's instance query failed: {reason}")))?;
+    for name in names {
+        let wanted = InstanceExtensions::from_iter([name.as_str()]);
+        if wanted.is_empty() || !made_with.contains(&wanted) {
+            return Err(Arc::from(format!(
+                "the instance was made without {name}, which NGX asks for"
+            )));
+        }
+    }
+    let names = dlss::device_extensions(physical_device)
+        .map_err(|reason| Arc::from(format!("NGX's device query failed: {reason}")))?;
+    tracing::info!("DLSS: NGX asks the device for {names:?}");
+    let supported = physical_device.supported_extensions();
+    let mut extensions = DeviceExtensions::empty();
+    for name in names {
+        let wanted = DeviceExtensions::from_iter([name.as_str()]);
+        if wanted.is_empty() {
+            return Err(Arc::from(format!(
+                "NGX asks for {name}, which vulkano 0.35 cannot enable"
+            )));
+        }
+        if !supported.contains(&wanted) {
+            return Err(Arc::from(format!(
+                "NGX asks for {name}, which this device does not have"
+            )));
+        }
+        extensions = extensions.union(&wanted);
+    }
+    Ok(extensions)
 }
 
 /// Whether the device can build acceleration structures and trace ray queries

@@ -34,6 +34,7 @@ use ash::vk::{self, Handle};
 use vulkano::VulkanObject;
 use vulkano::device::Queue;
 use vulkano::format::Format;
+use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageUsage};
 
 use super::record::Recorder;
@@ -441,15 +442,15 @@ pub(super) struct ContextDesc {
 
 /// One frame's inputs to the upscale.
 pub(super) struct Dispatch<'a> {
-    pub color: &'a Arc<Image>,
-    pub depth: &'a Arc<Image>,
-    pub motion: &'a Arc<Image>,
+    pub color: &'a Arc<ImageView>,
+    pub depth: &'a Arc<ImageView>,
+    pub motion: &'a Arc<ImageView>,
     /// 1x1, the exposure the tonemap applies.
-    pub exposure: &'a Arc<Image>,
+    pub exposure: &'a Arc<ImageView>,
     /// How much each pixel is of what the blended queues drew, where the
     /// frame drew either.
-    pub reactive: Option<&'a Arc<Image>>,
-    pub output: &'a Arc<Image>,
+    pub reactive: Option<&'a Arc<ImageView>>,
+    pub output: &'a Arc<ImageView>,
     /// In render pixels, as `ffxDispatchDescUpscale::jitterOffset` takes it.
     pub jitter: [f32; 2],
     /// What turns a motion vector into render pixels from this frame to the
@@ -612,15 +613,15 @@ impl UpscaleContext {
         let mut desc = DispatchUpscale {
             header: Header::new(DISPATCH_UPSCALE),
             command_list: std::ptr::null_mut(),
-            color: Resource::image(frame.color, STATE_COMPUTE_READ),
-            depth: Resource::image(frame.depth, STATE_COMPUTE_READ),
-            motion_vectors: Resource::image(frame.motion, STATE_COMPUTE_READ),
-            exposure: Resource::image(frame.exposure, STATE_COMPUTE_READ),
+            color: Resource::image(frame.color.image(), STATE_COMPUTE_READ),
+            depth: Resource::image(frame.depth.image(), STATE_COMPUTE_READ),
+            motion_vectors: Resource::image(frame.motion.image(), STATE_COMPUTE_READ),
+            exposure: Resource::image(frame.exposure.image(), STATE_COMPUTE_READ),
             reactive: frame.reactive.map_or(Resource::NONE, |mask| {
-                Resource::image(mask, STATE_COMPUTE_READ)
+                Resource::image(mask.image(), STATE_COMPUTE_READ)
             }),
             transparency_and_composition: Resource::NONE,
-            output: Resource::image(frame.output, STATE_UNORDERED_ACCESS),
+            output: Resource::image(frame.output.image(), STATE_UNORDERED_ACCESS),
             jitter_offset: Coords {
                 x: frame.jitter[0],
                 y: frame.jitter[1],
@@ -654,7 +655,7 @@ impl UpscaleContext {
                 0
             },
         };
-        let images = [
+        let views = [
             frame.color,
             frame.depth,
             frame.motion,
@@ -663,7 +664,7 @@ impl UpscaleContext {
             frame.reactive.unwrap_or(frame.output),
         ];
         let named = if frame.reactive.is_some() { 6 } else { 5 };
-        let code = recorder.record_foreign(&images[..named], |command_buffer| {
+        let code = recorder.record_foreign(&views[..named], |command_buffer| {
             desc.command_list = command_buffer.as_raw() as *mut c_void;
             // SAFETY: the command buffer is recording — the recorder owns it
             // and is borrowed for the call — and is in no rendering instance,

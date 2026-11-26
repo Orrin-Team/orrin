@@ -500,7 +500,7 @@ impl VkDriver {
 
     /// [`fill_depth`](Self::fill_depth) for a colour texture: for one read
     /// before anything has written it, which has to hold a value meanwhile.
-    #[cfg(all(feature = "fsr", windows))]
+    #[cfg(all(any(feature = "fsr", feature = "dlss"), windows))]
     pub fn fill_color(&self, texture: TextureViewId, color: [f32; 4]) {
         let view = lookup(&self.views, texture.0, "texture view");
         let image = view.image().clone();
@@ -1529,7 +1529,7 @@ impl<'a> VkEncoder<'a> {
     /// The recording itself, for a pass whose body a vendor's library
     /// records. Forgets the bound pipeline, since what the library binds
     /// replaces it.
-    #[cfg(all(feature = "fsr", windows))]
+    #[cfg(all(any(feature = "fsr", feature = "dlss"), windows))]
     pub(super) fn recorder(&mut self) -> &mut Recorder {
         self.bound = None;
         self.recorder

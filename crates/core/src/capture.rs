@@ -491,10 +491,12 @@ pub fn render(
 /// those finds no device at all on macOS.
 pub(crate) fn headless_instance() -> Arc<Instance> {
     let library = VulkanLibrary::new().expect("failed to load vulkan library");
+    let enabled_extensions = crate::gfx::vulkan::upscaler_instance_extensions(&library);
     Instance::new(
         library,
         InstanceCreateInfo {
             flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+            enabled_extensions,
             ..Default::default()
         },
     )

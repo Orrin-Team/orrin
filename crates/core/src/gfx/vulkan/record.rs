@@ -35,7 +35,7 @@ use vulkano::acceleration_structure::{
 };
 use vulkano::buffer::allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo};
 use vulkano::buffer::{BufferContents, IndexBuffer, Subbuffer};
-#[cfg(all(feature = "fsr", windows))]
+#[cfg(all(any(feature = "fsr", feature = "dlss"), windows))]
 use vulkano::command_buffer::ClearColorImageInfo;
 use vulkano::command_buffer::{
     BlitImageInfo, ClearDepthStencilImageInfo, CommandBuffer, CommandBufferBeginInfo,
@@ -597,20 +597,20 @@ impl Recorder {
     }
 
     /// Hand the raw buffer to a library that records into it itself, as a
-    /// vendor's upscaler does. `images` are what its commands name, held for
+    /// vendor's upscaler does. `views` are what its commands name, held for
     /// the frame like anything bound here.
     ///
     /// What it leaves bound is undefined afterwards, and nothing recorded
     /// later depends on it: an encoder is made per pass and refuses a set or
     /// a push before its pass has bound a pipeline of its own.
-    #[cfg(all(feature = "fsr", windows))]
+    #[cfg(all(any(feature = "fsr", feature = "dlss"), windows))]
     pub(super) fn record_foreign<R>(
         &mut self,
-        images: &[&Arc<Image>],
+        views: &[&Arc<vulkano::image::view::ImageView>],
         record: impl FnOnce(vk::CommandBuffer) -> R,
     ) -> R {
-        for image in images {
-            self.keep.hold_arc(Arc::clone(image));
+        for view in views {
+            self.keep.hold_arc(Arc::clone(view));
         }
         record(self.inner.handle())
     }
@@ -889,7 +889,7 @@ impl Recorder {
         self
     }
 
-    #[cfg(all(feature = "fsr", windows))]
+    #[cfg(all(any(feature = "fsr", feature = "dlss"), windows))]
     pub(super) fn clear_color_image(&mut self, info: ClearColorImageInfo) -> &mut Self {
         unsafe { self.inner.clear_color_image(&info) }.expect("invalid colour clear");
         self.keep.hold(info);

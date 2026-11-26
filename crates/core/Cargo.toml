@@ -127,6 +127,13 @@ export = ["tracing/max_level_info"]
 # nothing without AMD's DLLs beside the executable or in `ORRIN_FSR_DIR`, and
 # the engine's own resolve stands in wherever it cannot run.
 fsr = ["dep:libloading"]
+# NVIDIA DLSS as the temporal upscaler, through NGX on Vulkan on Windows
+# (`gfx/vulkan/dlss.rs`). Off by default: building it links NVIDIA's NGX SDK
+# statically from `ORRIN_DLSS_DIR`, which this repository does not carry, and
+# it does nothing without an RTX GPU and `nvngx_dlss.dll`, the engine's own
+# resolve standing in wherever it cannot run. No crate: what it costs is that
+# static library, about 4 MB of it before the linker drops what is unused.
+dlss = []
 
 [[bench]]
 name = "startup"

@@ -5,6 +5,8 @@ mod context;
 mod convert;
 mod cull;
 mod descriptors;
+#[cfg(all(feature = "dlss", windows))]
+mod dlss;
 mod dof;
 pub mod driver;
 mod environment;
@@ -178,6 +180,7 @@ pub(crate) const MSAA_SAMPLES: crate::gfx::format::SampleCount =
 pub(crate) const OFFSCREEN_FORMAT: crate::gfx::format::Format =
     crate::gfx::format::Format::Rgba8Srgb;
 
+pub use context::upscaler_instance_extensions;
 pub use cull::MAX_SURFACE_SHADERS;
 pub use gizmo::GizmoVertex;
 pub use outline::OutlineItem;
@@ -2294,14 +2297,14 @@ impl VulkanRenderer {
         // Whether a vendor's upscaler can resolve this frame is part of its
         // structure, so it is settled first.
         let vendor_resolve = {
-            let queue = match &self.backend {
-                Backend::Vulkan(vk) => Some(&vk.ctx.queue),
+            let vk = match &self.backend {
+                Backend::Vulkan(vk) => Some(&*vk.ctx),
                 #[cfg(target_os = "macos")]
                 Backend::Metal(_) => None,
             };
             self.upscaler.prepare(
                 &self.device,
-                queue,
+                vk,
                 taa,
                 self.backend.extent(),
                 hdr.manual_exposure(),
@@ -4027,6 +4030,19 @@ impl FrameRecord<'_> {
     /// reason it is contiguous: the runs are executed in order by one primary,
     /// and there is one primary per segment.
     fn record_segment(&self, builder: &mut Recorder, segment: Range<usize>, parallel: bool) {
+        // NGX takes its calls on one thread (`upscaler.rs`), so a run that
+        // holds its node is split around it and the node recorded here.
+        if parallel
+            && self.upscaler.records_on_caller()
+            && let Some(slot) = segment.clone().find(|&slot| {
+                self.frame.bodies[self.frame.graph.order()[slot].index()] == PassBody::VendorResolve
+            })
+        {
+            self.record_segment(builder, segment.start..slot, true);
+            self.record_slot(builder, slot);
+            self.record_segment(builder, slot + 1..segment.end, true);
+            return;
+        }
         let slots = segment.len();
         let groups = threads::count().min(RECORD_GROUPS);
         if !parallel || groups < 2 || slots < 2 {
@@ -4651,14 +4667,14 @@ impl FrameRecord<'_> {
                     .ids
                     .vendor_resolve
                     .expect("a vendor resolve without its images");
-                let image = |id| self.vk_view(self.texture_of(id)).image().clone();
+                let view = |id| self.vk_view(self.texture_of(id));
                 let images = upscaler::Images {
-                    color: image(ids.source),
-                    depth: image(prepass.depth),
-                    motion: image(prepass.velocity),
-                    exposure: image(ids.exposure_history),
-                    reactive: ids.reactive.map(image),
-                    output: image(ids.output),
+                    color: view(ids.source),
+                    depth: view(prepass.depth),
+                    motion: view(prepass.velocity),
+                    exposure: view(ids.exposure_history),
+                    reactive: ids.reactive.map(view),
+                    output: view(ids.output),
                 };
                 self.upscaler
                     .record(encoder, &images, &self.upscale, self.taa.take_reset());

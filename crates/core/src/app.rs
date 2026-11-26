@@ -1472,7 +1472,9 @@ fn create_vulkan_instance(
     validate: bool,
 ) -> (Arc<Instance>, Option<DebugUtilsMessenger>) {
     let library = VulkanLibrary::new().expect("failed to load vulkan library");
-    let mut enabled_extensions = Surface::required_extensions(event_loop).unwrap();
+    let mut enabled_extensions = Surface::required_extensions(event_loop)
+        .unwrap()
+        .union(&crate::gfx::vulkan::upscaler_instance_extensions(&library));
 
     // Architecture §3.5: validation on in every dev build. Silently skipped
     // when the layer isn't installed, so a machine without the Vulkan SDK
